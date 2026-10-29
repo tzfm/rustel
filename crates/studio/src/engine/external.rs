@@ -922,24 +922,49 @@ mod tests {
 
     /// Withdrawing a line that a published flip already cleared retires nothing:
     /// the audio from that line is the launched score's. An arm still set when
-    /// it is withdrawn has fired, and takes what the shield holds past it.
+    /// it is withdrawn has fired, and takes what the shield holds past it. A
+    /// plugin chain with latency fires the arm before the render frontier
+    /// passes its line, and the fired arm takes the same.
     #[cfg(feature = "osc")]
     #[test]
     fn withdrawing_a_line_retires_only_an_arm_still_set() {
         let mut engine = silent_engine_with_pattern(rustel_core::silence());
         run_clock_past(&engine, 0.5);
         let now = device_of(&engine).clock_seconds();
-        let line = frame_at(now - 0.1, device_of(&engine).sample_rate());
+        let rate = device_of(&engine).sample_rate();
+        let line = frame_at(now - 0.1, rate);
         engine.shield_hold.hold_osc_for_test(&[now + 1.0]);
+        // The flip carries a restart lead of 1 s: a chain with latency plays.
+        let lead = Arc::new(std::sync::atomic::AtomicU32::new(rate));
         let device = device_of(&engine);
+        device.set_restart_lead(lead);
         device.arm_line_cut(line, true);
         device.set_generation(device.generation() + 1, line, TakeoverCut::AtTakeover);
         engine.withdraw_line_cut(false);
         assert_eq!(engine.shield_hold.held_targets_for_test(), [now + 1.0]);
 
+        // The clock holds, so the device does not fire this arm. A fired arm
+        // latches until the device sees its withdrawal, and the next arm
+        // follows at once.
+        hold_clock(&engine, true);
         device_of(&engine).arm_line_cut(line, true);
         engine.withdraw_line_cut(false);
         assert!(engine.shield_hold.held_targets_for_test().is_empty());
+
+        // A line 0.9 s ahead: the device fires its arm the lead before it,
+        // at once, and the clock stops on that fire. The withdrawal retires
+        // from the line, and the frontier has not passed it.
+        let now = device_of(&engine).clock_seconds();
+        let line = frame_at(now + 0.9, rate);
+        engine.shield_hold.hold_osc_for_test(&[now + 1.0]);
+        device_of(&engine).arm_line_cut(line, true);
+        hold_clock_until(&engine, |engine| {
+            device_of(engine).fired_line_frame() == Some(line)
+        });
+        assert!(device_of(&engine).render_frontier_frames() < line);
+        engine.withdraw_line_cut(false);
+        assert!(engine.shield_hold.held_targets_for_test().is_empty());
+        hold_clock(&engine, false);
     }
 
     /// A flip retires the outgoing score's external output from its takeover,

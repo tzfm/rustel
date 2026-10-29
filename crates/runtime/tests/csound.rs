@@ -323,3 +323,74 @@ fn long_exports_prepare_score_events_as_the_audio_advances() {
         );
     });
 }
+
+/// A Csound note on a plugin effect with latency converts again, 480 frames
+/// early, so the effect plays in time. The note keeps the score event of
+/// its first conversion: the second conversion prepares none, so the score
+/// events of the notes after it follow on.
+#[cfg(all(feature = "vst", feature = "device-audio", feature = "test-support"))]
+#[test]
+fn a_note_on_an_effect_with_latency_keeps_its_score_event() {
+    if !native_available() {
+        return;
+    }
+    on_score_thread(|| {
+        // The fixture plugin as the only plugin of the process, with a preset
+        // that delays its output by 480 frames and gives that delay as its
+        // latency.
+        let folder = tempfile::tempdir().expect("plugin folder");
+        rustel_vst3_fixture::install(folder.path());
+        rustel_runtime::vst::pin_standard_folders(vec![folder.path().to_path_buf()]);
+        let presets = folder.path().join("presets");
+        rustel_runtime::vst::host().set_preset_folder(presets.clone());
+        let presets = presets.join(rustel_vst3_fixture::NAME);
+        std::fs::create_dir_all(&presets).expect("preset folder");
+        let delay = rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.1171875);
+        std::fs::write(presets.join("Delay.vstpreset"), delay).expect("preset file");
+        let mut session = session();
+        let library = rustel_runtime::samples::SampleLibrary::empty();
+        session.set_sample_library_for_test(std::sync::Arc::new(library));
+        let latent = "note('c4').csound('probe').vst('rustel fixture', { preset: 'delay' })";
+        let dry = "note('e4').csound('probe').late(0.25)";
+        session
+            .evaluate(&format!(
+                "loadCSound`instr probe\naOut init .05\nouts aOut,aOut\nendin`\nstack({latent}, {dry})"
+            ))
+            .expect("score");
+        let output = rustel_audio::LiveScalarDevice::start_silent(8_000, session.generation())
+            .expect("silent output");
+        session.attach_plugins(&output);
+        let started = std::time::Instant::now();
+        let ceiling = std::time::Duration::from_secs(1);
+        while session.plugins_pending(0.0, 1.0, ceiling) > 0 {
+            assert!(started.elapsed().as_secs() < 20, "no copy");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        // A window from `now`: the score event, the start frame and the lead
+        // of the note on the effect, and the score event of the note after
+        // it. The last look raised the lead of the chains to 480 frames, and
+        // a start moves cycle zero by that lead. So cycle zero is at 0.1 s,
+        // frame 800.
+        session.restart_transport_at(0.1 - session.plugin_lead());
+        let window = |session: &mut Session, now: f64| {
+            let events = session.schedule_audio_at(now, 8_000).expect("events");
+            let score = |event: &rustel_audio::AudioEvent| {
+                let instrument = event.controls.instrument.expect("the score event");
+                instrument.score().expect("a score event")
+            };
+            let [latent, dry] = &events[..] else {
+                panic!("{} notes", events.len());
+            };
+            assert!(latent.controls.effects[0].is_some());
+            let start = (latent.target_frame, latent.controls.lead);
+            (score(latent), start, score(dry))
+        };
+        let (first, start, after) = window(&mut session, 0.0);
+        assert_eq!(start, (320, 480));
+        assert_eq!(after, first + 1);
+        // The next cycle prepares one score event for each note again.
+        let (second, start, next) = window(&mut session, 1.0);
+        assert_eq!(start, (8_320, 480));
+        assert_eq!((second, next), (after + 1, after + 2));
+    });
+}

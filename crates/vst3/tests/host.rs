@@ -576,11 +576,22 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
     // no copy of the key at another rate.
     assert_eq!(rig.host.latency(default, SAMPLE_RATE, parked), Some(1024));
     assert_eq!(rig.host.latency(default, 44_100, parked), None);
+    // Before its copy, the key of the Half Level preset has the latency of
+    // the copy of another preset of its plugin: the copy of default. The
+    // host built no copy of the plugin at another rate, and no copy of
+    // another plugin.
+    let half = InsertKey { plugin, preset };
+    let slot = InsertSlot::effect(1, 0);
+    assert_eq!(rig.host.latency(half, SAMPLE_RATE, slot), Some(1024));
+    assert_eq!(rig.host.latency(half, 44_100, slot), None);
+    let another = InsertKey {
+        plugin: plugin + 1,
+        preset,
+    };
+    assert_eq!(rig.host.latency(another, SAMPLE_RATE, slot), None);
     let mut insert = rig.insert(preset).expect("insert");
     // The copy of the Half Level preset has a latency of its own. Its state
     // of 16 bytes has no delay.
-    let half = InsertKey { plugin, preset };
-    let slot = InsertSlot::effect(1, 0);
     assert_eq!(rig.host.latency(half, SAMPLE_RATE, slot), Some(0));
     // The plugin list has the largest latency of the copies.
     assert_eq!(rig.host.plugins()[0].latency, Some(1024));

@@ -2498,9 +2498,12 @@ impl Host {
 
     /// The latency of the plugin copy of one slot, in frames: the copy that
     /// waits for the slot, else the copy an engine holds or gives back, else
-    /// the last copy of the key at this rate. `None` when the host built no
-    /// copy of the key at this rate since the plugin loaded. The call makes
-    /// no plugin call and waits for nothing.
+    /// the last copy of the key at this rate. A key with no copy at this rate
+    /// has the latency of the last copy of another preset of its plugin at
+    /// this rate, the largest of them: a new preset keeps the latency of its
+    /// plugin until its own copy gives one. `None` when the host built no
+    /// copy of the plugin at this rate since the plugin loaded. The call
+    /// makes no plugin call and waits for nothing.
     pub fn latency(&self, key: InsertKey, sample_rate: u32, slot: InsertSlot) -> Option<u32> {
         let build = (key, sample_rate, slot);
         let state = self.state();
@@ -2509,7 +2512,13 @@ impl Host {
             (_, Some(cell)) if cell.place() != Place::Home => {
                 Some(cell.latency.load(Ordering::Relaxed))
             }
-            _ => state.latencies.get(&(key, sample_rate)).copied(),
+            _ => {
+                let last = state.latencies.get(&(key, sample_rate)).copied();
+                let presets = state.latencies.iter().filter(|((other, rate), _)| {
+                    other.plugin == key.plugin && *rate == sample_rate
+                });
+                last.or_else(|| presets.map(|(_, latency)| *latency).max())
+            }
         }
     }
 

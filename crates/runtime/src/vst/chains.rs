@@ -2286,7 +2286,6 @@ impl Want {
     }
 
     /// True for a copy of a lane that plays now.
-    #[cfg(feature = "device-audio")]
     pub(crate) fn sounds(&self) -> bool {
         self.sounds
     }
@@ -2453,6 +2452,121 @@ pub(crate) fn returning(chains: &Mutex<Chains>, sample_rate: u32) -> usize {
         return 0;
     }
     started().map_or(0, |host| host.returning(chains.caller, sample_rate))
+}
+
+/// The most latency of a plugin chain that the engine compensates, in
+/// seconds: a note starts this much before its onset at most. A plugin copy
+/// that gives more counts as this much: see [`latencies`].
+const MAX_LEAD_SECS: u32 = 1;
+
+/// Gives each stage of the chain of a note the latency of its plugin copy,
+/// in frames at the rate `rate`, 1 s at most: see [`Host::latency`]. A
+/// Csound stage has no latency, and neither has a stage whose plugin has no
+/// copy at the rate yet. `known` keeps the latency of each slot and key a
+/// window asked for, so the window asks the host one time for each. A chain
+/// whose copies give more than 1 s in all gives one plugin line: see
+/// [`take_problems`]. Gives the lead of the note in frames: the latency of
+/// its chain, 1 s at most. A note with no chain has no lead. Only a session
+/// with plugins on a live output asks.
+pub(crate) fn latencies(
+    chains: &Mutex<Chains>,
+    controls: &mut rustel_audio::OscillatorControls,
+    rate: u32,
+    known: &mut Vec<(InsertSlot, InsertKey, u32)>,
+) -> u32 {
+    let Some(chain) = controls.insert_chain else {
+        return 0;
+    };
+    let most = rate.saturating_mul(MAX_LEAD_SECS);
+    let effects = controls.effects.iter_mut().enumerate();
+    let effects = effects.filter_map(|(place, effect)| {
+        let effect = effect.as_mut()?;
+        let slot = rustel_audio::effect_slot(chain, effect.stage(place));
+        Some((slot, effect))
+    });
+    let instrument = controls.instrument.as_mut();
+    let instrument = instrument.map(|stage| (rustel_audio::instrument_slot(chain), stage));
+    // The sum of the latencies the host gives, before the cap of each stage.
+    let mut given = 0_u64;
+    for (slot, stage) in effects.chain(instrument) {
+        let latency = latency_of(slot, stage.key, rate, known);
+        given += u64::from(latency);
+        *stage = stage.with_latency(latency.min(most));
+    }
+    if given > u64::from(most) && rate > 0 {
+        let line = format!(
+            "a plugin chain has {} ms of latency: rustel compensates {} ms, \
+             and the lane plays the rest late",
+            given * 1000 / u64::from(rate),
+            MAX_LEAD_SECS * 1000
+        );
+        let mut chains = locked(chains);
+        if !chains.problems.contains(&line) {
+            chains.problems.push(line);
+        }
+    }
+    controls.chain_latency().min(most)
+}
+
+/// The lead of the plugin chains of `wants` at the rate `rate`, in seconds:
+/// the latency of the largest chain, 1 s at most. A chain has the sum of the
+/// latencies of its slots, and a slot the largest latency of the copies the
+/// wants ask of it. A plugin with no copy at the rate has no latency: see
+/// [`Host::latency`]. A plugin that loads has no key yet, and no latency.
+/// The caller asks after [`ensure`] started the loads and the builds. With
+/// no host, no copy exists, and the lead is 0.
+pub(crate) fn lead(wants: &[Want], rate: u32) -> f64 {
+    let Some(host) = started().filter(|_| rate > 0) else {
+        return 0.0;
+    };
+    let mut known = Vec::new();
+    // The largest latency of each slot.
+    let mut slots: Vec<(InsertSlot, u32)> = Vec::new();
+    for want in wants {
+        let preset = want.preset.as_deref();
+        let Ok(Some((key, _))) = host.key(&want.name, preset, want.instrument) else {
+            continue;
+        };
+        let latency = latency_of(want.slot, key, rate, &mut known);
+        match slots.iter_mut().find(|(slot, _)| *slot == want.slot) {
+            Some((_, most)) => *most = (*most).max(latency),
+            None => slots.push((want.slot, latency)),
+        }
+    }
+    // The sum of the slots of each chain.
+    let mut chains: Vec<(u64, u64)> = Vec::new();
+    for (slot, latency) in slots {
+        match chains.iter_mut().find(|(chain, _)| *chain == slot.chain) {
+            Some((_, sum)) => *sum += u64::from(latency),
+            None => chains.push((slot.chain, u64::from(latency))),
+        }
+    }
+    let most = u64::from(rate.saturating_mul(MAX_LEAD_SECS));
+    let largest = chains.iter().map(|(_, sum)| *sum).max().unwrap_or(0);
+    largest.min(most) as f64 / f64::from(rate)
+}
+
+/// The latency of the plugin copy of `key` in `slot` at the rate `rate`, in
+/// frames: the latency `known` has, else the latency the host gives, which
+/// `known` then keeps. A Csound copy has none, and so has a plugin with no
+/// copy at the rate.
+fn latency_of(
+    slot: InsertSlot,
+    key: InsertKey,
+    rate: u32,
+    known: &mut Vec<(InsertSlot, InsertKey, u32)>,
+) -> u32 {
+    if key.plugin == rustel_csound::PLUGIN_ID {
+        return 0;
+    }
+    let same = |(at, of, _): &&(InsertSlot, InsertKey, u32)| (*at, *of) == (slot, key);
+    if let Some((.., latency)) = known.iter().find(same) {
+        return *latency;
+    }
+    let latency = started().and_then(|host| host.latency(key, rate, slot));
+    let latency = latency.unwrap_or(0);
+    known.push((slot, key, latency));
+    latency
 }
 
 #[cfg(test)]
@@ -2826,22 +2940,24 @@ mod tests {
         // The note of the 65th lane converts with its plugins. The chains of
         // a session window then give it none: no chain, no effect, no
         // instrument, gain 0 and no gain binding.
-        let convert = |lane: usize| {
-            let bound = crate::OnsetEventJson {
-                live_controls: [7, 0, 0, 0],
-                ..onset(&note(lane), 1)
-            };
-            let event = crate::render::live_audio_event(&bound, 48_000, 0.5, &Plugins, |_| None);
+        let bound = |lane: usize| crate::OnsetEventJson {
+            live_controls: [7, 0, 0, 0],
+            ..onset(&note(lane), 1)
+        };
+        let onsets: Vec<crate::OnsetEventJson> = (0..65).map(bound).collect();
+        let convert = |onset: &crate::OnsetEventJson| {
+            let event = crate::render::live_audio_event(onset, 48_000, 0.5, &Plugins, |_| None);
             event.expect("the note")
         };
-        let mut events: Vec<rustel_audio::AudioEvent> = (0..65).map(convert).collect();
+        let mut events: Vec<rustel_audio::AudioEvent> = onsets.iter().map(convert).collect();
         let controls = &events[64].controls;
         let plugins = (controls.instrument.is_some(), controls.effects[0].is_some());
         assert_eq!((plugins, controls.live_controls[0]), ((true, true), 7));
         assert!(events[64].gain > 0.0);
-        let values: Vec<&crate::ValueJson> = notes.iter().collect();
-        let session = crate::Session::new().expect("session");
-        session.chain_live_events(&mut events, &values);
+        let onsets: Vec<&crate::OnsetEventJson> = onsets.iter().collect();
+        let mut session = crate::Session::new().expect("session");
+        let window = crate::session::LeadWindow::Steady;
+        session.chain_live_events(&mut events, &onsets, &Plugins, 48_000, 0.0, window);
         assert!(
             events[..64]
                 .iter()
@@ -4842,10 +4958,11 @@ mod tests {
             "s": "bd",
             "vst": [{"name": "a plugin of the export", "__rustel_sliders": {"mix": "mix"}}],
         });
-        let event =
-            crate::render::live_audio_event(&onset(&note, 1), 48_000, 0.5, &Plugins, |_| None);
+        let note_onset = onset(&note, 1);
+        let event = crate::render::live_audio_event(&note_onset, 48_000, 0.5, &Plugins, |_| None);
         let mut events = [event.expect("the note")];
-        export.chain_live_events(&mut events, &[&crate::ValueJson::Raw(note.clone())]);
+        let window = crate::session::LeadWindow::Steady;
+        export.chain_live_events(&mut events, &[&note_onset], &Plugins, 48_000, 0.0, window);
         let mut controls = events[0].controls.clone();
         let effect = controls.effects[0].as_mut().expect("the effect");
         assert!(effect.push(InsertParam { id: 3, value: 0.5 }));

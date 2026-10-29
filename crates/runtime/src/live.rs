@@ -232,9 +232,10 @@ pub struct LiveFileProducer {
     /// A future onset can hold the ring before a later, earlier onset.
     queued_through: f64,
     pending_publication: Option<rustel_audio::KabelPublication>,
-    /// One past the latest target any scheduled event has carried. Monotone;
-    /// the engine freezes it when the library forgets a sample, since
-    /// nothing scheduled afterwards can name that sample.
+    /// One past the latest frame the source of a scheduled event starts
+    /// on. It never goes backwards. The engine freezes it when the library
+    /// forgets a sample, since nothing scheduled afterwards names that
+    /// sample.
     scheduled_through_frame: u64,
     generation_needs_prefill: bool,
     /// Device generation handoff is deliberately later than Session install:
@@ -1583,7 +1584,9 @@ impl LiveFileProducer {
             ProducerPhase::AssetPreparation,
             preparation_started.elapsed(),
         );
-        self.note_scheduled_through(batch.events.iter().map(|event| event.target_frame));
+        let restart_lead = session.restart_lead_frames();
+        let starts = batch.events.iter();
+        self.note_scheduled_through(starts.map(|event| latest_start(event, restart_lead)));
         self.pending.extend(
             batch
                 .events
@@ -1975,9 +1978,12 @@ impl LiveFileProducer {
             // the exact retained backlog has crossed.
             let now = schedule_now();
             cover_age_started = Some(Instant::now());
-            // A rewind that reaches this turn with its cycle zero already
-            // behind the clock restarts from the top where it can sound:
-            // cycle zero slides to now (see `slide_pending_rewind_anchor`).
+            // A rewind that reaches this turn with its cycle zero behind the
+            // clock, or nearer to it than the lead of the plugin chains,
+            // restarts from the top where it can sound: cycle zero slides to
+            // now plus that lead (see `slide_pending_rewind_anchor`). A line
+            // still ahead keeps its takeover and its cut, so the countdown
+            // plays to the line.
             // Left in the rendered past, its downbeat started partway into
             // its sample; held past the cover, the gap skip began it bars
             // in.
@@ -2442,7 +2448,12 @@ impl LiveFileProducer {
                 // already have fired, leaving that room silent. An ordinary
                 // edit still refuses to publish into the past: its takeover
                 // is where the outgoing score's retained events stop, and a
-                // late publication would ask rendered frames to change.
+                // late publication would ask rendered frames to change. The
+                // notes of a plugin chain with latency start the lead the
+                // takeover added before it, so the edit refuses that much
+                // earlier.
+                #[cfg(feature = "vst")]
+                let publication_now = publication_now + session.takeover_lead();
                 if session.transport().is_stopped()
                     || (publication_now > takeover_time && takeover_cut == TakeoverCut::None)
                 {
@@ -2504,7 +2515,11 @@ impl LiveFileProducer {
                     // until the takeover, and this generation's copy arrives
                     // too late to matter). They keep playing without a
                     // receipt: the offer counts only the certifiable onsets,
-                    // and ordinals are numbered over those alone.
+                    // and ordinals are numbered over those alone. The device
+                    // judges an event by its musical onset: its target plus
+                    // the lead of its note. A note of a plugin chain with
+                    // latency is aimed that lead before it. So the offer
+                    // counts and tags by the musical onset too.
                     let start_frame = ((now * f64::from(sample_rate)).floor().max(0.0) as u64)
                         .max(takeover_frame);
                     // Count event by event, not with a binary search. The
@@ -2515,12 +2530,12 @@ impl LiveFileProducer {
                     let uncertifiable = batch
                         .events
                         .iter()
-                        .filter(|event| event.target_frame < start_frame)
+                        .filter(|event| event.controls.musical(event.target_frame) < start_frame)
                         .count();
                     let last_frame = batch
                         .events
                         .iter()
-                        .map(|event| event.target_frame)
+                        .map(|event| event.controls.musical(event.target_frame))
                         .max()
                         .unwrap_or(start_frame)
                         .max(start_frame);
@@ -2660,7 +2675,9 @@ impl LiveFileProducer {
             // about to sound; the excess is dropped and reported once.
             let room = MAX_PENDING_BACKLOG.saturating_sub(self.pending.len());
             let dropped = events.len().saturating_sub(room);
-            self.note_scheduled_through(events.iter().map(|event| event.target_frame));
+            let restart_lead = session.restart_lead_frames();
+            let starts = events.iter();
+            self.note_scheduled_through(starts.map(|event| latest_start(event, restart_lead)));
             let mut next_ordinal = 0u32;
             self.pending.extend(
                 events
@@ -2673,7 +2690,9 @@ impl LiveFileProducer {
                         // one that counts `uncertifiable`, so the ordinals
                         // match the offer.
                         confirmation: confirmation
-                            .filter(|_| event.target_frame >= certified_from)
+                            .filter(|_| {
+                                event.controls.musical(event.target_frame) >= certified_from
+                            })
                             .map(|key| {
                                 let ordinal = next_ordinal;
                                 next_ordinal += 1;
@@ -2755,10 +2774,21 @@ impl LiveFileProducer {
     }
 }
 
+/// The latest frame the source of `event` starts on: its target plus the
+/// latency of its plugin chain plus the restart lead of the output. See
+/// [`Session::restart_lead_frames`].
+fn latest_start(event: &rustel_audio::AudioEvent, restart_lead: u64) -> u64 {
+    event
+        .target_frame
+        .saturating_add(u64::from(event.controls.chain_latency()))
+        .saturating_add(restart_lead)
+}
+
 impl LiveFileProducer {
-    /// Remember how far ahead the backlog now reaches.
-    fn note_scheduled_through(&mut self, targets: impl Iterator<Item = u64>) {
-        let last = targets.max().map_or(0, |last| last.saturating_add(1));
+    /// Remember how far ahead the backlog now reaches: one past the latest
+    /// frame a source of the events starts on, from `starts`.
+    fn note_scheduled_through(&mut self, starts: impl Iterator<Item = u64>) {
+        let last = starts.max().map_or(0, |last| last.saturating_add(1));
         self.scheduled_through_frame = self.scheduled_through_frame.max(last);
     }
 
@@ -2770,7 +2800,9 @@ impl LiveFileProducer {
         }
     }
 
-    /// One past the latest target any scheduled event has carried.
+    /// One past the latest frame the source of a scheduled event starts
+    /// on: its target plus the latency of its plugin chain plus the
+    /// restart lead of the output.
     pub fn scheduled_through_frame(&self) -> u64 {
         self.scheduled_through_frame
     }
@@ -3821,6 +3853,13 @@ mod tests {
             .expect("initial prefill");
 
         let generation = session.generation();
+        // A plugin chain with latency plays: a restart moves a note up to 480
+        // frames after its target.
+        #[cfg(feature = "vst")]
+        {
+            session.set_plugin_rate(48_000);
+            session.set_plugin_lead_for_test(0.01);
+        }
         let mut shielded = Vec::new();
         assert!(
             producer
@@ -3840,15 +3879,19 @@ mod tests {
             shielded.iter().all(|event| event.generation == generation),
             "reload shield crossed generations"
         );
+        let latest = shielded
+            .iter()
+            .map(|event| event.target_frame)
+            .max()
+            .unwrap_or_default();
         assert!(
-            shielded
-                .iter()
-                .map(|event| event.target_frame)
-                .max()
-                .unwrap_or_default()
-                >= 96_000,
+            latest >= 96_000,
             "reload shield did not extend the audible ring by one 120 BPM cycle"
         );
+        // The producer keeps the samples of each note up to its latest
+        // start, the restart lead after its target.
+        #[cfg(feature = "vst")]
+        assert_eq!(producer.scheduled_through_frame(), latest + 480 + 1);
     }
 
     #[test]
@@ -4582,10 +4625,11 @@ mod tests {
     }
 
     /// The frontier of everything ever scheduled: one past the latest
-    /// target, and never backwards - a later, earlier batch does not
-    /// shorten what an evicted sample has to outlive.
+    /// start. It never goes backwards: a later, earlier batch does not
+    /// shorten what an evicted sample has to outlive. A note of a plugin
+    /// chain counts the frames its source starts after its target at most.
     #[test]
-    fn scheduled_through_frame_is_one_past_the_latest_target_seen() {
+    fn scheduled_through_frame_is_one_past_the_latest_start_seen() {
         let mut producer = LiveFileProducer::new(
             "unused.strudel",
             WatchLanguage::JavaScript,
@@ -4608,6 +4652,14 @@ mod tests {
             96_001,
             "an empty batch is nothing"
         );
+        // The source of a note of a plugin chain with 480 frames of latency
+        // starts up to that latency after its target, and a restart moves
+        // the target up to its restart lead later, 240 frames here.
+        let mut latent = queued_at(96_000).event;
+        let stage = rustel_audio::InsertControls::new(rustel_audio::InsertKey::default());
+        latent.controls.effects[0] = Some(stage.with_latency(480));
+        producer.note_scheduled_through([latest_start(&latent, 240)].into_iter());
+        assert_eq!(producer.scheduled_through_frame(), 96_721);
         producer.note_scheduled_through([u64::MAX].into_iter());
         assert_eq!(producer.scheduled_through_frame(), u64::MAX, "saturates");
     }
@@ -5267,8 +5319,8 @@ mod tests {
     struct Sent {
         /// Each published generation with its takeover frame.
         takeovers: Vec<(u64, u64)>,
-        /// Each event's generation, target frame and receipt ordinal.
-        events: Vec<(u64, u64, Option<u32>)>,
+        /// Each event's generation, target frame, lead and receipt ordinal.
+        events: Vec<(u64, u64, u32, Option<u32>)>,
     }
 
     impl Sent {
@@ -5276,8 +5328,8 @@ mod tests {
         fn window(&self, generation: u64) -> Vec<(u64, Option<u32>)> {
             self.events
                 .iter()
-                .filter(|(event_generation, _, _)| *event_generation == generation)
-                .map(|&(_, target_frame, receipt)| (target_frame, receipt))
+                .filter(|(event_generation, ..)| *event_generation == generation)
+                .map(|&(_, target_frame, _, receipt)| (target_frame, receipt))
                 .collect()
         }
     }
@@ -5306,6 +5358,7 @@ mod tests {
                         sent.events.push((
                             event.generation,
                             event.target_frame,
+                            event.controls.lead,
                             event.confirmation.map(|receipt| receipt.ordinal),
                         ));
                     }
@@ -5687,6 +5740,111 @@ mod tests {
         host.wait_idle();
         // SAFETY: as above.
         unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV) };
+    }
+
+    /// An edit of a lane through a plugin with 480 frames of latency. Each
+    /// note of the lane starts 480 frames before its musical onset, so a
+    /// note with its musical onset in the first 480 frames after the takeover
+    /// is aimed before the takeover. The device judges a note by its musical
+    /// onset: such a note has a receipt, and the device certifies the window
+    /// in the block that copies the musical onset of its last note.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn an_edit_gives_a_receipt_to_a_latent_note_aimed_before_its_takeover() {
+        use rustel_audio::device::ManualLiveOutput;
+
+        /// Blocks of 128 frames rendered before the edit.
+        const EDIT_BLOCK: usize = 317;
+
+        let (_one, folder) = crate::session::tests::fixture_plugins();
+        let presets = folder.path().join("presets");
+        let presets = presets.join(rustel_vst3_fixture::NAME);
+        std::fs::create_dir_all(&presets).expect("preset folder");
+        // The fixture delays its output by 480 frames, and gives that delay
+        // as its latency.
+        let delay = rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.1171875);
+        std::fs::write(presets.join("Delay.vstpreset"), delay).expect("preset file");
+        // A lane of 256 notes a cycle through the plugin: at the default
+        // half cycle a second and 48 kHz, one each 375 frames.
+        let lane = |note: &str| {
+            format!(
+                "$: note(\"{note}*256\").s(\"sine\").vst(\"rustel fixture\", {{ preset: \"delay\" }})"
+            )
+        };
+
+        let mut session = Session::new().expect("session");
+        session.set_direct_diagnostic_logging(false);
+        let library = crate::samples::SampleLibrary::empty();
+        session.set_sample_library_for_test(std::sync::Arc::new(library));
+        session.set_schedule_lead(0.0);
+        session.set_continuity_margin(0.125);
+        session.evaluate(&lane("c3")).expect("score");
+        let original = session.generation();
+        let mut output = ManualLiveOutput::new(48_000, original).expect("output");
+        session.attach_plugins(output.device());
+        session
+            .bind_audio_confirmations(output.device().confirmations())
+            .expect("bind output");
+        // The copy of the plugin is ready, so the host knows its latency.
+        let started = Instant::now();
+        while session.plugins_pending(0.0, 1.0, Duration::from_secs(1)) > 0 {
+            assert!(started.elapsed() < Duration::from_secs(20), "no copy");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        session.restart_transport_at(0.0);
+        let mut producer = LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+        for _ in 0..EDIT_BLOCK {
+            turn(&mut session, &mut producer, &mut output);
+        }
+
+        let now = output.device().render_frontier_seconds();
+        let edit = session
+            .reload_at(&lane("e3"), false, now)
+            .expect("the edit");
+        producer.arm_replacement(original, edit);
+        let sent = turn(&mut session, &mut producer, &mut output);
+        assert_eq!(sent.takeovers.len(), 1, "test premise: the edit publishes");
+        let (generation, takeover) = sent.takeovers[0];
+        assert_eq!(generation, edit);
+        // The target, the musical onset and the receipt of each note.
+        let notes: Vec<(u64, u64, Option<u32>)> = sent
+            .events
+            .iter()
+            .filter(|(generation, ..)| *generation == edit)
+            .map(|&(_, target, lead, receipt)| (target, target + u64::from(lead), receipt))
+            .collect();
+        let aimed_before = |&(target, musical, _): &(u64, u64, Option<u32>)| {
+            target < takeover && musical >= takeover
+        };
+        let early = notes.iter().find(|note| aimed_before(note));
+        let early = early.expect("test premise: a note aimed before the takeover");
+        assert!(early.2.is_some(), "no receipt: {notes:?}");
+        let window: Vec<_> = notes
+            .iter()
+            .map(|&(_, musical, receipt)| (musical, receipt))
+            .collect();
+        let receipts: Vec<_> = window.iter().map(|&(_, receipt)| receipt).collect();
+        assert_eq!(receipts, receipts_from(takeover, &window), "{notes:?}");
+
+        // The device certifies the window once it copied the musical onset
+        // of the last note with a receipt, not its target.
+        let last = window.iter().filter(|(_, receipt)| receipt.is_some());
+        let last = last.map(|&(musical, _)| musical).max().expect("a receipt");
+        while output.device().clock_frames() <= last {
+            let clock = output.device().clock_frames();
+            assert_ne!(
+                session.confirmed_audio_generation(),
+                Some(edit),
+                "certified at frame {clock}, before frame {last}"
+            );
+            turn(&mut session, &mut producer, &mut output);
+        }
+        assert_eq!(
+            session.confirmed_audio_generation(),
+            Some(edit),
+            "the device did not certify the window of the edit: {:?}",
+            output.device().report()
+        );
     }
 }
 

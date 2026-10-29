@@ -1004,6 +1004,87 @@ fn a_live_note_plays_through_its_plugin() {
             engine.stop(Duration::from_millis(200)).expect("stop");
         }
     }
+
+    // The Delay preset of the fixture delays its output by 480 frames, and
+    // gives that latency. A start of its score puts cycle zero 480 frames
+    // later, so its first notes have room for their lead, in the wait mode
+    // and in the async mode. A Stop ends the lead: a start of a score with
+    // no plugin puts cycle zero on the clock, the schedule lead and the
+    // pre-roll, and a slider requery takes over at the clock and the margin.
+    // The silent output moves its clock a block at a time, and its margin
+    // is a whole number of chunks of 128 frames. So cycle zero after each
+    // start sits on the grid of the blocks, with the schedule lead, the
+    // pre-roll and the lead, and a takeover with no lead sits on the grid
+    // of the chunks.
+    std::fs::write(
+        of_fixture.join("Delay.vstpreset"),
+        rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.1171875),
+    )
+    .unwrap();
+    host.set_preset_folder(presets.path().to_path_buf());
+    host.presets(rustel_vst3_fixture::NAME);
+    host.wait_idle();
+    let mut engine = silent_engine();
+    let master = engine.master_bus();
+    master.set_load_mode(LoadMode::Wait);
+    let plain = "note('c3').s('sine').gain(slider(0.5, 0, 1)).fast(8)";
+    let delayed = "note('c3').s('sine').vst('rustel fixture', { preset: 'Delay' }).fast(8)";
+    // A start of `score`, and its turns until a note sounds. Gives the
+    // first slider of its layout.
+    let start = |engine: &mut StudioEngine, score: &str| {
+        engine.evaluate_and_start(score, false).expect("a start");
+        let (mut slider, mut peak, started) = (None, 0.0_f32, Instant::now());
+        while peak <= 0.05 {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "silent: {score}"
+            );
+            let mut layout = |update: &StudioUpdate| {
+                if let StudioUpdate::Layout(envelope) = update
+                    && let Some(first) = envelope.ui_layout.sliders.first()
+                {
+                    slider = Some(first.id.clone());
+                }
+            };
+            tick_with(engine, Duration::from_millis(50), &mut layout, &mut |_| {
+                peak = peak.max(master.take_levels().peak);
+                false
+            });
+        }
+        slider
+    };
+    start(&mut engine, plain);
+    let output = engine.device_info().expect("the output");
+    let rate = f64::from(output.audio.output().sample_rate_hz());
+    let block = i64::from(output.audio.output().requested_buffer_frames());
+    assert_ne!(480 % block, 0, "the lead is off the grid of the blocks");
+    // The frame of cycle zero on the grid of the blocks.
+    let phase = |engine: &mut StudioEngine| {
+        let snapshot = engine.snapshot();
+        let zero = snapshot.device_time - snapshot.cycle / snapshot.cps;
+        ((zero * rate).round() as i64).rem_euclid(block)
+    };
+    let no_lead = phase(&mut engine);
+    let lead = (no_lead + 480).rem_euclid(block);
+    engine.stop(Duration::from_millis(200)).expect("stop");
+    start(&mut engine, delayed);
+    assert_eq!(phase(&mut engine), lead, "the Delay in the wait mode");
+    engine.stop(Duration::from_millis(200)).expect("stop");
+    let slider = start(&mut engine, plain).expect("the slider");
+    assert_eq!(phase(&mut engine), no_lead, "a Stop ends the lead");
+    engine.set_slider(&slider, 0.4).expect("a move");
+    let takeover = engine
+        .requery_takeover_cycle_for_test()
+        .expect("the requery names its takeover");
+    let snapshot = engine.snapshot();
+    let at = snapshot.device_time + (takeover - snapshot.cycle) / snapshot.cps;
+    let chunk = ((at * rate).round() as i64).rem_euclid(128);
+    assert_eq!(chunk, 0, "the requery takes over with no lead");
+    engine.stop(Duration::from_millis(200)).expect("stop");
+    master.set_load_mode(LoadMode::Async);
+    start(&mut engine, delayed);
+    assert_eq!(phase(&mut engine), lead, "the Delay in the async mode");
+    engine.stop(Duration::from_millis(200)).expect("stop");
     rustel_audio::set_plugin_pool_for_test(None);
 }
 

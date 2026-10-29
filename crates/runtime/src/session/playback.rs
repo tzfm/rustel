@@ -1130,9 +1130,9 @@ impl Session {
         self.collect_pending_osc(&onsets, now, cps);
 
         let mut input_warnings: Vec<String> = Vec::new();
-        // The note of each event, for its plugin chain.
+        // The onset of each event, for its plugin chain and its lead.
         #[cfg(feature = "vst")]
-        let mut values = Vec::new();
+        let mut event_onsets = Vec::new();
         // Only a plugin chain changes an event.
         #[cfg_attr(not(feature = "vst"), allow(unused_mut))]
         let (mut events, notices) =
@@ -1143,7 +1143,7 @@ impl Session {
                         match self.live_audio_event(onset, sample_rate, cps, lookup) {
                             Ok(event) => {
                                 #[cfg(feature = "vst")]
-                                values.push(&onset.value);
+                                event_onsets.push(onset);
                                 if let Some(warning) = self.input_channel_warning(&event)
                                     && !input_warnings.contains(&warning)
                                 {
@@ -1162,8 +1162,17 @@ impl Session {
                     })
                     .collect::<Vec<_>>()
             });
+        // A note whose lead does not fit after `now` plays late, so this
+        // window leaves out no note.
         #[cfg(feature = "vst")]
-        self.chain_live_events(&mut events, &values);
+        self.chain_live_events(
+            &mut events,
+            &event_onsets,
+            lookup,
+            sample_rate,
+            now,
+            LeadWindow::Steady,
+        );
         self.record_csound_chains(&events);
         self.report_voice_notices(notices);
         // Said once per score text, like a plugin line: the set plays on,

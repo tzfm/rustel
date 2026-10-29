@@ -1326,6 +1326,7 @@ mod tests {
                 &mut use_until,
                 48_000,
                 0,
+                0,
             );
             assert!(
                 use_until[&sample] > event.target_frame + 96_000,
@@ -1339,11 +1340,29 @@ mod tests {
                 &mut use_until,
                 48_000,
                 render_frontier,
+                0,
             );
             assert!(
                 use_until[&sample] > render_frontier + 96_000,
                 "a late onset still gets the full sample lifetime after adoption"
             );
+            // A note of a plugin chain with 480 frames of latency starts up
+            // to that latency after its frame, and a restart moves it up to
+            // its restart lead later.
+            let late = use_until[&sample];
+            let mut latent = event.clone();
+            let stage = rustel_audio::InsertControls::new(rustel_audio::InsertKey::default());
+            latent.controls.effects[0] = Some(stage.with_latency(480));
+            note_sample_use(
+                &latent,
+                &HashMap::new(),
+                Some(&library),
+                &mut use_until,
+                48_000,
+                render_frontier,
+                240,
+            );
+            assert_eq!(use_until[&sample], late + 720);
             assert_eq!(
                 library.take_ready().len(),
                 1,

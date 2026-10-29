@@ -70,6 +70,7 @@ fn controls(waveform: Waveform, pan: Option<f32>) -> OscillatorControls {
         insert_chain: None,
         effects: [None; rustel_audio::EFFECT_CHAIN],
         instrument: None,
+        lead: 0,
         lfos: [None; rustel_audio::MAX_VOICE_MODS],
         envs: [None; rustel_audio::MAX_VOICE_MODS],
         phaser: None,
@@ -670,7 +671,29 @@ fn duck_sidechain_dips_the_target_orbit_exponentially() {
             ..Default::default()
         });
     ducker.onset_frame = duck_at;
+    // The same trigger through a plugin chain with 480 frames of latency
+    // starts 480 frames early, before its musical onset.
+    let mut latent = ducker.clone();
+    latent.onset_frame = duck_at - 480;
+    latent.controls.lead = 480;
+    let key = rustel_audio::InsertKey {
+        plugin: 1,
+        preset: 0,
+    };
+    let stage = rustel_audio::InsertControls::new(key).with_latency(480);
+    latent.controls.effects[0] = Some(stage);
+    let early = render_pcm(
+        &mut ScalarBackend::new(),
+        sr,
+        48_000,
+        &[tone.clone(), latent],
+    )
+    .expect("render");
     let pcm = render_pcm(&mut ScalarBackend::new(), sr, 48_000, &[tone, ducker]).expect("render");
+    assert!(
+        early == pcm,
+        "an early latent trigger dips on the frame of its musical onset"
+    );
 
     let rms = |from: usize, to: usize| {
         let slice = &pcm[from * 2..to * 2];
@@ -1277,6 +1300,7 @@ fn live_sbd_carries_the_waveshaper_prehistory_into_its_attack() {
     let generation = AtomicU64::new(1);
     let takeover = AtomicU64::new(0);
     let line_arm = AtomicU64::new(0);
+    let line_fired = AtomicU64::new(0);
     let stopped = AtomicBool::new(false);
     let mut backend = rustel_audio::LiveScalarBackend::new(SAMPLE_RATE, 4).expect("live backend");
     let frames = ONSET + ATTACK_FRAMES;
@@ -1294,6 +1318,7 @@ fn live_sbd_carries_the_waveshaper_prehistory_into_its_attack() {
                 takeover_frame: &takeover,
                 takeover_cut: &AtomicU64::new(0),
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         );
@@ -1466,16 +1491,13 @@ fn late_duck_trigger_ramps_from_now_instead_of_stepping() {
 
 /// The live consumer arms the sidechain at ring intake, a schedule lead early.
 /// The 10 ms pre-hold ramp renders in full and bottoms out at the onset, as
-/// strudel.cc's webAudioTimeout contract requires.
+/// upstream's webAudioTimeout contract requires. A trigger through a plugin
+/// chain with latency starts that latency early, and its dip lands on its
+/// musical onset all the same.
 #[test]
 fn live_consumer_arms_the_duck_a_full_hold_ramp_early() {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     let sr = 48_000u32;
-    let ring = rustel_audio::Ring::new(16);
-    let generation = AtomicU64::new(1);
-    let takeover = AtomicU64::new(0);
-    let line_arm = AtomicU64::new(0);
-    let stopped = AtomicBool::new(false);
     let event = |onset_id: u64,
                  target_frame: u64,
                  freq: f32,
@@ -1498,91 +1520,108 @@ fn live_consumer_arms_the_duck_a_full_hold_ramp_early() {
             cut: None,
         }
     };
-    // Steady tone on orbit 2; a near-silent duck trigger at frame 24_000,
-    // pushed a full lead ahead like the producer does.
-    assert!(ring.push(event(
-        0,
-        0,
-        220.0,
-        1.0,
-        1.0,
-        OscillatorControls {
-            limit: None,
-            noise: 0.0,
-            bus_mods: [None; rustel_audio::MAX_VOICE_MODS],
-            bus: None,
-            busgain: 1.0,
-            channels: None,
-            orbit: 2,
-            lfos: [None; rustel_audio::MAX_VOICE_MODS],
-            envs: [None; rustel_audio::MAX_VOICE_MODS],
-            phaser: None,
-            tremolo: None,
-            vibrato: None,
-            pitch_env: None,
-            djf: None,
-            compressor: None,
-            partials: None,
-            transient: None,
-            fx_stages: [const { None }; rustel_audio::MAX_FX_STAGES],
-            vowel: None,
-            coarse: None,
-            crush: None,
-            shape: None,
-            ..controls(Waveform::Sine, None)
-        }
-    )));
-    assert!(ring.push(event(
-        1,
-        24_000,
-        220.0,
-        0.0,
-        0.01,
-        OscillatorControls {
-            limit: None,
-            noise: 0.0,
-            bus_mods: [None; rustel_audio::MAX_VOICE_MODS],
-            bus: None,
-            busgain: 1.0,
-            channels: None,
-            duck: Some(rustel_audio::DuckControls {
-                targets: [
-                    Some(rustel_audio::DuckTarget {
-                        orbit: 2,
-                        onset_secs: 0.0,
-                        attack_secs: 0.1,
-                        depth: 1.0,
-                    }),
-                    None,
-                    None,
-                    None,
-                ],
-            }),
-            ..controls(Waveform::Sine, None)
-        }
-    )));
-
-    let mut backend = rustel_audio::LiveScalarBackend::new(sr, 16).expect("live backend");
-    let total = 34_000usize;
-    let mut pcm = vec![0.0f32; total * 2];
-    let mut cursor = 0usize;
-    while cursor < total {
-        let n = (total - cursor).min(128);
-        backend.process_block_with(
-            &mut pcm[cursor * 2..(cursor + n) * 2],
-            n,
-            cursor as u64,
-            &ring,
-            LiveFlipAtomics {
-                generation: &generation,
-                takeover_frame: &takeover,
-                takeover_cut: &AtomicU64::new(0),
-                line_arm: &line_arm,
+    // The trigger goes through a plugin chain with `lead` frames of latency.
+    let render = |lead: u32| {
+        let ring = rustel_audio::Ring::new(16);
+        let generation = AtomicU64::new(1);
+        let takeover = AtomicU64::new(0);
+        let line_arm = AtomicU64::new(0);
+        let line_fired = AtomicU64::new(0);
+        let stopped = AtomicBool::new(false);
+        // Steady tone on orbit 2, and a near-silent duck trigger at frame
+        // 24_000, pushed a full lead ahead like the producer does.
+        assert!(ring.push(event(
+            0,
+            0,
+            220.0,
+            1.0,
+            1.0,
+            OscillatorControls {
+                limit: None,
+                noise: 0.0,
+                bus_mods: [None; rustel_audio::MAX_VOICE_MODS],
+                bus: None,
+                busgain: 1.0,
+                channels: None,
+                orbit: 2,
+                lfos: [None; rustel_audio::MAX_VOICE_MODS],
+                envs: [None; rustel_audio::MAX_VOICE_MODS],
+                phaser: None,
+                tremolo: None,
+                vibrato: None,
+                pitch_env: None,
+                djf: None,
+                compressor: None,
+                partials: None,
+                transient: None,
+                fx_stages: [const { None }; rustel_audio::MAX_FX_STAGES],
+                vowel: None,
+                coarse: None,
+                crush: None,
+                shape: None,
+                ..controls(Waveform::Sine, None)
+            }
+        )));
+        let trigger = event(
+            1,
+            24_000,
+            220.0,
+            0.0,
+            0.01,
+            OscillatorControls {
+                limit: None,
+                noise: 0.0,
+                bus_mods: [None; rustel_audio::MAX_VOICE_MODS],
+                bus: None,
+                busgain: 1.0,
+                channels: None,
+                duck: Some(rustel_audio::DuckControls {
+                    targets: [
+                        Some(rustel_audio::DuckTarget {
+                            orbit: 2,
+                            onset_secs: 0.0,
+                            attack_secs: 0.1,
+                            depth: 1.0,
+                        }),
+                        None,
+                        None,
+                        None,
+                    ],
+                }),
+                ..controls(Waveform::Sine, None)
             },
-            &stopped,
         );
-        cursor += n;
-    }
+        assert!(ring.push(with_lead(trigger, lead)));
+
+        let mut backend = rustel_audio::LiveScalarBackend::new(sr, 16).expect("live backend");
+        let total = 34_000usize;
+        let mut pcm = vec![0.0f32; total * 2];
+        let mut cursor = 0usize;
+        while cursor < total {
+            let n = (total - cursor).min(128);
+            backend.process_block_with(
+                &mut pcm[cursor * 2..(cursor + n) * 2],
+                n,
+                cursor as u64,
+                &ring,
+                LiveFlipAtomics {
+                    generation: &generation,
+                    takeover_frame: &takeover,
+                    takeover_cut: &AtomicU64::new(0),
+                    line_arm: &line_arm,
+                    line_fired: &line_fired,
+                },
+                &stopped,
+            );
+            cursor += n;
+        }
+        pcm
+    };
+    let pcm = render(0);
+    assert!(
+        render(480) == pcm,
+        "a trigger 480 frames early dips on the frame of its musical onset"
+    );
 
     let peak = |from: usize, to: usize| {
         pcm[from * 2..to * 2]
@@ -2263,6 +2302,7 @@ fn live_consumer_preserves_fractional_onset_lead() {
     let generation = AtomicU64::new(1);
     let takeover = AtomicU64::new(0);
     let line_arm = AtomicU64::new(0);
+    let line_fired = AtomicU64::new(0);
     let stopped = AtomicBool::new(false);
     let mut backend = rustel_audio::LiveScalarBackend::new(SAMPLE_RATE, 4).expect("live backend");
     let mut live = vec![0.0f32; FRAMES * 2];
@@ -2281,6 +2321,7 @@ fn live_consumer_preserves_fractional_onset_lead() {
                     takeover_frame: &takeover,
                     takeover_cut: &AtomicU64::new(0),
                     line_arm: &line_arm,
+                    line_fired: &line_fired,
                 },
                 &stopped,
             )
@@ -3272,6 +3313,9 @@ fn a_pitch_envelope_runs_offset_frames_late_in_the_first_quantum() {
 
 #[test]
 fn an_event_level_cut_chokes_the_previous_voice_in_the_group() {
+    use rustel_audio::{InsertControls, InsertKey, InsertProvider, OrbitInsert};
+    use std::sync::Arc;
+
     // Two long tones, half a second apart, in one event-level choke group
     // with no sample controls. The first must be gone 10 ms after the second
     // starts.
@@ -3305,6 +3349,104 @@ fn an_event_level_cut_chokes_the_previous_voice_in_the_group() {
     assert!(
         head.iter().any(|sample| sample.abs() > 0.01),
         "the first preview sounds until it is choked"
+    );
+
+    // A note through a plugin chain with 100 frames of latency, 60 frames
+    // after a note with no chain in the group. It starts 40 frames before
+    // the note with no chain, and chokes that note on its own onset. The
+    // note with no chain does not choke it: the latent note sounds whole.
+    const ONSET: u64 = 24_000;
+    // Plugin 2 delays 1 000 frames, plugin 3 4 800 frames, and any other
+    // plugin 100.
+    let provider: Arc<InsertProvider> = Arc::new(|key: InsertKey, _, _| {
+        let frames = match key.plugin {
+            2 => 1_000,
+            3 => 4_800,
+            _ => 100,
+        };
+        let delay = DelayInsert::new(key, frames, Heard::default());
+        Some(Box::new(delay) as Box<dyn OrbitInsert>)
+    });
+    let render = |events: &[OnsetEvent]| {
+        let mut backend = ScalarBackend::new();
+        backend.set_insert_provider(Arc::clone(&provider));
+        render_pcm(&mut backend, sr, sr as usize, events).expect("render")
+    };
+    let dry = OnsetEvent::new(ONSET, 220.0, 1.0, 2.0).with_cut(Some(1.0));
+    let mut latent = OnsetEvent::new(ONSET + 60 - 100, 493.9, 1.0, 2.0).with_cut(Some(1.0));
+    let key = InsertKey {
+        plugin: 1,
+        preset: 0,
+    };
+    latent.controls.effects[0] = Some(InsertControls::new(key).with_latency(100));
+    latent.controls.lead = 100;
+    let both = render(&[dry.clone(), latent.clone()]);
+    let (dry_alone, latent_alone) = (render(&[dry]), render(&[latent.clone()]));
+    let onset = (ONSET as usize + 60) * 2;
+    assert!(
+        both[..onset] == dry_alone[..onset],
+        "the note with no chain sounds up to the latent onset"
+    );
+    // The largest difference of `pcm` from `alone` from `frame` on.
+    let residue = |pcm: &[f32], alone: &[f32], frame: u64| {
+        let from = frame as usize * 2;
+        pcm[from..]
+            .iter()
+            .zip(&alone[from..])
+            .map(|(mixed, solo)| (mixed - solo).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let differs = residue(&both, &latent_alone, ONSET + 60 + 600);
+    assert!(
+        differs < 1e-6,
+        "the latent note sounds alone past the choke (max residue {differs})"
+    );
+
+    // A note with no chain 1 000 frames after the latent note chokes it.
+    // The voice of the latent note fades its output lead before that
+    // onset, so the output of the latent note fades out from the onset and
+    // is silent 480 frames after it.
+    let later = OnsetEvent::new(ONSET + 1_060, 220.0, 1.0, 2.0).with_cut(Some(1.0));
+    let both = render(&[latent, later.clone()]);
+    let differs = residue(&both, &render(&[later]), ONSET + 1_060 + 500);
+    assert!(
+        differs < 1e-6,
+        "the latent note sounds past the choke (max residue {differs})"
+    );
+
+    // A note through a chain of 1 000 frames starts before a note through a
+    // chain of 100 frames, and its onset is 100 frames after the onset of
+    // that note. It chokes that note on its own onset: the voice of that
+    // note fades its output lead before it.
+    let chained = |onset: u64, plugin: u32, latency: u32, orbit: u8| {
+        let aimed = onset - u64::from(latency);
+        let mut note = OnsetEvent::new(aimed, 220.0, 1.0, 2.0).with_cut(Some(1.0));
+        let stage = InsertControls::new(InsertKey { plugin, preset: 0 });
+        note.controls.effects[0] = Some(stage.with_latency(latency));
+        note.controls.lead = latency;
+        note.controls.orbit = orbit;
+        note
+    };
+    let long = chained(ONSET + 100, 2, 1_000, 2);
+    let both = render(&[long.clone(), chained(ONSET, 1, 100, 1)]);
+    let differs = residue(&both, &render(&[long]), ONSET + 650);
+    assert!(
+        differs < 1e-6,
+        "the earlier note sounds past the choke (max residue {differs})"
+    );
+
+    // A note with no chain 2 400 frames after a note through a chain of
+    // 4 800 frames chokes it. The voice of the latent note fades 4 800
+    // frames before that onset, while the note with no chain waits, so the
+    // output of the latent note fades out from that onset and is silent 480
+    // frames after it.
+    let latent = chained(ONSET, 3, 4_800, 1);
+    let later = OnsetEvent::new(ONSET + 2_400, 220.0, 1.0, 2.0).with_cut(Some(1.0));
+    let both = render(&[latent, later.clone()]);
+    let differs = residue(&both, &render(&[later]), ONSET + 2_400 + 500);
+    assert!(
+        differs < 1e-6,
+        "the latent note sounds past the choke of a later note with no chain (max residue {differs})"
     );
 }
 
@@ -3380,6 +3522,7 @@ fn a_takeover_cut_silences_the_old_generation_at_the_flip() {
         let generation = AtomicU64::new(1);
         let takeover = AtomicU64::new(0);
         let line_arm = AtomicU64::new(0);
+        let line_fired = AtomicU64::new(0);
         let cut_flag = AtomicU64::new(0);
         let stopped = AtomicBool::new(false);
         let mut backend = rustel_audio::LiveScalarBackend::new(SR, 8).expect("live backend");
@@ -3428,6 +3571,7 @@ fn a_takeover_cut_silences_the_old_generation_at_the_flip() {
                     takeover_frame: &takeover,
                     takeover_cut: &cut_flag,
                     line_arm: &line_arm,
+                    line_fired: &line_fired,
                 },
                 &stopped,
             );
@@ -3599,6 +3743,7 @@ fn a_takeover_cut_spans_the_flip_to_takeover_gap() {
         let generation = AtomicU64::new(1);
         let takeover = AtomicU64::new(0);
         let line_arm = AtomicU64::new(0);
+        let line_fired = AtomicU64::new(0);
         let cut_flag = AtomicU64::new(0);
         let stopped = AtomicBool::new(false);
         let mut backend = rustel_audio::LiveScalarBackend::new(SR, 8).expect("live backend");
@@ -3640,6 +3785,7 @@ fn a_takeover_cut_spans_the_flip_to_takeover_gap() {
                     takeover_frame: &takeover,
                     takeover_cut: &cut_flag,
                     line_arm: &line_arm,
+                    line_fired: &line_fired,
                 },
                 &stopped,
             );
@@ -3703,14 +3849,45 @@ fn a_takeover_cut_spans_the_flip_to_takeover_gap() {
         gone > pad_in_edit * 0.5,
         "the pad is removed across the whole gap: {gone} vs {pad_in_edit}"
     );
+
+    // An outgoing note through a plugin chain with 480 frames of latency is
+    // aimed 480 frames before its musical onset. One that reaches the
+    // consumer two blocks after the flip, with its musical onset in the gap
+    // and its target before the flip, is part of the ghost window too.
+    let mut stale = 0;
+    let late_ghost = render_live(
+        TAKEOVER,
+        |cursor, rig| {
+            if cursor == 0 {
+                assert!(rig.ring.push(takeover_pad(1, 1, 0)));
+            }
+            if cursor == FLIP {
+                rig.flip(2, TAKEOVER as u64, TakeoverCut::AtFlip);
+            }
+            if cursor == FLIP + 256 {
+                let mut ghost = takeover_pad(3, 1, (FLIP + 100) as u64);
+                ghost.duration_secs = 0.5;
+                assert!(rig.ring.push(with_lead(ghost, 480)));
+            }
+        },
+        |_, report| stale += report.stale,
+    );
+    assert_eq!(stale, 1, "the latent ghost is refused");
+    let silent = takeover_peak(&late_ghost, FLIP + 480 + 128, TAKEOVER);
+    assert!(silent < 1e-4, "and never sounds: {silent}");
 }
 
 /// A quantised rewind cuts at its line, not at the flip. The old score
 /// plays its countdown to the line, and the restarted loop takes over there.
+/// An instrument ends its notes on the start of a restarted note that
+/// starts before the cut it holds, and the restarted note plays whole.
 #[test]
 fn a_quantised_takeover_cut_lands_at_the_line_not_the_flip() {
-    use rustel_audio::TakeoverCut;
+    use rustel_audio::{
+        AudioBackend, InsertControls, InsertKey, InsertNote, OrbitInsert, TakeoverCut,
+    };
     use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::{Arc, Mutex};
 
     const SR: u32 = 48_000;
     const FLIP: usize = 9_600; // 0.2 s
@@ -3722,8 +3899,11 @@ fn a_quantised_takeover_cut_lands_at_the_line_not_the_flip() {
     // `downbeat` pushes the restarted loop's first onset on the line;
     // `horizon` pushes two more countdown events after the flip, one past
     // the line (the takeover horizon refuses it) and one before it (it
-    // plays, and stops at the line). Returns the pcm and the stale count.
-    let render = |intent: TakeoverCut, downbeat: bool, horizon: bool| {
+    // plays, and stops at the line). The outgoing score also has a note on
+    // the line, which the rewind replaces. With a `lead`, these notes and
+    // the downbeat go through a plugin chain with that latency: see
+    // `with_lead`. Returns the pcm and the stale count.
+    let render = |intent: TakeoverCut, downbeat: bool, horizon: bool, lead: u32| {
         let ring = rustel_audio::Ring::new(8);
         // The outgoing pad - the countdown's drone.
         assert!(ring.push(rustel_audio::AudioEvent {
@@ -3777,10 +3957,17 @@ fn a_quantised_takeover_cut_lands_at_the_line_not_the_flip() {
             synth: None,
             cut: None,
         }));
+        // The outgoing score's own note on the line. It waits in the queue
+        // at the flip, and the rewind takes it.
+        let mut on_line = takeover_pad(6, 1, TAKEOVER as u64);
+        on_line.freq_hz = 440.0;
+        on_line.duration_secs = 0.5;
+        assert!(ring.push(with_lead(on_line, lead)));
 
         let generation = AtomicU64::new(1);
         let takeover = AtomicU64::new(0);
         let line_arm = AtomicU64::new(0);
+        let line_fired = AtomicU64::new(0);
         let cut_flag = AtomicU64::new(0);
         let stopped = AtomicBool::new(false);
         let mut backend = rustel_audio::LiveScalarBackend::new(SR, 8).expect("live backend");
@@ -3795,7 +3982,7 @@ fn a_quantised_takeover_cut_lands_at_the_line_not_the_flip() {
                 cut_flag.store(intent as u64, std::sync::atomic::Ordering::Release);
                 generation.store(2, std::sync::atomic::Ordering::Release);
                 if downbeat {
-                    assert!(ring.push(rustel_audio::AudioEvent {
+                    let event = rustel_audio::AudioEvent {
                         onset_id: 2,
                         generation: 2,
                         ui_visuals: 0,
@@ -3809,14 +3996,15 @@ fn a_quantised_takeover_cut_lands_at_the_line_not_the_flip() {
                         wavetable: None,
                         synth: None,
                         cut: None,
-                    }));
+                    };
+                    assert!(ring.push(with_lead(event, lead)));
                 }
                 if horizon {
                     for (onset_id, target_frame) in [(4, TAKEOVER + 100), (5, TAKEOVER - 2_000)] {
                         let mut event = takeover_pad(onset_id, 1, target_frame as u64);
                         event.freq_hz = 330.0;
                         event.duration_secs = 0.5;
-                        assert!(ring.push(event));
+                        assert!(ring.push(with_lead(event, lead)));
                     }
                 }
             }
@@ -3830,6 +4018,7 @@ fn a_quantised_takeover_cut_lands_at_the_line_not_the_flip() {
                     takeover_frame: &takeover,
                     takeover_cut: &cut_flag,
                     line_arm: &line_arm,
+                    line_fired: &line_fired,
                 },
                 &stopped,
             );
@@ -3844,8 +4033,8 @@ fn a_quantised_takeover_cut_lands_at_the_line_not_the_flip() {
             .fold(0.0f32, |m, s| m.max(s.abs()))
     };
 
-    let (quantised_pcm, quantised_stale) = render(TakeoverCut::AtTakeover, true, false);
-    let (edit_pcm, _) = render(TakeoverCut::None, true, false);
+    let (quantised_pcm, quantised_stale) = render(TakeoverCut::AtTakeover, true, false, 0);
+    let (edit_pcm, _) = render(TakeoverCut::None, true, false, 0);
     assert_eq!(quantised_stale, 0);
 
     // Mid-countdown the old score still plays. The pad rings on exactly as
@@ -3892,8 +4081,8 @@ fn a_quantised_takeover_cut_lands_at_the_line_not_the_flip() {
     // The fade itself, measured without the downbeat (which both runs
     // share from the line): the choke ramp from unity at the line, linear
     // over 10 ms, and silence past it.
-    let (quantised_bare, _) = render(TakeoverCut::AtTakeover, false, false);
-    let (edit_bare, _) = render(TakeoverCut::None, false, false);
+    let (quantised_bare, _) = render(TakeoverCut::AtTakeover, false, false, 0);
+    let (edit_bare, _) = render(TakeoverCut::None, false, false, 0);
     assert_ramp_from(
         &quantised_bare,
         &edit_bare,
@@ -3922,7 +4111,7 @@ fn a_quantised_takeover_cut_lands_at_the_line_not_the_flip() {
     // Old ring events scheduled after the flip: one past the line is
     // refused by the ordinary takeover horizon, one before it plays the
     // countdown and stops at the line with everything else.
-    let (with_events, events_stale) = render(TakeoverCut::AtTakeover, true, true);
+    let (with_events, events_stale) = render(TakeoverCut::AtTakeover, true, true, 0);
     assert_eq!(
         events_stale, 1,
         "the old event past the line is refused, the one before it is not"
@@ -3938,6 +4127,184 @@ fn a_quantised_takeover_cut_lands_at_the_line_not_the_flip() {
         after < 1e-6,
         "nothing of the old events sounds past the line's ramp: {after}"
     );
+
+    // A lane through a plugin chain with 480 frames of latency starts each
+    // note 480 frames before its musical onset. Its outgoing note on the
+    // line and its note right after the line are aimed before the line, and
+    // the rewind still takes both: their output would start on the line or
+    // after it, so the lane is silent from the line.
+    const LEAD: u32 = 480;
+    let (latent_bare, latent_stale) = render(TakeoverCut::AtTakeover, false, false, LEAD);
+    assert_eq!(latent_stale, 0);
+    assert!(
+        latent_bare == quantised_bare,
+        "the outgoing note of the latent lane on the line sounded"
+    );
+    let (_, latent_events_stale) = render(TakeoverCut::AtTakeover, false, true, LEAD);
+    assert_eq!(
+        latent_events_stale, 1,
+        "the old latent event past the line is refused, the one before it is not"
+    );
+    // The new downbeat of the lane has its musical onset on the line. No
+    // copy serves its chain, so its source starts on the line: it sounds as
+    // the downbeat with no chain, and the line cut leaves it whole.
+    let (latent_pcm, _) = render(TakeoverCut::AtTakeover, true, false, LEAD);
+    assert!(
+        latent_pcm == quantised_pcm,
+        "the downbeat of the latent lane is not on the line"
+    );
+
+    // An instrument holds its own notes, and the cut ends them the output
+    // lead of the newest note of the chain before the line. A note of the
+    // restarted score through an effect of 480 frames starts that much
+    // before the line, on an instrument whose notes had no lead. The
+    // instrument ends its notes on the start of that note, so the note
+    // plays whole. A countdown note that starts after that frame gets no
+    // note. With an effect of no latency the cut stays on the line.
+    // Each note the instrument plays: its pitch, its start and its end.
+    type Played = Arc<Mutex<Vec<(f32, u64, u64)>>>;
+    // An instrument that keeps its notes as the plugin host does. A note
+    // ends after its frames, and a note that starts before the cut the
+    // instrument holds ends on that cut. A cut ends the notes the
+    // instrument holds on its frame, and drops a note that waits on that
+    // frame or after it.
+    struct Keys {
+        key: InsertKey,
+        frame: u64,
+        cut: Option<u64>,
+        played: Played,
+    }
+    impl OrbitInsert for Keys {
+        fn key(&self) -> InsertKey {
+            self.key
+        }
+        fn set_param(&mut self, _: rustel_audio::InsertParam, _: u32) {}
+        fn process(&mut self, left: &mut [f32], _: &mut [f32]) {
+            self.frame += left.len() as u64;
+            if self.cut.is_some_and(|cut| cut < self.frame) {
+                self.cut = None;
+            }
+        }
+        fn note(&mut self, note: InsertNote, frames: u32) {
+            let on = self.frame + u64::from(frames);
+            let mut off = on + u64::from(note.frames.max(1));
+            if let Some(cut) = self.cut.filter(|cut| on < *cut) {
+                off = off.min(cut);
+            }
+            let mut played = self.played.lock().expect("no test thread panicked");
+            played.push((note.pitch, on, off));
+        }
+        fn cut_notes(&mut self, frames: u32) {
+            let cut = self.frame + u64::from(frames);
+            self.cut = Some(cut);
+            let mut played = self.played.lock().expect("no test thread panicked");
+            played.retain(|(_, on, _)| *on < cut);
+            for (_, _, off) in played.iter_mut() {
+                *off = (*off).min(cut);
+            }
+        }
+        // The copy counts each frame, as a copy that holds a note does.
+        fn busy(&self) -> bool {
+            true
+        }
+    }
+    const CUT_LINE: u64 = 24_000;
+    const HALF: u32 = 24_000;
+    let instrument = InsertKey {
+        plugin: 3,
+        preset: 0,
+    };
+    // The notes the instrument plays under an effect of `latency` frames.
+    let played = |latency: u32| {
+        let record = Played::default();
+        let provider: Arc<rustel_audio::InsertProvider> = {
+            let record = Arc::clone(&record);
+            Arc::new(move |key: InsertKey, _, _| {
+                let copy: Box<dyn OrbitInsert> = if key == instrument {
+                    let played = Arc::clone(&record);
+                    Box::new(Keys {
+                        key,
+                        frame: 0,
+                        cut: None,
+                        played,
+                    })
+                } else {
+                    Box::new(DelayInsert::new(key, latency, Heard::default()))
+                };
+                Some(copy)
+            })
+        };
+        // A note of `generation` on the instrument of one chain.
+        let note = |onset: u64, generation: u64, pitch: f32, frames: u32| {
+            let secs = frames as f32 / SR as f32;
+            let mut event = OnsetEvent::new(onset, 220.0, 0.5, secs).with_generation(generation);
+            event.controls.insert_chain = Some(9);
+            let note = InsertNote {
+                pitch,
+                velocity: 1.0,
+                frames,
+            };
+            event.controls.instrument = Some(InsertControls::new(instrument).with_note(note));
+            event
+        };
+        let mut backend = ScalarBackend::new();
+        backend.set_insert_provider(provider);
+        backend.init(SR).expect("init");
+        let mut block = [0.0; 256];
+        backend.note(note(0, 1, 48.0, 4 * SR));
+        for _ in 0..128 {
+            backend.process_block(&mut block, 128);
+        }
+        backend.begin_takeover_cut(CUT_LINE, 1);
+        let mut restarted = note(CUT_LINE - u64::from(latency), 2, 60.0, HALF);
+        let effect = InsertControls::new(InsertKey {
+            plugin: 4,
+            preset: 0,
+        });
+        restarted.controls.effects[0] = Some(effect.with_latency(latency));
+        restarted.controls.lead = latency;
+        backend.note(restarted);
+        backend.note(note(CUT_LINE - 100, 1, 55.0, HALF));
+        for _ in 0..256 {
+            backend.process_block(&mut block, 128);
+        }
+        record.lock().expect("no test thread panicked").clone()
+    };
+    let start = CUT_LINE - 480;
+    let end = start + u64::from(HALF);
+    assert_eq!(
+        played(480),
+        [(48.0, 0, start), (60.0, start, end)],
+        "the restarted note through the effect"
+    );
+    let end = CUT_LINE + u64::from(HALF);
+    assert_eq!(
+        played(0),
+        [
+            (48.0, 0, CUT_LINE),
+            (55.0, CUT_LINE - 100, CUT_LINE),
+            (60.0, CUT_LINE, end)
+        ],
+        "an effect with no latency"
+    );
+}
+
+/// `event` through a plugin chain with `lead` frames of latency, which no
+/// copy serves here. Its target frame becomes its musical onset, and it is
+/// aimed that lead before it. With no copy its source starts on its musical
+/// onset. A lead of 0 leaves the event as it is.
+fn with_lead(mut event: rustel_audio::AudioEvent, lead: u32) -> rustel_audio::AudioEvent {
+    if lead > 0 {
+        let key = rustel_audio::InsertKey {
+            plugin: 1,
+            preset: 0,
+        };
+        let stage = rustel_audio::InsertControls::new(key).with_latency(lead);
+        event.controls.effects[0] = Some(stage);
+        event.controls.lead = lead;
+        event.target_frame -= u64::from(lead);
+    }
+    event
 }
 
 /// A pad event of the given generation, sounding from `target_frame`.
@@ -4023,6 +4390,7 @@ fn a_pre_armed_line_cut_fires_at_the_line_before_any_flip() {
         } else {
             0
         });
+        let line_fired = AtomicU64::new(0);
         let cut_flag = AtomicU64::new(0);
         let stopped = AtomicBool::new(false);
         let mut backend = rustel_audio::LiveScalarBackend::new(SR, 8).expect("live backend");
@@ -4087,6 +4455,7 @@ fn a_pre_armed_line_cut_fires_at_the_line_before_any_flip() {
                     takeover_frame: &takeover,
                     takeover_cut: &cut_flag,
                     line_arm: &line_arm,
+                    line_fired: &line_fired,
                 },
                 &stopped,
             );
@@ -4180,6 +4549,7 @@ fn an_onset_activating_in_the_arm_block_is_cut_at_the_line() {
         } else {
             0
         });
+        let line_fired = AtomicU64::new(0);
         let cut_flag = AtomicU64::new(0);
         let stopped = AtomicBool::new(false);
         let mut backend = rustel_audio::LiveScalarBackend::new(SR, 8).expect("live backend");
@@ -4198,6 +4568,7 @@ fn an_onset_activating_in_the_arm_block_is_cut_at_the_line() {
                     takeover_frame: &takeover,
                     takeover_cut: &cut_flag,
                     line_arm: &line_arm,
+                    line_fired: &line_fired,
                 },
                 &stopped,
             );
@@ -4242,6 +4613,7 @@ fn a_late_quantised_flip_fades_from_the_flip_not_a_step() {
         let generation = AtomicU64::new(1);
         let takeover = AtomicU64::new(0);
         let line_arm = AtomicU64::new(0);
+        let line_fired = AtomicU64::new(0);
         let cut_flag = AtomicU64::new(0);
         let stopped = AtomicBool::new(false);
         let mut backend = rustel_audio::LiveScalarBackend::new(SR, 8).expect("live backend");
@@ -4265,6 +4637,7 @@ fn a_late_quantised_flip_fades_from_the_flip_not_a_step() {
                     takeover_frame: &takeover,
                     takeover_cut: &cut_flag,
                     line_arm: &line_arm,
+                    line_fired: &line_fired,
                 },
                 &stopped,
             );
@@ -4316,6 +4689,7 @@ fn a_withdrawn_arm_lets_the_room_resume_and_the_next_arm_fire() {
         let generation = AtomicU64::new(1);
         let takeover = AtomicU64::new(0);
         let line_arm = AtomicU64::new(((LINE as u64) << 2) | 0b11);
+        let line_fired = AtomicU64::new(0);
         let cut_flag = AtomicU64::new(0);
         let stopped = AtomicBool::new(false);
         let mut backend = rustel_audio::LiveScalarBackend::new(SR, 8).expect("live backend");
@@ -4347,6 +4721,7 @@ fn a_withdrawn_arm_lets_the_room_resume_and_the_next_arm_fire() {
                     takeover_frame: &takeover,
                     takeover_cut: &cut_flag,
                     line_arm: &line_arm,
+                    line_fired: &line_fired,
                 },
                 &stopped,
             );
@@ -4404,6 +4779,7 @@ fn a_quantised_cut_after_a_skipped_generation_still_fades_the_countdown() {
         let generation = AtomicU64::new(1);
         let takeover = AtomicU64::new(0);
         let line_arm = AtomicU64::new(0);
+        let line_fired = AtomicU64::new(0);
         let cut_flag = AtomicU64::new(0);
         let stopped = AtomicBool::new(false);
         let mut backend = rustel_audio::LiveScalarBackend::new(SR, 8).expect("live backend");
@@ -4428,6 +4804,7 @@ fn a_quantised_cut_after_a_skipped_generation_still_fades_the_countdown() {
                     takeover_frame: &takeover,
                     takeover_cut: &cut_flag,
                     line_arm: &line_arm,
+                    line_fired: &line_fired,
                 },
                 &stopped,
             );
@@ -4454,8 +4831,10 @@ fn a_quantised_cut_after_a_skipped_generation_still_fades_the_countdown() {
 
 /// Render an immediate rewind's flip at `FLIP` with the restarted loop's
 /// downbeat aimed at `downbeat` (possibly already behind the flip), over an
-/// old pad; returns the interleaved buffer.
-fn render_restart(downbeat: u64, duration_secs: f32) -> Vec<f32> {
+/// old pad, and return the interleaved buffer. The cut word carries the
+/// restart lead `restart_lead`, and the downbeat goes through a plugin
+/// chain with `lead` frames of latency: see `with_lead`.
+fn render_restart(downbeat: u64, duration_secs: f32, restart_lead: u32, lead: u32) -> Vec<f32> {
     use rustel_audio::TakeoverCut;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -4466,6 +4845,7 @@ fn render_restart(downbeat: u64, duration_secs: f32) -> Vec<f32> {
     let generation = AtomicU64::new(1);
     let takeover = AtomicU64::new(0);
     let line_arm = AtomicU64::new(0);
+    let line_fired = AtomicU64::new(0);
     let cut_flag = AtomicU64::new(0);
     let stopped = AtomicBool::new(false);
     let mut backend = rustel_audio::LiveScalarBackend::new(SR, 8).expect("live backend");
@@ -4476,9 +4856,10 @@ fn render_restart(downbeat: u64, duration_secs: f32) -> Vec<f32> {
         let n = (total - cursor).min(128);
         if cursor == FLIP {
             takeover.store(downbeat, Ordering::Release);
-            cut_flag.store(TakeoverCut::AtFlip as u64, Ordering::Release);
+            let cut = TakeoverCut::AtFlip as u64 | (u64::from(restart_lead) << 2);
+            cut_flag.store(cut, Ordering::Release);
             generation.store(2, Ordering::Release);
-            assert!(ring.push(rustel_audio::AudioEvent {
+            let event = rustel_audio::AudioEvent {
                 onset_id: 2,
                 generation: 2,
                 ui_visuals: 0,
@@ -4501,7 +4882,8 @@ fn render_restart(downbeat: u64, duration_secs: f32) -> Vec<f32> {
                 wavetable: None,
                 synth: None,
                 cut: None,
-            }));
+            };
+            assert!(ring.push(with_lead(event, lead)));
         }
         backend.process_block_with(
             &mut pcm[cursor * 2..(cursor + n) * 2],
@@ -4513,6 +4895,7 @@ fn render_restart(downbeat: u64, duration_secs: f32) -> Vec<f32> {
                 takeover_frame: &takeover,
                 takeover_cut: &cut_flag,
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         );
@@ -4526,8 +4909,8 @@ fn render_restart(downbeat: u64, duration_secs: f32) -> Vec<f32> {
 #[test]
 fn a_restarts_past_due_downbeat_renders_whole_from_the_flip() {
     const FLIP: usize = 24_064;
-    let on_time = render_restart(FLIP as u64, 0.25);
-    let past_due = render_restart((FLIP - 480) as u64, 0.25);
+    let on_time = render_restart(FLIP as u64, 0.25, 0, 0);
+    let past_due = render_restart((FLIP - 480) as u64, 0.25, 0, 0);
     let differs = takeover_removed(&on_time, &past_due, FLIP, FLIP + 12_000);
     assert!(
         differs < 1e-6,
@@ -4540,14 +4923,36 @@ fn a_restarts_past_due_downbeat_renders_whole_from_the_flip() {
     );
 
     // A 5 ms one-shot aimed 20 ms behind the flip still sounds.
-    let short = render_restart((FLIP - 960) as u64, 0.005);
+    let short = render_restart((FLIP - 960) as u64, 0.005, 0, 0);
     let heard = takeover_peak(&short, FLIP, FLIP + 480);
-    let pad_only = render_restart((FLIP - 960) as u64, 0.0);
+    let pad_only = render_restart((FLIP - 960) as u64, 0.0, 0, 0);
     let pad_level = takeover_peak(&pad_only, FLIP, FLIP + 480);
     assert!(
         heard > pad_level + 0.1,
         "a short one-shot later than its own length is not lost: {heard} vs pad fade {pad_level}"
     );
+
+    // A restart lead of 480 frames: a note of a plugin chain with that
+    // latency starts 480 frames before its musical onset. Each downbeat
+    // behind the flip lands its musical onset 480 frames after the flip. A
+    // downbeat with no chain starts there, and a downbeat of the chain starts
+    // on the flip. A downbeat of the chain with its musical onset past that
+    // frame keeps its target. A downbeat with a larger lead starts on the
+    // flip too, and its musical onset comes that much later.
+    for (musical, lead, landed) in [
+        (FLIP - 480, 0, FLIP + 480),
+        (FLIP - 480, 480, FLIP + 480),
+        (FLIP + 600, 480, FLIP + 600),
+        (FLIP - 480, 960, FLIP + 960),
+    ] {
+        let restart = render_restart(musical as u64, 0.25, 480, lead);
+        let aimed = render_restart(landed as u64, 0.25, 0, lead);
+        let differs = takeover_removed(&aimed, &restart, FLIP, FLIP + 12_000);
+        assert!(
+            differs < 1e-6,
+            "a downbeat on {musical} with a lead of {lead} lands on {landed}: {differs}"
+        );
+    }
 }
 
 /// The live consumer's handshake, driven offline by a test: the ring and
@@ -4558,6 +4963,7 @@ struct LiveRig {
     takeover: std::sync::atomic::AtomicU64,
     cut: std::sync::atomic::AtomicU64,
     line_arm: std::sync::atomic::AtomicU64,
+    line_fired: std::sync::atomic::AtomicU64,
     stopped: std::sync::atomic::AtomicBool,
 }
 
@@ -4569,6 +4975,7 @@ impl LiveRig {
             takeover: std::sync::atomic::AtomicU64::new(0),
             cut: std::sync::atomic::AtomicU64::new(0),
             line_arm: std::sync::atomic::AtomicU64::new(0),
+            line_fired: std::sync::atomic::AtomicU64::new(0),
             stopped: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -4621,6 +5028,7 @@ fn render_live_with(
                 takeover_frame: &rig.takeover,
                 takeover_cut: &rig.cut,
                 line_arm: &rig.line_arm,
+                line_fired: &rig.line_fired,
             },
             &rig.stopped,
         );
@@ -5121,6 +5529,31 @@ fn a_fired_arm_fires_once_and_its_drop_bit_decides_the_ring() {
     );
     let silent = takeover_peak(&dropped, LINE as usize + 544, TOTAL);
     assert!(silent < 1e-4, "and never sounds: {silent}");
+
+    // An outgoing note through a plugin chain with 480 frames of latency is
+    // aimed 480 frames before its musical onset. Drained in the block the
+    // arm fires in, with its musical onset past the line, it is the ghost
+    // window too, though its target is before the line.
+    let mut latent_stale = 0;
+    let latent = render_live(
+        TOTAL,
+        |cursor, rig| {
+            if cursor == 0 {
+                assert!(rig.ring.push(takeover_pad(1, 1, 0)));
+                rig.line_arm.store((LINE << 2) | 0b11, Ordering::Release);
+            }
+            if cursor == LINE as usize {
+                let mut event = takeover_pad(2, 1, LINE + 100);
+                event.freq_hz = 330.0;
+                event.duration_secs = 0.2;
+                assert!(rig.ring.push(with_lead(event, 480)));
+            }
+        },
+        |_, report| latent_stale += report.stale,
+    );
+    assert_eq!(latent_stale, 1, "the arm refuses the latent note");
+    let silent = takeover_peak(&latent, LINE as usize + 544, TOTAL);
+    assert!(silent < 1e-4, "and it never sounds: {silent}");
 }
 
 /// A live input voice (`s("in")`) over a rewind: the monitored signal is a
@@ -5344,6 +5777,7 @@ fn a_live_fm_slider_bends_the_sounding_input_voice_without_a_new_hap() {
                     takeover_frame: &rig.takeover,
                     takeover_cut: &rig.cut,
                     line_arm: &rig.line_arm,
+                    line_fired: &rig.line_fired,
                 },
                 &rig.stopped,
             );
@@ -5533,6 +5967,50 @@ impl rustel_audio::OrbitInsert for GainInsert {
     }
 }
 
+/// The frame of each value an insert got, by its plugin number. The frame
+/// counts from the build of the insert.
+type Heard = std::sync::Arc<std::sync::Mutex<Vec<(u32, u64)>>>;
+
+/// An orbit insert that passes its input `frames` late, as a plugin with that
+/// latency does. It keeps the frame of each value it gets in `heard`.
+struct DelayInsert {
+    key: rustel_audio::InsertKey,
+    line: std::collections::VecDeque<[f32; 2]>,
+    frame: u64,
+    heard: Heard,
+}
+
+impl DelayInsert {
+    fn new(key: rustel_audio::InsertKey, frames: u32, heard: Heard) -> Self {
+        Self {
+            key,
+            line: std::iter::repeat_n([0.0; 2], frames as usize).collect(),
+            frame: 0,
+            heard,
+        }
+    }
+}
+
+impl rustel_audio::OrbitInsert for DelayInsert {
+    fn key(&self) -> rustel_audio::InsertKey {
+        self.key
+    }
+
+    fn set_param(&mut self, _param: rustel_audio::InsertParam, frames: u32) {
+        let frame = self.frame + u64::from(frames);
+        let mut heard = self.heard.lock().expect("no test thread panicked");
+        heard.push((self.key.plugin, frame));
+    }
+
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        for (left, right) in left.iter_mut().zip(right) {
+            self.line.push_back([*left, *right]);
+            [*left, *right] = self.line.pop_front().expect("the line holds a frame");
+            self.frame += 1;
+        }
+    }
+}
+
 #[test]
 fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
     use rustel_audio::{
@@ -5562,13 +6040,18 @@ fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
     let provider: Arc<InsertProvider> = Arc::new(move |wanted, _sample_rate, _orbit| {
         (wanted == key).then(|| Box::new(GainInsert { key, gain: 1.0 }) as Box<dyn OrbitInsert>)
     });
-    let render = |events: &[OnsetEvent], provider: Option<&Arc<InsertProvider>>| {
+    // Renders `frames` frames of `events`, and counts the notes that asked
+    // for an insert their chain did not hold.
+    let play = |frames: usize, events: &[OnsetEvent], provider: Option<&Arc<InsertProvider>>| {
         let mut backend = ScalarBackend::new();
         if let Some(provider) = provider {
             backend.set_insert_provider(Arc::clone(provider));
         }
-        let pcm = render_pcm(&mut backend, 48_000, 4_800, events).expect("render");
+        let pcm = render_pcm(&mut backend, 48_000, frames, events).expect("render");
         (pcm, backend.missing_insert_events())
+    };
+    let render = |events: &[OnsetEvent], provider: Option<&Arc<InsertProvider>>| {
+        play(4_800, events, provider)
     };
 
     let (dry, _) = render(&[note(1, &[])], None);
@@ -5637,6 +6120,378 @@ fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
         assert_eq!(backend.missing_insert_events(), 0);
         let copies = if offline { 1 } else { 2 };
         assert_eq!(builds.load(Ordering::Relaxed), copies, "offline: {offline}");
+    }
+
+    // A chain of 2 delays, plugins 1 and 2, with the latency of each in
+    // frames. A plugin with no latency here has no copy.
+    let heard = Heard::default();
+    let delays = |latencies: [Option<u32>; 2]| -> Arc<InsertProvider> {
+        let heard = Arc::clone(&heard);
+        Arc::new(move |wanted: InsertKey, _, _| {
+            let frames = latencies[wanted.plugin as usize - 1]?;
+            let delay = DelayInsert::new(wanted, frames, Arc::clone(&heard));
+            Some(Box::new(delay) as Box<dyn OrbitInsert>)
+        })
+    };
+    // `event` through the chain of `latencies`, aimed `lead` frames before
+    // its onset. Each stage gets one value.
+    let latent = |mut event: OnsetEvent, latencies: [u32; 2], lead: u32| {
+        let stages = event.controls.effects.iter_mut().zip(latencies);
+        for (plugin, (effect, latency)) in (1..).zip(stages) {
+            let mut stage = InsertControls::new(InsertKey { plugin, preset: 0 });
+            assert!(stage.push(InsertParam { id: 1, value: 1.0 }));
+            *effect = Some(stage.with_latency(latency));
+        }
+        event.controls.lead = lead;
+        event.onset_frame -= u64::from(lead);
+        event
+    };
+    let sine = |onset: u64, secs: f32| {
+        OnsetEvent::new(onset, 440.0, 0.5, secs).with_controls(controls(Waveform::Sine, None))
+    };
+
+    // Stages of 100 and 200 frames. The note starts 300 frames early, on
+    // frame 900, and sounds as the note with no chain. The copies start on
+    // the block of frame 896, and each stage gets its value when the note
+    // reaches it: the second stage 100 frames after the first.
+    let (dry, _) = render(&[sine(1_200, 0.05)], None);
+    let chain = delays([Some(100), Some(200)]);
+    let (wet, missed) = render(&[latent(sine(1_200, 0.05), [100, 200], 300)], Some(&chain));
+    assert_eq!(missed, 0);
+    assert!(wet == dry, "the note through the chain is not on its onset");
+    let values = std::mem::take(&mut *heard.lock().unwrap());
+    assert_eq!(values, [(1, 4), (2, 104)]);
+
+    // A stage with no copy starts the note its latency later, and the note
+    // still lands on its onset. The first stage gets its value when the
+    // note starts.
+    let chain = delays([Some(100), None]);
+    let (unserved, missed) = render(&[latent(sine(1_200, 0.05), [100, 200], 300)], Some(&chain));
+    assert_eq!(missed, 1);
+    assert!(
+        unserved == dry,
+        "the note with a stage of no copy is not on its onset"
+    );
+    let values = std::mem::take(&mut *heard.lock().unwrap());
+    assert_eq!(values, [(1, 204)]);
+
+    // A stage of 128 frames with a copy, and a stage of 200 frames with
+    // none. Each note sits on frame 96 048, 48 frames into its quantum, and
+    // is aimed 328 frames before it. With a lead of 328 its voice starts 200
+    // frames after its target, one quantum before its musical onset. With a
+    // lead of 0 it plays late onto the same frame from the same start, and
+    // its musical onset is its target. Each one sounds as the note with no
+    // chain: the FM skip, the pitch skip and the compressor divisions stay
+    // on the frames the voice runs on. The FM operator is white noise, so
+    // no note reads a seed.
+    let chain = delays([Some(128), None]);
+    let compressor = rustel_audio::CompressorControls {
+        threshold_db: -30.0,
+        ratio: 4.0,
+        knee_db: 0.0,
+        attack_secs: 0.003,
+        release_secs: 0.1,
+    };
+    let mut noise = fm_chain(&[Some((2.0, 1.0))]);
+    if let Some(operator) = &mut noise.operators[0] {
+        operator.waveform = rustel_audio::FmWave::Noise(0);
+    }
+    let mut fm = sine(96_048, 0.05);
+    fm.controls.fm = Some(noise);
+    let mut pitched = sine(96_048, 0.05);
+    pitched.controls.pitch_env = Some(rustel_audio::PitchEnvControls {
+        adsr: rustel_audio::FilterEnvelope {
+            attack_secs: 0.01,
+            decay_secs: 0.01,
+            sustain: 0.5,
+            release_secs: 0.01,
+            min_hz: 0.0,
+            max_hz: 1_200.0,
+        },
+        exponential: false,
+    });
+    let mut compressed = sine(96_048, 0.05);
+    compressed.controls.compressor = Some(compressor);
+    let mut fx_stage = sine(96_048, 0.05);
+    fx_stage.controls.fx_stages[0] = Some(rustel_audio::FxStage {
+        kabel: None,
+        stretch: None,
+        transient: None,
+        gain: 1.0,
+        filters: FilterControls::default(),
+        vowel: None,
+        coarse: None,
+        crush: None,
+        shape: None,
+        distort: None,
+        tremolo: None,
+        compressor: Some(compressor),
+        pan_x: None,
+        phaser: None,
+        delay: None,
+        dry: 1.0,
+        room: None,
+    });
+    let notes = [
+        ("fm", fm),
+        ("pitch", pitched),
+        ("compressor", compressed),
+        ("fx stage", fx_stage),
+    ];
+    for (kind, note) in notes {
+        let (dry, _) = play(100_800, std::slice::from_ref(&note), None);
+        assert!(dry.iter().any(|sample| sample.abs() > 0.01), "{kind}");
+        let mut aimed = note.clone();
+        aimed.onset_frame -= 328;
+        for (event, lead) in [(note, 328), (aimed, 0)] {
+            let (wet, missed) = play(100_800, &[latent(event, [128, 200], lead)], Some(&chain));
+            assert_eq!(missed, 1);
+            assert!(wet == dry, "the {kind} note with a lead of {lead} differs");
+        }
+    }
+
+    // Stages of 128 and 256 frames. A sine, a supersaw, an FM, a bytebeat
+    // and a ZzFX note on frame 96 000, 2 s, start 384 frames early, a whole
+    // number of quanta, and so do a sine with a tremolo from 2 s and a sine
+    // with LFOs that stop inside the note. Each one sounds as the note with
+    // no chain, sample for sample: the seeds and the gates read the onset.
+    let synth = |synth| sine(96_000, 0.05).with_optional_synth(Some(synth));
+    let mut fm = sine(96_000, 0.05);
+    fm.controls.fm = Some(fm_chain(&[Some((2.0, 1.5))]));
+    // The LFO of the lowpass stops 20 ms into the note, at the end of its
+    // hold, and the LFO of the gain stops 10 ms later.
+    let mut swept = sine(96_000, 0.02);
+    swept.controls.filters = FilterControls {
+        lowpass: Some(rustel_audio::StaticBiquad {
+            frequency_hz: 800.0,
+            q: 1.0,
+        }),
+        ..FilterControls::default()
+    };
+    swept.controls.envelope.release_secs = 0.03;
+    let lfo = |target, base, depth, filter| rustel_audio::LfoMod {
+        fxi: None,
+        target,
+        frequency_hz: 30.0,
+        phase0: 0.0,
+        depth,
+        dcoffset: -0.5,
+        skew: 0.5,
+        curve: 1.0,
+        shape: 0,
+        min: -1e9,
+        max: 1e9,
+        param_base: base,
+        filter,
+        id: None,
+    };
+    let lowpass = Some(rustel_audio::FilterLfoKind::Lowpass);
+    let cutoff = lfo(
+        rustel_audio::ModTarget::LowpassFreq,
+        800.0,
+        1_000.0,
+        lowpass,
+    );
+    swept.controls.lfos[0] = Some(cutoff);
+    swept.controls.lfos[1] = Some(lfo(rustel_audio::ModTarget::Gain, 0.5, 0.25, None));
+    swept.controls.filter_lfo_end_secs = 2.02;
+    swept.controls.lfo_end_secs = 2.03;
+    let mut tremolo = sine(96_000, 0.05);
+    tremolo.controls.tremolo = Some(rustel_audio::TremoloControls {
+        frequency_hz: 8.0,
+        depth: 1.0,
+        skew: 1.0,
+        shape: 0,
+        phase_offset: 0.0,
+        time_secs: 2.0,
+    });
+    let notes = [
+        ("lfo", swept),
+        ("tremolo", tremolo),
+        ("sine", sine(96_000, 0.05)),
+        (
+            "supersaw",
+            synth(rustel_audio::SynthSource::Supersaw {
+                voices: 5.0,
+                freqspread: 0.18,
+                panspread: 0.6,
+            }),
+        ),
+        ("fm", fm),
+        (
+            "bytebeat",
+            synth(rustel_audio::SynthSource::ByteBeat {
+                program: None,
+                expression: 2,
+                start_offset: None,
+            }),
+        ),
+        (
+            "zzfx",
+            synth(rustel_audio::SynthSource::ZzFx {
+                params: rustel_audio::zzfx::ZzfxParams::default(),
+            }),
+        ),
+    ];
+    let chain = delays([Some(128), Some(256)]);
+    for (kind, mut note) in notes {
+        note.controls.worklet_begin_secs = 2.0;
+        let (dry, _) = play(100_800, std::slice::from_ref(&note), None);
+        assert!(dry.iter().any(|sample| sample.abs() > 0.01), "{kind}");
+        let (wet, missed) = play(100_800, &[latent(note, [128, 256], 384)], Some(&chain));
+        assert_eq!(missed, 0);
+        assert!(wet == dry, "the {kind} note through the chain differs");
+    }
+    // The same for a wavetable note with two voices at random phases. The
+    // backend holds its table, a saw.
+    let wavetable = |event: OnsetEvent, provider: Option<&Arc<InsertProvider>>| {
+        let mut backend = ScalarBackend::prepared(48_000, 8).expect("backend");
+        let saw = (0..2_048).map(|i| i as f32 / 1_024.0 - 1.0).collect();
+        let table = rustel_audio::DecodedSample::from_parts(48_000, 1, saw).expect("table");
+        let id = rustel_audio::SampleId(9);
+        backend
+            .install_sample(id, Box::new(table))
+            .expect("install");
+        if let Some(provider) = provider {
+            backend.set_insert_provider(Arc::clone(provider));
+        }
+        render_pcm(&mut backend, 48_000, 100_800, &[event]).expect("render")
+    };
+    let mut note = sine(96_000, 0.05);
+    note.controls.worklet_begin_secs = 2.0;
+    note.wavetable = Some(rustel_audio::WavetableControls {
+        table: rustel_audio::SampleId(9),
+        frame_len: 2048,
+        voices: 2.0,
+        lfo_shape: 0,
+        phaserand: 1.0,
+        freqspread: 0.0,
+        panspread: 0.7,
+        position: 0.0,
+        pos_env_amount: 0.0,
+        pos_attack: 0.0,
+        pos_decay: 0.5,
+        pos_sustain: 0.0,
+        pos_release: 0.1,
+        lfo_depth: 0.0,
+        lfo_rate: 1.0,
+        lfo_skew: 0.5,
+        lfo_dc: 0.0,
+        warp: 0.0,
+        warp_mode: 0,
+        warp_env_amount: 0.0,
+        warp_attack: 0.0,
+        warp_decay: 0.5,
+        warp_sustain: 0.0,
+        warp_release: 0.1,
+        warp_lfo_depth: 0.0,
+        warp_lfo_rate: 1.0,
+        warp_lfo_skew: 0.5,
+        warp_lfo_dc: 0.0,
+        warp_lfo_shape: 0,
+    });
+    let dry = wavetable(note.clone(), None);
+    assert!(dry.iter().any(|sample| sample.abs() > 0.01), "wavetable");
+    let wet = wavetable(latent(note, [128, 256], 384), Some(&chain));
+    assert!(wet == dry, "the wavetable note through the chain differs");
+
+    // Delays of 0.8 s and 0.5 s, and a lead of 1 s: the note sounds 0.3 s
+    // late. A later note on the chain sets the level of the chain on the
+    // frame of its output, 1.5 s after the first one. It starts while the
+    // first one sounds.
+    let chain = delays([Some(38_400), Some(24_000)]);
+    let long = |onset: u64, secs: f32, postgain: f32| {
+        let mut note = sine(onset, secs);
+        note.controls.postgain = postgain;
+        latent(note, [38_400, 24_000], 48_000)
+    };
+    let (late, _) = play(76_800, &[long(48_000, 0.1, 1.0)], Some(&chain));
+    let (dry, _) = play(76_800, &[sine(62_400, 0.1)], None);
+    assert!(late == dry, "the note is not 0.3 s late");
+    let levels = |postgain| {
+        let notes = [long(48_000, 2.0, 1.0), long(120_000, 0.05, postgain)];
+        play(144_000, &notes, Some(&chain)).0
+    };
+    let (moved, kept) = (levels(0.25), levels(1.0));
+    const OUTPUT: usize = 120_000 + 14_400;
+    assert!(
+        moved[..OUTPUT * 2] == kept[..OUTPUT * 2],
+        "the level moved early"
+    );
+    assert_ne!(
+        moved[OUTPUT * 2],
+        kept[OUTPUT * 2],
+        "the level did not move"
+    );
+    // The reverb and delay sends of a note wait in the send lines, and join
+    // the orbit on the frame of the output of the note. The sine above, a
+    // voice of one channel, sends 1.3 s after it starts. A supersaw, a voice
+    // of 2 channels, through delays of 0.8 s and 0.2 s with a lead of 1 s
+    // sends on its onset. With no lines, or with lines that do not reach that
+    // far, the sends go at once, early, and the note counts.
+    let sends = |mut note: OnsetEvent| {
+        note.controls.reverb = Some(rustel_audio::ReverbControls {
+            wet: 0.5,
+            size_secs: 0.1,
+            fade_secs: 0.05,
+            lp_start_hz: 8_000.0,
+            lp_end_hz: 1_000.0,
+            ir: None,
+        });
+        note.controls.delay = Some(rustel_audio::DelayControls {
+            wet: 0.5,
+            time_secs: 0.05,
+            feedback: 0.25,
+        });
+        note
+    };
+    let supersaw = |onset: u64| {
+        let mut note = synth(rustel_audio::SynthSource::Supersaw {
+            voices: 5.0,
+            freqspread: 0.18,
+            panspread: 0.6,
+        });
+        note.onset_frame = onset;
+        note.duration_secs = 0.1;
+        note.controls.worklet_begin_secs = 1.0;
+        note
+    };
+    let cases = [
+        (sine(48_000, 0.1), [38_400, 24_000], sine(62_400, 0.1)),
+        (supersaw(48_000), [38_400, 9_600], supersaw(48_000)),
+    ];
+    for (note, latencies, heard) in cases {
+        let chain = delays(latencies.map(Some));
+        let note = latent(sends(note), latencies, 48_000);
+        // The note through the chain, with send lines made for `lines`.
+        // Gives the output and the notes whose sends went at once.
+        let through = |lines: Option<u32>| {
+            let mut backend = ScalarBackend::new();
+            backend.set_insert_provider(Arc::clone(&chain));
+            if let Some(latency) = lines {
+                let lines = rustel_audio::scalar::SendLines::new(latency, 48_000);
+                assert!(backend.install_send_lines(Box::new(lines)).is_none());
+            }
+            let events = std::slice::from_ref(&note);
+            let pcm = render_pcm(&mut backend, 48_000, 76_800, events).expect("render");
+            (pcm, backend.early_sends())
+        };
+        let (late, early_sends) = through(Some(latencies.iter().sum()));
+        assert_eq!(early_sends, 0);
+        let (dry, _) = play(76_800, &[sends(heard.clone())], None);
+        let (plain, _) = play(76_800, &[heard], None);
+        assert!(dry != plain, "the note has no sends");
+        // The rooms of the 2 renders start on other frames, so their sums
+        // round apart in the last bits.
+        let near = |pcm: &[f32]| pcm.iter().zip(&dry).all(|(a, b)| (a - b).abs() < 1e-6);
+        assert!(
+            near(&late),
+            "the sends are not on the frame of the output: {latencies:?}"
+        );
+        let early = through(None);
+        assert_eq!(early.1, 1);
+        assert!(!near(&early.0), "the sends waited with no send lines");
+        assert!(through(Some(0)) == early, "the sends waited past the reach");
     }
 }
 

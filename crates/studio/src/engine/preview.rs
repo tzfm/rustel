@@ -723,6 +723,7 @@ impl StudioEngine {
                 &mut self.sample_use_until,
                 live.device.sample_rate(),
                 live.device.render_frontier_frames(),
+                live.device.restart_lead(),
             );
         }
         Ok(AuditionPush::Played)

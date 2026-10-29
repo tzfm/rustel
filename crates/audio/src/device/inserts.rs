@@ -16,6 +16,7 @@ impl Default for LiveReverbBatch {
             // A turn with no plugin makes no allocation here.
             inserts: Vec::new(),
             refused: 0,
+            latency: 0,
         }
     }
 }
@@ -79,6 +80,7 @@ impl LiveReverbBatch {
     }
 
     fn observe_inserts(&mut self, event: &crate::AudioEvent) {
+        self.latency = self.latency.max(event.controls.effect_latency());
         let chain = event.controls.insert_chain();
         for (place, effect) in event.controls.effects.iter().enumerate() {
             if let Some(effect) = effect {
@@ -161,6 +163,7 @@ impl LiveReverbBatch {
             .fetch_add(self.refused, Ordering::Relaxed);
         self.refused = 0;
         device.ship_plugin_pool();
+        device.ship_send_lines(self.latency);
     }
 }
 
@@ -396,6 +399,31 @@ impl LiveScalarDevice {
             Err(install) => {
                 // SAFETY: the count never left this thread.
                 drop(unsafe { Arc::from_raw(install.0) });
+            }
+        }
+    }
+
+    /// Ships send lines to the backend of the stream for the notes of chains
+    /// with `latency` frames of effect latency, 1 s at most, when the lines
+    /// it shipped do not reach that far: see [`crate::scalar::SendLines`].
+    /// The lines are made here, on the producer. With send lines still on
+    /// their way to the callback, the next turn tries again.
+    fn ship_send_lines(&self, latency: u32) {
+        let latency = latency.min(self.sample_rate);
+        let installs = &self.shared.samples.send_line_installs;
+        if latency <= self.send_lines_reach.load(Ordering::Relaxed)
+            || installs.len() == installs.capacity()
+        {
+            return;
+        }
+        let lines = Box::new(crate::scalar::SendLines::new(latency, self.sample_rate));
+        let reach = lines.reach();
+        match installs.push(crate::assets::SendLineInstall(Box::into_raw(lines))) {
+            Ok(()) => self.send_lines_reach.store(reach, Ordering::Relaxed),
+            Err(install) => {
+                // Only this thread fills the ring, and a place was free.
+                // SAFETY: never left this thread. Unique owner.
+                drop(unsafe { Box::from_raw(install.0) });
             }
         }
     }
@@ -765,7 +793,9 @@ impl LiveScalarDevice {
     /// Drops each insert of a closed stream on the producer: each copy in the
     /// line to the callback, each copy the backend holds, then each copy the
     /// callback gave back. No box drops while a lock of the device is held.
-    /// A close asks the names source nothing.
+    /// A close asks the names source nothing. The send lines on their way to
+    /// the callback drop too, and the send lines of the backend go with the
+    /// backend. The next turn ships send lines again.
     ///
     /// Call it after the callback retired and its stream closed.
     pub(super) fn hand_back_inserts(&mut self) {
@@ -773,6 +803,11 @@ impl LiveScalarDevice {
             // SAFETY: the old callback joined. This unconsumed box has one owner.
             drop(unsafe { Box::from_raw(install.insert) });
         }
+        for install in self.shared.samples.send_line_installs.drain_available() {
+            // SAFETY: the old callback joined. These lines have one owner.
+            drop(unsafe { Box::from_raw(install.0) });
+        }
+        *self.send_lines_reach.get_mut() = 0;
         if let Some(cell) = self.backend.take() {
             // SAFETY: the callback retired, so no render uses the backend
             // again, and this thread holds no other reference to it.
@@ -869,11 +904,13 @@ mod tests {
         );
         let generation = AtomicU64::new(7);
         let zero = AtomicU64::new(0);
+        let fired = AtomicU64::new(0);
         let flip = crate::LiveFlipAtomics {
             generation: &generation,
             takeover_frame: &zero,
             takeover_cut: &zero,
             line_arm: &zero,
+            line_fired: &fired,
         };
         let stopped = AtomicBool::new(false);
         let mut output = [0.0; 1024];
@@ -1526,6 +1563,85 @@ mod tests {
             device.shared.samples.insert_installs.len() == 0
         });
 
+        // A turn with a note of key 2 through a stage with 480 frames of
+        // latency ships send lines, and the callback takes them. A turn that
+        // needs no longer reach ships none. A stage with 960 frames ships
+        // longer lines. The callback takes them and gives the first lines
+        // back. While those wait to be freed, the callback takes no other
+        // lines. The next turn frees them. A stage of 2 s ships lines for
+        // 1 s, one time. The turns build and drop no copy. The names source
+        // gives no copy the score no longer has, so the turns send no release.
+        *gone.lock().unwrap() = Vec::new();
+        let (built, drops) = (seen.built.load(Ordering::Relaxed), dropped());
+        let turn = |latency| {
+            let mut controls = crate::OscillatorControls {
+                orbit: 1,
+                ..Default::default()
+            };
+            let effect = crate::insert::InsertControls::new(key(2)).with_latency(latency);
+            controls.effects[0] = Some(effect);
+            let note = AudioEvent {
+                onset_id: 0,
+                generation: device.generation(),
+                target_frame: device.clock_frames() + 4_800,
+                onset_lead: 0.0,
+                freq_hz: 220.0,
+                gain: 0.5,
+                duration_secs: 0.05,
+                ui_visuals: 0,
+                controls,
+                sample: None,
+                synth: None,
+                wavetable: None,
+                cut: None,
+            };
+            LiveReverbBatch::install_inserts(&device, std::slice::from_ref(&note));
+        };
+        let lines = &device.shared.samples.send_line_installs;
+        let replaced = &device.shared.samples.send_line_returns;
+        let reach = || device.send_lines_reach.load(Ordering::Relaxed);
+        turn(480);
+        assert_eq!(reach(), 896);
+        until("the callback did not take the send lines", || {
+            lines.len() == 0
+        });
+        turn(480);
+        assert_eq!((lines.len(), reach()), (0, 896));
+        turn(960);
+        assert_eq!(reach(), 1_920);
+        until("the callback did not give the first lines back", || {
+            lines.len() == 0 && replaced.len() == 1
+        });
+        let next = Box::new(crate::scalar::SendLines::new(4_800, 48_000));
+        let next = crate::assets::SendLineInstall(Box::into_raw(next));
+        assert!(lines.push(next).is_ok());
+        let taken_by = device.clock_frames() + 512;
+        until("the callback did not run", || {
+            device.clock_frames() >= taken_by
+        });
+        assert_eq!((lines.len(), replaced.len()), (1, 1));
+        LiveReverbBatch::default().flush_inserts(&device);
+        until("the callback did not take the next lines", || {
+            lines.len() == 0 && replaced.len() == 1
+        });
+        LiveReverbBatch::default().flush_inserts(&device);
+        assert_eq!(replaced.len(), 0);
+        turn(96_000);
+        assert_eq!(reach(), 65_408);
+        until("the callback did not take the lines of 1 s", || {
+            lines.len() == 0
+        });
+        turn(96_000);
+        assert_eq!((lines.len(), reach()), (0, 65_408));
+        let long = crate::scalar::SendLines::new(96_000, 48_000);
+        assert_eq!(long.reach(), 65_408, "lines hold 1 s at most");
+        assert_eq!(
+            (seen.built.load(Ordering::Relaxed), dropped()),
+            (built, drops)
+        );
+        assert!(device.holds_insert(slot, key(2)));
+        *gone.lock().unwrap() = vec![(slot, key(2))];
+
         // Stop consumption so the next copy stays in the line during the
         // recycle. A copy that is not ready waits for the next turn. The
         // device keeps the backend of the stopped thread and its copy.
@@ -1913,7 +2029,10 @@ mod tests {
         drop(backend);
 
         // A failed replacement keeps the workers. The next turn ships them,
-        // and the recycle after it drops what no backend took.
+        // and the recycle after it drops what no backend took. A turn with a
+        // note through a stage with latency also ships send lines. A recycle
+        // drops the send lines no backend took and forgets their reach, so
+        // the next such turn ships send lines again.
         let fail = |device: &mut LiveScalarDevice| {
             device.recycle_output_to_with(
                 Some(SILENT_OUTPUT_NAME),
@@ -1921,16 +2040,46 @@ mod tests {
                 |_, _| Err(DevicePlaybackError::Unavailable("no output".into())),
             )
         };
+        let latent = |device: &LiveScalarDevice| {
+            let mut controls = crate::OscillatorControls::default();
+            let effect = crate::insert::InsertControls::new(key(1)).with_latency(480);
+            controls.effects[0] = Some(effect);
+            let note = AudioEvent {
+                onset_id: 0,
+                generation: device.generation(),
+                target_frame: 4_800,
+                onset_lead: 0.0,
+                freq_hz: 220.0,
+                gain: 0.5,
+                duration_secs: 0.05,
+                ui_visuals: 0,
+                controls,
+                sample: None,
+                synth: None,
+                wavetable: None,
+                cut: None,
+            };
+            LiveReverbBatch::install_inserts(device, std::slice::from_ref(&note));
+        };
+        let lines = |device: &LiveScalarDevice| {
+            let reach = device.send_lines_reach.load(Ordering::Relaxed);
+            (device.shared.samples.send_line_installs.len(), reach)
+        };
+        latent(&device);
+        assert_eq!(lines(&device), (1, 896));
         assert!(fail(&mut device).is_err());
+        assert_eq!(lines(&device), (0, 0));
         let installs = &device.shared.samples.pool_installs;
-        LiveReverbBatch::default().flush_inserts(&device);
+        latent(&device);
         assert_eq!((installs.len(), Arc::strong_count(&shared)), (1, 5));
+        assert_eq!(lines(&device), (1, 896));
         assert!(fail(&mut device).is_err());
         let installs = &device.shared.samples.pool_installs;
         assert_eq!((installs.len(), Arc::strong_count(&shared)), (0, 4));
+        assert_eq!(lines(&device), (0, 0));
 
         // The replacement output takes the same workers, which follow its
-        // buffer.
+        // buffer, and the send lines of its first turn.
         device.set_buffer_preference(AudioBufferPreference::Frames(257));
         device
             .recycle_output_to_with(
@@ -1939,9 +2088,12 @@ mod tests {
                 |device, _| device.prepare_recycled_output(None),
             )
             .expect("replacement output");
-        LiveReverbBatch::default().flush_inserts(&device);
+        latent(&device);
         until("the next backend did not take the pool", || {
             device.shared.samples.pool_installs.len() == 0
+        });
+        until("the next backend did not take the send lines", || {
+            lines(&device) == (0, 896)
         });
         assert_eq!(Arc::strong_count(&shared), 5);
         assert_eq!(device.report().plugin_workers, 2);

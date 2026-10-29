@@ -119,6 +119,8 @@ impl LiveScalarDevice {
             insert_values: std::sync::Mutex::new(None),
             plugin_pool: std::sync::Mutex::new(None),
             plugin_pool_shipped: AtomicBool::new(false),
+            send_lines_reach: std::sync::atomic::AtomicU32::new(0),
+            restart_lead_cell: std::sync::Mutex::new(None),
             shared,
             sample_rate: facts.sample_rate_hz(),
             channels: facts.channels(),
@@ -1506,10 +1508,12 @@ impl FiniteAdmission {
             // Sidechains arm here, once per admitted event, as the live
             // path arms at ring intake: the queue drains as ducks fire,
             // and arming at the prepare pass would spend its whole
-            // capacity on far-future onsets.
+            // capacity on far-future onsets. The dip lands on the musical
+            // onset, as in the live path.
+            let event = &self.events[self.next];
             backend.arm_duck_at(
-                self.events[self.next].onset_frame,
-                self.events[self.next].controls.duck,
+                event.controls.musical(event.onset_frame),
+                event.controls.duck,
             );
             self.next += 1;
         }
@@ -2287,7 +2291,9 @@ mod tests {
 
     /// Sidechains arm at admission, as the live path arms at ring intake:
     /// with a list longer than the duck queue's capacity, a trigger past
-    /// the old full-queue drop still dips its target orbit.
+    /// the old full-queue drop still dips its target orbit. A trigger through
+    /// a plugin chain with latency starts that latency early, and dips on its
+    /// musical onset.
     #[test]
     fn finite_playback_arms_ducks_past_the_queue_capacity() {
         let _guard = tripwire_assertion_guard();
@@ -2327,29 +2333,34 @@ mod tests {
             OnsetEvent::new(index * spacing + 2400, 220.0, 0.0, 0.01)
                 .with_controls(controls(1, Some(duck)))
         });
-        let mut events = vec![tone];
+        let mut events = vec![tone.clone()];
         events.extend(triggers);
         let total = last_onset + 12_000;
 
-        let mut backend = ScalarBackend::with_dispatch(DspDispatch::portable());
-        backend.init(48_000).unwrap();
-        let mut admission = queue_finite_events(&mut backend, &events, 48_000).unwrap();
-        let written = AtomicU64::new(0);
-        let mut output = vec![0.0f32; 0];
-        while written.load(Ordering::Acquire) < total {
-            let mut block = [0.0f32; 128 * 2];
-            crate::tripwire::audio_scope(|| {
-                super::super::callback::write_output(
-                    &mut backend,
-                    &mut block,
-                    2,
-                    total,
-                    &written,
-                    &mut admission,
-                );
-            });
-            output.extend_from_slice(&block);
-        }
+        // The first `total` frames of `events` through the finite path.
+        let render = |events: &[OnsetEvent], total: u64| {
+            let mut backend = ScalarBackend::with_dispatch(DspDispatch::portable());
+            backend.init(48_000).unwrap();
+            let mut admission = queue_finite_events(&mut backend, events, 48_000).unwrap();
+            let written = AtomicU64::new(0);
+            let mut output = vec![0.0f32; 0];
+            while written.load(Ordering::Acquire) < total {
+                let mut block = [0.0f32; 128 * 2];
+                crate::tripwire::audio_scope(|| {
+                    super::super::callback::write_output(
+                        &mut backend,
+                        &mut block,
+                        2,
+                        total,
+                        &written,
+                        &mut admission,
+                    );
+                });
+                output.extend_from_slice(&block);
+            }
+            output
+        };
+        let output = render(&events, total);
         let rms = |from: usize, to: usize| {
             let slice = &output[from * 2..to * 2];
             (slice
@@ -2368,6 +2379,25 @@ mod tests {
         assert!(
             dipped < before * 0.5,
             "the trigger past the queue capacity must still dip the orbit:              before {before:.5}, at the last trigger {dipped:.5}"
+        );
+
+        // A trigger with its musical onset on frame 9_600, through a plugin
+        // chain with `lead` frames of latency.
+        let trigger = |lead: u32| {
+            let key = crate::InsertKey {
+                plugin: 1,
+                preset: 0,
+            };
+            let mut trigger = OnsetEvent::new(9_600 - u64::from(lead), 220.0, 0.0, 0.01)
+                .with_controls(controls(1, Some(duck)));
+            trigger.controls.lead = lead;
+            trigger.controls.effects[0] = Some(crate::InsertControls::new(key).with_latency(lead));
+            trigger
+        };
+        let early = render(&[tone.clone(), trigger(480)], 19_200);
+        assert!(
+            early == render(&[tone, trigger(0)], 19_200),
+            "a trigger 480 frames early dips on the frame of its musical onset"
         );
     }
 

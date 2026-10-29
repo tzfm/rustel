@@ -73,6 +73,29 @@ pub(crate) fn scalar_event_detailed(
     cps: f64,
     samples: &dyn rustel_voice::SampleLookup,
 ) -> Result<rustel_audio::OnsetEvent, rustel_voice::VoiceError> {
+    let cycle = onset_cycle(onset, cps);
+    scalar_event_at(onset, onset.target_time, cycle, sample_rate, cps, samples)
+}
+
+/// The cycle of an onset: the begin of its whole. An onset with no readable
+/// `whole_begin` has no cycle of its own. The clock time then serves as the
+/// musical time.
+fn onset_cycle(onset: &OnsetEventJson, cps: f64) -> f64 {
+    whole_begin_cycle(&onset.whole_begin).unwrap_or(onset.target_time * cps)
+}
+
+/// [`scalar_event_detailed`] at the clock time `target_time`, in seconds,
+/// with `cycle` as the cycle of the onset. A note of a plugin chain with
+/// latency converts again at an earlier time and keeps the cycle of its
+/// onset: see [`early_audio_event`].
+fn scalar_event_at(
+    onset: &OnsetEventJson,
+    target_time: f64,
+    cycle: f64,
+    sample_rate: u32,
+    cps: f64,
+    samples: &dyn rustel_voice::SampleLookup,
+) -> Result<rustel_audio::OnsetEvent, rustel_voice::VoiceError> {
     let value = match &onset.value {
         crate::ValueJson::Null => serde_json::Value::Null,
         crate::ValueJson::Bool(flag) => serde_json::Value::Bool(*flag),
@@ -82,14 +105,11 @@ pub(crate) fn scalar_event_detailed(
         crate::ValueJson::String(note) => serde_json::Value::String(note.clone()),
         crate::ValueJson::Raw(raw) => raw.clone(),
     };
-    // An onset with no readable `whole_begin` has no cycle of its own. The
-    // clock time then serves as the musical time.
-    let cycle = whole_begin_cycle(&onset.whole_begin).unwrap_or(onset.target_time * cps);
     rustel_voice::resolve_voice_with_samples_detailed(
         &value,
         onset.onset_id,
         onset.duration_secs,
-        onset.target_time,
+        target_time,
         cycle,
         sample_rate,
         cps,
@@ -311,7 +331,102 @@ pub(crate) fn live_audio_event(
     let mut scalar = scalar_event_detailed(onset, sample_rate, cps, samples)?;
     scalar.controls.insert_chain = chain(&onset.value);
     bind_live_controls(&mut scalar, onset);
-    Ok(rustel_audio::AudioEvent {
+    Ok(audio_event(onset, scalar))
+}
+
+/// Converts a note of a live session again, `lead` frames before its onset,
+/// for a plugin chain with that much latency: the chain then plays in time
+/// with the other lanes. `first` is the event of the first conversion, on
+/// its chain. The new event keeps the chain of `first`, with the stage and
+/// the latency of each effect and of the instrument, and the gate times of
+/// `first`: the voice opens its gates in the time of the music. The cycle of
+/// the onset stays, so each modulator keeps its phase. Gives `None` when the
+/// earlier time does not convert.
+///
+/// `samples` give the sounds, and `first` gives the plugin and Csound
+/// controls: see [`ConvertedLookup`]. So the conversion asks the plugin host
+/// nothing and prepares no second score event. It gives no notice: the first
+/// conversion gave each one.
+#[cfg(feature = "vst")]
+pub(crate) fn early_audio_event(
+    onset: &OnsetEventJson,
+    first: &rustel_audio::AudioEvent,
+    lead: u32,
+    sample_rate: u32,
+    cps: f64,
+    samples: &dyn rustel_voice::SampleLookup,
+) -> Option<rustel_audio::AudioEvent> {
+    let target_time = onset.target_time - f64::from(lead) / f64::from(sample_rate);
+    let cycle = onset_cycle(onset, cps);
+    let lookup = ConvertedLookup {
+        samples,
+        controls: &first.controls,
+    };
+    let (scalar, _notices) = rustel_voice::with_diagnostic_policy(false, || {
+        scalar_event_at(onset, target_time, cycle, sample_rate, cps, &lookup)
+    });
+    let mut scalar = scalar.ok()?;
+    let (controls, kept) = (&mut scalar.controls, &first.controls);
+    controls.insert_chain = kept.insert_chain;
+    controls.effects = kept.effects;
+    controls.worklet_begin_secs = kept.worklet_begin_secs;
+    controls.lfo_end_secs = kept.lfo_end_secs;
+    controls.filter_lfo_end_secs = kept.filter_lfo_end_secs;
+    bind_live_controls(&mut scalar, onset);
+    scalar.controls.lead = lead;
+    Some(audio_event(onset, scalar))
+}
+
+/// The lookup of a second conversion of a note: see [`early_audio_event`].
+/// The sounds come from `samples`, and the instrument, a plugin or a Csound
+/// score event, is the instrument of the first conversion in `controls`, with
+/// its latency. An effect gets no controls here: the caller puts back the
+/// effects of the first conversion, each on its stage.
+#[cfg(feature = "vst")]
+struct ConvertedLookup<'a> {
+    samples: &'a dyn rustel_voice::SampleLookup,
+    controls: &'a rustel_audio::OscillatorControls,
+}
+
+#[cfg(feature = "vst")]
+impl rustel_voice::SampleLookup for ConvertedLookup<'_> {
+    fn resolve(&self, s: &str, n: f64, midi: f64) -> rustel_voice::SampleResolution {
+        self.samples.resolve(s, n, midi)
+    }
+
+    fn bus_names(&self) -> Option<&rustel_voice::BusNames> {
+        self.samples.bus_names()
+    }
+
+    fn insert(
+        &self,
+        request: &rustel_voice::PluginRequest<'_>,
+    ) -> Result<Option<rustel_audio::InsertControls>, String> {
+        Ok(self.controls.instrument.filter(|_| request.instrument))
+    }
+
+    fn insert_speech(
+        &self,
+        request: &rustel_voice::SpeechRequest<'_>,
+    ) -> Result<rustel_voice::SampleResolution, String> {
+        self.samples.insert_speech(request)
+    }
+
+    fn csound(
+        &self,
+        _request: &rustel_voice::CsoundRequest<'_>,
+    ) -> Result<rustel_audio::InsertControls, String> {
+        let prepared = self.controls.instrument;
+        prepared.ok_or_else(|| "the first conversion prepared no Csound event".to_owned())
+    }
+}
+
+/// The event of a live output for a converted onset.
+fn audio_event(
+    onset: &OnsetEventJson,
+    scalar: rustel_audio::OnsetEvent,
+) -> rustel_audio::AudioEvent {
+    rustel_audio::AudioEvent {
         onset_id: onset.onset_id,
         generation: onset.generation,
         ui_visuals: onset.ui_visuals,
@@ -325,7 +440,7 @@ pub(crate) fn live_audio_event(
         wavetable: scalar.wavetable,
         synth: scalar.synth,
         cut: None,
-    })
+    }
 }
 
 /// Convert the scheduler's floating onset time to the exact frame boundary
@@ -1921,6 +2036,130 @@ mod tests {
 
         // No readable cycle: the clock time gives frac(10.4 * 7).
         assert!((phase0(&event("")) - 0.8).abs() < 1e-4);
+
+        // The note of a chain with 480 frames of latency converts 480 frames
+        // early with the cycle of its onset: the lfo keeps its phase, and the
+        // gates read the earlier clock.
+        let start = 10.4 - 480.0 / 48_000.0;
+        let early = scalar_event_at(
+            &lfo_onset("3/4"),
+            start,
+            0.75,
+            48_000,
+            0.5,
+            &rustel_voice::BundledOnly,
+        )
+        .expect("early event");
+        assert_eq!(early.onset_frame, 498_720);
+        let lfo = early.controls.lfos[0].expect("the lfo() modulator");
+        assert_eq!(lfo.phase0, 0.5);
+        assert_eq!(early.controls.worklet_begin_secs, start as f32);
+        assert!(early.controls.worklet_begin_secs < live.controls.worklet_begin_secs);
+        // The note lasts 0.25 s, and its modulators 0.01 s more.
+        assert_eq!(early.controls.lfo_end_secs, (start + 0.25 + 0.01) as f32);
+        assert!(early.controls.lfo_end_secs < live.controls.lfo_end_secs);
+
+        // The second conversion of a note of a plugin chain keeps the chain,
+        // the instrument and the gates of the first event, and binds the
+        // sliders of the note. It asks the lookup of its sounds for no plugin
+        // and for no score event, and gives no notice: the first conversion
+        // gave each one.
+        #[cfg(feature = "vst")]
+        {
+            struct Plugins;
+            impl rustel_voice::SampleLookup for Plugins {
+                fn resolve(&self, s: &str, n: f64, midi: f64) -> rustel_voice::SampleResolution {
+                    rustel_voice::SampleLookup::resolve(&rustel_voice::BundledOnly, s, n, midi)
+                }
+                fn insert(
+                    &self,
+                    _: &rustel_voice::PluginRequest<'_>,
+                ) -> Result<Option<rustel_audio::InsertControls>, String> {
+                    let key = rustel_audio::InsertKey {
+                        plugin: 3,
+                        preset: 0,
+                    };
+                    Ok(Some(rustel_audio::InsertControls::new(key)))
+                }
+                fn csound(
+                    &self,
+                    _: &rustel_voice::CsoundRequest<'_>,
+                ) -> Result<rustel_audio::InsertControls, String> {
+                    let key = rustel_audio::InsertKey {
+                        plugin: rustel_csound::PLUGIN_ID,
+                        preset: 0,
+                    };
+                    Ok(rustel_audio::InsertControls::new(key).with_score(9))
+                }
+            }
+            // The sounds of the second conversion, with the count of the
+            // plugins and the score events it asks for.
+            #[derive(Default)]
+            struct Sounds(std::cell::Cell<usize>);
+            impl rustel_voice::SampleLookup for Sounds {
+                fn resolve(&self, s: &str, n: f64, midi: f64) -> rustel_voice::SampleResolution {
+                    rustel_voice::SampleLookup::resolve(&rustel_voice::BundledOnly, s, n, midi)
+                }
+                fn insert(
+                    &self,
+                    _: &rustel_voice::PluginRequest<'_>,
+                ) -> Result<Option<rustel_audio::InsertControls>, String> {
+                    self.0.set(self.0.get() + 1);
+                    Ok(None)
+                }
+                fn csound(
+                    &self,
+                    _: &rustel_voice::CsoundRequest<'_>,
+                ) -> Result<rustel_audio::InsertControls, String> {
+                    self.0.set(self.0.get() + 1);
+                    Err("a second score event".into())
+                }
+            }
+            // Each note names a duck orbit that does not exist, so its
+            // conversion gives a notice.
+            for value in [
+                serde_json::json!({ "note": 48, "duckorbit": 99, "vsti": { "name": "synth" }, "vst": [{ "name": "delay" }] }),
+                serde_json::json!({ "note": 60, "duckorbit": 99, "csound": "probe", "vst": [{ "name": "delay" }] }),
+            ] {
+                let note = OnsetEventJson {
+                    whole_begin: "3/4".into(),
+                    target_time: 10.4,
+                    live_controls: [7, 0, 0, 0],
+                    ..onset(value)
+                };
+                let (first, notices) = rustel_voice::with_diagnostic_policy(false, || {
+                    live_audio_event(&note, 48_000, 0.5, &Plugins, |_| Some(70))
+                });
+                let messages: Vec<&str> = notices
+                    .iter()
+                    .map(|notice| notice.message.as_str())
+                    .collect();
+                assert_eq!(messages, ["duck target orbit 99 does not exist"]);
+                let mut first = first.expect("first conversion");
+                let stage = first.controls.effects[0].as_mut().expect("the effect");
+                stage.set_stage(2);
+                *stage = stage.with_latency(480);
+                let sounds = Sounds::default();
+                // The outer scope keeps each notice that leaves the second
+                // conversion.
+                let (early, notices) = rustel_voice::with_diagnostic_policy(false, || {
+                    early_audio_event(&note, &first, 480, 48_000, 0.5, &sounds)
+                });
+                assert!(notices.is_empty(), "the second conversion gave {notices:?}");
+                let early = early.expect("second conversion");
+                assert_eq!(sounds.0.get(), 0);
+                assert_eq!((early.target_frame, early.controls.lead), (498_720, 480));
+                assert_eq!(early.gain, first.gain);
+                let (controls, kept) = (&early.controls, &first.controls);
+                assert_eq!(controls.insert_chain, Some(70));
+                assert_eq!(controls.effects, kept.effects);
+                assert_eq!(controls.instrument, kept.instrument);
+                assert_eq!(controls.live_controls, kept.live_controls);
+                assert_eq!(controls.worklet_begin_secs, kept.worklet_begin_secs);
+                assert_eq!(controls.lfo_end_secs, kept.lfo_end_secs);
+                assert_eq!(controls.filter_lfo_end_secs, kept.filter_lfo_end_secs);
+            }
+        }
     }
 
     #[test]

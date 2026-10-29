@@ -294,6 +294,12 @@ impl Session {
     /// Default horizon is 0.5 s. WSLg playback latency can grow past that;
     /// takeover then lands after the last queued onset and the tee records a
     /// silent second on the save.
+    ///
+    /// The cover also keeps room for the lead of the plugin chains: a
+    /// takeover waits that lead more, and the notes of a chain with latency
+    /// start that lead early. See [`Self::plugin_lead`]. The lead of the
+    /// plugin copies that do not play now counts when it is larger: see
+    /// [`Self::cover_lead`].
     fn live_schedule_cover(&self) -> f64 {
         let margin = self.continuity_margin.unwrap_or(self.schedule_lead);
         let margin = if margin.is_finite() {
@@ -301,7 +307,7 @@ impl Session {
         } else {
             0.0
         };
-        self.config.horizon + margin
+        self.config.horizon + margin + self.plugin_lead().max(self.cover_lead())
     }
 
     /// Seconds ahead of `now` a live producer keeps scheduled: the horizon
@@ -322,7 +328,7 @@ impl Session {
             .min(LIVE_IMPURE_BURST_RESERVE_MAX.as_secs_f64())
     }
 
-    fn sync_live_schedule_horizon(&mut self) {
+    pub(super) fn sync_live_schedule_horizon(&mut self) {
         self.scheduler.set_horizon(self.live_schedule_cover());
     }
 
@@ -359,7 +365,11 @@ impl Session {
         self.requery_takeover_cut = takeover.1;
     }
 
-    /// Slide an unpublished rewind's cycle zero to `now` once its anchor is
+    /// Slide an unpublished rewind's cycle zero to `now` plus the lead of the
+    /// plugin chains once its anchor is nearer than that: see
+    /// [`Self::plugin_lead`]. The first notes of a chain with latency start
+    /// that lead before cycle zero, and a rewind reached later has no room
+    /// for their lead. With no lead, the slide comes once the anchor is
     /// behind the clock.
     ///
     /// A rewind's cycle zero is anchored at install: the line for a
@@ -375,11 +385,14 @@ impl Session {
     /// reaches cycle zero queries every missed onset as one burst.
     ///
     /// A restart is the loop from its top, so the mapping re-anchors cycle
-    /// zero at `now`, the takeover moves with it, and the cut becomes the
-    /// flip's (whatever line it was waiting for has passed; the consumer
-    /// silences the old score where the new one begins). The window is
-    /// reopened first so nothing an earlier unpublished turn queried stays
-    /// marked emitted.
+    /// zero there. A quantised rewind whose line is still ahead of the clock
+    /// keeps its takeover and its cut on the line: the countdown plays to
+    /// the line, and the restart floor of the consumer lands the first notes
+    /// after it. Once the clock has passed the line, and for an immediate
+    /// rewind, the takeover moves with cycle zero and the cut becomes the
+    /// flip's: the consumer silences the old score where the new one begins.
+    /// The window is reopened first so nothing an earlier unpublished turn
+    /// queried stays marked emitted.
     ///
     /// Returns whether it slid. A takeover still ahead (a quantised launch
     /// mid-countdown) is left on its line.
@@ -391,14 +404,22 @@ impl Session {
         let Some(anchor) = self.requery_anchor_time else {
             return false;
         };
-        if now <= anchor {
+        let start = now + self.plugin_lead();
+        if start <= anchor {
             return false;
         }
         self.scheduler.reopen_window_at(now, anchor);
-        self.scheduler.rebase_start_anchor(now);
-        self.requery_anchor_time = Some(now);
+        self.scheduler.rebase_start_anchor(start);
+        self.requery_anchor_time = Some(start);
+        // A line still ahead keeps the takeover and its cut: the countdown
+        // plays to the line.
+        if self.requery_takeover_cut == TakeoverCut::AtTakeover
+            && self.requery_takeover_time.is_some_and(|line| now <= line)
+        {
+            return true;
+        }
         if self.requery_takeover_time.is_some() {
-            self.requery_takeover_time = Some(now);
+            self.requery_takeover_time = Some(start);
         }
         self.requery_takeover_cut = TakeoverCut::AtFlip;
         true
@@ -850,8 +871,7 @@ impl Session {
         // output gives a new rate with no new attach.
         #[cfg(feature = "vst")]
         if sample_rate > 0 {
-            self.plugin_rate
-                .store(sample_rate, std::sync::atomic::Ordering::Relaxed);
+            self.set_plugin_rate(sample_rate);
         }
         self.with_panic_recovery(now, |session| {
             Ok(session.schedule_audio_live_with_cover_at_guarded(
@@ -1199,13 +1219,9 @@ impl Session {
             sample_rate,
             pending_takeover,
         );
-        let mut compensated: Vec<handover::ConvertedOnset<'_>> = Vec::new();
-        // The plain events, for a copy whose effect a save removed. Only a
-        // window with a takeover frame can meet such a copy.
-        let mut plain: Vec<handover::ConvertedOnset<'_>> = Vec::new();
-        // The note of each event, for its plugin chain.
-        #[cfg(feature = "vst")]
-        let mut values = Vec::new();
+        // The onset of each event: its plugin chain and its lead, and its
+        // entry in the ledger of the compensated events.
+        let mut event_onsets = Vec::new();
         let conversion_started = Instant::now();
         let (mut events, notices) =
             rustel_voice::with_diagnostic_policy(self.direct_diagnostic_logging, || {
@@ -1214,32 +1230,11 @@ impl Session {
                     .filter_map(|onset| {
                         match self.live_audio_event(onset, sample_rate, cps, lookup) {
                             Ok(event) => {
-                                #[cfg(feature = "vst")]
-                                values.push(&onset.value);
+                                event_onsets.push(onset);
                                 if let Some(warning) = self.input_channel_warning(&event)
                                     && !input_warnings.contains(&warning)
                                 {
                                     input_warnings.push(warning);
-                                }
-                                // A latency compensation aimed the voice
-                                // before the frame of its onset. A time no
-                                // frame holds reads `u64::MAX`.
-                                let onset_frame =
-                                    crate::render::onset_frame_at(onset.target_time, sample_rate);
-                                let converted = handover::ConvertedOnset {
-                                    event: dispositions.converted as usize,
-                                    whole_begin: &onset.whole_begin,
-                                    value: &onset.value_show,
-                                    controls: &onset.value,
-                                    target_frame: event.target_frame,
-                                    onset_frame,
-                                };
-                                if event.target_frame < onset_frame && onset_frame != u64::MAX {
-                                    compensated.push(converted);
-                                } else if event.target_frame == onset_frame
-                                    && takeover_frame.is_some()
-                                {
-                                    plain.push(converted);
                                 }
                                 dispositions.converted += 1;
                                 if !matches!(mode, LiveQueryBudgetMode::Steady) {
@@ -1310,9 +1305,63 @@ impl Session {
                     })
                     .collect::<Vec<_>>()
             });
+        // The events of a plugin chain with latency start early, and the
+        // first window of an edit leaves out the notes the edit adds with no
+        // room for that lead: see `Session::chain_live_events`.
         #[cfg(feature = "vst")]
-        self.chain_live_events(&mut events, &values);
+        let mut left_out_events = {
+            let reach = now + self.continuity_margin.unwrap_or(self.schedule_lead);
+            let window = match (mode, pending_takeover) {
+                (LiveQueryBudgetMode::ReplacementPrefill, Some(takeover)) => {
+                    LeadWindow::Edit(takeover, self.takeover_lead())
+                }
+                (LiveQueryBudgetMode::ReplacementPrefill, None)
+                    if self.requery_takeover_cut.is_cut() =>
+                {
+                    LeadWindow::Rewind
+                }
+                _ => LeadWindow::Steady,
+            };
+            self.chain_live_events(
+                &mut events,
+                &event_onsets,
+                lookup,
+                sample_rate,
+                reach,
+                window,
+            )
+        };
+        #[cfg(not(feature = "vst"))]
+        let mut left_out_events = Vec::new();
         self.record_csound_chains(&events);
+        // The ledger reads the musical onset of each event: the frame the
+        // event starts on, and its plugin lead. A latency compensation of the
+        // voice aimed the musical onset before the frame of the onset. A time
+        // no frame holds reads `u64::MAX`.
+        let mut compensated: Vec<handover::ConvertedOnset<'_>> = Vec::new();
+        // The plain events, for a copy whose effect a save removed. Only a
+        // window with a takeover frame meets such a copy.
+        let mut plain: Vec<handover::ConvertedOnset<'_>> = Vec::new();
+        for (index, (event, onset)) in events.iter().zip(&event_onsets).enumerate() {
+            if left_out_events.binary_search(&index).is_ok() {
+                continue;
+            }
+            let onset_frame = crate::render::onset_frame_at(onset.target_time, sample_rate);
+            let musical = event.controls.musical(event.target_frame);
+            let entry = handover::ConvertedOnset {
+                event: index,
+                whole_begin: &onset.whole_begin,
+                value: &onset.value_show,
+                controls: &onset.value,
+                target_frame: musical,
+                onset_frame,
+            };
+            if musical < onset_frame && onset_frame != u64::MAX {
+                compensated.push(entry);
+            } else if musical == onset_frame && takeover_frame.is_some() {
+                plain.push(entry);
+            }
+        }
         // Leave out each compensated event whose onset has an outgoing copy
         // on the device: both copies would play, and the outgoing copy can
         // already sound. A left-out event leaves the converted and the
@@ -1326,7 +1375,6 @@ impl Session {
                 .claim_outgoing_copies(generation, takeover_frame, &compensated),
             _ => Vec::new(),
         };
-        let mut left_out_events = Vec::new();
         if left_out.contains(&true) {
             let mut left_out = left_out.into_iter();
             compensated.retain(|converted| {
@@ -1349,8 +1397,8 @@ impl Session {
             );
             let plain_events = plain.iter().zip(left_out).filter(|(_, left_out)| *left_out);
             left_out_events.extend(plain_events.map(|(converted, _)| converted.event));
-            left_out_events.sort_unstable();
         }
+        left_out_events.sort_unstable();
         if !left_out_events.is_empty() {
             for &index in &left_out_events {
                 self.csound.discard(&events[index].controls);
@@ -4531,39 +4579,77 @@ mod tests {
     /// An immediate rewind's cycle zero is anchored at the install clock,
     /// and the producer always publishes it later. Left there, the first
     /// window was aimed into rendered frames (attack lost). The producer
-    /// slides cycle zero to the instant it publishes.
+    /// slides cycle zero to the instant it publishes. With a lead of the
+    /// plugin chains, cycle zero is that lead after the instant it
+    /// publishes, so the first notes of a chain with latency have room for
+    /// their lead. A rewind on a line the producer reaches less than the
+    /// lead before the line slides its cycle zero too, and keeps its
+    /// takeover and its cut on the line, so its countdown plays to the line.
+    /// A line behind the clock moves them with cycle zero.
     #[test]
     #[cfg(feature = "device-audio")]
     fn an_immediate_rewind_restarts_where_the_producer_publishes_it() {
-        let (mut session, mut producer, _library) = rewind_hold_fixture();
-        let rewinding = session.generation();
-        session.start_next_from_zero();
-        session
-            .reload_at("s(\"sine\")", false, 0.0)
-            .expect("native sound replacement");
-        let after = session.generation();
-        producer.arm_replacement(rewinding, after);
+        // The frame and the cut the rewind publishes at, and the first
+        // frame of its window, with `lead` and the line `line`.
+        let rewind = |lead: f64, line: Option<f64>| {
+            let (mut session, mut producer, _library) = rewind_hold_fixture();
+            #[cfg(feature = "vst")]
+            session.set_plugin_lead_for_test(lead);
+            #[cfg(not(feature = "vst"))]
+            let _ = lead;
+            let rewinding = session.generation();
+            if let Some(line) = line {
+                session.set_next_takeover_time(line);
+            }
+            session.start_next_from_zero();
+            session
+                .reload_at("s(\"sine\")", false, 0.0)
+                .expect("native sound replacement");
+            let after = session.generation();
+            producer.arm_replacement(rewinding, after);
 
-        let mut published: Vec<(u64, u64, TakeoverCut)> = Vec::new();
-        let mut audio = Vec::new();
-        producer
-            .step_unwatched_with_clock_and_cutover(
-                &mut session,
-                || 0.02,
-                48_000,
-                |generation, frame, cut| published.push((generation, frame, cut)),
-                |event| {
-                    audio.push(event);
-                    true
-                },
-            )
-            .expect("the rewind publishes");
-        assert_eq!(published, [(after, 960, TakeoverCut::AtFlip)]);
+            let mut published: Vec<(u64, u64, TakeoverCut)> = Vec::new();
+            let mut audio = Vec::new();
+            producer
+                .step_unwatched_with_clock_and_cutover(
+                    &mut session,
+                    || 0.02,
+                    48_000,
+                    |generation, frame, cut| published.push((generation, frame, cut)),
+                    |event| {
+                        audio.push(event);
+                        true
+                    },
+                )
+                .expect("the rewind publishes");
+            assert_eq!(published.len(), 1);
+            assert_eq!(published[0].0, after);
+            let first = audio.iter().map(|event| event.target_frame).min();
+            (published[0].1, published[0].2, first)
+        };
         assert_eq!(
-            audio.iter().map(|event| event.target_frame).min(),
-            Some(960),
+            rewind(0.0, None),
+            (960, TakeoverCut::AtFlip, Some(960)),
             "cycle zero is where the producer published, not 20 ms behind it"
         );
+        #[cfg(feature = "vst")]
+        {
+            assert_eq!(
+                rewind(0.01, None),
+                (1_440, TakeoverCut::AtFlip, Some(1_440)),
+                "cycle zero is the lead after the instant of the publication"
+            );
+            assert_eq!(
+                rewind(0.25, Some(0.25)),
+                (12_000, TakeoverCut::AtTakeover, Some(12_960)),
+                "the line is 0.23 s ahead, less than the lead: the countdown plays to the line"
+            );
+            assert_eq!(
+                rewind(0.25, Some(0.01)),
+                (12_960, TakeoverCut::AtFlip, Some(12_960)),
+                "the line is behind the clock"
+            );
+        }
     }
 
     /// A rewind whose first window refuses an unknown sound while the look-
@@ -4694,6 +4780,388 @@ mod tests {
                 .onsets
                 .len(),
             4
+        );
+    }
+
+    /// A note of a plugin chain with latency starts early by that latency,
+    /// so the chain plays in time with the other lanes. A note with no room
+    /// for its lead after the reach of its window keeps its frame and plays
+    /// late, in onset order. The takeover of an edit waits the lead, so a
+    /// note after it has room. The first window of an edit leaves out each
+    /// note the edit adds before its takeover with no room for its lead. The
+    /// first window of a rewind gives each note its whole lead, and its
+    /// cycle zero comes the lead later. A chain of more than 1 s starts 1 s
+    /// early, with one plugin line. The takeover of a requery waits the lead
+    /// too, so the note on its frame starts early.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    #[test]
+    fn a_note_of_a_chain_with_latency_starts_early_by_its_lead() {
+        const RATE: u32 = 48_000;
+        let (_one, folder) = fixture_plugins();
+        let presets = folder.path().join("presets");
+        let presets = presets.join(rustel_vst3_fixture::NAME);
+        std::fs::create_dir_all(&presets).expect("preset folder");
+        // The fixture delays its output by its delay value times 4096 frames,
+        // and gives that delay as its latency: 480 frames for the Delay
+        // preset, and 4096 frames for the Long preset.
+        let delay = rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.1171875);
+        std::fs::write(presets.join("Delay.vstpreset"), delay).expect("preset file");
+        let long = rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 1.0);
+        std::fs::write(presets.join("Long.vstpreset"), long).expect("preset file");
+        let host = crate::vst::host();
+        // A session of a live output at `rate` that plays `score`, one cycle
+        // a second, with a horizon of 1.5 s and a continuity margin of
+        // 0.01 s. The copy of its first plugin note is ready.
+        let live = |score: &str, preset: &str, rate: u32| {
+            let mut session = Session::with_config(SessionConfig {
+                cps: 1.0,
+                horizon: 1.5,
+                sample_rate: rate,
+                ..SessionConfig::default()
+            })
+            .expect("session");
+            session.set_direct_diagnostic_logging(false);
+            let library = crate::samples::SampleLibrary::empty();
+            session.set_sample_library_for_test(Arc::new(library));
+            session.set_schedule_lead(0.0);
+            session.set_continuity_margin(0.01);
+            session.evaluate(score).expect("score");
+            let output = rustel_audio::device::ManualLiveOutput::new(rate, session.generation())
+                .expect("output");
+            session.attach_plugins(output.device());
+            session.plugins_pending(0.0, 1.0, Duration::from_secs(1));
+            let slot = rustel_audio::effect_slot(plugin_chain(&session), 0);
+            let name = rustel_vst3_fixture::NAME;
+            let started = Instant::now();
+            while !matches!(
+                host.prepared(name, Some(preset), false, rate, slot),
+                rustel_vst3::Prepared::Ready(_)
+            ) {
+                assert!(started.elapsed() < Duration::from_secs(20), "no copy");
+                host.wait_idle();
+            }
+            (session, output)
+        };
+        let window = |session: &mut Session, now: f64, rate: u32, mode| {
+            let batch = session.schedule_audio_live_at(now, rate, Duration::ZERO, mode);
+            batch.unwrap_or_else(|_| panic!("a window at {now}"))
+        };
+        let initial = LiveQueryBudgetMode::InitialPrefill;
+        let steady = LiveQueryBudgetMode::Steady;
+        let replacement = LiveQueryBudgetMode::ReplacementPrefill;
+        // The frame each event starts on, and its lead.
+        let starts = |events: &[rustel_audio::AudioEvent]| -> Vec<(u64, u32)> {
+            let start =
+                |event: &rustel_audio::AudioEvent| (event.target_frame, event.controls.lead);
+            events.iter().map(start).collect()
+        };
+        // A lane of the Delay preset. A cycle has 480 steps of 100 frames.
+        let lane = |notes: &str| {
+            format!(
+                "$: note(\"{notes}\").s(\"sine\").vst(\"rustel fixture\", {{ preset: \"delay\" }})"
+            )
+        };
+        let delayed = lane("c3 c3 c3 c3 ~ c3 ~@474");
+        let (mut session, _output) = live(&delayed, "delay", RATE);
+
+        // Cycle zero at 1 s, and the window reaches from 0.9995 s, frame
+        // 47 976. The first 4 notes of cycle 0 have no room for their lead:
+        // each keeps its frame. The other notes start 480 frames early. Each
+        // stage has its latency, and each gate its onset. The look of `live`
+        // raises the lead when the copy is ready before the look reads its
+        // latency. A Stop ends that lead, so cycle zero is on 1 s.
+        session.transport().stop();
+        session.transport().start();
+        session.restart_transport_at(1.0);
+        let first = window(&mut session, 0.9895, RATE, initial);
+        let late = [(48_000, 0), (48_100, 0), (48_200, 0), (48_300, 0)];
+        let early = [(48_020, 480), (95_520, 480), (95_620, 480), (95_720, 480)];
+        let next = [(95_820, 480), (96_020, 480)];
+        assert_eq!(starts(&first.events), [&late[..], &early, &next].concat());
+        for event in &first.events {
+            assert!(event.target_frame >= 47_976, "before the reach");
+            assert_eq!(event.controls.chain_latency(), 480);
+            let onset = event.controls.musical(event.target_frame) as f64 / f64::from(RATE);
+            let begin = f64::from(event.controls.worklet_begin_secs);
+            assert!((begin - onset).abs() < 1e-6, "{begin} is not {onset}");
+        }
+
+        // An edit at 2.989 s adds a lane with 4 notes before its takeover at
+        // 3.009 s, frame 144 432, and one after it. The takeover waits the
+        // margin and the lead of the chain, 480 frames. The window that
+        // played on reached past the takeover, so the outgoing notes before
+        // it stay with the device. The 4 notes the edit adds there have no
+        // room for their lead and leave the window. The note of each lane
+        // after the takeover starts 480 frames early, and so does the next
+        // cycle. Of the 16 notes of the window, 12 play. The new lane has no
+        // copy yet, and its plugin gives the latency of its preset.
+        window(&mut session, 1.9, RATE, steady);
+        let added = format!("{delayed}\n{}", lane("e3 e3 e3 e3 ~ e3 ~@474"));
+        session.reload_at(&added, false, 2.989).expect("the edit");
+        assert_eq!(
+            session.take_requery_takeover_time(),
+            Some(2.989 + 0.01 + 0.01)
+        );
+        session.rearm_requery_takeover((2.989 + 0.01 + 0.01, TakeoverCut::None));
+        let edit = window(&mut session, 2.989, RATE, replacement);
+        assert_eq!(edit.dispositions.intended, 12);
+        assert_eq!(edit.dispositions.converted, 12);
+        let mut played = starts(&edit.events);
+        played.sort_unstable();
+        assert_eq!(played[..2], [(144_020, 480); 2]);
+        let ahead = |(start, lead): &(u64, u32)| *lead == 480 && *start >= 191_520;
+        assert!(played[2..].iter().all(ahead));
+
+        // An immediate rewind at 3.5 s: cycle zero comes the lead later, at
+        // 3.51 s, frame 168 480. Each downbeat starts 480 frames before
+        // cycle zero, also with no room for its lead.
+        session.start_next_from_zero();
+        session.reload_at(&added, false, 3.5).expect("the rewind");
+        let rewind = window(&mut session, 3.5, RATE, replacement);
+        let downbeat = |(start, lead): &(u64, u32)| start + u64::from(*lead) == 168_480;
+        let downbeats = starts(&rewind.events).into_iter().filter(downbeat);
+        assert_eq!(downbeats.collect::<Vec<_>>(), [(168_000, 480); 2]);
+
+        // At 8 kHz the fixture delays 4096 frames at most, so 4 stages of
+        // 4096 frames are a chain of 2048 ms. Each note starts 1 s early,
+        // and the text gives one plugin line.
+        let stage = r#".vst("rustel fixture", { preset: "long" })"#;
+        let long = format!("$: note(\"c3\").s(\"sine\"){}", stage.repeat(4));
+        let (mut session, _output) = live(&long, "long", 8_000);
+        let _ = session.take_diagnostics();
+        // A Stop ends the lead of the look, as above.
+        session.transport().stop();
+        session.transport().start();
+        session.restart_transport_at(1.2);
+        let longest = window(&mut session, 0.0, 8_000, initial);
+        assert_eq!(starts(&longest.events), [(1_600, 8_000)]);
+        let controls = &longest.events[0].controls;
+        let stages = controls.effects.iter().flatten();
+        let latencies: Vec<u32> = stages.map(|stage| stage.latency()).collect();
+        assert_eq!(latencies, [4096; 4]);
+        assert_eq!(controls.chain_latency(), 16_384);
+        let plugin_lines = |session: &mut Session| -> Vec<String> {
+            let lines = session.take_diagnostics().into_iter();
+            let lines = lines.filter(|line| line.kind == PLUGIN_DIAGNOSTIC);
+            lines.map(|line| line.message).collect()
+        };
+        let line = "a plugin chain has 2048 ms of latency: rustel compensates 1000 ms, \
+                    and the lane plays the rest late";
+        assert_eq!(plugin_lines(&mut session), [line]);
+        window(&mut session, 1.0, 8_000, steady);
+        assert!(plugin_lines(&mut session).is_empty());
+
+        // At 4 kHz one stage of 4096 frames is more than 1 s: it counts as
+        // 1 s.
+        let long = format!("$: note(\"c3\").s(\"sine\"){stage}");
+        let (mut session, _output) = live(&long, "long", 4_000);
+        let _ = session.take_diagnostics();
+        // A Stop ends the lead of the look, as above.
+        session.transport().stop();
+        session.transport().start();
+        session.restart_transport_at(1.2);
+        let longest = window(&mut session, 0.0, 4_000, initial);
+        assert_eq!(starts(&longest.events), [(800, 4_000)]);
+        assert_eq!(longest.events[0].controls.chain_latency(), 4_000);
+        let line = "a plugin chain has 1024 ms of latency: rustel compensates 1000 ms, \
+                    and the lane plays the rest late";
+        assert_eq!(plugin_lines(&mut session), [line]);
+
+        // A requery takes over the margin and the lead after its time, on
+        // a note at 2 s. A start moves cycle zero by the lead of the chains,
+        // so cycle zero is on 1 s. The producer reads a later clock than the
+        // requery. The note on the takeover frame still starts 480 frames
+        // early.
+        let (mut session, _output) = live(&delayed, "delay", RATE);
+        session.restart_transport_at(1.0 - session.plugin_lead());
+        window(&mut session, 0.9895, RATE, initial);
+        session.requery_active_at(1.98).expect("a requery");
+        let requery = window(&mut session, 1.981, RATE, replacement);
+        let on_takeover = |(start, lead): &(u64, u32)| start + u64::from(*lead) == 96_000;
+        let notes = starts(&requery.events).into_iter().filter(on_takeover);
+        assert_eq!(notes.collect::<Vec<_>>(), [(95_520, 480)]);
+    }
+
+    /// A note of a plugin chain with latency reaches the output on its onset
+    /// through the copy of its chain. A note through the fixture Delay of 480
+    /// frames and the same note with no chain on orbit 2 sound on one frame,
+    /// also the downbeats after an immediate rewind that the output flips 2
+    /// blocks after the clock of its producer. A sine, a supersaw and
+    /// an FM note through a Delay of 384 frames, a whole number of quanta,
+    /// give the samples of the same score with no plugin.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    #[test]
+    fn a_note_of_a_chain_with_latency_reaches_the_output_on_its_onset() {
+        const RATE: u32 = 48_000;
+        let (_one, folder) = fixture_plugins();
+        let presets = folder.path().join("presets");
+        let presets = presets.join(rustel_vst3_fixture::NAME);
+        std::fs::create_dir_all(&presets).expect("preset folder");
+        // The fixture delays its output by its delay value times 4096 frames.
+        for (name, delay) in [("Delay", 0.1171875), ("Short", 0.09375)] {
+            let preset = rustel_vst3_fixture::preset_with_delay(1.0, 0.0, delay);
+            let file = presets.join(format!("{name}.vstpreset"));
+            std::fs::write(file, preset).expect("preset file");
+        }
+        let host = crate::vst::host();
+        // Plays `score` through a manual output for `seconds`, one cycle a
+        // second with cycle zero on 1 s, and rewinds it at `rewind` seconds.
+        // The copy of the chain of `preset` is ready. Gives the output and
+        // the frame of the rewind. A producer reads its clock before its
+        // query, and the output renders on while it queries. So the rewind
+        // and its producer read a clock 2 blocks behind the output, and the
+        // restart floor moves the downbeats.
+        let play = |score: &str, preset: Option<&str>, seconds: f64, rewind: Option<f64>| {
+            let mut session = Session::with_config(SessionConfig {
+                cps: 1.0,
+                horizon: 0.5,
+                sample_rate: RATE,
+                ..SessionConfig::default()
+            })
+            .expect("session");
+            session.set_direct_diagnostic_logging(false);
+            let library = crate::samples::SampleLibrary::empty();
+            session.set_sample_library_for_test(Arc::new(library));
+            session.set_schedule_lead(0.0);
+            session.set_continuity_margin(0.01);
+            session.evaluate(score).expect("score");
+            let mut output =
+                rustel_audio::device::ManualLiveOutput::new(RATE, session.generation())
+                    .expect("output");
+            session.attach_plugins(output.device());
+            if let Some(preset) = preset {
+                session.plugins_pending(0.0, 1.0, Duration::from_secs(1));
+                let slot = rustel_audio::effect_slot(plugin_chain(&session), 0);
+                let name = rustel_vst3_fixture::NAME;
+                let started = Instant::now();
+                while !matches!(
+                    host.prepared(name, Some(preset), false, RATE, slot),
+                    rustel_vst3::Prepared::Ready(_)
+                ) {
+                    assert!(started.elapsed() < Duration::from_secs(20), "no copy");
+                    host.wait_idle();
+                }
+            }
+            // A start moves cycle zero by the lead of the chains.
+            session.restart_transport_at(1.0 - session.plugin_lead());
+            let mut producer =
+                crate::LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+            let mut pcm = Vec::new();
+            let mut rewound_at = None;
+            let mut latest = 0;
+            let mut block = [0.0_f32; 256];
+            while pcm.len() < (seconds * f64::from(RATE)) as usize * 2 {
+                let device = output.device();
+                let mut behind = 0.0;
+                if rewind.is_some_and(|at| rewound_at.is_none() && device.clock_seconds() >= at) {
+                    rewound_at = Some(pcm.len() as u64 / 2);
+                    behind = 256.0 / f64::from(RATE);
+                    let rewinding = session.generation();
+                    session.start_next_from_zero();
+                    let now = device.clock_seconds() - behind;
+                    session.reload_at(score, false, now).expect("the rewind");
+                    producer.arm_replacement(rewinding, session.generation());
+                }
+                producer
+                    .step_unwatched_with_clock_and_cutover_and_preparation(
+                        &mut session,
+                        || device.clock_seconds() - behind,
+                        RATE,
+                        |_| Ok(rustel_audio::KabelPublication::default()),
+                        |events| {
+                            for event in events {
+                                let latency = event.controls.chain_latency();
+                                latest = latest.max(event.target_frame + u64::from(latency));
+                            }
+                            rustel_audio::LiveReverbBatch::install_inserts(device, events)
+                        },
+                        |generation, takeover, cut| {
+                            device.set_generation(generation, takeover, cut)
+                        },
+                        |event| device.push(event),
+                    )
+                    .expect("a turn");
+                output.render(&mut block);
+                pcm.extend_from_slice(&block);
+            }
+            // The producer keeps the samples of a note up to its latest
+            // start: its target plus the latency of its chain plus the
+            // restart lead of the output.
+            assert_eq!(
+                producer.scheduled_through_frame(),
+                latest + session.restart_lead_frames() + 1,
+                "the samples of the latest note"
+            );
+            // The flip of the rewind carries the restart lead of the session.
+            if rewound_at.is_some() {
+                assert_eq!(
+                    u64::from(output.device().restart_lead()),
+                    session.restart_lead_frames(),
+                    "the restart lead of the output"
+                );
+            }
+            if let Some(preset) = preset {
+                let name = rustel_vst3_fixture::NAME;
+                let (key, _) = host
+                    .key(name, Some(preset), false)
+                    .expect("a key")
+                    .expect("the key");
+                let slot = rustel_audio::effect_slot(plugin_chain(&session), 0);
+                assert!(
+                    output.device().holds_insert(slot, key),
+                    "no copy served the chain"
+                );
+            }
+            (pcm, rewound_at)
+        };
+        // Each channel of `pcm` from `from`: the left one, then the right.
+        let channels = |pcm: &[f32], from: u64| {
+            let frames = pcm.as_chunks::<2>().0.iter().skip(from as usize);
+            frames
+                .map(|[left, right]| (*left, *right))
+                .unzip::<_, _, Vec<_>, Vec<_>>()
+        };
+        let sounds = |samples: &[f32]| samples.iter().position(|sample| sample.abs() > 1e-6);
+
+        // The note through the Delay is on the left, and the note with no
+        // chain on the right. Each note ends before the rewind at 1.5 s.
+        let lanes = "$: note(\"c3\").s(\"sine\").clip(0.1).pan(0)\
+                     .vst(\"rustel fixture\", { preset: \"delay\" })\n\
+                     $: note(\"c3\").s(\"sine\").clip(0.1).pan(1).orbit(2)";
+        let (pcm, rewound_at) = play(lanes, Some("delay"), 2.0, Some(1.5));
+        let rewound_at = rewound_at.expect("a rewind");
+        let (left, right) = channels(&pcm, 0);
+        // A sine starts at 0 on frame 48 000.
+        assert_eq!(sounds(&right), Some(48_001), "the first downbeat");
+        assert_eq!(
+            sounds(&left),
+            sounds(&right),
+            "the downbeats are on one frame"
+        );
+        let differs = left
+            .iter()
+            .zip(&right)
+            .map(|(left, right)| (left - right).abs());
+        let differs = differs.fold(0.0_f32, f32::max);
+        assert!(differs < 1e-6, "the lanes differ by {differs}");
+        let (left, right) = channels(&pcm, rewound_at);
+        let downbeat = sounds(&left).expect("a downbeat after the rewind");
+        assert_eq!(
+            sounds(&right),
+            Some(downbeat),
+            "the downbeats are on one frame"
+        );
+
+        // The same score with no plugin, cycle zero on 1 s for both.
+        let stack = "stack(note(\"c3\").s(\"sine\"), note(\"e3\").s(\"supersaw\"), \
+                     note(\"g3\").s(\"sine\").fm(2)).clip(0.1)";
+        let chained = format!("$: {stack}.vst(\"rustel fixture\", {{ preset: \"short\" }})");
+        let (chained, _) = play(&chained, Some("short"), 2.25, None);
+        let (plain, _) = play(&format!("$: {stack}"), None, 2.25, None);
+        assert!(plain.iter().any(|sample| sample.abs() > 0.01));
+        assert!(
+            chained == plain,
+            "the chain of 384 frames changes the samples"
         );
     }
 }

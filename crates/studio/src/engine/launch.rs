@@ -48,17 +48,21 @@ impl StudioEngine {
 
     /// How long before its line a launch fires: the schedule lead, the
     /// longer of the continuity margin and the floor the takeover keeps past
-    /// its clock read, and [`LAUNCH_HEADROOM_SECS`] for the evaluation. With
-    /// the margin alone, the floor took the time of the evaluation, and a
-    /// slow fire landed past its line and lost the notes before it.
+    /// its clock read, [`LAUNCH_HEADROOM_SECS`] for the evaluation, and the
+    /// lead of the plugin chains: see
+    /// [`rustel_runtime::Session::takeover_headroom`]. With the margin alone,
+    /// the floor took the time of the evaluation, and a slow fire landed past
+    /// its line and lost the notes before it.
     pub(super) fn launch_headroom(&self) -> f64 {
         let floor = rustel_runtime::LIVE_REPLACEMENT_MIN_HEADROOM.as_secs_f64();
+        let lead = self.session.takeover_headroom();
         self.live
             .as_ref()
             .map(|live| {
                 live.device.schedule_lead_seconds()
                     + live.device.continuity_margin_seconds().max(floor)
                     + LAUNCH_HEADROOM_SECS
+                    + lead
             })
             .unwrap_or(LAUNCH_HEADROOM_SECS)
     }
@@ -448,7 +452,10 @@ impl StudioEngine {
 
     /// Fire the armed launch once its line is within the head-room: the
     /// reload is told the takeover time, so the old generation sounds
-    /// until the line and the new one is queried from it.
+    /// until the line and the new one is queried from it. The lead of the
+    /// plugin chains grows when a copy becomes ready in the countdown. A
+    /// fire that then has less room than the lead and the margin before
+    /// its line would land past it, so the launch takes the next line.
     pub(super) fn advance_launch(&mut self) {
         let Some(pending) = self.pending_launch.as_ref() else {
             return;
@@ -468,6 +475,16 @@ impl StudioEngine {
             return;
         }
         if self.launch_waits_for_sounds(now) {
+            return;
+        }
+        #[cfg(feature = "vst")]
+        if self.session.takeover_headroom() > 0.0
+            && boundary_time - now < self.launch_headroom() - LAUNCH_HEADROOM_SECS
+        {
+            self.launch_takes_next_line(
+                now,
+                "a plugin copy became ready inside the head-room - the launch takes the next line",
+            );
             return;
         }
         let pending = self.pending_launch.take().expect("checked");
@@ -628,15 +645,52 @@ mod tests {
     /// A launch fires early enough that its evaluation keeps
     /// LAUNCH_HEADROOM_SECS past the floor of its takeover. With the margin
     /// alone in the head-room, the floor took that time, and a fire slower
-    /// than the schedule lead landed past its line.
+    /// than the schedule lead landed past its line. The lead of the plugin
+    /// chains comes on top, so the notes of the launch have room for it. A
+    /// lead that grows after the fire time passed takes the next line.
     #[test]
     fn the_head_room_of_a_launch_keeps_its_evaluation_time_past_the_floor() {
-        let engine = silent_engine_with_pattern(rustel_core::silence());
-        let device = &engine.live.as_ref().expect("playing").device;
+        #[cfg_attr(not(feature = "vst"), allow(unused_mut))]
+        let mut engine = silent_engine_with_pattern(rustel_core::silence());
         let floor = rustel_runtime::LIVE_REPLACEMENT_MIN_HEADROOM.as_secs_f64();
-        assert!(device.continuity_margin_seconds() < floor);
-        let spare = engine.launch_headroom() - device.schedule_lead_seconds() - floor;
-        assert!((spare - LAUNCH_HEADROOM_SECS).abs() < 1e-9, "{spare}");
+        let spare = |engine: &StudioEngine| {
+            let device = &engine.live.as_ref().expect("playing").device;
+            assert!(device.continuity_margin_seconds() < floor);
+            engine.launch_headroom() - device.schedule_lead_seconds() - floor
+        };
+        let plain = spare(&engine);
+        assert!((plain - LAUNCH_HEADROOM_SECS).abs() < 1e-9, "{plain}");
+        #[cfg(feature = "vst")]
+        {
+            engine.session.set_plugin_lead_for_test(0.1);
+            let lead = spare(&engine);
+            assert!((lead - LAUNCH_HEADROOM_SECS - 0.1).abs() < 1e-9, "{lead}");
+            // The fire time passes with no lead. Then a copy becomes ready,
+            // and its lead leaves the fire less room than it needs before
+            // the line: the launch takes the next line.
+            engine.session.set_plugin_lead_for_test(0.0);
+            engine
+                .arm_launch("s(\"hh\")", false, 1.0, false)
+                .expect("arm")
+                .expect("armed");
+            let line = engine
+                .pending_launch
+                .as_ref()
+                .expect("armed")
+                .boundary_cycle;
+            hold_clock_until(&engine, |engine| {
+                let pending = engine.pending_launch.as_ref().expect("armed");
+                let now = engine.device_time();
+                now >= engine.pending_line_time(pending, now) - engine.launch_headroom()
+            });
+            engine.session.set_plugin_lead_for_test(0.3);
+            engine.advance_launch();
+            assert!(engine.take_launch_outcome().is_none(), "the launch fired");
+            let pending = engine.pending_launch.as_ref().expect("still armed");
+            assert_eq!(pending.boundary_cycle, line + 1.0, "the next line");
+            hold_clock(&engine, false);
+            engine.supersede_launch();
+        }
     }
 
     /// A quantised rewind whose incoming score still loads a sample must
@@ -927,6 +981,9 @@ mod tests {
 
     /// The same failure before the line: nothing was cut, so the arm is
     /// withdrawn and the old score plays on untouched, with no re-query.
+    /// While a plugin chain with latency plays, the device fires the arm the
+    /// lead of the chain before its line. A failure after that fire and
+    /// before the line refills the room from the margin.
     #[test]
     fn a_rewind_that_fails_before_its_line_withdraws_the_cut_without_a_requery() {
         let mut engine = silent_engine_with_pattern(rustel_core::silence());
@@ -940,6 +997,34 @@ mod tests {
             rustel_audio::LINE_ARM_WITHDRAWN
         );
         assert_eq!(engine.generation(), generation_before, "nothing to refill");
+        hold_clock(&engine, false);
+
+        // The next flip carries a restart lead of 1 s.
+        let rate = device_of(&engine).sample_rate();
+        let lead = Arc::new(std::sync::atomic::AtomicU32::new(rate));
+        device_of(&engine).set_restart_lead(lead);
+        engine.evaluate("s(\"tri\")", false).expect("a score");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while device_of(&engine).generation() != engine.generation() {
+            assert!(Instant::now() < deadline, "the score never published");
+            engine.tick(accepted).expect("tick");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // A line 0.9 s ahead: the device fires its arm at once, and the
+        // clock stops on that fire.
+        let line = frame_at(device_of(&engine).clock_seconds() + 0.9, rate);
+        device_of(&engine).arm_line_cut(line, true);
+        hold_clock_until(&engine, |engine| {
+            device_of(engine).fired_line_frame() == Some(line)
+        });
+        assert!(device_of(&engine).render_frontier_frames() < line);
+        let generation_before = engine.generation();
+        engine.withdraw_line_cut(true);
+        assert_eq!(
+            engine.generation(),
+            generation_before + 1,
+            "the old score is asked again once, so the room refills"
+        );
         hold_clock(&engine, false);
     }
 

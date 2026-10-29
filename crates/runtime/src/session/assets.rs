@@ -430,6 +430,11 @@ impl Session {
     /// after the look of the same score gives the count of that look. A
     /// session with no live output waits for no copy: the count is 0, with
     /// no call to the plugin host.
+    ///
+    /// The latency of the copies the call sees raises the lead of the
+    /// plugin chains, so a start moves its cycle zero by that lead: see
+    /// [`Self::plugin_lead`]. The copies of the lanes that do not play raise
+    /// the lead the cover keeps room for.
     #[cfg(feature = "vst")]
     pub fn plugins_pending(&mut self, from_cycle: f64, cycles: f64, ceiling: Duration) -> usize {
         if !self.plugins_live() {
@@ -450,7 +455,12 @@ impl Session {
             .with_logs_dropped(|| self.window_haps(from_cycle, cycles, ceiling));
         let (begin, end) = Self::window(from_cycle, cycles);
         let shadow = self.shadow_haps(begin, end, now + ceiling);
-        let pending = self.ensure_plugins(&haps, &shadow.unwrap_or_default());
+        let shadow = shadow.unwrap_or_default();
+        let wants = crate::vst::wants(&self.chains, &self.lanes, &self.csound, &haps, &shadow);
+        let pending = self.ensure_wants(&wants).len();
+        let (lead, shadow_lead) = self.leads_of(&wants);
+        self.raise_plugin_lead(lead);
+        self.raise_cover_lead(shadow_lead);
         self.plugin_look = Some((now, generation, pending));
         pending
     }
@@ -471,19 +481,19 @@ impl Session {
         crate::vst::returning(&self.chains, rate)
     }
 
-    /// Makes the plugin host build each plugin copy that the haps of the
-    /// score in play need, at the rate of the output: see
-    /// [`Self::ensure_wants`]. `shadow` has the haps of the lanes that do not
-    /// play. Gives the count of the copies of lanes that play and that are
-    /// not ready.
+    /// The leads of the plugin chains of `wants` at the rate of the output,
+    /// in seconds: of the lanes that play, and of the lanes that do not play
+    /// now. The wants of the lanes that play come first. See
+    /// [`crate::vst::lead`].
     #[cfg(feature = "vst")]
-    pub(super) fn ensure_plugins(
-        &mut self,
-        haps: &[crate::HapJson],
-        shadow: &[crate::HapJson],
-    ) -> usize {
-        let wants = crate::vst::wants(&self.chains, &self.lanes, &self.csound, haps, shadow);
-        self.ensure_wants(&wants).len()
+    pub(super) fn leads_of(&self, wants: &[crate::vst::Want]) -> (f64, f64) {
+        let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+        let playing = wants.iter().take_while(|want| want.sounds()).count();
+        let (playing, shadow) = wants.split_at(playing);
+        (
+            crate::vst::lead(playing, rate),
+            crate::vst::lead(shadow, rate),
+        )
     }
 
     /// Makes the plugin host build each copy in `wants` that is not ready,

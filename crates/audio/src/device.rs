@@ -127,6 +127,10 @@ pub struct LiveReverbBatch {
     /// The last insert each slot asked for in this turn.
     inserts: Vec<(crate::insert::InsertSlot, crate::insert::InsertKey)>,
     refused: u64,
+    /// The largest effect latency of the notes of this turn, in frames: the
+    /// wait the send lines of the output hold. See
+    /// [`crate::scalar::SendLines`].
+    latency: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -191,6 +195,13 @@ pub struct LiveScalarDevice {
     /// Set when the backend of the stream has the plugin workers. A recycle
     /// clears it, and the next turn ships them to the new backend.
     plugin_pool_shipped: AtomicBool,
+    /// The reach of the send lines shipped to the backend of the stream, in
+    /// frames: see [`crate::scalar::SendLines`]. A close clears it, and the
+    /// next turn with a chain with latency ships lines to the new backend.
+    send_lines_reach: std::sync::atomic::AtomicU32,
+    /// The cell of the restart lead of the score: see
+    /// [`Self::set_restart_lead`]. A lock of the producer only.
+    restart_lead_cell: std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicU32>>>,
     shared: LiveShared,
     sample_rate: u32,
     channels: u16,
@@ -407,7 +418,8 @@ struct LiveShared {
     /// rewind), or a cut at the takeover frame (a quantised rewind, where
     /// the countdown plays). The consumer reads it once at the generation
     /// flip, with the takeover frame, before the new generation admits
-    /// anything.
+    /// anything. The bits from bit 2 up hold the restart lead of the
+    /// cutover: see [`LiveScalarDevice::set_restart_lead`].
     takeover_cut: Arc<AtomicU64>,
     /// A launch's line, armed before its generation exists. The launch arms
     /// it at fire time, so the consumer cuts the outgoing rendition at the
@@ -427,6 +439,11 @@ struct LiveShared {
     /// ([`LiveScalarDevice::set_generation`]). A withdrawn arm stores
     /// [`crate::LINE_ARM_WITHDRAWN`] ([`LiveScalarDevice::clear_line_arm`]).
     line_arm: Arc<AtomicU64>,
+    /// The line arm word the callback fired, 0 when none fired since the
+    /// last flip. The callback fires an arm the lead of the plugin chains
+    /// before its line: see [`LiveScalarDevice::fired_line_frame`]. The
+    /// callback writes it at the fire, before the block renders.
+    line_fired: Arc<AtomicU64>,
     /// Asked for by the interface: silence what is sounding at the next
     /// block. A reload never does this - an edit that cut its own voices
     /// would click - so auditioning asks for it explicitly.

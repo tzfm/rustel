@@ -2354,7 +2354,8 @@ impl StudioEngine {
                         reverbs.observe_prepared(device, &event);
                         let pushed = device.push(event.clone());
                         if pushed {
-                            played.note(&event, device.render_frontier_frames());
+                            let frontier = device.render_frontier_frames();
+                            played.note(&event, frontier, device.restart_lead());
                             accepted_audio.push(UiAcceptedOnset {
                                 generation: event.generation,
                                 onset_id: event.onset_id,
@@ -2729,8 +2730,9 @@ struct PlayedSink<'a> {
 }
 
 impl PlayedSink<'_> {
-    /// Note a score event's sample, if it plays one.
-    fn note(&mut self, event: &AudioEvent, render_frontier: u64) {
+    /// Note a score event's sample, if it plays one. `render_frontier` and
+    /// `restart_lead` are the device's, read after the push.
+    fn note(&mut self, event: &AudioEvent, render_frontier: u64, restart_lead: u32) {
         note_sample_use(
             event,
             self.samples,
@@ -2738,6 +2740,7 @@ impl PlayedSink<'_> {
             self.use_until,
             self.sample_rate,
             render_frontier,
+            restart_lead,
         );
         if event.synth.is_some() || event.generation < self.from {
             return;
@@ -2764,6 +2767,7 @@ fn note_sample_use(
     use_until: &mut HashMap<SampleId, u64>,
     sample_rate: u32,
     render_frontier: u64,
+    restart_lead: u32,
 ) {
     if event.synth.is_some() {
         return;
@@ -2775,11 +2779,17 @@ fn note_sample_use(
     else {
         return;
     };
-    // A restart can move a late onset to its callback adoption frame. The
-    // frontier read after the successful push bounds that frame: generation
-    // publication precedes the push, and each render chunk rechecks it.
+    // A restart moves a late onset to its callback adoption frame, and up
+    // to its restart lead after it. The frontier read after the
+    // successful push bounds that frame: generation publication precedes
+    // the push, and each render chunk rechecks it. The source of a note of a
+    // plugin chain starts up to the latency of the chain after its frame.
+    let later = u64::from(event.controls.chain_latency()) + u64::from(restart_lead);
     let event = AudioEvent {
-        target_frame: event.target_frame.max(render_frontier),
+        target_frame: event
+            .target_frame
+            .max(render_frontier)
+            .saturating_add(later),
         ..event.clone()
     };
     // A decode can become ready during the query, after this turn's bank
@@ -3045,10 +3055,12 @@ impl ExternalOutputs<'_> {
     }
 }
 
-/// Whether the render frontier has passed `line_frame`, so a cut armed
-/// there has fired.
+/// Whether a cut armed at `line_frame` has fired: the render frontier has
+/// passed the line, or the device fired the cut before it. A note of a
+/// plugin chain with latency starts its lead before its output, so the
+/// device fires a cut that lead before its line.
 fn line_passed(device: &LiveScalarDevice, line_frame: u64) -> bool {
-    device.render_frontier_frames() > line_frame
+    device.render_frontier_frames() > line_frame || device.fired_line_frame() == Some(line_frame)
 }
 
 /// Where a flip at `takeover_frame` retires the outgoing score's external

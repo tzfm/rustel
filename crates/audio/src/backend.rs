@@ -189,6 +189,9 @@ pub struct OscillatorControls<K = KabelControls> {
     pub effects: [Option<crate::insert::InsertControls>; crate::insert::EFFECT_CHAIN],
     /// The insert that makes the sound of the note from the note itself.
     pub instrument: Option<crate::insert::InsertControls>,
+    /// The frames the note starts before its musical onset, so its chain
+    /// plays in time with the other lanes: see [`Self::musical`].
+    pub lead: u32,
     /// `lfo()` modulators: each rides an
     /// AudioParam additively. Fixed capacity keeps the ring event POD; the
     /// resolver skips-and-logs beyond it.
@@ -1037,6 +1040,33 @@ impl<K> OscillatorControls<K> {
             self.orbit.min(crate::scalar::MAX_ORBITS as u8 - 1),
         ))
     }
+
+    /// The latency of the effects of the note in frames: the sum of the
+    /// latencies of their stages.
+    pub fn effect_latency(&self) -> u32 {
+        self.effects
+            .iter()
+            .flatten()
+            .map(crate::insert::InsertControls::latency)
+            .fold(0, u32::saturating_add)
+    }
+
+    /// The latency of the chain of the note in frames: its effects and its
+    /// instrument. The output of the note comes this many frames after the
+    /// frame the note starts on.
+    pub fn chain_latency(&self) -> u32 {
+        let instrument = self
+            .instrument
+            .as_ref()
+            .map_or(0, crate::insert::InsertControls::latency);
+        self.effect_latency().saturating_add(instrument)
+    }
+
+    /// The musical onset of a note that starts on `target_frame`: that frame
+    /// plus the lead of the note.
+    pub fn musical(&self, target_frame: u64) -> u64 {
+        target_frame.saturating_add(u64::from(self.lead))
+    }
 }
 
 impl<K> Default for OscillatorControls<K> {
@@ -1075,6 +1105,7 @@ impl<K> Default for OscillatorControls<K> {
             insert_chain: None,
             effects: [None; crate::insert::EFFECT_CHAIN],
             instrument: None,
+            lead: 0,
             lfos: [None; MAX_VOICE_MODS],
             envs: [None; MAX_VOICE_MODS],
             phaser: None,
@@ -1374,6 +1405,7 @@ impl<K> OscillatorControls<K> {
             insert_chain: self.insert_chain,
             effects: self.effects,
             instrument: self.instrument,
+            lead: self.lead,
             lfos: self.lfos,
             bus_mods: self.bus_mods,
             bus: self.bus,

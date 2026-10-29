@@ -46,6 +46,8 @@ impl Session {
     /// its next step. That producer prefills the new generation and publishes
     /// it to the device together with [`Self::take_requery_takeover_time`], so
     /// already-audible old events survive while stale prefetched events do not.
+    /// The takeover waits the lead of the plugin chains as an edit does: see
+    /// [`Self::plugin_lead`].
     pub fn requery_active_at(&mut self, now: f64) -> Result<Option<(u64, u64)>, RuntimeError> {
         if !now.is_finite() || now < 0.0 {
             return Err(RuntimeError::Message(format!(
@@ -55,8 +57,15 @@ impl Session {
         if self.transport.is_stopped() {
             return Ok(None);
         }
-        let margin = self.continuity_margin.unwrap_or(self.schedule_lead);
-        let takeover_time = now + margin.max(0.0);
+        // The takeover waits the lead of the plugin chains too, inside the
+        // cover of the score in play, as the takeover of an edit does.
+        let margin = self
+            .continuity_margin
+            .unwrap_or(self.schedule_lead)
+            .max(0.0);
+        let room = self.scheduler.horizon_remaining(now) - margin;
+        let added = self.plugin_lead().min(room.max(0.0));
+        let takeover_time = now + margin + added;
         let generation_before = self.generation();
         // A rewind that is installed but not yet published owns the
         // takeover: its line (or its edit instant) and its cut. A slider,
@@ -110,6 +119,12 @@ impl Session {
             // ride along with its time.
             self.requery_takeover_cut = TakeoverCut::None;
             self.requery_anchor_time = None;
+            // The first notes after the takeover have the room it added. A
+            // pending rewind keeps its own.
+            #[cfg(all(feature = "vst", feature = "device-audio"))]
+            {
+                self.takeover_added = added;
+            }
         }
         // A pending rewind is a new score that the device does not play yet.
         self.requeried_generation = pending_rewind.is_none().then_some(generation_after);
@@ -134,7 +149,10 @@ impl Session {
         if self.transport.is_stopped() {
             return Ok(None);
         }
-        let cursor_time = now + self.schedule_lead.max(0.0);
+        // The first notes of a plugin chain with latency start the lead of
+        // the chains before the cursor.
+        let lead = self.plugin_lead();
+        let cursor_time = now + self.schedule_lead.max(0.0) + lead;
         let generation_before = self.generation();
         let Some(generation_after) = self.scheduler.requery_active(now, cursor_time) else {
             return Ok(None);
@@ -155,6 +173,11 @@ impl Session {
         // this recovery generation's cursor instead of its own line.
         self.requery_takeover_cut = TakeoverCut::None;
         self.requery_anchor_time = None;
+        // The first notes after the cursor have the room of the lead.
+        #[cfg(feature = "vst")]
+        {
+            self.takeover_added = lead;
+        }
         self.requeried_generation = Some(generation_after);
         // The new output holds no plugin copy yet, so the looks at the
         // cycles ahead start again at the cycle in play.
@@ -1211,15 +1234,21 @@ mod tests {
 
     /// A from-zero reload's takeover carries a cut, so the restarted loop is
     /// heard alone. An ordinary reload's takeover carries none: its voices
-    /// ring out.
+    /// ring out. With a lead of the plugin chains, an immediate rewind takes
+    /// over that whole lead after the edit instant, with no cover, and an
+    /// edit with no cover adds nothing.
     #[test]
     #[cfg(feature = "device-audio")]
     fn a_from_zero_reload_names_a_takeover_cut_an_ordinary_one_does_not() {
-        let takeover = |from_zero: bool| {
+        let takeover = |from_zero: bool, lead: f64| {
             let mut session = Session::new().expect("session");
             session
                 .evaluate("setcps(1); $: pure('old')")
                 .expect("a score to replace");
+            #[cfg(feature = "vst")]
+            session.set_plugin_lead_for_test(lead);
+            #[cfg(not(feature = "vst"))]
+            let _ = lead;
             let stopped = AtomicBool::new(false);
             if from_zero {
                 session.start_next_from_zero();
@@ -1227,19 +1256,23 @@ mod tests {
             session
                 .reload_with_clock_cancellable("setcps(1); $: pure('new')", false, &stopped, || 5.3)
                 .expect("live replacement");
+            // A session with no live output plans nothing, and its commit
+            // ends the lead.
+            assert_eq!(session.plugin_lead(), 0.0);
             session
                 .take_requery_takeover()
                 .expect("a continuous replacement names its takeover")
         };
 
-        let (_, ordinary_cut) = takeover(false);
+        #[cfg_attr(not(feature = "vst"), allow(unused_variables))]
+        let (ordinary_takeover, ordinary_cut) = takeover(false, 0.0);
         assert_eq!(
             ordinary_cut,
             TakeoverCut::None,
             "an edit lets its voices ring out"
         );
 
-        let (rewind_takeover, rewind_cut) = takeover(true);
+        let (rewind_takeover, rewind_cut) = takeover(true, 0.0);
         assert_eq!(
             rewind_cut,
             TakeoverCut::AtFlip,
@@ -1249,6 +1282,19 @@ mod tests {
             (rewind_takeover - 5.3).abs() < 1e-9,
             "the takeover is the edit instant itself: cycle zero lands at the cut, not a margin later (the hole a margin left was the restart's lag): {rewind_takeover}"
         );
+
+        #[cfg(feature = "vst")]
+        {
+            let (takeover_time, cut) = takeover(false, 0.1);
+            assert_eq!(cut, TakeoverCut::None);
+            assert_eq!(takeover_time, ordinary_takeover, "no cover, no lead");
+            let (rewind_takeover, rewind_cut) = takeover(true, 0.1);
+            assert_eq!(rewind_cut, TakeoverCut::AtFlip);
+            assert!(
+                (rewind_takeover - 5.4).abs() < 1e-9,
+                "the whole lead after the edit instant: {rewind_takeover}"
+            );
+        }
     }
 
     /// An immediate rewind whose evaluation fails installs nothing and
@@ -1281,31 +1327,48 @@ mod tests {
     /// A quantised scene launch that does NOT rewind rings out like an edit,
     /// so its takeover keeps the margin floor: an evaluation that ran past
     /// the line publishes a little late instead of into rendered frames,
-    /// where the producer refuses it and rolls the launch back.
+    /// where the producer refuses it and rolls the launch back. In the cover
+    /// of the score in play, the floor keeps the lead of the plugin chains
+    /// too.
     #[test]
     #[cfg(feature = "device-audio")]
     fn a_plain_quantised_launch_keeps_the_margin_floor() {
+        #[cfg(feature = "vst")]
+        let leads = [0.0, 0.1];
+        #[cfg(not(feature = "vst"))]
+        let leads = [0.0];
         for install_clock in [3.05, 2.99] {
-            let mut session = Session::new().expect("session");
-            session
-                .evaluate("setcps(1); $: pure('old')")
-                .expect("a score to replace");
-            session.set_continuity_margin(0.02);
-            let stopped = AtomicBool::new(false);
-            session.set_next_takeover_time(3.0);
-            session
-                .reload_with_clock_cancellable("setcps(1); $: pure('new')", false, &stopped, || {
-                    install_clock
-                })
-                .expect("launched replacement");
-            let (takeover, cut) = session
-                .take_requery_takeover()
-                .expect("the launch names its takeover");
-            assert_eq!(cut, TakeoverCut::None, "a plain launch rings out");
-            assert!(
-                takeover >= install_clock + 0.02 - 1e-9,
-                "installed at {install_clock}, the takeover keeps the floor: {takeover}"
-            );
+            for lead in leads {
+                let mut session = Session::new().expect("session");
+                session
+                    .evaluate("setcps(1); $: pure('old')")
+                    .expect("a score to replace");
+                session.set_continuity_margin(0.02);
+                // The score in play has a cover past the install.
+                #[cfg(feature = "vst")]
+                if lead > 0.0 {
+                    session.set_plugin_lead_for_test(lead);
+                    session.schedule_through(2.9, 2.9).expect("the cover");
+                }
+                let stopped = AtomicBool::new(false);
+                session.set_next_takeover_time(3.0);
+                session
+                    .reload_with_clock_cancellable(
+                        "setcps(1); $: pure('new')",
+                        false,
+                        &stopped,
+                        || install_clock,
+                    )
+                    .expect("launched replacement");
+                let (takeover, cut) = session
+                    .take_requery_takeover()
+                    .expect("the launch names its takeover");
+                assert_eq!(cut, TakeoverCut::None, "a plain launch rings out");
+                assert!(
+                    takeover >= install_clock + 0.02 + lead - 1e-9,
+                    "installed at {install_clock} with a lead of {lead}, the takeover keeps the floor: {takeover}"
+                );
+            }
         }
     }
 
@@ -1313,7 +1376,9 @@ mod tests {
     /// rewind's install and its publication re-queries the same graph. It
     /// must publish at the rewind's line with the rewind's cut: taking only
     /// the requery's own `now + margin` time kept the AtTakeover cut on it,
-    /// and the countdown was choked a head-room before its line.
+    /// and the countdown was choked a head-room before its line. With a lead
+    /// of the plugin chains, the rewind keeps its line too, and a later
+    /// requery takes over that lead after its own time, in the cover.
     #[test]
     #[cfg(feature = "device-audio")]
     fn a_control_requery_keeps_a_pending_rewinds_line() {
@@ -1327,6 +1392,9 @@ mod tests {
         session
             .reload_with_clock_cancellable("setcps(1); $: pure('new')", false, &stopped, || 2.9)
             .expect("launched replacement");
+        // A look of the new score sees a plugin chain with latency.
+        #[cfg(feature = "vst")]
+        session.set_plugin_lead_for_test(0.1);
         assert!(
             session
                 .requery_active_at(2.92)
@@ -1345,11 +1413,25 @@ mod tests {
 
         // Once the rewind has published, a requery is an ordinary one: its
         // own time and no cut at all.
+        #[cfg(feature = "vst")]
+        session.schedule_through(3.9, 3.9).expect("the cover");
         session.requery_active_at(4.0).expect("a later knob move");
-        let (_, cut) = session
+        let (takeover, cut) = session
             .take_requery_takeover()
             .expect("the requery names its takeover");
         assert_eq!(cut, TakeoverCut::None, "an ordinary requery rings out");
+        #[cfg(feature = "vst")]
+        {
+            assert!(
+                (takeover - 4.1).abs() < 1e-9,
+                "the lead after it: {takeover}"
+            );
+            // Past the cover the lead adds nothing.
+            session.requery_active_at(10.0).expect("a knob move later");
+            assert_eq!(session.take_requery_takeover_time(), Some(10.0));
+        }
+        #[cfg(not(feature = "vst"))]
+        let _ = takeover;
     }
 
     /// A rewind whose commit fails after its cut would have been decided
@@ -1739,6 +1821,40 @@ mod tests {
             first_seconds < 11.3 + 0.35,
             "reload cursor still sits at the floored start lead"
         );
+        assert_eq!(session.take_requery_takeover_time(), Some(11.3 + 0.02));
+
+        // With a lead of the plugin chains of 0.1 s, the next save takes
+        // over 0.1 s later, inside the cover of the score in play. A requery
+        // past the cover adds no lead. A new output resumes past the start
+        // lead and that lead, and its first notes have the room of that lead.
+        #[cfg(feature = "vst")]
+        {
+            session.set_plugin_lead_for_test(0.1);
+            let Ok(_) = session.schedule_audio_live_at(
+                11.4,
+                44_100,
+                std::time::Duration::ZERO,
+                LiveQueryBudgetMode::Steady,
+            ) else {
+                panic!("steady schedule failed");
+            };
+            session
+                .reload_at(r#"s("bd*16")"#, false, 11.5)
+                .expect("reload");
+            assert_eq!(
+                session.take_requery_takeover_time(),
+                Some(11.5 + 0.02 + 0.1)
+            );
+            session.requery_active_at(12.0).expect("a requery");
+            assert_eq!(session.takeover_lead(), 0.0);
+            let recycled = session.requery_after_output_recycle_at(12.0);
+            assert!(recycled.expect("a new output").is_some());
+            assert_eq!(
+                session.take_requery_takeover_time(),
+                Some(12.0 + 0.35 + 0.1)
+            );
+            assert_eq!(session.takeover_lead(), 0.1);
+        }
     }
 
     /// Dropping from a very fast tempo to a normal one used to resume the new
@@ -1785,61 +1901,77 @@ mod tests {
     /// A host whose playback latency exceeds the default 0.5 s query horizon
     /// (WSLg RDP sinks have reported >1 s) must still schedule through the
     /// continuity margin. Otherwise takeover sits in unscheduled time and the
-    /// live tee records a silent second on the save.
+    /// live tee records a silent second on the save. A lead of the plugin
+    /// chains gives the cover that lead more, and the takeover comes that
+    /// lead later.
     #[cfg(feature = "device-audio")]
     #[test]
     fn live_schedule_covers_a_continuity_margin_past_the_default_horizon() {
-        let mut session = Session::with_config(SessionConfig::default()).expect("session");
-        session.evaluate(r#"s("bd*16")"#).expect("initial evaluate");
-        session.restart_transport_at(10.0);
-        session.set_schedule_lead(0.35);
-        session.set_continuity_margin(1.0);
-        let batch = match session.schedule_audio_live_at(
-            10.0,
-            44_100,
-            std::time::Duration::ZERO,
-            LiveQueryBudgetMode::InitialPrefill,
-        ) {
-            Ok(batch) => batch,
-            Err(super::LiveAudioScheduleError::Retryable(error))
-            | Err(super::LiveAudioScheduleError::AwaitingSamples(error))
-            | Err(
-                super::LiveAudioScheduleError::CandidateCommitted(error)
-                | super::LiveAudioScheduleError::CandidateRefusedScore(error),
-            ) => {
-                panic!("prefill schedule failed: {error}");
-            }
-        };
-        let last_seconds = batch
-            .events
-            .iter()
-            .map(|event| event.target_frame as f64 / 44_100.0)
-            .fold(0.0_f64, f64::max);
-        assert!(
-            last_seconds >= 10.0 + 1.0 - 1e-6,
-            "prefill only reached {last_seconds:.3}s; takeover at 11.0s would be a hole"
-        );
-        session
-            .reload_at(r#"s("bd*16")"#, false, 10.0)
-            .expect("reload");
-        let Ok(batch) = session.schedule_audio_live_at(
-            10.0,
-            44_100,
-            std::time::Duration::from_millis(25),
-            LiveQueryBudgetMode::ReplacementPrefill,
-        ) else {
-            panic!("requery schedule failed");
-        };
-        let first_seconds = batch
-            .events
-            .iter()
-            .map(|event| event.target_frame as f64 / 44_100.0)
-            .fold(f64::INFINITY, f64::min);
-        let step = 1.0 / (16.0 * session.cps());
-        assert!(
-            first_seconds <= 10.0 + 1.0 + step + 1e-9,
-            "first replacement onset at {first_seconds:.3}s leaves a reload hole"
-        );
+        #[cfg(feature = "vst")]
+        let leads = [0.0, 0.1];
+        #[cfg(not(feature = "vst"))]
+        let leads = [0.0];
+        for lead in leads {
+            let mut session = Session::with_config(SessionConfig::default()).expect("session");
+            session.evaluate(r#"s("bd*16")"#).expect("initial evaluate");
+            session.restart_transport_at(10.0);
+            session.set_schedule_lead(0.35);
+            session.set_continuity_margin(1.0);
+            #[cfg(feature = "vst")]
+            session.set_plugin_lead_for_test(lead);
+            let batch = match session.schedule_audio_live_at(
+                10.0,
+                44_100,
+                std::time::Duration::ZERO,
+                LiveQueryBudgetMode::InitialPrefill,
+            ) {
+                Ok(batch) => batch,
+                Err(super::LiveAudioScheduleError::Retryable(error))
+                | Err(super::LiveAudioScheduleError::AwaitingSamples(error))
+                | Err(
+                    super::LiveAudioScheduleError::CandidateCommitted(error)
+                    | super::LiveAudioScheduleError::CandidateRefusedScore(error),
+                ) => {
+                    panic!("prefill schedule failed: {error}");
+                }
+            };
+            let last_seconds = batch
+                .events
+                .iter()
+                .map(|event| event.target_frame as f64 / 44_100.0)
+                .fold(0.0_f64, f64::max);
+            assert!(
+                last_seconds >= 10.0 + 1.0 - 1e-6,
+                "prefill only reached {last_seconds:.3}s; takeover at 11.0s would be a hole"
+            );
+            // The query ends on a grid of the cycle, a few ms off.
+            let cover = session.scheduler.horizon_remaining(10.0);
+            assert!(
+                (cover - (0.5 + 1.0 + lead)).abs() < 0.005,
+                "a lead of {lead} s: a cover of {cover} s"
+            );
+            session
+                .reload_at(r#"s("bd*16")"#, false, 10.0)
+                .expect("reload");
+            let Ok(batch) = session.schedule_audio_live_at(
+                10.0,
+                44_100,
+                std::time::Duration::from_millis(25),
+                LiveQueryBudgetMode::ReplacementPrefill,
+            ) else {
+                panic!("requery schedule failed");
+            };
+            let first_seconds = batch
+                .events
+                .iter()
+                .map(|event| event.target_frame as f64 / 44_100.0)
+                .fold(f64::INFINITY, f64::min);
+            let step = 1.0 / (16.0 * session.cps());
+            assert!(
+                first_seconds <= 10.0 + 1.0 + lead + step + 1e-9,
+                "first replacement onset at {first_seconds:.3}s leaves a reload hole"
+            );
+        }
     }
 
     /// A live reload never moves the
@@ -1850,6 +1982,9 @@ mod tests {
     #[test]
     fn live_reload_keeps_the_timeline_and_restart_rebases_to_zero() {
         let mut session = Session::with_config(SessionConfig::default()).expect("session");
+        // A first score starts with no lead of the plugin chains.
+        #[cfg(feature = "vst")]
+        session.set_plugin_lead_for_test(0.5);
         session.evaluate("note('c4')").expect("initial evaluate");
         session.restart_transport_at(10.0);
         let origin_before = session.time_at_cycle(rustel_fraction::Fraction::ZERO);
@@ -1876,12 +2011,22 @@ mod tests {
             "cursor did not land on the edit instant: {cursor_time}"
         );
         // The takeover time itself is unchanged: the device still flips
-        // generations one schedule lead after the edit.
+        // generations one schedule lead after the edit. Nothing is queued
+        // past the edit, and the takeover stays at the margin.
         assert_eq!(
             session.take_requery_takeover_time(),
             Some(11.3 + 0.25),
             "the edit-instant overlap must not move the takeover"
         );
+        // A lead of the plugin chains of 0.5 s with no cover adds nothing.
+        #[cfg(feature = "vst")]
+        {
+            session.set_plugin_lead_for_test(0.5);
+            session
+                .reload_at("note('c5')", false, 11.3)
+                .expect("live reload");
+            assert_eq!(session.take_requery_takeover_time(), Some(11.3 + 0.25));
+        }
 
         // A tempo change pivots at `now`: the cycle position there is
         // preserved while the origin moves with the new slope.
@@ -1895,9 +2040,25 @@ mod tests {
         );
         assert!((session.cps() - 1.0).abs() < 1e-12);
 
-        // Restart semantics: play begins at cycle zero again.
+        // Restart semantics: play begins at cycle zero again, the lead of
+        // the plugin chains after the anchor. A look at the copies that do
+        // not play raises the lead the cover keeps room for. A Stop ends
+        // both leads, so cycle zero is on the anchor and the cover is the
+        // horizon and the margin.
+        #[cfg(feature = "vst")]
+        {
+            session.restart_transport_at(15.0);
+            let zero = session.time_at_cycle(rustel_fraction::Fraction::ZERO);
+            assert!((zero - 15.5).abs() < 1e-12, "{zero}");
+            session.raise_cover_lead(0.5);
+        }
+        session.transport().stop();
+        session.transport().start();
         session.restart_transport_at(20.0);
         assert!((session.time_at_cycle(rustel_fraction::Fraction::ZERO) - 20.0).abs() < 1e-12);
+        session.schedule_through(20.0, 20.0).expect("the cover");
+        let cover = session.scheduler.horizon_remaining(20.0);
+        assert!((cover - (0.5 + 0.25)).abs() < 1e-9, "{cover}");
     }
 
     #[test]

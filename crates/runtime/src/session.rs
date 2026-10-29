@@ -376,6 +376,26 @@ pub(crate) enum LiveQueryBudgetMode {
     ReplacementPrefill,
 }
 
+/// The kind of a live window, for the lead of its plugin notes: see
+/// [`Session::chain_live_events`].
+#[cfg(feature = "vst")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum LeadWindow {
+    /// A window of the score in play, or the first window of a score with
+    /// no takeover.
+    Steady,
+    /// The first window of a takeover with a cut: a rewind. Each note takes
+    /// its whole lead. The restart floor of the output sounds a note aimed
+    /// behind the flip whole.
+    Rewind,
+    /// The first window of a takeover with no cut, on this frame, with the
+    /// lead in seconds that the takeover added: an edit, a requery of the
+    /// score in play, or a launch with no rewind. Only the live producer has
+    /// such a window.
+    #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
+    Edit(u64, f64),
+}
+
 enum EvaluatedScore {
     JavaScript {
         pattern: Pattern,
@@ -886,6 +906,28 @@ pub struct Session {
     /// takeover does not sound one of their onsets twice.
     #[cfg(feature = "device-audio")]
     compensated_onsets: handover::CompensatedOnsets,
+    /// The lead of the plugin chains of the score in play, in seconds, with
+    /// the stop count of the transport when it was set: see
+    /// [`Self::plugin_lead`].
+    #[cfg(feature = "vst")]
+    plugin_lead: (f64, u64),
+    /// The lead of the plugin copies of the lanes that do not play now and of
+    /// the cycles ahead, and of a held text, in seconds, with the stop count
+    /// as above. The cover of the producer keeps room for it.
+    #[cfg(feature = "vst")]
+    cover_lead: (f64, u64),
+    /// The lead of the plan of the candidate at the commit seam, in seconds,
+    /// from the seam to the commit: see `Session::plugin_seam`.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    plan_lead: Option<f64>,
+    /// The lead the takeover of the newest commit or requery added to its
+    /// margin, in seconds: see [`Self::takeover_lead`].
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    takeover_added: f64,
+    /// The lead of the plugin chains in frames at the rate of the output,
+    /// for the restart of a rewind: see [`Self::attach_instruments`].
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    restart_lead: Arc<std::sync::atomic::AtomicU32>,
     /// How far a live host has handed the OSC bundles out, so a takeover
     /// does not send an onset that is out again.
     #[cfg(all(feature = "device-audio", feature = "osc"))]
@@ -1183,6 +1225,16 @@ impl Session {
             audio_confirmations: None,
             #[cfg(feature = "device-audio")]
             compensated_onsets: handover::CompensatedOnsets::default(),
+            #[cfg(feature = "vst")]
+            plugin_lead: (0.0, 0),
+            #[cfg(feature = "vst")]
+            cover_lead: (0.0, 0),
+            #[cfg(all(feature = "vst", feature = "device-audio"))]
+            plan_lead: None,
+            #[cfg(all(feature = "vst", feature = "device-audio"))]
+            takeover_added: 0.0,
+            #[cfg(all(feature = "vst", feature = "device-audio"))]
+            restart_lead: Arc::default(),
             #[cfg(all(feature = "device-audio", feature = "osc"))]
             osc_handed_out: handover::HandedOut::default(),
             #[cfg(all(feature = "device-audio", feature = "serial"))]
@@ -1303,15 +1355,17 @@ impl Session {
         self.attach_instruments(device);
     }
 
-    /// Connects this session's instruments to a live output.
+    /// Connects this session's instruments to a live output. The output
+    /// publishes the lead of the plugin chains with each cutover, so a rewind
+    /// restarts its first notes in time: see [`Self::plugin_lead`].
     #[cfg(feature = "device-audio")]
     pub fn attach_instruments(&self, device: &rustel_audio::LiveScalarDevice) {
         #[cfg(feature = "vst")]
         {
-            self.plugin_rate
-                .store(device.sample_rate(), std::sync::atomic::Ordering::Relaxed);
+            self.set_plugin_rate(device.sample_rate());
             self.plugins_live
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            device.set_restart_lead(Arc::clone(&self.restart_lead));
         }
         device.set_insert_provider(self.csound.provider(false));
         let csound = self.csound.clone();
@@ -1344,10 +1398,199 @@ impl Session {
 
     /// Gives the plugins the sample rate of the live output after a reopen
     /// of the output. A reopen is no new attach: see [`Self::attach_plugins`].
+    /// The restart lead of the output takes the new rate too.
     #[cfg(feature = "vst")]
     pub fn set_plugin_rate(&self, sample_rate: u32) {
         self.plugin_rate
             .store(sample_rate, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "device-audio")]
+        self.store_restart_lead();
+    }
+
+    /// The lead of the plugin chains of the score in play, in seconds: the
+    /// notes of a chain with latency start this long before their onset, 1 s
+    /// at most, so the chain plays in time with the other lanes. An edit, a
+    /// start, a slider, a key and a clock steer take effect this long later,
+    /// and a live producer schedules this long further ahead. The plan of a
+    /// commit sets the lead. A look at the plugin copies and a live window
+    /// raise it: see [`Self::plugins_pending`]. A Stop ends the lead, and so
+    /// does [`Self::end_plugin_leads`]. 0 with no plugin.
+    pub fn plugin_lead(&self) -> f64 {
+        #[cfg(feature = "vst")]
+        {
+            self.lead_since_stop(self.plugin_lead)
+        }
+        #[cfg(not(feature = "vst"))]
+        {
+            0.0
+        }
+    }
+
+    /// The lead of the plugin copies of the lanes that do not play now, of
+    /// the cycles ahead and of a held text, in seconds. The cover of a live
+    /// producer keeps room for it, so the first notes of such a lane find
+    /// room for their lead. A Stop ends the lead. 0 with no plugin.
+    fn cover_lead(&self) -> f64 {
+        #[cfg(feature = "vst")]
+        {
+            self.lead_since_stop(self.cover_lead)
+        }
+        #[cfg(not(feature = "vst"))]
+        {
+            0.0
+        }
+    }
+
+    /// `lead` in seconds, with the stop count of the transport when it was
+    /// set: 0 after a later Stop.
+    #[cfg(feature = "vst")]
+    fn lead_since_stop(&self, (lead, stops): (f64, u64)) -> f64 {
+        if stops == self.transport.stops() {
+            lead
+        } else {
+            0.0
+        }
+    }
+
+    /// Raises the lead of the plugin chains of the score in play to `lead`
+    /// seconds: see [`Self::plugin_lead`]. After a Stop the lead starts from
+    /// 0.
+    #[cfg(feature = "vst")]
+    fn raise_plugin_lead(&mut self, lead: f64) {
+        if lead > self.plugin_lead() {
+            self.plugin_lead = (lead, self.transport.stops());
+            self.plugin_lead_changed();
+        }
+    }
+
+    /// Raises the lead of the plugin copies that do not play now to `lead`
+    /// seconds: see [`Self::cover_lead`]. After a Stop the lead starts from
+    /// 0.
+    #[cfg(feature = "vst")]
+    fn raise_cover_lead(&mut self, lead: f64) {
+        if lead > self.cover_lead() {
+            self.cover_lead = (lead, self.transport.stops());
+            self.sync_live_schedule_horizon();
+        }
+    }
+
+    /// The commit of a text with a plan: the lead of the plan is the lead of
+    /// the plugin chains of the score in play now, and the cover keeps room
+    /// for it alone.
+    #[cfg(feature = "vst")]
+    fn set_plugin_leads(&mut self, lead: f64) {
+        let stops = self.transport.stops();
+        self.plugin_lead = (lead, stops);
+        self.cover_lead = (lead, stops);
+        self.plugin_lead_changed();
+    }
+
+    /// Ends the lead of the plugin chains and the lead the cover keeps room
+    /// for, as a Stop ends them. A text that replaces a held start calls it:
+    /// the held text never sounded, so its lead does not count. See
+    /// [`Self::plugin_lead`].
+    #[cfg(feature = "vst")]
+    pub fn end_plugin_leads(&mut self) {
+        self.set_plugin_leads(0.0);
+    }
+
+    /// The lead of the plugin chains changed, or a start set cycle zero:
+    /// the cover of a live producer and the restart lead of the output
+    /// follow the lead.
+    #[cfg(feature = "vst")]
+    fn plugin_lead_changed(&mut self) {
+        #[cfg(feature = "device-audio")]
+        self.store_restart_lead();
+        self.sync_live_schedule_horizon();
+    }
+
+    /// Writes the lead of the plugin chains in frames at the rate of the
+    /// output to the cell the output reads: see [`Self::attach_instruments`].
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    fn store_restart_lead(&self) {
+        let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+        let frames = (self.plugin_lead() * f64::from(rate)).round() as u32;
+        self.restart_lead
+            .store(frames, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Takes the lead of the plan the commit seam made for a candidate, for
+    /// its commit: see `Session::plugin_seam`. `None` for a commit with no
+    /// seam.
+    fn take_plan_lead(&mut self) -> Option<f64> {
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        {
+            self.plan_lead.take()
+        }
+        #[cfg(not(all(feature = "vst", feature = "device-audio")))]
+        {
+            None
+        }
+    }
+
+    /// How much earlier a launch fires for the plugin chains, in seconds: the
+    /// lead of the plugin chains of the score in play, or the lead of the
+    /// copies of the text the arm of the launch prepared when that is larger.
+    /// The call reads those copies again, so a copy that became ready during
+    /// the countdown counts. See [`Self::plugin_lead`] and
+    /// [`Self::prepare_reload`]. The notes of the launch then have room for
+    /// their lead before its line. 0 with no plugin.
+    pub fn takeover_headroom(&self) -> f64 {
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        {
+            let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+            let prepared = self.plugin_hold.as_ref();
+            let prepared = prepared.map_or(0.0, |hold| hold.lead(rate));
+            self.plugin_lead().max(prepared)
+        }
+        #[cfg(not(all(feature = "vst", feature = "device-audio")))]
+        {
+            self.plugin_lead()
+        }
+    }
+
+    /// The lead the takeover of the newest commit or requery added for the
+    /// plugin chains, in seconds: see [`Self::plugin_lead`]. A note of a
+    /// chain with latency starts that long before the takeover, so the first
+    /// window goes out that long before its takeover at the latest. Only the
+    /// publication of a commit checks its freshness with it.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    pub(crate) fn takeover_lead(&self) -> f64 {
+        self.takeover_added
+    }
+
+    /// The restart lead the live output publishes with its cutovers, in
+    /// frames: see [`Self::attach_instruments`]. A restart moves a note of
+    /// its first window up to this far after its target. 0 with no plugin.
+    #[cfg(feature = "device-audio")]
+    pub(crate) fn restart_lead_frames(&self) -> u64 {
+        #[cfg(feature = "vst")]
+        {
+            u64::from(self.restart_lead.load(std::sync::atomic::Ordering::Relaxed))
+        }
+        #[cfg(not(feature = "vst"))]
+        {
+            0
+        }
+    }
+
+    /// Sets the lead of the plugin chains of the score in play to `lead`
+    /// seconds, as a look at copies with that latency sets it: see
+    /// [`Self::plugin_lead`].
+    #[cfg(all(feature = "vst", any(test, feature = "test-support")))]
+    #[doc(hidden)]
+    pub fn set_plugin_lead_for_test(&mut self, lead: f64) {
+        self.plugin_lead = (lead, self.transport.stops());
+        self.plugin_lead_changed();
+    }
+
+    /// The generation of the score of the last look of
+    /// [`Self::plugins_pending`] at the plugin copies. `None` before the
+    /// first look.
+    #[cfg(all(feature = "vst", any(test, feature = "test-support")))]
+    #[doc(hidden)]
+    pub fn plugin_look_for_test(&self) -> Option<u64> {
+        self.plugin_look.map(|(_, generation, _)| generation)
     }
 
     /// True when the score of this session plays through the plugins of a
@@ -1471,28 +1714,89 @@ impl Session {
     }
 
     /// Gives each event of a live window the plugin chain of its note, in
-    /// one assignment for the window: see [`crate::vst::assign`]. `values`
-    /// are the notes of `events`, in the same order. A note with no room
+    /// one assignment for the window: see [`crate::vst::assign`]. `onsets`
+    /// are the onsets of `events`, in the same order. A note with no room
     /// for its chain plays with no plugin. With plugins on a live output,
     /// a slider that is the value of a plugin key of a note links to the
     /// parameter of its copy: see [`crate::vst::link_sliders`].
+    ///
+    /// With plugins on a live output, each stage of a chain also gets the
+    /// latency of its copy at `sample_rate`: see [`crate::vst::latencies`].
+    /// A note of a chain with latency starts early by that latency, 1 s at
+    /// most, so the chain plays in time with the other lanes: the note
+    /// converts again at the earlier time, with the sounds of `samples`. See
+    /// [`crate::render::early_audio_event`]. The note takes its whole lead
+    /// when the earlier time is at `reach` or after it, the first time the
+    /// window reaches, in seconds, and in the first window of a rewind. Else
+    /// it keeps its frame and plays late by the latency of its chain, in
+    /// onset order. In the first window of an edit, a note before the
+    /// takeover is a note the edit adds there: with no room for its lead, it
+    /// does not play, and the edit sounds on its lane from the takeover on.
+    /// In the first window of an edit, a note on or after the takeover frame
+    /// also takes its whole lead when the earlier time is at or after the
+    /// edge of that frame less the lead the takeover added: the takeover
+    /// waited that lead for it. Each note of a chain with latency raises the
+    /// lead of the plugin chains to the lead of its chain: see
+    /// [`Self::plugin_lead`]. Gives the places of the events that do not
+    /// play, in ascending order.
     #[cfg(feature = "vst")]
     pub(crate) fn chain_live_events(
-        &self,
+        &mut self,
         events: &mut [rustel_audio::AudioEvent],
-        values: &[&ValueJson],
-    ) {
+        onsets: &[&OnsetEventJson],
+        samples: &dyn rustel_voice::SampleLookup,
+        sample_rate: u32,
+        reach: f64,
+        window: LeadWindow,
+    ) -> Vec<usize> {
         let live = self.plugins_live();
-        let notes = values.iter().copied();
+        let notes = onsets.iter().map(|onset| &onset.value);
         let chains = crate::vst::assign(&self.chains, &self.lanes, &self.csound, notes, live);
-        for ((event, chain), value) in events.iter_mut().zip(chains).zip(values) {
+        let (mut known, mut left_out) = (Vec::new(), Vec::new());
+        let events = events.iter_mut().zip(chains).zip(onsets);
+        for (place, ((event, chain), onset)) in events.enumerate() {
             chain.apply(&mut event.controls, &mut event.gain);
-            if live && let ValueJson::Raw(value) = value {
+            if !live {
+                continue;
+            }
+            if let ValueJson::Raw(value) = &onset.value {
                 let param_of =
                     |name: &str, key: &str| crate::vst::started()?.loaded(name)?.param(key);
                 crate::vst::link_sliders(&self.chains, value, &event.controls, param_of);
             }
+            let controls = &mut event.controls;
+            let lead = crate::vst::latencies(&self.chains, controls, sample_rate, &mut known);
+            if lead == 0 {
+                continue;
+            }
+            // The cover grows by the lead, so the next notes of the chain
+            // find room for it.
+            let lead_secs = f64::from(lead) / f64::from(sample_rate);
+            self.raise_plugin_lead(lead_secs);
+            let start = onset.target_time - lead_secs;
+            let onset_frame = crate::render::onset_frame_at(onset.target_time, sample_rate);
+            // The takeover of an edit waits the lead it added, so a note on
+            // or after its frame has that room before the frame.
+            let reach = match window {
+                LeadWindow::Edit(takeover, added) if onset_frame >= takeover => {
+                    reach.min(crate::render::onset_frame_edge(takeover, sample_rate) - added)
+                }
+                _ => reach,
+            };
+            if start < reach && window != LeadWindow::Rewind {
+                if matches!(window, LeadWindow::Edit(takeover, _) if onset_frame < takeover) {
+                    left_out.push(place);
+                }
+                continue;
+            }
+            let cps = self.config.cps;
+            let early =
+                crate::render::early_audio_event(onset, event, lead, sample_rate, cps, samples);
+            if let Some(early) = early {
+                *event = early;
+            }
         }
+        left_out
     }
 
     /// The plugin chains of this session, for the tests of the chains.

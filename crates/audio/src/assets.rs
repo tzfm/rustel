@@ -207,6 +207,21 @@ pub(crate) struct PoolInstall(pub *const crate::pool::PoolShared);
 // time. The pool is `Send` and `Sync`.
 unsafe impl Send for PoolInstall {}
 
+/// Send lines on their way to the callback, with the same baton discipline
+/// as a reverb: see [`crate::scalar::SendLines`].
+#[derive(Clone, Copy)]
+pub(crate) struct SendLineInstall(pub *mut crate::scalar::SendLines);
+
+/// The send lines the callback replaced, on their way back to be freed.
+#[derive(Clone, Copy)]
+pub(crate) struct ReturnedSendLines(pub *mut crate::scalar::SendLines);
+
+// SAFETY: same SPSC baton pass: the producer boxes the lines, the callback
+// takes them and returns the lines they replace, and the producer frees
+// those. One side owns each box at a time. `SendLines` is `Send`.
+unsafe impl Send for SendLineInstall {}
+unsafe impl Send for ReturnedSendLines {}
+
 const KABEL_RETIRING: usize = 1 << (usize::BITS - 1);
 
 /// Keeps prepared graph programs alive until a scheduling window has been
@@ -299,6 +314,10 @@ pub(crate) struct SampleChannel {
     pub insert_releases: AssetRing<InsertRelease>,
     /// One place: the device ships its plugin workers to each backend once.
     pub pool_installs: AssetRing<PoolInstall>,
+    /// One place each: the send lines on their way to the callback, and the
+    /// lines they replaced on their way back.
+    pub send_line_installs: AssetRing<SendLineInstall>,
+    pub send_line_returns: AssetRing<ReturnedSendLines>,
     /// Stage reverbs refused by the install queue or callback byte budget.
     pub fx_reverb_refusals: AtomicU64,
     pub insert_refusals: AtomicU64,
@@ -344,6 +363,8 @@ impl SampleChannel {
             insert_returns: AssetRing::with_capacity(crate::insert::INSERT_SLOTS),
             insert_releases: AssetRing::with_capacity(crate::insert::INSERT_SLOTS),
             pool_installs: AssetRing::with_capacity(1),
+            send_line_installs: AssetRing::with_capacity(1),
+            send_line_returns: AssetRing::with_capacity(1),
             fx_reverb_refusals: AtomicU64::new(0),
             insert_refusals: AtomicU64::new(0),
             kabel_installs: AssetRing::new(),
@@ -429,6 +450,10 @@ impl SampleChannel {
             // SAFETY: same pass for inserts displaced by the callback.
             returned_insert(unsafe { Box::from_raw(returned.0) });
         }
+        while let Some(returned) = self.send_line_returns.pop() {
+            // SAFETY: same pass for send lines the callback replaced.
+            drop(unsafe { Box::from_raw(returned.0) });
+        }
     }
 }
 
@@ -467,6 +492,10 @@ impl Drop for SampleChannel {
             // SAFETY: the count never reached the consumer, and this side
             // owns it.
             drop(unsafe { std::sync::Arc::from_raw(install.0) });
+        }
+        while let Some(install) = self.send_line_installs.pop() {
+            // SAFETY: never reached the consumer. Unique ownership here.
+            drop(unsafe { Box::from_raw(install.0) });
         }
     }
 }
@@ -782,6 +811,12 @@ mod tests {
         let pool = std::sync::Arc::new(crate::pool::PoolShared::new(1, true).expect("a pool"));
         let install = PoolInstall(std::sync::Arc::into_raw(std::sync::Arc::clone(&pool)));
         channel.pool_installs.push(install).ok().expect("push");
+        // Send lines go through their 2 rings as a reverb does.
+        let lines = || Box::into_raw(Box::new(crate::scalar::SendLines::new(0, 8_000)));
+        let install = SendLineInstall(lines());
+        channel.send_line_installs.push(install).ok().expect("push");
+        let returned = ReturnedSendLines(lines());
+        channel.send_line_returns.push(returned).ok().expect("push");
         channel
             .kabel_installs
             .push(KabelInstall {

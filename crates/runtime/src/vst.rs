@@ -10,8 +10,8 @@ mod lanes;
 
 pub(crate) use chains::{
     Chains, NoteChain, Want, assign, end_closed_documents, ensure, forget_document,
-    forget_lanes_away, link_sliders, load, plugin_names, render_chains, returning, score_changed,
-    slider_links, slider_moved, take_output_lines, take_problems, wants,
+    forget_lanes_away, latencies, lead, link_sliders, load, plugin_names, render_chains, returning,
+    score_changed, slider_links, slider_moved, take_output_lines, take_problems, wants,
 };
 #[cfg(feature = "device-audio")]
 pub(crate) use chains::{adopt_plan, forget_plan, named_chains, plan, take_slider_values, tick};

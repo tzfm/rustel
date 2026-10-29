@@ -63,6 +63,17 @@ pub(super) struct PluginHold {
     looked: Instant,
 }
 
+impl PluginHold {
+    /// The lead of the plugin chains of the lanes of the text that play, in
+    /// seconds, at the rate `rate`: see [`crate::vst::lead`]. Each call asks
+    /// the plugin host again, so a copy that became ready after the hold
+    /// gives its latency. See [`Session::takeover_headroom`].
+    pub(super) fn lead(&self, rate: u32) -> f64 {
+        let playing = self.wants.iter().take_while(|want| want.sounds()).count();
+        crate::vst::lead(&self.wants[..playing], rate)
+    }
+}
+
 /// The looks at the cycles ahead of the score in play: see
 /// [`Session::look_ahead_for_plugins`].
 #[derive(Default)]
@@ -257,6 +268,8 @@ impl Session {
     /// text goes in play, also with each copy ready. The commit seam of the
     /// launch looks at them when no cycle fits before its line: see
     /// [`Self::plugin_seam`]. A new text, a cancel or the commit ends them.
+    /// The launch fires the lead of the plan earlier: see
+    /// [`Self::takeover_headroom`].
     /// The same text in another document keeps them, and evaluates in that
     /// document: see [`Self::adopt_plugin_hold`].
     /// True when a copy of a lane that plays is not ready and the wait is
@@ -307,6 +320,8 @@ impl Session {
             .plugin_hold
             .take()
             .filter(|held| *held.source == *source);
+        let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+        let held_lead = held.as_ref().map_or(0.0, |held| held.lead(rate));
         let evaluation_started = Instant::now();
         let evaluated = self.evaluate_score_cancellable(
             source,
@@ -324,7 +339,7 @@ impl Session {
                 let cps = Self::evaluated_realtime_cps(&evaluated, self.scheduler.cps());
                 // The evaluation took time from the cover of the score in
                 // play. The read gets only the rest, as at the commit seam.
-                let spare = self.seam_time(clock(), LIVE_REPLACEMENT_MIN_HEADROOM, None);
+                let spare = self.seam_time(clock(), LIVE_REPLACEMENT_MIN_HEADROOM, None, held_lead);
                 let window = Self::live_replacement_probe_budget(cps).min(spare);
                 let from = from_cycle.floor() as i64;
                 let deadline = Instant::now() + window;
@@ -366,7 +381,8 @@ impl Session {
             Some(first) if self.plugin_wait => {
                 Ok(self.hold_edit(source, wants, pending, &first, held))
             }
-            // Nothing waits. The fire of the launch looks at the copies.
+            // Nothing waits. The fire of the launch looks at the copies, and
+            // comes the lead of the plan earlier.
             _ => {
                 let now = Instant::now();
                 self.lanes.hold(Some(source));
@@ -387,8 +403,9 @@ impl Session {
     /// ready and one became ready in the last [`PLUGIN_WAIT`]. A copy not
     /// ready after a look with each copy ready starts a new wait, with one
     /// line. A call asks the plugin host again when [`PLUGIN_LOOK_EVERY`]
-    /// passed since the last look. False with the wait off or a stopped
-    /// transport.
+    /// passed since the last look. The latency of the copies a look finds
+    /// raises the lead the cover keeps room for: see [`Self::plugin_lead`].
+    /// False with the wait off or a stopped transport.
     pub fn waits_for_plugins(&mut self, source: &str) -> bool {
         if !self.plugin_wait || self.transport.is_stopped() {
             return false;
@@ -403,6 +420,7 @@ impl Session {
         };
         let now = Instant::now();
         let mut first = None;
+        let mut lead = 0.0;
         if now.duration_since(hold.looked) >= PLUGIN_LOOK_EVERY {
             let (pending, _) = crate::vst::ensure(&hold.wants, rate);
             if hold.pending == 0 {
@@ -412,11 +430,15 @@ impl Session {
                 hold.progress = now;
             }
             (hold.pending, hold.looked) = (pending.len(), now);
+            lead = hold.lead(rate);
         }
         let waits = hold.pending > 0 && now.duration_since(hold.progress) < PLUGIN_WAIT;
         if let Some(first) = first {
             self.report_plugin_wait(&first);
         }
+        // A copy that became ready gives its latency. The cover keeps room
+        // for the lead of the held text, as at the hold.
+        self.raise_cover_lead(lead);
         waits
     }
 
@@ -521,6 +543,11 @@ impl Session {
     /// Nothing waits for a first score, a score with no pattern, a stopped
     /// transport or a session with no live output. Such a candidate makes no
     /// plan, and the plan of the text before ends.
+    ///
+    /// The commit of the candidate takes the lead of the plugin chains of
+    /// its plan, and a candidate with no plan has no lead: see
+    /// [`Self::plugin_lead`]. The reads and the wait keep room for the lead
+    /// in the cover of the score in play.
     pub(super) fn plugin_seam<F>(
         &mut self,
         evaluated: &EvaluatedScore,
@@ -543,12 +570,14 @@ impl Session {
         } = evaluated
         else {
             // A text with no plan of its own ends the plan of the text
-            // before.
+            // before, and has no lead.
             crate::vst::forget_plan(&self.chains);
+            self.plan_lead = Some(0.0);
             return Ok(Some(Vec::new()));
         };
         if !self.plugins_live() || self.generation() == 0 || self.transport.is_stopped() {
             crate::vst::forget_plan(&self.chains);
+            self.plan_lead = Some(0.0);
             return Ok(Some(Vec::new()));
         }
         let started = Instant::now();
@@ -561,13 +590,16 @@ impl Session {
         // launch, or from an earlier hold of the text.
         let arm = line.is_some() && held.is_some();
         // The seam ends before the takeover of the commit leaves the cover
-        // of the score in play, and before the line of a launch.
-        let spare = self.seam_time(seam_now, headroom, line);
+        // of the score in play, and before the line of a launch. The lead
+        // of the kept copies counts.
+        let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+        let held_lead = held.as_ref().map_or(0.0, |held| held.lead(rate));
+        let spare = self.seam_time(seam_now, headroom, line, held_lead);
         // A launch with no time before its line misses the line in any
         // case. With no kept copies, its first read then takes the cover,
         // so a copy that is not ready holds the launch.
         let first_spare = if spare.is_zero() {
-            self.seam_time(seam_now, headroom, None)
+            self.seam_time(seam_now, headroom, None, held_lead)
         } else {
             spare
         };
@@ -611,7 +643,6 @@ impl Session {
                 &shadow,
             ),
         };
-        let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
         // The count of the copies not ready and the plugin of the first, and
         // the lines of the copies the host cannot make.
         let look = |wants: &[crate::vst::Want]| {
@@ -660,6 +691,8 @@ impl Session {
         }
         // The plugins the candidate ran load after its copies.
         self.load_ran_plugins();
+        // The commit takes the lead of the plan.
+        self.plan_lead = Some(self.leads_of(&wants).0);
         if pending.is_none() || !(hold && self.plugin_wait) {
             return Ok(Some(lines));
         }
@@ -673,6 +706,8 @@ impl Session {
             std::thread::sleep(SEAM_LOOK_EVERY);
             (pending, lines) = look(&wants);
         }
+        // A copy that became ready gives its latency.
+        self.plan_lead = Some(self.leads_of(&wants).0);
         let Some((pending, first)) = pending else {
             return Ok(Some(lines));
         };
@@ -693,7 +728,9 @@ impl Session {
     /// with each copy ready is over, so a copy not ready now starts a new
     /// wait. False when the wait ends: no copy became ready in
     /// [`PLUGIN_WAIT`]. The edit then plays, with one line. A text gives one
-    /// line at the start of each wait.
+    /// line at the start of each wait. The cover of the score in play keeps
+    /// room for the lead of the plan of a held text: see
+    /// [`Self::plugin_lead`] and [`Self::waits_for_plugins`].
     fn hold_edit(
         &mut self,
         source: &str,
@@ -719,6 +756,11 @@ impl Session {
         if held.as_ref().is_none_or(|held| held.pending == 0) {
             self.report_plugin_wait(first);
         }
+        // The text does not go in play now, so no commit takes the lead of
+        // its plan. The cover keeps room for that lead.
+        let (lead, _) = self.leads_of(&wants);
+        self.plan_lead = None;
+        self.raise_cover_lead(lead);
         // A read of another text leaves the read of the hold.
         self.lanes.hold(Some(source));
         self.plugin_hold = Some(PluginHold {
@@ -740,11 +782,14 @@ impl Session {
 
     /// The longest time at the commit seam from `now`. The takeover of the
     /// commit comes the margin of the output or `headroom` after the commit,
-    /// and stays inside the cover of the score in play. With `line`, the
-    /// line of a launch, the takeover comes at the line or before it.
-    fn seam_time(&self, now: f64, headroom: Duration, line: Option<f64>) -> Duration {
+    /// and the lead of the plugin chains after that: the lead of the score
+    /// in play, or `lead`, the lead of a plan of the text, when that is
+    /// larger. The takeover stays inside the cover of the score in play.
+    /// With `line`, the line of a launch, the takeover comes at the line or
+    /// before it.
+    fn seam_time(&self, now: f64, headroom: Duration, line: Option<f64>, lead: f64) -> Duration {
         let margin = self.continuity_margin.unwrap_or(self.schedule_lead);
-        let margin = margin.max(headroom.as_secs_f64());
+        let margin = margin.max(headroom.as_secs_f64()) + self.plugin_lead().max(lead);
         let cover = self.scheduler.horizon_remaining(now);
         let cover = line.map_or(cover, |line| cover.min(line - now));
         let spare = cover - margin;
@@ -905,7 +950,9 @@ impl Session {
     /// twice the time. At [`LOOK_MOST`] the next look reads half of the
     /// part, so the looks skip no part of a cycle. Each copy the host cannot
     /// make gives its reason as a plugin line. The console lines of a look
-    /// go.
+    /// go. The latency of the copies raises the lead the cover keeps room
+    /// for, so the first notes of such a lane find room for their lead: see
+    /// [`Self::plugin_lead`].
     fn look_ahead_for_plugins(&mut self, now: f64, continuation_reserve: Duration) {
         let play = self.scheduler.cycle_at_time(now).floor() as i64;
         let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
@@ -939,11 +986,15 @@ impl Session {
         let Some(haps) = read else {
             return;
         };
-        if shadow {
-            self.ensure_plugins(&[], &haps);
+        let wants = if shadow {
+            crate::vst::wants(&self.chains, &self.lanes, &self.csound, &[], &haps)
         } else {
-            self.ensure_plugins(&haps, &[]);
-        }
+            crate::vst::wants(&self.chains, &self.lanes, &self.csound, &haps, &[])
+        };
+        self.ensure_wants(&wants);
+        // These notes play later: the cover keeps room for their lead.
+        let (lead, shadow_lead) = self.leads_of(&wants);
+        self.raise_cover_lead(lead.max(shadow_lead));
     }
 
     /// Puts the score in play in play again after a candidate that does not
@@ -1896,5 +1947,215 @@ mod tests {
         assert_eq!(copies_in(folder.path()), 6);
         // SAFETY: as above.
         unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV) };
+    }
+
+    /// The lead of the plugin chains follows their copies. The Delay preset
+    /// of the fixture has 480 frames of latency, 10 ms at 48 kHz, and a
+    /// chain of 2 such stages has 20 ms. A look at the copies of the score
+    /// raises the lead by the lanes that play, and the lead the cover keeps
+    /// room for by the lanes that do not play. An edit takes over with the
+    /// lead of its plan when that is larger, and its commit sets the lead.
+    /// The commit seam keeps room in the cover for the lead in play, or for
+    /// the lead of the kept copies when that is larger. An edit with no plan
+    /// takes over with the lead of the score in play, and ends it. At a rate
+    /// with no copy of the plugin, an edit waits at the seam while its copy
+    /// builds, and takes over with the latency of the copy. A look at the
+    /// cycles ahead raises the lead the cover keeps room for. A held edit
+    /// keeps the lead of its plan for the cover, and a launch its arm
+    /// prepared keeps it for its head-room. Both read the copies again: a
+    /// copy that becomes ready after the arm gives its latency to the
+    /// head-room, and a look of the wait gives it to the cover.
+    #[test]
+    fn the_lead_of_the_chains_follows_their_copies() {
+        let (_one, folder) = fixture_plugins();
+        let presets = folder.path().join("presets");
+        let presets = presets.join(rustel_vst3_fixture::NAME);
+        std::fs::create_dir_all(&presets).expect("preset folder");
+        let delay = rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.1171875);
+        for name in ["Delay", "Late", "Arm"] {
+            let file = presets.join(format!("{name}.vstpreset"));
+            std::fs::write(file, &delay).expect("preset file");
+        }
+        let long = rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 1.0);
+        std::fs::write(presets.join("Long.vstpreset"), long).expect("preset file");
+        let host = crate::vst::host();
+        let mut session = Session::new().expect("session");
+        session.set_direct_diagnostic_logging(false);
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        session.plugins_live.store(true, relaxed);
+        session.plugin_rate.store(48_000, relaxed);
+        session.set_continuity_margin(0.01);
+        // A lane of `stages` Delay stages that plays `notes`.
+        let lane = |notes: &str, stages: usize| {
+            let stage = r#".vst("rustel fixture", { preset: "delay" })"#;
+            format!("$: note(\"{notes}\").s(\"sine\"){}", stage.repeat(stages))
+        };
+        let near = |left: f64, right: f64| (left - right).abs() < 1e-9;
+        // The cover of the producer: the horizon, the margin and a lead.
+        let cover = |session: &Session, lead: f64| {
+            near(session.live_producer_schedule_cover(), 0.5 + 0.01 + lead)
+        };
+
+        // The lane of 1 stage plays, and the lane of 2 is muted.
+        let score = format!("{}\n_{}", lane("c3", 1), lane("e3", 2));
+        session.evaluate(&score).expect("score");
+        let ceiling = Duration::from_secs(1);
+        let started = Instant::now();
+        while session.plugins_pending(0.0, 1.0, ceiling) > 0 || session.plugin_lead() == 0.0 {
+            assert!(started.elapsed() < Duration::from_secs(20), "no copy");
+            host.wait_idle();
+            std::thread::sleep(PLUGIN_LOOK_EVERY);
+        }
+        assert_eq!(copies_in(folder.path()), 3);
+        assert!(near(session.plugin_lead(), 0.01));
+        assert!(cover(&session, 0.02), "the muted lane");
+
+        // The edit plays the lane of 2 stages: its plan has 20 ms of lead.
+        // The takeover waits it in the cover, and the commit sets it. A
+        // smaller lead keeps it.
+        let stopped = AtomicBool::new(false);
+        let floor = LIVE_REPLACEMENT_MIN_HEADROOM.as_secs_f64();
+        let edit = |session: &mut Session, text: &str, mini: bool| {
+            session.schedule_through(0.0, 0.0).expect("cover");
+            let edit = session.reload_live(text, mini, &stopped, || 0.0);
+            assert!(matches!(edit, Ok(LiveReload::Installed(_))), "{text}");
+            session.take_requery_takeover_time().expect("takeover")
+        };
+        let both = format!("{}\n{}", lane("c3", 1), lane("e3", 2));
+        let takeover = edit(&mut session, &both, false);
+        assert!(takeover >= floor + 0.02 - 1e-9, "{takeover}");
+        assert!(near(session.plugin_lead(), 0.02));
+        assert!(cover(&session, 0.02));
+        session.raise_plugin_lead(0.01);
+        assert!(near(session.plugin_lead(), 0.02), "a smaller lead");
+        // The seam keeps room in the cover for the lead in play, or for the
+        // lead of the kept copies when that is larger. So a seam that waits
+        // leaves its commit room for the whole lead.
+        session.schedule_through(0.0, 0.0).expect("cover");
+        let room = session.scheduler.horizon_remaining(0.0) - floor;
+        let spare = |session: &Session, lead: f64| {
+            let spare = session.seam_time(0.0, LIVE_REPLACEMENT_MIN_HEADROOM, None, lead);
+            spare.as_secs_f64()
+        };
+        assert!(near(spare(&session, 0.0), room - 0.02), "the lead in play");
+        let kept = spare(&session, 0.03);
+        assert!(near(kept, room - 0.03), "the lead of the kept copies");
+        // A mini edit has no plan: it takes over with the lead in play, and
+        // its commit ends the lead.
+        let takeover = edit(&mut session, "sine", true);
+        assert!(takeover >= floor + 0.02 - 1e-9, "{takeover}");
+        assert_eq!(session.plugin_lead(), 0.0);
+        assert!(cover(&session, 0.0));
+        // At 44.1 kHz the plugin has no copy yet, and the host knows no
+        // latency of it at that rate. The seam waits while the copy of the
+        // edit builds, and the edit takes over with the latency of the copy:
+        // 480 frames. The Late preset is the Delay preset under a new name,
+        // so its copy is a new build. The build takes 50 ms.
+        host.wait_idle();
+        // SAFETY: one fixture test runs at a time, and the plugin thread has
+        // no work. So no other thread reads the variable now.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV, "50") };
+        session.plugin_rate.store(44_100, relaxed);
+        let first = 480.0 / 44_100.0;
+        let late = r#"$: note("c3").s("sine").vst("rustel fixture", { preset: "late" })"#;
+        let takeover = edit(&mut session, late, false);
+        assert!(takeover >= floor + first - 1e-9, "{takeover}");
+        assert!(near(session.plugin_lead(), first));
+        session.plugin_rate.store(48_000, relaxed);
+        host.wait_idle();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV) };
+
+        // A lane with its first note at cycle 6. The plan of the commit
+        // reads 2 cycles, and a look at the cycles ahead finds the note.
+        let dry = r#"$: s("sine").gain(0)"#;
+        let ahead = format!("{dry}\n{}.mask(\"<0!6 1>\")", lane("c3", 1));
+        let edit = session.reload_live(&ahead, false, &stopped, || 0.0);
+        assert!(matches!(edit, Ok(LiveReload::Installed(_))));
+        assert_eq!(session.plugin_lead(), 0.0);
+        assert!(cover(&session, 0.0));
+        look_until(&mut session, 0.0, PLAN_CYCLES, false);
+        assert_eq!(session.plugin_lead(), 0.0);
+        assert!(cover(&session, 0.01), "the cycles ahead");
+        session.raise_cover_lead(0.0);
+        assert!(cover(&session, 0.01), "a smaller lead");
+
+        // A new lane of 2 stages: its copies build for 800 ms, and the edit
+        // waits. The cover keeps room for the lead of the held text.
+        host.wait_idle();
+        // SAFETY: one fixture test runs at a time, and the plugin thread has
+        // no work. So no other thread reads the variable now.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV, "400") };
+        let held = format!("{ahead}\n{}", lane("g3", 2));
+        let edit = session.reload_live(&held, false, &stopped, past_the_cover(0.0));
+        assert_eq!(edit.expect("a held edit"), LiveReload::Waiting);
+        assert_eq!(session.plugin_lead(), 0.0);
+        assert!(cover(&session, 0.02), "the held text");
+        assert!(near(session.takeover_headroom(), 0.02));
+        // A commit with no seam takes no lead of the held text.
+        session.reload_at(&ahead, false, 0.0).expect("a reload");
+        assert_eq!(session.plugin_lead(), 0.0);
+        session.cancel_plugin_hold();
+        host.wait_idle();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV) };
+
+        // A launch its arm prepared fires the lead of its plan earlier.
+        assert_eq!(session.takeover_headroom(), 0.0);
+        session.set_plugin_wait(false);
+        let launch = format!("{dry}\n{}", lane("e3", 2));
+        let prepared = session.prepare_reload(&launch, false, 0.0, &stopped, || 0.0);
+        assert!(!prepared.expect("prepare"));
+        assert!(near(session.takeover_headroom(), 0.02));
+        session.cancel_plugin_hold();
+
+        // The Arm preset is the Delay preset under a new name, so no slot
+        // holds a copy of it. A launch through 2 stages of it at a rate with
+        // no copy builds 2 new copies for 800 ms after its arm. The
+        // head-room reads them again: 2 stages of 480 frames are 30 ms at
+        // 32 kHz. A launch that waits for its copies looks at them again,
+        // and the cover keeps room for their lead: 40 ms at 24 kHz.
+        host.wait_idle();
+        // SAFETY: one fixture test runs at a time, and the plugin thread has
+        // no work. So no other thread reads the variable now.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV, "400") };
+        session.plugin_rate.store(32_000, relaxed);
+        let arm = r#".vst("rustel fixture", { preset: "arm" })"#;
+        let launch = format!("{dry}\n$: note(\"a3\").s(\"sine\"){}", arm.repeat(2));
+        let prepared = session.prepare_reload(&launch, false, 0.0, &stopped, || 0.0);
+        assert!(!prepared.expect("prepare"));
+        assert_eq!(session.takeover_headroom(), 0.0, "no copy at the rate");
+        host.wait_idle();
+        assert!(near(session.takeover_headroom(), 0.03));
+        session.cancel_plugin_hold();
+        session.set_plugin_wait(true);
+        session.plugin_rate.store(24_000, relaxed);
+        let prepared = session.prepare_reload(&launch, false, 0.0, &stopped, || 0.0);
+        assert!(prepared.expect("prepare"), "the launch waits");
+        assert_eq!(session.takeover_headroom(), 0.0);
+        host.wait_idle();
+        let hold = session.plugin_hold.as_mut().expect("the wait");
+        hold.looked = hold.looked.checked_sub(PLUGIN_LOOK_EVERY).expect("uptime");
+        assert!(!session.waits_for_plugins(&launch));
+        assert!(near(session.takeover_headroom(), 0.04));
+        assert!(cover(&session, 0.04), "the copies of the held launch");
+        session.cancel_plugin_hold();
+        host.wait_idle();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV) };
+
+        // At 8 kHz a stage of the Long preset has 4096 frames, 512 ms. A
+        // chain of 2 such stages has 1024 ms, and the lead is 1 s at most.
+        session.plugin_rate.store(8_000, relaxed);
+        let stage = r#".vst("rustel fixture", { preset: "long" })"#;
+        let longest = format!("$: note(\"c3\").s(\"sine\"){}", stage.repeat(2));
+        session.reload_at(&longest, false, 0.0).expect("a reload");
+        let started = Instant::now();
+        while session.plugins_pending(0.0, 1.0, ceiling) > 0 || session.plugin_lead() == 0.0 {
+            assert!(started.elapsed() < Duration::from_secs(20), "no copy");
+            host.wait_idle();
+            std::thread::sleep(PLUGIN_LOOK_EVERY);
+        }
+        assert_eq!(session.plugin_lead(), 1.0);
     }
 }

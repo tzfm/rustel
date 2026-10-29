@@ -499,12 +499,57 @@ yabridgectl sync
 The plugins then show in `~/.vst3/yabridge`. `wine` must be on `PATH` when
 rustel starts. yabridge 5.1.1 needs Wine Staging 9.21 or earlier.
 
+## Latency
+
+Rustel reads the latency of each plugin copy. The latency of a chain is the
+sum of the latencies of its plugins. Rustel starts the notes of a chain that
+much before their time, so the chain plays in time with the other lanes.
+Rustel compensates 1 second at most. A chain with more latency plays the
+rest late, with one warning for each evaluation:
+`a plugin chain has 1200 ms of latency: rustel compensates 1000 ms, and the lane plays the rest late`.
+
+When the score plays a chain with latency, these take effect later on each
+lane: an edit, a rail of the knobs column on a number with no `slider(...)`,
+a start, a key press that `midikeys` plays, a slider that asks the score
+again, and a tempo or phase change from Link or the MIDI clock in. They wait
+the largest latency of the chains that play, 1 second at most, as a DAW
+delays its output by the latency of its plugins. While the set plays, a
+start at cycle zero with no launch line cuts the score at once, and its
+first beat comes that much after the cut. A launch on a beat or cycle line
+still lands on its line. After a start, Link and a MIDI clock in that sent
+a Start steer the score back to their grid.
+
+A note that an edit adds before the edit takes effect still plays on a lane
+with no latency. A lane with latency leaves it out. `oneshot` still plays on
+its next grid line in a launch, and on a lane with no latency.
+
+A slider that is the value of a plugin key still moves the parameter value
+at once. A slider placed directly on `gain`, `lpf`, `lpq` or `fm` moves a
+voice with no latency at once, and a voice through a chain with latency
+later by the latency of the chain. A new preset counts the latency of the
+other presets of its plugin until its copy is ready.
+
 ## Limits
 
 - A plugin shows no window. Activate a plugin with a licence window in a
   different host first.
-- Rustel does not compensate plugin latency. A look-ahead effect plays late by
-  its look-ahead.
+- On a chain with latency, a `bus` send, the `delaytime`, `delayfeedback` and
+  `djf` of its orbit, the voice limit and a modulator on `postgain` act early
+  by the latency of the chain. The `scope` and `spectrum` of its lane show its
+  notes early by that latency.
+- When a chain that sounds changes a plugin with latency, the sound of the
+  chain has a gap up to that latency.
+- In the async mode, rustel knows the latency of a plugin once its first copy
+  at the sample rate of the output is ready. The notes that rustel queued
+  before that play through the copy late by its latency, for up to about half
+  a second. Then, for as long as the latency, those late notes overlap the
+  first notes in time.
+- A note that rustel queues less than the latency of its chain before its
+  time plays late by that latency. Rustel queues about half a second ahead,
+  and further while a chain with latency plays.
+- A `oneshot` on a lane with latency does not play when its grid line is
+  nearer to the edit than the latency.
+- An export and `rustel trace` play a chain with latency late by its latency.
 - A side-chain input of a plugin gets silence.
 - `cut` does not stop a note of an instrument plugin.
 - Native `distort`, `crush`, `coarse` and `compressor` do not process the

@@ -2840,6 +2840,7 @@ fn resolve_voice_at(
                         .and_then(|plugin| plugin_controls(plugin, "vsti", samples))
                         .map(clocked)
                 },
+                lead: 0,
                 lfos,
                 envs,
                 phaser: phaser_controls(object, target_time)?,

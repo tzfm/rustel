@@ -35,9 +35,11 @@ pub enum TakeoverCut {
 }
 
 impl TakeoverCut {
-    /// Decodes the device's shared word: 0 none, 1 at-flip, 2 at-takeover.
+    /// Decodes the 2 low bits of the device's shared word: 0 none, 1
+    /// at-flip, 2 at-takeover. The bits above them hold the restart lead of
+    /// the cutover.
     pub fn from_bits(bits: u64) -> Self {
-        match bits {
+        match bits & 0b11 {
             1 => Self::AtFlip,
             2 => Self::AtTakeover,
             _ => Self::None,
@@ -61,9 +63,10 @@ pub const MAX_LIVE_VOICES: usize = 4096;
 /// rendition's later events pass again and the next launch's arm can fire.
 pub const LINE_ARM_WITHDRAWN: u64 = 0b100;
 
-/// The four handshake words the producer thread publishes and the callback
-/// reads, named. All four are `AtomicU64`, so as positional arguments any two
-/// could be swapped without a type error. The struct holds four borrowed
+/// The handshake words of the producer thread and the callback, named: the
+/// four the producer publishes and the callback reads, and the line cut the
+/// callback fired. All five are `AtomicU64`, so as positional arguments any
+/// two could be swapped without a type error. The struct holds five borrowed
 /// pointers and is built at each call, so it allocates nothing.
 #[derive(Clone, Copy, Debug)]
 pub struct LiveFlipAtomics<'a> {
@@ -73,11 +76,19 @@ pub struct LiveFlipAtomics<'a> {
     /// before the generation.
     pub takeover_frame: &'a AtomicU64,
     /// The newest cutover's [`TakeoverCut`], as [`TakeoverCut::from_bits`]
-    /// reads it; published with the takeover frame.
+    /// reads it, with its restart lead in the bits above. It goes out with
+    /// the takeover frame.
     pub takeover_cut: &'a AtomicU64,
     /// A launch's pre-armed line: the frame in the top 62 bits, bit 1 the
     /// drop horizon, bit 0 the arm; [`LINE_ARM_WITHDRAWN`] once withdrawn.
     pub line_arm: &'a AtomicU64,
+    /// The arm word of the newest line cut the callback fired, 0 when none
+    /// fired since the last flip. The callback writes it at the fire, before
+    /// the cut acts and before the block renders, and 0 at a flip. An arm
+    /// that changes as the cut fires leaves its word, and the cut does not
+    /// act. A withdrawal keeps the word: the producer that withdrew the arm
+    /// reads it after.
+    pub line_fired: &'a AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -103,16 +114,19 @@ pub struct LiveScalarBackend {
     /// The last onset whose sidechain was armed at ring intake, so re-held
     /// events don't re-arm every block.
     armed_duck: Option<u64>,
-    /// A restart's catch-up floor, `(generation, frame)`, latched at a cut
-    /// flip (a rewind). The frame is the start of the first block that
-    /// drains the restart's events. Onsets of that generation aimed before
-    /// the floor are the restarted loop's first window, published after the
-    /// instant it was anchored to. They are admitted at the floor, not in
-    /// the past. A voice admitted in the past starts partway into its
-    /// sample: the downbeat loses its attack, and a one-shot later than
-    /// its own length never sounds. Later onsets of the generation aim past
-    /// the floor and are untouched. An edit's flip clears the floor.
-    restart_floor: Option<(u64, u64)>,
+    /// A restart's catch-up floor, `(generation, frame, lead)`, latched at a
+    /// cut flip (a rewind). The frame is the start of the first block that
+    /// drains the restart's events. The lead is the restart lead the cut word
+    /// carries: the frames a note of a plugin chain with latency starts
+    /// before its musical onset. Onsets of that generation with a musical
+    /// onset before the floor plus the lead are the restarted loop's first
+    /// window, published after the instant it was anchored to. Each lands its
+    /// musical onset there, and none starts before the floor. A voice
+    /// admitted in the past starts partway into its sample: the downbeat
+    /// loses its attack, and a one-shot later than its own length never
+    /// sounds. Later onsets of the generation aim past the floor and are
+    /// untouched. An edit's flip clears the floor.
+    restart_floor: Option<(u64, u64, u32)>,
     /// A takeover cut's drop horizon: old-generation ring events with a
     /// target at or after this frame are refused - they are the ghost
     /// window a restart replaces. Latched at the flip alongside the cut
@@ -293,10 +307,11 @@ impl LiveScalarBackend {
 
     /// Stage prepared inserts between audio blocks and return displaced
     /// copies to the producer. A full return ring defers new installs. The
-    /// plugin workers of the output come first, then the releases of the
-    /// copies the score no longer has: see [`ScalarBackend::release_insert`].
-    /// After the installs, the channel gets the insert refusals since it got
-    /// them last: of the copies, and of the notes the blocks had no bus for.
+    /// plugin workers of the output come first, then the send lines, then
+    /// the releases of the copies the score no longer has: see
+    /// [`ScalarBackend::release_insert`]. After the installs, the channel
+    /// gets the insert refusals since it got them last: of the copies, and of
+    /// the notes the blocks had no bus for.
     #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
     pub(crate) fn drain_insert_installs(&mut self, channel: &crate::assets::SampleChannel) {
         if let Some(install) = channel.pool_installs.pop() {
@@ -304,6 +319,22 @@ impl LiveScalarBackend {
             // and the pop gives it to this callback.
             let shared = unsafe { std::sync::Arc::from_raw(install.0) };
             self.scalar.set_plugin_pool(shared);
+        }
+        // New send lines take the place of the lines before, which go back:
+        // see `ScalarBackend::install_send_lines`.
+        let returns = &channel.send_line_returns;
+        if returns.len() < returns.capacity()
+            && let Some(install) = channel.send_line_installs.pop()
+        {
+            // SAFETY: producer-boxed pointer handed over via the SPSC ring.
+            let lines = unsafe { Box::from_raw(install.0) };
+            if let Some(replaced) = self.scalar.install_send_lines(lines) {
+                let returned = crate::assets::ReturnedSendLines(Box::into_raw(replaced));
+                // Only this callback fills the ring, and a place was free.
+                if returns.push(returned).is_err() {
+                    channel.leaked.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         // A stopped output past its ramp makes no sound. A copy a release
         // gives back goes back in this drain.
@@ -719,13 +750,14 @@ impl LiveScalarBackend {
     /// Consume one stereo block at an absolute sample-clock position.
     ///
     /// Besides the event `ring`, it reads the producer's side of the
-    /// handshake: the four words in [`LiveFlipAtomics`] (the newest
-    /// generation, its takeover frame, its [`TakeoverCut`] and a launch's
-    /// pre-armed line) and `stopped`, under which the block fades whatever
-    /// sounds over 10 ms and admits nothing. They are passed as references
-    /// rather than owned by this struct: the audio callback must read the
-    /// live values, and a copy taken at construction would pin a generation
-    /// that has since been replaced. The generation word is read at the
+    /// handshake: four words of [`LiveFlipAtomics`] (the newest generation,
+    /// its takeover frame, its [`TakeoverCut`] and a launch's pre-armed line)
+    /// and `stopped`, under which the block fades whatever sounds over 10 ms
+    /// and admits nothing. They are passed as references rather than owned
+    /// by this struct: the audio callback must read the live values, and a
+    /// copy taken at construction would pin a generation that has since been
+    /// replaced. It writes the fifth word of [`LiveFlipAtomics`]: the arm of
+    /// a line cut it fires, at the fire. The generation word is read at the
     /// block start and again before every ring event, so a flip published
     /// while the block is assembled is adopted before the remaining events
     /// are judged. It is read once more after the drain: a flip that lands
@@ -781,6 +813,7 @@ impl LiveScalarBackend {
             takeover_frame,
             takeover_cut,
             line_arm,
+            line_fired,
         } = flip;
         let Some(samples) = frames.checked_mul(2) else {
             output.fill(0.0);
@@ -895,9 +928,20 @@ impl LiveScalarBackend {
             self.line_arm_fired = false;
             self.line_arm_drop_from = None;
         }
+        // A note of a plugin chain with latency starts its lead before its
+        // output. So the arm fires that lead before the line: the restart
+        // lead of the newest cutover, or the output lead of the newest note
+        // of a chain when that is larger. The voices of the outgoing
+        // rendition then fall silent on the line, and a note of it with its
+        // musical onset on the line or after retires before it starts. The
+        // cut names its word before it acts and before the block renders. So
+        // a withdrawal during this block reads the fire and refills the room.
+        let restart_lead = takeover_cut.load(Ordering::Acquire) >> 2;
+        let lead = restart_lead.max(u64::from(self.scalar.largest_insert_lead()));
         if arm_word & 0b01 != 0
             && !self.line_arm_fired
-            && start_frame.wrapping_add(frames as u64) > line_frame
+            && start_frame.wrapping_add(frames as u64) > line_frame.saturating_sub(lead)
+            && name_line_fire(arm_word, line_arm, line_fired)
         {
             self.line_arm_fired = true;
             if arm_word & 0b10 != 0 {
@@ -913,8 +957,17 @@ impl LiveScalarBackend {
             self.scalar.begin_takeover_cut(line_frame, self.generation);
         }
         if generation != self.generation {
-            let (takeover, cut_intent) = published_cutover(takeover_frame, takeover_cut);
-            self.adopt_flip(generation, takeover, cut_intent, start_frame, start_frame);
+            let (takeover, cut_intent, restart_lead) =
+                published_cutover(takeover_frame, takeover_cut);
+            self.adopt_flip(
+                generation,
+                takeover,
+                cut_intent,
+                restart_lead,
+                start_frame,
+                start_frame,
+                line_fired,
+            );
         }
 
         let end_frame = start_frame.saturating_add(frames as u64);
@@ -928,15 +981,23 @@ impl LiveScalarBackend {
                 // A flip seen only mid-drain is adopted exactly as at the
                 // block start: this block's remaining events are the new
                 // generation's to judge.
-                let (takeover, cut_intent) = published_cutover(takeover_frame, takeover_cut);
+                let (takeover, cut_intent, restart_lead) =
+                    published_cutover(takeover_frame, takeover_cut);
                 self.adopt_flip(
                     latest_generation,
                     takeover,
                     cut_intent,
+                    restart_lead,
                     start_frame,
                     start_frame,
+                    line_fired,
                 );
             }
+            // The horizons below judge an event by its musical onset: its
+            // target plus the lead of its note. A note of a plugin chain
+            // with latency starts that lead early, so its output comes on
+            // the onset.
+            let musical = event.controls.musical(event.target_frame);
             // The pre-armed line's drop horizon, latched when the arm
             // fires. Until the flip, outgoing events from the line on are
             // the ghost window that the restart replaces. Without this
@@ -951,7 +1012,7 @@ impl LiveScalarBackend {
             if let Some(line_horizon) = self.line_arm_drop_from
                 && !event.controls.piano
                 && event.generation <= self.generation
-                && event.target_frame >= line_horizon
+                && musical >= line_horizon
             {
                 report.stale += 1;
                 #[cfg(feature = "device-audio")]
@@ -971,7 +1032,7 @@ impl LiveScalarBackend {
             if let Some(cut_horizon) = self.takeover_cut_frame
                 && !event.controls.piano
                 && event.generation != self.generation
-                && event.target_frame >= cut_horizon
+                && musical >= cut_horizon
             {
                 report.stale += 1;
                 #[cfg(feature = "device-audio")]
@@ -984,7 +1045,7 @@ impl LiveScalarBackend {
             }
             if !event.controls.piano
                 && event.generation != self.generation
-                && event.target_frame >= self.replaced_from(event.generation, takeover_frame)
+                && musical >= self.replaced_from(event.generation, takeover_frame)
             {
                 report.stale += 1;
                 #[cfg(feature = "device-audio")]
@@ -996,22 +1057,18 @@ impl LiveScalarBackend {
                 continue;
             }
             // A voice the takeover kept already plays this onset: an SBD
-            // graph that started early, or an onset the outgoing generation
-            // started before a late flip landed. This copy would sound it a
-            // second time. A generation that a newer flip replaced can have
-            // no marked voice. Its SBD copy is also left out when an older
-            // graph has started within one frame of it.
+            // graph that started early, an onset the outgoing generation
+            // started before a late flip landed, or a note of a plugin chain
+            // with latency that started its lead early. This copy would
+            // sound it a second time. A generation that a newer flip replaced
+            // has no marked voice. Its SBD copy is also left out when an
+            // older graph has started within one frame of it.
             let early_graph = matches!(event.synth, Some(crate::backend::SynthSource::Sbd { .. }));
             if !event.controls.piano
-                && (self.scalar.kept_onset_stands_for(
-                    event.target_frame,
-                    event.generation,
-                    early_graph,
-                ) || (early_graph
-                    && event.generation != self.generation
-                    && self
-                        .scalar
-                        .started_graph_plays(event.target_frame, event.generation)))
+                && (self.scalar.kept_onset_stands_for(&event)
+                    || (early_graph
+                        && event.generation != self.generation
+                        && self.scalar.started_graph_plays(musical, event.generation)))
             {
                 report.stale += 1;
                 #[cfg(feature = "device-audio")]
@@ -1022,23 +1079,32 @@ impl LiveScalarBackend {
                 }
                 continue;
             }
-            // A restart's first window lands whole: onsets the restarted
-            // generation aimed behind its flip start AT the flip.
-            if let Some((generation, floor)) = self.restart_floor
+            // A restart's first window lands whole: each onset the restarted
+            // generation aimed behind its flip start and its restart lead
+            // lands its musical onset there. A note of a plugin chain with
+            // latency starts its own lead earlier, and no note starts before
+            // the flip.
+            if let Some((generation, floor, restart_lead)) = self.restart_floor
                 && !event.controls.piano
                 && event.generation == generation
-                && event.target_frame < floor
             {
-                event.event.target_frame = floor;
+                let landing = floor.saturating_add(u64::from(restart_lead));
+                if musical < landing {
+                    let lead = u64::from(event.controls.lead);
+                    event.event.target_frame = landing.saturating_sub(lead).max(floor);
+                }
             }
             // Arm the sidechain at FIRST SIGHT of the event, at schedule
             // time: the duck's 10 ms pre-hold must still be in the future so
             // the dip ramps in full. Arming only at admission (the onset's
             // own block) compressed the ramp about tenfold into a thump on
-            // every duck trigger.
+            // every duck trigger. The dip lands on the musical onset, where
+            // the output of a note of a plugin chain with latency starts.
             if self.armed_duck != Some(event.onset_id) {
-                self.scalar
-                    .arm_duck_at(event.target_frame, event.controls.duck);
+                self.scalar.arm_duck_at(
+                    event.controls.musical(event.target_frame),
+                    event.controls.duck,
+                );
                 self.armed_duck = Some(event.onset_id);
             }
             // Admit ahead of the block. Scalar pending activates onsets only
@@ -1097,13 +1163,16 @@ impl LiveScalarBackend {
             // The replacement's events are drained from the NEXT block on,
             // so that block's start is where a restart's first window
             // lands.
-            let (takeover, cut_intent) = published_cutover(takeover_frame, takeover_cut);
+            let (takeover, cut_intent, restart_lead) =
+                published_cutover(takeover_frame, takeover_cut);
             self.adopt_flip(
                 latest_generation,
                 takeover,
                 cut_intent,
+                restart_lead,
                 start_frame,
                 end_frame,
+                line_fired,
             );
         }
         #[cfg(feature = "device-audio")]
@@ -1128,13 +1197,20 @@ impl LiveScalarBackend {
     /// where a restart's first window lands: this block's start when the
     /// flip is seen before the drain finishes, the next block's start when
     /// it is seen after (the replacement's events are drained from there).
+    /// The musical onsets of that window land `restart_lead` frames after
+    /// it, so the notes of a plugin chain with latency have room for their
+    /// lead. `line_fired` holds the line cut the callback fired. A flip
+    /// clears it.
+    #[allow(clippy::too_many_arguments)]
     fn adopt_flip(
         &mut self,
         generation: u64,
         takeover: u64,
         cut_intent: TakeoverCut,
+        restart_lead: u32,
         start_frame: u64,
         restart_floor_from: u64,
+        line_fired: &AtomicU64,
     ) {
         // The rendition going out is the one this consumer was playing.
         // Not `generation - 1`: a slider requery superseded by a launch
@@ -1148,6 +1224,7 @@ impl LiveScalarBackend {
         // NEXT launch's arm from ever firing.
         self.line_arm_drop_from = None;
         self.line_arm_fired = false;
+        line_fired.store(0, Ordering::Release);
         #[cfg(feature = "device-audio")]
         {
             self.confirmation_takeover = takeover;
@@ -1209,9 +1286,10 @@ impl LiveScalarBackend {
                 self.takeover_cut_frame = None;
             }
         }
-        self.restart_floor = cut_intent
-            .is_cut()
-            .then_some((generation, restart_floor_from));
+        self.restart_floor =
+            cut_intent
+                .is_cut()
+                .then_some((generation, restart_floor_from, restart_lead));
     }
 
     /// Where the ring stops admitting an older generation's events: the
@@ -1232,12 +1310,30 @@ impl LiveScalarBackend {
     }
 }
 
-/// The takeover frame and cut intent published with a flip, read in the
-/// producer's order (the generation has already been read by the caller).
-fn published_cutover(takeover_frame: &AtomicU64, takeover_cut: &AtomicU64) -> (u64, TakeoverCut) {
+/// The takeover frame, cut intent and restart lead published with a flip,
+/// read in the producer's order (the generation has already been read by
+/// the caller). The restart lead sits in the cut word above the 2 bits of
+/// the cut.
+fn published_cutover(
+    takeover_frame: &AtomicU64,
+    takeover_cut: &AtomicU64,
+) -> (u64, TakeoverCut, u32) {
     let takeover = takeover_frame.load(Ordering::Acquire);
-    let cut_intent = TakeoverCut::from_bits(takeover_cut.load(Ordering::Acquire));
-    (takeover, cut_intent)
+    let word = takeover_cut.load(Ordering::Acquire);
+    (takeover, TakeoverCut::from_bits(word), (word >> 2) as u32)
+}
+
+/// Names `arm_word` in `line_fired` as a line cut fires, before the cut
+/// acts, and reads the arm again. True when the arm still holds the word.
+/// The producer stores a withdrawal and then reads the word, with a fence
+/// between: see `LiveScalarDevice::clear_line_arm`. So the producer reads
+/// the word of each cut that acts. An arm that changed after the block read
+/// it does not fire.
+fn name_line_fire(arm_word: u64, line_arm: &AtomicU64, line_fired: &AtomicU64) -> bool {
+    line_fired.store(arm_word, Ordering::Release);
+    // Pairs with the fence in `LiveScalarDevice::clear_line_arm`.
+    std::sync::atomic::fence(Ordering::SeqCst);
+    line_arm.load(Ordering::Acquire) == arm_word
 }
 
 #[cfg(all(test, feature = "device-audio"))]
@@ -1292,12 +1388,14 @@ mod sample_lifetime_tests {
             let takeover = AtomicU64::new(0);
             let cut = AtomicU64::new(1);
             let line = AtomicU64::new(0);
+            let fired = AtomicU64::new(0);
             let stopped = AtomicBool::new(false);
             let flip = LiveFlipAtomics {
                 generation: &generation,
                 takeover_frame: &takeover,
                 takeover_cut: &cut,
                 line_arm: &line,
+                line_fired: &fired,
             };
             let ring = Ring::new(4);
             assert!(ring.push(event.clone()));
@@ -1315,7 +1413,7 @@ mod sample_lifetime_tests {
             if after_drain {
                 // Publication landed after this block's ring snapshot;
                 // its queued replacement is first drained next block.
-                live.adopt_flip(2, 0, TakeoverCut::AtFlip, frame, frontier);
+                live.adopt_flip(2, 0, TakeoverCut::AtFlip, 0, frame, frontier, &fired);
                 live.scalar.process_block(&mut output, BLOCK);
                 frame += BLOCK as u64;
             }
@@ -1803,20 +1901,34 @@ mod tests {
 
     /// The one flip body every site calls: it names the generation it
     /// replaces as the outgoing one (across a skipped generation too),
-    /// clears the line arm's latch, arms a rewind's cut, keeps a rewind's
-    /// arm across an edit's flip while its line is still ahead, and lands a
-    /// restart's floor where the caller says its first window is drained.
+    /// clears the line arm's latch and the word of the fired arm, arms a
+    /// rewind's cut, keeps a rewind's arm across an edit's flip while its
+    /// line is still ahead, and lands a restart's floor where the caller
+    /// says its first window is drained. The floor holds the restart lead
+    /// the cut word carries.
     #[test]
     fn adopt_flip_hands_over_in_one_place() {
         let mut live = LiveScalarBackend::new(48_000, 8).expect("live backend");
         live.generation = 1;
         live.line_arm_fired = true;
         live.line_arm_drop_from = Some(900);
+        // The word of the arm that fired at frame 900.
+        let fired = AtomicU64::new((900 << 2) | 0b11);
+        // A flip as the producer publishes it, with a restart lead of 480
+        // frames in the cut word above the cut.
+        let adopt =
+            |live: &mut LiveScalarBackend, generation, takeover, cut: TakeoverCut, start, floor| {
+                let word = AtomicU64::new(cut as u64 | (480 << 2));
+                let (takeover, cut, lead) = published_cutover(&AtomicU64::new(takeover), &word);
+                assert_eq!(lead, 480);
+                live.adopt_flip(generation, takeover, cut, lead, start, floor, &fired);
+            };
 
         // 1 -> 3: generation 2 never published.
-        live.adopt_flip(3, 10_000, TakeoverCut::AtTakeover, 1_024, 1_024);
+        adopt(&mut live, 3, 10_000, TakeoverCut::AtTakeover, 1_024, 1_024);
         assert_eq!(live.generation, 3);
         assert!(!live.line_arm_fired, "a flip lets the fired arm go");
+        assert_eq!(fired.load(Ordering::Acquire), 0, "and its word");
         assert_eq!(live.line_arm_drop_from, None);
         assert_eq!(
             live.scalar.armed_takeover_cut,
@@ -1827,34 +1939,35 @@ mod tests {
             live.takeover_cut_frame, None,
             "the countdown keeps its ring events"
         );
-        assert_eq!(live.restart_floor, Some((3, 1_024)));
+        assert_eq!(live.restart_floor, Some((3, 1_024, 480)));
 
         // An edit's flip inside the head-room keeps the line cut.
-        live.adopt_flip(4, 12_000, TakeoverCut::None, 2_048, 2_048);
+        adopt(&mut live, 4, 12_000, TakeoverCut::None, 2_048, 2_048);
         assert_eq!(live.generation, 4);
         assert_eq!(live.scalar.armed_takeover_cut, Some((10_000, 1)));
         assert_eq!(live.restart_floor, None, "an edit is not a restart");
 
         // At the line the arm has nothing left to do.
-        live.adopt_flip(5, 14_000, TakeoverCut::None, 10_000, 10_000);
+        adopt(&mut live, 5, 14_000, TakeoverCut::None, 10_000, 10_000);
         assert_eq!(live.scalar.armed_takeover_cut, None);
 
         // An immediate rewind seen after the drain: the cut is at this
         // block, the floor at the next one, where its events are drained.
-        live.adopt_flip(6, 16_000, TakeoverCut::AtFlip, 16_000, 16_128);
+        adopt(&mut live, 6, 16_000, TakeoverCut::AtFlip, 16_000, 16_128);
         assert_eq!(live.scalar.armed_takeover_cut, Some((16_000, 5)));
         assert_eq!(live.takeover_cut_frame, Some(16_000));
-        assert_eq!(live.restart_floor, Some((6, 16_128)));
+        assert_eq!(live.restart_floor, Some((6, 16_128, 480)));
     }
 
     const BLOCK: usize = 128;
 
-    /// The producer's side of the handshake, playing generation 1.
+    /// The words of the handshake, playing generation 1.
     struct Words {
         generation: AtomicU64,
         takeover: AtomicU64,
         cut: AtomicU64,
         line: AtomicU64,
+        fired: AtomicU64,
         stopped: AtomicBool,
     }
 
@@ -1865,6 +1978,7 @@ mod tests {
                 takeover: AtomicU64::new(0),
                 cut: AtomicU64::new(0),
                 line: AtomicU64::new(0),
+                fired: AtomicU64::new(0),
                 stopped: AtomicBool::new(false),
             }
         }
@@ -1881,6 +1995,7 @@ mod tests {
                 takeover_frame: &self.takeover,
                 takeover_cut: &self.cut,
                 line_arm: &self.line,
+                line_fired: &self.fired,
             }
         }
     }
@@ -1917,6 +2032,47 @@ mod tests {
         }
     }
 
+    /// A [`note`] of another sound.
+    fn other(onset_id: u64, generation: u64, target_frame: u64) -> crate::AudioEvent {
+        crate::AudioEvent {
+            freq_hz: 330.0,
+            ..note(onset_id, generation, target_frame)
+        }
+    }
+
+    /// The latency of the plugin chain of [`latent`], in frames.
+    const LEAD: u32 = 480;
+
+    /// The key of the plugin of [`latent`].
+    const LATENT_KEY: crate::insert::InsertKey = crate::insert::InsertKey {
+        plugin: 1,
+        preset: 0,
+    };
+
+    /// `event` through a plugin chain with a latency of [`LEAD`] frames. It
+    /// is aimed that lead before `musical`, its musical onset. In [`render`] a
+    /// copy serves the chain, so its voice starts that lead before its musical
+    /// onset.
+    fn latent(mut event: crate::AudioEvent, musical: u64) -> crate::AudioEvent {
+        let stage = crate::insert::InsertControls::new(LATENT_KEY).with_latency(LEAD);
+        event.controls.effects[0] = Some(stage);
+        event.controls.lead = LEAD;
+        event.target_frame = musical - u64::from(LEAD);
+        event
+    }
+
+    /// A copy that leaves its input as it is. The tests compare renders
+    /// through the same copy, so it needs no delay.
+    struct Through(crate::insert::InsertKey);
+
+    impl crate::insert::OrbitInsert for Through {
+        fn key(&self) -> crate::insert::InsertKey {
+            self.0
+        }
+        fn set_param(&mut self, _: crate::insert::InsertParam, _: u32) {}
+        fn process(&mut self, _: &mut [f32], _: &mut [f32]) {}
+    }
+
     /// Render `blocks` blocks from frame zero. `before_block` runs ahead of
     /// each one, as the producer does between two callbacks.
     fn render(
@@ -1939,6 +2095,10 @@ mod tests {
         let mut live = LiveScalarBackend::with_dispatch(48_000, voices, DspDispatch::portable())
             .expect("live backend");
         live.generation = 1;
+        // A copy serves the chain of `latent`, the chain of orbit 1.
+        let slot = crate::insert::effect_slot(1, 0);
+        let copy = Box::new(Through(LATENT_KEY));
+        assert!(live.scalar.install_insert(slot, copy).is_none());
         let mut pcm = vec![0.0; blocks * BLOCK * 2];
         let mut total = LiveBlockReport::default();
         for (index, output) in pcm.chunks_mut(BLOCK * 2).enumerate() {
@@ -2009,6 +2169,29 @@ mod tests {
             }
         });
         assert_eq!((report.stale, report.late, report.accepted), (0, 1, 1));
+
+        // An outgoing note of a plugin chain with latency is aimed its lead
+        // before its musical onset at 780, and its voice starts before the
+        // flip. The onset is past the takeover. The voice stands in for the
+        // copy of its onset with no chain, which is on time. An event of
+        // another sound on that frame sounds.
+        let once = {
+            let (ring, words) = (Ring::new(8), Words::new());
+            assert!(ring.push(latent(note(1, 1, 0), 780)));
+            assert!(ring.push(other(2, 1, 780)));
+            render(16, &ring, &words, |_| {}).0
+        };
+        let (ring, words) = (Ring::new(8), Words::new());
+        assert!(ring.push(latent(note(1, 1, 0), 780)));
+        let (handed_over, report) = render(16, &ring, &words, |block| {
+            if block == 3 {
+                words.publish(2, 512, TakeoverCut::None);
+                assert!(ring.push(other(2, 2, 780)));
+                assert!(ring.push(note(3, 2, 780)));
+            }
+        });
+        assert_eq!((report.stale, report.late, report.accepted), (1, 0, 2));
+        assert!(handed_over == once, "each sound plays once");
     }
 
     /// A slider that moves sends a requery again and again. Each one lands
@@ -2045,6 +2228,33 @@ mod tests {
         assert_eq!((report.late, report.refused), (0, 0));
         assert!(handed_over == once, "each onset sounds once");
         assert!(report.stale > 0, "test premise: copies arrive late");
+
+        // Two edits inside one lead. A note of a plugin chain with latency
+        // is aimed before both flips, and its musical onset at 780 is past
+        // both takeovers. Its voice stands in for the copy of its onset with
+        // no chain in each generation, also when the second edit changes the
+        // tempo and moves the onset to 880. An event of another sound on
+        // that frame sounds once.
+        let once = {
+            let (ring, words) = (Ring::new(8), Words::new());
+            assert!(ring.push(latent(note(1, 1, 0), 780)));
+            assert!(ring.push(other(2, 1, 880)));
+            render(16, &ring, &words, |_| {}).0
+        };
+        let (ring, words) = (Ring::new(8), Words::new());
+        assert!(ring.push(latent(note(1, 1, 0), 780)));
+        let (handed_over, report) = render(16, &ring, &words, |block| {
+            let (generation, takeover, onset) = match block {
+                3 => (2, 512, 780),
+                4 => (3, 640, 880),
+                _ => return,
+            };
+            words.publish(generation, takeover, TakeoverCut::None);
+            assert!(ring.push(other(2 * generation, generation, onset)));
+            assert!(ring.push(note(2 * generation + 1, generation, onset)));
+        });
+        assert_eq!((report.stale, report.late, report.accepted), (2, 0, 3));
+        assert!(handed_over == once, "each sound plays once");
     }
 
     /// A flip that names no takeover frame starts a new lifetime. Its
@@ -2088,32 +2298,41 @@ mod tests {
 
     /// Two flips can land in one block. The device then reads the copy of
     /// the first generation under the second one, and no voice is marked
-    /// for it. The started graph still plays that onset.
+    /// for it. The started graph still plays that onset. The same holds on
+    /// a lane of a plugin chain with latency.
     #[test]
     fn a_replaced_generation_does_not_sound_a_started_sbd_graph_again() {
-        let once = {
-            let (ring, words) = (Ring::new(8), Words::new());
-            assert!(ring.push(sbd(1, 1, 4_800)));
-            render(96, &ring, &words, |_| {}).0
-        };
-        // The device adopts generation 2 before generation 3, or it does not
-        // read generation 2 at all.
-        for adopts_both in [true, false] {
-            let (ring, words) = (Ring::new(8), Words::new());
-            assert!(ring.push(sbd(1, 1, 4_800)));
-            let (handed_over, report) = render(96, &ring, &words, |block| {
-                if block == 1 && adopts_both {
-                    words.publish(2, 384, TakeoverCut::None);
-                }
-                if block == 2 {
-                    words.publish(2, 384, TakeoverCut::None);
-                    assert!(ring.push(sbd(2, 2, 4_800)));
-                    // The hit is before this takeover: no third copy comes.
-                    words.publish(3, 4_800 + 960, TakeoverCut::None);
-                }
-            });
-            assert_eq!((report.stale, report.accepted), (1, 1));
-            assert!(handed_over == once, "the hit sounds once");
+        for latency in [false, true] {
+            // A hit of the lane with its musical onset on `musical`.
+            let hit = |onset_id, generation, musical| {
+                let hit = sbd(onset_id, generation, musical);
+                if latency { latent(hit, musical) } else { hit }
+            };
+            let once = {
+                let (ring, words) = (Ring::new(8), Words::new());
+                assert!(ring.push(hit(1, 1, 4_800)));
+                render(96, &ring, &words, |_| {}).0
+            };
+            // The device adopts generation 2 before generation 3, or it does
+            // not read generation 2 at all.
+            for adopts_both in [true, false] {
+                let (ring, words) = (Ring::new(8), Words::new());
+                assert!(ring.push(hit(1, 1, 4_800)));
+                let (handed_over, report) = render(96, &ring, &words, |block| {
+                    if block == 1 && adopts_both {
+                        words.publish(2, 384, TakeoverCut::None);
+                    }
+                    if block == 2 {
+                        words.publish(2, 384, TakeoverCut::None);
+                        assert!(ring.push(hit(2, 2, 4_800)));
+                        // The hit is before this takeover: no third copy
+                        // comes.
+                        words.publish(3, 4_800 + 960, TakeoverCut::None);
+                    }
+                });
+                assert_eq!((report.stale, report.accepted), (1, 1), "{latency}");
+                assert!(handed_over == once, "the hit sounds once: {latency}");
+            }
         }
     }
 
@@ -2134,26 +2353,35 @@ mod tests {
 
     /// An SBD graph one frame before the takeover frame has started. The copy
     /// on the takeover frame is left out. A copy one frame later is another
-    /// hit and sounds.
+    /// hit and sounds. On a lane of a plugin chain with latency, the frames
+    /// are musical onsets.
     #[test]
     fn a_takeover_leaves_out_the_copy_one_frame_after_a_started_sbd_graph() {
         const TAKEOVER: u64 = 4_800;
-        let once = {
-            let (ring, words) = (Ring::new(8), Words::new());
-            assert!(ring.push(sbd(1, 1, TAKEOVER - 1)));
-            render(96, &ring, &words, |_| {}).0
-        };
-        for (copy_frame, stale, accepted) in [(TAKEOVER, 1, 1), (TAKEOVER + 1, 0, 2)] {
-            let (ring, words) = (Ring::new(8), Words::new());
-            assert!(ring.push(sbd(1, 1, TAKEOVER - 1)));
-            let (handed_over, report) = render(96, &ring, &words, |block| {
-                if block == 1 {
-                    words.publish(2, TAKEOVER, TakeoverCut::None);
-                    assert!(ring.push(sbd(2, 2, copy_frame)));
-                }
-            });
-            assert_eq!((report.stale, report.accepted), (stale, accepted));
-            assert_eq!(handed_over == once, stale == 1, "copy at {copy_frame}");
+        for latency in [false, true] {
+            // A hit of the lane with its musical onset on `musical`.
+            let hit = |onset_id, generation, musical| {
+                let hit = sbd(onset_id, generation, musical);
+                if latency { latent(hit, musical) } else { hit }
+            };
+            let once = {
+                let (ring, words) = (Ring::new(8), Words::new());
+                assert!(ring.push(hit(1, 1, TAKEOVER - 1)));
+                render(96, &ring, &words, |_| {}).0
+            };
+            for (copy_frame, stale, accepted) in [(TAKEOVER, 1, 1), (TAKEOVER + 1, 0, 2)] {
+                let (ring, words) = (Ring::new(8), Words::new());
+                assert!(ring.push(hit(1, 1, TAKEOVER - 1)));
+                let (handed_over, report) = render(96, &ring, &words, |block| {
+                    if block == 1 {
+                        words.publish(2, TAKEOVER, TakeoverCut::None);
+                        assert!(ring.push(hit(2, 2, copy_frame)));
+                    }
+                });
+                assert_eq!((report.stale, report.accepted), (stale, accepted));
+                let what = format!("copy at {copy_frame}, {latency}");
+                assert_eq!(handed_over == once, stale == 1, "{what}");
+            }
         }
     }
 
@@ -2180,39 +2408,159 @@ mod tests {
     /// A rewind cuts the outgoing voices on its line. An outgoing SBD graph
     /// that has started for a hit on the line is cut where its source
     /// starts, so it cannot stand in for the first hit of the restarted loop.
+    /// The same holds on a lane of a plugin chain with latency, whose hits
+    /// start that latency before their musical onset.
     #[test]
     fn a_rewind_sounds_its_own_sbd_hit_on_the_line() {
         const LINE: u64 = 4_800;
-        let (ring, words) = (Ring::new(8), Words::new());
-        assert!(ring.push(sbd(1, 1, LINE)));
-        let (pcm, report) = render(96, &ring, &words, |block| {
-            // The outgoing graph has run since frame 0.
-            if block == 1 {
-                words.publish(2, LINE, TakeoverCut::AtTakeover);
-                assert!(ring.push(sbd(2, 2, LINE)));
-            }
-        });
-        assert_eq!((report.stale, report.accepted), (0, 2));
-        // 20 ms after the line the cut's 10 ms ramp has ended.
-        let after_ramp = (LINE as usize + 960) * 2;
-        assert!(pcm[after_ramp..].iter().any(|sample| sample.abs() > 1e-2));
+        for latency in [false, true] {
+            // A hit of the lane with its musical onset on `musical`.
+            let hit = |onset_id, generation, musical| {
+                let hit = sbd(onset_id, generation, musical);
+                if latency { latent(hit, musical) } else { hit }
+            };
+            let (ring, words) = (Ring::new(8), Words::new());
+            assert!(ring.push(hit(1, 1, LINE)));
+            let (pcm, report) = render(96, &ring, &words, |block| {
+                // The outgoing graph has run since frame 0.
+                if block == 1 {
+                    words.publish(2, LINE, TakeoverCut::AtTakeover);
+                    assert!(ring.push(hit(2, 2, LINE)));
+                }
+            });
+            assert_eq!((report.stale, report.accepted), (0, 2), "{latency}");
+            // 20 ms after the line the cut's 10 ms ramp has ended.
+            let after_ramp = (LINE as usize + 960) * 2;
+            assert!(pcm[after_ramp..].iter().any(|sample| sample.abs() > 1e-2));
 
-        // A control requery lands before the line. The graph of the
-        // restarted loop takes its copy, and the cut graph takes no event.
-        let (ring, words) = (Ring::new(8), Words::new());
-        assert!(ring.push(sbd(1, 1, LINE)));
-        let (_, report) = render(8, &ring, &words, |block| {
-            if block == 1 {
-                words.publish(2, LINE, TakeoverCut::AtTakeover);
-                assert!(ring.push(sbd(2, 2, LINE)));
+            // A control requery lands before the line. The graph of the
+            // restarted loop takes its copy, and the cut graph takes no
+            // event.
+            let (ring, words) = (Ring::new(8), Words::new());
+            assert!(ring.push(hit(1, 1, LINE)));
+            let (_, report) = render(8, &ring, &words, |block| {
+                if block == 1 {
+                    words.publish(2, LINE, TakeoverCut::AtTakeover);
+                    assert!(ring.push(hit(2, 2, LINE)));
+                }
+                if block == 2 {
+                    words.publish(3, 1_024, TakeoverCut::None);
+                    assert!(ring.push(hit(3, 3, LINE)));
+                    assert!(ring.push(hit(4, 3, LINE + 300)));
+                }
+            });
+            assert_eq!((report.stale, report.accepted), (1, 3), "{latency}");
+        }
+    }
+
+    /// A note of a plugin chain with latency starts its lead before its
+    /// output. So a line cut fires that lead before its line: the restart
+    /// lead of the newest cutover, or the output lead of the newest note of
+    /// a chain when that is larger. The cut names its word as it fires,
+    /// before the block renders. A withdrawal of the arm keeps the word, and
+    /// a flip clears it. An arm that changed after the block read it does
+    /// not fire.
+    #[test]
+    fn a_line_cut_fires_the_lead_of_the_chains_before_its_line() {
+        use crate::insert::{InsertKey, InsertParam, OrbitInsert};
+        use std::sync::Arc;
+        // A copy that keeps the fired word it reads as it renders.
+        struct Pass {
+            key: InsertKey,
+            fired: Arc<AtomicU64>,
+            seen: Arc<AtomicU64>,
+        }
+        impl OrbitInsert for Pass {
+            fn key(&self) -> InsertKey {
+                self.key
             }
-            if block == 2 {
-                words.publish(3, 1_024, TakeoverCut::None);
-                assert!(ring.push(sbd(3, 3, LINE)));
-                assert!(ring.push(sbd(4, 3, LINE + 300)));
+            fn set_param(&mut self, _: InsertParam, _: u32) {}
+            fn process(&mut self, _: &mut [f32], _: &mut [f32]) {
+                let fired = self.fired.load(Ordering::Acquire);
+                self.seen.store(fired, Ordering::Release);
             }
-        });
-        assert_eq!((report.stale, report.accepted), (1, 3));
+        }
+        const LINE: u64 = 8_192;
+        const WORD: u64 = (LINE << 2) | 0b11;
+        // The restart lead in the cut word, whether a copy serves a chain
+        // with an output lead of LEAD, and the first frame of the block the
+        // arm fires in.
+        for (restart_lead, served, fired_from) in
+            [(0, false, 8_192), (1_000, false, 7_168), (0, true, 7_680)]
+        {
+            let mut live = LiveScalarBackend::new(48_000, 8).expect("live backend");
+            live.generation = 1;
+            let (ring, words) = (Ring::new(8), Words::new());
+            words.cut.store(restart_lead << 2, Ordering::Release);
+            // The block writes the fired word, and the copy reads it.
+            let fired = Arc::new(AtomicU64::new(0));
+            let seen = Arc::new(AtomicU64::new(0));
+            let flip = LiveFlipAtomics {
+                line_fired: &fired,
+                ..words.flip()
+            };
+            if served {
+                let key = InsertKey {
+                    plugin: 1,
+                    preset: 0,
+                };
+                let pass = Pass {
+                    key,
+                    fired: Arc::clone(&fired),
+                    seen: Arc::clone(&seen),
+                };
+                let slot = crate::insert::effect_slot(9, 0);
+                assert!(live.scalar.install_insert(slot, Box::new(pass)).is_none());
+                // The copy has the key the chain of `latent` asks for. The
+                // note sounds through the block the arm fires in.
+                let mut event = latent(note(1, 1, 0), 4_000);
+                event.controls.insert_chain = Some(9);
+                event.duration_secs = 1.0;
+                assert!(ring.push(event));
+            }
+            words.line.store(WORD, Ordering::Release);
+            let mut fired_at = None;
+            for block in 0..70 {
+                let start = block * BLOCK as u64;
+                let mut output = [0.0; BLOCK * 2];
+                let stopped = &words.stopped;
+                live.process_block_with(&mut output, BLOCK, start, &ring, flip, stopped);
+                if live.line_arm_fired && fired_at.is_none() {
+                    fired_at = Some(start);
+                    assert_eq!(
+                        fired.load(Ordering::Acquire),
+                        WORD,
+                        "the fire names its word"
+                    );
+                    if served {
+                        let seen = seen.load(Ordering::Acquire);
+                        assert_eq!(seen, WORD, "the copy renders after the word goes out");
+                    }
+                }
+            }
+            assert_eq!(
+                fired_at,
+                Some(fired_from),
+                "restart lead {restart_lead}, served {served}"
+            );
+            // A withdrawal keeps the word, and a flip clears it.
+            words.line.store(LINE_ARM_WITHDRAWN, Ordering::Release);
+            let mut output = [0.0; BLOCK * 2];
+            let start = 70 * BLOCK as u64;
+            live.process_block_with(&mut output, BLOCK, start, &ring, flip, &words.stopped);
+            assert!(!live.line_arm_fired);
+            assert_eq!(fired.load(Ordering::Acquire), WORD);
+            words.publish(2, start, TakeoverCut::None);
+            let start = start + BLOCK as u64;
+            live.process_block_with(&mut output, BLOCK, start, &ring, flip, &words.stopped);
+            assert_eq!(fired.load(Ordering::Acquire), 0);
+        }
+        // An arm that changes after the block read it does not fire. The
+        // word still names it, so the producer that withdrew the arm refills.
+        let (arm, fired) = (AtomicU64::new(LINE_ARM_WITHDRAWN), AtomicU64::new(0));
+        assert!(!name_line_fire(WORD, &arm, &fired));
+        assert_eq!(fired.load(Ordering::Acquire), WORD);
+        assert!(name_line_fire(WORD, &AtomicU64::new(WORD), &fired));
     }
 }
 
@@ -2457,8 +2805,9 @@ mod kabel_program_lifetime_tests {
         let mut live = LiveScalarBackend::new(1000, 4).unwrap();
         live.generation = 1;
         let code = program(1);
-        let (generation, takeover, cut, arm) = (
+        let (generation, takeover, cut, arm, fired) = (
             AtomicU64::new(1),
+            AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
@@ -2468,6 +2817,7 @@ mod kabel_program_lifetime_tests {
             takeover_frame: &takeover,
             takeover_cut: &cut,
             line_arm: &arm,
+            line_fired: &fired,
         };
         let stopped = AtomicBool::new(false);
         let mut output = [0.0; 128];
@@ -2520,8 +2870,9 @@ mod kabel_program_lifetime_tests {
                 })
                 .is_ok()
         );
-        let (generation, takeover, cut, arm) = (
+        let (generation, takeover, cut, arm, fired) = (
             AtomicU64::new(1),
+            AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
@@ -2531,6 +2882,7 @@ mod kabel_program_lifetime_tests {
             takeover_frame: &takeover,
             takeover_cut: &cut,
             line_arm: &arm,
+            line_fired: &fired,
         };
         let stopped = AtomicBool::new(false);
         let mut output = [0.0; 128];

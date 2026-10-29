@@ -631,10 +631,16 @@ impl Session {
     /// the newest window's cycle when the code joins the running timeline,
     /// and 0 when its score starts from its own first cycle. That is after
     /// a stop, before a restart, and for a reload that starts from zero.
+    /// A launch on a line fires the lead of the plugin chains earlier, so it
+    /// reads that much later: see [`Self::takeover_headroom`]. An edit reads
+    /// the newest window's cycle.
     fn evaluation_cycle(&self) -> f64 {
         match self.newest_window {
             Some((cycle, stops)) if !self.next_from_zero && stops == self.transport.stops() => {
-                cycle
+                match self.takeover_override {
+                    Some(_) => cycle + self.takeover_headroom() * self.scheduler.cps(),
+                    None => cycle,
+                }
             }
             _ => 0.0,
         }
@@ -988,7 +994,12 @@ impl Session {
                 earliest_now
             }
             _ => {
-                Self::validate_live_score_clock("install", sampled_now)?;
+                // A refused clock makes no commit. The plan lead of the seam
+                // goes, so no later commit takes it.
+                if let Err(error) = Self::validate_live_score_clock("install", sampled_now) {
+                    self.take_plan_lead();
+                    return Err(error);
+                }
                 sampled_now
             }
         };
@@ -1091,6 +1102,8 @@ impl Session {
         // deliberately has no replayable source but still needs continuous
         // phase and last-good query protection on the next live replacement.
         let replacing_active = !restart_transport && self.generation() != 0;
+        #[cfg(feature = "vst")]
+        let first_score = self.generation() == 0;
         // The cycle at `now` uses the old mapping, and the margin is in
         // seconds. A save ends its window on the old tempo (see
         // `replace_pattern_continued`). A quantised launch puts its cursor
@@ -1105,22 +1118,38 @@ impl Session {
         } else {
             margin
         };
+        // The notes of a plugin chain with latency start the lead of their
+        // chain early: see `Session::plugin_lead`. So the takeover waits the
+        // lead of the score in play, or of the plan of the candidate when
+        // that is larger. The outgoing notes before the takeover keep their
+        // sound, and the incoming notes after it have room for their lead.
+        // An edit adds the lead only inside the cover of the score in play:
+        // nothing of that score is queued past its cover. A commit with no
+        // seam has no plan.
+        let plan_lead = self.take_plan_lead();
+        let lead = self.plugin_lead().max(plan_lead.unwrap_or(0.0));
+        let room = self.scheduler.horizon_remaining(now) - minimum_margin;
+        let added = lead.min(room.max(0.0));
         let continuity = (replacing_active && !self.transport.is_stopped())
             .then(|| self.scheduler.cycle_at_time(now));
         let from_zero = std::mem::take(&mut self.next_from_zero);
         // The takeover instant. A quantised rewind takes over exactly on its
         // line: the consumer's pre-armed cut sounds there, and a margin
         // after the line would replay the beat the line already had. An
-        // immediate rewind takes over at the edit instant: its cut rides
-        // the consumer's flip, so a margin ahead would leave silence
-        // between the cut and the first beat. Either can be behind the
-        // clock when the producer publishes (always, for the immediate
-        // one). The producer then slides cycle zero, the takeover and the
-        // cut to its own clock (`slide_pending_rewind_anchor`), and the
-        // consumer's restart floor sounds the residue whole. Rendered
-        // frames never change: the cut retires what sounds under them. An
-        // ordinary replacement, and a launch that does not rewind, keep
-        // the margin floor.
+        // immediate rewind takes over at the edit instant plus the whole
+        // lead of the plugin chains. Its cut rides the consumer's flip, so a
+        // margin ahead would leave silence between the cut and the first
+        // beat. The cut ends the outgoing score, so no cover has to reach
+        // the takeover. Either is at times behind the clock, or nearer to it
+        // than the lead, when the producer publishes (always, for the
+        // immediate one). The producer then slides cycle zero to its own
+        // clock plus the lead (`slide_pending_rewind_anchor`). The
+        // consumer's restart floor sounds the residue whole. The takeover
+        // slides with cycle zero, and the cut moves to the consumer's flip.
+        // A line still ahead keeps both: its countdown plays to the line.
+        // Rendered frames never change: the cut retires what sounds under
+        // them. An ordinary replacement, and a launch that does not rewind,
+        // keep the margin floor and the lead it adds.
         let takeover_time = match (continuity.is_some(), takeover_override) {
             // Only a REWIND may take its line in the rendered past: its cut
             // (pre-armed at the line, or the flip's) retires what sounds, so
@@ -1131,9 +1160,9 @@ impl Session {
             // keeps the margin floor, or an evaluation that outlasted the
             // head-room published into the past and was refused and rolled
             // back - the launch lost instead of landing late.
-            (true, Some(line)) if line.is_finite() => line.max(now + minimum_margin),
-            (true, None) if from_zero => now,
-            _ => now + minimum_margin,
+            (true, Some(line)) if line.is_finite() => line.max(now + minimum_margin + added),
+            (true, None) if from_zero => now + lead,
+            _ => now + minimum_margin + added,
         };
         // A from-zero reload silences the outgoing rendition. The shape
         // rides the takeover: the consumer cannot tell a rewind's flip from
@@ -1157,7 +1186,7 @@ impl Session {
             TakeoverCut::None => None,
             TakeoverCut::AtFlip | TakeoverCut::AtTakeover => Some(match takeover_override {
                 Some(line) if line.is_finite() => line,
-                _ => now,
+                _ => now + lead,
             }),
         };
         let requery_takeover_time = continuity.is_some().then_some(takeover_time);
@@ -1331,6 +1360,10 @@ impl Session {
         self.requery_takeover_cut = takeover_cut;
         self.requery_anchor_time = requery_anchor_time;
         self.requery_takeover_time = requery_takeover_time;
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        {
+            self.takeover_added = added;
+        }
         if let Some(cycle_now) = continuity {
             if from_zero {
                 // The takeover instant becomes cycle zero, and the query
@@ -1338,23 +1371,24 @@ impl Session {
                 // score's first cycle.
                 //
                 // The anchor is the musical instant (a quantised launch's
-                // line, or an immediate restart's edit instant), not a
-                // margin ahead of the edit. The consumer cuts the outgoing
-                // rendition at the flip (or the pre-armed line), so an
-                // anchor a margin late would leave silence between the cut
-                // and the first beat.
+                // line, or an immediate restart's edit instant plus the lead
+                // of the plugin chains), not a margin ahead of the edit. The
+                // consumer cuts the outgoing rendition at the flip (or the
+                // pre-armed line), so an anchor a margin late would leave
+                // silence between the cut and the first beat.
                 // An anchor the clock has passed by the time the producer
                 // reaches it (the immediate restart always, a launch whose
                 // evaluation outlasted its line, any restart held for a
-                // loading sample) is slid to the producer's clock before its
-                // first window is queried (`slide_pending_rewind_anchor`),
-                // so the downbeat is aimed where it can still sound; the few
-                // milliseconds of query and publication after that are the
-                // consumer's to absorb, and its restart floor admits those
-                // first onsets whole at the flip rather than partway in.
+                // loading sample) is slid to the producer's clock plus the
+                // lead of the plugin chains before its first window is
+                // queried (`slide_pending_rewind_anchor`), so the downbeat is
+                // aimed where it can still sound. The few milliseconds of
+                // query and publication after that are the consumer's to
+                // absorb, and its restart floor admits those first onsets
+                // whole at the flip rather than partway in.
                 let anchor = match takeover_override {
                     Some(line) if line.is_finite() => line,
-                    _ => now,
+                    _ => now + lead,
                 };
                 self.scheduler.rebase_start_anchor(anchor);
             } else if overlap_cycle.is_none() {
@@ -1404,7 +1438,9 @@ impl Session {
         // the chains of this session get them: a chain of a lane that left
         // ends after its time, at once with no live output. A lane that left
         // keeps its number while a chain has it. The looks at the plugin
-        // copies of the cycles ahead start again with the new score.
+        // copies of the cycles ahead start again with the new score. The
+        // lead of the plan is the lead of the plugin chains in play now, and
+        // a first score starts with no lead.
         #[cfg(feature = "vst")]
         {
             self.lanes.install(source);
@@ -1413,6 +1449,11 @@ impl Session {
             crate::vst::forget_lanes_away(&self.chains, &mut self.lanes);
             #[cfg(feature = "device-audio")]
             self.plugin_ahead.restart();
+            match plan_lead {
+                Some(lead) => self.set_plugin_leads(lead),
+                None if first_score => self.set_plugin_leads(0.0),
+                None => {}
+            }
         }
         Ok(())
     }
@@ -2059,15 +2100,21 @@ impl Session {
 
     /// Rebase the running transport so cycle zero is at `now`, without
     /// re-evaluating. Used when the device clock becomes available after score
-    /// evaluation.
+    /// evaluation. Cycle zero comes the lead of the plugin chains later, so
+    /// the first notes of a chain with latency have room for their lead: see
+    /// [`Self::plugin_lead`].
     pub fn restart_transport_at(&mut self, now: f64) {
         // A held note/key from the preceding transport lifetime must not turn
         // into a stuck gate when the same graph starts again. Continuous live
         // reloads deliberately keep current controller state; an explicit
         // restart is the reset boundary.
         self.js.midi_input_bus().clear_keys();
-        self.scheduler.rebase_start_anchor(now);
+        self.scheduler.rebase_start_anchor(now + self.plugin_lead());
         self.newest_window = None;
+        // The cover and the restart lead follow the lead of this start: a
+        // Stop ended the lead before it, or a look of the start raised it.
+        #[cfg(feature = "vst")]
+        self.plugin_lead_changed();
         // Nothing has sounded on the new timeline, so recovery and rollback
         // must not return to the previous performance's score. The device
         // also holds no latency-compensated event of that score.
@@ -2082,9 +2129,13 @@ impl Session {
     /// Finish an already-started transport after its preparation.
     /// Preserve both newly received MIDI keys and the explicit cycle-zero
     /// boundary; an outside-clock `retime` deliberately releases that boundary.
+    /// Cycle zero comes the lead of the plugin chains after `now`, as in
+    /// [`Self::restart_transport_at`].
     pub fn finish_transport_start_at(&mut self, now: f64) {
-        self.scheduler.rebase_anchor(now, 0.0);
+        self.scheduler.rebase_anchor(now + self.plugin_lead(), 0.0);
         self.newest_window = None;
+        #[cfg(feature = "vst")]
+        self.plugin_lead_changed();
         #[cfg(feature = "device-audio")]
         {
             self.compensated_onsets.clear();
@@ -3970,6 +4021,19 @@ endin`";
         );
         assert_eq!(session.scheduler.cps(), 1.0);
         assert_eq!(active_values(&session), ["e4"]);
+        // A refused install clock makes no commit, and leaves no plan lead
+        // of its seam to a later commit.
+        session
+            .evaluate_live_score_cancellable(
+                "g4",
+                true,
+                Duration::from_millis(1),
+                &cancellation,
+                || f64::NAN,
+            )
+            .expect_err("a refused install clock");
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        assert_eq!(session.plan_lead, None);
     }
 
     #[test]
@@ -4375,21 +4439,57 @@ endin`";
     }
 
     /// With no grid the next cycle plays: an edit at 37.3 fires at 38, the
-    /// cycle a player waits for when nothing larger was asked for.
+    /// cycle a player waits for when nothing larger was asked for. With a
+    /// lead of the plugin chains of 0.8 s, an edit still reads the cycle of
+    /// the newest window: the edit at 37.3 plays cycle 38, and a second edit
+    /// at 37.5 plays it one time.
     #[cfg(feature = "extensions")]
     #[test]
     fn a_bare_oneshot_plays_on_the_next_cycle() {
+        #[cfg(feature = "vst")]
+        let leads = [0.0, 0.8];
+        #[cfg(not(feature = "vst"))]
+        let leads = [0.0];
+        for lead in leads {
+            let mut session = Session::new().expect("session");
+            session
+                .evaluate("setcps(1); $: s('riser').oneshot()")
+                .expect("start");
+            assert_eq!(onsets(&session), [0.0], "a start");
+
+            run_clock(&mut session, 0.0, 37.3);
+            #[cfg(feature = "vst")]
+            session.set_plugin_lead_for_test(lead);
+            session
+                .reload_at("setcps(1); $: s('riser').oneshot()", false, 37.3)
+                .expect("edit");
+            assert_eq!(onsets(&session), [38.0], "an edit, a lead of {lead}");
+            run_clock(&mut session, 37.3, 37.5);
+            session
+                .reload_at("setcps(1); $: s('riser').oneshot()", false, 37.5)
+                .expect("second edit");
+            assert_eq!(onsets(&session), [38.0], "a second edit, a lead of {lead}");
+        }
+    }
+
+    /// A launch fires its head-room before its line, and the lead of the
+    /// plugin chains makes the head-room 0.8 s longer. `getTime()` reads that
+    /// much later for a launch, so its oneshot plays on its line: a launch
+    /// queries nothing before its line.
+    #[cfg(all(feature = "extensions", feature = "vst"))]
+    #[test]
+    fn a_launch_whose_head_room_grew_plays_its_oneshot_on_its_line() {
         let mut session = Session::new().expect("session");
         session
             .evaluate("setcps(1); $: s('riser').oneshot()")
             .expect("start");
-        assert_eq!(onsets(&session), [0.0], "a start");
-
-        run_clock(&mut session, 0.0, 37.3);
+        run_clock(&mut session, 0.0, 37.0);
+        session.set_plugin_lead_for_test(0.8);
+        session.set_next_takeover_time(38.0);
         session
-            .reload_at("setcps(1); $: s('riser').oneshot()", false, 37.3)
-            .expect("edit");
-        assert_eq!(onsets(&session), [38.0], "an edit");
+            .reload_at("setcps(1); $: s('riser').oneshot()", false, 37.0)
+            .expect("launch");
+        assert_eq!(onsets(&session), [38.0], "a launch");
     }
 
     /// A restart whose candidate fails leaves the timeline running, and

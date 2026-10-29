@@ -516,8 +516,13 @@ impl StudioEngine {
     /// Follow what a start's first window plays, and hold its cycle zero
     /// for it in [`LoadMode::Wait`]. The plugin copies of the window hold
     /// the start too. In [`LoadMode::Async`] the start waits a short time
-    /// for the copies a close sent home: see [`Self::start_returns`].
-    pub(super) fn follow_start(&mut self, source: &str) -> Result<(), RuntimeError> {
+    /// for the copies a close sent home: see [`Self::start_returns`]. It
+    /// also looks at the copies of the window, for the lead of their plugin
+    /// chains alone: cycle zero comes that lead later, so the first notes of
+    /// a chain with latency have room for it. See
+    /// [`rustel_runtime::Session::plugin_lead`]. A `mini` text, or a text of
+    /// a set with no plugin, asks the plugin host nothing.
+    pub(super) fn follow_start(&mut self, source: &str, mini: bool) -> Result<(), RuntimeError> {
         self.load.installed = self.followed_in_first_window(source)?;
         #[cfg(feature = "vst")]
         {
@@ -526,10 +531,24 @@ impl StudioEngine {
             self.load.start_returning = None;
             if self.waits_for_sounds() {
                 self.look_at_start_copies()?;
-            } else if self.session.plugins_returning() > 0 {
-                self.load.start_returning = Some(Instant::now());
+            } else {
+                if self.session.plugins_returning() > 0 {
+                    self.load.start_returning = Some(Instant::now());
+                }
+                if self.plays_plugins(source, mini) {
+                    let now = self.device_time();
+                    self.session.with_panic_recovery(now, |session| {
+                        Ok(session.plugins_pending(
+                            0.0,
+                            FIRST_WINDOW_CYCLES,
+                            STARTUP_SAMPLE_WARM_BUDGET,
+                        ))
+                    })?;
+                }
             }
         }
+        #[cfg(not(feature = "vst"))]
+        let _ = mini;
         self.load.start_held = self.waits_for_sounds()
             && (self.loading_among(&self.load.installed) || self.load.start_plugins > 0);
         Ok(())
@@ -602,7 +621,10 @@ impl StudioEngine {
 
     /// Replace a held start with `source`, from its own cycle zero and
     /// waiting for its own first window. A score that fails to evaluate
-    /// leaves the held start as it was.
+    /// leaves the held start as it was. The lead of the held text ends. When
+    /// the look of its first window raises the lead of the plugin chains,
+    /// cycle zero moves by that lead: see
+    /// [`rustel_runtime::Session::plugin_lead`].
     pub(super) fn replace_held_start(
         &mut self,
         source: &str,
@@ -621,6 +643,10 @@ impl StudioEngine {
         let generation =
             self.session
                 .reload_at_cancellable(source, mini, now, transport.stopped_flag())?;
+        // The held text never sounded, so its lead does not count. The look
+        // of the first window of `source` gives the lead again.
+        #[cfg(feature = "vst")]
+        self.session.end_plugin_leads();
         let live = self.live.as_mut().expect("a held start is live");
         let anchor = live.device.clock_seconds()
             + live.device.schedule_lead_seconds()
@@ -632,7 +658,11 @@ impl StudioEngine {
         live.audition_owned = false;
         self.warm_source(source, STARTUP_SAMPLE_WARM_BUDGET)?;
         self.note_install_for_played(generation, mark.preview, source);
-        self.follow_start(source)?;
+        self.follow_start(source, mini)?;
+        #[cfg(feature = "vst")]
+        if self.session.plugin_lead() > 0.0 {
+            self.session.finish_transport_start_at(anchor);
+        }
         Ok(StudioInstall {
             generation,
             source_revision: source_revision(source),
@@ -1144,7 +1174,9 @@ pub(super) mod tests {
         }
 
         /// Async: the start plays at once, the loading kick is skipped, and
-        /// its lateness is said once, in one line, when the load is over.
+        /// its lateness is said once, in one line, when the load is over. On
+        /// an output with plugins, a start of a text with no plugin makes no
+        /// look at the plugin copies. A text with `vst` makes one.
         #[test]
         fn an_async_start_plays_at_once_and_says_the_late_sound_once() {
             let library = loading_kick();
@@ -1174,6 +1206,27 @@ pub(super) mod tests {
                         == Some(DiagnosticAlert::Resolve(key.clone()))),
                 "and resolves it, its sounds being in"
             );
+
+            // On an output with plugins, the start of a text with no plugin
+            // makes no look at the plugin copies of its first window. A text
+            // with `vst` makes one, for the lead of its plugin chains.
+            #[cfg(feature = "vst")]
+            for (source, looks) in [("s(\"sine\")", false), ("// vst\ns(\"sine\")", true)] {
+                let mut engine = studio(LoadMode::Async, &library);
+                engine.session.transport().start();
+                let device = LiveScalarDevice::start_silent(48_000, engine.generation())
+                    .expect("silent output");
+                engine.session.attach_instruments(&device);
+                engine
+                    .session
+                    .bind_audio_confirmations(device.confirmations())
+                    .expect("bind the silent output");
+                let install = engine
+                    .start_on(device, source, false, false)
+                    .expect("the start");
+                let look = looks.then_some(install.generation);
+                assert_eq!(engine.session.plugin_look_for_test(), look, "{source}");
+            }
         }
 
         /// A rewind whose first window waits whole for its sound skips nothing:
@@ -1971,7 +2024,11 @@ $: s("supersaw").seg(16)"#;
 
         /// An update with a mistake sent while a start waits leaves the held
         /// start exactly as it was; a good one replaces it from its own cycle
-        /// zero and waits for its own first window.
+        /// zero and waits for its own first window. An update through a
+        /// plugin chain with latency whose copy is ready goes on at once, and
+        /// its cycle zero comes that latency after its anchor. An update with
+        /// no plugin that replaces a held start through such a chain has its
+        /// cycle zero on its anchor.
         #[test]
         fn an_update_during_a_held_start_replaces_it_only_if_it_evaluates() {
             let library = loading_kick();
@@ -2001,6 +2058,66 @@ $: s("supersaw").seg(16)"#;
                 engine.played_by_text.contains(&kick)
             });
             assert!(engine.session.cycle_at_time(arrived) < 0.0);
+
+            // The Delay preset of the fixture has 480 frames. A start played
+            // its copy before a Stop, so the copy is ready.
+            #[cfg(feature = "vst")]
+            {
+                let (_plugins, folder) = fixture_plugins();
+                let presets = folder.path().join("presets");
+                let delay = rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.1171875);
+                let file = presets
+                    .join(rustel_vst3_fixture::NAME)
+                    .join("Delay.vstpreset");
+                std::fs::write(file, delay).expect("preset");
+                let host = rustel_runtime::vst::host();
+                host.set_preset_folder(presets);
+                host.presets(rustel_vst3_fixture::NAME);
+                host.wait_idle();
+                let library = loading_kick();
+                let mut engine = studio(LoadMode::Wait, &library);
+                let update =
+                    r#"$: note("c3").s("sine").vst("rustel fixture", { preset: "Delay" })"#;
+                start_with_plugins(&mut engine, update);
+                engine.stop(Duration::ZERO).expect("stop");
+                let anchor_of = |engine: &StudioEngine| {
+                    let device = &engine.live.as_ref().expect("playing").device;
+                    device.clock_seconds()
+                        + device.schedule_lead_seconds()
+                        + engine.config.start_preroll.as_secs_f64()
+                };
+                // A held start through the Delay, its kick loading, and an
+                // update with no plugin. The held text never sounded, so its
+                // lead does not count: cycle zero is on the anchor.
+                start(&mut engine, &format!("{update}\n$: s(\"kick\")"));
+                assert!(engine.start_is_held());
+                assert!(
+                    engine.session.plugin_lead() > 0.0,
+                    "the look of the held start"
+                );
+                tests::hold_clock(&engine, true);
+                let anchor = anchor_of(&engine);
+                engine
+                    .evaluate("s(\"kick\")", false)
+                    .expect("an update with no plugin");
+                assert!(engine.start_is_held(), "it waits for its kick");
+                assert_eq!(engine.session.plugin_lead(), 0.0);
+                let zero = engine.session.cycle_at_time(anchor);
+                assert!(zero.abs() < 1e-9, "cycle zero on its anchor: {zero}");
+                tests::hold_clock(&engine, false);
+                library.finish_loading_sample_for_test();
+                // The held start of the kick that the update left, its kick
+                // loaded, and an update through the Delay.
+                tests::hold_clock(&engine, true);
+                let anchor = anchor_of(&engine);
+                engine.evaluate(update, false).expect("the update");
+                assert!(!engine.start_is_held(), "the update goes on at once");
+                let zero = engine.session.cycle_at_time(anchor + 480.0 / 48_000.0);
+                assert!(zero.abs() < 1e-9, "cycle zero 480 frames after: {zero}");
+                tests::hold_clock(&engine, false);
+                drop(engine);
+                rustel_runtime::vst::pin_standard_folders(Vec::new());
+            }
         }
 
         /// A slider moved while a start waits is part of the running score, its

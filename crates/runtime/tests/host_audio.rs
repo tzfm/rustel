@@ -58,12 +58,14 @@ fn a_custom_host_can_schedule_and_render_audio() {
             let takeover_frame = AtomicU64::new(0);
             let takeover_cut = AtomicU64::new(0);
             let line_arm = AtomicU64::new(0);
+            let line_fired = AtomicU64::new(0);
             let stopped = AtomicBool::new(false);
             let flip = LiveFlipAtomics {
                 generation: &generation,
                 takeover_frame: &takeover_frame,
                 takeover_cut: &takeover_cut,
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             };
             let mut backend = LiveScalarBackend::new(sample_rate, 16).expect("host DSP");
             let mut output = [0.0; 512 * 2];

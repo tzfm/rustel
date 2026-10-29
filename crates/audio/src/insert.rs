@@ -128,6 +128,9 @@ pub struct InsertControls {
     param_count: u8,
     /// The stage of the chain that serves this effect: see [`Self::stage`].
     stage: u8,
+    /// The latency of the copy of the stage in frames: see
+    /// [`Self::latency`].
+    latency: u32,
     /// The position of the note in quarter notes, and the quarter notes in
     /// one minute. A tempo of 0 means the note has no clock.
     beats: f64,
@@ -145,6 +148,7 @@ impl InsertControls {
             params: [InsertParam { id: 0, value: 0.0 }; MAX_INSERT_PARAMS],
             param_count: 0,
             stage: NO_STAGE,
+            latency: 0,
             beats: 0.0,
             tempo: 0.0,
             note: InsertNote {
@@ -223,6 +227,18 @@ impl InsertControls {
             stage if stage < EFFECT_CHAIN => stage,
             _ => place,
         }
+    }
+
+    /// Gives the stage the latency of its copy: see [`Self::latency`].
+    pub fn with_latency(mut self, frames: u32) -> Self {
+        self.latency = frames;
+        self
+    }
+
+    /// The latency of the copy that serves the stage, in frames. The output
+    /// of the stage comes this many frames after its input.
+    pub fn latency(&self) -> u32 {
+        self.latency
     }
 }
 
@@ -390,13 +406,14 @@ mod tests {
 
     #[test]
     fn a_note_carries_sixteen_parameter_values_and_refuses_one_more() {
-        // The stage fits in the room the fields leave, so the event keeps
-        // its size.
+        // The stage and the latency fit in the room the other fields leave,
+        // so the controls keep their size.
         assert_eq!(std::mem::size_of::<InsertControls>(), 184);
         let mut controls = InsertControls::new(InsertKey {
             plugin: 3,
             preset: 0,
         });
+        assert_eq!(controls.latency(), 0);
         // An effect with no stage takes the stage of its place.
         assert_eq!(controls.stage(2), 2);
         controls.set_stage(1);
@@ -409,5 +426,37 @@ mod tests {
         assert!(!controls.push(InsertParam { id: 99, value: 1.0 }));
         assert_eq!(controls.params().len(), MAX_INSERT_PARAMS);
         assert_eq!(controls.params()[15].id, 15);
+
+        // The other builders keep the latency of the stage.
+        let controls = controls.with_latency(480);
+        assert_eq!(controls.latency(), 480);
+        let note = InsertNote {
+            pitch: 60.0,
+            velocity: 1.0,
+            frames: 64,
+        };
+        assert_eq!(controls.with_note(note).latency(), 480);
+        assert_eq!(controls.with_score(7).latency(), 480);
+        assert_eq!(controls.with_clock(2.0, 120.0).latency(), 480);
+
+        // A chain sums the latencies of its stages, whatever the lead of the
+        // note.
+        let stage = |frames| InsertControls::new(InsertKey::default()).with_latency(frames);
+        let mut note_controls: crate::OscillatorControls = Default::default();
+        assert_eq!(note_controls.lead, 0);
+        assert_eq!(note_controls.chain_latency(), 0);
+        note_controls.effects[0] = Some(stage(100));
+        note_controls.effects[2] = Some(stage(200));
+        note_controls.instrument = Some(stage(64));
+        for lead in [0, 100, 364] {
+            note_controls.lead = lead;
+            assert_eq!(note_controls.effect_latency(), 300);
+            assert_eq!(note_controls.chain_latency(), 364);
+        }
+        // The musical onset is the frame the note starts on plus its lead.
+        note_controls.lead = 0;
+        assert_eq!(note_controls.musical(1000), 1000);
+        note_controls.lead = 480;
+        assert_eq!(note_controls.musical(1000), 1480);
     }
 }

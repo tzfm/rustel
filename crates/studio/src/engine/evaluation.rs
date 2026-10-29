@@ -234,10 +234,7 @@ impl StudioEngine {
         from_cycle: f64,
         document: u64,
     ) -> Option<bool> {
-        if mini
-            || !self.session.plugins_live()
-            || !(source.contains("vst") || self.session.ran_plugin_calls())
-        {
+        if !self.plays_plugins(source, mini) {
             return Some(false);
         }
         // A new score that waits for its first window publishes it before
@@ -260,6 +257,17 @@ impl StudioEngine {
                     live.device.clock_seconds()
                 });
         Some(true)
+    }
+
+    /// True for a text that asks the plugin host: a text that is not `mini`,
+    /// on an output with plugins, with `vst` in the text or in a session
+    /// where an evaluation ran a plugin call. A set with no plugin asks the
+    /// plugin host nothing for its texts.
+    #[cfg(feature = "vst")]
+    pub(super) fn plays_plugins(&self, source: &str, mini: bool) -> bool {
+        !mini
+            && self.session.plugins_live()
+            && (source.contains("vst") || self.session.ran_plugin_calls())
     }
 
     /// Prepares the plugin copies of the armed launch, in each mode: see
@@ -343,7 +351,8 @@ impl StudioEngine {
                     reverbs.observe_prepared(device, &event);
                     let pushed = device.push(event.clone());
                     if pushed {
-                        played.note(&event, device.render_frontier_frames());
+                        let frontier = device.render_frontier_frames();
+                        played.note(&event, frontier, device.restart_lead());
                         shield_audio.push(UiAcceptedOnset {
                             generation: event.generation,
                             onset_id: event.onset_id,
@@ -502,7 +511,7 @@ impl StudioEngine {
 
         if let Err(error) = self
             .warm_source(source, STARTUP_SAMPLE_WARM_BUDGET)
-            .and_then(|_| self.follow_start(source))
+            .and_then(|_| self.follow_start(source, mini))
         {
             transport.stop();
             self.restore_failed_start_device(device, was_piano_output);
@@ -909,7 +918,9 @@ mod tests {
             engine
                 .session
                 .inject_panic_for_test(SessionPanicPoint::Query);
-            let error = engine.follow_start(GOOD).expect_err("loading query panic");
+            let error = engine
+                .follow_start(GOOD, false)
+                .expect_err("loading query panic");
             assert!(matches!(error, RuntimeError::Panic(_)));
             assert_eq!(engine.active_source(), Some(GOOD));
             wait_for_audio(&mut engine);

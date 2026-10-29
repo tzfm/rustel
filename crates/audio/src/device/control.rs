@@ -88,6 +88,7 @@ impl LiveShared {
             takeover_frame: Arc::new(AtomicU64::new(0)),
             takeover_cut: Arc::new(AtomicU64::new(0)),
             line_arm: Arc::new(AtomicU64::new(0)),
+            line_fired: Arc::new(AtomicU64::new(0)),
             cut_sounding: Arc::new(AtomicBool::new(false)),
             frames: Arc::new(AtomicU64::new(0)),
             completed_intake_frame: Arc::new(AtomicU64::new(0)),
@@ -189,13 +190,15 @@ impl LiveShared {
         self.stop.request();
     }
 
-    /// The four handshake words the callback reads, each under its own name.
+    /// The handshake words of the callback, each under its own name: the
+    /// four it reads and the line cut it fires.
     pub(super) fn flip_atomics(&self) -> crate::LiveFlipAtomics<'_> {
         crate::LiveFlipAtomics {
             generation: &self.generation,
             takeover_frame: &self.takeover_frame,
             takeover_cut: &self.takeover_cut,
             line_arm: &self.line_arm,
+            line_fired: &self.line_fired,
         }
     }
 
@@ -259,6 +262,9 @@ impl LiveShared {
             self.line_arm
                 .store((line << 2) | (line_arm & 0b11), Ordering::Release);
         }
+        // The callback of the replacement fires an arm again in its own
+        // frames.
+        self.line_fired.store(0, Ordering::Release);
         self.frames.store(frames, Ordering::Release);
         self.completed_intake_frame
             .store(completed_intake_frame, Ordering::Release);
@@ -1134,20 +1140,43 @@ impl LiveScalarDevice {
     /// cuts at the takeover frame (a quantised rewind): the old score plays
     /// its countdown to the line, then the restarted loop sounds alone. An
     /// ordinary reload passes [`TakeoverCut::None`]: the old voices ring
-    /// out, so a live edit does not click.
+    /// out, so a live edit does not click. The cut goes out with the restart
+    /// lead the cell of [`Self::set_restart_lead`] holds now.
     pub fn set_generation(&self, generation: u64, takeover_frame: u64, cut: TakeoverCut) {
         self.shared
             .takeover_frame
             .store(takeover_frame, Ordering::Release);
-        self.shared
-            .takeover_cut
-            .store(cut as u64, Ordering::Release);
+        let restart_lead = self
+            .restart_lead_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, |lead| lead.load(Ordering::Relaxed));
+        self.shared.takeover_cut.store(
+            cut as u64 | (u64::from(restart_lead) << 2),
+            Ordering::Release,
+        );
+        // A restart moves a note of the generation up to the restart lead
+        // later, so the ring holds its custom wave that much longer.
+        self.shared.ring.set_restart_lead(restart_lead);
         // A published flip supersedes any line arm: from here the flip's
         // own cut intent and takeover frame carry the handoff, and a stale
         // arm from a cancelled launch must not cut a later generation's
         // line that never asked for one.
         self.shared.line_arm.store(0, Ordering::Release);
         self.shared.generation.store(generation, Ordering::Release);
+    }
+
+    /// Sets the cell of the restart lead: the frames the notes of the score
+    /// start before their onset at most, as the plugin chains of the score
+    /// ask. Each [`Self::set_generation`] publishes the lead the cell holds
+    /// then, in the cut word above the 2 bits of the cut. With no cell the
+    /// lead is 0.
+    pub fn set_restart_lead(&self, lead: Arc<std::sync::atomic::AtomicU32>) {
+        *self
+            .restart_lead_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lead);
     }
 
     /// Pre-arm a cut at `frame`, the line of a quantised launch, before the
@@ -1171,11 +1200,16 @@ impl LiveScalarDevice {
     /// Withdraw a pre-armed line cut: the launch was cancelled or its
     /// evaluation failed, and the outgoing rendition keeps playing whole.
     /// Leaves [`crate::LINE_ARM_WITHDRAWN`] rather than zero so a consumer
-    /// whose arm already fired knows no flip is coming and lets it go.
+    /// whose arm already fired knows no flip is coming and lets it go. A read
+    /// of [`Self::fired_line_frame`] or of the render frontier after the call
+    /// sees each cut the consumer fired from the arm.
     pub fn clear_line_arm(&self) {
         self.shared
             .line_arm
             .store(crate::LINE_ARM_WITHDRAWN, Ordering::Release);
+        // Pairs with the fence of a line cut that fires, and with the fence
+        // in `Ring::publish_frontier`.
+        std::sync::atomic::fence(Ordering::SeqCst);
     }
 
     /// The raw armed line word: a test and telemetry probe of exactly what
@@ -1191,10 +1225,28 @@ impl LiveScalarDevice {
     }
 
     /// The frame a line cut is armed at, while one is. The consumer fires it
-    /// in the first block that ends past that frame.
+    /// in the first block that ends past that frame, less the lead of the
+    /// plugin chains: see [`Self::fired_line_frame`].
     pub fn armed_line_frame(&self) -> Option<u64> {
         let word = self.armed_line_word();
         (word & 0b01 != 0).then_some(word >> 2)
+    }
+
+    /// The frame of the newest line cut the consumer fired since the last
+    /// flip. A note of a plugin chain with latency starts its lead before
+    /// its output, so the consumer fires a cut that lead before its line,
+    /// before the render frontier passes the line. A withdrawal of the arm
+    /// keeps the frame.
+    pub fn fired_line_frame(&self) -> Option<u64> {
+        let word = self.shared.line_fired.load(Ordering::Acquire);
+        (word & 0b01 != 0).then_some(word >> 2)
+    }
+
+    /// The restart lead of the newest cutover in frames: see
+    /// [`Self::set_restart_lead`]. A restart moves a note of its first window
+    /// this far at most.
+    pub fn restart_lead(&self) -> u32 {
+        self.shared.ring.restart_lead()
     }
 
     /// Generation currently published to the audio consumer.
@@ -2296,7 +2348,8 @@ mod tests {
         /// through `write_live_output`, the production wiring: a line armed
         /// with its drop bit refuses an outgoing event past it, and an
         /// immediate rewind's cut refuses an outgoing event its takeover frame
-        /// alone would have let through.
+        /// alone would have let through. The callback names the arm it fired
+        /// in a word of its own, until the flip.
         #[test]
         fn the_callback_reads_the_line_arm_and_the_cut_from_their_own_words() {
             let event = |onset_id: u64, generation: u64, target_frame: u64| AudioEvent {
@@ -2336,18 +2389,37 @@ mod tests {
                 1,
                 "the armed line refuses the outgoing event past it"
             );
+            let fired = || shared.line_fired.load(Ordering::Acquire);
+            assert_eq!(
+                fired(),
+                (256 << 2) | 0b11,
+                "the callback names the arm it fired"
+            );
 
             // An immediate rewind (set_generation's order), its takeover past
-            // the outgoing event: only the cut's own horizon refuses it.
+            // the outgoing event: only the cut's own horizon refuses it. The
+            // word holds a restart lead of 480 frames above the cut.
             shared.takeover_frame.store(8_192, Ordering::Release);
             shared
                 .takeover_cut
-                .store(TakeoverCut::AtFlip as u64, Ordering::Release);
+                .store(TakeoverCut::AtFlip as u64 | (480 << 2), Ordering::Release);
             shared.line_arm.store(0, Ordering::Release);
             shared.generation.store(2, Ordering::Release);
             assert!(shared.ring.push(event(2, 1, 6_000)));
             callback(&mut backend); // [384, 512)
             assert_eq!(stale(), 2, "the rewind's cut refuses the outgoing event");
+            assert_eq!(fired(), 0, "the flip lets the fired arm go");
+
+            // The restart lead of the flip fires an arm 480 frames before its
+            // line. A recycle starts a callback of its own, which has fired
+            // no arm.
+            shared
+                .line_arm
+                .store((1_024 << 2) | 0b11, Ordering::Release);
+            callback(&mut backend); // [512, 640)
+            assert_eq!(fired(), (1_024 << 2) | 0b11);
+            shared.prepare_recycled_stream(48_000, 48_000);
+            assert_eq!(fired(), 0, "a recycle lets the fired arm go");
         }
 
         /// A published flip supersedes a pre-armed line: `set_generation`
@@ -2355,7 +2427,8 @@ mod tests {
         /// own, so a launch's stale line can never cut a later generation that
         /// never asked for one. It leaves zero, not the withdrawn marker: the
         /// consumer tells "the flip took over" from "the launch was withdrawn"
-        /// by exactly that word.
+        /// by exactly that word. The flip publishes the restart lead of its
+        /// cell above its cut.
         #[test]
         fn a_published_flip_leaves_no_line_arm() {
             let device = LiveScalarDevice::start_silent(48_000, 6).expect("silent output");
@@ -2379,6 +2452,18 @@ mod tests {
                 0,
                 "a flip after a withdrawal is a flip, not a withdrawal"
             );
+            let cut = || device.shared.takeover_cut.load(Ordering::Acquire);
+            assert_eq!(cut(), 0, "no cell: no restart lead");
+
+            let lead = Arc::new(std::sync::atomic::AtomicU32::new(480));
+            device.set_restart_lead(Arc::clone(&lead));
+            device.set_generation(9, 5_000, TakeoverCut::AtFlip);
+            assert_eq!(cut(), (480 << 2) | TakeoverCut::AtFlip as u64);
+            assert_eq!(device.restart_lead(), 480, "the score ring holds it too");
+            lead.store(0, Ordering::Relaxed);
+            device.set_generation(10, 6_000, TakeoverCut::AtTakeover);
+            assert_eq!(cut(), TakeoverCut::AtTakeover as u64);
+            assert_eq!(device.restart_lead(), 0);
         }
 
         #[test]
