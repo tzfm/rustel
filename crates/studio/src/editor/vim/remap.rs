@@ -31,6 +31,15 @@ impl Editor {
         }
     }
 
+    /// Whether Vim is in the middle of something its next key finishes or
+    /// cancels: a pending command, Visual, or a mapping prefix.
+    pub(crate) fn vim_key_in_progress(&self) -> bool {
+        self.vim.keybindings == EditorKeybindings::Vim
+            && (self.vim_has_pending_command()
+                || matches!(self.vim.mode, Mode::Visual { .. })
+                || !self.vim_remap.pending.is_empty())
+    }
+
     pub(crate) fn vim_has_pending_command(&self) -> bool {
         self.find_open()
             || self.vim.count != 0

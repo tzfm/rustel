@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Edit ▸ Find, chosen with a click, takes what you type. The release of the click closed the find bar again, so the typing went into the score as text or ran as Vim commands.
+- With Vim keys on, any key the search box takes, such as `i`, Esc or a typed letter, calls off a pending delete in the set panel, the Samples tab and the theme picker, and a pending trim. Before, a later Enter or a second Ctrl+D could delete the score, the sample or the theme without asking again.
+- Vim `p` no longer crashes when the yanked line ends in a Unicode line or paragraph separator.
+- The wheel, a paste and leaving the terminal window no longer close the find bar or a Vim `/`, `?` or `:` prompt, and the wheel no longer ends Visual mode. A paste with `:` open types into it.
+- In Vim mode, Esc and the function keys no longer scroll the score back to the caret after a wheel scroll.
+- In Vim mode, a clicked slider takes ←/→, Enter and Esc as in Default mode, and typing lets it go. Typing after a slider or knob change is an undo step of its own.
+- In Vim mode, a paste in Insert mode is part of that insert, so one `u` undoes all of it.
+- In Vim mode, find opened from Insert mode returns to Normal mode, so `n` walks the matches.
+- Vim `n` moves on from a match at a line break, and a `/` or `?` closed with Esc no longer changes the direction of `n`.
+- Vim `u` after a Visual change puts the caret at the start of the restored text.
+- Vim motions and operators follow Vim more closely. `dw` and `cw` stop at the line end, `w` and `b` stop on empty lines, `2cw` changes every counted word, `dk` on the first line and `dj` on the last do nothing, `j` and `k` after `$` stay at the line end, and `G` skips the empty line after a final line break.
+- Vim `di(`, `ci(` and `yi{` on a block of whole lines take only the lines inside, so `ci(` leaves an empty line to type on.
+- In Vim Visual mode, `D`, `X`, `Y` and `C` act on whole lines.
+- A Vim yank with a backward motion or a text object leaves the caret at the start of the yanked text. Yanking the same text again makes it the newest copy for `p`.
+- On a Vim line of only spaces, `^` goes to the last space and `I` inserts after them. Leaving Insert right after `o`, `O` or `cc` removes the unused indent.
+- A Vim mapping to a panel action, such as `<Action:focus-timeline>`, runs it as its chord does, and a mapped action such as the shipped `gc` leaves Visual mode as its chord does.
+- The vimrc reader skips a line that reaches the command line after Esc or Ctrl+O or uses Ctrl+R. It reads flags written together, such as `<silent><Space>V`, keeps the first line after a byte order mark, and lets the last line win when two lines spell the same keys differently.
+- A vimrc that cannot be read keeps the shipped Vim mappings and still reports the error. It loads by itself once it becomes readable.
+- Vim `gd` with the block caret on the first letter of a name opens that name's docs, also inside an open call.
+- A learnt Ctrl+D or Ctrl+U shows in status hints while Vim keys are on, and the Keybinds page no longer presents `gd` as fixed.
+- With the Vim list keys on, Ctrl+D and Ctrl+U page the Settings sheet, `j`, `k`, `h` and `l` move a visuals dock's add list, going back from a reference entry returns to Command mode, and Backspace over a standing set filter reopens the search.
+- With Vim keys on, the first Esc over a running export closes the export sheet, and its hidden fields no longer take keys.
+- A paste into the Samples search calls off a pending trim.
+- Holding a letter in the Settings VST filter keeps typing it.
+- With Vim keys on, a panel search or form shows a bar caret while it types.
+
 ## v0.1.6
 
 - Sample and import downloads use rustls 0.23.46, which fixes four rustls advisories, the worst of medium severity.

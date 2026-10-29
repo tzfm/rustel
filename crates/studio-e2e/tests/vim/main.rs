@@ -570,7 +570,9 @@ fn visual_lines_and_text_objects_edit_complete_ranges() {
         ),
         ("// 'é🎹'", "é", "yi'P", "// 'é🎹é🎹'"),
         ("// `é🎹`", "é", "di`", "// ``"),
-        ("// call(\n  é🎹\n)", "é", "di(", "// call()"),
+        // Lines inside the brackets go whole, as in Vim: the brackets
+        // keep their own lines.
+        ("// call(\n  é🎹\n)", "é", "di(", "// call(\n)"),
         (r#"// call(é🎹, ")")"#, "é", "di(", "// call()"),
         (r#"// call("foo ) bar")"#, "foo", "di(", "// call()"),
         (r#"// call("foo ( bar")"#, "foo", "di(", "// call()"),

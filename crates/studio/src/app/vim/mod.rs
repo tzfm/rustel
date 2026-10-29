@@ -15,7 +15,9 @@ mod config;
 mod dispatch;
 mod keys;
 
-pub(super) use dispatch::{dispatch, flush_pending, flush_timeout, interrupt, mappings};
+pub(super) use dispatch::{
+    dispatch, flush_pending, flush_timeout, interrupt, learned_layer_shortcut, mappings,
+};
 pub(super) use keys::{
     VimTextKey, enter_insert, focus_changed, handle_text_key, panel_takes_list_navigation,
     surface_typing,

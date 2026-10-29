@@ -611,6 +611,12 @@ impl App {
                 self.status = "shortcut reset cancelled".into();
                 self.dirty_frame = true;
             }
+            // With Vim list keys on, Ctrl+D and Ctrl+U page every list
+            // panel, the sheet too. The sheet pages itself rather than
+            // handing the chord back, so no spelling of it falls through.
+            if let Some(page) = self.list_navigation_alias(&event) {
+                return self.handle_settings_key(page.code, false, false);
+            }
             // Settings is a modal sheet. A chord it does not implement is
             // still the sheet's: letting Ctrl+V, Ctrl+X or Ctrl+Z fall
             // through edits the covered score. Bracketed paste is routed to
@@ -1464,6 +1470,38 @@ mod tests {
 
         use crate::app::tests::support::*;
         use crate::app::*;
+
+        /// With Vim list keys on, Ctrl+D and Ctrl+U page the sheet as
+        /// PageDown and PageUp do.
+        #[test]
+        fn ctrl_d_and_ctrl_u_page_the_sheet_in_vim() {
+            use crate::settings::SettingsPage;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 30);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.toggle_settings_sheet();
+            app.settings_sheet
+                .as_mut()
+                .expect("sheet open")
+                .show_page(SettingsPage::Keybinds);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            let selected = |app: &App| app.settings_sheet.as_ref().expect("sheet open").selected;
+            let start = selected(&app);
+
+            press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+            let page = selected(&app);
+            assert!(page > start, "PageDown pages");
+            press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+            assert_eq!(selected(&app), start);
+
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert_eq!(selected(&app), page, "Ctrl+D paged as PageDown does");
+            press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+            assert_eq!(selected(&app), start, "Ctrl+U paged back up");
+            assert!(app.settings_sheet.is_some(), "the sheet stays open");
+        }
 
         #[test]
         fn the_visualizers_chord_toggles_the_inline_visualizers() {

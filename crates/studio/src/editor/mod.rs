@@ -51,7 +51,7 @@ use layout::{
     HorizontalLayoutCache, VirtualRows, display_column_of_offset_cached,
     offset_at_display_column_cached,
 };
-use selection::map_offset_shapes;
+use selection::{map_offset, map_offset_shapes};
 
 pub const DEFAULT_MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 /// Line-comment marker. Scores are JavaScript, so this is not configurable.
@@ -784,8 +784,27 @@ impl Editor {
 
     pub fn apply_transaction(
         &mut self,
+        transaction: Transaction,
+        moment: HistoryMoment,
+    ) -> Result<(), EditorError> {
+        self.apply_transaction_as(transaction, moment, false)
+    }
+
+    /// [`Self::apply_transaction`], undone together with the step before
+    /// it even when that step was closed.
+    pub(crate) fn apply_transaction_into_last_step(
+        &mut self,
+        transaction: Transaction,
+        moment: HistoryMoment,
+    ) -> Result<(), EditorError> {
+        self.apply_transaction_as(transaction, moment, true)
+    }
+
+    fn apply_transaction_as(
+        &mut self,
         mut transaction: Transaction,
         moment: HistoryMoment,
+        into_last_step: bool,
     ) -> Result<(), EditorError> {
         let moment = self.mode_history_transaction(&mut transaction, moment);
         transaction
@@ -807,6 +826,11 @@ impl Editor {
             .selection_after
             .clone()
             .unwrap_or_else(|| before.map_through(&transaction.edits));
+        // Offsets kept beside the selection follow the edit with it, so an
+        // edit Vim did not make, such as a slider's, leaves them on the same
+        // text.
+        let visual = self.vim_visual_through(&transaction.edits);
+        let find_anchor = self.find_anchor_through(&transaction.edits);
         // Rope clones share storage. Applying to a candidate gives a public
         // malformed transaction a true all-or-nothing boundary.
         let mut candidate = self.document.clone();
@@ -833,7 +857,13 @@ impl Editor {
             std::slice::from_ref(&edit_shapes),
         );
         self.selections = after;
-        self.history.record(entry);
+        self.vim_set_visual_ends(visual);
+        self.find_set_anchor(find_anchor);
+        if into_last_step {
+            self.history.fold_into_last(entry);
+        } else {
+            self.history.record(entry);
+        }
         self.virtual_rows = virtual_rows;
         self.drag = None;
         self.ensure_primary_visible();
@@ -892,7 +922,12 @@ impl Editor {
     }
 
     fn paste_text(&mut self, text: &str, moment: HistoryMoment) -> Result<(), EditorError> {
-        self.history.close_group();
+        // A paste is an undo step of its own, and it ends the typing before
+        // it even when it pastes nothing. A Vim insert folds it into the
+        // insert's one step instead.
+        if !(self.uses_modal_keys() && self.vim_is_insert()) {
+            self.history.close_group();
+        }
         let line_ending = self.preferred_line_ending();
         let text = normalize_paste_line_endings(text, &line_ending);
         self.replace_selections(&text, EditOrigin::Paste, moment)
@@ -3219,5 +3254,21 @@ mod tests {
             .unwrap();
         dispatch(&mut editor, Command::InsertText("$: ".into()), 0);
         assert_eq!(editor.map_offset_since(evaluated, anchor), Some(anchor + 3));
+    }
+
+    /// A paste ends the typing before it, even an empty one, so the typing
+    /// on each side undoes on its own.
+    #[test]
+    fn an_empty_paste_still_ends_the_typing_before_it() {
+        let mut editor = Editor::new("").unwrap();
+        dispatch(&mut editor, Command::InsertText("a".into()), 0);
+        dispatch(&mut editor, Command::PasteText(String::new()), 10);
+        dispatch(&mut editor, Command::InsertText("b".into()), 20);
+        dispatch(&mut editor, Command::Undo, 30);
+        assert_eq!(
+            editor.source(),
+            "a",
+            "one undo took the typing on both sides"
+        );
     }
 }

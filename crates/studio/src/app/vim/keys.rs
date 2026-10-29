@@ -31,6 +31,11 @@ pub(crate) trait VimTextSurface {
     fn anchored(&self) -> bool {
         false
     }
+    /// Call off a question the surface waits to have answered, such as a
+    /// delete that the next Enter would confirm. The surface's own keys
+    /// call it off for any key that is not the answer. A key the modes
+    /// take never reaches them, so the modes call it off instead.
+    fn withdraw_question(&mut self) {}
 }
 
 impl VimTextSurface for ReferencePanel {
@@ -52,6 +57,12 @@ impl VimTextSurface for ReferencePanel {
 
     fn space_command(&self) -> bool {
         !matches!(self.preview(), PanelAction::Nothing)
+    }
+
+    // The samples tab asks before it deletes a file or cuts a take.
+    fn withdraw_question(&mut self) {
+        self.confirm_delete = None;
+        self.confirm_trim = None;
     }
 }
 
@@ -81,7 +92,8 @@ impl VimTextSurface for SetPanel {
 
     // A filter standing leaves the list the keys it has without Vim:
     // Space folds the tapes, Delete asks, a digit opens a strip's score,
-    // `n` starts a tape, and +/- size the panel.
+    // `n` starts a tape, +/- size the panel, and Backspace takes the box
+    // back up to delete from the query.
     fn space_command(&self) -> bool {
         true
     }
@@ -89,8 +101,17 @@ impl VimTextSurface for SetPanel {
     fn list_key(&self, code: KeyCode) -> bool {
         matches!(
             code,
-            KeyCode::Delete | KeyCode::Char('1'..='9' | 'n' | '+' | '=' | '-' | '_')
+            KeyCode::Delete
+                | KeyCode::Backspace
+                | KeyCode::Char('1'..='9' | 'n' | '+' | '=' | '-' | '_')
         )
+    }
+
+    // A score's delete, and the question a set asks when a score could
+    // not be saved as it went.
+    fn withdraw_question(&mut self) {
+        self.deleting = None;
+        self.unsaved = None;
     }
 }
 
@@ -109,6 +130,10 @@ impl VimTextSurface for ThemePicker {
 
     fn set_insert(&mut self, insert: bool) {
         self.set_vim_insert(insert);
+    }
+
+    fn withdraw_question(&mut self) {
+        self.deleting = None;
     }
 }
 
@@ -139,6 +164,9 @@ impl VimTextSurface for ExportSheet {
 macro_rules! text_surfaces {
     ($($kind:pat => $field:ident),* $(,)?) => {
         fn surface_mut(app: &mut App) -> Option<&mut dyn VimTextSurface> {
+            if rendering(app) {
+                return None;
+            }
             match app.focus {
                 $(Focus::Panel($kind) => app.$field.as_mut().map(|panel| panel as &mut dyn VimTextSurface),)*
                 _ => None,
@@ -146,6 +174,9 @@ macro_rules! text_surfaces {
         }
 
         fn surface_ref(app: &App) -> Option<&dyn VimTextSurface> {
+            if rendering(app) {
+                return None;
+            }
             match app.focus {
                 $(Focus::Panel($kind) => app.$field.as_ref().map(|panel| panel as &dyn VimTextSurface),)*
                 _ => None,
@@ -159,6 +190,12 @@ text_surfaces! {
     PanelKind::Set => set_panel,
     PanelKind::Theme => theme_picker,
     PanelKind::Export => export_sheet,
+}
+
+/// The export sheet over a running bounce shows the render, not its
+/// fields. No text mode applies there, and its keys stay the sheet's.
+fn rendering(app: &App) -> bool {
+    app.focus == Focus::Panel(PanelKind::Export) && app.export_job.is_some()
 }
 
 /// An anchored completion always types: the search is the word being
@@ -259,7 +296,7 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
         if !surface.text_wanted() || surface.anchored() {
             return VimTextKey::Ignored;
         }
-        if surface.insert() {
+        let action = if surface.insert() {
             if key.code == KeyCode::Esc && key.modifiers.is_empty() {
                 TextAction::Command
             } else if let KeyCode::Char(character) = key.code
@@ -322,7 +359,14 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
                 }
                 _ => TextAction::Ignored,
             }
+        };
+        // The surface's own keys call a pending question off. A key the
+        // modes take never reaches them, so it is called off here. An
+        // arrow still reaches them.
+        if !matches!(action, TextAction::Ignored | TextAction::Arrow(..)) {
+            surface.withdraw_question();
         }
+        action
     };
     match action {
         TextAction::Ignored => VimTextKey::Ignored,
@@ -393,21 +437,26 @@ impl App {
 
 /// The panels whose rows j k h l walk. The knobs column walks the same
 /// way: h and l stand in for its ← and →, the nudge of a rail and the
-/// chords of its presets section.
-pub(crate) fn panel_takes_list_navigation(kind: PanelKind) -> bool {
-    matches!(
-        kind,
+/// chords of its presets section. A visuals dock walks only its add list.
+/// In the dock's body the arrows change a widget and `j` aligns the art,
+/// so the body keeps its own reading of the letters.
+pub(crate) fn panel_takes_list_navigation(app: &App, kind: PanelKind) -> bool {
+    match kind {
         PanelKind::Settings
-            | PanelKind::Set
-            | PanelKind::Devices
-            | PanelKind::Log
-            | PanelKind::Jobs
-            | PanelKind::Reference
-            | PanelKind::Knobs
-            | PanelKind::Theme
-            | PanelKind::Export
-            | PanelKind::Memory
-    )
+        | PanelKind::Set
+        | PanelKind::Devices
+        | PanelKind::Log
+        | PanelKind::Jobs
+        | PanelKind::Reference
+        | PanelKind::Knobs
+        | PanelKind::Theme
+        | PanelKind::Export
+        | PanelKind::Memory => true,
+        PanelKind::Viz => app.viz_docks[app.viz_focus]
+            .as_ref()
+            .is_some_and(|dock| dock.adding.is_some()),
+        _ => false,
+    }
 }
 
 #[cfg(test)]

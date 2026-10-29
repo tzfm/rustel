@@ -44,10 +44,35 @@ pub(super) enum Landing {
 }
 
 impl App {
+    /// The caret as a name lookup reads it. A bar caret stands between two
+    /// characters. Vim's block caret in Normal covers one, so on a name it
+    /// reads as just past the letter it covers, inside that name.
+    pub(super) fn name_caret(&self) -> ByteOffset {
+        let editor = self.editor();
+        let selection = editor.primary_selection();
+        let head = selection.head;
+        if !editor.vim_is_normal() || !selection.is_empty() {
+            return head;
+        }
+        let document = editor.document();
+        document
+            .next_grapheme_boundary(head)
+            .ok()
+            .filter(|next| {
+                *next > head
+                    && document.slice(head..*next).is_ok_and(|letter| {
+                        letter
+                            .chars()
+                            .all(|character| character.is_alphanumeric() || character == '_')
+                    })
+            })
+            .unwrap_or(head)
+    }
+
     /// The word under the caret and where it sits, when there is one.
     pub(super) fn word_range_at_caret(&self) -> Option<(String, Range<ByteOffset>)> {
         let editor = self.editor();
-        let (word, range) = word_before(editor.document(), editor.primary_selection().head)?;
+        let (word, range) = word_before(editor.document(), self.name_caret())?;
         let source = editor.source();
         let qualified = reference_name_range(&source, range.start.0..range.end.0);
         if qualified.start == range.start.0 {
@@ -94,7 +119,7 @@ impl App {
         if let Some(range) = self.chain_position_at_caret() {
             return self.chain_reference_scope(&range);
         }
-        let caret = self.editor().primary_selection().head;
+        let caret = self.name_caret();
         let scope = self.reference_scope_at(caret);
         let name = self
             .word_range_at_caret()
@@ -625,7 +650,7 @@ impl App {
             return None;
         }
         let editor = self.editor();
-        let caret = editor.primary_selection().head;
+        let caret = self.name_caret();
         let document = editor.document();
         let line = document.line_of(caret).ok()?;
         let start = document.line_start(line);
@@ -1205,6 +1230,31 @@ mod scoped_completion_tests {
         app.set_reference_panel(None);
         app.reference_anchor = None;
         app.focus = Focus::Editor;
+    }
+
+    /// Vim's block caret covers a letter, so `gd` on the first letter of
+    /// a name opens that name's docs, as it does on its bracket.
+    #[test]
+    fn gd_on_the_first_letter_of_a_name_opens_its_docs() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = crate::app::tests::support::app_over(directory.path());
+        app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+        app.vim_config.set_mappings_for_test(
+            crate::vim_config::VimMappings::parse_with_defaults("").expect("mappings"),
+        );
+        for (marked, name) in [
+            ("$: s(\"bd\").|gain(0.5)\n", "gain"),
+            ("$: |s(\"bd\").gain(0.5)\n", "s"),
+            ("$: s(\"bd\").gain|(0.5)\n", "gain"),
+            ("$: stack(s(\"bd\").|gain(0.5))\n", "gain"),
+        ] {
+            seed(&mut app, marked);
+            app.sync_editor_keybindings();
+            for key in ['g', 'd'] {
+                crate::app::tests::support::press(&mut app, KeyCode::Char(key), KeyModifiers::NONE);
+            }
+            assert_eq!(app.status, format!("reference - {name}"), "{marked}");
+        }
     }
 
     #[test]

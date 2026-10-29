@@ -22,6 +22,9 @@ pub enum EditOrigin {
     /// A control such as an inline slider rewriting its own literal. One
     /// drag is many edits and should undo as one.
     Control,
+    /// Text a modal editor's insert takes in, from entering it to leaving
+    /// it. The whole insert undoes as one step, apart from a control's.
+    Insert,
     Programmatic,
 }
 
@@ -29,7 +32,7 @@ impl EditOrigin {
     fn may_coalesce(self) -> bool {
         matches!(
             self,
-            Self::Typing | Self::Backspace | Self::Delete | Self::Control
+            Self::Typing | Self::Backspace | Self::Delete | Self::Control | Self::Insert
         )
     }
 }
@@ -291,6 +294,22 @@ impl History {
             selection,
             edit_steps,
         }))
+    }
+
+    /// Add `entry` to the newest undo step even when that step was closed:
+    /// an edit that finishes the step before it, such as taking back an
+    /// indent nothing used.
+    pub(crate) fn fold_into_last(&mut self, entry: HistoryEntry) {
+        if self.undo.is_empty() {
+            self.record(entry);
+            return;
+        }
+        self.drop_redo();
+        self.retained_bytes = self.retained_bytes.saturating_add(entry.retained_bytes);
+        let group = self.undo.last_mut().expect("checked above");
+        group.retained_bytes = group.retained_bytes.saturating_add(entry.retained_bytes);
+        group.entries.push(entry);
+        self.enforce_bounds();
     }
 
     fn drop_redo(&mut self) {

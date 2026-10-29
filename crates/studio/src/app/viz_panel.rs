@@ -1277,6 +1277,55 @@ mod tests {
             }
         }
 
+        /// With Vim list keys on, j k h l walk the add list as the arrows
+        /// do. The dock body keeps its own reading: j aligns the art, and
+        /// k changes no widget.
+        #[test]
+        fn vim_list_keys_walk_the_add_list() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.prefs.visuals[0].widgets = vec![
+                WidgetSpec::default_art(),
+                WidgetSpec::new(WidgetKind::Scope),
+            ];
+            app.viz_docks[0] = Some(VizPanel {
+                edge: Edge::Top,
+                ..VizPanel::default()
+            });
+            app.viz_focus = 0;
+            app.viz_unlaid[0] = true;
+            app.focus = Focus::Panel(PanelKind::Viz);
+            let adding = |app: &App| app.viz_docks[0].as_ref().expect("open").adding;
+
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+            assert_eq!(adding(&app), Some(0));
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(adding(&app), Some(1), "j moved down");
+            press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            assert_eq!(adding(&app), Some(2), "l moved on");
+            press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            assert_eq!(adding(&app), Some(1), "k moved up");
+            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            assert_eq!(adding(&app), Some(0), "h moved back");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(adding(&app), None);
+
+            let widgets = app.prefs.visuals[0].widgets.clone();
+            press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            assert_eq!(
+                app.prefs.visuals[0].widgets, widgets,
+                "k in the body changed no widget"
+            );
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(
+                app.prefs.visuals[0].widgets[0].alignment,
+                ArtAlignment::End,
+                "j in the body aligned the art"
+            );
+        }
+
         #[test]
         fn j_aligns_only_selected_art_and_pasted_drawing_waits_for_enter() {
             let directory = tempfile::tempdir().expect("temp dir");

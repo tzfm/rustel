@@ -3,7 +3,9 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::super::{display_column_of_offset_cached, offset_at_display_column_cached};
-use super::{ByteOffset, Editor, EditorError, HistoryMoment, Mode, Motion, Operator};
+use super::{
+    ByteOffset, Editor, EditorError, HistoryMoment, Mode, Motion, Operator, line_ending_len,
+};
 
 impl Editor {
     pub(super) fn vim_finish_motion(
@@ -32,16 +34,15 @@ impl Editor {
             } else {
                 motion
             };
-            let mut target = self.vim_motion_target(motion, count, true)?.0;
-            if matches!(motion, Motion::WordNext)
-                && count == 1
-                && !self.vim_grapheme_is_space(head)?
-                && self.document.line_of(target)? > self.document.line_of(head)?
+            let target = self.vim_motion_target(motion, count, true)?.0;
+            // j on the last line and k on the first fail, and the
+            // operator waiting for them does nothing, as in Vim.
+            if matches!(motion, Motion::Up | Motion::Down)
+                && self.document.line_of(target)? == self.document.line_of(head)?
             {
-                target = self
-                    .document
-                    .line_content_range(self.document.line_of(head)?)
-                    .end;
+                self.vim_cancel_pending();
+                self.vim.motion_blocked = true;
+                return Ok(());
             }
             let linewise = matches!(
                 motion,
@@ -54,13 +55,21 @@ impl Editor {
                 )
             } else {
                 let end = if matches!(motion, Motion::WordEnd | Motion::WordChange) {
-                    self.document.next_grapheme_boundary(head.max(target))?
+                    // An inclusive end takes the character it rests on,
+                    // never a line break. e rests on a line end only at
+                    // the end of the text.
+                    let last = head.max(target);
+                    let line_end = self
+                        .document
+                        .line_content_range(self.document.line_of(last)?)
+                        .end;
+                    self.document.next_grapheme_boundary(last)?.min(line_end)
                 } else {
                     head.max(target)
                 };
                 head.min(target)..end
             };
-            self.vim_apply_operator(operator, range, linewise, moment)
+            self.vim_apply_operator(operator, range, linewise, head.min(target), moment)
         } else {
             self.vim_move(motion, count)
         }
@@ -185,8 +194,7 @@ impl Editor {
                 let target_line = if matches!(motion, Motion::Up) {
                     line.saturating_sub(count_nonzero)
                 } else {
-                    line.saturating_add(count_nonzero)
-                        .min(self.document.line_count() - 1)
+                    self.vim_line_below(line, count_nonzero)
                 };
                 let offset = offset_at_display_column_cached(
                     &self.document,
@@ -198,33 +206,35 @@ impl Editor {
                 return Ok((self.vim_clamp_normal(offset)?, Some(goal)));
             }
             Motion::LineStart => range.start,
-            Motion::FirstText => self.document.first_non_whitespace(line),
+            // On a line of only blanks, ^ rests on the last one, as in Vim.
+            Motion::FirstText => self.vim_clamp_normal(self.document.indent_end(line))?,
             Motion::LineEnd => {
                 self.document
-                    .line_content_range(line.saturating_add(count_nonzero - 1))
+                    .line_content_range(self.vim_line_below(line, count_nonzero - 1))
                     .end
             }
             Motion::FirstLine | Motion::LastLine => {
                 let target_line = if matches!(motion, Motion::LastLine) && count == 0 {
-                    self.document.line_count() - 1
+                    self.vim_last_line()
                 } else {
-                    count_nonzero
-                        .saturating_sub(1)
-                        .min(self.document.line_count() - 1)
+                    count_nonzero.saturating_sub(1).min(self.vim_last_line())
                 };
-                self.document.first_non_whitespace(target_line)
+                self.document.indent_end(target_line)
             }
             Motion::WordNext | Motion::WordPrevious | Motion::WordEnd | Motion::WordChange => {
-                self.vim_word_target(head, motion, count_nonzero)?
+                self.vim_word_target(head, motion, count_nonzero, operator)
             }
         };
+        // $ keeps j and k at the end of every line after it, as Vim's goal
+        // column past the end does.
+        let goal = matches!(motion, Motion::LineEnd).then_some(usize::MAX);
         Ok((
             if operator {
                 target
             } else {
                 self.vim_clamp_normal(target)?
             },
-            None,
+            goal,
         ))
     }
 
@@ -248,75 +258,224 @@ impl Editor {
             .all(char::is_whitespace))
     }
 
+    /// Where `w`, `b`, `e` or the `cw` form of `e` takes the caret. An
+    /// operator's `w` stops its last word at the end of its line.
     fn vim_word_target(
         &self,
         head: ByteOffset,
         motion: Motion,
         count: usize,
-    ) -> Result<ByteOffset, EditorError> {
+        operator: bool,
+    ) -> ByteOffset {
         let text = self.document.text();
-        let clusters = text
-            .grapheme_indices(true)
-            .map(|(offset, cluster)| (offset, word_class(cluster)))
-            .collect::<Vec<_>>();
-        if clusters.is_empty() {
-            return Ok(ByteOffset::ZERO);
+        let mut walk = WordWalk::new(&text, head.0);
+        match motion {
+            Motion::WordPrevious => walk.back_word(count),
+            Motion::WordEnd => walk.end_word(count, false),
+            Motion::WordChange => walk.end_word(count, true),
+            _ => walk.forward_word(count, operator),
         }
-        let mut index = clusters.partition_point(|(offset, _)| *offset < head.0);
-        for step in 0..count.min(clusters.len()) {
-            let before = index;
-            match motion {
-                Motion::WordPrevious => {
-                    index = index.saturating_sub(1);
-                    while index > 0 && clusters[index].1 == 0 {
-                        index -= 1;
-                    }
-                    while index > 0 && clusters[index - 1].1 == clusters[index].1 {
-                        index -= 1;
-                    }
-                }
-                Motion::WordEnd | Motion::WordChange => {
-                    if step > 0 || matches!(motion, Motion::WordEnd) {
-                        index = index.saturating_add(1).min(clusters.len());
-                    }
-                    while index < clusters.len() && clusters[index].1 == 0 {
-                        index += 1;
-                    }
-                    while index + 1 < clusters.len() && clusters[index + 1].1 == clusters[index].1 {
-                        index += 1;
-                    }
-                }
-                _ => {
-                    if index < clusters.len() {
-                        let class = clusters[index].1;
-                        while index < clusters.len() && clusters[index].1 == class {
-                            index += 1;
-                        }
-                        while index < clusters.len() && clusters[index].1 == 0 {
-                            index += 1;
-                        }
-                    }
-                }
-            }
-            if index == before || index == clusters.len() {
-                break;
-            }
+        ByteOffset(
+            walk.clusters
+                .get(walk.index)
+                .map_or(text.len(), |(offset, ..)| *offset),
+        )
+    }
+
+    /// The last line Vim knows. The empty line after a final line break is
+    /// drawn, but no Vim motion or operator lands on it.
+    pub(super) fn vim_last_line(&self) -> usize {
+        let last = self.document.line_count() - 1;
+        if last > 0 && self.document.line_content_range(last).is_empty() {
+            last - 1
+        } else {
+            last
         }
-        Ok(ByteOffset(
-            clusters
-                .get(index)
-                .map_or(text.len(), |(offset, _)| *offset),
-        ))
+    }
+
+    /// The line `count` lines below `line`, held to the last line Vim
+    /// knows. It never climbs, even from the drawn line past the end.
+    fn vim_line_below(&self, line: usize, count: usize) -> usize {
+        line.saturating_add(count)
+            .min(self.vim_last_line().max(line))
     }
 
     pub(super) fn vim_line_range(&self, first: usize, last: usize) -> Range<ByteOffset> {
-        let last = last.min(self.document.line_count() - 1);
+        // The drawn line past the end is not a Vim line, so a command made
+        // from it takes nothing, never the line above.
+        if first > self.vim_last_line() {
+            let start = self.document.line_start(first);
+            return start..start;
+        }
+        let last = last.min(self.vim_last_line());
         let end = if last + 1 < self.document.line_count() {
             self.document.line_start(last + 1)
         } else {
             ByteOffset(self.document.len_bytes())
         };
-        self.document.line_start(first)..end
+        self.document.line_start(first.min(last))..end
+    }
+}
+
+/// The text as Vim's word motions walk it, one grapheme at a time. A line
+/// break stands where its line ends, as the NUL after each line does in
+/// Vim, and the break after the last line ends the text.
+struct WordWalk {
+    /// Each grapheme's offset and word class, and whether it breaks a line.
+    clusters: Vec<(usize, u8, bool)>,
+    /// Where the last line ends. Nothing lies past it.
+    end: usize,
+    /// Where the last line starts.
+    last_line: usize,
+    index: usize,
+}
+
+impl WordWalk {
+    fn new(text: &str, head: usize) -> Self {
+        let clusters = text
+            .grapheme_indices(true)
+            .map(|(offset, cluster)| (offset, word_class(cluster), line_ending_len(cluster) > 0))
+            .collect::<Vec<_>>();
+        let end = clusters.len() - usize::from(clusters.last().is_some_and(|cluster| cluster.2));
+        let last_line = clusters[..end]
+            .iter()
+            .rposition(|cluster| cluster.2)
+            .map_or(0, |index| index + 1);
+        let index = clusters
+            .partition_point(|(offset, ..)| *offset < head)
+            .min(end);
+        Self {
+            clusters,
+            end,
+            last_line,
+            index,
+        }
+    }
+
+    fn at_line_end(&self) -> bool {
+        self.index >= self.end || self.clusters[self.index].2
+    }
+
+    fn on_empty_line(&self) -> bool {
+        self.at_line_end() && (self.index == 0 || self.clusters[self.index - 1].2)
+    }
+
+    /// The word class here. A line end is blank.
+    fn class(&self) -> u8 {
+        if self.at_line_end() {
+            0
+        } else {
+            self.clusters[self.index].1
+        }
+    }
+
+    /// One grapheme on, as Vim's `inc`. `None` at the end of the text,
+    /// otherwise whether the step left a line or reached its end.
+    fn forward(&mut self) -> Option<bool> {
+        if self.index >= self.end {
+            return None;
+        }
+        let left = self.at_line_end();
+        self.index += 1;
+        Some(left || self.at_line_end())
+    }
+
+    /// One grapheme back, as Vim's `dec`. False at the start of the text.
+    fn back(&mut self) -> bool {
+        let moved = self.index > 0;
+        self.index = self.index.saturating_sub(1);
+        moved
+    }
+
+    /// One grapheme on inside `w`. False where the motion ends: at the end
+    /// of the text, or on reaching a line end when `eol` holds.
+    fn step(&mut self, eol: bool) -> bool {
+        matches!(self.forward(), Some(crossed) if !(crossed && eol))
+    }
+
+    /// Past every grapheme of `class`. False at the end of the text.
+    fn skip(&mut self, class: u8) -> bool {
+        while self.class() == class {
+            if self.forward().is_none() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Vim's `w`, which stops on an empty line. With `eol`, the last word
+    /// ends at its line's end, as it does for an operator.
+    fn forward_word(&mut self, count: usize, eol: bool) {
+        for step in 0..count {
+            let eol = eol && step + 1 == count;
+            let class = self.class();
+            let on_last_line = self.index >= self.last_line;
+            if !self.step(eol || on_last_line) {
+                return;
+            }
+            if class != 0 {
+                while self.class() == class {
+                    if !self.step(eol) {
+                        return;
+                    }
+                }
+            }
+            while self.class() == 0 && !self.on_empty_line() {
+                if !self.step(eol) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Vim's `b`, which stops on an empty line.
+    fn back_word(&mut self, count: usize) {
+        for _ in 0..count {
+            if !self.back() {
+                return;
+            }
+            while self.class() == 0 && !self.on_empty_line() {
+                if !self.back() {
+                    return;
+                }
+            }
+            if self.on_empty_line() {
+                continue;
+            }
+            let class = self.class();
+            while self.class() == class {
+                if !self.back() {
+                    return;
+                }
+            }
+            self.forward();
+        }
+    }
+
+    /// Vim's `e`. With `stop`, a first word that already ends here counts
+    /// as reached, as it does for `cw`. Later words never do.
+    fn end_word(&mut self, count: usize, mut stop: bool) {
+        for _ in 0..count {
+            let class = self.class();
+            if self.forward().is_none() {
+                return;
+            }
+            if self.class() == class && class != 0 {
+                if !self.skip(class) {
+                    return;
+                }
+            } else if !stop || class == 0 {
+                if !self.skip(0) {
+                    return;
+                }
+                let word = self.class();
+                if !self.skip(word) {
+                    return;
+                }
+            }
+            self.back();
+            stop = false;
+        }
     }
 }
 

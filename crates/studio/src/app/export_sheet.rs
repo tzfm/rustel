@@ -461,6 +461,47 @@ mod tests {
             assert!(app.status.starts_with("exported"), "{}", app.status);
         }
 
+        /// Over a running bounce the sheet's Vim text modes do not apply:
+        /// `i` enters no Insert, a letter edits no hidden field, and the
+        /// first Esc closes the sheet as the render face says.
+        #[test]
+        fn vim_text_modes_stand_down_over_a_running_bounce() {
+            use crate::export::Field;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.toggle_export_sheet();
+            app.export_sheet.as_mut().expect("open").field = Field::Target;
+            let target = app.export_sheet.as_ref().expect("open").target.clone();
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.export_job.is_some(), "the bounce started");
+
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert!(
+                !app.export_sheet.as_ref().expect("open").vim_insert(),
+                "i entered no Insert"
+            );
+            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+            assert_eq!(
+                app.export_sheet.as_ref().expect("open").target,
+                target,
+                "the hidden target is untouched"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.export_sheet.is_none(), "the first Esc closed the sheet");
+            assert!(app.export_job.is_some(), "the bounce runs on");
+            let landed = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while app.export_job.is_some() && std::time::Instant::now() < landed {
+                app.poll_export();
+                if app.export_job.is_some() {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            assert!(app.export_job.is_none(), "the bounce never landed");
+        }
+
         /// The render window closes on its outcome, and the export chord
         /// over it ends the bounce early, as the status says.
         #[test]

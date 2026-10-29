@@ -4737,7 +4737,8 @@ fn keybinds_footer_hint(
     if settings.editor_keybindings == EditorKeybindings::Vim {
         match keybind_action_at(sheet.selected) {
             Some(BindAction::Docs) => {
-                return "Vim: gd (default mapping) · Ctrl+D pages down · Enter: rebind".to_owned();
+                return "Vim: gd unless the vimrc maps it · Ctrl+D pages down · Enter: rebind"
+                    .to_owned();
             }
             Some(BindAction::Wrap) => {
                 return "Vim: no chord · Ctrl+U pages up · Enter: rebind".to_owned();
@@ -6261,6 +6262,11 @@ mod tests {
         assert!(
             keybinds_footer_hint(sheet, &settings, &features).contains("Ctrl+D pages down"),
             "the Docs row names the key it gave up"
+        );
+        assert!(
+            keybinds_footer_hint(sheet, &settings, &features)
+                .contains("gd unless the vimrc maps it"),
+            "a vimrc line can replace gd, so the row does not promise it"
         );
         sheet.selected = row(BindAction::Wrap);
         assert!(

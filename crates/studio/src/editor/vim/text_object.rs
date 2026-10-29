@@ -1,6 +1,8 @@
 use std::ops::Range;
 
-use super::{ByteOffset, Editor, EditorError, HistoryMoment, Mode, Selection};
+use unicode_segmentation::UnicodeSegmentation;
+
+use super::{ByteOffset, Editor, EditorError, HistoryMoment, Mode, Selection, line_ending_len};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TextObjectKind {
@@ -26,7 +28,8 @@ impl Editor {
             return Ok(());
         };
         if let Some(operator) = operator {
-            self.vim_apply_operator(operator, range, false, moment)?;
+            let start = range.start;
+            self.vim_apply_operator(operator, range, false, start, moment)?;
         } else {
             let head = if range.is_empty() {
                 range.start
@@ -140,7 +143,7 @@ fn block_range(
             && let Some(start) = stack.pop()
         {
             let range = match kind {
-                TextObjectKind::Inner => start + 1..index,
+                TextObjectKind::Inner => inner_block(text, start + 1, index),
                 TextObjectKind::Around => start..index + 1,
             };
             if start <= head && head <= index {
@@ -165,6 +168,25 @@ fn block_range(
         }
     }
     (!enclosing).then_some(next).flatten()
+}
+
+/// The inside of a block, from just after its opening bracket to its
+/// closing bracket at `end`. A line break right after the opening bracket
+/// stays out, and so does the indent before a closing bracket that starts
+/// its line, as in Vim. A block of whole lines then takes just those lines.
+fn inner_block(text: &str, start: usize, end: usize) -> Range<usize> {
+    let start = text[start..end]
+        .graphemes(true)
+        .next()
+        .filter(|cluster| line_ending_len(cluster) > 0)
+        .map_or(start, |cluster| start + cluster.len());
+    let inside = &text[start..end];
+    let indent_start = end - (inside.len() - inside.trim_end_matches([' ', '\t']).len());
+    if line_ending_len(&text[..indent_start]) > 0 {
+        start..indent_start
+    } else {
+        start..end
+    }
 }
 
 fn closing_quote(bytes: &[u8], start: usize) -> Option<usize> {
