@@ -385,16 +385,6 @@ struct Voice {
     /// Coarse sample-and-hold last output, per channel.
     coarse_hold: [f32; 2],
     fx_mod_hold: FxParamHold,
-    /// The quantum-derived gates below change only when `abs & !127` moves.
-    /// The per-sample loop reads them every frame, so they are cached here
-    /// and recomputed at each quantum start: identical values, one compute
-    /// per 128 frames instead of one per frame.
-    quantum_cache_loaded: bool,
-    cached_transient_open: bool,
-    cached_filter_lfo_alive: bool,
-    cached_source_open: bool,
-    cached_lfo_live: bool,
-    cached_note_alive: bool,
     /// Gate value for the pitch envelope's linear shape.
     pitch_gate: f32,
     /// Event/sample choke group. Keeping it on the live voice means groups
