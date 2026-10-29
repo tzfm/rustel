@@ -24,6 +24,7 @@ pub use stream::audio_devices;
 #[cfg(feature = "test-support")]
 use stream::buffer_preference_error;
 pub use stream::input_retry_delay;
+pub use stream::prime_playback_host;
 use stream::rebase_frame_rate;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
