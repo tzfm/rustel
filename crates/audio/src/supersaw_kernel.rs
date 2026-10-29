@@ -87,7 +87,9 @@ impl StaticSupersawKernel {
         sample_rate: f32,
         pan_gains: (f32, f32),
     ) -> (f32, f32) {
-        debug_assert!(count >= 8 && count <= phases.len() && count <= detune_ratios.len());
+        debug_assert!(
+            count >= self.minimum_lanes && count <= phases.len() && count <= detune_ratios.len()
+        );
         // SAFETY: construction established the target feature and the caller
         // supplies the prepared supersaw arrays described above.
         unsafe {
