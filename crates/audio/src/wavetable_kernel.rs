@@ -39,7 +39,10 @@ pub fn selected_wavetable_kernel_kind() -> WavetableKernelKind {
     *automatic_kind()
 }
 
-/// A target-feature implementation selected before the sample loop.
+/// A target-feature implementation selected before the sample loop. The
+/// stub below serves every target without a compiled kernel, so this enum
+/// exists only where a kernel does.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WavetableKernel {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
