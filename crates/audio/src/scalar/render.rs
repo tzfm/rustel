@@ -1,5 +1,6 @@
 use super::*;
 use crate::pool::{JobKind, JoinGuard, PoolHandle};
+use crate::sample::{SampleBank, SampleResamplingMode};
 
 /// On x86_64, flush subnormal inputs and results to zero so quiet filter and
 /// reverb tails avoid denormal arithmetic costs. These flags are per-thread;
@@ -30,6 +31,141 @@ pub(crate) fn enable_denormal_flush() {
             }
         }
     }
+}
+
+/// True when the voice runs no optional ladder at all: a stereo sample
+/// with no modulators, no FM route, no live sliders, no fades, no filters,
+/// no FX of any kind, no sends, no insert routing and no visual capture.
+///
+/// Every frame of such a voice is the source, the envelope, three gains,
+/// the panner and the mix - which is exactly what
+/// [`render_plain_stereo_sample`] computes, operation for operation as the
+/// general body does with every gate closed. The classification is
+/// recomputed each render because steals and polyphony fades change a
+/// voice's ladders mid-life.
+fn plain_sample_voice(v: &Voice) -> bool {
+    matches!(v.source, VoiceSource::Sample { .. })
+        && v.filters_right.is_some()
+        && !v.has_filters
+        && !v.has_pre_distort_fx
+        && !v.has_param_modulators
+        && v.pitch_quantum_skip == 0
+        && v.fm_state.is_none()
+        && v.controls.fm.is_none()
+        && v.live_fm_index.binding == 0
+        && v.live_cutoff.binding == 0
+        && v.live_resonance.binding == 0
+        && v.live_gain.binding == 0
+        && v.cut_fade_frame.is_none()
+        && v.polyphony_fade_frame.is_none()
+        && !v.through_insert
+        && v.controls.vibrato.is_none()
+        && v.controls.pitch_env.is_none()
+        && v.controls.tremolo.is_none()
+        && v.controls.phaser.is_none()
+        && v.controls.vowel.is_none()
+        && v.controls.distort.is_none()
+        && v.compressor.is_none()
+        && v.controls.compressor.is_none()
+        && v.limiter.is_none()
+        && v.fx_stage_state.is_none()
+        && v.kabel.is_none()
+        && v.stretch.is_none()
+        && v.controls.stretch.is_none()
+        && v.transient.is_none()
+        && v.delay_wet == 0.0
+        && v.reverb_wet == 0.0
+        && v.controls.bus.is_none()
+        && v.ui_visuals == 0
+}
+
+/// The tight path a plain sample voice takes, one frame at a time.
+///
+/// Kept out of line so it earns its own registers: the general body in
+/// [`ScalarBackend::process_segment`] is so wide that a plain voice paid
+/// its stack spills every frame, plain or not. The arithmetic here is the
+/// general body's with every gate closed, in the same order: skips are
+/// only identities (a multiply by one, an add the full path also makes),
+/// so the frames are bit for bit what the general body produces.
+#[inline(never)]
+fn render_plain_stereo_sample(
+    v: &mut Voice,
+    bank: &SampleBank,
+    resampling: SampleResamplingMode,
+    i: usize,
+    t: f32,
+    blocks: &mut [[[f32; crate::reverb::REVERB_BLOCK]; 2]],
+    piano_mix: &mut [[f32; crate::reverb::REVERB_BLOCK]; 2],
+) {
+    let env = ScalarBackend::envelope(t, v.duration_secs, v.controls.envelope, v.gate_value);
+    let VoiceSource::Sample {
+        sample,
+        position,
+        increment,
+        reversed,
+        delay_frames,
+        loop_frames,
+    } = &mut v.source
+    else {
+        return;
+    };
+    // The general body reads its playback step through the per-quantum
+    // pitch hold; a plain voice holds no pitch shaper, so its step is the
+    // increment itself (multiplying by the held one is an exact identity).
+    let (wave_l, wave_r) = if bank.get(*sample).is_none() {
+        // The slot was emptied under the voice - an uninstall landed. The
+        // voice ends with the block, as the general body ends it.
+        v.source_gone = true;
+        (0.0, 0.0)
+    } else if *delay_frames > 0 {
+        *delay_frames -= 1;
+        (0.0, 0.0)
+    } else if let Some((loop_start, loop_end)) = *loop_frames
+        && loop_end > loop_start
+        && bank
+            .get(*sample)
+            .is_some_and(|decoded| *increment > loop_end.min(decoded.frames() as f64) - loop_start)
+    {
+        (0.0, 0.0)
+    } else {
+        let wave = bank
+            .get(*sample)
+            .and_then(|decoded| {
+                if *reversed {
+                    let last = (decoded.frames().max(1) - 1) as f64;
+                    let read = last - *position;
+                    if read < 0.0 {
+                        return None;
+                    }
+                    decoded.stereo_at_reversed_with_mode(read, resampling)
+                } else {
+                    decoded.stereo_at_with_mode(*position, resampling)
+                }
+            })
+            .unwrap_or((0.0, 0.0));
+        *position += *increment;
+        if let Some((loop_start, loop_end)) = loop_frames
+            && *position >= *loop_end
+            && *loop_end > *loop_start
+        {
+            *position -= *loop_end - *loop_start;
+        }
+        wave
+    };
+    let scale = v.amplitude_scale * env;
+    let (left, right) = (wave_l * scale, wave_r * scale);
+    let (left, right) = stereo_pan(left, right, v.pan_x);
+    let post_gain = v.controls.postgain;
+    let (left, right) = (left * post_gain, right * post_gain);
+    let dry = v.dry_gain + 0.0;
+    let (left, right) = (left * dry, right * dry);
+    let mix = if v.piano {
+        piano_mix
+    } else {
+        &mut blocks[v.orbit]
+    };
+    mix[0][i] += left;
+    mix[1][i] += right;
 }
 
 impl ScalarPressureState {
@@ -1479,6 +1615,7 @@ impl ScalarBackend {
                     ui_visuals: e.ui_visuals,
                     preview_epoch: e.controls.preview_epoch,
                     piano: e.controls.piano,
+                    plain: false,
                     onset_lead: e.onset_lead,
                     distort_curve: e.controls.distort.map(|d| d.curve(d.shape())),
                     delay_wet,
@@ -1757,6 +1894,18 @@ impl ScalarBackend {
         // The GainNode on the delay's feedback edge is shared in the same
         // way, and its `gain` AudioParam is a-rate too.
         let mut delay_feedback_mods = [0.0f32; MAX_ORBITS];
+        // Tight-path classification, after every activation of this render:
+        // a steal or a polyphony fade lands its ladders on a voice that
+        // was plain until then, and the classification has to see them.
+        // A field read, not a method: this late, `self` is already split
+        // across the block pipeline's borrows.
+        #[cfg(test)]
+        let plain_disabled = self.disable_plain_path;
+        #[cfg(not(test))]
+        let plain_disabled = false;
+        for voice in &mut self.voices {
+            voice.plain = !plain_disabled && plain_sample_voice(voice);
+        }
         // Per-orbit block pipeline: voices, delay and reverb returns
         // accumulate into ≤128-frame per-orbit buffers (the reverb is a
         // block convolution on WebAudio's 128-frame quantum), then the duck
@@ -1941,6 +2090,21 @@ impl ScalarBackend {
                         ((abs - v.start_frame) as f32 + v.onset_lead) / sr as f32
                     };
                     if t >= v.stop_secs {
+                        continue;
+                    }
+                    // The plain voice's whole frame, out of line: the
+                    // general body below is correct for it too, at the
+                    // price of its register spills.
+                    if v.plain {
+                        render_plain_stereo_sample(
+                            v,
+                            bank,
+                            sample_resampling_mode,
+                            i,
+                            t,
+                            blocks,
+                            &mut piano_mix,
+                        );
                         continue;
                     }
                     let env = Self::envelope(t, v.duration_secs, v.controls.envelope, v.gate_value);
@@ -3972,6 +4136,94 @@ impl ScalarBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod plain_path_tests {
+        use super::*;
+
+        /// A stereo sample the test installs, so the voice is a plain
+        /// sample voice the way a piano voice is: the bundled `bd` is mono
+        /// and would classify away from the tight path.
+        const TEST_SAMPLE: crate::sample::SampleId = crate::sample::SampleId(40);
+
+        fn install_stereo_sample(backend: &mut ScalarBackend) {
+            let pcm: Vec<f32> = (0..48_000)
+                .map(|frame| {
+                    let phase = frame as f32 * 440.0 * 2.0 * std::f32::consts::PI / 48_000.0;
+                    (phase.sin() * (1.0 - frame as f32 / 48_000.0)) * 0.4
+                })
+                .collect();
+            let decoded = crate::sample::DecodedSample::from_parts(48_000, 2, pcm).unwrap();
+            backend
+                .install_sample(TEST_SAMPLE, Box::new(decoded))
+                .expect("the test slot installs");
+        }
+
+        fn sample_note(frame: u64, rate: f32) -> OnsetEvent {
+            let mut event = OnsetEvent::new(frame, 220.0, 0.5, 2.0);
+            event.sample = Some(crate::SampleControls {
+                sample: TEST_SAMPLE,
+                playback_rate: rate,
+                begin: 0.0,
+                end: 1.0,
+                hold: crate::sample::SampleHold::Hap,
+                muted: false,
+                loop_secs: None,
+                envelope_peak: 1.0,
+                reversed: false,
+                nudge_secs: 0.0,
+                cut: None,
+            });
+            event
+        }
+
+        fn render(disable_plain: bool) -> (Vec<f32>, usize) {
+            let mut backend = ScalarBackend::prepared(48_000, 16).unwrap();
+            backend.disable_plain_path = disable_plain;
+            install_stereo_sample(&mut backend);
+            for (frame, rate) in [(0u64, 1.0), (200, 0.5), (1024, 1.5)] {
+                backend.note(sample_note(frame, rate));
+            }
+            let mut out = vec![0.0f32; 2 * 128];
+            let mut all = Vec::new();
+            for _ in 0..48 {
+                backend.process_block(&mut out[..], 128);
+                all.extend_from_slice(&out);
+            }
+            let plain_voices = backend.voices.iter().filter(|voice| voice.plain).count();
+            (all, plain_voices)
+        }
+
+        /// The tight path computes the same frame the general body does,
+        /// bit for bit, for every plain sample voice.
+        #[test]
+        fn the_plain_sample_path_matches_the_general_body_bit_for_bit() {
+            let (tight, plain_voices) = render(false);
+            let (general, _) = render(true);
+            assert!(
+                plain_voices > 0,
+                "the test's voices must classify as plain or it proves nothing"
+            );
+            assert!(
+                tight.iter().any(|value| value.abs() > 0.001),
+                "the test's samples must sound or the comparison proves nothing"
+            );
+            assert_eq!(tight.len(), general.len());
+            for (tight, general) in tight.iter().zip(&general) {
+                assert_eq!(tight.to_bits(), general.to_bits());
+            }
+        }
+
+        /// A plain sample voice classifies for the tight path.
+        #[test]
+        fn a_plain_sample_voice_classifies_for_the_tight_path() {
+            let mut backend = ScalarBackend::prepared(48_000, 4).unwrap();
+            install_stereo_sample(&mut backend);
+            backend.note(sample_note(0, 1.0));
+            let mut out = [0.0f32; 256];
+            backend.process_block(&mut out[..], 128);
+            assert!(backend.voices.iter().any(|voice| voice.plain));
+        }
+    }
+
     mod dispatch_tests {
         use super::*;
 
