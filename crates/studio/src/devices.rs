@@ -712,13 +712,10 @@ impl DeviceScanner {
         if std::thread::Builder::new()
             .name("studio-devices".into())
             .spawn(move || {
-                // A backstop for hosts the event loop's own priming never
-                // reached: the host connection thread inherits its
-                // creator's priority, and the audio callback rides it. The
-                // event loop primes before it demotes; this thread is born
-                // demoted, so its priming only lands when nothing primed
-                // before it.
-                rustel_audio::prime_playback_host();
+                // No priming here: this thread is born demoted, and the
+                // host refuses to be built by a demoted thread anyway -
+                // the event loop primes before it demotes, and the host
+                // cache holds the connection for every later caller.
                 crate::background::demote();
                 let _ = sender.send(DeviceInventory::probe());
             })
