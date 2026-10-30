@@ -5,6 +5,7 @@
 //! terminal thread owns editing, input and drawing.
 
 pub mod app;
+mod background;
 mod bounded_file;
 mod catalogue;
 mod config;

@@ -19,6 +19,8 @@ pub enum CapabilityId {
     Avx2Convolution,
     Avx2Supersaw,
     Avx2Wavetable,
+    NeonSupersaw,
+    NeonWavetable,
 }
 
 impl CapabilityId {
@@ -29,6 +31,8 @@ impl CapabilityId {
             Self::Avx2Convolution => "avx2_convolution",
             Self::Avx2Supersaw => "avx2_supersaw",
             Self::Avx2Wavetable => "avx2_wavetable",
+            Self::NeonWavetable => "neon_wavetable",
+            Self::NeonSupersaw => "neon_supersaw",
         }
     }
 }
@@ -385,14 +389,24 @@ impl CapabilityRegistry {
         let convolution_detected = convolution_compiled && avx2_feature_detected;
         let convolution_selected =
             dispatch.convolution_kernel_kind() == rustel_audio::ConvolutionKernelKind::Avx2;
-        let supersaw_compiled = rustel_audio::SupersawKernelKind::Avx2.compiled();
-        let supersaw_detected = supersaw_compiled && avx2_feature_detected;
+        let supersaw_compiled = rustel_audio::SupersawKernelKind::Avx2.compiled()
+            || rustel_audio::SupersawKernelKind::Neon.compiled();
+        let supersaw_detected = supersaw_compiled
+            && (avx2_feature_detected
+                || cpu_features
+                    .status(CpuFeatureId::Neon)
+                    .is_some_and(|status| status.detected()));
         let supersaw_selected =
-            dispatch.supersaw_kernel_kind() == rustel_audio::SupersawKernelKind::Avx2;
-        let wavetable_compiled = rustel_audio::WavetableKernelKind::Avx2.compiled();
-        let wavetable_detected = wavetable_compiled && avx2_feature_detected;
+            dispatch.supersaw_kernel_kind() != rustel_audio::SupersawKernelKind::Portable;
+        let wavetable_compiled = rustel_audio::WavetableKernelKind::Avx2.compiled()
+            || rustel_audio::WavetableKernelKind::Neon.compiled();
+        let wavetable_detected = wavetable_compiled
+            && (avx2_feature_detected
+                || cpu_features
+                    .status(CpuFeatureId::Neon)
+                    .is_some_and(|status| status.detected()));
         let wavetable_selected =
-            dispatch.wavetable_kernel_kind() == rustel_audio::WavetableKernelKind::Avx2;
+            dispatch.wavetable_kernel_kind() != rustel_audio::WavetableKernelKind::Portable;
         let accelerated = convolution_selected || supersaw_selected || wavetable_selected;
 
         let mut statuses = Vec::with_capacity(
@@ -435,8 +449,15 @@ impl CapabilityRegistry {
                 }
                 AccelerationPreference::Auto => CapabilityReason::CpuFeatureUnavailable,
             };
+            // Exactly one accelerated supersaw implementation is compiled in,
+            // named by the architecture this binary was built for.
+            let id = if rustel_audio::SupersawKernelKind::Avx2.compiled() {
+                CapabilityId::Avx2Supersaw
+            } else {
+                CapabilityId::NeonSupersaw
+            };
             statuses.push(CapabilityStatus::new(
-                CapabilityId::Avx2Supersaw,
+                id,
                 true,
                 supersaw_detected,
                 supersaw_selected,
@@ -451,8 +472,15 @@ impl CapabilityRegistry {
                 }
                 AccelerationPreference::Auto => CapabilityReason::CpuFeatureUnavailable,
             };
+            // Exactly one accelerated wavetable implementation is compiled
+            // in, named by the architecture this binary was built for.
+            let id = if rustel_audio::WavetableKernelKind::Avx2.compiled() {
+                CapabilityId::Avx2Wavetable
+            } else {
+                CapabilityId::NeonWavetable
+            };
             statuses.push(CapabilityStatus::new(
-                CapabilityId::Avx2Wavetable,
+                id,
                 true,
                 wavetable_detected,
                 wavetable_selected,
@@ -553,8 +581,14 @@ mod tests {
         assert_eq!(
             registry.statuses().len(),
             1 + usize::from(rustel_audio::ConvolutionKernelKind::Avx2.compiled())
-                + usize::from(rustel_audio::SupersawKernelKind::Avx2.compiled())
-                + usize::from(rustel_audio::WavetableKernelKind::Avx2.compiled())
+                + usize::from(
+                    rustel_audio::SupersawKernelKind::Avx2.compiled()
+                        || rustel_audio::SupersawKernelKind::Neon.compiled()
+                )
+                + usize::from(
+                    rustel_audio::WavetableKernelKind::Avx2.compiled()
+                        || rustel_audio::WavetableKernelKind::Neon.compiled()
+                )
         );
 
         let scalar = registry
@@ -568,7 +602,7 @@ mod tests {
             if rustel_audio::selected_convolution_kernel_kind()
                 == rustel_audio::ConvolutionKernelKind::Avx2
                 || rustel_audio::selected_supersaw_kernel_kind()
-                    == rustel_audio::SupersawKernelKind::Avx2
+                    != rustel_audio::SupersawKernelKind::Portable
                 || rustel_audio::selected_wavetable_kernel_kind()
                     == rustel_audio::WavetableKernelKind::Avx2
             {
@@ -619,6 +653,26 @@ mod tests {
                 }
             );
         }
+        if rustel_audio::SupersawKernelKind::Neon.compiled() {
+            let neon = registry
+                .status(CapabilityId::NeonSupersaw)
+                .expect("NEON supersaw");
+            let detected = registry
+                .cpu_features()
+                .status(CpuFeatureId::Neon)
+                .is_some_and(|status| status.detected());
+            assert!(neon.compiled());
+            assert_eq!(neon.detected(), detected);
+            assert_eq!(neon.selected(), detected);
+            assert_eq!(
+                neon.reason(),
+                if detected {
+                    CapabilityReason::SelectedByRuntime
+                } else {
+                    CapabilityReason::CpuFeatureUnavailable
+                }
+            );
+        }
 
         if rustel_audio::WavetableKernelKind::Avx2.compiled() {
             let avx2 = registry
@@ -633,6 +687,26 @@ mod tests {
             assert_eq!(avx2.selected(), detected);
             assert_eq!(
                 avx2.reason(),
+                if detected {
+                    CapabilityReason::SelectedByRuntime
+                } else {
+                    CapabilityReason::CpuFeatureUnavailable
+                }
+            );
+        }
+        if rustel_audio::WavetableKernelKind::Neon.compiled() {
+            let neon = registry
+                .status(CapabilityId::NeonWavetable)
+                .expect("NEON wavetable");
+            let detected = registry
+                .cpu_features()
+                .status(CpuFeatureId::Neon)
+                .is_some_and(|status| status.detected());
+            assert!(neon.compiled());
+            assert_eq!(neon.detected(), detected);
+            assert_eq!(neon.selected(), detected);
+            assert_eq!(
+                neon.reason(),
                 if detected {
                     CapabilityReason::SelectedByRuntime
                 } else {
@@ -670,12 +744,26 @@ mod tests {
             assert!(!avx2.selected());
             assert_eq!(avx2.reason(), CapabilityReason::DisabledByPreference);
         }
+        if rustel_audio::SupersawKernelKind::Neon.compiled() {
+            let neon = portable
+                .status(CapabilityId::NeonSupersaw)
+                .expect("NEON supersaw");
+            assert!(!neon.selected());
+            assert_eq!(neon.reason(), CapabilityReason::DisabledByPreference);
+        }
         if rustel_audio::WavetableKernelKind::Avx2.compiled() {
             let avx2 = portable
                 .status(CapabilityId::Avx2Wavetable)
                 .expect("AVX2 wavetable");
             assert!(!avx2.selected());
             assert_eq!(avx2.reason(), CapabilityReason::DisabledByPreference);
+        }
+        if rustel_audio::WavetableKernelKind::Neon.compiled() {
+            let neon = portable
+                .status(CapabilityId::NeonWavetable)
+                .expect("NEON wavetable");
+            assert!(!neon.selected());
+            assert_eq!(neon.reason(), CapabilityReason::DisabledByPreference);
         }
     }
 
@@ -706,9 +794,19 @@ mod tests {
                     dispatch.supersaw_kernel_kind() == rustel_audio::SupersawKernelKind::Avx2,
                 ),
                 (
+                    CapabilityId::NeonSupersaw,
+                    rustel_audio::SupersawKernelKind::Neon.compiled(),
+                    dispatch.supersaw_kernel_kind() == rustel_audio::SupersawKernelKind::Neon,
+                ),
+                (
                     CapabilityId::Avx2Wavetable,
                     rustel_audio::WavetableKernelKind::Avx2.compiled(),
                     dispatch.wavetable_kernel_kind() == rustel_audio::WavetableKernelKind::Avx2,
+                ),
+                (
+                    CapabilityId::NeonWavetable,
+                    rustel_audio::WavetableKernelKind::Neon.compiled(),
+                    dispatch.wavetable_kernel_kind() == rustel_audio::WavetableKernelKind::Neon,
                 ),
             ] {
                 let status = registry.status(id);

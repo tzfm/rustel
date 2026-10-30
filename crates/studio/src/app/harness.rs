@@ -723,6 +723,17 @@ impl Studio {
         self.app.editor().document().text()
     }
 
+    /// The log's line texts, oldest first: the durable record of what the
+    /// engine and the studio said, beyond the transient status line.
+    pub fn log_texts(&self) -> Vec<String> {
+        self.app
+            .log
+            .lines()
+            .iter()
+            .map(|line| line.text.clone())
+            .collect()
+    }
+
     /// Put the caret at a byte offset of the focused scene - the way a
     /// click places it, with no selection. Tests walk the caret to a
     /// bracket or a word without guessing at screen geometry.

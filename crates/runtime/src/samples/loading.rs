@@ -313,14 +313,14 @@ fn run_sample_loader(shared: Weak<Shared>, jobs: Arc<LoadQueue>, dir: PathBuf) {
                     budget: &budget,
                     publication: &shared.publication,
                 },
-                |bytes| decode_guarded(&url, bytes, context_rate),
+                |bytes| super::decode_cache::decode_cached(&dir, &url, context_rate, bytes),
             ),
             None => fetch_cached_decoded_with_budget(
                 &dir,
                 &url,
                 &budget,
                 &shared.publication,
-                |bytes| decode_guarded(&url, bytes, context_rate),
+                |bytes| super::decode_cache::decode_cached(&dir, &url, context_rate, bytes),
             ),
         };
         match outcome {
@@ -1173,6 +1173,7 @@ impl SampleLibrary {
 
 #[cfg(test)]
 pub(super) mod tests {
+    use super::codecs::decode_guarded;
     use super::*;
     #[cfg(test)]
     mod empty_font_tests {

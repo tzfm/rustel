@@ -53,9 +53,27 @@ use rustel_runtime::ui_events::{
     source_revision,
 };
 use rustel_runtime::{
-    EnginePressureMonitor, EnginePressureSnapshot, LiveFileProducer, LiveProducerStep,
-    RuntimeError, Session, SessionConfig,
+    DEFAULT_HORIZON, EnginePressureMonitor, EnginePressureSnapshot, LIVE_REPLACEMENT_MIN_HEADROOM,
+    LiveFileProducer, LiveProducerStep, RuntimeError, Session, SessionConfig,
 };
+
+/// The most the studio lets the scheduling horizon grow. An evaluation
+/// slower than this still drains the ring, and the replacement it arms
+/// rolls back rather than taking over into a gap.
+const MAX_LIVE_HORIZON: f64 = 2.0;
+
+/// The horizon that keeps a replacement's takeover inside scheduled audio
+/// after an evaluation of the playing score took `evaluation`.
+///
+/// The engine thread is also the live producer, so while it compiles nothing
+/// refills the ring, and a replacement armed after a compile longer than the
+/// ring holds takes over past its last scheduled onset: the refusal that
+/// follows keeps the old score and drops the edit. Twice the compile plus a
+/// tenth keeps a full ring through the next one; a fast machine's compile
+/// never reaches the default horizon, so it schedules as before.
+pub(super) fn horizon_for_evaluation(evaluation: Duration) -> f64 {
+    (evaluation.as_secs_f64() * 2.0 + 0.1).clamp(DEFAULT_HORIZON, MAX_LIVE_HORIZON)
+}
 
 /// Scheduling cadence used by the native studio worker.
 pub const DEFAULT_STUDIO_POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -176,9 +194,12 @@ struct ProtectionKey {
 /// How far ahead of the device clock a preview is placed.
 const AUDITION_LEAD_SECS: f64 = 0.06;
 /// How far ahead of its own moment a run's note is handed to the device.
-/// Wider than the lead itself, so a note is always placed at the moment
-/// it belongs to rather than at the earliest the device would take it.
-const AUDITION_RUN_LEAD_SECS: f64 = AUDITION_LEAD_SECS * 2.0;
+/// Wide enough that a slow engine turn - a busy small machine renders its
+/// turns hundreds of milliseconds apart - still hands each note over
+/// before its moment, so the device places it at the time it belongs to
+/// and the run keeps its tempo. A note already handed over cannot be
+/// taken back; `stop_audition` cuts each of those at its own start.
+const AUDITION_RUN_LEAD_SECS: f64 = 0.6;
 /// Gate length of a preview; a one-shot sample plays to its end anyway.
 const AUDITION_GATE_SECS: f64 = 2.0;
 /// A chord is held a little longer than a one-shot: the ear needs the
@@ -1123,6 +1144,15 @@ const BATON_SETTLE_CALLBACKS: u64 = 2;
 pub struct StudioEngine {
     config: StudioConfig,
     session: Session,
+    /// The horizon the session keeps filled, raised when an evaluation of the
+    /// playing score runs longer than the audio scheduled ahead of the clock
+    /// (see [`Self::widen_horizon_for_evaluation`]).
+    live_horizon: f64,
+    /// The last evaluation of the playing score, wall-clock. The first
+    /// replacement of a score sizes its takeover from this until the
+    /// producer has measured a cutover of its own (see
+    /// [`Self::match_replacement_headroom_to_producer`]).
+    last_live_evaluation: Duration,
     recovery_epoch: u64,
     launch_pads: Vec<(u8, u8)>,
     live: Option<StudioPlayback>,
@@ -1703,6 +1733,8 @@ impl StudioEngine {
         Ok(Self {
             config,
             session,
+            live_horizon: DEFAULT_HORIZON,
+            last_live_evaluation: Duration::ZERO,
             recovery_epoch: 0,
             launch_pads: Vec::new(),
             live: None,

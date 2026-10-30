@@ -38,6 +38,15 @@ with `downloaded rustel failed its version check`. Install both libraries
 with your package manager, then run `rustelup` again. On Linux and macOS,
 `rustelup` needs `curl`, `tar`, and `sha256sum` or `shasum`.
 
+On Linux, after a successful install, `rustelup` checks the audio system.
+A machine that runs PipeWire or PulseAudio without `rtkit` can click its
+output when the CPU is busy, because nothing grants the audio server
+realtime. When `rustelup` finds that combination it offers to install
+`rtkit` with your package manager, and prints the exact command when it
+cannot ask (a piped install) or when you decline. The check never fails
+the install. See the [hardware guide](../docs/hardware.md) for what the
+grant does.
+
 The bootstrap downloads `rustelup` (or `rustelup.ps1` on Windows) from the
 latest release. Both it and `rustelup` verify the release asset against its
 `.sha256` sidecar before replacing an installed file. A failed download or
