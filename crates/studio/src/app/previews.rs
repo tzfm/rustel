@@ -233,6 +233,20 @@ impl App {
     /// selected. Follow its own source until it is replaced or stopped,
     /// including failures that recover after a later loader retry.
     #[cfg(feature = "hydra")]
+    /// Whether the preview sound's bank is still on its way in. A preview
+    /// pressed while this is true waits for the bank before it sounds, so
+    /// the status says the load instead of claiming a preview that has
+    /// not happened yet.
+    fn preview_sound_loading(&self) -> bool {
+        use rustel_voice::{SampleLookup, SampleResolution};
+        self.worker.library().is_some_and(|library| {
+            matches!(
+                library.resolve(CHORD_PREVIEW_SOUND, 0.0, 60.0),
+                SampleResolution::Loading
+            )
+        })
+    }
+
     pub(super) fn refresh_preview_readiness(&mut self) {
         let Some(preview) = self.snippet_preview.as_mut() else {
             return;
@@ -273,7 +287,11 @@ impl App {
         {
             self.preview_armed = Some((chord.to_owned(), Instant::now()));
             self.preview_lit_until = Some(Instant::now() + CHORD_PREVIEW_GLOW);
-            self.status = format!("preview {chord}");
+            self.status = if self.preview_sound_loading() {
+                "loading the piano for previews...".to_owned()
+            } else {
+                format!("preview {chord}")
+            };
         } else {
             self.status = format!("the engine is busy; {chord} was not previewed");
         }
@@ -349,7 +367,11 @@ impl App {
                         SCALE_PREVIEW_STEP_SECS * run.len().min(MAX_PREVIEW_RUN_NOTES) as f64,
                     ),
             );
-            self.status = format!("preview {scale}");
+            self.status = if self.preview_sound_loading() {
+                "loading the piano for previews...".to_owned()
+            } else {
+                format!("preview {scale}")
+            };
         } else {
             self.status = format!("the engine is busy; {scale} was not previewed");
         }
@@ -2749,7 +2771,13 @@ mod tests {
             assert_eq!(app.prefs.auto_preview, Some(true));
             assert!(app.status.contains("auto-play on"), "{}", app.status);
             press(&mut app, KeyCode::Down, KeyModifiers::NONE);
-            assert!(app.status.contains("C7"), "{}", app.status);
+            // The preview bank can still be loading in a test host, and
+            // then the honest status says the load rather than the chord.
+            assert!(
+                app.status.contains("C7") || app.status.contains("loading"),
+                "{}",
+                app.status
+            );
             // Alt+A again: the choice turns off, and is kept turned off.
             press(&mut app, KeyCode::Char('a'), KeyModifiers::ALT);
             assert!(!app.ui_settings.auto_preview);

@@ -194,9 +194,12 @@ struct ProtectionKey {
 /// How far ahead of the device clock a preview is placed.
 const AUDITION_LEAD_SECS: f64 = 0.06;
 /// How far ahead of its own moment a run's note is handed to the device.
-/// Wider than the lead itself, so a note is always placed at the moment
-/// it belongs to rather than at the earliest the device would take it.
-const AUDITION_RUN_LEAD_SECS: f64 = AUDITION_LEAD_SECS * 2.0;
+/// Wide enough that a slow engine turn - a busy small machine renders its
+/// turns hundreds of milliseconds apart - still hands each note over
+/// before its moment, so the device places it at the time it belongs to
+/// and the run keeps its tempo. A note already handed over cannot be
+/// taken back; `stop_audition` cuts each of those at its own start.
+const AUDITION_RUN_LEAD_SECS: f64 = 0.6;
 /// Gate length of a preview; a one-shot sample plays to its end anyway.
 const AUDITION_GATE_SECS: f64 = 2.0;
 /// A chord is held a little longer than a one-shot: the ear needs the
