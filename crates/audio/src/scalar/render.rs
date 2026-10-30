@@ -1,6 +1,7 @@
 use super::*;
 use crate::pool::{JobKind, JoinGuard, PoolHandle};
 use crate::sample::{SampleBank, SampleResamplingMode};
+use crate::supersaw_kernel::StaticSupersawKernel;
 
 /// On x86_64, flush subnormal inputs and results to zero so quiet filter and
 /// reverb tails avoid denormal arithmetic costs. These flags are per-thread;
@@ -47,7 +48,7 @@ pub(crate) fn enable_denormal_flush() {
 fn plain_sample_voice(v: &Voice) -> bool {
     matches!(
         v.source,
-        VoiceSource::Sample { .. } | VoiceSource::Oscillator { .. }
+        VoiceSource::Sample { .. } | VoiceSource::Oscillator { .. } | VoiceSource::Supersaw { .. }
     ) && v.controls.noise == 0.0
         && v.filters_right.is_some()
         && !v.has_filters
@@ -97,7 +98,9 @@ fn render_plain_voice(
     v: &mut Voice,
     bank: &SampleBank,
     tables: &PeriodicWaveTables,
+    supersaw_kernel: Option<StaticSupersawKernel>,
     resampling: SampleResamplingMode,
+    abs: u64,
     i: usize,
     sr: f64,
     t: f32,
@@ -182,6 +185,52 @@ fn render_plain_voice(
                 sr,
             );
             (wave, wave)
+        }
+        // The supersaw's begin gate: no output and no phase advance until
+        // the gate opens, exactly as the general body guards it.
+        VoiceSource::Supersaw { .. }
+            if !lfo_quantum_open(abs & !127, sr, v.controls.worklet_begin_secs) =>
+        {
+            (0.0, 0.0)
+        }
+        VoiceSource::Supersaw { plan, phases } => {
+            let (mut gain_l, mut gain_r) = plan.pan_gains(0.0);
+            let freq = (v.freq_hz + 0.0) * 1.0;
+            // A plain voice carries no spread modulator, so the spread is
+            // static and the fast kernel takes it when this machine has
+            // one.
+            if let Some(kernel) = supersaw_kernel
+                && kernel.supports(plan.count)
+            {
+                // SAFETY: the kernel was selected only after its CPU
+                // prerequisites were detected, and both arrays have
+                // MAX_UNISON entries while count is clamped to that bound.
+                unsafe {
+                    kernel.render(
+                        phases,
+                        &plan.detune_ratios,
+                        plan.count,
+                        freq,
+                        sr as f32,
+                        (gain_l, gain_r),
+                    )
+                }
+            } else {
+                let (scale, center) = (0.0, 0.0);
+                let mut left = 0.0f32;
+                let mut right = 0.0f32;
+                for (n, phase) in phases.iter_mut().enumerate().take(plan.count) {
+                    let ratio = plan.detune_ratios[n];
+                    let voice_freq = freq * ratio;
+                    let dt = saw_step(voice_freq / sr as f32);
+                    let value = saw_blep(*phase, dt);
+                    left += value * gain_l;
+                    right += value * gain_r;
+                    *phase = wrap_phase(f64::from(*phase + dt)) as f32;
+                    std::mem::swap(&mut gain_l, &mut gain_r);
+                }
+                (left, right)
+            }
         }
         _ => return,
     };
@@ -2146,7 +2195,9 @@ impl ScalarBackend {
                             v,
                             bank,
                             tables,
+                            supersaw_kernel,
                             sample_resampling_mode,
+                            abs,
                             i,
                             sr,
                             t,
