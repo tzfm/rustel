@@ -53,6 +53,8 @@ pub use catalog::{
 use manifests::*;
 
 mod codecs;
+#[cfg(feature = "video")]
+pub(crate) use codecs::container_video_track;
 mod folders;
 mod font_queue;
 mod local_names;
@@ -895,6 +897,12 @@ struct Shared {
     /// Full-screen clients own the terminal and suppress informational
     /// loader writes; failures still travel through `failures` above.
     direct_diagnostic_logging: AtomicBool,
+    /// A video container's picture, as thumbnails, by url. One decode per
+    /// url: the first ask starts it on a library thread, later asks read
+    /// it. Kept for the `video()` painters; nothing else reads a
+    /// container's picture.
+    #[cfg(feature = "video")]
+    videos: Mutex<HashMap<Arc<str>, crate::video::VideoPicture>>,
     /// Persistent score-selected bytes have their own namespace and budget.
     /// One library belongs to one Session, so this also owns that Session's
     /// share of the process-independent cache allowance.

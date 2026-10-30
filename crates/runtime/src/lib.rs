@@ -84,6 +84,9 @@ pub mod ui_analysis;
 /// Bounded, versioned live-editor event protocol.
 pub mod ui_events;
 pub mod updates;
+/// A video container's picture as thumbnails, for the `video()` painters.
+#[cfg(feature = "video")]
+pub mod video;
 #[cfg(feature = "vst")]
 pub mod vst;
 mod watch;

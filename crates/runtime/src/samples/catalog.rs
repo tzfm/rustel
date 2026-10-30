@@ -1,5 +1,61 @@
 use super::*;
 
+/// Video clips one set may keep pictures for. Each strip is bounded by its
+/// own budget, and the count is bounded so a score cannot ask for a
+/// picture of a whole sample folder.
+#[cfg(feature = "video")]
+const MAX_TRACKED_VIDEO_CLIPS: usize = 8;
+
+/// Fetch a video sample's container bytes the way the loader fetches a
+/// sample, then decode its picture.
+///
+/// Validation stays the audio decode, as for any sample: the picture
+/// decode refuses codecs this build cannot read, and a refused picture
+/// must not evict cache bytes the sound still plays from.
+#[cfg(feature = "video")]
+fn decode_video_picture(
+    shared: &Shared,
+    url: &Arc<str>,
+) -> Result<crate::video::VideoThumbnails, String> {
+    let budget = sample_fetch::FetchBudget::for_one_fetch_with_cancellation(
+        shared.publication.cancellation(),
+    );
+    let score_access = shared
+        .score_sources
+        .read()
+        .expect("score sample sources")
+        .get(url)
+        .cloned();
+    let extension = match codec_for(url) {
+        Codec::Mp4 => "mp4",
+        Codec::Matroska => "mkv",
+        _ => return Err(format!("{url} is not a video container")),
+    };
+    let validated = |bytes: &[u8]| decode_guarded(url, bytes, None).map(|_| bytes.to_vec());
+    let bytes = match score_access {
+        Some(access) => fetch_score_source_cached_with_budget(
+            &shared.score_cache,
+            url,
+            &access,
+            ScoreCacheKind::Audio,
+            rustel_audio::sample_pcm_ceiling(),
+            CacheFetchScope {
+                budget: &budget,
+                publication: &shared.publication,
+            },
+            validated,
+        ),
+        None => fetch_cached_decoded_with_budget(
+            &shared.host_cache,
+            url,
+            &budget,
+            &shared.publication,
+            validated,
+        ),
+    }?;
+    crate::video::decode_thumbnails(&bytes, extension)
+}
+
 /// A pack's base as a prefix its files start with: with the slash, so
 /// `…/piano` does not claim `…/piano-two/`.
 pub(super) fn source_prefix(base: &str) -> std::borrow::Cow<'_, str> {
@@ -1455,6 +1511,65 @@ impl SampleLibrary {
             _ => return None,
         };
         Some((shape, duration))
+    }
+
+    /// The picture of the video sample `s("name")` names, as thumbnails.
+    ///
+    /// `None` when the name is no video container this build reads. The
+    /// first ask for a url starts one decode on a library thread and
+    /// answers [`VideoPicture::Decoding`]; a later poll reads what it
+    /// produced. The strip stays for the library's life, so a stopped set
+    /// keeps its picture.
+    #[cfg(feature = "video")]
+    pub fn video_thumbnails(&self, name: &str) -> Option<crate::video::VideoPicture> {
+        let (bank, n) = match name.rsplit_once(':') {
+            Some((head, tail)) => match tail.parse::<f64>() {
+                Ok(n) if !head.is_empty() => (head, n),
+                _ => (name, 0.0),
+            },
+            None => (name, 0.0),
+        };
+        let url = self.look_up(bank, |named| match named {
+            Named::Bank(bank) => pick_from_bank(bank, n, 36.0).map(|(url, _)| url),
+            Named::Font(_) => None,
+        })??;
+        if !matches!(codec_for(&url), Codec::Mp4 | Codec::Matroska) {
+            return None;
+        }
+        {
+            let mut videos = self.shared.videos.lock().expect("video thumbnails");
+            if let Some(picture) = videos.get(&url) {
+                return Some(picture.clone());
+            }
+            if videos.len() >= MAX_TRACKED_VIDEO_CLIPS {
+                return Some(crate::video::VideoPicture::Failed(
+                    "too many video clips in one set".to_owned(),
+                ));
+            }
+            videos.insert(Arc::clone(&url), crate::video::VideoPicture::Decoding);
+        }
+        // The decode reads the container through the loader's own paths,
+        // on a thread of its own so a poll never decodes. A weak handle,
+        // like the loader workers: the library can drop mid-decode.
+        let shared = Arc::downgrade(&self.shared);
+        std::thread::Builder::new()
+            .name("video-thumbnails".into())
+            .spawn(move || {
+                let Some(shared) = shared.upgrade() else {
+                    return;
+                };
+                let picture = decode_video_picture(&shared, &url)
+                    .map_or_else(crate::video::VideoPicture::Failed, |strip| {
+                        crate::video::VideoPicture::Ready(Arc::new(strip))
+                    });
+                shared
+                    .videos
+                    .lock()
+                    .expect("video thumbnails")
+                    .insert(url, picture);
+            })
+            .ok()?;
+        Some(crate::video::VideoPicture::Decoding)
     }
 
     /// Whether a `samples(...)` the score wrote - its string argument, as

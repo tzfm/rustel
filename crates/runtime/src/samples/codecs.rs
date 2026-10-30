@@ -563,6 +563,16 @@ fn audio_track<'a>(
         .ok_or_else(|| format!("{extension} has no audio track").into())
 }
 
+/// The container's first video track: one no audio decoder could read. A
+/// video track has neither a rate nor a channel layout, which every audio
+/// track has. The `video` painters decode this track's packets.
+#[cfg(feature = "video")]
+pub(crate) fn container_video_track(
+    format: &dyn symphonia::core::formats::FormatReader,
+) -> Option<&symphonia::core::formats::Track> {
+    format.tracks().iter().find(|track| !is_audio_track(track))
+}
+
 fn decode_compressed_with(
     bytes: &[u8],
     extension: &str,
