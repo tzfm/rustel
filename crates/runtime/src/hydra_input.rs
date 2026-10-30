@@ -167,9 +167,8 @@ struct MediaJob {
     url: String,
     media: HydraMedia,
     access: ScoreSampleAccess,
-    /// The open set's folder in Studio, or why it did not open. A relative
-    /// path is read here first.
-    folder: Option<Result<Arc<ServedRoot>, String>>,
+    /// The open set's folder in Studio. A relative path is read here first.
+    folder: Option<PathBuf>,
     cancel: Arc<AtomicBool>,
     lease: HydraInputLease,
 }
@@ -795,9 +794,9 @@ pub struct HydraInputs {
     sink: HydraInputSink,
     policy: HydraInputPolicy,
     score_sample_access: ScoreSampleAccess,
-    /// The open set's folder, opened or the reason it did not open, beside
-    /// the path it was opened from.
-    media_folder: Option<(PathBuf, Result<Arc<ServedRoot>, String>)>,
+    /// The open set's folder. It is opened for each read and not held, so
+    /// the set can be renamed or moved while Studio runs.
+    media_folder: Option<PathBuf>,
     slots: [Option<ManagedSource>; HYDRA_SOURCE_SLOTS],
     /// Whether the selected theme explicitly uses the default camera as s0.
     /// It is only an acquisition request while the score renderer is absent.
@@ -853,19 +852,7 @@ impl HydraInputs {
     /// Read relative image and video paths in this folder first: the open
     /// set's folder in Studio. `None` leaves only the local sample root.
     pub(crate) fn set_media_folder(&mut self, folder: Option<&Path>) {
-        let Some(folder) = folder else {
-            self.media_folder = None;
-            return;
-        };
-        if self
-            .media_folder
-            .as_ref()
-            .is_some_and(|(path, root)| path == folder && root.is_ok())
-        {
-            return;
-        }
-        // A folder that did not open is tried again at the next update.
-        self.media_folder = Some((folder.to_path_buf(), ServedRoot::open(folder).map(Arc::new)));
+        self.media_folder = folder.map(Path::to_path_buf);
     }
 
     /// Replace the source plan after a validated program was accepted.
@@ -1071,7 +1058,7 @@ impl HydraInputs {
                 url,
                 media,
                 access: self.score_sample_access.clone(),
-                folder: self.media_folder.as_ref().map(|(_, root)| root.clone()),
+                folder: self.media_folder.clone(),
                 cancel,
                 lease,
             };
@@ -1334,7 +1321,7 @@ fn run_media_job(job: MediaJob, diagnostics: &mpsc::Sender<InputDiagnostic>) -> 
         HydraMedia::Video => VIDEO_FETCH_TIMEOUT,
     };
     let budget = sample_fetch::FetchBudget::until(Instant::now() + timeout, Arc::clone(&cancel));
-    let bytes = read_media(&url, &access, folder.as_ref(), &budget, media)?;
+    let bytes = read_media(&url, &access, folder.as_deref(), &budget, media)?;
     budget.check()?;
     let ready = |width: u32, height: u32| {
         let what = match media {
@@ -1375,7 +1362,7 @@ fn run_media_job(job: MediaJob, diagnostics: &mpsc::Sender<InputDiagnostic>) -> 
 fn read_media(
     source: &str,
     access: &ScoreSampleAccess,
-    folder: Option<&Result<Arc<ServedRoot>, String>>,
+    folder: Option<&Path>,
     budget: &sample_fetch::FetchBudget,
     media: HydraMedia,
 ) -> Result<Vec<u8>, String> {
@@ -1384,11 +1371,13 @@ fn read_media(
     }
     let in_set = match folder {
         None => return access.read_hydra_local_media(source, media),
-        Some(Ok(folder)) => crate::samples::read_local_media(folder, source, media),
-        Some(Err(why)) => Err(format!(
-            "{} {source:?} could not be read: the set folder did not open ({why})",
-            media.label()
-        )),
+        Some(folder) => match ServedRoot::open(folder) {
+            Ok(folder) => crate::samples::read_local_media(&folder, source, media),
+            Err(why) => Err(format!(
+                "{} {source:?} could not be read: the set folder did not open ({why})",
+                media.label()
+            )),
+        },
     };
     in_set.or_else(|in_set| {
         access
