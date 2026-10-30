@@ -33,18 +33,22 @@ pub(crate) fn enable_denormal_flush() {
     }
 }
 
-/// True when the voice runs no optional ladder at all: a stereo sample
-/// with no modulators, no FM route, no live sliders, no fades, no filters,
-/// no FX of any kind, no sends, no insert routing and no visual capture.
+/// True when the voice runs no optional ladder at all: a stereo sample or
+/// oscillator with no modulators, no FM route, no live sliders, no fades,
+/// no filters, no FX of any kind, no insert routing and no visual capture.
+/// Sends it may carry: the tight path accumulates them.
 ///
 /// Every frame of such a voice is the source, the envelope, three gains,
-/// the panner and the mix - which is exactly what
-/// [`render_plain_stereo_sample`] computes, operation for operation as the
+/// the panner, its sends and the mix - which is exactly what
+/// [`render_plain_voice`] computes, operation for operation as the
 /// general body does with every gate closed. The classification is
 /// recomputed each render because steals and polyphony fades change a
 /// voice's ladders mid-life.
 fn plain_sample_voice(v: &Voice) -> bool {
-    matches!(v.source, VoiceSource::Sample { .. })
+    matches!(
+        v.source,
+        VoiceSource::Sample { .. } | VoiceSource::Oscillator { .. }
+    ) && v.controls.noise == 0.0
         && v.filters_right.is_some()
         && !v.has_filters
         && !v.has_pre_distort_fx
@@ -73,90 +77,132 @@ fn plain_sample_voice(v: &Voice) -> bool {
         && v.stretch.is_none()
         && v.controls.stretch.is_none()
         && v.transient.is_none()
-        && v.delay_wet == 0.0
-        && v.reverb_wet == 0.0
         && v.controls.bus.is_none()
         && v.ui_visuals == 0
 }
 
-/// The tight path a plain sample voice takes, one frame at a time.
+/// The tight path a plain voice takes, one frame at a time.
 ///
 /// Kept out of line so it earns its own registers: the general body in
 /// [`ScalarBackend::process_segment`] is so wide that a plain voice paid
 /// its stack spills every frame, plain or not. The arithmetic here is the
 /// general body's with every gate closed, in the same order: skips are
 /// only identities (a multiply by one, an add the full path also makes),
-/// so the frames are bit for bit what the general body produces.
+/// so the frames are bit for bit what the general body produces. A plain
+/// voice is a sample or an oscillator; sends it carries are accumulated
+/// here, so a room or a delay does not by itself push a voice off the
+/// path.
 #[inline(never)]
-fn render_plain_stereo_sample(
+fn render_plain_voice(
     v: &mut Voice,
     bank: &SampleBank,
+    tables: &PeriodicWaveTables,
     resampling: SampleResamplingMode,
     i: usize,
+    sr: f64,
     t: f32,
     blocks: &mut [[[f32; crate::reverb::REVERB_BLOCK]; 2]],
+    sends: &mut [[[f32; crate::reverb::REVERB_BLOCK]; 2]],
+    orbit_inputs: &mut [[f32; 2]],
     piano_mix: &mut [[f32; crate::reverb::REVERB_BLOCK]; 2],
 ) {
     let env = ScalarBackend::envelope(t, v.duration_secs, v.controls.envelope, v.gate_value);
-    let VoiceSource::Sample {
-        sample,
-        position,
-        increment,
-        reversed,
-        delay_frames,
-        loop_frames,
-    } = &mut v.source
-    else {
-        return;
-    };
-    // The general body reads its playback step through the per-quantum
-    // pitch hold; a plain voice holds no pitch shaper, so its step is the
-    // increment itself (multiplying by the held one is an exact identity).
-    let (wave_l, wave_r) = if bank.get(*sample).is_none() {
-        // The slot was emptied under the voice - an uninstall landed. The
-        // voice ends with the block, as the general body ends it.
-        v.source_gone = true;
-        (0.0, 0.0)
-    } else if *delay_frames > 0 {
-        *delay_frames -= 1;
-        (0.0, 0.0)
-    } else if let Some((loop_start, loop_end)) = *loop_frames
-        && loop_end > loop_start
-        && bank
-            .get(*sample)
-            .is_some_and(|decoded| *increment > loop_end.min(decoded.frames() as f64) - loop_start)
-    {
-        (0.0, 0.0)
-    } else {
-        let wave = bank
-            .get(*sample)
-            .and_then(|decoded| {
-                if *reversed {
-                    let last = (decoded.frames().max(1) - 1) as f64;
-                    let read = last - *position;
-                    if read < 0.0 {
-                        return None;
-                    }
-                    decoded.stereo_at_reversed_with_mode(read, resampling)
-                } else {
-                    decoded.stereo_at_with_mode(*position, resampling)
+    let (wave_l, wave_r) = match &mut v.source {
+        VoiceSource::Sample {
+            sample,
+            position,
+            increment,
+            reversed,
+            delay_frames,
+            loop_frames,
+        } => {
+            // The general body reads its playback step through the
+            // per-quantum pitch hold; a plain voice holds no pitch shaper,
+            // so its step is the increment itself (multiplying by the held
+            // one is an exact identity).
+            if bank.get(*sample).is_none() {
+                // The slot was emptied under the voice - an uninstall
+                // landed. The voice ends with the block, as the general
+                // body ends it.
+                v.source_gone = true;
+                (0.0, 0.0)
+            } else if *delay_frames > 0 {
+                *delay_frames -= 1;
+                (0.0, 0.0)
+            } else if let Some((loop_start, loop_end)) = *loop_frames
+                && loop_end > loop_start
+                && bank.get(*sample).is_some_and(|decoded| {
+                    *increment > loop_end.min(decoded.frames() as f64) - loop_start
+                })
+            {
+                (0.0, 0.0)
+            } else {
+                let wave = bank
+                    .get(*sample)
+                    .and_then(|decoded| {
+                        if *reversed {
+                            let last = (decoded.frames().max(1) - 1) as f64;
+                            let read = last - *position;
+                            if read < 0.0 {
+                                return None;
+                            }
+                            decoded.stereo_at_reversed_with_mode(read, resampling)
+                        } else {
+                            decoded.stereo_at_with_mode(*position, resampling)
+                        }
+                    })
+                    .unwrap_or((0.0, 0.0));
+                *position += *increment;
+                if let Some((loop_start, loop_end)) = loop_frames
+                    && *position >= *loop_end
+                    && *loop_end > *loop_start
+                {
+                    *position -= *loop_end - *loop_start;
                 }
-            })
-            .unwrap_or((0.0, 0.0));
-        *position += *increment;
-        if let Some((loop_start, loop_end)) = loop_frames
-            && *position >= *loop_end
-            && *loop_end > *loop_start
-        {
-            *position -= *loop_end - *loop_start;
+                wave
+            }
         }
-        wave
+        VoiceSource::Oscillator {
+            table_selection,
+            phase,
+            partial_limit,
+        } => {
+            // No FM route and no detune: both offsets the general body
+            // passes are exact zeroes, and adding or multiplying by them
+            // is an exact identity.
+            let wave = oscillator_sample(
+                tables,
+                &v.controls,
+                *table_selection,
+                phase,
+                partial_limit,
+                v.freq_hz,
+                0.0,
+                1.0,
+                sr,
+            );
+            (wave, wave)
+        }
+        _ => return,
     };
     let scale = v.amplitude_scale * env;
     let (left, right) = (wave_l * scale, wave_r * scale);
     let (left, right) = stereo_pan(left, right, v.pan_x);
     let post_gain = v.controls.postgain;
     let (left, right) = (left * post_gain, right * post_gain);
+    // The sends tap the voiced signal after the chain's gain, exactly
+    // where the general body taps them; the modulation adds are the zero
+    // pair's, an exact identity on a wet value above zero.
+    let delay_wet = (v.delay_wet + 0.0).max(0.0);
+    if delay_wet > 0.0 && v.delay_wet > 0.0 {
+        orbit_inputs[v.orbit][0] += left * delay_wet;
+        orbit_inputs[v.orbit][1] += right * delay_wet;
+    }
+    let reverb_wet = (v.reverb_wet + 0.0).max(0.0);
+    if reverb_wet > 0.0 && v.reverb_wet > 0.0 {
+        sends[v.orbit][0][i] += left * reverb_wet;
+        sends[v.orbit][1][i] += right * reverb_wet;
+    }
     let dry = v.dry_gain + 0.0;
     let (left, right) = (left * dry, right * dry);
     let mix = if v.piano {
@@ -2096,13 +2142,17 @@ impl ScalarBackend {
                     // general body below is correct for it too, at the
                     // price of its register spills.
                     if v.plain {
-                        render_plain_stereo_sample(
+                        render_plain_voice(
                             v,
                             bank,
+                            tables,
                             sample_resampling_mode,
                             i,
+                            sr,
                             t,
                             blocks,
+                            sends,
+                            &mut orbit_inputs,
                             &mut piano_mix,
                         );
                         continue;
@@ -4182,6 +4232,21 @@ mod tests {
             for (frame, rate) in [(0u64, 1.0), (200, 0.5), (1024, 1.5)] {
                 backend.note(sample_note(frame, rate));
             }
+            // An oscillator voice, and a sample voice that carries a room
+            // send: both are plain under the widened path.
+            let mut osc = OnsetEvent::new(512, 330.0, 0.4, 1.5);
+            osc.controls.waveform = crate::backend::Waveform::Sawtooth;
+            backend.note(osc);
+            let mut roomy = sample_note(768, 1.0);
+            roomy.controls.reverb = Some(crate::backend::ReverbControls {
+                wet: 0.4,
+                size_secs: 1.0,
+                fade_secs: 0.1,
+                lp_start_hz: 8000.0,
+                lp_end_hz: 2000.0,
+                ir: None,
+            });
+            backend.note(roomy);
             let mut out = vec![0.0f32; 2 * 128];
             let mut all = Vec::new();
             for _ in 0..48 {
