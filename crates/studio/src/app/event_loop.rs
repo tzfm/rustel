@@ -766,10 +766,15 @@ pub(super) fn paced_after(
 ) -> (u8, u8, u8) {
     let paced = interval * u32::from(pace);
     if draw > interval {
-        // `overruns` resets at the limit, so it stays far below the addition's
-        // ceiling.
-        if overruns + 1 >= FRAME_OVERRUN_LIMIT && pace < MAX_FRAME_PACE {
-            return ((pace * 2).min(MAX_FRAME_PACE), 0, 0);
+        // `overruns` resets at the limit, so it stays far below the
+        // addition's ceiling - at the last pace rung included, where the
+        // pace can no longer grow and a machine that overruns every frame
+        // would otherwise count past the ceiling.
+        if overruns + 1 >= FRAME_OVERRUN_LIMIT {
+            if pace < MAX_FRAME_PACE {
+                return ((pace * 2).min(MAX_FRAME_PACE), 0, 0);
+            }
+            return (pace, 0, 0);
         }
         return (pace, overruns + 1, 0);
     }
