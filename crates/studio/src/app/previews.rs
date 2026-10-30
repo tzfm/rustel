@@ -9,7 +9,7 @@ use super::*;
 
 /// The voice a chord is previewed on, and what stands in for it before
 /// its bank has downloaded.
-const CHORD_PREVIEW_SOUND: &str = "piano";
+pub(super) const CHORD_PREVIEW_SOUND: &str = "piano";
 const CHORD_PREVIEW_FALLBACK: &str = "triangle";
 
 /// The octave a previewed chord is played in, matching the panel's own.

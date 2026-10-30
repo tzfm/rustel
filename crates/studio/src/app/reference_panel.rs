@@ -570,6 +570,17 @@ impl App {
             next
         };
         self.reference_panel = next;
+        // A panel that opens can preview chords and scales, and those play
+        // on the piano bank, which decodes on first use: asking at the
+        // open gives the decode a browse's worth of head start, so the
+        // first preview does not wait it out and lose its turn. The
+        // engine's loader makes the ask idempotent - a sound already
+        // loaded or on its way stays as it is.
+        if self.reference_panel.is_some() {
+            let _ = self
+                .worker
+                .try_look_up_samples(super::previews::CHORD_PREVIEW_SOUND);
+        }
     }
 
     pub(super) fn handle_reference_key_with_modifiers(
