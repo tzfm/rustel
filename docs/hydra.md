@@ -171,11 +171,14 @@ first frame. `initVideo()` plays in a loop, without sound:
 
 | Format | Video |
 | --- | --- |
-| WebM, MKV, MP4 | VP8 or VP9, 8-bit 4:2:0 |
+| WebM, MKV | VP8 or VP9, 8-bit 4:2:0 |
 | GIF, PNG, WebP | animated or still |
 
 H.264, H.265, AV1 and 4:4:4 VP9 do not play: no decoder for them is pure
-Rust and complete. Convert such a file to VP9 with:
+Rust and complete. A VP9 file that uses segmentation or reference scaling,
+as some real-time encoders write, can also fail. MP4 files do not play, even
+with VP9 inside: their demuxer can be made to ask for gigabytes of memory by
+a small file. Convert such a file to VP9 in WebM with:
 
 ```sh
 ffmpeg -i input.mp4 -c:v libvpx-vp9 -pix_fmt yuv420p -an output.webm

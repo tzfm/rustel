@@ -49,8 +49,11 @@ shared deadline: 15 seconds for an image, 60 for a video.
 
 A video job keeps its worker while it plays. It decodes one frame at a time
 and publishes each at its timestamp, then starts again at the end. Its
-container demuxers and VP8 and VP9 decoders come from OxiMedia, and animated
-GIF, PNG and WebP from `image`. All are pure Rust. Those VP8 and VP9 decoders
+Matroska demuxer and VP8 and VP9 decoders come from OxiMedia, and animated
+GIF, PNG and WebP from `image`. All are pure Rust. MP4 is refused, because
+OxiMedia's MP4 demuxer sizes its tables from header counts that the file size
+does not bound. A gap of more than 10 seconds between two frames is refused
+too, so a crafted timestamp cannot freeze the picture. Those VP8 and VP9 decoders
 allocate the size a frame header names, so the worker first reads each header
 with the decoder's own parser and refuses one over the limits. A panic in a
 decoder ends that job, not the worker.

@@ -837,7 +837,7 @@ pub(super) const ENTRIES: &[ReferenceEntry] = &[
         "initVideo",
         "inputs",
         "Fill an input from a video.",
-        "Plays a video into this input in a loop, without sound. Give a public HTTPS URL that allows CORS, or a path relative to the set folder, such as 'clips/loop.webm'. Outside a set, a relative path reads the folder granted with --allow-local-samples. WebM, MKV and MP4 files with VP8 or VP9 video play, and so do animated GIF, PNG and WebP files. H.264, H.265 and AV1 do not. Convert those with: ffmpeg -i input.mp4 -c:v libvpx-vp9 -pix_fmt yuv420p -an output.webm",
+        "Plays a video into this input in a loop, without sound. Give a public HTTPS URL that allows CORS, or a path relative to the set folder, such as 'clips/loop.webm'. Outside a set, a relative path reads the folder granted with --allow-local-samples. WebM and MKV files with VP8 or VP9 video play, and so do animated GIF, PNG and WebP files. MP4 files, H.264, H.265 and AV1 do not. Convert those with: ffmpeg -i input.mp4 -c:v libvpx-vp9 -pix_fmt yuv420p -an output.webm",
         [param!(
             "url",
             "string",
@@ -920,7 +920,7 @@ pub(super) const ENTRIES: &[ReferenceEntry] = &[
         "initScreen",
         "method",
         "Not supported.",
-        "Rustel cannot capture the screen. Use initCam() or initImage()."
+        "Rustel cannot capture the screen. Use initCam(), initImage() or initVideo()."
     ),
     unavailable!(
         "initStream",

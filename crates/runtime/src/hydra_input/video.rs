@@ -1,10 +1,14 @@
 //! Looping video for Hydra inputs.
 //!
 //! A video plays in a loop, without sound, on its input's own thread, as
-//! Hydra's own videos do. WebM, Matroska and MP4 files with VP8 or VP9 video
-//! decode through OxiMedia. Animated GIF, PNG and WebP files decode through
-//! `image`. Every decoder is pure Rust. A frame header that names a picture
-//! over the input limits is refused before a decoder allocates for it.
+//! Hydra's own videos do. WebM and Matroska files with VP8 or VP9 video decode
+//! through OxiMedia. Animated GIF, PNG and WebP files decode through `image`.
+//! Every decoder is pure Rust. A frame header that names a picture over the
+//! input limits is refused before a decoder allocates for it.
+//!
+//! MP4 is refused. OxiMedia's MP4 demuxer sizes its sample tables from header
+//! counts that the file size does not bound, so a few hundred bytes could
+//! ask for gigabytes. Its Matroska demuxer reads only the bytes the file has.
 
 use super::*;
 
@@ -14,7 +18,7 @@ use image::codecs::png::PngDecoder;
 use image::codecs::webp::WebPDecoder;
 use image::{AnimationDecoder, ImageDecoder, ImageFormat};
 use oximedia_codec::traits::{DecoderConfig, VideoDecoder};
-use oximedia_container::demux::{Demuxer, MatroskaDemuxer, Mp4Demuxer};
+use oximedia_container::demux::{Demuxer, MatroskaDemuxer};
 use oximedia_container::{ContainerFormat, StreamInfo};
 use oximedia_core::{CodecId, MediaType};
 use oximedia_io::MemorySource;
@@ -23,14 +27,13 @@ use oximedia_io::MemorySource;
 pub(crate) const VIDEO_MEDIA_TYPES: &[&str] = &[
     "video/webm",
     "video/x-matroska",
-    "video/mp4",
     "image/gif",
     "image/apng",
     "image/png",
     "image/webp",
 ];
 
-/// What a refused codec should become, as a command a musician can run.
+/// What a refused file should become, as a command a musician can run.
 const CONVERT_HINT: &str =
     "convert it with: ffmpeg -i input.mp4 -c:v libvpx-vp9 -pix_fmt yuv420p -an output.webm";
 
@@ -39,6 +42,9 @@ const MIN_FRAME_DELAY: Duration = Duration::from_millis(10);
 const SHORT_FRAME_DELAY: Duration = Duration::from_millis(100);
 /// The frame time a container gives no timestamps for: 30 frames a second.
 const DEFAULT_FRAME_STEP: Duration = Duration::from_micros(33_333);
+/// The longest gap between two frames. A later timestamp is refused rather
+/// than freezing the picture without a word.
+const MAX_FRAME_GAP: Duration = Duration::from_secs(10);
 /// How long a wait sleeps before it looks at the cancel flag again.
 const CANCEL_POLL: Duration = Duration::from_millis(20);
 
@@ -101,6 +107,9 @@ fn container_pass(
     let stream = demuxer.video_stream()?;
     let mut decoder = decoder_for(stream.codec)?;
     let timebase = (stream.timebase.num, stream.timebase.den);
+    let undecodable = |error: oximedia_codec::CodecError| {
+        format!("Hydra video could not be decoded ({error}); {CONVERT_HINT}")
+    };
     let mut first_pts = None;
     let mut frames = 0;
     let mut last = Duration::ZERO;
@@ -116,13 +125,16 @@ fn container_pass(
         let pts = packet.timestamp.pts;
         decoder
             .send_packet(&packet.data, pts)
-            .map_err(|error| format!("Hydra video could not be decoded: {error}"))?;
-        while let Some(frame) = decoder
-            .receive_frame()
-            .map_err(|error| format!("Hydra video could not be decoded: {error}"))?
-        {
+            .map_err(undecodable)?;
+        while let Some(frame) = decoder.receive_frame().map_err(undecodable)? {
             let first = *first_pts.get_or_insert(pts);
             let at = pts_offset(pts.saturating_sub(first), timebase).unwrap_or(last + step);
+            if at > last + MAX_FRAME_GAP {
+                return Err(format!(
+                    "Hydra video has a gap of more than {} seconds between two frames",
+                    MAX_FRAME_GAP.as_secs()
+                ));
+            }
             if at > last {
                 step = at - last;
                 last = at;
@@ -130,8 +142,12 @@ fn container_pass(
             if !wait_until(started, at, cancel) {
                 return Ok(Pass::Stopped);
             }
-            let (width, height, rgba) = raw_frame_rgba(&frame)
-                .map_err(|_| "Hydra video frame could not be converted to RGBA".to_owned())?;
+            let (width, height, rgba) = raw_frame_rgba(&frame).map_err(|_| {
+                format!(
+                    "Hydra video frames are {:?}; only 8-bit 4:2:0 plays, {CONVERT_HINT}",
+                    frame.format
+                )
+            })?;
             if !publish(width, height, rgba)? {
                 return Ok(Pass::Stopped);
             }
@@ -144,44 +160,30 @@ fn container_pass(
     })
 }
 
-/// A container demuxer over the whole file in memory. Its API is async; the
+/// A Matroska demuxer over the whole file in memory. Its API is async; the
 /// input worker has no other work, so it blocks on each call.
-enum Demux {
-    Matroska(Box<MatroskaDemuxer<MemorySource>>),
-    Mp4(Box<Mp4Demuxer<MemorySource>>),
-}
+struct Demux(MatroskaDemuxer<MemorySource>);
 
 impl Demux {
     fn open(bytes: &Bytes) -> Result<Self, String> {
-        let refused = || format!("Hydra video is not WebM, Matroska or MP4; {CONVERT_HINT}");
+        let refused = || format!("Hydra video is not WebM or Matroska; {CONVERT_HINT}");
         let format = oximedia_container::probe_format(bytes)
             .map_err(|_| refused())?
             .format;
-        let source = MemorySource::new(bytes.clone());
-        let mut demuxer = match format {
-            ContainerFormat::Matroska | ContainerFormat::WebM => {
-                Self::Matroska(Box::new(MatroskaDemuxer::new(source)))
-            }
-            ContainerFormat::Mp4 => Self::Mp4(Box::new(Mp4Demuxer::new(source))),
-            _ => return Err(refused()),
-        };
-        let probed = match &mut demuxer {
-            Self::Matroska(demuxer) => pollster::block_on(demuxer.probe()).map(|_| ()),
-            Self::Mp4(demuxer) => pollster::block_on(demuxer.probe()).map(|_| ()),
-        };
-        probed.map_err(|error| {
+        if !matches!(format, ContainerFormat::Matroska | ContainerFormat::WebM) {
+            return Err(refused());
+        }
+        let mut demuxer = MatroskaDemuxer::new(MemorySource::new(bytes.clone()));
+        pollster::block_on(demuxer.probe()).map_err(|error| {
             format!(
                 "Hydra video could not be read ({error}); only VP8 and VP9 play, {CONVERT_HINT}"
             )
         })?;
-        Ok(demuxer)
+        Ok(Self(demuxer))
     }
 
     fn streams(&self) -> &[StreamInfo] {
-        match self {
-            Self::Matroska(demuxer) => demuxer.streams(),
-            Self::Mp4(demuxer) => demuxer.streams(),
-        }
+        self.0.streams()
     }
 
     /// The first video stream, checked against the input limits.
@@ -201,11 +203,7 @@ impl Demux {
     }
 
     fn next_packet(&mut self) -> Result<Option<oximedia_container::Packet>, String> {
-        let packet = match self {
-            Self::Matroska(demuxer) => pollster::block_on(demuxer.read_packet()),
-            Self::Mp4(demuxer) => pollster::block_on(demuxer.read_packet()),
-        };
-        match packet {
+        match pollster::block_on(self.0.read_packet()) {
             Ok(packet) => Ok(Some(packet)),
             Err(error) if error.is_eof() => Ok(None),
             Err(error) => Err(format!("Hydra video could not be read: {error}")),
@@ -322,7 +320,7 @@ fn animation_frames(bytes: &[u8], format: ImageFormat) -> Result<image::Frames<'
         }
         _ => {
             return Err(format!(
-                "Hydra video is not WebM, Matroska or MP4; {CONVERT_HINT}"
+                "Hydra video is not WebM or Matroska; {CONVERT_HINT}"
             ));
         }
     };
@@ -538,6 +536,17 @@ mod tests {
             assert_eq!(result, Ok(()));
             assert_eq!(frames, 4, "three frames, then the first again");
         }
+    }
+
+    /// MP4 is refused before its demuxer reads the sample tables, even with
+    /// VP9 inside: those tables can ask for any amount of memory.
+    #[test]
+    fn an_mp4_is_refused_before_it_is_demuxed() {
+        let cancel = AtomicBool::new(false);
+        let clip = include_bytes!("testdata/red_vp9.mp4").to_vec();
+        let error = play(clip, &cancel, &mut |_, _, _| Ok(true)).expect_err("refused");
+        assert!(error.contains("not WebM or Matroska"), "{error}");
+        assert!(error.contains("ffmpeg"), "{error}");
     }
 
     #[test]

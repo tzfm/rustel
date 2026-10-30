@@ -21,7 +21,7 @@ Studio's reference describes each call and its limits.
 | Browser DOM | There is no `document`. DOM calls, including browser slider creation, fail. |
 | ES modules | `import ... from`, `export` and a relative `import()` are refused. `await import('https://...')` runs a script from a trusted origin as setup code and gives an empty module. See [Script imports](studio.md#script-imports). |
 | Phone motion and orientation | There is no native sensor input. |
-| Hydra browser features | DOM, video, screen and stream sources, WebRTC, custom GLSL functions, and browser render-loop hooks are unsupported. `setResolution()` is refused. See the [Hydra limits](hydra.md#what-a-score-cannot-do-here). |
+| Hydra browser features | DOM, screen and stream sources, WebRTC, custom GLSL functions, and browser render-loop hooks are unsupported. `setResolution()` is refused. See the [Hydra limits](hydra.md#what-a-score-cannot-do-here). |
 
 ## Accepted without native support
 
