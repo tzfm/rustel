@@ -33,7 +33,8 @@ pub(super) fn decode_cached(
     bytes: &[u8],
 ) -> Result<DecodedSample, String> {
     let rate = context_rate.unwrap_or(0);
-    let path = sidecar_path(dir, bytes, rate);
+    let codec = super::codecs::codec_for(url);
+    let path = sidecar_path(dir, bytes, rate, codec);
     if let Some(decoded) = read_sidecar(&path) {
         return Ok(decoded);
     }
@@ -42,11 +43,24 @@ pub(super) fn decode_cached(
     Ok(decoded)
 }
 
-/// The sidecar file for these bytes at this context rate: the content digest
-/// names it, so a source that changed upstream never answers to an older
-/// decode, and the two context rates a file can decode under never collide.
-fn sidecar_path(dir: &std::path::Path, bytes: &[u8], rate: u32) -> std::path::PathBuf {
+/// The sidecar file for these bytes under this codec at this context rate:
+/// the content digest names it, so a source that changed upstream never
+/// answers to an older decode, the two context rates a file can decode
+/// under never collide, and the same bytes under two extensions - which
+/// name two decoders - never share one decode.
+fn sidecar_path(
+    dir: &std::path::Path,
+    bytes: &[u8],
+    rate: u32,
+    codec: super::Codec,
+) -> std::path::PathBuf {
+    let tag = match codec {
+        super::Codec::Wav => b"w",
+        super::Codec::Mp3 => b"m",
+        super::Codec::Ogg => b"o",
+    };
     let mut hasher = Sha256::new();
+    hasher.update(tag);
     hasher.update(bytes);
     let digest = hasher.finalize();
     let name = format!("{}.r{rate}.pcm", hex(&digest));
@@ -79,14 +93,19 @@ fn read_sidecar(path: &std::path::Path) -> Option<DecodedSample> {
         return None;
     }
     let frames = usize::try_from(frames).ok()?;
-    let expected = HEADER_LEN + frames * usize::from(channels) * 4;
-    if bytes.len() != expected {
+    // A damaged header can name any frame count; the size arithmetic is
+    // checked so a huge one is a miss, never an overflow.
+    let body = match frames
+        .checked_mul(usize::from(channels))
+        .and_then(|samples| samples.checked_mul(4))
+    {
+        Some(body) if body <= rustel_audio::sample_pcm_ceiling() => body,
+        _ => return None,
+    };
+    if bytes.len() != HEADER_LEN + body {
         return None;
     }
-    let samples = (frames * usize::from(channels))
-        .checked_mul(4)
-        .filter(|bytes| *bytes <= rustel_audio::sample_pcm_ceiling())?;
-    let mut pcm = vec![0.0f32; samples / 4];
+    let mut pcm = vec![0.0f32; body / 4];
     let body = &bytes[HEADER_LEN..];
     for (index, slot) in pcm.iter_mut().enumerate() {
         let at = index * 4;
@@ -97,6 +116,8 @@ fn read_sidecar(path: &std::path::Path) -> Option<DecodedSample> {
 
 /// Store one decode beside its source, best-effort: a full disk or a
 /// read-only cache costs the next load its decode again, nothing more.
+/// The frames stream out in bounded chunks, so a long sample never holds
+/// itself twice in memory for the write.
 fn write_sidecar(path: &std::path::Path, decoded: &DecodedSample) {
     let Some(parent) = path.parent() else {
         return;
@@ -104,15 +125,11 @@ fn write_sidecar(path: &std::path::Path, decoded: &DecodedSample) {
     if ensure_private_dir(parent).is_err() {
         return;
     }
-    let mut file = Vec::with_capacity(HEADER_LEN + decoded.pcm().len() * 4);
-    file.extend_from_slice(b"RSPC");
-    file.extend_from_slice(&1u32.to_le_bytes());
-    file.extend_from_slice(&decoded.sample_rate().to_le_bytes());
-    file.extend_from_slice(&decoded.channels().to_le_bytes());
-    let frames = u64::try_from(decoded.frames()).unwrap_or(u64::MAX);
-    file.extend_from_slice(&frames.to_le_bytes());
-    for sample in decoded.pcm() {
-        file.extend_from_slice(&sample.to_le_bytes());
+    let body = decoded.pcm().len() * 4;
+    if body > rustel_audio::sample_pcm_ceiling() {
+        // A read would refuse this much PCM; do not store what cannot
+        // come back.
+        return;
     }
     let staged = parent.join(format!(
         ".{}.{}.tmp",
@@ -121,10 +138,33 @@ fn write_sidecar(path: &std::path::Path, decoded: &DecodedSample) {
             .unwrap_or("pcm"),
         std::process::id()
     ));
-    if std::fs::write(&staged, &file).is_err() {
+    if write_staged(&staged, decoded).is_err() {
+        let _ = std::fs::remove_file(&staged);
         return;
     }
     let _ = std::fs::rename(&staged, path);
+}
+
+fn write_staged(staged: &std::path::Path, decoded: &DecodedSample) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::fs::File::create(staged)?;
+    let frames = u64::try_from(decoded.frames()).unwrap_or(u64::MAX);
+    let mut header = [0u8; HEADER_LEN];
+    header[..4].copy_from_slice(b"RSPC");
+    header[4..8].copy_from_slice(&1u32.to_le_bytes());
+    header[8..12].copy_from_slice(&decoded.sample_rate().to_le_bytes());
+    header[12..14].copy_from_slice(&decoded.channels().to_le_bytes());
+    header[14..22].copy_from_slice(&frames.to_le_bytes());
+    out.write_all(&header)?;
+    let mut chunk = Vec::with_capacity(64 * 1024);
+    for batch in decoded.pcm().chunks(16 * 1024) {
+        chunk.clear();
+        for sample in batch {
+            chunk.extend_from_slice(&sample.to_le_bytes());
+        }
+        out.write_all(&chunk)?;
+    }
+    out.flush()
 }
 
 #[cfg(test)]
@@ -142,21 +182,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pcm: Vec<f32> = (0..48_000).map(|i| i as f32 * 0.5 - 1.0).collect();
         let stored = sample(48_000, 2, pcm.clone());
-        let path = sidecar_path(dir.path(), b"bytes", 48_000);
+        let path = sidecar_path(dir.path(), b"bytes", 48_000, super::super::Codec::Wav);
         write_sidecar(&path, &stored);
         let loaded = read_sidecar(&path).expect("the sidecar reads back");
         assert_eq!(loaded.sample_rate(), 48_000);
         assert_eq!(loaded.channels(), 2);
         assert_eq!(loaded.pcm(), stored.pcm());
 
-        // Different bytes or a different rate are different entries.
+        // Different bytes, a different rate, or a different codec are
+        // different entries: the same bytes under two extensions name two
+        // decoders, and neither may answer to the other's decode.
         assert_ne!(
-            sidecar_path(dir.path(), b"bytes", 48_000),
-            sidecar_path(dir.path(), b"bytes2", 48_000)
+            sidecar_path(dir.path(), b"bytes", 48_000, super::super::Codec::Wav),
+            sidecar_path(dir.path(), b"bytes2", 48_000, super::super::Codec::Wav)
         );
         assert_ne!(
-            sidecar_path(dir.path(), b"bytes", 48_000),
-            sidecar_path(dir.path(), b"bytes", 44_100)
+            sidecar_path(dir.path(), b"bytes", 48_000, super::super::Codec::Wav),
+            sidecar_path(dir.path(), b"bytes", 44_100, super::super::Codec::Wav)
+        );
+        assert_ne!(
+            sidecar_path(dir.path(), b"bytes", 48_000, super::super::Codec::Wav),
+            sidecar_path(dir.path(), b"bytes", 48_000, super::super::Codec::Mp3)
         );
     }
 
@@ -165,7 +211,7 @@ mod tests {
     fn a_damaged_sidecar_is_a_miss() {
         let dir = tempfile::tempdir().unwrap();
         let stored = sample(48_000, 1, vec![0.25; 100]);
-        let path = sidecar_path(dir.path(), b"bytes", 48_000);
+        let path = sidecar_path(dir.path(), b"bytes", 48_000, super::super::Codec::Wav);
         write_sidecar(&path, &stored);
         let full = std::fs::read(&path).unwrap();
         assert!(read_sidecar(&path).is_some());
