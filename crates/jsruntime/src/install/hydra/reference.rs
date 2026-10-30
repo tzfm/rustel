@@ -290,7 +290,7 @@ pub(super) const ENTRIES: &[ReferenceEntry] = &[
         [],
         "values",
         "Seconds on Hydra's clock.",
-        "The clock that moves every animation. Read it in a function argument, for example () => Math.sin(time). Assign a number to set the clock: with time = 0 every animation starts again at each update. Math.random() in a function argument gives a new value each frame.",
+        "The clock that moves every animation. Read it in a function argument, for example () => Math.sin(time). Assign a number to set the clock: with time = 0 every animation starts again at each update. Math.random() in a function argument gives a new value each frame, and holds while the clock stands still.",
         "osc(() => 10 + Math.sin(time) * 5).out()"
     ),
     value!(
@@ -306,7 +306,7 @@ pub(super) const ENTRIES: &[ReferenceEntry] = &[
         [],
         "values",
         "The step rate of array arguments.",
-        "Assign the beats a minute that array arguments step at. The default is 30, one step every 2 seconds, and the most is 10000. It does not follow the tempo of the score.",
+        "Assign the beats a minute that array arguments step at. The default is 30, one step every 2 seconds. The range is 0.01 to 10000. It does not follow the tempo of the score.",
         "bpm = 120\nshape([3, 4, 5]).out()"
     ),
     value!(

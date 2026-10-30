@@ -39,7 +39,7 @@ rustel-runtime = { path = "../runtime", default-features = false, features = [
 rustel-audio = { path = "../audio" }
 rustel-core = { path = "../core" }
 rustel-ext = { path = "../ext", optional = true }
-rustel-hydra = { git = "https://github.com/tzfm/rustel-hydra.git", tag = "v0.2.0", optional = true }
+rustel-hydra = { git = "https://github.com/tzfm/rustel-hydra.git", tag = "v0.2.1", optional = true }
 rustel-jsruntime = { path = "../jsruntime", default-features = false }
 rustel-midi = { path = "../midi" }
 rustel-osc = { path = "../osc", optional = true }

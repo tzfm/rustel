@@ -99,7 +99,7 @@ code.
 | Setting | Range |
 | --- | --- |
 | `speed` | -1000 to 1000 |
-| `bpm` | above 0, up to 10000 |
+| `bpm` | 0.01 to 10000 |
 | `fps` | 1 to 240 |
 | `time` | -1e9 to 1e9 seconds |
 
@@ -249,7 +249,8 @@ its pinned upstream shader is invalid.
 
 Callbacks are compiled shader expressions, not arbitrary JavaScript. They
 read arithmetic, `Math` functions, `time`, `width`, `height` and `a.fft[n]`.
-`Math.random()` gives a new value each frame, the same for every pixel.
+Each `Math.random()` has its own value, the same for every pixel. The value
+changes each frame while the clock runs, and stays while `speed = 0`.
 Closures, mutation and user functions are refused. Use `H(pattern)` for
 musical values. Use `a.fft`, not `a0()`-`a3()`.
 
