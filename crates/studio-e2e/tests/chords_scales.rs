@@ -168,8 +168,7 @@ fn arrows_preview_chords_and_scales() {
     // status says the load instead of the chord, and the chord plays
     // when the bank is in.
     assert!(
-        studio.status() == "preview C^"
-            || studio.status().contains("loading"),
+        studio.status() == "preview C^" || studio.status().contains("loading"),
         "{}",
         studio.status()
     );
@@ -184,8 +183,7 @@ fn arrows_preview_chords_and_scales() {
     studio.press(KeyCode::Down, KeyModifiers::NONE);
     studio.press(KeyCode::Right, KeyModifiers::NONE);
     assert!(
-        studio.status() == "preview C:major"
-            || studio.status().contains("loading"),
+        studio.status() == "preview C:major" || studio.status().contains("loading"),
         "{}",
         studio.status()
     );
