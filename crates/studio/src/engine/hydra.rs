@@ -97,6 +97,11 @@ impl StudioEngine {
         if let Some(candidate) = self.session.take_pending_hydra() {
             match rustel_runtime::hydra::HydraUpdate::from_candidate(&candidate) {
                 Ok(update) => {
+                    let folder = self
+                        .session
+                        .sample_library()
+                        .and_then(|library| library.set_folder());
+                    hydra.set_media_folder(folder.as_deref());
                     if let Err(message) = hydra.apply_with_sample_access(
                         update,
                         &self.session.config().score_sample_access,

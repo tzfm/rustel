@@ -333,8 +333,8 @@ impl<'a> Visit<'a> for RegexLiteralCollector {
 
 /// Double-quoted arguments that are JavaScript data rather than mini
 /// notation. Keep this list deliberately tiny and structural: globally
-/// exempting URLs (or every argument to a method named `initImage`) would
-/// silently change ordinary score semantics.
+/// exempting URLs (or every argument to a method named `initImage` or
+/// `initVideo`) would silently change ordinary score semantics.
 #[derive(Default)]
 struct OrdinaryStringLiteralRanges(Vec<(usize, usize)>);
 
@@ -347,7 +347,7 @@ impl OrdinaryStringLiteralRanges {
             .iter()
             .chain(ERROR_MESSAGE_CALLS.iter())
             .map(|(name, _)| *name)
-            .chain(["initImage", "import", "talkit"])
+            .chain(["initImage", "initVideo", "import", "talkit"])
             .any(|name| source.contains(name))
         {
             return Self::default();
@@ -489,10 +489,12 @@ impl HydraImageStringCollector {
 impl<'a> Visit<'a> for HydraImageStringCollector {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         let direct_hydra_source = call.callee.as_member_expression().is_some_and(|member| {
-            member.static_property_name() == Some("initImage")
-                && ["s0", "s1", "s2", "s3"]
-                    .iter()
-                    .any(|source| member.object().is_specific_id(source))
+            matches!(
+                member.static_property_name(),
+                Some("initImage" | "initVideo")
+            ) && ["s0", "s1", "s2", "s3"]
+                .iter()
+                .any(|source| member.object().is_specific_id(source))
         });
         if direct_hydra_source
             && let Some(Argument::StringLiteral(literal)) = call.arguments.first()
@@ -5688,6 +5690,10 @@ mod tests {
         assert_eq!(
             transpile("s4.initImage(\"bd\")", &options).output,
             "s4.initImage(m('bd', 13));"
+        );
+        assert_eq!(
+            transpile("s1.initVideo(\"clips/loop.webm\")", &options).output,
+            "s1.initVideo('clips/loop.webm');"
         );
     }
 

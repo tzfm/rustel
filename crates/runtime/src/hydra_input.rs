@@ -1,11 +1,14 @@
 //! External textures for native Hydra.
 //!
-//! Network and camera work lives here, above `rustel-hydra`: the renderer only
-//! accepts complete RGBA frames through a generation-scoped latest-value sink.
-//! That keeps operating-system permissions and score-selected I/O out of the
-//! GPU thread, and makes removal/revocation an immediate texture clear.
+//! Network, file and camera work lives here, above `rustel-hydra`: the
+//! renderer only accepts complete RGBA frames through a generation-scoped
+//! latest-value sink. That keeps operating-system permissions and
+//! score-selected I/O out of the GPU thread, and makes removal/revocation an
+//! immediate texture clear. Videos play on their input's worker; see
+//! `video.rs`.
 
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -18,15 +21,22 @@ use oximedia_codec::{MatrixCoefficients, Plane, VideoFrame};
 use oximedia_core::PixelFormat;
 use rustel_hydra::{HYDRA_SOURCE_SLOTS, HydraEvent, HydraInputLease, HydraInputSink, HydraSource};
 
-use crate::sample_fetch;
+use crate::sample_fetch::{self, HydraMedia};
+use crate::sample_server::ServedRoot;
 use crate::samples::ScoreSampleAccess;
+
+mod video;
+pub(crate) use video::VIDEO_MEDIA_TYPES;
 
 /// A decoded RGBA source occupies at most 16 MiB. With Hydra's four source
 /// slots, retained CPU-side image pixels are therefore bounded to 64 MiB.
 const MAX_IMAGE_EDGE: u32 = 2048;
 const MAX_IMAGE_PIXELS: u64 = 4_194_304;
 const MAX_DECODE_ALLOC: u64 = 32 * 1024 * 1024;
+/// How long one image or video may take to arrive. A video file is read whole
+/// before it plays.
 const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+const VIDEO_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const CAMERA_POLL: Duration = Duration::from_millis(100);
 /// How many capture modes a worker tries before giving up on a device.
 ///
@@ -151,17 +161,21 @@ enum CameraSlotStatus {
     Error,
 }
 
-struct ImageJob {
+/// One image or video for one input: where it is, and who may read it.
+struct MediaJob {
     slot: u8,
     url: String,
+    media: HydraMedia,
     access: ScoreSampleAccess,
+    /// The open set's folder in Studio. A relative path is read here first.
+    folder: Option<PathBuf>,
     cancel: Arc<AtomicBool>,
     lease: HydraInputLease,
 }
 
 #[derive(Default)]
-struct ImageQueueState {
-    pending: Mutex<Option<ImageJob>>,
+struct MediaQueueState {
+    pending: Mutex<Option<MediaJob>>,
     wake: Condvar,
     closed: AtomicBool,
 }
@@ -169,29 +183,30 @@ struct ImageQueueState {
 /// One lazy, latest-job worker per Hydra slot. A slow socket remains bounded
 /// by its fetch deadline, but repeated evaluations can only replace one
 /// pending request; they cannot create an unbounded pile of detached threads.
+/// A video keeps its worker while it plays, until its job is cancelled.
 #[derive(Default)]
-struct ImageQueue {
-    state: Arc<ImageQueueState>,
+struct MediaQueue {
+    state: Arc<MediaQueueState>,
     started: bool,
 }
 
-impl ImageQueue {
+impl MediaQueue {
     fn submit(
         &mut self,
-        job: ImageJob,
+        job: MediaJob,
         diagnostics: mpsc::Sender<InputDiagnostic>,
     ) -> Result<(), String> {
         if let Ok(mut pending) = self.state.pending.lock() {
             *pending = Some(job);
         } else {
-            return Err("web-image request queue is unavailable".into());
+            return Err("image and video request queue is unavailable".into());
         }
         if !self.started {
             let state = Arc::clone(&self.state);
             std::thread::Builder::new()
-                .name("hydra-image".into())
-                .spawn(move || image_worker(state, diagnostics))
-                .map_err(|error| format!("could not start web-image worker: {error}"))?;
+                .name("hydra-media".into())
+                .spawn(move || media_worker(state, diagnostics))
+                .map_err(|error| format!("could not start the image and video worker: {error}"))?;
             self.started = true;
         }
         self.state.wake.notify_one();
@@ -779,13 +794,16 @@ pub struct HydraInputs {
     sink: HydraInputSink,
     policy: HydraInputPolicy,
     score_sample_access: ScoreSampleAccess,
+    /// The open set's folder. It is opened for each read and not held, so
+    /// the set can be renamed or moved while Studio runs.
+    media_folder: Option<PathBuf>,
     slots: [Option<ManagedSource>; HYDRA_SOURCE_SLOTS],
     /// Whether the selected theme explicitly uses the default camera as s0.
     /// It is only an acquisition request while the score renderer is absent.
     theme_camera: bool,
     cameras: [Option<CameraWorker>; CAMERA_REQUEST_SLOTS],
     camera_retry_at: [Option<Instant>; CAMERA_REQUEST_SLOTS],
-    images: [ImageQueue; HYDRA_SOURCE_SLOTS],
+    media: [MediaQueue; HYDRA_SOURCE_SLOTS],
     diagnostics: mpsc::Receiver<InputDiagnostic>,
     diagnostics_tx: mpsc::Sender<InputDiagnostic>,
 }
@@ -812,11 +830,12 @@ impl HydraInputs {
             sink,
             policy,
             score_sample_access: ScoreSampleAccess::denied(),
+            media_folder: None,
             slots: std::array::from_fn(|_| None),
             theme_camera: false,
             cameras: std::array::from_fn(|_| None),
             camera_retry_at: [None; CAMERA_REQUEST_SLOTS],
-            images: std::array::from_fn(|_| ImageQueue::default()),
+            media: std::array::from_fn(|_| MediaQueue::default()),
             diagnostics,
             diagnostics_tx,
         }
@@ -828,6 +847,12 @@ impl HydraInputs {
 
     pub(crate) fn set_score_sample_access(&mut self, access: ScoreSampleAccess) {
         self.score_sample_access = access;
+    }
+
+    /// Read relative image and video paths in this folder first: the open
+    /// set's folder in Studio. `None` leaves only the local sample root.
+    pub(crate) fn set_media_folder(&mut self, folder: Option<&Path>) {
+        self.media_folder = folder.map(Path::to_path_buf);
     }
 
     /// Replace the source plan after a validated program was accepted.
@@ -888,7 +913,7 @@ impl HydraInputs {
             // Retire a camera's lease before an image binds the same slot.
             // Reversing these two calls lets the camera clear invalidate the
             // freshly queued one-shot image generation.
-            self.start_images();
+            self.start_media();
         }
 
         if camera_mask != 0 && !self.policy.webcam_allowed() {
@@ -944,7 +969,7 @@ impl HydraInputs {
             // Camera handoff must clear its old generation first. Images need
             // no webcam consent, but they share the transport lifecycle: Play
             // now binds and fetches a fresh generation after Stop.
-            self.start_images();
+            self.start_media();
         }
     }
 
@@ -1007,15 +1032,17 @@ impl HydraInputs {
         })
     }
 
-    fn start_images(&mut self) {
+    fn start_media(&mut self) {
         for slot in 0..HYDRA_SOURCE_SLOTS {
-            let Some(url) = self.slots[slot].as_ref().and_then(|managed| {
-                if let HydraSource::ImageUrl { url } = &managed.source {
-                    Some(url.clone())
-                } else {
-                    None
-                }
-            }) else {
+            let Some((url, media)) =
+                self.slots[slot]
+                    .as_ref()
+                    .and_then(|managed| match &managed.source {
+                        HydraSource::ImageUrl { url } => Some((url.clone(), HydraMedia::Image)),
+                        HydraSource::Video { url } => Some((url.clone(), HydraMedia::Video)),
+                        _ => None,
+                    })
+            else {
                 continue;
             };
             let cancel = Arc::new(AtomicBool::new(false));
@@ -1026,14 +1053,16 @@ impl HydraInputs {
             let Some(lease) = self.sink.bind(slot as u8) else {
                 continue;
             };
-            let job = ImageJob {
+            let job = MediaJob {
                 slot: slot as u8,
                 url,
+                media,
                 access: self.score_sample_access.clone(),
+                folder: self.media_folder.clone(),
                 cancel,
                 lease,
             };
-            if let Err(message) = self.images[slot].submit(job, self.diagnostics_tx.clone()) {
+            if let Err(message) = self.media[slot].submit(job, self.diagnostics_tx.clone()) {
                 let _ = self.diagnostics_tx.send(InputDiagnostic {
                     slot: slot as u8,
                     message,
@@ -1231,12 +1260,12 @@ impl Drop for HydraInputs {
                 managed.stop();
             }
             self.sink.clear(slot as u8);
-            self.images[slot].close();
+            self.media[slot].close();
         }
     }
 }
 
-fn image_worker(state: Arc<ImageQueueState>, diagnostics: mpsc::Sender<InputDiagnostic>) {
+fn media_worker(state: Arc<MediaQueueState>, diagnostics: mpsc::Sender<InputDiagnostic>) {
     loop {
         let job = {
             let Ok(mut pending) = state.pending.lock() else {
@@ -1253,34 +1282,16 @@ fn image_worker(state: Arc<ImageQueueState>, diagnostics: mpsc::Sender<InputDiag
             }
             pending.take()
         };
-        let Some(ImageJob {
-            slot,
-            url,
-            access,
-            cancel,
-            lease,
-        }) = job
-        else {
+        let Some(job) = job else {
             continue;
         };
-        let result = (|| {
-            let budget = sample_fetch::FetchBudget::until(
-                Instant::now() + IMAGE_FETCH_TIMEOUT,
-                Arc::clone(&cancel),
-            );
-            let bytes = sample_fetch::fetch_image_with_budget(&url, &budget, &access)?;
-            budget.check()?;
-            let (width, height, rgba) = decode_image(&bytes)?;
-            budget.check()?;
-            if lease.publish(width, height, rgba)? {
-                let _ = diagnostics.send(InputDiagnostic {
-                    slot,
-                    message: format!("web image ready ({width}x{height})"),
-                    failed: false,
-                });
-            }
-            Ok::<(), String>(())
-        })();
+        let (slot, cancel) = (job.slot, Arc::clone(&job.cancel));
+        // A decoder reads score-selected bytes. A panic in one ends that
+        // input's request, not the worker every later request needs.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_media_job(job, &diagnostics)
+        }))
+        .unwrap_or_else(|_| Err("Hydra image or video could not be decoded".into()));
         if let Err(message) = result
             && !cancel.load(Ordering::Acquire)
         {
@@ -1291,6 +1302,88 @@ fn image_worker(state: Arc<ImageQueueState>, diagnostics: mpsc::Sender<InputDiag
             });
         }
     }
+}
+
+/// Read one image or video and put it on its input. A video plays here until
+/// its request is cancelled.
+fn run_media_job(job: MediaJob, diagnostics: &mpsc::Sender<InputDiagnostic>) -> Result<(), String> {
+    let MediaJob {
+        slot,
+        url,
+        media,
+        access,
+        folder,
+        cancel,
+        lease,
+    } = job;
+    let timeout = match media {
+        HydraMedia::Image => IMAGE_FETCH_TIMEOUT,
+        HydraMedia::Video => VIDEO_FETCH_TIMEOUT,
+    };
+    let budget = sample_fetch::FetchBudget::until(Instant::now() + timeout, Arc::clone(&cancel));
+    let bytes = read_media(&url, &access, folder.as_deref(), &budget, media)?;
+    budget.check()?;
+    let ready = |width: u32, height: u32| {
+        let what = match media {
+            HydraMedia::Image => "image ready",
+            HydraMedia::Video => "video playing",
+        };
+        let _ = diagnostics.send(InputDiagnostic {
+            slot,
+            message: format!("{what} ({width}x{height})"),
+            failed: false,
+        });
+    };
+    match media {
+        HydraMedia::Image => {
+            let (width, height, rgba) = decode_image(&bytes)?;
+            budget.check()?;
+            if lease.publish(width, height, rgba)? {
+                ready(width, height);
+            }
+            Ok(())
+        }
+        HydraMedia::Video => {
+            let mut first = true;
+            video::play(bytes, &cancel, &mut |width, height, rgba| {
+                let current = lease.publish(width, height, rgba)?;
+                if current && std::mem::take(&mut first) {
+                    ready(width, height);
+                }
+                Ok(current)
+            })
+        }
+    }
+}
+
+/// The bytes an image or video input names. A URL goes through the network
+/// policy. A relative path is read in the set folder, then in the local
+/// sample root, under the rules a local sample follows.
+fn read_media(
+    source: &str,
+    access: &ScoreSampleAccess,
+    folder: Option<&Path>,
+    budget: &sample_fetch::FetchBudget,
+    media: HydraMedia,
+) -> Result<Vec<u8>, String> {
+    if source.contains("://") {
+        return sample_fetch::fetch_hydra_media_with_budget(source, budget, access, media);
+    }
+    let in_set = match folder {
+        None => return access.read_hydra_local_media(source, media),
+        Some(folder) => match ServedRoot::open(folder) {
+            Ok(folder) => crate::samples::read_local_media(&folder, source, media),
+            Err(why) => Err(format!(
+                "{} {source:?} could not be read: the set folder did not open ({why})",
+                media.label()
+            )),
+        },
+    };
+    in_set.or_else(|in_set| {
+        access
+            .read_hydra_local_media(source, media)
+            .map_err(|_| in_set)
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2692,11 +2785,11 @@ mod tests {
             url: "https://example.com/texture.png".into(),
         });
         inputs.configure(plan);
-        inputs.images[0].started = true;
+        inputs.media[0].started = true;
 
         inputs.set_drawing(true);
         assert!(camera_cancel.load(Ordering::Acquire));
-        let image = inputs.images[0]
+        let image = inputs.media[0]
             .state
             .pending
             .lock()
@@ -2719,14 +2812,14 @@ mod tests {
         let mut inputs = HydraInputs::new(host.input_sink());
         inputs.theme_camera = true;
         inputs.policy().set_webcam_allowed(true);
-        inputs.images[0].started = true;
+        inputs.media[0].started = true;
         inputs.policy.state.drawing.store(true, Ordering::Release);
         let mut plan = std::array::from_fn(|_| None);
         plan[0] = Some(HydraSource::ImageUrl {
             url: "https://example.com/texture.png".into(),
         });
         inputs.configure(plan);
-        let image = inputs.images[0]
+        let image = inputs.media[0]
             .state
             .pending
             .lock()
@@ -2917,12 +3010,12 @@ mod tests {
         });
         inputs.configure(plan);
         let configured = Arc::clone(&inputs.slots[0].as_ref().unwrap().cancel);
-        assert!(!inputs.images[0].started, "stopped scores do not fetch");
+        assert!(!inputs.media[0].started, "stopped scores do not fetch");
         assert!(!configured.load(Ordering::Acquire));
 
         inputs.set_drawing(true);
         let first_play = Arc::clone(&inputs.slots[0].as_ref().unwrap().cancel);
-        assert!(inputs.images[0].started);
+        assert!(inputs.media[0].started);
         assert!(!Arc::ptr_eq(&configured, &first_play));
         assert!(configured.load(Ordering::Acquire));
         let first_lease = inputs.sink.bind(0).unwrap();
@@ -3007,5 +3100,95 @@ mod tests {
             raw_frame_rgba(&bt709).unwrap().2,
             vec![191, 63, 165, 255, 191, 63, 165, 255]
         );
+    }
+
+    /// Wait for the first diagnostic of an input, as the engine reads them.
+    fn first_event(inputs: &HydraInputs) -> (u8, String, bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(HydraEvent::Input {
+                slot,
+                message,
+                failed,
+            }) = inputs.take_events().into_iter().next()
+            {
+                return (slot, message, failed);
+            }
+            assert!(Instant::now() < deadline, "the input never answered");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn video_plan(slot: usize, url: &str) -> [Option<HydraSource>; HYDRA_SOURCE_SLOTS] {
+        let mut plan = std::array::from_fn(|_| None);
+        plan[slot] = Some(HydraSource::Video { url: url.into() });
+        plan
+    }
+
+    #[test]
+    fn a_video_in_the_set_folder_plays_into_its_input() {
+        let folder = tempfile::tempdir().expect("set folder");
+        std::fs::create_dir(folder.path().join("clips")).expect("clips");
+        std::fs::write(
+            folder.path().join("clips").join("red.webm"),
+            include_bytes!("hydra_input/testdata/red_vp9.webm"),
+        )
+        .expect("clip");
+        let host = rustel_hydra::HydraHost::new();
+        let mut inputs = HydraInputs::new(host.input_sink());
+        inputs.set_media_folder(Some(folder.path()));
+        inputs.configure(video_plan(1, "clips/red.webm"));
+        inputs.set_drawing(true);
+        assert_eq!(
+            first_event(&inputs),
+            (1, "video playing (32x16)".to_owned(), false)
+        );
+        inputs.set_drawing(false);
+
+        // The local sample root reads the same path without a set folder.
+        let mut access = ScoreSampleAccess::denied();
+        access.permit_local_root(folder.path()).expect("local root");
+        let mut inputs = HydraInputs::new(host.input_sink());
+        inputs.set_score_sample_access(access);
+        inputs.configure(video_plan(2, "clips/red.webm"));
+        inputs.set_drawing(true);
+        assert_eq!(
+            first_event(&inputs),
+            (2, "video playing (32x16)".to_owned(), false)
+        );
+        inputs.set_drawing(false);
+    }
+
+    #[test]
+    fn a_local_path_outside_the_folder_or_with_no_folder_is_refused() {
+        let folder = tempfile::tempdir().expect("set folder");
+        let gone = folder.path().join("gone");
+        let host = rustel_hydra::HydraHost::new();
+        for (set_folder, url, expected) in [
+            (
+                Some(folder.path()),
+                "../red.webm",
+                "relative path inside the folder",
+            ),
+            (
+                Some(folder.path()),
+                "missing.webm",
+                "is not a file in the permitted folder",
+            ),
+            (None, "red.webm", "--allow-local-samples"),
+            (
+                Some(gone.as_path()),
+                "red.webm",
+                "the set folder did not open",
+            ),
+        ] {
+            let mut inputs = HydraInputs::new(host.input_sink());
+            inputs.set_media_folder(set_folder);
+            inputs.configure(video_plan(0, url));
+            inputs.set_drawing(true);
+            let (slot, message, failed) = first_event(&inputs);
+            assert!(failed && slot == 0, "{url}: {message}");
+            assert!(message.contains(expected), "{url}: {message}");
+        }
     }
 }

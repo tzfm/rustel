@@ -442,3 +442,72 @@ fn kabelsalat_completion_keeps_globals_and_node_methods_in_their_own_positions()
         );
     }
 }
+
+/// Hydra names and pattern names share spellings: `osc` and `shape` are
+/// shader sources in a Hydra statement and controls in a pattern. Ctrl+D
+/// reads each one in the language of its own statement.
+#[test]
+fn ctrl_d_reads_hydra_names_in_hydra_code_and_pattern_names_elsewhere() {
+    let text = "await initHydra()\nosc(10).kaleid(4).out()\n$: s(\"bd\").shape(0.5)";
+    for (name, signature) in [
+        ("osc", "osc(frequency, sync, offset)"),
+        ("kaleid", "kaleid(nSides)"),
+        ("shape", "shape("),
+    ] {
+        let mut studio = hermetic();
+        studio.set_score(text);
+        studio.set_caret(text.find(name).expect("a name") + name.len() - 1);
+        studio.chord("ctrl+d");
+
+        assert_eq!(studio.reference_tab(), Some("reference"));
+        assert_eq!(studio.status(), format!("reference - {name}"));
+        let rows = studio.rows();
+        row_containing(&rows, signature);
+        assert!(
+            !rows.iter().any(|row| row.contains("shape(sides")),
+            "{name}: the pattern shape is not the Hydra shape"
+        );
+        assert_eq!(studio.score(), text);
+    }
+}
+
+/// Completion after a dot in a Hydra chain offers Hydra methods and
+/// inserts the chosen one as a call.
+#[test]
+fn hydra_completion_inserts_hydra_methods() {
+    let mut studio = hermetic();
+    let text = "await initHydra()\nosc(10).kalei";
+    studio.set_score(text);
+    studio.set_caret(text.len());
+    studio.chord("ctrl+space");
+
+    assert_eq!(studio.reference_tab(), Some("reference"));
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(studio.score(), "await initHydra()\nosc(10).kaleid()");
+}
+
+/// The searchable list follows the language at the caret: Hydra names in
+/// Hydra code, and never in pattern code.
+#[test]
+fn ctrl_f_lists_only_the_language_at_the_caret() {
+    for (text, hydra) in [
+        ("await initHydra()\nosc(10).out()\n", true),
+        ("await initHydra()\nosc(10).out()\n$: s(\"bd\")\n", false),
+    ] {
+        let mut studio = hermetic();
+        studio.set_score(text);
+        studio.set_caret(text.len());
+        studio.chord("ctrl+f");
+        studio.type_text("kaleid");
+
+        let rows = studio.rows();
+        row_containing(&rows, "search: kaleid");
+        assert_eq!(
+            rows.iter()
+                .any(|row| row.contains("kaleid") && !row.contains("search:")),
+            hydra,
+            "{text:?}: {rows:#?}"
+        );
+        assert_eq!(studio.score(), text, "searching leaves the score alone");
+    }
+}

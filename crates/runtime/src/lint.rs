@@ -2455,7 +2455,7 @@ fn literal_banks(source: &str, code: &str, literal: &Literal) -> (Vec<String>, b
 /// ending it. Enough to find the `.osc()` a sound string is routed through
 /// without parsing the score, and no further, so a route on another `$:`
 /// line stays that line's.
-fn statement_around(source: &str, at: usize) -> std::ops::Range<usize> {
+pub fn statement_around(source: &str, at: usize) -> std::ops::Range<usize> {
     let mut lines = Vec::new();
     let mut start = 0;
     for line in source.split_inclusive('\n') {

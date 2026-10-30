@@ -919,6 +919,54 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     assert!(row_with(&mut studio, "native orchestras").contains("  on"));
 }
 
+/// A score whose `samples()` names an origin outside the policy plays on
+/// without the bank, and the origin lands on the permissions page with
+/// what it would read. Enter trusts it, and the next studio still trusts
+/// it. The CORS switch and the local folder are on the page from the
+/// start.
+#[test]
+fn a_refused_sample_origin_is_trusted_with_one_key_and_kept() {
+    let mut studio = hermetic();
+    open_permissions(&mut studio);
+    // The hermetic studio permits no sample origin, as
+    // `--strict-sample-origins` does, so its switch is held off.
+    assert!(row_with(&mut studio, "public servers with CORS").contains("  off"));
+    assert!(row_with(&mut studio, "local folder").contains("  off"));
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+
+    studio.set_score("samples('http://kit.invalid/kit.json')\n$: s(\"bd\")");
+    studio.chord("ctrl+s");
+    studio.settle();
+    open_permissions(&mut studio);
+    select_row(&mut studio, "▸ http://kit.invalid");
+    let refused = row_with(&mut studio, "http://kit.invalid");
+    assert!(
+        refused.contains("  off") && refused.contains("samples, media"),
+        "{refused}"
+    );
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    assert!(row_with(&mut studio, "http://kit.invalid").contains("  on"));
+    assert!(
+        studio
+            .status()
+            .contains("http://kit.invalid trusted for samples"),
+        "{}",
+        studio.status()
+    );
+
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    // Prefs are written on a debounce.
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    studio.pump();
+    studio.quit();
+    let mut studio = reopen_over(studio);
+    open_permissions(&mut studio);
+    assert!(row_with(&mut studio, "http://kit.invalid").contains("  on"));
+}
+
 /// An orchestra score plays with no flag and no keypress: an installed
 /// library is the studio's opt-in. Space takes the switch off for the run,
 /// the next save of an edited score stops with the refusal that names the
@@ -940,6 +988,7 @@ fn the_orchestra_switch_starts_on_and_space_takes_it_back_for_a_run() {
     open_permissions(&mut studio);
     assert!(row_with(&mut studio, "native orchestras").contains("  on"));
 
+    select_row(&mut studio, "▸ native orchestras");
     studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
     studio.settle();
     assert!(row_with(&mut studio, "native orchestras").contains("  off"));
@@ -958,6 +1007,7 @@ fn the_orchestra_switch_starts_on_and_space_takes_it_back_for_a_run() {
     );
 
     open_permissions(&mut studio);
+    select_row(&mut studio, "▸ native orchestras");
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
     assert!(row_with(&mut studio, "native orchestras").contains("  on"));

@@ -366,6 +366,17 @@ pub struct StudioPrefs {
     /// score, such as `https://glossing.dev`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub import_origins: Vec<String>,
+    /// The origins the player trusts for a score's `samples()`, images and
+    /// videos, as `--allow-sample-origin` does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample_origins: Vec<String>,
+    /// Refuse the public CORS default, as `--strict-sample-origins` does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict_sample_origins: bool,
+    /// The folder `samples('local:')` and relative Hydra paths read, as
+    /// `--allow-local-samples` does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_sample_root: Option<String>,
     /// What an imported bank was renamed to, by the name it arrived under.
     /// An overlay: the files are untouched, and removing the entry brings
     /// the old name back.
@@ -651,6 +662,16 @@ impl StudioPrefs {
                     .map(|(from, to)| ((source.clone(), from.clone()), to.clone()))
             })
             .collect()
+    }
+
+    /// The permissions page's grants for samples and media, as the engine
+    /// takes them.
+    pub fn sample_grants(&self) -> super::engine::SampleGrants {
+        super::engine::SampleGrants {
+            origins: self.sample_origins.clone(),
+            strict: self.strict_sample_origins,
+            local_root: self.local_sample_root.as_ref().map(PathBuf::from),
+        }
     }
 
     /// The imported sources as the library takes them.

@@ -227,11 +227,17 @@ impl App {
         self.sync_live_material(now);
         self.send_sample_memory();
         self.send_import_origins();
+        self.send_sample_grants();
         self.send_csound();
+        self.note_refused_samples();
         // A permit that unblocked a refused update re-runs it here, once
         // the sends above have put the permission in the engine's hands -
         // a re-run ahead of them would be refused by the old state.
-        if self.refused_update_owed && !self.csound_owed && !self.import_origins_owed {
+        if self.refused_update_owed
+            && !self.csound_owed
+            && !self.import_origins_owed
+            && !self.sample_grants_owed
+        {
             self.refused_update_owed = false;
             self.retry_refused_update();
         }

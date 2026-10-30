@@ -563,6 +563,7 @@ impl SampleLibrary {
             source_tables: Mutex::new(SourceTables::default()),
             bank_imports: RwLock::new(HashMap::new()),
             set_banks: RwLock::new(BTreeMap::new()),
+            set_folder: RwLock::new(None),
             custom_file_names: RwLock::new(HashMap::new()),
             global_file_names: RwLock::new(HashMap::new()),
             // Id 0 is the bundled bd; the library allocates from 1.
@@ -2230,6 +2231,7 @@ pub(super) mod tests {
                 source_tables: Mutex::new(SourceTables::default()),
                 bank_imports: RwLock::new(HashMap::new()),
                 set_banks: RwLock::new(BTreeMap::new()),
+                set_folder: RwLock::new(None),
                 custom_file_names: RwLock::new(HashMap::new()),
                 global_file_names: RwLock::new(HashMap::new()),
                 fonts: RwLock::new(HashMap::new()),

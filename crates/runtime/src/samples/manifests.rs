@@ -101,7 +101,14 @@ impl ManifestContext {
                         )
                         .map_err(|error| format!("{url}: not JSON: {error}"))
                     },
-                )?;
+                )
+                .inspect_err(|error| {
+                    if let ScoreFetchAccess::Remote { origin, .. } = &fetch_access
+                        && error.contains(NO_CORS_CONSENT)
+                    {
+                        access.note_refused_origin(origin);
+                    }
+                })?;
                 budget.check()?;
                 // The directory the manifest came from is only a fallback base.
                 // A fetched map can name its own `_base`: the shabda maps are
@@ -313,7 +320,7 @@ impl ManifestContext {
     ) -> Result<(), String> {
         budget.check()?;
         let allowed_root = access.local_root.as_ref().ok_or_else(|| {
-            "samples('local:') requires a host-selected local sample root".to_owned()
+            "samples('local:') requires a host-selected local sample root (--allow-local-samples, or the Studio Permissions page)".to_owned()
         })?;
         let allowed_path = allowed_root.path();
         let requested = Path::new(requested);

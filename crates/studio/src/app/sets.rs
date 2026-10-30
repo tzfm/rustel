@@ -833,6 +833,7 @@ impl App {
                 prompt,
                 SetPrompt::SetsFolder
                     | SetPrompt::RecordingsFolder
+                    | SetPrompt::LocalSampleFolder
                     | SetPrompt::VimMappingsPath
                     | SetPrompt::AddSampleSource
                     | SetPrompt::EditSampleSource(_)
@@ -855,6 +856,7 @@ impl App {
             prompt,
             SetPrompt::SetsFolder
                 | SetPrompt::RecordingsFolder
+                | SetPrompt::LocalSampleFolder
                 | SetPrompt::VimMappingsPath
                 | SetPrompt::AddSampleSource
                 | SetPrompt::EditSampleSource(_)
@@ -928,6 +930,22 @@ impl App {
                 picker.offer(&shorten_home(&recordings));
                 picker
             }
+            SetPrompt::LocalSampleFolder => {
+                let folder = self
+                    .prefs
+                    .local_sample_root
+                    .as_ref()
+                    .map_or_else(|| root.clone(), PathBuf::from);
+                let mut picker = FilePicker::new(
+                    "local samples folder",
+                    "lets samples('local:') read it",
+                    Vec::new(),
+                    &folder,
+                )
+                .choosing_folders();
+                picker.offer(&shorten_home(&folder));
+                picker
+            }
             SetPrompt::VimMappingsPath => {
                 let mut picker =
                     FilePicker::text("Vim mappings path", "read Vim mappings from this file");
@@ -998,6 +1016,10 @@ impl App {
             }
             SetPrompt::RecordingsFolder => {
                 "recordings folder - type a path, or Tab to browse and Enter on . · Esc back".into()
+            }
+            SetPrompt::LocalSampleFolder => {
+                "local samples folder - type a path, or Tab to browse and Enter on . · Esc back"
+                    .into()
             }
             SetPrompt::VimMappingsPath => {
                 "Vim mappings path - type a full path · Enter keeps · Esc back".into()
@@ -1071,6 +1093,7 @@ impl App {
                 }
                 SetPrompt::SetsFolder => self.choose_sets_folder(&path),
                 SetPrompt::RecordingsFolder => self.choose_recordings_folder(&path),
+                SetPrompt::LocalSampleFolder => self.choose_local_sample_folder(&path),
                 SetPrompt::VimMappingsPath => {
                     if path.is_absolute() {
                         self.close_set_prompt();
@@ -1999,6 +2022,8 @@ pub(super) enum SetPrompt {
     RenameSet,
     SetsFolder,
     RecordingsFolder,
+    /// The folder `samples('local:')` reads, for the permissions page.
+    LocalSampleFolder,
     VimMappingsPath,
     /// A folder of samples, or a pack's address, to import for every set.
     AddSampleSource,

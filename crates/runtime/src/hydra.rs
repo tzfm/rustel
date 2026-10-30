@@ -258,6 +258,13 @@ impl HydraBridge {
         Ok(())
     }
 
+    /// Let a score's images and videos name files in this folder by a path
+    /// relative to it: the open set's folder in Studio. The local sample
+    /// root, when one is granted, is read after it.
+    pub fn set_media_folder(&mut self, folder: Option<&std::path::Path>) {
+        self.inputs.set_media_folder(folder);
+    }
+
     /// Show a snippet in the shelf's own picture, or, with `None`, stop.
     ///
     /// The score keeps its screen throughout - the snippet renders in a second
@@ -770,5 +777,38 @@ mod tests {
             ..HydraProgram::default()
         };
         assert_eq!(configured_audio_bins(&program), 8);
+    }
+
+    /// The reference documents each shader function with the inputs the
+    /// renderer compiles, in order, and every shader function has an entry.
+    #[test]
+    fn hydra_reference_parameters_match_the_shader_table() {
+        let entries: Vec<_> = rustel_jsruntime::hydra_reference_entries().collect();
+        for function in rustel_hydra::glsl::FUNCTIONS {
+            let documented = entries.iter().find(|entry| {
+                entry.name == function.name
+                    && entry
+                        .tags
+                        .contains(&if function.kind == rustel_hydra::glsl::Kind::Src {
+                            "global"
+                        } else {
+                            "method"
+                        })
+            });
+            let Some(entry) = documented else {
+                panic!("{} has no reference entry", function.name);
+            };
+            if entry.no_autocomplete {
+                continue;
+            }
+            let params: Vec<&str> = entry
+                .params
+                .iter()
+                .map(|param| param.name)
+                .filter(|name| *name != "texture")
+                .collect();
+            let inputs: Vec<&str> = function.inputs.iter().map(|input| input.name).collect();
+            assert_eq!(params, inputs, "{}", function.name);
+        }
     }
 }

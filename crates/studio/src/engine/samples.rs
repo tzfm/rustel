@@ -362,6 +362,18 @@ impl StudioEngine {
         ));
     }
 
+    /// Replace what the permissions page permits a score's `samples()`,
+    /// images and videos to read. The next evaluation and the next pack
+    /// import read it. Banks already loaded stay.
+    pub fn set_sample_grants(&mut self, grants: SampleGrants) {
+        let access = sample_access(&self.config.session, &grants);
+        self.config.sample_grants = grants;
+        if let Some(library) = self.session.sample_library() {
+            library.set_import_policy(access.clone());
+        }
+        self.session.set_score_sample_access(access);
+    }
+
     /// Flip the permissions page's orchestra switch. The next evaluation
     /// reads it, and a playing orchestra keeps sounding until then.
     pub fn set_csound(&mut self, allowed: bool) {
@@ -1094,6 +1106,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The page's grants reach the session and the pack imports alike, and
+    /// a change replaces the last one. The record of refused origins stays
+    /// the host's, so the studio reads it from the policy it gave.
+    #[test]
+    fn sample_grants_reach_the_session_and_the_pack_imports() {
+        let mut host = SessionConfig::default();
+        host.score_sample_access.permit_public_cors_origins();
+        let refused = host.score_sample_access.clone();
+        let mut engine = StudioEngine::new(StudioConfig {
+            session: host,
+            sample_grants: SampleGrants {
+                strict: true,
+                ..SampleGrants::default()
+            },
+            ..StudioConfig::default()
+        })
+        .expect("engine");
+        let access = || engine.session.config().score_sample_access.clone();
+        assert!(
+            !access().public_cors_origins(),
+            "the page closed the default"
+        );
+
+        engine.set_sample_grants(SampleGrants {
+            origins: vec!["http://kit.invalid".to_owned()],
+            ..SampleGrants::default()
+        });
+        let granted = engine.session.config().score_sample_access.clone();
+        assert!(granted.public_cors_origins(), "the page opened it again");
+        let library = engine.session.sample_library().expect("library");
+        assert_eq!(library.import_policy_for_test(), Some(granted));
+
+        // Plain http needs a grant. The score plays on without the bank, and
+        // the refusal is a diagnostic.
+        engine
+            .session
+            .evaluate("samples('http://other.invalid/kit.json')\n$: s(\"bd\")")
+            .expect("the score");
+        assert_eq!(refused.take_refused_origins(), ["http://other.invalid"]);
     }
 
     mod sample_reclamation {

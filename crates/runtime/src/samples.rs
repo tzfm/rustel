@@ -30,6 +30,8 @@ use url::Url;
 use crate::product;
 
 mod access;
+#[cfg(feature = "hydra")]
+pub(crate) use access::read_local_media;
 use access::*;
 pub(crate) use access::{js_round, sound_index};
 mod cache;
@@ -126,6 +128,49 @@ pub struct ScoreSampleAccess {
     local_root: Option<Arc<crate::sample_server::ServedRoot>>,
     allowed_origins: Vec<String>,
     open_public: bool,
+    refused: RefusedOrigins,
+}
+
+/// The origins a policy refused, newest last, so a host can offer to trust
+/// them. Every clone of one policy shares the list. It reports what happened
+/// and is not part of the policy, so two policies compare equal without it.
+#[derive(Clone, Default)]
+pub struct RefusedOrigins(Arc<Mutex<Vec<String>>>);
+
+impl RefusedOrigins {
+    /// The most origins kept. A score names one or two.
+    const MAX: usize = 16;
+
+    fn note(&self, origin: String) {
+        if let Ok(mut origins) = self.0.lock() {
+            origins.retain(|kept| *kept != origin);
+            origins.push(origin);
+            if origins.len() > Self::MAX {
+                origins.remove(0);
+            }
+        }
+    }
+
+    fn take(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .map(|mut origins| std::mem::take(&mut *origins))
+            .unwrap_or_default()
+    }
+}
+
+impl PartialEq for RefusedOrigins {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RefusedOrigins {}
+
+impl std::fmt::Debug for RefusedOrigins {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RefusedOrigins")
+    }
 }
 
 /// The `Origin` this host presents when it requires CORS consent, and the
@@ -839,6 +884,9 @@ struct Shared {
     /// dropping them by name alone would take a score's `kicks` with them,
     /// which the set never supplied.
     set_banks: RwLock<BTreeMap<String, Option<Bank>>>,
+    /// The open set's folder, canonical, while a set is open. Hydra reads
+    /// the images and videos a score names inside it.
+    set_folder: RwLock<Option<PathBuf>>,
     /// Hidden filename addresses; kept out of the browser's bank rows.
     custom_file_names: RwLock<local_names::Names>,
     global_file_names: RwLock<local_names::Names>,

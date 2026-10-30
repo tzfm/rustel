@@ -182,8 +182,13 @@ impl Studio {
                 // ^H would open the host's default input; a hermetic
                 // studio answers it as a machine with no input does.
                 open_default_input: false,
+                // The studio reads refused origins from the policy it was
+                // given, so the engine must hold that one, as `run_once`
+                // gives it.
+                session: studio_options.session.clone(),
                 // As `run_once` does: the permissions page of the last studio.
                 import_origins: crate::prefs::StudioPrefs::load().import_origins,
+                sample_grants: crate::prefs::StudioPrefs::load().sample_grants(),
                 ..Default::default()
             },
             #[cfg(feature = "hydra")]

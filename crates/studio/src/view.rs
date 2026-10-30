@@ -703,7 +703,7 @@ pub struct StudioView<'a> {
     pub mappings: [super::settings::SlotView; super::settings::MAPPING_SLOTS],
     /// The shortcut rows, for the Keybinds page.
     pub keybind_rows: Vec<super::settings::KeybindRow>,
-    /// The origins of the permissions page.
+    /// The rows of the permissions page.
     pub permission_rows: Vec<super::settings::PermissionRow>,
     /// The plugin folders, for the vst page. Empty while another page shows.
     #[cfg(feature = "vst")]

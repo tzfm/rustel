@@ -10,7 +10,7 @@
 //! |---|---|
 //! | the mixer desk, master level and limiter | `mixer.rs` |
 //! | the reference column (Ctrl+D) | `reference_panel.rs` |
-//! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs` |
+//! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs`, `hydra_scope.rs` |
 //! | hearing a chord, scale, sound or snippet | `previews.rs` |
 //! | the Settings sheet | `settings_sheet.rs` |
 //! | its Permissions page: origins and orchestras | `permissions.rs` |
@@ -166,6 +166,8 @@ mod external_changes;
 mod find;
 mod focus;
 mod hydra_backdrop;
+#[cfg(feature = "hydra")]
+mod hydra_scope;
 mod jobs_panel;
 mod key_bindings;
 mod keyboard;
@@ -643,6 +645,7 @@ fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
             preview_budget_bytes: sample_settings.preview_budget.bytes(),
             unused_sample_idle: sample_settings.unused_sample_idle.duration(),
             import_origins: prefs.import_origins.clone(),
+            sample_grants: prefs.sample_grants(),
             // `csound_allowed` stays at its default: on, because an
             // installed Csound library is the studio's opt-in. The
             // permissions page takes it back for a run, and the one-shot
@@ -1271,6 +1274,11 @@ struct App {
     csound_owed: bool,
     /// The permissions page changed and the engine does not have the list yet.
     import_origins_owed: bool,
+    /// Origins the engine refused a score's samples or media from in this
+    /// studio, oldest first.
+    blocked_samples: Vec<String>,
+    /// The page's sample grants changed and the engine does not have them yet.
+    sample_grants_owed: bool,
     /// A permit unblocked a refused update and the studio owes its re-run.
     /// It waits for the engine to hold the permission, so the re-run cannot
     /// be refused by the state it is running to use.
@@ -1842,6 +1850,8 @@ impl App {
             csound_refused: false,
             csound_owed: false,
             import_origins_owed: false,
+            blocked_samples: Vec::new(),
+            sample_grants_owed: false,
             refused_update_owed: false,
             evaluation_alerts: HashMap::new(),
             lint_status: None,

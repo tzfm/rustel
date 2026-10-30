@@ -46,10 +46,14 @@ vst = ["dep:rustel-vst3"]
 # Hydra visuals, drawn behind the code. A minimal/headless build can omit the
 # GPU stack.
 hydra = [
+  "dep:bytes",
   "dep:image",
   "dep:oximedia-capture",
   "dep:oximedia-codec",
+  "dep:oximedia-container",
   "dep:oximedia-core",
+  "dep:oximedia-io",
+  "dep:pollster",
   "dep:rustel-hydra",
   "rustel-jsruntime/hydra",
 ]
@@ -131,13 +135,24 @@ log = { version = "0.4", optional = true }
 
 rustel-osc = { path = "../osc", optional = true }
 rustel-vst3 = { path = "../vst3", optional = true }
-rustel-hydra = { git = "https://github.com/tzfm/rustel-hydra.git", tag = "v0.1.0", optional = true }
+rustel-hydra = { git = "https://github.com/tzfm/rustel-hydra.git", tag = "v0.2.1", optional = true }
 # Native Hydra sources. OxiMedia is one pure-Rust capture surface across
 # V4L2, AVFoundation and Media Foundation; pin the young API until its frame
 # contract has settled. `image` decodes guarded HTTP images and MJPEG frames.
+# Video inputs use the same stack: its container demuxers and its VP8 and VP9
+# decoders, which are pure Rust. `pollster` runs the async demuxer API on the
+# input worker thread.
 oximedia-capture = { version = "=0.2.1", optional = true }
-oximedia-codec = { version = "=0.2.1", default-features = false, optional = true }
+oximedia-codec = { version = "=0.2.1", default-features = false, features = [
+  "vp8",
+  "vp9",
+], optional = true }
+oximedia-container = { version = "=0.2.1", optional = true }
 oximedia-core = { version = "=0.2.1", optional = true }
+oximedia-io = { version = "=0.2.1", optional = true }
+pollster = { version = "0.4", optional = true }
+# Shares one video file between loop passes without a copy each pass.
+bytes = { version = "1", optional = true }
 image = { version = "=0.25.10", default-features = false, features = [
   "gif",
   "jpeg",

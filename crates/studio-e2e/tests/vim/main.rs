@@ -604,5 +604,68 @@ fn visual_lines_and_text_objects_edit_complete_ranges() {
     assert_eq!(studio.source(), "// issing");
 }
 
+/// `gd` on the block caret reads a name in the language of its statement,
+/// as Ctrl+D does outside Vim.
+#[test]
+fn gd_reads_hydra_names_in_hydra_code() {
+    let mut studio = hermetic();
+    enable_vim(&mut studio);
+    let source = "await initHydra()\nosc(10).kaleid(4).out()\n$: s(\"bd\").shape(0.5)";
+    for (name, signature) in [("kaleid", "kaleid(nSides)"), ("shape", "shape(")] {
+        studio.set_score(source);
+        studio.set_caret(source.find(name).expect("a name"));
+        studio.type_text("gd");
+        assert_eq!(studio.status(), format!("reference - {name}"));
+        let rows = studio.rows();
+        assert!(rows.iter().any(|row| row.contains(signature)), "{name}");
+        assert!(
+            !rows.iter().any(|row| row.contains("shape(sides")),
+            "{name}"
+        );
+        studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    }
+}
+
+/// `j` and `k` walk the permissions page in Vim, and Enter on the local
+/// folder opens its prompt over the page.
+#[test]
+fn vim_keys_walk_the_sample_permissions() {
+    let mut studio = hermetic();
+    enable_vim(&mut studio);
+    studio.chord("ctrl+o");
+    for _ in 0..10 {
+        if studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("▸ public servers with CORS"))
+        {
+            break;
+        }
+        studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    }
+    let selected = |studio: &mut Hermetic, label: &str| {
+        let marker = format!("▸ {label}");
+        studio.rows().iter().any(|row| row.contains(&marker))
+    };
+    assert!(selected(&mut studio, "public servers with CORS"));
+    studio.type_text("j");
+    assert!(selected(&mut studio, "local folder"));
+    studio.type_text("k");
+    assert!(selected(&mut studio, "public servers with CORS"));
+
+    studio.type_text("j");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        studio.status().starts_with("local samples folder"),
+        "{}",
+        studio.status()
+    );
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(
+        selected(&mut studio, "local folder"),
+        "Esc comes back to the row"
+    );
+}
+
 mod mappings;
 mod search;

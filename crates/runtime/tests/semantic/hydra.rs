@@ -367,7 +367,9 @@ fn source_initialisers_have_strict_arity_types_and_native_support_errors() {
         ("s0.initImage('a', 'b')", "exactly one JavaScript string"),
         ("s0.initImage(42)", "actual JavaScript string"),
         ("s0.initImage('')", "non-empty URL"),
-        ("s0.initVideo('clip.mp4')", "not supported by native Hydra"),
+        ("s0.initVideo()", "exactly one JavaScript string"),
+        ("s0.initVideo(42)", "actual JavaScript string"),
+        ("s0.initVideo('')", "non-empty URL"),
         ("s0.initScreen()", "not supported by native Hydra"),
         ("s0.initStream({})", "not supported by native Hydra"),
         ("s0.initCanvas({})", "not supported by native Hydra"),
@@ -378,6 +380,29 @@ fn source_initialisers_have_strict_arity_types_and_native_support_errors() {
         let message = evaluate_error(&format!("await initHydra()\n{call}"));
         assert!(message.contains(expected), "{call}: {message}");
     }
+}
+
+/// A video names a URL or a relative path, in either quote: a double-quoted
+/// path is not mini-notation here.
+#[test]
+fn a_video_records_its_address_as_a_typed_source() {
+    let update = program(
+        "await initHydra()\ns0.initVideo(\"clips/loop.webm\")\ns1.initVideo('https://example.com/a.webm')\nsrc(s0).out()",
+    );
+    assert!(matches!(
+        update.program.statements.as_slice(),
+        [
+            HydraStatement::ConfigureSource {
+                slot: 0,
+                source: HydraSource::Video { url: local },
+            },
+            HydraStatement::ConfigureSource {
+                slot: 1,
+                source: HydraSource::Video { url: remote },
+            },
+            HydraStatement::Evaluate { .. },
+        ] if local == "clips/loop.webm" && remote == "https://example.com/a.webm"
+    ));
 }
 
 #[test]
@@ -524,20 +549,32 @@ fn the_visuals_surface_borrows_shape_and_gives_it_back() {
 }
 
 #[test]
-fn speed_remains_a_strudel_control_but_native_hydra_timing_assignments_are_refused() {
+fn speed_remains_a_strudel_control_and_hydra_clock_assignments_are_recorded() {
     let mut session = Session::new().expect("session");
     // The getter still answers with the pattern control while the Hydra
-    // surface is installed.
+    // surface is installed, also after an assignment to Hydra's speed.
     session
         .evaluate(
             r#"
             await initHydra()
+            speed = 0.5
             osc(10).out()
             $: s("bd*4").speed(2)
             "#,
         )
         .expect("the Strudel speed control remains callable");
-    for name in ["speed", "bpm", "fps", "time", "update", "afterUpdate"] {
+    let update =
+        program("await initHydra()\nspeed = 2\nbpm = 120\nfps = 12\ntime = 0\nosc(10).out()");
+    assert_eq!(
+        update.program.clock(),
+        rustel_hydra::HydraClock {
+            speed: 2.0,
+            bpm: 120.0,
+            fps: Some(12.0),
+            time: Some(0.0),
+        }
+    );
+    for name in ["update", "afterUpdate"] {
         let message = evaluate_error(&format!("await initHydra()\n{name} = 2"));
         assert!(
             message.contains(&format!("Hydra's {name}"))
@@ -545,6 +582,8 @@ fn speed_remains_a_strudel_control_but_native_hydra_timing_assignments_are_refus
             "{name}: {message}"
         );
     }
+    let message = evaluate_error("await initHydra()\nspeed = 'fast'");
+    assert!(message.contains("finite number"), "{message}");
 }
 
 #[test]
