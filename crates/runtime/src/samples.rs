@@ -1441,6 +1441,11 @@ enum Codec {
     Wav,
     Mp3,
     Ogg,
+    /// An ISO base media container: MP4, M4V or QuickTime. The sound is
+    /// its audio track.
+    Mp4,
+    /// A Matroska or WebM container. The sound is its audio track.
+    Matroska,
 }
 
 /// Take `count` slots of the sample bank: ids handed back through
@@ -1561,6 +1566,8 @@ pub(crate) enum SampleAudioKind {
     Wav,
     Mp3,
     Ogg,
+    Mp4,
+    Matroska,
 }
 
 pub(crate) const MAX_SAMPLE_MANIFEST_ENTRIES: usize = 16_384;

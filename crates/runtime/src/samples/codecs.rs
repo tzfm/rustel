@@ -24,6 +24,13 @@ pub(super) fn codec_for(url: &str) -> Codec {
         // `.oga` is the Xiph-recommended extension for audio-only Ogg and
         // shows up in exported folders.
         "ogg" | "oga" => Codec::Ogg,
+        // Video containers are sample containers too: their audio track is
+        // the sound the score asks for. `.mov` is QuickTime, which shares the
+        // ISO base media layout.
+        "mp4" | "m4v" | "mov" => Codec::Mp4,
+        // WebM is Matroska's web profile, and Symphonia reads its audio
+        // tracks through the same demuxer.
+        "mkv" | "webm" => Codec::Matroska,
         _ => Codec::Wav,
     }
 }
@@ -41,6 +48,7 @@ fn codec_name(codec: symphonia::core::codecs::CodecType) -> &'static str {
         codecs::CODEC_TYPE_MP3 => "MP3",
         codecs::CODEC_TYPE_FLAC => "FLAC",
         codecs::CODEC_TYPE_AAC => "AAC",
+        codecs::CODEC_TYPE_ALAC => "ALAC",
         codecs::CODEC_TYPE_NULL => "unknown codec",
         _ => "unrecognised codec",
     }
@@ -81,6 +89,8 @@ pub(super) fn decode_guarded(
         let decoded = match codec {
             Codec::Mp3 => decode_mp3(bytes),
             Codec::Ogg => decode_ogg(bytes),
+            Codec::Mp4 => decode_compressed(bytes, "mp4"),
+            Codec::Matroska => decode_compressed(bytes, "mkv"),
             Codec::Wav => decode_wav(bytes),
         }?;
         // Convert to the context rate before playback, which interpolates
@@ -529,6 +539,30 @@ impl From<String> for CompressedFailure {
     }
 }
 
+/// Whether a container track carries audio. Symphonia has no single
+/// "audio" flag, but every audio codec it can describe gives the track a
+/// rate or a channel layout; a video track has neither.
+fn is_audio_track(track: &symphonia::core::formats::Track) -> bool {
+    track.codec_params.sample_rate.is_some() || track.codec_params.channels.is_some()
+}
+
+/// The track a sample asks for: the container's default when that is
+/// audio, else its first audio track.
+///
+/// A video container's default track is the picture. Refusing it with
+/// "unsupported codec: H.264" would be technically true and useless - the
+/// sound is in the next track.
+fn audio_track<'a>(
+    format: &'a dyn symphonia::core::formats::FormatReader,
+    extension: &str,
+) -> Result<&'a symphonia::core::formats::Track, CompressedFailure> {
+    format
+        .default_track()
+        .filter(|track| is_audio_track(track))
+        .or_else(|| format.tracks().iter().find(|track| is_audio_track(track)))
+        .ok_or_else(|| format!("{extension} has no audio track").into())
+}
+
 fn decode_compressed_with(
     bytes: &[u8],
     extension: &str,
@@ -558,18 +592,17 @@ fn decode_compressed_with(
         )
         .map_err(|error| format!("{extension} probe: {error}"))?;
     let mut format = probed.format;
-    let track = format
-        .default_track()
-        .ok_or_else(|| format!("{extension} has no track"))?;
+    let track = audio_track(format.as_ref(), extension)?;
     let track_id = track.id;
-    let codec = track.codec_params.codec;
+    let params = track.codec_params.clone();
+    let codec = params.codec;
     // This is the one boundary every container reaches, whatever its
     // extension, before a decoder is built. A Vorbis setup header can size a
     // codebook lookup table so large that `VorbisDecoder::try_new` aborts the
     // process allocating it; guard the exact bytes the decoder will read -
     // the demuxed identification and setup headers - before `make` sees them.
     if codec == symphonia::core::codecs::CODEC_TYPE_VORBIS {
-        guard_vorbis_setup(track.codec_params.extra_data.as_deref().unwrap_or_default())
+        guard_vorbis_setup(params.extra_data.as_deref().unwrap_or_default())
             .map_err(CompressedFailure::Refused)?;
     }
     // Encoder delay and padding, for the manual trim of the fallback path;
@@ -578,16 +611,15 @@ fn decode_compressed_with(
         (0usize, 0usize)
     } else {
         (
-            track.codec_params.delay.unwrap_or(0) as usize,
-            track.codec_params.padding.unwrap_or(0) as usize,
+            params.delay.unwrap_or(0) as usize,
+            params.padding.unwrap_or(0) as usize,
         )
     };
     if codec == symphonia::core::codecs::CODEC_TYPE_OPUS {
-        let params = track.codec_params.clone();
         return decode_opus_packets(&mut format, track_id, &params).map_err(Into::into);
     }
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make(&params, &DecoderOptions::default())
         .map_err(|error| {
             // "unsupported codec" alone sends someone to check their file
             // name. Naming what is actually inside the container tells them
@@ -1322,6 +1354,65 @@ mod tests {
             let audio: Vec<&[u8]> = packets[3..].iter().map(Vec::as_slice).collect();
             out.extend(ogg_page_packets(&audio, 0x04, 4, serial, final_gp)); // audio (EOS)
             out
+        }
+    }
+
+    mod video_container_tests {
+
+        //! Video containers as sample sources: their audio track is decoded,
+        //! and a container with no audio track is refused by name.
+
+        use super::*;
+
+        /// 0.6 s of 440 Hz at 8 kHz, beside a 64x36 H.264 picture. The
+        /// picture is the default track, so reaching the tone proves the
+        /// audio track is chosen rather than the default one.
+        const TINY_VIDEO: &[u8] = include_bytes!("testdata/tiny_video.mp4");
+        /// The same encoder's picture alone, with no audio track.
+        const SILENT_VIDEO: &[u8] = include_bytes!("testdata/tiny_video_silent.mp4");
+
+        #[test]
+        fn video_extensions_choose_a_video_container_decoder() {
+            for url in [
+                "clip.mp4",
+                "clip.M4V",
+                "clip.mov?cache=1",
+                "https://example.test/clip.webm#t=1",
+            ] {
+                assert!(
+                    matches!(codec_for(url), Codec::Mp4 | Codec::Matroska),
+                    "{url} must reach a container decoder"
+                );
+            }
+            assert_eq!(
+                codec_for("file://C:/clips/deep bass.mp4"),
+                Codec::Mp4,
+                "a space in the path is part of the name"
+            );
+        }
+
+        #[test]
+        fn a_video_file_plays_its_audio_track() {
+            let decoded =
+                decode_guarded("clip.mp4", TINY_VIDEO, None).expect("the audio track must decode");
+            assert_eq!(decoded.sample_rate(), 8_000);
+            assert_eq!(decoded.channels(), 1);
+            assert!(decoded.frames() > 2_000, "about half a second of tone");
+            let peak = decoded
+                .pcm()
+                .iter()
+                .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+            assert!(peak > 0.05, "decoded to near silence: peak {peak}");
+        }
+
+        #[test]
+        fn a_video_file_without_an_audio_track_says_so() {
+            let error = decode_guarded("clip.mp4", SILENT_VIDEO, None)
+                .expect_err("a silent picture is not a sample");
+            assert!(
+                error.contains("no audio track"),
+                "names what is missing: {error}"
+            );
         }
     }
 }

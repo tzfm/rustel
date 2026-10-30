@@ -1111,7 +1111,9 @@ impl SampleLibrary {
             let extension = match codec_for(url) {
                 Codec::Mp3 => "mp3",
                 Codec::Ogg => "ogg",
-                _ => "wav",
+                Codec::Mp4 => "mp4",
+                Codec::Matroska => "mkv",
+                Codec::Wav => "wav",
             };
             let into = folder.join(format!("{index:0width$}.{extension}"));
             if std::fs::symlink_metadata(&into)
