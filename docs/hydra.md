@@ -73,6 +73,33 @@ Array entries must be finite numbers. Invalid numeric arguments refuse the
 new score and leave the committed score in place. Raw shelf snippets do not
 accept arrays.
 
+### The clock
+
+Assign a number to change Hydra's clock:
+
+```js
+await initHydra()
+speed = 0.5 // every animation at half speed
+bpm = 120   // arrays step four times as often as at the default 30
+fps = 12    // draw 12 frames a second
+time = 0    // start every animation again at each update
+shape([3, 4, 5]).rotate(() => time).out()
+```
+
+`speed` scales `time`, and 1 is real time. `bpm` sets how fast arrays step. It
+does not follow the tempo of the score. `fps` keeps the last frame on screen
+between draws. Studio draws at most 30 frames a second, so a higher value
+changes nothing. Without `time = …`, the clock keeps running across updates.
+`speed(2)` stays the playback-speed control, and only `speed = …` is Hydra
+code.
+
+| Setting | Range |
+| --- | --- |
+| `speed` | -1000 to 1000 |
+| `bpm` | above 0, up to 10000 |
+| `fps` | 1 to 240 |
+| `time` | -1e9 to 1e9 seconds |
+
 ## Camera, image and video sources
 
 ```js

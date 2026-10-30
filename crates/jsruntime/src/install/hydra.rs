@@ -45,9 +45,10 @@ const VALUES: &[&str] = &[
 /// Hydra globals that are plain calls with no chain.
 const ACTIONS: &[&str] = &["render", "hush", "setResolution", "update"];
 
-/// Hydra globals a sketch may try to assign. Their native timing semantics are
-/// not implemented, so setters refuse explicitly; the getter still preserves
-/// the `speed(...)` pattern control instead of shadowing it with a number.
+/// Hydra globals a sketch may assign. The clock settings are recorded for the
+/// renderer, and the render-loop hooks are refused. The getter still
+/// preserves the `speed(...)` pattern control instead of shadowing it with a
+/// number.
 const SETTINGS: &[&str] = &["speed", "bpm", "fps", "time", "update", "afterUpdate"];
 
 /// Defaults mirrored from `rustel-hydra`, so a score that says nothing gets
@@ -580,8 +581,7 @@ fn bare_object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<rquickjs::Object<'js>> {
 /// same way: after `initHydra()` the name is Hydra's, and `clearHydra()`
 /// gives it back. `speed` is the exception and differs from upstream: it is
 /// installed as a property whose getter still returns the pattern control,
-/// so `speed(2)` keeps working. Assigning Hydra's clock settings is refused
-/// until the native renderer can honor them.
+/// so `speed(2)` keeps working. Assigning it records Hydra's clock speed.
 fn install_surface<'js>(
     ctx: &Ctx<'js>,
     chains: &Rc<RefCell<HydraChains>>,
@@ -1108,14 +1108,16 @@ fn action_function<'js>(
     Ok(function)
 }
 
-/// Keep a colliding pattern global readable, but reject an assignment whose
-/// Hydra timing semantics the native renderer cannot reproduce.
+/// Keep a colliding pattern global readable, and record an assignment to one
+/// of Hydra's clock settings for the renderer. Assigning `update` or
+/// `afterUpdate` is refused, because a render-loop hook runs JavaScript every
+/// frame.
 fn install_setting<'js>(
     ctx: &Ctx<'js>,
     _chains: &Rc<RefCell<HydraChains>>,
-    _transaction: &Rc<RefCell<Option<ScoreEffects>>>,
-    _policy: &Rc<Cell<EffectPolicy>>,
-    _refusal: &Rc<RefCell<Option<String>>>,
+    transaction: &Rc<RefCell<Option<ScoreEffects>>>,
+    policy: &Rc<Cell<EffectPolicy>>,
+    refusal: &Rc<RefCell<Option<String>>>,
     name: &'static str,
 ) -> rquickjs::Result<()> {
     // Preserve the post-install getter while replacing only assignment:
@@ -1128,13 +1130,37 @@ fn install_setting<'js>(
         let assigned: rquickjs::Object = state(&ctx)?.get(ASSIGNED)?;
         assigned.get(name)
     };
-    let set = move |ctx: Ctx<'js>, _args: Rest<rquickjs::Value<'js>>| -> rquickjs::Result<()> {
-        Err(throw_type_error(
+    let transaction = transaction.clone();
+    let policy = policy.clone();
+    let refusal = refusal.clone();
+    let set = move |ctx: Ctx<'js>, args: Rest<rquickjs::Value<'js>>| -> rquickjs::Result<()> {
+        if matches!(name, "update" | "afterUpdate") {
+            return Err(throw_type_error(
+                &ctx,
+                &format!(
+                    "assigning Hydra's {name} is not supported by native Hydra; it runs JavaScript on every frame"
+                ),
+            ));
+        }
+        let value = args
+            .0
+            .first()
+            .and_then(rquickjs::Value::as_number)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| {
+                throw_type_error(&ctx, &format!("Hydra's {name} takes a finite number"))
+            })?;
+        push_statement(
             &ctx,
-            &format!(
-                "assigning Hydra's {name} is not supported by native Hydra; the timing effect would otherwise be silently wrong"
-            ),
-        ))
+            &transaction,
+            &policy,
+            &refusal,
+            serde_json::json!({
+                "s": "set",
+                "name": name,
+                "value": { "c": "num", "v": value },
+            }),
+        )
     };
     ctx.globals()
         .prop(name, Accessor::new(get, set).configurable().enumerable())

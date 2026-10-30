@@ -549,20 +549,32 @@ fn the_visuals_surface_borrows_shape_and_gives_it_back() {
 }
 
 #[test]
-fn speed_remains_a_strudel_control_but_native_hydra_timing_assignments_are_refused() {
+fn speed_remains_a_strudel_control_and_hydra_clock_assignments_are_recorded() {
     let mut session = Session::new().expect("session");
     // The getter still answers with the pattern control while the Hydra
-    // surface is installed.
+    // surface is installed, also after an assignment to Hydra's speed.
     session
         .evaluate(
             r#"
             await initHydra()
+            speed = 0.5
             osc(10).out()
             $: s("bd*4").speed(2)
             "#,
         )
         .expect("the Strudel speed control remains callable");
-    for name in ["speed", "bpm", "fps", "time", "update", "afterUpdate"] {
+    let update =
+        program("await initHydra()\nspeed = 2\nbpm = 120\nfps = 12\ntime = 0\nosc(10).out()");
+    assert_eq!(
+        update.program.clock(),
+        rustel_hydra::HydraClock {
+            speed: 2.0,
+            bpm: 120.0,
+            fps: Some(12.0),
+            time: Some(0.0),
+        }
+    );
+    for name in ["update", "afterUpdate"] {
         let message = evaluate_error(&format!("await initHydra()\n{name} = 2"));
         assert!(
             message.contains(&format!("Hydra's {name}"))
@@ -570,6 +582,8 @@ fn speed_remains_a_strudel_control_but_native_hydra_timing_assignments_are_refus
             "{name}: {message}"
         );
     }
+    let message = evaluate_error("await initHydra()\nspeed = 'fast'");
+    assert!(message.contains("finite number"), "{message}");
 }
 
 #[test]
