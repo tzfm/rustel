@@ -140,7 +140,8 @@ may read. These are the folders that local samples use, with the same rules:
 - In Studio, the open set's folder. Put `loop.webm` in the set folder and
   write `s0.initVideo('loop.webm')`. No flag is needed.
 - The folder granted with `--allow-local-samples`, the one that
-  `samples('local:')` reads. Studio reads it after the set folder.
+  `samples('local:')` reads. Studio reads it after the set folder. In
+  Studio, the `local folder` row of Settings > Permissions grants it too.
 
 ```sh
 rustel studio set/ --allow-local-samples ~/visuals
@@ -152,8 +153,9 @@ set folder or a grant, a local path is refused.
 
 ### Web addresses
 
-Studio allows public CORS origins by default. With `--strict-sample-origins`,
-grant each origin:
+Studio allows public CORS origins by default. Settings > Permissions has
+the switch for that default and the origins you trust. With
+`--strict-sample-origins`, grant each origin:
 
 ```sh
 rustel studio set/ --strict-sample-origins \

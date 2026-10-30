@@ -600,13 +600,15 @@ pub(crate) fn scope_line(peaks: &[f32; SCOPE_COLUMNS]) -> String {
 
 /// Snapshot the host default and any persisted score override for an isolated
 /// export. Re-evaluating source text can then override this inherited value.
-/// The export imports scripts from the origins of the permissions page, and
-/// runs orchestras under its switch, too.
+/// The export imports scripts from the origins of the permissions page,
+/// reads samples and media under its grants, and runs orchestras under its
+/// switch, too.
 pub(super) fn session_config(
     default: &SessionConfig,
     host_default: usize,
     score_override: Option<usize>,
     import_origins: &[String],
+    sample_grants: &super::engine::SampleGrants,
     csound_allowed: bool,
 ) -> SessionConfig {
     default
@@ -617,6 +619,7 @@ pub(super) fn session_config(
             import_origins,
             csound_allowed,
         ))
+        .with_score_sample_access(super::engine::sample_access(default, sample_grants))
 }
 
 /// What one bounce plays: the score's source, the flag that says how to
@@ -1908,7 +1911,14 @@ mod tests {
                     mp3: false,
                     ..ExportSettings::default()
                 },
-                session_config(&config, config.max_polyphony, None, &[], allowed),
+                session_config(
+                    &config,
+                    config.max_polyphony,
+                    None,
+                    &[],
+                    &Default::default(),
+                    allowed,
+                ),
                 target.clone(),
             )
             .expect("job");
@@ -2069,7 +2079,7 @@ mod tests {
                 "polyphony".into(),
                 plain_score(&format!("{setter} stack(note('c3'), note('e3'), note('g3'), note('c4')).s('sine').gain(0.05).attack(0).decay(0).sustain(1)")),
                 ExportSettings { length: Length::Cycles(0.025), mp3: false, ..ExportSettings::default() },
-                session_config(&SessionConfig::default(), voices, inherited, &[], false),
+                session_config(&SessionConfig::default(), voices, inherited, &[], &Default::default(), false),
                 target.clone(),
             ).expect("start export job");
             let deadline = Instant::now() + std::time::Duration::from_secs(30);
@@ -2091,11 +2101,24 @@ mod tests {
             limited, unrestricted,
             "the job must use the passed host budget"
         );
-        // The origins of the permissions page reach the export.
+        // The origins and the CORS switch of the permissions page reach the
+        // export.
         let origins = ["https://glossing.dev".to_owned()];
-        let config = session_config(&SessionConfig::default(), 192, None, &origins, false);
+        let grants = crate::engine::SampleGrants {
+            strict: true,
+            ..Default::default()
+        };
+        let config = session_config(
+            &SessionConfig::default(),
+            192,
+            None,
+            &origins,
+            &grants,
+            false,
+        );
         assert_eq!(config.max_polyphony, 192);
         assert_eq!(config.score_import_access.origins(), origins);
+        assert!(!config.score_sample_access.public_cors_origins());
         let mut live = Session::new().expect("live session");
         live.evaluate("setMaxPolyphony(1); s('sine')")
             .expect("set persistent override");

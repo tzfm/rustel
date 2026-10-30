@@ -281,6 +281,31 @@ check a score with an import for unknown function names: the script defines
 names Studio does not read before the script runs. See
 [Script imports](../SECURITY.md#script-imports) for the security rules.
 
+### Samples and media
+
+By default, a score's `samples()`, Hydra images and Hydra videos load from
+any public HTTPS server that allows cross-origin reads, as on strudel.cc.
+The Permissions page changes what they can read:
+
+- `public servers with CORS` is the switch for that default. Turn it off
+  and only trusted origins load. With `--strict-sample-origins`, the switch
+  stays off for the run.
+- A refused origin, such as `http://kit.example`, comes onto the page with
+  `samples, media` beside it. Press Enter to trust it. A trusted origin
+  loads with no CORS header, over plain HTTP, or from a server on this
+  computer. Space turns a trust off, and `d` removes it.
+- `local folder` is the folder that `samples('local:...')` reads. Hydra also
+  reads a file from it when the set folder does not have the file. Press
+  Enter to choose the folder, and `d` to forget it. With
+  `--allow-local-samples`, the folder of the flag is used for the run.
+
+Studio keeps the trusted origins, the switch and the folder in
+`studio.json`. If an update stopped on the refusal, it runs again when you
+give the permission. Otherwise the next update reads with the new
+permission. Hydra images and videos still need HTTPS and CORS, also from a
+trusted origin. See [Sample access](../SECURITY.md#sample-access) for the
+rules.
+
 ## Checking and playback
 
 Studio checks the source after a short typing pause. The first-error command,

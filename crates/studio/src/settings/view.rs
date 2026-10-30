@@ -694,6 +694,21 @@ pub(super) fn render_keybinds(
     }
 }
 
+/// What a row of the permissions page names.
+fn permission_label(row: &PermissionRow) -> &str {
+    match row {
+        PermissionRow::Origin { origin, .. } | PermissionRow::SampleOrigin { origin, .. } => origin,
+        PermissionRow::PublicCors { .. } => "public servers with CORS",
+        PermissionRow::LocalFolder {
+            folder: Some(folder),
+            ..
+        } => folder,
+        PermissionRow::LocalFolder { fixed: true, .. } => "folder from --allow-local-samples",
+        PermissionRow::LocalFolder { .. } => "local folder",
+        PermissionRow::Csound { .. } => "native orchestras",
+    }
+}
+
 /// The permissions page: one row an origin or a switch, and what the
 /// keys do below the list.
 pub(super) fn render_permissions(
@@ -706,22 +721,10 @@ pub(super) fn render_permissions(
     let width = usize::from(rows.width);
     let shown = usize::from(rows.height).max(1);
     let first = view.sheet.first_row(shown, view.permissions.len());
-    if view.permissions.is_empty() {
-        buffer.set_stringn(
-            rows.x,
-            rows.y,
-            "  none yet · a refused import or orchestra puts its row here",
-            width,
-            Style::default().fg(theme.muted),
-        );
-    }
-    let origin_width = view
+    let label_width = view
         .permissions
         .iter()
-        .map(|row| match row {
-            PermissionRow::Origin { origin, .. } => origin.width(),
-            PermissionRow::Csound { .. } => "native orchestras".width(),
-        })
+        .map(|row| permission_label(row).width())
         .max()
         .unwrap_or(0);
     for (offset, (index, row)) in view
@@ -738,11 +741,15 @@ pub(super) fn render_permissions(
         } else {
             " "
         };
-        let (label, allowed) = match row {
-            PermissionRow::Origin { origin, allowed } => (origin.as_str(), *allowed),
-            PermissionRow::Csound { allowed } => ("native orchestras", *allowed),
-        };
+        let allowed = row.allowed();
         let state = if allowed { "on" } else { "off" };
+        // What the row permits, so a script origin and a sample origin
+        // with the same name read apart.
+        let reads = match row {
+            PermissionRow::Origin { .. } => "scripts",
+            PermissionRow::Csound { .. } => "",
+            _ => "samples, media",
+        };
         let style = if selected {
             Style::default()
                 .fg(theme.accent)
@@ -755,7 +762,11 @@ pub(super) fn render_permissions(
         buffer.set_stringn(
             rows.x,
             rows.y + offset as u16,
-            format!("{marker} {:<origin_width$}  {state}", label),
+            format!(
+                "{marker} {:<label_width$}  {state:<3}  {reads}",
+                permission_label(row)
+            )
+            .trim_end(),
             width,
             style,
         );
@@ -763,14 +774,34 @@ pub(super) fn render_permissions(
     // The keys lead, as on every other page: the footer often has room
     // for one line, and a player who cannot see "Enter permits" cannot
     // work the page.
-    let keys = match view.permissions.get(view.sheet.selected) {
+    let selected = view.permissions.get(view.sheet.selected);
+    let keys = match selected {
+        Some(
+            PermissionRow::PublicCors { fixed: true, .. }
+            | PermissionRow::LocalFolder { fixed: true, .. },
+        ) => "set on the command line for this run · Tab pages",
+        Some(PermissionRow::PublicCors { allowed: true, .. }) => "←/→/Space off · Tab pages",
+        Some(PermissionRow::PublicCors { .. }) => "Enter permits · ←/→/Space on/off · Tab pages",
+        Some(PermissionRow::LocalFolder {
+            folder: Some(_), ..
+        }) => "Enter chooses another · d forgets it · Tab pages",
+        Some(PermissionRow::LocalFolder { .. }) => "Enter chooses a folder · Tab pages",
         Some(row) if row.allowed() => "←/→/Space off · d removes · Tab pages",
         Some(_) => "Enter permits · ←/→/Space on/off · d dismisses · Tab pages",
         None => "Tab pages",
     };
-    let says = match view.permissions.get(view.sheet.selected) {
+    let says = match selected {
         Some(PermissionRow::Csound { .. }) => {
             "an orchestra runs native code that reads files and starts processes. The switch resets to on when Studio starts."
+        }
+        Some(PermissionRow::SampleOrigin { .. }) => {
+            "samples() reads a trusted origin even when its server does not allow cross-origin reads. Hydra images and videos still need https and that consent."
+        }
+        Some(PermissionRow::PublicCors { .. }) => {
+            "samples(), images and videos read any public https server that allows cross-origin reads, as on strudel.cc. Off, only the trusted origins load."
+        }
+        Some(PermissionRow::LocalFolder { .. }) => {
+            "samples('local:...') and a Hydra file outside the set read this folder and nothing outside it."
         }
         _ => {
             "a score loads a script with await import('https://...') only from a trusted origin. The script runs as setup code before the score."

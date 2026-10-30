@@ -115,6 +115,12 @@ server without CORS configuration, a plain-http origin, or a loopback server
 is reached at all. Applications embedding `Session` provide the same policy
 through `SessionConfig::score_sample_access`.
 
+The Studio Permissions page gives the same grants: trusted origins, the
+parity default, and a local root. The page adds to the command line. It can
+turn the parity default off, but not on over `--strict-sample-origins`. A
+root from `--allow-local-samples` is used instead of the root of the page.
+Studio keeps these grants in `studio.json`.
+
 ### Local root
 
 `--allow-local-samples` confines `samples('local:...')` to one canonical root.

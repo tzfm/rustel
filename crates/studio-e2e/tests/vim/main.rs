@@ -626,5 +626,46 @@ fn gd_reads_hydra_names_in_hydra_code() {
     }
 }
 
+/// `j` and `k` walk the permissions page in Vim, and Enter on the local
+/// folder opens its prompt over the page.
+#[test]
+fn vim_keys_walk_the_sample_permissions() {
+    let mut studio = hermetic();
+    enable_vim(&mut studio);
+    studio.chord("ctrl+o");
+    for _ in 0..10 {
+        if studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("▸ public servers with CORS"))
+        {
+            break;
+        }
+        studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    }
+    let selected = |studio: &mut Hermetic, label: &str| {
+        let marker = format!("▸ {label}");
+        studio.rows().iter().any(|row| row.contains(&marker))
+    };
+    assert!(selected(&mut studio, "public servers with CORS"));
+    studio.type_text("j");
+    assert!(selected(&mut studio, "local folder"));
+    studio.type_text("k");
+    assert!(selected(&mut studio, "public servers with CORS"));
+
+    studio.type_text("j");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        studio.status().starts_with("local samples folder"),
+        "{}",
+        studio.status()
+    );
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(
+        selected(&mut studio, "local folder"),
+        "Esc comes back to the row"
+    );
+}
+
 mod mappings;
 mod search;

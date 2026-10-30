@@ -2749,7 +2749,8 @@ pub enum SettingsPage {
     Vst,
     /// Which kinds of entry the reference and the suggestions offer.
     Reference,
-    /// What a score may reach: import origins, and native orchestras.
+    /// What a score may reach: import origins, sample origins, the local
+    /// folder, and native orchestras.
     Permissions,
     About,
 }
@@ -2845,8 +2846,8 @@ pub struct SettingsSheet {
     /// How many keybind rows the keybinds page is showing, for the same
     /// reason as `source_count`.
     pub keybind_count: usize,
-    /// How many rows the permissions page is showing: the trusted origins,
-    /// then the ones refused in this studio.
+    /// How many rows the permissions page is showing: the origins, the
+    /// switches and the local folder.
     pub permissions_count: usize,
     /// How many folders the player added on the vst page, for the same
     /// reason as `source_count`.
@@ -4418,8 +4419,8 @@ pub struct SettingsSheetView<'a> {
     pub mappings: [SlotView; MAPPING_SLOTS],
     /// The shortcut rows, as the keybinds page reads them.
     pub bindings: Vec<KeybindRow>,
-    /// The rows of the permissions page: the trusted origins, then the
-    /// refused, then the orchestra switch.
+    /// The rows of the permissions page: the script origins, the sample
+    /// origins, the CORS switch, the local folder, then the orchestra switch.
     pub permissions: Vec<PermissionRow>,
     /// The plugin folders and the two facts under them, as the vst page
     /// reads them.
@@ -4674,6 +4675,18 @@ pub enum PermissionRow {
         /// one key.
         allowed: bool,
     },
+    /// An origin a score's `samples()`, images and videos read from with
+    /// no CORS consent, as `--allow-sample-origin` trusts one. A refused
+    /// origin is on the page until the studio closes.
+    SampleOrigin { origin: String, allowed: bool },
+    /// The public CORS default: any public https server that consents to
+    /// cross-origin reads. `fixed` when `--strict-sample-origins` holds it
+    /// off for the run.
+    PublicCors { allowed: bool, fixed: bool },
+    /// The folder `samples('local:')` and a Hydra file outside the set
+    /// read, as the page shows it. `fixed` when `--allow-local-samples`
+    /// named one for the run.
+    LocalFolder { folder: Option<String>, fixed: bool },
     /// The native orchestra switch. It lasts one studio run: the studio
     /// does not keep it, and the next start turns it on.
     Csound { allowed: bool },
@@ -4683,7 +4696,23 @@ impl PermissionRow {
     /// Whether the row's permission is on.
     pub fn allowed(&self) -> bool {
         match self {
-            Self::Origin { allowed, .. } | Self::Csound { allowed } => *allowed,
+            Self::Origin { allowed, .. }
+            | Self::SampleOrigin { allowed, .. }
+            | Self::PublicCors { allowed, .. }
+            | Self::Csound { allowed } => *allowed,
+            Self::LocalFolder { folder, fixed } => *fixed || folder.is_some(),
+        }
+    }
+
+    /// Whether `other` is this row, on or off: an origin moves between
+    /// the trusted and the refused, and the selection follows it.
+    pub fn is_same_row(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Origin { origin, .. }, Self::Origin { origin: other, .. })
+            | (Self::SampleOrigin { origin, .. }, Self::SampleOrigin { origin: other, .. }) => {
+                origin == other
+            }
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
     }
 }

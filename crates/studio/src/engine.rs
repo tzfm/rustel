@@ -272,6 +272,9 @@ pub struct StudioConfig {
     /// The origins of the permissions page, which scores import scripts from.
     /// They add to the origins that `session` already trusts.
     pub import_origins: Vec<String>,
+    /// What the permissions page permits a score's `samples()`, images and
+    /// videos to read, over what `session` permits.
+    pub sample_grants: SampleGrants,
     /// Whether native orchestras run. The studio turns them on at start -
     /// an installed library is the opt-in - and the permissions page can
     /// flip the switch during a run. The default is the studio's rule, so
@@ -296,9 +299,50 @@ impl Default for StudioConfig {
             watch_pads: true,
             open_default_input: true,
             import_origins: Vec::new(),
+            sample_grants: SampleGrants::default(),
             csound_allowed: true,
         }
     }
+}
+
+/// The permissions page's answers for what a score's `samples()`, images
+/// and videos read. Each one does what its command line flag does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SampleGrants {
+    /// The origins trusted as `--allow-sample-origin` trusts one.
+    pub origins: Vec<String>,
+    /// Refuse the public CORS default, as `--strict-sample-origins` does.
+    pub strict: bool,
+    /// The folder `samples('local:')` reads, as `--allow-local-samples`
+    /// names one.
+    pub local_root: Option<std::path::PathBuf>,
+}
+
+/// What `session` permits a score to read, with the page's `grants` added.
+/// The page can close the public CORS default but not open it over the
+/// command line, and a folder from the command line wins over its own.
+pub(super) fn sample_access(
+    session: &SessionConfig,
+    grants: &SampleGrants,
+) -> rustel_runtime::ScoreSampleAccess {
+    // A clone shares the policy's record of refused origins, which the
+    // page reads.
+    let mut access = session.score_sample_access.clone();
+    for origin in &grants.origins {
+        // The page keeps only origins that the runtime named.
+        let _ = access.permit_origin(origin);
+    }
+    if grants.strict {
+        access.set_public_cors_origins(false);
+    }
+    if let Some(root) = &grants.local_root
+        && !access.has_local_root()
+    {
+        // A folder that is gone since the page chose it permits nothing,
+        // and `samples('local:')` says how to grant one.
+        let _ = access.permit_local_root(root);
+    }
+    access
 }
 
 /// The origins that `session` trusts for script imports, `origins` of the
@@ -1667,6 +1711,7 @@ impl StudioEngine {
             &config.import_origins,
             config.csound_allowed,
         ));
+        session.set_score_sample_access(sample_access(&config.session, &config.sample_grants));
         session.set_query_hap_budget(STUDIO_QUERY_HAP_BUDGET)?;
         let master = Arc::new(StudioMasterBus::default());
         master.set_max_polyphony(config.session.max_polyphony);
@@ -1697,7 +1742,7 @@ impl StudioEngine {
         // is: the policy the host chose for scores, with each pack's own
         // origin permitted on top of it. The library must exist first.
         if let Some(library) = session.sample_library() {
-            library.set_import_policy(config.session.score_sample_access.clone());
+            library.set_import_policy(session.config().score_sample_access.clone());
         }
 
         Ok(Self {

@@ -1015,33 +1015,32 @@ impl App {
                 return true;
             }
             SettingsAction::RefreshSource(at) => self.refresh_sample_source(at),
-            SettingsAction::PermitRow(at) => {
-                let refused_origin = matches!(
-                    self.permission_rows().get(at),
-                    Some(PermissionRow::Origin { allowed: false, .. })
-                );
-                self.permit_row(at);
-                if refused_origin {
-                    // The origin moved up, to the end of the trusted ones.
-                    sheet.selected = self.prefs.import_origins.len().saturating_sub(1);
+            action @ (SettingsAction::PermitRow(at) | SettingsAction::ToggleRow(at)) => {
+                let row = self.permission_rows().into_iter().nth(at);
+                // The folder prompt opens over the page, as the import
+                // prompt does.
+                if let Some(PermissionRow::LocalFolder { fixed: false, .. }) = row {
+                    self.settings_sheet = Some(sheet);
+                    self.open_set_prompt(SetPrompt::LocalSampleFolder);
+                    #[cfg(feature = "hydra")]
+                    self.sync_settings_webcam_preview();
+                    return true;
                 }
-            }
-            SettingsAction::ToggleRow(at) => {
-                // The orchestra switch stays where it stands. Either way an
-                // origin moved: a permission taken back lands at the end of
-                // the refused ones, one given at the end of the trusted.
-                let (origin, refused) = match self.permission_rows().get(at) {
-                    Some(PermissionRow::Origin { allowed, .. }) => (true, !*allowed),
-                    _ => (false, false),
-                };
-                self.toggle_row(at);
-                if origin {
-                    sheet.selected = if refused {
-                        self.prefs.import_origins.len().saturating_sub(1)
-                    } else {
-                        (self.prefs.import_origins.len() + self.blocked_imports.len())
-                            .saturating_sub(1)
-                    };
+                if matches!(action, SettingsAction::PermitRow(_)) {
+                    self.permit_row(at);
+                } else {
+                    self.toggle_row(at);
+                }
+                // A switch stays where it stands. An origin moves: one given
+                // lands at the end of the trusted ones of its kind, one taken
+                // back at the end of the refused, and the selection follows.
+                if let Some(row) = row
+                    && let Some(now) = self
+                        .permission_rows()
+                        .iter()
+                        .position(|moved| moved.is_same_row(&row))
+                {
+                    sheet.selected = now;
                 }
             }
             SettingsAction::ForgetRow(at) => {
