@@ -10,7 +10,7 @@
 //! |---|---|
 //! | the mixer desk, master level and limiter | `mixer.rs` |
 //! | the reference column (Ctrl+D) | `reference_panel.rs` |
-//! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs` |
+//! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs`, `hydra_scope.rs` |
 //! | hearing a chord, scale, sound or snippet | `previews.rs` |
 //! | the Settings sheet | `settings_sheet.rs` |
 //! | its Permissions page: origins and orchestras | `permissions.rs` |
@@ -166,6 +166,8 @@ mod external_changes;
 mod find;
 mod focus;
 mod hydra_backdrop;
+#[cfg(feature = "hydra")]
+mod hydra_scope;
 mod jobs_panel;
 mod key_bindings;
 mod keyboard;

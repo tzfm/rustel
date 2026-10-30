@@ -48,7 +48,10 @@ column makes music, not Hydra sketches.
 ## What a score can use
 
 Call `await initHydra()` before Hydra chains. Use **Ctrl+D** on a name or
-search the reference for its arguments.
+search the reference for its arguments. In a Hydra statement, **Ctrl+F** and
+the suggestions list Hydra names only, under the `hydra` heading. In pattern
+code they never list a Hydra name. See
+[the reference](studio.md#reference) for how a statement counts as Hydra code.
 
 | Option | Effect |
 | --- | --- |

@@ -186,6 +186,10 @@ pub struct Reference {
     entries: Vec<Entry>,
     by_name: HashMap<String, usize>,
     by_kabel_name: HashMap<String, usize>,
+    /// Hydra names written first in a statement or argument: `osc`, `o0`.
+    by_hydra_name: HashMap<String, usize>,
+    /// Hydra names written after a dot: `kaleid`, `out`, `initCam`.
+    by_hydra_member: HashMap<String, usize>,
     revision: String,
     /// Documented but filtered out by the `known` predicate; reported,
     /// not shown.
@@ -195,7 +199,9 @@ pub struct Reference {
     hidden: Vec<Category>,
 }
 
-/// The namespace available at the editor caret. The full browser keeps both.
+/// The namespace available at the editor caret. The full browser keeps
+/// pattern and graph entries. Hydra entries appear only in the Hydra scopes,
+/// and pattern and graph entries never appear there.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReferenceScope {
     #[default]
@@ -203,11 +209,36 @@ pub enum ReferenceScope {
     Pattern,
     Kabelsalat,
     KabelsalatMember,
+    /// Hydra names that start a statement or an argument.
+    Hydra,
+    /// Hydra names written after a dot.
+    HydraMember,
+    /// The Hydra browser: every Hydra name, as `All` is for pattern code.
+    HydraAll,
 }
 
 impl ReferenceScope {
     pub fn is_kabelsalat(self) -> bool {
         matches!(self, Self::Kabelsalat | Self::KabelsalatMember)
+    }
+
+    pub fn is_hydra(self) -> bool {
+        matches!(self, Self::Hydra | Self::HydraMember | Self::HydraAll)
+    }
+
+    /// Whether this scope is a whole browser rather than one position's
+    /// completion list.
+    pub fn is_browser(self) -> bool {
+        matches!(self, Self::All | Self::HydraAll)
+    }
+
+    /// The browser for the language of this scope.
+    pub fn browser(self) -> Self {
+        if self.is_hydra() {
+            Self::HydraAll
+        } else {
+            Self::All
+        }
     }
 }
 
@@ -228,16 +259,19 @@ pub enum Category {
     Internals,
     /// KabelSalat graph builders, nodes and inputs.
     Kabelsalat,
+    /// Hydra visuals: the Hydra namespace, `initHydra` and `clearHydra`.
+    Hydra,
 }
 
 impl Category {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Osc,
         Self::Serial,
         Self::FmMatrix,
         Self::Bind,
         Self::Internals,
         Self::Kabelsalat,
+        Self::Hydra,
     ];
 
     /// The tag an entry carries to belong to this category.
@@ -249,6 +283,7 @@ impl Category {
             Self::Bind => "bind",
             Self::Internals => "internals",
             Self::Kabelsalat => "kabelsalat",
+            Self::Hydra => "hydra",
         }
     }
 
@@ -1290,7 +1325,8 @@ mod tests {
                     }
                     let covered = if *label == "engine names" {
                         // S and audioin are installed score guards whose use is
-                        // documented in the graph namespace.
+                        // documented in the graph namespace, and H is
+                        // documented in the Hydra namespace.
                         reference.documents(name)
                     } else if *exact {
                         reference.by_name.contains_key(name)
@@ -1388,10 +1424,12 @@ mod tests {
             let mut stray: Vec<&str> = Vec::new();
             for index in 0..reference.len() {
                 let entry = reference.entry(index).expect("entry");
-                // Snippets are lines to paste. Graph names live in a separate
-                // namespace, whose installation coverage is checked by jsruntime.
+                // Snippets are lines to paste. Graph and Hydra names live in
+                // separate namespaces, installed only inside `K` or after
+                // `initHydra()`.
                 if entry.snippet.is_some()
                     || reference.by_kabel_name.get(&entry.name) == Some(&index)
+                    || entry.is_hydra()
                 {
                     continue;
                 }
@@ -5014,7 +5052,11 @@ mod tests {
             let bypasses = reference.search("tag:bypass");
             assert!(!bypasses.is_empty());
             assert!(bypasses.iter().all(|index| !listed.contains(index)));
-            assert_eq!(listed.len() + bypasses.len(), reference.len());
+            // Hydra names are listed only in Hydra code.
+            let hydra = (0..reference.len())
+                .filter(|&index| reference.entry(index).unwrap().is_hydra())
+                .count();
+            assert_eq!(listed.len() + bypasses.len() + hydra, reference.len());
             assert!(reference.search("zzzzqqq").is_empty());
         }
 
@@ -6776,5 +6818,147 @@ mod kabelsalat_tests {
             .unwrap();
         assert!(reference.entry(midi).unwrap().no_autocomplete);
         assert!(tagged.contains(&midi));
+    }
+}
+
+#[cfg(all(test, feature = "hydra"))]
+mod hydra_tests {
+    use super::*;
+
+    fn names(reference: &Reference, query: &str, scope: ReferenceScope) -> Vec<String> {
+        reference
+            .search_in(query, false, scope)
+            .into_iter()
+            .map(|index| reference.entry(index).expect("a listed entry").name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn hydra_and_pattern_names_never_share_a_list() {
+        let reference = Reference::load_all();
+        for query in ["", "os", "sha", "tag:hydra", "tag:", "kaleid"] {
+            for scope in [ReferenceScope::All, ReferenceScope::Pattern] {
+                for index in reference.search_in(query, false, scope) {
+                    let entry = reference.entry(index).unwrap();
+                    assert!(
+                        !entry.is_hydra(),
+                        "{query:?} in {scope:?} lists {}",
+                        entry.name
+                    );
+                }
+            }
+            for scope in [
+                ReferenceScope::Hydra,
+                ReferenceScope::HydraMember,
+                ReferenceScope::HydraAll,
+            ] {
+                for index in reference.search_in(query, false, scope) {
+                    let entry = reference.entry(index).unwrap();
+                    assert!(
+                        entry.is_hydra(),
+                        "{query:?} in {scope:?} lists {}",
+                        entry.name
+                    );
+                    assert_eq!(entry.heading(), "hydra", "{}", entry.name);
+                }
+            }
+        }
+        assert!(
+            names(&reference, "tag:hydra", ReferenceScope::Pattern)
+                .contains(&"initHydra".to_owned())
+        );
+    }
+
+    #[test]
+    fn hydra_names_resolve_in_their_own_namespace() {
+        let reference = Reference::load_all();
+        for name in ["osc", "noise", "shape", "src"] {
+            let hydra = reference.lookup_in(name, ReferenceScope::Hydra).unwrap();
+            assert!(reference.entry(hydra).unwrap().is_hydra(), "{name}");
+            assert!(reference.is_hydra_global(name), "{name}");
+            if let Some(pattern) = reference.lookup_in(name, ReferenceScope::Pattern) {
+                assert_ne!(pattern, hydra, "{name} needs separate documentation");
+            }
+        }
+        let kaleid = reference
+            .lookup_in("kaleid", ReferenceScope::HydraMember)
+            .unwrap();
+        assert!(reference.entry(kaleid).unwrap().inserts_as_call());
+        assert!(
+            reference
+                .lookup_in("kaleid", ReferenceScope::Pattern)
+                .is_none()
+        );
+        let o0 = reference.lookup_in("o2", ReferenceScope::Hydra).unwrap();
+        assert_eq!(reference.entry(o0).unwrap().name, "o0");
+        assert!(!reference.entry(o0).unwrap().inserts_as_call());
+        // `a` is the analyser as a global and the alpha channel after a dot.
+        let analyser = reference.lookup_in("a", ReferenceScope::Hydra).unwrap();
+        let alpha = reference
+            .lookup_in("a", ReferenceScope::HydraMember)
+            .unwrap();
+        assert_ne!(analyser, alpha);
+        assert!(!reference.entry(analyser).unwrap().inserts_as_call());
+        assert!(reference.entry(alpha).unwrap().inserts_as_call());
+    }
+
+    #[test]
+    fn hydra_completion_separates_statement_heads_from_methods() {
+        let reference = Reference::load_all();
+        let heads = names(&reference, "", ReferenceScope::Hydra);
+        let methods = names(&reference, "", ReferenceScope::HydraMember);
+        for head in ["osc", "src", "o0", "s0", "render", "H"] {
+            assert!(
+                heads.contains(&head.to_owned()),
+                "{head} starts a statement"
+            );
+            assert!(
+                !methods.contains(&head.to_owned()),
+                "{head} is not a method"
+            );
+        }
+        for method in ["kaleid", "out", "modulate", "initCam", "setBins", "fast"] {
+            assert!(methods.contains(&method.to_owned()), "{method} is a method");
+            assert!(
+                !heads.contains(&method.to_owned()),
+                "{method} is not a head"
+            );
+        }
+        assert!(
+            !methods.contains(&"sum".to_owned()),
+            "refused names are not offered"
+        );
+        assert!(
+            reference
+                .lookup_in("sum", ReferenceScope::HydraMember)
+                .is_some()
+        );
+    }
+
+    /// Each browser counts only the entries it can list.
+    #[test]
+    fn each_browser_counts_its_own_language() {
+        let reference = Reference::load_all();
+        let hydra = reference.len_in(ReferenceScope::HydraAll);
+        assert!(hydra > 0);
+        assert_eq!(
+            reference
+                .search_in("", false, ReferenceScope::HydraAll)
+                .len(),
+            hydra
+        );
+        assert_eq!(
+            reference.len_in(ReferenceScope::All) + hydra,
+            reference.len()
+        );
+    }
+
+    #[test]
+    fn hiding_hydra_leaves_lookup_and_its_tag() {
+        let mut reference = Reference::load_all();
+        reference.set_hidden([Category::Hydra]);
+        assert!(names(&reference, "", ReferenceScope::Hydra).is_empty());
+        assert!(!names(&reference, "tag:hydra", ReferenceScope::Hydra).is_empty());
+        assert!(reference.lookup_in("osc", ReferenceScope::Hydra).is_some());
     }
 }

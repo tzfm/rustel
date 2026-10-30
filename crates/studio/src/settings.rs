@@ -2284,6 +2284,7 @@ const REFERENCE_ROWS: &[Row] = &[
     Row::ReferenceCategory(Category::Bind),
     Row::ReferenceCategory(Category::Internals),
     Row::ReferenceCategory(Category::Kabelsalat),
+    Row::ReferenceCategory(Category::Hydra),
 ];
 
 /// Cache controls at the top of the Sources page, before imports and
@@ -2559,6 +2560,7 @@ impl Row {
             Self::ReferenceCategory(Category::Bind) => "bind & join",
             Self::ReferenceCategory(Category::Internals) => "pattern internals",
             Self::ReferenceCategory(Category::Kabelsalat) => "KabelSalat",
+            Self::ReferenceCategory(Category::Hydra) => "Hydra",
         }
     }
 
@@ -2662,6 +2664,9 @@ impl Row {
             }
             Self::ReferenceCategory(Category::Kabelsalat) => {
                 "K() graphs, nodes and inputs · tag:kabelsalat lists them anyway"
+            }
+            Self::ReferenceCategory(Category::Hydra) => {
+                "Hydra names, offered only in Hydra code · tag:hydra lists them there"
             }
         }
     }
@@ -9263,7 +9268,7 @@ mod tests {
             Category::ALL
         );
         sheet.key(KeyCode::Left, &mut settings, &features);
-        assert!(settings.shows_category(Category::Kabelsalat));
+        assert!(settings.shows_category(Category::Hydra), "the last row");
     }
 
     #[test]

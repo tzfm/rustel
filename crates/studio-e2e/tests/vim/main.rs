@@ -604,5 +604,27 @@ fn visual_lines_and_text_objects_edit_complete_ranges() {
     assert_eq!(studio.source(), "// issing");
 }
 
+/// `gd` on the block caret reads a name in the language of its statement,
+/// as Ctrl+D does outside Vim.
+#[test]
+fn gd_reads_hydra_names_in_hydra_code() {
+    let mut studio = hermetic();
+    enable_vim(&mut studio);
+    let source = "await initHydra()\nosc(10).kaleid(4).out()\n$: s(\"bd\").shape(0.5)";
+    for (name, signature) in [("kaleid", "kaleid(nSides)"), ("shape", "shape(")] {
+        studio.set_score(source);
+        studio.set_caret(source.find(name).expect("a name"));
+        studio.type_text("gd");
+        assert_eq!(studio.status(), format!("reference - {name}"));
+        let rows = studio.rows();
+        assert!(rows.iter().any(|row| row.contains(signature)), "{name}");
+        assert!(
+            !rows.iter().any(|row| row.contains("shape(sides")),
+            "{name}"
+        );
+        studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    }
+}
+
 mod mappings;
 mod search;

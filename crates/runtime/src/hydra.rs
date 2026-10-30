@@ -778,4 +778,37 @@ mod tests {
         };
         assert_eq!(configured_audio_bins(&program), 8);
     }
+
+    /// The reference documents each shader function with the inputs the
+    /// renderer compiles, in order, and every shader function has an entry.
+    #[test]
+    fn hydra_reference_parameters_match_the_shader_table() {
+        let entries: Vec<_> = rustel_jsruntime::hydra_reference_entries().collect();
+        for function in rustel_hydra::glsl::FUNCTIONS {
+            let documented = entries.iter().find(|entry| {
+                entry.name == function.name
+                    && entry
+                        .tags
+                        .contains(&if function.kind == rustel_hydra::glsl::Kind::Src {
+                            "global"
+                        } else {
+                            "method"
+                        })
+            });
+            let Some(entry) = documented else {
+                panic!("{} has no reference entry", function.name);
+            };
+            if entry.no_autocomplete {
+                continue;
+            }
+            let params: Vec<&str> = entry
+                .params
+                .iter()
+                .map(|param| param.name)
+                .filter(|name| *name != "texture")
+                .collect();
+            let inputs: Vec<&str> = function.inputs.iter().map(|input| input.name).collect();
+            assert_eq!(params, inputs, "{}", function.name);
+        }
+    }
 }

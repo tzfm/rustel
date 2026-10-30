@@ -26,6 +26,13 @@ use super::*;
 use rquickjs::function::{Rest, This};
 use rquickjs::object::Accessor;
 
+mod reference;
+
+pub(super) fn reference_entries()
+-> impl Iterator<Item = &'static rustel_core::reference::ReferenceEntry> {
+    reference::ENTRIES.iter()
+}
+
 /// Marks a recorded chain: the value is its index in the per-evaluation arena.
 const CHAIN_KEY: &str = "__rustelHydraChain";
 /// Marks an `H(pattern)` handle: the value is its signal slot.

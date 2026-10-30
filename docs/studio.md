@@ -476,6 +476,22 @@ Two shortcuts open the reference panel for the caret position:
 keeps Ctrl+Space for input sources by default. The menus and Settings show
 Ctrl+Space only where Studio expects it to arrive.
 
+Hydra code has its own names. `osc`, `noise`, `shape` and `src` are shader
+sources in a Hydra statement and pattern functions in pattern code, so the
+panel follows the statement at the caret:
+
+- In a Hydra statement, Ctrl+F and the suggestions list only Hydra names,
+  under the `hydra` heading. Ctrl+F outside a call browses all of them.
+- In pattern code, they never list a Hydra name, not even for `tag:hydra`.
+- Ctrl+D opens the entry in the language of the statement: `osc` in
+  `osc(10).out()` is the Hydra source.
+
+A statement is Hydra code when the score calls `initHydra()` and the
+statement starts with a Hydra name, such as `osc`, `src`, `o0`, `s0` or
+`render`. The argument of `H()` is pattern code. On an empty line, or while
+you type the first name, the statement above decides: below
+`await initHydra()` or a Hydra statement, the list is Hydra.
+
 Use arrows to select an item. Enter uses the selected item as shown in the
 footer. Depending on the view, it inserts text or copies an example. Esc goes
 back or closes the panel. Search filters such as `tag:vis` and `tag:snippet`
@@ -488,9 +504,9 @@ search `lpf` and Enter writes `lpf`. When two names differ only in case, the
 row shows the camelCase name. A capital in your search text selects the names
 with this capital first: `cycleS` puts `cycleStruct` before `cyclesPer`.
 
-Settings ▸ Reference has one switch for each of six kinds of entry. All six
-are on by default. Turn one off to hide the kind from the reference and the
-suggestions:
+Settings ▸ Reference has one switch for each of seven kinds of entry. All
+seven are on by default. Turn one off to hide the kind from the reference and
+the suggestions:
 
 - **OSC / SuperDirt**: controls only SuperDirt or another OSC receiver reads,
   plus `osc()`, `oschost` and `oscport`.
@@ -502,10 +518,13 @@ suggestions:
 - **pattern internals**: `withHap`, `splitQueries` and other hap plumbing.
 - **KabelSalat**: `K()`, `S()`, graph nodes and inputs such as `sFreq` and
   `sGate`. This setting does not change score playback.
+- **Hydra**: the Hydra names, plus `initHydra()` and `clearHydra()`. This
+  setting does not change the visuals.
 
 A hidden kind stays in reach. `tag:osc`, `tag:serial`, `tag:fm_matrix`,
-`tag:bind`, `tag:internals` and `tag:kabelsalat` list the kind anyway, and
-Ctrl+D still opens the documentation.
+`tag:bind`, `tag:internals`, `tag:kabelsalat` and `tag:hydra` list the kind
+anyway, and Ctrl+D still opens the documentation. `tag:hydra` lists Hydra
+names only in Hydra code.
 
 In the panel, Tab goes to the next tab. The examples tab has parts, tracks,
 sound design, and Hydra visuals. The generator tab makes new music from a

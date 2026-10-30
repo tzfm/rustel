@@ -2,24 +2,9 @@ use super::*;
 use rquickjs::function::Rest;
 use rustel_core::reference::{ReferenceEntry, ReferenceParam};
 
-/// Reference entries for visual helpers and unsupported score calls.
+/// Reference entries for visual helpers and unsupported score calls. `H` is
+/// written inside Hydra code, so its entry lives with the Hydra names.
 pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
-    ReferenceEntry {
-        name: "H",
-        synonyms: &[],
-        summary: "use a pattern as a Hydra parameter",
-        description: "Uses a pattern to supply a Hydra parameter at the current transport position. The pattern must be queryable without JavaScript: mini-notation, arithmetic and signals are supported; JavaScript callbacks are not.",
-        params: &[ReferenceParam {
-            name: "pattern",
-            r#type: "string | Pattern",
-            description: "the pattern to read, in mini-notation or already built.",
-        }],
-        examples: &["await initHydra()\nshape(H(\"3 4 5 [6 7]*2\")).out(o0)"],
-        tags: &["rustel", "visuals", "hydra"],
-        no_autocomplete: false,
-        deprecated: false,
-        origin: "rustel",
-    },
     ReferenceEntry {
         name: "clearHydra",
         synonyms: &[],

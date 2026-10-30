@@ -458,15 +458,15 @@ impl App {
                 && caret <= range.end
                 && code.get(range.start.0..range.end.0) == Some(name.as_str())
                 && (code[range.end.0..].trim_start().starts_with('(')
-                    || (self.reference_scope_at(range.start).is_kabelsalat()
-                        && self
-                            .reference
-                            .lookup_in(name, ReferenceScope::Kabelsalat)
-                            .and_then(|index| self.reference.entry(index))
-                            .is_some_and(|entry| !entry.inserts_as_call())))
+                    || self.graph_value_at(name, range.start))
         });
         let Some((word, range)) = named_entry.cloned().or(enclosing).or(word) else {
-            let mut panel = ReferencePanel::browse_for(&self.reference, "");
+            let scope = self.reference_scope_at_caret();
+            let mut panel = if scope.is_hydra() {
+                ReferencePanel::browse_in(&self.reference, "", scope.browser())
+            } else {
+                ReferencePanel::browse_for(&self.reference, "")
+            };
             panel.snippets_last = !self.caret_on_blank_line();
             panel.refresh(&self.reference);
             self.set_reference_panel(Some(panel));
@@ -498,6 +498,24 @@ impl App {
         self.focus_panel(PanelKind::Reference);
         self.invalidate_maps();
         self.dirty_frame = true;
+    }
+
+    /// Whether `name` at `at` is a graph or Hydra value such as `sFreq` or
+    /// `o0`. Ctrl+D documents a value under the caret before the call
+    /// around it, as it does a callee.
+    fn graph_value_at(&self, name: &str, at: ByteOffset) -> bool {
+        let scope = self.reference_scope_at(at);
+        let scope = if scope.is_kabelsalat() {
+            ReferenceScope::Kabelsalat
+        } else if scope.is_hydra() {
+            ReferenceScope::Hydra
+        } else {
+            return false;
+        };
+        self.reference
+            .lookup_in(name, scope)
+            .and_then(|index| self.reference.entry(index))
+            .is_some_and(|entry| !entry.inserts_as_call())
     }
 
     fn open_argument_reference(&mut self, index: usize) {
