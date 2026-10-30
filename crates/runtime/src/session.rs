@@ -1268,6 +1268,12 @@ impl Session {
         self.config.score_import_access = access;
     }
 
+    /// Replace what a score's `samples()`, images and videos may read. The
+    /// next evaluation reads the new policy. Banks already loaded stay.
+    pub fn set_score_sample_access(&mut self, access: ScoreSampleAccess) {
+        self.config.score_sample_access = access;
+    }
+
     pub fn csound_snapshot(&self) -> crate::CsoundSnapshot {
         self.csound.snapshot()
     }

@@ -1,5 +1,9 @@
 use super::*;
 
+/// What a fetch refused for a missing CORS consent says. The caller that
+/// holds the policy finds it by this and notes the origin.
+pub(super) const NO_CORS_CONSENT: &str = "the server does not consent to cross-origin reads";
+
 impl ScoreSampleAccess {
     pub fn denied() -> Self {
         Self::default()
@@ -53,6 +57,36 @@ impl ScoreSampleAccess {
         self.open_public = true;
     }
 
+    /// Turn the public CORS default of [`Self::permit_public_cors_origins`]
+    /// on or off. Exact grants and the local root stay.
+    pub fn set_public_cors_origins(&mut self, open: bool) {
+        self.open_public = open;
+    }
+
+    /// Whether the public CORS default is on.
+    pub fn public_cors_origins(&self) -> bool {
+        self.open_public
+    }
+
+    /// Whether `samples('local:')` has a root to read.
+    pub fn has_local_root(&self) -> bool {
+        self.local_root.is_some()
+    }
+
+    /// The origins this policy refused since the last call, newest last:
+    /// an origin outside it, or one whose server did not consent to a
+    /// cross-origin read. Each is one exact grant away from loading.
+    pub fn take_refused_origins(&self) -> Vec<String> {
+        self.refused.take()
+    }
+
+    pub(super) fn note_refused_origin(&self, origin: &str) {
+        // An opaque origin, such as a `data:` URL's, is nothing to grant.
+        if origin.starts_with("https://") || origin.starts_with("http://") {
+            self.refused.note(origin.to_owned());
+        }
+    }
+
     pub fn is_denied(&self) -> bool {
         self.local_root.is_none() && self.allowed_origins.is_empty() && !self.open_public
     }
@@ -81,6 +115,7 @@ impl ScoreSampleAccess {
                 cors_required: true,
             }
         } else if self.open_public {
+            self.note_refused_origin(&origin);
             return Err(
                 "samples() URL is outside the permitted sample origins (the default policy \
                  fetches public https origins that consent via CORS; grant this one \
@@ -88,6 +123,7 @@ impl ScoreSampleAccess {
                     .to_owned(),
             );
         } else {
+            self.note_refused_origin(&origin);
             return Err("samples() URL is outside the permitted sample origins".to_owned());
         };
         let normalized: Arc<str> = Arc::from(parsed.as_str());
@@ -123,7 +159,7 @@ impl ScoreSampleAccess {
     ) -> Result<Vec<u8>, String> {
         let root = self.local_root.as_ref().ok_or_else(|| {
             format!(
-                "{} {path:?} is a local file; grant its folder with --allow-local-samples, or keep it in the set folder in Studio",
+                "{} {path:?} is a local file; keep it in the set folder, or grant its folder with --allow-local-samples or on the Studio Permissions page",
                 media.label()
             )
         })?;
@@ -143,7 +179,7 @@ impl ScoreSampleAccess {
             SampleSource::LocalFolder(_) => {
                 if self.local_root.is_none() {
                     return Err(
-                        "samples('local:') requires a host-selected local sample root".to_owned(),
+                        "samples('local:') requires a host-selected local sample root (--allow-local-samples, or the Studio Permissions page)".to_owned(),
                     );
                 }
                 Ok(())
@@ -425,7 +461,7 @@ pub(super) fn fetch_score_source_with_budget(
                 if *cors_required && !cors_consents(response.header("Access-Control-Allow-Origin"))
                 {
                     return Err(format!(
-                        "GET {current}: the server does not consent to cross-origin reads \
+                        "GET {current}: {NO_CORS_CONSENT} \
                          (no `Access-Control-Allow-Origin: *`), so this URL would fail on \
                          strudel.cc as well; pass --allow-sample-origin {origin} to trust \
                          it anyway"
@@ -803,6 +839,50 @@ pub(super) fn expand_case_insensitive(banks: &mut HashMap<String, Bank>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal names its origin once, for every clone of the policy, and
+    /// an exact grant then lets the same URL through.
+    #[test]
+    fn refused_origins_are_noted_once_and_a_grant_clears_the_refusal() {
+        let mut access = ScoreSampleAccess::denied();
+        access.permit_public_cors_origins();
+        let clone = access.clone();
+        for url in [
+            "http://samples.example/a.json",
+            "http://samples.example/b.json",
+            "https://127.0.0.1/kit.json",
+        ] {
+            assert!(clone.approve_remote(url).is_err(), "{url}");
+        }
+        assert!(
+            access
+                .approve_remote("https://public.example/kit.json")
+                .is_ok()
+        );
+        assert_eq!(
+            access.take_refused_origins(),
+            ["http://samples.example", "https://127.0.0.1"]
+        );
+        assert!(access.take_refused_origins().is_empty(), "taken once");
+
+        access
+            .permit_origin("http://samples.example")
+            .expect("grant");
+        assert!(
+            access
+                .approve_remote("http://samples.example/a.json")
+                .is_ok()
+        );
+        access.set_public_cors_origins(false);
+        assert!(!access.public_cors_origins());
+        assert!(
+            access
+                .approve_remote("https://public.example/kit.json")
+                .is_err()
+        );
+        assert_eq!(access.take_refused_origins(), ["https://public.example"]);
+    }
+
     #[cfg(test)]
     mod base_url_tests {
         use super::{
