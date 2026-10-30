@@ -24,9 +24,9 @@ const THUMB_EDGE: u32 = 160;
 /// more frames than that thins to fewer, evenly spaced ones.
 const CLIP_BUDGET_BYTES: usize = 12 << 20;
 
-/// Picture packets one clip may carry before the decode stops early. The
-/// kept strip covers the decoded prefix; an hour-long video is a film,
-/// not a sample.
+/// Container packets one clip may carry before the decode stops early,
+/// sound packets counted with the picture's. The kept strip covers the
+/// decoded prefix; an hour-long video is a film, not a sample.
 const MAX_PICTURE_PACKETS: u64 = 65_536;
 
 /// The fastest thumbnail rate kept. Frames closer together than this are
@@ -46,6 +46,44 @@ pub struct VideoThumbnails {
 }
 
 impl VideoThumbnails {
+    /// Build a strip from kept frames: presentation times in ascending
+    /// order, each frame `width * height * 4` RGBA bytes. The library
+    /// builds these by decoding a container; a host that decodes its own
+    /// pictures can build one the same way.
+    pub fn from_frames(
+        width: u32,
+        height: u32,
+        frames: Vec<(f32, Vec<u8>)>,
+    ) -> Result<Self, String> {
+        let stride = width as usize * height as usize * 4;
+        if width == 0 || height == 0 {
+            return Err("a strip is at least one pixel".to_owned());
+        }
+        let mut times = Vec::with_capacity(frames.len());
+        let mut packed = Vec::with_capacity(stride * frames.len());
+        let mut last = f32::MIN;
+        for (time, frame) in frames {
+            if !time.is_finite() || time <= last {
+                return Err("frame times are finite and ascending".to_owned());
+            }
+            if frame.len() != stride {
+                return Err("a frame is width * height * 4 bytes".to_owned());
+            }
+            times.push(time);
+            packed.extend_from_slice(&frame);
+            last = time;
+        }
+        if times.is_empty() {
+            return Err("a strip has at least one frame".to_owned());
+        }
+        Ok(Self {
+            width,
+            height,
+            times: times.into(),
+            frames: packed.into(),
+        })
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }

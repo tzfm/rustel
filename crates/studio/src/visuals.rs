@@ -23,6 +23,8 @@ use rustel_runtime::ui_events::{
     UiAudioMetadata, UiEventBatch, UiEventValidationError, UiLayout, UiLayoutEnvelope,
     UiScheduledEvent, UiTraceBatchRequest,
 };
+#[cfg(feature = "video")]
+use rustel_runtime::video::VideoThumbnails;
 
 use super::engine::StudioSnapshot;
 use super::theme::{Theme, VisualOptions, hsv, luminance, mix, parse_color, true_rgb, wash};
@@ -74,6 +76,11 @@ pub struct VisualState {
     /// it lands whatever generation or state the score is in, so the
     /// preview scope works on a stopped set too.
     audition_audio: Option<UiAudioAnalysisFrame>,
+    /// The video clips the layout's painters name, keyed by the sound the
+    /// score spells. A clip is asked for until it lands here with a strip
+    /// or a reason it has none.
+    #[cfg(feature = "video")]
+    videos: BTreeMap<String, VideoEntry>,
     /// The spectrogram's memory: one column per audio frame, per tap
     /// (`None` is the master), newest last. strudel.cc's spectrum scrolls
     /// the last frames across the canvas; a terminal keeps them here.
@@ -86,6 +93,52 @@ pub struct VisualState {
     audio_sample_rate: u32,
     audio_sequence: u64,
     dropped: u64,
+}
+
+/// How many times a video painter asks the library for a clip before it
+/// says the picture never arrived. A clip downloads and decodes behind
+/// its sound, so a first play can outlast a few polls.
+#[cfg(feature = "video")]
+const VIDEO_ASK_LIMIT: u8 = 100;
+
+/// One named clip's picture, as a painter finds it.
+#[cfg(feature = "video")]
+#[derive(Clone, Debug)]
+pub enum VideoEntry {
+    /// Asked this many times; the library has no strip and no refusal yet.
+    Asking(u8),
+    /// The decoded strip.
+    Ready(std::sync::Arc<VideoThumbnails>),
+    /// Why there is no strip.
+    Failed(String),
+}
+
+#[cfg(feature = "video")]
+impl PartialEq for VideoEntry {
+    fn eq(&self, other: &Self) -> bool {
+        use std::sync::Arc;
+        match (self, other) {
+            (Self::Asking(asks), Self::Asking(other_asks)) => asks == other_asks,
+            (Self::Ready(strip), Self::Ready(other_strip)) => Arc::ptr_eq(strip, other_strip),
+            (Self::Failed(message), Self::Failed(other)) => message == other,
+            _ => false,
+        }
+    }
+}
+
+/// The sound an event's chain carries: the `s:name` token, spelled the way
+/// the score spelled it. A name with a space in it stops at the space, the
+/// way the chain text does; the painter then says no clip answered to it.
+#[cfg(feature = "video")]
+fn event_sound_name(event: &UiScheduledEvent) -> Option<&str> {
+    event
+        .value
+        .as_deref()?
+        .split_whitespace()
+        .find_map(|token| {
+            let (key, value) = token.split_once(':')?;
+            (key == "s").then_some(value)
+        })
 }
 
 /// The bit the display sets on a preview's onset id, so a preview is told
@@ -585,6 +638,87 @@ impl VisualState {
     /// samples browser is sounding, with none of the score in it.
     pub fn audition_audio(&self) -> Option<&UiAudioAnalysisFrame> {
         self.audition_audio.as_ref()
+    }
+
+    /// The strip a video painter's sound decoded, or why it has none.
+    #[cfg(feature = "video")]
+    pub fn video_for(&self, name: &str) -> Option<&VideoEntry> {
+        self.videos.get(name)
+    }
+
+    /// Remember a clip's decoded strip, or why it has none. Returns
+    /// whether anything changed, so the caller knows to repaint.
+    #[cfg(feature = "video")]
+    pub fn install_video(&mut self, name: &str, entry: VideoEntry) -> bool {
+        if self.videos.get(name) == Some(&entry) {
+            return false;
+        }
+        self.videos.insert(name.to_owned(), entry);
+        true
+    }
+
+    /// Count one ask for a clip the library has no answer for yet. A clip
+    /// still downloading answers `None` or `Decoding` a while longer; past
+    /// [`VIDEO_ASK_LIMIT`] asks the painter says so and stops asking.
+    #[cfg(feature = "video")]
+    pub fn note_video_ask(&mut self, name: &str) {
+        let next = match self.videos.get(name) {
+            Some(VideoEntry::Asking(asks)) if *asks >= VIDEO_ASK_LIMIT => {
+                Some(VideoEntry::Failed("the picture did not arrive".to_owned()))
+            }
+            Some(VideoEntry::Asking(asks)) => Some(VideoEntry::Asking(asks + 1)),
+            Some(_) => None,
+            None => Some(VideoEntry::Asking(1)),
+        };
+        if let Some(next) = next {
+            self.videos.insert(name.to_owned(), next);
+        }
+    }
+
+    /// The sounds a video painter's events name and no strip is held for:
+    /// what the next library ask is for. A stopped set keeps its strips,
+    /// so this names nothing once every clip has landed.
+    #[cfg(feature = "video")]
+    pub fn video_names_to_ask(&self) -> Vec<String> {
+        let Some(layout) = self.layout.as_ref() else {
+            return Vec::new();
+        };
+        // An inline painter asks only for its own lane's clips. A stage
+        // painter tags no hap, so it asks for whatever the set sounds.
+        let mut slot_mask = 0_u64;
+        let mut stage = false;
+        for visual in &layout.visuals {
+            if visual.kind != "video" {
+                continue;
+            }
+            match visual.slot {
+                Some(slot) => slot_mask |= 1_u64 << slot,
+                None => stage = true,
+            }
+        }
+        if slot_mask == 0 && !stage {
+            return Vec::new();
+        }
+        let mut names: Vec<String> = Vec::new();
+        let mut push = |event: &UiScheduledEvent| {
+            let Some(name) = event_sound_name(event) else {
+                return;
+            };
+            if !stage && event.ui_visuals & slot_mask == 0 {
+                return;
+            }
+            if matches!(
+                self.videos.get(name),
+                None | Some(VideoEntry::Asking(..=VIDEO_ASK_LIMIT))
+            ) && !names.iter().any(|asked| asked == name)
+            {
+                names.push(name.to_owned());
+            }
+        };
+        for event in self.events.iter().chain(self.previews.iter()) {
+            push(event);
+        }
+        names
     }
 
     pub fn dropped(&self) -> u64 {
@@ -1180,6 +1314,8 @@ pub fn render(request: VisualRequest<'_>, area: Rect, buffer: &mut Buffer) {
         "pitchwheel" => PitchWheel::new(&request).render(area, buffer),
         "scope" | "tscope" => Scope::new(&request).render(area, buffer),
         "spectrum" => Spectrum::new(&request).render(area, buffer),
+        #[cfg(feature = "video")]
+        "video" => Video::new(&request).render(area, buffer),
         kind => note(
             &request,
             buffer,
@@ -2894,6 +3030,121 @@ impl Widget for Spectrum<'_, '_> {
     }
 }
 
+/// The video painter: a clip's own picture where its sound is. The frame
+/// is the one the clock says is showing, so the picture plays with the
+/// sample and holds when the transport holds.
+#[cfg(feature = "video")]
+struct Video<'a, 'b> {
+    request: &'a VisualRequest<'b>,
+}
+
+#[cfg(feature = "video")]
+impl<'a, 'b> Video<'a, 'b> {
+    fn new(request: &'a VisualRequest<'b>) -> Self {
+        Self { request }
+    }
+
+    /// The clip to show: the event sounding now, else the last that
+    /// sounded, else the next to come. A chord of clips shows the newest.
+    fn clip(&self, now: f64) -> Option<(&UiScheduledEvent, &str)> {
+        let state = self.request.state;
+        let slot = self.request.slot;
+        let mut active: Option<(&UiScheduledEvent, &str)> = None;
+        let mut past: Option<(&UiScheduledEvent, &str)> = None;
+        let mut future: Option<(&UiScheduledEvent, &str)> = None;
+        for event in state.events() {
+            if !slot.is_none_or(|slot| event.ui_visuals & (1_u64 << slot) != 0) {
+                continue;
+            }
+            let Some(name) = event_sound_name(event) else {
+                continue;
+            };
+            let end = event.target_time + event.duration_seconds.max(0.035);
+            if !now.is_finite() {
+                // No clock yet: the first clip the score names will do.
+                future.get_or_insert((event, name));
+            } else if event.target_time <= now && now <= end {
+                let newer = active.is_none_or(|(held, _)| held.target_time < event.target_time);
+                if newer {
+                    active = Some((event, name));
+                }
+            } else if event.target_time <= now {
+                let later = past.is_none_or(|(held, _)| held.target_time < event.target_time);
+                if later {
+                    past = Some((event, name));
+                }
+            } else {
+                let sooner = future.is_none_or(|(held, _)| held.target_time > event.target_time);
+                if sooner {
+                    future = Some((event, name));
+                }
+            }
+        }
+        active.or(past).or(future)
+    }
+}
+
+#[cfg(feature = "video")]
+impl Widget for Video<'_, '_> {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        let state = self.request.state;
+        let (now, _, _) = state.current_clock().unwrap_or((f64::NAN, 0.0, 0.0));
+        let Some((event, name)) = self.clip(now) else {
+            note(self.request, buffer, area, "no video event in this lane");
+            return;
+        };
+        let strip = match state.video_for(name) {
+            Some(VideoEntry::Ready(strip)) => strip,
+            Some(VideoEntry::Failed(message)) => {
+                note(self.request, buffer, area, &format!("{name}: {message}"));
+                return;
+            }
+            Some(VideoEntry::Asking(_)) | None => {
+                note(self.request, buffer, area, &format!("{name} is decoding"));
+                return;
+            }
+        };
+        let position = if now.is_finite() {
+            ((now - event.target_time) as f32).clamp(0.0, strip.duration())
+        } else {
+            0.0
+        };
+        let Some(frame) = strip.frame_at(position) else {
+            note(
+                self.request,
+                buffer,
+                area,
+                &format!("{name} decoded to no frames"),
+            );
+            return;
+        };
+        let mut canvas = Canvas::bars(area);
+        let (canvas_width, canvas_height) = (canvas.width(), canvas.height());
+        let (frame_width, frame_height) = (strip.width() as usize, strip.height() as usize);
+        // The frame keeps its shape inside the canvas points and sits
+        // centred; the points it leaves untouched show the pane behind.
+        let scale = (canvas_width / frame_width.max(1)).min(canvas_height / frame_height.max(1));
+        let (draw_width, draw_height) = (
+            (frame_width * scale).max(1).min(canvas_width),
+            (frame_height * scale).max(1).min(canvas_height),
+        );
+        let (x0, y0) = (
+            (canvas_width - draw_width) / 2,
+            (canvas_height - draw_height) / 2,
+        );
+        for y in 0..draw_height {
+            let source_row = (y * frame_height / draw_height) * frame_width;
+            for x in 0..draw_width {
+                let at = (source_row + x * frame_width / draw_width) * 4;
+                if let [red, green, blue, ..] = frame.get(at..at + 3).unwrap_or_default() {
+                    canvas.set(x0 + x, y0 + y, Color::Rgb(*red, *green, *blue));
+                }
+            }
+        }
+        canvas.paint(buffer, self.request.background);
+    }
+}
+
 fn parse_fraction(value: &str) -> Option<f64> {
     let (numerator, denominator) = value.split_once('/')?;
     let numerator = numerator.trim().parse::<f64>().ok()?;
@@ -3145,6 +3396,12 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
             number("min", -80.0, -120.0, 0.0),
             number("max", 0.0, -120.0, 0.0),
         ],
+    },
+    PainterTerminal {
+        painter: "video",
+        entry: "Small by default: eight rows under its own line, a real picture on a kitty terminal and coloured cells on the glyph tiers, the clip's shape kept inside the rows. A plain video() paints the stage behind the score. The frame is the one the clock says is showing; between the clip's kept frames the earlier one shows, and past the last one the last one holds.",
+        options: &[],
+        numbers: &[],
     },
     PainterTerminal {
         painter: "markcss",
@@ -3613,6 +3870,18 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         examples: &[
             "n(\"<0 4 <2 3> 1>*3\")\n.off(1/8, add(n(5)))\n.off(1/5, add(n(7)))\n.scale(\"d3:minor:pentatonic\")\n.s('sine')\n.dec(.3).room(.5)\n._spectrum()",
         ],
+        tags: &["visualization"],
+        no_autocomplete: false,
+        deprecated: false,
+        origin: "rustel",
+    },
+    ReferenceEntry {
+        name: "video",
+        synonyms: &[],
+        summary: "Shows the picture of a video sample while its sound plays.",
+        description: "Shows the picture of a video sample while its sound plays. The frame follows the pattern's clock, so the picture plays with the sample and holds when the transport holds. The picture decodes once per clip and stays small. VP8 WebM and Motion JPEG decode in this build; a clip in another video codec says which codec it is and what to re-encode it as.",
+        params: &[],
+        examples: &["$: s(\"bd\")._video()"],
         tags: &["visualization"],
         no_autocomplete: false,
         deprecated: false,
@@ -6246,5 +6515,157 @@ mod tests {
             }
         }
         assert!(checked >= 8, "every terminal number is drawn");
+    }
+
+    #[cfg(feature = "video")]
+    mod video {
+        //! The video painter: the clip a lane's sound names, its frame
+        //! following the clock, and the poll that asks for each strip once.
+
+        use super::super::*;
+        use super::{draw, event, playing, rows};
+
+        /// A two-frame strip: all red, then all blue.
+        fn strip() -> rustel_runtime::video::VideoThumbnails {
+            let red = [255, 0, 0, 255].repeat(4);
+            let blue = [0, 0, 255, 255].repeat(4);
+            rustel_runtime::video::VideoThumbnails::from_frames(2, 2, vec![(0.0, red), (0.5, blue)])
+                .expect("strip")
+        }
+
+        fn clip_event(target_time: f64) -> UiScheduledEvent {
+            let mut event = event(1, "0/1", "1/2", target_time);
+            event.value = Some("s:clip.webm note:60".to_owned());
+            event.label = None;
+            // The lane's one visual is slot 0, the transpiler's first.
+            event.ui_visuals = 1;
+            event
+        }
+
+        #[test]
+        fn an_event_names_the_sound_its_chain_carries() {
+            let mut event = clip_event(10.0);
+            assert_eq!(event_sound_name(&event), Some("clip.webm"));
+            event.value = Some("note:60 gain:1".to_owned());
+            assert_eq!(event_sound_name(&event), None, "no sound, no clip");
+            event.value = Some("speed:2 s:loop.mkv s:again.webm".to_owned());
+            assert_eq!(
+                event_sound_name(&event),
+                Some("loop.mkv"),
+                "the first sound"
+            );
+        }
+
+        #[test]
+        fn the_painter_draws_the_frame_the_clock_is_showing() {
+            let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
+            assert!(
+                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip()))),
+                "the strip lands"
+            );
+            // The event sounds now, so the first frame shows: red.
+            let picture = draw("video", "", &state, Rect::new(0, 0, 20, 8));
+            let red = picture
+                .content
+                .iter()
+                .filter(|cell| cell.fg == Color::Rgb(255, 0, 0))
+                .count();
+            assert!(red > 100, "the first frame filled the pane: {red} cells");
+            assert!(
+                picture
+                    .content
+                    .iter()
+                    .all(|cell| cell.fg != Color::Rgb(0, 0, 255)),
+                "the second frame is not showing yet"
+            );
+        }
+
+        #[test]
+        fn the_frame_follows_the_position_into_the_clip() {
+            // The event began 0.6 s ago: past the second frame's time, the
+            // picture holds the blue one.
+            let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(9.4)], 0.0);
+            assert!(
+                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
+            );
+            let picture = draw("video", "", &state, Rect::new(0, 0, 20, 8));
+            let blue = picture
+                .content
+                .iter()
+                .filter(|cell| cell.fg == Color::Rgb(0, 0, 255))
+                .count();
+            assert!(blue > 100, "the later frame filled the pane: {blue} cells");
+        }
+
+        #[test]
+        fn a_clip_that_has_not_decoded_says_so_and_a_refusal_names_itself() {
+            let state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
+            let waiting = draw("video", "", &state, Rect::new(0, 0, 40, 8));
+            assert!(
+                rows(&waiting).contains("decoding"),
+                "says the clip is on its way"
+            );
+            let mut refused = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
+            assert!(refused.install_video(
+                "clip.webm",
+                VideoEntry::Failed("the picture is H.264".to_owned())
+            ));
+            let picture = draw("video", "", &refused, Rect::new(0, 0, 40, 8));
+            assert!(
+                rows(&picture).contains("H.264"),
+                "the refusal is the note: {}",
+                rows(&picture)
+            );
+        }
+
+        #[test]
+        fn the_poll_names_each_clip_once_and_stops_at_its_strip() {
+            let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
+            let asks = state.video_names_to_ask();
+            assert_eq!(asks, vec!["clip.webm".to_owned()]);
+            // Another lane's sound is not this painter's to ask for.
+            let mut other = clip_event(10.2);
+            other.ui_visuals = 1_u64 << 3;
+            other.value = Some("s:other.webm".to_owned());
+            let wider = playing(
+                "stack(s('clip.webm')._video(), s('other.webm')._spiral())",
+                vec![clip_event(10.0), other],
+                0.0,
+            );
+            assert_eq!(
+                wider.video_names_to_ask(),
+                vec!["clip.webm".to_owned()],
+                "the spiral's sound is not asked for"
+            );
+            state.note_video_ask("clip.webm");
+            assert_eq!(
+                state.video_names_to_ask(),
+                vec!["clip.webm".to_owned()],
+                "an unanswered ask is asked again"
+            );
+            assert!(
+                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
+            );
+            assert!(
+                state.video_names_to_ask().is_empty(),
+                "a strip answers the ask"
+            );
+        }
+
+        #[test]
+        fn a_clip_that_never_answers_is_said_so_and_left_alone() {
+            let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
+            for _ in 0..=VIDEO_ASK_LIMIT {
+                state.note_video_ask("clip.webm");
+            }
+            assert!(
+                matches!(state.video_for("clip.webm"), Some(VideoEntry::Failed(_))),
+                "the asking ran out"
+            );
+            assert!(
+                state.video_names_to_ask().is_empty(),
+                "a failed clip is not asked for again"
+            );
+        }
     }
 }
