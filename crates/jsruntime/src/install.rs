@@ -41,6 +41,7 @@ pub fn reference_entries() -> impl Iterator<Item = &'static rustel_core::referen
 {
     unsupported::REFERENCE_ENTRIES
         .iter()
+        .chain(unsupported::ABSENT_VISUALS_ENTRIES.iter())
         .chain(slider::REFERENCE_ENTRIES.iter())
         .chain(generators::REFERENCE_ENTRIES.iter())
         .chain(csound::REFERENCE_ENTRIES.iter())
