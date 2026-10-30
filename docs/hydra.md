@@ -73,13 +73,14 @@ Array entries must be finite numbers. Invalid numeric arguments refuse the
 new score and leave the committed score in place. Raw shelf snippets do not
 accept arrays.
 
-## Camera and web-image sources
+## Camera, image and video sources
 
 ```js
 await initHydra()
 s0.initCam() // Use initCam(1) for the second enumerated camera.
 s1.initImage('https://example.com/texture.png')
-src(s0).blend(src(s1), 0.25).out()
+s2.initVideo('clips/loop.webm')
+src(s0).blend(src(s1), 0.25).modulate(src(s2), 0.1).out()
 ```
 
 **Hydra webcam** in Settings is blocked by default. Set it to **allowed**
@@ -98,23 +99,64 @@ before shutdown completes. It cannot publish stale frames. Physical camera
 operation on Windows and Linux has not been verified. Camera indices can
 change after reconnecting.
 
-Images need no webcam permission. They load while the score draws and stop
-with it. Studio allows public CORS origins by default. With
-`--strict-sample-origins`, grant each origin:
+Images and videos need no webcam permission. They load while the score draws
+and stop with it. Give each one a direct public HTTPS URL or a local path.
+
+### Local files
+
+A path without `://` is a local file, relative to a folder that the score
+may read. These are the folders that local samples use, with the same rules:
+
+- In Studio, the open set's folder. Put `loop.webm` in the set folder and
+  write `s0.initVideo('loop.webm')`. No flag is needed.
+- The folder granted with `--allow-local-samples`, the one that
+  `samples('local:')` reads. Studio reads it after the set folder.
+
+```sh
+rustel studio set/ --allow-local-samples ~/visuals
+```
+
+The path must be relative and made of plain names. Absolute paths, `..`,
+hidden entries and links that lead out of the folder are refused. Without a
+set folder or a grant, a local path is refused.
+
+### Web addresses
+
+Studio allows public CORS origins by default. With `--strict-sample-origins`,
+grant each origin:
 
 ```sh
 rustel studio set/ --strict-sample-origins \
   --allow-sample-origin https://images.example
 ```
 
-Use a direct public **HTTPS** image URL. Its response must allow CORS for
+Use a direct public HTTPS URL. Its response must allow CORS for
 `https://strudel.cc` or `*`. Redirects must stay on the same origin. Private,
 loopback, and link-local addresses are refused, even with an origin grant.
 
-PNG, JPEG, GIF, and WebP are decoded; animated files use their first frame.
-Limits are 16 MiB downloaded, 2048 pixels per edge, and 4,194,304 pixels.
-An explicit camera or image on `s0` takes precedence over `feedStrudel`.
-Removing it restores the terminal feed on the next evaluation.
+### Formats and limits
+
+`initImage()` decodes PNG, JPEG, GIF, and WebP. An animated file shows its
+first frame. `initVideo()` plays in a loop, without sound:
+
+| Format | Video |
+| --- | --- |
+| WebM, MKV, MP4 | VP8 or VP9, 8-bit 4:2:0 |
+| GIF, PNG, WebP | animated or still |
+
+H.264, H.265, AV1 and 4:4:4 VP9 do not play: no decoder for them is pure
+Rust and complete. Convert such a file to VP9 with:
+
+```sh
+ffmpeg -i input.mp4 -c:v libvpx-vp9 -pix_fmt yuv420p -an output.webm
+```
+
+An image may be 16 MiB and a video 64 MiB, read or downloaded. A picture may
+be 2048 pixels per edge and 4,194,304 pixels. A video holds its whole file in
+memory while it plays, so four videos hold at most 256 MiB.
+
+An explicit camera, image or video on `s0` takes precedence over
+`feedStrudel`. Removing it restores the terminal feed on the next evaluation.
 
 ## `H(pattern)`
 
@@ -164,14 +206,17 @@ automatically.
 
 ## What a score cannot do here
 
-Browser objects, video, screen and stream sources, WebRTC, custom GLSL
-functions, `setResolution()`, render-loop hooks (`update`, `afterUpdate`), and
-assignments to `fps`, `speed`, `bpm`, or `time` are unsupported. `sum()` is
-refused because its pinned upstream shader is invalid.
+Browser objects, screen and stream sources, WebRTC, custom GLSL
+functions, `setResolution()`, render-loop hooks (`update`, `afterUpdate`),
+`mouse`, and the analyser settings `a.setCutoff()`, `a.setScale()`,
+`a.setSmooth()` and `a.setMax()` are unsupported. `sum()` is refused because
+its pinned upstream shader is invalid.
 
-Callbacks are compiled shader expressions, not arbitrary JavaScript.
-Closures, mutation, `mouse`, `Math.random()`, and user functions are refused.
-Use `H(pattern)` for musical values. Use `a.fft`, not `a0()`-`a3()`.
+Callbacks are compiled shader expressions, not arbitrary JavaScript. They
+read arithmetic, `Math` functions, `time`, `width`, `height` and `a.fft[n]`.
+`Math.random()` gives a new value each frame, the same for every pixel.
+Closures, mutation and user functions are refused. Use `H(pattern)` for
+musical values. Use `a.fft`, not `a0()`-`a3()`.
 
 `strength`, `pixelRatio`, `pixelated`, and `contextType` are accepted but
 ignored. They do not select opacity, render scale, texture sampling, or a

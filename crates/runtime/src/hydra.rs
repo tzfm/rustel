@@ -258,6 +258,13 @@ impl HydraBridge {
         Ok(())
     }
 
+    /// Let a score's images and videos name files in this folder by a path
+    /// relative to it: the open set's folder in Studio. The local sample
+    /// root, when one is granted, is read after it.
+    pub fn set_media_folder(&mut self, folder: Option<&std::path::Path>) {
+        self.inputs.set_media_folder(folder);
+    }
+
     /// Show a snippet in the shelf's own picture, or, with `None`, stop.
     ///
     /// The score keeps its screen throughout - the snippet renders in a second

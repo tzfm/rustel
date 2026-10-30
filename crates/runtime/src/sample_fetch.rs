@@ -38,6 +38,45 @@ pub(crate) const MAX_REMOTE_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 /// dimensions and allocations are capped separately by the image loader.
 #[cfg(feature = "hydra")]
 pub(crate) const MAX_REMOTE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Compressed bytes accepted for one score-selected Hydra video. The whole
+/// file stays in memory while it loops, so four inputs hold at most 256 MiB.
+#[cfg(feature = "hydra")]
+pub(crate) const MAX_HYDRA_VIDEO_BYTES: usize = 64 * 1024 * 1024;
+
+/// What a Hydra input reads: a still image or a video.
+#[cfg(feature = "hydra")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HydraMedia {
+    Image,
+    Video,
+}
+
+#[cfg(feature = "hydra")]
+impl HydraMedia {
+    /// How a message names this input.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Image => "Hydra image",
+            Self::Video => "Hydra video",
+        }
+    }
+
+    /// Compressed bytes accepted for one input.
+    pub(crate) fn limit(self) -> usize {
+        match self {
+            Self::Image => MAX_REMOTE_IMAGE_BYTES,
+            Self::Video => MAX_HYDRA_VIDEO_BYTES,
+        }
+    }
+
+    /// The `Accept` header: every format the decoder for this input reads.
+    fn accept(self) -> String {
+        match self {
+            Self::Image => hydra_image_accept(),
+            Self::Video => crate::hydra_input::VIDEO_MEDIA_TYPES.join(","),
+        }
+    }
+}
 /// Native scores are portable from the public Strudel editor. Sending its
 /// origin reproduces an anonymous browser image request, and accepting only a
 /// matching or wildcard response keeps CORS meaningful instead of treating it
@@ -820,45 +859,51 @@ pub(crate) fn fetch_manifest_with_budget(
     fetch_following_redirects(url, budget, MAX_REMOTE_MANIFEST_BYTES, "sample manifest")
 }
 
-/// Fetch one Hydra image through the same per-hop DNS/redirect boundary as
-/// samples. An image URL is score text too: it must not gain a second, weaker
-/// network path merely because its bytes are destined for the GPU.
+/// Fetch one Hydra image or video through the same per-hop DNS/redirect
+/// boundary as samples. A media URL is score text too: it must not gain a
+/// second, weaker network path merely because its bytes are destined for the
+/// GPU.
 #[cfg(feature = "hydra")]
-pub(crate) fn fetch_image_with_budget(
+pub(crate) fn fetch_hydra_media_with_budget(
     url: &str,
     budget: &FetchBudget,
     access: &crate::samples::ScoreSampleAccess,
+    media: HydraMedia,
 ) -> Result<Vec<u8>, String> {
-    let mut current = hydra_image_url(url)?;
-    // A score-selected image must not start a request solely because it
-    // satisfies the image loader's address and CORS restrictions.
-    access.approve_hydra_image_url(current.as_str())?;
+    let label = media.label();
+    let mut current = hydra_media_url(url, media)?;
+    // A score-selected input must not start a request solely because it
+    // satisfies the loader's address and CORS restrictions.
+    access.approve_hydra_media_url(current.as_str(), media)?;
     let origin = current.origin();
     budget.check()?;
     for redirects in 0..=5 {
-        let response = hydra_image_hop(&current, budget, resolve_public)?;
-        let action = inspect_hydra_image_response(
+        let response = hydra_media_hop(&current, budget, media, resolve_public)?;
+        let action = inspect_hydra_media_response(
             &current,
             &origin,
             response.status(),
             response.header("Location"),
             response.header("Access-Control-Allow-Origin"),
+            media,
         )?;
         if let HydraImageResponseAction::Redirect(next) = action {
             if redirects == 5 {
-                return Err("Hydra image request followed too many redirects".into());
+                return Err(format!("{label} request followed too many redirects"));
             }
             current = next;
             continue;
         }
 
-        refuse_web_page(response.content_type())?;
+        refuse_web_page(response.content_type(), media)?;
+        let limit = media.limit();
+        let too_large = || format!("{label} exceeds the {} MiB transfer limit", limit >> 20);
         if response
             .header("Content-Length")
             .and_then(|length| length.parse::<u64>().ok())
-            .is_some_and(|length| length > MAX_REMOTE_IMAGE_BYTES as u64)
+            .is_some_and(|length| length > limit as u64)
         {
-            return Err("Hydra image exceeds the 16 MiB transfer limit".into());
+            return Err(too_large());
         }
         let mut bytes = Vec::new();
         if let Some(length) = response
@@ -866,43 +911,44 @@ pub(crate) fn fetch_image_with_budget(
             .and_then(|length| length.parse::<usize>().ok())
         {
             bytes
-                .try_reserve_exact(length.min(MAX_REMOTE_IMAGE_BYTES))
-                .map_err(|_| "Hydra image response exceeds host memory".to_owned())?;
+                .try_reserve_exact(length.min(limit))
+                .map_err(|_| format!("{label} response exceeds host memory"))?;
         }
         use std::io::Read;
         response
             .into_reader()
-            .take(MAX_REMOTE_IMAGE_BYTES as u64 + 1)
+            .take(limit as u64 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|_| "Hydra image response could not be read".to_owned())?;
+            .map_err(|_| format!("{label} response could not be read"))?;
         budget.check()?;
-        if bytes.len() > MAX_REMOTE_IMAGE_BYTES {
-            return Err("Hydra image exceeds the 16 MiB transfer limit".into());
+        if bytes.len() > limit {
+            return Err(too_large());
         }
         return Ok(bytes);
     }
-    unreachable!("Hydra image redirect loop returns at its fixed bound")
+    unreachable!("Hydra media redirect loop returns at its fixed bound")
 }
 
-/// One hop of a Hydra image fetch, sent as a browser sends an anonymous image
-/// request. An error names the HTTP status when there is one, and never the
-/// URL.
+/// One hop of a Hydra media fetch, sent as a browser sends an anonymous
+/// media request. An error names the HTTP status when there is one, and never
+/// the URL.
 #[cfg(feature = "hydra")]
-fn hydra_image_hop(
+fn hydra_media_hop(
     url: &Url,
     budget: &FetchBudget,
+    media: HydraMedia,
     resolve: impl FnOnce(&str, &FetchBudget) -> io::Result<Vec<SocketAddr>>,
 ) -> Result<ureq::Response, String> {
     single_hop_get_with_resolver(
         url,
         budget,
         Some(HYDRA_IMAGE_REQUEST_ORIGIN),
-        Some(&hydra_image_accept()),
+        Some(&media.accept()),
         resolve,
     )
     .map_err(|error| match error {
-        HopError::Status { code, .. } => hydra_status_error(code),
-        HopError::Other(message) => safe_hydra_request_error(&message),
+        HopError::Status { code, .. } => hydra_status_error(code, media),
+        HopError::Other(message) => safe_hydra_request_error(&message, media),
     })
 }
 
@@ -918,8 +964,8 @@ fn hydra_image_accept() -> String {
 }
 
 #[cfg(feature = "hydra")]
-fn hydra_status_error(status: u16) -> String {
-    format!("Hydra image request returned HTTP {status}")
+fn hydra_status_error(status: u16, media: HydraMedia) -> String {
+    format!("{} request returned HTTP {status}", media.label())
 }
 
 #[cfg(feature = "hydra")]
@@ -929,55 +975,59 @@ enum HydraImageResponseAction {
     Body,
 }
 
-/// Parse a browser image URL without the sample loader's compatibility rewrite
-/// for `#` in legacy sample filenames. A fragment is ordinary URL metadata and
-/// is removed before the request, exactly as it is by a browser.
+/// Parse a browser media URL without the sample loader's compatibility
+/// rewrite for `#` in legacy sample filenames. A fragment is ordinary URL
+/// metadata and is removed before the request, exactly as it is by a browser.
 #[cfg(feature = "hydra")]
-fn hydra_image_url(raw: &str) -> Result<Url, String> {
-    let mut url = Url::parse(raw).map_err(|_| "Hydra image URL is not valid".to_owned())?;
-    validate_hydra_image_url(&url)?;
+fn hydra_media_url(raw: &str, media: HydraMedia) -> Result<Url, String> {
+    let mut url = Url::parse(raw).map_err(|_| format!("{} URL is not valid", media.label()))?;
+    validate_hydra_media_url(&url, media)?;
     url.set_fragment(None);
     Ok(url)
 }
 
 #[cfg(feature = "hydra")]
-fn validate_hydra_image_url(url: &Url) -> Result<(), String> {
+fn validate_hydra_media_url(url: &Url, media: HydraMedia) -> Result<(), String> {
+    let label = media.label();
+    let public = || format!("{label}s require a public HTTPS URL");
     if url.scheme() != "https" {
-        return Err("Hydra images require a public HTTPS URL".into());
+        return Err(public());
     }
     if url.host_str().is_none() {
-        return Err("Hydra image URL names no host".into());
+        return Err(format!("{label} URL names no host"));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err("Hydra image URLs may not contain credentials".into());
+        return Err(format!("{label} URLs may not contain credentials"));
     }
-    let netloc = url_netloc(url).map_err(|_| "Hydra image URL names no host".to_owned())?;
+    let netloc = url_netloc(url).map_err(|_| format!("{label} URL names no host"))?;
     if host_names_loopback(&netloc) {
-        return Err("Hydra images require a public HTTPS URL".into());
+        return Err(public());
     }
     if let Some(ip) = url.host_str().and_then(|host| host.parse::<IpAddr>().ok())
         && !addr_is_public(ip)
     {
-        return Err("Hydra images require a public HTTPS URL".into());
+        return Err(public());
     }
     Ok(())
 }
 
 #[cfg(feature = "hydra")]
-fn inspect_hydra_image_response(
+fn inspect_hydra_media_response(
     current: &Url,
     original_origin: &url::Origin,
     status: u16,
     location: Option<&str>,
     allow_origin: Option<&str>,
+    media: HydraMedia,
 ) -> Result<HydraImageResponseAction, String> {
+    let label = media.label();
     let cors = allow_origin.is_some_and(|allowed| {
         let allowed = allowed.trim();
         allowed == "*" || allowed == HYDRA_IMAGE_REQUEST_ORIGIN
     });
     if !cors {
         return Err(format!(
-            "Hydra image response did not grant CORS access to {HYDRA_IMAGE_REQUEST_ORIGIN}"
+            "{label} response did not grant CORS access to {HYDRA_IMAGE_REQUEST_ORIGIN}"
         ));
     }
     if (200..300).contains(&status) {
@@ -986,29 +1036,37 @@ fn inspect_hydra_image_response(
     if !(300..400).contains(&status) {
         // Ureq currently turns 4xx/5xx into an error before this helper, but
         // retain the status boundary here as well so a transport upgrade
-        // cannot accidentally reinterpret an error page as image bytes.
-        return Err(hydra_status_error(status));
+        // cannot accidentally reinterpret an error page as media bytes.
+        return Err(hydra_status_error(status, media));
     }
-    let location = location.ok_or_else(|| "Hydra image redirect has no Location".to_owned())?;
+    let location = location.ok_or_else(|| format!("{label} redirect has no Location"))?;
     let mut next = current
         .join(location)
-        .map_err(|_| "Hydra image redirect Location is invalid".to_owned())?;
-    validate_hydra_image_url(&next)?;
+        .map_err(|_| format!("{label} redirect Location is invalid"))?;
+    validate_hydra_media_url(&next, media)?;
     if &next.origin() != original_origin {
-        return Err("Hydra image redirects must stay on the original HTTPS origin".into());
+        return Err(format!(
+            "{label} redirects must stay on the original HTTPS origin"
+        ));
     }
     next.set_fragment(None);
     Ok(HydraImageResponseAction::Redirect(next))
 }
 
-/// Refuse a final response whose media type is a web page: a link to an
-/// image's page rather than the image itself.
+/// Refuse a final response whose media type is a web page: a link to the
+/// page around an image or video rather than the file itself.
 #[cfg(feature = "hydra")]
-fn refuse_web_page(media_type: &str) -> Result<(), String> {
+fn refuse_web_page(media_type: &str, media: HydraMedia) -> Result<(), String> {
     if media_type.trim().eq_ignore_ascii_case("text/html") {
-        return Err(
-            "Hydra image URL returned a web page, not an image; use the direct image link".into(),
-        );
+        return Err(match media {
+            HydraMedia::Image => {
+                "Hydra image URL returned a web page, not an image; use the direct image link"
+            }
+            HydraMedia::Video => {
+                "Hydra video URL returned a web page, not a video; use the direct video link"
+            }
+        }
+        .into());
     }
     Ok(())
 }
@@ -1017,15 +1075,16 @@ fn refuse_web_page(media_type: &str) -> Result<(), String> {
 /// put signed tokens in queries/fragments, so translate to a small stable set
 /// without reflecting the error string into studio diagnostics.
 #[cfg(feature = "hydra")]
-fn safe_hydra_request_error(error: &str) -> String {
+fn safe_hydra_request_error(error: &str, media: HydraMedia) -> String {
+    let label = media.label();
     if error.contains("cancelled") {
-        "Hydra image request was cancelled".into()
+        format!("{label} request was cancelled")
     } else if error.contains("deadline") || error.contains("timed out") {
-        "Hydra image request timed out".into()
+        format!("{label} request timed out")
     } else if error.contains("public address") || error.contains("not a public") {
-        "Hydra image destination is not a public address".into()
+        format!("{label} destination is not a public address")
     } else {
-        "Hydra image request failed".into()
+        format!("{label} request failed")
     }
 }
 
@@ -1151,6 +1210,29 @@ mod tests {
 
     fn test_budget(duration: Duration) -> FetchBudget {
         FetchBudget::until(Instant::now() + duration, Arc::new(AtomicBool::new(false)))
+    }
+
+    #[cfg(feature = "hydra")]
+    fn hydra_image_url(raw: &str) -> Result<Url, String> {
+        hydra_media_url(raw, HydraMedia::Image)
+    }
+
+    #[cfg(feature = "hydra")]
+    fn inspect_hydra_image_response(
+        current: &Url,
+        original_origin: &url::Origin,
+        status: u16,
+        location: Option<&str>,
+        allow_origin: Option<&str>,
+    ) -> Result<HydraImageResponseAction, String> {
+        inspect_hydra_media_response(
+            current,
+            original_origin,
+            status,
+            location,
+            allow_origin,
+            HydraMedia::Image,
+        )
     }
 
     fn guarded_resolver() -> GuardedResolver {
@@ -1308,10 +1390,11 @@ mod tests {
     fn hydra_exact_gallery_imgur_image_fetches_with_cors() {
         let mut access = crate::samples::ScoreSampleAccess::denied();
         access.permit_public_cors_origins();
-        let bytes = fetch_image_with_budget(
+        let bytes = fetch_hydra_media_with_budget(
             "https://i.imgur.com/zFttbWq.jpg",
             &test_budget(Duration::from_secs(15)),
             &access,
+            HydraMedia::Image,
         )
         .expect("the exact gallery image should allow anonymous Strudel CORS reads");
         assert!(bytes.starts_with(&[0xff, 0xd8]), "expected a JPEG response");
@@ -1322,7 +1405,7 @@ mod tests {
     fn hydra_image_diagnostics_do_not_reflect_secret_urls() {
         let library_error =
             "GET https://user:pass@images.example/a.png?token=secret#private: failed";
-        let safe = safe_hydra_request_error(library_error);
+        let safe = safe_hydra_request_error(library_error, HydraMedia::Image);
         assert_eq!(safe, "Hydra image request failed");
         for url_part in [
             "user",
@@ -1395,9 +1478,12 @@ mod tests {
     #[cfg(feature = "hydra")]
     fn hydra_image_hop_to(address: SocketAddr) -> Result<ureq::Response, String> {
         let url = Url::parse(&format!("http://{address}/a.png?token=secret")).expect("URL");
-        hydra_image_hop(&url, &test_budget(Duration::from_secs(5)), |_, _| {
-            Ok(vec![address])
-        })
+        hydra_media_hop(
+            &url,
+            &test_budget(Duration::from_secs(5)),
+            HydraMedia::Image,
+            |_, _| Ok(vec![address]),
+        )
     }
 
     /// A Hydra image request accepts exactly the formats the decoder reads, so a
@@ -1419,7 +1505,10 @@ mod tests {
             accept,
             ["Accept: image/gif,image/jpeg,image/png,image/webp"]
         );
-        assert_eq!(refuse_web_page(response.content_type()), Ok(()));
+        assert_eq!(
+            refuse_web_page(response.content_type(), HydraMedia::Image),
+            Ok(())
+        );
     }
 
     /// A final response that is a web page is refused as one, rather than handed
@@ -1435,7 +1524,7 @@ mod tests {
         let response = hydra_image_hop_to(address).expect("the page");
         server.join().expect("server thread");
         assert_eq!(
-            refuse_web_page(response.content_type()),
+            refuse_web_page(response.content_type(), HydraMedia::Image),
             Err(
                 "Hydra image URL returned a web page, not an image; use the direct image link"
                     .to_owned()
@@ -2419,22 +2508,30 @@ mod hydra_access_tests {
         );
         let denied = ScoreSampleAccess::denied();
         assert_eq!(
-            fetch_image_with_budget(url, &budget, &denied),
+            fetch_hydra_media_with_budget(url, &budget, &denied, HydraMedia::Image),
             Err("Hydra image URL is outside the permitted sample origins".to_owned()),
             "the default policy must refuse before DNS or HTTP"
         );
 
         let mut exact = ScoreSampleAccess::denied();
         exact.permit_origin("https://images.example").unwrap();
-        assert!(exact.approve_hydra_image_url(url).is_ok());
         assert!(
             exact
-                .approve_hydra_image_url("https://different.example/texture.png")
+                .approve_hydra_media_url(url, HydraMedia::Image)
+                .is_ok()
+        );
+        assert!(
+            exact
+                .approve_hydra_media_url("https://different.example/texture.png", HydraMedia::Image)
                 .is_err()
         );
 
         let mut public = ScoreSampleAccess::denied();
         public.permit_public_cors_origins();
-        assert!(public.approve_hydra_image_url(url).is_ok());
+        assert!(
+            public
+                .approve_hydra_media_url(url, HydraMedia::Image)
+                .is_ok()
+        );
     }
 }

@@ -475,13 +475,20 @@ impl SampleLibrary {
         self.adopt_set_folder_inner(folder, true)
     }
 
+    /// The open set's folder, canonical, as the last set change read it.
+    pub fn set_folder(&self) -> Option<PathBuf> {
+        self.shared.set_folder.read().expect("set folder").clone()
+    }
+
     fn adopt_set_folder_inner(&self, folder: &Path, refresh: bool) -> Result<usize, String> {
         // Read before either lock is taken: the folder is walked on the
         // thread that opened the set, and the browser reads these two at
         // the other end of them.
-        let staged: Result<Vec<(String, Bank)>, String> = folder
+        let root = folder
             .canonicalize()
-            .map_err(|error| format!("set samples: cannot read {}: {error}", folder.display()))
+            .map_err(|error| format!("set samples: cannot read {}: {error}", folder.display()));
+        let staged: Result<Vec<(String, Bank)>, String> = root
+            .clone()
             .and_then(|root| set_folder_banks(&root))
             .map(|banks| {
                 banks
@@ -544,6 +551,9 @@ impl SampleLibrary {
             .custom_file_names
             .write()
             .expect("custom filenames") = local_names::index(custom.values());
+        // The folder belongs to the open set even when its samples do not
+        // fit, so its images and videos stay readable.
+        *self.shared.set_folder.write().expect("set folder") = root.ok();
         let staged = staged?;
         if let Some(error) = full {
             return Err(error);

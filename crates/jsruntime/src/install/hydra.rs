@@ -116,7 +116,7 @@ impl HydraCandidate {
     /// Recording schema emitted by this side of the score/window boundary.
     /// `rustel-runtime` asserts this against `rustel-hydra` so the otherwise
     /// intentionally decoupled crates cannot silently drift.
-    pub const PROGRAM_VERSION: u16 = 3;
+    pub const PROGRAM_VERSION: u16 = 4;
 
     /// Number of typed source slots emitted by this recording version.
     pub const SOURCE_SLOTS: usize = 4;
@@ -338,10 +338,10 @@ fn arguments<'js>(
     args.iter().map(|arg| node(ctx, chains, arg, 0)).collect()
 }
 
-/// Turn the two browser-source initialisers we can acquire natively into a
-/// typed protocol statement. A source setup is deliberately not left as an
-/// arbitrary chain: it may open hardware or the network and therefore has to
-/// reach the host as something it can permission-check before acting.
+/// Turn the browser-source initialisers we can acquire natively into a typed
+/// protocol statement. A source setup is deliberately not left as an
+/// arbitrary chain: it may open hardware, files or the network and therefore
+/// has to reach the host as something it can permission-check before acting.
 fn source_statement<'js>(
     ctx: &Ctx<'js>,
     chain: &Chain,
@@ -356,14 +356,8 @@ fn source_statement<'js>(
     else {
         return Ok(None);
     };
-    const SUPPORTED: &[&str] = &["initCam", "initImage", "clear"];
-    const UNSUPPORTED: &[&str] = &[
-        "initVideo",
-        "initScreen",
-        "initStream",
-        "initCanvas",
-        "init",
-    ];
+    const SUPPORTED: &[&str] = &["initCam", "initImage", "initVideo", "clear"];
+    const UNSUPPORTED: &[&str] = &["initScreen", "initStream", "initCanvas", "init"];
     if !SUPPORTED.contains(&method) && !UNSUPPORTED.contains(&method) {
         return Ok(None);
     }
@@ -379,7 +373,7 @@ fn source_statement<'js>(
         return Err(throw_type_error(
             ctx,
             &format!(
-                "{method}(...) is not supported by native Hydra; use initCam(...) or initImage(url)"
+                "{method}(...) is not supported by native Hydra; use initCam(...), initImage(url) or initVideo(url)"
             ),
         ));
     }
@@ -427,33 +421,12 @@ fn source_statement<'js>(
             serde_json::json!({ "kind": "camera", "device": device })
         }
         "initImage" => {
-            if args.len() != 1 {
-                return Err(throw_type_error(
-                    ctx,
-                    "initImage(url) accepts exactly one JavaScript string",
-                ));
-            }
-            let Some(value) = args[0].as_string() else {
-                return Err(throw_type_error(
-                    ctx,
-                    "initImage(url) needs an actual JavaScript string",
-                ));
-            };
-            let url = value.to_string()?;
-            if url.is_empty() {
-                return Err(throw_type_error(
-                    ctx,
-                    "initImage(url) needs a non-empty URL",
-                ));
-            }
-            if url.len() > MAX_TEXT_BYTES {
-                return Err(too_many(
-                    ctx,
-                    "string bytes in one source URL",
-                    MAX_TEXT_BYTES,
-                ));
-            }
+            let url = source_url(ctx, method, args)?;
             serde_json::json!({ "kind": "image_url", "url": url })
+        }
+        "initVideo" => {
+            let url = source_url(ctx, method, args)?;
+            serde_json::json!({ "kind": "video", "url": url })
         }
         _ => return Ok(None),
     };
@@ -462,6 +435,43 @@ fn source_statement<'js>(
         "slot": slot,
         "source": source,
     })))
+}
+
+/// The one string an image or video initialiser takes: an HTTPS URL, or a
+/// path relative to the set folder or the local sample root. The host checks
+/// which of these it may read.
+fn source_url<'js>(
+    ctx: &Ctx<'js>,
+    method: &str,
+    args: &[rquickjs::Value<'js>],
+) -> rquickjs::Result<String> {
+    if args.len() != 1 {
+        return Err(throw_type_error(
+            ctx,
+            &format!("{method}(url) accepts exactly one JavaScript string"),
+        ));
+    }
+    let Some(value) = args[0].as_string() else {
+        return Err(throw_type_error(
+            ctx,
+            &format!("{method}(url) needs an actual JavaScript string"),
+        ));
+    };
+    let url = value.to_string()?;
+    if url.is_empty() {
+        return Err(throw_type_error(
+            ctx,
+            &format!("{method}(url) needs a non-empty URL"),
+        ));
+    }
+    if url.len() > MAX_TEXT_BYTES {
+        return Err(too_many(
+            ctx,
+            "string bytes in one source URL",
+            MAX_TEXT_BYTES,
+        ));
+    }
+    Ok(url)
 }
 
 enum AnalyserEffect {

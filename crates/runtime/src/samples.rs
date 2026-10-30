@@ -30,6 +30,8 @@ use url::Url;
 use crate::product;
 
 mod access;
+#[cfg(feature = "hydra")]
+pub(crate) use access::read_local_media;
 use access::*;
 pub(crate) use access::{js_round, sound_index};
 mod cache;
@@ -839,6 +841,9 @@ struct Shared {
     /// dropping them by name alone would take a score's `kicks` with them,
     /// which the set never supplied.
     set_banks: RwLock<BTreeMap<String, Option<Bank>>>,
+    /// The open set's folder, canonical, while a set is open. Hydra reads
+    /// the images and videos a score names inside it.
+    set_folder: RwLock<Option<PathBuf>>,
     /// Hidden filename addresses; kept out of the browser's bank rows.
     custom_file_names: RwLock<local_names::Names>,
     global_file_names: RwLock<local_names::Names>,

@@ -37,18 +37,32 @@ holds only its newest frame. Rebind, removal, Stop, or permission revocation
 invalidates publication before clearing. Old workers cannot restore stale
 pixels. Clearing an old lease cannot erase a replacement source.
 
-Each image job carries the session's sample-access policy. The worker checks
-origin permission, public-only pinned DNS, same-origin HTTPS redirects, and
-CORS before decoding. `HydraBridge::apply_with_sample_access` supplies that
-policy; plain `apply` grants no image origins. Each slot has one active job
-and one replaceable pending job. Cancellation prevents publication; active
-OS I/O can continue until the shared 15-second deadline.
+Each image and video job carries the session's sample-access policy. For a
+URL, the worker checks origin permission, public-only pinned DNS, same-origin
+HTTPS redirects, and CORS before decoding. `HydraBridge::apply_with_sample_access`
+supplies that policy. Plain `apply` grants no image origins. A path without
+`://` is read beneath the set folder that `HydraBridge::set_media_folder`
+names, then beneath the local sample root, through the same confined open as
+a local sample. Each slot has one active job and one replaceable pending job.
+Cancellation prevents publication. Active OS I/O can continue until the
+shared deadline: 15 seconds for an image, 60 for a video.
 
-Images and camera frames have a 2048-pixel edge and 4,194,304-pixel limit.
-Images also have 16 MiB transfer and 32 MiB decoder-allocation limits. Four
-RGBA source slots retain at most 64 MiB. Camera mode selection filters unsafe
-or undecodable formats before opening by stable device ID, then validates
-the negotiated mode again.
+A video job keeps its worker while it plays. It decodes one frame at a time
+and publishes each at its timestamp, then starts again at the end. Its
+container demuxers and VP8 and VP9 decoders come from OxiMedia, and animated
+GIF, PNG and WebP from `image`. All are pure Rust. Those VP8 and VP9 decoders
+allocate the size a frame header names, so the worker first reads each header
+with the decoder's own parser and refuses one over the limits. A panic in a
+decoder ends that job, not the worker.
+
+Images, video frames and camera frames have a 2048-pixel edge and
+4,194,304-pixel limit. Images have a 16 MiB transfer limit and videos a 64
+MiB one. The `image` decoders, still or animated, have a 32 MiB allocation
+limit per picture. Four
+RGBA source slots retain at most 64 MiB. A playing video also holds its file,
+so four videos hold at most 256 MiB more. Camera mode selection filters
+unsafe or undecodable formats before opening by stable device ID, then
+validates the negotiated mode again.
 
 ## Camera consent and lifetime
 

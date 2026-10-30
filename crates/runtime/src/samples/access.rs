@@ -94,13 +94,40 @@ impl ScoreSampleAccess {
         Ok((normalized, access))
     }
 
-    /// Apply the same host-granted origin scope to a score's Hydra image.
-    /// The image loader independently keeps its stricter HTTPS and CORS rules.
+    /// Apply the same host-granted origin scope to a score's Hydra image or
+    /// video. The media loader independently keeps its stricter HTTPS and
+    /// CORS rules.
     #[cfg(feature = "hydra")]
-    pub(crate) fn approve_hydra_image_url(&self, raw: &str) -> Result<(), String> {
-        self.approve_remote(raw)
-            .map(|_| ())
-            .map_err(|_| "Hydra image URL is outside the permitted sample origins".to_owned())
+    pub(crate) fn approve_hydra_media_url(
+        &self,
+        raw: &str,
+        media: sample_fetch::HydraMedia,
+    ) -> Result<(), String> {
+        self.approve_remote(raw).map(|_| ()).map_err(|_| {
+            format!(
+                "{} URL is outside the permitted sample origins",
+                media.label()
+            )
+        })
+    }
+
+    /// Read a score's Hydra image or video from the local sample root, the
+    /// folder `samples('local:')` reads. `path` is relative to that root,
+    /// under the same rules: no absolute path, no `..`, no hidden or linked
+    /// entry, and no read outside the root.
+    #[cfg(feature = "hydra")]
+    pub(crate) fn read_hydra_local_media(
+        &self,
+        path: &str,
+        media: sample_fetch::HydraMedia,
+    ) -> Result<Vec<u8>, String> {
+        let root = self.local_root.as_ref().ok_or_else(|| {
+            format!(
+                "{} {path:?} is a local file; grant its folder with --allow-local-samples, or keep it in the set folder in Studio",
+                media.label()
+            )
+        })?;
+        read_local_media(root, path, media)
     }
 
     /// The textual half of approval, run at enqueue time so a refused source
@@ -124,6 +151,44 @@ impl ScoreSampleAccess {
             SampleSource::Url(url) => self.approve_remote(&url).map(|_| ()),
         }
     }
+}
+
+/// Read a Hydra image or video at `path` beneath `root`. The path is
+/// relative and made of plain names: no absolute path, no `..`, and no
+/// hidden entry. The open is confined to the root the same way a local
+/// sample's is, so a link or a rename cannot lead a read outside it.
+#[cfg(feature = "hydra")]
+pub(crate) fn read_local_media(
+    root: &crate::sample_server::ServedRoot,
+    path: &str,
+    media: sample_fetch::HydraMedia,
+) -> Result<Vec<u8>, String> {
+    let label = media.label();
+    let relative = Path::new(path);
+    if !crate::sample_server::relative_sample_path_allowed(relative) {
+        return Err(format!(
+            "{label} {path:?} must be a relative path inside the folder, without `..`"
+        ));
+    }
+    let (file, length) = root
+        .open_score_file(&root.path().join(relative))
+        .map_err(|_| format!("{label} {path:?} is not a file in the permitted folder"))?;
+    let limit = media.limit();
+    let too_large = || format!("{label} {path:?} exceeds the {} MiB limit", limit >> 20);
+    if length > limit as u64 {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length as usize)
+        .map_err(|_| format!("{label} {path:?} exceeds host memory"))?;
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| format!("{label} {path:?} could not be read"))?;
+    if bytes.len() > limit {
+        return Err(too_large());
+    }
+    Ok(bytes)
 }
 
 pub(super) fn fetch_manifest_located_with_budget(

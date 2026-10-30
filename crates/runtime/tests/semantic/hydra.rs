@@ -367,7 +367,9 @@ fn source_initialisers_have_strict_arity_types_and_native_support_errors() {
         ("s0.initImage('a', 'b')", "exactly one JavaScript string"),
         ("s0.initImage(42)", "actual JavaScript string"),
         ("s0.initImage('')", "non-empty URL"),
-        ("s0.initVideo('clip.mp4')", "not supported by native Hydra"),
+        ("s0.initVideo()", "exactly one JavaScript string"),
+        ("s0.initVideo(42)", "actual JavaScript string"),
+        ("s0.initVideo('')", "non-empty URL"),
         ("s0.initScreen()", "not supported by native Hydra"),
         ("s0.initStream({})", "not supported by native Hydra"),
         ("s0.initCanvas({})", "not supported by native Hydra"),
@@ -378,6 +380,29 @@ fn source_initialisers_have_strict_arity_types_and_native_support_errors() {
         let message = evaluate_error(&format!("await initHydra()\n{call}"));
         assert!(message.contains(expected), "{call}: {message}");
     }
+}
+
+/// A video names a URL or a relative path, in either quote: a double-quoted
+/// path is not mini-notation here.
+#[test]
+fn a_video_records_its_address_as_a_typed_source() {
+    let update = program(
+        "await initHydra()\ns0.initVideo(\"clips/loop.webm\")\ns1.initVideo('https://example.com/a.webm')\nsrc(s0).out()",
+    );
+    assert!(matches!(
+        update.program.statements.as_slice(),
+        [
+            HydraStatement::ConfigureSource {
+                slot: 0,
+                source: HydraSource::Video { url: local },
+            },
+            HydraStatement::ConfigureSource {
+                slot: 1,
+                source: HydraSource::Video { url: remote },
+            },
+            HydraStatement::Evaluate { .. },
+        ] if local == "clips/loop.webm" && remote == "https://example.com/a.webm"
+    ));
 }
 
 #[test]
