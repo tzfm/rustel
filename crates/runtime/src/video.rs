@@ -20,6 +20,13 @@ use symphonia::core::probe::Hint;
 /// larger picture would only cost memory.
 const THUMB_EDGE: u32 = 160;
 
+/// The longest frame edge this module will decode, whatever the container
+/// says. A frame's own header sizes the decoder's allocations before any
+/// pixel is checked, so a lying edge is refused here, not by the
+/// allocator: an allocation failure aborts, and no panic boundary catches
+/// it.
+const MAX_PICTURE_EDGE: u32 = 4096;
+
 /// RGBA bytes one clip's thumbnails may hold between them. A clip with
 /// more frames than that thins to fewer, evenly spaced ones.
 const CLIP_BUDGET_BYTES: usize = 12 << 20;
@@ -142,15 +149,17 @@ fn sniff_picture_codec(packet: &[u8]) -> PictureCodec {
     if packet.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return PictureCodec::MotionJpeg;
     }
-    // Matroska carries H.264 and HEVC behind Annex B start codes.
+    // Matroska carries H.264 and HEVC behind Annex B start codes, with the
+    // parameter sets in the track header: a stream can open on a slice,
+    // an AUD or an SEI, not only on an SPS.
     if packet.starts_with(&[0, 0, 1]) || packet.starts_with(&[0, 0, 0, 1]) {
         let start = if packet[2] == 1 { 3 } else { 4 };
         return match packet.get(start) {
-            // An SPS (type 7) heads an H.264 stream.
-            Some(&nal) if nal & 0x1F == 7 => PictureCodec::H264,
             // HEVC heads with a VPS or SPS (32, 33) or an IRAP slice
-            // (19, 20).
-            Some(&nal) if matches!((nal >> 1) & 0x3F, 19 | 20 | 32 | 33) => PictureCodec::Hevc,
+            // (19 through 21).
+            Some(&nal) if matches!((nal >> 1) & 0x3F, 19..=21 | 32..=34) => PictureCodec::Hevc,
+            // H.264: forbidden bit clear, then any VCL NAL, SPS, or AUD.
+            Some(&nal) if nal & 0x80 == 0 && matches!(nal & 0x1F, 1..=9) => PictureCodec::H264,
             _ => PictureCodec::Unknown,
         };
     }
@@ -208,17 +217,31 @@ impl PictureCodec {
     }
 
     /// The decoders this build carries. A codec with none is refused before
-    /// any packet is wasted on it.
-    fn decoder(self) -> Result<PictureDecoder, String> {
+    /// any packet is wasted on it. `packet` is the sniffed one, whose
+    /// headers size the decoder's allocations.
+    fn decoder(self, packet: &[u8]) -> Result<PictureDecoder, String> {
         match self {
             Self::MotionJpeg => Ok(PictureDecoder::MotionJpeg),
-            Self::Vp8 => Ok(PictureDecoder::Vp8(Box::new(
-                oximedia_codec::Vp8Decoder::new(oximedia_codec::DecoderConfig {
-                    codec: oximedia_core::CodecId::Vp8,
-                    ..Default::default()
-                })
-                .map_err(|error| format!("VP8 decoder: {error}"))?,
-            ))),
+            Self::Vp8 => {
+                // The frame tag sizes the decoder's planes before any
+                // pixel is decoded; a lying edge is refused here rather
+                // than by the allocator, whose failure aborts.
+                if let Some((width, height)) = vp8_frame_size(packet)
+                    && width.max(height) > MAX_PICTURE_EDGE
+                {
+                    return Err(format!(
+                        "the clip says its picture is {width}x{height}, past the \
+                         {MAX_PICTURE_EDGE} pixel decode limit"
+                    ));
+                }
+                Ok(PictureDecoder::Vp8(Box::new(
+                    oximedia_codec::Vp8Decoder::new(oximedia_codec::DecoderConfig {
+                        codec: oximedia_core::CodecId::Vp8,
+                        ..Default::default()
+                    })
+                    .map_err(|error| format!("VP8 decoder: {error}"))?,
+                )))
+            }
             codec => Err(format!(
                 "the picture is {}, which this build cannot decode yet; \
                  re-encode the clip as VP8 WebM or Motion JPEG",
@@ -262,17 +285,29 @@ fn decode_jpeg_frame(packet: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(packet))
         .with_guessed_format()
         .map_err(|error| format!("MJPEG frame: {error}"))?;
-    // A frame far larger than its thumbnail can only cost time.
+    // A frame far larger than its thumbnail can only cost time and memory,
+    // and its own header sizes the buffers before any pixel is seen.
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(8192);
-    limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(64 << 20);
+    limits.max_image_width = Some(MAX_PICTURE_EDGE);
+    limits.max_image_height = Some(MAX_PICTURE_EDGE);
+    limits.max_alloc = Some(256 << 20);
     reader.limits(limits);
     let decoded = reader
         .decode()
         .map_err(|error| format!("MJPEG frame: {error}"))?;
     let rgba = decoded.to_rgba8();
     Ok((rgba.width(), rgba.height(), rgba.into_raw()))
+}
+
+/// A VP8 keyframe's declared picture size, from its uncompressed frame
+/// tag: 14 bits for each side, one less than stored. Read before the
+/// decoder is built, because the tag sizes its planes.
+fn vp8_frame_size(packet: &[u8]) -> Option<(u32, u32)> {
+    if packet.len() < 10 {
+        return None;
+    }
+    let edge = |low: u8, high: u8| u32::from((u16::from(high) & 0x3F) << 8 | u16::from(low)) + 1;
+    Some((edge(packet[6], packet[7]), edge(packet[8], packet[9])))
 }
 
 /// A decoded VP8 frame to RGBA. VP8 pictures are 4:2:0 BT.601 with
@@ -490,17 +525,27 @@ fn decode_thumbnails_inner(bytes: &[u8], extension: &str) -> Result<VideoThumbna
         )
         .map_err(|error| format!("{extension} probe: {error}"))?;
     let mut format = probed.format;
-    let track = crate::samples::container_video_track(format.as_ref())
-        .ok_or_else(|| format!("{extension} has no video track"))?;
-    let track_id = track.id;
-    // The demuxer counts time in the track's time base; without one a
-    // Matroska tick is a millisecond.
-    let time_base = track
-        .codec_params
-        .time_base
-        .unwrap_or(symphonia::core::units::TimeBase::new(1, 1_000));
+    // Tracks that could carry the picture, with the time base each counts
+    // in. A subtitle or chapter track sits among them: its packets sniff
+    // as nothing known and are passed over, so a text track listed before
+    // the video does not refuse the clip.
+    let mut time_bases: std::collections::HashMap<u32, symphonia::core::units::TimeBase> =
+        std::collections::HashMap::new();
+    for track in format.tracks() {
+        let base = track
+            .codec_params
+            .time_base
+            .unwrap_or(symphonia::core::units::TimeBase::new(1, 1_000));
+        time_bases.insert(track.id, base);
+    }
+    let candidates = crate::samples::container_video_track_ids(format.as_ref());
+    if candidates.is_empty() {
+        return Err(format!("{extension} has no video track"));
+    }
+    let mut skipped: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut strip: Option<Strip> = None;
     let mut decoder: Option<PictureDecoder> = None;
+    let mut selected: Option<u32> = None;
     let mut refused: Option<String> = None;
     let mut packets = 0u64;
     while packets < MAX_PICTURE_PACKETS {
@@ -510,20 +555,37 @@ fn decode_thumbnails_inner(bytes: &[u8], extension: &str) -> Result<VideoThumbna
             Err(_) => break,
         };
         packets += 1;
-        if packet.track_id() != track_id {
+        let track_id = packet.track_id();
+        if !candidates.contains(&track_id)
+            || skipped.contains(&track_id)
+            || selected.is_some_and(|selected| selected != track_id)
+        {
             continue;
         }
-        let seconds = packet.ts() as f32 * time_base.numer as f32 / time_base.denom as f32;
         let data = &packet.data[..];
+        if data.is_empty() {
+            continue;
+        }
         if decoder.is_none() {
-            match sniff_picture_codec(data).decoder() {
-                Ok(picture) => decoder = Some(picture),
+            match sniff_picture_codec(data).decoder(data) {
+                Ok(picture) => {
+                    selected = Some(track_id);
+                    decoder = Some(picture);
+                }
                 Err(message) => {
-                    refused = Some(message);
-                    break;
+                    // A codec this build cannot decode is named once, but a
+                    // later track can still be the picture: Matroska files
+                    // open with text tracks before video.
+                    refused.get_or_insert(message);
+                    skipped.insert(track_id);
+                    continue;
                 }
             }
         }
+        // The demuxer counts time in the track's time base; without one a
+        // Matroska tick is a millisecond.
+        let time_base = time_bases[&track_id];
+        let seconds = packet.ts() as f32 * time_base.numer as f32 / time_base.denom as f32;
         let strip = strip.get_or_insert_with(|| Strip {
             width: 0,
             height: 0,
@@ -597,6 +659,8 @@ mod tests {
     const TINY_H264: &[u8] = include_bytes!("samples/testdata/tiny_video.mp4");
     /// A Matroska with no video track at all.
     const AUDIO_ONLY: &[u8] = include_bytes!("video/testdata/tiny_audio_only.webm");
+    /// A subtitle track listed before the VP8 picture.
+    const TINY_SUBS: &[u8] = include_bytes!("video/testdata/tiny_video_subs.mkv");
 
     #[test]
     fn a_vp8_clip_decodes_a_filmstrip_that_moves() {
@@ -635,6 +699,68 @@ mod tests {
         assert!(
             error.contains("H.264") && error.contains("re-encode"),
             "names what to do: {error}"
+        );
+    }
+
+    /// A text track listed before the video is passed over, not mistaken
+    /// for the picture: its packets sniff as nothing this build knows.
+    #[test]
+    fn a_subtitle_track_before_the_video_is_not_the_picture() {
+        let strip = decode_thumbnails(TINY_SUBS, "mkv").expect("the picture must decode");
+        assert_eq!((strip.width(), strip.height()), (64, 36));
+        assert_eq!(strip.frame_count(), 4, "0.4 s at ten frames a second");
+        assert_ne!(
+            strip.frame_at(0.0).expect("the first frame"),
+            strip.frame_at(0.3).expect("the last frame"),
+            "the test pattern moves"
+        );
+    }
+
+    /// A VP8 keyframe's tag sizes the decoder's planes before any pixel
+    /// is decoded, so an edge past the decode limit is refused by name and
+    /// never reaches the allocator.
+    #[test]
+    fn a_lying_vp8_keyframe_edge_is_refused() {
+        let mut keyframe = [0u8; 10];
+        // Keyframe flag clear, the VP8 start code, then 16383x16383 in the
+        // tag's 14-bit sides-less-one.
+        keyframe[3..6].copy_from_slice(&[0x9D, 0x01, 0x2A]);
+        keyframe[6..8].copy_from_slice(&0x3FFE_u16.to_le_bytes());
+        keyframe[8..10].copy_from_slice(&0x3FFE_u16.to_le_bytes());
+        assert_eq!(vp8_frame_size(&keyframe), Some((16_383, 16_383)));
+        let refused = sniff_picture_codec(&keyframe).decoder(&keyframe);
+        assert!(
+            refused
+                .err()
+                .is_some_and(|message| message.contains("4096")),
+            "the edge is refused by name"
+        );
+        assert_eq!(vp8_frame_size(&[0; 9]), None, "a short tag is no tag");
+    }
+
+    #[test]
+    fn a_built_strip_refuses_its_malformed_frames() {
+        let red = [255, 0, 0, 255].repeat(4);
+        assert!(
+            VideoThumbnails::from_frames(0, 2, vec![(0.0, red.clone())]).is_err(),
+            "no edge is no picture"
+        );
+        assert!(
+            VideoThumbnails::from_frames(2, 2, Vec::new()).is_err(),
+            "no frames is no strip"
+        );
+        assert!(
+            VideoThumbnails::from_frames(2, 2, vec![(0.0, red.clone()), (0.0, red.clone())])
+                .is_err(),
+            "times ascend"
+        );
+        assert!(
+            VideoThumbnails::from_frames(2, 2, vec![(0.0, vec![0; 15])]).is_err(),
+            "a frame is width * height * 4 bytes"
+        );
+        assert!(
+            VideoThumbnails::from_frames(2, 2, vec![(f32::NAN, red)]).is_err(),
+            "times are finite"
         );
     }
 

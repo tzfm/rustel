@@ -563,14 +563,20 @@ fn audio_track<'a>(
         .ok_or_else(|| format!("{extension} has no audio track").into())
 }
 
-/// The container's first video track: one no audio decoder could read. A
+/// The ids of the container's tracks that no audio decoder could read: a
 /// video track has neither a rate nor a channel layout, which every audio
-/// track has. The `video` painters decode this track's packets.
+/// track has, and so does a subtitle or chapter track. The caller tells
+/// them apart by their packets; this only rules out the sound.
 #[cfg(feature = "video")]
-pub(crate) fn container_video_track(
+pub(crate) fn container_video_track_ids(
     format: &dyn symphonia::core::formats::FormatReader,
-) -> Option<&symphonia::core::formats::Track> {
-    format.tracks().iter().find(|track| !is_audio_track(track))
+) -> Vec<u32> {
+    format
+        .tracks()
+        .iter()
+        .filter(|track| !is_audio_track(track))
+        .map(|track| track.id)
+        .collect()
 }
 
 fn decode_compressed_with(

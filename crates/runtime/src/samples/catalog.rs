@@ -1552,13 +1552,14 @@ impl SampleLibrary {
         // on a thread of its own so a poll never decodes. A weak handle,
         // like the loader workers: the library can drop mid-decode.
         let shared = Arc::downgrade(&self.shared);
-        std::thread::Builder::new()
+        let decoding = Arc::clone(&url);
+        if std::thread::Builder::new()
             .name("video-thumbnails".into())
             .spawn(move || {
                 let Some(shared) = shared.upgrade() else {
                     return;
                 };
-                let picture = decode_video_picture(&shared, &url)
+                let picture = decode_video_picture(&shared, &decoding)
                     .map_or_else(crate::video::VideoPicture::Failed, |strip| {
                         crate::video::VideoPicture::Ready(Arc::new(strip))
                     });
@@ -1566,9 +1567,19 @@ impl SampleLibrary {
                     .videos
                     .lock()
                     .expect("video thumbnails")
-                    .insert(url, picture);
+                    .insert(decoding, picture);
             })
-            .ok()?;
+            .is_err()
+        {
+            // A thread that never started must not leave the url claimed
+            // as decoding, or the clip is stuck and the slot is spent.
+            self.shared
+                .videos
+                .lock()
+                .expect("video thumbnails")
+                .remove(&url);
+            return None;
+        }
         Some(crate::video::VideoPicture::Decoding)
     }
 

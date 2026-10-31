@@ -522,7 +522,7 @@ impl App {
                         .install_video(&name, super::super::visuals::VideoEntry::Failed(message));
                 }
                 Some(VideoPicture::Decoding) | None => {
-                    self.visual.note_video_ask(&name);
+                    changed |= self.visual.note_video_ask(&name);
                 }
             }
         }
