@@ -239,6 +239,19 @@ a smaller picture gets a larger factor. Smoothing on a small picture can use
 more GPU work. Terminal capability detection selects the display detail
 automatically.
 
+## The pointer
+
+`mouse.x` and `mouse.y` give the position of the mouse over the terminal,
+in pixels of the picture from its top-left corner. Read them in a callback:
+
+```js
+await initHydra()
+osc(() => mouse.x / width * 40, 0.1, () => mouse.y / height).out()
+```
+
+`mousex` and `mousey` in pattern code read the same pointer, from 0 to 1.
+Outside Studio the pointer stays at 0.
+
 ## What a score cannot do here
 
 Browser objects, screen and stream sources, WebRTC, custom GLSL

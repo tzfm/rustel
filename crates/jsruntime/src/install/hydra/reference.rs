@@ -366,6 +366,14 @@ pub(super) const ENTRIES: &[ReferenceEntry] = &[
         "Divides the picture into a grid and gives each cell one colour.",
         [
             param!("pixelX", "Cells across. Default 20."),
+    value!(
+        "mouse",
+        [],
+        "values",
+        "The pointer position in pixels.",
+        "mouse.x and mouse.y give the position of the pointer in pixels of the picture, from its top-left corner. Read them in a function argument, for example () => mouse.x / width. In Studio they follow the mouse over the terminal. Elsewhere they stay at 0.",
+        "osc(() => mouse.x / width * 40).out()"
+    ),
             param!("pixelY", "Cells down. Default 20.")
         ],
         "noise(3).pixelate(16, 9).out()"

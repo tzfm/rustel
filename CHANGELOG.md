@@ -7,6 +7,7 @@
 - `initImage()` and `initVideo()` read a local file by a path relative to the set folder, or to the folder granted with `--allow-local-samples`. The rules of local samples apply: no absolute path, no `..`, and no read outside the folder.
 - Settings ▸ Permissions holds what a score's samples, images and videos can read. An origin that the policy refused comes onto the page, and Enter trusts it. A switch turns off the public CORS default, and the `local folder` row chooses the folder that `samples('local:')` and Hydra files read. Studio keeps all of them.
 - A Hydra sketch can set its clock: `speed`, `bpm`, `fps` and `time` take a number. Hydra callbacks also read `width`, `height` and `Math.random()`.
+- Hydra callbacks read the pointer as `mouse.x` and `mouse.y`, and pattern code reads it as `mousex` and `mousey`. In Studio both follow the mouse over the terminal.
 - Edit ▸ Find, chosen with a click, takes what you type. The release of the click closed the find bar again, so the typing went into the score as text or ran as Vim commands.
 - With Vim keys on, any key the search box takes, such as `i`, Esc or a typed letter, calls off a pending delete in the set panel, the Samples tab and the theme picker, and a pending trim. Before, a later Enter or a second Ctrl+D could delete the score, the sample or the theme without asking again.
 - Vim `p` no longer crashes when the yanked line ends in a Unicode line or paragraph separator.

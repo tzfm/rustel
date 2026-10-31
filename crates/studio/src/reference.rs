@@ -4886,23 +4886,20 @@ mod tests {
         }
 
         #[test]
-        fn mouse_signal_search_explains_the_missing_input() {
+        fn mouse_signal_search_explains_where_the_pointer_is_read() {
             let reference = Reference::load(engine_knows());
             for name in ["mousex", "mouseX", "mousey", "mouseY"] {
                 let index = reference.lookup(name).expect("mouse signal entry");
                 assert_eq!(reference.search(name).first(), Some(&index), "{name}");
                 let entry = reference.entry(index).unwrap();
-                assert!(entry.summary.contains("not supported"), "{name}");
+                assert!(entry.summary.contains("pointer"), "{name}");
                 let body = entry_body(entry, 80)
                     .into_iter()
                     .map(|line| line.text)
                     .collect::<Vec<_>>()
                     .join(" ");
-                assert!(body.contains("always returns 0"), "{name}: {body}");
-                assert!(
-                    body.contains("does not track the pointer"),
-                    "{name}: {body}"
-                );
+                assert!(body.contains("follows the mouse"), "{name}: {body}");
+                assert!(body.contains("returns 0"), "{name}: {body}");
             }
         }
 

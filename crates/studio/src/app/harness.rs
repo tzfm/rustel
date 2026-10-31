@@ -139,7 +139,9 @@ impl Studio {
         let studio_options = StudioOptions {
             path: Some(directory.clone()),
             mini: false,
-            session: Default::default(),
+            // As `run_once` does: the session reads the terminal pointer.
+            session: rustel_runtime::SessionConfig::default()
+                .with_pointer(rustel_core::host_value::Pointer::default()),
             theme: options.theme,
             output: Some("silent".to_owned()),
             output_buffer_frames: None,
@@ -514,6 +516,14 @@ impl Studio {
     /// The status bar's text.
     pub fn status(&self) -> &str {
         &self.app.status
+    }
+
+    /// Where the pointer is, as the engine's session reads it for `mousex`
+    /// and Hydra's `mouse`: from 0 to 1 across the frame, from the top-left
+    /// corner. `None` when the session follows no pointer.
+    pub fn score_pointer(&self) -> Option<(f64, f64)> {
+        let pointer = self.app.options.session.pointer.as_ref()?;
+        Some((pointer.x.get(), pointer.y.get()))
     }
 
     /// Clear the status bar so a test can wait for the next notice.

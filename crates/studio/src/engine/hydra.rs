@@ -141,6 +141,10 @@ impl StudioEngine {
         // so browsing does not keep the score's visuals alive - and inserting
         // a snippet leaves the screen still until you press play.
         hydra.set_drawing(self.is_playing());
+        // `mouse` reads the pointer that `mousex` reads.
+        if let Some(pointer) = &self.session.config().pointer {
+            hydra.set_pointer(pointer.x.get(), pointer.y.get());
+        }
         let now = Instant::now();
         if let Err(message) = hydra.tick(
             now,

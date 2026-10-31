@@ -394,6 +394,12 @@ impl HydraBridge {
         let _ = self.tui_sink().publish(&frame());
     }
 
+    /// Set where the pointer is, from 0 to 1 across the picture from its
+    /// top-left corner, for `mouse`.
+    pub fn set_pointer(&self, x: f64, y: f64) {
+        self.host.set_pointer(x as f32, y as f32);
+    }
+
     /// Publish what the engine is playing, for `detectAudio`.
     pub fn audio(&self, frame: &HydraAudioFrame) {
         if !self.host.wants_audio() {

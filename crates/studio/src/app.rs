@@ -546,7 +546,10 @@ fn status_file_path(path: &std::path::Path, full: bool) -> String {
     clippy::print_stderr,
     reason = "the theme fallback is reported before the screen opens"
 )]
-fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
+fn run_once(mut options: StudioOptions) -> Result<Session, RuntimeError> {
+    // The terminal pointer, for `mousex` in patterns and `mouse` in Hydra.
+    // The engine's session reads it, and the app writes it.
+    options.session.pointer.get_or_insert_with(Default::default);
     let starter = if options.mini {
         DEFAULT_MINI_SCORE
     } else {
@@ -1439,6 +1442,8 @@ struct App {
     pin_frame_inputs: bool,
     /// Geometry of the last painted frame, used to route pointer input.
     frame: Rect,
+    /// Where the pointer is over the frame, shared with the engine's session.
+    score_pointer: rustel_core::host_value::Pointer,
     regions: StudioRegions,
     pointer: Option<Pointer>,
     /// How far into its cell the pointer was at the last report, 0..1. A
@@ -1634,6 +1639,7 @@ impl App {
         // The switch starts on, as the engine's does: an installed library
         // is the opt-in, and the permissions page owns the switch from here.
         let csound_at_start = true;
+        let score_pointer = options.session.pointer.clone().unwrap_or_default();
         let mut app = Self {
             output_latency_pending: true,
             cli_output_latency: options.output_buffer_frames.map(OutputLatency::from_frames),
@@ -1930,6 +1936,7 @@ impl App {
             #[cfg(feature = "harness")]
             pin_frame_inputs: false,
             frame: Rect::default(),
+            score_pointer,
             regions: StudioRegions::default(),
             pointer: None,
             pointer_subcell: 0.0,

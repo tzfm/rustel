@@ -4,7 +4,7 @@
 static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
 
-use crossterm::event::{KeyCode, KeyModifiers, ModifierKeyCode};
+use crossterm::event::{KeyCode, KeyModifiers, ModifierKeyCode, MouseEventKind};
 use rustel_studio::editor::KeyboardCapabilities;
 use rustel_studio_e2e::{Hermetic, PanelKind, hermetic, hermetic_with, reopen_over};
 
@@ -665,6 +665,16 @@ fn vim_keys_walk_the_sample_permissions() {
         selected(&mut studio, "local folder"),
         "Esc comes back to the row"
     );
+}
+
+/// Vim mode keeps the pointer for the score: `mousex` and Hydra's `mouse`
+/// follow it as they do outside Vim.
+#[test]
+fn vim_mode_keeps_the_pointer_for_the_score() {
+    let mut studio = hermetic();
+    enable_vim(&mut studio);
+    studio.mouse(MouseEventKind::Moved, 29, 9, KeyModifiers::NONE);
+    assert_eq!(studio.score_pointer(), Some((29.5 / 150.0, 9.5 / 40.0)));
 }
 
 mod mappings;

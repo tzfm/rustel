@@ -36,7 +36,7 @@ These names remain available, but the named feature is inactive.
 | `.onSchedule()`, `.onTrigger()`, `.onTriggerTime()` | Return the pattern without calling the callback. |
 | `addEventListener`, `removeEventListener` | Accept the call. Rustel has no browser events, and the listener is never called. |
 | `theme`, `fontFamily`, `fontSize` | Do not change Studio's appearance. |
-| `mousex`, `mouseX`, `mousey`, `mouseY` | Return zero. They do not read the pointer. |
+| `mousex`, `mouseX`, `mousey`, `mouseY` | Follow the mouse over the terminal in Studio, from 0 to 1. Elsewhere they return 0. |
 | `keyDown`, `whenKey` | Do not read keyboard input. `keyDown` replaces each value with `false`. `whenKey` returns the pattern unchanged. |
 
 ## Native audio gaps

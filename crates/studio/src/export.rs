@@ -602,7 +602,8 @@ pub(crate) fn scope_line(peaks: &[f32; SCOPE_COLUMNS]) -> String {
 /// export. Re-evaluating source text can then override this inherited value.
 /// The export imports scripts from the origins of the permissions page,
 /// reads samples and media under its grants, and runs orchestras under its
-/// switch, too.
+/// switch, too. An export renders faster than time, so it never follows the
+/// pointer: `mousex` reads 0, the same in every bounce.
 pub(super) fn session_config(
     default: &SessionConfig,
     host_default: usize,
@@ -611,7 +612,7 @@ pub(super) fn session_config(
     sample_grants: &super::engine::SampleGrants,
     csound_allowed: bool,
 ) -> SessionConfig {
-    default
+    let mut config = default
         .clone()
         .with_max_polyphony(score_override.unwrap_or(host_default))
         .with_score_import_access(super::engine::import_access(
@@ -619,7 +620,9 @@ pub(super) fn session_config(
             import_origins,
             csound_allowed,
         ))
-        .with_score_sample_access(super::engine::sample_access(default, sample_grants))
+        .with_score_sample_access(super::engine::sample_access(default, sample_grants));
+    config.pointer = None;
+    config
 }
 
 /// What one bounce plays: the score's source, the flag that says how to
