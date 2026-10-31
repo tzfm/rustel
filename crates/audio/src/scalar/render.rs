@@ -93,6 +93,7 @@ fn plain_sample_voice(v: &Voice) -> bool {
 /// voice is a sample or an oscillator; sends it carries are accumulated
 /// here, so a room or a delay does not by itself push a voice off the
 /// path.
+#[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn render_plain_voice(
     v: &mut Voice,
@@ -216,7 +217,6 @@ fn render_plain_voice(
                     )
                 }
             } else {
-                let (scale, center) = (0.0, 0.0);
                 let mut left = 0.0f32;
                 let mut right = 0.0f32;
                 for (n, phase) in phases.iter_mut().enumerate().take(plan.count) {
