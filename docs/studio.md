@@ -284,40 +284,41 @@ names Studio does not read before the script runs. See
 ### Samples and media
 
 A score's `samples()`, Hydra images and Hydra videos load only from a source
-on the Permissions page. A source is one of these:
+that you allow. `raw.githubusercontent.com`, `strudel.b-cdn.net`,
+`shabda.ndre.gr` and `cdn.freesound.org` are always allowed. They serve the
+`github:`, `bubo:` and `shabda:` shorthands, the default banks, and the
+freesound sounds that shared scores name. They have no row on the page. With
+`--strict-sample-origins`, they are off for the run.
 
-- A domain, such as `cdn.example.com`. It allows HTTPS from that domain and
-  its subdomains.
-- An address, such as `https://example.com/kits/`. It allows only the
-  addresses that start with it. Plain HTTP and a server on this computer
-  need an address, such as `http://localhost:8000/`.
+When a score loads a file that no source allows, the score plays without the
+file. The folder of the file comes onto the Permissions page as `samples off`.
+Press Enter to allow the folder and all addresses below it. Space turns a
+source off or on, and `d` removes it.
 
-The page has four sections:
+Press `e` to edit a source. The text sets what the source allows:
 
-- `samples, images and videos` lists the sources.
-  `raw.githubusercontent.com`, `strudel.b-cdn.net` and `shabda.ndre.gr` are
-  built in. They serve the `github:`, `bubo:` and `shabda:` shorthands and
-  the default banks. Space turns a built-in source off, and it stays on the
-  page. With `--strict-sample-origins`, they stay off for the run. A refused
-  source comes onto the page as `blocked`. Press Enter to allow it. Space
-  turns a source off, and `d` removes it. `+ Add a domain or address…` asks
-  for a new source.
-- `? Try an address…` asks for an address and tells you which source allows
-  it. An allowed address loads once, and the row tells you what came back,
-  such as `sample map, 42 sounds`. If no source allows it, press `a` to allow
-  its domain, or `u` to allow only its folder.
-- `local files` is the folder that `samples('local:...')` reads. Hydra also
-  reads a file from it when the set folder does not have the file. Press
-  Enter to choose the folder, and `d` to forget it. With
-  `--allow-local-samples`, the folder of the flag is used for the run.
-- `scripts` and `csound` hold the script origins and the orchestra switch.
+- A domain, such as `github.com`. It allows HTTPS from that domain and its
+  subdomains.
+- An address, such as `github.com/me/kits/`. It allows HTTPS from that
+  address and below.
+- A full address, such as `http://localhost:8000/`. Plain HTTP and a server
+  on this computer need the full address.
 
-Studio keeps the sources, the built-in sources you turned off, the script
-origins and the folder in `studio.json`. If an update stopped on a refusal,
-it runs again when you give the permission. Otherwise the next update reads
-with the new permission. A redirect must stay inside the source that allowed
-the address. See [Sample access](../SECURITY.md#sample-access) for the
-rules.
+The edit must still allow what the row allowed, so a typing error cannot
+allow a different site. To allow all of `github.com/me/kits/808/`, cut it
+down to `github.com`. A script origin stays exact, and `e` does not edit it.
+
+The `local:` row is the folder that `samples('local:...')` reads. Hydra also
+reads a file from it when the set folder does not have the file. The row
+comes onto the page when a score asks for a `local:` file, or when a folder
+is set. Press Enter to choose the folder, and `d` to forget it. With
+`--allow-local-samples`, the folder of the flag is used for the run.
+
+Studio keeps the sources and the folder in `studio.json`. If an update
+stopped on a refusal, it runs again when you give the permission. Otherwise
+the next update reads with the new permission. A redirect must stay inside
+the source that allowed the address. See
+[Sample access](../SECURITY.md#sample-access) for the rules.
 
 ## Checking and playback
 

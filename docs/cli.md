@@ -187,9 +187,10 @@ rustel samples clear --dry-run
 ```
 
 A score loads samples only from an allowed source.
-`raw.githubusercontent.com`, `strudel.b-cdn.net` and `shabda.ndre.gr` are
-allowed from the start. `--allow-sample-origin` adds a domain or an address,
-and `--strict-sample-origins` turns off the three built-in sources. See
+`raw.githubusercontent.com`, `strudel.b-cdn.net`, `shabda.ndre.gr` and
+`cdn.freesound.org` are allowed from the start. `--allow-sample-origin` adds
+a domain or an address, and `--strict-sample-origins` turns off the four
+built-in sources. See
 [Local samples](local-samples.md) and [Security](../SECURITY.md).
 
 `samples cache` downloads the shipped packs for offline use. Repeat it to

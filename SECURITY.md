@@ -22,7 +22,7 @@ discussion.
 - The realm exposes no filesystem, process, socket, HTTP, or environment API.
 - Score-level `samples(...)` performs no I/O itself. It asks the host, and the
   host applies the policy in "Sample access" below. The library default is
-  fully inert, while the command line allows three built-in sources.
+  fully inert, while the command line allows four built-in sources.
 - CPU, JavaScript heap, pending-job, query, and staged-effect limits bound
   score work in the realm and host.
 
@@ -82,15 +82,17 @@ plays no part. A source is one of these:
 
 - A domain, such as `example.com`. It allows HTTPS on the default port from
   that domain and its subdomains, at any path.
-- An address, such as `https://example.com/kits/`. It allows the addresses
-  on that origin whose path is the address path or below it, by whole path
-  segments. An address is the only form that allows plain `http`, another
-  port, or a server on this computer.
+- An address, such as `example.com/kits/`. Without a scheme, it is HTTPS.
+  It allows the addresses on that origin whose path is the address path or
+  below it, by whole path segments. An address is the only form that allows
+  another port or a server on this computer. Plain `http` needs the scheme,
+  such as `http://localhost:5432/`.
 
-The command line allows three built-in domains: `raw.githubusercontent.com`,
-`strudel.b-cdn.net` and `shabda.ndre.gr`. They serve the `github:`, `bubo:`
-and `shabda:` shorthands and the default banks. `--strict-sample-origins`
-removes them, restoring the inert policy in which nothing loads without an
+The command line allows four built-in domains: `raw.githubusercontent.com`,
+`strudel.b-cdn.net`, `shabda.ndre.gr` and `cdn.freesound.org`. They serve the
+`github:`, `bubo:` and `shabda:` shorthands, the default banks, and the
+freesound sounds that shared scores name. `--strict-sample-origins` removes
+them, restoring the inert policy in which nothing loads without an
 explicit source. Embedders get the inert policy by default and opt in with
 `ScoreSampleAccess::permit_builtin_sources` and
 `ScoreSampleAccess::permit_source`.
@@ -113,10 +115,11 @@ request. The source is checked before the cache is read, so a score with no
 source for a URL cannot read bytes that another score left.
 
 The Studio Permissions page gives the same sources and a local root. The page
-adds to the command line. It can turn a built-in source off, but not on over
-`--strict-sample-origins`. A root from `--allow-local-samples` is used instead
-of the root of the page. Studio keeps these choices in `studio.json`. Its
-try row loads one address once under the same policy and keeps nothing.
+adds to the command line and does not list the built-in sources. A refused
+file puts its folder on the page, turned off. An edit of a row must still
+allow what the row named, so a typing error cannot allow a different site. A
+root from `--allow-local-samples` is used instead of the root of the page.
+Studio keeps these choices in `studio.json`.
 
 ### Local root
 

@@ -141,7 +141,7 @@ may read. These are the folders that local samples use, with the same rules:
   write `s0.initVideo('loop.webm')`. No flag is needed.
 - The folder granted with `--allow-local-samples`, the one that
   `samples('local:')` reads. Studio reads it after the set folder. In
-  Studio, the `local folder` row of Settings > Permissions grants it too.
+  Studio, the `local:` row of Settings > Permissions grants it too.
 
 ```sh
 rustel studio set/ --allow-local-samples ~/visuals
@@ -153,9 +153,10 @@ set folder or a grant, a local path is refused.
 
 ### Web addresses
 
-An address loads only from an allowed source, as a sample does. Settings ▸
-Permissions lists the sources and adds one. On the command line, allow a
-domain or an address:
+An address loads only from an allowed source, as a sample does. In Studio, a
+refused address puts its folder on Settings ▸ Permissions. Enter allows the
+folder, and `e` cuts it down to a domain. On the command line, allow a domain
+or an address:
 
 ```sh
 rustel studio set/ --allow-sample-origin images.example
@@ -180,11 +181,7 @@ H.264, H.265, AV1 and 4:4:4 VP9 do not play: no decoder for them is pure
 Rust and complete. A VP9 file that uses segmentation or reference scaling,
 as some real-time encoders write, can also fail. MP4 files do not play, even
 with VP9 inside: their demuxer can be made to ask for gigabytes of memory by
-a small file. Convert such a file to VP9 in WebM with:
-
-```sh
-ffmpeg -i input.mp4 -c:v libvpx-vp9 -pix_fmt yuv420p -an output.webm
-```
+a small file.
 
 An image may be 16 MiB and a video 64 MiB, read or downloaded. A picture may
 be 2048 pixels per edge and 4,194,304 pixels. A video holds its whole file in
