@@ -311,17 +311,13 @@ impl Default for StudioConfig {
 pub struct SampleGrants {
     /// The sources allowed as `--allow-sample-origin` allows one.
     pub sources: Vec<String>,
-    /// The built-in sources turned off, as `--strict-sample-origins` turns
-    /// off all of them.
-    pub builtins_off: Vec<String>,
     /// The folder `samples('local:')` reads, as `--allow-local-samples`
     /// names one.
     pub local_root: Option<std::path::PathBuf>,
 }
 
 /// What `session` permits a score to read, with the page's `grants` added.
-/// The page can turn a built-in source off but not on over the command
-/// line, and a folder from the command line wins over its own.
+/// A folder from the command line wins over the page's own.
 pub(super) fn sample_access(
     session: &SessionConfig,
     grants: &SampleGrants,
@@ -329,11 +325,6 @@ pub(super) fn sample_access(
     // A clone shares the policy's record of refused sources, which the
     // page reads.
     let mut access = session.score_sample_access.clone();
-    for builtin in &grants.builtins_off {
-        if let Ok(rule) = rustel_runtime::SourceRule::parse(builtin) {
-            access.revoke_source(&rule);
-        }
-    }
     for source in &grants.sources {
         // The page keeps only sources that the runtime read.
         let _ = access.permit_source(source);

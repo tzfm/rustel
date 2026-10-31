@@ -834,9 +834,7 @@ impl App {
                 SetPrompt::SetsFolder
                     | SetPrompt::RecordingsFolder
                     | SetPrompt::LocalSampleFolder
-                    | SetPrompt::AllowSource
-                    | SetPrompt::TrySource
-                    | SetPrompt::TrustScriptOrigin
+                    | SetPrompt::EditSource
                     | SetPrompt::VimMappingsPath
                     | SetPrompt::AddSampleSource
                     | SetPrompt::EditSampleSource(_)
@@ -860,9 +858,7 @@ impl App {
             SetPrompt::SetsFolder
                 | SetPrompt::RecordingsFolder
                 | SetPrompt::LocalSampleFolder
-                | SetPrompt::AllowSource
-                | SetPrompt::TrySource
-                | SetPrompt::TrustScriptOrigin
+                | SetPrompt::EditSource
                 | SetPrompt::VimMappingsPath
                 | SetPrompt::AddSampleSource
                 | SetPrompt::EditSampleSource(_)
@@ -952,22 +948,12 @@ impl App {
                 picker.offer(&shorten_home(&folder));
                 picker
             }
-            SetPrompt::AllowSource => {
-                let mut picker = FilePicker::text("allow a source", "lets scores load from it");
+            SetPrompt::EditSource => {
+                let mut picker = FilePicker::text("edit a source", "allows it");
                 picker.label = "source";
-                picker
-            }
-            SetPrompt::TrySource => {
-                let mut picker = FilePicker::text("try an address", "says if it loads");
-                picker.label = "address";
-                if let Some(tried) = &self.tried_source {
-                    picker.offer(&tried.address);
+                if let Some(rule) = &self.editing_source {
+                    picker.set_path(rule);
                 }
-                picker
-            }
-            SetPrompt::TrustScriptOrigin => {
-                let mut picker = FilePicker::text("trust a script origin", "lets its scripts run");
-                picker.label = "origin";
                 picker
             }
             SetPrompt::VimMappingsPath => {
@@ -1045,16 +1031,9 @@ impl App {
                 "local samples folder - type a path, or Tab to browse and Enter on . · Esc back"
                     .into()
             }
-            SetPrompt::AllowSource => {
-                "allow a source - a domain such as example.com, or an address such as https://example.com/kits/ · Enter allows · Esc back"
+            SetPrompt::EditSource => {
+                "edit a source - cut it down to a domain, such as github.com, to allow all of it · Enter allows · Esc back"
                     .into()
-            }
-            SetPrompt::TrySource => {
-                "try an address - the full address of a sample, map, image or video · Enter tries · Esc back"
-                    .into()
-            }
-            SetPrompt::TrustScriptOrigin => {
-                "trust a script origin - such as https://example.com · Enter trusts · Esc back".into()
             }
             SetPrompt::VimMappingsPath => {
                 "Vim mappings path - type a full path · Enter keeps · Esc back".into()
@@ -1129,11 +1108,7 @@ impl App {
                 SetPrompt::SetsFolder => self.choose_sets_folder(&path),
                 SetPrompt::RecordingsFolder => self.choose_recordings_folder(&path),
                 SetPrompt::LocalSampleFolder => self.choose_local_sample_folder(&path),
-                SetPrompt::AllowSource => self.allow_typed_source(&path.to_string_lossy()),
-                SetPrompt::TrySource => self.try_typed_address(&path.to_string_lossy()),
-                SetPrompt::TrustScriptOrigin => {
-                    self.trust_typed_origin(&path.to_string_lossy());
-                }
+                SetPrompt::EditSource => self.edit_typed_source(&path.to_string_lossy()),
                 SetPrompt::VimMappingsPath => {
                     if path.is_absolute() {
                         self.close_set_prompt();
@@ -2064,12 +2039,9 @@ pub(super) enum SetPrompt {
     RecordingsFolder,
     /// The folder `samples('local:')` reads, for the permissions page.
     LocalSampleFolder,
-    /// A domain or an address to allow, for the permissions page.
-    AllowSource,
-    /// An address to try, for the permissions page.
-    TrySource,
-    /// An origin to trust for scripts, for the permissions page.
-    TrustScriptOrigin,
+    /// A source of the permissions page, to cut down to its domain. Which
+    /// one is in `editing_source`.
+    EditSource,
     VimMappingsPath,
     /// A folder of samples, or a pack's address, to import for every set.
     AddSampleSource,

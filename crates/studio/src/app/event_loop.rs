@@ -230,7 +230,6 @@ impl App {
         self.send_sample_grants();
         self.send_csound();
         self.note_refused_samples();
-        self.poll_tried_source();
         // A permit that unblocked a refused update re-runs it here, once
         // the sends above have put the permission in the engine's hands -
         // a re-run ahead of them would be refused by the old state.

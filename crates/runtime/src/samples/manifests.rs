@@ -313,6 +313,7 @@ impl ManifestContext {
     ) -> Result<(), String> {
         budget.check()?;
         let allowed_root = access.local_root.as_ref().ok_or_else(|| {
+            access.note_local_refused();
             "samples('local:') requires a host-selected local sample root (--allow-local-samples, or the Studio Permissions page)".to_owned()
         })?;
         let allowed_path = allowed_root.path();

@@ -375,9 +375,6 @@ pub struct StudioPrefs {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub allowed_sources: Vec<String>,
-    /// The built-in sources the player turned off.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub builtin_sources_off: Vec<String>,
     /// The folder `samples('local:')` and relative Hydra paths read, as
     /// `--allow-local-samples` does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -674,7 +671,6 @@ impl StudioPrefs {
     pub fn sample_grants(&self) -> super::engine::SampleGrants {
         super::engine::SampleGrants {
             sources: self.allowed_sources.clone(),
-            builtins_off: self.builtin_sources_off.clone(),
             local_root: self.local_sample_root.as_ref().map(PathBuf::from),
         }
     }

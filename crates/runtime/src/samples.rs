@@ -35,7 +35,7 @@ mod rules;
 pub(crate) use access::read_local_media;
 use access::*;
 pub(crate) use access::{js_round, sound_index};
-pub use rules::{BUILTIN_SOURCES, SourceRule};
+pub use rules::{BUILTIN_SOURCES, LOCAL_FILES, SourceRule};
 mod cache;
 pub(crate) use cache::fetch_located;
 use cache::*;

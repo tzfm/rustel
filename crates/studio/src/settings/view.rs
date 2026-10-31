@@ -694,146 +694,125 @@ pub(super) fn render_keybinds(
     }
 }
 
-/// What a row of the permissions page names, after its mark.
-fn permission_label(row: &PermissionRow) -> std::borrow::Cow<'_, str> {
+/// What a row of the permissions page names.
+fn permission_label(row: &PermissionRow) -> String {
     match row {
-        PermissionRow::Source { rule, .. } => rule.into(),
-        PermissionRow::AddSource => "Add a domain or address…".into(),
-        PermissionRow::TrySource(None) => "Try an address…".into(),
-        PermissionRow::TrySource(Some(tried)) => tried.address.as_str().into(),
+        PermissionRow::Origin { origin, .. } => origin.clone(),
+        PermissionRow::Source { rule, .. } => rule.clone(),
         PermissionRow::LocalFolder {
             folder: Some(folder),
             ..
-        } => folder.into(),
-        PermissionRow::LocalFolder { fixed: true, .. } => {
-            "folder from --allow-local-samples".into()
-        }
-        PermissionRow::LocalFolder { .. } => "no folder".into(),
-        PermissionRow::Origin { origin, .. } => origin.into(),
-        PermissionRow::AddOrigin => "Add a script origin…".into(),
+        } => format!("local: {folder}"),
+        PermissionRow::LocalFolder { fixed: true, .. } => "local: --allow-local-samples".into(),
+        PermissionRow::LocalFolder { .. } => "local: no folder".into(),
         PermissionRow::Csound { .. } => "native orchestras".into(),
     }
 }
 
-/// The mark before a row's label: on, off, a row that adds, or the try
-/// row.
-fn permission_mark(row: &PermissionRow) -> &'static str {
+/// What a row permits, so a script origin and a sample source with the
+/// same name read apart.
+fn permission_kind(row: &PermissionRow) -> &'static str {
     match row {
-        PermissionRow::AddSource | PermissionRow::AddOrigin => "+",
-        PermissionRow::TrySource(_) => "?",
-        row if row.allowed() => super::super::terminal::symbol("✓"),
-        _ => super::super::terminal::symbol("✗"),
+        PermissionRow::Source { .. } | PermissionRow::LocalFolder { .. } => "samples",
+        PermissionRow::Origin { .. } => "scripts",
+        PermissionRow::Csound { .. } => "csound",
     }
 }
 
-/// What a built-in source serves.
-fn builtin_serves(rule: &str) -> &'static str {
-    match rule {
-        "raw.githubusercontent.com" => "github: bubo:",
-        "shabda.ndre.gr" => "shabda:",
-        _ => "default banks",
+/// The permissions page: one row a source, an origin or a switch, and
+/// what the keys do below the list.
+pub(super) fn render_permissions(
+    view: &SettingsSheetView<'_>,
+    panel: Rect,
+    rows: Rect,
+    buffer: &mut Buffer,
+) {
+    let theme = view.theme;
+    let width = usize::from(rows.width);
+    let shown = usize::from(rows.height).max(1);
+    let first = view.sheet.first_row(shown, view.permissions.len());
+    if view.permissions.is_empty() {
+        buffer.set_stringn(
+            rows.x,
+            rows.y,
+            "  none yet · a refused sample, import or orchestra puts its row here",
+            width,
+            Style::default().fg(theme.muted),
+        );
     }
-}
-
-/// What the row says after its label.
-fn permission_note(row: &PermissionRow) -> String {
-    match row {
-        PermissionRow::Source {
-            fixed: true,
-            builtin: true,
-            ..
-        } => "built in · off for this run (--strict-sample-origins)".into(),
-        PermissionRow::Source { fixed: true, .. } => "--allow-sample-origin · this run".into(),
-        PermissionRow::Source {
-            rule,
-            builtin: true,
-            allowed: true,
-            ..
-        } => format!("built in · {}", builtin_serves(rule)),
-        PermissionRow::Source { builtin: true, .. } => "built in · off".into(),
-        PermissionRow::Source { allowed: false, .. }
-        | PermissionRow::Origin { allowed: false, .. } => "blocked · Enter allows".into(),
-        PermissionRow::Source { rule, .. } if rule.contains("://") => {
-            "this address and below".into()
-        }
-        PermissionRow::Source { .. } => "domain".into(),
-        PermissionRow::TrySource(Some(tried)) => match &tried.verdict {
-            TryVerdict::Refused { domain, folder } => {
-                let mut note = "not allowed".to_owned();
-                if let Some(domain) = domain {
-                    note.push_str(&format!(" · a allows {domain}"));
-                }
-                if let Some(folder) = folder {
-                    note.push_str(&format!(" · u allows only {folder}"));
-                }
-                note
-            }
-            TryVerdict::Loading { by } => format!("allowed by {by} · loading…"),
-            TryVerdict::Loaded { by, what } => format!("allowed by {by} · {what}"),
-            TryVerdict::Failed { by, why } => format!("allowed by {by} · does not load: {why}"),
-        },
-        PermissionRow::LocalFolder { fixed: true, .. } => "--allow-local-samples · this run".into(),
-        PermissionRow::LocalFolder {
-            folder: Some(_), ..
-        } => "samples('local:') and Hydra files".into(),
-        PermissionRow::LocalFolder { .. } => "Enter chooses one".into(),
-        PermissionRow::Csound { allowed: true } => "this run only".into(),
-        PermissionRow::Csound { .. } => "off · this run only".into(),
-        PermissionRow::AddSource
-        | PermissionRow::TrySource(None)
-        | PermissionRow::Origin { .. }
-        | PermissionRow::AddOrigin => String::new(),
+    let label_width = view
+        .permissions
+        .iter()
+        .map(|row| permission_label(row).width())
+        .max()
+        .unwrap_or(0);
+    for (offset, (index, row)) in view
+        .permissions
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(shown)
+        .enumerate()
+    {
+        let selected = index == view.sheet.selected;
+        let marker = if selected {
+            super::super::terminal::symbol("▸")
+        } else {
+            " "
+        };
+        let allowed = row.allowed();
+        let state = if allowed { "on" } else { "off" };
+        let style = if selected {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if allowed {
+            Style::default().fg(theme.foreground)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        buffer.set_stringn(
+            rows.x,
+            rows.y + offset as u16,
+            format!(
+                "{marker} {:<label_width$}  {:<7}  {state}",
+                permission_label(row),
+                permission_kind(row)
+            ),
+            width,
+            style,
+        );
     }
-}
-
-/// What the keys do on the selected row.
-fn permission_keys(row: Option<&PermissionRow>) -> &'static str {
-    match row {
+    // The keys lead, as on every other page: the footer often has room
+    // for one line, and a player who cannot see "Enter allows" cannot
+    // work the page.
+    let selected = view.permissions.get(view.sheet.selected);
+    let keys = match selected {
         Some(
             PermissionRow::Source { fixed: true, .. }
             | PermissionRow::LocalFolder { fixed: true, .. },
         ) => "set on the command line for this run · Tab pages",
-        Some(PermissionRow::Source {
-            builtin: true,
-            allowed: true,
-            ..
-        }) => "Space off · Tab pages",
-        Some(PermissionRow::Source { builtin: true, .. }) => "Enter or Space on · Tab pages",
-        Some(PermissionRow::AddSource) => "Enter adds a domain or address · Tab pages",
-        Some(PermissionRow::TrySource(Some(TriedSource {
-            verdict:
-                TryVerdict::Refused {
-                    domain: Some(_),
-                    folder: Some(_),
-                },
-            ..
-        }))) => "a allows the domain · u allows only the folder · Enter tries another · Tab pages",
-        Some(PermissionRow::TrySource(Some(TriedSource {
-            verdict: TryVerdict::Refused {
-                domain: Some(_), ..
-            },
-            ..
-        }))) => "a allows it · Enter tries another · Tab pages",
-        Some(PermissionRow::TrySource(_)) => "Enter tries an address · Tab pages",
+        Some(PermissionRow::Source { allowed: true, .. }) => {
+            "e edits · ←/→/Space off · d removes · Tab pages"
+        }
+        Some(PermissionRow::Source { .. }) => {
+            "Enter allows · e edits · ←/→/Space on/off · d dismisses · Tab pages"
+        }
         Some(PermissionRow::LocalFolder {
             folder: Some(_), ..
         }) => "Enter chooses another · d forgets it · Tab pages",
         Some(PermissionRow::LocalFolder { .. }) => "Enter chooses a folder · Tab pages",
-        Some(PermissionRow::AddOrigin) => "Enter adds a script origin · Tab pages",
-        Some(row) if row.allowed() => "Space off · d removes · Tab pages",
-        Some(_) => "Enter allows · Space on/off · d dismisses · Tab pages",
+        Some(row) if row.allowed() => "←/→/Space off · d removes · Tab pages",
+        Some(_) => "Enter allows · ←/→/Space on/off · d dismisses · Tab pages",
         None => "Tab pages",
-    }
-}
-
-/// What the selected row's section is for.
-fn permission_explain(row: Option<&PermissionRow>) -> &'static str {
-    match row {
-        Some(PermissionRow::Source { .. } | PermissionRow::AddSource) => {
-            "samples(), images and videos load only from these sources. A domain allows https from it and its subdomains. An address allows only what starts with it. Plain http and this computer need an address."
+    };
+    let says = match selected {
+        // A domain holds no slash; an address always does.
+        Some(PermissionRow::Source { rule, .. }) if !rule.contains('/') => {
+            "samples(), images and videos load over https from this domain and its subdomains."
         }
-        Some(PermissionRow::TrySource(_)) => {
-            "see which source allows an address. An allowed address loads once, and nothing is kept."
+        Some(PermissionRow::Source { .. }) => {
+            "samples(), images and videos load from this address and below. e cuts it down to a domain, such as github.com, to allow all of it."
         }
         Some(PermissionRow::LocalFolder { .. }) => {
             "samples('local:...') and a Hydra file outside the set read this folder and nothing outside it."
@@ -844,106 +823,8 @@ fn permission_explain(row: Option<&PermissionRow>) -> &'static str {
         _ => {
             "a score loads a script with await import('https://...') only from a trusted origin. The script runs as setup code before the score."
         }
-    }
-}
-
-/// The permissions page: one boxed group a section, one row a source, a
-/// folder, an origin or a switch, and what the keys do below the list.
-pub(super) fn render_permissions(
-    view: &SettingsSheetView<'_>,
-    panel: Rect,
-    rows: Rect,
-    buffer: &mut Buffer,
-) {
-    let theme = view.theme;
-    let width = usize::from(rows.width);
-    let shown = usize::from(rows.height).max(1);
-    let lines = permission_lines(view.sheet.permission_counts);
-    let first = view.sheet.first_choice(shown, &lines);
-    // A long address on the try row must not push every note off the
-    // page: the label column stops at half the row.
-    let label_width = view
-        .permissions
-        .iter()
-        .map(|row| permission_label(row).width())
-        .max()
-        .unwrap_or(0)
-        .min(width.saturating_sub(8) / 2);
-    let border = Style::default().fg(theme.muted);
-    for (offset, line) in lines.iter().skip(first).take(shown).enumerate() {
-        let y = rows.y + offset as u16;
-        let index = match line {
-            SourceLine::Header { section, first } => {
-                if offset + 1 == shown {
-                    continue;
-                }
-                let rule = if *first {
-                    GroupRule::Opens(section.title())
-                } else {
-                    GroupRule::Between(section.title())
-                };
-                draw_group_border(buffer, rows, y, rule, theme);
-                continue;
-            }
-            SourceLine::Footer => {
-                draw_group_border(buffer, rows, y, GroupRule::Closes, theme);
-                continue;
-            }
-            SourceLine::Row(index) => *index,
-            _ => continue,
-        };
-        let Some(row) = view.permissions.get(index) else {
-            continue;
-        };
-        buffer.set_stringn(rows.x, y, "│", 1, border);
-        buffer.set_stringn(rows.right() - 1, y, "│", 1, border);
-        let selected = index == view.sheet.selected;
-        let marker = if selected {
-            super::super::terminal::symbol("▸")
-        } else {
-            " "
-        };
-        let label = permission_label(row);
-        let label = if label.width() > label_width {
-            let mut cut: String = label.chars().take(label_width.saturating_sub(1)).collect();
-            cut.push('…');
-            cut
-        } else {
-            label.into_owned()
-        };
-        let style = if selected {
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD)
-        } else if row.allowed() {
-            Style::default().fg(theme.foreground)
-        } else {
-            Style::default().fg(theme.muted)
-        };
-        let pad = label_width.saturating_sub(label.width());
-        buffer.set_stringn(
-            rows.x + 1,
-            y,
-            format!(
-                "{marker} {} {label}{:pad$}  {}",
-                permission_mark(row),
-                "",
-                permission_note(row)
-            )
-            .trim_end(),
-            width.saturating_sub(2),
-            style,
-        );
-    }
-    // The keys lead, as on every other page: the footer often has room
-    // for one line, and a player who cannot see "Enter allows" cannot
-    // work the page.
-    let selected = view.permissions.get(view.sheet.selected);
-    let text = format!(
-        "{} · {}",
-        permission_keys(selected),
-        permission_explain(selected)
-    );
+    };
+    let text = format!("{keys} · {says}");
     let lines = wrap_words(&text, width);
     let height = usize::from(
         panel

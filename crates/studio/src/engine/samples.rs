@@ -1119,25 +1119,16 @@ mod tests {
         let github = rustel_runtime::SourceRule::parse("raw.githubusercontent.com").unwrap();
         let mut engine = StudioEngine::new(StudioConfig {
             session: host,
-            sample_grants: SampleGrants {
-                builtins_off: vec![github.to_string()],
-                ..SampleGrants::default()
-            },
             ..StudioConfig::default()
         })
         .expect("engine");
-        let access = || engine.session.config().score_sample_access.clone();
-        assert!(
-            !access().sources().contains(&github),
-            "the page turned the built-in off"
-        );
 
         engine.set_sample_grants(SampleGrants {
             sources: vec!["http://kit.invalid".to_owned()],
             ..SampleGrants::default()
         });
         let granted = engine.session.config().score_sample_access.clone();
-        assert!(granted.sources().contains(&github), "the built-in is back");
+        assert!(granted.sources().contains(&github), "the built-ins stay");
         assert_eq!(
             granted.source_for("http://kit.invalid/kit.json"),
             Ok(Some(

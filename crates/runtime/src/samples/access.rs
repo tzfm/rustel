@@ -16,17 +16,13 @@ impl ScoreSampleAccess {
     }
 
     /// Allow the domains of [`BUILTIN_SOURCES`], which the `github:`,
-    /// `bubo:` and `shabda:` shorthands and the default banks read.
+    /// `bubo:` and `shabda:` shorthands, the default banks and freesound
+    /// sounds read.
     pub fn permit_builtin_sources(&mut self) {
         for source in BUILTIN_SOURCES {
             self.permit_source(source)
                 .expect("a built-in source is a domain");
         }
-    }
-
-    /// Take one source back. The other sources and the local root stay.
-    pub fn revoke_source(&mut self, rule: &SourceRule) {
-        self.sources.retain(|kept| kept != rule);
     }
 
     /// The sources this policy allows, in the order they were given.
@@ -54,33 +50,22 @@ impl ScoreSampleAccess {
     }
 
     /// The sources this policy refused since the last call, newest last,
-    /// each written as the [`SourceRule`] that would allow it.
+    /// each written as the [`SourceRule`] that allows the refused file's
+    /// folder, or as [`LOCAL_FILES`] for `local:` files with no folder.
     pub fn take_refused_sources(&self) -> Vec<String> {
         self.refused.take()
     }
 
-    fn note_refused(&self, url: &Url) {
-        // An opaque address, such as a `data:` URL, has no source to allow.
-        if let Some(rule) = SourceRule::for_url(url) {
-            self.refused.note(rule.to_string());
-        }
+    /// Note that a score asked for `local:` files with no folder chosen.
+    pub(super) fn note_local_refused(&self) {
+        self.refused.note(LOCAL_FILES.to_owned());
     }
 
-    /// Load `raw` once under this policy, as a score would, and say what
-    /// came back: a sample map and how many sounds it names, audio, an
-    /// image, a video, or other data. Nothing is cached. The Permissions
-    /// page asks this to check a source before a score needs it.
-    pub fn try_address(&self, raw: &str) -> Result<String, String> {
-        const TRY_LIMIT: usize = 64 * 1024 * 1024;
-        let (url, access) = self.approve_remote(raw)?;
-        let bytes = fetch_score_source_with_budget(
-            &url,
-            &access,
-            TRY_LIMIT,
-            &sample_fetch::FetchBudget::for_one_fetch(),
-            || {},
-        )?;
-        Ok(describe_loaded(&bytes))
+    fn note_refused(&self, url: &Url) {
+        // An opaque address, such as a `data:` URL, has no source to allow.
+        if let Some(rule) = SourceRule::folder_of(url) {
+            self.refused.note(rule.to_string());
+        }
     }
 
     pub fn is_denied(&self) -> bool {
@@ -95,7 +80,7 @@ impl ScoreSampleAccess {
         }
         let Some(rule) = self.sources.iter().find(|rule| rule.allows(&parsed)) else {
             self.note_refused(&parsed);
-            let grant = SourceRule::for_url(&parsed)
+            let grant = SourceRule::folder_of(&parsed)
                 .map(|rule| format!(" Allow it with --allow-sample-origin {rule} or on the Studio Permissions page."))
                 .unwrap_or_default();
             return Err(format!(
@@ -137,6 +122,7 @@ impl ScoreSampleAccess {
         media: sample_fetch::HydraMedia,
     ) -> Result<Vec<u8>, String> {
         let root = self.local_root.as_ref().ok_or_else(|| {
+            self.note_local_refused();
             format!(
                 "{} {path:?} is a local file; keep it in the set folder, or grant its folder with --allow-local-samples or on the Studio Permissions page",
                 media.label()
@@ -157,6 +143,7 @@ impl ScoreSampleAccess {
         match read_source(&source, GITHUB_SAMPLE_MANIFEST) {
             SampleSource::LocalFolder(_) => {
                 if self.local_root.is_none() {
+                    self.note_local_refused();
                     return Err(
                         "samples('local:') requires a host-selected local sample root (--allow-local-samples, or the Studio Permissions page)".to_owned(),
                     );
@@ -441,43 +428,6 @@ pub(super) fn fetch_score_source_with_budget(
             unreachable!("redirect loop returns on success or refusal")
         }
     }
-}
-
-/// What a loaded body is, in a few words, with its size: a JSON object is a
-/// sample map, and a file is known by its first bytes.
-fn describe_loaded(bytes: &[u8]) -> String {
-    if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(bytes) {
-        // `_base` and the other `_` keys are settings, not sounds.
-        let sounds = map.keys().filter(|key| !key.starts_with('_')).count();
-        let noun = if sounds == 1 { "sound" } else { "sounds" };
-        return format!("sample map, {sounds} {noun}");
-    }
-    let head = |at: usize, magic: &[u8]| bytes.get(at..at + magic.len()) == Some(magic);
-    let kind = if head(0, b"RIFF") && head(8, b"WAVE") {
-        "WAV audio"
-    } else if head(0, b"ID3") || matches!(bytes, [0xff, second, ..] if second & 0xe0 == 0xe0) {
-        "MP3 audio"
-    } else if head(0, b"OggS") {
-        "Ogg audio"
-    } else if head(0, b"fLaC") {
-        "FLAC audio"
-    } else if head(0, b"\x89PNG") || head(0, b"GIF8") || (head(0, b"RIFF") && head(8, b"WEBP")) {
-        "image"
-    } else if head(0, &[0xff, 0xd8, 0xff]) {
-        "JPEG image"
-    } else if head(0, &[0x1a, 0x45, 0xdf, 0xa3]) {
-        "WebM video"
-    } else if head(4, b"ftyp") {
-        "MP4 video"
-    } else {
-        "data"
-    };
-    let size = match bytes.len() {
-        small if small < 1024 => format!("{small} B"),
-        kilo if kilo < 1024 * 1024 => format!("{} KB", kilo / 1024),
-        mega => format!("{:.1} MB", mega as f64 / (1024.0 * 1024.0)),
-    };
-    format!("{kind}, {size}")
 }
 
 impl Shorthand {
@@ -816,27 +766,8 @@ mod tests {
     use super::*;
 
     /// A tried address says what it loaded in words a player reads.
-    #[test]
-    fn a_loaded_body_is_named_by_its_kind_and_size() {
-        assert_eq!(
-            describe_loaded(br#"{"_base": "https://a.example/", "bd": ["bd.wav"], "sd": []}"#),
-            "sample map, 2 sounds"
-        );
-        let mut wav = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
-        wav.resize(3000, 0);
-        assert_eq!(describe_loaded(&wav), "WAV audio, 2 KB");
-        assert_eq!(describe_loaded(b"ID3\x04"), "MP3 audio, 4 B");
-        assert_eq!(describe_loaded(b"\x89PNG\r\n"), "image, 6 B");
-        assert_eq!(describe_loaded(b"\0\0\0\x20ftypisom"), "MP4 video, 12 B");
-        assert_eq!(describe_loaded(b"<html>"), "data, 6 B");
-        assert_eq!(
-            describe_loaded(&vec![0; 3 * 1024 * 1024 / 2]),
-            "data, 1.5 MB"
-        );
-    }
-
-    /// A refusal names the source that would allow it once, for every clone
-    /// of the policy, and allowing that source lets the same URL through.
+    /// A refusal names the folder of the refused file once, for every clone
+    /// of the policy, and allowing that folder lets the same URL through.
     #[test]
     fn refused_sources_are_noted_once_and_allowing_one_clears_the_refusal() {
         let mut access = ScoreSampleAccess::denied();
@@ -846,7 +777,7 @@ mod tests {
             "http://samples.example/a.json",
             "http://samples.example/b.json",
             "https://127.0.0.1/kit.json",
-            "https://cdn.public.example/kit.json",
+            "https://cdn.public.example/kits/808/kit.json",
         ] {
             assert!(clone.approve_remote(url).is_err(), "{url}");
         }
@@ -859,8 +790,8 @@ mod tests {
             access.take_refused_sources(),
             [
                 "http://samples.example",
-                "https://127.0.0.1",
-                "cdn.public.example"
+                "127.0.0.1/",
+                "cdn.public.example/kits/808/"
             ]
         );
         assert!(access.take_refused_sources().is_empty(), "taken once");
@@ -873,14 +804,6 @@ mod tests {
                 .approve_remote("http://samples.example/a.json")
                 .is_ok()
         );
-        let github = SourceRule::parse("raw.githubusercontent.com").unwrap();
-        access.revoke_source(&github);
-        assert!(
-            access
-                .approve_remote("https://raw.githubusercontent.com/a/b/main/strudel.json")
-                .is_err()
-        );
-        assert_eq!(access.take_refused_sources(), ["raw.githubusercontent.com"]);
         assert_eq!(
             access.source_for("https://cdn.strudel.b-cdn.net/x.wav"),
             Ok(Some(&SourceRule::parse("strudel.b-cdn.net").unwrap()))
@@ -889,6 +812,10 @@ mod tests {
             access.take_refused_sources().is_empty(),
             "asking notes nothing"
         );
+
+        // `local:` files with no folder chosen are noted as such.
+        assert!(access.preapprove_effect("\"local:kit\"").is_err());
+        assert_eq!(access.take_refused_sources(), [LOCAL_FILES]);
     }
 
     #[cfg(test)]

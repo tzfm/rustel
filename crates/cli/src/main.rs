@@ -1393,9 +1393,10 @@ struct SourceInput {
 struct SampleAccessArgs {
     /// Let scores load samples, images and videos from this source. A
     /// domain, such as example.com, allows https from it and its
-    /// subdomains. An address, such as https://example.com/kits/, allows
-    /// that folder only. Plain http and this computer need an address.
-    /// Repeatable. Redirects must stay inside the same source.
+    /// subdomains. An address, such as example.com/kits/, allows that
+    /// folder and below. Plain http needs the scheme, such as
+    /// http://localhost:8000/. Repeatable. Redirects must stay inside the
+    /// same source.
     #[arg(
         long = "allow-sample-origin",
         value_name = "SOURCE",

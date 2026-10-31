@@ -1,7 +1,7 @@
 //! The sources a score may load samples, images and videos from.
 //!
 //! A source is a domain, such as `example.com`, or an address, such as
-//! `https://example.com/kits/`. Nothing else loads: a server's own headers
+//! `example.com/kits/`. Nothing else loads: a server's own headers
 //! never widen the list.
 
 use url::{Host, Url};
@@ -16,15 +16,20 @@ pub const BUILTIN_SOURCES: &[&str] = &[
     "cdn.freesound.org",
 ];
 
+/// What [`crate::ScoreSampleAccess::take_refused_sources`] gives for a score
+/// that asked for `local:` files while the host chose no folder.
+pub const LOCAL_FILES: &str = "local:";
+
 /// One allowed source.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SourceRule {
     /// `example.com`: HTTPS from this domain and its subdomains, on the
     /// default port, at any path.
     Domain(String),
-    /// `https://example.com/kits/`: the addresses on this origin whose path
-    /// is `path` or below it. A path of `/` is the whole origin. This is
-    /// the only form that allows plain HTTP or a server on this computer.
+    /// `example.com/kits/`, which is `https://example.com/kits/`: the
+    /// addresses on this origin whose path is `path` or below it. A path of
+    /// `/` is the whole origin. This is the only form that allows plain
+    /// HTTP or a server on this computer.
     Address { origin: String, path: String },
 }
 
@@ -37,6 +42,10 @@ impl SourceRule {
         }
         if text.contains("://") {
             return Self::address(text);
+        }
+        // A path or a port makes an HTTPS address: `example.com/kits/`.
+        if text.contains(['/', ':']) {
+            return Self::address(&format!("https://{text}"));
         }
         Self::domain(text)
     }
@@ -99,29 +108,24 @@ impl SourceRule {
         }
     }
 
-    /// The source that allows `url` and the rest of its server: its
-    /// domain for HTTPS on the default port, otherwise its origin. `None`
-    /// for an address that no source can allow, such as a `data:` URL.
-    pub fn for_url(url: &Url) -> Option<Self> {
-        if !matches!(url.scheme(), "http" | "https") {
-            return None;
+    /// The address this source names: `https://example.com/` for a domain,
+    /// and the address itself otherwise.
+    pub fn url(&self) -> Option<Url> {
+        match self {
+            Self::Domain(domain) => Url::parse(&format!("https://{domain}/")).ok(),
+            Self::Address { origin, path } => Url::parse(&format!("{origin}{path}")).ok(),
         }
-        if url.scheme() == "https"
-            && url.port().is_none()
-            && let Some(Host::Domain(host)) = url.host()
-            && let Ok(domain) = Self::domain(host)
-        {
-            return Some(domain);
-        }
-        let origin = url.origin().ascii_serialization();
-        (origin != "null").then(|| Self::Address {
-            origin,
-            path: "/".to_owned(),
-        })
+    }
+
+    /// Whether this source allows the address `other` names, as a source
+    /// cut down from `other` does.
+    pub fn covers(&self, other: &Self) -> bool {
+        other.url().is_some_and(|url| self.allows(&url))
     }
 
     /// The source that allows `url`'s folder and nothing else on its
-    /// server: `https://a.example/kits/` for `https://a.example/kits/kick.wav`.
+    /// server: `a.example/kits/` for `https://a.example/kits/kick.wav`. `None`
+    /// for an address that no source can allow, such as a `data:` URL.
     pub fn folder_of(url: &Url) -> Option<Self> {
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             return None;
@@ -146,15 +150,28 @@ fn path_is_below(path: &str, folder: &str) -> bool {
 }
 
 impl std::fmt::Display for SourceRule {
-    /// The source as it is written: `example.com`, or the address with no
+    /// The source as it is written: `example.com`, `example.com/kits/` for
+    /// HTTPS on the default port, and the full address otherwise, with no
     /// slash after a bare origin.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Domain(domain) => f.write_str(domain),
-            Self::Address { origin, path } if path == "/" => f.write_str(origin),
-            Self::Address { origin, path } => write!(f, "{origin}{path}"),
+            Self::Address { origin, path } => match short_https(origin) {
+                Some(host) => write!(f, "{host}{path}"),
+                None if path == "/" => f.write_str(origin),
+                None => write!(f, "{origin}{path}"),
+            },
         }
     }
+}
+
+/// The host of an HTTPS origin on the default port, which a source can name
+/// without its scheme: `example.com` for `https://example.com`.
+fn short_https(origin: &str) -> Option<&str> {
+    let host = origin.strip_prefix("https://")?;
+    // An IPv6 host holds colons of its own; a port follows its bracket.
+    let after_ip6 = host.rsplit(']').next().unwrap_or(host);
+    (!after_ip6.contains(':')).then_some(host)
 }
 
 #[cfg(test)]
@@ -193,6 +210,7 @@ mod tests {
     #[test]
     fn an_address_allows_its_folder_and_nothing_beside_it() {
         let folder = rule("https://example.com/kits/");
+        assert_eq!(folder.to_string(), "example.com/kits/");
         assert!(folder.allows(&url("https://example.com/kits/808/bd.wav")));
         assert!(!folder.allows(&url("https://example.com/other/bd.wav")));
         assert!(!folder.allows(&url("https://cdn.example.com/kits/bd.wav")));
@@ -216,44 +234,80 @@ mod tests {
         for (text, says) in [
             ("", "write a domain"),
             ("localhost", "https://localhost/"),
-            ("example.com:8443", "Write the full address"),
-            ("example.com/kits", "Write the full address"),
             ("127.0.0.1", "Write the full address"),
             ("ftp://example.com/", "not an http or https address"),
             ("https://u:p@example.com/", "user name or password"),
             ("https://example.com/kit.json?x=1", "? or # part"),
+            ("example.com/kit.json#x", "? or # part"),
         ] {
             let error = SourceRule::parse(text).expect_err(text);
             assert!(error.contains(says), "{text}: {error}");
         }
     }
 
+    /// A path or a port without a scheme is an HTTPS address, and an
+    /// HTTPS address on the default port reads back without its scheme.
     #[test]
-    fn a_refused_address_suggests_its_domain_or_its_origin() {
-        let suggest = |text: &str| SourceRule::for_url(&url(text)).map(|rule| rule.to_string());
-        assert_eq!(
-            suggest("https://cdn.kit.example/a.wav").as_deref(),
-            Some("cdn.kit.example")
-        );
-        assert_eq!(
-            suggest("http://kit.example/a.wav").as_deref(),
-            Some("http://kit.example")
-        );
-        assert_eq!(
-            suggest("https://kit.example:8443/a.wav").as_deref(),
-            Some("https://kit.example:8443")
-        );
-        assert_eq!(
-            suggest("https://localhost/a.wav").as_deref(),
-            Some("https://localhost")
-        );
-        assert_eq!(suggest("data:audio/wav;base64,AAAA"), None);
+    fn a_path_or_a_port_without_a_scheme_is_https() {
+        for (text, written) in [
+            ("example.com/kits", "example.com/kits"),
+            ("https://example.com/kits/", "example.com/kits/"),
+            ("example.com:8443/kits/", "https://example.com:8443/kits/"),
+            ("example.com:8443", "https://example.com:8443"),
+            ("https://example.com", "example.com/"),
+            ("[::1]/kits/", "[::1]/kits/"),
+            ("http://example.com/kits/", "http://example.com/kits/"),
+        ] {
+            assert_eq!(rule(text).to_string(), written, "{text}");
+            assert_eq!(rule(written), rule(text), "{written} reads back");
+        }
+        let short = rule("github.com/me/kit/");
+        assert!(short.allows(&url("https://github.com/me/kit/raw/main/bd.wav")));
+        assert!(!short.allows(&url("http://github.com/me/kit/bd.wav")));
+        assert!(!short.allows(&url("https://raw.github.com/me/kit/bd.wav")));
+    }
 
-        let folder = SourceRule::folder_of(&url("https://kit.example/kits/808/bd.wav"));
+    /// A source cut down toward its domain covers the one it was. One that
+    /// moves to another host, another scheme or a narrower path does not.
+    #[test]
+    fn a_wider_source_covers_a_narrower_one() {
+        let folder = rule("github.com/me/kit/raw/main/");
+        for wider in [
+            "github.com/me/kit/raw/main/",
+            "github.com/me/",
+            "github.com",
+            "https://github.com",
+        ] {
+            assert!(rule(wider).covers(&folder), "{wider}");
+        }
+        for other in [
+            "gihtub.com",
+            "raw.github.com",
+            "http://github.com/me/",
+            "github.com/me/kit/raw/main/drums/",
+            "github.com:8443",
+        ] {
+            assert!(!rule(other).covers(&folder), "{other}");
+        }
+        assert!(!rule("github.com/me/").covers(&rule("github.com")));
+    }
+
+    #[test]
+    fn a_refused_file_suggests_its_folder() {
+        let folder = |text: &str| SourceRule::folder_of(&url(text)).map(|rule| rule.to_string());
         assert_eq!(
-            folder.map(|rule| rule.to_string()).as_deref(),
-            Some("https://kit.example/kits/808/")
+            folder("https://kit.example/kits/808/bd.wav").as_deref(),
+            Some("kit.example/kits/808/")
         );
+        assert_eq!(
+            folder("https://kit.example/bd.wav").as_deref(),
+            Some("kit.example/")
+        );
+        assert_eq!(
+            folder("http://localhost:8000/kit.json").as_deref(),
+            Some("http://localhost:8000")
+        );
+        assert_eq!(folder("data:audio/wav;base64,AAAA"), None);
     }
 
     #[test]
