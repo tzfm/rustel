@@ -33,10 +33,6 @@ pub(crate) const VIDEO_MEDIA_TYPES: &[&str] = &[
     "image/webp",
 ];
 
-/// What a refused file should become, as a command a musician can run.
-const CONVERT_HINT: &str =
-    "convert it with: ffmpeg -i input.mp4 -c:v libvpx-vp9 -pix_fmt yuv420p -an output.webm";
-
 /// Browsers show an animation frame with a delay of 10 ms or less for 100 ms.
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(10);
 const SHORT_FRAME_DELAY: Duration = Duration::from_millis(100);
@@ -107,9 +103,8 @@ fn container_pass(
     let stream = demuxer.video_stream()?;
     let mut decoder = decoder_for(stream.codec)?;
     let timebase = (stream.timebase.num, stream.timebase.den);
-    let undecodable = |error: oximedia_codec::CodecError| {
-        format!("Hydra video could not be decoded ({error}); {CONVERT_HINT}")
-    };
+    let undecodable =
+        |error: oximedia_codec::CodecError| format!("Hydra video could not be decoded ({error})");
     let mut first_pts = None;
     let mut frames = 0;
     let mut last = Duration::ZERO;
@@ -144,7 +139,7 @@ fn container_pass(
             }
             let (width, height, rgba) = raw_frame_rgba(&frame).map_err(|_| {
                 format!(
-                    "Hydra video frames are {:?}; only 8-bit 4:2:0 plays, {CONVERT_HINT}",
+                    "Hydra video frames are {:?}; only 8-bit 4:2:0 plays",
                     frame.format
                 )
             })?;
@@ -166,7 +161,7 @@ struct Demux(MatroskaDemuxer<MemorySource>);
 
 impl Demux {
     fn open(bytes: &Bytes) -> Result<Self, String> {
-        let refused = || format!("Hydra video is not WebM or Matroska; {CONVERT_HINT}");
+        let refused = || "Hydra video is not WebM or Matroska".to_owned();
         let format = oximedia_container::probe_format(bytes)
             .map_err(|_| refused())?
             .format;
@@ -175,9 +170,7 @@ impl Demux {
         }
         let mut demuxer = MatroskaDemuxer::new(MemorySource::new(bytes.clone()));
         pollster::block_on(demuxer.probe()).map_err(|error| {
-            format!(
-                "Hydra video could not be read ({error}); only VP8 and VP9 play, {CONVERT_HINT}"
-            )
+            format!("Hydra video could not be read ({error}); only VP8 and VP9 play")
         })?;
         Ok(Self(demuxer))
     }
@@ -224,9 +217,7 @@ fn decoder_for(codec: CodecId) -> Result<Box<dyn VideoDecoder>, String> {
             Box::new(oximedia_codec::vp9::Vp9Decoder::new(config).map_err(decoder_error)?)
         }
         other => {
-            return Err(format!(
-                "Hydra video uses {other}; only VP8 and VP9 play, {CONVERT_HINT}"
-            ));
+            return Err(format!("Hydra video uses {other}; only VP8 and VP9 play"));
         }
     };
     Ok(decoder)
@@ -319,9 +310,7 @@ fn animation_frames(bytes: &[u8], format: ImageFormat) -> Result<image::Frames<'
             decoder.into_frames()
         }
         _ => {
-            return Err(format!(
-                "Hydra video is not WebM or Matroska; {CONVERT_HINT}"
-            ));
+            return Err("Hydra video is not WebM or Matroska".to_owned());
         }
     };
     Ok(frames)
@@ -546,16 +535,15 @@ mod tests {
         let clip = include_bytes!("testdata/red_vp9.mp4").to_vec();
         let error = play(clip, &cancel, &mut |_, _, _| Ok(true)).expect_err("refused");
         assert!(error.contains("not WebM or Matroska"), "{error}");
-        assert!(error.contains("ffmpeg"), "{error}");
     }
 
     #[test]
-    fn a_file_that_is_not_a_video_says_how_to_convert_it() {
+    fn a_file_that_is_not_a_video_says_it_is_not_one() {
         let cancel = AtomicBool::new(false);
         let error = play(b"not a video at all".to_vec(), &cancel, &mut |_, _, _| {
             Ok(true)
         })
         .expect_err("refused");
-        assert!(error.contains("ffmpeg"), "{error}");
+        assert_eq!(error, "Hydra video is not WebM or Matroska");
     }
 }

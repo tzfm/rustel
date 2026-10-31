@@ -866,11 +866,11 @@ pub(super) const ENTRIES: &[ReferenceEntry] = &[
         "initImage",
         "inputs",
         "Fill an input from an image.",
-        "Loads an image into this input. Give a public HTTPS URL that allows CORS, or a path relative to the set folder, such as 'pics/cat.png'. Outside a set, a relative path reads the folder granted with --allow-local-samples. PNG, JPEG, GIF and WebP work. An animated file shows its first frame. Use initVideo() to play it.",
+        "Loads an image into this input. Give a web address that a source on the Permissions page allows, or a path relative to the set folder, such as 'pics/cat.png'. Outside a set, a relative path reads the folder granted with --allow-local-samples. PNG, JPEG, GIF and WebP work. An animated file shows its first frame. Use initVideo() to play it.",
         [param!(
             "url",
             "string",
-            "An HTTPS URL, or a relative path such as 'pics/cat.png'."
+            "A web address, or a relative path such as 'pics/cat.png'."
         )],
         "s0.initImage('https://upload.wikimedia.org/wikipedia/commons/2/26/YellowLabradorLooking_new.jpg')\nsrc(s0).out()"
     ),
@@ -878,11 +878,11 @@ pub(super) const ENTRIES: &[ReferenceEntry] = &[
         "initVideo",
         "inputs",
         "Fill an input from a video.",
-        "Plays a video into this input in a loop, without sound. Give a public HTTPS URL that allows CORS, or a path relative to the set folder, such as 'clips/loop.webm'. Outside a set, a relative path reads the folder granted with --allow-local-samples. WebM and MKV files with VP8 or VP9 video play, and so do animated GIF, PNG and WebP files. MP4 files, H.264, H.265 and AV1 do not. Convert those with: ffmpeg -i input.mp4 -c:v libvpx-vp9 -pix_fmt yuv420p -an output.webm",
+        "Plays a video into this input in a loop, without sound. Give a web address that a source on the Permissions page allows, or a path relative to the set folder, such as 'clips/loop.webm'. Outside a set, a relative path reads the folder granted with --allow-local-samples. WebM and MKV files with VP8 or VP9 video play, and so do animated GIF, PNG and WebP files. MP4 files, H.264, H.265 and AV1 do not play.",
         [param!(
             "url",
             "string",
-            "An HTTPS URL, or a relative path such as 'clips/loop.webm'."
+            "A web address, or a relative path such as 'clips/loop.webm'."
         )],
         "s0.initVideo('clips/loop.webm')\nsrc(s0).modulate(osc(4), 0.1).out()"
     ),

@@ -450,7 +450,7 @@ fn source_statement<'js>(
     }))))
 }
 
-/// The one string an image or video initialiser takes: an HTTPS URL, or a
+/// The one string an image or video initialiser takes: a web address, or a
 /// path relative to the set folder or the local sample root. The host checks
 /// which of these it may read.
 fn source_url<'js>(
