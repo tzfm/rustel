@@ -2284,6 +2284,7 @@ const REFERENCE_ROWS: &[Row] = &[
     Row::ReferenceCategory(Category::Bind),
     Row::ReferenceCategory(Category::Internals),
     Row::ReferenceCategory(Category::Kabelsalat),
+    Row::ReferenceCategory(Category::Hydra),
 ];
 
 /// Cache controls at the top of the Sources page, before imports and
@@ -2559,6 +2560,7 @@ impl Row {
             Self::ReferenceCategory(Category::Bind) => "bind & join",
             Self::ReferenceCategory(Category::Internals) => "pattern internals",
             Self::ReferenceCategory(Category::Kabelsalat) => "KabelSalat",
+            Self::ReferenceCategory(Category::Hydra) => "Hydra",
         }
     }
 
@@ -2663,6 +2665,9 @@ impl Row {
             Self::ReferenceCategory(Category::Kabelsalat) => {
                 "K() graphs, nodes and inputs · tag:kabelsalat lists them anyway"
             }
+            Self::ReferenceCategory(Category::Hydra) => {
+                "Hydra names, offered only in Hydra code · tag:hydra lists them there"
+            }
         }
     }
 }
@@ -2744,7 +2749,8 @@ pub enum SettingsPage {
     Vst,
     /// Which kinds of entry the reference and the suggestions offer.
     Reference,
-    /// What a score may reach: import origins, and native orchestras.
+    /// What a score may reach: import origins, sample origins, the local
+    /// folder, and native orchestras.
     Permissions,
     About,
 }
@@ -2840,8 +2846,8 @@ pub struct SettingsSheet {
     /// How many keybind rows the keybinds page is showing, for the same
     /// reason as `source_count`.
     pub keybind_count: usize,
-    /// How many rows the permissions page is showing: the trusted origins,
-    /// then the ones refused in this studio.
+    /// How many rows the permissions page is showing: the origins, the
+    /// switches and the local folder.
     pub permissions_count: usize,
     /// How many folders the player added on the vst page, for the same
     /// reason as `source_count`.
@@ -3005,6 +3011,9 @@ pub enum SettingsAction {
     ToggleRow(usize),
     /// Delete, Backspace or `d` on a row: take it off the page.
     ForgetRow(usize),
+    /// `e` on a source row: open it in a prompt, to cut it down to its
+    /// domain.
+    EditRow(usize),
     /// Ask before replacing all overrides with this terminal's defaults.
     AskResetKeybinds,
     /// The second Enter on the reset row confirmed replacing all overrides.
@@ -3040,10 +3049,10 @@ impl SettingsSheet {
         matches!(self.page, SettingsPage::Permissions)
     }
 
-    /// The arrows walk the rows and wrap. Enter permits, Space or either
+    /// The arrows walk the rows and wrap. Enter allows, Space or either
     /// sideways arrow flips a row where it stands, the way every switch
-    /// on the controls pages flips, and Delete, Backspace or `d` takes a
-    /// row off the page. Esc and Tab stay the sheet's.
+    /// on the controls pages flips, Delete, Backspace or `d` takes a row
+    /// off the page, and `e` edits a source. Esc and Tab stay the sheet's.
     fn permissions_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
         let len = self.permissions_count;
@@ -3065,6 +3074,7 @@ impl SettingsSheet {
             KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('d' | 'D') => {
                 SettingsAction::ForgetRow(at)
             }
+            KeyCode::Char('e' | 'E') => SettingsAction::EditRow(at),
             _ => SettingsAction::Ignored,
         }
     }
@@ -4413,8 +4423,8 @@ pub struct SettingsSheetView<'a> {
     pub mappings: [SlotView; MAPPING_SLOTS],
     /// The shortcut rows, as the keybinds page reads them.
     pub bindings: Vec<KeybindRow>,
-    /// The rows of the permissions page: the trusted origins, then the
-    /// refused, then the orchestra switch.
+    /// The rows of the permissions page: the script origins, the sample
+    /// origins, the CORS switch, the local folder, then the orchestra switch.
     pub permissions: Vec<PermissionRow>,
     /// The plugin folders and the two facts under them, as the vst page
     /// reads them.
@@ -4669,6 +4679,20 @@ pub enum PermissionRow {
         /// one key.
         allowed: bool,
     },
+    /// A source a score's `samples()`, images and videos load from, as
+    /// `--allow-sample-origin` allows one: an address such as
+    /// `github.com/me/kit/`, or a domain such as `github.com`. A refused
+    /// source is on the page until the studio closes. `fixed` when the
+    /// command line named it for the run.
+    Source {
+        rule: String,
+        allowed: bool,
+        fixed: bool,
+    },
+    /// The folder `samples('local:')` and a Hydra file outside the set
+    /// read, as the page shows it. `fixed` when `--allow-local-samples`
+    /// named one for the run.
+    LocalFolder { folder: Option<String>, fixed: bool },
     /// The native orchestra switch. It lasts one studio run: the studio
     /// does not keep it, and the next start turns it on.
     Csound { allowed: bool },
@@ -4678,7 +4702,22 @@ impl PermissionRow {
     /// Whether the row's permission is on.
     pub fn allowed(&self) -> bool {
         match self {
-            Self::Origin { allowed, .. } | Self::Csound { allowed } => *allowed,
+            Self::Origin { allowed, .. }
+            | Self::Source { allowed, .. }
+            | Self::Csound { allowed } => *allowed,
+            Self::LocalFolder { folder, fixed } => *fixed || folder.is_some(),
+        }
+    }
+
+    /// Whether `other` is this row, on or off: a source or an origin moves
+    /// between the allowed and the refused, and the selection follows it.
+    pub fn is_same_row(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Origin { origin, .. }, Self::Origin { origin: other, .. })
+            | (Self::Source { rule: origin, .. }, Self::Source { rule: other, .. }) => {
+                origin == other
+            }
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
     }
 }
@@ -8972,6 +9011,10 @@ mod tests {
             permissions_key(KeyCode::Char('d')),
             SettingsAction::ForgetRow(0)
         );
+        assert_eq!(
+            permissions_key(KeyCode::Char('e')),
+            SettingsAction::EditRow(0)
+        );
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
         assert_eq!(sheet.page, SettingsPage::About);
         // The About page reads; a key it has no use for is the score's.
@@ -9036,7 +9079,7 @@ mod tests {
     /// The permissions page's hint leads with its keys and keeps its whole
     /// text. The keys closed the hint before, so a terminal narrow
     /// enough to wrap it cut them off the page, and a player who cannot
-    /// see "Enter permits" cannot work the page.
+    /// see "Enter allows" cannot work the page.
     #[test]
     fn the_permissions_page_hint_leads_with_its_keys_and_stays_whole() {
         let sheet = SettingsSheet {
@@ -9101,7 +9144,7 @@ mod tests {
                 .join(" ");
             let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
             let keys = flat
-                .find("Enter permits")
+                .find("Enter allows")
                 .unwrap_or_else(|| panic!("the keys are on the page at {width}x{height}"));
             let explain = flat
                 .find("a score loads a script")
@@ -9115,7 +9158,7 @@ mod tests {
                 "the whole hint fits at {width}x{height}: {flat}"
             );
             assert!(
-                flat.contains("https://example.com off"),
+                flat.contains("https://example.com scripts off"),
                 "the row reads as a switch: {flat}"
             );
         }
@@ -9263,7 +9306,7 @@ mod tests {
             Category::ALL
         );
         sheet.key(KeyCode::Left, &mut settings, &features);
-        assert!(settings.shows_category(Category::Kabelsalat));
+        assert!(settings.shows_category(Category::Hydra), "the last row");
     }
 
     #[test]

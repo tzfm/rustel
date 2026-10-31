@@ -475,13 +475,20 @@ impl SampleLibrary {
         self.adopt_set_folder_inner(folder, true)
     }
 
+    /// The open set's folder, canonical, as the last set change read it.
+    pub fn set_folder(&self) -> Option<PathBuf> {
+        self.shared.set_folder.read().expect("set folder").clone()
+    }
+
     fn adopt_set_folder_inner(&self, folder: &Path, refresh: bool) -> Result<usize, String> {
         // Read before either lock is taken: the folder is walked on the
         // thread that opened the set, and the browser reads these two at
         // the other end of them.
-        let staged: Result<Vec<(String, Bank)>, String> = folder
+        let root = folder
             .canonicalize()
-            .map_err(|error| format!("set samples: cannot read {}: {error}", folder.display()))
+            .map_err(|error| format!("set samples: cannot read {}: {error}", folder.display()));
+        let staged: Result<Vec<(String, Bank)>, String> = root
+            .clone()
             .and_then(|root| set_folder_banks(&root))
             .map(|banks| {
                 banks
@@ -544,6 +551,9 @@ impl SampleLibrary {
             .custom_file_names
             .write()
             .expect("custom filenames") = local_names::index(custom.values());
+        // The folder belongs to the open set even when its samples do not
+        // fit, so its images and videos stay readable.
+        *self.shared.set_folder.write().expect("set folder") = root.ok();
         let staged = staged?;
         if let Some(error) = full {
             return Err(error);
@@ -834,7 +844,7 @@ impl SampleLibrary {
     ///
     /// A URL that the player types in Settings is a grant, like
     /// `--allow-sample-origin` for a score from another author. Each pack's
-    /// origin is permitted exactly, in addition to the policy a score gets.
+    /// origin is allowed, in addition to the sources a score gets.
     /// A pack's `_base` can then point at a CDN, as a score's imports can.
     fn register_global_packs(
         &self,
@@ -849,7 +859,7 @@ impl SampleLibrary {
             .clone()
             .unwrap_or_else(|| {
                 let mut access = ScoreSampleAccess::denied();
-                access.permit_public_cors_origins();
+                access.permit_builtin_sources();
                 access
             });
         let mut effects = Vec::with_capacity(packs.len());
@@ -861,7 +871,7 @@ impl SampleLibrary {
                 .map_err(|error| format!("{spec}: invalid sample source: {error}"))?
                 .origin()
                 .ascii_serialization();
-            access.permit_origin(&origin)?;
+            access.permit_source(&origin)?;
             effects.push((
                 serde_json::to_string(spec).map_err(|error| error.to_string())?,
                 None,
@@ -949,14 +959,12 @@ impl SampleLibrary {
         let path = cache_path(&self.shared.host_cache, url);
         let _ = std::fs::remove_file(&path);
         let cache = &self.shared.score_cache;
-        for trust in [ScoreCacheTrust::Grant, ScoreCacheTrust::Cors] {
-            let path = cache.path(url, ScoreCacheKind::Manifest, trust);
-            let _ = with_score_cache_lock(&cache.base, || match std::fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(format!("forget {}: {error}", path.display())),
-            });
-        }
+        let path = cache.path(url, ScoreCacheKind::Manifest);
+        let _ = with_score_cache_lock(&cache.base, || match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("forget {}: {error}", path.display())),
+        });
     }
 
     /// Whether the set's own folder already answers `name`.
@@ -1139,9 +1147,9 @@ impl SampleLibrary {
         if url.starts_with("file://") {
             return fetch_located(url).ok();
         }
-        // A url a score or a Settings pack named was fetched under a grant
-        // and lives in the score cache, keyed by the trust its grant
-        // carried. The pinned banks live in the plain cache beside it.
+        // A url a score or a Settings pack named was fetched from an allowed
+        // source and lives in the score cache. The pinned banks live in the
+        // plain cache beside it.
         let granted = self
             .shared
             .score_sources
@@ -1150,11 +1158,7 @@ impl SampleLibrary {
             .contains_key(url);
         if granted {
             let cache = &self.shared.score_cache;
-            return [ScoreCacheTrust::Grant, ScoreCacheTrust::Cors]
-                .into_iter()
-                .find_map(|trust| {
-                    read_sample_cache(&cache.path(url, ScoreCacheKind::Audio, trust)).ok()
-                });
+            return read_sample_cache(&cache.path(url, ScoreCacheKind::Audio)).ok();
         }
         read_sample_cache(&cache_path(&cache_dir(), url)).ok()
     }

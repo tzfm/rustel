@@ -312,15 +312,23 @@ fn the_linked_gallery_constructs_and_exact_image_url_record_as_typed_data() {
 }
 
 #[test]
-fn analyser_controls_are_typed_noops_or_clear_errors() {
-    let update = program("await initHydra()\na.setBins(1)\na.setBins(16)\na.show()\na.hide()");
+fn analyser_controls_are_recorded_ignored_or_clear_errors() {
+    use rustel_hydra::HydraAnalyserSetting::{Cutoff, Scale, Smooth};
+    let update = program(
+        "await initHydra()\na.setBins(1)\na.setBins(16)\na.show()\na.hide()\n\
+         a.setCutoff(2.5)\na.setScale(4)\na.setSmooth(0.8)\na.setMax(10)",
+    );
+    let setting = |setting, value| HydraStatement::ConfigureAnalyser { setting, value };
     assert_eq!(
         update.program.statements,
         vec![
             HydraStatement::ConfigureAudio { bins: 1 },
             HydraStatement::ConfigureAudio { bins: 16 },
+            setting(Cutoff, 2.5),
+            setting(Scale, 4.0),
+            setting(Smooth, 0.8),
         ],
-        "show/hide only control the browser analyser canvas and are native no-ops"
+        "show, hide and the deprecated a.setMax are native no-ops"
     );
 
     for (call, expected) in [
@@ -330,34 +338,120 @@ fn analyser_controls_are_typed_noops_or_clear_errors() {
         ("a.setBins(1.5)", "whole-number bin count from 1 through 16"),
         ("a.setBins(0)", "whole-number bin count from 1 through 16"),
         ("a.setBins(17)", "whole-number bin count from 1 through 16"),
-        ("a.setCutoff(2)", "not supported by native Hydra yet"),
-        ("a.setScale(4)", "not supported by native Hydra yet"),
-        ("a.setSmooth(0.4)", "not supported by native Hydra yet"),
-        ("a.setMax(10)", "not supported by native Hydra yet"),
         ("a.hide(1)", "accepts no arguments"),
-    ] {
-        let message = evaluate_error(&format!("await initHydra()\n{call}"));
-        assert!(message.contains(expected), "{call}: {message}");
-    }
-}
-
-#[test]
-fn unsupported_global_commands_fail_in_the_score_realm() {
-    for (call, expected) in [
+        ("a.setSmooth()", "a.setSmooth(n) takes one finite number"),
+        ("a.setCutoff('4')", "a.setCutoff(n) takes one finite number"),
+        ("a.setScale(1, 2)", "a.setScale(n) takes one finite number"),
         (
-            "setResolution(1920, 1080)",
-            "Studio chooses its delivery size",
+            "a.setScale(Infinity)",
+            "a.setScale(n) takes one finite number",
         ),
-        ("update(() => {})", "not supported by native Hydra"),
-        ("hush(1)", "hush() accepts no arguments"),
+    ] {
+        let message = evaluate_error(&format!("await initHydra()\n{call}"));
+        assert!(message.contains(expected), "{call}: {message}");
+    }
+
+    // rustel-hydra owns the range of each setting and names it when the
+    // recording is read.
+    let mut session = Session::new().expect("session");
+    session
+        .evaluate("await initHydra()\na.setSmooth(2)\nosc().out()")
+        .expect("the call records");
+    let candidate = session.take_pending_hydra().expect("a recording");
+    let Err(error) = HydraUpdate::from_candidate(&candidate) else {
+        panic!("a smooth past 1 is refused");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("a.setSmooth takes a number from 0 to 1"),
+        "{error}"
+    );
+}
+
+#[test]
+fn hush_takes_no_arguments() {
+    let message = evaluate_error("await initHydra()\nhush(1)");
+    assert!(message.contains("hush() accepts no arguments"), "{message}");
+}
+
+/// A shared sketch runs as written: the calls that need a browser record
+/// nothing, and the rest of the sketch records as it would without them.
+#[test]
+fn browser_only_calls_are_ignored() {
+    let plain = program("await initHydra()\nosc(10).rotate(0.5).out()\nsrc(s0).out(o1)");
+    let pasted = program(
+        "await initHydra()\n\
+         setResolution(1920, 1080)\n\
+         update()\n\
+         update = () => { time += 1 }\n\
+         afterUpdate = () => {}\n\
+         s0.initScreen()\n\
+         s1.initStream({})\n\
+         s2.initCanvas({})\n\
+         s3.init({})\n\
+         osc(10).sum().rotate(0.5).out()\n\
+         src(s0).out(o1)",
+    );
+    assert_eq!(pasted.program.statements, plain.program.statements);
+}
+
+#[test]
+fn a_function_given_to_set_function_is_ignored() {
+    let plain = program(
+        "await initHydra()\nosc(10).rotate(0.5).out()\nsolid(0, 0, 0, 0).kaleid(4).out(o1)",
+    );
+    let pasted = program(
+        "await initHydra()\n\
+         setFunction({ name: 'chroma', type: 'color', inputs: [], glsl: 'return _c0;' })\n\
+         setFunction({ name: 'stars', type: 'src', inputs: [], glsl: 'return vec4(1.0);' })\n\
+         setFunction({ name: 'osc', type: 'src', inputs: [], glsl: 'return vec4(1.0);' })\n\
+         osc(10).chroma(2).rotate(0.5).out()\n\
+         stars(3, 0.5).kaleid(4).out(o1)",
+    );
+    assert_eq!(
+        pasted.program.statements, plain.program.statements,
+        "a new transform leaves the chain alone, a new source draws nothing, \
+         and Hydra's own osc stays"
+    );
+
+    for (call, expected) in [
+        ("setFunction()", "needs an object with a name"),
+        (
+            "setFunction({ type: 'src' })",
+            "needs an object with a name",
+        ),
+        ("setFunction({ name: 'two words' })", "plain name"),
+        ("setFunction({ name: 'then' })", "plain name"),
     ] {
         let message = evaluate_error(&format!("await initHydra()\n{call}"));
         assert!(message.contains(expected), "{call}: {message}");
     }
 }
 
+/// A source that `setFunction` named is a global only while Hydra is.
 #[test]
-fn source_initialisers_have_strict_arity_types_and_native_support_errors() {
+fn a_set_function_source_is_given_back_with_the_surface() {
+    let mut session = Session::new().expect("session");
+    session
+        .evaluate(
+            "await initHydra()\nsetFunction({ name: 'stars', type: 'src', glsl: '' })\nstars().out()",
+        )
+        .expect("a pasted sketch runs");
+    session
+        .evaluate("$: pure(typeof stars)")
+        .expect("a score without Hydra runs");
+    let haps = session
+        .query(
+            rustel_fraction::Fraction::ZERO,
+            rustel_fraction::Fraction::ONE,
+        )
+        .expect("query");
+    assert_eq!(haps[0].value, rustel_core::Value::Str("undefined".into()));
+}
+
+#[test]
+fn source_initialisers_have_strict_arity_and_types() {
     for (call, expected) in [
         ("s0.initCam(0, 1)", "accepts no arguments"),
         ("s0.initCam('0')", "numeric device index"),
@@ -367,17 +461,38 @@ fn source_initialisers_have_strict_arity_types_and_native_support_errors() {
         ("s0.initImage('a', 'b')", "exactly one JavaScript string"),
         ("s0.initImage(42)", "actual JavaScript string"),
         ("s0.initImage('')", "non-empty URL"),
-        ("s0.initVideo('clip.mp4')", "not supported by native Hydra"),
-        ("s0.initScreen()", "not supported by native Hydra"),
-        ("s0.initStream({})", "not supported by native Hydra"),
-        ("s0.initCanvas({})", "not supported by native Hydra"),
-        ("s0.init()", "not supported by native Hydra"),
+        ("s0.initVideo()", "exactly one JavaScript string"),
+        ("s0.initVideo(42)", "actual JavaScript string"),
+        ("s0.initVideo('')", "non-empty URL"),
         ("s0.clear(1)", "clear() accepts no arguments"),
         ("s0(1).initCam()", "directly on a pristine s0"),
     ] {
         let message = evaluate_error(&format!("await initHydra()\n{call}"));
         assert!(message.contains(expected), "{call}: {message}");
     }
+}
+
+/// A video names a URL or a relative path, in either quote: a double-quoted
+/// path is not mini-notation here.
+#[test]
+fn a_video_records_its_address_as_a_typed_source() {
+    let update = program(
+        "await initHydra()\ns0.initVideo(\"clips/loop.webm\")\ns1.initVideo('https://example.com/a.webm')\nsrc(s0).out()",
+    );
+    assert!(matches!(
+        update.program.statements.as_slice(),
+        [
+            HydraStatement::ConfigureSource {
+                slot: 0,
+                source: HydraSource::Video { url: local },
+            },
+            HydraStatement::ConfigureSource {
+                slot: 1,
+                source: HydraSource::Video { url: remote },
+            },
+            HydraStatement::Evaluate { .. },
+        ] if local == "clips/loop.webm" && remote == "https://example.com/a.webm"
+    ));
 }
 
 #[test]
@@ -524,27 +639,33 @@ fn the_visuals_surface_borrows_shape_and_gives_it_back() {
 }
 
 #[test]
-fn speed_remains_a_strudel_control_but_native_hydra_timing_assignments_are_refused() {
+fn speed_remains_a_strudel_control_and_hydra_clock_assignments_are_recorded() {
     let mut session = Session::new().expect("session");
     // The getter still answers with the pattern control while the Hydra
-    // surface is installed.
+    // surface is installed, also after an assignment to Hydra's speed.
     session
         .evaluate(
             r#"
             await initHydra()
+            speed = 0.5
             osc(10).out()
             $: s("bd*4").speed(2)
             "#,
         )
         .expect("the Strudel speed control remains callable");
-    for name in ["speed", "bpm", "fps", "time", "update", "afterUpdate"] {
-        let message = evaluate_error(&format!("await initHydra()\n{name} = 2"));
-        assert!(
-            message.contains(&format!("Hydra's {name}"))
-                && message.contains("not supported by native Hydra"),
-            "{name}: {message}"
-        );
-    }
+    let update =
+        program("await initHydra()\nspeed = 2\nbpm = 120\nfps = 12\ntime = 0\nosc(10).out()");
+    assert_eq!(
+        update.program.clock(),
+        rustel_hydra::HydraClock {
+            speed: 2.0,
+            bpm: 120.0,
+            fps: Some(12.0),
+            time: Some(0.0),
+        }
+    );
+    let message = evaluate_error("await initHydra()\nspeed = 'fast'");
+    assert!(message.contains("finite number"), "{message}");
 }
 
 #[test]

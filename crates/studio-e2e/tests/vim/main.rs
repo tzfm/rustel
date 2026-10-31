@@ -4,7 +4,7 @@
 static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
 
-use crossterm::event::{KeyCode, KeyModifiers, ModifierKeyCode};
+use crossterm::event::{KeyCode, KeyModifiers, ModifierKeyCode, MouseEventKind};
 use rustel_studio::editor::KeyboardCapabilities;
 use rustel_studio_e2e::{Hermetic, PanelKind, hermetic, hermetic_with, reopen_over};
 
@@ -602,6 +602,109 @@ fn visual_lines_and_text_objects_edit_complete_ranges() {
     assert_eq!(studio.source(), "// missing");
     studio.type_text("x");
     assert_eq!(studio.source(), "// issing");
+}
+
+/// `gd` on the block caret reads a name in the language of its statement,
+/// as Ctrl+D does outside Vim.
+#[test]
+fn gd_reads_hydra_names_in_hydra_code() {
+    let mut studio = hermetic();
+    enable_vim(&mut studio);
+    let source = "await initHydra()\nosc(10).kaleid(4).out()\n$: s(\"bd\").shape(0.5)";
+    for (name, signature) in [("kaleid", "kaleid(nSides)"), ("shape", "shape(")] {
+        studio.set_score(source);
+        studio.set_caret(source.find(name).expect("a name"));
+        studio.type_text("gd");
+        assert_eq!(studio.status(), format!("reference - {name}"));
+        let rows = studio.rows();
+        assert!(rows.iter().any(|row| row.contains(signature)), "{name}");
+        assert!(
+            !rows.iter().any(|row| row.contains("shape(sides")),
+            "{name}"
+        );
+        studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    }
+}
+
+/// `j` and `k` walk the permissions page in Vim. `e` opens a refused
+/// folder in its prompt, and Enter on the local folder opens the folder
+/// prompt.
+#[test]
+fn vim_keys_walk_the_sample_permissions() {
+    let mut studio = hermetic();
+    enable_vim(&mut studio);
+    studio.set_score(
+        "samples('https://kit.invalid/kits/kit.json')\nsamples('local:kit')\n$: s(\"bd\")",
+    );
+    studio.chord("ctrl+s");
+    studio.settle();
+    studio.chord("ctrl+o");
+    for _ in 0..10 {
+        if studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("native orchestras"))
+        {
+            break;
+        }
+        studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    }
+    let selected = |studio: &mut Hermetic, label: &str| {
+        let marker = format!("▸ {label}");
+        studio.rows().iter().any(|row| row.contains(&marker))
+    };
+    assert!(
+        selected(&mut studio, "kit.invalid/kits/"),
+        "{}",
+        studio.rows().join("\n")
+    );
+    studio.type_text("j");
+    assert!(selected(&mut studio, "local: no folder"));
+    studio.type_text("k");
+    assert!(selected(&mut studio, "kit.invalid/kits/"));
+
+    studio.type_text("e");
+    assert!(
+        studio.status().starts_with("edit a source"),
+        "{}",
+        studio.status()
+    );
+    for _ in "/kits/".chars() {
+        studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    }
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("▸ kit.invalid ") && row.contains("samples  on")),
+        "{}",
+        studio.rows().join("\n")
+    );
+
+    studio.type_text("j");
+    assert!(selected(&mut studio, "local: no folder"));
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        studio.status().starts_with("local samples folder"),
+        "{}",
+        studio.status()
+    );
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(
+        selected(&mut studio, "local: no folder"),
+        "Esc comes back to the row"
+    );
+}
+
+/// Vim mode keeps the pointer for the score: `mousex` and Hydra's `mouse`
+/// follow it as they do outside Vim.
+#[test]
+fn vim_mode_keeps_the_pointer_for_the_score() {
+    let mut studio = hermetic();
+    enable_vim(&mut studio);
+    studio.mouse(MouseEventKind::Moved, 29, 9, KeyModifiers::NONE);
+    assert_eq!(studio.score_pointer(), Some((29.5 / 150.0, 9.5 / 40.0)));
 }
 
 mod mappings;

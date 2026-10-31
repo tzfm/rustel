@@ -231,6 +231,9 @@ enum EngineCommand {
     },
     /// The origins of the permissions page, after the player changed them.
     SetImportOrigins(Vec<String>),
+    /// What the permissions page permits samples and media to read, after
+    /// the player changed it.
+    SetSampleGrants(super::engine::SampleGrants),
     /// The orchestra switch of the permissions page, after the player
     /// flipped it.
     SetCsound(bool),
@@ -695,6 +698,14 @@ impl StudioWorker {
             && self
                 .commands
                 .try_send(EngineCommand::SetImportOrigins(origins))
+                .is_ok()
+    }
+
+    pub fn try_set_sample_grants(&self, grants: super::engine::SampleGrants) -> bool {
+        !self.shutdown_requested.load(Ordering::Acquire)
+            && self
+                .commands
+                .try_send(EngineCommand::SetSampleGrants(grants))
                 .is_ok()
     }
 
@@ -1709,6 +1720,10 @@ fn process_command(
         }
         EngineCommand::SetImportOrigins(origins) => {
             engine.set_import_origins(&origins);
+            false
+        }
+        EngineCommand::SetSampleGrants(grants) => {
+            engine.set_sample_grants(grants);
             false
         }
         EngineCommand::SetCsound(allowed) => {

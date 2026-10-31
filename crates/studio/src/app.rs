@@ -10,7 +10,7 @@
 //! |---|---|
 //! | the mixer desk, master level and limiter | `mixer.rs` |
 //! | the reference column (Ctrl+D) | `reference_panel.rs` |
-//! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs` |
+//! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs`, `hydra_scope.rs` |
 //! | hearing a chord, scale, sound or snippet | `previews.rs` |
 //! | the Settings sheet | `settings_sheet.rs` |
 //! | its Permissions page: origins and orchestras | `permissions.rs` |
@@ -166,6 +166,8 @@ mod external_changes;
 mod find;
 mod focus;
 mod hydra_backdrop;
+#[cfg(feature = "hydra")]
+mod hydra_scope;
 mod jobs_panel;
 mod key_bindings;
 mod keyboard;
@@ -544,7 +546,10 @@ fn status_file_path(path: &std::path::Path, full: bool) -> String {
     clippy::print_stderr,
     reason = "the theme fallback is reported before the screen opens"
 )]
-fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
+fn run_once(mut options: StudioOptions) -> Result<Session, RuntimeError> {
+    // The terminal pointer, for `mousex` in patterns and `mouse` in Hydra.
+    // The engine's session reads it, and the app writes it.
+    options.session.pointer.get_or_insert_with(Default::default);
     let starter = if options.mini {
         DEFAULT_MINI_SCORE
     } else {
@@ -643,6 +648,7 @@ fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
             preview_budget_bytes: sample_settings.preview_budget.bytes(),
             unused_sample_idle: sample_settings.unused_sample_idle.duration(),
             import_origins: prefs.import_origins.clone(),
+            sample_grants: prefs.sample_grants(),
             // `csound_allowed` stays at its default: on, because an
             // installed Csound library is the studio's opt-in. The
             // permissions page takes it back for a run, and the one-shot
@@ -1271,6 +1277,16 @@ struct App {
     csound_owed: bool,
     /// The permissions page changed and the engine does not have the list yet.
     import_origins_owed: bool,
+    /// Folders the engine refused a score's samples or media from in this
+    /// studio, oldest first.
+    blocked_samples: Vec<String>,
+    /// A score asked for `local:` files with no folder chosen, so the
+    /// permissions page shows the folder row.
+    local_files_asked: bool,
+    /// The source the permissions page's edit prompt is cutting down.
+    editing_source: Option<String>,
+    /// The page's sample grants changed and the engine does not have them yet.
+    sample_grants_owed: bool,
     /// A permit unblocked a refused update and the studio owes its re-run.
     /// It waits for the engine to hold the permission, so the re-run cannot
     /// be refused by the state it is running to use.
@@ -1431,6 +1447,8 @@ struct App {
     pin_frame_inputs: bool,
     /// Geometry of the last painted frame, used to route pointer input.
     frame: Rect,
+    /// Where the pointer is over the frame, shared with the engine's session.
+    score_pointer: rustel_core::host_value::Pointer,
     regions: StudioRegions,
     pointer: Option<Pointer>,
     /// How far into its cell the pointer was at the last report, 0..1. A
@@ -1626,6 +1644,7 @@ impl App {
         // The switch starts on, as the engine's does: an installed library
         // is the opt-in, and the permissions page owns the switch from here.
         let csound_at_start = true;
+        let score_pointer = options.session.pointer.clone().unwrap_or_default();
         let mut app = Self {
             output_latency_pending: true,
             cli_output_latency: options.output_buffer_frames.map(OutputLatency::from_frames),
@@ -1842,6 +1861,10 @@ impl App {
             csound_refused: false,
             csound_owed: false,
             import_origins_owed: false,
+            blocked_samples: Vec::new(),
+            local_files_asked: false,
+            editing_source: None,
+            sample_grants_owed: false,
             refused_update_owed: false,
             evaluation_alerts: HashMap::new(),
             lint_status: None,
@@ -1920,6 +1943,7 @@ impl App {
             #[cfg(feature = "harness")]
             pin_frame_inputs: false,
             frame: Rect::default(),
+            score_pointer,
             regions: StudioRegions::default(),
             pointer: None,
             pointer_subcell: 0.0,

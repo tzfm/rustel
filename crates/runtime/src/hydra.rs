@@ -231,10 +231,9 @@ impl HydraBridge {
         self.apply_with_sample_access(update, &ScoreSampleAccess::denied())
     }
 
-    /// Install a score with its host-granted sample origin scope. Image
-    /// workers carry a snapshot and recheck it before every network fetch.
-    /// A grant does not relax the public HTTPS, CORS or same-origin redirect
-    /// requirements for images.
+    /// Install a score with its host-allowed sample sources. Image workers
+    /// carry a snapshot and recheck it before every network fetch, and every
+    /// redirect must stay inside the source that allowed the first address.
     pub fn apply_with_sample_access(
         &mut self,
         update: HydraUpdate,
@@ -256,6 +255,13 @@ impl HydraBridge {
         self.inputs
             .set_drawing(self.transport_drawing && self.host.is_open());
         Ok(())
+    }
+
+    /// Let a score's images and videos name files in this folder by a path
+    /// relative to it: the open set's folder in Studio. The local sample
+    /// root, when one is granted, is read after it.
+    pub fn set_media_folder(&mut self, folder: Option<&std::path::Path>) {
+        self.inputs.set_media_folder(folder);
     }
 
     /// Show a snippet in the shelf's own picture, or, with `None`, stop.
@@ -385,6 +391,12 @@ impl HydraBridge {
         }
         self.next_tui = Some(now + TUI_INTERVAL);
         let _ = self.tui_sink().publish(&frame());
+    }
+
+    /// Set where the pointer is, from 0 to 1 across the picture from its
+    /// top-left corner, for `mouse`.
+    pub fn set_pointer(&self, x: f64, y: f64) {
+        self.host.set_pointer(x as f32, y as f32);
     }
 
     /// Publish what the engine is playing, for `detectAudio`.
@@ -770,5 +782,38 @@ mod tests {
             ..HydraProgram::default()
         };
         assert_eq!(configured_audio_bins(&program), 8);
+    }
+
+    /// The reference documents each shader function with the inputs the
+    /// renderer compiles, in order, and every shader function has an entry.
+    #[test]
+    fn hydra_reference_parameters_match_the_shader_table() {
+        let entries: Vec<_> = rustel_jsruntime::hydra_reference_entries().collect();
+        for function in rustel_hydra::glsl::FUNCTIONS {
+            let documented = entries.iter().find(|entry| {
+                entry.name == function.name
+                    && entry
+                        .tags
+                        .contains(&if function.kind == rustel_hydra::glsl::Kind::Src {
+                            "global"
+                        } else {
+                            "method"
+                        })
+            });
+            let Some(entry) = documented else {
+                panic!("{} has no reference entry", function.name);
+            };
+            if entry.no_autocomplete {
+                continue;
+            }
+            let params: Vec<&str> = entry
+                .params
+                .iter()
+                .map(|param| param.name)
+                .filter(|name| *name != "texture")
+                .collect();
+            let inputs: Vec<&str> = function.inputs.iter().map(|input| input.name).collect();
+            assert_eq!(params, inputs, "{}", function.name);
+        }
     }
 }

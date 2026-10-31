@@ -152,9 +152,10 @@ pub use producer::{
 pub use render::{MP3_EXPORT, RenderFormat, write_onset_dump, write_scalar_wav, write_silent_wav};
 pub use rustel_audio::TakeoverCut;
 pub use samples::{
-    SCORE_SAMPLE_CACHE_MAX_BYTES, SCORE_SAMPLE_CACHE_MAX_ENTRIES,
+    BUILTIN_SOURCES, LOCAL_FILES, SCORE_SAMPLE_CACHE_MAX_BYTES, SCORE_SAMPLE_CACHE_MAX_ENTRIES,
     SCORE_SAMPLE_CACHE_SESSION_MAX_BYTES, SCORE_SAMPLE_CACHE_SESSION_MAX_ENTRIES,
-    ScoreSampleAccess, clear_score_sample_cache, sample_cache_dir, score_sample_cache_dir,
+    ScoreSampleAccess, SourceRule, clear_score_sample_cache, sample_cache_dir,
+    score_sample_cache_dir,
 };
 pub use score_import::{ScoreImportAccess, import_origin};
 pub use session::{

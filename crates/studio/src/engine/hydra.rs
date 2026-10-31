@@ -97,6 +97,11 @@ impl StudioEngine {
         if let Some(candidate) = self.session.take_pending_hydra() {
             match rustel_runtime::hydra::HydraUpdate::from_candidate(&candidate) {
                 Ok(update) => {
+                    let folder = self
+                        .session
+                        .sample_library()
+                        .and_then(|library| library.set_folder());
+                    hydra.set_media_folder(folder.as_deref());
                     if let Err(message) = hydra.apply_with_sample_access(
                         update,
                         &self.session.config().score_sample_access,
@@ -136,6 +141,10 @@ impl StudioEngine {
         // so browsing does not keep the score's visuals alive - and inserting
         // a snippet leaves the screen still until you press play.
         hydra.set_drawing(self.is_playing());
+        // `mouse` reads the pointer that `mousex` reads.
+        if let Some(pointer) = &self.session.config().pointer {
+            hydra.set_pointer(pointer.x.get(), pointer.y.get());
+        }
         let now = Instant::now();
         if let Err(message) = hydra.tick(
             now,

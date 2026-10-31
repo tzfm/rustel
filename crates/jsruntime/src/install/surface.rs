@@ -1435,8 +1435,8 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
     ReferenceEntry {
         name: "mousex",
         synonyms: &[],
-        summary: "Mouse input is not supported in Rustel.",
-        description: "This signal always returns 0; it does not track the pointer's horizontal position.",
+        summary: "The pointer's horizontal position, from 0 to 1.",
+        description: "In Studio this signal follows the mouse over the terminal, from 0 at the left edge to 1 at the right edge. Elsewhere, and in an export, it returns 0.",
         params: &[],
         examples: &[],
         tags: &["external_io"],
@@ -1447,8 +1447,8 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
     ReferenceEntry {
         name: "mousey",
         synonyms: &[],
-        summary: "Mouse input is not supported in Rustel.",
-        description: "This signal always returns 0; it does not track the pointer's vertical position.",
+        summary: "The pointer's vertical position, from 0 to 1.",
+        description: "In Studio this signal follows the mouse over the terminal, from 0 at the top edge to 1 at the bottom edge. Elsewhere, and in an export, it returns 0.",
         params: &[],
         examples: &[],
         tags: &["external_io"],

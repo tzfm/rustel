@@ -51,7 +51,7 @@ mod fraction;
 mod host;
 mod install;
 #[cfg(feature = "hydra")]
-pub use install::{HYDRA_SCOPE_POLICY, HydraCandidate};
+pub use install::{HYDRA_SCOPE_POLICY, HydraCandidate, hydra_reference_entries};
 mod pattern;
 mod runtime;
 mod surface;

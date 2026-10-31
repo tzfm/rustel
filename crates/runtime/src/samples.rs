@@ -30,8 +30,12 @@ use url::Url;
 use crate::product;
 
 mod access;
+mod rules;
+#[cfg(feature = "hydra")]
+pub(crate) use access::read_local_media;
 use access::*;
 pub(crate) use access::{js_round, sound_index};
+pub use rules::{BUILTIN_SOURCES, LOCAL_FILES, SourceRule};
 mod cache;
 pub(crate) use cache::fetch_located;
 use cache::*;
@@ -112,43 +116,69 @@ const SCORE_CACHE_NO_LEGACY_MARKER: &str = ".score-cache-no-legacy";
 // offline entries.
 const SCORE_CACHE_KEY_DOMAIN_V1: &[u8] = b"strudel-score-cache-v1\0";
 
-/// Host-granted resources that score-level `samples(...)` may use, and origin
-/// grants for Hydra image sources.
+/// Host-granted resources that score-level `samples(...)`, Hydra images and
+/// Hydra videos may use.
 ///
 /// An empty policy is deliberately inert: evaluating score text must not read
 /// the working directory or choose a network destination. Hosts opt in with
-/// exact HTTP(S) origins, one canonical local sample root, and/or the
-/// strudel.cc parity default of [`Self::permit_public_cors_origins`].
-/// Hydra images also require public HTTPS destinations and CORS consent,
-/// including for explicitly granted origins.
+/// [`SourceRule`]s, the built-in domains of [`Self::permit_builtin_sources`],
+/// and one canonical local sample root. A server's own headers never widen
+/// what a policy allows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScoreSampleAccess {
     local_root: Option<Arc<crate::sample_server::ServedRoot>>,
-    allowed_origins: Vec<String>,
-    open_public: bool,
+    sources: Vec<SourceRule>,
+    refused: RefusedSources,
 }
 
-/// The `Origin` this host presents when it requires CORS consent, and the
-/// value a server's `Access-Control-Allow-Origin` answer is compared against.
-/// strudel.cc is the origin whose reachable set this policy reproduces: a
-/// server that would refuse the browser refuses us.
-const CORS_REQUEST_ORIGIN: &str = "https://strudel.cc";
+/// The sources a policy refused, written as the [`SourceRule`] that would
+/// allow each, newest last, so a host can offer to allow them. Every clone of
+/// one policy shares the list. It reports what happened and is not part of
+/// the policy, so two policies compare equal without it.
+#[derive(Clone, Default)]
+pub struct RefusedSources(Arc<Mutex<Vec<String>>>);
 
-/// Whether an `Access-Control-Allow-Origin` answer consents to the read.
-fn cors_consents(header: Option<&str>) -> bool {
-    header
-        .map(str::trim)
-        .is_some_and(|value| value == "*" || value.eq_ignore_ascii_case(CORS_REQUEST_ORIGIN))
+impl RefusedSources {
+    /// The most sources kept. A score names one or two.
+    const MAX: usize = 16;
+
+    fn note(&self, source: String) {
+        if let Ok(mut sources) = self.0.lock() {
+            sources.retain(|kept| *kept != source);
+            sources.push(source);
+            if sources.len() > Self::MAX {
+                sources.remove(0);
+            }
+        }
+    }
+
+    fn take(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .map(|mut sources| std::mem::take(&mut *sources))
+            .unwrap_or_default()
+    }
+}
+
+impl PartialEq for RefusedSources {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RefusedSources {}
+
+impl std::fmt::Debug for RefusedSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RefusedSources")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ScoreFetchAccess {
-    Remote {
-        origin: String,
-        /// Approved by the default policy rather than an exact grant: every
-        /// response must consent via `Access-Control-Allow-Origin`.
-        cors_required: bool,
-    },
+    /// An address the policy allows, and the source that allows it. Every
+    /// redirect must stay inside that source.
+    Remote { rule: SourceRule },
     Local {
         root: Arc<crate::sample_server::ServedRoot>,
     },
@@ -839,6 +869,9 @@ struct Shared {
     /// dropping them by name alone would take a score's `kicks` with them,
     /// which the set never supplied.
     set_banks: RwLock<BTreeMap<String, Option<Bank>>>,
+    /// The open set's folder, canonical, while a set is open. Hydra reads
+    /// the images and videos a score names inside it.
+    set_folder: RwLock<Option<PathBuf>>,
     /// Hidden filename addresses; kept out of the browser's bank rows.
     custom_file_names: RwLock<local_names::Names>,
     global_file_names: RwLock<local_names::Names>,
@@ -1396,17 +1429,6 @@ enum ScoreCacheKind {
     Audio,
 }
 
-/// Whether the cache entry was admitted under CORS consent or an exact grant.
-///
-/// Trust mode is part of the persistent identity so a grant-only fetch (no
-/// `Access-Control-Allow-Origin`) cannot later satisfy the public-https/CORS
-/// policy for the same URL.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ScoreCacheTrust {
-    Cors,
-    Grant,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CacheAdmission {
     Stored,
@@ -1616,7 +1638,7 @@ impl SampleLibrary {
     fn register_custom_for_test(&self, origin: &str, map_json: &str) -> Result<(), String> {
         let mut access = ScoreSampleAccess::denied();
         access
-            .permit_origin(origin)
+            .permit_source(origin)
             .expect("test origin is well formed");
         self.register_score_custom(map_json, None, &access)
     }

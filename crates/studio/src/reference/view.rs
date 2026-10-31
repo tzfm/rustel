@@ -1579,8 +1579,9 @@ impl ReferenceView<'_> {
                     // Hidden entries are not in the count. The empty box
                     // says how many are hidden, so a short list does not
                     // look broken.
-                    let hidden = self.reference.hidden_len();
-                    let shown = self.reference.len() - hidden;
+                    let scope = self.panel.scope;
+                    let hidden = self.reference.hidden_len_in(scope);
+                    let shown = self.reference.len_in(scope) - hidden;
                     match filter.label() {
                         // Naming the filter is what tells a reader the short
                         // list is the whole answer and not a search that went
@@ -1588,7 +1589,7 @@ impl ReferenceView<'_> {
                         Some(label) => format!(
                             "{} of {} functions · {label}",
                             self.panel.results.len(),
-                            self.reference.len()
+                            self.reference.len_in(scope)
                         ),
                         // An empty box has nothing to count: the number is
                         // the same on both sides of the `of`. The row

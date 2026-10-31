@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- The reference knows Hydra. In a Hydra statement, Ctrl+F, Ctrl+D and the suggestions show the Hydra names with their parameters and defaults, under the `hydra` heading. Pattern code never lists a Hydra name, and Hydra code never lists a pattern name. Settings ▸ Reference has a Hydra switch.
+- `s0.initVideo()` plays a video in a loop, without sound: WebM or MKV with VP8 or VP9 video, or an animated GIF, PNG or WebP. Other formats are refused.
+- `initImage()` and `initVideo()` read a local file by a path relative to the set folder, or to the folder granted with `--allow-local-samples`. The rules of local samples apply: no absolute path, no `..`, and no read outside the folder.
+- A score loads samples, images and videos only from an allowed source. `raw.githubusercontent.com`, `strudel.b-cdn.net`, `shabda.ndre.gr` and `cdn.freesound.org` are allowed from the start. A public server that sends CORS headers is no longer allowed because of them. `--allow-sample-origin` takes a domain, such as `samples.example`, which allows HTTPS from it and its subdomains, or an address, such as `http://localhost:8000/kits/`, which allows what starts with it. `--strict-sample-origins` turns off the four built-in sources.
+- Settings ▸ Permissions lists the folder of a refused sample, image or video. Enter allows the folder, and `e` edits it: cut it down to a domain, such as `github.com`, to allow all of the domain. The `local:` row chooses the folder that `samples('local:')` and Hydra files read. Studio keeps all of them.
+- A Hydra sketch can set its clock: `speed`, `bpm`, `fps` and `time` take a number. Hydra callbacks also read `width`, `height` and `Math.random()`.
+- Hydra callbacks read the pointer as `mouse.x` and `mouse.y`, and pattern code reads it as `mousex` and `mousey`. In Studio both follow the mouse over the terminal.
+- A shared Hydra sketch runs as written. `setResolution()`, `setFunction()`, `sum()`, `update`, `afterUpdate`, `a.setMax()` and the screen, stream and canvas sources are accepted and do nothing. The reference says what each one does here.
+- Hydra callbacks read `%`, comparisons, `&&`, `||`, `!`, `? :`, `Math.atan2`, `Math.hypot`, `Math.trunc`, `Math.log10` and the `Math` constants. `a.setSmooth()`, `a.setCutoff()` and `a.setScale()` change how `a.fft` reads, as in hydra-synth.
 - Edit ▸ Find, chosen with a click, takes what you type. The release of the click closed the find bar again, so the typing went into the score as text or ran as Vim commands.
 - With Vim keys on, any key the search box takes, such as `i`, Esc or a typed letter, calls off a pending delete in the set panel, the Samples tab and the theme picker, and a pending trim. Before, a later Enter or a second Ctrl+D could delete the score, the sample or the theme without asking again.
 - Vim `p` no longer crashes when the yanked line ends in a Unicode line or paragraph separator.

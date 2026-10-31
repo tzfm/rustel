@@ -139,7 +139,9 @@ impl Studio {
         let studio_options = StudioOptions {
             path: Some(directory.clone()),
             mini: false,
-            session: Default::default(),
+            // As `run_once` does: the session reads the terminal pointer.
+            session: rustel_runtime::SessionConfig::default()
+                .with_pointer(rustel_core::host_value::Pointer::default()),
             theme: options.theme,
             output: Some("silent".to_owned()),
             output_buffer_frames: None,
@@ -182,8 +184,13 @@ impl Studio {
                 // ^H would open the host's default input; a hermetic
                 // studio answers it as a machine with no input does.
                 open_default_input: false,
+                // The studio reads refused origins from the policy it was
+                // given, so the engine must hold that one, as `run_once`
+                // gives it.
+                session: studio_options.session.clone(),
                 // As `run_once` does: the permissions page of the last studio.
                 import_origins: crate::prefs::StudioPrefs::load().import_origins,
+                sample_grants: crate::prefs::StudioPrefs::load().sample_grants(),
                 ..Default::default()
             },
             #[cfg(feature = "hydra")]
@@ -509,6 +516,14 @@ impl Studio {
     /// The status bar's text.
     pub fn status(&self) -> &str {
         &self.app.status
+    }
+
+    /// Where the pointer is, as the engine's session reads it for `mousex`
+    /// and Hydra's `mouse`: from 0 to 1 across the frame, from the top-left
+    /// corner. `None` when the session follows no pointer.
+    pub fn score_pointer(&self) -> Option<(f64, f64)> {
+        let pointer = self.app.options.session.pointer.as_ref()?;
+        Some((pointer.x.get(), pointer.y.get()))
     }
 
     /// Clear the status bar so a test can wait for the next notice.

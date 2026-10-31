@@ -22,8 +22,7 @@ discussion.
 - The realm exposes no filesystem, process, socket, HTTP, or environment API.
 - Score-level `samples(...)` performs no I/O itself. It asks the host, and the
   host applies the policy in "Sample access" below. The library default is
-  fully inert, while the command line defaults to the strudel.cc parity
-  policy.
+  fully inert, while the command line allows four built-in sources.
 - CPU, JavaScript heap, pending-job, query, and staged-effect limits bound
   score work in the realm and host.
 
@@ -77,43 +76,50 @@ the code reaches. The sandbox does not limit what the code does to your set.
 
 ## Sample access
 
-By default the command line applies the strudel.cc parity policy. A score's
-`samples(...)` can fetch from any public HTTPS origin whose server consents
-to cross-origin reads. The client checks consent on every response, including
-each redirect. Every response must carry `Access-Control-Allow-Origin: *` (or
-`https://strudel.cc`). Without that header, the same fetch fails on
-strudel.cc. The reachable hosts are therefore the same as in the browser: a
-host that does not opt in to scripted fetches stays unreachable, and the
-address boundary below still applies. This default never grants `file://`,
-plain `http`, or URLs that name loopback.
+A score's `samples(...)`, Hydra images and Hydra videos load only from an
+allowed source. A server's own headers never widen the list: CORS consent
+plays no part. A source is one of these:
 
-CORS consent identifies servers that accept script traffic. It does not show
-that a server is safe. The rest of the boundary limits a hostile server that
-consents: the server cannot be on a private address, it learns nothing beyond
-the fetch itself, and memory-safe decoders read its bytes.
+- A domain, such as `example.com`. It allows HTTPS on the default port from
+  that domain and its subdomains, at any path.
+- An address, such as `example.com/kits/`. Without a scheme, it is HTTPS.
+  It allows the addresses on that origin whose path is the address path or
+  below it, by whole path segments. An address is the only form that allows
+  another port or a server on this computer. Plain `http` needs the scheme,
+  such as `http://localhost:5432/`.
 
-Consent belongs to a live response, so the client checks it once per fetch.
-Bytes already committed to the score cache serve offline reruns without a new
-request, as a browser cache does. After you clear the sample cache, every
-fetch checks consent again.
+The command line allows four built-in domains: `raw.githubusercontent.com`,
+`strudel.b-cdn.net`, `shabda.ndre.gr` and `cdn.freesound.org`. They serve the
+`github:`, `bubo:` and `shabda:` shorthands, the default banks, and the
+freesound sounds that shared scores name. `--strict-sample-origins` removes
+them, restoring the inert policy in which nothing loads without an
+explicit source. Embedders get the inert policy by default and opt in with
+`ScoreSampleAccess::permit_builtin_sources` and
+`ScoreSampleAccess::permit_source`.
 
-`--strict-sample-origins` removes the parity default, restoring the inert
-policy in which nothing loads without an explicit grant. Embedders get the
-inert policy by default and opt in with
-`ScoreSampleAccess::permit_public_cors_origins`.
-
-Explicit grants extend the default:
+More sources extend the list:
 
 ```sh
 rustel play song.strudel --allow-local-samples /srv/kits
-rustel play song.strudel --allow-sample-origin https://samples.example
+rustel play song.strudel --allow-sample-origin samples.example
+rustel play song.strudel --allow-sample-origin http://localhost:5432/
 ```
 
-An origin granted with `--allow-sample-origin` is trusted by the operator
-directly, so no CORS consent is demanded of it. This is how a personal
-server without CORS configuration, a plain-http origin, or a loopback server
-is reached at all. Applications embedding `Session` provide the same policy
+A domain trusts every server under it. On a host with many authors, such as
+a CDN or a code host, the domain trusts all of them. An address narrows the
+trust to one folder. Applications embedding `Session` provide the same policy
 through `SessionConfig::score_sample_access`.
+
+Bytes already committed to the score cache serve offline reruns without a new
+request. The source is checked before the cache is read, so a score with no
+source for a URL cannot read bytes that another score left.
+
+The Studio Permissions page gives the same sources and a local root. The page
+adds to the command line and does not list the built-in sources. A refused
+file puts its folder on the page, turned off. An edit of a row must still
+allow what the row named, so a typing error cannot allow a different site. A
+root from `--allow-local-samples` is used instead of the root of the page.
+Studio keeps these choices in `studio.json`.
 
 ### Local root
 
@@ -126,19 +132,19 @@ runtime pins an open handle to the granted root and opens samples relative to
 that handle, so a filesystem rename between validation and use cannot redirect
 a read outside the grant.
 
-### Remote origins
+### Remote sources
 
-Repeat `--allow-sample-origin` once per origin. Each value is one exact
-HTTP(S) origin, without credentials, a path, query, or fragment. Every
-manifest and audio URL reached through a sample map must individually pass
-the policy, either an exact grant or the parity default, so a manifest on one
-origin cannot pivot fetches to a host the policy would refuse. Redirects are
-free to stay on their origin but cannot move to another one.
+Repeat `--allow-sample-origin` once per source. A source holds no credentials,
+query, or fragment. Every manifest and audio URL reached through a sample map
+must individually pass the policy, so a manifest on one source cannot pivot
+fetches to a host the policy would refuse. A redirect must stay inside the
+source that allowed the first address.
 
 Connections resolve only to permitted public addresses, with one exception: explicitly
-named loopback. Loopback is available only when the granted URL names
+named loopback. Loopback is available only when the allowed address names
 `localhost`, a name beneath `.localhost`, or a loopback IP, and such a name
-must resolve exclusively to loopback. Private, link-local, carrier-NAT,
+must resolve exclusively to loopback. A domain source never names loopback.
+Private, link-local, carrier-NAT,
 site-local, multicast, benchmarking, documentation, and selected
 special-purpose address ranges are refused. This includes IPv4 TEST-NET
 ranges, deprecated 6to4 relay anycast, and IPv6 discard-only, ORCHID, ORCHIDv2,
@@ -151,9 +157,9 @@ converts a path such as `/file/../../secret` into a local filesystem read. A
 separately launched `serve-samples` process maps requests only within its
 selected root.
 
-These flags are trust decisions stronger than the default: a granted origin
-is fetched without asking the server's consent. Grant only the folders and
-origins you intend for the score being run.
+These flags are trust decisions: an allowed source is fetched whenever a
+score asks for it. Allow only the folders and sources you intend for the
+score being run.
 
 ## Hydra visuals
 
@@ -166,13 +172,13 @@ reach shader compilation and rendering. The program size, argument count,
 nesting depth, output dimensions, and frame delivery have fixed limits. A
 minimal build can omit Hydra with `--no-default-features`.
 
-Hydra image sources are host fetches. They must pass the session's score sample
-access policy, use public HTTPS addresses, remain on the same origin across
-redirects, and return CORS permission for `https://strudel.cc` on every
-response. A response body is limited to 16 MiB before image decoding, with
-separate decoded-image limits. The stricter Hydra URL rules apply even when an
-origin has an explicit sample grant; a sample grant does not authorize Hydra
-images from plain HTTP or loopback. Camera input is governed separately by
+Hydra images and videos from a web address are host fetches. They must pass
+the session's score sample access policy, as a sample does: an allowed
+source, guarded DNS on every hop, and redirects that stay inside the source.
+A response body is limited to 16 MiB for an image, before image decoding,
+with separate decoded-image limits, and to 64 MiB for a video. A relative
+path is read in the folder of the set, then in the local root, under the
+rules of a local sample. Camera input is governed separately by
 the studio's camera consent setting.
 
 ## OSC output
@@ -265,8 +271,8 @@ plugin in the folders runs also when no score names the plugin. `query`,
 
 ## Remote sample cache
 
-An exact-origin grant authorizes validated manifests and audio from that origin
-to be kept in a bounded persistent cache. Authorization is checked before each
+An allowed source authorizes validated manifests and audio from it to be
+kept in a bounded persistent cache. Authorization is checked before each
 cache read or write. Invalid responses are not committed, and an invalid entry
 in the dedicated score namespace is removed before one network retry. Local
 sample files are read in place and never copied into this cache.
@@ -316,7 +322,7 @@ to score JavaScript. It listens on loopback by default, and binding it to a
 network interface is an explicit host decision. Browser reads require an exact
 origin: `https://strudel.cc` by default, or the origins named with
 `--allow-origin`. Requests must also carry the listener's permitted `Host`
-authority. This policy is separate from the native score capability granted by
+authority. This policy is separate from the native score capability allowed by
 `--allow-sample-origin`.
 
 The server exposes only visible `.wav`, `.mp3`, and `.ogg` files beneath its

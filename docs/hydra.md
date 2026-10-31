@@ -48,11 +48,14 @@ column makes music, not Hydra sketches.
 ## What a score can use
 
 Call `await initHydra()` before Hydra chains. Use **Ctrl+D** on a name or
-search the reference for its arguments.
+search the reference for its arguments. In a Hydra statement, **Ctrl+F** and
+the suggestions list Hydra names only, under the `hydra` heading. In pattern
+code they never list a Hydra name. See
+[the reference](studio.md#reference) for how a statement counts as Hydra code.
 
 | Option | Effect |
 | --- | --- |
-| `detectAudio` | Defaults to true. Feeds `a.fft` from playback, never a microphone. `a.setBins(n)` selects 1-16 bins; default 4. |
+| `detectAudio` | Defaults to true. Feeds `a.fft` from playback, never a microphone. `a.setBins(n)` selects 1-16 bins; default 4. `a.setSmooth()`, `a.setCutoff()` and `a.setScale()` work as in hydra-synth, with its defaults 0.4, 2 and 10. |
 | `feedStrudel` | Defaults to false. Sends the terminal frame into `s0`. |
 | `width`, `height` | Fallback size, default 640×360. Studio's delivery size overrides it. |
 
@@ -73,13 +76,41 @@ Array entries must be finite numbers. Invalid numeric arguments refuse the
 new score and leave the committed score in place. Raw shelf snippets do not
 accept arrays.
 
-## Camera and web-image sources
+### The clock
+
+Assign a number to change Hydra's clock:
+
+```js
+await initHydra()
+speed = 0.5 // every animation at half speed
+bpm = 120   // arrays step four times as often as at the default 30
+fps = 12    // draw 12 frames a second
+time = 0    // start every animation again at each update
+shape([3, 4, 5]).rotate(() => time).out()
+```
+
+`speed` scales `time`, and 1 is real time. `bpm` sets how fast arrays step. It
+does not follow the tempo of the score. `fps` keeps the last frame on screen
+between draws. Studio draws at most 30 frames a second, so a higher value
+changes nothing. Without `time = …`, the clock keeps running across updates.
+`speed(2)` stays the playback-speed control, and only `speed = …` is Hydra
+code.
+
+| Setting | Range |
+| --- | --- |
+| `speed` | -1000 to 1000 |
+| `bpm` | 0.01 to 10000 |
+| `fps` | 1 to 240 |
+| `time` | -1e9 to 1e9 seconds |
+
+## Camera, image and video sources
 
 ```js
 await initHydra()
 s0.initCam() // Use initCam(1) for the second enumerated camera.
 s1.initImage('https://example.com/texture.png')
-src(s0).blend(src(s1), 0.25).out()
+s2.initVideo('clips/loop.webm')
+src(s0).blend(src(s1), 0.25).modulate(src(s2), 0.1).out()
 ```
 
 **Hydra webcam** in Settings is blocked by default. Set it to **allowed**
@@ -98,23 +129,66 @@ before shutdown completes. It cannot publish stale frames. Physical camera
 operation on Windows and Linux has not been verified. Camera indices can
 change after reconnecting.
 
-Images need no webcam permission. They load while the score draws and stop
-with it. Studio allows public CORS origins by default. With
-`--strict-sample-origins`, grant each origin:
+Images and videos need no webcam permission. They load while the score draws
+and stop with it. Give each one a direct public HTTPS URL or a local path.
+
+### Local files
+
+A path without `://` is a local file, relative to a folder that the score
+may read. These are the folders that local samples use, with the same rules:
+
+- In Studio, the open set's folder. Put `loop.webm` in the set folder and
+  write `s0.initVideo('loop.webm')`. No flag is needed.
+- The folder granted with `--allow-local-samples`, the one that
+  `samples('local:')` reads. Studio reads it after the set folder. In
+  Studio, the `local:` row of Settings > Permissions grants it too.
 
 ```sh
-rustel studio set/ --strict-sample-origins \
-  --allow-sample-origin https://images.example
+rustel studio set/ --allow-local-samples ~/visuals
 ```
 
-Use a direct public **HTTPS** image URL. Its response must allow CORS for
-`https://strudel.cc` or `*`. Redirects must stay on the same origin. Private,
-loopback, and link-local addresses are refused, even with an origin grant.
+The path must be relative and made of plain names. Absolute paths, `..`,
+hidden entries and links that lead out of the folder are refused. Without a
+set folder or a grant, a local path is refused.
 
-PNG, JPEG, GIF, and WebP are decoded; animated files use their first frame.
-Limits are 16 MiB downloaded, 2048 pixels per edge, and 4,194,304 pixels.
-An explicit camera or image on `s0` takes precedence over `feedStrudel`.
-Removing it restores the terminal feed on the next evaluation.
+### Web addresses
+
+An address loads only from an allowed source, as a sample does. In Studio, a
+refused address puts its folder on Settings ▸ Permissions. Enter allows the
+folder, and `e` cuts it down to a domain. On the command line, allow a domain
+or an address:
+
+```sh
+rustel studio set/ --allow-sample-origin images.example
+```
+
+A domain allows HTTPS from it and its subdomains. An address, such as
+`http://localhost:8000/media/`, allows what starts with it. Redirects must
+stay inside the source. Private and link-local addresses are refused, and a
+server on this computer needs an address that names it.
+
+### Formats and limits
+
+`initImage()` decodes PNG, JPEG, GIF, and WebP. An animated file shows its
+first frame. `initVideo()` plays in a loop, without sound:
+
+| Format | Video |
+| --- | --- |
+| WebM, MKV | VP8 or VP9, 8-bit 4:2:0 |
+| GIF, PNG, WebP | animated or still |
+
+H.264, H.265, AV1 and 4:4:4 VP9 do not play: no decoder for them is pure
+Rust and complete. A VP9 file that uses segmentation or reference scaling,
+as some real-time encoders write, can also fail. MP4 files do not play, even
+with VP9 inside: their demuxer can be made to ask for gigabytes of memory by
+a small file.
+
+An image may be 16 MiB and a video 64 MiB, read or downloaded. A picture may
+be 2048 pixels per edge and 4,194,304 pixels. A video holds its whole file in
+memory while it plays, so four videos hold at most 256 MiB.
+
+An explicit camera, image or video on `s0` takes precedence over
+`feedStrudel`. Removing it restores the terminal feed on the next evaluation.
 
 ## `H(pattern)`
 
@@ -162,16 +236,53 @@ a smaller picture gets a larger factor. Smoothing on a small picture can use
 more GPU work. Terminal capability detection selects the display detail
 automatically.
 
+## The pointer
+
+`mouse.x` and `mouse.y` give the position of the mouse over the terminal,
+in pixels of the picture from its top-left corner. Read them in a callback:
+
+```js
+await initHydra()
+osc(() => mouse.x / width * 40, 0.1, () => mouse.y / height).out()
+```
+
+`mousex` and `mousey` in pattern code read the same pointer, from 0 to 1.
+Outside Studio the pointer stays at 0.
+
 ## What a score cannot do here
 
-Browser objects, video, screen and stream sources, WebRTC, custom GLSL
-functions, `setResolution()`, render-loop hooks (`update`, `afterUpdate`), and
-assignments to `fps`, `speed`, `bpm`, or `time` are unsupported. `sum()` is
-refused because its pinned upstream shader is invalid.
+Some Hydra calls need a browser. Rustel accepts them and ignores them, so a
+shared sketch that uses them still runs:
 
-Callbacks are compiled shader expressions, not arbitrary JavaScript.
-Closures, mutation, `mouse`, `Math.random()`, and user functions are refused.
-Use `H(pattern)` for musical values. Use `a.fft`, not `a0()`-`a3()`.
+| Call | Here |
+| --- | --- |
+| `s0.initScreen()`, `initStream()`, `initCanvas()`, `init()` | The source stays empty. |
+| `setResolution()` | Nothing. Studio sets the size from the backdrop. |
+| `update = …`, `afterUpdate = …` | The function never runs. |
+| `setFunction({ … })` | The GLSL is not compiled. A call to a new transform leaves the chain as it is, and a new source draws nothing. A name that Hydra already has keeps its own function. |
+| `sum()` | The chain stays as it is. Its upstream shader does not compile. |
+| `a.setMax()` | Nothing. hydra-synth no longer uses it either. |
+
+Browser objects and WebRTC are not available.
+
+Callbacks are compiled shader expressions, not arbitrary JavaScript. They
+read numbers, `time`, `width`, `height`, `mouse.x`, `mouse.y` and
+`a.fft[n]`, with these operators:
+
+- Arithmetic: `+`, `-`, `*`, `/` and `%`. `%` keeps the sign of its left
+  side, as in JavaScript.
+- Comparisons: `<`, `>`, `<=`, `>=`, `==`, `===`, `!=` and `!==`. A
+  comparison gives 1 or 0.
+- Logic: `&&`, `||`, `!` and `? :`. 0 counts as false.
+- `Math`: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `floor`,
+  `ceil`, `round`, `trunc`, `abs`, `sign`, `sqrt`, `exp`, `log`, `log2`,
+  `log10`, `pow`, `min`, `max`, `hypot` and `random`, and the constants such
+  as `Math.PI` and `Math.E`.
+
+Each `Math.random()` has its own value, the same for every pixel. The value
+changes each frame while the clock runs, and stays while `speed = 0`.
+Closures, mutation and user functions are refused. Use `H(pattern)` for
+musical values. Use `a.fft`, not `a0()`-`a3()`.
 
 `strength`, `pixelRatio`, `pixelated`, and `contextType` are accepted but
 ignored. They do not select opacity, render scale, texture sampling, or a

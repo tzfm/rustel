@@ -395,7 +395,7 @@ pub(super) mod tests {
             let entry: serde_json::Value = serde_json::from_str(TIE_BANK).expect("bank JSON");
             let mut access = ScoreSampleAccess::denied();
             access
-                .permit_origin("https://samples.example")
+                .permit_source("https://samples.example")
                 .expect("sample origin");
             let bank = parse_score_bank(&entry, BASE, &access, &mut Vec::new())
                 .expect("approved bank")

@@ -1890,7 +1890,7 @@ $: s("supersaw").seg(16)"#;
             let mut session = SessionConfig::default();
             session
                 .score_sample_access
-                .permit_origin("http://127.0.0.1:9")
+                .permit_source("http://127.0.0.1:9")
                 .expect("the test origin");
             let mut engine = studio_with(LoadMode::Wait, &library, session);
             start(&mut engine, "s(\"sine\")");
