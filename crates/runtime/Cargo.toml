@@ -14,7 +14,7 @@ description = "Native host library behind the rustel command and studio: Session
 # explicitly with `--no-default-features` and adds back only the capabilities
 # it needs. Internal benchmark instrumentation remains opt-in even for the
 # complete product.
-default = ["mp3-export", "extensions", "opus", "osc", "serial", "hydra", "gamepad", "vst"]
+default = ["mp3-export", "extensions", "opus", "osc", "serial", "hydra", "video", "gamepad", "vst"]
 # Recording and replaying a live-coding set (`session_log`). The rustel
 # command and the studio record; a host that records nothing leaves it out.
 session-log = []
@@ -53,6 +53,9 @@ hydra = [
   "dep:rustel-hydra",
   "rustel-jsruntime/hydra",
 ]
+# The picture half of a video sample: `video()` and `_video()` painters.
+# Motion JPEG decodes through `image`, VP8 through OxiMedia, both pure Rust.
+video = ["dep:image", "dep:oximedia-codec", "dep:oximedia-core", "oximedia-codec/vp8"]
 
 [[test]]
 name = "midi_input"
@@ -156,6 +159,11 @@ symphonia = { version = "0.5", default-features = false, features = [
   "mp3",
   "ogg",
   "vorbis",
+  # Video containers, for their audio track: a folder of clips is also a
+  # folder of sounds, and the score names one the way it names a wav.
+  "isomp4",
+  "aac",
+  "mkv",
 ] }
 # symphonia demuxes Ogg Opus but ships no Opus decoder. opuscule is a pure-Rust,
 # decode-only implementation with no C or CMake dependency. Its MPL-2.0 license

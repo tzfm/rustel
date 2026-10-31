@@ -20,8 +20,11 @@ a condition a release must satisfy:
 - **serialport 4.9.0** - MPL-2.0 - https://github.com/serialport/serialport-rs
 - **symphonia 0.5.5** - MPL-2.0 - https://github.com/pdeljanov/Symphonia
 - **symphonia-bundle-mp3 0.5.5** - MPL-2.0 - https://github.com/pdeljanov/Symphonia
+- **symphonia-codec-aac 0.5.5** - MPL-2.0 - https://github.com/pdeljanov/Symphonia
 - **symphonia-codec-vorbis 0.5.5** - MPL-2.0 - https://github.com/pdeljanov/Symphonia
 - **symphonia-core 0.5.5** - MPL-2.0 - https://github.com/pdeljanov/Symphonia
+- **symphonia-format-isomp4 0.5.5** - MPL-2.0 - https://github.com/pdeljanov/Symphonia
+- **symphonia-format-mkv 0.5.5** - MPL-2.0 - https://github.com/pdeljanov/Symphonia
 - **symphonia-format-ogg 0.5.5** - MPL-2.0 - https://github.com/pdeljanov/Symphonia
 - **symphonia-metadata 0.5.5** - MPL-2.0 - https://github.com/pdeljanov/Symphonia
 - **symphonia-utils-xiph 0.5.5** - MPL-2.0 - https://github.com/pdeljanov/Symphonia
@@ -663,8 +666,11 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `subtle` | 2.6.1 | BSD-3-Clause |
 | `symphonia` | 0.5.5 | MPL-2.0 |
 | `symphonia-bundle-mp3` | 0.5.5 | MPL-2.0 |
+| `symphonia-codec-aac` | 0.5.5 | MPL-2.0 |
 | `symphonia-codec-vorbis` | 0.5.5 | MPL-2.0 |
 | `symphonia-core` | 0.5.5 | MPL-2.0 |
+| `symphonia-format-isomp4` | 0.5.5 | MPL-2.0 |
+| `symphonia-format-mkv` | 0.5.5 | MPL-2.0 |
 | `symphonia-format-ogg` | 0.5.5 | MPL-2.0 |
 | `symphonia-metadata` | 0.5.5 | MPL-2.0 |
 | `symphonia-utils-xiph` | 0.5.5 | MPL-2.0 |

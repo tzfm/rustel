@@ -1143,6 +1143,8 @@ pub const VISUAL_WIDGET_METHODS: &[&str] = &[
     "_pitchwheel",
     "spectrum",
     "_spectrum",
+    "video",
+    "_video",
     "markcss",
 ];
 

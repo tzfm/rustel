@@ -4260,6 +4260,7 @@ endin`";
             "_spiral",
             "_pitchwheel",
             "_spectrum",
+            "_video",
             "scope",
             "tscope",
             "pianoroll",
@@ -4267,6 +4268,7 @@ endin`";
             "spiral",
             "pitchwheel",
             "spectrum",
+            "video",
             "markcss",
         ] {
             let argument = if method == "markcss" {

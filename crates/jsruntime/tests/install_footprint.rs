@@ -1,6 +1,6 @@
 use rustel_jsruntime::JsRuntime;
 
-const CORE_SEMANTIC_OBJECT_BUDGET: usize = 3_527;
+const CORE_SEMANTIC_OBJECT_BUDGET: usize = 3_530;
 
 fn semantic_object_budget() -> usize {
     let mut budget = CORE_SEMANTIC_OBJECT_BUDGET;

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `_video()` and `video()` draw a video sample's picture, small by default, its frame following the sound through the pattern, including `begin` and `speed`. A kitty terminal shows it as real pixels. The picture decodes once per clip and stays bounded; H.264 and its family are named in a note that says to re-encode the clip as VP8 WebM or Motion JPEG, which this build decodes natively.
+- A video file can be a sample: `mp4`, `m4v`, `mov`, `mkv` and `webm` play their audio track as a wav does, from a sample folder or a fetched bank. A video with no audio track says so, and a codec the build cannot play is named in the error.
 - Edit ▸ Find, chosen with a click, takes what you type. The release of the click closed the find bar again, so the typing went into the score as text or ran as Vim commands.
 - With Vim keys on, any key the search box takes, such as `i`, Esc or a typed letter, calls off a pending delete in the set panel, the Samples tab and the theme picker, and a pending trim. Before, a later Enter or a second Ctrl+D could delete the score, the sample or the theme without asking again.
 - Vim `p` no longer crashes when the yanked line ends in a Unicode line or paragraph separator.

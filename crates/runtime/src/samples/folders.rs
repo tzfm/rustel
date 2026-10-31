@@ -150,7 +150,10 @@ pub(crate) fn sample_audio_kind(path: &Path) -> Option<SampleAudioKind> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "wav" => Some(SampleAudioKind::Wav),
         "mp3" => Some(SampleAudioKind::Mp3),
-        "ogg" => Some(SampleAudioKind::Ogg),
+        "ogg" | "oga" => Some(SampleAudioKind::Ogg),
+        // Video files in a sample folder are sounds as well as pictures.
+        "mp4" | "m4v" | "mov" => Some(SampleAudioKind::Mp4),
+        "mkv" | "webm" => Some(SampleAudioKind::Matroska),
         _ => None,
     }
 }
