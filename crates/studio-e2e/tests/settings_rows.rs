@@ -868,12 +868,12 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
 
     open_permissions(&mut studio);
     select_row(&mut studio, "▸ https://scripts.invalid");
-    let refused = row_with(&mut studio, "https://scripts.invalid");
-    assert!(refused.contains("scripts  off"), "{refused}");
+    let row = row_with(&mut studio, "https://scripts.invalid");
+    assert!(row.contains("scripts  off"), "{row}");
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
-    let trusted = row_with(&mut studio, "https://scripts.invalid");
-    assert!(trusted.contains("scripts  on"), "{trusted}");
+    let row = row_with(&mut studio, "https://scripts.invalid");
+    assert!(row.contains("scripts  on"), "{row}");
     // The trust re-ran the refused update by itself, so the footer can only
     // hold the fetch of the newly trusted origin - never the refusal.
     if let Some(error) = studio.errors() {
