@@ -437,6 +437,15 @@ impl CallbackRealTime {
     /// `workers_ready` set. A worker with the class proves that the system
     /// gives the class to the process, so the call meets no refusal, whose
     /// error the crate allocates. Until then the thread keeps its priority.
+    ///
+    /// There is deliberately no direct-scheduling fallback. A callback
+    /// whose render work sits near the whole of every period runs at a
+    /// near-total real-time duty cycle, and the kernel's real-time
+    /// watchdog kills such a thread (SIGXCPU, then death) within a
+    /// fraction of a second of the grant: the class is only safe for a
+    /// thread that sleeps most of every period. rtkit's own grant carries
+    /// the same watchdog, so this is not a workaround; the duty cycle is
+    /// the constraint.
     pub(super) fn promote_once(&mut self, workers_ready: &AtomicBool) {
         if !self.asked && workers_ready.load(Ordering::Acquire) {
             self.asked = true;

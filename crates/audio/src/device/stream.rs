@@ -2099,6 +2099,33 @@ where
     // drops with the stream.
     #[cfg(target_os = "linux")]
     let mut real_time = CallbackRealTime::new(buffer_frames, sample_rate);
+    // A live stream without plugins still owes its callback the real-time
+    // class. rtkit grants the class per thread and the callback can only
+    // ask for itself, so prove the class here on a throwaway thread and
+    // open the gate the callback's first call reads. The probe releases
+    // the class again at once; a refusal leaves the gate closed and the
+    // callback an ordinary thread, exactly as before.
+    #[cfg(target_os = "linux")]
+    if !shared.plugin_real_time.load(Ordering::Acquire) {
+        let flag = Arc::clone(&shared.plugin_real_time);
+        let frames = buffer_frames;
+        let rate = sample_rate;
+        std::thread::spawn(move || {
+            // The probe proves the class the only safe way, rtkit's grant,
+            // and opens the gate. It releases the class again at once; a
+            // refusal leaves the gate closed and the callback an ordinary
+            // thread, exactly as before. A direct grant is deliberately
+            // not tried: the real-time watchdog kills a callback whose
+            // render runs near the whole of every period, which is the
+            // only kind of machine that needs this help.
+            if let Ok(handle) =
+                audio_thread_priority::promote_current_thread_to_real_time(frames, rate)
+            {
+                drop(handle);
+                flag.store(true, Ordering::Release);
+            }
+        });
+    }
     // cpal reports no underruns for a WASAPI output, so the callback counts
     // them from the playback clock.
     #[cfg(windows)]
