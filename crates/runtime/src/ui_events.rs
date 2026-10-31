@@ -258,6 +258,7 @@ impl UiVisual {
                     | "tscope"
                     | "pitchwheel"
                     | "spectrum"
+                    | "video"
                     | "markcss"
             )
         {

@@ -429,8 +429,8 @@ impl App {
     /// scene's imports whose failure has rested, asked again; what the
     /// checker knows; the files still caching; and the Sources rows. Last,
     /// while the focused scene's sounds are still arriving it asks after
-    /// them again; and with Hydra, on every poll, it follows a sounding
-    /// preview's sounds.
+    /// them again; with video, every clip a painter names; and with Hydra,
+    /// on every poll, it follows a sounding preview's sounds.
     pub(super) fn poll_readiness(&mut self) {
         self.readiness_polled_at = Instant::now();
         self.poll_trim_jobs();
@@ -451,6 +451,8 @@ impl App {
         {
             self.refresh_readiness(scene);
         }
+        #[cfg(feature = "video")]
+        self.poll_video_thumbnails();
         #[cfg(feature = "hydra")]
         self.refresh_preview_readiness();
     }
@@ -492,6 +494,40 @@ impl App {
             .map_or(0, |library| library.pending_loads());
         if caching != self.caching_samples {
             self.caching_samples = caching;
+            self.dirty_frame = true;
+        }
+    }
+
+    /// Ask the library for every clip a video painter names and no strip
+    /// is held for. The first ask starts a decode on a library thread;
+    /// this poll collects it when it lands. A clip whose answer never
+    /// comes is named once and then left alone.
+    #[cfg(feature = "video")]
+    fn poll_video_thumbnails(&mut self) {
+        let Some(library) = self.worker.library() else {
+            return;
+        };
+        let every_sound = self.wants_video_feeds();
+        let mut changed = false;
+        for name in self.visual.video_names_to_ask(every_sound) {
+            use rustel_runtime::video::VideoPicture;
+            match library.video_thumbnails(&name) {
+                Some(VideoPicture::Ready(strip)) => {
+                    changed |= self
+                        .visual
+                        .install_video(&name, super::super::visuals::VideoEntry::Ready(strip));
+                }
+                Some(VideoPicture::Failed(message)) => {
+                    changed |= self
+                        .visual
+                        .install_video(&name, super::super::visuals::VideoEntry::Failed(message));
+                }
+                Some(VideoPicture::Decoding) | None => {
+                    changed |= self.visual.note_video_ask(&name);
+                }
+            }
+        }
+        if changed {
             self.dirty_frame = true;
         }
     }

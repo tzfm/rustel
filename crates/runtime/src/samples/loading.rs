@@ -586,6 +586,8 @@ impl SampleLibrary {
             direct_diagnostic_logging: AtomicBool::new(
                 rustel_voice::default_direct_diagnostic_logging(),
             ),
+            #[cfg(feature = "video")]
+            videos: Mutex::new(HashMap::new()),
             score_cache: ScoreCache::new(dir.clone()),
             manifest_pending: AtomicUsize::new(0),
             publication,
@@ -2243,6 +2245,8 @@ pub(super) mod tests {
                 font_jobs: FontQueue::new(),
                 failures: Mutex::new(Vec::new()),
                 direct_diagnostic_logging: AtomicBool::new(true),
+                #[cfg(feature = "video")]
+                videos: Mutex::new(HashMap::new()),
                 score_cache: ScoreCache::new(cache_dir()),
                 manifest_pending: AtomicUsize::new(0),
                 publication: Arc::new(PublicationGate::new()),

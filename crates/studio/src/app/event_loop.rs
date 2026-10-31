@@ -140,6 +140,10 @@ impl App {
         // The plugins: on macOS each one is created and released here.
         #[cfg(feature = "vst")]
         rustel_runtime::vst::pump_main();
+        // The detached video window: on every platform its events arrive
+        // here, on the studio's own thread.
+        #[cfg(feature = "video")]
+        self.pump_video_window();
         self.drive_mapped_faders(Instant::now());
         self.drain_lint();
         self.pump_theme_editor();
@@ -490,6 +494,15 @@ impl App {
                 wait.min(crate::remote::POLL)
             } else {
                 wait
+            };
+            // A detached video window moves with its sound, so while one
+            // is open the idle sleep ends often enough to keep it moving
+            // even when the terminal itself has nothing to repaint.
+            #[cfg(feature = "video")]
+            let wait = if self.video_windows.is_empty() {
+                wait
+            } else {
+                wait.min(Duration::from_millis(33))
             };
             if terminal.poll_event(wait)? {
                 // What this batch of input marks stale is told apart from

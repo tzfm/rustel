@@ -681,14 +681,16 @@ mod tests {
 
     /// The art is a title rather than a picture of the mix, and the mixer
     /// a control surface, so they are there whatever the set is doing;
-    /// everything else goes with the sound.
+    /// everything else goes with the sound. The art, the spacer and the
+    /// mixer are there whatever the set is doing, and so is the video
+    /// picker: its feeds are chosen before anything plays.
     #[test]
-    fn only_the_art_the_spacer_and_the_mixer_are_always_there() {
+    fn only_the_art_the_spacer_the_mixer_and_the_video_picker_are_always_there() {
         use super::super::WidgetKind;
         for kind in WidgetKind::ALL {
             let always = matches!(
                 kind,
-                WidgetKind::Art | WidgetKind::Spacer | WidgetKind::Mixer
+                WidgetKind::Art | WidgetKind::Spacer | WidgetKind::Mixer | WidgetKind::Video
             );
             assert_eq!(kind.always_visible(), always, "{kind:?}");
         }

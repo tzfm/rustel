@@ -1049,6 +1049,11 @@ fn audio_content_type(path: &Path) -> Option<&'static str> {
         SampleAudioKind::Wav => "audio/wav",
         SampleAudioKind::Mp3 => "audio/mpeg",
         SampleAudioKind::Ogg => "audio/ogg",
+        // The route serves the container's audio for a score. Naming the
+        // container rather than `audio/mp4` keeps the response honest about
+        // what the bytes are.
+        SampleAudioKind::Mp4 => "video/mp4",
+        SampleAudioKind::Matroska => "video/x-matroska",
     })
 }
 
