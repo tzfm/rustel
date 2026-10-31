@@ -153,18 +153,18 @@ set folder or a grant, a local path is refused.
 
 ### Web addresses
 
-Studio allows public CORS origins by default. Settings > Permissions has
-the switch for that default and the origins you trust. With
-`--strict-sample-origins`, grant each origin:
+An address loads only from an allowed source, as a sample does. Settings ▸
+Permissions lists the sources and adds one. On the command line, allow a
+domain or an address:
 
 ```sh
-rustel studio set/ --strict-sample-origins \
-  --allow-sample-origin https://images.example
+rustel studio set/ --allow-sample-origin images.example
 ```
 
-Use a direct public HTTPS URL. Its response must allow CORS for
-`https://strudel.cc` or `*`. Redirects must stay on the same origin. Private,
-loopback, and link-local addresses are refused, even with an origin grant.
+A domain allows HTTPS from it and its subdomains. An address, such as
+`http://localhost:8000/media/`, allows what starts with it. Redirects must
+stay inside the source. Private and link-local addresses are refused, and a
+server on this computer needs an address that names it.
 
 ### Formats and limits
 

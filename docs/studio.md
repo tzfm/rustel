@@ -283,27 +283,40 @@ names Studio does not read before the script runs. See
 
 ### Samples and media
 
-By default, a score's `samples()`, Hydra images and Hydra videos load from
-any public HTTPS server that allows cross-origin reads, as on strudel.cc.
-The Permissions page changes what they can read:
+A score's `samples()`, Hydra images and Hydra videos load only from a source
+on the Permissions page. A source is one of these:
 
-- `public servers with CORS` is the switch for that default. Turn it off
-  and only trusted origins load. With `--strict-sample-origins`, the switch
-  stays off for the run.
-- A refused origin, such as `http://kit.example`, comes onto the page with
-  `samples, media` beside it. Press Enter to trust it. A trusted origin
-  loads with no CORS header, over plain HTTP, or from a server on this
-  computer. Space turns a trust off, and `d` removes it.
-- `local folder` is the folder that `samples('local:...')` reads. Hydra also
+- A domain, such as `cdn.example.com`. It allows HTTPS from that domain and
+  its subdomains.
+- An address, such as `https://example.com/kits/`. It allows only the
+  addresses that start with it. Plain HTTP and a server on this computer
+  need an address, such as `http://localhost:8000/`.
+
+The page has four sections:
+
+- `samples, images and videos` lists the sources.
+  `raw.githubusercontent.com`, `strudel.b-cdn.net` and `shabda.ndre.gr` are
+  built in. They serve the `github:`, `bubo:` and `shabda:` shorthands and
+  the default banks. Space turns a built-in source off, and it stays on the
+  page. With `--strict-sample-origins`, they stay off for the run. A refused
+  source comes onto the page as `blocked`. Press Enter to allow it. Space
+  turns a source off, and `d` removes it. `+ Add a domain or address…` asks
+  for a new source.
+- `? Try an address…` asks for an address and tells you which source allows
+  it. An allowed address loads once, and the row tells you what came back,
+  such as `sample map, 42 sounds`. If no source allows it, press `a` to allow
+  its domain, or `u` to allow only its folder.
+- `local files` is the folder that `samples('local:...')` reads. Hydra also
   reads a file from it when the set folder does not have the file. Press
   Enter to choose the folder, and `d` to forget it. With
   `--allow-local-samples`, the folder of the flag is used for the run.
+- `scripts` and `csound` hold the script origins and the orchestra switch.
 
-Studio keeps the trusted origins, the switch and the folder in
-`studio.json`. If an update stopped on the refusal, it runs again when you
-give the permission. Otherwise the next update reads with the new
-permission. Hydra images and videos still need HTTPS and CORS, also from a
-trusted origin. See [Sample access](../SECURITY.md#sample-access) for the
+Studio keeps the sources, the built-in sources you turned off, the script
+origins and the folder in `studio.json`. If an update stopped on a refusal,
+it runs again when you give the permission. Otherwise the next update reads
+with the new permission. A redirect must stay inside the source that allowed
+the address. See [Sample access](../SECURITY.md#sample-access) for the
 rules.
 
 ## Checking and playback

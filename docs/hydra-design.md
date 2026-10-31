@@ -38,9 +38,9 @@ invalidates publication before clearing. Old workers cannot restore stale
 pixels. Clearing an old lease cannot erase a replacement source.
 
 Each image and video job carries the session's sample-access policy. For a
-URL, the worker checks origin permission, public-only pinned DNS, same-origin
-HTTPS redirects, and CORS before decoding. `HydraBridge::apply_with_sample_access`
-supplies that policy. Plain `apply` grants no image origins. A path without
+URL, the worker checks that a source allows it, pins guarded DNS on every
+hop, and keeps redirects inside the source before decoding.
+`HydraBridge::apply_with_sample_access` supplies that policy. Plain `apply` grants no image origins. A path without
 `://` is read beneath the set folder that `HydraBridge::set_media_folder`
 names, then beneath the local sample root, through the same confined open as
 a local sample. Each slot has one active job and one replaceable pending job.
