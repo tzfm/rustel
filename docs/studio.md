@@ -725,6 +725,13 @@ The View menu opens the two visuals docks. Use `e` to change a dock's edge and
 `+` or `-` to resize it. Use its controls to choose a scope, spectrum, events,
 mixer, or another visual. Follow the footer for actions in the selected view.
 
+A video widget plays a video sample's picture in its slot. Use the arrows to
+pick which clip feeds it, from every video the set sounds. Press Enter and the
+clip opens a window of its own on the desktop, in sync with the sound, and the
+widget folds to a note. Press Enter again, or close the window, and the clip
+comes back to the dock. Windows are placed and sized by hand, one per clip,
+and none of it outlives the studio.
+
 Scores can also contain inline visualizers. Use the visualizers switch in
 Settings, or View > Inline visualizers, to show or hide them. Bind a key for
 Inline visualizers on the Settings > Keybinds page. Visual settings control

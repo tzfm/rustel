@@ -212,6 +212,8 @@ mod stage_pixels;
 mod string_roles;
 mod theme_sheets;
 mod transport;
+#[cfg(feature = "video")]
+mod video_window;
 mod vim;
 mod viz_panel;
 #[cfg(feature = "vst")]
@@ -837,6 +839,11 @@ struct App {
     worker: StudioWorker,
     save_worker: SaveWorker,
     visual: VisualState,
+    /// The detached video windows, one per clip the video widgets have
+    /// sent to the desktop. Attached is the default: a window exists
+    /// only while the player keeps it, and nothing of it persists.
+    #[cfg(feature = "video")]
+    video_windows: Vec<video_window::VideoWindowHost>,
     /// One or two panes, left to right. The focused one holds the caret and
     /// is always the set's current scene.
     panes: Vec<Pane>,
@@ -1659,6 +1666,8 @@ impl App {
             worker,
             save_worker,
             visual,
+            #[cfg(feature = "video")]
+            video_windows: Vec::new(),
             panes: vec![Pane {
                 scene: first_scene,
                 last_map: None,

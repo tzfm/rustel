@@ -15,7 +15,10 @@ default = ["extensions", "gamepad", "hydra", "video", "osc", "serial", "remote-c
 extensions = ["dep:rustel-ext", "rustel-runtime/extensions"]
 gamepad = ["rustel-runtime/gamepad"]
 hydra = ["dep:rustel-hydra", "rustel-runtime/hydra"]
-video = ["rustel-runtime/video"]
+# The picture half of a video sample: the painters, the dock's video
+# widget, and the detached desktop window it opens. `winit` and
+# `softbuffer` are the window itself, pure Rust, no GPU stack.
+video = ["rustel-runtime/video", "dep:winit", "dep:softbuffer"]
 osc = ["dep:rustel-osc", "rustel-runtime/osc"]
 serial = ["dep:rustel-serial", "rustel-runtime/serial"]
 vst = ["rustel-runtime/vst"]
@@ -56,6 +59,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
 getrandom = { version = "0.4", optional = true }
 url = "2.5.8"
+# The detached video window's surface: winit opens the desktop window and
+# softbuffer presents the frame, both pure Rust and neither a GPU stack.
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
 # The terminal studio is intentionally a Rust-only surface. Ratatui shares the
 # exact Crossterm 0.29 event types used for enhanced-keyboard negotiation.
 arboard = { version = "3.6", default-features = false }

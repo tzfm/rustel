@@ -804,6 +804,11 @@ pub struct StudioView<'a> {
     /// Live Hydra camera state for the Settings row.
     #[cfg(feature = "hydra")]
     pub hydra_webcam: Option<rustel_runtime::hydra::HydraWebcamStatus>,
+    /// The clips the detached video windows are playing, when any are
+    /// open: a video widget folds to a note while its clip plays
+    /// elsewhere.
+    #[cfg(feature = "video")]
+    pub video_windows: Vec<String>,
     /// The settings sheet, when it is open, with what it shows.
     pub settings: Option<(SettingsSheet, &'a UiSettings, &'a TerminalFeatures)>,
 }
@@ -1295,6 +1300,8 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 area: layout.viz[index],
                 focused: view.focused_panel == Some(PanelKind::Viz) && view.viz_focus == index,
                 mixer: view.mixer.as_ref(),
+                #[cfg(feature = "video")]
+                windows: &view.video_windows,
             },
             area,
         );
@@ -3176,6 +3183,8 @@ mod tests {
                 render(
                     frame,
                     StudioView {
+                        #[cfg(feature = "video")]
+                        video_windows: Vec::new(),
                         show_scrollbars: true,
                         midi_rows: Vec::new(),
                         clock_in: None,
@@ -3301,6 +3310,8 @@ mod tests {
                 render(
                     frame,
                     StudioView {
+                        #[cfg(feature = "video")]
+                        video_windows: Vec::new(),
                         show_scrollbars: true,
                         midi_rows: Vec::new(),
                         clock_in: None,
@@ -3414,6 +3425,8 @@ mod tests {
                 render(
                     frame,
                     StudioView {
+                        #[cfg(feature = "video")]
+                        video_windows: Vec::new(),
                         show_scrollbars: true,
                         midi_rows: Vec::new(),
                         clock_in: None,
@@ -3530,6 +3543,8 @@ mod tests {
                 render(
                     frame,
                     StudioView {
+                        #[cfg(feature = "video")]
+                        video_windows: Vec::new(),
                         show_scrollbars: true,
                         midi_rows: Vec::new(),
                         clock_in: None,

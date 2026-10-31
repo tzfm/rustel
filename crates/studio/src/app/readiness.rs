@@ -507,8 +507,9 @@ impl App {
         let Some(library) = self.worker.library() else {
             return;
         };
+        let every_sound = self.wants_video_feeds();
         let mut changed = false;
-        for name in self.visual.video_names_to_ask() {
+        for name in self.visual.video_names_to_ask(every_sound) {
             use rustel_runtime::video::VideoPicture;
             match library.video_thumbnails(&name) {
                 Some(VideoPicture::Ready(strip)) => {

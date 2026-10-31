@@ -90,7 +90,7 @@ impl App {
     }
 
     /// The dock with the keyboard, when one is open.
-    fn focused_dock(&self) -> Option<usize> {
+    pub(super) fn focused_dock(&self) -> Option<usize> {
         self.viz_docks[self.viz_focus]
             .is_some()
             .then_some(self.viz_focus)
@@ -537,7 +537,21 @@ impl App {
                     return false;
                 }
             }
-            KeyCode::Enter if !primary => self.open_art_text_prompt(),
+            KeyCode::Enter if !primary => {
+                // The video widget's Enter is its window: the clip moves
+                // to the desktop and back.
+                if self.focused_widget_kind() == Some(WidgetKind::Video) {
+                    #[cfg(feature = "video")]
+                    self.toggle_video_window();
+                    #[cfg(not(feature = "video"))]
+                    {
+                        self.status =
+                            "the video window needs a build with the video feature".into();
+                    }
+                } else {
+                    self.open_art_text_prompt();
+                }
+            }
             KeyCode::Char('+' | '=') if !primary => {
                 self.resize_viz_dock(true);
                 self.viz_unlaid[index] = true;
@@ -599,7 +613,21 @@ impl App {
             return;
         };
         let changed = if style {
-            spec.step_style(forwards)
+            // The video widget's arrows choose its feed; a clip picker is
+            // what the arrows are for there.
+            #[cfg(feature = "video")]
+            {
+                if spec.kind == WidgetKind::Video {
+                    let feeds = self.visual.video_feeds();
+                    spec.step_feed(forwards, &feeds)
+                } else {
+                    spec.step_style(forwards)
+                }
+            }
+            #[cfg(not(feature = "video"))]
+            {
+                spec.step_style(forwards)
+            }
         } else {
             spec.step_colour(forwards)
         };
@@ -876,6 +904,40 @@ mod tests {
         use crate::app::*;
         use crate::viz_panel::ART_MAX_BYTES;
         use crate::viz_panel::{ArtAlignment, Edge};
+
+        /// The video widget's arrows pick its feed from whatever the set
+        /// has, wrapping; the choice is the widget's own and survives
+        /// with the dock's preferences.
+        #[test]
+        #[cfg(feature = "video")]
+        fn the_video_widget_steps_its_feed_with_the_arrows() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.prefs.visuals[0].widgets = vec![WidgetSpec::new(WidgetKind::Video)];
+            app.viz_docks[0] = Some(VizPanel::default());
+            app.viz_focus = 0;
+            app.focus = Focus::Panel(PanelKind::Viz);
+            for feed in ["a.webm", "b.webm"] {
+                assert!(
+                    app.visual
+                        .install_video(feed, crate::visuals::VideoEntry::Asking(1))
+                );
+            }
+            let feeds = |app: &App| app.prefs.visuals[0].widgets[0].feed.clone();
+            assert_eq!(feeds(&app), None, "attached starts with no feed chosen");
+            assert!(app.handle_viz_key(KeyCode::Right, false, false));
+            assert_eq!(feeds(&app).as_deref(), Some("b.webm"), "right steps on");
+            assert!(app.handle_viz_key(KeyCode::Right, false, false));
+            assert_eq!(feeds(&app).as_deref(), Some("a.webm"), "right wraps");
+            assert!(app.handle_viz_key(KeyCode::Left, false, false));
+            assert_eq!(feeds(&app).as_deref(), Some("b.webm"), "left steps back");
+            // The widget asks for every sound the set has.
+            assert!(app.wants_video_feeds());
+            assert!(
+                app.detached_video_feeds().is_empty(),
+                "attached by default: no window until Enter asks for one"
+            );
+        }
 
         /// Shift+F1 and Shift+F2 toggle the two visuals docks, as View > Visuals
         /// 1 and 2 do, so the ticked row and the key agree. Ctrl+Shift+V does
@@ -1220,6 +1282,8 @@ mod tests {
                 let facts = app.mixer_facts().expect("mixer facts");
                 let mut buffer = Buffer::empty(app.frame);
                 VizDockView {
+                    #[cfg(feature = "video")]
+                    windows: &[],
                     panel: app.viz_docks[0].as_ref().unwrap(),
                     index: 0,
                     widgets: &app.prefs.visuals[0].widgets,

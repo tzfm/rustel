@@ -1325,6 +1325,8 @@ impl App {
             theme_camera: None,
             #[cfg(feature = "hydra")]
             hydra_webcam: visuals.hydra_webcam,
+            #[cfg(feature = "video")]
+            video_windows: self.detached_video_feeds(),
             settings: self
                 .settings_sheet
                 .map(|sheet| (sheet, &self.ui_settings, &self.features)),

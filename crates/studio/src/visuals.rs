@@ -150,7 +150,6 @@ fn event_clip_name(event: &UiScheduledEvent) -> Option<String> {
 /// One `key:number` link of an event's chain, as the number the control
 /// holds.
 #[cfg(feature = "video")]
-#[cfg(feature = "video")]
 fn event_chain_number(event: &UiScheduledEvent, key: &str) -> Option<f64> {
     event
         .value
@@ -163,6 +162,35 @@ fn event_chain_number(event: &UiScheduledEvent, key: &str) -> Option<f64> {
                 .flatten()
                 .filter(|number| number.is_finite())
         })
+}
+
+/// Where a clip's sound is inside it, in seconds: the event's `begin` and
+/// `speed` carry where the voice started and how fast it walks - and
+/// `scrub` is begin under another name, so a scrubbed clip seeks its
+/// picture. A looping clip wraps. A reversed clip walks to its end; a
+/// live scrub that never reaches the event text moves the voice, not yet
+/// the picture.
+#[cfg(feature = "video")]
+fn clip_position(event: &UiScheduledEvent, now: f64, duration: f64) -> f64 {
+    let begin = event_chain_number(event, "begin")
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let speed = event_chain_number(event, "speed").unwrap_or(1.0);
+    let looping = event_chain_number(event, "loop").unwrap_or(0.0) >= 1.0;
+    if !now.is_finite() {
+        return begin * duration;
+    }
+    let elapsed = (now - event.target_time).max(0.0);
+    let advanced = if speed >= 0.0 {
+        begin * duration + elapsed * speed
+    } else {
+        duration - elapsed * -speed
+    };
+    if looping && duration > 0.0 {
+        advanced.rem_euclid(duration)
+    } else {
+        advanced.clamp(0.0, duration)
+    }
 }
 
 /// The bit the display sets on a preview's onset id, so a preview is told
@@ -676,6 +704,68 @@ impl VisualState {
         self.videos.get(name)
     }
 
+    /// The set's video clips by name, sorted: what the dock's video
+    /// widget steps through with ←/→. Only clips asked for are listed;
+    /// the poll asks for the painters' clips and, when a video widget is
+    /// in a dock, every sound the set plays.
+    #[cfg(feature = "video")]
+    pub fn video_feeds(&self) -> Vec<String> {
+        let mut feeds: Vec<String> = self.videos.keys().cloned().collect();
+        feeds.sort();
+        feeds
+    }
+
+    /// The strip a named feed is showing and the position inside it, in
+    /// seconds, for the dock's video widget and the detached window: the
+    /// event sounding now for that clip, else the last that sounded, else
+    /// the next to come.
+    #[cfg(feature = "video")]
+    pub fn video_feed_frame(&self, feed: &str) -> Option<(f64, std::sync::Arc<VideoThumbnails>)> {
+        let strip = match self.videos.get(feed) {
+            Some(VideoEntry::Ready(strip)) => std::sync::Arc::clone(strip),
+            _ => return None,
+        };
+        let (now, _, _) = self.current_clock().unwrap_or((f64::NAN, 0.0, 0.0));
+        let mut active = None;
+        let mut past = None;
+        let mut future = None;
+        for event in self.events() {
+            if event_clip_name(event).as_deref() != Some(feed) {
+                continue;
+            }
+            let end = event.target_time + event.duration_seconds.max(0.035);
+            if !now.is_finite() {
+                future.get_or_insert(event);
+            } else if event.target_time <= now && now <= end {
+                let newer = active
+                    .is_none_or(|held: &UiScheduledEvent| held.target_time < event.target_time);
+                if newer {
+                    active = Some(event);
+                }
+            } else if event.target_time <= now {
+                let later =
+                    past.is_none_or(|held: &UiScheduledEvent| held.target_time < event.target_time);
+                if later {
+                    past = Some(event);
+                }
+            } else {
+                let sooner = future
+                    .is_none_or(|held: &UiScheduledEvent| held.target_time > event.target_time);
+                if sooner {
+                    future = Some(event);
+                }
+            }
+        }
+        let event = active.or(past).or(future);
+        // With no event of its own, the clip shows its poster: the first
+        // frame is what a docked widget or a window has before the score
+        // reaches it.
+        let position = event.map_or(0.0, |event| {
+            clip_position(event, now, f64::from(strip.duration()))
+        });
+        Some((position, strip))
+    }
+
     /// Remember a clip's decoded strip, or why it has none. Returns
     /// whether anything changed, so the caller knows to repaint.
     #[cfg(feature = "video")]
@@ -714,15 +804,20 @@ impl VisualState {
     /// The sounds a video painter's events name and no strip is held for:
     /// what the next library ask is for. A stopped set keeps its strips,
     /// so this names nothing once every clip has landed.
+    ///
+    /// `every_sound` asks for whatever the set sounds, not only the
+    /// painters' own lanes: the dock's video widget picks its feed from
+    /// any of them.
     #[cfg(feature = "video")]
-    pub fn video_names_to_ask(&self) -> Vec<String> {
+    pub fn video_names_to_ask(&self, every_sound: bool) -> Vec<String> {
         let Some(layout) = self.layout.as_ref() else {
             return Vec::new();
         };
         // An inline painter asks only for its own lane's clips. A stage
-        // painter tags no hap, so it asks for whatever the set sounds.
+        // painter tags no hap, and the dock's widget names no lane, so
+        // either asks for whatever the set sounds.
         let mut slot_mask = 0_u64;
-        let mut stage = false;
+        let mut stage = every_sound;
         for visual in &layout.visuals {
             if visual.kind != "video" {
                 continue;
@@ -3162,26 +3257,9 @@ impl Widget for Video<'_, '_> {
                 return;
             }
         };
-        // Where the sound is inside the clip: the event's begin and speed
-        // carry where the voice started and how fast it walks. A reversed
-        // or looping clip walks to its end and holds; a live scrub moves
-        // the voice, not yet the picture.
+        // Where the sound is inside the clip, from the event's own chain.
         let duration = f64::from(strip.duration());
-        let begin = event_chain_number(event, "begin")
-            .unwrap_or(0.0)
-            .clamp(0.0, 1.0);
-        let speed = event_chain_number(event, "speed").unwrap_or(1.0);
-        let position = if !now.is_finite() {
-            begin * duration
-        } else {
-            let elapsed = (now - event.target_time).max(0.0);
-            let advanced = if speed >= 0.0 {
-                begin * duration + elapsed * speed
-            } else {
-                duration - elapsed * -speed
-            };
-            advanced.clamp(0.0, duration)
-        };
+        let position = clip_position(event, now, duration);
         let Some(frame) = strip.frame_at(position as f32) else {
             note(
                 self.request,
@@ -6776,11 +6854,13 @@ mod tests {
         #[test]
         fn the_poll_names_each_clip_once_and_stops_at_its_strip() {
             let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
-            let asks = state.video_names_to_ask();
+            let asks = state.video_names_to_ask(false);
             assert_eq!(asks, vec!["clip.webm".to_owned()]);
-            // Another lane's sound is not this painter's to ask for.
+            // Another lane's sound is not this painter's to ask for: the
+            // spiral's lane is slot 1.
             let mut other = clip_event(10.2);
-            other.ui_visuals = 1_u64 << 3;
+            other.onset_id = 2;
+            other.ui_visuals = 1_u64 << 1;
             other.value = Some("s:other.webm".to_owned());
             let wider = playing(
                 "stack(s('clip.webm')._video(), s('other.webm')._spiral())",
@@ -6788,13 +6868,22 @@ mod tests {
                 0.0,
             );
             assert_eq!(
-                wider.video_names_to_ask(),
+                wider.video_names_to_ask(false),
                 vec!["clip.webm".to_owned()],
                 "the spiral's sound is not asked for"
             );
+            // The dock's video widget picks its feed from any lane, so
+            // its ask is for every sound the set plays.
+            let mut every: Vec<String> = wider.video_names_to_ask(true);
+            every.sort();
+            assert_eq!(
+                every,
+                vec!["clip.webm".to_owned(), "other.webm".to_owned()],
+                "every sound, whatever its lane"
+            );
             state.note_video_ask("clip.webm");
             assert_eq!(
-                state.video_names_to_ask(),
+                state.video_names_to_ask(false),
                 vec!["clip.webm".to_owned()],
                 "an unanswered ask is asked again"
             );
@@ -6802,9 +6891,72 @@ mod tests {
                 state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
             );
             assert!(
-                state.video_names_to_ask().is_empty(),
+                state.video_names_to_ask(false).is_empty(),
                 "a strip answers the ask"
             );
+        }
+
+        #[test]
+        fn a_looping_clip_wraps_its_picture_back_to_the_start() {
+            // Three frames: red, green, blue, the last at half a second.
+            let strip = rustel_runtime::video::VideoThumbnails::from_frames(
+                2,
+                2,
+                vec![
+                    (0.0, [255, 0, 0, 255].repeat(4)),
+                    (0.25, [0, 255, 0, 255].repeat(4)),
+                    (0.5, [0, 0, 255, 255].repeat(4)),
+                ],
+            )
+            .expect("strip");
+            let mut looping = playing("$: s(\"clip.webm\")._video()", vec![clip_event(9.3)], 0.0);
+            let mut chain = clip_event(9.3);
+            chain.value = Some("s:clip.webm loop:1".to_owned());
+            looping.events.pop_back();
+            looping.events.push_back(chain);
+            assert!(
+                looping.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip)))
+            );
+            // 0.7 s in: past the clip's end, so the loop wraps to 0.2 s -
+            // the red frame - where the unlooping clip holds the blue one.
+            let picture = draw("video", "", &looping, Rect::new(0, 0, 20, 8));
+            assert!(
+                picture
+                    .content
+                    .iter()
+                    .any(|cell| cell.fg == Color::Rgb(255, 0, 0)),
+                "the loop wrapped the picture to its start"
+            );
+            assert!(
+                picture
+                    .content
+                    .iter()
+                    .all(|cell| cell.fg != Color::Rgb(0, 0, 255)),
+                "the last frame is not held while the clip loops"
+            );
+        }
+
+        #[test]
+        fn a_named_feed_shows_its_own_event_s_place_in_the_clip() {
+            // The dock's widget and the detached window ask by name: the
+            // position is the named clip's own event, not another's.
+            let mut a_event = clip_event(10.0);
+            a_event.value = Some("s:a.webm".to_owned());
+            let mut state = playing(
+                "stack(s('a.webm')._video(), s('b.webm')._video())",
+                vec![a_event],
+                0.0,
+            );
+            assert!(state.install_video("a.webm", VideoEntry::Ready(std::sync::Arc::new(strip()))));
+            assert!(state.install_video("b.webm", VideoEntry::Ready(std::sync::Arc::new(strip()))));
+            // `a.webm` has its event sounding now; `b.webm` has none, and
+            // shows its poster frame - the clip's first.
+            assert!(state.video_feed_frame("a.webm").is_some());
+            let (position, _) = state
+                .video_feed_frame("b.webm")
+                .expect("a landed strip always has a frame to show");
+            assert_eq!(position, 0.0, "the poster is the clip's first frame");
+            assert_eq!(state.video_feeds(), vec!["a.webm", "b.webm"]);
         }
 
         #[test]
@@ -6820,7 +6972,7 @@ mod tests {
                 "the asking ran out"
             );
             assert!(
-                state.video_names_to_ask().is_empty(),
+                state.video_names_to_ask(false).is_empty(),
                 "a failed clip is not asked for again"
             );
             // A new score gives the clip its chance back: the failed note
