@@ -89,4 +89,4 @@ The first-frame allowance is 65 seconds on macOS for its permission prompt,
 five seconds elsewhere. Persistent failures retry after five seconds without
 repeating identical log messages.
 
-See [Visuals](hydra.md) for permissions, settings, and unsupported operations.
+See [Visuals](hydra.md) for permissions, settings, and the calls that need a browser.

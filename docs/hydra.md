@@ -55,7 +55,7 @@ code they never list a Hydra name. See
 
 | Option | Effect |
 | --- | --- |
-| `detectAudio` | Defaults to true. Feeds `a.fft` from playback, never a microphone. `a.setBins(n)` selects 1-16 bins; default 4. |
+| `detectAudio` | Defaults to true. Feeds `a.fft` from playback, never a microphone. `a.setBins(n)` selects 1-16 bins; default 4. `a.setSmooth()`, `a.setCutoff()` and `a.setScale()` work as in hydra-synth, with its defaults 0.4, 2 and 10. |
 | `feedStrudel` | Defaults to false. Sends the terminal frame into `s0`. |
 | `width`, `height` | Fallback size, default 640×360. Studio's delivery size overrides it. |
 
@@ -254,14 +254,34 @@ Outside Studio the pointer stays at 0.
 
 ## What a score cannot do here
 
-Browser objects, screen and stream sources, WebRTC, custom GLSL
-functions, `setResolution()`, render-loop hooks (`update`, `afterUpdate`),
-`mouse`, and the analyser settings `a.setCutoff()`, `a.setScale()`,
-`a.setSmooth()` and `a.setMax()` are unsupported. `sum()` is refused because
-its pinned upstream shader is invalid.
+Some Hydra calls need a browser. Rustel accepts them and ignores them, so a
+shared sketch that uses them still runs:
+
+| Call | Here |
+| --- | --- |
+| `s0.initScreen()`, `initStream()`, `initCanvas()`, `init()` | The source stays empty. |
+| `setResolution()` | Nothing. Studio sets the size from the backdrop. |
+| `update = …`, `afterUpdate = …` | The function never runs. |
+| `setFunction({ … })` | The GLSL is not compiled. A call to a new transform leaves the chain as it is, and a new source draws nothing. A name that Hydra already has keeps its own function. |
+| `sum()` | The chain stays as it is. Its upstream shader does not compile. |
+| `a.setMax()` | Nothing. hydra-synth no longer uses it either. |
+
+Browser objects and WebRTC are not available.
 
 Callbacks are compiled shader expressions, not arbitrary JavaScript. They
-read arithmetic, `Math` functions, `time`, `width`, `height` and `a.fft[n]`.
+read numbers, `time`, `width`, `height`, `mouse.x`, `mouse.y` and
+`a.fft[n]`, with these operators:
+
+- Arithmetic: `+`, `-`, `*`, `/` and `%`. `%` keeps the sign of its left
+  side, as in JavaScript.
+- Comparisons: `<`, `>`, `<=`, `>=`, `==`, `===`, `!=` and `!==`. A
+  comparison gives 1 or 0.
+- Logic: `&&`, `||`, `!` and `? :`. 0 counts as false.
+- `Math`: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `floor`,
+  `ceil`, `round`, `trunc`, `abs`, `sign`, `sqrt`, `exp`, `log`, `log2`,
+  `log10`, `pow`, `min`, `max`, `hypot` and `random`, and the constants such
+  as `Math.PI` and `Math.E`.
+
 Each `Math.random()` has its own value, the same for every pixel. The value
 changes each frame while the clock runs, and stays while `speed = 0`.
 Closures, mutation and user functions are refused. Use `H(pattern)` for

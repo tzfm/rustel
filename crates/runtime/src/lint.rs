@@ -3292,6 +3292,22 @@ mod tests {
         assert!(check(source).is_empty(), "{:?}", check(source));
     }
 
+    /// A shared sketch is checked as it runs: the calls that need a browser
+    /// are known names, and so are the names that `setFunction` gives.
+    #[cfg(feature = "hydra")]
+    #[test]
+    fn a_shared_hydra_sketch_is_not_refused() {
+        let source = "await initHydra()\n\
+            setResolution(1280, 720)\n\
+            update = () => {}\n\
+            s0.initScreen()\n\
+            a.setSmooth(0.8)\n\
+            setFunction({ name: 'chroma', type: 'color', glsl: '' })\n\
+            setFunction({ name: 'stars', type: 'src', glsl: '' })\n\
+            stars(3).chroma().sum().rotate(() => mouse.x / width).out()";
+        assert!(check(source).is_empty(), "{:?}", check(source));
+    }
+
     #[test]
     fn a_call_to_a_name_nothing_answers_to_is_a_finding_with_the_nearest_name() {
         let source = "$: s(\"bd\").lpff(800).gian(.5)";

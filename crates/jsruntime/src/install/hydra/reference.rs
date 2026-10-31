@@ -75,15 +75,16 @@ macro_rules! method {
     };
 }
 
-/// A Hydra name with no native implementation. Lookup explains why, and
-/// completion never offers it.
-macro_rules! unavailable {
-    ($name:literal, $context:literal, $summary:literal, $description:literal) => {
+/// A Hydra name with no native form, accepted and ignored so that a shared
+/// sketch runs as written. Lookup explains what it does here, and completion
+/// never offers it.
+macro_rules! ignored {
+    ($name:literal, $context:literal, $description:literal) => {
         ReferenceEntry {
             name: $name,
-            summary: $summary,
+            summary: "Accepted and ignored.",
             description: $description,
-            tags: &["hydra", "unsupported", $context],
+            tags: &["hydra", "ignored", $context],
             no_autocomplete: true,
             origin: "hydra",
             ..ReferenceEntry::blank($name)
@@ -237,7 +238,7 @@ pub(super) const ENTRIES: &[ReferenceEntry] = &[
         [],
         "audio",
         "The audio analyser.",
-        "Reads the sound that Rustel plays, never a microphone. a.fft[0] to a.fft[n - 1] hold the level of each frequency band, from 0 upwards. Use them in a function argument. a.setBins(n) sets the number of bands. Turn this off with initHydra({ detectAudio: false }).",
+        "Reads the sound that Rustel plays, never a microphone. a.fft[0] to a.fft[n - 1] hold the level of each frequency band, from 0 upwards. Use them in a function argument. a.setBins(n) sets the number of bands. a.setSmooth, a.setCutoff and a.setScale change how the bands move and read. Turn this off with initHydra({ detectAudio: false }).",
         "osc(10, 0.1, () => a.fft[0] * 4).out()"
     ),
     method!(
@@ -255,6 +256,38 @@ pub(super) const ENTRIES: &[ReferenceEntry] = &[
         "Divides the spectrum into n bands, from 1 to 16. The default is 4.",
         [param!("n", "number", "Number of bands, from 1 to 16.")],
         "a.setBins(8)\nosc(() => a.fft[7] * 40).out()"
+    ),
+    method!(
+        "setSmooth",
+        "audio",
+        "Set how slowly the audio bands move.",
+        "Each band keeps this share of its last level and takes the rest from the new one. 0 follows the sound at once and 1 never moves. The default is 0.4.",
+        [param!(
+            "n",
+            "number",
+            "Share of the last level, from 0 to 1."
+        )],
+        "a.setSmooth(0.8)\nosc(10, 0.1, () => a.fft[0] * 4).out()"
+    ),
+    method!(
+        "setCutoff",
+        "audio",
+        "Set the level a band must pass.",
+        "a.fft stays at 0 until a band passes this level. A higher value ignores quieter sound. The default is 2. The levels use the scale of hydra-synth, so the values in a shared sketch have about the same effect.",
+        [param!("n", "number", "Level, from -1000 to 1000.")],
+        "a.setCutoff(4)\nosc(() => a.fft[0] * 40).out()"
+    ),
+    method!(
+        "setScale",
+        "audio",
+        "Set the level that reads as 1.",
+        "a.fft reads 1 when a band is this far past the cutoff. A lower value makes a.fft larger. The default is 10.",
+        [param!(
+            "n",
+            "number",
+            "Level past the cutoff, from 0.001 to 1000."
+        )],
+        "a.setScale(4)\nshape(4, () => 0.2 + a.fft[1]).out()"
     ),
     method!(
         "show",
@@ -333,6 +366,14 @@ pub(super) const ENTRIES: &[ReferenceEntry] = &[
         "The height of the picture that Hydra draws. The studio sets it from the size of the backdrop.",
         "osc(() => height / 20).out()"
     ),
+    value!(
+        "mouse",
+        [],
+        "values",
+        "The pointer position in pixels.",
+        "mouse.x and mouse.y give the position of the pointer in pixels of the picture, from its top-left corner. Read them in a function argument, for example () => mouse.x / width. In Studio they follow the mouse over the terminal. Elsewhere they stay at 0.",
+        "osc(() => mouse.x / width * 40).out()"
+    ),
     // Geometry: these move where a chain samples its picture.
     method!(
         "rotate",
@@ -366,14 +407,6 @@ pub(super) const ENTRIES: &[ReferenceEntry] = &[
         "Divides the picture into a grid and gives each cell one colour.",
         [
             param!("pixelX", "Cells across. Default 20."),
-    value!(
-        "mouse",
-        [],
-        "values",
-        "The pointer position in pixels.",
-        "mouse.x and mouse.y give the position of the pointer in pixels of the picture, from its top-left corner. Read them in a function argument, for example () => mouse.x / width. In Studio they follow the mouse over the terminal. Elsewhere they stay at 0.",
-        "osc(() => mouse.x / width * 40).out()"
-    ),
             param!("pixelY", "Cells down. Default 20.")
         ],
         "noise(3).pixelate(16, 9).out()"
@@ -917,59 +950,56 @@ pub(super) const ENTRIES: &[ReferenceEntry] = &[
         ],
         "osc([0, 1, 2, 3].fit(5, 40)).out()"
     ),
-    // Hydra names with no native form.
-    unavailable!(
+    // Hydra names with no native form. A shared sketch that uses them still
+    // runs.
+    ignored!(
         "sum",
         "method",
-        "Not supported.",
-        "The upstream shader for sum() does not compile, so Rustel refuses it."
+        "The upstream shader for sum() does not compile. Rustel leaves the chain as it is."
     ),
-    unavailable!(
+    ignored!(
         "initScreen",
         "method",
-        "Not supported.",
-        "Rustel cannot capture the screen. Use initCam(), initImage() or initVideo()."
+        "Rustel cannot capture the screen. The input stays empty. Use initCam(), initImage() or initVideo()."
     ),
-    unavailable!(
+    ignored!(
         "initStream",
         "method",
-        "Not supported.",
-        "Stream inputs need a browser peer connection, which Rustel does not have."
+        "Stream inputs need a browser peer connection, which Rustel does not have. The input stays empty."
     ),
-    unavailable!(
+    ignored!(
         "initCanvas",
         "method",
-        "Not supported.",
-        "Canvas inputs need a browser canvas, which Rustel does not have."
+        "Canvas inputs need a browser canvas, which Rustel does not have. The input stays empty."
     ),
-    unavailable!(
+    ignored!(
+        "init",
+        "method",
+        "init() reads a browser element, which Rustel does not have. The input stays empty."
+    ),
+    ignored!(
         "setResolution",
         "global",
-        "Not supported yet.",
-        "The studio sets the render size from the backdrop. A headless host can use initHydra({ width, height })."
+        "Studio sets the render size from the backdrop. A headless host can use initHydra({ width, height })."
     ),
-    unavailable!(
+    ignored!(
         "update",
         "global",
-        "Not supported.",
-        "update runs JavaScript on every frame. Rustel records the sketch and runs no JavaScript while it draws."
+        "The browser runs this function on every frame. Rustel runs no JavaScript while it draws, so the function never runs."
     ),
-    unavailable!(
+    ignored!(
         "afterUpdate",
         "global",
-        "Not supported.",
-        "afterUpdate runs JavaScript after every frame. Rustel records the sketch and runs no JavaScript while it draws."
+        "The browser runs this function after every frame. Rustel runs no JavaScript while it draws, so the function never runs."
     ),
-    unavailable!(
-        "mouse",
-        "global",
-        "Not supported yet.",
-        "Hydra callbacks cannot read the pointer in Rustel yet."
-    ),
-    unavailable!(
+    ignored!(
         "setFunction",
         "global",
-        "Not supported yet.",
-        "Custom GLSL functions are refused."
+        "Rustel does not compile custom GLSL. A call to a new transform leaves the chain as it is, and a new source draws nothing. A name that Hydra already has keeps its own function."
+    ),
+    ignored!(
+        "setMax",
+        "method",
+        "hydra-synth no longer uses a.setMax(), so it changes nothing there either. Use a.setScale() to set the level that reads as 1."
     ),
 ];

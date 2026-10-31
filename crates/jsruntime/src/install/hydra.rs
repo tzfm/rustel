@@ -50,13 +50,16 @@ const VALUES: &[&str] = &[
 ];
 
 /// Hydra globals that are plain calls with no chain.
-const ACTIONS: &[&str] = &["render", "hush", "setResolution", "update"];
+const ACTIONS: &[&str] = &["render", "hush", "setResolution", "update", "setFunction"];
 
 /// Hydra globals a sketch may assign. The clock settings are recorded for the
-/// renderer, and the render-loop hooks are refused. The getter still
-/// preserves the `speed(...)` pattern control instead of shadowing it with a
-/// number.
+/// renderer, and the render-loop hooks are kept and never run. The getter
+/// still preserves the `speed(...)` pattern control instead of shadowing it
+/// with a number.
 const SETTINGS: &[&str] = &["speed", "bpm", "fps", "time", "update", "afterUpdate"];
+
+/// How many names one score may give to `setFunction`.
+const MAX_FUNCTIONS: usize = 64;
 
 /// Defaults mirrored from `rustel-hydra`, so a score that says nothing gets
 /// the same picture the renderer would have chosen.
@@ -191,6 +194,11 @@ pub(crate) struct HydraChains {
     /// The names that this surface protected from `clearScope()` at install.
     /// The surface releases them when it gives the names back.
     protected: Vec<&'static str>,
+    /// Transforms that `setFunction` named. A call to one leaves the chain
+    /// as it is.
+    ignored_transforms: Vec<String>,
+    /// Sources that `setFunction` named. Each draws nothing.
+    blank_sources: Vec<String>,
 }
 
 fn candidate(effects: &mut ScoreEffects) -> &mut HydraCandidate {
@@ -350,12 +358,14 @@ fn arguments<'js>(
 /// protocol statement. A source setup is deliberately not left as an
 /// arbitrary chain: it may open hardware, files or the network and therefore
 /// has to reach the host as something it can permission-check before acting.
+/// The browser-only initialisers are accepted and ignored: the source stays
+/// empty, so a shared sketch runs as written.
 fn source_statement<'js>(
     ctx: &Ctx<'js>,
     chain: &Chain,
     method: &str,
     args: &[rquickjs::Value<'js>],
-) -> rquickjs::Result<Option<serde_json::Value>> {
+) -> rquickjs::Result<Option<SetupEffect>> {
     let Some(slot) = chain
         .head
         .strip_prefix('s')
@@ -365,8 +375,8 @@ fn source_statement<'js>(
         return Ok(None);
     };
     const SUPPORTED: &[&str] = &["initCam", "initImage", "initVideo", "clear"];
-    const UNSUPPORTED: &[&str] = &["initScreen", "initStream", "initCanvas", "init"];
-    if !SUPPORTED.contains(&method) && !UNSUPPORTED.contains(&method) {
+    const IGNORED: &[&str] = &["initScreen", "initStream", "initCanvas", "init"];
+    if !SUPPORTED.contains(&method) && !IGNORED.contains(&method) {
         return Ok(None);
     }
     if chain.args.is_some() || !chain.calls.is_empty() {
@@ -377,22 +387,17 @@ fn source_statement<'js>(
             ),
         ));
     }
-    if UNSUPPORTED.contains(&method) {
-        return Err(throw_type_error(
-            ctx,
-            &format!(
-                "{method}(...) is not supported by native Hydra; use initCam(...), initImage(url) or initVideo(url)"
-            ),
-        ));
+    if IGNORED.contains(&method) {
+        return Ok(Some(SetupEffect::Noop));
     }
     if method == "clear" {
         if !args.is_empty() {
             return Err(throw_type_error(ctx, "sN.clear() accepts no arguments"));
         }
-        return Ok(Some(serde_json::json!({
+        return Ok(Some(SetupEffect::Record(serde_json::json!({
             "s": "clear_source",
             "slot": slot,
-        })));
+        }))));
     }
 
     let source = match method {
@@ -438,11 +443,11 @@ fn source_statement<'js>(
         }
         _ => return Ok(None),
     };
-    Ok(Some(serde_json::json!({
+    Ok(Some(SetupEffect::Record(serde_json::json!({
         "s": "source",
         "slot": slot,
         "source": source,
-    })))
+    }))))
 }
 
 /// The one string an image or video initialiser takes: an HTTPS URL, or a
@@ -482,7 +487,9 @@ fn source_url<'js>(
     Ok(url)
 }
 
-enum AnalyserEffect {
+/// What a source or analyser setup call does: record a statement for the
+/// host, or nothing.
+enum SetupEffect {
     Record(serde_json::Value),
     Noop,
 }
@@ -490,21 +497,30 @@ enum AnalyserEffect {
 /// Interpret the analyser methods whose semantics matter outside a GLSL
 /// chain. Upstream resizes `a.fft` and divides its spectrum into `n`
 /// contiguous regions. Its analyser-canvas visibility methods have no native
-/// canvas to affect, while its scaling/smoothing controls must be refused
-/// until their settings are carried by the typed protocol.
+/// canvas to affect, and its scaling and smoothing controls are accepted and
+/// ignored.
 fn analyser_effect<'js>(
     ctx: &Ctx<'js>,
     chain: &Chain,
     method: &str,
     args: &[rquickjs::Value<'js>],
-) -> rquickjs::Result<Option<AnalyserEffect>> {
+) -> rquickjs::Result<Option<SetupEffect>> {
     if chain.head != "a" {
         return Ok(None);
     }
-    const MATERIAL_CONTROLS: &[&str] = &["setCutoff", "setScale", "setSmooth", "setMax"];
+    const SETTINGS: &[(&str, &str)] = &[
+        ("setSmooth", "smooth"),
+        ("setCutoff", "cutoff"),
+        ("setScale", "scale"),
+    ];
     const CANVAS_CONTROLS: &[&str] = &["show", "hide"];
+    let setting = SETTINGS
+        .iter()
+        .find(|(name, _)| *name == method)
+        .map(|(_, setting)| *setting);
     if method != "setBins"
-        && !MATERIAL_CONTROLS.contains(&method)
+        && method != "setMax"
+        && setting.is_none()
         && !CANVAS_CONTROLS.contains(&method)
     {
         return Ok(None);
@@ -515,13 +531,26 @@ fn analyser_effect<'js>(
             &format!("a.{method}(...) must be called directly on the pristine audio analyser"),
         ));
     }
-    if MATERIAL_CONTROLS.contains(&method) {
-        return Err(throw_type_error(
-            ctx,
-            &format!(
-                "a.{method}(...) is not supported by native Hydra yet; only a.setBins(n) is available"
-            ),
-        ));
+    if method == "setMax" {
+        // hydra-synth deprecated it, and it does nothing there either.
+        return Ok(Some(SetupEffect::Noop));
+    }
+    if let Some(setting) = setting {
+        let Some(value) = (match args {
+            [value] => value.as_number().filter(|value| value.is_finite()),
+            _ => None,
+        }) else {
+            return Err(throw_type_error(
+                ctx,
+                &format!("a.{method}(n) takes one finite number"),
+            ));
+        };
+        // rustel-hydra owns the range of each setting.
+        return Ok(Some(SetupEffect::Record(serde_json::json!({
+            "s": "analyser",
+            "setting": setting,
+            "value": value,
+        }))));
     }
     if CANVAS_CONTROLS.contains(&method) {
         if !args.is_empty() {
@@ -533,7 +562,7 @@ fn analyser_effect<'js>(
         // Native Hydra has no browser analyser canvas. These calls are kept
         // as intentional compatibility no-ops so shared sketches need not
         // remove their `a.hide()` line.
-        return Ok(Some(AnalyserEffect::Noop));
+        return Ok(Some(SetupEffect::Noop));
     }
     if args.len() != 1 {
         return Err(throw_type_error(
@@ -558,7 +587,7 @@ fn analyser_effect<'js>(
             ),
         ));
     }
-    Ok(Some(AnalyserEffect::Record(serde_json::json!({
+    Ok(Some(SetupEffect::Record(serde_json::json!({
         "s": "audio",
         "bins": bins as u8,
     }))))
@@ -787,6 +816,8 @@ pub(crate) fn restore_surface<'js>(
         }
     }
     chains.chains.clear();
+    chains.ignored_transforms.clear();
+    chains.blank_sources.clear();
     chains.installed = false;
     match first_failure {
         Some(error) => Err(error),
@@ -906,6 +937,13 @@ fn chain_apply<'js>(
         }
         None => Vec::new(),
     };
+    if chains.borrow().blank_sources.contains(&chain.head) {
+        // A source that `setFunction` named has no GLSL here: it draws
+        // nothing, whatever its arguments.
+        chain.head = "solid".to_owned();
+        chain.args = Some(vec![serde_json::json!({ "c": "num", "v": 0.0 }); 4]);
+        return new_chain(ctx, chains, transaction, policy, refusal, chain);
+    }
     chain.args = Some(arguments(ctx, chains, &called)?);
     new_chain(ctx, chains, transaction, policy, refusal, chain)
 }
@@ -969,24 +1007,27 @@ fn chain_get<'js>(
             if chain.calls.len() >= MAX_CALLS {
                 return Err(too_many(&ctx, "calls in one chain", MAX_CALLS));
             }
-            if let Some(statement) = source_statement(&ctx, &chain, &method, &args.0)? {
-                push_statement(&ctx, &transaction, &policy, &refusal, statement)?;
-                // A source configuration is a complete visual effect even
-                // without a following `.out()`. Return the same sentinel as
-                // `.out()` so the score commit seam does not mistake a
-                // source-only program for an undefined/no-pattern result and
-                // discard its staged transaction.
-                return ctx.globals().get("silence");
-            }
-            if let Some(effect) = analyser_effect(&ctx, &chain, &method, &args.0)? {
-                if let AnalyserEffect::Record(statement) = effect {
+            let setup = match source_statement(&ctx, &chain, &method, &args.0)? {
+                Some(effect) => Some(effect),
+                None => analyser_effect(&ctx, &chain, &method, &args.0)?,
+            };
+            if let Some(effect) = setup {
+                if let SetupEffect::Record(statement) = effect {
                     push_statement(&ctx, &transaction, &policy, &refusal, statement)?;
                 }
-                // Like source setup, analyser setup is a complete visual
-                // effect and must survive a score containing no `.out()`.
-                // show/hide are deliberate native no-ops because there is no
-                // analyser canvas, but still return the statement sentinel.
+                // A source or analyser setup is a complete visual effect even
+                // without a following `.out()`. Return the same sentinel as
+                // `.out()` so the score commit seam does not mistake a
+                // setup-only program for an undefined/no-pattern result and
+                // discard its staged transaction. The ignored setups return
+                // it too.
                 return ctx.globals().get("silence");
+            }
+            // `sum()` has no valid upstream shader, and a transform that
+            // `setFunction` named has no GLSL here. Both leave the chain as
+            // it is, so a shared sketch runs as written.
+            if method == "sum" || chains.borrow().ignored_transforms.contains(&method) {
+                return new_chain(&ctx, &chains, &transaction, &policy, &refusal, chain);
             }
             let recorded = arguments(&ctx, &chains, &args.0)?;
             let out = method == "out";
@@ -1076,17 +1117,15 @@ fn action_function<'js>(
         ctx.clone(),
         move |ctx: Ctx<'js>, args: Rest<rquickjs::Value<'js>>| {
             match name {
-                "setResolution" => {
-                    return Err(throw_type_error(
-                        &ctx,
-                        "setResolution(width, height) is not supported by native Hydra; Studio chooses its delivery size, while headless or custom hosts can use initHydra({ width, height }) as a fallback",
-                    ));
+                // Accepted and ignored, so a shared sketch runs as written.
+                // Studio chooses the render size, and nothing runs a
+                // render-loop hook.
+                "setResolution" | "update" => {
+                    return ctx.globals().get::<_, rquickjs::Value>("silence");
                 }
-                "update" => {
-                    return Err(throw_type_error(
-                        &ctx,
-                        "update(callback) is not supported by native Hydra",
-                    ));
+                "setFunction" => {
+                    set_function(&ctx, &chains, &transaction, &policy, &refusal, &args.0)?;
+                    return ctx.globals().get::<_, rquickjs::Value>("silence");
                 }
                 "hush" if !args.0.is_empty() => {
                     return Err(throw_type_error(&ctx, "hush() accepts no arguments"));
@@ -1115,10 +1154,93 @@ fn action_function<'js>(
     Ok(function)
 }
 
+/// `setFunction({ name, type, inputs, glsl })` adds custom GLSL to
+/// hydra-synth. Here it is accepted and ignored: the GLSL never compiles, a
+/// call to the new transform leaves the chain as it is, and a new source
+/// draws nothing. A name Hydra already has keeps its own function.
+fn set_function<'js>(
+    ctx: &Ctx<'js>,
+    chains: &Rc<RefCell<HydraChains>>,
+    transaction: &Rc<RefCell<Option<ScoreEffects>>>,
+    policy: &Rc<Cell<EffectPolicy>>,
+    refusal: &Rc<RefCell<Option<String>>>,
+    args: &[rquickjs::Value<'js>],
+) -> rquickjs::Result<()> {
+    let definition = args.first().and_then(rquickjs::Value::as_object);
+    let text = |key: &str| -> rquickjs::Result<Option<String>> {
+        let Some(definition) = definition else {
+            return Ok(None);
+        };
+        let value: rquickjs::Value = definition.get(key)?;
+        value
+            .as_string()
+            .map(rquickjs::String::to_string)
+            .transpose()
+    };
+    let Some(name) = text("name")? else {
+        return Err(throw_type_error(
+            ctx,
+            "setFunction({ name, type, glsl }) needs an object with a name",
+        ));
+    };
+    let plain = name.len() <= 64
+        && name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+    if !plain || RESERVED.contains(&name.as_str()) || name.starts_with("__") {
+        return Err(throw_type_error(
+            ctx,
+            "setFunction needs a plain name of at most 64 letters, digits, _ or $, such as 'chroma'",
+        ));
+    }
+    if reference::ENTRIES.iter().any(|entry| entry.name == name) {
+        return Ok(());
+    }
+    let source = text("type")?.as_deref() == Some("src");
+    {
+        let mut chains = chains.borrow_mut();
+        if chains.ignored_transforms.contains(&name) || chains.blank_sources.contains(&name) {
+            return Ok(());
+        }
+        if chains.ignored_transforms.len() + chains.blank_sources.len() >= MAX_FUNCTIONS {
+            return Err(too_many(ctx, "setFunction names", MAX_FUNCTIONS));
+        }
+        if source {
+            chains.blank_sources.push(name.clone());
+        } else {
+            chains.ignored_transforms.push(name.clone());
+        }
+    }
+    if source {
+        // A new source is a global, given back with the others.
+        let globals = ctx.globals();
+        let saved: rquickjs::Object = state(ctx)?.get(SAVED)?;
+        remember(ctx, &globals, &saved, &name)?;
+        let value = new_chain(
+            ctx,
+            chains,
+            transaction,
+            policy,
+            refusal,
+            Chain {
+                head: name.clone(),
+                args: None,
+                calls: Vec::new(),
+            },
+        )?;
+        globals.set(name, value)?;
+    }
+    Ok(())
+}
+
 /// Keep a colliding pattern global readable, and record an assignment to one
-/// of Hydra's clock settings for the renderer. Assigning `update` or
-/// `afterUpdate` is refused, because a render-loop hook runs JavaScript every
-/// frame.
+/// of Hydra's clock settings for the renderer. A function assigned to
+/// `update` or `afterUpdate` is kept and never runs: nothing runs JavaScript
+/// while the picture draws.
 fn install_setting<'js>(
     ctx: &Ctx<'js>,
     _chains: &Rc<RefCell<HydraChains>>,
@@ -1128,8 +1250,8 @@ fn install_setting<'js>(
     name: &'static str,
 ) -> rquickjs::Result<()> {
     // Preserve the post-install getter while replacing only assignment:
-    // the pattern speed control, Hydra's time recorder, or update(...)'s clear
-    // unsupported error all remain callable/readable.
+    // the pattern speed control, Hydra's time recorder, and the ignored
+    // update(...) all remain callable/readable.
     let current: rquickjs::Value = ctx.globals().get(name)?;
     let assigned: rquickjs::Object = state(ctx)?.get(ASSIGNED)?;
     assigned.set(name, current)?;
@@ -1142,12 +1264,9 @@ fn install_setting<'js>(
     let refusal = refusal.clone();
     let set = move |ctx: Ctx<'js>, args: Rest<rquickjs::Value<'js>>| -> rquickjs::Result<()> {
         if matches!(name, "update" | "afterUpdate") {
-            return Err(throw_type_error(
-                &ctx,
-                &format!(
-                    "assigning Hydra's {name} is not supported by native Hydra; it runs JavaScript on every frame"
-                ),
-            ));
+            let assigned: rquickjs::Object = state(&ctx)?.get(ASSIGNED)?;
+            let value = args.0.into_iter().next();
+            return assigned.set(name, value.unwrap_or(rquickjs::Value::new_undefined(ctx)));
         }
         let value = args
             .0

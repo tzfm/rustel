@@ -1932,6 +1932,52 @@ impl RegistrationCollector<'_> {
             _ => self.has_dynamic_names = true,
         }
     }
+
+    /// Hydra's `setFunction({ name, ... })` names a transform or a source
+    /// that later calls reach, as `register` does.
+    fn is_set_function(&self, expression: &Expression<'_>) -> bool {
+        matches!(expression.get_inner_expression(), Expression::Identifier(identifier)
+            if identifier.name == "setFunction"
+                && identifier.reference_id.get().is_some_and(|reference|
+                    self.scoping.get_reference(reference).symbol_id().is_none()))
+    }
+
+    fn collect_set_function(&mut self, argument: Option<&Argument<'_>>) {
+        let definition = match argument {
+            // Refused when it runs, and it names nothing.
+            None => return,
+            Some(Argument::ObjectExpression(definition)) => definition,
+            Some(_) => {
+                self.has_dynamic_names = true;
+                return;
+            }
+        };
+        for property in &definition.properties {
+            match property {
+                ObjectPropertyKind::ObjectProperty(property)
+                    if !property.computed
+                        && property.key.static_name().as_deref() == Some("name") =>
+                {
+                    match &property.value {
+                        Expression::StringLiteral(literal) => self.push(literal.value.as_str()),
+                        Expression::TemplateLiteral(template) => {
+                            match static_template_value(template) {
+                                Some(name) => self.push(name),
+                                None => self.has_dynamic_names = true,
+                            }
+                        }
+                        _ => self.has_dynamic_names = true,
+                    }
+                    return;
+                }
+                ObjectPropertyKind::SpreadProperty(_) => {
+                    self.has_dynamic_names = true;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 impl<'a> Visit<'a> for RegistrationCollector<'_> {
@@ -1952,6 +1998,8 @@ impl<'a> Visit<'a> for RegistrationCollector<'_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if self.is_registration(&call.callee) {
             self.collect_argument(call.arguments.first());
+        } else if self.is_set_function(&call.callee) {
+            self.collect_set_function(call.arguments.first());
         }
         walk::walk_call_expression(self, call);
     }
@@ -7579,5 +7627,32 @@ p._scope({ text: "/* not a comment */" });"#;
             "the template and its regex stay as written: {}",
             output.output
         );
+    }
+
+    /// Hydra's `setFunction` names what later calls reach. A name the checker
+    /// cannot read makes the names dynamic, and a local `setFunction` is
+    /// not Hydra's.
+    #[test]
+    fn set_function_names_are_registrations() {
+        let hints = registration_hints(
+            "setFunction({ type: 'color', name: 'chroma', glsl: '' })\n\
+             setFunction({ name: `stars`, type: 'src' })\n\
+             setFunction()",
+        );
+        assert_eq!(hints.names, ["chroma", "stars"]);
+        assert!(!hints.has_dynamic_names);
+
+        for source in [
+            "setFunction(definition)",
+            "setFunction({ name: prefix + 'x' })",
+            "setFunction({ ...definition })",
+        ] {
+            assert!(registration_hints(source).has_dynamic_names, "{source}");
+        }
+
+        let local =
+            registration_hints("const setFunction = () => {}\nsetFunction({ name: 'mine' })");
+        assert!(local.names.is_empty());
+        assert!(!local.has_dynamic_names);
     }
 }
