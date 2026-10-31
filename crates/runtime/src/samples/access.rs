@@ -1,38 +1,44 @@
 use super::*;
 
-/// What a fetch refused for a missing CORS consent says. The caller that
-/// holds the policy finds it by this and notes the origin.
-pub(super) const NO_CORS_CONSENT: &str = "the server does not consent to cross-origin reads";
-
 impl ScoreSampleAccess {
     pub fn denied() -> Self {
         Self::default()
     }
 
-    /// Permit score-selected URLs on one exact HTTP(S) origin.
-    ///
-    /// The origin must not contain credentials, a path, query, or fragment.
-    /// Redirects are confined to the same origin.
-    pub fn permit_origin(&mut self, origin: &str) -> Result<(), String> {
-        let parsed =
-            Url::parse(origin).map_err(|error| format!("invalid sample origin: {error}"))?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-            return Err("sample origin must be an http or https origin".to_owned());
-        }
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err("sample origin must not contain credentials".to_owned());
-        }
-        if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
-            return Err("sample origin must not contain a path, query, or fragment".to_owned());
-        }
-        let canonical = parsed.origin().ascii_serialization();
-        if canonical == "null" {
-            return Err("sample origin is not a network origin".to_owned());
-        }
-        if !self.allowed_origins.contains(&canonical) {
-            self.allowed_origins.push(canonical);
+    /// Allow one source: a domain such as `example.com`, or an address such
+    /// as `https://example.com/kits/`. See [`SourceRule`].
+    pub fn permit_source(&mut self, source: &str) -> Result<(), String> {
+        let rule = SourceRule::parse(source)?;
+        if !self.sources.contains(&rule) {
+            self.sources.push(rule);
         }
         Ok(())
+    }
+
+    /// Allow the domains of [`BUILTIN_SOURCES`], which the `github:`,
+    /// `bubo:` and `shabda:` shorthands and the default banks read.
+    pub fn permit_builtin_sources(&mut self) {
+        for source in BUILTIN_SOURCES {
+            self.permit_source(source)
+                .expect("a built-in source is a domain");
+        }
+    }
+
+    /// Take one source back. The other sources and the local root stay.
+    pub fn revoke_source(&mut self, rule: &SourceRule) {
+        self.sources.retain(|kept| kept != rule);
+    }
+
+    /// The sources this policy allows, in the order they were given.
+    pub fn sources(&self) -> &[SourceRule] {
+        &self.sources
+    }
+
+    /// The source that allows `raw`, or `None` when no source does. It does
+    /// not note a refusal, so a host can ask before it fetches.
+    pub fn source_for(&self, raw: &str) -> Result<Option<&SourceRule>, String> {
+        let parsed = sample_fetch::wire_url(raw)?;
+        Ok(self.sources.iter().find(|rule| rule.allows(&parsed)))
     }
 
     /// Permit `samples('local:...')` beneath one host-selected directory.
@@ -42,53 +48,43 @@ impl ScoreSampleAccess {
         Ok(())
     }
 
-    /// Permit any public **https** origin whose server consents to
-    /// cross-origin reads - the strudel.cc parity policy.
-    ///
-    /// Consent is checked at the wire, per response: every hop of every
-    /// manifest and audio fetch must answer with
-    /// `Access-Control-Allow-Origin: *` (or `https://strudel.cc`), exactly the
-    /// header without which the same URL fails on strudel.cc. The reachable
-    /// set is therefore the browser's, not "everything": a host that never
-    /// opted into scripted fetching stays unreachable. The address boundary
-    /// is unchanged - only public addresses, and URLs that *name* loopback or
-    /// use plain http still require an exact [`Self::permit_origin`] grant.
-    pub fn permit_public_cors_origins(&mut self) {
-        self.open_public = true;
-    }
-
-    /// Turn the public CORS default of [`Self::permit_public_cors_origins`]
-    /// on or off. Exact grants and the local root stay.
-    pub fn set_public_cors_origins(&mut self, open: bool) {
-        self.open_public = open;
-    }
-
-    /// Whether the public CORS default is on.
-    pub fn public_cors_origins(&self) -> bool {
-        self.open_public
-    }
-
     /// Whether `samples('local:')` has a root to read.
     pub fn has_local_root(&self) -> bool {
         self.local_root.is_some()
     }
 
-    /// The origins this policy refused since the last call, newest last:
-    /// an origin outside it, or one whose server did not consent to a
-    /// cross-origin read. Each is one exact grant away from loading.
-    pub fn take_refused_origins(&self) -> Vec<String> {
+    /// The sources this policy refused since the last call, newest last,
+    /// each written as the [`SourceRule`] that would allow it.
+    pub fn take_refused_sources(&self) -> Vec<String> {
         self.refused.take()
     }
 
-    pub(super) fn note_refused_origin(&self, origin: &str) {
-        // An opaque origin, such as a `data:` URL's, is nothing to grant.
-        if origin.starts_with("https://") || origin.starts_with("http://") {
-            self.refused.note(origin.to_owned());
+    fn note_refused(&self, url: &Url) {
+        // An opaque address, such as a `data:` URL, has no source to allow.
+        if let Some(rule) = SourceRule::for_url(url) {
+            self.refused.note(rule.to_string());
         }
     }
 
+    /// Load `raw` once under this policy, as a score would, and say what
+    /// came back: a sample map and how many sounds it names, audio, an
+    /// image, a video, or other data. Nothing is cached. The Permissions
+    /// page asks this to check a source before a score needs it.
+    pub fn try_address(&self, raw: &str) -> Result<String, String> {
+        const TRY_LIMIT: usize = 64 * 1024 * 1024;
+        let (url, access) = self.approve_remote(raw)?;
+        let bytes = fetch_score_source_with_budget(
+            &url,
+            &access,
+            TRY_LIMIT,
+            &sample_fetch::FetchBudget::for_one_fetch(),
+            || {},
+        )?;
+        Ok(describe_loaded(&bytes))
+    }
+
     pub fn is_denied(&self) -> bool {
-        self.local_root.is_none() && self.allowed_origins.is_empty() && !self.open_public
+        self.local_root.is_none() && self.sources.is_empty()
     }
 
     pub(super) fn approve_remote(&self, raw: &str) -> Result<(Arc<str>, ScoreFetchAccess), String> {
@@ -97,54 +93,37 @@ impl ScoreSampleAccess {
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err("samples() URL contains credentials".to_owned());
         }
-        let origin = parsed.origin().ascii_serialization();
-        let access = if self.allowed_origins.contains(&origin) {
-            // An exact operator grant carries its own trust: no consent
-            // header is demanded, which is what lets a personal server
-            // without CORS configuration be granted at all.
-            ScoreFetchAccess::Remote {
-                origin,
-                cors_required: false,
-            }
-        } else if self.open_public
-            && parsed.scheme() == "https"
-            && !sample_fetch::url_names_loopback(&parsed)
-        {
-            ScoreFetchAccess::Remote {
-                origin,
-                cors_required: true,
-            }
-        } else if self.open_public {
-            self.note_refused_origin(&origin);
-            return Err(
-                "samples() URL is outside the permitted sample origins (the default policy \
-                 fetches public https origins that consent via CORS; grant this one \
-                 explicitly with --allow-sample-origin)"
-                    .to_owned(),
-            );
-        } else {
-            self.note_refused_origin(&origin);
-            return Err("samples() URL is outside the permitted sample origins".to_owned());
+        let Some(rule) = self.sources.iter().find(|rule| rule.allows(&parsed)) else {
+            self.note_refused(&parsed);
+            let grant = SourceRule::for_url(&parsed)
+                .map(|rule| format!(" Allow it with --allow-sample-origin {rule} or on the Studio Permissions page."))
+                .unwrap_or_default();
+            return Err(format!(
+                "{} is not an allowed sample source.{grant}",
+                parsed.origin().ascii_serialization()
+            ));
         };
         let normalized: Arc<str> = Arc::from(parsed.as_str());
-        Ok((normalized, access))
+        Ok((normalized, ScoreFetchAccess::Remote { rule: rule.clone() }))
     }
 
-    /// Apply the same host-granted origin scope to a score's Hydra image or
-    /// video. The media loader independently keeps its stricter HTTPS and
-    /// CORS rules.
+    /// Apply the same sources to a score's Hydra image or video, and give the
+    /// source that allows it. That source must also allow every redirect.
     #[cfg(feature = "hydra")]
     pub(crate) fn approve_hydra_media_url(
         &self,
         raw: &str,
         media: sample_fetch::HydraMedia,
-    ) -> Result<(), String> {
-        self.approve_remote(raw).map(|_| ()).map_err(|_| {
-            format!(
-                "{} URL is outside the permitted sample origins",
-                media.label()
-            )
-        })
+    ) -> Result<SourceRule, String> {
+        match self.approve_remote(raw) {
+            Ok((_, ScoreFetchAccess::Remote { rule })) => Ok(rule),
+            Ok(_) => Err(format!("{} URL is not a network address", media.label())),
+            Err(error) => Err(error.replacen(
+                "an allowed sample source",
+                &format!("an allowed source for a {}", media.label()),
+                1,
+            )),
+        }
     }
 
     /// Read a score's Hydra image or video from the local sample root, the
@@ -295,11 +274,7 @@ pub(super) fn fetch_score_source_cached_with_budget<T>(
     } = scope;
     budget.check()?;
     // A local grant reads the file where it lies; a copy would only go stale.
-    let ScoreFetchAccess::Remote {
-        origin,
-        cors_required,
-    } = access
-    else {
+    let ScoreFetchAccess::Remote { rule } = access else {
         let value = validate(&fetch_score_source_with_budget(
             url,
             access,
@@ -312,18 +287,11 @@ pub(super) fn fetch_score_source_cached_with_budget<T>(
     };
 
     let parsed = sample_fetch::wire_url(url)?;
-    if parsed.origin().ascii_serialization() != *origin
-        || !matches!(parsed.scheme(), "http" | "https")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
-        return Err(format!(
-            "sample URL {url:?} is outside its permitted origin"
-        ));
+    if !rule.allows(&parsed) {
+        return Err(format!("sample URL {url:?} is outside its allowed source"));
     }
 
-    let trust = ScoreCacheTrust::from_cors_required(*cors_required);
-    let path = cache.path(url, kind, trust);
+    let path = cache.path(url, kind);
     if let Some(file) = cache.open(&path)? {
         budget.check()?;
         let mut bytes = Vec::new();
@@ -352,21 +320,17 @@ pub(super) fn fetch_score_source_cached_with_budget<T>(
 
     // Before score-selected bytes had a dedicated namespace they shared the
     // host-trusted cache root. Keep offline renders working across the
-    // transition for exact grants only: the old namespace holds pinned and
-    // host-trusted data with no CORS provenance, so a cors_required fetch
-    // must not read it. A valid legacy hit is copied under both quotas. The
-    // old namespace is never removed during migration. If admission is full
-    // it still serves this run from its original location.
-    if !*cors_required {
-        let legacy = cache_path(&cache.base, url);
-        if let Some(bytes) = cache.read_legacy(&legacy, limit)?
-            && let Ok(value) = validate(&bytes)
-        {
-            budget.check()?;
-            cache.copy_legacy_with_publication(&path, &bytes, publication, budget);
-            budget.check()?;
-            return Ok(value);
-        }
+    // transition: a valid legacy hit is copied under both quotas. The old
+    // namespace is never removed during migration. If admission is full it
+    // still serves this run from its original location.
+    let legacy = cache_path(&cache.base, url);
+    if let Some(bytes) = cache.read_legacy(&legacy, limit)?
+        && let Ok(value) = validate(&bytes)
+    {
+        budget.check()?;
+        cache.copy_legacy_with_publication(&path, &bytes, publication, budget);
+        budget.check()?;
+        return Ok(value);
     }
 
     let bytes = fetch_score_source_with_budget(url, access, limit, budget, || {})?;
@@ -430,43 +394,20 @@ pub(super) fn fetch_score_source_with_budget(
             budget.check()?;
             Ok(bytes)
         }
-        ScoreFetchAccess::Remote {
-            origin,
-            cors_required,
-        } => {
+        ScoreFetchAccess::Remote { rule } => {
             let mut current = sample_fetch::wire_url(url)?;
             for redirects in 0..=5 {
                 budget.check()?;
-                if current.origin().ascii_serialization() != *origin
-                    || !matches!(current.scheme(), "http" | "https")
-                    || !current.username().is_empty()
-                    || current.password().is_some()
-                {
+                if !rule.allows(&current) {
                     return Err(format!(
-                        "sample URL {current:?} is outside its permitted origin"
+                        "sample URL {current:?} is outside its allowed source"
                     ));
                 }
-                // The guarded agent, not a bare one: the origin check above is
+                // The guarded agent, not a bare one: the source check above is
                 // text, and says nothing about the address the name resolves
-                // to. A granted origin can still point at a private target,
+                // to. An allowed name can still point at a private target,
                 // and can point somewhere different on the next lookup.
-                let response = sample_fetch::guarded_single_hop_get(
-                    &current,
-                    budget,
-                    cors_required.then_some(CORS_REQUEST_ORIGIN),
-                )?;
-                // Consent is per RESPONSE, redirects included, exactly as a
-                // browser applies its access check to every hop: a consenting
-                // server must not become a pivot through a non-consenting one.
-                if *cors_required && !cors_consents(response.header("Access-Control-Allow-Origin"))
-                {
-                    return Err(format!(
-                        "GET {current}: {NO_CORS_CONSENT} \
-                         (no `Access-Control-Allow-Origin: *`), so this URL would fail on \
-                         strudel.cc as well; pass --allow-sample-origin {origin} to trust \
-                         it anyway"
-                    ));
-                }
+                let response = sample_fetch::guarded_single_hop_get(&current, budget)?;
                 if (300..400).contains(&response.status()) {
                     if redirects == 5 {
                         return Err(format!("GET {url}: too many redirects"));
@@ -477,12 +418,9 @@ pub(super) fn fetch_score_source_with_budget(
                     let next = current.join(location).map_err(|error| {
                         format!("GET {current}: invalid redirect target: {error}")
                     })?;
-                    if next.origin().ascii_serialization() != *origin
-                        || !next.username().is_empty()
-                        || next.password().is_some()
-                    {
+                    if !rule.allows(&next) {
                         return Err(format!(
-                            "GET {current}: redirect target is outside the permitted sample origin"
+                            "GET {current}: redirect target is outside the allowed source {rule}"
                         ));
                     }
                     current = next;
@@ -503,6 +441,43 @@ pub(super) fn fetch_score_source_with_budget(
             unreachable!("redirect loop returns on success or refusal")
         }
     }
+}
+
+/// What a loaded body is, in a few words, with its size: a JSON object is a
+/// sample map, and a file is known by its first bytes.
+fn describe_loaded(bytes: &[u8]) -> String {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(bytes) {
+        // `_base` and the other `_` keys are settings, not sounds.
+        let sounds = map.keys().filter(|key| !key.starts_with('_')).count();
+        let noun = if sounds == 1 { "sound" } else { "sounds" };
+        return format!("sample map, {sounds} {noun}");
+    }
+    let head = |at: usize, magic: &[u8]| bytes.get(at..at + magic.len()) == Some(magic);
+    let kind = if head(0, b"RIFF") && head(8, b"WAVE") {
+        "WAV audio"
+    } else if head(0, b"ID3") || matches!(bytes, [0xff, second, ..] if second & 0xe0 == 0xe0) {
+        "MP3 audio"
+    } else if head(0, b"OggS") {
+        "Ogg audio"
+    } else if head(0, b"fLaC") {
+        "FLAC audio"
+    } else if head(0, b"\x89PNG") || head(0, b"GIF8") || (head(0, b"RIFF") && head(8, b"WEBP")) {
+        "image"
+    } else if head(0, &[0xff, 0xd8, 0xff]) {
+        "JPEG image"
+    } else if head(0, &[0x1a, 0x45, 0xdf, 0xa3]) {
+        "WebM video"
+    } else if head(4, b"ftyp") {
+        "MP4 video"
+    } else {
+        "data"
+    };
+    let size = match bytes.len() {
+        small if small < 1024 => format!("{small} B"),
+        kilo if kilo < 1024 * 1024 => format!("{} KB", kilo / 1024),
+        mega => format!("{:.1} MB", mega as f64 / (1024.0 * 1024.0)),
+    };
+    format!("{kind}, {size}")
 }
 
 impl Shorthand {
@@ -840,47 +815,80 @@ pub(super) fn expand_case_insensitive(banks: &mut HashMap<String, Bank>) {
 mod tests {
     use super::*;
 
-    /// A refusal names its origin once, for every clone of the policy, and
-    /// an exact grant then lets the same URL through.
+    /// A tried address says what it loaded in words a player reads.
     #[test]
-    fn refused_origins_are_noted_once_and_a_grant_clears_the_refusal() {
+    fn a_loaded_body_is_named_by_its_kind_and_size() {
+        assert_eq!(
+            describe_loaded(br#"{"_base": "https://a.example/", "bd": ["bd.wav"], "sd": []}"#),
+            "sample map, 2 sounds"
+        );
+        let mut wav = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
+        wav.resize(3000, 0);
+        assert_eq!(describe_loaded(&wav), "WAV audio, 2 KB");
+        assert_eq!(describe_loaded(b"ID3\x04"), "MP3 audio, 4 B");
+        assert_eq!(describe_loaded(b"\x89PNG\r\n"), "image, 6 B");
+        assert_eq!(describe_loaded(b"\0\0\0\x20ftypisom"), "MP4 video, 12 B");
+        assert_eq!(describe_loaded(b"<html>"), "data, 6 B");
+        assert_eq!(
+            describe_loaded(&vec![0; 3 * 1024 * 1024 / 2]),
+            "data, 1.5 MB"
+        );
+    }
+
+    /// A refusal names the source that would allow it once, for every clone
+    /// of the policy, and allowing that source lets the same URL through.
+    #[test]
+    fn refused_sources_are_noted_once_and_allowing_one_clears_the_refusal() {
         let mut access = ScoreSampleAccess::denied();
-        access.permit_public_cors_origins();
+        access.permit_builtin_sources();
         let clone = access.clone();
         for url in [
             "http://samples.example/a.json",
             "http://samples.example/b.json",
             "https://127.0.0.1/kit.json",
+            "https://cdn.public.example/kit.json",
         ] {
             assert!(clone.approve_remote(url).is_err(), "{url}");
         }
         assert!(
             access
-                .approve_remote("https://public.example/kit.json")
+                .approve_remote("https://raw.githubusercontent.com/a/b/main/strudel.json")
                 .is_ok()
         );
         assert_eq!(
-            access.take_refused_origins(),
-            ["http://samples.example", "https://127.0.0.1"]
+            access.take_refused_sources(),
+            [
+                "http://samples.example",
+                "https://127.0.0.1",
+                "cdn.public.example"
+            ]
         );
-        assert!(access.take_refused_origins().is_empty(), "taken once");
+        assert!(access.take_refused_sources().is_empty(), "taken once");
 
         access
-            .permit_origin("http://samples.example")
-            .expect("grant");
+            .permit_source("http://samples.example")
+            .expect("an address");
         assert!(
             access
                 .approve_remote("http://samples.example/a.json")
                 .is_ok()
         );
-        access.set_public_cors_origins(false);
-        assert!(!access.public_cors_origins());
+        let github = SourceRule::parse("raw.githubusercontent.com").unwrap();
+        access.revoke_source(&github);
         assert!(
             access
-                .approve_remote("https://public.example/kit.json")
+                .approve_remote("https://raw.githubusercontent.com/a/b/main/strudel.json")
                 .is_err()
         );
-        assert_eq!(access.take_refused_origins(), ["https://public.example"]);
+        assert_eq!(access.take_refused_sources(), ["raw.githubusercontent.com"]);
+        assert_eq!(
+            access.source_for("https://cdn.strudel.b-cdn.net/x.wav"),
+            Ok(Some(&SourceRule::parse("strudel.b-cdn.net").unwrap()))
+        );
+        assert!(
+            access.take_refused_sources().is_empty(),
+            "asking notes nothing"
+        );
     }
 
     #[cfg(test)]

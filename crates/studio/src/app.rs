@@ -1282,6 +1282,10 @@ struct App {
     blocked_samples: Vec<String>,
     /// The page's sample grants changed and the engine does not have them yet.
     sample_grants_owed: bool,
+    /// The last address the permissions page tried, and what came of it.
+    tried_source: Option<crate::settings::TriedSource>,
+    /// The answer of the load the try row started, while it is out.
+    try_answer: Option<std::sync::mpsc::Receiver<(String, Result<String, String>)>>,
     /// A permit unblocked a refused update and the studio owes its re-run.
     /// It waits for the engine to hold the permission, so the re-run cannot
     /// be refused by the state it is running to use.
@@ -1858,6 +1862,8 @@ impl App {
             import_origins_owed: false,
             blocked_samples: Vec::new(),
             sample_grants_owed: false,
+            tried_source: None,
+            try_answer: None,
             refused_update_owed: false,
             evaluation_alerts: HashMap::new(),
             lint_status: None,

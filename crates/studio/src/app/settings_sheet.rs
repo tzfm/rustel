@@ -505,9 +505,9 @@ impl App {
         }
         // A row of the permissions page: the click chooses it. Permitting
         // and removal stay the keys' work.
-        let permissions = self.permission_row_count();
+        let permissions = self.permission_counts();
         if let Some(sheet) = self.settings_sheet.as_mut() {
-            sheet.permissions_count = permissions;
+            sheet.permission_counts = permissions;
         }
         if let Some(row) = self
             .settings_sheet
@@ -664,7 +664,7 @@ impl App {
         // The learnable rows plus the fixed ones past them (the panels'
         // Alt chords, which a learn can neither take nor move).
         sheet.keybind_count = super::super::settings::keybind_count(&self.ui_settings);
-        sheet.permissions_count = self.permission_row_count();
+        sheet.permission_counts = self.permission_counts();
         #[cfg(feature = "vst")]
         self.count_vst_folders(&mut sheet);
         match sheet.key_in_frame(
@@ -1017,11 +1017,20 @@ impl App {
             SettingsAction::RefreshSource(at) => self.refresh_sample_source(at),
             action @ (SettingsAction::PermitRow(at) | SettingsAction::ToggleRow(at)) => {
                 let row = self.permission_rows().into_iter().nth(at);
-                // The folder prompt opens over the page, as the import
-                // prompt does.
-                if let Some(PermissionRow::LocalFolder { fixed: false, .. }) = row {
+                // A row that asks for something opens its prompt over the
+                // page, as the import prompt does.
+                let prompt = match row {
+                    Some(PermissionRow::LocalFolder { fixed: false, .. }) => {
+                        Some(SetPrompt::LocalSampleFolder)
+                    }
+                    Some(PermissionRow::AddSource) => Some(SetPrompt::AllowSource),
+                    Some(PermissionRow::TrySource(_)) => Some(SetPrompt::TrySource),
+                    Some(PermissionRow::AddOrigin) => Some(SetPrompt::TrustScriptOrigin),
+                    _ => None,
+                };
+                if let Some(prompt) = prompt {
                     self.settings_sheet = Some(sheet);
-                    self.open_set_prompt(SetPrompt::LocalSampleFolder);
+                    self.open_set_prompt(prompt);
                     #[cfg(feature = "hydra")]
                     self.sync_settings_webcam_preview();
                     return true;
@@ -1045,8 +1054,14 @@ impl App {
             }
             SettingsAction::ForgetRow(at) => {
                 self.forget_row(at);
-                let rows = self.permission_row_count();
+                let rows = self.permission_counts().total();
                 sheet.selected = at.min(rows.saturating_sub(1));
+            }
+            action @ (SettingsAction::AllowTriedDomain | SettingsAction::AllowTriedFolder) => {
+                self.allow_tried(action == SettingsAction::AllowTriedFolder);
+                // A new source lands above the try row, and the cursor
+                // stays on the try row to show the new answer.
+                sheet.selected = self.permission_counts().try_row();
             }
             // The prompt opens over the page, as the import prompt does.
             #[cfg(feature = "vst")]

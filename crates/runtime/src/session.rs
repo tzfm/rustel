@@ -1527,7 +1527,7 @@ mod test_support {
         let mut config = SessionConfig::default();
         config
             .score_sample_access
-            .permit_origin(origin)
+            .permit_source(origin)
             .expect("test sample origin");
         Session::with_config(config).expect("session")
     }

@@ -626,8 +626,9 @@ fn gd_reads_hydra_names_in_hydra_code() {
     }
 }
 
-/// `j` and `k` walk the permissions page in Vim, and Enter on the local
-/// folder opens its prompt over the page.
+/// `j` and `k` walk the permissions page in Vim, across its sections. Enter
+/// on the try row opens its prompt over the page, `u` allows the folder it
+/// offers, and Enter on the local folder opens the folder prompt.
 #[test]
 fn vim_keys_walk_the_sample_permissions() {
     let mut studio = hermetic();
@@ -637,7 +638,7 @@ fn vim_keys_walk_the_sample_permissions() {
         if studio
             .rows()
             .iter()
-            .any(|row| row.contains("▸ public servers with CORS"))
+            .any(|row| row.contains("▸ ✗ raw.githubusercontent.com"))
         {
             break;
         }
@@ -647,13 +648,39 @@ fn vim_keys_walk_the_sample_permissions() {
         let marker = format!("▸ {label}");
         studio.rows().iter().any(|row| row.contains(&marker))
     };
-    assert!(selected(&mut studio, "public servers with CORS"));
+    assert!(selected(&mut studio, "✗ raw.githubusercontent.com"));
     studio.type_text("j");
-    assert!(selected(&mut studio, "local folder"));
+    assert!(selected(&mut studio, "✗ strudel.b-cdn.net"));
     studio.type_text("k");
-    assert!(selected(&mut studio, "public servers with CORS"));
+    assert!(selected(&mut studio, "✗ raw.githubusercontent.com"));
+
+    // The three built-in sources, then the add row, then the try row.
+    studio.type_text("jjjj");
+    assert!(selected(&mut studio, "? Try an address…"));
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        studio.status().starts_with("try an address"),
+        "{}",
+        studio.status()
+    );
+    studio.type_text("https://other.invalid/kits/kick.wav");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(selected(
+        &mut studio,
+        "? https://other.invalid/kits/kick.wav"
+    ));
+    studio.type_text("u");
+    assert!(
+        studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("✓ https://other.invalid/kits/")),
+        "{}",
+        studio.rows().join("\n")
+    );
 
     studio.type_text("j");
+    assert!(selected(&mut studio, "✗ no folder"));
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     assert!(
         studio.status().starts_with("local samples folder"),
@@ -662,7 +689,7 @@ fn vim_keys_walk_the_sample_permissions() {
     );
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     assert!(
-        selected(&mut studio, "local folder"),
+        selected(&mut studio, "✗ no folder"),
         "Esc comes back to the row"
     );
 }

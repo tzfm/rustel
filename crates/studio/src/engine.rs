@@ -309,31 +309,34 @@ impl Default for StudioConfig {
 /// and videos read. Each one does what its command line flag does.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SampleGrants {
-    /// The origins trusted as `--allow-sample-origin` trusts one.
-    pub origins: Vec<String>,
-    /// Refuse the public CORS default, as `--strict-sample-origins` does.
-    pub strict: bool,
+    /// The sources allowed as `--allow-sample-origin` allows one.
+    pub sources: Vec<String>,
+    /// The built-in sources turned off, as `--strict-sample-origins` turns
+    /// off all of them.
+    pub builtins_off: Vec<String>,
     /// The folder `samples('local:')` reads, as `--allow-local-samples`
     /// names one.
     pub local_root: Option<std::path::PathBuf>,
 }
 
 /// What `session` permits a score to read, with the page's `grants` added.
-/// The page can close the public CORS default but not open it over the
-/// command line, and a folder from the command line wins over its own.
+/// The page can turn a built-in source off but not on over the command
+/// line, and a folder from the command line wins over its own.
 pub(super) fn sample_access(
     session: &SessionConfig,
     grants: &SampleGrants,
 ) -> rustel_runtime::ScoreSampleAccess {
-    // A clone shares the policy's record of refused origins, which the
+    // A clone shares the policy's record of refused sources, which the
     // page reads.
     let mut access = session.score_sample_access.clone();
-    for origin in &grants.origins {
-        // The page keeps only origins that the runtime named.
-        let _ = access.permit_origin(origin);
+    for builtin in &grants.builtins_off {
+        if let Ok(rule) = rustel_runtime::SourceRule::parse(builtin) {
+            access.revoke_source(&rule);
+        }
     }
-    if grants.strict {
-        access.set_public_cors_origins(false);
+    for source in &grants.sources {
+        // The page keeps only sources that the runtime read.
+        let _ = access.permit_source(source);
     }
     if let Some(root) = &grants.local_root
         && !access.has_local_root()
@@ -3289,7 +3292,7 @@ pub(super) mod tests {
     #[test]
     fn constructor_passes_the_score_sample_policy_to_imported_sources() {
         let mut granted = rustel_runtime::samples::ScoreSampleAccess::denied();
-        granted.permit_origin("https://samples.example").unwrap();
+        granted.permit_source("https://samples.example").unwrap();
         for access in [
             rustel_runtime::samples::ScoreSampleAccess::denied(),
             granted,

@@ -2756,7 +2756,7 @@ mod tests {
         let sink = host.input_sink();
         let mut inputs = HydraInputs::new(sink.clone());
         let mut access = ScoreSampleAccess::denied();
-        access.permit_origin("https://example.com").unwrap();
+        access.permit_source("https://example.com").unwrap();
         inputs.set_score_sample_access(access.clone());
         inputs.theme_camera = true;
         inputs.policy().set_webcam_allowed(true);

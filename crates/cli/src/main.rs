@@ -1391,19 +1391,20 @@ struct SourceInput {
 
 #[derive(Clone, Debug, Default, clap::Args)]
 struct SampleAccessArgs {
-    /// Permit score-level samples() requests to this exact HTTP(S) origin.
-    /// May be repeated. Redirects to other origins remain blocked.
+    /// Let scores load samples, images and videos from this source. A
+    /// domain, such as example.com, allows https from it and its
+    /// subdomains. An address, such as https://example.com/kits/, allows
+    /// that folder only. Plain http and this computer need an address.
+    /// Repeatable. Redirects must stay inside the same source.
     #[arg(
         long = "allow-sample-origin",
-        value_name = "ORIGIN",
+        value_name = "SOURCE",
         help_heading = "Sample access"
     )]
-    origins: Vec<String>,
-    /// Fetch score samples() only from origins granted above. By default a
-    /// public https origin whose server consents via CORS
-    /// (`Access-Control-Allow-Origin: *`) is fetched without a grant - the
-    /// same set strudel.cc can reach. Private and loopback addresses are
-    /// refused either way.
+    sources: Vec<String>,
+    /// Do not allow the built-in sources (raw.githubusercontent.com,
+    /// strudel.b-cdn.net and shabda.ndre.gr). Scores then load only from
+    /// the sources given above.
     #[arg(long = "strict-sample-origins", help_heading = "Sample access")]
     strict_origins: bool,
     /// Permit samples('local:...') beneath this directory.
@@ -1434,11 +1435,11 @@ fn with_sample_access(
 ) -> Result<SessionConfig, RuntimeError> {
     let mut access = ScoreSampleAccess::denied();
     if !args.strict_origins {
-        access.permit_public_cors_origins();
+        access.permit_builtin_sources();
     }
-    for origin in &args.origins {
+    for source in &args.sources {
         access
-            .permit_origin(origin)
+            .permit_source(source)
             .map_err(RuntimeError::Message)?;
     }
     if let Some(root) = &args.local_root {

@@ -231,10 +231,9 @@ impl HydraBridge {
         self.apply_with_sample_access(update, &ScoreSampleAccess::denied())
     }
 
-    /// Install a score with its host-granted sample origin scope. Image
-    /// workers carry a snapshot and recheck it before every network fetch.
-    /// A grant does not relax the public HTTPS, CORS or same-origin redirect
-    /// requirements for images.
+    /// Install a score with its host-allowed sample sources. Image workers
+    /// carry a snapshot and recheck it before every network fetch, and every
+    /// redirect must stay inside the source that allowed the first address.
     pub fn apply_with_sample_access(
         &mut self,
         update: HydraUpdate,

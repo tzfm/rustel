@@ -2846,9 +2846,9 @@ pub struct SettingsSheet {
     /// How many keybind rows the keybinds page is showing, for the same
     /// reason as `source_count`.
     pub keybind_count: usize,
-    /// How many rows the permissions page is showing: the origins, the
-    /// switches and the local folder.
-    pub permissions_count: usize,
+    /// How many rows each section of the permissions page is showing, for
+    /// the same reason as `source_count`.
+    pub permission_counts: PermissionCounts,
     /// How many folders the player added on the vst page, for the same
     /// reason as `source_count`.
     #[cfg(feature = "vst")]
@@ -3011,6 +3011,11 @@ pub enum SettingsAction {
     ToggleRow(usize),
     /// Delete, Backspace or `d` on a row: take it off the page.
     ForgetRow(usize),
+    /// `a` on the try row: allow the server of the address it refused.
+    AllowTriedDomain,
+    /// `u` on the try row: allow only the folder of the address it
+    /// refused.
+    AllowTriedFolder,
     /// Ask before replacing all overrides with this terminal's defaults.
     AskResetKeybinds,
     /// The second Enter on the reset row confirmed replacing all overrides.
@@ -3046,13 +3051,14 @@ impl SettingsSheet {
         matches!(self.page, SettingsPage::Permissions)
     }
 
-    /// The arrows walk the rows and wrap. Enter permits, Space or either
+    /// The arrows walk the rows and wrap. Enter allows, Space or either
     /// sideways arrow flips a row where it stands, the way every switch
     /// on the controls pages flips, and Delete, Backspace or `d` takes a
-    /// row off the page. Esc and Tab stay the sheet's.
+    /// row off the page. On the try row, `a` and `u` allow what it refused.
+    /// Esc and Tab stay the sheet's.
     fn permissions_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
-        let len = self.permissions_count;
+        let len = self.permission_counts.total();
         if len == 0 {
             return SettingsAction::Ignored;
         }
@@ -3070,6 +3076,13 @@ impl SettingsSheet {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => SettingsAction::ToggleRow(at),
             KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('d' | 'D') => {
                 SettingsAction::ForgetRow(at)
+            }
+            // The app knows whether the try row refused anything.
+            KeyCode::Char('a' | 'A') if at == self.permission_counts.try_row() => {
+                SettingsAction::AllowTriedDomain
+            }
+            KeyCode::Char('u' | 'U') if at == self.permission_counts.try_row() => {
+                SettingsAction::AllowTriedFolder
             }
             _ => SettingsAction::Ignored,
         }
@@ -3589,8 +3602,13 @@ impl SettingsSheet {
                     _ => None,
                 })
                 .collect(),
-            SettingsPage::Permissions => (0..self.permissions_count)
-                .map(|index| (index, index))
+            SettingsPage::Permissions => permission_lines(self.permission_counts)
+                .iter()
+                .enumerate()
+                .filter_map(|(line, row)| match row {
+                    SourceLine::Row(index) => Some((line, *index)),
+                    _ => None,
+                })
                 .collect(),
             SettingsPage::Mapping => {
                 let columns = usize::from(MAPPING_COLUMNS);
@@ -3996,18 +4014,6 @@ impl SettingsSheet {
         }
     }
 
-    /// The first row drawn of a page of `total` plain rows, `shown` at a
-    /// time: the selection among them, with its margin kept.
-    fn first_row(self, shown: usize, total: usize) -> usize {
-        super::scroll::follow(
-            self.first,
-            self.selected,
-            shown,
-            total,
-            self.scroll_margin(shown),
-        )
-    }
-
     /// The first display line drawn of a grouped page, `shown` at a time.
     fn first_line(self, shown: usize, display: &[DisplayRow]) -> usize {
         if display.is_empty() {
@@ -4100,7 +4106,9 @@ impl SettingsSheet {
                 self.first_line(shown, &grouped_rows(self.rows()))
             }
             SettingsPage::Keybinds => self.first_line(shown, &keybind_lines(self.keybind_count)),
-            SettingsPage::Permissions => self.first_row(shown, self.permissions_count),
+            SettingsPage::Permissions => {
+                self.first_choice(shown, &permission_lines(self.permission_counts))
+            }
             SettingsPage::Sources => {
                 self.first_sources(shown, self.source_count, self.default_count)
             }
@@ -4243,13 +4251,7 @@ impl SettingsSheet {
         if !self.shows_permissions() {
             return None;
         }
-        let (_, rows) = self.geometry_for(available)?;
-        if x < rows.x || x >= rows.right() || y < rows.y || y >= rows.bottom() {
-            return None;
-        }
-        let shown = usize::from(rows.height).max(1);
-        let index = self.first_row(shown, self.permissions_count) + usize::from(y - rows.y);
-        (index < self.permissions_count).then_some(index)
+        self.choice_at(available, x, y, &permission_lines(self.permission_counts))
     }
 
     /// The source under a point, while the sources page is up: an import
@@ -4666,6 +4668,28 @@ impl SlotGrid {
 /// One row of the permissions page.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PermissionRow {
+    /// A source a score's `samples()`, images and videos load from: a
+    /// domain such as `cdn.example.com`, or an address such as
+    /// `https://example.com/kits/`. A refused source is on the page until
+    /// the studio closes, so the player allows it with one key.
+    Source {
+        rule: String,
+        allowed: bool,
+        /// One of [`rustel_runtime::BUILTIN_SOURCES`]: it stays on the page
+        /// when it is off.
+        builtin: bool,
+        /// The command line set it for this run: `--allow-sample-origin`
+        /// named it, or `--strict-sample-origins` holds a built-in off.
+        fixed: bool,
+    },
+    /// The row that asks for a domain or an address to allow.
+    AddSource,
+    /// The row that asks for an address and says whether it loads.
+    TrySource(Option<TriedSource>),
+    /// The folder `samples('local:')` and a Hydra file outside the set
+    /// read, as the page shows it. `fixed` when `--allow-local-samples`
+    /// named one for the run.
+    LocalFolder { folder: Option<String>, fixed: bool },
     /// An origin the score imports scripts from, as the engine names it,
     /// such as `https://glossing.dev`.
     Origin {
@@ -4675,46 +4699,119 @@ pub enum PermissionRow {
         /// one key.
         allowed: bool,
     },
-    /// An origin a score's `samples()`, images and videos read from with
-    /// no CORS consent, as `--allow-sample-origin` trusts one. A refused
-    /// origin is on the page until the studio closes.
-    SampleOrigin { origin: String, allowed: bool },
-    /// The public CORS default: any public https server that consents to
-    /// cross-origin reads. `fixed` when `--strict-sample-origins` holds it
-    /// off for the run.
-    PublicCors { allowed: bool, fixed: bool },
-    /// The folder `samples('local:')` and a Hydra file outside the set
-    /// read, as the page shows it. `fixed` when `--allow-local-samples`
-    /// named one for the run.
-    LocalFolder { folder: Option<String>, fixed: bool },
+    /// The row that asks for a script origin to trust.
+    AddOrigin,
     /// The native orchestra switch. It lasts one studio run: the studio
     /// does not keep it, and the next start turns it on.
     Csound { allowed: bool },
 }
 
+/// The last address the player tried on the permissions page, and what
+/// came of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TriedSource {
+    pub address: String,
+    pub verdict: TryVerdict,
+}
+
+/// Whether a tried address loads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TryVerdict {
+    /// No source allows it. `domain` is the source that allows its whole
+    /// server, and `folder` the one that allows only its folder, when that
+    /// is narrower.
+    Refused {
+        domain: Option<String>,
+        folder: Option<String>,
+    },
+    /// The source `by` allows it, and the studio is loading it once.
+    Loading { by: String },
+    /// It loaded: `what` says what came back.
+    Loaded { by: String, what: String },
+    /// The source allows it, but it did not load.
+    Failed { by: String, why: String },
+}
+
 impl PermissionRow {
-    /// Whether the row's permission is on.
+    /// Whether the row's permission is on. A row that asks for something
+    /// has no permission of its own.
     pub fn allowed(&self) -> bool {
         match self {
-            Self::Origin { allowed, .. }
-            | Self::SampleOrigin { allowed, .. }
-            | Self::PublicCors { allowed, .. }
+            Self::Source { allowed, .. }
+            | Self::Origin { allowed, .. }
             | Self::Csound { allowed } => *allowed,
             Self::LocalFolder { folder, fixed } => *fixed || folder.is_some(),
+            Self::AddSource | Self::TrySource(_) | Self::AddOrigin => true,
         }
     }
 
-    /// Whether `other` is this row, on or off: an origin moves between
-    /// the trusted and the refused, and the selection follows it.
+    /// Whether `other` is this row, on or off: a source or an origin moves
+    /// between the allowed and the refused, and the selection follows it.
     pub fn is_same_row(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Origin { origin, .. }, Self::Origin { origin: other, .. })
-            | (Self::SampleOrigin { origin, .. }, Self::SampleOrigin { origin: other, .. }) => {
-                origin == other
+            (Self::Source { rule, .. }, Self::Source { rule: other, .. })
+            | (Self::Origin { origin: rule, .. }, Self::Origin { origin: other, .. }) => {
+                rule == other
             }
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
     }
+}
+
+/// How many rows each section of the permissions page shows. The sheet
+/// reckons its lines by these, as the page draws them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PermissionCounts {
+    /// The sources, before the add and try rows.
+    pub sources: usize,
+    /// The script origins, before the add row.
+    pub scripts: usize,
+    /// Whether the orchestra switch is shown.
+    pub csound: bool,
+}
+
+impl PermissionCounts {
+    /// Every row of the page. The add and try rows, the local folder and
+    /// the add row of the scripts are always there.
+    pub fn total(self) -> usize {
+        self.sources + 2 + 1 + self.scripts + 1 + usize::from(self.csound)
+    }
+
+    /// Where the try row stands.
+    pub fn try_row(self) -> usize {
+        self.sources + 1
+    }
+}
+
+/// The lines of the permissions page in order: the sources with their add
+/// and try rows, the local folder, the script origins with their add row,
+/// then the orchestra switch when it is shown. Each section is a boxed
+/// group, and each row's index is the one the cursor walks.
+fn permission_lines(counts: PermissionCounts) -> Vec<SourceLine> {
+    use SourceSection::{Csound, LocalFiles, Scripts, Sources};
+    let mut groups = vec![
+        (Sources, counts.sources + 2),
+        (LocalFiles, 1),
+        (Scripts, counts.scripts + 1),
+    ];
+    if counts.csound {
+        groups.push((Csound, 1));
+    }
+    let mut lines = Vec::with_capacity(counts.total() + 3 * groups.len());
+    let mut at = 0;
+    for (section, rows) in groups {
+        if at > 0 {
+            lines.push(SourceLine::Gap);
+        }
+        lines.push(SourceLine::Header {
+            section,
+            first: at == 0,
+        });
+        lines.extend((at..at + rows).map(SourceLine::Row));
+        at += rows;
+    }
+    lines.push(SourceLine::Footer);
+    lines
 }
 
 /// One action's binding, as its row should read.
@@ -4823,6 +4920,10 @@ enum SourceSection {
     Cache,
     User,
     Defaults,
+    Sources,
+    LocalFiles,
+    Scripts,
+    Csound,
     #[cfg(feature = "vst")]
     Plugins,
     #[cfg(feature = "vst")]
@@ -4841,6 +4942,10 @@ impl SourceSection {
             Self::Cache => "sample cache",
             Self::User => "user samples",
             Self::Defaults => "default samples",
+            Self::Sources => "samples, images and videos",
+            Self::LocalFiles => "local files",
+            Self::Scripts => "scripts",
+            Self::Csound => "csound",
             #[cfg(feature = "vst")]
             Self::Plugins => "plugins",
             #[cfg(feature = "vst")]
@@ -8857,9 +8962,14 @@ mod tests {
             selected: ROWS.len() - 1,
             ..SettingsSheet::default()
         };
-        assert!(last.first_row(shown, ROWS.len()) + shown >= ROWS.len());
+        let display = grouped_rows(ROWS);
+        let line = display
+            .iter()
+            .position(|row| *row == DisplayRow::Control(ROWS.len() - 1))
+            .expect("the last row has a line");
+        assert!(last.first_line(shown, &display) + shown > line);
         // …and the first one still starts at the top.
-        assert_eq!(SettingsSheet::default().first_row(shown, ROWS.len()), 0);
+        assert_eq!(SettingsSheet::default().first_line(shown, &display), 0);
 
         // Too short for even that, and it says nothing rather than lying.
         assert!(SettingsSheetView::geometry(Rect::new(0, 0, 120, 6)).is_none());
@@ -8978,22 +9088,27 @@ mod tests {
         assert_eq!(sheet.page, SettingsPage::Reference);
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
         assert_eq!(sheet.page, SettingsPage::Permissions);
-        // The permissions page walks its rows and names the one a key acts on.
-        sheet.permissions_count = 2;
+        // The permissions page walks its rows across its sections and names
+        // the one a key acts on: one source, the add and try rows, the
+        // folder, and the add row of the scripts.
+        sheet.permission_counts = PermissionCounts {
+            sources: 1,
+            ..PermissionCounts::default()
+        };
         let mut permissions_key =
             |code| sheet.key(code, &mut settings, &TerminalFeatures::default());
         assert_eq!(permissions_key(KeyCode::Up), SettingsAction::Nothing);
         assert_eq!(
             permissions_key(KeyCode::Enter),
-            SettingsAction::PermitRow(1)
+            SettingsAction::PermitRow(4)
         );
         assert_eq!(
             permissions_key(KeyCode::Char(' ')),
-            SettingsAction::ToggleRow(1)
+            SettingsAction::ToggleRow(4)
         );
         assert_eq!(
             permissions_key(KeyCode::Left),
-            SettingsAction::ToggleRow(1),
+            SettingsAction::ToggleRow(4),
             "Left flips a trusted row like every other switch"
         );
         assert_eq!(permissions_key(KeyCode::Down), SettingsAction::Nothing);
@@ -9005,6 +9120,18 @@ mod tests {
         assert_eq!(
             permissions_key(KeyCode::Char('d')),
             SettingsAction::ForgetRow(0)
+        );
+        // `a` and `u` answer on the try row alone.
+        assert_eq!(permissions_key(KeyCode::Char('a')), SettingsAction::Ignored);
+        permissions_key(KeyCode::Down);
+        permissions_key(KeyCode::Down);
+        assert_eq!(
+            permissions_key(KeyCode::Char('a')),
+            SettingsAction::AllowTriedDomain
+        );
+        assert_eq!(
+            permissions_key(KeyCode::Char('u')),
+            SettingsAction::AllowTriedFolder
         );
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
         assert_eq!(sheet.page, SettingsPage::About);
@@ -9070,7 +9197,7 @@ mod tests {
     /// The permissions page's hint leads with its keys and keeps its whole
     /// text. The keys closed the hint before, so a terminal narrow
     /// enough to wrap it cut them off the page, and a player who cannot
-    /// see "Enter permits" cannot work the page.
+    /// see "Enter allows" cannot work the page.
     #[test]
     fn the_permissions_page_hint_leads_with_its_keys_and_stays_whole() {
         let sheet = SettingsSheet {
@@ -9088,7 +9215,12 @@ mod tests {
             let mut buffer = Buffer::empty(area);
             SettingsSheetView {
                 sheet: SettingsSheet {
-                    permissions_count: 1,
+                    permission_counts: PermissionCounts {
+                        scripts: 1,
+                        ..PermissionCounts::default()
+                    },
+                    // The refused origin.
+                    selected: 3,
                     ..sheet
                 },
                 settings: &settings,
@@ -9109,10 +9241,19 @@ mod tests {
                 sources: Vec::new(),
                 mappings: Default::default(),
                 bindings: Vec::new(),
-                permissions: vec![PermissionRow::Origin {
-                    origin: "https://example.com".to_owned(),
-                    allowed: false,
-                }],
+                permissions: vec![
+                    PermissionRow::AddSource,
+                    PermissionRow::TrySource(None),
+                    PermissionRow::LocalFolder {
+                        folder: None,
+                        fixed: false,
+                    },
+                    PermissionRow::Origin {
+                        origin: "https://example.com".to_owned(),
+                        allowed: false,
+                    },
+                    PermissionRow::AddOrigin,
+                ],
                 #[cfg(feature = "vst")]
                 vst: VstPage::default(),
                 #[cfg(feature = "hydra")]
@@ -9135,7 +9276,7 @@ mod tests {
                 .join(" ");
             let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
             let keys = flat
-                .find("Enter permits")
+                .find("Enter allows")
                 .unwrap_or_else(|| panic!("the keys are on the page at {width}x{height}"));
             let explain = flat
                 .find("a score loads a script")
@@ -9149,8 +9290,8 @@ mod tests {
                 "the whole hint fits at {width}x{height}: {flat}"
             );
             assert!(
-                flat.contains("https://example.com off"),
-                "the row reads as a switch: {flat}"
+                flat.contains("https://example.com blocked · Enter allows"),
+                "the row says what it is and what Enter does: {flat}"
             );
         }
     }

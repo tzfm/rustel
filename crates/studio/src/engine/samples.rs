@@ -1109,17 +1109,18 @@ mod tests {
     }
 
     /// The page's grants reach the session and the pack imports alike, and
-    /// a change replaces the last one. The record of refused origins stays
+    /// a change replaces the last one. The record of refused sources stays
     /// the host's, so the studio reads it from the policy it gave.
     #[test]
     fn sample_grants_reach_the_session_and_the_pack_imports() {
         let mut host = SessionConfig::default();
-        host.score_sample_access.permit_public_cors_origins();
+        host.score_sample_access.permit_builtin_sources();
         let refused = host.score_sample_access.clone();
+        let github = rustel_runtime::SourceRule::parse("raw.githubusercontent.com").unwrap();
         let mut engine = StudioEngine::new(StudioConfig {
             session: host,
             sample_grants: SampleGrants {
-                strict: true,
+                builtins_off: vec![github.to_string()],
                 ..SampleGrants::default()
             },
             ..StudioConfig::default()
@@ -1127,26 +1128,32 @@ mod tests {
         .expect("engine");
         let access = || engine.session.config().score_sample_access.clone();
         assert!(
-            !access().public_cors_origins(),
-            "the page closed the default"
+            !access().sources().contains(&github),
+            "the page turned the built-in off"
         );
 
         engine.set_sample_grants(SampleGrants {
-            origins: vec!["http://kit.invalid".to_owned()],
+            sources: vec!["http://kit.invalid".to_owned()],
             ..SampleGrants::default()
         });
         let granted = engine.session.config().score_sample_access.clone();
-        assert!(granted.public_cors_origins(), "the page opened it again");
+        assert!(granted.sources().contains(&github), "the built-in is back");
+        assert_eq!(
+            granted.source_for("http://kit.invalid/kit.json"),
+            Ok(Some(
+                &rustel_runtime::SourceRule::parse("http://kit.invalid").unwrap()
+            ))
+        );
         let library = engine.session.sample_library().expect("library");
         assert_eq!(library.import_policy_for_test(), Some(granted));
 
-        // Plain http needs a grant. The score plays on without the bank, and
-        // the refusal is a diagnostic.
+        // Plain http needs a source that spells it out. The score plays on
+        // without the bank, and the refusal is a diagnostic.
         engine
             .session
             .evaluate("samples('http://other.invalid/kit.json')\n$: s(\"bd\")")
             .expect("the score");
-        assert_eq!(refused.take_refused_origins(), ["http://other.invalid"]);
+        assert_eq!(refused.take_refused_sources(), ["http://other.invalid"]);
     }
 
     mod sample_reclamation {

@@ -2051,7 +2051,18 @@ mod tests {
 
             // Enter on a refused row of the same origin adds nothing.
             app.blocked_imports.push(origin.to_owned());
-            app.permit_row(1);
+            let refused = app
+                .permission_rows()
+                .iter()
+                .position(|row| {
+                    matches!(
+                        row,
+                        crate::settings::PermissionRow::Origin { origin: named, allowed: false }
+                            if named == origin
+                    )
+                })
+                .expect("the refused row");
+            app.permit_row(refused);
             assert_eq!(app.prefs.import_origins, [origin]);
             assert!(app.blocked_imports.is_empty());
         }

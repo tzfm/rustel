@@ -2104,11 +2104,11 @@ mod tests {
             limited, unrestricted,
             "the job must use the passed host budget"
         );
-        // The origins and the CORS switch of the permissions page reach the
+        // The origins and the sources of the permissions page reach the
         // export.
         let origins = ["https://glossing.dev".to_owned()];
         let grants = crate::engine::SampleGrants {
-            strict: true,
+            sources: vec!["cdn.kit.example".to_owned()],
             ..Default::default()
         };
         let config = session_config(
@@ -2121,7 +2121,15 @@ mod tests {
         );
         assert_eq!(config.max_polyphony, 192);
         assert_eq!(config.score_import_access.origins(), origins);
-        assert!(!config.score_sample_access.public_cors_origins());
+        assert_eq!(
+            config
+                .score_sample_access
+                .sources()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["cdn.kit.example"]
+        );
         let mut live = Session::new().expect("live session");
         live.evaluate("setMaxPolyphony(1); s('sine')")
             .expect("set persistent override");

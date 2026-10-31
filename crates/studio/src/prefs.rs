@@ -366,13 +366,18 @@ pub struct StudioPrefs {
     /// score, such as `https://glossing.dev`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub import_origins: Vec<String>,
-    /// The origins the player trusts for a score's `samples()`, images and
-    /// videos, as `--allow-sample-origin` does.
+    /// The sources the player allows for a score's `samples()`, images and
+    /// videos, as `--allow-sample-origin` allows one: a domain, or an
+    /// address. The trusted origins of an older studio read as addresses.
+    #[serde(
+        default,
+        alias = "sample_origins",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub allowed_sources: Vec<String>,
+    /// The built-in sources the player turned off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sample_origins: Vec<String>,
-    /// Refuse the public CORS default, as `--strict-sample-origins` does.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub strict_sample_origins: bool,
+    pub builtin_sources_off: Vec<String>,
     /// The folder `samples('local:')` and relative Hydra paths read, as
     /// `--allow-local-samples` does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -668,8 +673,8 @@ impl StudioPrefs {
     /// takes them.
     pub fn sample_grants(&self) -> super::engine::SampleGrants {
         super::engine::SampleGrants {
-            origins: self.sample_origins.clone(),
-            strict: self.strict_sample_origins,
+            sources: self.allowed_sources.clone(),
+            builtins_off: self.builtin_sources_off.clone(),
             local_root: self.local_sample_root.as_ref().map(PathBuf::from),
         }
     }

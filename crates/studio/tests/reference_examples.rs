@@ -11,7 +11,7 @@ use rustel_studio::reference::Reference;
 
 fn session(csound: bool) -> Session {
     let mut access = ScoreSampleAccess::denied();
-    access.permit_public_cors_origins();
+    access.permit_builtin_sources();
     let mut config = SessionConfig::default().with_score_sample_access(access);
     if csound {
         config.score_import_access.permit_csound();

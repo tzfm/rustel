@@ -1,20 +1,23 @@
-//! The Permissions page: the origins a score imports scripts from, what
-//! its samples, images and videos read, and the native orchestra switch.
+//! The Permissions page: the sources a score's samples, images and videos
+//! load from, the local folder, the origins it imports scripts from, and
+//! the native orchestra switch.
 //!
-//! The engine refuses `await import('https://...')` from an origin that is
-//! not trusted, a sample or media origin outside its policy, and an
+//! The engine refuses a sample or media address that no source allows,
+//! `await import('https://...')` from an origin that is not trusted, and an
 //! orchestra while native execution is not permitted. The page reads as a
-//! switch: Enter permits a refused row, and Space or either sideways arrow
+//! switch: Enter allows a refused row, and Space or either sideways arrow
 //! flips a row where it stands, so a permission can be taken back without
-//! the row leaving the page. A refused or turned-off origin stays listed
-//! until the studio closes. Origin trusts, the CORS switch and the local
-//! folder are kept in the settings, while the orchestra switch lasts one
-//! run.
+//! the row leaving the page. A refused or turned-off row stays listed
+//! until the studio closes. The add rows ask for a source or an origin, and
+//! the try row loads one address once to show which source allows it.
+//! Sources, origins and the local folder are kept in the settings, while
+//! the orchestra switch lasts one run.
 
-use super::super::settings::PermissionRow;
+use super::super::settings::{PermissionCounts, PermissionRow, TriedSource, TryVerdict};
 use super::super::worker::EngineFailure;
 use super::App;
 use super::transport::ErrorOwner;
+use rustel_runtime::{BUILTIN_SOURCES, SourceRule};
 
 /// The most refused origins the page keeps of each kind. A score names
 /// one or two.
@@ -28,6 +31,16 @@ fn note_blocked(blocked: &mut Vec<String>, origin: &str) {
         blocked.remove(0);
     }
     blocked.push(origin.to_owned());
+}
+
+/// Whether a refusal on the footer is one that a new source can lift.
+fn names_a_refused_source(message: &str) -> bool {
+    message.contains("is not an allowed sample source")
+        || message.contains("is not an allowed source for a")
+}
+
+fn is_builtin(rule: &str) -> bool {
+    BUILTIN_SOURCES.contains(&rule)
 }
 
 impl App {
@@ -62,60 +75,93 @@ impl App {
         )
     }
 
-    /// Put the origins the engine refused a score's samples or media from
+    /// Put the sources the engine refused a score's samples or media from
     /// on the page. The status line names the newest.
     pub(super) fn note_refused_samples(&mut self) {
         let refused = self
             .options
             .session
             .score_sample_access
-            .take_refused_origins();
-        if let Some(origin) = refused
+            .take_refused_sources();
+        if let Some(rule) = refused
             .into_iter()
-            .filter(|origin| self.note_refused_sample(origin))
+            .filter(|rule| self.note_refused_sample(rule))
             .last()
         {
             self.status =
-                format!("{origin} is not trusted for samples - Settings → Permissions trusts it");
+                format!("{rule} is not allowed for samples - Settings → Permissions allows it");
         }
     }
 
-    /// Put one refused sample origin on the page. A refusal for an origin
-    /// on the saved list is stale: the engine did not have the list yet.
-    fn note_refused_sample(&mut self, origin: &str) -> bool {
-        if self.prefs.sample_origins.iter().any(|kept| kept == origin) {
+    /// Put one refused source on the page. A refusal for a source on the
+    /// saved list is stale: the engine did not have the list yet. A
+    /// built-in source has its row already.
+    fn note_refused_sample(&mut self, rule: &str) -> bool {
+        if self.prefs.allowed_sources.iter().any(|kept| kept == rule) {
             return false;
         }
-        note_blocked(&mut self.blocked_samples, origin);
+        if !is_builtin(rule) {
+            note_blocked(&mut self.blocked_samples, rule);
+        }
         true
     }
 
-    /// The rows of the permissions page: the trusted script origins, then
-    /// the refused, the same for samples and media, the CORS switch, the
-    /// local folder, and the orchestra switch once the studio has a reason
-    /// to show it.
-    pub(super) fn permission_rows(&self) -> Vec<PermissionRow> {
-        let origins =
-            |trusted: &[String], refused: &[String], row: fn(String, bool) -> PermissionRow| {
-                let trusted = trusted.iter().map(move |origin| row(origin.clone(), true));
-                let refused = refused.iter().map(move |origin| row(origin.clone(), false));
-                trusted.chain(refused).collect::<Vec<_>>()
-            };
-        let mut rows = origins(
-            &self.prefs.import_origins,
-            &self.blocked_imports,
-            |origin, allowed| PermissionRow::Origin { origin, allowed },
-        );
-        rows.extend(origins(
-            &self.prefs.sample_origins,
-            &self.blocked_samples,
-            |origin, allowed| PermissionRow::SampleOrigin { origin, allowed },
-        ));
-        let host = &self.options.session.score_sample_access;
-        rows.push(PermissionRow::PublicCors {
-            allowed: self.public_cors(),
-            fixed: !host.public_cors_origins(),
+    /// The source rows: the built-in domains, the player's sources, the
+    /// ones the command line named, then the refused.
+    fn sample_source_rows(&self) -> Vec<PermissionRow> {
+        let host = self.options.session.score_sample_access.sources();
+        let in_host = |rule: &str| SourceRule::parse(rule).is_ok_and(|rule| host.contains(&rule));
+        let builtins = BUILTIN_SOURCES.iter().map(|rule| PermissionRow::Source {
+            rule: (*rule).to_owned(),
+            allowed: in_host(rule) && !self.prefs.builtin_sources_off.iter().any(|off| off == rule),
+            builtin: true,
+            fixed: !in_host(rule),
         });
+        let added = self
+            .prefs
+            .allowed_sources
+            .iter()
+            .map(|rule| PermissionRow::Source {
+                rule: rule.clone(),
+                allowed: true,
+                builtin: false,
+                fixed: false,
+            });
+        let command_line = host
+            .iter()
+            .map(ToString::to_string)
+            .filter(|rule| !is_builtin(rule) && !self.prefs.allowed_sources.contains(rule))
+            .map(|rule| PermissionRow::Source {
+                rule,
+                allowed: true,
+                builtin: false,
+                fixed: true,
+            });
+        let refused = self
+            .blocked_samples
+            .iter()
+            .map(|rule| PermissionRow::Source {
+                rule: rule.clone(),
+                allowed: false,
+                builtin: false,
+                fixed: false,
+            });
+        builtins
+            .chain(added)
+            .chain(command_line)
+            .chain(refused)
+            .collect()
+    }
+
+    /// The rows of the permissions page, section by section: the sources
+    /// with the add and try rows, the local folder, the trusted then the
+    /// refused script origins with their add row, and the orchestra switch
+    /// once the studio has a reason to show it.
+    pub(super) fn permission_rows(&self) -> Vec<PermissionRow> {
+        let mut rows = self.sample_source_rows();
+        rows.push(PermissionRow::AddSource);
+        rows.push(PermissionRow::TrySource(self.tried_source.clone()));
+        let host = &self.options.session.score_sample_access;
         rows.push(PermissionRow::LocalFolder {
             folder: self
                 .prefs
@@ -125,6 +171,21 @@ impl App {
                 .map(|folder| super::sets::shorten_home(std::path::Path::new(folder))),
             fixed: host.has_local_root(),
         });
+        let trusted = self
+            .prefs
+            .import_origins
+            .iter()
+            .map(|origin| (origin, true));
+        let refused = self.blocked_imports.iter().map(|origin| (origin, false));
+        rows.extend(
+            trusted
+                .chain(refused)
+                .map(|(origin, allowed)| PermissionRow::Origin {
+                    origin: origin.clone(),
+                    allowed,
+                }),
+        );
+        rows.push(PermissionRow::AddOrigin);
         if self.csound_allowed || self.csound_refused {
             rows.push(PermissionRow::Csound {
                 allowed: self.csound_allowed,
@@ -133,31 +194,40 @@ impl App {
         rows
     }
 
-    /// How many rows the permissions page is showing. The sheet counts its
-    /// keys by this, and the pointer counts its hits.
-    pub(super) fn permission_row_count(&self) -> usize {
-        self.prefs.import_origins.len()
-            + self.blocked_imports.len()
-            + self.prefs.sample_origins.len()
-            + self.blocked_samples.len()
-            // The CORS switch and the local folder are always there.
-            + 2
-            + usize::from(self.csound_allowed || self.csound_refused)
+    /// How many rows each section of the permissions page shows. The sheet
+    /// counts its keys by this, and the pointer counts its hits.
+    pub(super) fn permission_counts(&self) -> PermissionCounts {
+        PermissionCounts {
+            sources: self.sample_source_rows().len(),
+            scripts: self.prefs.import_origins.len() + self.blocked_imports.len(),
+            csound: self.csound_allowed || self.csound_refused,
+        }
     }
 
-    /// Whether the public CORS default is on: the command line permits it
-    /// and the page did not take it back.
-    fn public_cors(&self) -> bool {
-        self.options
-            .session
-            .score_sample_access
-            .public_cors_origins()
-            && !self.prefs.strict_sample_origins
-    }
-
-    /// Enter on a row of the permissions page.
+    /// Enter on a row of the permissions page. The sheet opens the prompt
+    /// of a row that asks for something.
     pub(super) fn permit_row(&mut self, at: usize) {
         match self.permission_rows().into_iter().nth(at) {
+            Some(
+                PermissionRow::Source { fixed: true, .. }
+                | PermissionRow::LocalFolder { fixed: true, .. },
+            ) => {
+                self.status = "the command line set this for the run".into();
+            }
+            Some(PermissionRow::Source {
+                rule,
+                allowed: true,
+                ..
+            }) => {
+                self.status = format!("{rule} is allowed · Space turns it off");
+            }
+            Some(PermissionRow::Source { rule, .. }) => self.allow_source(&rule),
+            Some(
+                PermissionRow::AddSource
+                | PermissionRow::TrySource(_)
+                | PermissionRow::LocalFolder { .. }
+                | PermissionRow::AddOrigin,
+            ) => {}
             Some(PermissionRow::Origin {
                 origin,
                 allowed: true,
@@ -167,63 +237,7 @@ impl App {
             Some(PermissionRow::Origin {
                 origin,
                 allowed: false,
-            }) => {
-                self.blocked_imports.retain(|blocked| *blocked != origin);
-                if !self.prefs.import_origins.contains(&origin) {
-                    self.prefs.import_origins.push(origin.clone());
-                    self.import_origins_changed();
-                }
-                self.status = if self.rerun_refused(|message| message.contains(&origin)) {
-                    format!("{origin} trusted · updating the score")
-                } else {
-                    format!("{origin} trusted")
-                };
-            }
-            Some(PermissionRow::SampleOrigin {
-                origin,
-                allowed: true,
-            }) => {
-                self.status = format!("{origin} is trusted for samples · Space turns it off");
-            }
-            Some(PermissionRow::SampleOrigin {
-                origin,
-                allowed: false,
-            }) => {
-                self.blocked_samples.retain(|blocked| *blocked != origin);
-                if !self.prefs.sample_origins.contains(&origin) {
-                    self.prefs.sample_origins.push(origin.clone());
-                    self.sample_grants_changed();
-                }
-                self.status = if self.rerun_refused(|message| {
-                    message.contains(&origin) || message.contains("permitted sample origins")
-                }) {
-                    format!("{origin} trusted for samples · updating the score")
-                } else {
-                    format!("{origin} trusted for samples · the next update reads it")
-                };
-            }
-            Some(PermissionRow::PublicCors { fixed: true, .. }) => {
-                self.status =
-                    "--strict-sample-origins holds public servers off for this run".into();
-            }
-            Some(PermissionRow::PublicCors { allowed: true, .. }) => {
-                self.status = "public servers with CORS are on · Space turns them off".into();
-            }
-            Some(PermissionRow::PublicCors { allowed: false, .. }) => {
-                self.prefs.strict_sample_origins = false;
-                self.sample_grants_changed();
-                self.status =
-                    if self.rerun_refused(|message| message.contains("permitted sample origins")) {
-                        "public servers with CORS on · updating the score".into()
-                    } else {
-                        "public servers with CORS on".into()
-                    };
-            }
-            Some(PermissionRow::LocalFolder { fixed: true, .. }) => {
-                self.status = "--allow-local-samples names the folder for this run".into();
-            }
-            // The sheet opens the folder prompt for this row.
-            Some(PermissionRow::LocalFolder { .. }) => {}
+            }) => self.trust_origin(&origin),
             Some(PermissionRow::Csound { allowed: true }) => {
                 self.status = "Csound is on · Space turns it off".into();
             }
@@ -238,45 +252,43 @@ impl App {
         }
     }
 
-    /// Space on a row of the permissions page: permit a refused row, or
+    /// Space on a row of the permissions page: allow a refused row, or
     /// take the permission back where the row stands. The row stays on the
     /// page, so the permission can come back with one more Space.
     pub(super) fn toggle_row(&mut self, at: usize) {
         match self.permission_rows().into_iter().nth(at) {
-            Some(PermissionRow::Origin { allowed: false, .. }) => self.permit_row(at),
+            Some(PermissionRow::Source {
+                rule,
+                allowed: true,
+                builtin: true,
+                fixed: false,
+            }) => {
+                self.prefs.builtin_sources_off.push(rule.clone());
+                self.sample_grants_changed();
+                self.status = format!("{rule} off · new samples no longer load from it");
+            }
+            Some(PermissionRow::Source {
+                rule,
+                allowed: true,
+                fixed: false,
+                ..
+            }) => {
+                self.prefs.allowed_sources.retain(|kept| *kept != rule);
+                self.sample_grants_changed();
+                // The row stays: it moves to the refused ones, which the
+                // studio keeps until it closes, so a permission taken back
+                // can be given again.
+                note_blocked(&mut self.blocked_samples, &rule);
+                self.status = format!("{rule} off · new samples no longer load from it");
+            }
             Some(PermissionRow::Origin {
                 origin,
                 allowed: true,
             }) => {
                 self.prefs.import_origins.retain(|kept| *kept != origin);
                 self.import_origins_changed();
-                // The row stays: it moves to the refused ones, which the
-                // studio keeps until it closes, so a permission taken back
-                // can be given again.
                 note_blocked(&mut self.blocked_imports, &origin);
                 self.status = format!("{origin} off · its scripts no longer load");
-            }
-            Some(PermissionRow::SampleOrigin { allowed: false, .. }) => self.permit_row(at),
-            Some(PermissionRow::SampleOrigin {
-                origin,
-                allowed: true,
-            }) => {
-                self.prefs.sample_origins.retain(|kept| *kept != origin);
-                self.sample_grants_changed();
-                note_blocked(&mut self.blocked_samples, &origin);
-                self.status = format!("{origin} off · new samples no longer load from it");
-            }
-            Some(PermissionRow::PublicCors {
-                allowed: true,
-                fixed: false,
-            }) => {
-                self.prefs.strict_sample_origins = true;
-                self.sample_grants_changed();
-                self.status =
-                    "public servers with CORS off · only trusted origins load new samples".into();
-            }
-            Some(PermissionRow::PublicCors { .. } | PermissionRow::LocalFolder { .. }) => {
-                self.permit_row(at);
             }
             Some(PermissionRow::Csound { allowed }) => {
                 let unblocked = self.set_csound(!allowed);
@@ -293,6 +305,7 @@ impl App {
                     "Csound on".into()
                 };
             }
+            Some(_) => self.permit_row(at),
             None => {}
         }
     }
@@ -300,6 +313,52 @@ impl App {
     /// Delete on a row of the permissions page.
     pub(super) fn forget_row(&mut self, at: usize) {
         match self.permission_rows().into_iter().nth(at) {
+            Some(
+                PermissionRow::Source { fixed: true, .. }
+                | PermissionRow::LocalFolder { fixed: true, .. },
+            ) => self.permit_row(at),
+            // A built-in source is part of the page: it goes off, and stays
+            // listed so it can come back.
+            Some(PermissionRow::Source {
+                rule,
+                allowed,
+                builtin: true,
+                ..
+            }) => {
+                if allowed {
+                    self.toggle_row(at);
+                }
+                self.status = format!("{rule} is built in · it stays off · Space turns it on");
+            }
+            Some(PermissionRow::Source {
+                rule,
+                allowed: true,
+                ..
+            }) => {
+                self.prefs.allowed_sources.retain(|kept| *kept != rule);
+                self.sample_grants_changed();
+                self.status = format!("{rule} removed · new samples no longer load from it");
+            }
+            Some(PermissionRow::Source { rule, .. }) => {
+                self.blocked_samples.retain(|blocked| *blocked != rule);
+                self.status = format!("{rule} dismissed");
+            }
+            Some(PermissionRow::TrySource(Some(_))) => {
+                self.tried_source = None;
+                self.try_answer = None;
+                self.status = "try cleared".into();
+            }
+            Some(
+                PermissionRow::AddSource
+                | PermissionRow::TrySource(None)
+                | PermissionRow::AddOrigin,
+            ) => {}
+            Some(PermissionRow::LocalFolder { .. }) => {
+                if self.prefs.local_sample_root.take().is_some() {
+                    self.sample_grants_changed();
+                }
+                self.status = "local folder forgotten · samples('local:') reads nothing".into();
+            }
             Some(PermissionRow::Origin {
                 origin,
                 allowed: true,
@@ -315,33 +374,6 @@ impl App {
                 self.blocked_imports.retain(|blocked| *blocked != origin);
                 self.status = format!("{origin} dismissed");
             }
-            Some(PermissionRow::SampleOrigin {
-                origin,
-                allowed: true,
-            }) => {
-                self.prefs.sample_origins.retain(|kept| *kept != origin);
-                self.sample_grants_changed();
-                self.status = format!("{origin} removed · new samples no longer load from it");
-            }
-            Some(PermissionRow::SampleOrigin {
-                origin,
-                allowed: false,
-            }) => {
-                self.blocked_samples.retain(|blocked| *blocked != origin);
-                self.status = format!("{origin} dismissed");
-            }
-            // The switch is a default, not something a score asked for, so
-            // it stays on the page.
-            Some(PermissionRow::PublicCors { .. }) => {
-                self.status = "the CORS switch stays · Space turns it on or off".into();
-            }
-            Some(PermissionRow::LocalFolder { fixed: true, .. }) => self.permit_row(at),
-            Some(PermissionRow::LocalFolder { .. }) => {
-                if self.prefs.local_sample_root.take().is_some() {
-                    self.sample_grants_changed();
-                }
-                self.status = "local folder forgotten · samples('local:') reads nothing".into();
-            }
             Some(PermissionRow::Csound { .. }) => {
                 // The switch leaves the page with its refusal, off either
                 // way: a score brings it back by asking again.
@@ -350,6 +382,231 @@ impl App {
                 self.status = "Csound off".into();
             }
             None => {}
+        }
+    }
+
+    /// Allow one source, as written on the page: a refused one, a built-in
+    /// one that is off, or one the player typed.
+    fn allow_source(&mut self, rule: &str) {
+        self.blocked_samples.retain(|blocked| blocked != rule);
+        if is_builtin(rule) {
+            let held = SourceRule::parse(rule).is_ok_and(|rule| {
+                !self
+                    .options
+                    .session
+                    .score_sample_access
+                    .sources()
+                    .contains(&rule)
+            });
+            if held {
+                self.status = format!("--strict-sample-origins holds {rule} off for this run");
+                return;
+            }
+            self.prefs.builtin_sources_off.retain(|off| off != rule);
+        } else if !self.prefs.allowed_sources.iter().any(|kept| kept == rule) {
+            self.prefs.allowed_sources.push(rule.to_owned());
+        }
+        self.sample_grants_changed();
+        self.status = if self.rerun_refused(names_a_refused_source) {
+            format!("{rule} allowed · updating the score")
+        } else {
+            format!("{rule} allowed · the next update reads it")
+        };
+    }
+
+    /// The source the add prompt read. A text that is no source keeps the
+    /// prompt open and says how to write one.
+    pub(super) fn allow_typed_source(&mut self, text: &str) {
+        let rule = match SourceRule::parse(text) {
+            Ok(rule) => rule.to_string(),
+            Err(why) => {
+                if let Some((_, picker)) = self.set_prompt.as_mut() {
+                    picker.error = Some(why);
+                }
+                return;
+            }
+        };
+        self.close_set_prompt();
+        self.allow_source(&rule);
+        self.select_permission(
+            |row| matches!(row, PermissionRow::Source { rule: named, .. } if *named == rule),
+        );
+        self.dirty_frame = true;
+    }
+
+    /// Trust one script origin: a refused one, or one the player typed.
+    fn trust_origin(&mut self, origin: &str) {
+        self.blocked_imports.retain(|blocked| blocked != origin);
+        if !self.prefs.import_origins.iter().any(|kept| kept == origin) {
+            self.prefs.import_origins.push(origin.to_owned());
+            self.import_origins_changed();
+        }
+        self.status = if self.rerun_refused(|message| message.contains(origin)) {
+            format!("{origin} trusted · updating the score")
+        } else {
+            format!("{origin} trusted")
+        };
+    }
+
+    /// The origin the add prompt of the scripts read.
+    pub(super) fn trust_typed_origin(&mut self, text: &str) {
+        let origin = match rustel_runtime::import_origin(text.trim()) {
+            Ok(origin) => origin,
+            Err(why) => {
+                if let Some((_, picker)) = self.set_prompt.as_mut() {
+                    picker.error = Some(why);
+                }
+                return;
+            }
+        };
+        self.close_set_prompt();
+        self.trust_origin(&origin);
+        self.select_permission(
+            |row| matches!(row, PermissionRow::Origin { origin: named, .. } if *named == origin),
+        );
+        self.dirty_frame = true;
+    }
+
+    /// The address the try prompt read: an http or https address, or the
+    /// prompt stays open and says so.
+    pub(super) fn try_typed_address(&mut self, text: &str) {
+        let address = text.trim().to_owned();
+        let form = url::Url::parse(&address)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+        if form.is_none() {
+            if let Some((_, picker)) = self.set_prompt.as_mut() {
+                picker.error = Some(format!("{address} is not an http or https address"));
+            }
+            return;
+        }
+        self.close_set_prompt();
+        self.try_address(address);
+        self.dirty_frame = true;
+    }
+
+    /// Say which source allows `address`, and load it once when one does.
+    /// The load runs off the studio's thread; [`Self::poll_tried_source`]
+    /// takes its answer.
+    fn try_address(&mut self, address: String) {
+        let access =
+            crate::engine::sample_access(&self.options.session, &self.prefs.sample_grants());
+        let verdict = match access.source_for(&address) {
+            Ok(Some(rule)) => {
+                let by = rule.to_string();
+                let (send, answer) = std::sync::mpsc::channel();
+                let tried = address.clone();
+                let started =
+                    std::thread::Builder::new()
+                        .name("try-source".into())
+                        .spawn(move || {
+                            let loaded = access.try_address(&tried);
+                            let _ = send.send((tried, loaded));
+                        });
+                match started {
+                    Ok(_) => {
+                        self.try_answer = Some(answer);
+                        TryVerdict::Loading { by }
+                    }
+                    Err(why) => TryVerdict::Failed {
+                        by,
+                        why: why.to_string(),
+                    },
+                }
+            }
+            Ok(None) => {
+                let url = url::Url::parse(&address).ok();
+                let domain = url.as_ref().and_then(SourceRule::for_url);
+                let folder = url
+                    .as_ref()
+                    .and_then(SourceRule::folder_of)
+                    .filter(|folder| Some(folder) != domain.as_ref());
+                TryVerdict::Refused {
+                    domain: domain.map(|rule| rule.to_string()),
+                    folder: folder.map(|rule| rule.to_string()),
+                }
+            }
+            Err(why) => TryVerdict::Failed {
+                by: String::new(),
+                why,
+            },
+        };
+        self.status = match &verdict {
+            TryVerdict::Refused { .. } => format!("{address} is not allowed"),
+            TryVerdict::Loading { by } => format!("{address} is allowed by {by} · loading"),
+            TryVerdict::Loaded { .. } | TryVerdict::Failed { .. } => format!("{address} tried"),
+        };
+        self.tried_source = Some(TriedSource { address, verdict });
+    }
+
+    /// Take the answer of the load the try row started, when it is in.
+    pub(super) fn poll_tried_source(&mut self) {
+        let Some(answer) = &self.try_answer else {
+            return;
+        };
+        let (address, loaded) = match answer.try_recv() {
+            Ok(answered) => answered,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.try_answer = None;
+                return;
+            }
+        };
+        self.try_answer = None;
+        if let Some(tried) = self.tried_source.as_mut()
+            && tried.address == address
+            && let TryVerdict::Loading { by } = &tried.verdict
+        {
+            let by = by.clone();
+            tried.verdict = match loaded {
+                Ok(what) => TryVerdict::Loaded { by, what },
+                // The address is on the row already.
+                Err(why) => TryVerdict::Failed {
+                    by,
+                    why: why
+                        .strip_prefix("GET ")
+                        .and_then(|rest| rest.split_once(": "))
+                        .map_or(why.clone(), |(_, rest)| rest.to_owned()),
+                },
+            };
+            self.dirty_frame = true;
+        }
+    }
+
+    /// `a` or `u` on the try row: allow the server, or only the folder, of
+    /// the address it refused, and try it again.
+    pub(super) fn allow_tried(&mut self, folder: bool) {
+        let Some(TriedSource {
+            address,
+            verdict:
+                TryVerdict::Refused {
+                    domain,
+                    folder: narrow,
+                },
+        }) = self.tried_source.clone()
+        else {
+            self.status = "nothing refused to allow · Enter tries an address".into();
+            return;
+        };
+        let Some(rule) = (if folder { narrow } else { domain }) else {
+            self.status = "this address has no narrower folder · a allows it".into();
+            return;
+        };
+        self.allow_source(&rule);
+        let allowed = std::mem::take(&mut self.status);
+        self.try_address(address);
+        self.status = allowed;
+    }
+
+    /// Put the sheet's cursor on the first row that `pick` takes.
+    fn select_permission(&mut self, pick: impl Fn(&PermissionRow) -> bool) {
+        let at = self.permission_rows().iter().position(pick);
+        let counts = self.permission_counts();
+        if let Some(sheet) = self.settings_sheet.as_mut() {
+            sheet.permission_counts = counts;
+            if let Some(at) = at {
+                sheet.selected = at;
+            }
         }
     }
 
@@ -478,7 +735,7 @@ mod tests {
 
         /// Where the orchestra switch stands on a page with no origins.
         fn csound_row(app: &App) -> usize {
-            app.permission_row_count() - 1
+            app.permission_counts().total() - 1
         }
 
         /// The switch starts on, as the engine's does: an installed library
@@ -590,108 +847,221 @@ mod tests {
             );
         }
 
-        /// The row a sample origin stands on, on or off.
-        fn sample_origin(app: &App, origin: &str) -> Option<(usize, bool)> {
+        /// The row a source stands on, on or off.
+        fn source_row(app: &App, rule: &str) -> Option<(usize, bool)> {
             app.permission_rows()
                 .into_iter()
                 .enumerate()
                 .find_map(|(at, row)| match row {
-                    PermissionRow::SampleOrigin {
-                        origin: named,
+                    PermissionRow::Source {
+                        rule: named,
                         allowed,
-                    } if named == origin => Some((at, allowed)),
+                        ..
+                    } if named == rule => Some((at, allowed)),
                     _ => None,
                 })
         }
 
-        /// A refused sample origin lands on the page. Enter trusts it and
-        /// keeps the trust in the settings, Space takes it back where it
-        /// stands, and `d` dismisses it. The count the sheet reads agrees
-        /// with the rows at every step.
-        #[test]
-        fn a_refused_sample_origin_is_trusted_kept_and_taken_back() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            let origin = "https://kit.invalid";
-            let count = |app: &App| {
-                assert_eq!(app.permission_row_count(), app.permission_rows().len());
-            };
-            count(&app);
-            assert!(app.note_refused_sample(origin));
-            assert!(app.note_refused_sample(origin), "noted again, kept once");
-            assert_eq!(app.blocked_samples, [origin]);
-            let (at, allowed) = sample_origin(&app, origin).expect("the refused row");
-            assert!(!allowed);
-            count(&app);
-
-            app.permit_row(at);
-            assert_eq!(app.prefs.sample_origins, [origin]);
-            assert!(app.blocked_samples.is_empty());
-            assert_eq!(sample_origin(&app, origin), Some((at, true)));
-            assert!(!app.sample_grants_owed, "the engine took the grant");
-            assert_eq!(app.prefs.sample_grants().origins, [origin]);
-            // A refusal from before the engine held the trust is stale.
-            assert!(!app.note_refused_sample(origin));
-            count(&app);
-
-            app.toggle_row(at);
-            assert!(app.prefs.sample_origins.is_empty());
-            assert_eq!(sample_origin(&app, origin), Some((at, false)));
-            app.forget_row(at);
-            assert_eq!(sample_origin(&app, origin), None);
-            count(&app);
+        /// The count the sheet reads agrees with the rows.
+        fn counts_agree(app: &App) {
+            let counts = app.permission_counts();
+            let rows = app.permission_rows();
+            assert_eq!(counts.total(), rows.len());
+            assert!(matches!(
+                rows[counts.try_row()],
+                PermissionRow::TrySource(_)
+            ));
         }
 
-        /// Space flips the public CORS default the host permits, and the
-        /// page keeps it off. A host that refused the default holds the
-        /// switch off: the page cannot open what the command line closed.
+        /// A refused source lands on the page. Enter allows it and keeps it
+        /// in the settings, Space takes it back where it stands, and `d`
+        /// dismisses it. The count the sheet reads agrees with the rows at
+        /// every step.
         #[test]
-        fn the_cors_switch_closes_the_default_and_never_opens_it_over_the_host() {
+        fn a_refused_source_is_allowed_kept_and_taken_back() {
             let directory = tempfile::tempdir().expect("temp dir");
             let mut app = app_over(directory.path());
-            let cors = |app: &App| {
+            let rule = "https://kit.invalid";
+            counts_agree(&app);
+            assert!(app.note_refused_sample(rule));
+            assert!(app.note_refused_sample(rule), "noted again, kept once");
+            assert_eq!(app.blocked_samples, [rule]);
+            let (at, allowed) = source_row(&app, rule).expect("the refused row");
+            assert!(!allowed);
+            counts_agree(&app);
+
+            app.permit_row(at);
+            assert_eq!(app.prefs.allowed_sources, [rule]);
+            assert!(app.blocked_samples.is_empty());
+            assert_eq!(source_row(&app, rule), Some((at, true)));
+            assert!(!app.sample_grants_owed, "the engine took the grant");
+            assert_eq!(app.prefs.sample_grants().sources, [rule]);
+            // A refusal from before the engine held the source is stale.
+            assert!(!app.note_refused_sample(rule));
+            counts_agree(&app);
+
+            app.toggle_row(at);
+            assert!(app.prefs.allowed_sources.is_empty());
+            assert_eq!(source_row(&app, rule), Some((at, false)));
+            app.forget_row(at);
+            assert_eq!(source_row(&app, rule), None);
+            counts_agree(&app);
+        }
+
+        /// The built-in sources are always on the page. The command line
+        /// can hold them off, and the page cannot open them over it. Where
+        /// the host allows them, Space turns one off and on, and `d` turns
+        /// it off but leaves it listed.
+        #[test]
+        fn a_builtin_source_turns_off_and_on_and_stays_listed() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let github = "raw.githubusercontent.com";
+            let builtin = |app: &App| {
                 app.permission_rows()
                     .into_iter()
                     .enumerate()
-                    .find(|(_, row)| matches!(row, PermissionRow::PublicCors { .. }))
-                    .expect("the switch is always on the page")
+                    .find(|(_, row)| {
+                        matches!(row, PermissionRow::Source { rule, .. } if rule == github)
+                    })
+                    .expect("a built-in source is always on the page")
             };
-            // The test session permits nothing, as `--strict-sample-origins`
+            // The test session allows nothing, as `--strict-sample-origins`
             // does.
-            let (at, row) = cors(&app);
+            let (at, row) = builtin(&app);
             assert_eq!(
                 row,
-                PermissionRow::PublicCors {
+                PermissionRow::Source {
+                    rule: github.to_owned(),
                     allowed: false,
-                    fixed: true
+                    builtin: true,
+                    fixed: true,
                 }
             );
             app.toggle_row(at);
-            assert!(!app.prefs.strict_sample_origins);
-            assert!(
-                app.status.contains("--strict-sample-origins"),
-                "{}",
-                app.status
-            );
+            assert!(app.prefs.builtin_sources_off.is_empty());
+            assert!(app.status.contains("command line"), "{}", app.status);
 
             app.options
                 .session
                 .score_sample_access
-                .permit_public_cors_origins();
-            assert_eq!(
-                cors(&app).1,
-                PermissionRow::PublicCors {
-                    allowed: true,
-                    fixed: false
-                }
-            );
+                .permit_builtin_sources();
+            assert!(builtin(&app).1.allowed());
             app.toggle_row(at);
-            assert!(app.prefs.strict_sample_origins);
-            assert!(app.prefs.sample_grants().strict);
-            assert!(!cors(&app).1.allowed());
+            assert_eq!(app.prefs.builtin_sources_off, [github]);
+            assert_eq!(app.prefs.sample_grants().builtins_off, [github]);
+            assert!(!builtin(&app).1.allowed());
             app.permit_row(at);
-            assert!(!app.prefs.strict_sample_origins);
-            assert!(cors(&app).1.allowed());
+            assert!(app.prefs.builtin_sources_off.is_empty());
+            assert!(builtin(&app).1.allowed());
+
+            app.forget_row(at);
+            assert_eq!(builtin(&app).0, at, "it stays where it was");
+            assert!(!builtin(&app).1.allowed());
+            // A refusal of a built-in has its row already.
+            assert!(app.note_refused_sample(github));
+            assert!(app.blocked_samples.is_empty());
+            counts_agree(&app);
+        }
+
+        /// A typed source or origin that is not one keeps its prompt open
+        /// and says how to write it. One that is lands on the page, in the
+        /// settings, under the cursor.
+        #[test]
+        fn a_typed_source_or_origin_is_checked_kept_and_selected() {
+            use crate::app::sets::SetPrompt;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.settings_sheet = Some(crate::settings::SettingsSheet::default());
+
+            app.open_set_prompt(SetPrompt::AllowSource);
+            app.allow_typed_source("example.com/kits");
+            let error = app
+                .set_prompt
+                .as_ref()
+                .and_then(|(_, picker)| picker.error.clone())
+                .expect("the prompt says what is wrong");
+            assert!(error.contains("https://example.com/kits/"), "{error}");
+            assert!(app.prefs.allowed_sources.is_empty());
+
+            app.allow_typed_source("Example.com");
+            assert!(app.set_prompt.is_none(), "the prompt closed");
+            assert_eq!(app.prefs.allowed_sources, ["example.com"]);
+            let (at, _) = source_row(&app, "example.com").expect("the row");
+            assert_eq!(app.settings_sheet.expect("the sheet").selected, at);
+
+            app.open_set_prompt(SetPrompt::TrustScriptOrigin);
+            app.trust_typed_origin("http://scripts.example");
+            assert!(app.set_prompt.is_some(), "plain http is refused");
+            app.trust_typed_origin("https://scripts.example/");
+            assert_eq!(app.prefs.import_origins, ["https://scripts.example"]);
+            counts_agree(&app);
+        }
+
+        /// The try row says no source allows an address and offers its
+        /// server and its folder. `a` allows the server and tries again,
+        /// and the row then says what loaded.
+        #[test]
+        fn the_try_row_offers_a_source_and_shows_what_loads() {
+            use crate::settings::{TriedSource, TryVerdict};
+            use std::io::{Read, Write};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("one request");
+                let mut head = [0; 1024];
+                let _ = stream.read(&mut head);
+                let body = r#"{"bd": ["bd.wav"]}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+            let address = format!("{origin}/kits/kit.json");
+
+            app.try_typed_address("kit.json");
+            assert_eq!(app.tried_source, None, "not an address");
+            app.try_typed_address(&address);
+            assert_eq!(
+                app.tried_source,
+                Some(TriedSource {
+                    address: address.clone(),
+                    verdict: TryVerdict::Refused {
+                        domain: Some(origin.clone()),
+                        folder: Some(format!("{origin}/kits/")),
+                    },
+                })
+            );
+            // The refusal asked nothing of the engine's record.
+            assert!(app.blocked_samples.is_empty());
+
+            app.allow_tried(false);
+            assert_eq!(app.prefs.allowed_sources, std::slice::from_ref(&origin));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                app.poll_tried_source();
+                let verdict = &app.tried_source.as_ref().expect("the try").verdict;
+                if !matches!(verdict, TryVerdict::Loading { .. }) {
+                    assert_eq!(
+                        *verdict,
+                        TryVerdict::Loaded {
+                            by: origin.clone(),
+                            what: "sample map, 1 sound".to_owned(),
+                        }
+                    );
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the load never answered"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            server.join().expect("server thread");
         }
 
         /// A chosen folder is kept and named on its row. One that does not
