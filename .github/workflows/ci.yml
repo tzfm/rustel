@@ -145,7 +145,13 @@ jobs:
           }
           Remove-Item $probe, "$probe.exe" -ErrorAction SilentlyContinue
 
+      # Pull requests restore only. A pull request's save is scoped to that
+      # pull request, so main can never reuse it, and each extra generation
+      # evicted the heavy sample caches from the 10 GB repository quota.
+      # Main pushes are the only writer, as in the heavy workflow.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Install Linux audio build dependencies
         if: runner.os == 'Linux'
@@ -307,7 +313,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # Pull requests restore only. The check job's cache step gives the
+      # reason.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
 
       # The runner image no longer carries the ALSA headers, and the audio
       # crates fail to build without them.
@@ -358,7 +368,11 @@ jobs:
           rustup show
           rustup target add ${{ matrix.target }}
 
+      # Pull requests restore only. The check job's cache step gives the
+      # reason.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Install Linux audio and serial build dependencies
         if: runner.os == 'Linux'
