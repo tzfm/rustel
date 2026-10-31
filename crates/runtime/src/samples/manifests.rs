@@ -2487,6 +2487,9 @@ pub(super) mod tests {
                     rule: SourceRule::parse("raw.githubusercontent.com").expect("a test source"),
                 }
             );
+            access
+                .approve_remote("https://cdn.freesound.org/previews/182/182967_529852-lq.mp3")
+                .expect("freesound is built in");
             for refused in [
                 "https://samples.example/kit.json",
                 "http://raw.githubusercontent.com/a/b/main/strudel.json",

@@ -7,12 +7,13 @@
 use url::{Host, Url};
 
 /// The domains every policy starts with, unless the host turns them off.
-/// They serve the `github:`, `bubo:` and `shabda:` shorthands and the
-/// default banks.
+/// They serve the `github:`, `bubo:` and `shabda:` shorthands, the default
+/// banks, and the freesound sounds that shared scores name.
 pub const BUILTIN_SOURCES: &[&str] = &[
     "raw.githubusercontent.com",
     "strudel.b-cdn.net",
     "shabda.ndre.gr",
+    "cdn.freesound.org",
 ];
 
 /// One allowed source.

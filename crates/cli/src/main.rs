@@ -1403,8 +1403,8 @@ struct SampleAccessArgs {
     )]
     sources: Vec<String>,
     /// Do not allow the built-in sources (raw.githubusercontent.com,
-    /// strudel.b-cdn.net and shabda.ndre.gr). Scores then load only from
-    /// the sources given above.
+    /// strudel.b-cdn.net, shabda.ndre.gr and cdn.freesound.org). Scores
+    /// then load only from the sources given above.
     #[arg(long = "strict-sample-origins", help_heading = "Sample access")]
     strict_origins: bool,
     /// Permit samples('local:...') beneath this directory.
