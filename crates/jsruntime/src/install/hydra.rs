@@ -124,7 +124,7 @@ impl HydraCandidate {
     /// Recording schema emitted by this side of the score/window boundary.
     /// `rustel-runtime` asserts this against `rustel-hydra` so the otherwise
     /// intentionally decoupled crates cannot silently drift.
-    pub const PROGRAM_VERSION: u16 = 4;
+    pub const PROGRAM_VERSION: u16 = 5;
 
     /// Number of typed source slots emitted by this recording version.
     pub const SOURCE_SLOTS: usize = 4;
