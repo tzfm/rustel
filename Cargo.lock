@@ -3801,8 +3801,8 @@ dependencies = [
 
 [[package]]
 name = "rustel-hydra"
-version = "0.2.2"
-source = "git+https://github.com/tzfm/rustel-hydra.git?tag=v0.2.2#4ee3e1511c1d1cc96b77586288f5146b855a6007"
+version = "0.2.3"
+source = "git+https://github.com/tzfm/rustel-hydra.git?tag=v0.2.3#53c967239752300c796aab9f9508c791d88f2fe1"
 dependencies = [
  "pollster",
  "serde",
