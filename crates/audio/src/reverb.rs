@@ -180,6 +180,26 @@ const TAIL_START: usize = 2048;
 const TAIL_BLOCK: usize = TAIL_START;
 const TAIL_FFT: usize = 2 * TAIL_BLOCK;
 
+/// Fill a spectrum's upper half with the conjugates of its lower half.
+///
+/// Both convolvers multiply-accumulate only the bins up to the middle and
+/// let this build the rest: the transform of real audio is Hermitian, so
+/// the bins above the middle hold the conjugates of the bins below it.
+/// The transform's own rounding means a directly computed upper bin can
+/// differ from the conjugate by its last bit; filling by conjugation
+/// makes the output differ from the full computation by float rounding
+/// alone, well below hearing.
+fn fill_conjugate_half(spectrum: &mut [Complex<f32>]) {
+    let len = spectrum.len();
+    for k in 1..len / 2 {
+        let lower = spectrum[k];
+        spectrum[len - k] = Complex {
+            re: lower.re,
+            im: -lower.im,
+        };
+    }
+}
+
 /// The tail half of a non-uniform partitioned convolution.
 ///
 /// Handles impulse-response offsets `[TAIL_START, end)` only. Because every
@@ -326,12 +346,22 @@ impl TailConvolver {
 
         self.accumulator.fill(Complex::default());
         let count = self.history.len();
+        // A transform of real audio is Hermitian: the bins above the
+        // middle carry the conjugates of the bins below it. Multiply-
+        // accumulate the lower half and fill the upper half by
+        // conjugation, which is half the work for the same spectrum -
+        // the products differ only in the transform's own rounding.
+        let bins = self.accumulator.len() / 2 + 1;
         for (lag, partition) in self.partitions.iter().enumerate() {
             let slot = (self.head + count - lag) % count;
             let spectrum = &self.history[slot];
-            self.kernel
-                .multiply_accumulate(&mut self.accumulator, spectrum, partition);
+            self.kernel.multiply_accumulate(
+                &mut self.accumulator[..bins],
+                &spectrum[..bins],
+                &partition[..bins],
+            );
         }
+        fill_conjugate_half(&mut self.accumulator);
         self.ifft
             .process_with_scratch(&mut self.accumulator, &mut self.scratch);
         let scale = 1.0 / TAIL_FFT as f32;
@@ -646,12 +676,19 @@ impl MonoConvolver {
 
         self.accumulator.fill(Complex::default());
         let count = self.partitions.len();
+        // The same Hermitian half as the tail: the head's spectra come off
+        // real audio too, so its upper half is filled by conjugation.
+        let bins = self.accumulator.len() / 2 + 1;
         for (lag, partition) in self.partitions.iter().enumerate() {
             let slot = (self.head + count - lag) % count;
             let spectrum = &self.history[slot];
-            self.kernel
-                .multiply_accumulate(&mut self.accumulator, spectrum, partition);
+            self.kernel.multiply_accumulate(
+                &mut self.accumulator[..bins],
+                &spectrum[..bins],
+                &partition[..bins],
+            );
         }
+        fill_conjugate_half(&mut self.accumulator);
         self.ifft
             .process_with_scratch(&mut self.accumulator, &mut self.scratch);
         // rustfft's inverse is unnormalized; the valid overlap-save half is

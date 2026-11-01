@@ -1863,7 +1863,7 @@ fn with_preferred_host<T>(
         let mut pulse = PULSE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pulse.is_none() {
+        if pulse.is_none() && host_builder_at_normal_priority() {
             *pulse = cpal::host_from_id(cpal::HostId::PulseAudio).ok();
         }
         if let Some(host) = pulse.as_ref() {
@@ -1872,6 +1872,28 @@ fn with_preferred_host<T>(
         }
     }
     use_host(&cpal::default_host())
+}
+
+/// True when the calling thread still stands at or above its normal
+/// scheduling priority.
+///
+/// The host's connection hands its work to a fresh thread that carries no
+/// name, and a thread with no name inherits its creator's scheduling
+/// priority and name; the audio callback later rides that thread. Only a
+/// caller at a normal priority may build the connection: one demoted below
+/// it - a device probe - would put the sound below the workers around it
+/// for the life of the process. A demoted caller lists through the default
+/// host instead, and the next caller at a normal priority - a priming at
+/// startup, or a stream opening - builds the cache.
+#[cfg(target_os = "linux")]
+fn host_builder_at_normal_priority() -> bool {
+    // SAFETY: getpriority only reads a scheduling value.
+    unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) <= 0 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_builder_at_normal_priority() -> bool {
+    true
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1891,6 +1913,38 @@ fn with_preferred_host<T>(
     use_host: impl FnOnce(&cpal::Host) -> Result<T, DevicePlaybackError>,
 ) -> Result<T, DevicePlaybackError> {
     use_host(&cpal::default_host())
+}
+
+/// Build the cached playback host now, at the calling thread's priority,
+/// and wait for it.
+///
+/// The host's connection hands its work to a fresh thread that carries no
+/// name, and a thread with no name inherits its creator's scheduling
+/// priority and name. The audio callback later rides that thread, so a
+/// host first built by a demoted worker - a device probe spawned by a
+/// demoted frame loop - puts the sound itself below the workers around it
+/// for the life of the process. Call this while the calling thread still
+/// stands at its normal priority; the helper here carries that priority
+/// and the name `audio-host` over to the connection. The wait is bounded
+/// by the host's own handshake timeout, so a server that never answers
+/// costs seconds at worst - and without the wait a demoted probe spawned
+/// right after could reach the cache first.
+pub fn prime_playback_host() {
+    let primed = std::thread::Builder::new()
+        .name("audio-host".into())
+        .spawn(|| {
+            let _ = with_preferred_host(|_| Ok::<(), DevicePlaybackError>(()));
+        });
+    match primed {
+        Ok(handle) => {
+            let _ = handle.join();
+        }
+        // A thread that cannot be spawned leaves the host to be built
+        // inline, at this thread's priority.
+        Err(_) => {
+            let _ = with_preferred_host(|_| Ok::<(), DevicePlaybackError>(()));
+        }
+    }
 }
 
 fn build_stream(
@@ -2045,6 +2099,14 @@ where
     // drops with the stream.
     #[cfg(target_os = "linux")]
     let mut real_time = CallbackRealTime::new(buffer_frames, sample_rate);
+    // Deliberately no probe here. The class is per thread and the callback
+    // can only ask for itself, but asking is not safe unconditionally: a
+    // callback whose render runs near the whole of every period sits near a
+    // total real-time duty cycle, and the kernel's watchdog kills such a
+    // thread (SIGXCPU) within a fraction of a second of the grant. Until
+    // the callback measures its own duty cycle and asks only with
+    // headroom, the class stays with the plugin workers, whose turns are
+    // short - which is the behaviour this stream has always shipped.
     // cpal reports no underruns for a WASAPI output, so the callback counts
     // them from the playback clock.
     #[cfg(windows)]

@@ -43,6 +43,12 @@ windows-sys = { version = "0.61", features = [
 # Linux. Without its `dbus` feature, the crate needs no system library on
 # Linux.
 audio_thread_priority = { version = "0.38", default-features = false, optional = true }
+# On Linux the dbus feature is what makes the class real: rtkit grants it
+# over dbus, and without the backend every promotion call is a silent
+# no-op. The library is present wherever rtkit is; a machine without it
+# fails the probe and the threads stay ordinary, as before.
+[target.'cfg(target_os = "linux")'.dependencies]
+audio_thread_priority = { version = "0.38", default-features = false, features = ["with_dbus"] }
 # The cores of the process, which set the count of plugin workers and the
 # CPUs a plugin worker keeps to on Linux, and the thread time of a plugin
 # worker.

@@ -1,5 +1,7 @@
 use super::*;
 use crate::pool::{JobKind, JoinGuard, PoolHandle};
+use crate::sample::{SampleBank, SampleResamplingMode};
+use crate::supersaw_kernel::StaticSupersawKernel;
 
 /// On x86_64, flush subnormal inputs and results to zero so quiet filter and
 /// reverb tails avoid denormal arithmetic costs. These flags are per-thread;
@@ -30,6 +32,235 @@ pub(crate) fn enable_denormal_flush() {
             }
         }
     }
+}
+
+/// True when the voice runs no optional ladder at all: a stereo sample or
+/// oscillator with no modulators, no FM route, no live sliders, no fades,
+/// no filters, no FX of any kind, no insert routing and no visual capture.
+/// Sends it may carry: the tight path accumulates them.
+///
+/// Every frame of such a voice is the source, the envelope, three gains,
+/// the panner, its sends and the mix - which is exactly what
+/// [`render_plain_voice`] computes, operation for operation as the
+/// general body does with every gate closed. The classification is
+/// recomputed each render because steals and polyphony fades change a
+/// voice's ladders mid-life.
+fn plain_sample_voice(v: &Voice) -> bool {
+    matches!(
+        v.source,
+        VoiceSource::Sample { .. } | VoiceSource::Oscillator { .. } | VoiceSource::Supersaw { .. }
+    ) && v.controls.noise == 0.0
+        && v.filters_right.is_some()
+        && !v.has_filters
+        && !v.has_pre_distort_fx
+        && !v.has_param_modulators
+        && v.pitch_quantum_skip == 0
+        && v.fm_state.is_none()
+        && v.controls.fm.is_none()
+        && v.live_fm_index.binding == 0
+        && v.live_cutoff.binding == 0
+        && v.live_resonance.binding == 0
+        && v.live_gain.binding == 0
+        && v.cut_fade_frame.is_none()
+        && v.polyphony_fade_frame.is_none()
+        && !v.through_insert
+        && v.controls.vibrato.is_none()
+        && v.controls.pitch_env.is_none()
+        && v.controls.tremolo.is_none()
+        && v.controls.phaser.is_none()
+        && v.controls.vowel.is_none()
+        && v.controls.distort.is_none()
+        && v.compressor.is_none()
+        && v.controls.compressor.is_none()
+        && v.limiter.is_none()
+        && v.fx_stage_state.is_none()
+        && v.kabel.is_none()
+        && v.stretch.is_none()
+        && v.controls.stretch.is_none()
+        && v.transient.is_none()
+        && v.controls.bus.is_none()
+        && v.ui_visuals == 0
+}
+
+/// The tight path a plain voice takes, one frame at a time.
+///
+/// Kept out of line so it earns its own registers: the general body in
+/// [`ScalarBackend::process_segment`] is so wide that a plain voice paid
+/// its stack spills every frame, plain or not. The arithmetic here is the
+/// general body's with every gate closed, in the same order: skips are
+/// only identities (a multiply by one, an add the full path also makes),
+/// so the frames are bit for bit what the general body produces. A plain
+/// voice is a sample or an oscillator; sends it carries are accumulated
+/// here, so a room or a delay does not by itself push a voice off the
+/// path.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn render_plain_voice(
+    v: &mut Voice,
+    bank: &SampleBank,
+    tables: &PeriodicWaveTables,
+    supersaw_kernel: Option<StaticSupersawKernel>,
+    resampling: SampleResamplingMode,
+    abs: u64,
+    i: usize,
+    sr: f64,
+    t: f32,
+    blocks: &mut [[[f32; crate::reverb::REVERB_BLOCK]; 2]],
+    sends: &mut [[[f32; crate::reverb::REVERB_BLOCK]; 2]],
+    orbit_inputs: &mut [[f32; 2]],
+    piano_mix: &mut [[f32; crate::reverb::REVERB_BLOCK]; 2],
+) {
+    let env = ScalarBackend::envelope(t, v.duration_secs, v.controls.envelope, v.gate_value);
+    let (wave_l, wave_r) = match &mut v.source {
+        VoiceSource::Sample {
+            sample,
+            position,
+            increment,
+            reversed,
+            delay_frames,
+            loop_frames,
+        } => {
+            // The general body reads its playback step through the
+            // per-quantum pitch hold; a plain voice holds no pitch shaper,
+            // so its step is the increment itself (multiplying by the held
+            // one is an exact identity).
+            if bank.get(*sample).is_none() {
+                // The slot was emptied under the voice - an uninstall
+                // landed. The voice ends with the block, as the general
+                // body ends it.
+                v.source_gone = true;
+                (0.0, 0.0)
+            } else if *delay_frames > 0 {
+                *delay_frames -= 1;
+                (0.0, 0.0)
+            } else if let Some((loop_start, loop_end)) = *loop_frames
+                && loop_end > loop_start
+                && bank.get(*sample).is_some_and(|decoded| {
+                    *increment > loop_end.min(decoded.frames() as f64) - loop_start
+                })
+            {
+                (0.0, 0.0)
+            } else {
+                let wave = bank
+                    .get(*sample)
+                    .and_then(|decoded| {
+                        if *reversed {
+                            let last = (decoded.frames().max(1) - 1) as f64;
+                            let read = last - *position;
+                            if read < 0.0 {
+                                return None;
+                            }
+                            decoded.stereo_at_reversed_with_mode(read, resampling)
+                        } else {
+                            decoded.stereo_at_with_mode(*position, resampling)
+                        }
+                    })
+                    .unwrap_or((0.0, 0.0));
+                *position += *increment;
+                if let Some((loop_start, loop_end)) = loop_frames
+                    && *position >= *loop_end
+                    && *loop_end > *loop_start
+                {
+                    *position -= *loop_end - *loop_start;
+                }
+                wave
+            }
+        }
+        VoiceSource::Oscillator {
+            table_selection,
+            phase,
+            partial_limit,
+        } => {
+            // No FM route and no detune: both offsets the general body
+            // passes are exact zeroes, and adding or multiplying by them
+            // is an exact identity.
+            let wave = oscillator_sample(
+                tables,
+                &v.controls,
+                *table_selection,
+                phase,
+                partial_limit,
+                v.freq_hz,
+                0.0,
+                1.0,
+                sr,
+            );
+            (wave, wave)
+        }
+        // The supersaw's begin gate: no output and no phase advance until
+        // the gate opens, exactly as the general body guards it.
+        VoiceSource::Supersaw { .. }
+            if !lfo_quantum_open(abs & !127, sr, v.controls.worklet_begin_secs) =>
+        {
+            (0.0, 0.0)
+        }
+        VoiceSource::Supersaw { plan, phases } => {
+            let (mut gain_l, mut gain_r) = plan.pan_gains(0.0);
+            let freq = (v.freq_hz + 0.0) * 1.0;
+            // A plain voice carries no spread modulator, so the spread is
+            // static and the fast kernel takes it when this machine has
+            // one.
+            if let Some(kernel) = supersaw_kernel
+                && kernel.supports(plan.count)
+            {
+                // SAFETY: the kernel was selected only after its CPU
+                // prerequisites were detected, and both arrays have
+                // MAX_UNISON entries while count is clamped to that bound.
+                unsafe {
+                    kernel.render(
+                        phases,
+                        &plan.detune_ratios,
+                        plan.count,
+                        freq,
+                        sr as f32,
+                        (gain_l, gain_r),
+                    )
+                }
+            } else {
+                let mut left = 0.0f32;
+                let mut right = 0.0f32;
+                for (n, phase) in phases.iter_mut().enumerate().take(plan.count) {
+                    let ratio = plan.detune_ratios[n];
+                    let voice_freq = freq * ratio;
+                    let dt = saw_step(voice_freq / sr as f32);
+                    let value = saw_blep(*phase, dt);
+                    left += value * gain_l;
+                    right += value * gain_r;
+                    *phase = wrap_phase(f64::from(*phase + dt)) as f32;
+                    std::mem::swap(&mut gain_l, &mut gain_r);
+                }
+                (left, right)
+            }
+        }
+        _ => return,
+    };
+    let scale = v.amplitude_scale * env;
+    let (left, right) = (wave_l * scale, wave_r * scale);
+    let (left, right) = stereo_pan(left, right, v.pan_x);
+    let post_gain = v.controls.postgain;
+    let (left, right) = (left * post_gain, right * post_gain);
+    // The sends tap the voiced signal after the chain's gain, exactly
+    // where the general body taps them; the modulation adds are the zero
+    // pair's, an exact identity on a wet value above zero.
+    let delay_wet = (v.delay_wet + 0.0).max(0.0);
+    if delay_wet > 0.0 && v.delay_wet > 0.0 {
+        orbit_inputs[v.orbit][0] += left * delay_wet;
+        orbit_inputs[v.orbit][1] += right * delay_wet;
+    }
+    let reverb_wet = (v.reverb_wet + 0.0).max(0.0);
+    if reverb_wet > 0.0 && v.reverb_wet > 0.0 {
+        sends[v.orbit][0][i] += left * reverb_wet;
+        sends[v.orbit][1][i] += right * reverb_wet;
+    }
+    let dry = v.dry_gain + 0.0;
+    let (left, right) = (left * dry, right * dry);
+    let mix = if v.piano {
+        piano_mix
+    } else {
+        &mut blocks[v.orbit]
+    };
+    mix[0][i] += left;
+    mix[1][i] += right;
 }
 
 impl ScalarPressureState {
@@ -1479,6 +1710,7 @@ impl ScalarBackend {
                     ui_visuals: e.ui_visuals,
                     preview_epoch: e.controls.preview_epoch,
                     piano: e.controls.piano,
+                    plain: false,
                     onset_lead: e.onset_lead,
                     distort_curve: e.controls.distort.map(|d| d.curve(d.shape())),
                     delay_wet,
@@ -1757,6 +1989,18 @@ impl ScalarBackend {
         // The GainNode on the delay's feedback edge is shared in the same
         // way, and its `gain` AudioParam is a-rate too.
         let mut delay_feedback_mods = [0.0f32; MAX_ORBITS];
+        // Tight-path classification, after every activation of this render:
+        // a steal or a polyphony fade lands its ladders on a voice that
+        // was plain until then, and the classification has to see them.
+        // A field read, not a method: this late, `self` is already split
+        // across the block pipeline's borrows.
+        #[cfg(test)]
+        let plain_disabled = self.disable_plain_path;
+        #[cfg(not(test))]
+        let plain_disabled = false;
+        for voice in &mut self.voices {
+            voice.plain = !plain_disabled && plain_sample_voice(voice);
+        }
         // Per-orbit block pipeline: voices, delay and reverb returns
         // accumulate into ≤128-frame per-orbit buffers (the reverb is a
         // block convolution on WebAudio's 128-frame quantum), then the duck
@@ -1941,6 +2185,27 @@ impl ScalarBackend {
                         ((abs - v.start_frame) as f32 + v.onset_lead) / sr as f32
                     };
                     if t >= v.stop_secs {
+                        continue;
+                    }
+                    // The plain voice's whole frame, out of line: the
+                    // general body below is correct for it too, at the
+                    // price of its register spills.
+                    if v.plain {
+                        render_plain_voice(
+                            v,
+                            bank,
+                            tables,
+                            supersaw_kernel,
+                            sample_resampling_mode,
+                            abs,
+                            i,
+                            sr,
+                            t,
+                            blocks,
+                            sends,
+                            &mut orbit_inputs,
+                            &mut piano_mix,
+                        );
                         continue;
                     }
                     let env = Self::envelope(t, v.duration_secs, v.controls.envelope, v.gate_value);
@@ -3972,6 +4237,109 @@ impl ScalarBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod plain_path_tests {
+        use super::*;
+
+        /// A stereo sample the test installs, so the voice is a plain
+        /// sample voice the way a piano voice is: the bundled `bd` is mono
+        /// and would classify away from the tight path.
+        const TEST_SAMPLE: crate::sample::SampleId = crate::sample::SampleId(40);
+
+        fn install_stereo_sample(backend: &mut ScalarBackend) {
+            let pcm: Vec<f32> = (0..48_000)
+                .map(|frame| {
+                    let phase = frame as f32 * 440.0 * 2.0 * std::f32::consts::PI / 48_000.0;
+                    (phase.sin() * (1.0 - frame as f32 / 48_000.0)) * 0.4
+                })
+                .collect();
+            let decoded = crate::sample::DecodedSample::from_parts(48_000, 2, pcm).unwrap();
+            backend
+                .install_sample(TEST_SAMPLE, Box::new(decoded))
+                .expect("the test slot installs");
+        }
+
+        fn sample_note(frame: u64, rate: f32) -> OnsetEvent {
+            let mut event = OnsetEvent::new(frame, 220.0, 0.5, 2.0);
+            event.sample = Some(crate::SampleControls {
+                sample: TEST_SAMPLE,
+                playback_rate: rate,
+                begin: 0.0,
+                end: 1.0,
+                hold: crate::sample::SampleHold::Hap,
+                muted: false,
+                loop_secs: None,
+                envelope_peak: 1.0,
+                reversed: false,
+                nudge_secs: 0.0,
+                cut: None,
+            });
+            event
+        }
+
+        fn render(disable_plain: bool) -> (Vec<f32>, usize) {
+            let mut backend = ScalarBackend::prepared(48_000, 16).unwrap();
+            backend.disable_plain_path = disable_plain;
+            install_stereo_sample(&mut backend);
+            for (frame, rate) in [(0u64, 1.0), (200, 0.5), (1024, 1.5)] {
+                backend.note(sample_note(frame, rate));
+            }
+            // An oscillator voice, and a sample voice that carries a room
+            // send: both are plain under the widened path.
+            let mut osc = OnsetEvent::new(512, 330.0, 0.4, 1.5);
+            osc.controls.waveform = crate::backend::Waveform::Sawtooth;
+            backend.note(osc);
+            let mut roomy = sample_note(768, 1.0);
+            roomy.controls.reverb = Some(crate::backend::ReverbControls {
+                wet: 0.4,
+                size_secs: 1.0,
+                fade_secs: 0.1,
+                lp_start_hz: 8000.0,
+                lp_end_hz: 2000.0,
+                ir: None,
+            });
+            backend.note(roomy);
+            let mut out = vec![0.0f32; 2 * 128];
+            let mut all = Vec::new();
+            for _ in 0..48 {
+                backend.process_block(&mut out[..], 128);
+                all.extend_from_slice(&out);
+            }
+            let plain_voices = backend.voices.iter().filter(|voice| voice.plain).count();
+            (all, plain_voices)
+        }
+
+        /// The tight path computes the same frame the general body does,
+        /// bit for bit, for every plain sample voice.
+        #[test]
+        fn the_plain_sample_path_matches_the_general_body_bit_for_bit() {
+            let (tight, plain_voices) = render(false);
+            let (general, _) = render(true);
+            assert!(
+                plain_voices > 0,
+                "the test's voices must classify as plain or it proves nothing"
+            );
+            assert!(
+                tight.iter().any(|value| value.abs() > 0.001),
+                "the test's samples must sound or the comparison proves nothing"
+            );
+            assert_eq!(tight.len(), general.len());
+            for (tight, general) in tight.iter().zip(&general) {
+                assert_eq!(tight.to_bits(), general.to_bits());
+            }
+        }
+
+        /// A plain sample voice classifies for the tight path.
+        #[test]
+        fn a_plain_sample_voice_classifies_for_the_tight_path() {
+            let mut backend = ScalarBackend::prepared(48_000, 4).unwrap();
+            install_stereo_sample(&mut backend);
+            backend.note(sample_note(0, 1.0));
+            let mut out = [0.0f32; 256];
+            backend.process_block(&mut out[..], 128);
+            assert!(backend.voices.iter().any(|voice| voice.plain));
+        }
+    }
+
     mod dispatch_tests {
         use super::*;
 

@@ -306,6 +306,22 @@ A small buffer leaves little time for each callback: 32 frames at 48 kHz is
 the hint to raise the audio out latency. With reverb in the score, use 128
 frames, or 64 on a fast machine.
 
+On Linux through PulseAudio or PipeWire, a busy CPU can click the output even
+when rustel's own DSP is quick: the audio server drives the device on a
+normal-priority thread, and a saturated core delays it past its buffer. A
+server with a realtime grant, which rtkit provides, holds the output clean
+at any buffer size. rustelup offers to install rtkit when it finds a system
+that runs such a server without it; to install it by hand:
+
+```sh
+sudo apt-get install -y rtkit
+```
+
+Without one, a larger buffer is the cushion: on a small machine such as a
+Raspberry Pi 3, a fully loaded CPU clicked at 512 and 1024 frames in testing
+and held clean from 2048 up. Studio's audio out latency row is the same
+setting.
+
 A laptop in a power-saving mode keeps the CPU clock low for short, regular
 work such as an audio callback, and it changes the clock often. The same
 score can then need two to four times the DSP time, and some callbacks miss
@@ -335,6 +351,54 @@ period cannot reduce latency. Larger requests add buffer space.
 
 `RUSTEL_LIVE_BUFFER_FRAMES` overrides automatic.
 `RUSTEL_MAX_LIVE_LATENCY_MS` sets the accepted latency ceiling, from 50-5000 ms.
+
+## Finding what makes a machine slow
+
+A machine that plays badly is usually short on one of four things. Check them
+in this order: each has a symptom that names it, and a command that confirms
+it.
+
+```text
+power  -> priority -> time  -> speed
+starved   no realtime  small    slow
+supply    for the      buffer   CPU
+          audio graph
+```
+
+Power first. A small board such as a Raspberry Pi lowers its clock when its
+power supply sags, and half clock turns a comfortable score into a struggling
+one. A cool chip that runs slow is the tell: the temperature is fine and the
+machine is still starved. On a Raspberry Pi, run:
+
+```sh
+vcgencmd get_throttled
+vcgencmd measure_clock arm
+```
+
+`0x0` is healthy. Anything else names the problem: bit 0 set is under-voltage
+now, bit 1 an ARM frequency cap now, bit 2 throttling now, and bits 16 to 18
+say one of those happened earlier in this boot. A clock far under the board's
+rated speed while the machine works confirms it. The fix is a supply that
+meets the board's rating and a short, thick cable, not a setting. A laptop in
+a power-saving mode behaves the same way; see the hint above.
+
+Priority second. Through PulseAudio or PipeWire, another program's busy CPU
+can click the output even when the score is light, because the server drives
+the device on a thread that busy work can delay. See the realtime grant and
+buffer cushion under "Output latency" above. `pw-top` shows the stream's
+quantum and an error count that climbs while the graph misses.
+
+Time third. A small buffer leaves little room for a slow turn. Raise the audio
+out latency one rung and listen: cleaner at 2048 than at 256 says the machine
+needs the room, and the sections above say why.
+
+Speed last, and only now blame the score. `rustel doctor --json` reports the
+DSP kernels the machine selected and the deadline misses of the last stream.
+The studio log names its own trouble: "the producer fell behind the audio
+clock" says scheduling could not keep the ring fed, and "replacement prefill
+finished after its takeover" says an edit outran its window. A score that
+needs more than the machine has slows at the same place every time, rather
+than at random.
 
 ## Trust boundary
 

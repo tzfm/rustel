@@ -516,6 +516,43 @@ impl StudioEngine {
     /// sounding preview exactly as the next preview would and is itself
     /// inaudible. Nothing to do when nothing is live.
     pub fn stop_audition(&mut self) {
+        // A run hands its notes to the device ahead of their moments, so
+        // some may already be queued when the preview stops, and a queued
+        // event cannot be taken back. Each of those gets a zero-gain
+        // member of its own choke group landing one frame after its
+        // start: the note is cut the moment it begins, and the stop stays
+        // clean. Notes past the queue window were never handed over, and
+        // a cut for a note that never sounds cuts nothing.
+        if let Some(live) = self.live.as_ref()
+            && let Some(run) = live.run.as_ref()
+        {
+            let now = live.device.clock_seconds();
+            let rate = live.device.sample_rate();
+            let step = run.request.step_secs.max(0.01);
+            for index in run.next..run.request.notes.len() {
+                let due = run.due + (index - run.next) as f64 * step;
+                if due > now + AUDITION_RUN_LEAD_SECS {
+                    break;
+                }
+                let cut_at = frame_at(due + 1.0 / f64::from(rate), rate);
+                let slot = index % MAX_AUDITION_RUN_NOTES;
+                let _ = live.device.push(AudioEvent {
+                    onset_id: u64::MAX,
+                    generation: live.device.generation(),
+                    target_frame: cut_at,
+                    onset_lead: 0.0,
+                    freq_hz: 440.0,
+                    gain: 0.0,
+                    duration_secs: 0.01,
+                    ui_visuals: AUDITION_VISUALS,
+                    controls: Default::default(),
+                    sample: None,
+                    wavetable: None,
+                    synth: None,
+                    cut: Some(audition_cut_group(slot)),
+                });
+            }
+        }
         if let Some(live) = self.live.as_mut() {
             live.audition = None;
             // A run's remaining notes are the engine's, not the device's:
@@ -854,12 +891,24 @@ mod tests {
             "an overdue note is still placed where the device can take it: {first}"
         );
         run.sounded();
-        assert_eq!(
-            run.next_onset(late),
-            None,
-            "and the note after it waits its step out rather than piling on"
+        // The window is wider than a step, so the notes behind the first
+        // one are handed over together - each at its own moment, a step
+        // apart, so nothing lands piled on the same frame.
+        let second = run
+            .next_onset(late)
+            .expect("the window holds a step, so the next note goes out with its own moment");
+        assert!(
+            (second - (first + step)).abs() < 1e-9,
+            "the step holds behind a slid note: {second} vs {}",
+            first + step
         );
-        assert!((run.due - (first + step)).abs() < 1e-9);
+        run.sounded();
+        let third = run
+            .next_onset(late)
+            .expect("a third note still sits inside the window");
+        assert!((third - (first + 2.0 * step)).abs() < 1e-9);
+        run.sounded();
+        assert_eq!(run.next_onset(late), None, "the run is out of notes");
     }
 
     #[test]

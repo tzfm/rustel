@@ -7,3 +7,6 @@
   This revision preserves new jobs that finalizers queue while old jobs are discarded.
   Replace the pin when a compatible official rquickjs release includes the cancellation API and this finalizer fix.
   The API proposals are [QuickJS-NG #1745](https://github.com/quickjs-ng/quickjs/pull/1745) and [rquickjs #763](https://github.com/DelSkayn/rquickjs/pull/763).
+- **pulseaudio 0.3.2:** pinned to the copy under `third_party/pulseaudio` because the connection reactor's read loop grows its buffer by a zeroed megabyte on every socket wakeup, which costs more than the audio each wakeup carries on a small machine.
+  The copy reads into a scratch it keeps between wakeups instead; nothing else in the crate is changed.
+  Replace the pin when an official release includes that read-loop fix.
