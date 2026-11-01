@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A Hydra callback with a round number, such as `() => mouse.x / 3000`, compiles. Before, the score wrote the number as `3e3`, and the callback was refused.
 - The reference knows Hydra. In a Hydra statement, Ctrl+F, Ctrl+D and the suggestions show the Hydra names with their parameters and defaults, under the `hydra` heading. Pattern code never lists a Hydra name, and Hydra code never lists a pattern name. Settings ▸ Reference has a Hydra switch.
 - `s0.initVideo()` plays a video in a loop, without sound: WebM or MKV with VP8 or VP9 video, or an animated GIF, PNG or WebP. Other formats are refused.
 - `initImage()` and `initVideo()` read a local file by a path relative to the set folder, or to the folder granted with `--allow-local-samples`. The rules of local samples apply: no absolute path, no `..`, and no read outside the folder.

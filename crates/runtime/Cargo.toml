@@ -135,7 +135,7 @@ log = { version = "0.4", optional = true }
 
 rustel-osc = { path = "../osc", optional = true }
 rustel-vst3 = { path = "../vst3", optional = true }
-rustel-hydra = { git = "https://github.com/tzfm/rustel-hydra.git", tag = "v0.2.2", optional = true }
+rustel-hydra = { git = "https://github.com/tzfm/rustel-hydra.git", tag = "v0.2.3", optional = true }
 # Native Hydra sources. OxiMedia is one pure-Rust capture surface across
 # V4L2, AVFoundation and Media Foundation; pin the young API until its frame
 # contract has settled. `image` decodes guarded HTTP images and MJPEG frames.

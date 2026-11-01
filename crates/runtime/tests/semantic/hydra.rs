@@ -905,6 +905,21 @@ fn a_solid_of_smoothed_arrays_inside_an_image_chain_composes() {
     assert!(shader.contains("solid("), "{shader}");
 }
 
+/// A callback keeps its numbers through the score's printer, which writes
+/// 3000 as `3e3`, and the chain composes.
+#[test]
+fn a_callback_with_a_round_number_composes() {
+    let update = program(
+        "await initHydra()\n\
+         gradient()\n .hue(()=>mouse.x/3000)\n .scale(1,1,()=>mouse.y/1000)\n .out()",
+    );
+    let HydraStatement::Evaluate { node } = &update.program.statements[0] else {
+        panic!("a drawing chain: {:?}", update.program.statements);
+    };
+    rustel_hydra::glsl::compose(node, "highp")
+        .unwrap_or_else(|error| panic!("the chain composes: {error}"));
+}
+
 #[test]
 fn a_failed_restoration_does_not_wedge_later_scores() {
     // A score that locks one borrowed name can fail the restoration that
