@@ -78,6 +78,7 @@ impl StudioEngine {
                 request,
                 next: 0,
                 due,
+                handed: Vec::new(),
             });
         }
         self.advance_run();
@@ -517,24 +518,25 @@ impl StudioEngine {
     /// inaudible. Nothing to do when nothing is live.
     pub fn stop_audition(&mut self) {
         // A run hands its notes to the device ahead of their moments, so
-        // some may already be queued when the preview stops, and a queued
-        // event cannot be taken back. Each of those gets a zero-gain
-        // member of its own choke group landing one frame after its
-        // start: the note is cut the moment it begins, and the stop stays
-        // clean. Notes past the queue window were never handed over, and
-        // a cut for a note that never sounds cuts nothing.
+        // when the preview stops some may already be queued with start
+        // frames still in the future, and a queued event cannot be taken
+        // back. Each of those gets a true choke of its own group landing
+        // one frame after the moment the note was queued to sound - the
+        // recorded moment, slides included, because a slide moves a note
+        // off the ideal step grid and the times cannot be rebuilt from
+        // `due` afterwards. A note at or past `now` already rang; the
+        // all-slot choke below silences its tail.
         if let Some(live) = self.live.as_ref()
             && let Some(run) = live.run.as_ref()
         {
             let now = live.device.clock_seconds();
-            let rate = live.device.sample_rate();
-            let step = run.request.step_secs.max(0.01);
-            for index in run.next..run.request.notes.len() {
-                let due = run.due + (index - run.next) as f64 * step;
-                if due > now + AUDITION_RUN_LEAD_SECS {
-                    break;
+            let rate = f64::from(live.device.sample_rate().max(1));
+            let rate_hz = live.device.sample_rate();
+            for (index, handed_at) in run.handed.iter().enumerate() {
+                if *handed_at <= now {
+                    continue;
                 }
-                let cut_at = frame_at(due + 1.0 / f64::from(rate), rate);
+                let cut_at = frame_at(handed_at + 1.0 / rate, rate_hz);
                 let slot = index % MAX_AUDITION_RUN_NOTES;
                 let _ = live.device.push(AudioEvent {
                     onset_id: u64::MAX,
@@ -545,13 +547,39 @@ impl StudioEngine {
                     gain: 0.0,
                     duration_secs: 0.01,
                     ui_visuals: AUDITION_VISUALS,
-                    controls: Default::default(),
+                    controls: rustel_audio::OscillatorControls {
+                        choke_only: true,
+                        ..Default::default()
+                    },
                     sample: None,
                     wavetable: None,
                     synth: None,
                     cut: Some(audition_cut_group(slot)),
                 });
             }
+            // The audition analysis window holds its last content once no
+            // voice feeds it. The queued strays sound after the ordinary
+            // chokes die, so without more the window freezes on their
+            // blip for the rest of the session. One silent carrier after
+            // the last stray scrolls the window to real silence and then
+            // leaves it frozen there.
+            let last_handed = run.handed.last().copied().unwrap_or(now);
+            let last_cut = frame_at(last_handed.max(now) + 0.06, rate_hz);
+            let _ = live.device.push(AudioEvent {
+                onset_id: u64::MAX,
+                generation: live.device.generation(),
+                target_frame: last_cut,
+                onset_lead: 0.0,
+                freq_hz: 440.0,
+                gain: 0.0,
+                duration_secs: 0.12,
+                ui_visuals: AUDITION_VISUALS,
+                controls: Default::default(),
+                sample: None,
+                wavetable: None,
+                synth: None,
+                cut: None,
+            });
         }
         if let Some(live) = self.live.as_mut() {
             live.audition = None;
@@ -848,6 +876,7 @@ mod tests {
             },
             next: 0,
             due: clock + AUDITION_LEAD_SECS,
+            handed: Vec::new(),
         };
         // The tick loop, walking the device clock forward two milliseconds
         // at a time and handing over whatever has come due.
@@ -883,6 +912,7 @@ mod tests {
             },
             next: 0,
             due: clock + AUDITION_LEAD_SECS,
+            handed: Vec::new(),
         };
         let late = clock + 2.0;
         let first = run.next_onset(late).expect("its moment is long past");

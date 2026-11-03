@@ -199,7 +199,7 @@ const AUDITION_LEAD_SECS: f64 = 0.06;
 /// before its moment, so the device places it at the time it belongs to
 /// and the run keeps its tempo. A note already handed over cannot be
 /// taken back; `stop_audition` cuts each of those at its own start.
-const AUDITION_RUN_LEAD_SECS: f64 = 0.6;
+const AUDITION_RUN_LEAD_SECS: f64 = 0.15;
 /// Gate length of a preview; a one-shot sample plays to its end anyway.
 const AUDITION_GATE_SECS: f64 = 2.0;
 /// A chord is held a little longer than a one-shot: the ear needs the
@@ -2835,6 +2835,11 @@ struct RunningAudition {
     /// handed over. A run is heard as a tempo, so what matters is where
     /// each note sounds, and the device places a note by its own clock.
     due: f64,
+    /// The clock second each handed-over note was QUEUED to sound at,
+    /// slides included: a slide moves a note off the ideal step grid, so
+    /// the queue times cannot be rebuilt from `due` afterwards. A stop
+    /// reads these to cut exactly the notes the device already holds.
+    handed: Vec<f64>,
 }
 
 impl RunningAudition {
@@ -2853,6 +2858,7 @@ impl RunningAudition {
 
     /// That note is the device's now; the one after it is a step later.
     fn sounded(&mut self) {
+        self.handed.push(self.due);
         self.next += 1;
         self.due += self.request.step_secs.max(0.01);
     }
