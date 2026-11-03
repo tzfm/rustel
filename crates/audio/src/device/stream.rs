@@ -2094,11 +2094,12 @@ where
     // the closure drops with the stream.
     #[cfg(windows)]
     let mut pro_audio = CallbackProAudio(None);
-    // On Linux the callback takes the class of the plugin workers at its
-    // first call after a worker got it, and gives it back when the closure
-    // drops with the stream.
-    #[cfg(target_os = "linux")]
-    let mut real_time = CallbackRealTime::new(buffer_frames, sample_rate);
+    // On Linux the callback deliberately holds no real-time handle. The
+    // class is per thread and the callback could only ask for itself, and
+    // asking is not safe for a callback whose render runs near the whole
+    // of every period: the kernel's watchdog kills such a thread within a
+    // fraction of a second of the grant. The plugin workers keep the
+    // class; their turns are short.
     // Deliberately no probe here. The class is per thread and the callback
     // can only ask for itself, but asking is not safe unconditionally: a
     // callback whose render runs near the whole of every period sits near a
@@ -2117,8 +2118,6 @@ where
             move |output: &mut [T], info| {
                 #[cfg(windows)]
                 pro_audio.attach_once();
-                #[cfg(target_os = "linux")]
-                real_time.promote_once(&shared.plugin_real_time);
                 gate.render_or_silence(output, |output| {
                     let playback = info.timestamp().playback;
                     let origin = *playback_origin.get_or_insert(playback);
