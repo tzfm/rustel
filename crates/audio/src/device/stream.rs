@@ -1891,11 +1891,6 @@ fn host_builder_at_normal_priority() -> bool {
     unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) <= 0 }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn host_builder_at_normal_priority() -> bool {
-    true
-}
-
 #[cfg(any(target_os = "linux", test))]
 fn finish_cached_host_request<H, T>(
     host: &mut Option<H>,
