@@ -214,16 +214,18 @@ impl App {
 
     /// The pick of a plugin name wrote the call: the panel stays open, in
     /// the presets of the plugin, so the next Enter picks one for the call.
+    /// A plugin the read of the preset folders holds no preset for goes to
+    /// its parameters, where Enter picks one of them.
     pub(super) fn open_plugin_presets(&mut self, name: String) {
         let mut panel = ReferencePanel::browse(&self.reference);
         panel.select_tab(Tab::Vst);
         panel.vst.open_named(name);
-        panel.vst.show_section(VstSection::Presets);
+        panel.vst.show_picked_presets();
         self.reference_anchor = None;
         self.set_reference_panel(Some(panel));
+        self.status = "plugin presets - Enter picks one for this call".into();
         self.sync_plugins();
         self.install_catalogue();
-        self.status = "plugin presets - Enter picks one for this call".into();
         self.focus_panel(PanelKind::Reference);
         self.invalidate_maps();
         self.dirty_frame = true;
@@ -926,9 +928,18 @@ impl App {
         changed |= panel.vst.set_presets_reading(host.presets_reading());
         // The host reads the preset folder on its own thread. The tab asks
         // again on the next read of the list until the names are here.
+        let mut picked_params = false;
         if let Some(presets) = panel.vst.presets_due().and_then(|name| host.presets(name)) {
+            let before = panel.vst.inside();
             panel.vst.set_presets(presets);
+            // A pick that found no preset moved to the parameters: the
+            // status line says what Enter picks now.
+            picked_params = before == Some(VstSection::Presets)
+                && panel.vst.inside() == Some(VstSection::Params);
             changed = true;
+        }
+        if picked_params {
+            self.status = "plugin parameters - Enter adds the choice to this call".into();
         }
         self.dirty_frame |= changed;
     }

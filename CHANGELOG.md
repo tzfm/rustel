@@ -3,6 +3,7 @@
 ## Unreleased
 
 - The waterfall of the spectrum no longer starts over on an eval. The frames of the new score follow the ones of the score before on the scroll. A painter the new score no longer has loses its own scroll.
+- Picking a plugin name from the reference opens the presets of the plugin. A plugin with no preset file opens its parameters instead, so the panel never stands in a list that offers nothing, and Enter still adds a choice to the call.
 - The reference knows Hydra. In a Hydra statement, Ctrl+F, Ctrl+D and the suggestions show the Hydra names with their parameters and defaults, under the `hydra` heading. Pattern code never lists a Hydra name, and Hydra code never lists a pattern name. Settings ▸ Reference has a Hydra switch.
 - `s0.initVideo()` plays a video in a loop, without sound: WebM or MKV with VP8 or VP9 video, or an animated GIF, PNG or WebP. Other formats are refused.
 - `initImage()` and `initVideo()` read a local file by a path relative to the set folder, or to the folder granted with `--allow-local-samples`. The rules of local samples apply: no absolute path, no `..`, and no read outside the folder.
