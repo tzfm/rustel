@@ -504,7 +504,8 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
 /// The pick of a plugin name opens the presets of the plugin, one Enter
 /// from a choice. A plugin the read of the preset folders holds no preset
 /// for goes to its parameters instead, where Enter picks one of them: the
-/// panel never stands in a half that offers nothing.
+/// panel never stands in a half that offers nothing. The pick into a call
+/// open at its bracket closes the call.
 #[test]
 fn a_pick_of_a_plugin_with_no_preset_opens_its_parameters() {
     let mut studio = hermetic();
@@ -515,8 +516,10 @@ fn a_pick_of_a_plugin_with_no_preset_opens_its_parameters() {
     let presets = tempfile::tempdir().expect("empty preset root");
     vst::host().set_preset_folder(presets.path().to_path_buf());
 
-    let text = "$: s(\"bd\").vst(\"fix\")";
-    complete_after(&mut studio, text, "fix");
+    // The call open at its bracket: the pick writes the name and closes
+    // the call, so the reader does not have to type the bracket.
+    let text = "$: s(\"bd\").vst(";
+    complete_after(&mut studio, text, ".vst(");
     wait_for_row(&mut studio, "1 of 1 plugins");
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();

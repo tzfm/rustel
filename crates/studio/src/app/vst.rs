@@ -12,7 +12,7 @@
 use rustel_runtime::lint::scan;
 use rustel_runtime::vst::{self, PluginInfo, Status, canonical};
 
-use super::args::parameter_edit;
+use super::args::{members, parameter_edit};
 use super::sets::shorten_home;
 use super::*;
 use crate::memory::PluginMemory;
@@ -229,6 +229,68 @@ impl App {
         self.focus_panel(PanelKind::Reference);
         self.invalidate_maps();
         self.dirty_frame = true;
+    }
+
+    /// The pick of a plugin name wrote the name into a call the reader had
+    /// opened and not closed: `.vst("OTT` with no `)`. The pick closes the
+    /// call after the name, so a reader who picks no parameter does not
+    /// have to type the bracket, and a parameter a later Enter picks lands
+    /// inside a closed call. A call already closed, or with more arguments
+    /// typed, stays as it is.
+    pub(super) fn close_picked_plugin_call(&mut self) -> Result<(), RuntimeError> {
+        let Some((_, open)) = self.plugin_call_at_caret() else {
+            return Ok(());
+        };
+        let source = self.editor().source();
+        let code = rustel_runtime::lint::code_only(&source);
+        if members(&code, open, false).is_some() {
+            return Ok(());
+        }
+        // The name argument: the call ends after its closing quote. A
+        // string still open leaves the reader inside it, and a comma
+        // after the name says more arguments are typed.
+        let rest = &source[open + 1..];
+        let quote = open + 1 + (rest.len() - rest.trim_start().len());
+        let Some(&opening) = source
+            .as_bytes()
+            .get(quote)
+            .filter(|&byte| matches!(byte, b'"' | b'\'' | b'`'))
+        else {
+            return Ok(());
+        };
+        let mut escaped = false;
+        let Some(close) = source[quote + 1..]
+            .bytes()
+            .enumerate()
+            .find_map(|(at, byte)| {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == opening {
+                    return Some(at);
+                }
+                None
+            })
+            .map(|at| quote + 1 + at)
+        else {
+            return Ok(());
+        };
+        if code[close + 1..].trim_start().starts_with(',') {
+            return Ok(());
+        }
+        let at = close + 1;
+        self.dispatch_editor(Command::ReplaceRange {
+            from: ByteOffset(at),
+            to: ByteOffset(at),
+            text: ")".to_owned(),
+        })?;
+        let _ = self
+            .scenes
+            .current_mut()
+            .editor
+            .set_selection(crate::editor::Selection::caret(ByteOffset(at)));
+        Ok(())
     }
 
     /// The plugin and the range of the key at the caret, when the caret is
@@ -1022,6 +1084,55 @@ mod tests {
         app.toggle_vst_presets(&mut sheet, 0);
         assert_eq!(sheet.vst_open, None);
         assert_eq!(sheet.vst_open_listed, None);
+    }
+
+    /// The pick of a plugin name closes the call the reader had left open:
+    /// `.vst("OTT` gains its `)`, with the caret before the bracket, so a
+    /// choice of the open panel lands inside the call. A call already
+    /// closed stays, a string still open stays, and a call with more
+    /// arguments typed stays: the bracket is not the pick's to place there.
+    #[test]
+    fn the_pick_of_a_plugin_name_closes_the_call_left_open() {
+        fn app_with(source: &str) -> App {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _) = crate::app::tests::support::plain_app(directory.path(), "");
+            let end = app.editor().source().len();
+            app.dispatch_editor(Command::ReplaceRange {
+                from: ByteOffset(0),
+                to: ByteOffset(end),
+                text: source.to_owned(),
+            })
+            .expect("the score");
+            app.editor_mut()
+                .set_selection(crate::editor::Selection::caret(ByteOffset(source.len())))
+                .expect("the caret");
+            app
+        }
+
+        // The call open after its name string: the bracket goes in after
+        // the closing quote.
+        let mut app = app_with("$: s(\"bd\").vst(\"OTT\"");
+        app.close_picked_plugin_call().expect("the close");
+        assert_eq!(app.editor().source(), "$: s(\"bd\").vst(\"OTT\")");
+        assert_eq!(
+            app.editor().primary_selection().head.0,
+            app.editor().source().len() - 1,
+            "the caret stands before the bracket"
+        );
+        // The call now closed: a second pick closes nothing.
+        app.close_picked_plugin_call().expect("the close");
+        assert_eq!(app.editor().source(), "$: s(\"bd\").vst(\"OTT\")");
+
+        // A string still open leaves the reader inside it, and more
+        // arguments typed leave the bracket to the reader.
+        for (source, after) in [
+            ("$: s(\"bd\").vst(\"OTT", "$: s(\"bd\").vst(\"OTT"),
+            ("$: s(\"bd\").vst(\"OTT\", ", "$: s(\"bd\").vst(\"OTT\", "),
+        ] {
+            let mut app = app_with(source);
+            app.close_picked_plugin_call().expect("the close");
+            assert_eq!(app.editor().source(), after, "{source}");
+        }
     }
 
     #[test]

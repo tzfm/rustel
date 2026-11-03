@@ -241,6 +241,7 @@ impl App {
         }
         #[cfg(feature = "vst")]
         if let Some(plugin) = preset_pick {
+            self.close_picked_plugin_call()?;
             self.open_plugin_presets(plugin);
         }
         self.dirty_frame = true;
