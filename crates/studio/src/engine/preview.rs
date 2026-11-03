@@ -921,24 +921,23 @@ mod tests {
             "an overdue note is still placed where the device can take it: {first}"
         );
         run.sounded();
-        // The window is wider than a step, so the notes behind the first
-        // one are handed over together - each at its own moment, a step
-        // apart, so nothing lands piled on the same frame.
+        // The slid note ate the window: the next note waits for a later
+        // tick rather than piling onto the slid frame. The next tick
+        // hands it with its own moment, a full step behind the first.
+        assert_eq!(
+            run.next_onset(late),
+            None,
+            "a note behind a slid one waits for the next tick"
+        );
+        let later = late + AUDITION_LEAD_SECS + 0.002;
         let second = run
-            .next_onset(late)
-            .expect("the window holds a step, so the next note goes out with its own moment");
+            .next_onset(later)
+            .expect("the next tick hands the next note");
         assert!(
             (second - (first + step)).abs() < 1e-9,
             "the step holds behind a slid note: {second} vs {}",
             first + step
         );
-        run.sounded();
-        let third = run
-            .next_onset(late)
-            .expect("a third note still sits inside the window");
-        assert!((third - (first + 2.0 * step)).abs() < 1e-9);
-        run.sounded();
-        assert_eq!(run.next_onset(late), None, "the run is out of notes");
     }
 
     #[test]
