@@ -125,7 +125,7 @@ jobs:
         run: |
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
             sudo apt-get update
-            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev
+            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
           fi
 
       # Portable runs before `auto` so that a host-dependent kernel difference
@@ -249,7 +249,7 @@ jobs:
         run: |
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
             sudo apt-get update
-            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev
+            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
           fi
           if ! dpkg -s mesa-vulkan-drivers >/dev/null 2>&1; then
             sudo apt-get update

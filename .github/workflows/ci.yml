@@ -152,7 +152,7 @@ jobs:
         run: |
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
             sudo apt-get update
-            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev
+            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
           fi
 
       - name: Install Csound for native instrument tests
@@ -316,7 +316,7 @@ jobs:
         run: |
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
             sudo apt-get update
-            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev
+            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
           fi
 
       - name: Run Miri
@@ -365,7 +365,7 @@ jobs:
         run: |
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
             sudo apt-get update
-            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev
+            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
           fi
 
       # Check the remaining release targets without optimized builds or publication.
