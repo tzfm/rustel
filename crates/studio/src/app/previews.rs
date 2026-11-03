@@ -232,7 +232,6 @@ impl App {
     /// A preview can keep sounding while another scene or shelf row is
     /// selected. Follow its own source until it is replaced or stopped,
     /// including failures that recover after a later loader retry.
-    #[cfg(feature = "hydra")]
     /// Whether the preview sound's bank is still on its way in. A preview
     /// pressed while this is true waits for the bank before it sounds, so
     /// the status says the load instead of claiming a preview that has
@@ -247,6 +246,7 @@ impl App {
         })
     }
 
+    #[cfg(feature = "hydra")]
     pub(super) fn refresh_preview_readiness(&mut self) {
         let Some(preview) = self.snippet_preview.as_mut() else {
             return;
