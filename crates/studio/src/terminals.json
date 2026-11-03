@@ -14,7 +14,7 @@
   "terminals": [
     {
       "terminal": "Windows Terminal",
-      "capabilities": {"truecolor": true},
+      "capabilities": {"truecolor": true, "windows_pixel_input_since": 20240000},
       "source": "https://github.com/microsoft/terminal/blob/main/src/cascadia/TerminalSettingsModel/defaults.json",
       "unbind": "Settings > Actions: remove or reassign the terminal shortcut.",
       "steals": [
@@ -61,7 +61,7 @@
     {
       "terminal": "Windows Console",
       "generic": true,
-      "capabilities": {"symbols": false},
+      "capabilities": {"symbols": false, "windows_pixel_input_since": 20240000},
       "source": "https://github.com/microsoft/terminal/blob/main/src/host/input.cpp ; https://github.com/microsoft/terminal/blob/main/src/interactivity/win32/windowio.cpp",
       "unbind": "Studio uses raw Windows console input; rebind Studio shortcuts in Settings > Keybinds.",
       "steals": []

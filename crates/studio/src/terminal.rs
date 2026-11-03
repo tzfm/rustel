@@ -879,12 +879,15 @@ pub mod profiles {
         let Some(minimum) = profile.capabilities.windows_pixel_input_since else {
             return false;
         };
+        // The version is an optional trailing word. An identity like
+        // "Windows Terminal" has a second name word, not a version: only
+        // treat it as one when it parses as the expected date form.
         active
             .split_ascii_whitespace()
             .nth(1)
             .and_then(|version| version.get(..8))
             .and_then(|date| date.parse::<u32>().ok())
-            .is_some_and(|date| date >= minimum)
+            .map_or(true, |date| date >= minimum)
     }
 
     /// What `terminal` does with `chord`, if it keeps it for itself.
@@ -1899,9 +1902,6 @@ fn windows_terminal_input(features: &mut TerminalFeatures) -> Option<windows_inp
     let mut input = windows_input::WindowsInput::new().ok()?;
     input.prepare_console().ok()?;
     features.apply_answers(windows_query(&mut input, true).ok()?);
-    features.pixel_mouse = features.cell_pixels.is_some();
-    // Keep the reader even if the size query times out: it owns any native
-    // keys typed during probing. This session then uses ordinary SGR cells.
     Some(input)
 }
 
@@ -2835,16 +2835,24 @@ mod tests {
                 "{name}"
             );
         }
+        // A dated release below the floor is refused, and a terminal
+        // without a profile for it never offers the mode.
         for name in [
-            "WezTerm",
             "WezTerm 20220101-000000-example",
-            "WezTerm unknown",
-            "Windows Terminal",
             "kitty 0.35.2",
             "not-wezterm 20240203",
         ] {
             assert!(
                 !super::profiles::supports_windows_pixel_input(name),
+                "{name}"
+            );
+        }
+        // Windows Terminal identifies itself without a date-form version
+        // ("Windows Terminal 1.24.23624.0"), so an unparsable version word
+        // is treated as current rather than as a refusal.
+        for name in ["WezTerm", "WezTerm unknown", "Windows Terminal"] {
+            assert!(
+                super::profiles::supports_windows_pixel_input(name),
                 "{name}"
             );
         }
