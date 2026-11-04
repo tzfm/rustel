@@ -634,7 +634,7 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `proc-macro2` | 1.0.107 | MIT OR Apache-2.0 |
 | `process_path` | 0.1.4 | MIT/Apache-2.0 |
 | `profiling` | 1.0.18 | MIT OR Apache-2.0 |
-| `pulseaudio` | 0.3.1 | MIT |
+| `pulseaudio` | 0.3.2 | MIT |
 | `pxfm` | 0.1.30 | BSD-3-Clause OR Apache-2.0 |
 | `quick-error` | 2.0.1 | MIT/Apache-2.0 |
 | `quick-xml` | 0.41.0 | MIT |
