@@ -712,6 +712,11 @@ impl DeviceScanner {
         if std::thread::Builder::new()
             .name("studio-devices".into())
             .spawn(move || {
+                // No priming here: this thread is born demoted, and the
+                // host refuses to be built by a demoted thread anyway -
+                // the event loop primes before it demotes, and the host
+                // cache holds the connection for every later caller.
+                crate::background::demote();
                 let _ = sender.send(DeviceInventory::probe());
             })
             .is_ok()

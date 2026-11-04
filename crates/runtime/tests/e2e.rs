@@ -238,12 +238,11 @@ enum Outcome {
     Failed(String),
 }
 
-/// The policy a musician runs under: `rustel` grants public CORS origins
-/// unless asked for `--strict-origins`, and upstream's sample examples select
-/// banks by URL.
+/// The policy a musician runs under: `rustel` allows the built-in sources
+/// unless asked for `--strict-sample-origins`.
 fn session_config(dispatch: DspDispatch) -> SessionConfig {
     let mut access = ScoreSampleAccess::denied();
-    access.permit_public_cors_origins();
+    access.permit_builtin_sources();
     SessionConfig::default()
         .with_score_sample_access(access)
         .with_dsp_dispatch(dispatch)

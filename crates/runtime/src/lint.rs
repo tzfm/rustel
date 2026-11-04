@@ -2455,7 +2455,7 @@ fn literal_banks(source: &str, code: &str, literal: &Literal) -> (Vec<String>, b
 /// ending it. Enough to find the `.osc()` a sound string is routed through
 /// without parsing the score, and no further, so a route on another `$:`
 /// line stays that line's.
-fn statement_around(source: &str, at: usize) -> std::ops::Range<usize> {
+pub fn statement_around(source: &str, at: usize) -> std::ops::Range<usize> {
     let mut lines = Vec::new();
     let mut start = 0;
     for line in source.split_inclusive('\n') {
@@ -3289,6 +3289,22 @@ mod tests {
     #[test]
     fn hydra_array_modifiers_are_known_in_a_hydra_score() {
         let source = "await initHydra()\nosc([10,30].fit(0,1).smooth(0.5).offset(0.25).ease('sin').fast(2)).out(o0)";
+        assert!(check(source).is_empty(), "{:?}", check(source));
+    }
+
+    /// A shared sketch is checked as it runs: the calls that need a browser
+    /// are known names, and so are the names that `setFunction` gives.
+    #[cfg(feature = "hydra")]
+    #[test]
+    fn a_shared_hydra_sketch_is_not_refused() {
+        let source = "await initHydra()\n\
+            setResolution(1280, 720)\n\
+            update = () => {}\n\
+            s0.initScreen()\n\
+            a.setSmooth(0.8)\n\
+            setFunction({ name: 'chroma', type: 'color', glsl: '' })\n\
+            setFunction({ name: 'stars', type: 'src', glsl: '' })\n\
+            stars(3).chroma().sum().rotate(() => mouse.x / width).out()";
         assert!(check(source).is_empty(), "{:?}", check(source));
     }
 

@@ -868,14 +868,12 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
 
     open_permissions(&mut studio);
     select_row(&mut studio, "▸ https://scripts.invalid");
-    let refused = row_with(&mut studio, "https://scripts.invalid");
-    assert!(
-        refused.contains("▸") && refused.contains("off"),
-        "{refused}"
-    );
+    let row = row_with(&mut studio, "https://scripts.invalid");
+    assert!(row.contains("scripts  off"), "{row}");
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
-    assert!(row_with(&mut studio, "https://scripts.invalid").contains("  on"));
+    let row = row_with(&mut studio, "https://scripts.invalid");
+    assert!(row.contains("scripts  on"), "{row}");
     // The trust re-ran the refused update by itself, so the footer can only
     // hold the fetch of the newly trusted origin - never the refusal.
     if let Some(error) = studio.errors() {
@@ -887,11 +885,10 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     // Space takes the trust back, and the row stays to give it again.
     studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
     studio.settle();
-    let off = row_with(&mut studio, "https://scripts.invalid");
-    assert!(off.contains("  off"), "{off}");
+    assert!(row_with(&mut studio, "https://scripts.invalid").contains("scripts  off"));
     studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
     studio.settle();
-    assert!(row_with(&mut studio, "https://scripts.invalid").contains("  on"));
+    assert!(row_with(&mut studio, "https://scripts.invalid").contains("scripts  on"));
 
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();
@@ -902,21 +899,105 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     let mut studio = reopen_over(studio);
     open_permissions(&mut studio);
     select_row(&mut studio, "▸ https://scripts.invalid");
-    assert!(row_with(&mut studio, "https://scripts.invalid").contains("  on"));
     // `d` takes the origin off the page; the orchestra switch stays. The
     // status line still names the origin - it reports the removal - so the
-    // check reads the row shape: a row is the origin, two spaces, its state.
+    // check reads the row shape: a row is its marker, then the origin.
     studio.press(KeyCode::Char('d'), KeyModifiers::NONE);
     studio.settle();
     assert!(
         studio
             .rows()
             .into_iter()
-            .all(|row| !row.contains("scripts.invalid  ")),
+            .all(|row| !row.contains("▸ https://scripts.invalid")
+                && !row.contains("  https://scripts.invalid")),
         "no row carries the origin as its label:\n{}",
         studio.rows().join("\n")
     );
-    assert!(row_with(&mut studio, "native orchestras").contains("  on"));
+    row_with(&mut studio, "native orchestras");
+}
+
+/// A score whose `samples()` names a server that no source allows plays on
+/// without the bank, and the folder of the refused file lands on the
+/// permissions page. Enter allows it, and the next studio still allows it.
+/// Before that, the page lists no source: the built-in ones have no row.
+#[test]
+fn a_refused_sample_folder_is_allowed_with_one_key_and_kept() {
+    let mut studio = hermetic();
+    open_permissions(&mut studio);
+    assert!(
+        studio
+            .rows()
+            .iter()
+            .all(|row| !row.contains("samples  ") && !row.contains("githubusercontent")),
+        "no source row yet:\n{}",
+        studio.rows().join("\n")
+    );
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+
+    studio.set_score("samples('http://kit.invalid/kit.json')\n$: s(\"bd\")");
+    studio.chord("ctrl+s");
+    studio.settle();
+    open_permissions(&mut studio);
+    select_row(&mut studio, "▸ http://kit.invalid");
+    let refused = row_with(&mut studio, "http://kit.invalid");
+    assert!(refused.contains("samples  off"), "{refused}");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    let allowed = row_with(&mut studio, "http://kit.invalid");
+    assert!(allowed.contains("samples  on"), "{allowed}");
+    assert!(
+        studio.status().contains("http://kit.invalid allowed"),
+        "{}",
+        studio.status()
+    );
+
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    // Prefs are written on a debounce.
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    studio.pump();
+    studio.quit();
+    let mut studio = reopen_over(studio);
+    open_permissions(&mut studio);
+    assert!(row_with(&mut studio, "http://kit.invalid").contains("samples  on"));
+}
+
+/// `e` opens a refused folder in a prompt with its text. Cut down to the
+/// domain, the row allows all of it.
+#[test]
+fn a_refused_folder_is_cut_down_to_its_domain_with_e() {
+    let mut studio = hermetic();
+    studio.set_score("samples('https://kit.invalid/kits/808/kit.json')\n$: s(\"bd\")");
+    studio.chord("ctrl+s");
+    studio.settle();
+    open_permissions(&mut studio);
+    select_row(&mut studio, "▸ kit.invalid/kits/808/");
+    studio.press(KeyCode::Char('e'), KeyModifiers::NONE);
+    studio.settle();
+    assert!(
+        studio.status().starts_with("edit a source"),
+        "{}",
+        studio.status()
+    );
+    for _ in "/kits/808/".chars() {
+        studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    }
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    let domain = row_with(&mut studio, "kit.invalid");
+    assert!(
+        domain.contains("▸ kit.invalid ") && domain.contains("samples  on"),
+        "the domain takes the row's place, under the cursor: {domain}"
+    );
+    assert!(
+        studio
+            .rows()
+            .iter()
+            .all(|row| !row.contains("kit.invalid/kits/808/")),
+        "{}",
+        studio.rows().join("\n")
+    );
 }
 
 /// An orchestra score plays with no flag and no keypress: an installed
@@ -940,6 +1021,7 @@ fn the_orchestra_switch_starts_on_and_space_takes_it_back_for_a_run() {
     open_permissions(&mut studio);
     assert!(row_with(&mut studio, "native orchestras").contains("  on"));
 
+    select_row(&mut studio, "▸ native orchestras");
     studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
     studio.settle();
     assert!(row_with(&mut studio, "native orchestras").contains("  off"));
@@ -958,6 +1040,7 @@ fn the_orchestra_switch_starts_on_and_space_takes_it_back_for_a_run() {
     );
 
     open_permissions(&mut studio);
+    select_row(&mut studio, "▸ native orchestras");
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
     assert!(row_with(&mut studio, "native orchestras").contains("  on"));

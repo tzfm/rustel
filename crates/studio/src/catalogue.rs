@@ -64,6 +64,7 @@ impl Catalogue {
         std::thread::Builder::new()
             .name("studio-catalogue".into())
             .spawn(move || {
+                crate::background::demote();
                 while input.recv().is_ok() {
                     if output.send(rebuild()).is_err() {
                         break;

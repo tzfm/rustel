@@ -288,6 +288,31 @@ impl Session {
         self.sync_live_schedule_horizon();
     }
 
+    /// Set the scheduling horizon, in seconds ahead of the clock the producer
+    /// keeps filled. A host that evaluates a save slower than the horizon
+    /// drains it raises the horizon, so the replacement's takeover still
+    /// finds scheduled audio to cut over at. A non-finite or non-positive
+    /// value changes nothing.
+    pub fn set_horizon(&mut self, horizon: f64) {
+        if horizon.is_finite() && horizon > 0.0 {
+            self.config.horizon = horizon;
+            self.sync_live_schedule_horizon();
+        }
+    }
+
+    /// Put a floor under a live replacement's takeover headroom. The default
+    /// pricing answers an edit in 80 ms on a machine whose producer turns are
+    /// that quick; a host that measured slower turns sets the floor to what
+    /// they take, so an edit lands late rather than being refused for
+    /// publishing after its takeover. A shorter floor than the default
+    /// pricing changes nothing.
+    #[cfg(any(feature = "device-audio", test))]
+    pub fn set_replacement_headroom_floor(&mut self, floor: Duration) {
+        if floor > super::LIVE_REPLACEMENT_MIN_HEADROOM {
+            self.replacement_headroom_floor = floor;
+        }
+    }
+
     /// How far ahead of `now` a live tick must query so a reload's takeover
     /// (the consumption frontier) still sits inside already-scheduled cover.
     ///

@@ -267,6 +267,9 @@ struct Voice {
     ui_visuals: u64,
     preview_epoch: u64,
     piano: bool,
+    /// Whether the tight sample path of `render_plain_stereo_sample` may
+    /// render this voice; recomputed every render by `plain_sample_voice`.
+    plain: bool,
     /// Sub-sample onset placement: how far the source has already advanced at
     /// `start_frame` (see OnsetEvent::onset_lead). Rounding this away costs up
     /// to half a sample per onset, which `crush` then magnifies into whole
@@ -1221,6 +1224,10 @@ pub(crate) struct InsertMix {
 /// computed one sample at a time.
 #[derive(Default)]
 pub struct ScalarBackend {
+    /// Turns the plain-voice tight path off, for the bit-exactness test
+    /// that compares it against the general body.
+    #[cfg(test)]
+    disable_plain_path: bool,
     #[allow(clippy::vec_box)]
     kabel_programs: Vec<Box<crate::assets::PreparedKabelProgram>>,
     kabel_program_protected: Vec<bool>,
@@ -1793,6 +1800,8 @@ impl ScalarBackend {
     ) -> Result<Self, String> {
         let mut backend = Self {
             dispatch,
+            #[cfg(test)]
+            disable_plain_path: false,
             pending: PendingEvents::with_capacity(voice_capacity),
             voices: Vec::with_capacity(voice_capacity),
             ..Self::default()

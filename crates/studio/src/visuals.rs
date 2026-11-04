@@ -324,6 +324,17 @@ impl VisualState {
             .as_ref()
             .is_none_or(|current| current.source_revision != next.source_revision);
         let generation = next.generation;
+        // The taps the new score draws on: the master, and the tap of each
+        // painter that takes one. A painter that went, or one that moved to
+        // another place in the score, drops its tap out of the list.
+        let taps: Vec<Option<u8>> = std::iter::once(None)
+            .chain(
+                next.visuals
+                    .iter()
+                    .filter_map(|visual| visual.slot)
+                    .map(Some),
+            )
+            .collect();
         self.layout = Some(envelope.ui_layout);
         if source_changed {
             self.events.clear();
@@ -331,13 +342,15 @@ impl VisualState {
             self.previews.clear();
             self.real_keys.clear();
             self.clock = None;
-            // The analysers and their history belong to the score that was
-            // playing. A different score is a different picture, so they
-            // start again.
+            // The analyser and the spectrogram follow one stream of sound,
+            // and an eval does not stop the stream: their memory carries on
+            // and the new score's frames merge into it. A tap the new score
+            // has not loses its ring, so nothing stays behind for a painter
+            // that went.
+            self.spectrograms.retain(|tap, _| taps.contains(tap));
+            self.analysers.retain(|tap, _| taps.contains(tap));
             self.audio = None;
             self.visual_audio.clear();
-            self.spectrograms.clear();
-            self.analysers.clear();
             self.audio_sequence = 0;
             // The clips the new score names are asked for again; the ones
             // the old score failed to send have their chance back, and a
@@ -615,7 +628,7 @@ impl VisualState {
     }
 
     /// What the spectrograms' histories hold: the room each tap's ring
-    /// has taken, which a full history keeps until the score is reset.
+    /// has taken, which stays until the tap goes.
     pub fn history_bytes(&self) -> usize {
         self.spectrograms
             .values()
@@ -6491,14 +6504,79 @@ mod tests {
             "the picture is the same picture"
         );
 
-        // A different score is a different picture, and starts again.
+        // A different score is still the same stream of sound: the history
+        // carries on, and the new score's frames merge into it.
         visual.install_layout(
             rustel_runtime::ui_events::visual_layout("note(62)._scope()._spectrum()", 9).unwrap(),
         );
         assert!(
-            !visual.analysers_are_kept_across_a_generation(),
-            "a score that changed starts its analysers over"
+            visual.analysers_are_kept_across_a_generation(),
+            "the history of the sound outlives the score"
         );
+    }
+
+    /// An eval does not reset the spectrogram: the columns of the score
+    /// before stay in the scroll, the frames of the new score follow them,
+    /// and a tap the new score has not - a painter that went - loses its
+    /// ring.
+    #[test]
+    fn a_new_score_merges_into_the_spectrograms_history() {
+        let source = "note(60)._scope()._spectrum()";
+        let mut visual = VisualState::default();
+        visual.install_layout(rustel_runtime::ui_events::visual_layout(source, 7).unwrap());
+        visual.start();
+        let frame = |bins: f32| UiAudioAnalysisSet {
+            master: UiAudioAnalysisFrame {
+                scope: [0.5; UI_SCOPE_SAMPLES],
+                spectrum: [bins; UI_SPECTRUM_BINS],
+            },
+            visuals: vec![(
+                0,
+                UiAudioAnalysisFrame {
+                    scope: [0.5; UI_SCOPE_SAMPLES],
+                    spectrum: [bins; UI_SPECTRUM_BINS],
+                },
+            )],
+            sides: Vec::new(),
+        };
+        let feed = |visual: &mut VisualState, generation: u64, sequence: u64, bins: f32| {
+            visual.install_audio(
+                UiAudioMetadata {
+                    sequence,
+                    generation,
+                    device_time: 0.5,
+                    stream_id: 1,
+                    epoch: 1,
+                    end_frame: 24_000,
+                    sample_rate: 48_000,
+                },
+                frame(bins),
+            );
+        };
+        feed(&mut visual, 7, 1, -40.0);
+        feed(&mut visual, 7, 2, -20.0);
+        assert_eq!(visual.spectrogram(None).expect("the master").len(), 2);
+        assert_eq!(visual.spectrogram(Some(0)).expect("the tap").len(), 2);
+
+        // The new score: the columns of the old one stay at the front of
+        // the scroll and the new ones follow them.
+        visual.install_layout(rustel_runtime::ui_events::visual_layout(source, 8).unwrap());
+        feed(&mut visual, 8, 3, -30.0);
+        let columns = visual.spectrogram(None).expect("the master");
+        assert_eq!(columns.len(), 3);
+        assert_eq!(
+            columns.front(),
+            Some(&spectrogram_column(&UiAudioAnalysisFrame {
+                scope: [0.5; UI_SCOPE_SAMPLES],
+                spectrum: [-40.0; UI_SPECTRUM_BINS],
+            })),
+            "the oldest column of the score before leads the scroll"
+        );
+
+        // A score with no painter: the tap's ring goes, the master stays.
+        visual.install_layout(rustel_runtime::ui_events::visual_layout("note(62)", 9).unwrap());
+        assert!(visual.spectrogram(None).is_some());
+        assert!(visual.spectrogram(Some(0)).is_none());
     }
 
     #[test]

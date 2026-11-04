@@ -834,6 +834,43 @@ impl App {
         self.pointer_subrow = f64::from(y % height) / f64::from(height);
     }
 
+    /// Where the pointer is over the frame, for `mousex` in patterns and
+    /// `mouse` in Hydra: from 0 to 1 across, from the top-left corner. A
+    /// terminal that reports cells puts the pointer in the middle of its
+    /// cell, and one that reports pixels puts it where it is.
+    pub(super) fn follow_score_pointer(&self, event: &Event) {
+        let Event::Mouse(mouse) = event else {
+            return;
+        };
+        let frame = self.frame;
+        if frame.width == 0 || frame.height == 0 {
+            return;
+        }
+        let within = |fraction: f64| {
+            if self.features.pixel_mouse {
+                fraction
+            } else {
+                0.5
+            }
+        };
+        let across = |cell: u16, start: u16, fraction: f64, cells: u16| {
+            ((f64::from(cell.saturating_sub(start)) + within(fraction)) / f64::from(cells)).min(1.0)
+        };
+        let pointer = &self.score_pointer;
+        pointer.x.set(across(
+            mouse.column,
+            frame.x,
+            self.pointer_subcell,
+            frame.width,
+        ));
+        pointer.y.set(across(
+            mouse.row,
+            frame.y,
+            self.pointer_subrow,
+            frame.height,
+        ));
+    }
+
     pub(super) fn refresh_cell_pixels(&mut self, current: Option<(u16, u16)>) {
         if let Some(size) = current.filter(|(width, height)| *width > 0 && *height > 0)
             && Some(size) != self.last_pty_cell_pixels
@@ -2044,6 +2081,40 @@ mod tests {
                 app.editor().viewport(),
                 viewport,
                 "the score did not scroll"
+            );
+        }
+
+        /// The pointer reaches the score as fractions of the frame: at the
+        /// middle of its cell, or where it is when the terminal reports
+        /// pixels.
+        #[test]
+        fn the_pointer_over_the_frame_reaches_the_score() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _, _) = slider_app(directory.path());
+            app.frame = Rect::new(0, 0, 100, 50);
+            let moved = |column, row| {
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                })
+            };
+            let at = |app: &App| (app.score_pointer.x.get(), app.score_pointer.y.get());
+            app.follow_score_pointer(&moved(49, 24));
+            assert_eq!(at(&app), (0.495, 0.49), "the middle of the cell");
+            app.follow_score_pointer(&moved(400, 200));
+            assert_eq!(at(&app), (1.0, 1.0), "never past the frame");
+
+            app.features.pixel_mouse = true;
+            app.features.cell_pixels = Some((10, 20));
+            let mut event = moved(993, 485);
+            app.pointer_to_cells(&mut event);
+            app.follow_score_pointer(&event);
+            let (x, y) = at(&app);
+            assert!(
+                (x - 0.993).abs() < 1e-9 && (y - 0.485).abs() < 1e-9,
+                "{x}, {y}"
             );
         }
     }

@@ -328,7 +328,15 @@ impl ZzfxVoice {
             } else {
                 0.0
             };
-            s = tremolo_gain * sign * s.abs().powf(self.shape_curve) * self.volume * envelope;
+            // A curve of one leaves the magnitude unchanged: `x.powf(1.0)`
+            // is `x` for every finite and NaN input, so the default voice
+            // skips the library call per sample.
+            let shaped = if self.shape_curve == 1.0 {
+                s.abs()
+            } else {
+                s.abs().powf(self.shape_curve)
+            };
+            s = tremolo_gain * sign * shaped * self.volume * envelope;
 
             s = if self.delay != 0.0 {
                 let tap = if self.delay > i {
@@ -357,11 +365,23 @@ impl ZzfxVoice {
         // `f = (frequency += slide += deltaSlide) * cos(modulation * tm++)`.
         self.slide += self.delta_slide;
         self.frequency += self.slide;
-        let f = self.frequency * (self.modulation * self.tm).cos();
+        // Zero modulation multiplies by `cos(0) == 1`, which leaves the
+        // frequency unchanged: the default voice skips the call per sample.
+        let f = if self.modulation == 0.0 {
+            self.frequency
+        } else {
+            self.frequency * (self.modulation * self.tm).cos()
+        };
         self.tm += 1.0;
         // The pseudo-noise is `sin` of the sample index pushed through `1e9`
-        // and `% 2` - deterministic, not a RNG, and not simplifiable.
-        self.t += f - f * self.noise * (1.0 - (((self.i.sin() + 1.0) * 1e9) % 2.0));
+        // and `% 2` - deterministic, not a RNG, and not simplifiable. Zero
+        // noise zeroes the whole term; `sin` of a finite index is finite, so
+        // the skipped product cannot change the sum's bits.
+        if self.noise != 0.0 {
+            self.t += f - f * self.noise * (1.0 - (((self.i.sin() + 1.0) * 1e9) % 2.0));
+        } else {
+            self.t += f;
+        }
 
         if self.j != 0.0 {
             self.j += 1.0;

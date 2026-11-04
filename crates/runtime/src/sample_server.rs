@@ -1010,7 +1010,7 @@ fn request_path(target: &str) -> Option<PathBuf> {
     relative_sample_path_allowed(&relative).then_some(relative)
 }
 
-fn relative_sample_path_allowed(relative: &Path) -> bool {
+pub(crate) fn relative_sample_path_allowed(relative: &Path) -> bool {
     let mut saw_component = false;
     for component in relative.components() {
         let Component::Normal(component) = component else {

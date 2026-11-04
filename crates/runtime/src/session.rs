@@ -60,7 +60,8 @@ use crate::samples::ScoreSampleAccess;
 use crate::score_import::ScoreImportAccess;
 
 const DEFAULT_CPS: f64 = 0.5;
-const DEFAULT_HORIZON: f64 = 0.5;
+/// The scheduling horizon a fresh session keeps ahead of the clock, in seconds.
+pub const DEFAULT_HORIZON: f64 = 0.5;
 pub(crate) const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 const DEFAULT_CHANNELS: u16 = 2;
 const SCORE_CPU_BUDGET: Duration = Duration::from_secs(2);
@@ -896,6 +897,11 @@ pub struct Session {
     /// Live-reload re-query margin (the device's consumption frontier).
     /// Falls back to `schedule_lead` when the host never measured one.
     continuity_margin: Option<f64>,
+    /// Floor a host puts under a live replacement's takeover headroom, from
+    /// how long its producer's turns actually take. Zero keeps the default
+    /// response-time pricing (see [`Self::set_replacement_headroom_floor`]).
+    #[cfg(any(feature = "device-audio", test))]
+    replacement_headroom_floor: Duration,
     /// The sample rate of the last live schedule, in Hz. The producer
     /// converts a takeover time to the takeover frame at this rate, and
     /// [`Self::takeover_frame_edge`] uses the same rate. `None` until a
@@ -1182,6 +1188,8 @@ impl Session {
             audio_input_channels: None,
             schedule_lead: 0.0,
             continuity_margin: None,
+            #[cfg(any(feature = "device-audio", test))]
+            replacement_headroom_floor: Duration::ZERO,
             live_sample_rate: None,
             requery_takeover_time: None,
             requery_takeover_cut: TakeoverCut::None,
@@ -1266,6 +1274,12 @@ impl Session {
     pub fn set_score_import_access(&mut self, access: ScoreImportAccess) {
         self.csound.set_allowed(access.csound_allowed());
         self.config.score_import_access = access;
+    }
+
+    /// Replace what a score's `samples()`, images and videos may read. The
+    /// next evaluation reads the new policy. Banks already loaded stay.
+    pub fn set_score_sample_access(&mut self, access: ScoreSampleAccess) {
+        self.config.score_sample_access = access;
     }
 
     pub fn csound_snapshot(&self) -> crate::CsoundSnapshot {
@@ -1521,7 +1535,7 @@ mod test_support {
         let mut config = SessionConfig::default();
         config
             .score_sample_access
-            .permit_origin(origin)
+            .permit_source(origin)
             .expect("test sample origin");
         Session::with_config(config).expect("session")
     }

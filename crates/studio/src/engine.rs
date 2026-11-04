@@ -53,9 +53,27 @@ use rustel_runtime::ui_events::{
     source_revision,
 };
 use rustel_runtime::{
-    EnginePressureMonitor, EnginePressureSnapshot, LiveFileProducer, LiveProducerStep,
-    RuntimeError, Session, SessionConfig,
+    DEFAULT_HORIZON, EnginePressureMonitor, EnginePressureSnapshot, LIVE_REPLACEMENT_MIN_HEADROOM,
+    LiveFileProducer, LiveProducerStep, RuntimeError, Session, SessionConfig,
 };
+
+/// The most the studio lets the scheduling horizon grow. An evaluation
+/// slower than this still drains the ring, and the replacement it arms
+/// rolls back rather than taking over into a gap.
+const MAX_LIVE_HORIZON: f64 = 2.0;
+
+/// The horizon that keeps a replacement's takeover inside scheduled audio
+/// after an evaluation of the playing score took `evaluation`.
+///
+/// The engine thread is also the live producer, so while it compiles nothing
+/// refills the ring, and a replacement armed after a compile longer than the
+/// ring holds takes over past its last scheduled onset: the refusal that
+/// follows keeps the old score and drops the edit. Twice the compile plus a
+/// tenth keeps a full ring through the next one; a fast machine's compile
+/// never reaches the default horizon, so it schedules as before.
+pub(super) fn horizon_for_evaluation(evaluation: Duration) -> f64 {
+    (evaluation.as_secs_f64() * 2.0 + 0.1).clamp(DEFAULT_HORIZON, MAX_LIVE_HORIZON)
+}
 
 /// Scheduling cadence used by the native studio worker.
 pub const DEFAULT_STUDIO_POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -176,9 +194,12 @@ struct ProtectionKey {
 /// How far ahead of the device clock a preview is placed.
 const AUDITION_LEAD_SECS: f64 = 0.06;
 /// How far ahead of its own moment a run's note is handed to the device.
-/// Wider than the lead itself, so a note is always placed at the moment
-/// it belongs to rather than at the earliest the device would take it.
-const AUDITION_RUN_LEAD_SECS: f64 = AUDITION_LEAD_SECS * 2.0;
+/// Wide enough that a slow engine turn - a busy small machine renders its
+/// turns hundreds of milliseconds apart - still hands each note over
+/// before its moment, so the device places it at the time it belongs to
+/// and the run keeps its tempo. A note already handed over cannot be
+/// taken back; `stop_audition` cuts each of those at its own start.
+const AUDITION_RUN_LEAD_SECS: f64 = 0.15;
 /// Gate length of a preview; a one-shot sample plays to its end anyway.
 const AUDITION_GATE_SECS: f64 = 2.0;
 /// A chord is held a little longer than a one-shot: the ear needs the
@@ -272,6 +293,9 @@ pub struct StudioConfig {
     /// The origins of the permissions page, which scores import scripts from.
     /// They add to the origins that `session` already trusts.
     pub import_origins: Vec<String>,
+    /// What the permissions page permits a score's `samples()`, images and
+    /// videos to read, over what `session` permits.
+    pub sample_grants: SampleGrants,
     /// Whether native orchestras run. The studio turns them on at start -
     /// an installed library is the opt-in - and the permissions page can
     /// flip the switch during a run. The default is the studio's rule, so
@@ -296,9 +320,44 @@ impl Default for StudioConfig {
             watch_pads: true,
             open_default_input: true,
             import_origins: Vec::new(),
+            sample_grants: SampleGrants::default(),
             csound_allowed: true,
         }
     }
+}
+
+/// The permissions page's answers for what a score's `samples()`, images
+/// and videos read. Each one does what its command line flag does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SampleGrants {
+    /// The sources allowed as `--allow-sample-origin` allows one.
+    pub sources: Vec<String>,
+    /// The folder `samples('local:')` reads, as `--allow-local-samples`
+    /// names one.
+    pub local_root: Option<std::path::PathBuf>,
+}
+
+/// What `session` permits a score to read, with the page's `grants` added.
+/// A folder from the command line wins over the page's own.
+pub(super) fn sample_access(
+    session: &SessionConfig,
+    grants: &SampleGrants,
+) -> rustel_runtime::ScoreSampleAccess {
+    // A clone shares the policy's record of refused sources, which the
+    // page reads.
+    let mut access = session.score_sample_access.clone();
+    for source in &grants.sources {
+        // The page keeps only sources that the runtime read.
+        let _ = access.permit_source(source);
+    }
+    if let Some(root) = &grants.local_root
+        && !access.has_local_root()
+    {
+        // A folder that is gone since the page chose it permits nothing,
+        // and `samples('local:')` says how to grant one.
+        let _ = access.permit_local_root(root);
+    }
+    access
 }
 
 /// The origins that `session` trusts for script imports, `origins` of the
@@ -1123,6 +1182,15 @@ const BATON_SETTLE_CALLBACKS: u64 = 2;
 pub struct StudioEngine {
     config: StudioConfig,
     session: Session,
+    /// The horizon the session keeps filled, raised when an evaluation of the
+    /// playing score runs longer than the audio scheduled ahead of the clock
+    /// (see [`Self::widen_horizon_for_evaluation`]).
+    live_horizon: f64,
+    /// The last evaluation of the playing score, wall-clock. The first
+    /// replacement of a score sizes its takeover from this until the
+    /// producer has measured a cutover of its own (see
+    /// [`Self::match_replacement_headroom_to_producer`]).
+    last_live_evaluation: Duration,
     recovery_epoch: u64,
     launch_pads: Vec<(u8, u8)>,
     live: Option<StudioPlayback>,
@@ -1667,6 +1735,7 @@ impl StudioEngine {
             &config.import_origins,
             config.csound_allowed,
         ));
+        session.set_score_sample_access(sample_access(&config.session, &config.sample_grants));
         session.set_query_hap_budget(STUDIO_QUERY_HAP_BUDGET)?;
         let master = Arc::new(StudioMasterBus::default());
         master.set_max_polyphony(config.session.max_polyphony);
@@ -1697,12 +1766,14 @@ impl StudioEngine {
         // is: the policy the host chose for scores, with each pack's own
         // origin permitted on top of it. The library must exist first.
         if let Some(library) = session.sample_library() {
-            library.set_import_policy(config.session.score_sample_access.clone());
+            library.set_import_policy(session.config().score_sample_access.clone());
         }
 
         Ok(Self {
             config,
             session,
+            live_horizon: DEFAULT_HORIZON,
+            last_live_evaluation: Duration::ZERO,
             recovery_epoch: 0,
             launch_pads: Vec::new(),
             live: None,
@@ -2803,6 +2874,11 @@ struct RunningAudition {
     /// handed over. A run is heard as a tempo, so what matters is where
     /// each note sounds, and the device places a note by its own clock.
     due: f64,
+    /// The clock second each handed-over note was QUEUED to sound at,
+    /// slides included: a slide moves a note off the ideal step grid, so
+    /// the queue times cannot be rebuilt from `due` afterwards. A stop
+    /// reads these to cut exactly the notes the device already holds.
+    handed: Vec<f64>,
 }
 
 impl RunningAudition {
@@ -2821,6 +2897,7 @@ impl RunningAudition {
 
     /// That note is the device's now; the one after it is a step later.
     fn sounded(&mut self) {
+        self.handed.push(self.due);
         self.next += 1;
         self.due += self.request.step_secs.max(0.01);
     }
@@ -3244,7 +3321,7 @@ pub(super) mod tests {
     #[test]
     fn constructor_passes_the_score_sample_policy_to_imported_sources() {
         let mut granted = rustel_runtime::samples::ScoreSampleAccess::denied();
-        granted.permit_origin("https://samples.example").unwrap();
+        granted.permit_source("https://samples.example").unwrap();
         for access in [
             rustel_runtime::samples::ScoreSampleAccess::denied(),
             granted,

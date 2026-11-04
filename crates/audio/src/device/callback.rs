@@ -421,44 +421,13 @@ impl CallbackProAudio {
     }
 }
 
-#[cfg(target_os = "linux")]
-impl CallbackRealTime {
-    /// The class for a stream of `frames` at `rate`.
-    pub(super) fn new(frames: u32, rate: u32) -> Self {
-        Self {
-            frames,
-            rate,
-            asked: false,
-            promoted: None,
-        }
-    }
-
-    /// Promotes the calling thread at the first call that finds
-    /// `workers_ready` set. A worker with the class proves that the system
-    /// gives the class to the process, so the call meets no refusal, whose
-    /// error the crate allocates. Until then the thread keeps its priority.
-    pub(super) fn promote_once(&mut self, workers_ready: &AtomicBool) {
-        if !self.asked && workers_ready.load(Ordering::Acquire) {
-            self.asked = true;
-            self.promoted =
-                audio_thread_priority::promote_current_thread_to_real_time(self.frames, self.rate)
-                    .ok()
-                    .map(|handle| (handle, std::thread::current().id()));
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for CallbackRealTime {
-    fn drop(&mut self) {
-        if let Some((handle, thread)) = self.promoted.take()
-            && thread == std::thread::current().id()
-        {
-            let _ = audio_thread_priority::demote_current_thread_from_real_time(handle);
-        }
-    }
-}
-
+/// The output callback holds no real-time handle, by design. The class
+/// is per thread and the callback could only ask for itself, and a
+/// callback whose render runs near the whole of every period sits near a
+/// total real-time duty cycle - the kernel's real-time watchdog kills
+/// such a thread (SIGXCPU, then death) within a fraction of a second of
+/// the grant. The plugin workers keep the class instead; their turns are
+/// short, and `pool.rs` asks for them.
 #[cfg(any(windows, feature = "test-support"))]
 impl PlaybackUnderruns {
     /// The count of a stream of `buffer_frames` at `sample_rate`.

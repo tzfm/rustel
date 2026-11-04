@@ -59,6 +59,21 @@ impl ContinuationWindow {
     }
 }
 
+impl LiveFileProducer {
+    /// The slowest full scheduling, conversion and ring turn of the recent
+    /// window, and of the recent windows that carried a cutover: how long a
+    /// producer step has actually taken on this machine. `None` before the
+    /// first turn.
+    pub fn observed_turn_high_water(&self) -> Option<Duration> {
+        let steady = self.continuation_window.high_water();
+        let cutover = self.replacement_window.high_water();
+        match (steady, cutover) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            pair => pair.0.or(pair.1),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveProducerStep {
     /// Score-file poll. Only an Installed event here may cut generations.
@@ -180,6 +195,11 @@ pub struct LiveFileProducer {
     /// score work. Query deadlines use the separate post-query tail below so a
     /// slow successful query cannot recursively price out every later query.
     continuation_window: ContinuationWindow,
+    /// Full turns that carried an unpublished cutover: the expensive ones a
+    /// replacement's takeover headroom must cover. Kept apart from
+    /// [`Self::continuation_window`], whose half-second of 2 ms turns would
+    /// age a slow replacement out before the next save arrives.
+    replacement_window: ContinuationWindow,
     /// Whether the backlog-overflow message has already been printed for the
     /// current overflow episode.
     backlog_dropped_reported: bool,
@@ -332,6 +352,7 @@ impl LiveFileProducer {
             next_watch_poll: Duration::ZERO,
             evaluation_continuation_floor,
             continuation_window: ContinuationWindow::default(),
+            replacement_window: ContinuationWindow::default(),
             starving_since: None,
             backlog_dropped_reported: false,
             query_tail_window: ContinuationWindow::default(),
@@ -419,6 +440,7 @@ impl LiveFileProducer {
             next_watch_poll: Duration::ZERO,
             evaluation_continuation_floor,
             continuation_window: ContinuationWindow::default(),
+            replacement_window: ContinuationWindow::default(),
             starving_since: None,
             backlog_dropped_reported: false,
             query_tail_window: ContinuationWindow::default(),
@@ -663,6 +685,7 @@ impl LiveFileProducer {
     ) -> Result<LiveProducerStep, RuntimeError> {
         self.sync_panic_recovery(session);
         let started = self.begin_turn();
+        let cutover_turn = self.pending_generation.is_some();
         let result = self.step_with_clock_inner(
             session,
             observed_at,
@@ -673,6 +696,9 @@ impl LiveFileProducer {
             set_generation,
             push,
         );
+        if cutover_turn {
+            self.replacement_window.record(started.elapsed());
+        }
         self.stage_turn(session, started, &result);
         result
     }
@@ -916,7 +942,7 @@ impl LiveFileProducer {
             && !matches!(watches.score, WatchPoll::Stopped)
             && !matches!(watches.prebake, WatchPoll::Stopped))
         .then(Instant::now);
-        let step = self.finish_step_with_preparation(
+        let result = self.finish_step_with_preparation(
             session,
             watches,
             &mut schedule_now,
@@ -925,7 +951,9 @@ impl LiveFileProducer {
             install,
             set_generation,
             push,
-        )?;
+        );
+        // A refused turn is the one a slow machine most needs priced into the
+        // continuation reserve: record it before the error leaves the step.
         if let Some(started) = continuation_started {
             let elapsed = started.elapsed();
             // A look at the plugin copies ahead caps itself by the cover, so
@@ -934,7 +962,7 @@ impl LiveFileProducer {
             let elapsed = elapsed.saturating_sub(session.take_look_ahead_time());
             self.continuation_window.record(elapsed);
         }
-        Ok(step)
+        result
     }
 
     /// Arm a Session-installed replacement so the next unwatched step completes
@@ -1613,6 +1641,7 @@ impl LiveFileProducer {
     ) -> Result<LiveProducerStep, RuntimeError> {
         self.sync_panic_recovery(session);
         let started = self.begin_turn();
+        let cutover_turn = self.pending_generation.is_some();
         let result = self.step_unwatched_with_clock_and_cutover_inner(
             session,
             schedule_now,
@@ -1622,6 +1651,9 @@ impl LiveFileProducer {
             set_generation,
             push,
         );
+        if cutover_turn {
+            self.replacement_window.record(started.elapsed());
+        }
         self.stage_turn(session, started, &result);
         result
     }
@@ -1662,7 +1694,7 @@ impl LiveFileProducer {
         };
         let measure_continuation = watch != WatchPoll::Stopped;
         let continuation_started = measure_continuation.then(Instant::now);
-        let step = self.finish_step_with_preparation(
+        let result = self.finish_step_with_preparation(
             session,
             WatchResults {
                 score: watch.clone(),
@@ -1674,11 +1706,13 @@ impl LiveFileProducer {
             install,
             set_generation,
             push,
-        )?;
+        );
+        // A refused turn is the one a slow machine most needs priced into the
+        // continuation reserve: record it before the error leaves the step.
         if let Some(started) = continuation_started {
             self.continuation_window.record(started.elapsed());
         }
-        Ok(step)
+        result
     }
 
     #[cfg(test)]

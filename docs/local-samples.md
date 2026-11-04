@@ -115,7 +115,7 @@ Local files stay on disk and are not copied to the remote cache.
 
 ## A score that uses a local sample server
 
-For `samples('http://localhost:5432')`, run a server and grant its exact origin:
+For `samples('http://localhost:5432')`, run a server and allow its address:
 
 ```sh
 rustel play song.strudel --allow-sample-origin http://localhost:5432
@@ -154,7 +154,7 @@ files. Requests must use the listener's host and port; loopback also accepts
 `--allow-origin` grants browser access to this server. The separate
 `--allow-sample-origin` grants native score fetches. Neither implies the other.
 Remote fetches restrict private and special-purpose addresses; explicitly
-granted loopback servers are allowed. See [Sample access](../SECURITY.md#sample-access).
+named loopback servers are allowed. See [Sample access](../SECURITY.md#sample-access).
 
 Files above 128 MiB and scans above 16,384 audio files are refused. Escaping
 symlinks are refused; systems without atomic path confinement skip all symlinks.

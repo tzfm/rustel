@@ -553,6 +553,7 @@ impl App {
             self.caret_visible = true;
         }
         self.note_pointer_shape_event(&terminal_event);
+        self.follow_score_pointer(&terminal_event);
         // A find prompt owns the keys before Vim mappings and every editor
         // command: a typed pattern is never a motion or an edit.
         if allow_modal_keys && self.route_find_event(&terminal_event)? {

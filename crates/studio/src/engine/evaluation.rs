@@ -23,7 +23,22 @@ impl StudioEngine {
         // installs nothing. A flag that stays set would rewind the next
         // unrelated save, so a failed evaluation clears it below.
         self.sync_polyphony();
+        // The evaluation and the producer turns share this thread, so a slow
+        // compile drains the scheduled ring. Time it only while playing: a
+        // stopped engine has no ring to drain.
+        let was_live = self.live.is_some();
+        if was_live {
+            self.match_replacement_headroom_to_producer();
+        }
+        let started = std::time::Instant::now();
         let result = self.evaluate_guarded_inner(source, mini, cancelled);
+        // Recorded whether or not the engine was live: the first save of a
+        // session prices its takeover from the evaluation that started the
+        // set, which ran while the engine was still stopped.
+        self.last_live_evaluation = started.elapsed();
+        if was_live {
+            self.widen_horizon_for_evaluation(self.last_live_evaluation);
+        }
         self.sync_recovered_session();
         self.sync_polyphony();
         if result.is_ok() {
@@ -37,6 +52,45 @@ impl StudioEngine {
         // Taken by the install; one that never ran leaves it for nobody.
         self.next_install_preview = false;
         result
+    }
+
+    /// Raise the session horizon when an evaluation of the playing score ran
+    /// close to the audio scheduled ahead of the clock. See
+    /// [`horizon_for_evaluation`] for the window it keeps.
+    fn widen_horizon_for_evaluation(&mut self, evaluation: std::time::Duration) {
+        let needed = horizon_for_evaluation(evaluation);
+        if needed > self.live_horizon {
+            self.live_horizon = needed;
+            self.session.set_horizon(needed);
+        }
+    }
+
+    /// Put the producer's measured turn time under a replacement's takeover
+    /// headroom. The default pricing answers an edit in 80 ms, which a
+    /// machine whose producer turns take longer cannot meet: the first
+    /// window publishes after its takeover and the edit rolls back. One
+    /// measured turn plus the default response time keeps the window open as
+    /// long as the machine needs, and no longer.
+    ///
+    /// Until the producer has measured a cutover of its own, the last
+    /// evaluation stands in for one: an evaluation and a first window cost
+    /// the same machine the same order of work, and the probe that prices
+    /// the takeover covers the query but not the conversion of the voices
+    /// the window installs. A first save on a slow machine bounced once and
+    /// landed on the retry before this; with the evaluation in the floor it
+    /// lands the first time.
+    fn match_replacement_headroom_to_producer(&mut self) {
+        let Some(playback) = self.live.as_ref() else {
+            return;
+        };
+        let floor = playback
+            .producer
+            .observed_turn_high_water()
+            .map(|turn| turn + LIVE_REPLACEMENT_MIN_HEADROOM)
+            .unwrap_or(Duration::ZERO)
+            .max(self.last_live_evaluation + LIVE_REPLACEMENT_MIN_HEADROOM)
+            .min(Duration::from_secs_f64(MAX_LIVE_HORIZON));
+        self.session.set_replacement_headroom_floor(floor);
     }
 
     fn evaluate_guarded_inner(
@@ -730,6 +784,25 @@ mod tests {
     mod panic_recovery {
         use super::*;
         use rustel_runtime::SessionPanicPoint;
+
+        #[test]
+        fn a_slow_evaluation_widens_the_horizon_it_drew_down() {
+            assert_eq!(
+                horizon_for_evaluation(Duration::from_millis(50)),
+                DEFAULT_HORIZON,
+                "a fast compile keeps the default horizon"
+            );
+            assert_eq!(
+                horizon_for_evaluation(Duration::from_millis(600)),
+                1.3,
+                "twice the compile plus a tenth"
+            );
+            assert_eq!(
+                horizon_for_evaluation(Duration::from_secs(30)),
+                MAX_LIVE_HORIZON,
+                "and never past the cap"
+            );
+        }
 
         const GOOD: &str = "note('c3').s('sine').fast(8)";
         const CANDIDATE: &str = "note('g4').s('triangle').fast(8)";

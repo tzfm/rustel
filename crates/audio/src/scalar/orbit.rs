@@ -3,8 +3,18 @@ use super::*;
 /// Stereo pan, STEREO input branch (the mono branch is
 /// `channel_gains`): x ≤ 0 folds right into left, x > 0 folds left into
 /// right, equal-power.
+///
+/// A centred panner (x = 0) still evaluates `cos` and `sin` of the same
+/// quarter-turn constant on every frame of every stereo voice. The cached
+/// values below hold exactly that pair, so the centred path - the ordinary
+/// case for a voice with no pan control - costs two multiplies instead of a
+/// library call. Every other `x` keeps the library call.
 pub(super) fn stereo_pan(l: f32, r: f32, x: f32) -> (f32, f32) {
     use std::f32::consts::FRAC_PI_2;
+    if x == 0.0 {
+        let (cos, sin) = *CENTRED_PAN.get_or_init(centred_pan);
+        return (l + r * cos, r * sin);
+    }
     if x <= 0.0 {
         let a = (x + 1.0) * FRAC_PI_2;
         (l + r * a.cos(), r * a.sin())
@@ -12,6 +22,17 @@ pub(super) fn stereo_pan(l: f32, r: f32, x: f32) -> (f32, f32) {
         let a = x * FRAC_PI_2;
         (l * a.cos(), r + l * a.sin())
     }
+}
+
+/// `cos` and `sin` of the exact angle a centred panner computes: `1.0 *
+/// FRAC_PI_2`. The pair is the library's own answer for that exact input.
+static CENTRED_PAN: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+
+/// Populate [`CENTRED_PAN`] with the library values for the centred angle.
+fn centred_pan() -> (f32, f32) {
+    use std::f32::consts::FRAC_PI_2;
+    let a = 1.0 * FRAC_PI_2;
+    (a.cos(), a.sin())
 }
 
 impl DuckSegments {
@@ -272,6 +293,24 @@ impl ScalarBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_centred_panner_matches_the_library_bit_for_bit() {
+        let (cos, sin) = centred_pan();
+        assert_eq!(cos.to_bits(), (std::f32::consts::FRAC_PI_2).cos().to_bits());
+        assert_eq!(sin.to_bits(), (std::f32::consts::FRAC_PI_2).sin().to_bits());
+        for pair in [(0.0f32, 0.0), (0.5, -0.5), (-1.0, 1.0), (3.2e-9, -7.7e8)] {
+            let (l, r) = pair;
+            let expected = {
+                let a = 1.0 * std::f32::consts::FRAC_PI_2;
+                (l + r * a.cos(), r * a.sin())
+            };
+            let actual = stereo_pan(l, r, 0.0);
+            assert_eq!(actual.0.to_bits(), expected.0.to_bits());
+            assert_eq!(actual.1.to_bits(), expected.1.to_bits());
+        }
+    }
+
     mod ui_visual_mix_tests {
         use super::*;
         use crate::backend::{AudioBackend, OnsetEvent};

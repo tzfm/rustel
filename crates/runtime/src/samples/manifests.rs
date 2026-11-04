@@ -313,7 +313,8 @@ impl ManifestContext {
     ) -> Result<(), String> {
         budget.check()?;
         let allowed_root = access.local_root.as_ref().ok_or_else(|| {
-            "samples('local:') requires a host-selected local sample root".to_owned()
+            access.note_local_refused();
+            "samples('local:') requires a host-selected local sample root (--allow-local-samples, or the Studio Permissions page)".to_owned()
         })?;
         let allowed_path = allowed_root.path();
         let requested = Path::new(requested);
@@ -1644,7 +1645,7 @@ pub(super) mod tests {
         pub(in crate::samples) fn access() -> ScoreSampleAccess {
             let mut access = ScoreSampleAccess::denied();
             access
-                .permit_origin("https://raw.githubusercontent.com")
+                .permit_source("https://raw.githubusercontent.com")
                 .expect("origin");
             access
         }
@@ -1927,7 +1928,7 @@ pub(super) mod tests {
             library.set_direct_diagnostic_logging(false);
             let mut access = ScoreSampleAccess::denied();
             access
-                .permit_origin("https://samples.example")
+                .permit_source("https://samples.example")
                 .expect("fixture origin");
             let first = source_map(0);
             let mut plateau = None;
@@ -2023,7 +2024,7 @@ pub(super) mod tests {
                 (200, r#"{"_base":"{origin}/","retried":"retried.wav"}"#),
             ]);
             let mut access = ScoreSampleAccess::denied();
-            access.permit_origin(&origin).expect("origin");
+            access.permit_source(&origin).expect("origin");
             let library = SampleLibrary::empty();
             let score = format!("samples('{spec}')\n$: s(\"retried\")");
             let refusal = || crate::lint::rejection(&score, false, Some(&library));
@@ -2125,7 +2126,7 @@ pub(super) mod tests {
         fn a_failure_in_a_row_rests_longer_before_the_background_asks() {
             let (origin, spec, server) = scripted_server(vec![(404, ""), (404, "")]);
             let mut access = ScoreSampleAccess::denied();
-            access.permit_origin(&origin).expect("origin");
+            access.permit_source(&origin).expect("origin");
             let library = SampleLibrary::empty();
             let ask = || {
                 library
@@ -2228,7 +2229,7 @@ pub(super) mod tests {
         /// grants it.
         fn scored(map: &str, base: Option<&str>, origin: &str) -> SampleLibrary {
             let mut access = ScoreSampleAccess::denied();
-            access.permit_origin(origin).expect("a well-formed origin");
+            access.permit_source(origin).expect("a well-formed origin");
             settled(|library| library.register_score_custom(map, base, &access))
         }
 
@@ -2302,7 +2303,8 @@ pub(super) mod tests {
         #[test]
         fn a_samples_source_with_a_trailing_newline_still_registers() {
             let mut access = ScoreSampleAccess::denied();
-            access.permit_public_cors_origins();
+            access.permit_builtin_sources();
+            access.permit_source("samples.example").unwrap();
 
             let source = "https://samples.example/kit.json\n";
             access
@@ -2438,7 +2440,7 @@ pub(super) mod tests {
         fn score_and_trusted_routes_share_one_wire_identity() {
             let mut access = ScoreSampleAccess::denied();
             access
-                .permit_origin("https://example.com")
+                .permit_source("https://example.com")
                 .expect("grant origin");
             let raw = "HTTPS://EXAMPLE.com:443/kit/take#2.wav?q=//";
             let (approved, approved_access) =
@@ -2451,8 +2453,7 @@ pub(super) mod tests {
             assert_eq!(
                 approved_access,
                 ScoreFetchAccess::Remote {
-                    origin: "https://example.com".to_owned(),
-                    cors_required: false,
+                    rule: SourceRule::parse("https://example.com").expect("a test source"),
                 }
             );
             assert_eq!(
@@ -2462,138 +2463,104 @@ pub(super) mod tests {
             );
         }
 
-        /// The default policy matches strudel.cc: public https with the server's
-        /// CORS consent. Loopback names and plain http need an exact grant, and
-        /// an exact grant removes the consent requirement.
+        /// The built-in sources allow their own domains over https and nothing
+        /// else. Loopback names and plain http need a source that spells them
+        /// out.
         #[test]
-        fn the_default_policy_approves_public_https_and_nothing_nearer() {
+        fn the_builtin_sources_allow_their_domains_and_nothing_nearer() {
             let denied = ScoreSampleAccess::denied();
             assert!(denied.is_denied());
             assert!(
                 denied
-                    .approve_remote("https://samples.example/kit.json")
+                    .approve_remote("https://raw.githubusercontent.com/a/b/main/strudel.json")
                     .is_err()
             );
 
             let mut access = ScoreSampleAccess::denied();
-            access.permit_public_cors_origins();
-            assert!(!access.is_denied(), "the parity default is not a denial");
-            let (_, open) = access
-                .approve_remote("https://samples.example/kit.json")
-                .expect("public https is approved by default");
+            access.permit_builtin_sources();
+            assert!(!access.is_denied(), "the built-in sources are not a denial");
+            let (_, github) = access
+                .approve_remote("https://raw.githubusercontent.com/a/b/main/strudel.json")
+                .expect("a built-in domain");
             assert_eq!(
-                open,
+                github,
                 ScoreFetchAccess::Remote {
-                    origin: "https://samples.example".to_owned(),
-                    cors_required: true,
+                    rule: SourceRule::parse("raw.githubusercontent.com").expect("a test source"),
                 }
             );
-            for nearer in [
-                "http://samples.example/kit.json",
+            access
+                .approve_remote("https://cdn.freesound.org/previews/182/182967_529852-lq.mp3")
+                .expect("freesound is built in");
+            for refused in [
+                "https://samples.example/kit.json",
+                "http://raw.githubusercontent.com/a/b/main/strudel.json",
                 "https://localhost:9000/kit.json",
                 "https://kit.localhost/kit.json",
                 "https://127.0.0.1:9000/kit.json",
                 "https://[::1]:9000/kit.json",
             ] {
-                let refusal = access.approve_remote(nearer).expect_err(nearer);
+                let refusal = access.approve_remote(refused).expect_err(refused);
                 assert!(
                     refusal.contains("--allow-sample-origin"),
-                    "{nearer}: the refusal must name the grant that fixes it: {refusal}"
+                    "{refused}: the refusal must name the flag that fixes it: {refusal}"
                 );
             }
 
             access
-                .permit_origin("http://localhost:9000")
-                .expect("grant loopback origin");
+                .permit_source("http://localhost:9000")
+                .expect("an address on this computer");
             let (_, granted) = access
                 .approve_remote("http://localhost:9000/kit.json")
-                .expect("an exact grant reaches what the default cannot");
+                .expect("a source that spells out loopback reaches it");
             assert_eq!(
                 granted,
                 ScoreFetchAccess::Remote {
-                    origin: "http://localhost:9000".to_owned(),
-                    cors_required: false,
+                    rule: SourceRule::parse("http://localhost:9000").expect("a test source"),
                 }
             );
         }
 
-        /// Consent is enforced on the wire, per response: a server that answers
-        /// without `Access-Control-Allow-Origin` is refused even though its
-        /// address and origin both passed, and the request carries the `Origin`
-        /// header a dynamically-configured server needs to answer at all.
+        /// An allowed source loads without asking the server for CORS
+        /// headers: the request carries no `Origin`, and a response without
+        /// `Access-Control-Allow-Origin` is read.
         #[test]
-        fn wire_fetches_under_the_default_policy_require_cors_consent() {
+        fn an_allowed_source_loads_without_cors_headers() {
             use std::io::Write;
             use std::net::TcpListener;
 
             let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
             let origin = format!("http://{}", listener.local_addr().unwrap());
             let url = format!("{origin}/kit.wav");
-            let saw_origin_header = Arc::new(AtomicBool::new(false));
-            let server_seen = Arc::clone(&saw_origin_header);
             let server = std::thread::spawn(move || {
-                for consent in [None, Some("*"), None] {
-                    let Ok((mut stream, _)) = listener.accept() else {
-                        return;
-                    };
-                    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
-                    let mut line = String::new();
-                    loop {
-                        line.clear();
-                        match std::io::BufRead::read_line(&mut reader, &mut line) {
-                            Ok(0) => break,
-                            Ok(_) if line == "\r\n" || line == "\n" => break,
-                            Ok(_) => {
-                                if line
-                                    .to_ascii_lowercase()
-                                    .starts_with(&format!("origin: {CORS_REQUEST_ORIGIN}"))
-                                {
-                                    server_seen.store(true, Ordering::Release);
-                                }
-                            }
-                            Err(_) => break,
-                        }
+                let (mut stream, _) = listener.accept().expect("one request");
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+                let mut sent_origin = false;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match std::io::BufRead::read_line(&mut reader, &mut line) {
+                        Ok(0) => break,
+                        Ok(_) if line == "\r\n" || line == "\n" => break,
+                        Ok(_) => sent_origin |= line.to_ascii_lowercase().starts_with("origin:"),
+                        Err(_) => break,
                     }
-                    let consent_header = consent
-                        .map(|value| format!("Access-Control-Allow-Origin: {value}\r\n"))
-                        .unwrap_or_default();
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\n{consent_header}Content-Length: 2\r\nConnection: close\r\n\r\nok"
-                    );
-                    let _ = stream.flush();
                 }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                );
+                let _ = stream.flush();
+                sent_origin
             });
 
-            let consent_required = ScoreFetchAccess::Remote {
-                origin: origin.clone(),
-                cors_required: true,
-            };
-            let refusal = fetch_score_source(&url, &consent_required, 4096)
-                .expect_err("a response without consent must be refused");
-            assert!(
-                refusal.contains("consent") && refusal.contains("--allow-sample-origin"),
-                "the refusal names the header and the remedy: {refusal}"
-            );
-            assert_eq!(
-                fetch_score_source(&url, &consent_required, 4096).expect("a consenting response"),
-                b"ok".to_vec()
-            );
-            assert!(
-                saw_origin_header.load(Ordering::Acquire),
-                "consent-requiring fetches must send the Origin header"
-            );
-
-            // An exact grant asks the same server with no consent demanded.
-            let granted = ScoreFetchAccess::Remote {
-                origin,
-                cors_required: false,
+            let allowed = ScoreFetchAccess::Remote {
+                rule: SourceRule::parse(&origin).expect("a test source"),
             };
             assert_eq!(
-                fetch_score_source(&url, &granted, 4096).expect("granted fetch"),
+                fetch_score_source(&url, &allowed, 4096).expect("an allowed fetch"),
                 b"ok".to_vec()
             );
-            server.join().expect("server thread");
+            assert!(!server.join().expect("server thread"), "no Origin header");
         }
 
         fn settle(library: &SampleLibrary) {
@@ -3434,15 +3401,10 @@ pub(super) mod tests {
                 .insert(
                     Arc::from(url),
                     ScoreFetchAccess::Remote {
-                        origin: "http://127.0.0.1:9".to_owned(),
-                        cors_required: false,
+                        rule: SourceRule::parse("http://127.0.0.1:9").expect("a test source"),
                     },
                 );
-            let path =
-                library
-                    .shared
-                    .score_cache
-                    .path(url, ScoreCacheKind::Audio, ScoreCacheTrust::Grant);
+            let path = library.shared.score_cache.path(url, ScoreCacheKind::Audio);
             library
                 .shared
                 .score_cache
@@ -4826,9 +4788,9 @@ pub(super) mod tests {
             let origin = Url::parse(&url).unwrap().origin().ascii_serialization();
             let library = SampleLibrary::empty();
             let mut access = ScoreSampleAccess::denied();
-            access.permit_origin(&origin).expect("origin");
+            access.permit_source(&origin).expect("origin");
             access
-                .permit_origin("http://127.0.0.1:9")
+                .permit_source("http://127.0.0.1:9")
                 .expect("declared host");
             library
                 .register_score_custom(&serde_json::to_string(&url).unwrap(), None, &access)
@@ -5709,11 +5671,7 @@ pub(super) mod tests {
                 publication.cancellation(),
             );
             let cache = Arc::new(ScoreCache::new(root.clone()));
-            let destination = cache.path(
-                "https://samples.example/late.wav",
-                ScoreCacheKind::Audio,
-                ScoreCacheTrust::Grant,
-            );
+            let destination = cache.path("https://samples.example/late.wav", ScoreCacheKind::Audio);
             let worker_cache = Arc::clone(&cache);
             let worker_destination = destination.clone();
             let writer = std::thread::spawn(move || {

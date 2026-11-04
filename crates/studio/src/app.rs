@@ -10,7 +10,7 @@
 //! |---|---|
 //! | the mixer desk, master level and limiter | `mixer.rs` |
 //! | the reference column (Ctrl+D) | `reference_panel.rs` |
-//! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs` |
+//! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs`, `hydra_scope.rs` |
 //! | hearing a chord, scale, sound or snippet | `previews.rs` |
 //! | the Settings sheet | `settings_sheet.rs` |
 //! | its Permissions page: origins and orchestras | `permissions.rs` |
@@ -166,6 +166,8 @@ mod external_changes;
 mod find;
 mod focus;
 mod hydra_backdrop;
+#[cfg(feature = "hydra")]
+mod hydra_scope;
 mod jobs_panel;
 mod key_bindings;
 mod keyboard;
@@ -253,9 +255,7 @@ use readiness::{
 use recording::{
     SampleTake, TAKE_NOTICE_DURATION, TrimJob, TrimTarget, format_take_length, trim_candidate,
 };
-use reference_panel::{
-    CATALOGUE_LOADING_REFRESH, CATALOGUE_REFRESH, browser_imports, with_input_channels,
-};
+use reference_panel::{browser_imports, catalogue_refresh_interval, with_input_channels};
 use replay_tabs::SetStash;
 use sample_import::dropped_paths;
 use sample_sources::{
@@ -546,7 +546,10 @@ fn status_file_path(path: &std::path::Path, full: bool) -> String {
     clippy::print_stderr,
     reason = "the theme fallback is reported before the screen opens"
 )]
-fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
+fn run_once(mut options: StudioOptions) -> Result<Session, RuntimeError> {
+    // The terminal pointer, for `mousex` in patterns and `mouse` in Hydra.
+    // The engine's session reads it, and the app writes it.
+    options.session.pointer.get_or_insert_with(Default::default);
     let starter = if options.mini {
         DEFAULT_MINI_SCORE
     } else {
@@ -645,6 +648,7 @@ fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
             preview_budget_bytes: sample_settings.preview_budget.bytes(),
             unused_sample_idle: sample_settings.unused_sample_idle.duration(),
             import_origins: prefs.import_origins.clone(),
+            sample_grants: prefs.sample_grants(),
             // `csound_allowed` stays at its default: on, because an
             // installed Csound library is the studio's opt-in. The
             // permissions page takes it back for a run, and the one-shot
@@ -859,6 +863,15 @@ struct App {
     #[cfg(feature = "hydra")]
     generator_session: super::ideas::Generator,
     catalogue_refreshed_at: Instant,
+    /// When the catalogue last changed while loading, so the fast loading
+    /// cadence holds only while something keeps arriving.
+    catalogue_progress_at: Instant,
+    /// How far the animated cadence is stretched from the configured frame
+    /// rate, and the draws that say whether to stretch or relax it. See
+    /// `event_loop::paced_after`.
+    frame_pace: u8,
+    frame_overruns: u8,
+    frame_cheaps: u8,
     /// When the vst tab of the reference column last read the plugin list.
     #[cfg(feature = "vst")]
     plugins_polled_at: Instant,
@@ -1278,6 +1291,16 @@ struct App {
     csound_owed: bool,
     /// The permissions page changed and the engine does not have the list yet.
     import_origins_owed: bool,
+    /// Folders the engine refused a score's samples or media from in this
+    /// studio, oldest first.
+    blocked_samples: Vec<String>,
+    /// A score asked for `local:` files with no folder chosen, so the
+    /// permissions page shows the folder row.
+    local_files_asked: bool,
+    /// The source the permissions page's edit prompt is cutting down.
+    editing_source: Option<String>,
+    /// The page's sample grants changed and the engine does not have them yet.
+    sample_grants_owed: bool,
     /// A permit unblocked a refused update and the studio owes its re-run.
     /// It waits for the engine to hold the permission, so the re-run cannot
     /// be refused by the state it is running to use.
@@ -1438,6 +1461,8 @@ struct App {
     pin_frame_inputs: bool,
     /// Geometry of the last painted frame, used to route pointer input.
     frame: Rect,
+    /// Where the pointer is over the frame, shared with the engine's session.
+    score_pointer: rustel_core::host_value::Pointer,
     regions: StudioRegions,
     pointer: Option<Pointer>,
     /// How far into its cell the pointer was at the last report, 0..1. A
@@ -1633,6 +1658,7 @@ impl App {
         // The switch starts on, as the engine's does: an installed library
         // is the opt-in, and the permissions page owns the switch from here.
         let csound_at_start = true;
+        let score_pointer = options.session.pointer.clone().unwrap_or_default();
         let mut app = Self {
             output_latency_pending: true,
             cli_output_latency: options.output_buffer_frames.map(OutputLatency::from_frames),
@@ -1680,6 +1706,10 @@ impl App {
             #[cfg(feature = "hydra")]
             generator_session: super::ideas::Generator::default(),
             catalogue_refreshed_at: now,
+            catalogue_progress_at: now,
+            frame_pace: 1,
+            frame_overruns: 0,
+            frame_cheaps: 0,
             #[cfg(feature = "vst")]
             plugins_polled_at: now,
             #[cfg(feature = "vst")]
@@ -1851,6 +1881,10 @@ impl App {
             csound_refused: false,
             csound_owed: false,
             import_origins_owed: false,
+            blocked_samples: Vec::new(),
+            local_files_asked: false,
+            editing_source: None,
+            sample_grants_owed: false,
             refused_update_owed: false,
             evaluation_alerts: HashMap::new(),
             lint_status: None,
@@ -1929,6 +1963,7 @@ impl App {
             #[cfg(feature = "harness")]
             pin_frame_inputs: false,
             frame: Rect::default(),
+            score_pointer,
             regions: StudioRegions::default(),
             pointer: None,
             pointer_subcell: 0.0,

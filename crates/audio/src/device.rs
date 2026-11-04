@@ -24,6 +24,7 @@ pub use stream::audio_devices;
 #[cfg(feature = "test-support")]
 use stream::buffer_preference_error;
 pub use stream::input_retry_delay;
+pub use stream::prime_playback_host;
 use stream::rebase_frame_rate;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -731,28 +732,6 @@ enum AudioDeviceDetails {
 /// it and a drop on any other thread skips the revert.
 #[cfg(windows)]
 struct CallbackProAudio(Option<Option<crate::mmcss::ProAudioThread>>);
-
-/// The output callback's real-time class on Linux: `SCHED_FIFO`, the class
-/// of a plugin worker. The callback asks for it at its first call after a
-/// worker of the output got it, so no worker outranks the callback that
-/// waits for it. An output with no such worker keeps its priority.
-///
-/// The drop gives the class back. On the PulseAudio host the callback runs
-/// on the reader thread of the connection, which serves the process after
-/// the stream ends. The closure drops on that thread when the server deletes
-/// the stream. A drop on any other thread skips the demotion, as the drop of
-/// a Windows registration does.
-#[cfg(target_os = "linux")]
-struct CallbackRealTime {
-    frames: u32,
-    rate: u32,
-    asked: bool,
-    /// The promotion and the thread that made it.
-    promoted: Option<(
-        audio_thread_priority::RtPriorityHandle,
-        std::thread::ThreadId,
-    )>,
-}
 
 /// The underruns of an output on Windows, read from its playback clock: cpal
 /// reports no underrun for a WASAPI output.

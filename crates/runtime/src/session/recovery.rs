@@ -1033,7 +1033,7 @@ mod tests {
         let mut config = SessionConfig::default();
         config
             .score_sample_access
-            .permit_origin("https://example.invalid")
+            .permit_source("https://example.invalid")
             .unwrap();
         let mut session = Session::with_config(config).expect("session");
         let library = Arc::new(crate::samples::SampleLibrary::empty());

@@ -186,9 +186,12 @@ rustel samples cache
 rustel samples clear --dry-run
 ```
 
-Public HTTPS sample packs with CORS enabled load by default. Other access needs
-an explicit grant. See [Local samples](local-samples.md) and
-[Security](../SECURITY.md).
+A score loads samples only from an allowed source.
+`raw.githubusercontent.com`, `strudel.b-cdn.net`, `shabda.ndre.gr` and
+`cdn.freesound.org` are allowed from the start. `--allow-sample-origin` adds
+a domain or an address, and `--strict-sample-origins` turns off the four
+built-in sources. See
+[Local samples](local-samples.md) and [Security](../SECURITY.md).
 
 `samples cache` downloads the shipped packs for offline use. Repeat it to
 resume an interrupted download. `samples clear` removes all downloaded samples;

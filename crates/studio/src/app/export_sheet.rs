@@ -195,6 +195,7 @@ impl App {
                 self.ui_settings.max_polyphony,
                 self.worker.master().max_polyphony_override(),
                 &self.prefs.import_origins,
+                &self.prefs.sample_grants(),
                 self.csound_allowed,
             ),
             target,

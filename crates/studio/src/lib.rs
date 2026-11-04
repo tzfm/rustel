@@ -5,6 +5,7 @@
 //! terminal thread owns editing, input and drawing.
 
 pub mod app;
+mod background;
 mod bounded_file;
 mod catalogue;
 mod config;
@@ -67,9 +68,9 @@ pub mod worker;
 
 pub use app::{RecordingOptions, StudioOptions, run};
 pub use engine::{
-    StudioCapabilities, StudioConfig, StudioDeviceInfo, StudioDiagnostic, StudioDiagnosticLevel,
-    StudioEngine, StudioInstall, StudioSnapshot, StudioStop, StudioStopHandle, StudioTick,
-    StudioUpdate, StudioUpdateSendResult, try_send_update,
+    SampleGrants, StudioCapabilities, StudioConfig, StudioDeviceInfo, StudioDiagnostic,
+    StudioDiagnosticLevel, StudioEngine, StudioInstall, StudioSnapshot, StudioStop,
+    StudioStopHandle, StudioTick, StudioUpdate, StudioUpdateSendResult, try_send_update,
 };
 pub use piano::PianoSound;
 #[cfg(feature = "remote-control")]

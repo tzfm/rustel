@@ -1117,14 +1117,13 @@ fn query_score_text_has_no_implicit_module_or_sample_io_access() {
         let denied = run(&["query", "--json", "-e", source]);
         assert!(!denied.status.success(), "denied query exited 0");
         assert!(
-            String::from_utf8_lossy(&denied.stderr)
-                .contains("outside the permitted sample origins"),
+            String::from_utf8_lossy(&denied.stderr).contains("is not an allowed sample source"),
             "the denied capability was not reported for {source:?}: {}",
             String::from_utf8_lossy(&denied.stderr)
         );
     }
 
-    // --strict-sample-origins removes the parity default entirely: with no
+    // --strict-sample-origins removes the built-in sources: with no
     // grants at all, registration is refused before any URL is considered.
     let strict = run(&[
         "query",
@@ -1174,7 +1173,7 @@ fn query_score_text_has_no_implicit_module_or_sample_io_access() {
             "--allow-sample-origin",
             "file:///tmp",
         ],
-        "must be an http or https origin",
+        "not an http or https address",
     );
 }
 
@@ -8900,7 +8899,7 @@ fn a_refused_samples_import_is_reported_where_it_is_written() {
         .find(|line| {
             line["check"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("outside the permitted sample origins"))
+                .is_some_and(|message| message.contains("is not an allowed sample source"))
         })
         .unwrap_or_else(|| panic!("no refusal finding: {stdout}"));
     assert_eq!(refusal["check"]["line"], 2, "{refusal}");

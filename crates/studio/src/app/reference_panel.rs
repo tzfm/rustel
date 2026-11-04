@@ -17,6 +17,29 @@ pub(super) const CATALOGUE_REFRESH: Duration = Duration::from_millis(1_000);
 /// browser on its loading row for a full second.
 pub(super) const CATALOGUE_LOADING_REFRESH: Duration = Duration::from_millis(50);
 
+/// How long the loading cadence survives without the catalogue changing and
+/// without a download running. A manifest that hangs holds the loading state
+/// without progress, and rebuilding the catalogue twenty times a second then
+/// costs a slow machine most of a core while nothing new arrives.
+pub(super) const CATALOGUE_PROGRESS_WINDOW: Duration = Duration::from_secs(2);
+
+/// The catalogue refresh interval for this turn. While the library loads,
+/// follow it at [`CATALOGUE_LOADING_REFRESH`] for as long as the catalogue
+/// keeps changing or a download keeps running, and fall back to
+/// [`CATALOGUE_REFRESH`] once neither has happened for
+/// [`CATALOGUE_PROGRESS_WINDOW`].
+pub(super) fn catalogue_refresh_interval(
+    loading: bool,
+    downloading: bool,
+    since_progress: Duration,
+) -> Duration {
+    if loading && (downloading || since_progress <= CATALOGUE_PROGRESS_WINDOW) {
+        CATALOGUE_LOADING_REFRESH
+    } else {
+        CATALOGUE_REFRESH
+    }
+}
+
 /// The browser's `in` row grows one variant a channel once an input is
 /// open, so `s("in:1")` is a row to pick, not a number to know.
 pub(super) fn with_input_channels(
@@ -241,6 +264,7 @@ impl App {
         }
         #[cfg(feature = "vst")]
         if let Some(plugin) = preset_pick {
+            self.close_picked_plugin_call()?;
             self.open_plugin_presets(plugin);
         }
         self.dirty_frame = true;
@@ -458,15 +482,15 @@ impl App {
                 && caret <= range.end
                 && code.get(range.start.0..range.end.0) == Some(name.as_str())
                 && (code[range.end.0..].trim_start().starts_with('(')
-                    || (self.reference_scope_at(range.start).is_kabelsalat()
-                        && self
-                            .reference
-                            .lookup_in(name, ReferenceScope::Kabelsalat)
-                            .and_then(|index| self.reference.entry(index))
-                            .is_some_and(|entry| !entry.inserts_as_call())))
+                    || self.graph_value_at(name, range.start))
         });
         let Some((word, range)) = named_entry.cloned().or(enclosing).or(word) else {
-            let mut panel = ReferencePanel::browse_for(&self.reference, "");
+            let scope = self.reference_scope_at_caret();
+            let mut panel = if scope.is_hydra() {
+                ReferencePanel::browse_in(&self.reference, "", scope.browser())
+            } else {
+                ReferencePanel::browse_for(&self.reference, "")
+            };
             panel.snippets_last = !self.caret_on_blank_line();
             panel.refresh(&self.reference);
             self.set_reference_panel(Some(panel));
@@ -498,6 +522,24 @@ impl App {
         self.focus_panel(PanelKind::Reference);
         self.invalidate_maps();
         self.dirty_frame = true;
+    }
+
+    /// Whether `name` at `at` is a graph or Hydra value such as `sFreq` or
+    /// `o0`. Ctrl+D documents a value under the caret before the call
+    /// around it, as it does a callee.
+    fn graph_value_at(&self, name: &str, at: ByteOffset) -> bool {
+        let scope = self.reference_scope_at(at);
+        let scope = if scope.is_kabelsalat() {
+            ReferenceScope::Kabelsalat
+        } else if scope.is_hydra() {
+            ReferenceScope::Hydra
+        } else {
+            return false;
+        };
+        self.reference
+            .lookup_in(name, scope)
+            .and_then(|index| self.reference.entry(index))
+            .is_some_and(|entry| !entry.inserts_as_call())
     }
 
     fn open_argument_reference(&mut self, index: usize) {
@@ -547,6 +589,17 @@ impl App {
             next
         };
         self.reference_panel = next;
+        // A panel that opens can preview chords and scales, and those play
+        // on the piano bank, which decodes on first use: asking at the
+        // open gives the decode a browse's worth of head start, so the
+        // first preview does not wait it out and lose its turn. The
+        // engine's loader makes the ask idempotent - a sound already
+        // loaded or on its way stays as it is.
+        if self.reference_panel.is_some() {
+            let _ = self
+                .worker
+                .try_look_up_samples(super::previews::CHORD_PREVIEW_SOUND);
+        }
     }
 
     pub(super) fn handle_reference_key_with_modifiers(
@@ -1801,6 +1854,30 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn loading_cadence_needs_progress_or_a_download() {
+        let loading = catalogue_refresh_interval(true, false, Duration::ZERO);
+        assert_eq!(loading, CATALOGUE_LOADING_REFRESH);
+        let progressing = catalogue_refresh_interval(
+            true,
+            false,
+            CATALOGUE_PROGRESS_WINDOW - Duration::from_millis(1),
+        );
+        assert_eq!(progressing, CATALOGUE_LOADING_REFRESH);
+        let downloading = catalogue_refresh_interval(true, true, Duration::from_secs(60));
+        assert_eq!(downloading, CATALOGUE_LOADING_REFRESH);
+        let stalled = catalogue_refresh_interval(
+            true,
+            false,
+            CATALOGUE_PROGRESS_WINDOW + Duration::from_millis(1),
+        );
+        assert_eq!(stalled, CATALOGUE_REFRESH);
+        let idle = catalogue_refresh_interval(false, false, Duration::MAX);
+        assert_eq!(idle, CATALOGUE_REFRESH);
+    }
+
     mod catalogue {
         //! Tests for catalogue.
 

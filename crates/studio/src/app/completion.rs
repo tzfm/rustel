@@ -86,9 +86,17 @@ impl App {
     }
 
     /// A callee uses the namespace before its name. Its arguments can
-    /// switch namespace themselves, as `K` and `S` do.
+    /// switch namespace themselves, as `K`, `S` and `H` do. A Hydra
+    /// statement is Hydra code; see `hydra_scope.rs`.
     pub(super) fn reference_scope_at(&self, at: ByteOffset) -> ReferenceScope {
-        reference_scope(&self.editor().source(), at.0)
+        let source = self.editor().source();
+        #[cfg(feature = "hydra")]
+        if super::hydra_scope::in_hydra_code(&source, at.0, |name| {
+            self.reference.is_hydra_global(name)
+        }) {
+            return ReferenceScope::Hydra;
+        }
+        reference_scope(&source, at.0)
     }
 
     pub(super) fn reference_scope_at_caret(&self) -> ReferenceScope {
@@ -99,8 +107,8 @@ impl App {
     /// only members belong in the list behind that documentation.
     pub(super) fn reference_name_scope_at(&self, at: ByteOffset) -> ReferenceScope {
         let scope = self.reference_scope_at(at);
-        if scope.is_kabelsalat() && self.editor().source()[..at.0].trim_end().ends_with('.') {
-            ReferenceScope::KabelsalatMember
+        if self.editor().source()[..at.0].trim_end().ends_with('.') {
+            member_scope(scope)
         } else {
             scope
         }
@@ -108,8 +116,8 @@ impl App {
 
     fn chain_reference_scope(&self, range: &Range<ByteOffset>) -> ReferenceScope {
         let scope = self.reference_name_scope_at(range.start);
-        if scope.is_kabelsalat() && range.is_empty() {
-            ReferenceScope::KabelsalatMember
+        if range.is_empty() {
+            member_scope(scope)
         } else {
             scope
         }
@@ -837,8 +845,9 @@ impl App {
                     })
                     .is_some_and(|asked| asked != index),
                 ReferenceMode::Browse => {
-                    panel.scope != ReferenceScope::All
-                        && panel.scope != self.completion_scope_at_caret()
+                    let caret = self.completion_scope_at_caret();
+                    (!panel.scope.is_browser() && panel.scope != caret)
+                        || panel.scope.is_hydra() != caret.is_hydra()
                 }
             });
         let retarget = self.reference_panel.is_some()
@@ -909,6 +918,9 @@ impl App {
                         (None, None) if enclosing.is_some() => {
                             ReferencePanel::browse_in(&self.reference, "", scope)
                         }
+                        (None, None) if scope.is_hydra() => {
+                            ReferencePanel::browse_in(&self.reference, "", scope.browser())
+                        }
                         (None, None) => ReferencePanel::browse(&self.reference),
                     };
                     self.reference_anchor = None;
@@ -948,9 +960,9 @@ impl App {
                     anchor.word
                 )
             }
-            (Some(_), None) => format!(
+            (Some(panel), None) => format!(
                 "reference - {} entries; type to search",
-                self.reference.len() - self.reference.hidden_len()
+                self.reference.len_in(panel.scope) - self.reference.hidden_len_in(panel.scope)
             ),
             (None, _) => "reference closed".into(),
         };
@@ -980,6 +992,16 @@ impl App {
             .find('\n')
             .map_or(source.len(), |at| caret + at);
         source[start..end].trim().is_empty()
+    }
+}
+
+/// The namespace of a name written after a dot. Pattern methods share
+/// their namespace with pattern globals.
+fn member_scope(scope: ReferenceScope) -> ReferenceScope {
+    match scope {
+        ReferenceScope::Kabelsalat => ReferenceScope::KabelsalatMember,
+        ReferenceScope::Hydra => ReferenceScope::HydraMember,
+        other => other,
     }
 }
 
