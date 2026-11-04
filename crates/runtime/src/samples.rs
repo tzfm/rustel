@@ -57,15 +57,16 @@ pub use catalog::{
 use manifests::*;
 
 mod codecs;
+mod decode_cache;
 mod folders;
 mod font_queue;
 mod local_names;
 mod manifest_queue;
 mod soundfonts;
 mod speech;
+use codecs::codec_for;
 #[cfg(test)]
 use codecs::decode_ogg;
-use codecs::{codec_for, decode_guarded};
 pub use folders::without_verbatim_prefix;
 #[cfg(test)]
 use folders::{

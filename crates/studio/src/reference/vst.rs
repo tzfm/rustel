@@ -75,6 +75,11 @@ pub struct VstTab {
     /// The App owes the tab the presets of the open plugin: the plugin
     /// opened, or the plugin list changed.
     presets_due: bool,
+    /// The presets show because a plugin pick opened them. The read of the
+    /// preset folders can answer after the pick: an answer of no preset at
+    /// all moves the view to the parameters, so a pick never leaves the
+    /// reader in an empty half. One ask only.
+    presets_picked: bool,
     /// The parameter groups of the open plugin, in the order the plugin
     /// gives them: the name and the number of parameters.
     groups: Vec<(String, usize)>,
@@ -348,6 +353,14 @@ impl VstTab {
     pub fn set_presets(&mut self, presets: Vec<String>) {
         self.presets_due = false;
         self.keeping_place(|tab| tab.presets = presets);
+        // The pick of a plugin name waits for this answer. No preset at
+        // all: the parameters take the place of the empty half.
+        if self.presets_picked {
+            self.presets_picked = false;
+            if self.inside == Some(VstSection::Presets) && self.presets.is_empty() {
+                self.show_section(VstSection::Params);
+            }
+        }
     }
 
     /// The presets came from a read that is past: the next sync asks the
@@ -540,6 +553,15 @@ impl VstTab {
         self.selected = 0;
         self.scroll.set(0);
         true
+    }
+
+    /// The presets of the open plugin show the way a plugin pick leaves
+    /// them: the pick waits for the read of the preset folders, and when
+    /// its answer holds no preset, [`Self::set_presets`] shows the
+    /// parameters in the place of the empty half.
+    pub fn show_picked_presets(&mut self) {
+        self.show_section(VstSection::Presets);
+        self.presets_picked = true;
     }
 
     /// Tab in the half of an open plugin: the other half of the plugin
@@ -1076,6 +1098,44 @@ mod tests {
                 PluginRow::Section(VstSection::Params)
             ]
         );
+    }
+
+    /// The pick of a plugin name opens the presets of the plugin. The read
+    /// of the preset folders can answer after the pick: an answer of no
+    /// preset at all moves the view to the parameters, so the pick never
+    /// leaves the reader in an empty half. An answer with presets, a later
+    /// read, and a half the reader walked into move nothing.
+    #[test]
+    fn a_pick_with_no_preset_to_answer_shows_the_parameters() {
+        use PluginRow::Preset;
+        let mut tab = VstTab::default();
+        tab.set_plugins(vec![synth()]);
+        tab.open_named("Synth".into());
+
+        // The answer holds no preset: the parameters take the place of the
+        // empty half, with the search empty and the cursor on its first
+        // row.
+        tab.show_picked_presets();
+        tab.set_presets(Vec::new());
+        assert_eq!(tab.inside(), Some(VstSection::Params));
+        assert_eq!(tab.query(), "");
+        assert_eq!(tab.row(tab.selected), Some(PluginRow::Param(0)));
+
+        // The reader left the half before the answer: the answer moves
+        // nothing.
+        tab.show_picked_presets();
+        assert!(tab.leave());
+        tab.set_presets(Vec::new());
+        assert_eq!(tab.inside(), None, "the reader stands in the plugin list");
+
+        // An answer with presets keeps the half, and a later read that
+        // empties the folder moves nothing: the ask was answered.
+        tab.show_picked_presets();
+        tab.set_presets(vec!["Lead".into()]);
+        assert_eq!(tab.inside(), Some(VstSection::Presets));
+        assert_eq!(tab.row(tab.selected), Some(Preset(0)));
+        tab.set_presets(Vec::new());
+        assert_eq!(tab.inside(), Some(VstSection::Presets));
     }
 
     /// The count line of the tab says where the read of the plugin folders

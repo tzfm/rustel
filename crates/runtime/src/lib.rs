@@ -159,7 +159,7 @@ pub use samples::{
 };
 pub use score_import::{ScoreImportAccess, import_origin};
 pub use session::{
-    EvaluateSource, PLUGIN_DIAGNOSTIC, PREVIEW_ONSET_ID_FLAG, RuntimeError,
+    DEFAULT_HORIZON, EvaluateSource, PLUGIN_DIAGNOSTIC, PREVIEW_ONSET_ID_FLAG, RuntimeError,
     SAMPLE_AWAITED_DIAGNOSTIC, SAMPLE_LOADING_DIAGNOSTIC, Session, SessionConfig,
     SessionDiagnostic, VOICE_NOTICE_DIAGNOSTIC, WindowSound,
 };

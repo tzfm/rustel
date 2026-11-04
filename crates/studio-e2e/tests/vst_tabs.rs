@@ -501,6 +501,43 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
     vst::host().set_preset_folder(empty.path().to_path_buf());
 }
 
+/// The pick of a plugin name opens the presets of the plugin, one Enter
+/// from a choice. A plugin the read of the preset folders holds no preset
+/// for goes to its parameters instead, where Enter picks one of them: the
+/// panel never stands in a half that offers nothing. The pick into a call
+/// open at its bracket closes the call.
+#[test]
+fn a_pick_of_a_plugin_with_no_preset_opens_its_parameters() {
+    let mut studio = hermetic();
+    let folder = tempfile::tempdir().expect("plugin folder");
+    rustel_vst3_fixture::install(folder.path());
+    vst::pin_standard_folders(vec![folder.path().to_path_buf()]);
+    // The preset root holds no file of the plugin.
+    let presets = tempfile::tempdir().expect("empty preset root");
+    vst::host().set_preset_folder(presets.path().to_path_buf());
+
+    // The call open at its bracket: the pick writes the name and closes
+    // the call, so the reader does not have to type the bracket.
+    let text = "$: s(\"bd\").vst(";
+    complete_after(&mut studio, text, ".vst(");
+    wait_for_row(&mut studio, "1 of 1 plugins");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    assert_eq!(studio.score(), "$: s(\"bd\").vst(\"Rustel Fixture\")");
+
+    // The load gives the plugin its class, the read of the preset folders
+    // answers no preset, and the parameters take the place of the empty
+    // half.
+    wait_for_row(&mut studio, "4 parameters of Rustel Fixture");
+    assert_eq!(
+        studio.status(),
+        "plugin parameters - Enter adds the choice to this call"
+    );
+    let rows = studio.rows();
+    row_containing(&rows, "Rustel Fixture > parameters");
+    row_containing(&rows, "gain  Gain");
+}
+
 /// Switching from plugin-name completion to the vst tab keeps the plugin
 /// of the call open. Ctrl+F in a call opens the parameters of its plugin
 /// as the view of the tab, so Enter picks from them, regardless of the

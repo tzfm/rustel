@@ -17,12 +17,13 @@ use std::arch::x86_64::{
     _mm256_storeu_ps, _mm256_sub_ps,
 };
 
-use super::StaticSupersawKernel;
+use super::{StaticSupersawKernel, SupersawKernelKind};
 use crate::scalar::{saw_blep, saw_step};
 
 const LANES_PER_VECTOR: usize = 8;
 
 pub(super) const AVX2: StaticSupersawKernel = StaticSupersawKernel {
+    kind: SupersawKernelKind::Avx2,
     render: avx2_render_static_lanes,
     minimum_lanes: LANES_PER_VECTOR,
 };

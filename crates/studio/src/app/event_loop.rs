@@ -208,12 +208,13 @@ impl App {
             self.auto_evaluate_due = false;
             self.auto_evaluate();
         }
-        let catalogue_refresh = if self.library_loading {
-            CATALOGUE_LOADING_REFRESH
-        } else {
-            CATALOGUE_REFRESH
-        };
+        let catalogue_refresh = catalogue_refresh_interval(
+            self.library_loading,
+            self.downloads_active(),
+            now.duration_since(self.catalogue_progress_at),
+        );
         if self.worker.poll_catalogue() {
+            self.catalogue_progress_at = now;
             self.install_catalogue();
         }
         if now.duration_since(self.catalogue_refreshed_at) >= catalogue_refresh {
@@ -343,6 +344,16 @@ impl App {
         &mut self,
         terminal: &mut TerminalSession,
     ) -> Result<(), RuntimeError> {
+        // This thread paints; the audio callback and the engine producer keep
+        // their deadlines. On a machine without spare cores the frame loop
+        // stands below them (see `background`). The host connection must be
+        // built BEFORE the demotion: this loop's probe threads are born
+        // demoted, the connection thread inherits its creator's priority,
+        // and the audio callback rides that thread - a host first built
+        // below would put the sound below the workers this demotion is
+        // meant to order below the sound.
+        rustel_audio::prime_playback_host();
+        crate::background::demote();
         let mut raw_paste_continuation = false;
         while !self.quit {
             // Art coloured by the clock or the mix is a moving picture:
@@ -391,6 +402,7 @@ impl App {
             // above the loop's own 60 is allowed to stand: it can cost
             // the terminal, never a note.
             let frame_interval = self.ui_settings.frame_rate.interval();
+            let paced_interval = frame_interval * u32::from(self.frame_pace);
             let animating = self.is_playing()
                 // The piano indicator fades at the configured frame rate,
                 // including before the first note, without starting transport.
@@ -444,13 +456,19 @@ impl App {
                 // Set before drawing, so the draw spends the interval rather
                 // than extending it.
                 self.next_frame =
-                    next_frame_deadline(self.next_frame, Instant::now(), frame_interval);
+                    next_frame_deadline(self.next_frame, Instant::now(), paced_interval);
                 // Sampling the meter immediately before painting is what
                 // makes the peak per frame rather than per loop turn: the
                 // engine folds every producer reading in with a maximum, and
                 // reading it resets that accumulator.
                 self.observe_master(now);
+                let draw_started = Instant::now();
                 self.draw(terminal)?;
+                (self.frame_pace, self.frame_overruns, self.frame_cheaps) = paced_after(
+                    (self.frame_pace, self.frame_overruns, self.frame_cheaps),
+                    draw_started.elapsed(),
+                    frame_interval,
+                );
                 self.dirty_frame = false;
                 self.input_dirty = false;
             }
@@ -472,7 +490,7 @@ impl App {
                     self.input_dirty,
                     wait_from,
                     self.next_frame,
-                    frame_interval,
+                    paced_interval,
                 ),
                 midi_wait_cap(
                     self.pads.open_count(),
@@ -726,6 +744,53 @@ pub(super) fn pacing_wait(
     } else {
         IDLE_POLL
     }
+}
+
+/// The most the animated cadence is stretched away from the configured frame
+/// rate: eight times the interval, the thriftiest rung of the frame-rate
+/// ladder.
+pub(super) const MAX_FRAME_PACE: u8 = 8;
+/// Consecutive over budget draws before the animated cadence steps slower.
+pub(super) const FRAME_OVERRUN_LIMIT: u8 = 6;
+/// Consecutive cheap draws before the animated cadence steps back faster.
+pub(super) const FRAME_QUICK_LIMIT: u8 = 24;
+
+/// The animated pace after one draw, from `(pace, overruns, cheap draws)` and
+/// how long the draw took against the configured `interval`.
+///
+/// A draw that costs more than the configured interval cannot run at the
+/// configured rate without spending a core on repaints; after a run of them
+/// the animated cadence doubles until it fits, which on a small machine hands
+/// the core back to the audio path. A draw a quarter of the paced budget has
+/// room for a faster rung, taken once it has held for a while so a cheap
+/// moment does not bounce the rate up and down. Only the animated repaint is
+/// paced: a keystroke still paints at once.
+pub(super) fn paced_after(
+    (pace, overruns, cheap): (u8, u8, u8),
+    draw: Duration,
+    interval: Duration,
+) -> (u8, u8, u8) {
+    let paced = interval * u32::from(pace);
+    if draw > interval {
+        // `overruns` resets at the limit, so it stays far below the
+        // addition's ceiling - at the last pace rung included, where the
+        // pace can no longer grow and a machine that overruns every frame
+        // would otherwise count past the ceiling.
+        if overruns + 1 >= FRAME_OVERRUN_LIMIT {
+            if pace < MAX_FRAME_PACE {
+                return ((pace * 2).min(MAX_FRAME_PACE), 0, 0);
+            }
+            return (pace, 0, 0);
+        }
+        return (pace, overruns + 1, 0);
+    }
+    if pace > 1 && draw * 4 <= paced {
+        if cheap + 1 >= FRAME_QUICK_LIMIT {
+            return (pace / 2, 0, 0);
+        }
+        return (pace, 0, cheap + 1);
+    }
+    (pace, 0, 0)
 }
 
 /// The longest the loop may wait while a MIDI press can act, `since_drain`
@@ -1156,6 +1221,41 @@ mod tests {
                 after.contains("bd*4"),
                 "what was typed is on disk: {after:?}"
             );
+        }
+
+        /// A run of draws that cost more than the configured interval halves
+        /// the animated rate, because running at the configured rate would
+        /// spend a core on repaints.
+        #[test]
+        fn overruns_slow_the_animated_cadence() {
+            let mut state = (1, 0, 0);
+            for _ in 0..FRAME_OVERRUN_LIMIT {
+                state = paced_after(state, SIXTY * 2, SIXTY);
+            }
+            assert_eq!(state.0, 2, "the pace doubled");
+            state = (8, 0, 0);
+            state = paced_after(state, SIXTY * 2, SIXTY);
+            assert_eq!(state.0, 8, "the pace is already at its floor");
+        }
+
+        /// Cheap draws hold for a while and then win a faster rung back, so
+        /// a cheap moment does not bounce the rate up and down.
+        #[test]
+        fn a_run_of_cheap_draws_wins_the_rate_back() {
+            let mut state = (4, 0, 0);
+            let cheap = SIXTY / 4;
+            for _ in 0..FRAME_QUICK_LIMIT - 1 {
+                state = paced_after(state, cheap, SIXTY);
+                assert_eq!(state.0, 4, "the pace holds while draws run cheap");
+            }
+            state = paced_after(state, cheap, SIXTY);
+            assert_eq!(state.0, 2, "the pace stepped back down");
+            // A draw that neither overruns nor is a quarter of the paced
+            // budget resets the run instead of letting it drift. At pace 2
+            // that window is a draw between a quarter and all of the
+            // configured interval.
+            let state = paced_after((2, 0, FRAME_QUICK_LIMIT - 2), SIXTY * 3 / 4, SIXTY);
+            assert_eq!(state, (2, 0, 0), "an ordinary draw resets the run");
         }
     }
 

@@ -75,7 +75,7 @@ pub use device::{
     AssetQueuePressureSnapshot, AudioDeviceInfo, AudioInput, CallbackTripwireArmError,
     DevicePlaybackError, LiveAnalysisSnapshot, LiveDeviceMemory, LiveDeviceReport, LiveReverbBatch,
     LiveScalarDevice, RecordCapture, RecordCaptureError, SILENT_OUTPUT_NAME, ScalarDevice,
-    audio_device_inventory, audio_devices, input_retry_delay,
+    audio_device_inventory, audio_devices, input_retry_delay, prime_playback_host,
 };
 pub use device_facts::{
     AudioHost, AudioInputFacts, AudioOutputFacts, AudioSampleFormat, AudioStreamFacts,

@@ -1,5 +1,7 @@
 use super::*;
 use crate::pool::{JobKind, JoinGuard, PoolHandle};
+use crate::sample::{SampleBank, SampleResamplingMode};
+use crate::supersaw_kernel::StaticSupersawKernel;
 
 /// On x86_64, flush subnormal inputs and results to zero so quiet filter and
 /// reverb tails avoid denormal arithmetic costs. These flags are per-thread;
@@ -30,6 +32,235 @@ pub(crate) fn enable_denormal_flush() {
             }
         }
     }
+}
+
+/// True when the voice runs no optional ladder at all: a stereo sample or
+/// oscillator with no modulators, no FM route, no live sliders, no fades,
+/// no filters, no FX of any kind, no insert routing and no visual capture.
+/// Sends it may carry: the tight path accumulates them.
+///
+/// Every frame of such a voice is the source, the envelope, three gains,
+/// the panner, its sends and the mix - which is exactly what
+/// [`render_plain_voice`] computes, operation for operation as the
+/// general body does with every gate closed. The classification is
+/// recomputed each render because steals and polyphony fades change a
+/// voice's ladders mid-life.
+fn plain_sample_voice(v: &Voice) -> bool {
+    matches!(
+        v.source,
+        VoiceSource::Sample { .. } | VoiceSource::Oscillator { .. } | VoiceSource::Supersaw { .. }
+    ) && v.controls.noise == 0.0
+        && v.filters_right.is_some()
+        && !v.has_filters
+        && !v.has_pre_distort_fx
+        && !v.has_param_modulators
+        && v.pitch_quantum_skip == 0
+        && v.fm_state.is_none()
+        && v.controls.fm.is_none()
+        && v.live_fm_index.binding == 0
+        && v.live_cutoff.binding == 0
+        && v.live_resonance.binding == 0
+        && v.live_gain.binding == 0
+        && v.cut_fade_frame.is_none()
+        && v.polyphony_fade_frame.is_none()
+        && !v.through_insert
+        && v.controls.vibrato.is_none()
+        && v.controls.pitch_env.is_none()
+        && v.controls.tremolo.is_none()
+        && v.controls.phaser.is_none()
+        && v.controls.vowel.is_none()
+        && v.controls.distort.is_none()
+        && v.compressor.is_none()
+        && v.controls.compressor.is_none()
+        && v.limiter.is_none()
+        && v.fx_stage_state.is_none()
+        && v.kabel.is_none()
+        && v.stretch.is_none()
+        && v.controls.stretch.is_none()
+        && v.transient.is_none()
+        && v.controls.bus.is_none()
+        && v.ui_visuals == 0
+}
+
+/// The tight path a plain voice takes, one frame at a time.
+///
+/// Kept out of line so it earns its own registers: the general body in
+/// [`ScalarBackend::process_segment`] is so wide that a plain voice paid
+/// its stack spills every frame, plain or not. The arithmetic here is the
+/// general body's with every gate closed, in the same order: skips are
+/// only identities (a multiply by one, an add the full path also makes),
+/// so the frames are bit for bit what the general body produces. A plain
+/// voice is a sample or an oscillator; sends it carries are accumulated
+/// here, so a room or a delay does not by itself push a voice off the
+/// path.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn render_plain_voice(
+    v: &mut Voice,
+    bank: &SampleBank,
+    tables: &PeriodicWaveTables,
+    supersaw_kernel: Option<StaticSupersawKernel>,
+    resampling: SampleResamplingMode,
+    abs: u64,
+    i: usize,
+    sr: f64,
+    t: f32,
+    blocks: &mut [[[f32; crate::reverb::REVERB_BLOCK]; 2]],
+    sends: &mut [[[f32; crate::reverb::REVERB_BLOCK]; 2]],
+    orbit_inputs: &mut [[f32; 2]],
+    piano_mix: &mut [[f32; crate::reverb::REVERB_BLOCK]; 2],
+) {
+    let env = ScalarBackend::envelope(t, v.duration_secs, v.controls.envelope, v.gate_value);
+    let (wave_l, wave_r) = match &mut v.source {
+        VoiceSource::Sample {
+            sample,
+            position,
+            increment,
+            reversed,
+            delay_frames,
+            loop_frames,
+        } => {
+            // The general body reads its playback step through the
+            // per-quantum pitch hold; a plain voice holds no pitch shaper,
+            // so its step is the increment itself (multiplying by the held
+            // one is an exact identity).
+            if bank.get(*sample).is_none() {
+                // The slot was emptied under the voice - an uninstall
+                // landed. The voice ends with the block, as the general
+                // body ends it.
+                v.source_gone = true;
+                (0.0, 0.0)
+            } else if *delay_frames > 0 {
+                *delay_frames -= 1;
+                (0.0, 0.0)
+            } else if let Some((loop_start, loop_end)) = *loop_frames
+                && loop_end > loop_start
+                && bank.get(*sample).is_some_and(|decoded| {
+                    *increment > loop_end.min(decoded.frames() as f64) - loop_start
+                })
+            {
+                (0.0, 0.0)
+            } else {
+                let wave = bank
+                    .get(*sample)
+                    .and_then(|decoded| {
+                        if *reversed {
+                            let last = (decoded.frames().max(1) - 1) as f64;
+                            let read = last - *position;
+                            if read < 0.0 {
+                                return None;
+                            }
+                            decoded.stereo_at_reversed_with_mode(read, resampling)
+                        } else {
+                            decoded.stereo_at_with_mode(*position, resampling)
+                        }
+                    })
+                    .unwrap_or((0.0, 0.0));
+                *position += *increment;
+                if let Some((loop_start, loop_end)) = loop_frames
+                    && *position >= *loop_end
+                    && *loop_end > *loop_start
+                {
+                    *position -= *loop_end - *loop_start;
+                }
+                wave
+            }
+        }
+        VoiceSource::Oscillator {
+            table_selection,
+            phase,
+            partial_limit,
+        } => {
+            // No FM route and no detune: both offsets the general body
+            // passes are exact zeroes, and adding or multiplying by them
+            // is an exact identity.
+            let wave = oscillator_sample(
+                tables,
+                &v.controls,
+                *table_selection,
+                phase,
+                partial_limit,
+                v.freq_hz,
+                0.0,
+                1.0,
+                sr,
+            );
+            (wave, wave)
+        }
+        // The supersaw's begin gate: no output and no phase advance until
+        // the gate opens, exactly as the general body guards it.
+        VoiceSource::Supersaw { .. }
+            if !lfo_quantum_open(abs & !127, sr, v.controls.worklet_begin_secs) =>
+        {
+            (0.0, 0.0)
+        }
+        VoiceSource::Supersaw { plan, phases } => {
+            let (mut gain_l, mut gain_r) = plan.pan_gains(0.0);
+            let freq = (v.freq_hz + 0.0) * 1.0;
+            // A plain voice carries no spread modulator, so the spread is
+            // static and the fast kernel takes it when this machine has
+            // one.
+            if let Some(kernel) = supersaw_kernel
+                && kernel.supports(plan.count)
+            {
+                // SAFETY: the kernel was selected only after its CPU
+                // prerequisites were detected, and both arrays have
+                // MAX_UNISON entries while count is clamped to that bound.
+                unsafe {
+                    kernel.render(
+                        phases,
+                        &plan.detune_ratios,
+                        plan.count,
+                        freq,
+                        sr as f32,
+                        (gain_l, gain_r),
+                    )
+                }
+            } else {
+                let mut left = 0.0f32;
+                let mut right = 0.0f32;
+                for (n, phase) in phases.iter_mut().enumerate().take(plan.count) {
+                    let ratio = plan.detune_ratios[n];
+                    let voice_freq = freq * ratio;
+                    let dt = saw_step(voice_freq / sr as f32);
+                    let value = saw_blep(*phase, dt);
+                    left += value * gain_l;
+                    right += value * gain_r;
+                    *phase = wrap_phase(f64::from(*phase + dt)) as f32;
+                    std::mem::swap(&mut gain_l, &mut gain_r);
+                }
+                (left, right)
+            }
+        }
+        _ => return,
+    };
+    let scale = v.amplitude_scale * env;
+    let (left, right) = (wave_l * scale, wave_r * scale);
+    let (left, right) = stereo_pan(left, right, v.pan_x);
+    let post_gain = v.controls.postgain;
+    let (left, right) = (left * post_gain, right * post_gain);
+    // The sends tap the voiced signal after the chain's gain, exactly
+    // where the general body taps them; the modulation adds are the zero
+    // pair's, an exact identity on a wet value above zero.
+    let delay_wet = (v.delay_wet + 0.0).max(0.0);
+    if delay_wet > 0.0 && v.delay_wet > 0.0 {
+        orbit_inputs[v.orbit][0] += left * delay_wet;
+        orbit_inputs[v.orbit][1] += right * delay_wet;
+    }
+    let reverb_wet = (v.reverb_wet + 0.0).max(0.0);
+    if reverb_wet > 0.0 && v.reverb_wet > 0.0 {
+        sends[v.orbit][0][i] += left * reverb_wet;
+        sends[v.orbit][1][i] += right * reverb_wet;
+    }
+    let dry = v.dry_gain + 0.0;
+    let (left, right) = (left * dry, right * dry);
+    let mix = if v.piano {
+        piano_mix
+    } else {
+        &mut blocks[v.orbit]
+    };
+    mix[0][i] += left;
+    mix[1][i] += right;
 }
 
 impl ScalarPressureState {
@@ -1479,6 +1710,7 @@ impl ScalarBackend {
                     ui_visuals: e.ui_visuals,
                     preview_epoch: e.controls.preview_epoch,
                     piano: e.controls.piano,
+                    plain: false,
                     onset_lead: e.onset_lead,
                     distort_curve: e.controls.distort.map(|d| d.curve(d.shape())),
                     delay_wet,
@@ -1757,6 +1989,19 @@ impl ScalarBackend {
         // The GainNode on the delay's feedback edge is shared in the same
         // way, and its `gain` AudioParam is a-rate too.
         let mut delay_feedback_mods = [0.0f32; MAX_ORBITS];
+        // Tight-path classification, after every activation of this render:
+        // a steal or a polyphony fade lands its ladders on a voice that
+        // was plain until then, and the classification has to see them.
+        // A field read, not a method: this late, `self` is already split
+        // across the block pipeline's borrows.
+        #[cfg(test)]
+        let plain_disabled = self.disable_plain_path;
+        #[cfg(not(test))]
+        let plain_disabled = false;
+        for voice in &mut self.voices {
+            voice.plain = !plain_disabled && plain_sample_voice(voice);
+        }
+        let any_plain = self.voices.iter().any(|voice| voice.plain);
         // Per-orbit block pipeline: voices, delay and reverb returns
         // accumulate into ≤128-frame per-orbit buffers (the reverb is a
         // block convolution on WebAudio's 128-frame quantum), then the duck
@@ -1899,416 +2144,426 @@ impl ScalarBackend {
                     delay_time_mods.fill(0.0);
                     delay_feedback_mods.fill(0.0);
                 }
-                for v in &mut self.voices {
-                    if abs < v.graph_start_frame {
-                        continue;
-                    }
-                    let sbd_pre_onset =
-                        abs < v.start_frame && matches!(v.source, VoiceSource::Sbd { .. });
-                    // A plugin chain gets no value before the onset. That
-                    // value is no sound, and with it the chain is not
-                    // silent at the first frame of the note.
-                    if abs < v.start_frame && (!sbd_pre_onset || v.through_insert) {
-                        continue;
-                    }
-                    if !sbd_pre_onset && v.fm_state.is_some() && abs & 127 == 0 {
-                        let state = v.fm_state.as_deref_mut().expect("FM state must be present");
-                        if state.quantum_skip > 0 {
-                            let fm = v.controls.fm.expect("FM state requires FM controls");
-                            fm_advance(
-                                fm,
-                                v.freq_hz,
-                                &mut state.phases,
-                                &mut state.noise,
-                                u32::from(state.quantum_skip),
-                                tables,
-                                sample_rate,
-                            );
-                            state.quantum_skip = 0;
-                        }
-                    }
-                    if !sbd_pre_onset && v.pitch_quantum_skip > 0 && abs & 127 == 0 {
-                        v.pitch_quantum_skip = 0;
-                    }
-                    // The oscillator, noise source, and their automation do
-                    // not advance before `start_frame`. Only the connected
-                    // WaveShaper processes its zero input. Downstream nodes do
-                    // process that value, so use onset-time controls while the
-                    // source clock remains parked.
-                    let t = if sbd_pre_onset {
-                        0.0
-                    } else {
-                        ((abs - v.start_frame) as f32 + v.onset_lead) / sr as f32
-                    };
-                    if t >= v.stop_secs {
-                        continue;
-                    }
-                    let env = Self::envelope(t, v.duration_secs, v.controls.envelope, v.gate_value);
-                    // lfo()/env() modulators: each rides its param
-                    // additively. LFO phases free-run from the
-                    // onset-aligned phase0.
-                    // Modulators only run on 128-frame context quanta
-                    // starting strictly after the onset (the begin gate), so
-                    // each note opens unmodulated for up to one quantum, and
-                    // the envelope clock reads quantum starts.
-                    let quantum_start = abs & !127;
-                    // Compare against the fractional onset, not its rounded
-                    // frame. An onset at frame 127.6 rounds to 128 but must
-                    // still open the transient gate at quantum 128.
-                    let transient_open =
-                        (quantum_start as f64) > v.start_frame as f64 - f64::from(v.onset_lead);
-                    // Filter LFOs stop contributing at the hap's hold end.
-                    // Other modulators can run until release ends. Neither end
-                    // is based on the sample slice's potentially longer duration.
-                    let filter_lfo_alive =
-                        lfo_quantum_alive(quantum_start, sr, v.controls.filter_lfo_end_secs);
-                    // LFOs and the pulse, wavetable and supersaw oscillators
-                    // share the f32-rounded begin gate. The transient shaper
-                    // uses the fractional-frame comparison above instead.
-                    let source_open =
-                        lfo_quantum_open(quantum_start, sr, v.controls.worklet_begin_secs);
-                    let lfo_live = source_open
-                        && lfo_quantum_alive(quantum_start, sr, v.controls.lfo_end_secs);
-                    let mut mod_adds = if v.has_param_modulators && lfo_live {
-                        Some(ModAdds::default())
-                    } else {
-                        None
-                    };
-                    let note_alive = note_end_alive(
-                        quantum_start,
-                        v.start_frame,
-                        v.onset_lead,
-                        v.hap_duration_secs,
-                        v.controls.modulator_release_secs,
-                        sr,
-                    );
-                    // Parameter and bus modulators stop at hold plus release;
-                    // their target parameters then keep their base values.
-                    if let Some(mod_adds) = mod_adds.as_mut() {
-                        // The f32-rounded gate can open in the quantum that
-                        // contains the onset, before `start_frame`. Keep the
-                        // subtraction signed and clamp envelope time to zero.
-                        let t_env = (((quantum_start as f64 - v.start_frame as f64) as f32
-                            + v.onset_lead)
-                            / sr as f32)
-                            .max(0.0);
-                        // Two passes. A modulator aimed at a FILTER's own LFO
-                        // has to be summed before that LFO is evaluated -
-                        // WebAudio gets the ordering for free by processing a
-                        // node that feeds an AudioParam ahead of the node
-                        // owning it, and here it has to be arranged. Each
-                        // modulator appears in exactly one pass, so phases
-                        // still advance once per sample.
-                        // A bus modulator's signal is another pattern's audio.
-                        // `connectBusModulator` sums the bus into a
-                        // `ConstantSourceNode` offset, scales by depth/0.3,
-                        // clamps to the param's range, and adds to the param.
-                        // A stereo node feeding an AudioParam is down-mixed,
-                        // so the two channels average.
-                        for slot in v.controls.bus_mods.iter().flatten() {
-                            let bus = bus_now[usize::from(slot.bus)];
-                            let signal = (bus[0] + bus[1]) * 0.5 + slot.dc;
-                            let value = (signal * slot.depth).clamp(slot.min, slot.max);
-                            mod_adds.bucket_at(slot.fxi, slot.target, value, slot.param_base);
-                        }
-                        for first_pass in [true, false] {
-                            for (slot, phase) in
-                                v.controls.lfos.iter().zip(v.mod_lfo_phases.iter_mut())
-                            {
-                                let Some(lfo) = slot else { continue };
-                                if ModAdds::targets_another_modulator(lfo.target) != first_pass {
-                                    continue;
-                                }
-                                // Dead past the hold end; see `filter_lfo_alive`.
-                                if lfo.filter.is_some() && !filter_lfo_alive {
-                                    continue;
-                                }
-                                // Every one of these is block-rate, so
-                                // modulation of them is latched per
-                                // quantum.
-                                let mut depth = lfo.depth;
-                                let mut dcoffset = lfo.dcoffset;
-                                let mut skew = lfo.skew;
-                                let mut curve = lfo.curve;
-                                let mut rate = lfo.frequency_hz;
-                                if let Some(kind) = lfo.filter {
-                                    let hold = v.mod_param_hold.filter[kind.index()];
-                                    depth += hold.depth;
-                                    dcoffset += hold.dc;
-                                    skew += hold.skew;
-                                }
-                                if let Some(hold) = lfo
-                                    .id
-                                    .and_then(|id| v.mod_param_hold.lfo.get(usize::from(id)))
-                                {
-                                    depth += hold.depth;
-                                    dcoffset += hold.dcoffset;
-                                    skew += hold.skew;
-                                    curve += hold.curve;
-                                    rate += hold.rate;
-                                }
-                                let wave = lfo_waveshape_f64(lfo.shape, *phase, skew);
-                                let raw = (wave as f32 + dcoffset) * depth;
-                                let shaped = raw.powf(curve);
-                                // The reference computes the sample in f64.
-                                // A small negative value rounds to zero in
-                                // f32 and hides the NaN.
-                                let nan = shaped.is_nan()
-                                    || (raw == 0.0 && {
-                                        let exact = (wave + f64::from(dcoffset)) * f64::from(depth);
-                                        exact < 0.0 && exact.powf(f64::from(curve)).is_nan()
-                                    });
-                                // A NaN sample makes the summed param NaN.
-                                // The param then takes its default value.
-                                let value = if nan {
-                                    nan_param_default(lfo.target, &v.source) - lfo.param_base
-                                } else {
-                                    js_clamp(shaped, lfo.min, lfo.max)
-                                };
-                                mod_adds.bucket_at(lfo.fxi, lfo.target, value, lfo.param_base);
-                                *phase = wrap_phase(*phase + f64::from(rate) / sr);
+                macro_rules! voice_sample_pass {
+                    ($plain:expr) => {
+                        for v in &mut self.voices {
+                            if abs < v.graph_start_frame {
+                                continue;
                             }
-                            for env_mod in v.controls.envs.iter().flatten() {
-                                if ModAdds::targets_another_modulator(env_mod.target) != first_pass
-                                {
-                                    continue;
+                            let sbd_pre_onset =
+                                abs < v.start_frame && matches!(v.source, VoiceSource::Sbd { .. });
+                            // A plugin chain gets no value before the onset. That
+                            // value is no sound, and with it the chain is not
+                            // silent at the first frame of the note.
+                            if abs < v.start_frame && (!sbd_pre_onset || v.through_insert) {
+                                continue;
+                            }
+                            if !sbd_pre_onset && v.fm_state.is_some() && abs & 127 == 0 {
+                                let state =
+                                    v.fm_state.as_deref_mut().expect("FM state must be present");
+                                if state.quantum_skip > 0 {
+                                    let fm = v.controls.fm.expect("FM state requires FM controls");
+                                    fm_advance(
+                                        fm,
+                                        v.freq_hz,
+                                        &mut state.phases,
+                                        &mut state.noise,
+                                        u32::from(state.quantum_skip),
+                                        tables,
+                                        sample_rate,
+                                    );
+                                    state.quantum_skip = 0;
                                 }
-                                // begin==0 never satisfies the envelope's
-                                // begin-changed trigger check, so a note
-                                // starting at context time zero stays idle.
-                                // The browser's envelope processor writes
-                                // nothing for a block whose start is at or
-                                // before the trigger, and triggers on the
-                                // first block after it.
-                                let value = if v.start_frame == 0 || t_env <= 0.0 {
-                                    0.0
-                                } else {
-                                    let hold = env_mod
-                                        .id
-                                        .and_then(|id| v.mod_param_hold.env.get(usize::from(id)))
-                                        .copied()
-                                        .unwrap_or_default();
-                                    // The envelope clamps sustain to
-                                    // 0..1 and keeps every time non-negative,
-                                    // so a modulator cannot drive them out of
-                                    // range however deep it swings.
-                                    let shaped = crate::backend::EnvMod {
-                                        attack_secs: (env_mod.attack_secs + hold.attack).max(0.0),
-                                        decay_secs: (env_mod.decay_secs + hold.decay).max(0.0),
-                                        sustain: (env_mod.sustain + hold.sustain).clamp(0.0, 1.0),
-                                        release_secs: (env_mod.release_secs + hold.release)
-                                            .max(0.0),
-                                        ..*env_mod
-                                    };
-                                    env_mod_value(&shaped, t_env) * (env_mod.depth + hold.depth)
-                                };
-                                mod_adds.bucket_at(
-                                    env_mod.fxi,
-                                    env_mod.target,
-                                    js_clamp(value, env_mod.min, env_mod.max),
-                                    env_mod.param_base,
+                            }
+                            if !sbd_pre_onset && v.pitch_quantum_skip > 0 && abs & 127 == 0 {
+                                v.pitch_quantum_skip = 0;
+                            }
+                            // The oscillator, noise source, and their automation do
+                            // not advance before `start_frame`. Only the connected
+                            // WaveShaper processes its zero input. Downstream nodes do
+                            // process that value, so use onset-time controls while the
+                            // source clock remains parked.
+                            let t = if sbd_pre_onset {
+                                0.0
+                            } else {
+                                ((abs - v.start_frame) as f32 + v.onset_lead) / sr as f32
+                            };
+                            if t >= v.stop_secs {
+                                continue;
+                            }
+                            // The plain voice's whole frame, out of line: the
+                            // general body below is correct for it too, at the
+                            // price of its register spills.
+                            if $plain && v.plain {
+                                render_plain_voice(
+                                    v,
+                                    bank,
+                                    tables,
+                                    supersaw_kernel,
+                                    sample_resampling_mode,
+                                    abs,
+                                    i,
+                                    sr,
+                                    t,
+                                    blocks,
+                                    sends,
+                                    &mut orbit_inputs,
+                                    &mut piano_mix,
                                 );
+                                continue;
                             }
-                            if first_pass && abs & 127 == 0 {
-                                v.mod_param_hold = mod_adds.mod_params;
-                            }
-                        }
-                    }
-                    // Latch the block-rate params once per render quantum,
-                    // then hold for the block.
-                    if abs & 127 == 0 {
-                        v.fx_mod_hold = mod_adds
-                            .as_ref()
-                            .map_or_else(FxParamHold::default, ModAdds::fx_hold);
-                    }
-                    let mod_adds = mod_adds.as_ref().unwrap_or(&zero_mod_adds);
-                    // A slider at zero carries the binding but no route, so
-                    // the ramp only runs while the matrix exists.
-                    let live_fm_index = (v.live_fm_index.binding != 0 && v.controls.fm.is_some())
-                        .then(|| v.live_fm_index.next());
-                    let fm_matrix_hz = match &v.controls.fm {
-                        None => 0.0f32,
-                        Some(fm) => {
-                            let state =
-                                v.fm_state.as_deref_mut().expect("FM state must be present");
-                            Self::render_fm_offset(
-                                fm,
-                                v.freq_hz,
+                            let env = Self::envelope(
                                 t,
                                 v.duration_secs,
-                                state.quantum_skip,
-                                &mut state.phases,
-                                &mut state.noise,
-                                live_fm_index,
-                                mod_adds,
-                                tables,
+                                v.controls.envelope,
+                                v.gate_value,
+                            );
+                            // lfo()/env() modulators: each rides its param
+                            // additively. LFO phases free-run from the
+                            // onset-aligned phase0.
+                            // Modulators only run on 128-frame context quanta
+                            // starting strictly after the onset (the begin gate), so
+                            // each note opens unmodulated for up to one quantum, and
+                            // the envelope clock reads quantum starts.
+                            let quantum_start = abs & !127;
+                            // Compare against the fractional onset, not its rounded
+                            // frame. An onset at frame 127.6 rounds to 128 but must
+                            // still open the transient gate at quantum 128.
+                            let transient_open = (quantum_start as f64)
+                                > v.start_frame as f64 - f64::from(v.onset_lead);
+                            // Filter LFOs stop contributing at the hap's hold end.
+                            // Other modulators can run until release ends. Neither end
+                            // is based on the sample slice's potentially longer duration.
+                            let filter_lfo_alive = lfo_quantum_alive(
+                                quantum_start,
                                 sr,
-                            )
-                        }
-                    };
-                    let fm_offset_hz = fm_matrix_hz + mod_adds.frequency_hz;
-                    if v.live_cutoff.binding != 0 {
-                        let cutoff = v.live_cutoff.next();
-                        v.filters.set_lowpass_frequency(cutoff);
-                        if let Some(right) = &mut v.filters_right {
-                            right.set_lowpass_frequency(cutoff);
-                        }
-                    }
-                    if v.live_resonance.binding != 0 {
-                        let q = v.live_resonance.next();
-                        v.filters.set_lowpass_q(q);
-                        if let Some(right) = &mut v.filters_right {
-                            right.set_lowpass_q(q);
-                        }
-                    }
-                    let filter_adds = [
-                        mod_adds.lowpass_hz,
-                        mod_adds.highpass_hz,
-                        mod_adds.bandpass_hz,
-                    ];
-                    let filter_q_adds = [mod_adds.lowpass_q, mod_adds.highpass_q, mod_adds.band_q];
-                    let live_gain = if v.live_gain.binding != 0 {
-                        v.live_gain.next()
-                    } else {
-                        1.0
-                    };
-                    let mut env = env * mod_adds.gain_factor();
-                    if let Some(fade) = v.cut_fade_frame
-                        && abs >= fade
-                    {
-                        // setValueAtTime(1, t) + linearRampToValueAtTime(0, t+0.01)
-                        env *= (1.0 - (abs - fade) as f32 / (0.01 * sr as f32)).max(0.0);
-                    }
-                    if let Some(fade) = v.polyphony_fade_frame
-                        && abs >= fade
-                    {
-                        // A linear ramp to 0 over 0.25 s on the voice's own
-                        // gain, paired with the stop at t + 0.25.
-                        env *= (1.0 - (abs - fade) as f32 / (POLYPHONY_FADE_SECS * sr as f32))
-                            .max(0.0);
-                    }
-                    // The `post` gain sits AFTER the whole chain and is
-                    // tapped for every send. Folding it into the source
-                    // instead would move the level a non-linear stage sees:
-                    // `.distort(2).postgain(.5)` would drive the waveshaper
-                    // at half the amplitude and come out 1.7 dB loud, with
-                    // a different shape, rather than simply half as loud.
-                    let post_gain = v.controls.postgain * mod_adds.postgain_factor();
-                    let post_insert = v.through_insert && !v.piano;
-                    if post_insert && !sbd_pre_onset {
-                        let gain = &mut insert_postgains[v.insert_bus.expect("insert voice bus")];
-                        let owner = (v.start_frame, v.id);
-                        if owner >= gain.owner {
-                            // A new owner while the chain still sounds: a
-                            // step is a click on the notes before. A note
-                            // after silence takes its level at once.
-                            if owner > gain.owner && gain.owned {
-                                gain.offset = crate::live_control::Ramp::new(0, 0.0);
-                                let sounds = gain.quiet.min(gain.unfed) < INSERT_QUIET_FRAMES;
-                                if sounds {
-                                    let before =
-                                        crate::live_control::Ramp::new(0, gain.applied - post_gain);
-                                    gain.offset.declick_from(before, sample_rate);
+                                v.controls.filter_lfo_end_secs,
+                            );
+                            // LFOs and the pulse, wavetable and supersaw oscillators
+                            // share the f32-rounded begin gate. The transient shaper
+                            // uses the fractional-frame comparison above instead.
+                            let source_open =
+                                lfo_quantum_open(quantum_start, sr, v.controls.worklet_begin_secs);
+                            let lfo_live = source_open
+                                && lfo_quantum_alive(quantum_start, sr, v.controls.lfo_end_secs);
+                            let mut mod_adds = if v.has_param_modulators && lfo_live {
+                                Some(ModAdds::default())
+                            } else {
+                                None
+                            };
+                            let note_alive = note_end_alive(
+                                quantum_start,
+                                v.start_frame,
+                                v.onset_lead,
+                                v.hap_duration_secs,
+                                v.controls.modulator_release_secs,
+                                sr,
+                            );
+                            // Parameter and bus modulators stop at hold plus release;
+                            // their target parameters then keep their base values.
+                            if let Some(mod_adds) = mod_adds.as_mut() {
+                                // The f32-rounded gate can open in the quantum that
+                                // contains the onset, before `start_frame`. Keep the
+                                // subtraction signed and clamp envelope time to zero.
+                                let t_env = (((quantum_start as f64 - v.start_frame as f64)
+                                    as f32
+                                    + v.onset_lead)
+                                    / sr as f32)
+                                    .max(0.0);
+                                // Two passes. A modulator aimed at a FILTER's own LFO
+                                // has to be summed before that LFO is evaluated -
+                                // WebAudio gets the ordering for free by processing a
+                                // node that feeds an AudioParam ahead of the node
+                                // owning it, and here it has to be arranged. Each
+                                // modulator appears in exactly one pass, so phases
+                                // still advance once per sample.
+                                // A bus modulator's signal is another pattern's audio.
+                                // `connectBusModulator` sums the bus into a
+                                // `ConstantSourceNode` offset, scales by depth/0.3,
+                                // clamps to the param's range, and adds to the param.
+                                // A stereo node feeding an AudioParam is down-mixed,
+                                // so the two channels average.
+                                for slot in v.controls.bus_mods.iter().flatten() {
+                                    let bus = bus_now[usize::from(slot.bus)];
+                                    let signal = (bus[0] + bus[1]) * 0.5 + slot.dc;
+                                    let value = (signal * slot.depth).clamp(slot.min, slot.max);
+                                    mod_adds.bucket_at(
+                                        slot.fxi,
+                                        slot.target,
+                                        value,
+                                        slot.param_base,
+                                    );
+                                }
+                                for first_pass in [true, false] {
+                                    for (slot, phase) in
+                                        v.controls.lfos.iter().zip(v.mod_lfo_phases.iter_mut())
+                                    {
+                                        let Some(lfo) = slot else { continue };
+                                        if ModAdds::targets_another_modulator(lfo.target)
+                                            != first_pass
+                                        {
+                                            continue;
+                                        }
+                                        // Dead past the hold end; see `filter_lfo_alive`.
+                                        if lfo.filter.is_some() && !filter_lfo_alive {
+                                            continue;
+                                        }
+                                        // Every one of these is block-rate, so
+                                        // modulation of them is latched per
+                                        // quantum.
+                                        let mut depth = lfo.depth;
+                                        let mut dcoffset = lfo.dcoffset;
+                                        let mut skew = lfo.skew;
+                                        let mut curve = lfo.curve;
+                                        let mut rate = lfo.frequency_hz;
+                                        if let Some(kind) = lfo.filter {
+                                            let hold = v.mod_param_hold.filter[kind.index()];
+                                            depth += hold.depth;
+                                            dcoffset += hold.dc;
+                                            skew += hold.skew;
+                                        }
+                                        if let Some(hold) = lfo.id.and_then(|id| {
+                                            v.mod_param_hold.lfo.get(usize::from(id))
+                                        }) {
+                                            depth += hold.depth;
+                                            dcoffset += hold.dcoffset;
+                                            skew += hold.skew;
+                                            curve += hold.curve;
+                                            rate += hold.rate;
+                                        }
+                                        let wave = lfo_waveshape_f64(lfo.shape, *phase, skew);
+                                        let raw = (wave as f32 + dcoffset) * depth;
+                                        let shaped = raw.powf(curve);
+                                        // The reference computes the sample in f64.
+                                        // A small negative value rounds to zero in
+                                        // f32 and hides the NaN.
+                                        let nan = shaped.is_nan()
+                                            || (raw == 0.0 && {
+                                                let exact =
+                                                    (wave + f64::from(dcoffset)) * f64::from(depth);
+                                                exact < 0.0 && exact.powf(f64::from(curve)).is_nan()
+                                            });
+                                        // A NaN sample makes the summed param NaN.
+                                        // The param then takes its default value.
+                                        let value = if nan {
+                                            nan_param_default(lfo.target, &v.source)
+                                                - lfo.param_base
+                                        } else {
+                                            js_clamp(shaped, lfo.min, lfo.max)
+                                        };
+                                        mod_adds.bucket_at(
+                                            lfo.fxi,
+                                            lfo.target,
+                                            value,
+                                            lfo.param_base,
+                                        );
+                                        *phase = wrap_phase(*phase + f64::from(rate) / sr);
+                                    }
+                                    for env_mod in v.controls.envs.iter().flatten() {
+                                        if ModAdds::targets_another_modulator(env_mod.target)
+                                            != first_pass
+                                        {
+                                            continue;
+                                        }
+                                        // begin==0 never satisfies the envelope's
+                                        // begin-changed trigger check, so a note
+                                        // starting at context time zero stays idle.
+                                        // The browser's envelope processor writes
+                                        // nothing for a block whose start is at or
+                                        // before the trigger, and triggers on the
+                                        // first block after it.
+                                        let value = if v.start_frame == 0 || t_env <= 0.0 {
+                                            0.0
+                                        } else {
+                                            let hold = env_mod
+                                                .id
+                                                .and_then(|id| {
+                                                    v.mod_param_hold.env.get(usize::from(id))
+                                                })
+                                                .copied()
+                                                .unwrap_or_default();
+                                            // The envelope clamps sustain to
+                                            // 0..1 and keeps every time non-negative,
+                                            // so a modulator cannot drive them out of
+                                            // range however deep it swings.
+                                            let shaped = crate::backend::EnvMod {
+                                                attack_secs: (env_mod.attack_secs + hold.attack)
+                                                    .max(0.0),
+                                                decay_secs: (env_mod.decay_secs + hold.decay)
+                                                    .max(0.0),
+                                                sustain: (env_mod.sustain + hold.sustain)
+                                                    .clamp(0.0, 1.0),
+                                                release_secs: (env_mod.release_secs + hold.release)
+                                                    .max(0.0),
+                                                ..*env_mod
+                                            };
+                                            env_mod_value(&shaped, t_env)
+                                                * (env_mod.depth + hold.depth)
+                                        };
+                                        mod_adds.bucket_at(
+                                            env_mod.fxi,
+                                            env_mod.target,
+                                            js_clamp(value, env_mod.min, env_mod.max),
+                                            env_mod.param_base,
+                                        );
+                                    }
+                                    if first_pass && abs & 127 == 0 {
+                                        v.mod_param_hold = mod_adds.mod_params;
+                                    }
                                 }
                             }
-                            gain.owner = owner;
-                            gain.value = post_gain;
-                            gain.owned = true;
-                        }
-                    }
-                    // Pan modulators ride the StereoPanner's pan param
-                    // (base 2·pan−1, clamped to the param's [-1, 1] range).
-                    let pan_param = if mod_adds.pan != 0.0 {
-                        (v.pan_x + mod_adds.pan).clamp(-1.0, 1.0)
-                    } else {
-                        v.pan_x
-                    };
-                    // vib/penv ride the source's DETUNE param (cents), which
-                    // multiplies the computed frequency by 2^(cents/1200) after
-                    // the additive frequency-param mods. sbd runs its own pitch
-                    // envelope, so the general detune path skips it.
-                    let pitch_ratio = {
-                        let mut cents = 0.0f32;
-                        if let Some(vb) = v.controls.vibrato {
-                            // Phase INTEGRATES the rate. sin(2*pi*f*t) agrees
-                            // only while f is constant; once a modulator moves
-                            // it, treating the rate as a position rather than
-                            // a speed bends the whole waveform.
-                            let rate = vb.freq_hz + mod_adds.vib_rate;
-                            let cents_depth = vb.cents + mod_adds.vib_depth;
-                            cents += (std::f64::consts::TAU * v.vibrato_phase).sin() as f32
-                                * cents_depth;
-                            v.vibrato_phase = wrap_phase(v.vibrato_phase + f64::from(rate) / sr);
-                        }
-                        // In a source's first render quantum the browser reads
-                        // its per-frame detune automation from the quantum
-                        // start while writing output from the onset, so the
-                        // envelope arrives `offset` frames late there and
-                        // frames before the automation event read zero.
-                        let t_pitch = t - f32::from(v.pitch_quantum_skip) / sr as f32;
-                        if let Some(pe) = v.controls.pitch_env.filter(|_| t_pitch >= 0.0) {
-                            cents += if pe.exponential {
-                                crate::biquad::FilterStage::frequency_at(
-                                    pe.adsr,
-                                    t_pitch,
-                                    v.duration_secs,
-                                )
-                            } else {
-                                let shape = Self::envelope(
-                                    t_pitch,
-                                    v.duration_secs,
-                                    crate::backend::Envelope {
-                                        attack_secs: pe.adsr.attack_secs,
-                                        decay_secs: pe.adsr.decay_secs,
-                                        sustain: pe.adsr.sustain as f32,
-                                        release_secs: pe.adsr.release_secs,
-                                    },
-                                    v.pitch_gate,
-                                );
-                                (pe.adsr.min_hz
-                                    + f64::from(shape) * (pe.adsr.max_hz - pe.adsr.min_hz))
-                                    as f32
+                            // Latch the block-rate params once per render quantum,
+                            // then hold for the block.
+                            if abs & 127 == 0 {
+                                v.fx_mod_hold = mod_adds
+                                    .as_ref()
+                                    .map_or_else(FxParamHold::default, ModAdds::fx_hold);
+                            }
+                            let mod_adds = mod_adds.as_ref().unwrap_or(&zero_mod_adds);
+                            // A slider at zero carries the binding but no route, so
+                            // the ramp only runs while the matrix exists.
+                            let live_fm_index = (v.live_fm_index.binding != 0
+                                && v.controls.fm.is_some())
+                            .then(|| v.live_fm_index.next());
+                            let fm_matrix_hz = match &v.controls.fm {
+                                None => 0.0f32,
+                                Some(fm) => {
+                                    let state = v
+                                        .fm_state
+                                        .as_deref_mut()
+                                        .expect("FM state must be present");
+                                    Self::render_fm_offset(
+                                        fm,
+                                        v.freq_hz,
+                                        t,
+                                        v.duration_secs,
+                                        state.quantum_skip,
+                                        &mut state.phases,
+                                        &mut state.noise,
+                                        live_fm_index,
+                                        mod_adds,
+                                        tables,
+                                        sr,
+                                    )
+                                }
                             };
-                        }
-                        if cents == 0.0 || matches!(v.source, VoiceSource::Sbd { .. }) {
-                            1.0
-                        } else {
-                            (cents / 1200.0).exp2()
-                        }
-                    };
-                    // What a SAMPLE plays at this block. `detune` on a buffer
-                    // source is k-rate: one value per 128-frame quantum, read
-                    // from where the automation ENDS in it, held for the whole
-                    // block. Sampling it per frame glides where the browser
-                    // steps, which leaves the level right and the waveform
-                    // wrong. An oscillator's detune is a-rate and uses
-                    // `pitch_ratio` above unchanged.
-                    let sample_pitch = if matches!(v.source, VoiceSource::Sample { .. }) {
-                        if abs & 127 == 0 || v.sample_pitch_hold.is_none() {
-                            // A k-rate param is sampled at the FIRST frame of
-                            // the block and held for all of it. Measured both
-                            // ways against Chromium: reading the block's end
-                            // instead scores 0.18 where this scores 1.000000.
-                            let ahead_frames = -((abs & 127) as i32);
-                            let block_start = t + ahead_frames as f32 / sr as f32;
-                            // A block that began BEFORE this voice did reads
-                            // the param where no automation has run yet, which
-                            // for detune is zero. The browser plays that whole
-                            // block at the undetuned rate, however late in it
-                            // the source starts.
-                            let mut cents = 0.0f32;
-                            if let Some(pe) = v.controls.pitch_env.filter(|_| block_start >= 0.0) {
-                                let shifted = block_start;
-                                if shifted >= 0.0 {
+                            let fm_offset_hz = fm_matrix_hz + mod_adds.frequency_hz;
+                            if v.live_cutoff.binding != 0 {
+                                let cutoff = v.live_cutoff.next();
+                                v.filters.set_lowpass_frequency(cutoff);
+                                if let Some(right) = &mut v.filters_right {
+                                    right.set_lowpass_frequency(cutoff);
+                                }
+                            }
+                            if v.live_resonance.binding != 0 {
+                                let q = v.live_resonance.next();
+                                v.filters.set_lowpass_q(q);
+                                if let Some(right) = &mut v.filters_right {
+                                    right.set_lowpass_q(q);
+                                }
+                            }
+                            let filter_adds = [
+                                mod_adds.lowpass_hz,
+                                mod_adds.highpass_hz,
+                                mod_adds.bandpass_hz,
+                            ];
+                            let filter_q_adds =
+                                [mod_adds.lowpass_q, mod_adds.highpass_q, mod_adds.band_q];
+                            let live_gain = if v.live_gain.binding != 0 {
+                                v.live_gain.next()
+                            } else {
+                                1.0
+                            };
+                            let mut env = env * mod_adds.gain_factor();
+                            if let Some(fade) = v.cut_fade_frame
+                                && abs >= fade
+                            {
+                                // setValueAtTime(1, t) + linearRampToValueAtTime(0, t+0.01)
+                                env *= (1.0 - (abs - fade) as f32 / (0.01 * sr as f32)).max(0.0);
+                            }
+                            if let Some(fade) = v.polyphony_fade_frame
+                                && abs >= fade
+                            {
+                                // A linear ramp to 0 over 0.25 s on the voice's own
+                                // gain, paired with the stop at t + 0.25.
+                                env *= (1.0
+                                    - (abs - fade) as f32 / (POLYPHONY_FADE_SECS * sr as f32))
+                                    .max(0.0);
+                            }
+                            // The `post` gain sits AFTER the whole chain and is
+                            // tapped for every send. Folding it into the source
+                            // instead would move the level a non-linear stage sees:
+                            // `.distort(2).postgain(.5)` would drive the waveshaper
+                            // at half the amplitude and come out 1.7 dB loud, with
+                            // a different shape, rather than simply half as loud.
+                            let post_gain = v.controls.postgain * mod_adds.postgain_factor();
+                            let post_insert = v.through_insert && !v.piano;
+                            if post_insert && !sbd_pre_onset {
+                                let gain =
+                                    &mut insert_postgains[v.insert_bus.expect("insert voice bus")];
+                                let owner = (v.start_frame, v.id);
+                                if owner >= gain.owner {
+                                    // A new owner while the chain still sounds: a
+                                    // step is a click on the notes before. A note
+                                    // after silence takes its level at once.
+                                    if owner > gain.owner && gain.owned {
+                                        gain.offset = crate::live_control::Ramp::new(0, 0.0);
+                                        let sounds =
+                                            gain.quiet.min(gain.unfed) < INSERT_QUIET_FRAMES;
+                                        if sounds {
+                                            let before = crate::live_control::Ramp::new(
+                                                0,
+                                                gain.applied - post_gain,
+                                            );
+                                            gain.offset.declick_from(before, sample_rate);
+                                        }
+                                    }
+                                    gain.owner = owner;
+                                    gain.value = post_gain;
+                                    gain.owned = true;
+                                }
+                            }
+                            // Pan modulators ride the StereoPanner's pan param
+                            // (base 2·pan−1, clamped to the param's [-1, 1] range).
+                            let pan_param = if mod_adds.pan != 0.0 {
+                                (v.pan_x + mod_adds.pan).clamp(-1.0, 1.0)
+                            } else {
+                                v.pan_x
+                            };
+                            // vib/penv ride the source's DETUNE param (cents), which
+                            // multiplies the computed frequency by 2^(cents/1200) after
+                            // the additive frequency-param mods. sbd runs its own pitch
+                            // envelope, so the general detune path skips it.
+                            let pitch_ratio = {
+                                let mut cents = 0.0f32;
+                                if let Some(vb) = v.controls.vibrato {
+                                    // Phase INTEGRATES the rate. sin(2*pi*f*t) agrees
+                                    // only while f is constant; once a modulator moves
+                                    // it, treating the rate as a position rather than
+                                    // a speed bends the whole waveform.
+                                    let rate = vb.freq_hz + mod_adds.vib_rate;
+                                    let cents_depth = vb.cents + mod_adds.vib_depth;
+                                    cents += (std::f64::consts::TAU * v.vibrato_phase).sin() as f32
+                                        * cents_depth;
+                                    v.vibrato_phase =
+                                        wrap_phase(v.vibrato_phase + f64::from(rate) / sr);
+                                }
+                                // In a source's first render quantum the browser reads
+                                // its per-frame detune automation from the quantum
+                                // start while writing output from the onset, so the
+                                // envelope arrives `offset` frames late there and
+                                // frames before the automation event read zero.
+                                let t_pitch = t - f32::from(v.pitch_quantum_skip) / sr as f32;
+                                if let Some(pe) = v.controls.pitch_env.filter(|_| t_pitch >= 0.0) {
                                     cents += if pe.exponential {
                                         crate::biquad::FilterStage::frequency_at(
                                             pe.adsr,
-                                            shifted,
+                                            t_pitch,
                                             v.duration_secs,
                                         )
                                     } else {
                                         let shape = Self::envelope(
-                                            shifted,
+                                            t_pitch,
                                             v.duration_secs,
                                             crate::backend::Envelope {
                                                 attack_secs: pe.adsr.attack_secs,
@@ -2323,931 +2578,1026 @@ impl ScalarBackend {
                                             as f32
                                     };
                                 }
-                            }
-                            // A modulator aimed at the source's pitch lands
-                            // on `detune` here, in cents, because a buffer
-                            // source has no frequency param of its own. It is
-                            // the same k-rate param the envelope and the
-                            // vibrato ride, so it is read at the block start
-                            // with them.
-                            cents += mod_adds.frequency_hz;
-                            if let Some(vb) = v.controls.vibrato.filter(|_| block_start >= 0.0) {
-                                // The vibrato oscillator runs on its own clock,
-                                // so its value at the block end is read from the
-                                // phase this block will reach.
-                                let ahead = f64::from(ahead_frames) * f64::from(vb.freq_hz) / sr;
-                                cents += (std::f64::consts::TAU * (v.vibrato_phase + ahead)).sin()
-                                    as f32
-                                    * vb.cents;
-                            }
-                            v.sample_pitch_hold = Some(if cents == 0.0 {
-                                1.0
-                            } else {
-                                (cents / 1200.0).exp2()
-                            });
-                        }
-                        v.sample_pitch_hold.unwrap_or(1.0)
-                    } else {
-                        1.0
-                    };
-                    // Tremolo: gain = max(1−depth, 0) + the LFO's
-                    // clamp(pow(shape·depth, 1.5), 0, 1); the LFO obeys the
-                    // same onset-quantum gate, so a full-depth tremolo opens
-                    // silent for up to one quantum by design.
-                    let trem_gain = match v.controls.tremolo {
-                        None => 1.0f32,
-                        Some(tr) => {
-                            // The chain is a gain node the LFO ADDS to:
-                            // gain = max(1-depth, 0), lfo -> gain.gain.
-                            // `tremolodepth` names that
-                            // node's gain, so a modulator moves the floor and
-                            // leaves the LFO's own depth where it was.
-                            let base = tr.gain_floor() + mod_adds.trem_depth;
-                            if lfo_live {
-                                let hold = &v.fx_mod_hold;
-                                let skew = tr.skew + hold.trem_skew;
-                                let shape = if hold.trem_shape == 0.0 {
-                                    tr.shape
-                                } else {
-                                    ((f32::from(tr.shape) + hold.trem_shape) as i32).rem_euclid(5)
-                                        as u8
-                                };
-                                // The seed reads the frequency param, so a
-                                // modulated rate shifts where the LFO starts.
-                                let freq = tr.frequency_hz + hold.trem_rate;
-                                let phase = *v.tremolo_phase.get_or_insert_with(|| {
-                                    lfo_phase0(tr.time_secs, freq, tr.phase_offset)
-                                });
-                                let raw = lfo_waveshape(shape, phase, skew) * tr.depth;
-                                let shaped = raw.powf(1.5).clamp(0.0, 1.0);
-                                let next = wrap_phase(phase + f64::from(freq) / sr);
-                                v.tremolo_phase = Some(next);
-                                // A NaN sum gives the gain its default.
-                                let gain = base + shaped;
-                                if gain.is_nan() { 1.0 } else { gain }
-                            } else {
-                                base
-                            }
-                        }
-                    };
-                    // Phaser: notch at (center+282)·2^(detune/1200), detune from
-                    // a default tri LFO clamped to ±sweep cents. Before the
-                    // gate opens and after it closes the LFO is silent, so the
-                    // notch sits at its static center.
-                    let phaser_coefs = match v.controls.phaser {
-                        None => None,
-                        Some(ph) => {
-                            // The phaser's LFO is built with depth =
-                            // sweep*2, and phasersweep names that depth
-                            // param, so the modulator adds to the doubled
-                            // value rather than to the sweep it was derived
-                            // from.
-                            let lfo_depth =
-                                (2.0 * ph.sweep_cents + v.fx_mod_hold.phaser_sweep).max(0.0);
-                            let sweep = lfo_depth * 0.5;
-                            let rate = ph.rate_hz + v.fx_mod_hold.phaser_rate;
-                            let detune = if lfo_live {
-                                // getPhaser passes no phaseoffset, and its
-                                // `time` is the note's begin.
-                                let phase = *v
-                                    .phaser_phase
-                                    .get_or_insert_with(|| lfo_phase0(ph.time_secs, rate, 0.0));
-                                let raw = (lfo_waveshape(0, phase, 0.5) - 0.5) * lfo_depth;
-                                let next = wrap_phase(phase + f64::from(rate) / sr);
-                                v.phaser_phase = Some(next);
-                                js_clamp(raw, -sweep, sweep)
-                            } else {
-                                0.0
-                            };
-                            let center = ph.center_hz + mod_adds.phaser_center;
-                            let frequency = (center + 282.0) * (detune / 1200.0).exp2();
-                            // phaserdepth names the notch's Q, not the depth
-                            // control: the modulator lands after the
-                            // depth-to-Q conversion, not before it.
-                            let q = 2.0 - (ph.depth * 2.0).clamp(0.0, 1.9) + mod_adds.phaser_depth;
-                            Some(notch_coefs(frequency, q, sr as f32))
-                        }
-                    };
-                    // All five vowel filters are one `vowel` target, so the
-                    // SAME a-rate signal lands on every frequency param.
-                    // Keep the precomputed static coefficients when there
-                    // is no signal to add.
-                    let vowel_coefs = match (v.controls.vowel, mod_adds.vowel_hz) {
-                        (Some(vw), add) if add != 0.0 => std::array::from_fn(|k| {
-                            bandpass_coefs(vw.freqs[k] + add, vw.qs[k], sr as f32)
-                        }),
-                        _ => v.vowel_coefs,
-                    };
-                    let (wave_l, wave_r) = match &mut v.source {
-                        VoiceSource::Oscillator {
-                            table_selection,
-                            phase,
-                            partial_limit,
-                        } => {
-                            let wave = oscillator_sample(
-                                tables,
-                                &v.controls,
-                                *table_selection,
-                                phase,
-                                partial_limit,
-                                v.freq_hz,
-                                fm_offset_hz,
-                                pitch_ratio,
-                                sr,
-                            );
-                            // `noise` crossfades PINK noise with the
-                            // oscillator before the envelope. `wetfade`
-                            // holds at one below a half and falls linearly
-                            // above it, and the dry leg reads the amount
-                            // while the wet leg reads its complement - so a
-                            // half leaves both legs open.
-                            let wave = if v.controls.noise > 0.0 {
-                                let wetfade =
-                                    |d: f32| if d < 0.5 { 1.0 } else { 1.0 - (d - 0.5) / 0.5 };
-                                let pink = v.source_noise.next(1, 0.0);
-                                wave * wetfade(v.controls.noise)
-                                    + pink * wetfade(1.0 - v.controls.noise)
-                            } else {
-                                wave
-                            };
-                            (wave, wave)
-                        }
-                        // The supersaw has the same begin gate as the pulse
-                        // oscillator: no output and no phase advance until
-                        // the gate opens.
-                        VoiceSource::Supersaw { .. } if !source_open => (0.0, 0.0),
-                        VoiceSource::Supersaw { plan, phases } => {
-                            // `detune` and `spread` are params the supersaw
-                            // shares with the wavetable, so a modulator on
-                            // either moves both.
-                            let (mut gain_l, mut gain_r) = plan.pan_gains(mod_adds.panspread);
-                            let freq = (v.freq_hz + fm_offset_hz) * pitch_ratio;
-                            let static_spread = mod_adds.freqspread.to_bits() == 0;
-                            if static_spread
-                                && let Some(kernel) = supersaw_kernel
-                                && kernel.supports(plan.count)
-                            {
-                                // SAFETY: the kernel was selected only after
-                                // its CPU prerequisites were detected, and
-                                // both arrays have MAX_UNISON entries while
-                                // count is clamped to that bound.
-                                unsafe {
-                                    kernel.render(
-                                        phases,
-                                        &plan.detune_ratios,
-                                        plan.count,
-                                        freq,
-                                        sr as f32,
-                                        (gain_l, gain_r),
-                                    )
-                                }
-                            } else {
-                                let (scale, center) = if static_spread {
-                                    (0.0, 0.0)
-                                } else {
-                                    supersaw_spread_geometry(
-                                        plan.voices,
-                                        (plan.freqspread + mod_adds.freqspread).max(0.0),
-                                    )
-                                };
-                                let mut left = 0.0f32;
-                                let mut right = 0.0f32;
-                                // `count` is clamped to MAX_UNISON when the
-                                // plan is built, so the take never shortens
-                                // the loop.
-                                for (n, phase) in phases.iter_mut().enumerate().take(plan.count) {
-                                    let ratio = if static_spread {
-                                        plan.detune_ratios[n]
-                                    } else {
-                                        supersaw_detune_ratio(n, scale, center)
-                                    };
-                                    let voice_freq = freq * ratio;
-                                    // Euclidean remainder, not `fract` - dt
-                                    // must stay non-negative.
-                                    let dt = saw_step(voice_freq / sr as f32);
-                                    let value = saw_blep(*phase, dt);
-                                    left += value * gain_l;
-                                    right += value * gain_r;
-                                    *phase = wrap_phase(f64::from(*phase + dt)) as f32;
-                                    std::mem::swap(&mut gain_l, &mut gain_r);
-                                }
-                                (left, right)
-                            }
-                        }
-                        VoiceSource::Pulse {
-                            pulsewidth,
-                            width_lfo,
-                            width_lfo_phase,
-                            phi,
-                            y0,
-                            y1,
-                            dphif,
-                            envf,
-                            env: pulse_env,
-                        } => {
-                            use std::f64::consts::PI;
-                            // The begin gate: the source emits nothing, and
-                            // advances nothing, until the first context
-                            // quantum past the note's begin - the begin the
-                            // AudioParam holds, narrowed to f32, which is not
-                            // always the quantum after the onset FRAME.
-                            if !source_open {
-                                (0.0, 0.0)
-                            } else {
-                                // The per-block decay resets each 128
-                                // frames of the CONTEXT grid.
-                                if abs.is_multiple_of(128) {
-                                    *pulse_env = 1.0;
-                                }
-                                // The pulse synth's own LFO is a-rate at
-                                // its output, but its frequency and depth
-                                // params are read once per quantum. Its
-                                // clamp bounds were baked from the original
-                                // sweep, not from a later modulated depth.
-                                let width_lfo_add = match width_lfo {
-                                    None => 0.0,
-                                    Some(lfo) => {
-                                        let hold = v.mod_param_hold.pulse_width;
-                                        let rate = lfo.frequency_hz + hold.rate;
-                                        let depth = lfo.depth + hold.depth;
-                                        let phase = *width_lfo_phase.get_or_insert_with(|| {
-                                            lfo_phase0(lfo.time_secs, rate, 0.0)
-                                        });
-                                        let raw = (lfo_waveshape(0, phase, 0.5) - 0.5) * depth;
-                                        let add = js_clamp(raw, -0.5 * lfo.depth, 0.5 * lfo.depth);
-                                        *width_lfo_phase =
-                                            Some(wrap_phase(phase + f64::from(rate) / sr));
-                                        add
-                                    }
-                                };
-                                let width = *pulsewidth + mod_adds.pulse_width + width_lfo_add;
-                                let pw = (1.0 - f64::from(width.clamp(-0.99, 0.99))) * PI;
-                                let freq = f64::from((v.freq_hz + fm_offset_hz) * pitch_ratio);
-                                let dphi = freq * (2.0 * PI) / sr;
-                                *dphif += 0.1 * (dphi - *dphif);
-                                *pulse_env *= 0.9998;
-                                *envf += 0.1 * (*pulse_env - *envf);
-                                let mut b = 2.3 * (1.0 - 0.0001 * freq);
-                                if b < 0.0 {
-                                    b = 0.0;
-                                }
-                                *phi += *dphif;
-                                if *phi >= PI {
-                                    *phi -= 2.0 * PI;
-                                }
-                                let out0 = (*phi + b * *y0).cos();
-                                *y0 = 0.5 * (out0 + *y0);
-                                let out1 = (*phi + b * *y1 + pw).cos();
-                                *y1 = 0.5 * (out1 + *y1);
-                                let value = (0.15 * (out0 - out1) * *envf) as f32;
-                                (value, value)
-                            }
-                        }
-                        VoiceSource::ByteBeat {
-                            expression,
-                            program,
-                            t,
-                            start_offset,
-                            gate,
-                        } => {
-                            if abs < *gate {
-                                // Gated: the source has not run yet, so it
-                                // emits nothing and advances nothing.
-                                (0.0, 0.0)
-                            } else {
-                                // local_t scales the integer counter by
-                                // 256/sampleRate and the voice's frequency,
-                                // the expression's low byte becomes a
-                                // bipolar signal, and the output is clamped
-                                // before anything downstream sees it.
-                                let scale = 256.0 / sr;
-                                let local_t = scale * f64::from(v.freq_hz + fm_offset_hz) * *t
-                                    + *start_offset;
-                                // A compiled `byteBeatExpression` replaces the
-                                // built-in table; `n` still picks a built-in
-                                // when the score gave no expression of its own.
-                                let value = match program {
-                                    Some(program) => program.eval(local_t),
-                                    None => crate::backend::bytebeat_sample(*expression, local_t),
-                                };
-                                let byte = f64::from(crate::backend::bytebeat_byte(value));
-                                let signal = (byte / 127.5 - 1.0) * 0.2;
-                                let out = signal.clamp(-0.4, 0.4) as f32;
-                                *t += 1.0;
-                                (out, out)
-                            }
-                        }
-                        VoiceSource::Bus { bus } => {
-                            let tap = bus_now[usize::from(*bus)];
-                            (tap[0], tap[1])
-                        }
-                        VoiceSource::ZzFx { voice, ring } => {
-                            let sample = voice
-                                .step(ring.as_deref_mut().unwrap_or(&mut []))
-                                .unwrap_or(0.0);
-                            (sample, sample)
-                        }
-                        VoiceSource::Input { channel, fm_phase } => {
-                            let sample = match (&input, input_base) {
-                                (Some(ring), Some((base, ratio))) => {
-                                    // The FM matrix bends the read rate, as
-                                    // it bends an oscillator's frequency: the
-                                    // deviation in Hz against the voice's
-                                    // nominal frequency is the rate multiplier
-                                    // the reader runs at, integrated into
-                                    // `fm_phase`. The multiplier deviation is
-                                    // the route amount times the operator
-                                    // signal, independent of the note. A read
-                                    // that runs past the writer lands in
-                                    // silence and one far behind in the
-                                    // ring's oldest frames.
-                                    let position =
-                                        base + (sub_start + i) as f64 * ratio + *fm_phase;
-                                    if v.controls.fm.is_some() {
-                                        // The matrix output is exactly zero
-                                        // when the nominal frequency is zero,
-                                        // which keeps the division finite.
-                                        if fm_matrix_hz != 0.0 {
-                                            *fm_phase += f64::from(fm_matrix_hz)
-                                                / f64::from(v.freq_hz)
-                                                * ratio;
-                                        }
-                                        // The integral of a modulator that
-                                        // starts at phase zero carries its DC
-                                        // as a one-sided LEAD into the
-                                        // writer, which a reader one block
-                                        // behind has no room for. The leak
-                                        // re-centers the swing into the
-                                        // ring's history and bounds a
-                                        // drifting operator; above a hertz it
-                                        // is too slow to hear.
-                                        *fm_phase -= *fm_phase * INPUT_FM_LEAK;
-                                    }
-                                    ring.sample_at(position, usize::from(*channel))
-                                }
-                                _ => 0.0,
-                            };
-                            (sample, sample)
-                        }
-                        VoiceSource::Noise {
-                            kind,
-                            density,
-                            state,
-                        } => {
-                            // One stream feeding both channels: the source is
-                            // mono until the panner, like every other synth.
-                            let sample = state.next(*kind, *density);
-                            (sample, sample)
-                        }
-                        VoiceSource::One => (1.0, 1.0),
-                        VoiceSource::Sbd {
-                            controls: sbd,
-                            phase,
-                            noise,
-                        } => {
-                            if sbd_pre_onset {
-                                // The scheduled oscillator contributes zero
-                                // before source start, while the connected
-                                // WaveShaper remains active. Its sample-rate-
-                                // length curve is one element short of symmetry,
-                                // so interpolating at zero yields the small
-                                // negative DC value required by the downstream
-                                // signal path.
-                                let value = sbd_saturation(0.0, sbd_saturation_curve);
-                                (value, value)
-                            } else {
-                                // Pitch env: detune from penv semitones (penv×100
-                                // cents) exponentially to 0.001 cents over pdecay,
-                                // then held.
-                                let start_cents = f64::from(sbd.penv_semitones) * 100.0;
-                                let cents = if start_cents.abs() < f64::EPSILON {
-                                    0.0
-                                } else if t >= sbd.pdecay_secs {
-                                    0.001
-                                } else {
-                                    start_cents
-                                        * (0.001 / start_cents.abs())
-                                            .powf(f64::from(t / sbd.pdecay_secs))
-                                };
-                                let freq = f64::from(v.freq_hz) * 2.0f64.powf(cents / 1200.0);
-                                // Use a band-limited PeriodicWave table selected
-                                // from the swept pitch, not the base note,
-                                // because SBD crosses three octaves.
-                                let tri = tables.sample(
-                                    crate::backend::Waveform::Triangle,
-                                    *phase,
-                                    tables.selection(freq as f32),
-                                );
-                                *phase = wrap_phase(*phase + freq / sr);
-                                // WaveShaper saturation, then the drum's own envelope:
-                                // hold 1 until 20 ms, exponential to 0.001 over decay.
-                                let saturated = sbd_saturation(tri, sbd_saturation_curve);
-                                let attackhold = 0.02f32;
-                                let body_env = if t <= attackhold {
+                                if cents == 0.0 || matches!(v.source, VoiceSource::Sbd { .. }) {
                                     1.0
                                 } else {
-                                    0.001f32.powf(((t - attackhold) / sbd.decay_secs).min(1.0))
-                                };
-                                // Brown noise buffer: gain 1.2 exponentially to
-                                // 0.001 over 25 ms, then hold the endpoint.
-                                let brown = noise.next(2, 0.0);
-                                let noise_env = sbd_noise_gain(t);
-                                let mut value = saturated * body_env + brown * noise_env;
-                                // 10 ms linear fade landing exactly at the stop.
-                                let remaining = sbd.stop_secs - t;
-                                if remaining < 0.01 {
-                                    value *= (remaining / 0.01).max(0.0);
+                                    (cents / 1200.0).exp2()
                                 }
-                                (value, value)
-                            }
-                        }
-                        VoiceSource::Sample {
-                            sample,
-                            position,
-                            increment,
-                            reversed,
-                            delay_frames,
-                            loop_frames,
-                        } => {
-                            if bank.get(*sample).is_none() {
-                                // The slot was emptied under the voice - an
-                                // uninstall landed. Silence for the rest of the
-                                // block, and the voice ends with it: the id may
-                                // go to another sound, and a voice still reading
-                                // the slot would play that one under this name.
-                                v.source_gone = true;
-                                (0.0, 0.0)
-                            } else if *delay_frames > 0 {
-                                *delay_frames -= 1;
-                                (0.0, 0.0)
-                            } else if let Some((loop_start, loop_end)) = *loop_frames
-                                && loop_end > loop_start
-                                && bank.get(*sample).is_some_and(|decoded| {
-                                    *increment * f64::from(sample_pitch)
-                                        > loop_end.min(decoded.frames() as f64) - loop_start
-                                })
-                            {
-                                // While the step is longer than the loop, its
-                                // end clamped to the buffer, the voice is
-                                // silent and its cursor holds, as Chromium's
-                                // buffer source does.
-                                (0.0, 0.0)
+                            };
+                            // What a SAMPLE plays at this block. `detune` on a buffer
+                            // source is k-rate: one value per 128-frame quantum, read
+                            // from where the automation ENDS in it, held for the whole
+                            // block. Sampling it per frame glides where the browser
+                            // steps, which leaves the level right and the waveform
+                            // wrong. An oscillator's detune is a-rate and uses
+                            // `pitch_ratio` above unchanged.
+                            let sample_pitch = if matches!(v.source, VoiceSource::Sample { .. }) {
+                                if abs & 127 == 0 || v.sample_pitch_hold.is_none() {
+                                    // A k-rate param is sampled at the FIRST frame of
+                                    // the block and held for all of it. Measured both
+                                    // ways against Chromium: reading the block's end
+                                    // instead scores 0.18 where this scores 1.000000.
+                                    let ahead_frames = -((abs & 127) as i32);
+                                    let block_start = t + ahead_frames as f32 / sr as f32;
+                                    // A block that began BEFORE this voice did reads
+                                    // the param where no automation has run yet, which
+                                    // for detune is zero. The browser plays that whole
+                                    // block at the undetuned rate, however late in it
+                                    // the source starts.
+                                    let mut cents = 0.0f32;
+                                    if let Some(pe) =
+                                        v.controls.pitch_env.filter(|_| block_start >= 0.0)
+                                    {
+                                        let shifted = block_start;
+                                        if shifted >= 0.0 {
+                                            cents += if pe.exponential {
+                                                crate::biquad::FilterStage::frequency_at(
+                                                    pe.adsr,
+                                                    shifted,
+                                                    v.duration_secs,
+                                                )
+                                            } else {
+                                                let shape = Self::envelope(
+                                                    shifted,
+                                                    v.duration_secs,
+                                                    crate::backend::Envelope {
+                                                        attack_secs: pe.adsr.attack_secs,
+                                                        decay_secs: pe.adsr.decay_secs,
+                                                        sustain: pe.adsr.sustain as f32,
+                                                        release_secs: pe.adsr.release_secs,
+                                                    },
+                                                    v.pitch_gate,
+                                                );
+                                                (pe.adsr.min_hz
+                                                    + f64::from(shape)
+                                                        * (pe.adsr.max_hz - pe.adsr.min_hz))
+                                                    as f32
+                                            };
+                                        }
+                                    }
+                                    // A modulator aimed at the source's pitch lands
+                                    // on `detune` here, in cents, because a buffer
+                                    // source has no frequency param of its own. It is
+                                    // the same k-rate param the envelope and the
+                                    // vibrato ride, so it is read at the block start
+                                    // with them.
+                                    cents += mod_adds.frequency_hz;
+                                    if let Some(vb) =
+                                        v.controls.vibrato.filter(|_| block_start >= 0.0)
+                                    {
+                                        // The vibrato oscillator runs on its own clock,
+                                        // so its value at the block end is read from the
+                                        // phase this block will reach.
+                                        let ahead =
+                                            f64::from(ahead_frames) * f64::from(vb.freq_hz) / sr;
+                                        cents += (std::f64::consts::TAU * (v.vibrato_phase + ahead))
+                                            .sin() as f32
+                                            * vb.cents;
+                                    }
+                                    v.sample_pitch_hold = Some(if cents == 0.0 {
+                                        1.0
+                                    } else {
+                                        (cents / 1200.0).exp2()
+                                    });
+                                }
+                                v.sample_pitch_hold.unwrap_or(1.0)
                             } else {
-                                let wave = bank
-                                    .get(*sample)
-                                    .and_then(|decoded| {
-                                        if *reversed {
-                                            let last = (decoded.frames().max(1) - 1) as f64;
-                                            let read = last - *position;
-                                            if read < 0.0 {
-                                                return None;
-                                            }
-                                            decoded.stereo_at_reversed_with_mode(
-                                                read,
-                                                sample_resampling_mode,
-                                            )
+                                1.0
+                            };
+                            // Tremolo: gain = max(1−depth, 0) + the LFO's
+                            // clamp(pow(shape·depth, 1.5), 0, 1); the LFO obeys the
+                            // same onset-quantum gate, so a full-depth tremolo opens
+                            // silent for up to one quantum by design.
+                            let trem_gain = match v.controls.tremolo {
+                                None => 1.0f32,
+                                Some(tr) => {
+                                    // The chain is a gain node the LFO ADDS to:
+                                    // gain = max(1-depth, 0), lfo -> gain.gain.
+                                    // `tremolodepth` names that
+                                    // node's gain, so a modulator moves the floor and
+                                    // leaves the LFO's own depth where it was.
+                                    let base = tr.gain_floor() + mod_adds.trem_depth;
+                                    if lfo_live {
+                                        let hold = &v.fx_mod_hold;
+                                        let skew = tr.skew + hold.trem_skew;
+                                        let shape = if hold.trem_shape == 0.0 {
+                                            tr.shape
                                         } else {
-                                            decoded.stereo_at_with_mode(
-                                                *position,
-                                                sample_resampling_mode,
+                                            ((f32::from(tr.shape) + hold.trem_shape) as i32)
+                                                .rem_euclid(5) as u8
+                                        };
+                                        // The seed reads the frequency param, so a
+                                        // modulated rate shifts where the LFO starts.
+                                        let freq = tr.frequency_hz + hold.trem_rate;
+                                        let phase = *v.tremolo_phase.get_or_insert_with(|| {
+                                            lfo_phase0(tr.time_secs, freq, tr.phase_offset)
+                                        });
+                                        let raw = lfo_waveshape(shape, phase, skew) * tr.depth;
+                                        let shaped = raw.powf(1.5).clamp(0.0, 1.0);
+                                        let next = wrap_phase(phase + f64::from(freq) / sr);
+                                        v.tremolo_phase = Some(next);
+                                        // A NaN sum gives the gain its default.
+                                        let gain = base + shaped;
+                                        if gain.is_nan() { 1.0 } else { gain }
+                                    } else {
+                                        base
+                                    }
+                                }
+                            };
+                            // Phaser: notch at (center+282)·2^(detune/1200), detune from
+                            // a default tri LFO clamped to ±sweep cents. Before the
+                            // gate opens and after it closes the LFO is silent, so the
+                            // notch sits at its static center.
+                            let phaser_coefs = match v.controls.phaser {
+                                None => None,
+                                Some(ph) => {
+                                    // The phaser's LFO is built with depth =
+                                    // sweep*2, and phasersweep names that depth
+                                    // param, so the modulator adds to the doubled
+                                    // value rather than to the sweep it was derived
+                                    // from.
+                                    let lfo_depth = (2.0 * ph.sweep_cents
+                                        + v.fx_mod_hold.phaser_sweep)
+                                        .max(0.0);
+                                    let sweep = lfo_depth * 0.5;
+                                    let rate = ph.rate_hz + v.fx_mod_hold.phaser_rate;
+                                    let detune = if lfo_live {
+                                        // getPhaser passes no phaseoffset, and its
+                                        // `time` is the note's begin.
+                                        let phase = *v.phaser_phase.get_or_insert_with(|| {
+                                            lfo_phase0(ph.time_secs, rate, 0.0)
+                                        });
+                                        let raw = (lfo_waveshape(0, phase, 0.5) - 0.5) * lfo_depth;
+                                        let next = wrap_phase(phase + f64::from(rate) / sr);
+                                        v.phaser_phase = Some(next);
+                                        js_clamp(raw, -sweep, sweep)
+                                    } else {
+                                        0.0
+                                    };
+                                    let center = ph.center_hz + mod_adds.phaser_center;
+                                    let frequency = (center + 282.0) * (detune / 1200.0).exp2();
+                                    // phaserdepth names the notch's Q, not the depth
+                                    // control: the modulator lands after the
+                                    // depth-to-Q conversion, not before it.
+                                    let q = 2.0 - (ph.depth * 2.0).clamp(0.0, 1.9)
+                                        + mod_adds.phaser_depth;
+                                    Some(notch_coefs(frequency, q, sr as f32))
+                                }
+                            };
+                            // All five vowel filters are one `vowel` target, so the
+                            // SAME a-rate signal lands on every frequency param.
+                            // Keep the precomputed static coefficients when there
+                            // is no signal to add.
+                            let vowel_coefs = match (v.controls.vowel, mod_adds.vowel_hz) {
+                                (Some(vw), add) if add != 0.0 => std::array::from_fn(|k| {
+                                    bandpass_coefs(vw.freqs[k] + add, vw.qs[k], sr as f32)
+                                }),
+                                _ => v.vowel_coefs,
+                            };
+                            let (wave_l, wave_r) = match &mut v.source {
+                                VoiceSource::Oscillator {
+                                    table_selection,
+                                    phase,
+                                    partial_limit,
+                                } => {
+                                    let wave = oscillator_sample(
+                                        tables,
+                                        &v.controls,
+                                        *table_selection,
+                                        phase,
+                                        partial_limit,
+                                        v.freq_hz,
+                                        fm_offset_hz,
+                                        pitch_ratio,
+                                        sr,
+                                    );
+                                    // `noise` crossfades PINK noise with the
+                                    // oscillator before the envelope. `wetfade`
+                                    // holds at one below a half and falls linearly
+                                    // above it, and the dry leg reads the amount
+                                    // while the wet leg reads its complement - so a
+                                    // half leaves both legs open.
+                                    let wave = if v.controls.noise > 0.0 {
+                                        let wetfade = |d: f32| {
+                                            if d < 0.5 { 1.0 } else { 1.0 - (d - 0.5) / 0.5 }
+                                        };
+                                        let pink = v.source_noise.next(1, 0.0);
+                                        wave * wetfade(v.controls.noise)
+                                            + pink * wetfade(1.0 - v.controls.noise)
+                                    } else {
+                                        wave
+                                    };
+                                    (wave, wave)
+                                }
+                                // The supersaw has the same begin gate as the pulse
+                                // oscillator: no output and no phase advance until
+                                // the gate opens.
+                                VoiceSource::Supersaw { .. } if !source_open => (0.0, 0.0),
+                                VoiceSource::Supersaw { plan, phases } => {
+                                    // `detune` and `spread` are params the supersaw
+                                    // shares with the wavetable, so a modulator on
+                                    // either moves both.
+                                    let (mut gain_l, mut gain_r) =
+                                        plan.pan_gains(mod_adds.panspread);
+                                    let freq = (v.freq_hz + fm_offset_hz) * pitch_ratio;
+                                    let static_spread = mod_adds.freqspread.to_bits() == 0;
+                                    if static_spread
+                                        && let Some(kernel) = supersaw_kernel
+                                        && kernel.supports(plan.count)
+                                    {
+                                        // SAFETY: the kernel was selected only after
+                                        // its CPU prerequisites were detected, and
+                                        // both arrays have MAX_UNISON entries while
+                                        // count is clamped to that bound.
+                                        unsafe {
+                                            kernel.render(
+                                                phases,
+                                                &plan.detune_ratios,
+                                                plan.count,
+                                                freq,
+                                                sr as f32,
+                                                (gain_l, gain_r),
                                             )
                                         }
-                                    })
-                                    .unwrap_or((0.0, 0.0));
-                                *position += *increment * f64::from(sample_pitch);
-                                if let Some((loop_start, loop_end)) = loop_frames
-                                    && *position >= *loop_end
-                                    && *loop_end > *loop_start
-                                {
-                                    *position -= *loop_end - *loop_start;
+                                    } else {
+                                        let (scale, center) = if static_spread {
+                                            (0.0, 0.0)
+                                        } else {
+                                            supersaw_spread_geometry(
+                                                plan.voices,
+                                                (plan.freqspread + mod_adds.freqspread).max(0.0),
+                                            )
+                                        };
+                                        let mut left = 0.0f32;
+                                        let mut right = 0.0f32;
+                                        // `count` is clamped to MAX_UNISON when the
+                                        // plan is built, so the take never shortens
+                                        // the loop.
+                                        for (n, phase) in
+                                            phases.iter_mut().enumerate().take(plan.count)
+                                        {
+                                            let ratio = if static_spread {
+                                                plan.detune_ratios[n]
+                                            } else {
+                                                supersaw_detune_ratio(n, scale, center)
+                                            };
+                                            let voice_freq = freq * ratio;
+                                            // Euclidean remainder, not `fract` - dt
+                                            // must stay non-negative.
+                                            let dt = saw_step(voice_freq / sr as f32);
+                                            let value = saw_blep(*phase, dt);
+                                            left += value * gain_l;
+                                            right += value * gain_r;
+                                            *phase = wrap_phase(f64::from(*phase + dt)) as f32;
+                                            std::mem::swap(&mut gain_l, &mut gain_r);
+                                        }
+                                        (left, right)
+                                    }
                                 }
-                                wave
-                            }
-                        }
-                        // The wavetable has the same begin gate as the pulse
-                        // oscillator and the LFOs. Until the first context
-                        // quantum strictly after its onset, it writes
-                        // nothing and does not advance its phase.
-                        VoiceSource::Wavetable { .. } if !source_open => (0.0, 0.0),
-                        VoiceSource::Wavetable { controls, .. }
-                            if bank.get(controls.table).is_none() =>
-                        {
-                            // The table's slot was emptied under the voice.
-                            v.source_gone = true;
-                            (0.0, 0.0)
-                        }
-                        VoiceSource::Wavetable {
-                            controls,
-                            phases,
-                            lfo_phase,
-                            warp_lfo_phase,
-                        } => Self::wavetable_sample(
-                            bank,
-                            controls,
-                            phases,
-                            lfo_phase,
-                            warp_lfo_phase,
-                            v.start_frame as f64 / sr,
-                            v.freq_hz * pitch_ratio,
-                            t,
-                            v.duration_secs,
-                            sr as f32,
-                            WavetableAdds {
-                                position: mod_adds.position,
-                                freqspread: mod_adds.freqspread,
-                                panspread: mod_adds.panspread,
-                                lfo_rate: v.mod_param_hold.wt.rate,
-                                lfo_depth: v.mod_param_hold.wt.depth,
-                                lfo_skew: v.mod_param_hold.wt.skew,
-                                warp: mod_adds.warp,
-                                warp_lfo_rate: v.mod_param_hold.warp.rate,
-                                warp_lfo_depth: v.mod_param_hold.warp.depth,
-                                warp_lfo_skew: v.mod_param_hold.warp.skew,
-                            },
-                            wavetable_kernel,
-                        ),
-                    };
-                    // `.FX(...)` stages run BEFORE the voice's own params:
-                    // `FX = [...FX, value]` appends the hap's controls last,
-                    // so each stage is a complete effects pass the signal has
-                    // already been through by the time the main chain sees it.
-                    let block_n = (abs % 128) as f32;
-                    // The source's amplitude envelope applies before the
-                    // stages: the envelope gain sits between the source and
-                    // the FX loop. The order matters. Crush, shape and
-                    // distort are non-linear, so the raw oscillator would
-                    // quantise and clip at the wrong level.
-                    let has_stages = v.fx_stage_state.is_some();
-                    let stretched = v.stretch.is_some() && v.controls.stretch.is_some();
-                    // The vocoder and the transient shaper take the same
-                    // split as the stages: both are fed the source BEFORE
-                    // the main gain, the vocoder's delay leads a gain that
-                    // moves, and a nonlinear shaper hears the level it is
-                    // given.
-                    let has_kabel = v.kabel.is_some()
-                        || v.fx_stage_state.as_ref().is_some_and(|stages| {
-                            stages.iter().flatten().any(|stage| stage.kabel.is_some())
-                        });
-                    let split_gain = has_kabel
-                        || (has_stages || stretched || v.transient.is_some())
-                            && v.fx_post_gain != 0.0;
-                    // With no stages the split is invisible, so keep the
-                    // single multiply the rest of the engine expects.
-                    let scale = if split_gain && v.fx_post_gain == 0.0 {
-                        0.0
-                    } else if split_gain {
-                        v.amplitude_scale / v.fx_post_gain * env
-                    } else {
-                        v.amplitude_scale * env * live_gain
-                    };
-                    let (mut wave_l, mut wave_r) = (wave_l * scale, wave_r * scale);
-                    if let Some(states) = &mut v.fx_stage_state {
-                        for (index, state) in states.iter_mut().enumerate() {
-                            let Some(state) = state else {
-                                continue;
-                            };
-                            let stage_adds =
-                                mod_adds.fx_stage.get(index).copied().unwrap_or_default();
-                            (wave_l, wave_r) = apply_fx_stage(
-                                wave_l,
-                                wave_r,
-                                state,
-                                t,
-                                v.hap_duration_secs,
-                                block_n,
-                                sr as f32,
-                                (abs / 128 * 128) as f64 / sr,
-                                transient_open && note_alive,
-                                lfo_live,
-                                &stage_adds,
-                            );
-                        }
-                    }
-                    if let Some(kabel) = &mut v.kabel {
-                        (wave_l, wave_r) = kabel.process(wave_l, (abs / 128 * 128) as f64 / sr, sr);
-                    }
-                    // Signal order: earlier .FX() stages -> vocoder ->
-                    // transient shaper -> main gain -> filters -> ... ->
-                    // sends. The vocoder comes first, as in each stage, so
-                    // everything downstream, the sends included, hears the
-                    // shifted signal.
-                    if let (Some(vocoder), Some(factor)) = (&mut v.stretch, v.controls.stretch) {
-                        wave_l = vocoder[0].process(wave_l, factor);
-                        // A mono chain carries one channel; the right is its
-                        // copy.
-                        wave_r = if v.filters_right.is_some() {
-                            vocoder[1].process(wave_r, factor)
-                        } else {
-                            wave_l
-                        };
-                    }
-                    // The shaper is nonlinear, so moving it across the gain
-                    // or filters changes the sound.
-                    if v.transient.is_some() {
-                        if transient_open && note_alive {
-                            if v.filters_right.is_some() {
-                                let (l, r) = v
-                                    .transient
-                                    .as_mut()
-                                    .map_or((wave_l, wave_r), |s| s.process(wave_l, wave_r));
-                                wave_l = l;
-                                wave_r = r;
-                            } else {
-                                // A mono chain reaches the shaper as ONE
-                                // channel, and one follower runs.
-                                let mono = v
-                                    .transient
-                                    .as_mut()
-                                    .map_or(wave_l, |s| s.process_mono(wave_l));
-                                wave_l = mono;
-                                wave_r = mono;
-                            }
-                        } else {
-                            // The shaper feeds silence into the downstream chain
-                            // before it opens and after hold plus release.
-                            wave_l = 0.0;
-                            wave_r = 0.0;
-                        }
-                    }
-                    if split_gain {
-                        wave_l *= v.fx_post_gain * live_gain;
-                        wave_r *= v.fx_post_gain * live_gain;
-                    }
-                    if let Some(filters_right) = &mut v.filters_right {
-                        // STEREO chain: each channel filters and shapes
-                        // independently, then the stereo pan law mixes.
-                        let (mut left, mut right) = if v.has_filters {
-                            (
-                                v.filters.process_modulated(
-                                    wave_l,
+                                VoiceSource::Pulse {
+                                    pulsewidth,
+                                    width_lfo,
+                                    width_lfo_phase,
+                                    phi,
+                                    y0,
+                                    y1,
+                                    dphif,
+                                    envf,
+                                    env: pulse_env,
+                                } => {
+                                    use std::f64::consts::PI;
+                                    // The begin gate: the source emits nothing, and
+                                    // advances nothing, until the first context
+                                    // quantum past the note's begin - the begin the
+                                    // AudioParam holds, narrowed to f32, which is not
+                                    // always the quantum after the onset FRAME.
+                                    if !source_open {
+                                        (0.0, 0.0)
+                                    } else {
+                                        // The per-block decay resets each 128
+                                        // frames of the CONTEXT grid.
+                                        if abs.is_multiple_of(128) {
+                                            *pulse_env = 1.0;
+                                        }
+                                        // The pulse synth's own LFO is a-rate at
+                                        // its output, but its frequency and depth
+                                        // params are read once per quantum. Its
+                                        // clamp bounds were baked from the original
+                                        // sweep, not from a later modulated depth.
+                                        let width_lfo_add = match width_lfo {
+                                            None => 0.0,
+                                            Some(lfo) => {
+                                                let hold = v.mod_param_hold.pulse_width;
+                                                let rate = lfo.frequency_hz + hold.rate;
+                                                let depth = lfo.depth + hold.depth;
+                                                let phase =
+                                                    *width_lfo_phase.get_or_insert_with(|| {
+                                                        lfo_phase0(lfo.time_secs, rate, 0.0)
+                                                    });
+                                                let raw =
+                                                    (lfo_waveshape(0, phase, 0.5) - 0.5) * depth;
+                                                let add = js_clamp(
+                                                    raw,
+                                                    -0.5 * lfo.depth,
+                                                    0.5 * lfo.depth,
+                                                );
+                                                *width_lfo_phase =
+                                                    Some(wrap_phase(phase + f64::from(rate) / sr));
+                                                add
+                                            }
+                                        };
+                                        let width =
+                                            *pulsewidth + mod_adds.pulse_width + width_lfo_add;
+                                        let pw = (1.0 - f64::from(width.clamp(-0.99, 0.99))) * PI;
+                                        let freq =
+                                            f64::from((v.freq_hz + fm_offset_hz) * pitch_ratio);
+                                        let dphi = freq * (2.0 * PI) / sr;
+                                        *dphif += 0.1 * (dphi - *dphif);
+                                        *pulse_env *= 0.9998;
+                                        *envf += 0.1 * (*pulse_env - *envf);
+                                        let mut b = 2.3 * (1.0 - 0.0001 * freq);
+                                        if b < 0.0 {
+                                            b = 0.0;
+                                        }
+                                        *phi += *dphif;
+                                        if *phi >= PI {
+                                            *phi -= 2.0 * PI;
+                                        }
+                                        let out0 = (*phi + b * *y0).cos();
+                                        *y0 = 0.5 * (out0 + *y0);
+                                        let out1 = (*phi + b * *y1 + pw).cos();
+                                        *y1 = 0.5 * (out1 + *y1);
+                                        let value = (0.15 * (out0 - out1) * *envf) as f32;
+                                        (value, value)
+                                    }
+                                }
+                                VoiceSource::ByteBeat {
+                                    expression,
+                                    program,
                                     t,
-                                    v.hap_duration_secs,
-                                    filter_adds,
-                                    filter_q_adds,
-                                ),
-                                filters_right.process_modulated(
-                                    wave_r,
+                                    start_offset,
+                                    gate,
+                                } => {
+                                    if abs < *gate {
+                                        // Gated: the source has not run yet, so it
+                                        // emits nothing and advances nothing.
+                                        (0.0, 0.0)
+                                    } else {
+                                        // local_t scales the integer counter by
+                                        // 256/sampleRate and the voice's frequency,
+                                        // the expression's low byte becomes a
+                                        // bipolar signal, and the output is clamped
+                                        // before anything downstream sees it.
+                                        let scale = 256.0 / sr;
+                                        let local_t =
+                                            scale * f64::from(v.freq_hz + fm_offset_hz) * *t
+                                                + *start_offset;
+                                        // A compiled `byteBeatExpression` replaces the
+                                        // built-in table; `n` still picks a built-in
+                                        // when the score gave no expression of its own.
+                                        let value = match program {
+                                            Some(program) => program.eval(local_t),
+                                            None => crate::backend::bytebeat_sample(
+                                                *expression,
+                                                local_t,
+                                            ),
+                                        };
+                                        let byte = f64::from(crate::backend::bytebeat_byte(value));
+                                        let signal = (byte / 127.5 - 1.0) * 0.2;
+                                        let out = signal.clamp(-0.4, 0.4) as f32;
+                                        *t += 1.0;
+                                        (out, out)
+                                    }
+                                }
+                                VoiceSource::Bus { bus } => {
+                                    let tap = bus_now[usize::from(*bus)];
+                                    (tap[0], tap[1])
+                                }
+                                VoiceSource::ZzFx { voice, ring } => {
+                                    let sample = voice
+                                        .step(ring.as_deref_mut().unwrap_or(&mut []))
+                                        .unwrap_or(0.0);
+                                    (sample, sample)
+                                }
+                                VoiceSource::Input { channel, fm_phase } => {
+                                    let sample = match (&input, input_base) {
+                                        (Some(ring), Some((base, ratio))) => {
+                                            // The FM matrix bends the read rate, as
+                                            // it bends an oscillator's frequency: the
+                                            // deviation in Hz against the voice's
+                                            // nominal frequency is the rate multiplier
+                                            // the reader runs at, integrated into
+                                            // `fm_phase`. The multiplier deviation is
+                                            // the route amount times the operator
+                                            // signal, independent of the note. A read
+                                            // that runs past the writer lands in
+                                            // silence and one far behind in the
+                                            // ring's oldest frames.
+                                            let position =
+                                                base + (sub_start + i) as f64 * ratio + *fm_phase;
+                                            if v.controls.fm.is_some() {
+                                                // The matrix output is exactly zero
+                                                // when the nominal frequency is zero,
+                                                // which keeps the division finite.
+                                                if fm_matrix_hz != 0.0 {
+                                                    *fm_phase += f64::from(fm_matrix_hz)
+                                                        / f64::from(v.freq_hz)
+                                                        * ratio;
+                                                }
+                                                // The integral of a modulator that
+                                                // starts at phase zero carries its DC
+                                                // as a one-sided LEAD into the
+                                                // writer, which a reader one block
+                                                // behind has no room for. The leak
+                                                // re-centers the swing into the
+                                                // ring's history and bounds a
+                                                // drifting operator; above a hertz it
+                                                // is too slow to hear.
+                                                *fm_phase -= *fm_phase * INPUT_FM_LEAK;
+                                            }
+                                            ring.sample_at(position, usize::from(*channel))
+                                        }
+                                        _ => 0.0,
+                                    };
+                                    (sample, sample)
+                                }
+                                VoiceSource::Noise {
+                                    kind,
+                                    density,
+                                    state,
+                                } => {
+                                    // One stream feeding both channels: the source is
+                                    // mono until the panner, like every other synth.
+                                    let sample = state.next(*kind, *density);
+                                    (sample, sample)
+                                }
+                                VoiceSource::One => (1.0, 1.0),
+                                VoiceSource::Sbd {
+                                    controls: sbd,
+                                    phase,
+                                    noise,
+                                } => {
+                                    if sbd_pre_onset {
+                                        // The scheduled oscillator contributes zero
+                                        // before source start, while the connected
+                                        // WaveShaper remains active. Its sample-rate-
+                                        // length curve is one element short of symmetry,
+                                        // so interpolating at zero yields the small
+                                        // negative DC value required by the downstream
+                                        // signal path.
+                                        let value = sbd_saturation(0.0, sbd_saturation_curve);
+                                        (value, value)
+                                    } else {
+                                        // Pitch env: detune from penv semitones (penv×100
+                                        // cents) exponentially to 0.001 cents over pdecay,
+                                        // then held.
+                                        let start_cents = f64::from(sbd.penv_semitones) * 100.0;
+                                        let cents = if start_cents.abs() < f64::EPSILON {
+                                            0.0
+                                        } else if t >= sbd.pdecay_secs {
+                                            0.001
+                                        } else {
+                                            start_cents
+                                                * (0.001 / start_cents.abs())
+                                                    .powf(f64::from(t / sbd.pdecay_secs))
+                                        };
+                                        let freq =
+                                            f64::from(v.freq_hz) * 2.0f64.powf(cents / 1200.0);
+                                        // Use a band-limited PeriodicWave table selected
+                                        // from the swept pitch, not the base note,
+                                        // because SBD crosses three octaves.
+                                        let tri = tables.sample(
+                                            crate::backend::Waveform::Triangle,
+                                            *phase,
+                                            tables.selection(freq as f32),
+                                        );
+                                        *phase = wrap_phase(*phase + freq / sr);
+                                        // WaveShaper saturation, then the drum's own envelope:
+                                        // hold 1 until 20 ms, exponential to 0.001 over decay.
+                                        let saturated = sbd_saturation(tri, sbd_saturation_curve);
+                                        let attackhold = 0.02f32;
+                                        let body_env = if t <= attackhold {
+                                            1.0
+                                        } else {
+                                            0.001f32
+                                                .powf(((t - attackhold) / sbd.decay_secs).min(1.0))
+                                        };
+                                        // Brown noise buffer: gain 1.2 exponentially to
+                                        // 0.001 over 25 ms, then hold the endpoint.
+                                        let brown = noise.next(2, 0.0);
+                                        let noise_env = sbd_noise_gain(t);
+                                        let mut value = saturated * body_env + brown * noise_env;
+                                        // 10 ms linear fade landing exactly at the stop.
+                                        let remaining = sbd.stop_secs - t;
+                                        if remaining < 0.01 {
+                                            value *= (remaining / 0.01).max(0.0);
+                                        }
+                                        (value, value)
+                                    }
+                                }
+                                VoiceSource::Sample {
+                                    sample,
+                                    position,
+                                    increment,
+                                    reversed,
+                                    delay_frames,
+                                    loop_frames,
+                                } => {
+                                    if bank.get(*sample).is_none() {
+                                        // The slot was emptied under the voice - an
+                                        // uninstall landed. Silence for the rest of the
+                                        // block, and the voice ends with it: the id may
+                                        // go to another sound, and a voice still reading
+                                        // the slot would play that one under this name.
+                                        v.source_gone = true;
+                                        (0.0, 0.0)
+                                    } else if *delay_frames > 0 {
+                                        *delay_frames -= 1;
+                                        (0.0, 0.0)
+                                    } else if let Some((loop_start, loop_end)) = *loop_frames
+                                        && loop_end > loop_start
+                                        && bank.get(*sample).is_some_and(|decoded| {
+                                            *increment * f64::from(sample_pitch)
+                                                > loop_end.min(decoded.frames() as f64) - loop_start
+                                        })
+                                    {
+                                        // While the step is longer than the loop, its
+                                        // end clamped to the buffer, the voice is
+                                        // silent and its cursor holds, as Chromium's
+                                        // buffer source does.
+                                        (0.0, 0.0)
+                                    } else {
+                                        let wave = bank
+                                            .get(*sample)
+                                            .and_then(|decoded| {
+                                                if *reversed {
+                                                    let last = (decoded.frames().max(1) - 1) as f64;
+                                                    let read = last - *position;
+                                                    if read < 0.0 {
+                                                        return None;
+                                                    }
+                                                    decoded.stereo_at_reversed_with_mode(
+                                                        read,
+                                                        sample_resampling_mode,
+                                                    )
+                                                } else {
+                                                    decoded.stereo_at_with_mode(
+                                                        *position,
+                                                        sample_resampling_mode,
+                                                    )
+                                                }
+                                            })
+                                            .unwrap_or((0.0, 0.0));
+                                        *position += *increment * f64::from(sample_pitch);
+                                        if let Some((loop_start, loop_end)) = loop_frames
+                                            && *position >= *loop_end
+                                            && *loop_end > *loop_start
+                                        {
+                                            *position -= *loop_end - *loop_start;
+                                        }
+                                        wave
+                                    }
+                                }
+                                // The wavetable has the same begin gate as the pulse
+                                // oscillator and the LFOs. Until the first context
+                                // quantum strictly after its onset, it writes
+                                // nothing and does not advance its phase.
+                                VoiceSource::Wavetable { .. } if !source_open => (0.0, 0.0),
+                                VoiceSource::Wavetable { controls, .. }
+                                    if bank.get(controls.table).is_none() =>
+                                {
+                                    // The table's slot was emptied under the voice.
+                                    v.source_gone = true;
+                                    (0.0, 0.0)
+                                }
+                                VoiceSource::Wavetable {
+                                    controls,
+                                    phases,
+                                    lfo_phase,
+                                    warp_lfo_phase,
+                                } => Self::wavetable_sample(
+                                    bank,
+                                    controls,
+                                    phases,
+                                    lfo_phase,
+                                    warp_lfo_phase,
+                                    v.start_frame as f64 / sr,
+                                    v.freq_hz * pitch_ratio,
                                     t,
-                                    v.hap_duration_secs,
-                                    filter_adds,
-                                    filter_q_adds,
+                                    v.duration_secs,
+                                    sr as f32,
+                                    WavetableAdds {
+                                        position: mod_adds.position,
+                                        freqspread: mod_adds.freqspread,
+                                        panspread: mod_adds.panspread,
+                                        lfo_rate: v.mod_param_hold.wt.rate,
+                                        lfo_depth: v.mod_param_hold.wt.depth,
+                                        lfo_skew: v.mod_param_hold.wt.skew,
+                                        warp: mod_adds.warp,
+                                        warp_lfo_rate: v.mod_param_hold.warp.rate,
+                                        warp_lfo_depth: v.mod_param_hold.warp.depth,
+                                        warp_lfo_skew: v.mod_param_hold.warp.skew,
+                                    },
+                                    wavetable_kernel,
                                 ),
-                            )
-                        } else {
-                            (wave_l, wave_r)
-                        };
-                        if v.has_pre_distort_fx {
-                            let worklets = FxWorkletControls {
-                                vowel: v.controls.vowel.as_ref(),
-                                coarse: v.controls.coarse,
-                                crush: v.controls.crush,
-                                shape: v.controls.shape,
                             };
+                            // `.FX(...)` stages run BEFORE the voice's own params:
+                            // `FX = [...FX, value]` appends the hap's controls last,
+                            // so each stage is a complete effects pass the signal has
+                            // already been through by the time the main chain sees it.
                             let block_n = (abs % 128) as f32;
-                            left = voice_fx_pre_distort(
-                                left,
-                                0,
-                                worklets,
-                                &vowel_coefs,
-                                &mut v.vowel_filters,
-                                &mut v.coarse_hold,
-                                block_n,
-                                &v.fx_mod_hold,
-                            );
-                            right = voice_fx_pre_distort(
-                                right,
-                                1,
-                                worklets,
-                                &vowel_coefs,
-                                &mut v.vowel_filters,
-                                &mut v.coarse_hold,
-                                block_n,
-                                &v.fx_mod_hold,
-                            );
-                        }
-                        if let Some(distort) = v.controls.distort {
-                            // a-rate: DistortProcessor reads per sample.
-                            let curve = match v.distort_curve {
-                                Some(curve) if mod_adds.distort == 0.0 => curve,
-                                _ => distort.curve(distort.shape_with(mod_adds.distort)),
-                            };
-                            let (l, r) = (curve.apply(left), curve.apply(right));
-                            let vol = mod_adds.distort_vol;
-                            let (l, r) = if vol == 0.0 {
-                                (l, r)
+                            // The source's amplitude envelope applies before the
+                            // stages: the envelope gain sits between the source and
+                            // the FX loop. The order matters. Crush, shape and
+                            // distort are non-linear, so the raw oscillator would
+                            // quantise and clip at the wrong level.
+                            let has_stages = v.fx_stage_state.is_some();
+                            let stretched = v.stretch.is_some() && v.controls.stretch.is_some();
+                            // The vocoder and the transient shaper take the same
+                            // split as the stages: both are fed the source BEFORE
+                            // the main gain, the vocoder's delay leads a gain that
+                            // moves, and a nonlinear shaper hears the level it is
+                            // given.
+                            let has_kabel = v.kabel.is_some()
+                                || v.fx_stage_state.as_ref().is_some_and(|stages| {
+                                    stages.iter().flatten().any(|stage| stage.kabel.is_some())
+                                });
+                            let split_gain = has_kabel
+                                || (has_stages || stretched || v.transient.is_some())
+                                    && v.fx_post_gain != 0.0;
+                            // With no stages the split is invisible, so keep the
+                            // single multiply the rest of the engine expects.
+                            let scale = if split_gain && v.fx_post_gain == 0.0 {
+                                0.0
+                            } else if split_gain {
+                                v.amplitude_scale / v.fx_post_gain * env
                             } else {
-                                let scale = distort.postgain_scale(vol);
-                                (l * scale, r * scale)
+                                v.amplitude_scale * env * live_gain
                             };
-                            left = l;
-                            right = r;
-                        }
-                        left *= trem_gain;
-                        right *= trem_gain;
-                        let (left, right) = match (&mut v.compressor, v.controls.compressor) {
-                            (Some(state), Some(c)) => {
-                                state.process(left, right, &mod_adds.compressor(c), sr as f32)
+                            let (mut wave_l, mut wave_r) = (wave_l * scale, wave_r * scale);
+                            if let Some(states) = &mut v.fx_stage_state {
+                                for (index, state) in states.iter_mut().enumerate() {
+                                    let Some(state) = state else {
+                                        continue;
+                                    };
+                                    let stage_adds =
+                                        mod_adds.fx_stage.get(index).copied().unwrap_or_default();
+                                    (wave_l, wave_r) = apply_fx_stage(
+                                        wave_l,
+                                        wave_r,
+                                        state,
+                                        t,
+                                        v.hap_duration_secs,
+                                        block_n,
+                                        sr as f32,
+                                        (abs / 128 * 128) as f64 / sr,
+                                        transient_open && note_alive,
+                                        lfo_live,
+                                        &stage_adds,
+                                    );
+                                }
                             }
-                            _ => (left, right),
-                        };
-                        let (left, right) = stereo_pan(left, right, pan_param);
-                        // Phaser sits AFTER the panner,
-                        // one notch state per channel.
-                        let (mut left, mut right) = if let Some(coefs) = &phaser_coefs {
-                            (
-                                v.phaser_notch[0].process(coefs, left),
-                                v.phaser_notch[1].process(coefs, right),
-                            )
-                        } else {
-                            (left, right)
-                        };
-                        if !post_insert {
-                            left *= post_gain;
-                            right *= post_gain;
-                        }
-                        // This bounds the native voice. Insert effects and
-                        // their postgain follow it and can exceed its ceiling.
-                        if let Some(limiter) = v.limiter.as_mut() {
-                            let (l, r) = limiter.process_frame(left, right);
-                            left = l;
-                            right = r;
-                        }
-                        let send_gain = if post_insert { post_gain } else { 1.0 };
-                        let (send_left, send_right) = (left * send_gain, right * send_gain);
-                        let delay_wet = (v.delay_wet + mod_adds.delay_send).max(0.0);
-                        if delay_wet > 0.0 && v.delay_wet > 0.0 {
-                            orbit_inputs[v.orbit][0] += send_left * delay_wet;
-                            orbit_inputs[v.orbit][1] += send_right * delay_wet;
-                        }
-                        let reverb_wet = (v.reverb_wet + mod_adds.room_send).max(0.0);
-                        if reverb_wet > 0.0 && v.reverb_wet > 0.0 {
-                            sends[v.orbit][0][i] += send_left * reverb_wet;
-                            sends[v.orbit][1][i] += send_right * reverb_wet;
-                        }
-                        // `effectSend(post, busNode, busgain)` taps the voice
-                        // BEFORE its dry gain, so a `.dry(0)` sender is still
-                        // heard by whatever modulates off its bus.
-                        if let Some(bus) = v.controls.bus {
-                            let send = v.controls.busgain;
-                            let slot = &mut bus_now[usize::from(bus)];
-                            slot[0] += send_left * send;
-                            slot[1] += send_right * send;
-                        }
-                        let dry = v.dry_gain + mod_adds.dry;
-                        let (left, right) = (left * dry, right * dry);
-                        let mix = if v.piano {
-                            &mut piano_mix
-                        } else if v.through_insert {
-                            &mut insert_blocks[v.insert_bus.expect("insert voice bus")]
-                        } else {
-                            &mut blocks[v.orbit]
-                        };
-                        mix[0][i] += left;
-                        mix[1][i] += right;
-                        let mut slots = if v.generation >= visual_capture_generation_floor {
-                            v.ui_visuals & visual_capture_mask
-                        } else {
-                            0
-                        };
-                        while slots != 0 {
-                            let slot = slots.trailing_zeros() as usize;
-                            let at = (block_offset + sub_start + i) * 2;
-                            if let Some(block) = visual_blocks.get_mut(slot)
-                                && at + 1 < block.len()
+                            if let Some(kabel) = &mut v.kabel {
+                                (wave_l, wave_r) =
+                                    kabel.process(wave_l, (abs / 128 * 128) as f64 / sr, sr);
+                            }
+                            // Signal order: earlier .FX() stages -> vocoder ->
+                            // transient shaper -> main gain -> filters -> ... ->
+                            // sends. The vocoder comes first, as in each stage, so
+                            // everything downstream, the sends included, hears the
+                            // shifted signal.
+                            if let (Some(vocoder), Some(factor)) =
+                                (&mut v.stretch, v.controls.stretch)
                             {
-                                block[at] += left * send_gain;
-                                block[at + 1] += right * send_gain;
+                                wave_l = vocoder[0].process(wave_l, factor);
+                                // A mono chain carries one channel; the right is its
+                                // copy.
+                                wave_r = if v.filters_right.is_some() {
+                                    vocoder[1].process(wave_r, factor)
+                                } else {
+                                    wave_l
+                                };
                             }
-                            slots &= slots - 1;
-                        }
-                    } else {
-                        let mut sample = if v.has_filters {
-                            v.filters.process_modulated(
-                                wave_l,
-                                t,
-                                v.hap_duration_secs,
-                                filter_adds,
-                                filter_q_adds,
-                            )
-                        } else {
-                            wave_l
-                        };
-                        // Mono chain: the modulated pan param re-derives the
-                        // equal-power channel gains per frame.
-                        let (lg, rg) = if mod_adds.pan != 0.0 {
-                            Self::channel_gains(Some((pan_param + 1.0) * 0.5))
-                        } else {
-                            (v.left_gain, v.right_gain)
-                        };
-                        if v.has_pre_distort_fx {
-                            sample = voice_fx_pre_distort(
-                                sample,
-                                0,
-                                FxWorkletControls {
-                                    vowel: v.controls.vowel.as_ref(),
-                                    coarse: v.controls.coarse,
-                                    crush: v.controls.crush,
-                                    shape: v.controls.shape,
-                                },
-                                &vowel_coefs,
-                                &mut v.vowel_filters,
-                                &mut v.coarse_hold,
-                                (abs % 128) as f32,
-                                &v.fx_mod_hold,
-                            );
-                        }
-                        // FX-loop distortion runs after the filter chain
-                        // and before the panner, one sample at a time with
-                        // no oversampling.
-                        if let Some(distort) = v.controls.distort {
-                            let curve = match v.distort_curve {
-                                Some(curve) if mod_adds.distort == 0.0 => curve,
-                                _ => distort.curve(distort.shape_with(mod_adds.distort)),
-                            };
-                            sample = curve.apply(sample);
-                            if mod_adds.distort_vol != 0.0 {
-                                sample *= distort.postgain_scale(mod_adds.distort_vol);
+                            // The shaper is nonlinear, so moving it across the gain
+                            // or filters changes the sound.
+                            if v.transient.is_some() {
+                                if transient_open && note_alive {
+                                    if v.filters_right.is_some() {
+                                        let (l, r) =
+                                            v.transient.as_mut().map_or((wave_l, wave_r), |s| {
+                                                s.process(wave_l, wave_r)
+                                            });
+                                        wave_l = l;
+                                        wave_r = r;
+                                    } else {
+                                        // A mono chain reaches the shaper as ONE
+                                        // channel, and one follower runs.
+                                        let mono = v
+                                            .transient
+                                            .as_mut()
+                                            .map_or(wave_l, |s| s.process_mono(wave_l));
+                                        wave_l = mono;
+                                        wave_r = mono;
+                                    }
+                                } else {
+                                    // The shaper feeds silence into the downstream chain
+                                    // before it opens and after hold plus release.
+                                    wave_l = 0.0;
+                                    wave_r = 0.0;
+                                }
+                            }
+                            if split_gain {
+                                wave_l *= v.fx_post_gain * live_gain;
+                                wave_r *= v.fx_post_gain * live_gain;
+                            }
+                            if let Some(filters_right) = &mut v.filters_right {
+                                // STEREO chain: each channel filters and shapes
+                                // independently, then the stereo pan law mixes.
+                                let (mut left, mut right) = if v.has_filters {
+                                    (
+                                        v.filters.process_modulated(
+                                            wave_l,
+                                            t,
+                                            v.hap_duration_secs,
+                                            filter_adds,
+                                            filter_q_adds,
+                                        ),
+                                        filters_right.process_modulated(
+                                            wave_r,
+                                            t,
+                                            v.hap_duration_secs,
+                                            filter_adds,
+                                            filter_q_adds,
+                                        ),
+                                    )
+                                } else {
+                                    (wave_l, wave_r)
+                                };
+                                if v.has_pre_distort_fx {
+                                    let worklets = FxWorkletControls {
+                                        vowel: v.controls.vowel.as_ref(),
+                                        coarse: v.controls.coarse,
+                                        crush: v.controls.crush,
+                                        shape: v.controls.shape,
+                                    };
+                                    let block_n = (abs % 128) as f32;
+                                    left = voice_fx_pre_distort(
+                                        left,
+                                        0,
+                                        worklets,
+                                        &vowel_coefs,
+                                        &mut v.vowel_filters,
+                                        &mut v.coarse_hold,
+                                        block_n,
+                                        &v.fx_mod_hold,
+                                    );
+                                    right = voice_fx_pre_distort(
+                                        right,
+                                        1,
+                                        worklets,
+                                        &vowel_coefs,
+                                        &mut v.vowel_filters,
+                                        &mut v.coarse_hold,
+                                        block_n,
+                                        &v.fx_mod_hold,
+                                    );
+                                }
+                                if let Some(distort) = v.controls.distort {
+                                    // a-rate: DistortProcessor reads per sample.
+                                    let curve = match v.distort_curve {
+                                        Some(curve) if mod_adds.distort == 0.0 => curve,
+                                        _ => distort.curve(distort.shape_with(mod_adds.distort)),
+                                    };
+                                    let (l, r) = (curve.apply(left), curve.apply(right));
+                                    let vol = mod_adds.distort_vol;
+                                    let (l, r) = if vol == 0.0 {
+                                        (l, r)
+                                    } else {
+                                        let scale = distort.postgain_scale(vol);
+                                        (l * scale, r * scale)
+                                    };
+                                    left = l;
+                                    right = r;
+                                }
+                                left *= trem_gain;
+                                right *= trem_gain;
+                                let (left, right) = match (&mut v.compressor, v.controls.compressor)
+                                {
+                                    (Some(state), Some(c)) => state.process(
+                                        left,
+                                        right,
+                                        &mod_adds.compressor(c),
+                                        sr as f32,
+                                    ),
+                                    _ => (left, right),
+                                };
+                                let (left, right) = stereo_pan(left, right, pan_param);
+                                // Phaser sits AFTER the panner,
+                                // one notch state per channel.
+                                let (mut left, mut right) = if let Some(coefs) = &phaser_coefs {
+                                    (
+                                        v.phaser_notch[0].process(coefs, left),
+                                        v.phaser_notch[1].process(coefs, right),
+                                    )
+                                } else {
+                                    (left, right)
+                                };
+                                if !post_insert {
+                                    left *= post_gain;
+                                    right *= post_gain;
+                                }
+                                // This bounds the native voice. Insert effects and
+                                // their postgain follow it and can exceed its ceiling.
+                                if let Some(limiter) = v.limiter.as_mut() {
+                                    let (l, r) = limiter.process_frame(left, right);
+                                    left = l;
+                                    right = r;
+                                }
+                                let send_gain = if post_insert { post_gain } else { 1.0 };
+                                let (send_left, send_right) = (left * send_gain, right * send_gain);
+                                let delay_wet = (v.delay_wet + mod_adds.delay_send).max(0.0);
+                                if delay_wet > 0.0 && v.delay_wet > 0.0 {
+                                    orbit_inputs[v.orbit][0] += send_left * delay_wet;
+                                    orbit_inputs[v.orbit][1] += send_right * delay_wet;
+                                }
+                                let reverb_wet = (v.reverb_wet + mod_adds.room_send).max(0.0);
+                                if reverb_wet > 0.0 && v.reverb_wet > 0.0 {
+                                    sends[v.orbit][0][i] += send_left * reverb_wet;
+                                    sends[v.orbit][1][i] += send_right * reverb_wet;
+                                }
+                                // `effectSend(post, busNode, busgain)` taps the voice
+                                // BEFORE its dry gain, so a `.dry(0)` sender is still
+                                // heard by whatever modulates off its bus.
+                                if let Some(bus) = v.controls.bus {
+                                    let send = v.controls.busgain;
+                                    let slot = &mut bus_now[usize::from(bus)];
+                                    slot[0] += send_left * send;
+                                    slot[1] += send_right * send;
+                                }
+                                let dry = v.dry_gain + mod_adds.dry;
+                                let (left, right) = (left * dry, right * dry);
+                                let mix = if v.piano {
+                                    &mut piano_mix
+                                } else if v.through_insert {
+                                    &mut insert_blocks[v.insert_bus.expect("insert voice bus")]
+                                } else {
+                                    &mut blocks[v.orbit]
+                                };
+                                mix[0][i] += left;
+                                mix[1][i] += right;
+                                let mut slots = if v.generation >= visual_capture_generation_floor {
+                                    v.ui_visuals & visual_capture_mask
+                                } else {
+                                    0
+                                };
+                                while slots != 0 {
+                                    let slot = slots.trailing_zeros() as usize;
+                                    let at = (block_offset + sub_start + i) * 2;
+                                    if let Some(block) = visual_blocks.get_mut(slot)
+                                        && at + 1 < block.len()
+                                    {
+                                        block[at] += left * send_gain;
+                                        block[at + 1] += right * send_gain;
+                                    }
+                                    slots &= slots - 1;
+                                }
+                            } else {
+                                let mut sample = if v.has_filters {
+                                    v.filters.process_modulated(
+                                        wave_l,
+                                        t,
+                                        v.hap_duration_secs,
+                                        filter_adds,
+                                        filter_q_adds,
+                                    )
+                                } else {
+                                    wave_l
+                                };
+                                // Mono chain: the modulated pan param re-derives the
+                                // equal-power channel gains per frame.
+                                let (lg, rg) = if mod_adds.pan != 0.0 {
+                                    Self::channel_gains(Some((pan_param + 1.0) * 0.5))
+                                } else {
+                                    (v.left_gain, v.right_gain)
+                                };
+                                if v.has_pre_distort_fx {
+                                    sample = voice_fx_pre_distort(
+                                        sample,
+                                        0,
+                                        FxWorkletControls {
+                                            vowel: v.controls.vowel.as_ref(),
+                                            coarse: v.controls.coarse,
+                                            crush: v.controls.crush,
+                                            shape: v.controls.shape,
+                                        },
+                                        &vowel_coefs,
+                                        &mut v.vowel_filters,
+                                        &mut v.coarse_hold,
+                                        (abs % 128) as f32,
+                                        &v.fx_mod_hold,
+                                    );
+                                }
+                                // FX-loop distortion runs after the filter chain
+                                // and before the panner, one sample at a time with
+                                // no oversampling.
+                                if let Some(distort) = v.controls.distort {
+                                    let curve = match v.distort_curve {
+                                        Some(curve) if mod_adds.distort == 0.0 => curve,
+                                        _ => distort.curve(distort.shape_with(mod_adds.distort)),
+                                    };
+                                    sample = curve.apply(sample);
+                                    if mod_adds.distort_vol != 0.0 {
+                                        sample *= distort.postgain_scale(mod_adds.distort_vol);
+                                    }
+                                }
+                                sample *= trem_gain;
+                                if let (Some(state), Some(c)) =
+                                    (&mut v.compressor, v.controls.compressor)
+                                {
+                                    let c = mod_adds.compressor(c);
+                                    sample = state.process(sample, sample, &c, sr as f32).0;
+                                }
+                                // Phaser belongs post-pan, but the mono path's pan
+                                // is a static per-voice gain pair, which commutes
+                                // with the (linear) notch - one state on the mono
+                                // signal.
+                                if let Some(coefs) = &phaser_coefs {
+                                    sample = v.phaser_notch[0].process(coefs, sample);
+                                }
+                                if !post_insert {
+                                    sample *= post_gain;
+                                }
+                                // The same native limiter as the stereo branch,
+                                // with identical input channels.
+                                if let Some(limiter) = v.limiter.as_mut() {
+                                    sample = limiter.process_frame(sample, sample).0;
+                                }
+                                let send_gain = if post_insert { post_gain } else { 1.0 };
+                                let send_sample = sample * send_gain;
+                                // The delay send taps after the chain's panner and
+                                // post-gain, so echoes keep the voice's stereo image.
+                                let delay_wet = (v.delay_wet + mod_adds.delay_send).max(0.0);
+                                if delay_wet > 0.0 && v.delay_wet > 0.0 {
+                                    orbit_inputs[v.orbit][0] += send_sample * lg * delay_wet;
+                                    orbit_inputs[v.orbit][1] += send_sample * rg * delay_wet;
+                                }
+                                let reverb_wet = (v.reverb_wet + mod_adds.room_send).max(0.0);
+                                if reverb_wet > 0.0 && v.reverb_wet > 0.0 {
+                                    sends[v.orbit][0][i] += send_sample * lg * reverb_wet;
+                                    sends[v.orbit][1][i] += send_sample * rg * reverb_wet;
+                                }
+                                // The same send as the stereo branch above. A mono
+                                // voice is the ordinary case for `s("sine")`, so
+                                // sending only on the stereo path left every bus empty
+                                // while every part looked wired.
+                                if let Some(bus) = v.controls.bus {
+                                    let send = v.controls.busgain;
+                                    let slot = &mut bus_now[usize::from(bus)];
+                                    slot[0] += send_sample * lg * send;
+                                    slot[1] += send_sample * rg * send;
+                                }
+                                let dry = v.dry_gain + mod_adds.dry;
+                                let (left, right) = (sample * lg * dry, sample * rg * dry);
+                                let mix = if v.piano {
+                                    &mut piano_mix
+                                } else if v.through_insert {
+                                    &mut insert_blocks[v.insert_bus.expect("insert voice bus")]
+                                } else {
+                                    &mut blocks[v.orbit]
+                                };
+                                mix[0][i] += left;
+                                mix[1][i] += right;
+                                let mut slots = if v.generation >= visual_capture_generation_floor {
+                                    v.ui_visuals & visual_capture_mask
+                                } else {
+                                    0
+                                };
+                                while slots != 0 {
+                                    let slot = slots.trailing_zeros() as usize;
+                                    let at = (block_offset + sub_start + i) * 2;
+                                    if let Some(block) = visual_blocks.get_mut(slot)
+                                        && at + 1 < block.len()
+                                    {
+                                        block[at] += left * send_gain;
+                                        block[at + 1] += right * send_gain;
+                                    }
+                                    slots &= slots - 1;
+                                }
+                            }
+                            if v.has_param_modulators && lfo_live {
+                                if abs & 127 == 0 {
+                                    djf_mods[v.orbit] += mod_adds.djf;
+                                }
+                                delay_time_mods[v.orbit] += mod_adds.delay_time;
+                                delay_feedback_mods[v.orbit] += mod_adds.delay_feedback;
                             }
                         }
-                        sample *= trem_gain;
-                        if let (Some(state), Some(c)) = (&mut v.compressor, v.controls.compressor) {
-                            let c = mod_adds.compressor(c);
-                            sample = state.process(sample, sample, &c, sr as f32).0;
-                        }
-                        // Phaser belongs post-pan, but the mono path's pan
-                        // is a static per-voice gain pair, which commutes
-                        // with the (linear) notch - one state on the mono
-                        // signal.
-                        if let Some(coefs) = &phaser_coefs {
-                            sample = v.phaser_notch[0].process(coefs, sample);
-                        }
-                        if !post_insert {
-                            sample *= post_gain;
-                        }
-                        // The same native limiter as the stereo branch,
-                        // with identical input channels.
-                        if let Some(limiter) = v.limiter.as_mut() {
-                            sample = limiter.process_frame(sample, sample).0;
-                        }
-                        let send_gain = if post_insert { post_gain } else { 1.0 };
-                        let send_sample = sample * send_gain;
-                        // The delay send taps after the chain's panner and
-                        // post-gain, so echoes keep the voice's stereo image.
-                        let delay_wet = (v.delay_wet + mod_adds.delay_send).max(0.0);
-                        if delay_wet > 0.0 && v.delay_wet > 0.0 {
-                            orbit_inputs[v.orbit][0] += send_sample * lg * delay_wet;
-                            orbit_inputs[v.orbit][1] += send_sample * rg * delay_wet;
-                        }
-                        let reverb_wet = (v.reverb_wet + mod_adds.room_send).max(0.0);
-                        if reverb_wet > 0.0 && v.reverb_wet > 0.0 {
-                            sends[v.orbit][0][i] += send_sample * lg * reverb_wet;
-                            sends[v.orbit][1][i] += send_sample * rg * reverb_wet;
-                        }
-                        // The same send as the stereo branch above. A mono
-                        // voice is the ordinary case for `s("sine")`, so
-                        // sending only on the stereo path left every bus empty
-                        // while every part looked wired.
-                        if let Some(bus) = v.controls.bus {
-                            let send = v.controls.busgain;
-                            let slot = &mut bus_now[usize::from(bus)];
-                            slot[0] += send_sample * lg * send;
-                            slot[1] += send_sample * rg * send;
-                        }
-                        let dry = v.dry_gain + mod_adds.dry;
-                        let (left, right) = (sample * lg * dry, sample * rg * dry);
-                        let mix = if v.piano {
-                            &mut piano_mix
-                        } else if v.through_insert {
-                            &mut insert_blocks[v.insert_bus.expect("insert voice bus")]
-                        } else {
-                            &mut blocks[v.orbit]
-                        };
-                        mix[0][i] += left;
-                        mix[1][i] += right;
-                        let mut slots = if v.generation >= visual_capture_generation_floor {
-                            v.ui_visuals & visual_capture_mask
-                        } else {
-                            0
-                        };
-                        while slots != 0 {
-                            let slot = slots.trailing_zeros() as usize;
-                            let at = (block_offset + sub_start + i) * 2;
-                            if let Some(block) = visual_blocks.get_mut(slot)
-                                && at + 1 < block.len()
-                            {
-                                block[at] += left * send_gain;
-                                block[at + 1] += right * send_gain;
-                            }
-                            slots &= slots - 1;
-                        }
-                    }
-                    if v.has_param_modulators && lfo_live {
-                        if abs & 127 == 0 {
-                            djf_mods[v.orbit] += mod_adds.djf;
-                        }
-                        delay_time_mods[v.orbit] += mod_adds.delay_time;
-                        delay_feedback_mods[v.orbit] += mod_adds.delay_feedback;
-                    }
+                    };
+                }
+                if any_plain {
+                    voice_sample_pass!(true);
+                } else {
+                    voice_sample_pass!(false);
                 }
                 let mut buses = effect_buses;
                 while buses != 0 {
@@ -3972,6 +4322,109 @@ impl ScalarBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod plain_path_tests {
+        use super::*;
+
+        /// A stereo sample the test installs, so the voice is a plain
+        /// sample voice the way a piano voice is: the bundled `bd` is mono
+        /// and would classify away from the tight path.
+        const TEST_SAMPLE: crate::sample::SampleId = crate::sample::SampleId(40);
+
+        fn install_stereo_sample(backend: &mut ScalarBackend) {
+            let pcm: Vec<f32> = (0..48_000)
+                .map(|frame| {
+                    let phase = frame as f32 * 440.0 * 2.0 * std::f32::consts::PI / 48_000.0;
+                    (phase.sin() * (1.0 - frame as f32 / 48_000.0)) * 0.4
+                })
+                .collect();
+            let decoded = crate::sample::DecodedSample::from_parts(48_000, 2, pcm).unwrap();
+            backend
+                .install_sample(TEST_SAMPLE, Box::new(decoded))
+                .expect("the test slot installs");
+        }
+
+        fn sample_note(frame: u64, rate: f32) -> OnsetEvent {
+            let mut event = OnsetEvent::new(frame, 220.0, 0.5, 2.0);
+            event.sample = Some(crate::SampleControls {
+                sample: TEST_SAMPLE,
+                playback_rate: rate,
+                begin: 0.0,
+                end: 1.0,
+                hold: crate::sample::SampleHold::Hap,
+                muted: false,
+                loop_secs: None,
+                envelope_peak: 1.0,
+                reversed: false,
+                nudge_secs: 0.0,
+                cut: None,
+            });
+            event
+        }
+
+        fn render(disable_plain: bool) -> (Vec<f32>, usize) {
+            let mut backend = ScalarBackend::prepared(48_000, 16).unwrap();
+            backend.disable_plain_path = disable_plain;
+            install_stereo_sample(&mut backend);
+            for (frame, rate) in [(0u64, 1.0), (200, 0.5), (1024, 1.5)] {
+                backend.note(sample_note(frame, rate));
+            }
+            // An oscillator voice, and a sample voice that carries a room
+            // send: both are plain under the widened path.
+            let mut osc = OnsetEvent::new(512, 330.0, 0.4, 1.5);
+            osc.controls.waveform = crate::backend::Waveform::Sawtooth;
+            backend.note(osc);
+            let mut roomy = sample_note(768, 1.0);
+            roomy.controls.reverb = Some(crate::backend::ReverbControls {
+                wet: 0.4,
+                size_secs: 1.0,
+                fade_secs: 0.1,
+                lp_start_hz: 8000.0,
+                lp_end_hz: 2000.0,
+                ir: None,
+            });
+            backend.note(roomy);
+            let mut out = vec![0.0f32; 2 * 128];
+            let mut all = Vec::new();
+            for _ in 0..48 {
+                backend.process_block(&mut out[..], 128);
+                all.extend_from_slice(&out);
+            }
+            let plain_voices = backend.voices.iter().filter(|voice| voice.plain).count();
+            (all, plain_voices)
+        }
+
+        /// The tight path computes the same frame the general body does,
+        /// bit for bit, for every plain sample voice.
+        #[test]
+        fn the_plain_sample_path_matches_the_general_body_bit_for_bit() {
+            let (tight, plain_voices) = render(false);
+            let (general, _) = render(true);
+            assert!(
+                plain_voices > 0,
+                "the test's voices must classify as plain or it proves nothing"
+            );
+            assert!(
+                tight.iter().any(|value| value.abs() > 0.001),
+                "the test's samples must sound or the comparison proves nothing"
+            );
+            assert_eq!(tight.len(), general.len());
+            for (tight, general) in tight.iter().zip(&general) {
+                assert_eq!(tight.to_bits(), general.to_bits());
+            }
+        }
+
+        /// A plain sample voice classifies for the tight path.
+        #[test]
+        fn a_plain_sample_voice_classifies_for_the_tight_path() {
+            let mut backend = ScalarBackend::prepared(48_000, 4).unwrap();
+            install_stereo_sample(&mut backend);
+            backend.note(sample_note(0, 1.0));
+            let mut out = [0.0f32; 256];
+            backend.process_block(&mut out[..], 128);
+            assert!(backend.voices.iter().any(|voice| voice.plain));
+        }
+    }
+
     mod dispatch_tests {
         use super::*;
 

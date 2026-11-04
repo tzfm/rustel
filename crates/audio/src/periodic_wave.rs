@@ -86,6 +86,7 @@ pub(crate) struct PeriodicWaveTables {
     sample_rate: f32,
     table_size: usize,
     range_count: usize,
+    sine: ShapeTables,
     square: ShapeTables,
     sawtooth: ShapeTables,
     triangle: ShapeTables,
@@ -121,15 +122,16 @@ impl PeriodicWaveTables {
             sample_rate: sample_rate as f32,
             table_size,
             range_count,
+            sine: ShapeTables::new(Waveform::Sine, table_size, range_count),
             square: ShapeTables::new(Waveform::Square, table_size, range_count),
             sawtooth: ShapeTables::new(Waveform::Sawtooth, table_size, range_count),
             triangle: ShapeTables::new(Waveform::Triangle, table_size, range_count),
         }
     }
 
-    /// The three shapes' tables, every band of each.
+    /// The four shapes' tables, every band of each.
     pub(crate) fn bytes(&self) -> usize {
-        [&self.square, &self.sawtooth, &self.triangle]
+        [&self.sine, &self.square, &self.sawtooth, &self.triangle]
             .into_iter()
             .map(|shape| std::mem::size_of_val(&*shape.samples))
             .sum()
@@ -146,8 +148,10 @@ impl PeriodicWaveTables {
 
     /// Sample a builtin oscillator at its nominal frequency.
     ///
-    /// Sine is evaluated directly and never consults the band-limited table
-    /// ranges, so calculating their logarithmic selection would be dead work.
+    /// Sine never consults the band-limited ranges: a sine has one partial,
+    /// nothing to cull, and a frequency past Nyquist aliases exactly as
+    /// Firefox's oscillator does. Calculating the logarithmic selection
+    /// would be dead work.
     #[inline]
     pub(crate) fn sample_for_frequency(
         &self,
@@ -156,21 +160,20 @@ impl PeriodicWaveTables {
         frequency: f32,
     ) -> f32 {
         if waveform == Waveform::Sine {
-            (phase * std::f64::consts::TAU).sin() as f32
-        } else {
-            self.sample(waveform, phase, self.selection(frequency))
+            return self.sample_sine(phase);
         }
+        self.sample(waveform, phase, self.selection(frequency))
     }
 
     pub(crate) fn sample(&self, waveform: Waveform, phase: f64, selection: TableSelection) -> f32 {
         if waveform == Waveform::Sine {
-            return (phase * std::f64::consts::TAU).sin() as f32;
+            return self.sample_sine(phase);
         }
         let shape = match waveform {
             Waveform::Square => &self.square,
             Waveform::Sawtooth => &self.sawtooth,
             Waveform::Triangle => &self.triangle,
-            Waveform::Sine => unreachable!(),
+            Waveform::Sine => unreachable!("sine reads its own table"),
         };
         read(
             shape.range(selection.higher_range),
@@ -178,6 +181,21 @@ impl PeriodicWaveTables {
             phase,
             selection.range_fraction,
         )
+    }
+
+    /// The sine table read: one range, the fundamental only, so a frequency
+    /// past Nyquist aliases instead of falling silent the way a culled
+    /// band-limited table would.
+    #[inline]
+    fn sample_sine(&self, phase: f64) -> f32 {
+        let table = self.sine.range(0);
+        let table_size = table.len();
+        let virtual_index = phase * table_size as f64;
+        let whole = virtual_index.floor();
+        let index = whole as i64 as usize & (table_size - 1);
+        let next = (index + 1) & (table_size - 1);
+        let fraction = (virtual_index - whole) as f32;
+        table[index] + fraction * (table[next] - table[index])
     }
 }
 
@@ -537,12 +555,17 @@ mod tests {
     #[test]
     fn webaudio_tables_are_normalized_and_band_limited() {
         let tables = PeriodicWaveTables::new(48_000);
-        for waveform in [Waveform::Square, Waveform::Sawtooth, Waveform::Triangle] {
+        for waveform in [
+            Waveform::Sine,
+            Waveform::Square,
+            Waveform::Sawtooth,
+            Waveform::Triangle,
+        ] {
             let shape = match waveform {
+                Waveform::Sine => &tables.sine,
                 Waveform::Square => &tables.square,
                 Waveform::Sawtooth => &tables.sawtooth,
                 Waveform::Triangle => &tables.triangle,
-                Waveform::Sine => unreachable!(),
             };
             let low_peak = shape
                 .range(0)
@@ -552,6 +575,26 @@ mod tests {
                 .fold(0.0, f32::max);
             assert!((low_peak - 1.0).abs() < 1e-5, "{waveform:?}: {low_peak}");
             assert_eq!(tables.sample(waveform, 0.0, tables.selection(440.0)), 0.0);
+        }
+    }
+
+    /// The table's interpolated sine agrees with the library sine the old
+    /// path computed, well under the float32 quantum the mix carries.
+    #[test]
+    fn sine_table_reads_track_the_library_sine() {
+        let tables = PeriodicWaveTables::new(48_000);
+        for frequency in [55.0f32, 440.0, 3_000.0, 11_000.0] {
+            let selection = tables.selection(frequency);
+            let mut phase = 0.0f64;
+            let step = f64::from(frequency) / 48_000.0;
+            let mut worst = 0.0f32;
+            for _ in 0..20_000 {
+                let table = tables.sample(Waveform::Sine, phase, selection);
+                let direct = ((phase * std::f64::consts::TAU).sin()) as f32;
+                worst = worst.max((table - direct).abs());
+                phase = (phase + step).rem_euclid(1.0);
+            }
+            assert!(worst < 2e-6, "{frequency} Hz drifted {worst}");
         }
     }
 

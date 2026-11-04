@@ -253,9 +253,7 @@ use readiness::{
 use recording::{
     SampleTake, TAKE_NOTICE_DURATION, TrimJob, TrimTarget, format_take_length, trim_candidate,
 };
-use reference_panel::{
-    CATALOGUE_LOADING_REFRESH, CATALOGUE_REFRESH, browser_imports, with_input_channels,
-};
+use reference_panel::{browser_imports, catalogue_refresh_interval, with_input_channels};
 use replay_tabs::SetStash;
 use sample_import::dropped_paths;
 use sample_sources::{
@@ -858,6 +856,15 @@ struct App {
     #[cfg(feature = "hydra")]
     generator_session: super::ideas::Generator,
     catalogue_refreshed_at: Instant,
+    /// When the catalogue last changed while loading, so the fast loading
+    /// cadence holds only while something keeps arriving.
+    catalogue_progress_at: Instant,
+    /// How far the animated cadence is stretched from the configured frame
+    /// rate, and the draws that say whether to stretch or relax it. See
+    /// `event_loop::paced_after`.
+    frame_pace: u8,
+    frame_overruns: u8,
+    frame_cheaps: u8,
     /// When the vst tab of the reference column last read the plugin list.
     #[cfg(feature = "vst")]
     plugins_polled_at: Instant,
@@ -1690,6 +1697,10 @@ impl App {
             #[cfg(feature = "hydra")]
             generator_session: super::ideas::Generator::default(),
             catalogue_refreshed_at: now,
+            catalogue_progress_at: now,
+            frame_pace: 1,
+            frame_overruns: 0,
+            frame_cheaps: 0,
             #[cfg(feature = "vst")]
             plugins_polled_at: now,
             #[cfg(feature = "vst")]
