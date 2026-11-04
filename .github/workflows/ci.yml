@@ -61,7 +61,9 @@ jobs:
       matrix:
         include:
           - name: Linux x64
-            runner: ubuntu-latest
+            # The OS of the release build. ubuntu-latest moved to 26.04 in
+            # November 2026, and the Csound bounce test segfaults there.
+            runner: ubuntu-24.04
             jobs: "4"
           - name: macOS Apple Silicon
             # macos-14 retired on 2026-11-02 with brownouts through October
