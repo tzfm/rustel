@@ -2698,6 +2698,7 @@ mod tests {
         /// A theme whose characters animate repaints the score on every frame,
         /// playing or not. However many glyphs a frame rewrites, it shows the
         /// terminal's cursor on one cell only: the caret.
+        #[cfg(feature = "themes")]
         #[test]
         fn animated_characters_keep_the_cursor_on_the_caret() {
             use crate::terminal::StudioBackend;

@@ -316,10 +316,12 @@ impl ShowroomFx {
 }
 
 #[cfg(test)]
+#[cfg(feature = "themes")]
 mod tests {
     use super::*;
     use ratatui::style::Style;
 
+    #[cfg(feature = "themes")]
     #[test]
     fn smoke_remains_visible_and_moves_below_full_density() {
         let theme = Theme::built_in("smoke").expect("smoke preset");

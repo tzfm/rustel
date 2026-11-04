@@ -1475,6 +1475,7 @@ mod tests {
         assert_eq!(editor.draft.opacity.interface, Some(100));
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn tachyon_mode_is_visible_editable_and_limited_to_native_themes() {
         let burn = super::super::theme::Theme::built_in("burn").expect("burn theme");

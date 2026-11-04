@@ -350,7 +350,7 @@ mod tests {
         /// The webcam switch in the settings sheet is the consent for a camera
         /// theme: browsing to the theme opens the camera only with the switch
         /// on. A theme-editor draft never opens the camera.
-        #[cfg(feature = "hydra")]
+        #[cfg(all(feature = "hydra", feature = "themes"))]
         #[test]
         fn a_camera_theme_previews_under_the_webcam_switch_and_never_from_a_draft() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -605,7 +605,7 @@ mod tests {
         /// A theme's last sketch frame goes with the theme: a reset-colour theme
         /// after `synthwave` is the terminal's own background, not a gradient
         /// nobody is drawing any more.
-        #[cfg(feature = "hydra")]
+        #[cfg(all(feature = "hydra", feature = "themes"))]
         #[test]
         fn changing_theme_drops_the_previous_sketch_frame() {
             let directory = tempfile::tempdir().expect("temp dir");

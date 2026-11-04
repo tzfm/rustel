@@ -3968,6 +3968,7 @@ dependencies = [
  "rustel-runtime",
  "rustel-scheduler",
  "rustel-serial",
+ "rustel-studio-themes",
  "rustel-transpiler",
  "rustel-voice",
  "rustel-vst3-fixture",
@@ -3999,6 +4000,11 @@ dependencies = [
  "similar",
  "tempfile",
 ]
+
+[[package]]
+name = "rustel-studio-themes"
+version = "0.1.0"
+source = "git+https://github.com/undy-aeon/rustel-studio-themes.git?tag=v0.1.0#6718468e510ebb2881884d0ece05e020d7efff32"
 
 [[package]]
 name = "rustel-talkit"

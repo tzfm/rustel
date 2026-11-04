@@ -1067,6 +1067,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn text_mode_normalizes_interface_ground_without_repainting_it() {
         let mut theme = Theme::built_in("burn").expect("burn theme");
@@ -1145,6 +1146,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn image_mode_emits_rgba_without_mutating_terminal_characters() {
         let theme = Theme::built_in("burn").expect("burn theme");
@@ -1267,44 +1269,47 @@ mod tests {
                 })
         );
 
-        let area = Rect::new(0, 0, 120, 40);
-        let theme = Theme::built_in("rustel-live").expect("brand theme");
-        let background = theme.background;
-        let active = ActiveVisual {
-            config: theme.cell_visual().expect("brand scene"),
-            background,
-            foreground: theme.foreground,
-            accent: theme.accent,
-            secondary: theme.syntax.number,
-            muted: theme.muted,
-        };
-        let scene = RustelBrandScene::new(&active);
-        let render = |audio| {
-            let mut buffer = Buffer::empty(area);
-            buffer.set_style(area, Style::default().bg(background));
-            scene.render(1_850, audio, &mut buffer, area);
-            buffer
-        };
-        let silent = render(ReactiveAudio::default());
-        let loud = render(ReactiveAudio {
-            rms: 0.95,
-            bass: 0.9,
-            mid: 0.8,
-            treble: 1.0,
-        });
-        assert_ne!(silent, loud, "the exact logo deforms with live audio bands");
-        assert!(
-            silent
-                .content
-                .iter()
-                .any(|cell| cell.fg == Color::Rgb(0, 238, 251))
-        );
-        assert!(
-            silent
-                .content
-                .iter()
-                .any(|cell| cell.fg == Color::Rgb(242, 2, 247))
-        );
+        #[cfg(feature = "themes")]
+        {
+            let area = Rect::new(0, 0, 120, 40);
+            let theme = Theme::built_in("rustel-live").expect("brand theme");
+            let background = theme.background;
+            let active = ActiveVisual {
+                config: theme.cell_visual().expect("brand scene"),
+                background,
+                foreground: theme.foreground,
+                accent: theme.accent,
+                secondary: theme.syntax.number,
+                muted: theme.muted,
+            };
+            let scene = RustelBrandScene::new(&active);
+            let render = |audio| {
+                let mut buffer = Buffer::empty(area);
+                buffer.set_style(area, Style::default().bg(background));
+                scene.render(1_850, audio, &mut buffer, area);
+                buffer
+            };
+            let silent = render(ReactiveAudio::default());
+            let loud = render(ReactiveAudio {
+                rms: 0.95,
+                bass: 0.9,
+                mid: 0.8,
+                treble: 1.0,
+            });
+            assert_ne!(silent, loud, "the exact logo deforms with live audio bands");
+            assert!(
+                silent
+                    .content
+                    .iter()
+                    .any(|cell| cell.fg == Color::Rgb(0, 238, 251))
+            );
+            assert!(
+                silent
+                    .content
+                    .iter()
+                    .any(|cell| cell.fg == Color::Rgb(242, 2, 247))
+            );
+        }
     }
 
     #[test]

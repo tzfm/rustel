@@ -1693,7 +1693,7 @@ mod tests {
         /// its Hydra siblings do: the switch is the consent, the theme has to
         /// be kept or on the picker, a draft being typed never acquires, and a
         /// score's own picture drawn over the theme's suppresses it.
-        #[cfg(feature = "hydra")]
+        #[cfg(all(feature = "hydra", feature = "themes"))]
         #[test]
         fn the_native_camera_theme_requests_capture_only_while_its_picture_is_visible() {
             let directory = tempfile::tempdir().expect("temp dir");

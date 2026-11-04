@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+
+- The studio theme pack lives in its own repository, [rustel-studio-themes](https://github.com/undy-aeon/rustel-studio-themes), and the default build takes it as a pinned package at tag v0.1.0. A build without the `themes` feature keeps `rustel-dark`.
 - The studio keeps its core for the audio on a small machine. On Linux the frame loop, the catalogue worker and the device probes stand below the audio callback, an animated frame rate that does not fit its interval paints at a slower pace until it fits again, and a sample manifest that hangs no longer rebuilds the sound catalogue twenty times a second.
 - An edit of a playing score lands on a machine slower than its takeover window. The scheduling horizon grows with the time an evaluation takes, a replacement's takeover keeps the headroom the producer's own measured turns need, and a refused turn now counts toward that measurement, so the edit arrives late instead of rolling back with "replacement prefill finished after its takeover".
 - An edit that runs long to accept grows its own takeover runway: the scheduling probe measured how long the edit's first window needs, and the takeover keeps that much time instead of a fixed half second. A slow machine lands such an edit late instead of refusing it. The first edit of a set is priced from the evaluation that started it, so it lands the first time rather than bouncing once and landing on the retry.

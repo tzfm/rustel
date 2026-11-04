@@ -5311,6 +5311,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn fades_keep_their_colour_on_a_ground_the_terminal_owns() {
         let terminal = Theme::built_in("terminal").unwrap();
@@ -5341,6 +5342,7 @@ mod tests {
     /// The spectrogram paints its quiet level, so its lowest colour must
     /// be one the terminal can show. A reset ground would paint black or
     /// the default foreground, and the picture would open on a slab.
+    #[cfg(feature = "themes")]
     #[test]
     fn a_spectrum_ramp_on_a_terminal_ground_starts_visible() {
         let theme = Theme::built_in("terminal").expect("terminal ships");
@@ -5357,6 +5359,7 @@ mod tests {
     /// whole painter path runs under the terminal theme: no cell that
     /// carries a glyph may come back `Reset`, which the pixel raster
     /// paints as plain black, and the bars wear the palette's own slots.
+    #[cfg(feature = "themes")]
     #[test]
     fn a_roll_under_the_terminal_theme_paints_no_black_bars() {
         let state = playing(
@@ -5415,12 +5418,16 @@ mod tests {
         indexed.syntax.string = Color::Indexed(2);
         indexed.syntax.number = Color::Indexed(3);
         indexed.meter.peak = Color::Indexed(1);
-        for theme in [
+        #[cfg(feature = "themes")]
+        let themes = vec![
             theme(),
-            Theme::built_in("rustel-light").unwrap(),
-            Theme::built_in("mono").unwrap(),
+            Theme::built_in("rustel-light").expect("rustel-light"),
+            Theme::built_in("mono").expect("mono"),
             indexed,
-        ] {
+        ];
+        #[cfg(not(feature = "themes"))]
+        let themes = vec![theme(), indexed];
+        for theme in themes {
             for level in [-8.0, -32.0] {
                 let state = analyser_state(&[[level; UI_SPECTRUM_BINS]]);
                 let options = VisualOptions::parse("");

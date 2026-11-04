@@ -886,19 +886,22 @@ mod tests {
             buffer[(4, 0)].clone()
         };
 
-        let terminal = Theme::built_in("terminal").expect("terminal ships");
-        assert!(
-            flashed(&terminal, 0.8)
-                .modifier
-                .contains(Modifier::REVERSED),
-            "a bright fade swaps the line"
-        );
-        let dim = flashed(&terminal, 0.3);
-        assert!(
-            !dim.modifier.contains(Modifier::REVERSED),
-            "a dim fade leaves it"
-        );
-        assert_eq!(dim.fg, Color::Indexed(2));
+        #[cfg(feature = "themes")]
+        {
+            let terminal = Theme::built_in("terminal").expect("terminal ships");
+            assert!(
+                flashed(&terminal, 0.8)
+                    .modifier
+                    .contains(Modifier::REVERSED),
+                "a bright fade swaps the line"
+            );
+            let dim = flashed(&terminal, 0.3);
+            assert!(
+                !dim.modifier.contains(Modifier::REVERSED),
+                "a dim fade leaves it"
+            );
+            assert_eq!(dim.fg, Color::Indexed(2));
+        }
 
         let theme = Theme::built_in_default();
         let washed = flashed(&theme, 0.25);

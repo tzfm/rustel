@@ -10,11 +10,13 @@ description = "The terminal studio behind `rustel studio`: editor, visuals, mixe
 [features]
 # The complete studio. `--no-default-features` keeps the editor and live
 # playback; each feature below adds one capability back and turns on the
-# runtime feature of the same name.
-default = ["extensions", "gamepad", "hydra", "osc", "serial", "remote-control", "vst"]
+# runtime feature of the same name when the runtime has one.
+default = ["extensions", "gamepad", "hydra", "osc", "serial", "remote-control", "vst", "themes"]
 extensions = ["dep:rustel-ext", "rustel-runtime/extensions"]
 gamepad = ["rustel-runtime/gamepad"]
 hydra = ["dep:rustel-hydra", "rustel-runtime/hydra"]
+# Theme documents beyond `rustel-dark`. On in an ordinary build.
+themes = ["dep:rustel-studio-themes"]
 osc = ["dep:rustel-osc", "rustel-runtime/osc"]
 serial = ["dep:rustel-serial", "rustel-runtime/serial"]
 vst = ["rustel-runtime/vst"]
@@ -40,6 +42,7 @@ rustel-audio = { path = "../audio" }
 rustel-core = { path = "../core" }
 rustel-ext = { path = "../ext", optional = true }
 rustel-hydra = { git = "https://github.com/tzfm/rustel-hydra.git", tag = "v0.2.3", optional = true }
+rustel-studio-themes = { git = "https://github.com/undy-aeon/rustel-studio-themes.git", tag = "v0.1.0", optional = true }
 rustel-jsruntime = { path = "../jsruntime", default-features = false }
 rustel-midi = { path = "../midi" }
 rustel-osc = { path = "../osc", optional = true }

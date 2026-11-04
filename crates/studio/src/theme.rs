@@ -20,6 +20,7 @@ use super::terminal::CaretShape;
 mod opacity;
 pub(super) use opacity::backdrop_strength;
 #[cfg(test)]
+#[cfg(feature = "themes")]
 mod opacity_render_tests {
     //! Exercise opacity defaults through the real cell compositors. The optional
     //! export is a visual QA aid: native scenes are rendered; Hydra pictures here
@@ -201,6 +202,7 @@ mod opacity_render_tests {
             .expect("write requested render export");
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn animated_presets_render_visibly_while_menu_labels_stay_sharp() {
         let started = Instant::now();
@@ -314,6 +316,7 @@ mod opacity_render_tests {
         export("native.json", exported);
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn hydra_defaults_keep_text_readable_over_synthetic_bright_and_dark_frames() {
         let started = Instant::now();
@@ -399,121 +402,36 @@ mod opacity_render_tests {
 pub const DEFAULT_THEME: &str = "rustel-dark";
 const MAX_THEME_DOCUMENT_BYTES: usize = 64 * 1024;
 
-const BUILT_INS: &[(&str, &str)] = &[
-    ("rustel-dark", include_str!("themes/rustel-dark.json")),
-    // rustel-dark with a slow drift breathing behind the code: the theme
-    // that shows a theme can carry a sketch of its own.
-    ("rustel-drift", include_str!("themes/rustel-drift.json")),
-    // Camera-backed themes. They request the camera only while their own
-    // picture is visible; the persisted webcam permission still owns
-    // whether a device may open. The first three go through Hydra and its
-    // `s0` texture; the fourth is drawn by the studio itself, in Braille,
-    // and so needs no GPU and no sketch.
-    ("webcam-clean", include_str!("themes/webcam-clean.json")),
-    ("webcam-distort", include_str!("themes/webcam-distort.json")),
-    ("webcam-hacker", include_str!("themes/webcam-hacker.json")),
-    ("webcam-braille", include_str!("themes/webcam-braille.json")),
-    // An independently authored feedback current from the snippet shelf.
-    ("prism", include_str!("themes/prism.json")),
-    ("rustel-light", include_str!("themes/rustel-light.json")),
-    ("strudel", include_str!("themes/strudel.json")),
-    ("powershell", include_str!("themes/powershell.json")),
-    ("rustel-live", include_str!("themes/rustel-live.json")),
-    ("synthwave", include_str!("themes/synthwave.json")),
-    ("vectrex", include_str!("themes/vectrex.json")),
-    ("mode7", include_str!("themes/mode7.json")),
-    // Black ground, phosphor green, and a slow rain behind the code.
-    ("matrix", include_str!("themes/matrix.json")),
-    ("space", include_str!("themes/space.json")),
-    ("campfire", include_str!("themes/campfire.json")),
-    ("basketball", include_str!("themes/basketball.json")),
-    ("forest", include_str!("themes/forest.json")),
-    ("bear", include_str!("themes/bear.json")),
-    ("mono", include_str!("themes/mono.json")),
-    // No palette of its own: `reset` and the terminal's 16 colours, so the
-    // studio wears whatever palette the terminal already carries.
-    ("terminal", include_str!("themes/terminal.json")),
-    // The same ground with one role moved: the accent and the selection
-    // take the palette's slot 1, which reads warm in palettes whose
-    // bright slot is gold.
-    ("terminal-warm", include_str!("themes/terminal-warm.json")),
-    ("solarized", include_str!("themes/solarized.json")),
-    ("ember", include_str!("themes/ember.json")),
-    ("hell", include_str!("themes/hell.json")),
-    ("lavender", include_str!("themes/lavender.json")),
-    // Ports of the palettes people already read code in.
-    ("one-dark", include_str!("themes/one-dark.json")),
-    ("dracula", include_str!("themes/dracula.json")),
-    ("tokyo-night", include_str!("themes/tokyo-night.json")),
-    (
-        "catppuccin-mocha",
-        include_str!("themes/catppuccin-mocha.json"),
-    ),
-    (
-        "catppuccin-latte",
-        include_str!("themes/catppuccin-latte.json"),
-    ),
-    ("nord", include_str!("themes/nord.json")),
-    ("ayu-mirage", include_str!("themes/ayu-mirage.json")),
-    ("github-light", include_str!("themes/github-light.json")),
-    (
-        "solarized-light",
-        include_str!("themes/solarized-light.json"),
-    ),
-    ("emacs", include_str!("themes/emacs.json")),
-    // And some with a mood of their own.
-    ("unicorn", include_str!("themes/unicorn.json")),
-    // The dark palette with every hue rolling through the code.
-    ("rainbow", include_str!("themes/rainbow.json")),
-    // Everything at once, on purpose: a Hydra sketch under an aurora over
-    // the glyphs, a lit current line, and a palette
-    // where nothing agrees with anything. The one theme that is not trying
-    // to stay out of the way.
-    ("lsd", include_str!("themes/lsd.json")),
-];
+/// The one theme compiled into every studio.
+const CORE_THEMES: &[(&str, &str)] = &[("rustel-dark", include_str!("themes/rustel-dark.json"))];
 
-// Fixed effect presets live in JSON too, with independently editable defaults.
-const SHOWROOM_THEMES: &[(&str, &str)] = &[
-    ("beams", include_str!("themes/beams.json")),
-    ("binarypath", include_str!("themes/binarypath.json")),
-    ("blackhole", include_str!("themes/blackhole.json")),
-    ("bouncyballs", include_str!("themes/bouncyballs.json")),
-    ("bubbles", include_str!("themes/bubbles.json")),
-    ("burn", include_str!("themes/burn.json")),
-    ("colorshift", include_str!("themes/colorshift.json")),
-    ("crumble", include_str!("themes/crumble.json")),
-    ("decrypt", include_str!("themes/decrypt.json")),
-    ("dvd-bounce", include_str!("themes/dvd-bounce.json")),
-    ("errorcorrect", include_str!("themes/errorcorrect.json")),
-    ("expand", include_str!("themes/expand.json")),
-    ("fireworks", include_str!("themes/fireworks.json")),
-    ("highlight", include_str!("themes/highlight.json")),
-    ("leak", include_str!("themes/leak.json")),
-    (
-        "orbittingvolley",
-        include_str!("themes/orbittingvolley.json"),
-    ),
-    ("overflow", include_str!("themes/overflow.json")),
-    ("print", include_str!("themes/print.json")),
-    ("rain", include_str!("themes/rain.json")),
-    ("scramble", include_str!("themes/scramble.json")),
-    ("rings", include_str!("themes/rings.json")),
-    ("scattered", include_str!("themes/scattered.json")),
-    ("slice", include_str!("themes/slice.json")),
-    ("smoke", include_str!("themes/smoke.json")),
-    ("spotlights", include_str!("themes/spotlights.json")),
-    ("snow", include_str!("themes/snow.json")),
-    ("swarm", include_str!("themes/swarm.json")),
-    ("sweep", include_str!("themes/sweep.json")),
-    ("synthgrid", include_str!("themes/synthgrid.json")),
-    ("thunderstorm", include_str!("themes/thunderstorm.json")),
-    ("unstable", include_str!("themes/unstable.json")),
-    ("vhstape", include_str!("themes/vhstape.json")),
-    ("waves", include_str!("themes/waves.json")),
-    ("waves-reactive", include_str!("themes/waves-reactive.json")),
-    ("wipe", include_str!("themes/wipe.json")),
-];
+fn fixed_themes() -> impl Iterator<Item = (&'static str, &'static str)> {
+    CORE_THEMES
+        .iter()
+        .copied()
+        .chain(pack_catalogue())
+        .chain(pack_showroom())
+}
 
+#[cfg(feature = "themes")]
+fn pack_catalogue() -> impl Iterator<Item = (&'static str, &'static str)> {
+    rustel_studio_themes::catalogue().iter().copied()
+}
+
+#[cfg(not(feature = "themes"))]
+fn pack_catalogue() -> impl Iterator<Item = (&'static str, &'static str)> {
+    std::iter::empty()
+}
+
+#[cfg(feature = "themes")]
+fn pack_showroom() -> impl Iterator<Item = (&'static str, &'static str)> {
+    rustel_studio_themes::showroom().iter().copied()
+}
+
+#[cfg(not(feature = "themes"))]
+fn pack_showroom() -> impl Iterator<Item = (&'static str, &'static str)> {
+    std::iter::empty()
+}
 /// How an active (currently sounding) source range is marked.
 ///
 /// The default marks sounding text with a translucent tint of the event
@@ -1435,16 +1353,11 @@ impl Theme {
             "retro-3d" => "vectrex",
             name => name,
         };
-        if let Some(theme) = BUILT_INS
-            .iter()
-            .chain(SHOWROOM_THEMES)
-            .find(|(key, _)| *key == name)
-            .map(|(key, document)| match Self::from_json(document) {
+        if let Some((key, document)) = fixed_themes().find(|(key, _)| *key == name) {
+            return Some(match Self::from_json(document) {
                 Ok(theme) => theme.named(key),
                 Err(error) => panic!("built-in theme {key} is malformed: {error}"),
-            })
-        {
-            return Some(theme);
+            });
         }
         if name == RANDOMIZE_THEME {
             // Every resolution is a new roll, so remembering `randomize` in
@@ -1457,11 +1370,12 @@ impl Theme {
 
     /// Names of the compiled-in themes, in presentation order.
     pub fn built_in_names() -> impl Iterator<Item = &'static str> {
-        BUILT_INS
+        CORE_THEMES
             .iter()
             .map(|(name, _)| *name)
+            .chain(pack_catalogue().map(|(name, _)| name))
             .chain(std::iter::once(RANDOMIZE_THEME))
-            .chain(SHOWROOM_THEMES.iter().map(|(name, _)| *name))
+            .chain(pack_showroom().map(|(name, _)| name))
     }
 
     pub fn from_json(document: &str) -> Result<Self, ThemeError> {
@@ -1678,7 +1592,7 @@ impl Theme {
 ///
 /// Maps Randomize's nine rolled palette colours onto the whole of [`Theme`].
 fn theme_from_palette(name: &str, palette: ThemePalette) -> Theme {
-    let document = BUILT_INS
+    let document = CORE_THEMES
         .iter()
         .find(|(key, _)| *key == DEFAULT_THEME)
         .map(|(_, document)| *document)
@@ -3319,6 +3233,7 @@ mod tests {
 
     /// The camera theme that the studio paints itself declares a camera
     /// without a Hydra sketch, so it reads the same in a build with no Hydra.
+    #[cfg(feature = "themes")]
     #[test]
     fn the_braille_camera_theme_declares_a_camera_without_a_hydra_chain() {
         let theme = Theme::built_in("webcam-braille").expect("the theme is compiled in");
@@ -3344,6 +3259,17 @@ mod tests {
     }
 
     #[test]
+    fn the_theme_pack_is_optional() {
+        let names: Vec<_> = Theme::built_in_names()
+            .filter(|name| *name != RANDOMIZE_THEME)
+            .collect();
+        #[cfg(feature = "themes")]
+        assert!(names.len() > 1, "the theme pack ships with the studio");
+        #[cfg(not(feature = "themes"))]
+        assert_eq!(names, vec!["rustel-dark"]);
+    }
+
+    #[test]
     fn every_built_in_theme_parses() {
         for name in Theme::built_in_names() {
             let theme = Theme::built_in(name).unwrap_or_else(|| panic!("{name} is missing"));
@@ -3351,7 +3277,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "hydra")]
+    #[cfg(all(feature = "hydra", feature = "themes"))]
     #[test]
     fn camera_themes_are_original_visible_s0_chains_and_invisible_capture_is_refused() {
         for name in ["webcam-clean", "webcam-distort", "webcam-hacker"] {
@@ -3409,7 +3335,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let real = directory.path().join("real.json");
         let linked = directory.path().join("linked.json");
-        std::fs::write(&real, include_str!("themes/synthwave.json")).unwrap();
+        std::fs::write(&real, include_str!("themes/rustel-dark.json")).unwrap();
         symlink(&real, &linked).unwrap();
 
         assert!(is_real_theme_file(&real));
@@ -3423,6 +3349,7 @@ mod tests {
         assert_eq!(theme.mini_fill, None);
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn the_matrix_theme_uses_the_native_cell_renderer() {
         let theme = Theme::built_in("matrix").expect("matrix is compiled in");
@@ -3443,6 +3370,7 @@ mod tests {
 
     /// Every built-in says how long its sounding marks linger, and each
     /// says something its own: a sharp theme cuts, a dusk theme lets go.
+    #[cfg(feature = "themes")]
     #[test]
     fn every_built_in_theme_names_its_own_highlight_fade() {
         for name in Theme::built_in_names() {
@@ -3468,6 +3396,7 @@ mod tests {
         assert_eq!(plain.event_fade(), 0.3);
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn the_picker_exposes_only_the_requested_native_effect_themes() {
         let mut names = Theme::built_in_names()
@@ -3582,7 +3511,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "hydra")]
+    #[cfg(all(feature = "hydra", feature = "themes"))]
     #[test]
     fn the_prism_theme_matches_its_kaleidoscope_example_and_composes() {
         let theme = Theme::built_in("prism").expect("prism is compiled in");
@@ -3776,7 +3705,7 @@ mod tests {
 
     #[test]
     fn every_bundled_theme_marks_sounding_syntax_without_losing_contrast() {
-        for (name, document) in BUILT_INS.iter().chain(SHOWROOM_THEMES) {
+        for (name, document) in fixed_themes() {
             let theme = Theme::from_json(document).unwrap();
             if theme.event_mark != MarkStyle::Tint {
                 // A theme whose ground only the terminal knows cannot mix a
@@ -3838,7 +3767,7 @@ mod tests {
     /// palette keeps its accents readable on.
     #[test]
     fn filled_chip_text_follows_who_owns_the_ground() {
-        for (name, document) in BUILT_INS.iter().chain(SHOWROOM_THEMES) {
+        for (name, document) in fixed_themes() {
             let theme = Theme::from_json(document).unwrap();
             if true_rgb(theme.background).is_some() {
                 assert_eq!(theme.fill_text(), theme.background, "{name}");
@@ -3851,6 +3780,7 @@ mod tests {
     /// The warm sibling is one ground with one role moved: a theme that also
     /// changed its ground would be a different theme, not a variant of this
     /// one. Checking the whole document catches a field that drifts.
+    #[cfg(feature = "themes")]
     #[test]
     fn terminal_warm_moves_only_the_accent_and_selection() {
         let plain = Theme::built_in("terminal").expect("terminal ships");
@@ -3898,7 +3828,7 @@ mod tests {
     /// A theme that carries a sketch must carry one that runs: a chain that
     /// fails to parse or compose draws a warning line where the furniture
     /// should be, in a theme the reader chose for its look.
-    #[cfg(feature = "hydra")]
+    #[cfg(all(feature = "hydra", feature = "themes"))]
     #[test]
     fn every_theme_owned_sketch_parses_and_composes() {
         let mut sketches = 0;
@@ -3993,26 +3923,29 @@ mod tests {
 
     #[test]
     fn character_effects_are_independent_strict_and_shipped_in_three_styles() {
-        assert_eq!(
-            Theme::built_in("lavender").and_then(|theme| theme.character_visual()),
-            Some(CharacterVisual {
-                effect: CharacterEffect::Fade,
-                strength: 62,
-                speed: 38,
-            })
-        );
-        assert_eq!(
-            Theme::built_in("synthwave")
-                .and_then(|theme| theme.character_visual())
-                .map(|visual| visual.effect),
-            Some(CharacterEffect::Aurora),
-            "a character effect can coexist with Hydra"
-        );
-        assert_eq!(
-            Theme::built_in("synthwave2").map(|theme| theme.name),
-            Some("synthwave".into()),
-            "the old second name still resolves"
-        );
+        #[cfg(feature = "themes")]
+        {
+            assert_eq!(
+                Theme::built_in("lavender").and_then(|theme| theme.character_visual()),
+                Some(CharacterVisual {
+                    effect: CharacterEffect::Fade,
+                    strength: 62,
+                    speed: 38,
+                })
+            );
+            assert_eq!(
+                Theme::built_in("synthwave")
+                    .and_then(|theme| theme.character_visual())
+                    .map(|visual| visual.effect),
+                Some(CharacterEffect::Aurora),
+                "a character effect can coexist with Hydra"
+            );
+            assert_eq!(
+                Theme::built_in("synthwave2").map(|theme| theme.name),
+                Some("synthwave".into()),
+                "the old second name still resolves"
+            );
+        }
 
         let mut value = serde_json::to_value(Theme::built_in_default()).unwrap();
         value["characters"] = serde_json::json!({ "effect": "fade" });
@@ -4096,10 +4029,13 @@ mod tests {
         );
         assert_ne!(theme.pane_colour(1), theme.accent);
 
-        let terminal = Theme::built_in("terminal").expect("terminal ships");
-        assert_eq!(terminal.pane_colour(0), terminal.accent);
-        assert_eq!(terminal.pane_colour(1), terminal.mini);
-        assert_ne!(terminal.pane_colour(1), terminal.pane_colour(0));
+        #[cfg(feature = "themes")]
+        {
+            let terminal = Theme::built_in("terminal").expect("terminal ships");
+            assert_eq!(terminal.pane_colour(0), terminal.accent);
+            assert_eq!(terminal.pane_colour(1), terminal.mini);
+            assert_ne!(terminal.pane_colour(1), terminal.pane_colour(0));
+        }
     }
 
     #[test]
@@ -4187,7 +4123,7 @@ mod confinement_tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("midnight.json");
         // Any real theme file will do; copy a built-in's JSON.
-        let source = include_str!("themes/synthwave.json");
+        let source = include_str!("themes/rustel-dark.json");
         std::fs::write(&path, source).expect("write theme");
         let selector = format!("{}", path.display());
         Theme::resolve(Some(&selector)).expect("an explicit theme file must load");
@@ -4204,7 +4140,7 @@ mod confinement_tests {
         let themes = directory.path().join("themes");
         std::fs::create_dir_all(&themes).expect("theme directory");
         let outside = directory.path().join("outside.json");
-        std::fs::write(&outside, include_str!("themes/synthwave.json")).expect("write");
+        std::fs::write(&outside, include_str!("themes/rustel-dark.json")).expect("write");
 
         let _scoped = test_env::ScopedThemeDir::set(&themes);
         let escape = format!("{}", outside.display());

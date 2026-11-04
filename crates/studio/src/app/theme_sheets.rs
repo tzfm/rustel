@@ -1295,6 +1295,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             let names = crate::theme::Theme::available_names();
+            #[cfg(feature = "themes")]
             for required in ["forest", "rustel-live"] {
                 assert!(names.iter().any(|name| name == required));
                 crate::theme::Theme::resolve(Some(required)).expect("bundled theme");
@@ -1446,24 +1447,29 @@ mod tests {
             let directory = tempfile::tempdir().expect("temp dir");
             let mut app = app_over(directory.path());
             app.toggle_theme_picker();
-            for character in "snow".chars() {
-                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
-            }
-            let picker = app.theme_picker.as_ref().expect("picker open");
-            assert_eq!(picker.query, "snow");
-            assert_eq!(picker.match_count(), 1);
-            assert_eq!(picker.selected_name(), Some("snow"));
-            // Typing waits for the settle, like the arrows; settled, it previews
-            // the only match.
-            app.theme_apply_due = None;
-            app.preview_theme();
-            assert_eq!(app.theme.name, "snow", "typing previews the only match");
+            // `snow` is one document in the theme pack. A build without the
+            // pack still has the filter, and the arrows below exercise it.
+            #[cfg(feature = "themes")]
+            {
+                for character in "snow".chars() {
+                    press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+                }
+                let picker = app.theme_picker.as_ref().expect("picker open");
+                assert_eq!(picker.query, "snow");
+                assert_eq!(picker.match_count(), 1);
+                assert_eq!(picker.selected_name(), Some("snow"));
+                // Typing waits for the settle, like the arrows; settled, it previews
+                // the only match.
+                app.theme_apply_due = None;
+                app.preview_theme();
+                assert_eq!(app.theme.name, "snow", "typing previews the only match");
 
-            for _ in 0..4 {
-                press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+                for _ in 0..4 {
+                    press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+                }
+                app.theme_apply_due = None;
+                app.preview_theme();
             }
-            app.theme_apply_due = None;
-            app.preview_theme();
 
             // ↑/↓ walk the list.
             let before = app.theme.name.clone();
@@ -1496,8 +1502,14 @@ mod tests {
                 .position(|name| name == crate::theme::RANDOMIZE_THEME)
                 .expect("the randomize row is in the list");
             let at = app.theme_picker.as_ref().expect("picker").selected;
-            for _ in at..chance {
-                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            if at <= chance {
+                for _ in at..chance {
+                    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+                }
+            } else {
+                for _ in chance..at {
+                    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+                }
             }
             assert!(app.theme_picker.as_ref().expect("picker").on_randomize());
             assert!(!app.theme_picker.as_ref().expect("picker").rolled);
@@ -1676,6 +1688,7 @@ mod tests {
         /// theme from it is no built-in's variation, and the modified d
         /// deletes the file. Without the file the name is the shipped
         /// theme's again.
+        #[cfg(feature = "themes")]
         #[test]
         fn a_user_theme_under_a_shipped_name_is_edited_and_deleted_as_its_own() {
             let _theme_dir = THEME_DIR_LOCK
@@ -1786,7 +1799,7 @@ mod tests {
             assert_eq!(app.focus, Focus::Panel(PanelKind::ThemeEditor));
         }
 
-        #[cfg(feature = "hydra")]
+        #[cfg(all(feature = "hydra", feature = "themes"))]
         #[test]
         fn keyboard_and_mouse_theme_previews_never_confirm_camera_acquisition() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -1881,6 +1894,7 @@ mod tests {
             ));
         }
 
+        #[cfg(feature = "themes")]
         #[test]
         fn keyboard_theme_browsing_applies_only_the_last_row() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -2031,7 +2045,7 @@ mod tests {
 
         /// Keeping a camera theme says what to expect: the picture in a moment,
         /// or the setting that stands in its way.
-        #[cfg(feature = "hydra")]
+        #[cfg(all(feature = "hydra", feature = "themes"))]
         #[test]
         fn keeping_a_camera_theme_says_what_stands_between_the_reader_and_it() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -2080,17 +2094,20 @@ mod tests {
                 .expect("mouse");
             };
             // The picker opens on the theme in use, wherever that is in the list.
-            let start = app.theme_picker.as_ref().expect("picker").selected;
+            // A short list wraps, so the steps are counted modulo its length.
+            let picker = app.theme_picker.as_ref().expect("picker");
+            let start = picker.selected;
+            let count = picker.match_count();
             wheel(&mut app, MouseEventKind::ScrollDown);
             wheel(&mut app, MouseEventKind::ScrollDown);
             assert_eq!(
                 app.theme_picker.as_ref().expect("picker").selected,
-                start + 2
+                (start + 2) % count
             );
             wheel(&mut app, MouseEventKind::ScrollUp);
             assert_eq!(
                 app.theme_picker.as_ref().expect("picker").selected,
-                start + 1
+                (start + 1) % count
             );
             assert!(app.status.starts_with("theme - "), "{}", app.status);
         }
@@ -2280,6 +2297,7 @@ mod tests {
 
             // Selecting a calibrated preset explicitly replaces even manually
             // claimed settings; a restart alone, above, still preserves them.
+            #[cfg(feature = "themes")]
             for name in ["rustel-drift", "unicorn", "smoke", "randomize"] {
                 app.ui_settings.backdrop_opacity = 0;
                 app.ui_settings.interface_opacity = 100;

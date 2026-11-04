@@ -1177,7 +1177,10 @@ mod tests {
                 sheet.right() > app.regions.sidebar.x,
                 "the sheet lies over the panel's column"
             );
-            let point = (rows.x + 2, rows.y + 1);
+            let before = picker.selected;
+            let first = picker.first_row(usize::from(rows.height));
+            let row = if before == first { 1 } else { 0 };
+            let point = (rows.x + 2, rows.y + row);
             assert_eq!(app.pointer_shape_at(point.0, point.1), SHAPE_POINTER);
             let before = app.theme_picker.as_ref().map(|picker| picker.selected);
             app.handle_mouse(MouseEvent {
