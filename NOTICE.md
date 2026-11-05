@@ -267,9 +267,12 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `arrayvec` | 0.7.8 | MIT OR Apache-2.0 |
 | `as-raw-xcb-connection` | 1.0.1 | MIT OR Apache-2.0 |
 | `ash` | 0.38.0+1.3.281 | MIT OR Apache-2.0 |
+| `assert_matches` | 1.5.0 | MIT/Apache-2.0 |
 | `async-trait` | 0.1.92 | MIT OR Apache-2.0 |
 | `atomic-waker` | 1.1.2 | Apache-2.0 OR MIT |
 | `atomic` | 0.6.1 | Apache-2.0/MIT |
+| `atomig-macro` | 0.4.0 | MIT/Apache-2.0 |
+| `atomig` | 0.4.3 | MIT/Apache-2.0 |
 | `audio_thread_priority` | 0.38.0 | MPL-2.0 |
 | `autocfg` | 1.5.1 | Apache-2.0 OR MIT |
 | `autotools` | 0.2.7 | MIT |
@@ -505,6 +508,7 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `mp3lame-encoder` | 0.2.4 | LGPL-3.0 |
 | `mp3lame-sys` | 0.1.11 | LGPL-3.0 |
 | `naga` | 26.0.0 | MIT OR Apache-2.0 |
+| `nasm-rs` | 0.3.2 | MIT OR Apache-2.0 |
 | `ndk-context` | 0.1.1 | MIT OR Apache-2.0 |
 | `ndk-sys` | 0.6.0+11769913 | MIT OR Apache-2.0 |
 | `ndk` | 0.9.0 | MIT OR Apache-2.0 |
@@ -650,6 +654,8 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `ratatui-termwiz` | 0.1.2 | MIT |
 | `ratatui-widgets` | 0.3.2 | MIT |
 | `ratatui` | 0.30.2 | MIT |
+| `rav1d` | 1.1.0 | BSD-2-Clause |
+| `raw-cpuid` | 11.6.0 | MIT |
 | `raw-window-handle` | 0.6.2 | MIT OR Apache-2.0 OR Zlib |
 | `rayon-core` | 1.13.0 | MIT OR Apache-2.0 |
 | `rayon` | 1.12.0 | MIT OR Apache-2.0 |
@@ -667,6 +673,7 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `rquickjs-macro` | 0.14.0 | MIT |
 | `rquickjs-sys` | 0.14.0 | MIT |
 | `rquickjs` | 0.14.0 | MIT |
+| `rust_h264` | 0.6.1 | MIT OR Apache-2.0 |
 | `rustc_version` | 0.4.1 | MIT OR Apache-2.0 |
 | `rustc-hash` | 1.1.0 | Apache-2.0/MIT |
 | `rustc-hash` | 2.1.3 | Apache-2.0 OR MIT |
@@ -680,6 +687,8 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `rustls` | 0.23.46 | Apache-2.0 OR ISC OR MIT |
 | `rustversion` | 1.0.23 | MIT OR Apache-2.0 |
 | `rusty-xinput` | 1.3.0 | Zlib OR Apache-2.0 OR MIT |
+| `rusty_h265-accel` | 0.6.2 | Apache-2.0 |
+| `rusty_h265` | 0.6.2 | Apache-2.0 |
 | `ryu` | 1.0.23 | Apache-2.0 OR BSL-1.0 |
 | `same-file` | 1.0.6 | Unlicense/MIT |
 | `scoped-tls` | 1.0.1 | MIT/Apache-2.0 |
@@ -725,7 +734,9 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `strength_reduce` | 0.2.4 | MIT OR Apache-2.0 |
 | `strict-num` | 0.1.1 | MIT |
 | `strsim` | 0.11.1 | MIT |
+| `strum_macros` | 0.26.4 | MIT |
 | `strum_macros` | 0.28.0 | MIT |
+| `strum` | 0.26.3 | MIT |
 | `strum` | 0.28.0 | MIT |
 | `subtle` | 2.6.1 | BSD-3-Clause |
 | `symphonia-bundle-mp3` | 0.5.5 | MPL-2.0 |
@@ -762,6 +773,7 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `tiny-skia` | 0.11.4 | BSD-3-Clause |
 | `tiny-xlib` | 0.2.5 | MIT OR Apache-2.0 OR Zlib |
 | `tinystr` | 0.8.4 | Unicode-3.0 |
+| `to_method` | 1.1.0 | CC0-1.0 |
 | `tokio-macros` | 2.7.2 | MIT |
 | `tokio` | 1.53.1 | MIT |
 | `toml_datetime` | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 |
@@ -894,7 +906,9 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `xml-rs` | 0.8.29 | MIT |
 | `yoke-derive` | 0.8.2 | Unicode-3.0 |
 | `yoke` | 0.8.3 | Unicode-3.0 |
+| `zerocopy-derive` | 0.7.35 | BSD-2-Clause OR Apache-2.0 OR MIT |
 | `zerocopy-derive` | 0.8.56 | BSD-2-Clause OR Apache-2.0 OR MIT |
+| `zerocopy` | 0.7.35 | BSD-2-Clause OR Apache-2.0 OR MIT |
 | `zerocopy` | 0.8.56 | BSD-2-Clause OR Apache-2.0 OR MIT |
 | `zerofrom-derive` | 0.1.7 | Unicode-3.0 |
 | `zerofrom` | 0.1.8 | Unicode-3.0 |
