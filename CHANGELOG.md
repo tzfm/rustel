@@ -1,300 +1,159 @@
 # Changelog
 
 ## Unreleased
-- The studio keeps its core for the audio on a small machine. On Linux the frame loop, the catalogue worker and the device probes stand below the audio callback, an animated frame rate that does not fit its interval paints at a slower pace until it fits again, and a sample manifest that hangs no longer rebuilds the sound catalogue twenty times a second.
-- An edit of a playing score lands on a machine slower than its takeover window. The scheduling horizon grows with the time an evaluation takes, a replacement's takeover keeps the headroom the producer's own measured turns need, and a refused turn now counts toward that measurement, so the edit arrives late instead of rolling back with "replacement prefill finished after its takeover".
-- An edit that runs long to accept grows its own takeover runway: the scheduling probe measured how long the edit's first window needs, and the takeover keeps that much time instead of a fixed half second. A slow machine lands such an edit late instead of refusing it. The first edit of a set is priced from the evaluation that started it, so it lands the first time rather than bouncing once and landing on the retry.
-- Supersaw lanes render through a NEON kernel on 64-bit ARM, including Apple silicon. The kernel matches the scalar reference bit for bit, and the sound does not change. On a Raspberry Pi 3, a 32-voice supersaw renders about three times faster.
-- Wavetable interpolation runs a NEON kernel on 64-bit ARM as well, matching the scalar reference bit for bit.
-- A sample's decoded audio is kept beside its file in the cache, so the second time any score plays it the file loads without decoding again. The stored frames are the decoder's own, and the sound does not change. `rustel samples clear` removes them with everything else.
-- A `zzfx` voice skips the library math its parameters zero out: the curve power at the default curve of one, the modulation cosine at zero modulation, and the noise sine at zero noise. The sound is bit for bit the same, and a default voice renders about 10 percent faster on a small machine.
-- The sine oscillator reads a table like every other waveform, instead of calling the library sine for every sample. The table's linear interpolation stays within two millionths of the library sine on the tested frequencies, and moves corpus hashes by bits alone - event streams stay put, and a mix peak can move in its fourth decimal, larger than one oscillator's bound because a mix adds many oscillators. Sine-heavy scores render about 30 percent faster on a small machine.
-- A stereo voice that sits at the centre no longer calls the library sine and cosine for every sample: the centred panner keeps its trigonometric pair as a constant. The sound is bit for bit the same, and pan-less voices render about 7 percent faster on a small machine.
-- The sound no longer stands below the studio's own workers on Linux. The frame loop demotes itself, its device probe is born demoted, and the host connection the probe builds first inherits that demotion - the thread the audio callback rides. The studio now builds the host connection before the frame loop demotes, so a playing score keeps its priority, and the connection thread reads as `audio-host` instead of the probe's name.
-- The PipeWire and PulseAudio connection no longer zeroes a megabyte of memory for every message it carries: the read loop keeps its buffer between messages instead of growing a fresh one each time. The sound does not change, and on a small machine the audio thread spends about half the time it did on the connection, at every buffer size.
-- A sample voice that runs no filter, no effect and no send renders through a tight path of its own. The general render body is one wide block, and a plain voice paid its register spills every frame; the tight path holds only the source, the envelope, the gains, the panner and the mix, with the same arithmetic in the same order. The sound is bit for bit the same - the corpus hashes and a direct comparison against the general body both hold - and plain sample voices render about 2.3 times faster, on every machine.
-- The room reverb multiplies only the lower half of each spectrum and builds the upper half by conjugation, which is half the frequency-domain work for the same room. A transform of real audio is symmetric about its middle bin, so the halves differ only in the transform's own float rounding: nineteen corpus hashes move, printed peaks by at most one in the last digit. A room that cost sixty percent over the dry score on a small machine now costs about forty.
-- The chord and scale browser starts loading its preview sound when it opens, not when a preview is first asked for. The piano bank decodes on first use, and on a slow machine that decode could outlast the preview's wait: the first press then played nothing and the next one worked. Opening the panel gives the decode a browse's worth of head start, so the first preview sounds.
-- A scale preview keeps its tempo on a slow machine, and stopping one stays clean. Each note of the run is handed to the audio device ahead of its moment - the recorded moment, so a slide that moved the note off the step grid is honoured - and a stop cuts the notes already queued at exactly those moments, so nothing the device already holds rings out after the stop. A short silent carrier after the last one scrolls the preview"s analysis window to real silence, so a stopped preview cannot read as still sounding.
-- A plain voice may now carry its room and delay sends and stay on the tight render path, and plain supersaw voices join it. Stereo samples with a room were the voices a score most easily pushed off the path; they keep it now. A mono oscillator keeps the general body, as before - it is not stereo, so it was never on the path. The frames are bit for bit the same, held by the corpus hashes and by a direct comparison against the general body.
-- The real-time request now carries its dbus backend on Linux, so a grant the system offers is really taken - by the plugin workers, whose turns are short. The output callback deliberately keeps its ordinary class on every platform: a callback whose render runs near the whole of every period is near a total real-time duty cycle, and the kernel watchdog kills such a thread within a fraction of a second of the grant. Until a callback can measure its own duty cycle and ask only with headroom, asking at all is the hazard.
-- The visualizer's audio analysis thins its own cadence when the sound thread reports spending most of its periods rendering. The analysis is real FFT work on the producer for every visual slot, and its memory traffic is what a loaded audio callback feels first: above three quarters load the analysis runs at a quarter rate until the load clears, and the meters redraw a little less often instead of the sound dropping frames. Nothing audible changes.
-- A render block with no plain voices compiles its own copy of the voice loop, without the fast path's routing branch in it. The fast path earned up to four times on sample-heavy scores, but the routing branch sat in the compiled loop for every voice, and the all-filtered synth chords that can never leave the general body paid it back as a few percent: with the loop compiled both ways and chosen per block, those scores render at the release's own speed again, and the fast path keeps everything it won.
-- rustelup checks the audio system on Linux after an install. A machine that runs PipeWire or PulseAudio without rtkit can click its output when the CPU is busy. rustelup offers to install rtkit, and prints the command when it cannot ask. The check never fails the install.
-
-- The visuals docks have a video widget: a video sample's picture in its slot, the arrows picking which clip feeds it, from every video the set sounds. Enter opens the clip in a window of its own on the desktop, in sync with the sound, and the widget folds to a note. Enter again, or closing the window, brings the clip back. One window per clip, placed by hand, nothing kept past the studio's exit.
-- `_video()` and `video()` draw a video sample's picture, small by default, its frame following the sound through the pattern, including `begin` and `speed`. A kitty terminal shows it as real pixels. The picture decodes once per clip and stays bounded; H.264 and its family are named in a note that says to re-encode the clip as VP8 WebM or Motion JPEG, which this build decodes natively.
-- A video file can be a sample: `mp4`, `m4v`, `mov`, `mkv` and `webm` play their audio track as a wav does, from a sample folder or a fetched bank. A video with no audio track says so, and a codec the build cannot play is named in the error.
-- A Hydra callback with a round number, such as `() => mouse.x / 3000`, compiles. Before, the score wrote the number as `3e3`, and the callback was refused.
-- The waterfall of the spectrum no longer starts over on an eval. The frames of the new score follow the ones of the score before on the scroll. A painter the new score no longer has loses its own scroll.
-- Picking a plugin name from the reference opens the presets of the plugin. A plugin with no preset file opens its parameters instead, so the panel never stands in a list that offers nothing, and Enter still adds a choice to the call. The pick into a call open at its bracket closes the call, so the missing `)` does not have to be typed.
-- The reference knows Hydra. In a Hydra statement, Ctrl+F, Ctrl+D and the suggestions show the Hydra names with their parameters and defaults, under the `hydra` heading. Pattern code never lists a Hydra name, and Hydra code never lists a pattern name. Settings ▸ Reference has a Hydra switch.
-- `s0.initVideo()` plays a video in a loop, without sound: WebM or MKV with VP8 or VP9 video, or an animated GIF, PNG or WebP. Other formats are refused.
-- `initImage()` and `initVideo()` read a local file by a path relative to the set folder, or to the folder granted with `--allow-local-samples`. The rules of local samples apply: no absolute path, no `..`, and no read outside the folder.
-- A score loads samples, images and videos only from an allowed source. `raw.githubusercontent.com`, `strudel.b-cdn.net`, `shabda.ndre.gr` and `cdn.freesound.org` are allowed from the start. A public server that sends CORS headers is no longer allowed because of them. `--allow-sample-origin` takes a domain, such as `samples.example`, which allows HTTPS from it and its subdomains, or an address, such as `http://localhost:8000/kits/`, which allows what starts with it. `--strict-sample-origins` turns off the four built-in sources.
-- Settings ▸ Permissions lists the folder of a refused sample, image or video. Enter allows the folder, and `e` edits it: cut it down to a domain, such as `github.com`, to allow all of the domain. The `local:` row chooses the folder that `samples('local:')` and Hydra files read. Studio keeps all of them.
-- A Hydra sketch can set its clock: `speed`, `bpm`, `fps` and `time` take a number. Hydra callbacks also read `width`, `height` and `Math.random()`.
-- Hydra callbacks read the pointer as `mouse.x` and `mouse.y`, and pattern code reads it as `mousex` and `mousey`. In Studio both follow the mouse over the terminal.
-- A shared Hydra sketch runs as written. `setResolution()`, `setFunction()`, `sum()`, `update`, `afterUpdate`, `a.setMax()` and the screen, stream and canvas sources are accepted and do nothing. The reference says what each one does here.
-- Hydra callbacks read `%`, comparisons, `&&`, `||`, `!`, `? :`, `Math.atan2`, `Math.hypot`, `Math.trunc`, `Math.log10` and the `Math` constants. `a.setSmooth()`, `a.setCutoff()` and `a.setScale()` change how `a.fft` reads, as in hydra-synth.
-- Edit ▸ Find, chosen with a click, takes what you type. The release of the click closed the find bar again, so the typing went into the score as text or ran as Vim commands.
-- With Vim keys on, any key the search box takes, such as `i`, Esc or a typed letter, calls off a pending delete in the set panel, the Samples tab and the theme picker, and a pending trim. Before, a later Enter or a second Ctrl+D could delete the score, the sample or the theme without asking again.
-- Vim `p` no longer crashes when the yanked line ends in a Unicode line or paragraph separator.
-- The wheel, a paste and leaving the terminal window no longer close the find bar or a Vim `/`, `?` or `:` prompt, and the wheel no longer ends Visual mode. A paste with `:` open types into it.
-- In Vim mode, Esc and the function keys no longer scroll the score back to the caret after a wheel scroll.
-- In Vim mode, a clicked slider takes ←/→, Enter and Esc as in Default mode, and typing lets it go. Typing after a slider or knob change is an undo step of its own.
-- In Vim mode, a paste in Insert mode is part of that insert, so one `u` undoes all of it.
-- In Vim mode, find opened from Insert mode returns to Normal mode, so `n` walks the matches.
-- Vim `n` moves on from a match at a line break, and a `/` or `?` closed with Esc no longer changes the direction of `n`.
-- Vim `u` after a Visual change puts the caret at the start of the restored text.
-- Vim motions and operators follow Vim more closely. `dw` and `cw` stop at the line end, `w` and `b` stop on empty lines, `2cw` changes every counted word, `dk` on the first line and `dj` on the last do nothing, `j` and `k` after `$` stay at the line end, and `G` skips the empty line after a final line break.
-- Vim `di(`, `ci(` and `yi{` on a block of whole lines take only the lines inside, so `ci(` leaves an empty line to type on.
-- In Vim Visual mode, `D`, `X`, `Y` and `C` act on whole lines.
-- A Vim yank with a backward motion or a text object leaves the caret at the start of the yanked text. Yanking the same text again makes it the newest copy for `p`.
-- On a Vim line of only spaces, `^` goes to the last space and `I` inserts after them. Leaving Insert right after `o`, `O` or `cc` removes the unused indent.
-- A Vim mapping to a panel action, such as `<Action:focus-timeline>`, runs it as its chord does, and a mapped action such as the shipped `gc` leaves Visual mode as its chord does.
-- The vimrc reader skips a line that reaches the command line after Esc or Ctrl+O or uses Ctrl+R. It reads flags written together, such as `<silent><Space>V`, keeps the first line after a byte order mark, and lets the last line win when two lines spell the same keys differently.
-- A vimrc that cannot be read keeps the shipped Vim mappings and still reports the error. It loads by itself once it becomes readable.
-- Vim `gd` with the block caret on the first letter of a name opens that name's docs, also inside an open call.
-- A learnt Ctrl+D or Ctrl+U shows in status hints while Vim keys are on, and the Keybinds page no longer presents `gd` as fixed.
-- With the Vim list keys on, Ctrl+D and Ctrl+U page the Settings sheet, `j`, `k`, `h` and `l` move a visuals dock's add list, going back from a reference entry returns to Command mode, and Backspace over a standing set filter reopens the search.
-- With Vim keys on, the first Esc over a running export closes the export sheet, and its hidden fields no longer take keys.
-- A paste into the Samples search calls off a pending trim.
-- Holding a letter in the Settings VST filter keeps typing it.
-- With Vim keys on, a panel search or form shows a bar caret while it types.
+- A video file plays as a sample: `mp4`, `m4v`, `mov`, `mkv` and `webm` play their audio track.
+- `_video()` and `video()` draw a video sample's picture in sync with its sound. H.264, HEVC, AV1, VP9, VP8 and Motion JPEG decode natively.
+- The visuals docks have a video widget for the clips of `_video()` and `video()` lanes. Enter opens the clip in a desktop window.
+- Settings ▸ General ▸ biggest video sets the largest video file that loads. The default is 256 MiB.
+- `s0.initVideo()` plays a WebM or MKV video in VP8 or VP9, or an animated GIF, PNG or WebP. `initImage()` and `initVideo()` read files from the set folder.
+- Hydra callbacks read `mouse.x`, `mouse.y`, `width`, `height`, more operators and more `Math` functions. Pattern code reads the mouse as `mousex` and `mousey`.
+- A Hydra sketch can set `speed`, `bpm`, `fps` and `time`. A shared sketch with calls Rustel does not support still runs.
+- The reference knows the Hydra names, with their parameters and defaults.
+- Picking a plugin from the reference opens its presets.
+- Samples, images and videos load only from allowed sources. `--allow-sample-origin` adds a source, and Settings ▸ Permissions allows a refused folder.
+- Scores render faster on small machines and on 64-bit ARM, with the same sound.
+- A decoded sample is kept in the cache, so it loads faster the next time.
+- On a slow machine, an edit of a playing score arrives late instead of being refused.
+- On Linux, the audio keeps its priority over the studio's own work.
+- rustelup offers to install rtkit on Linux when the audio system needs it.
+- The first chord or scale preview sounds, and a scale preview keeps its tempo on a slow machine.
+- A save no longer shows "saved" and the file name on the status line.
+- A terminal that answers Kitty pictures no longer types its answers into the score. The studio draws in text cells there and says so.
+- Vim mode follows Vim more closely in motions, operators, text objects, Visual mode, search, paste, undo and vimrc files.
+- With Vim keys on, a key typed into a search box cancels a pending delete, so a later Enter cannot delete without asking.
+- Fixed: Edit ▸ Find chosen with a click takes typing, Vim `p` no longer crashes on a Unicode line separator, and a Hydra callback with a round number such as `mouse.x / 3000` compiles.
 
 ## v0.1.6
 
-- Sample and import downloads use rustls 0.23.46, which fixes four rustls advisories, the worst of medium severity.
-- File ▸ Export patterns writes the open set's scores as one pattern export at the sets root, named after the set and the day: the shape strudel.cc's Patterns tab gives and takes, keyed by name, so the names come back on an import and the file loads in strudel.cc. A score on screen goes out as it stands, unsaved edits included, and the open-set prompt offers the export beside the sets.
-- The set panel's search box repaints on every key it takes. A held Backspace showed its work only when the caret's blink happened to repaint, so the query thinned a beat behind the key.
-- A panel search box in vim mode types every letter at once, `j` and `k` included. The shipped `jk` insert mapping, made to leave Insert in a score, held every `j` typed into a box and left Insert on `jk`, so the next list keys walked the rows mid query. A search box is a command line, and Vim's command line reads no insert mappings.
-- The set panel's search box shows a caret while it types, and a query that matches nothing says no match and blinks with the studio's caret, so a filter left standing cannot read as an empty folder.
-- Backspace over a standing filter edits the query, never the file. The key a hand reaches for to fix a filter had fallen to the panel's delete arm, so a second press could confirm the delete of the score under it. Backspace takes the search box back up and deletes from its term; Delete keeps the ask-first arm it always had.
-- File ▸ Import patterns reads a Strudel export into the set already open: one named score file an entry lands in the set's folder, listed by the set panel with no tab taken up. An entry the set already holds under its name is skipped and counted, so the same file twice says there is nothing new in it. A name that holds other code goes on to `name 2`, so a second strudel.cc export, whose patterns number from one again, lands too. Nothing is overwritten.
-- File ▸ Open set says what it opens: a set or a Strudel pattern export. The prompt's title and hint name both, and the exports lying at the sets root are offered beside the sets with their pattern counts, so an export opens with Enter the way a set does instead of needing a typed path or a folder walk.
-- The export sheet stays open over its bounce, as a DAW's render window does. A percent and a bar say how far under a chosen ceiling, a scope moves with what it hears, and an open end keeps a clock. Esc runs the bounce on in the header, and the export chord ends it early and keeps the file.
-- Ctrl with Shift and a digit selects the strip's score too. Option types real characters on some layouts, and those digits keep typing, so the Ctrl spelling is the one that holds on every layout: Ctrl composes nothing anywhere. A chord learnt over the key retires it, and the help names both spellings.
-- Alt with a digit reaches the strip on every terminal that carries the keyboard protocol, Ghostty and kitty among them. Those terminals report the digit with the Alt bit and its composed text beside it, and the studio took the text, typing `@` into the score where a Swedish layout composes it. A composition of one exotic character now gives its Alt chord back, so the US Option+2 `™` and the Swedish Option+3 `£` select where they typed, while a plain typeable character keeps typing, so the one way to type `@`, `$`, `|`, `[` or `]` on a Swedish layout stays open.
-- The set panel reads each score's saved time once, with the folder. The details block asked the file system on every redraw, which costs nothing on local disk and seconds on a synced or network folder, where it landed on every search keypress.
-- A score of only comments stops the Hydra picture now. The close was staged only when an evaluation succeeded, so a mute left the previous score's picture standing.
-- The studio's terminal probe names the keyboard protocol, so a report from a terminal where the Alt digits stay dead carries whether the handshake answered.
-- `talkit` speech plays from a live score and a bounce. The lookups that wrap a host's sample bank, for control validation and for Csound scores, answered a speech request with the default that says the host has none, so no host could speak. Both hand speech to the bank they wrap now.
-- Alt with 1 to 9 selects that strip's score from the editor, as a digit on its row in the set panel does. The chord runs to nine, and a number the strip does not hold says so. Apple Terminal, and iTerm2 without the keyboard protocol, send a composed Option digit as the bare character, the same as a layout's own key, so there the character types: `§` on an ISO Mac keyboard and `£` on a UK layout are keys of their own.
-- The set panel's details block stands under a rule of its own, set off from the list the way the foot of a file manager's pane is.
-- The set panel's hints and help rows name the strip keys: 1 to 9 opens the strip's score, beside the open and filter keys the foot already names.
-- The set panel's foot follows a save: a score whose header changed on update renews its row's details without the score being reopened, and the reader's selection does not move. An edit another program saved renews them too.
-- The export sheet takes stems: the row on, a bounce writes a `<name> stems` folder beside the take, holding `main.wav` with the same audio plus one stereo WAV a sounding orbit, named `1.wav` upward, as the CLI's `--stems` does. Stems need the WAV format: turning them on takes the format back to wav, and mp3 turns them off. The status names the folder, because the take lands inside it.
-- The hint rows at the set panel's bottom name the open and filter keys, so Enter and `/` are easy to find.
-- `--stems` on render writes a `<name> stems` folder beside the bounce: the same audio as `main.wav`, plus one stereo WAV per sounding orbit, named `1.wav` upward, in the export format. Each stem is tapped after its orbit's delay, reverb, filter, duck and fader, before the master, so the stems sum back to an unmastered main and mastering stays in the DAW. Stems need a WAV format, and an existing stems folder is refused.
-- File ▸ Open set takes a Strudel pattern export. A `.json` object of pattern code becomes a new set folder named after the file, with one score per entry. Every entry is a named file: a `@title` inside its code leads, then the key when the export keys by name, then `pattern N` in the order the patterns were made - a push id is never a file name, and an entry past what the strip holds stays a file of the folder.
-- Press / in the set panel to filter the scores: the panel hides the ones a query does not answer, matching names and @field values. Enter leaves the filter standing and moves to the first match, Esc restores the full list, and the sessions fold stays unfiltered. In vim mode `/` starts typing at once, as Vim's own search does, and Esc leaves Insert before the next Esc clears the filter. The box's hints say plainly what Enter and Esc do with the filter.
-- The set panel's foot shows the selected row's details and follows the selection: the name, its strip number and open state, the @fields its leading comments carry, and when the file was last saved. A tape's row shows its recording time and size, the sessions fold its count, and long detail is cut with a count of what did not fit.
-- Settings ▸ Set has sync with score metadata, on by default. An update renames the score's file to its @title field. The characters a name may not hold turn into dashes, a name already in use is refused with a ribbon, and a score with no @title is left alone.
-- The talkit speech synthesizer lives in its own repository, [rustel-talkit](https://github.com/tzfm/rustel-talkit), and the build takes it as a pinned package at tag v0.1.1. Scores speak as before, and the talkit command installs from that repository.
-- The Hydra video synth lives in its own repository, [rustel-hydra](https://github.com/tzfm/rustel-hydra), and the build takes it as a pinned package at tag v0.1.0. Visuals draw as before, with the same character-checked shaders.
-- While one score plays, auto evaluate applies an edit of that score alone. An edit of another score of the set stays in its file until the evaluate key runs it, and the typing pause says so.
-- The knobs column shows the presets of a plugin call under its rails, closed until → opens them. Enter on a name, and a click on one, write the preset into the call, and the name the call holds carries the mark. The Vim list keys drive the column now, as they do the other panels, and its value form walks its fields with ↑↓ and Tab, as the smart action's form does.
-- A slider() on `fm` moves the sounding voice, as the gain and filter sliders do: `s("in").fm(slider(2, 0, 8))` rides the depth live, with no wait for the next hap. This reaches every source; on `s("in")`, whose hap spans the cycle, it is the difference between now and a cycle late. The chain's other operators stay query-time, and a modulator aimed at `fm` keeps its own graph.
-- A change of the preset folders reads them again at once, on the plugin thread as before: the background-jobs sheet lists the read while it runs, and the count line of the vst tab says it too.
-- A preset name no file of its plugin has is a value error of the Studio check, like an unknown sound: the update is refused, the name is marked in the score, and the nearest preset name is given. `rustel play` keeps its one warning for it.
-- The vst tab of the reference column is a tree: → on a plugin opens the two rows under it, its presets and its parameters with their counts, and → on one of the two makes that half the view of the tab, with its own search and a trail on the search line. ← and Esc go back, also from an empty half. A search of the plugin list reads plugin names only. Ctrl+F in a plugin call opens the parameters view, and Ctrl+Space in a name keeps opening the presets.
-- A beat line chosen on its own survives a restart. Before, it went back to off unless an opacity changed too.
-- An edit another program saved while the studio was still finishing its own save is loaded, not left on disk for the next studio save to overwrite.
-- An orbit sent to an output pair a mono device does not have still sounds, through the main pair.
-- A render or playback longer than the queue of pending events keeps every note. Before, notes past 8192 queued events disappeared before their time came.
-- Keys typed while the terminal answers the studio's startup questions reach the editor. Before, they vanished into the answers.
-- A rename that only changes capitalization works where the filesystem folds case, for a set, a scene and a tape.
-- midi-monitor shows packets it does not model, as raw bytes, in both text and --json output.
-- Hydra's fps option sets the frame rate of the score's visuals. Before, every value played at 30 frames a second.
-- The plugin list of the Settings vst page takes a filter: `/` starts it, the letters keep the plugins their names reach - a part of a name is enough, as the preset search reads it - Enter keeps it standing and Esc drops it. While it types, the keys the page binds are letters of it, so `a` adds no folder.
-- The header's tempo line reads cycle 0.00 while the studio is stopped, as before the first play. The stop freezes the clock for the canvas the player keeps, and the header kept saying the cycle the score stopped on. A canvas that is already stopped no longer takes a second stop word, and a stop pressed while the playback is already stopped no longer asks the engine to stop again: the word came back as a second settle, which reset the advisories and discarded the visual update the held frame was showing.
-- Copying samples into a set refuses bank names and links that could write outside the set folder.
-- On a terminal that composes Option+A into text, the Chords and Scales tabs read it as the auto preview toggle. Before, the composed character typed into the search box.
-- A click on the preview fader reads the bar it draws. Before, the click's bar was narrower than the drawn one, so a click on the knob set a gain a few dB higher.
-- Sample and manifest fetches retry a transient 429 or 5xx after a short rest, so a briefly overloaded sample host no longer fails a corpus run.
-- Settings has an Appearance page: the visual rows of the first page in one place. The Advanced page is gone, its rows sit at the end of General, and the first tab is renamed General. A beat line under the header keeps the tempo visible in pulse, travel and wave looks, and the evaluation animation row shapes the flash a run of code makes, with fades of three speeds, swipe, zap, steps, glitch and wave.
-- Auto evaluate no longer reinstalls a score when the edit adds no instruction. Typing a `$:`, a lane name, or a new line under a playing set leaves the sound alone, so an `oneshot` lane does not fire for it. A press, or a watched file, still applies.
-- `oneshot()` with no grid plays on the next cycle, the same as `oneshot(1)`. Before, it was silent.
-- A `$:` typed with no chain under it no longer doubles the lane above it. A label with no code changes no sound.
-- A rail in the knobs column sounds while it moves, the way a score slider does. Before, the change waited for the typing pause.
-- Each pane in a split has its own colour, and a click on a tab moves the caret to that pane.
+- rustls 0.23.46 fixes four rustls advisories.
+- File ▸ Export patterns and File ▸ Import patterns write and read Strudel pattern exports. File ▸ Open set opens an export as a new set.
+- In the set panel, `/` filters the scores, 1 to 9 opens a strip score, and the foot shows the selected file's details.
+- Alt or Ctrl+Shift with a digit selects that strip score from the editor.
+- Settings ▸ Set ▸ sync with score metadata renames a score's file to its `@title`.
+- The export sheet shows the bounce's progress and can write stems. `rustel render --stems` writes one WAV per orbit.
+- `talkit('hello')` speaks text in a score, and the `talkit` command speaks or writes a WAV. Talkit is experimental. See [Talkit](https://github.com/tzfm/rustel/blob/main/docs/talkit.md).
+- View ▸ Knobs opens sliders for the numbers of the call under the caret, and the presets of a plugin call.
+- The vst tab of the reference is a tree of presets and parameters. Settings ▸ VST filters the plugin list.
+- An unknown preset name refuses the update and gives the nearest name.
+- A `slider()` on `fm` moves the sounding voice.
+- `oneshot(grid)` plays a pattern once on the next grid line.
+- Auto evaluate applies an edit only to the playing score, and skips an edit that adds no instruction.
 - Studio reloads scores when another program saves them.
-- Vim keys work in many more places: lists, menus, search boxes, find, paste, replace and half-page moves. Default Vim mappings ship under your vimrc.
-- The mouse wheel and the trackpad scroll a score in Vim mode. Each step of a scroll was pulled back to the caret, so the score barely moved.
-- Mac Option keys type their character, so Option+4 on an ISO layout types $.
-- The prebakes open from the Options menu.
-- `register()` can replace any built-in name, as on strudel.cc. The log notes each replacement once, and the built-in comes back when the call is removed.
-- Prebake helpers such as window.bpm = b => setcpm(b/4) now pass. Writing over an engine name gives a hint.
-- A set opened from inside the studio runs its own local prebake, as a fresh start on it does. The last set's helpers no longer pass the check in its scores, so a score that plays also exports.
-- The mixer no longer shows "no gamepad". The camera warning clears when nothing asks for the camera.
-- New terminal and terminal-warm themes use your terminal's colours.
-- Plugin edits load only the copy that changed. Heavy sets spread plugin chains over several cores.
-- Windows reports underruns, and Csound reports when it falls behind, in play and in an offline render.
-- Two memory leaks are fixed, in macOS gamepad polling and in the Chords tab.
-- all() returning undefined is an error now.
-- Pattern queries allocate less, and rustelup checks the Linux build packages first.
-- View ▸ Knobs or ^⇧K opens a column of sliders for the numbers of the call under the caret. A move writes the score. Counts stay whole, speeds move in quarters, and vst calls and documented options such as `_pianoroll` or `lfo` get their own rails.
-- A drag or a notch on any slider can land back on a whole number.
-- `getTime()` reads 0 when a score starts from its first cycle: Play after a stop, a restart or a rewind. Before, it kept the old cycle, so a pattern placed with it played late. A failed update that falls back to the last score gives that score its first value again.
-- New `oneshot(grid)` from Switch Angel plays a pattern once, on the next grid line after the update.
-- In Windows Terminal, a syntax error no longer leaves stray coloured cells across the screen. The studio now sends underline colours in the colon form that Windows Terminal reads.
-- `talkit('hello there')` speaks text in a score, the way `s("...")` plays a sample. Single quotes speak one phrase, and double quotes are mini-notation, so `talkit("my name is")` speaks one word per event. A note sets the pitch the voice starts on, so `note("c3 e3 g3").talkit('la')` sings three notes. An options object sets the 20 voices, pitch, speed, quality, effort and language, each as a pattern, as in `talkit('hola mundo', { v: "little-robot", l: "es" })`, and Studio completes their values. Talkit is experimental. See [Talkit](https://github.com/tzfm/rustel/blob/main/docs/talkit.md).
-- The `talkit` command speaks text through the default output device or writes a WAV file. It carries the parameter model of the old Talk It! program, with the 20 voices, pitch, speed, natural, monotone and sung quality, normal, breathy and whispered effort, English and Spanish rules, and numbers read as words. Its sounds, timing, intonation and English readings are measured from the original engine, and it speaks as that engine does, in 8-bit steps at 11.025 kHz. See [Talkit](https://github.com/tzfm/rustel/blob/main/docs/talkit.md).
-- The left and right arrows turn a trust row on or off, as Space does, so the Trust page changes values the way the settings rows do.
-- Apple Terminal no longer shows a line of the studio's startup questions after the studio quits. The terminal printed the questions it could not read, `pp` and a graphics query, on the shell's screen. The studio now erases them.
-- Pictures drawn with Kitty pixels no longer wobble. The size they were drawn at moved on every frame, so a widget, a visualizer or the Hydra backdrop went wider and narrower many times a second. The size now follows many frames, and one slow frame moves nothing.
+- Vim keys work in lists, menus, search boxes, find, paste and replace. Default Vim mappings ship, and the wheel scrolls in Vim mode.
+- Mac Option keys type their character.
+- `register()` can replace a built-in name.
+- Settings has an Appearance page, and the first tab is renamed General.
+- A plugin edit loads only the copy that changed, and heavy sets spread plugin chains over several cores.
+- Windows reports underruns, and Csound reports when it falls behind.
+- `getTime()` reads 0 when a score starts from its first cycle.
+- talkit and the Hydra synth live in their own repositories, pinned by tag.
+- Fixed: long renders keep every note, a mono device plays orbits sent to other pairs, `talkit` speaks from a live score, Hydra `fps` works, a comment-only score stops Hydra, and two memory leaks.
+- Fixed: stray colours in Windows Terminal, wobbling Kitty pictures, and startup leftovers in Apple Terminal.
+- Sample copies that could write outside the set folder are refused. Fetches retry a 429 or 5xx response.
 
 ### Sound changes
 
-- FM modulators now run from the start of the render, as in the browser reference. Before, each note restarted its modulator phase, so FM notes past the first cycle sounded different from strudel, and dense FM scores came out louder.
-- LFO rates above the sample clock, and negative rates, keep moving through their cycle instead of sticking at a clamp.
-- A sound under an explicit bank plays the bank's asset when the bank has one, and names the missing sound when it does not. A banked wavetable keeps its pitch and position controls, the same as its direct spelling.
-- `s("in")` takes the FM controls: `fm`, `fmh`, `fmwave` and the operator envelopes bend the playback rate of the incoming signal, and the route amounts set the bend while `note` still does not retune the input. Waveshaping already reached the input through `dist` and `diode`, and still does.
-- `partials` plays up to 2047 partials, or 4095 from a list of 4096, as Firefox does. Before, only the first 32 played, so a 128-partial sawtooth was too dark. The partials use Firefox's band-limited tables and normalization. Eight voices with 128 partials render 128 s of audio in 4.6 s instead of 62 s on a 4-core x86-64 Linux machine.
-- Sawtooth, square and triangle tables have 4096 samples at every sample rate, as in Firefox. At 44.1 kHz and 48 kHz the sound does not change.
+- FM modulators run from the start of the render, as in strudel.
+- LFO rates above the sample clock, and negative rates, keep moving.
+- A sound under an explicit bank plays the bank's asset when the bank has one.
+- `s("in")` takes the FM controls.
+- `partials` plays up to 2047 partials with Firefox's tables, and renders much faster.
+- Sawtooth, square and triangle tables have 4096 samples at every sample rate.
 
 ## v0.1.5
 
-- A score that stretches every voice no longer overruns the audio device. The stretch vocoder slid its input and output windows one sample at a time, two 8 KiB moves per sample per channel, so a set of stretched voices spent most of its callback moving memory. The vocoder now keeps both as rings and reads each output slot once per overlap cycle. A score of about thirty stretched voices runs under half the callback budget where it overran before, with byte-identical audio.
-- A popup opened from Settings closes when the sheet closes, or when a click lands outside it. Before, a click on the page behind moved the keys to the page, and Esc closed the sheet while the popup stayed up with no key to close it.
-- Csound instruments play and export with `.csound()` and `.csoundm()`. Load orchestras with `loadCSound` or `loadOrc`. Requires double-precision Csound 6.18 or later 6.x. Studio enables native orchestras at startup, and the command line requires `--allow-csound`. See [Csound](https://github.com/tzfm/rustel/blob/main/docs/csound.md).
-- A note release no longer suppresses a MIDI press that follows within 40 ms. Scene pads and learned action buttons could miss that press.
-- Vim mapping replacements can name a Studio action, as `<Action:visualizers>`, so a rebind moves the mapping with it.
-- Inline visualizers in the score can be toggled from View > Inline visualizers, or from a key learned on the Keybinds page.
-- Studio can find text in the focused score with a regular expression. Outside Vim, Ctrl+Shift+Y opens a find bar that searches as you type; Enter walks the matches. In Vim, `/` and `?` search, `n` and `N` repeat with counts, and Ctrl+C leaves Insert mode. See [Vim editor keys](https://github.com/tzfm/rustel/blob/main/docs/studio.md#vim-editor-keys).
-- Studio has optional Vim editor keybindings and external Vim mappings in Settings > Keybinds. Preferences are saved in `studio.json`.
-- File picker and artwork popups support Copy and Cut for selected text. Double-click selects the whole field.
+- `.csound()` and `.csoundm()` play Csound instruments. They need Csound 6.18 or a later 6.x. See [Csound](https://github.com/tzfm/rustel/blob/main/docs/csound.md).
+- Studio has optional Vim keys and regular expression find. See [Vim editor keys](https://github.com/tzfm/rustel/blob/main/docs/studio.md#vim-editor-keys).
+- View ▸ Inline visualizers turns the inline visualizers on and off.
+- A Vim mapping can name a Studio action, as `<Action:visualizers>`.
+- A score that stretches every voice no longer overruns the audio device.
+- A MIDI press right after a release is no longer missed.
+- File picker and artwork popups have Copy and Cut.
 
 ## v0.1.4
 
-- A Studio export fails when it cannot find or load a sound, or when the engine refuses a note. The file is still written, and the log names each refusal. Before, the export reported success with silence in place of those notes. `rustel export --json` lists the same refusals as `voices_refused`.
-- Studio's export uses the same samples as play: the folders and packs in Settings ▸ Samples, the audio in the set folder, and your bank renames. Before, the export used only the default library, so those sounds were silent in the file while the score played them.
-- Any studio action can run from a MIDI button. On the keybinds page of Settings, Enter on a row and a press learn the message: a note with velocity, or a CC crossing the line at 64, so a swept knob fires once per crossing. A button that latches, sending a note-off for its second press, fires on that press too: a note held past a hand's release ends in a new press, not a release, and a CC button that toggles between 127 and 0 fires on both presses, so the Maschine transport works in MIDI mode. Bindings are kept in `studio.json` beside the chord overrides, a message moves between rows rather than meaning two, and a bound note never sounds through `midikeys`. The mapping page is renamed sliders, after what its slots drive. See [hardware](https://github.com/tzfm/rustel/blob/main/docs/hardware.md#midi-input).
-- Studio shows a hint when audio struggles while the CPU is in a power-saving mode: callbacks keep missing their deadline, or the DSP load stays above 70%, for three seconds. That mode keeps the clock low for short, regular work such as the audio callback, so the same score can need two to four times the DSP time. Studio reads the mode on Linux and Windows, and only after the trouble lasts. See [hardware](https://github.com/tzfm/rustel/blob/main/docs/hardware.md#output-latency).
-- Voices with distortion, `crush`, FM or a supersaw render faster. Each voice computed some fixed values again on every sample: the shape terms of `diode`, `asym`, `cubic` and `chebyshev`, the `crush` step count, a copy of the FM routing, and a library remainder for each supersaw lane. Rustel now computes them once or skips them. A supersaw score with `fm`, `crush`, `diode` and a tremolo renders 1.16 times faster on one x86-64 desktop and 1.27 times faster on one x86-64 Linux laptop. The audio stays the same, byte for byte.
-- A VST3 bundle with several plugins keeps the plugins that start when one of them does not. The whole bundle failed, and all of its plugins stayed off until a rescan.
-- VST3 plugins are created and released on the process's main thread on macOS, in the command line, the studio and the scan process. Some plugin shells stop the process when their objects are created or destroyed on another thread. A library embedder that runs no main thread keeps the previous behavior: the plugin thread does the whole lifecycle.
-- The plugin scan limits the time of one class of a bundle, not of the bundle as a whole. A bundle whose classes together take longer than the limit, such as a large bundle of slow plugins, no longer fails its scan as a whole; a single class that takes longer than two minutes still fails its bundle.
-- Split large source files by concern and consolidate repeated tests. Studio tests now check the callback allocator at runtime.
-- `stackLeft`, `stackRight`, `stackCenter` and `stackRepeat` combine patterns with different step counts. `degradeByWith` uses a signal to choose which events to keep. `open` and `close` provide fades over one cycle.
-- Custom `xen` scales accept ratio strings and patterns. `getFreq` and `getFrequency` both accept notes and events.
-- Rustel joins a Link session that is already running and takes its tempo. Before, the running session took the rustel tempo: an app playing at 128 BPM jumped to 90 BPM when `rustel play --link` started at 90 BPM.
-- Stop stops the set when auto evaluate is on. An edit that applied in the 100 ms after the press started the set again.
-- `rustel vst | head -1` and other pipes into a reader that stops early end quietly with exit code 0. Rustel printed a panic when the reader closed the pipe.
-- The header's warning count lets go of a warning that nothing resolves. A warning with a condition the studio can re-evaluate, such as a refused score or a failed import, leaves the count when its condition clears. A keyless warning, such as a voice refused once per score text, kept the count up until the log was opened. It now counts as news for ten seconds from its last word and then leaves the count on its own, and the line stays in the log. Opening the log still takes the whole count down at once.
-- The vst page of Studio's settings ends with a row for every plugin the scan found, each with its state: `found`, `loading`, `ready` or `failed`. The rows are read-only, the scan is what changes them. While the scan runs, the scan row says where the read is, as `scanning · 3 of 124 bundles`.
-- The vst page of Studio's settings has a `scan` row above `rescan`. `scan` reads the folders and tests only new or changed plugins, as after an install. `rescan` empties the scan cache and tests each plugin again. Before, a plugin installed while Studio ran needed a restart or a full rescan.
-- The plugin scan names the plugin in its test: on the status line of `rustel vst`, in Studio's background jobs and on the scan row. A shell bundle shows the bundle and the plugin, as `Shell › Comp`. A fault of the scan process names the plugin in its load, and the plugin row on Studio's vst page shows the fault. Before, the scan showed a count or a percent only, so a plugin that stopped the scan had no name.
-- A part of a plugin name that is a whole word of a name finds that plugin first, then a part at the start of a word, then a part inside a word. `vsti("TAL")` played Vital, the shortest name with "tal" in it, and `vsti("TAL", { preset: "tal" })` then looked for the preset of Vital. It now plays TAL-NoiseMaker.
-- A plugin call with no `preset` plays `default.vstpreset` from the preset folder of the plugin, when the folder has one.
-- The plugin scan makes a preset folder for each plugin it finds, with the exact plugin name. In Studio, a `.vstpreset` file dropped on the window goes to the folder of its plugin: rustel reads the plugin class in the file. The scan cache keeps the class of each plugin. A cache of an earlier version has none, so rescan once after the upgrade.
-- Presets come from any folder the player adds, in any structure. Settings ▸ VST has an `add preset folder` row: the header of each `.vstpreset` file names its plugin, so no folder naming is needed. The plugin rows of the page say each plugin's preset count, and Enter on a row lists the presets. `~/.rustel/vst` stays the folder a dropped preset is copied into.
-- An open plugin in the vst tab lists in two halves, its parameters and its presets: Tab moves between them, and a search lists the half the cursor is in. Enter on a preset writes the call, or changes only the `preset` in a call of the same plugin. Picking a plugin name with Ctrl-F leaves the panel on the presets of that plugin, and Enter on the row of the plugin a call names goes to its rows.
-- The preset folders are watched while Studio runs: a preset saved or copied in after the scan is in the lists with no rescan and no restart, and the open plugin takes it mid-play. The count line of the vst tab says where the plugin scan is while it runs, as the samples tab says its imports.
-- Two Link participants that joined each other's sessions at once stayed on two grids forever. Neither session had a founder left, and a member measures its clock against the founder of its session. A member whose founder has been silent for ten seconds now re-founds the session where the grid stands, keeping the tempo, the phase and the clock, so a founder announces the session again and the participants merge. A session whose founder left is re-founded the same way.
+- Any Studio action can run from a MIDI button, learnt on Settings ▸ Keybinds. See [hardware](https://github.com/tzfm/rustel/blob/main/docs/hardware.md#midi-input).
+- A Studio export uses the same samples as play, and fails when a sound does not load. `rustel export --json` lists the refusals.
+- Studio shows a hint when audio struggles in a CPU power-saving mode. See [hardware](https://github.com/tzfm/rustel/blob/main/docs/hardware.md#output-latency).
+- Presets come from any folder you add. A dropped `.vstpreset` goes to its plugin's folder, and a call with no preset plays `default.vstpreset`.
+- Preset folders are watched, so a new preset shows with no rescan.
+- Settings ▸ VST lists each plugin's state, and `scan` tests only new plugins.
+- The plugin scan names the plugin it tests and limits the time per plugin.
+- On macOS, plugins are created and released on the main thread. A bundle keeps its working plugins when one fails.
+- A plugin search prefers whole words, so `vsti("TAL")` plays TAL-NoiseMaker.
+- Rustel joins a running Link session at its tempo, and two sessions that joined each other merge.
+- New: `stackLeft`, `stackRight`, `stackCenter`, `stackRepeat`, `degradeByWith`, `open` and `close`. Custom `xen` scales take ratio strings and patterns.
+- Voices with distortion, `crush`, FM or a supersaw render faster.
+- Stop stops the set when auto evaluate is on.
+- A pipe into a reader that stops early ends quietly.
+- The header's warning count lets go of a warning that nothing resolves.
 
 ### Sound changes
 
-- Euclidean rhythms accept negative steps and more pulses than steps. Negative steps switch between regular and legato notes. Extra pulses extend the rhythm across cycles. Legato rotation shifts the rhythm without shifting the source notes.
-- Distortion curves compute `tanh` in double precision and round once. Each result is within one unit in the last place of the exact value. glibc's `tanhf` was off by up to two units and took 1.5 to 3.4 times longer per call, depending on the input. The `diode` voice above renders 1.08 times faster on the same Linux laptop.
+- Euclidean rhythms take negative steps and more pulses than steps.
+- Distortion curves compute `tanh` more exactly and faster.
 - `randL` uses the score's random seed.
 
 ## v0.1.3
 
-- Scores use `.vst()` for VST3 effects and `.vsti()` for VST3 instruments, with parameters and presets. Plugin support is experimental. `rustel vst` lists your plugins. Studio lists the plugins in the reference panel and completes plugin names, parameters and presets. See [Plugins](https://github.com/tzfm/rustel/blob/main/docs/plugins.md).
-- The audio of a VST3 plugin runs in the rustel process, as in most DAWs. Studio and `rustel vst` scan each plugin bundle in a process of its own, so a plugin fault at the scan ends no host. A bundle that fails its scan stays off until its files change or a rescan. An edit keeps the plugin copies of each call it does not change, and a plugin with no sound sleeps until its next note. `rustel vst <name>` shows at most 40 parameters with no group, with a hint for the rest.
-- Studio and the CLI report device underruns apart from DSP deadline misses. A recoverable underrun keeps playback running.
-- Studio's export runs the global and local prebakes before the score, as the engine does before play. Before, an export of a score that called a name its setup defined stopped with `ReferenceError`, while the score played.
-- A set opened to hear it and closed with no change keeps its files and their changed dates. Update rewrote a score the file already held, and opening and closing rewrote the set's project file, so a set you only played rose to the top of the open list. A write that would put the same bytes on disk is skipped. A folder of scores with no project file gains one the first time it is opened, so it exists to be opened by name.
-- A digit in a name has the colour of the name in the Studio editor. The `1` in `filter1on` had the number colour.
-- Ableton Link joins rustel to the tempo and transport of other participants on the local network. `rustel play --link` and `rustel studio --link` join, and in Studio the `link` tab of the Devices panel holds the checkbox, off at each start. A session that starts playing starts rustel, one that stops stops it, and rustel tells the session its own starts, stops and tempo changes. Participants on the same machine are found over loopback, with no network. Enabling Link releases the MIDI clock in. See [hardware](https://github.com/tzfm/rustel/blob/main/docs/hardware.md#link).
-- Backspace in the quick action's slider form deletes one character from the caret, not the whole field. Each field opens selected so a typed number replaces the default, and the selection is not drawn, so an erase key read as the whole default number going at once.
-- The header's transport word keeps to `PLAYING`, `STOPPING` and `STOPPED`, drawn in an eight-column field. The readiness chip, the tempo line and the take clock after it stay put while the word changes. An evaluation no longer replaces the word with `EVALUATING`. The logo dot breathes amber while a job runs.
-- `K(...)` binds the same note frequency on every platform. The frequency came from the host `pow`, whose last bits differ on Windows, so a score using `sFreq` produced a different event hash there and failed the corpus. The bound frequency is trimmed, as tonal frequencies already are, and the two affected golden rows are recaptured.
-- KabelSalat guide tests read examples with Unix or Windows line endings.
-- Methods defined through aliases such as `const rg = register` pass score checks and remain available in later updates.
-- Studio names the caret menu Quick action. Theme and score save confirmations clear after five seconds.
-- `K(...)` runs KabelSalat synths and effects through a Rust graph builder and audio engine. Supports patterned inputs, polyphony, feedback and `.FX(K(...))`. See [KabelSalat graphs](https://github.com/tzfm/rustel/blob/main/docs/kabelsalat.md) for examples and limits.
-- Custom KabelSalat methods such as `.fm(...)` keep their arguments inside the graph. Calls with local variables no longer fail with an undefined variable error.
-- The corpus includes ten published KabelSalat scores with source links, author credits and AGPL-3.0-or-later notices.
-- Studio reference and completion include KabelSalat functions, node methods and inputs under `tag:kabelsalat`. Help inside `K(...)` uses graph definitions. Underscore bypass methods appear only when searched with `_` or `tag:bypass`. Settings > Reference > KabelSalat hides these entries from suggestions and browsing.
-- The lint no longer reports `unknown bank "gm_pad"` on a working score. The bank check read the sample banks but not the General MIDI names, which are the only holders of banks such as `gm_pad`. The score played either way, and `s("halo").bank("gm_pad")` and `s("gm_pad_halo")` now lint the same.
-- The check reads a bank name without regard to case, as playback does. `.bank("TR909")` was flagged `unknown bank` while it played the machine `tr909` names.
-- A sound only some machines of a `.bank()` hold is a note, not a problem. `s("sh*16").bank("tr909,dmx,linn")` was refused as `unknown sound "sh"` while the dmx and linn layers played. The note says which machines go without and which carry the voice, and a sound no machine holds stays a refusal.
-- A refused voice is said once per score text and its line names the music. `unknown sound "tr909_sh": no sample bank or synth of that name is loaded` was logged on every scheduling window, its count climbing while the set played on. The line now reads `tr909_sh is not loaded - that layer stays silent, the rest plays`, the command line prints it as a warning, and a changed score says it again.
-- The installer puts `rustelup.ps1` in `~/.rustel/lib` and leaves only `rustelup.cmd` in `bin`. PowerShell runs a `.ps1` found on `PATH` before a `.cmd` of the same name, and the default execution policy blocks the script. `rustelup` now reaches the shim and runs with the default policy. Run the install command again to move an installed updater.
-- Studio no longer pauses animated themes during the first sample-library refresh.
-- `rustelup` runs from PowerShell 7. The shim starts Windows PowerShell through cmd.exe, where `Get-FileHash` is not available, so the updater computes the SHA256 hash itself.
-- Studio applies a paused edit by itself while the set plays. Settings ▸ Live coding turns auto evaluate on, off by default, and sets the typing pause: how long a rest before the edit applies, 250 ms to 2 s with a 500 ms default. Only a clean edit applies, a refused one keeps the last good score playing, and an applied edit never flashes the pane. The launch setting names the line an applied edit waits for, as for an update.
+- `.vst()` and `.vsti()` play VST3 effects and instruments, with parameters and presets. Plugin support is experimental. See [Plugins](https://github.com/tzfm/rustel/blob/main/docs/plugins.md).
+- Plugins are scanned in a separate process, so a plugin fault does not stop Rustel.
+- `K(...)` runs KabelSalat synths and effects. See [KabelSalat graphs](https://github.com/tzfm/rustel/blob/main/docs/kabelsalat.md).
+- `--link` and the Devices panel join Rustel to an Ableton Link session. See [hardware](https://github.com/tzfm/rustel/blob/main/docs/hardware.md#link).
+- Settings ▸ Live coding turns on auto evaluate, which applies an edit after a typing pause.
+- Studio and the CLI report device underruns apart from DSP deadline misses.
+- Studio's export runs the prebakes before the score.
+- A set you only open and play keeps its files unchanged.
+- The bank check knows the General MIDI names and ignores case. A sound only some machines hold is a note, not an error.
+- A refused voice is reported once per score text.
+- `rustelup` runs from PowerShell 7 and under the default execution policy.
 
 ### Sound changes
 
-- Stop fades an orbit routed to another output pair with the main pair. Before, the orbit kept its level through the stop fade, and the stopped output played the last block of the orbit in a loop.
-- Studio master volume changes ramp over 10 ms, removing the crackle when dragging the fader. The same ramp reaches routed outputs.
-- Limiter threshold, mode and makeup changes fade smoothly during playback. Mode changes keep audio flowing while the new mode fills its lookahead buffer.
-- On macOS, Studio keeps its output stream open across Stop and reuses it on the next start, avoiding the click from closing and reopening it even from silence. The stream closes when you quit, change the output device or buffer size, or the stream fails.
+- Stop fades a routed orbit with the main pair.
+- Master volume and limiter changes ramp without clicks.
+- On macOS, Studio keeps its output stream open across Stop, so there is no click.
 
 ## v0.1.2
 
-- With an empty search, the reference lists its headings by use across the 186 songs in the score corpus. Temporal, tonal and audio come first. A search still opens on the best match.
-- Settings ▸ Reference has five switches, all on by default. Turn one off to hide a kind of entry from the reference and the editor suggestions. The kinds are OSC and SuperDirt-only controls, `serial()`, the FM routing matrix `fmi11` to `fmi88`, the `bind` and `join` family, and pattern internals such as `withHap`. `tag:` search still lists a hidden kind, and Ctrl+D still opens its page. `fadeInTime`, `chorus`, `oschost` and `oscport` now carry the `osc` tag. `dry`, `bus`, `busgain`, `octave`, `unit` and `phaserdepth` play natively, so they lose the `superdirt` tag.
-- Pattern queries are faster. Cycle time arithmetic uses 64-bit math when numerators and denominators are below 2^31. Every operation used 128-bit math. `s("[bd hh sd hh]*8").fast(2)` queries 1.7 times faster over whole cycles and 1.65 times faster over a 25 millicycle live window, in a release build on one x86-64 desktop. Events stay the same.
-- Scores with several controls query faster. A control such as `.gain(0.8)` built a lookup table for each event, and only `pick` reads the table. Rustel now builds the table when a `pick` asks. `s("[bd hh sd hh]*8").n(3).gain(0.8).pan(0.25).cutoff(800).room(0.3)` queries 1.9 times faster in a release build on one x86-64 desktop. Events stay the same.
-- A host which builds `rustel-core` with no default features drops the scale table (244 KB compressed) and its decoder. The new `tuning-list` feature holds both and is on by default. Named scales are unknown in the smaller build, and a scale given as a frequency list works as before. A default build and every Rustel product build stay unchanged.
-- A build which never reads the reference text of the controls no longer links the text, about 230 KB uncompressed. The control registry reads a table of names and aliases, and only code which shows the text reads the full table. A product build is unchanged.
-- The new `transpiler::on_caller_stack(work)` runs every parse of `work` on the calling thread. Each parse spawned a thread with 256 MiB of stack. A host with no threads got a refusal diagnostic from every `transpile` call, and a host on a large stack of its own paid for a thread the host did not need. The nesting checks still run first, and the caller owns the stack size. Existing callers stay unchanged.
-- `rustelup --branch main` and `rustelup --commit <hash>` build rustel from source and install the binary. Use them to test a change before its release. The build needs `git` and `rustup`. Run the install command again to get the new `rustelup`.
-- `rustelup` keeps the backup of the previous binary when a restore fails and prints its path. The cleanup deleted the backup with the stage directory.
-- `rustel play song.strudel` plays a score, and the playing flags are in `rustel play --help`. `rustel song.strudel` is removed and stops with a tip for `rustel play`. `play` was a hidden alias of `trace`, so `rustel play song.strudel` ran with no sound.
-- `rustel export` accepts `--prebake` and is the one command for a bounce to a file. `rustel play` has no `--export`, `--cycles`, `--until-silence`, `--silence-floor`, `--silence-hold` or `--sample-rate`. The old `--export` wrote WAV only, with a default length of 2 seconds.
-- `rustel-ext` no longer turns the scale table on. A host which builds `rustel-core` with no default features keeps the table off and still gets the extension names. A default build stays unchanged.
-- Studio asks when it cannot save a score as you open or create another set. Enter retries the save, Del leaves the set without those edits, and Esc keeps the set. Before, the set stayed open with no way out, for example after its folder lost write permission.
-- Studio marks the cycle count of the `arrange` section in play. `arrange([8, intro], [16, verse])` marks the `8` for 8 cycles, then the `16`. An `arrange` call had no mark, so the score did not show your place in the song. Each event of a section carries one more source span. Sound and timing stay the same.
-- `rustel studio my_folder`, with no `my_folder` on disk, creates the set folder `my_folder` with a starter scene. File > Open set does the same with a typed path. A missing path that ends in `.strudel` still opens a starter score. If the parent folder is missing or locked, the launch stops and names the path. Before, Studio opened `my_folder` as a score in the parent folder. The set panel never listed it, and with `/` as the parent each save failed with `Permission denied (os error 13)`.
-- Two timing tests no longer fail on a loaded CI runner. The scheduler budget test measured the age of its own channel as wake jitter, 138 ms on one Windows runner. The studio handover test left 50 ms for a late wake of the MIDI sender thread and now leaves 200 ms.
-- A score loads a helper script with `await import('https://glossing.dev/scripts.js')` when you trust the origin. `rustel play song.strudel --allow-import-origin https://glossing.dev` trusts one origin. In Studio, the first update names the origin on the footer and Settings ▸ Trust lists the origin. Enter trusts the origin, and Studio keeps the choice. Rustel fetches the script and runs the script as setup code before the score, in the score sandbox. No origin is trusted by default. Before, each `import()` stopped the score with `dynamic import is disabled`. See [Script imports](https://github.com/tzfm/rustel/blob/main/SECURITY.md#script-imports).
-- `bus` takes a name. `.bus('drums')`, `bmod({ b: 'drums' })` and `s("bus").n('drums')` share one of the 16 buses, and a number still selects its own bus. Before, a name refused the voice with `bus must be a finite number`.
-- `getTime()`, `getCps()`, `getRandsAtTime(time, n, seed)` and `getFrequencyFromValue(value)` are available in scores and prebakes. Helper scripts written for the browser call them. `addEventListener` is accepted and does nothing.
-- A pattern made with `mini('...')` in a score no longer highlights the first characters of the score when its events play. The events carried positions inside the string, and Studio read them as positions in the score.
-- A slider move no longer silences the set when the score has a refused voice. The move asks the score again, and one refused voice refused the full update. The rollback then loaded the same score, and the set stayed silent. A refused voice is now skipped and logged, as on the first play.
-- In a split view, a click on the tab of a scene open in the other pane keeps the caret in your pane. The status line names the pane with the scene, and F10 moves the caret there. Before, the click moved the caret to the other pane.
-- `rustel export`, `rustel render` and `rustel replay --export` print each voice notice once, with the number of onsets. Before, an LFO on a target Rustel does not modulate, such as `.lpenv(4).lfo({s:.7})`, printed several JSON lines for each note. With `--json`, the records stay the same.
-- A score plays with the names from its own imports. Two helper scripts which both define `.sc()` no longer change each other. Before, the script loaded last gave its `.sc()` to every score, so a score sounded different after another scene played. A name from one script only stays available to every score, and an import in a prebake shares its names with every score.
-- `.onSchedule(callback)` is accepted and returns the pattern unchanged, the same as `.onTrigger()`. Rustel calls no playback callback. Before, a score with `.onSchedule()` stopped with an error.
-- `isobite(structure)` plays the next cycle of a pattern on each event of a structure. `"<0 1 2 3 4 5>".isobite("[x - x*2]*2")` plays `"0 - [1 2] 3 - [4 5]"`. With a pattern and a structure of different lengths, the two shift against each other from cycle to cycle. `cyclestruct` and `cycleStruct` are the same function.
-- A search in the reference shows each function under the name you type. `cycleS` shows `cycleStruct`, with `also: isobite` on a line under the row, and Enter writes `cycleStruct`. The other names of each function are on this line, so the summary has the full width of the row. Before, the row showed the main name `isobite` and Enter wrote `isobite`. When two names differ only in case, the row shows the camelCase name. A capital in your search text puts the names with this capital first, so `cycleS` lists `cycleStruct` before `cyclesPer` and before the `set tempo` snippet.
-- Space stops a sample preview the first time, every time. On a loaded machine the engine's two-slot command queue held the studio's setup commands while the first Space queued the sound, the second Space's stop command was dropped, and the preview rang on with the status line still naming the sound. The stop now sets a flag the engine honours on its next turn, the same guarantee the transport's second Stop press has.
+- `rustel play song.strudel` plays a score, and `rustel export` bounces one to a file.
+- `rustelup --branch main` and `rustelup --commit <hash>` build and install from source.
+- A score can `import()` a helper script from a trusted origin. See [Script imports](https://github.com/tzfm/rustel/blob/main/SECURITY.md#script-imports).
+- `rustel studio my_folder` creates a missing set folder.
+- Settings ▸ Reference hides kinds of entries, and an empty search lists the headings by use.
+- A reference search shows each function under the name you type.
+- `isobite` and `cycleStruct` play the next cycle of a pattern on each event of a structure.
+- `bus` takes a name.
+- `getTime()`, `getCps()`, `getRandsAtTime()`, `getFrequencyFromValue()` and `.onSchedule()` are available.
+- Studio marks the playing section of `arrange`.
+- Studio asks what to do when it cannot save a score as you open another set.
+- Pattern queries are faster.
+- Library builds can leave out the scale table and the control reference text.
+- Fixed: a slider move no longer silences a set with a refused voice, Space stops a sample preview the first time, and helper scripts no longer share names between scores.
 
 ### Sound changes
 
-- The stop fade runs for the full 10 ms. The fade ended after 128 frames, about 3 ms at 48 kHz, and left a click.
-- `.pg(x)` multiplies the postgain of each note by `x`. `.accent(x)` multiplies `velocity` and `lpenv` the same way. Before, both silenced the pattern with no error, because the multiplier held no events.
-- `s("one")` plays a constant signal, the source of a bus modulator: `s("one").gain("0 1").bus(1).dry(0)` moves the control another pattern reads with `bmod({ b: 1 })`. Before, the sound was unknown and the modulator voice was refused. A sample named `one` still plays as a sample.
-- An `lpq` slider moves the resonance of a note already sounding. It works like an `lpf` slider on the cutoff. An exact move takes 5 ms, and a smoothed mouse move takes 35 ms. Before, the new resonance reached only the next note, so a long note or a `legato(2)` pad kept the old value. A render does not change.
+- The stop fade runs for the full 10 ms.
+- `.pg()` and `.accent()` multiply the note's level.
+- `s("one")` plays a constant signal for bus modulators.
+- An `lpq` slider moves the resonance of a sounding note.
 
 ## v0.1.1
 
-- A key pressed at the same moment as a terminal resize reaches Studio at once. The key stayed unread until the next key, and Studio used one full CPU core while it waited.
-- Rustel announces new stable releases with a `rustelup` hint. Studio prints the notice after you quit. Disable checks with `rustel config set check_updates false`.
-- Theme effects keep `//`, `=>` and other punctuation ligatures whole. The waves themes split them while a wave passed.
-- Alt+click and Ctrl+click extend the selection, as Shift+click does. kitty keeps Shift+click and does not send it to Studio.
-- Keyboard help says when the terminal does not send Shift+Home and Shift+End. Ghostty on Linux keeps both keys for its scrollback. See [Selecting text](https://github.com/tzfm/rustel/blob/main/docs/studio.md#selecting-text).
-- Settings ▸ Keybinds rebinds the panel shortcuts: show file, rename, delete sample, trim sample, and focus the tape timeline.
-- `rustls` moves from 0.23.43 to 0.23.45. Versions 0.23.13 to 0.23.44 accept TLS 1.3 handshake messages at the wrong encryption level ([GHSA-2mjx-qc3c-rqvc](https://github.com/advisories/GHSA-2mjx-qc3c-rqvc)). Sample and image downloads use `rustls`.
-- `rustel render --format scalar-f32` reports the real length. `--duration 8` printed `16.0 s, 8 cycles`.
-- CI runs the tests of the hand-written `unsafe` code under [Miri](https://github.com/rust-lang/miri) on each pull request. Miri stops on a memory error or a data race in the audio rings, the AVX2 kernels, the callback host pointers and the QuickJS allocator.
-- The QuickJS allocator reports 0 usable bytes for a null pointer. The size read had no null check.
-- Rustel plays through and records from devices with a 24-bit sample format. The output stayed silent with `sample format i24 is not supported`.
+- Rustel tells you about a new release. `rustel config set check_updates false` turns this off.
+- Settings ▸ Keybinds rebinds the panel shortcuts.
+- Alt+click and Ctrl+click extend the selection.
+- `rustls` 0.23.45 fixes [GHSA-2mjx-qc3c-rqvc](https://github.com/advisories/GHSA-2mjx-qc3c-rqvc).
+- Devices with a 24-bit sample format play and record.
+- Fixed: a key pressed during a resize is read at once, and `rustel render --format scalar-f32` reports the real length.
 
 ### Sound changes
 
-- `tremolo(4).tremolodepth(-1)` wrote NaN to the output. The tremolo gain takes 1 for those samples.
-- The default sustain of a bus receiver is 1.0. The default was 0.6, so the level fell during each 50 ms decay and returned to full level at the next start. ADSR controls you set stay unchanged.
-- Live playback starts tremolo, each filter LFO and `lfo()` with no retrig from the musical time of the note, `cycle / cps`. Live playback read the clock, so the sweep started at a new point on each play. A render does not change.
-- A supersaw note waits for the begin gate, as pulse and wavetable notes do. Each supersaw note starts 1 to 128 frames later. With an LFO on the filter, some notes started with a low thump.
-- A fractional `curve` in `lfo()` with a negative LFO value gives NaN. The target takes its default for those samples, 350 Hz for a filter frequency. The cutoff went to 20 Hz.
-- A ladder filter with a cutoff below 0 or a resonance below -7.69 went to infinity. Both are bounded. Delay feedback and the supersaw spread stay in -1..1 under modulation.
+- `tremolodepth(-1)` no longer writes NaN.
+- A bus receiver's default sustain is 1.0.
+- Live tremolo and LFOs start from the note's musical time.
+- A supersaw note waits for the begin gate.
+- LFO curves, ladder filters, delay feedback and supersaw spread stay in range.
 
 ## v0.1.0
 
