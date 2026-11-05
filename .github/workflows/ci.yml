@@ -27,7 +27,7 @@ jobs:
   # documents listed below. A push to main always runs the checks.
   changes:
     name: Changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       code: ${{ steps.diff.outputs.code }}
     steps:
@@ -61,8 +61,6 @@ jobs:
       matrix:
         include:
           - name: Linux x64
-            # The OS of the release build. ubuntu-latest moved to 26.04 in
-            # November 2026, and the Csound bounce test segfaults there.
             runner: ubuntu-24.04
             jobs: "4"
           - name: macOS Apple Silicon
@@ -300,7 +298,7 @@ jobs:
     name: Miri (Linux x64)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     concurrency:
       group: ${{ github.workflow }}-miri-${{ github.ref }}
       cancel-in-progress: true
@@ -399,7 +397,7 @@ jobs:
     name: CI result
     needs: [changes, check, build-release-platforms]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Fail when a required job failed
         env:
