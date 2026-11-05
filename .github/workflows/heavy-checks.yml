@@ -37,7 +37,7 @@ jobs:
       matrix:
         include: &platforms
           - name: Linux x64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             jobs: "4"
           - name: macOS Apple Silicon
             # macos-14 retired on 2026-11-02 with brownouts through October
