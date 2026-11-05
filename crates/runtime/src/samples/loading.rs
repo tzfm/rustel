@@ -308,7 +308,7 @@ fn run_sample_loader(shared: Weak<Shared>, jobs: Arc<LoadQueue>, dir: PathBuf) {
                 &url,
                 &access,
                 ScoreCacheKind::Audio,
-                rustel_audio::sample_pcm_ceiling(),
+                FileLimit::of(&url).bytes,
                 CacheFetchScope {
                     budget: &budget,
                     publication: &shared.publication,
@@ -589,6 +589,8 @@ impl SampleLibrary {
             ),
             #[cfg(feature = "video")]
             videos: Mutex::new(HashMap::new()),
+            #[cfg(feature = "video")]
+            video_ceiling_seen: AtomicU64::new(file_limit::video_ceiling_moves()),
             score_cache: ScoreCache::new(dir.clone()),
             manifest_pending: AtomicUsize::new(0),
             publication,
@@ -2250,6 +2252,8 @@ pub(super) mod tests {
                 direct_diagnostic_logging: AtomicBool::new(true),
                 #[cfg(feature = "video")]
                 videos: Mutex::new(HashMap::new()),
+                #[cfg(feature = "video")]
+                video_ceiling_seen: AtomicU64::new(0),
                 score_cache: ScoreCache::new(cache_dir()),
                 manifest_pending: AtomicUsize::new(0),
                 publication: Arc::new(PublicationGate::new()),

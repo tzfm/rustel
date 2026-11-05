@@ -931,8 +931,6 @@ mod tests {
             assert_eq!(feeds(&app).as_deref(), Some("a.webm"), "right wraps");
             assert!(app.handle_viz_key(KeyCode::Left, false, false));
             assert_eq!(feeds(&app).as_deref(), Some("b.webm"), "left steps back");
-            // The widget asks for every sound the set has.
-            assert!(app.wants_video_feeds());
             assert!(
                 app.detached_video_feeds().is_empty(),
                 "attached by default: no window until Enter asks for one"

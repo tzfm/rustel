@@ -6,17 +6,60 @@ use super::*;
 #[cfg(feature = "video")]
 const MAX_TRACKED_VIDEO_CLIPS: usize = 8;
 
+/// Picture decodes that run at once. Each takes a few cores beside the
+/// audio engine, so a set of many clips decodes them a few at a time.
+#[cfg(feature = "video")]
+const MAX_PICTURE_DECODES: usize = 2;
+
+/// The picture decodes running now, and the wait for a free one.
+#[cfg(feature = "video")]
+static PICTURE_DECODES: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// One of the [`MAX_PICTURE_DECODES`] turns, given back on drop.
+#[cfg(feature = "video")]
+struct PictureTurn;
+
+#[cfg(feature = "video")]
+impl PictureTurn {
+    fn take() -> Self {
+        let (running, freed) = &PICTURE_DECODES;
+        let mut running = running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *running >= MAX_PICTURE_DECODES {
+            running = freed
+                .wait(running)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *running += 1;
+        Self
+    }
+}
+
+#[cfg(feature = "video")]
+impl Drop for PictureTurn {
+    fn drop(&mut self) {
+        let (running, freed) = &PICTURE_DECODES;
+        *running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
+        freed.notify_one();
+    }
+}
+
 /// Fetch a video sample's container bytes the way the loader fetches a
 /// sample, then decode its picture.
 ///
-/// Validation stays the audio decode, as for any sample: the picture
-/// decode refuses codecs this build cannot read, and a refused picture
-/// must not evict cache bytes the sound still plays from.
+/// A file read where it lies goes straight to the picture. A fetched
+/// one is checked by its audio decode first, as for any sample: the
+/// picture decode refuses codecs this build cannot read, and a refused
+/// picture must not evict cache bytes the sound still plays from.
 #[cfg(feature = "video")]
 fn decode_video_picture(
     shared: &Shared,
     url: &Arc<str>,
 ) -> Result<crate::video::VideoThumbnails, String> {
+    let _turn = PictureTurn::take();
     let budget = sample_fetch::FetchBudget::for_one_fetch_with_cancellation(
         shared.publication.cancellation(),
     );
@@ -33,12 +76,18 @@ fn decode_video_picture(
     };
     let validated = |bytes: &[u8]| codecs::decode_guarded(url, bytes, None).map(|_| bytes.to_vec());
     let bytes = match score_access {
+        // A file where it lies is its own cache: nothing to guard, so the
+        // sound need not decode first, and the bytes are not copied.
+        Some(access @ ScoreFetchAccess::Local { .. }) => {
+            fetch_score_source_with_budget(url, &access, FileLimit::of(url).bytes, &budget, || {})
+        }
+        None if url.starts_with("file://") => fetch_located(url),
         Some(access) => fetch_score_source_cached_with_budget(
             &shared.score_cache,
             url,
             &access,
             ScoreCacheKind::Audio,
-            rustel_audio::sample_pcm_ceiling(),
+            FileLimit::of(url).bytes,
             CacheFetchScope {
                 budget: &budget,
                 publication: &shared.publication,
@@ -53,7 +102,7 @@ fn decode_video_picture(
             validated,
         ),
     }?;
-    crate::video::decode_thumbnails(&bytes, extension)
+    crate::video::decode_thumbnails(bytes, extension, &shared.publication.cancellation())
 }
 
 /// A pack's base as a prefix its files start with: with the slash, so
@@ -1216,9 +1265,13 @@ impl SampleLibrary {
             .contains_key(url);
         if granted {
             let cache = &self.shared.score_cache;
-            return read_sample_cache(&cache.path(url, ScoreCacheKind::Audio)).ok();
+            return read_sample_cache(
+                &cache.path(url, ScoreCacheKind::Audio),
+                FileLimit::of(url).bytes,
+            )
+            .ok();
         }
-        read_sample_cache(&cache_path(&cache_dir(), url)).ok()
+        read_sample_cache(&cache_path(&cache_dir(), url), FileLimit::of(url).bytes).ok()
     }
 
     /// Every sound a score can name right now, for a browser: banks from
@@ -1542,6 +1595,12 @@ impl SampleLibrary {
         }
         {
             let mut videos = self.shared.videos.lock().expect("video thumbnails");
+            let moves = file_limit::video_ceiling_moves();
+            if self.shared.video_ceiling_seen.swap(moves, Ordering::AcqRel) != moves {
+                // A new ceiling may take a clip the old one refused.
+                videos
+                    .retain(|_, picture| !matches!(picture, crate::video::VideoPicture::Failed(_)));
+            }
             if let Some(picture) = videos.get(&url) {
                 return Some(picture.clone());
             }
@@ -1567,11 +1626,13 @@ impl SampleLibrary {
                     .map_or_else(crate::video::VideoPicture::Failed, |strip| {
                         crate::video::VideoPicture::Ready(Arc::new(strip))
                     });
-                shared
-                    .videos
-                    .lock()
-                    .expect("video thumbnails")
-                    .insert(decoding, picture);
+                let mut videos = shared.videos.lock().expect("video thumbnails");
+                // A decode the library cancelled is not the clip's answer.
+                if shared.publication.cancellation().load(Ordering::Acquire) {
+                    videos.remove(&decoding);
+                } else {
+                    videos.insert(decoding, picture);
+                }
             })
             .is_err()
         {

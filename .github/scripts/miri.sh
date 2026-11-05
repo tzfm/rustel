@@ -68,5 +68,10 @@ RUSTFLAGS="-C target-feature=+avx2" miri -p rustel-audio --lib -- _kernel::
 # Miri.
 miri -p rustel-vst3 --lib -- main_thread::tests
 
+# The AV1 picture decoder's unsafe calls into rav1d stay out. rav1d finds its
+# default picture allocator by comparing function pointers, and Miri gives
+# each use of a function its own address on purpose, so a decode under Miri
+# stops inside rav1d before it reaches this code.
+
 # QuickJS allocator and bridge frame stack.
 miri -p rustel-jsruntime --lib -- alloc:: bridge:: runtime::inspection::

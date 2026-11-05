@@ -81,6 +81,17 @@ pub struct VisualState {
     /// or a reason it has none.
     #[cfg(feature = "video")]
     videos: BTreeMap<String, VideoEntry>,
+    /// The frame each video painter drew last, by its slot. It stays on
+    /// screen while the painter has nothing newer to draw: between an
+    /// edit and the new score's first events, while its clip is asked
+    /// for again, and when the set stops. Kept by the draw, which sees the
+    /// state only through a shared borrow.
+    #[cfg(feature = "video")]
+    held_videos: std::cell::RefCell<BTreeMap<Option<u8>, HeldFrame>>,
+    /// The place each named feed showed last, for the dock's widget and
+    /// the detached window to hold the same way.
+    #[cfg(feature = "video")]
+    held_feeds: std::cell::RefCell<BTreeMap<String, f64>>,
     /// The spectrogram's memory: one column per audio frame, per tap
     /// (`None` is the master), newest last. strudel.cc's spectrum scrolls
     /// the last frames across the canvas; a terminal keeps them here.
@@ -111,6 +122,35 @@ pub enum VideoEntry {
     Ready(std::sync::Arc<VideoThumbnails>),
     /// Why there is no strip.
     Failed(String),
+}
+
+/// Which events the video painters show.
+#[cfg(feature = "video")]
+#[derive(Clone, Copy, Debug)]
+enum VideoLanes {
+    /// The lanes whose events carry these painter bits.
+    Tagged(u64),
+    /// Every event: a painter of the whole stack is there.
+    Every,
+}
+
+#[cfg(feature = "video")]
+impl VideoLanes {
+    fn holds(self, event: &UiScheduledEvent) -> bool {
+        match self {
+            Self::Tagged(bits) => event.ui_visuals & bits != 0,
+            Self::Every => true,
+        }
+    }
+}
+
+/// The frame a video painter drew last: its clip and the place in it.
+#[cfg(feature = "video")]
+#[derive(Clone, Debug)]
+struct HeldFrame {
+    name: String,
+    strip: std::sync::Arc<VideoThumbnails>,
+    position: f32,
 }
 
 #[cfg(feature = "video")]
@@ -335,6 +375,14 @@ impl VisualState {
                     .map(Some),
             )
             .collect();
+        // A painter the new score dropped lets go of its frame. One it
+        // kept holds the frame until the new score's events reach it.
+        #[cfg(feature = "video")]
+        self.held_videos.get_mut().retain(|slot, _| {
+            next.visuals
+                .iter()
+                .any(|visual| visual.kind == "video" && visual.slot == *slot)
+        });
         self.layout = Some(envelope.ui_layout);
         if source_changed {
             self.events.clear();
@@ -718,9 +766,9 @@ impl VisualState {
     }
 
     /// The set's video clips by name, sorted: what the dock's video
-    /// widget steps through with ←/→. Only clips asked for are listed;
-    /// the poll asks for the painters' clips and, when a video widget is
-    /// in a dock, every sound the set plays.
+    /// widget steps through with ←/→. Only the clips the video painters
+    /// asked for are listed, so the widget shows the sounds of a lane
+    /// with `_video()` or `video()` and no other.
     #[cfg(feature = "video")]
     pub fn video_feeds(&self) -> Vec<String> {
         let mut feeds: Vec<String> = self.videos.keys().cloned().collect();
@@ -731,7 +779,7 @@ impl VisualState {
     /// The strip a named feed is showing and the position inside it, in
     /// seconds, for the dock's video widget and the detached window: the
     /// event sounding now for that clip, else the last that sounded, else
-    /// the next to come.
+    /// the next to come, else the place it showed last.
     #[cfg(feature = "video")]
     pub fn video_feed_frame(&self, feed: &str) -> Option<(f64, std::sync::Arc<VideoThumbnails>)> {
         let strip = match self.videos.get(feed) {
@@ -739,11 +787,14 @@ impl VisualState {
             _ => return None,
         };
         let (now, _, _) = self.current_clock().unwrap_or((f64::NAN, 0.0, 0.0));
+        let lanes = self.video_lanes();
         let mut active = None;
         let mut past = None;
         let mut future = None;
         for event in self.events() {
-            if event_clip_name(event).as_deref() != Some(feed) {
+            if !lanes.is_some_and(|lanes| lanes.holds(event))
+                || event_clip_name(event).as_deref() != Some(feed)
+            {
                 continue;
             }
             let end = event.target_time + event.duration_seconds.max(0.035);
@@ -769,13 +820,18 @@ impl VisualState {
                 }
             }
         }
-        let event = active.or(past).or(future);
-        // With no event of its own, the clip shows its poster: the first
-        // frame is what a docked widget or a window has before the score
-        // reaches it.
-        let position = event.map_or(0.0, |event| {
-            clip_position(event, now, f64::from(strip.duration()))
-        });
+        let mut held = self.held_feeds.borrow_mut();
+        let position = match active.or(past).or(future) {
+            Some(event) => {
+                let position = clip_position(event, now, f64::from(strip.duration()));
+                held.insert(feed.to_owned(), position);
+                position
+            }
+            // With no event of its own, the clip holds the place it showed
+            // last, or shows its poster: the first frame is what a docked
+            // widget or a window has before the score reaches it.
+            None => held.get(feed).copied().unwrap_or(0.0),
+        };
         Some((position, strip))
     }
 
@@ -788,6 +844,14 @@ impl VisualState {
         }
         self.videos.insert(name.to_owned(), entry);
         true
+    }
+
+    /// Drop every clip's refusal, so the next poll asks for it again: a
+    /// setting that refused it has changed.
+    #[cfg(feature = "video")]
+    pub fn forget_failed_videos(&mut self) {
+        self.videos
+            .retain(|_, entry| !matches!(entry, VideoEntry::Failed(_)));
     }
 
     /// Count one ask for a clip the library has no answer for yet. A clip
@@ -814,41 +878,40 @@ impl VisualState {
         }
     }
 
-    /// The sounds a video painter's events name and no strip is held for:
+    /// The lanes the video painters show, or `None` with no video
+    /// painter. `_video()` and `video()` each tag their own lane's events.
+    #[cfg(feature = "video")]
+    fn video_lanes(&self) -> Option<VideoLanes> {
+        let mut lanes = None;
+        for visual in &self.layout.as_ref()?.visuals {
+            if visual.kind == "video" {
+                lanes = Some(match (lanes, visual.slot) {
+                    // A painter of the whole stack tags no event.
+                    (_, None) | (Some(VideoLanes::Every), _) => VideoLanes::Every,
+                    (Some(VideoLanes::Tagged(bits)), Some(slot)) => {
+                        VideoLanes::Tagged(bits | 1_u64 << slot)
+                    }
+                    (None, Some(slot)) => VideoLanes::Tagged(1_u64 << slot),
+                });
+            }
+        }
+        lanes
+    }
+
+    /// The sounds a video painter's lane names and no strip is held for:
     /// what the next library ask is for. A stopped set keeps its strips,
     /// so this names nothing once every clip has landed.
-    ///
-    /// `every_sound` asks for whatever the set sounds, not only the
-    /// painters' own lanes: the dock's video widget picks its feed from
-    /// any of them.
     #[cfg(feature = "video")]
-    pub fn video_names_to_ask(&self, every_sound: bool) -> Vec<String> {
-        let Some(layout) = self.layout.as_ref() else {
+    pub fn video_names_to_ask(&self) -> Vec<String> {
+        let Some(lanes) = self.video_lanes() else {
             return Vec::new();
         };
-        // An inline painter asks only for its own lane's clips. A stage
-        // painter tags no hap, and the dock's widget names no lane, so
-        // either asks for whatever the set sounds.
-        let mut slot_mask = 0_u64;
-        let mut stage = every_sound;
-        for visual in &layout.visuals {
-            if visual.kind != "video" {
-                continue;
-            }
-            match visual.slot {
-                Some(slot) => slot_mask |= 1_u64 << slot,
-                None => stage = true,
-            }
-        }
-        if slot_mask == 0 && !stage {
-            return Vec::new();
-        }
         let mut names: Vec<String> = Vec::new();
         let mut push = |event: &UiScheduledEvent| {
             let Some(name) = event_clip_name(event) else {
                 return;
             };
-            if !stage && event.ui_visuals & slot_mask == 0 {
+            if !lanes.holds(event) {
                 return;
             }
             if matches!(
@@ -3251,29 +3314,17 @@ impl<'a, 'b> Video<'a, 'b> {
 }
 
 #[cfg(feature = "video")]
-impl Widget for Video<'_, '_> {
-    fn render(self, area: Rect, buffer: &mut Buffer) {
-        let state = self.request.state;
-        let (now, _, _) = state.current_clock().unwrap_or((f64::NAN, 0.0, 0.0));
-        let Some((event, name)) = self.clip(now) else {
-            note(self.request, buffer, area, "no video event in this lane");
-            return;
-        };
-        let strip = match state.video_for(&name) {
-            Some(VideoEntry::Ready(strip)) => strip,
-            Some(VideoEntry::Failed(message)) => {
-                note(self.request, buffer, area, &format!("{name}: {message}"));
-                return;
-            }
-            Some(VideoEntry::Asking(_)) | None => {
-                note(self.request, buffer, area, &format!("waiting for {name}"));
-                return;
-            }
-        };
-        // Where the sound is inside the clip, from the event's own chain.
-        let duration = f64::from(strip.duration());
-        let position = clip_position(event, now, duration);
-        let Some(frame) = strip.frame_at(position as f32) else {
+impl Video<'_, '_> {
+    /// Draw `strip`'s frame at `position`, keeping its shape and centred.
+    fn paint(
+        &self,
+        name: &str,
+        strip: &VideoThumbnails,
+        position: f32,
+        area: Rect,
+        buffer: &mut Buffer,
+    ) {
+        let Some(frame) = strip.frame_at(position) else {
             note(
                 self.request,
                 buffer,
@@ -3311,6 +3362,46 @@ impl Widget for Video<'_, '_> {
             }
         }
         canvas.paint(buffer, self.request.background);
+    }
+}
+
+#[cfg(feature = "video")]
+impl Widget for Video<'_, '_> {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        let state = self.request.state;
+        let (now, _, _) = state.current_clock().unwrap_or((f64::NAN, 0.0, 0.0));
+        let gap = match self.clip(now) {
+            None => "no video event in this lane".to_owned(),
+            Some((event, name)) => match state.video_for(&name) {
+                Some(VideoEntry::Ready(strip)) => {
+                    // Where the sound is inside the clip, from the event's
+                    // own chain.
+                    let position = clip_position(event, now, f64::from(strip.duration())) as f32;
+                    self.paint(&name, strip, position, area, buffer);
+                    state.held_videos.borrow_mut().insert(
+                        self.request.slot,
+                        HeldFrame {
+                            name,
+                            strip: std::sync::Arc::clone(strip),
+                            position,
+                        },
+                    );
+                    return;
+                }
+                Some(VideoEntry::Failed(message)) => {
+                    note(self.request, buffer, area, &format!("{name}: {message}"));
+                    return;
+                }
+                Some(VideoEntry::Asking(_)) | None => format!("waiting for {name}"),
+            },
+        };
+        // Nothing newer to draw: the last frame stays, the way a player
+        // holds its picture, rather than a blank between two takes.
+        let held = state.held_videos.borrow().get(&self.request.slot).cloned();
+        match held {
+            Some(held) => self.paint(&held.name, &held.strip, held.position, area, buffer),
+            None => note(self.request, buffer, area, &gap),
+        }
     }
 }
 
@@ -4048,7 +4139,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "video",
         synonyms: &[],
         summary: "Shows the picture of a video sample while its sound plays.",
-        description: "Shows the picture of a video sample while its sound plays. The frame follows the pattern's clock, so the picture plays with the sample and holds when the transport holds. The picture decodes once per clip and stays small. VP8 WebM and Motion JPEG decode in this build; a clip in another video codec says which codec it is and what to re-encode it as.",
+        description: "Shows the picture of a video sample while its sound plays. The frame follows the pattern's clock, so the picture plays with the sample and holds when the transport holds. The picture decodes once per clip and stays small. H.264, HEVC, AV1, VP9, VP8 and Motion JPEG decode in this build. A clip in another video codec says which codec it is.",
         params: &[],
         examples: &["$: s(\"bd\")._video()"],
         tags: &["visualization"],
@@ -6909,6 +7000,49 @@ mod tests {
         }
 
         #[test]
+        fn the_last_frame_stays_while_the_painter_has_nothing_newer() {
+            // The blue frame shows 0.6 s into the clip.
+            let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(9.4)], 0.0);
+            assert!(
+                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
+            );
+            let blue = |state: &VisualState| {
+                draw("video", "", state, Rect::new(0, 0, 20, 8))
+                    .content
+                    .iter()
+                    .filter(|cell| cell.fg == Color::Rgb(0, 0, 255))
+                    .count()
+            };
+            assert!(blue(&state) > 100, "the frame the clock shows");
+            let place = |state: &VisualState| {
+                state
+                    .video_feed_frame("clip.webm")
+                    .map(|(position, _)| position)
+            };
+            // Past the clip's last frame, at its end.
+            let shown = place(&state);
+            assert_eq!(shown, Some(0.5), "the dock's widget is at the same frame");
+            // The events go, as they do between an edit and the new
+            // score's first events, and the clip is asked for again.
+            state.events.clear();
+            state.videos.clear();
+            assert!(blue(&state) > 100, "the frame stays, not a blank");
+            assert_eq!(
+                place(&state),
+                None,
+                "a feed with no strip has nothing to show"
+            );
+            assert!(
+                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
+            );
+            assert_eq!(
+                place(&state),
+                shown,
+                "the widget holds its place too, not the poster"
+            );
+        }
+
+        #[test]
         fn a_clip_that_has_not_decoded_says_so_and_a_refusal_names_itself() {
             let state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
             let waiting = draw("video", "", &state, Rect::new(0, 0, 40, 8));
@@ -6932,7 +7066,7 @@ mod tests {
         #[test]
         fn the_poll_names_each_clip_once_and_stops_at_its_strip() {
             let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
-            let asks = state.video_names_to_ask(false);
+            let asks = state.video_names_to_ask();
             assert_eq!(asks, vec!["clip.webm".to_owned()]);
             // Another lane's sound is not this painter's to ask for: the
             // spiral's lane is slot 1.
@@ -6946,22 +7080,20 @@ mod tests {
                 0.0,
             );
             assert_eq!(
-                wider.video_names_to_ask(false),
+                wider.video_names_to_ask(),
                 vec!["clip.webm".to_owned()],
                 "the spiral's sound is not asked for"
             );
-            // The dock's video widget picks its feed from any lane, so
-            // its ask is for every sound the set plays.
-            let mut every: Vec<String> = wider.video_names_to_ask(true);
-            every.sort();
-            assert_eq!(
-                every,
-                vec!["clip.webm".to_owned(), "other.webm".to_owned()],
-                "every sound, whatever its lane"
-            );
+            // The dock's widget lists what the painters asked for: the
+            // spiral's lane is not a video lane, so its sound is no feed.
+            let mut wider = wider;
+            for name in wider.video_names_to_ask() {
+                wider.note_video_ask(&name);
+            }
+            assert_eq!(wider.video_feeds(), vec!["clip.webm".to_owned()]);
             state.note_video_ask("clip.webm");
             assert_eq!(
-                state.video_names_to_ask(false),
+                state.video_names_to_ask(),
                 vec!["clip.webm".to_owned()],
                 "an unanswered ask is asked again"
             );
@@ -6969,7 +7101,7 @@ mod tests {
                 state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
             );
             assert!(
-                state.video_names_to_ask(false).is_empty(),
+                state.video_names_to_ask().is_empty(),
                 "a strip answers the ask"
             );
         }
@@ -7015,6 +7147,21 @@ mod tests {
         }
 
         #[test]
+        fn a_whole_stack_painter_asks_for_every_lane_s_clip() {
+            // `all(video)` tags no event, so an untagged sound is its clip.
+            let mut plain = clip_event(10.0);
+            plain.ui_visuals = 0;
+            let mut state = playing("$: s(\"clip.webm\")\nall(video)", vec![plain], 0.0);
+            assert_eq!(state.video_names_to_ask(), vec!["clip.webm".to_owned()]);
+            state.note_video_ask("clip.webm");
+            assert_eq!(state.video_feeds(), vec!["clip.webm".to_owned()]);
+            assert!(
+                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
+            );
+            assert!(state.video_feed_frame("clip.webm").is_some());
+        }
+
+        #[test]
         fn a_named_feed_shows_its_own_event_s_place_in_the_clip() {
             // The dock's widget and the detached window ask by name: the
             // position is the named clip's own event, not another's.
@@ -7050,7 +7197,7 @@ mod tests {
                 "the asking ran out"
             );
             assert!(
-                state.video_names_to_ask(false).is_empty(),
+                state.video_names_to_ask().is_empty(),
                 "a failed clip is not asked for again"
             );
             // A new score gives the clip its chance back: the failed note

@@ -206,6 +206,7 @@ impl Widget for SettingsSheetView<'_> {
                     self.settings.sample_ceiling.label(),
                     self.settings.sample_ceiling.minutes()
                 ),
+                Row::VideoCeiling => self.settings.video_ceiling.label().to_owned(),
                 Row::MaxPolyphony => {
                     max_polyphony_readout(self.settings.max_polyphony, self.max_polyphony_override)
                 }

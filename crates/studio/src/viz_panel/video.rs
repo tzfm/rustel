@@ -41,7 +41,7 @@ impl Widget for VideoView<'_> {
             self.say(
                 buffer,
                 area,
-                "no video clips yet - the set's sounds answer as they play",
+                "no video clips yet - a lane with _video() or video() shows here",
             );
             return;
         }

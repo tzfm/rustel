@@ -60,6 +60,11 @@ mod codecs;
 #[cfg(feature = "video")]
 pub(crate) use codecs::container_video_track_ids;
 mod decode_cache;
+mod file_limit;
+pub(crate) use file_limit::FileLimit;
+pub use file_limit::{
+    DEFAULT_VIDEO_FILE_BYTES, MAX_VIDEO_FILE_BYTES, set_video_file_ceiling, video_file_ceiling,
+};
 mod folders;
 mod font_queue;
 mod local_names;
@@ -937,6 +942,10 @@ struct Shared {
     /// container's picture.
     #[cfg(feature = "video")]
     videos: Mutex<HashMap<Arc<str>, crate::video::VideoPicture>>,
+    /// The video ceiling's moves the table has seen. A move clears the
+    /// table's refusals, so a clip the old ceiling refused is decoded again.
+    #[cfg(feature = "video")]
+    video_ceiling_seen: AtomicU64,
     /// Persistent score-selected bytes have their own namespace and budget.
     /// One library belongs to one Session, so this also owns that Session's
     /// share of the process-independent cache allowance.

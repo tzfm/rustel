@@ -1,44 +1,64 @@
 //! A video container's picture, decoded once into bounded thumbnails.
 //!
-//! A video sample's sound is its audio track ([`crate::samples`]); this
-//! module is its picture. The first video track's packets are demuxed with
-//! Symphonia and decoded - Motion JPEG through `image`, VP8 through
-//! OxiMedia, both pure Rust. The frames are thinned to a fixed byte
-//! budget, so a painter can follow the clip where the sound is without
-//! holding its full frames. H.264 and its family are named and refused:
-//! no native decoder ships yet, and the message says what to re-encode
-//! the clip as.
+//! A video sample's sound is its audio track ([`crate::samples`]). This
+//! module is its picture. Symphonia demuxes the first video track, and a
+//! pure-Rust decoder turns its packets into pictures: H.264, HEVC, AV1,
+//! VP9, VP8 or Motion JPEG. The kept frames fit a fixed byte budget, so a
+//! painter can follow the clip where the sound is without holding its full
+//! frames. A long clip spreads that budget over its length and decodes only
+//! the keyframe groups its kept frames fall in.
 
+mod av1;
+mod codec;
+mod matroska;
+mod mp4;
+mod picture;
+
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia::core::units::TimeBase;
+
+use codec::{Decoder, Refusal, Track};
+use picture::Picture;
 
 /// The longest edge a thumbnail keeps. The inline painter is small, and a
 /// larger picture would only cost memory.
 const THUMB_EDGE: u32 = 160;
 
-/// The longest frame edge this module will decode, whatever the container
-/// says. A frame's own header sizes the decoder's allocations before any
-/// pixel is checked, so a lying edge is refused here, not by the
-/// allocator: an allocation failure aborts, and no panic boundary catches
-/// it.
-const MAX_PICTURE_EDGE: u32 = 4096;
-
 /// RGBA bytes one clip's thumbnails may hold between them. A clip with
 /// more frames than that thins to fewer, evenly spaced ones.
 const CLIP_BUDGET_BYTES: usize = 12 << 20;
 
-/// Container packets one clip may carry before the decode stops early,
-/// sound packets counted with the picture's. The kept strip covers the
-/// decoded prefix; an hour-long video is a film, not a sample.
-const MAX_PICTURE_PACKETS: u64 = 65_536;
+/// Picture packets one clip may carry before the decode stops early: 72
+/// minutes at 60 frames a second. The decode time bounds the work, and
+/// this bounds a container of endless tiny packets. The strip covers the
+/// decoded prefix.
+const MAX_PICTURE_PACKETS: u64 = 1 << 18;
 
 /// The fastest thumbnail rate kept. Frames closer together than this are
-/// decoded - a later frame needs them - but not stored.
+/// decoded, because a later frame needs them, but not stored.
 const MAX_KEPT_FPS: f32 = 24.0;
+
+/// Bytes one keyframe group may buffer before it decodes as it arrives. A
+/// stream whose keyframes go unrecognised still decodes, frame by frame.
+const MAX_GROUP_BYTES: usize = 32 << 20;
+
+/// The time a clip's picture aims to take. A keyframe group decodes whole
+/// only while the decode keeps that pace, so a long clip falls back to
+/// one picture a group rather than running out of time.
+const TARGET_DECODE_TIME: Duration = Duration::from_secs(15);
+
+/// The time one clip's picture may take. Past it, the strip keeps the
+/// frames decoded so far.
+const MAX_DECODE_TIME: Duration = Duration::from_secs(60);
 
 /// One clip's picture as a filmstrip of RGBA thumbnails.
 #[derive(Clone, Debug)]
@@ -55,7 +75,7 @@ pub struct VideoThumbnails {
 impl VideoThumbnails {
     /// Build a strip from kept frames: presentation times in ascending
     /// order, each frame `width * height * 4` RGBA bytes. The library
-    /// builds these by decoding a container; a host that decodes its own
+    /// builds these by decoding a container. A host that decodes its own
     /// pictures can build one the same way.
     pub fn from_frames(
         width: u32,
@@ -124,292 +144,11 @@ impl VideoThumbnails {
 /// Where a clip's picture stands, as the library answers a painter.
 #[derive(Clone, Debug)]
 pub enum VideoPicture {
-    /// A decode is running on a library thread; ask again on a later poll.
+    /// A decode is running on a library thread. Ask again on a later poll.
     Decoding,
     Ready(Arc<VideoThumbnails>),
     /// Why there is no strip. Names the codec when the build cannot decode it.
     Failed(String),
-}
-
-/// What a first packet says the picture track holds. Container headers
-/// name codecs only as far as Symphonia's audio tables go, so the packet
-/// itself identifies the codec: each family starts with unmistakable bytes.
-enum PictureCodec {
-    MotionJpeg,
-    Vp8,
-    Vp9,
-    Av1,
-    H264,
-    Hevc,
-    Unknown,
-}
-
-fn sniff_picture_codec(packet: &[u8]) -> PictureCodec {
-    // A JPEG image begins with its SOI marker and another marker.
-    if packet.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        return PictureCodec::MotionJpeg;
-    }
-    // Matroska carries H.264 and HEVC behind Annex B start codes, with the
-    // parameter sets in the track header: a stream can open on a slice,
-    // an AUD or an SEI, not only on an SPS.
-    if packet.starts_with(&[0, 0, 1]) || packet.starts_with(&[0, 0, 0, 1]) {
-        let start = if packet[2] == 1 { 3 } else { 4 };
-        return match packet.get(start) {
-            // HEVC heads with a VPS or SPS (32, 33) or an IRAP slice
-            // (19 through 21).
-            Some(&nal) if matches!((nal >> 1) & 0x3F, 19..=21 | 32..=34) => PictureCodec::Hevc,
-            // H.264: forbidden bit clear, then any VCL NAL, SPS, or AUD.
-            Some(&nal) if nal & 0x80 == 0 && matches!(nal & 0x1F, 1..=9) => PictureCodec::H264,
-            _ => PictureCodec::Unknown,
-        };
-    }
-    // A VP8 chunk carries its start code at byte 3.
-    if packet.len() >= 6 && packet[3..6] == [0x9D, 0x01, 0x2A] {
-        return PictureCodec::Vp8;
-    }
-    // MP4 stores H.264 and HEVC as length-prefixed NALs, with the parameter
-    // sets in the track header rather than the stream: a sample begins with
-    // a slice. The length must stay inside the packet, or the bytes are not
-    // a prefix at all.
-    if let (Some(length), Some(&nal)) = (
-        packet
-            .get(..4)
-            .and_then(|bytes| bytes.try_into().ok())
-            .map(u32::from_be_bytes),
-        packet.get(4),
-    ) && usize::try_from(length).is_ok_and(|length| length < packet.len())
-    {
-        // H.264: forbidden bit clear, then a slice or a parameter set.
-        if nal & 0x80 == 0 && matches!(nal & 0x1F, 1..=9) {
-            return PictureCodec::H264;
-        }
-        // HEVC: the type is the first six bits after the forbidden one.
-        if nal & 0x80 == 0 && matches!((nal >> 1) & 0x3F, 16..=23 | 32..=35) {
-            return PictureCodec::Hevc;
-        }
-    }
-    // VP9's two-bit frame marker is 0b10.
-    if packet.first().is_some_and(|&byte| byte >> 6 == 0b10) {
-        return PictureCodec::Vp9;
-    }
-    // AV1 packs OBUs; a stream starts with a temporal delimiter (type 2)
-    // or a sequence header (type 1).
-    if packet
-        .first()
-        .is_some_and(|&byte| byte & 0x80 == 0 && matches!((byte >> 3) & 0x0F, 1 | 2))
-    {
-        return PictureCodec::Av1;
-    }
-    PictureCodec::Unknown
-}
-
-impl PictureCodec {
-    fn name(self) -> &'static str {
-        match self {
-            Self::MotionJpeg => "Motion JPEG",
-            Self::Vp8 => "VP8",
-            Self::Vp9 => "VP9",
-            Self::Av1 => "AV1",
-            Self::H264 => "H.264",
-            Self::Hevc => "H.265",
-            Self::Unknown => "an unrecognised video codec",
-        }
-    }
-
-    /// The decoders this build carries. A codec with none is refused before
-    /// any packet is wasted on it. `packet` is the sniffed one, whose
-    /// headers size the decoder's allocations.
-    fn decoder(self, packet: &[u8]) -> Result<PictureDecoder, String> {
-        match self {
-            Self::MotionJpeg => Ok(PictureDecoder::MotionJpeg),
-            Self::Vp8 => {
-                // The frame tag sizes the decoder's planes before any
-                // pixel is decoded; a lying edge is refused here rather
-                // than by the allocator, whose failure aborts.
-                if let Some((width, height)) = vp8_frame_size(packet)
-                    && width.max(height) > MAX_PICTURE_EDGE
-                {
-                    return Err(format!(
-                        "the clip says its picture is {width}x{height}, past the \
-                         {MAX_PICTURE_EDGE} pixel decode limit"
-                    ));
-                }
-                Ok(PictureDecoder::Vp8(Box::new(
-                    oximedia_codec::Vp8Decoder::new(oximedia_codec::DecoderConfig {
-                        codec: oximedia_core::CodecId::Vp8,
-                        ..Default::default()
-                    })
-                    .map_err(|error| format!("VP8 decoder: {error}"))?,
-                )))
-            }
-            codec => Err(format!(
-                "the picture is {}, which this build cannot decode yet; \
-                 re-encode the clip as VP8 WebM or Motion JPEG",
-                codec.name(),
-            )),
-        }
-    }
-}
-
-/// The picture decoders this build carries.
-enum PictureDecoder {
-    /// Each packet is a whole JPEG image.
-    MotionJpeg,
-    /// OxiMedia's push-pull VP8 decoder, boxed to keep the enum small.
-    Vp8(Box<oximedia_codec::Vp8Decoder>),
-}
-
-impl PictureDecoder {
-    /// One packet to RGBA. A failed frame is skipped by the caller, so a
-    /// torn packet costs one frame and not the clip.
-    fn decode(&mut self, packet: &[u8], pts: i64) -> Result<(u32, u32, Vec<u8>), String> {
-        match self {
-            Self::MotionJpeg => decode_jpeg_frame(packet),
-            Self::Vp8(decoder) => {
-                use oximedia_codec::VideoDecoder as _;
-                decoder
-                    .send_packet(packet, pts)
-                    .map_err(|error| format!("VP8 packet: {error}"))?;
-                let frame = decoder
-                    .receive_frame()
-                    .map_err(|error| format!("VP8 frame: {error}"))?
-                    .ok_or("VP8 packet decoded to no frame")?;
-                yuv420_to_rgba(&frame)
-            }
-        }
-    }
-}
-
-/// One Motion JPEG packet: a whole JPEG image.
-fn decode_jpeg_frame(packet: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(packet))
-        .with_guessed_format()
-        .map_err(|error| format!("MJPEG frame: {error}"))?;
-    // A frame far larger than its thumbnail can only cost time and memory,
-    // and its own header sizes the buffers before any pixel is seen.
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_PICTURE_EDGE);
-    limits.max_image_height = Some(MAX_PICTURE_EDGE);
-    limits.max_alloc = Some(256 << 20);
-    reader.limits(limits);
-    let decoded = reader
-        .decode()
-        .map_err(|error| format!("MJPEG frame: {error}"))?;
-    let rgba = decoded.to_rgba8();
-    Ok((rgba.width(), rgba.height(), rgba.into_raw()))
-}
-
-/// A VP8 keyframe's declared picture size, from its uncompressed frame
-/// tag: 14 bits for each side, one less than stored. Read before the
-/// decoder is built, because the tag sizes its planes.
-fn vp8_frame_size(packet: &[u8]) -> Option<(u32, u32)> {
-    if packet.len() < 10 {
-        return None;
-    }
-    let edge = |low: u8, high: u8| u32::from((u16::from(high) & 0x3F) << 8 | u16::from(low)) + 1;
-    Some((edge(packet[6], packet[7]), edge(packet[8], packet[9])))
-}
-
-/// A decoded VP8 frame to RGBA. VP8 pictures are 4:2:0 BT.601 with
-/// limited range, and the planes carry their own strides.
-fn yuv420_to_rgba(frame: &oximedia_codec::VideoFrame) -> Result<(u32, u32, Vec<u8>), String> {
-    if frame.format != oximedia_core::PixelFormat::Yuv420p {
-        return Err(format!("VP8 gave {:?} pixels", frame.format).to_string());
-    }
-    let (width, height) = (frame.width as usize, frame.height as usize);
-    if frame.planes.len() < 3 || width == 0 || height == 0 {
-        return Err("VP8 gave no planes".to_owned());
-    }
-    let plane = |index: usize| -> Result<(&[u8], usize), String> {
-        let plane = frame
-            .planes
-            .get(index)
-            .ok_or_else(|| "VP8 gave no planes".to_owned())?;
-        Ok((&plane.data, plane.stride.max(plane.width as usize).max(1)))
-    };
-    let (y, y_stride) = plane(0)?;
-    let (u, u_stride) = plane(1)?;
-    let (v, v_stride) = plane(2)?;
-    let mut rgba = Vec::with_capacity(width * height * 4);
-    let mut convert = |luma: u8, chroma_u: u8, chroma_v: u8| {
-        // BT.601 limited range, the coefficients every YUV conversion in
-        // this engine shares.
-        let luma = f32::from(luma) - 16.0;
-        let chroma_u = f32::from(chroma_u) - 128.0;
-        let chroma_v = f32::from(chroma_v) - 128.0;
-        let red = 1.164_38 * luma + 1.596_03 * chroma_v;
-        let green = 1.164_38 * luma - 0.391_76 * chroma_u - 0.812_97 * chroma_v;
-        let blue = 1.164_38 * luma + 2.017_23 * chroma_u;
-        for channel in [red, green, blue] {
-            rgba.push(channel.round().clamp(0.0, 255.0) as u8);
-        }
-        rgba.push(255);
-    };
-    for row in 0..height {
-        let y_row = row * y_stride;
-        let chroma_row = (row / 2) * u_stride;
-        let v_row = (row / 2) * v_stride;
-        for column in 0..width {
-            let luma = *y.get(y_row + column).ok_or("VP8 luma plane is short")?;
-            let at = column / 2;
-            let chroma_u = *u.get(chroma_row + at).ok_or("VP8 chroma plane is short")?;
-            let chroma_v = *v.get(v_row + at).ok_or("VP8 chroma plane is short")?;
-            convert(luma, chroma_u, chroma_v);
-        }
-    }
-    Ok((width as u32, height as u32, rgba))
-}
-
-/// Average the source pixels under each destination pixel. Nearest sampling
-/// would shimmer as the clip plays; a box keeps still areas still.
-fn scale_rgba(
-    source: &[u8],
-    source_width: u32,
-    source_height: u32,
-    width: u32,
-    height: u32,
-) -> Vec<u8> {
-    let (sw, sh, dw, dh) = (
-        source_width as usize,
-        source_height as usize,
-        width as usize,
-        height as usize,
-    );
-    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(dw * dh * 4);
-    for dy in 0..dh {
-        // Source rows this destination row covers.
-        let y0 = dy * sh / dh;
-        let y1 = ((dy + 1) * sh / dh).max(y0 + 1);
-        for dx in 0..dw {
-            let x0 = dx * sw / dw;
-            let x1 = ((dx + 1) * sw / dw).max(x0 + 1);
-            let (mut red, mut green, mut blue) = (0u64, 0u64, 0u64);
-            let mut pixels = 0u64;
-            for y in y0..y1.min(sh) {
-                let row = y * sw;
-                for x in x0..x1.min(sw) {
-                    let at = (row + x) * 4;
-                    red += u64::from(source[at]);
-                    green += u64::from(source[at + 1]);
-                    blue += u64::from(source[at + 2]);
-                    pixels += 1;
-                }
-            }
-            if pixels == 0 {
-                out.extend_from_slice(&[0, 0, 0, 255]);
-            } else {
-                let mean = |sum: u64| u8::try_from(sum / pixels).unwrap_or(u8::MAX);
-                out.push(mean(red));
-                out.push(mean(green));
-                out.push(mean(blue));
-                out.push(255);
-            }
-        }
-    }
-    out
 }
 
 /// Thumbnail dimensions for a frame `width` by `height`: the largest fit
@@ -435,17 +174,85 @@ struct Strip {
     height: u32,
     times: Vec<f32>,
     frames: Vec<u8>,
-    /// Seconds between kept frames, which doubles every time the strip
-    /// thins.
+    /// Seconds between kept frames. The clip's length sets it, and it
+    /// doubles every time the strip thins.
     min_gap: f32,
     last_time: f32,
+    /// The clip's length, when the container gives it.
+    duration: Option<f32>,
     decoded: usize,
     failures: usize,
 }
 
 impl Strip {
+    fn new(duration: Option<f32>) -> Self {
+        let mut strip = Self {
+            width: 0,
+            height: 0,
+            times: Vec::new(),
+            frames: Vec::new(),
+            min_gap: 1.0 / MAX_KEPT_FPS,
+            last_time: f32::MIN,
+            duration: duration.filter(|duration| duration.is_finite() && *duration > 0.0),
+            decoded: 0,
+            failures: 0,
+        };
+        // A 16:9 thumbnail until the first frame gives the real shape.
+        let (width, height) = thumb_size(1920, 1080);
+        strip.plan(width as usize * height as usize * 4);
+        strip
+    }
+
     fn frame_bytes(&self) -> usize {
         self.width as usize * self.height as usize * 4
+    }
+
+    /// Space the kept frames so the clip's length fits in nine tenths of
+    /// half the budget, the most a strip holds before it thins. The margin
+    /// absorbs frame times that fall late of the plan.
+    fn plan(&mut self, frame_bytes: usize) {
+        if let Some(duration) = self.duration {
+            let frames = (CLIP_BUDGET_BYTES / 2 / frame_bytes.max(1) * 9 / 10).max(1);
+            self.min_gap = self.min_gap.max(duration / frames as f32);
+        }
+    }
+
+    /// Whether a frame shown at `time` is due.
+    fn wants(&self, time: f32) -> bool {
+        self.times.is_empty() || (time > self.last_time && time - self.last_time >= self.min_gap)
+    }
+
+    /// The kept frames due in a keyframe group shown from `start` until
+    /// `end`.
+    fn due_between(&self, start: f32, end: f32) -> usize {
+        let first = if self.times.is_empty() {
+            start
+        } else {
+            (self.last_time + self.min_gap).max(start)
+        };
+        if first >= end {
+            0
+        } else {
+            ((end - first) / self.min_gap).ceil() as usize
+        }
+    }
+
+    /// A decoded picture shown at `time`. Only a due one is scaled and
+    /// kept. `force` keeps a picture newer than the last kept one even
+    /// when it is early: a keyframe that stands for its whole group.
+    fn offer(&mut self, time: f32, picture: &Picture<'_>, force: bool) -> Result<(), String> {
+        self.decoded += 1;
+        if self.width == 0 {
+            let (width, height) = picture.size();
+            (self.width, self.height) = thumb_size(width, height);
+            self.plan(self.frame_bytes());
+        }
+        if !(self.wants(time) || (force && time > self.last_time)) {
+            return Ok(());
+        }
+        let thumbnail = picture.thumbnail(self.width, self.height)?;
+        self.keep(time, &thumbnail);
+        Ok(())
     }
 
     fn keep(&mut self, time: f32, frame: &[u8]) {
@@ -485,17 +292,251 @@ impl Strip {
     }
 }
 
+/// An open decoder and the times of the packets it was given. Pictures
+/// leave a decoder in display order, and a packet's time is when its own
+/// picture shows, so each picture takes the earliest time still waiting.
+/// That holds for Matroska, which times packets as shown, and for MP4,
+/// whose decode times Symphonia gives in decode order.
+struct Session {
+    decoder: Decoder,
+    pending: BinaryHeap<Reverse<u64>>,
+    /// The session began at an HEVC CRA, so its decoder drops the RASL
+    /// pictures until the next keyframe.
+    drops_rasl: bool,
+    /// No packet has gone in yet: the next is the keyframe it opened at.
+    fresh: bool,
+}
+
+/// The picture track's packets on their way to the strip, one keyframe
+/// group at a time. A group is buffered until the next keyframe bounds it.
+/// Then it is skipped when no kept frame falls in it, reduced to its
+/// keyframe when one does, and decoded whole when several do and the
+/// decode keeps pace.
+struct Clip {
+    track: Track,
+    time_base: TimeBase,
+    started: Instant,
+    session: Option<Session>,
+    group: Vec<(u64, Box<[u8]>)>,
+    group_bytes: usize,
+    /// Set when the group outgrew its buffer: the rest of it decodes as
+    /// it arrives.
+    streaming: bool,
+    strip: Strip,
+    /// Why the first failed packet failed, in case none ever decodes.
+    first_failure: Option<String>,
+}
+
+impl Clip {
+    fn new(track: Track, time_base: TimeBase, duration: Option<f32>) -> Self {
+        Self {
+            track,
+            time_base,
+            started: Instant::now(),
+            session: None,
+            group: Vec::new(),
+            group_bytes: 0,
+            streaming: false,
+            strip: Strip::new(duration),
+            first_failure: None,
+        }
+    }
+
+    fn push(&mut self, ts: u64, data: Box<[u8]>) {
+        if self.track.is_keyframe(&data) && (self.streaming || !self.group.is_empty()) {
+            self.close_group(seconds(ts, self.time_base));
+        }
+        if self.streaming {
+            self.decode(ts, &data, false);
+            return;
+        }
+        self.group_bytes += data.len();
+        self.group.push((ts, data));
+        if self.group_bytes > MAX_GROUP_BYTES {
+            self.streaming = true;
+            self.group_bytes = 0;
+            for (ts, data) in std::mem::take(&mut self.group) {
+                self.decode(ts, &data, false);
+            }
+        }
+    }
+
+    /// Decode what the buffered group is worth, now that `end` bounds it.
+    fn close_group(&mut self, end: f32) {
+        let group = std::mem::take(&mut self.group);
+        self.group_bytes = 0;
+        if std::mem::take(&mut self.streaming) {
+            return;
+        }
+        let Some((first, _)) = group.first() else {
+            return;
+        };
+        let start = seconds(*first, self.time_base);
+        let due = self.strip.due_between(start, end);
+        let whole = due > 1 && on_pace(self.started.elapsed(), start, self.strip.duration);
+        match (due, whole) {
+            (0, _) => self.end_session(false),
+            (_, false) => {
+                // The keyframe's picture stands for the group. A fresh
+                // decoder starts from it, and the rest is never decoded.
+                // One picture needs no thread pool made and joined for it.
+                self.end_session(false);
+                let (ts, data) = &group[0];
+                self.open_session(data, 1);
+                self.decode(*ts, data, true);
+                self.end_session(true);
+            }
+            (_, true) => {
+                for (ts, data) in &group {
+                    self.decode(*ts, data, false);
+                }
+            }
+        }
+    }
+
+    /// Open a session of up to `threads` decode threads, starting at the
+    /// keyframe `data`.
+    fn open_session(&mut self, data: &[u8], threads: usize) {
+        match self.track.open(threads) {
+            Ok(decoder) => {
+                self.session = Some(Session {
+                    decoder,
+                    pending: BinaryHeap::new(),
+                    drops_rasl: self.track.is_cra(data),
+                    fresh: true,
+                });
+            }
+            Err(message) => {
+                self.strip.failures += 1;
+                self.first_failure.get_or_insert(message);
+            }
+        }
+    }
+
+    fn decode(&mut self, ts: u64, data: &[u8], force: bool) {
+        if self.session.is_none() {
+            self.open_session(data, codec::decode_threads());
+        }
+        let Some(Session {
+            decoder,
+            pending,
+            drops_rasl,
+            fresh,
+        }) = self.session.as_mut()
+        else {
+            return;
+        };
+        // A later keyframe's leading pictures have what they lean on.
+        if !std::mem::take(fresh) && self.track.is_keyframe(data) {
+            *drops_rasl = false;
+        }
+        // A picture the decoder drops would leave its time waiting, and
+        // every later picture would take the time before its own.
+        if *drops_rasl && self.track.is_rasl(data) {
+            return;
+        }
+        pending.push(Reverse(ts));
+        let (strip, failure, time_base) =
+            (&mut self.strip, &mut self.first_failure, self.time_base);
+        let mut shown = 0_usize;
+        let result = decoder.decode(data, &mut |picture: Picture<'_>| {
+            shown += 1;
+            offer(strip, failure, pending, time_base, &picture, force);
+        });
+        // A packet that failed, or that a decoder in packet order showed
+        // nothing for, such as a hidden VP8 frame, gives its time back.
+        if result.is_err() || (shown == 0 && !self.track.codec.reorders()) {
+            pending.retain(|&Reverse(waiting)| waiting != ts);
+        }
+        if let Err(message) = result {
+            self.strip.failures += 1;
+            self.first_failure.get_or_insert(message);
+        }
+    }
+
+    /// Hand over the pictures the open decoder still holds, then close it.
+    fn end_session(&mut self, force: bool) {
+        let Some(Session {
+            mut decoder,
+            mut pending,
+            ..
+        }) = self.session.take()
+        else {
+            return;
+        };
+        let (strip, failure, time_base) =
+            (&mut self.strip, &mut self.first_failure, self.time_base);
+        decoder.finish(&mut |picture: Picture<'_>| {
+            offer(strip, failure, &mut pending, time_base, &picture, force);
+        });
+    }
+
+    fn finish(mut self) -> Result<VideoThumbnails, String> {
+        // The last group ends a frame after its last packet.
+        if let Some(&(last, _)) = self.group.last() {
+            self.close_group(seconds(last, self.time_base) + 1.0 / MAX_KEPT_FPS);
+        }
+        self.end_session(false);
+        if self.strip.times.is_empty() {
+            let codec = self.track.codec.name();
+            let failures = self.strip.failures;
+            return Err(self.first_failure.unwrap_or_else(|| {
+                format!("the {codec} picture decoded no frames ({failures} packets failed)")
+            }));
+        }
+        Ok(self.strip.finish())
+    }
+}
+
+/// Whether a decode `elapsed` into its work, at a group shown from
+/// `start`, is on pace to finish a clip `duration` long within
+/// [`TARGET_DECODE_TIME`]. A clip of unknown length keeps any pace.
+fn on_pace(elapsed: Duration, start: f32, duration: Option<f32>) -> bool {
+    let Some(duration) = duration else {
+        return true;
+    };
+    // A tenth of the target is spent at the start, before any pace shows.
+    let share = (start / duration).clamp(0.0, 1.0) + 0.1;
+    elapsed <= TARGET_DECODE_TIME.mul_f32(share)
+}
+
+/// A picture leaving a decoder takes the earliest waiting packet time.
+fn offer(
+    strip: &mut Strip,
+    failure: &mut Option<String>,
+    pending: &mut BinaryHeap<Reverse<u64>>,
+    time_base: TimeBase,
+    picture: &Picture<'_>,
+    force: bool,
+) {
+    let Some(Reverse(ts)) = pending.pop() else {
+        return;
+    };
+    if let Err(message) = strip.offer(seconds(ts, time_base), picture, force) {
+        strip.failures += 1;
+        failure.get_or_insert(message);
+    }
+}
+
+fn seconds(ts: u64, time_base: TimeBase) -> f32 {
+    (ts as f64 * f64::from(time_base.numer) / f64::from(time_base.denom)) as f32
+}
+
 /// Decode a video container's picture track into thumbnails.
 ///
 /// `extension` names the container family, `mp4` or `mkv`, the way the
-/// sample loader names it for the audio track; Symphonia probes by it.
+/// sample loader names it for the audio track. Symphonia probes by it.
 /// A container with no video track, or one this build cannot decode, is
-/// refused by name.
-pub fn decode_thumbnails(bytes: &[u8], extension: &str) -> Result<VideoThumbnails, String> {
+/// refused by name. The decode stops early once `cancelled` is set.
+pub fn decode_thumbnails(
+    bytes: Vec<u8>,
+    extension: &str,
+    cancelled: &AtomicBool,
+) -> Result<VideoThumbnails, String> {
     // Decoders parse untrusted input on a library thread, so a panic is
-    // contained the same refusal as any other decode failure; see
+    // contained the same refusal as any other decode failure. See
     // `samples::codecs::decode_guarded`.
-    let decode = || decode_thumbnails_inner(bytes, extension);
+    let decode = || decode_thumbnails_inner(bytes, extension, cancelled);
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(decode)) {
         Ok(result) => result,
         Err(payload) => {
@@ -509,11 +550,25 @@ pub fn decode_thumbnails(bytes: &[u8], extension: &str) -> Result<VideoThumbnail
     }
 }
 
-fn decode_thumbnails_inner(bytes: &[u8], extension: &str) -> Result<VideoThumbnails, String> {
-    let stream = MediaSourceStream::new(
-        Box::new(std::io::Cursor::new(bytes.to_vec())),
-        Default::default(),
-    );
+/// What Symphonia says about a track that could be the picture.
+struct Candidate {
+    time_base: TimeBase,
+    duration: Option<f32>,
+}
+
+fn decode_thumbnails_inner(
+    bytes: Vec<u8>,
+    extension: &str,
+    cancelled: &AtomicBool,
+) -> Result<VideoThumbnails, String> {
+    // Symphonia names a codec only for sound, so the container's own
+    // header names the picture's.
+    let entries = match extension {
+        "mp4" => mp4::entries(&bytes),
+        "mkv" => matroska::entries(&bytes),
+        _ => HashMap::new(),
+    };
+    let stream = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes)), Default::default());
     let mut hint = Hint::new();
     hint.with_extension(extension);
     let probed = symphonia::default::get_probe()
@@ -525,129 +580,87 @@ fn decode_thumbnails_inner(bytes: &[u8], extension: &str) -> Result<VideoThumbna
         )
         .map_err(|error| format!("{extension} probe: {error}"))?;
     let mut format = probed.format;
-    // Tracks that could carry the picture, with the time base each counts
-    // in. A subtitle or chapter track sits among them: its packets sniff
-    // as nothing known and are passed over, so a text track listed before
-    // the video does not refuse the clip.
-    let mut time_bases: std::collections::HashMap<u32, symphonia::core::units::TimeBase> =
-        std::collections::HashMap::new();
-    for track in format.tracks() {
-        let base = track
-            .codec_params
-            .time_base
-            .unwrap_or(symphonia::core::units::TimeBase::new(1, 1_000));
-        time_bases.insert(track.id, base);
-    }
-    let candidates = crate::samples::container_video_track_ids(format.as_ref());
-    if candidates.is_empty() {
+    // Tracks that could carry the picture. A subtitle or chapter track sits
+    // among them: its header names it, or its packets sniff as nothing
+    // known, and it is passed over. A text track listed before the video
+    // does not refuse the clip.
+    let ids = crate::samples::container_video_track_ids(format.as_ref());
+    if ids.is_empty() {
         return Err(format!("{extension} has no video track"));
     }
-    let mut skipped: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let mut strip: Option<Strip> = None;
-    let mut decoder: Option<PictureDecoder> = None;
-    let mut selected: Option<u32> = None;
+    let candidates: HashMap<u32, Candidate> = format
+        .tracks()
+        .iter()
+        .filter(|track| ids.contains(&track.id))
+        .map(|track| {
+            let params = &track.codec_params;
+            // Without a time base a Matroska tick is a millisecond.
+            let time_base = params.time_base.unwrap_or(TimeBase::new(1, 1_000));
+            let candidate = Candidate {
+                time_base,
+                duration: params.n_frames.map(|ticks| seconds(ticks, time_base)),
+            };
+            (track.id, candidate)
+        })
+        .collect();
+    let started = Instant::now();
+    let mut clip: Option<(u32, Clip)> = None;
+    let mut skipped: HashSet<u32> = HashSet::new();
     let mut refused: Option<String> = None;
     let mut packets = 0u64;
-    while packets < MAX_PICTURE_PACKETS {
-        let packet = match format.next_packet() {
-            Ok(packet) => packet,
-            // The end of the container ends the strip, whatever it holds.
-            Err(_) => break,
+    while packets < MAX_PICTURE_PACKETS && started.elapsed() < MAX_DECODE_TIME {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("the picture decode was cancelled".to_owned());
+        }
+        // The end of the container ends the strip, whatever it holds.
+        let Ok(packet) = format.next_packet() else {
+            break;
         };
-        packets += 1;
-        let track_id = packet.track_id();
-        if !candidates.contains(&track_id)
-            || skipped.contains(&track_id)
-            || selected.is_some_and(|selected| selected != track_id)
+        let id = packet.track_id();
+        let Some(candidate) = candidates.get(&id) else {
+            continue;
+        };
+        if packet.data.is_empty()
+            || skipped.contains(&id)
+            || clip.as_ref().is_some_and(|(selected, _)| *selected != id)
         {
             continue;
         }
-        let data = &packet.data[..];
-        if data.is_empty() {
-            continue;
-        }
-        if decoder.is_none() {
-            match sniff_picture_codec(data).decoder(data) {
-                Ok(picture) => {
-                    selected = Some(track_id);
-                    decoder = Some(picture);
+        if clip.is_none() {
+            match Track::identify(entries.get(&id), &packet.data) {
+                Ok(track) => {
+                    clip = Some((
+                        id,
+                        Clip::new(track, candidate.time_base, candidate.duration),
+                    ));
                 }
-                Err(message) => {
-                    // A codec this build cannot decode is named once, but a
-                    // later track can still be the picture: Matroska files
-                    // open with text tracks before video.
-                    refused.get_or_insert(message);
-                    skipped.insert(track_id);
+                Err(refusal) => {
+                    // A track this build cannot decode is named once, but
+                    // a later track can still be the picture: Matroska
+                    // files open with text tracks before video.
+                    if let Refusal::Codec(message) = refusal {
+                        refused.get_or_insert(message);
+                    }
+                    skipped.insert(id);
                     continue;
                 }
             }
         }
-        // The demuxer counts time in the track's time base; without one a
-        // Matroska tick is a millisecond.
-        let time_base = time_bases[&track_id];
-        let seconds = packet.ts() as f32 * time_base.numer as f32 / time_base.denom as f32;
-        let strip = strip.get_or_insert_with(|| Strip {
-            width: 0,
-            height: 0,
-            times: Vec::new(),
-            frames: Vec::new(),
-            min_gap: 1.0 / MAX_KEPT_FPS,
-            last_time: f32::MIN,
-            decoded: 0,
-            failures: 0,
-        });
-        // The strip names its size once; a frame that does not match is
-        // scaled to it, so a mid-clip size change costs nothing.
-        let frame = decoder
-            .as_mut()
-            .expect("the decoder is chosen before the first frame")
-            .decode(data, packet.ts() as i64);
-        match frame {
-            Ok((frame_width, frame_height, rgba)) => {
-                strip.decoded += 1;
-                if strip.width == 0 {
-                    let (width, height) = thumb_size(frame_width, frame_height);
-                    strip.width = width;
-                    strip.height = height;
-                }
-                let scaled =
-                    scale_rgba(&rgba, frame_width, frame_height, strip.width, strip.height);
-                // A frame out of order, or on the heels of the last kept
-                // one, is decoded but not stored.
-                if seconds > strip.last_time && seconds - strip.last_time >= strip.min_gap {
-                    strip.keep(seconds, &scaled);
-                }
-            }
-            Err(message) => {
-                strip.failures += 1;
-                if strip.decoded == 0 && strip.times.is_empty() {
-                    // Nothing has decoded yet: hold the reason in case
-                    // nothing ever does.
-                    refused = refused.or(Some(message));
-                }
-            }
+        if let Some((_, clip)) = clip.as_mut() {
+            packets += 1;
+            clip.push(packet.ts(), packet.data);
         }
     }
-    if let Some(message) = refused
-        && strip.as_ref().is_none_or(|strip| strip.times.is_empty())
-    {
-        return Err(message);
+    match clip {
+        Some((_, clip)) => clip.finish(),
+        None => Err(refused.unwrap_or_else(|| format!("{extension} has no video track"))),
     }
-    let strip = strip.ok_or_else(|| format!("{extension} has no video track"))?;
-    if strip.times.is_empty() {
-        return Err(format!(
-            "{extension} decoded no video frames ({} packets failed)",
-            strip.failures
-        ));
-    }
-    Ok(strip.finish())
 }
 
 #[cfg(test)]
 mod tests {
     //! Video containers as picture sources: their first video track's
-    //! packets decode to a thinned filmstrip, and a codec this build
-    //! cannot decode is named.
+    //! packets decode to a thinned filmstrip, whatever the codec.
 
     use super::*;
 
@@ -655,23 +668,61 @@ mod tests {
     const TINY_VP8: &[u8] = include_bytes!("video/testdata/tiny_video_vp8.webm");
     /// The same pattern as Motion JPEG in a QuickTime container.
     const TINY_MJPEG: &[u8] = include_bytes!("video/testdata/tiny_video_mjpeg.mov");
-    /// An H.264 picture beside a tone: the audio plays, the picture cannot.
-    const TINY_H264: &[u8] = include_bytes!("samples/testdata/tiny_video.mp4");
     /// A Matroska with no video track at all.
     const AUDIO_ONLY: &[u8] = include_bytes!("video/testdata/tiny_audio_only.webm");
     /// A subtitle track listed before the VP8 picture.
     const TINY_SUBS: &[u8] = include_bytes!("video/testdata/tiny_video_subs.mkv");
+    /// 0.6 s of grey at 10 fps, one step brighter each frame: limited-range
+    /// luma 16 + 40 a frame, or the same at 10 bits. The H.264 and HEVC
+    /// clips carry B-frames, so their decode order is not their display
+    /// order.
+    const RAMPS: [(&str, &[u8], &str); 6] = [
+        (
+            "H.264 with B-frames",
+            include_bytes!("video/testdata/tiny_ramp_h264.mp4"),
+            "mp4",
+        ),
+        (
+            "10-bit H.264 in Matroska",
+            include_bytes!("video/testdata/tiny_ramp_h264_10bit.mkv"),
+            "mkv",
+        ),
+        (
+            "HEVC with B-frames",
+            include_bytes!("video/testdata/tiny_ramp_hevc.mp4"),
+            "mp4",
+        ),
+        (
+            "AV1",
+            include_bytes!("video/testdata/tiny_ramp_av1.webm"),
+            "mkv",
+        ),
+        (
+            "10-bit AV1",
+            include_bytes!("video/testdata/tiny_ramp_av1_10bit.webm"),
+            "mkv",
+        ),
+        (
+            "VP9",
+            include_bytes!("video/testdata/tiny_ramp_vp9.webm"),
+            "mkv",
+        ),
+    ];
+
+    fn decode(clip: &[u8], extension: &str) -> Result<VideoThumbnails, String> {
+        decode_thumbnails(clip.to_vec(), extension, &AtomicBool::new(false))
+    }
 
     #[test]
     fn a_vp8_clip_decodes_a_filmstrip_that_moves() {
-        let strip = decode_thumbnails(TINY_VP8, "mkv").expect("the picture must decode");
+        let strip = decode(TINY_VP8, "mkv").expect("the picture must decode");
         assert_eq!((strip.width(), strip.height()), (64, 36));
         assert_eq!(strip.frame_count(), 6, "every frame fits the budget");
         assert!((strip.duration() - 0.5).abs() < 0.05, "ten frames a second");
         let first = strip.frame_at(0.0).expect("the first frame");
         let last = strip.frame_at(0.6).expect("the last frame holds");
         assert_ne!(first, last, "the test pattern moves");
-        // Between two kept frames the earlier one shows; before the first,
+        // Between two kept frames the earlier one shows. Before the first,
         // the first does.
         assert_eq!(strip.frame_at(0.14), strip.frame_at(0.1));
         assert_eq!(strip.frame_at(0.0), strip.frame_at(0.04));
@@ -681,9 +732,35 @@ mod tests {
         );
     }
 
+    /// Each codec decodes the ramp into six frames whose grey follows the
+    /// clock, so a frame out of display order, or in the wrong range, fails.
+    #[test]
+    fn every_codec_shows_its_frames_in_display_order() {
+        for (name, clip, extension) in RAMPS {
+            let strip = decode(clip, extension).unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!((strip.width(), strip.height()), (64, 36), "{name}");
+            assert_eq!(strip.frame_count(), 6, "{name}");
+            for step in 0..6u32 {
+                let frame = strip.frame_at(step as f32 / 10.0 + 0.01).expect("a frame");
+                let grey = frame
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|pixel| u32::from(pixel[1]))
+                    .sum::<u32>()
+                    / (64 * 36);
+                let expected = step * 40 * 255 / 219;
+                assert!(
+                    grey.abs_diff(expected) <= 4,
+                    "{name} frame {step}: grey {grey}, not {expected}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_motion_jpeg_clip_decodes_the_same_strip() {
-        let strip = decode_thumbnails(TINY_MJPEG, "mp4").expect("the picture must decode");
+        let strip = decode(TINY_MJPEG, "mp4").expect("the picture must decode");
         assert_eq!((strip.width(), strip.height()), (64, 36));
         assert_eq!(strip.frame_count(), 6);
         assert_ne!(
@@ -693,20 +770,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_h264_picture_is_refused_by_name() {
-        let error = decode_thumbnails(TINY_H264, "mp4").expect_err("no native H.264 decoder ships");
-        assert!(
-            error.contains("H.264") && error.contains("re-encode"),
-            "names what to do: {error}"
-        );
-    }
-
     /// A text track listed before the video is passed over, not mistaken
     /// for the picture: its packets sniff as nothing this build knows.
     #[test]
     fn a_subtitle_track_before_the_video_is_not_the_picture() {
-        let strip = decode_thumbnails(TINY_SUBS, "mkv").expect("the picture must decode");
+        let strip = decode(TINY_SUBS, "mkv").expect("the picture must decode");
         assert_eq!((strip.width(), strip.height()), (64, 36));
         assert_eq!(strip.frame_count(), 4, "0.4 s at ten frames a second");
         assert_ne!(
@@ -714,28 +782,6 @@ mod tests {
             strip.frame_at(0.3).expect("the last frame"),
             "the test pattern moves"
         );
-    }
-
-    /// A VP8 keyframe's tag sizes the decoder's planes before any pixel
-    /// is decoded, so an edge past the decode limit is refused by name and
-    /// never reaches the allocator.
-    #[test]
-    fn a_lying_vp8_keyframe_edge_is_refused() {
-        let mut keyframe = [0u8; 10];
-        // Keyframe flag clear, the VP8 start code, then 16383x16383 in the
-        // tag's 14-bit sides-less-one.
-        keyframe[3..6].copy_from_slice(&[0x9D, 0x01, 0x2A]);
-        keyframe[6..8].copy_from_slice(&0x3FFE_u16.to_le_bytes());
-        keyframe[8..10].copy_from_slice(&0x3FFE_u16.to_le_bytes());
-        assert_eq!(vp8_frame_size(&keyframe), Some((16_383, 16_383)));
-        let refused = sniff_picture_codec(&keyframe).decoder(&keyframe);
-        assert!(
-            refused
-                .err()
-                .is_some_and(|message| message.contains("4096")),
-            "the edge is refused by name"
-        );
-        assert_eq!(vp8_frame_size(&[0; 9]), None, "a short tag is no tag");
     }
 
     #[test]
@@ -766,11 +812,18 @@ mod tests {
 
     #[test]
     fn a_container_without_a_video_track_says_so() {
-        let error = decode_thumbnails(AUDIO_ONLY, "mkv").expect_err("there is no picture");
+        let error = decode(AUDIO_ONLY, "mkv").expect_err("there is no picture");
         assert!(
             error.contains("no video track"),
             "says what is missing: {error}"
         );
+    }
+
+    #[test]
+    fn a_cancelled_decode_stops() {
+        let error = decode_thumbnails(TINY_VP8.to_vec(), "mkv", &AtomicBool::new(true))
+            .expect_err("cancelled before the first packet");
+        assert!(error.contains("cancelled"), "{error}");
     }
 
     #[test]
@@ -782,27 +835,13 @@ mod tests {
     }
 
     #[test]
-    fn a_huge_frame_is_averaged_not_sampled() {
-        // 8 red pixels and 8 blue ones under one destination pixel must
-        // average, not pick a side.
-        let source = [255, 0, 0, 255, 0, 0, 255, 255];
-        let scaled = scale_rgba(&source, 2, 1, 1, 1);
-        assert_eq!(scaled, vec![127, 0, 127, 255]);
-    }
-
-    #[test]
     fn thinning_keeps_every_second_frame_and_its_times() {
-        let strip = decode_thumbnails(TINY_VP8, "mkv").expect("the picture must decode");
-        let mut thin = Strip {
-            width: strip.width,
-            height: strip.height,
-            times: strip.times.to_vec(),
-            frames: strip.frames.to_vec(),
-            min_gap: 1.0 / MAX_KEPT_FPS,
-            last_time: strip.duration(),
-            decoded: strip.frame_count(),
-            failures: 0,
-        };
+        let strip = decode(TINY_VP8, "mkv").expect("the picture must decode");
+        let mut thin = Strip::new(None);
+        thin.width = strip.width;
+        thin.height = strip.height;
+        thin.times = strip.times.to_vec();
+        thin.frames = strip.frames.to_vec();
         thin.thin();
         assert_eq!(thin.times.len(), 3, "half of six");
         assert_eq!(thin.times[0], strip.times[0]);
@@ -810,5 +849,56 @@ mod tests {
         assert_eq!(thin.times[2], strip.times[4]);
         assert_eq!(thin.frames.len(), thin.frame_bytes() * 3);
         assert!((thin.min_gap - 2.0 / MAX_KEPT_FPS).abs() < f32::EPSILON);
+    }
+
+    /// A long clip spreads its budget over its length from the start, so
+    /// it never decodes more frames than it keeps.
+    #[test]
+    fn a_long_clip_spaces_its_frames_over_its_length() {
+        let short = Strip::new(Some(2.0));
+        assert!((short.min_gap - 1.0 / MAX_KEPT_FPS).abs() < f32::EPSILON);
+        let film = Strip::new(Some(600.0));
+        let frames = CLIP_BUDGET_BYTES / 2 / (160 * 90 * 4) * 9 / 10;
+        assert!((film.min_gap - 600.0 / frames as f32).abs() < 0.01);
+        assert!(Strip::new(Some(f32::NAN)).duration.is_none());
+    }
+
+    /// A keyframe group with no kept frame due in it is skipped, one with
+    /// one due is reduced to its keyframe, and one with several decodes
+    /// whole.
+    #[test]
+    fn a_keyframe_group_decodes_as_far_as_its_kept_frames_need() {
+        let mut strip = Strip::new(None);
+        strip.min_gap = 4.0;
+        assert_eq!(strip.due_between(0.0, 2.0), 1, "the first frame is due");
+        strip.times.push(0.0);
+        strip.last_time = 0.0;
+        assert_eq!(strip.due_between(2.0, 4.0), 0, "nothing due before 4 s");
+        assert_eq!(strip.due_between(4.0, 6.0), 1, "one due at 4 s");
+        assert_eq!(strip.due_between(4.0, 12.5), 3, "4, 8 and 12 s");
+        assert_eq!(strip.due_between(6.0, 4.0), 0, "an empty group");
+    }
+
+    /// A decode behind the pace that finishes the clip in time reduces its
+    /// next groups to their keyframes, so a long clip is covered to its end.
+    #[test]
+    fn a_decode_behind_its_pace_reduces_groups_to_keyframes() {
+        let clip = Some(300.0);
+        assert!(
+            on_pace(Duration::ZERO, 0.0, clip),
+            "the first group decodes whole"
+        );
+        assert!(
+            on_pace(Duration::from_secs(4), 150.0, clip),
+            "ahead at half way"
+        );
+        assert!(
+            !on_pace(Duration::from_secs(14), 150.0, clip),
+            "behind at half way"
+        );
+        assert!(
+            on_pace(Duration::from_secs(40), 150.0, None),
+            "no length, no pace"
+        );
     }
 }

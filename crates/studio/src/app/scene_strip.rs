@@ -267,7 +267,6 @@ impl App {
         let before = self.scenes.current().name();
         let scene_id = self.scenes.current().id;
         let dirty = self.scenes.current().dirty;
-        let revision = self.scenes.current().editor.revision();
         let source = Arc::<str>::from(self.scenes.current().editor.source());
         match self.scenes.rename_current(name) {
             Ok(()) => {
@@ -279,7 +278,7 @@ impl App {
                 // that receives the bytes; handle_save_result ignores a
                 // completion whose path no longer matches.
                 if dirty || before != after {
-                    self.write_scene(scene_id, revision, source);
+                    self.write_scene(scene_id, source);
                 }
                 self.persist_manifest();
                 self.status = if before == after {
@@ -359,12 +358,8 @@ impl App {
         let scene = self.scenes.current();
         let path = scene.path.clone();
         if scene.dirty {
-            let (id, revision, source) = (
-                scene.id,
-                scene.editor.revision(),
-                Arc::<str>::from(scene.editor.source()),
-            );
-            self.write_scene(id, revision, source);
+            let (id, source) = (scene.id, Arc::<str>::from(scene.editor.source()));
+            self.write_scene(id, source);
             self.wait_for_saves();
             if let Some(scene) = self.scenes.get(id).filter(|scene| scene.unsaved()) {
                 self.status = format!(
