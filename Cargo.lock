@@ -4003,8 +4003,14 @@ dependencies = [
 
 [[package]]
 name = "rustel-studio-themes"
-version = "0.1.0"
-source = "git+https://github.com/undy-aeon/rustel-studio-themes.git?tag=v0.1.0#6718468e510ebb2881884d0ece05e020d7efff32"
+version = "0.2.0"
+source = "git+https://github.com/tzfm/rustel-studio-themes.git?tag=v0.2.0#7c0c9bf9c711da823d6dbd1bd043e66882217b2a"
+dependencies = [
+ "ratatui",
+ "serde",
+ "tachyonfx",
+ "unicode-width",
+]
 
 [[package]]
 name = "rustel-talkit"

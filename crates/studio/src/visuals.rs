@@ -807,7 +807,11 @@ pub(super) fn braille_dot(level: f32, dx: usize, dy: usize) -> bool {
 /// A 2×4 patch of luminance as one Braille glyph, indexed `[dy][dx]`.
 /// Empty is `⠀` and full is `⣿`; everything between is a dot count, which
 /// is the only shading a glyph raster has.
-pub(super) fn braille_luma_glyph(patch: [[u8; 2]; 4]) -> char {
+///
+/// The camera painter moved with the theme engines. The studio keeps this
+/// copy so the shading test below still has the same function to call.
+#[cfg(test)]
+fn braille_luma_glyph(patch: [[u8; 2]; 4]) -> char {
     let mut bits = 0u8;
     for (dy, row) in patch.iter().enumerate() {
         for (dx, level) in row.iter().enumerate() {

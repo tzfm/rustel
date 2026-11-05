@@ -611,7 +611,7 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `rustc-hash` | 2.1.3 | Apache-2.0 OR MIT |
 | `rustc_version` | 0.4.1 | MIT OR Apache-2.0 |
 | `rustel-hydra` | 0.1.0 | AGPL-3.0-or-later |
-| `rustel-studio-themes` | 0.1.0 | AGPL-3.0-or-later |
+| `rustel-studio-themes` | 0.2.0 | AGPL-3.0-or-later |
 | `rustel-talkit` | 0.1.1 | AGPL-3.0-or-later |
 | `rustfft` | 6.4.1 | MIT OR Apache-2.0 |
 | `rustix` | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |

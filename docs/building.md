@@ -54,7 +54,7 @@ Optional features, combinable as needed:
 | `serial` | serial output for microcontrollers, included by default |
 | `studio` | the terminal editor, included by default (includes device audio and MIDI discovery) |
 | `hydra` | [Hydra visuals](hydra.md), included by default and removable from a lean build |
-| `themes` | the studio theme pack, included by default. A build without it keeps `rustel-dark` |
+| `themes` | the extra studio theme documents, included by default. A build without it keeps `rustel-dark` |
 | `vst` | [VST3 plugins](plugins.md) for `.vst()` and `.vsti()`, included by default |
 
 OSC output is included by default. On Debian and Ubuntu, the default and `--all-features`
