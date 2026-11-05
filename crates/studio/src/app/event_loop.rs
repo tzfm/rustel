@@ -105,6 +105,22 @@ pub(super) fn studio_runtime_snapshot(
 }
 
 impl App {
+    /// A terminal that answers its pictures, though each asks for no
+    /// answer, answers every frame. It draws in text cells for the rest of
+    /// the session, and says so once. The saved choice stays, for the next
+    /// terminal.
+    pub(super) fn stop_answered_pictures(&mut self) {
+        if !self.features.kitty_graphics {
+            return;
+        }
+        self.features.kitty_graphics = false;
+        super::super::graphics::set_tier(self.ui_settings.rendering.resolve(&self.features));
+        let message = "Kitty pixels are off: this terminal answers every picture, so pictures draw in text cells";
+        self.log
+            .push(LogLevel::Info, "terminal", message.to_owned());
+        self.set_notice(message.to_owned());
+    }
+
     /// One turn of the loop's housekeeping, between frames: every drain,
     /// the debounce timers, the timed decorations. This is the sequence the
     /// event loop runs each turn and the method the end-to-end harness
@@ -140,6 +156,10 @@ impl App {
         // The plugins: on macOS each one is created and released here.
         #[cfg(feature = "vst")]
         rustel_runtime::vst::pump_main();
+        // The detached video windows take their frames here. Off macOS
+        // their events arrive here too, on the studio's own thread.
+        #[cfg(feature = "video")]
+        self.pump_video_window();
         self.drive_mapped_faders(Instant::now());
         self.drain_lint();
         self.pump_theme_editor();
@@ -515,6 +535,15 @@ impl App {
             } else {
                 wait
             };
+            // A detached video window moves with its sound, so while one
+            // is open the idle sleep ends often enough to keep it moving
+            // even when the terminal itself has nothing to repaint.
+            #[cfg(feature = "video")]
+            let wait = if self.video_windows.is_empty() {
+                wait
+            } else {
+                wait.min(Duration::from_millis(33))
+            };
             if terminal.poll_event(wait)? {
                 // What this batch of input marks stale is told apart from
                 // what the turn's animation already had: only the input
@@ -565,6 +594,10 @@ impl App {
                 self.dirty_frame |= animated_dirty;
             } else {
                 raw_paste_continuation = false;
+            }
+            // A swallowed picture reply can be the turn's only input.
+            if terminal.pictures_answered() {
+                self.stop_answered_pictures();
             }
         }
         Ok(())
@@ -842,6 +875,36 @@ mod tests {
 
         use crate::app::event_loop::*;
         use crate::app::tests::support::*;
+
+        #[test]
+        fn a_terminal_that_answers_its_pictures_draws_in_cells_and_says_so_once() {
+            use crate::graphics::{self, RenderingMode, Tier};
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let before = graphics::tier();
+            app.features.kitty_graphics = true;
+            app.features.fine_glyphs = false;
+            app.features.cell_pixels = Some((10, 20));
+            app.ui_settings.rendering = RenderingMode::Kitty;
+            graphics::set_tier(app.ui_settings.rendering.resolve(&app.features));
+            assert_eq!(graphics::tier(), Tier::Pixels);
+            app.stop_answered_pictures();
+            assert_eq!(graphics::tier(), Tier::Cells, "the pictures draw in cells");
+            assert!(
+                app.status.starts_with("Kitty pixels are off"),
+                "{}",
+                app.status
+            );
+            assert_eq!(
+                app.ui_settings.rendering,
+                RenderingMode::Kitty,
+                "the saved choice stays for the next terminal"
+            );
+            app.status.clear();
+            app.stop_answered_pictures();
+            assert!(app.status.is_empty(), "it says so once");
+            graphics::set_tier(before);
+        }
 
         const SIXTY: Duration = Duration::from_micros(16_667);
 

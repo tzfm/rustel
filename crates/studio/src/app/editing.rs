@@ -285,7 +285,7 @@ impl App {
                     // is settled first: the rename must never leave a save
                     // in flight to the path the file just left.
                     self.sync_name_from_title();
-                    self.write_scene(scene, revision, Arc::clone(&source));
+                    self.write_scene(scene, Arc::clone(&source));
                 }
                 // Nothing to install: the sounding score is already this one,
                 // byte for byte. Said rather than silently dropped, because

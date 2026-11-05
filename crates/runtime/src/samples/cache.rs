@@ -896,7 +896,8 @@ pub(super) fn ensure_private_dir(path: &Path) -> Result<(), String> {
 pub(crate) fn fetch_located(url: &str) -> Result<Vec<u8>, String> {
     if let Some(path) = url.strip_prefix("file://") {
         use std::io::Read;
-        let ceiling = rustel_audio::sample_pcm_ceiling();
+        let limit = FileLimit::of(url);
+        let ceiling = limit.bytes;
         let file = std::fs::File::open(path).map_err(|error| format!("read {path}: {error}"))?;
         // Ask the filesystem for the length first. One stat refuses a file
         // that is too big, and the error can state its size. Without the
@@ -905,11 +906,7 @@ pub(crate) fn fetch_located(url: &str) -> Result<Vec<u8>, String> {
         if let Some(length) = length
             && length > ceiling as u64
         {
-            return Err(format!(
-                "{path} is {}, past the {} one sound can hold",
-                rustel_audio::format_sample_bytes(length as usize),
-                rustel_audio::format_sample_bytes(ceiling)
-            ));
+            return Err(limit.refusal(path, Some(length)));
         }
         // The read stays bounded, because the reported length is not
         // reliable: a pipe or a device reports none (`/dev/zero` reports
@@ -928,10 +925,7 @@ pub(crate) fn fetch_located(url: &str) -> Result<Vec<u8>, String> {
         if bytes.len() > ceiling {
             // The reader stopped at the ceiling, so this one cannot say the
             // size: nothing measured it, which is the point.
-            return Err(format!(
-                "{path} is over {}, the most one sound can hold",
-                rustel_audio::format_sample_bytes(ceiling)
-            ));
+            return Err(limit.refusal(path, None));
         }
         return Ok(bytes);
     }
@@ -953,7 +947,7 @@ pub(super) fn fetch_cached_with_budget(
         return Ok(bytes);
     }
     let path = cache_path(dir, url);
-    if let Ok(bytes) = read_sample_cache(&path) {
+    if let Ok(bytes) = read_sample_cache(&path, FileLimit::of(url).bytes) {
         budget.check()?;
         return Ok(bytes);
     }
@@ -1175,7 +1169,8 @@ mod tests {
 
             let sample = cache_path(dir.path(), "https://samples.example/kick.wav");
             symlink(&victim, &sample).expect("plant sample symlink");
-            let error = read_sample_cache(&sample).expect_err("a sample symlink is refused");
+            let error = read_sample_cache(&sample, rustel_audio::sample_pcm_ceiling())
+                .expect_err("a sample symlink is refused");
             assert!(error.contains("not a regular file"), "{error}");
 
             let manifest = cache_path(dir.path(), "https://samples.example/kit.json");
@@ -1186,7 +1181,11 @@ mod tests {
 
             let honest = cache_path(dir.path(), "https://samples.example/snare.wav");
             std::fs::write(&honest, b"sample").expect("regular sample entry");
-            assert_eq!(read_sample_cache(&honest).expect("sample entry"), b"sample");
+            assert_eq!(
+                read_sample_cache(&honest, rustel_audio::sample_pcm_ceiling())
+                    .expect("sample entry"),
+                b"sample"
+            );
             std::fs::write(&honest, b"{}").expect("regular manifest entry");
             assert_eq!(read_manifest_cache(&honest).expect("manifest entry"), b"{}");
         }

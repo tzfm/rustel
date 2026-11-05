@@ -1610,6 +1610,55 @@ thread_local! {
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
+/// The most characters a Kitty picture reply holds between its `ESC _`
+/// and its `ESC \`: an id, a placement and an error message.
+#[cfg(unix)]
+const MAX_PICTURE_REPLY: usize = 256;
+
+/// How long the rest of a picture reply may take after its `ESC _`.
+#[cfg(unix)]
+const PICTURE_REPLY_WAIT: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// Whether `event` is `character` with Alt alone: how crossterm reads an
+/// `ESC` followed by that character.
+#[cfg(unix)]
+fn is_alt_char(event: &crossterm::event::Event, character: char) -> bool {
+    matches!(
+        event,
+        crossterm::event::Event::Key(key)
+            if key.code == crossterm::event::KeyCode::Char(character)
+                && key.modifiers == crossterm::event::KeyModifiers::ALT
+    )
+}
+
+/// The character a reply's body puts in `event`, if it is one.
+#[cfg(unix)]
+fn reply_char(event: &crossterm::event::Event) -> Option<char> {
+    use crossterm::event::{Event, KeyCode, KeyModifiers};
+    match event {
+        Event::Key(key) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
+            match key.code {
+                KeyCode::Char(character) if character.is_ascii_graphic() || character == ' ' => {
+                    Some(character)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether the events after an Alt+`_` spell the rest of a Kitty picture
+/// reply: `G`, its keys and message, and the closing Alt+`\`.
+#[cfg(unix)]
+fn is_picture_reply(tail: &[crossterm::event::Event]) -> bool {
+    let Some((last, body)) = tail.split_last() else {
+        return false;
+    };
+    let text: Option<String> = body.iter().map(reply_char).collect();
+    is_alt_char(last, '\\') && text.is_some_and(|text| text.starts_with('G') && text.contains(';'))
+}
+
 /// Split the probe window's bytes into the terminal's replies and the keys
 /// typed while it ran. A key is a bare byte, or a CSI sequence a terminal
 /// never answers a capability query with: an arrow, home, end, or a `~`
@@ -1963,6 +2012,10 @@ pub struct TerminalSession {
     /// see [`Self::poll_event`].
     #[cfg(unix)]
     hung_up: std::cell::Cell<bool>,
+    /// The terminal answered a picture that asked for no answer. Sticky:
+    /// a terminal that does it once does it for every frame.
+    #[cfg(unix)]
+    pictures_answered: std::cell::Cell<bool>,
     #[cfg(windows)]
     windows_input: std::cell::RefCell<Option<windows_input::WindowsInput>>,
     #[cfg(windows)]
@@ -2057,6 +2110,8 @@ impl TerminalSession {
             entered: true,
             #[cfg(unix)]
             hung_up: std::cell::Cell::new(false),
+            #[cfg(unix)]
+            pictures_answered: std::cell::Cell::new(false),
             #[cfg(windows)]
             windows_input: std::cell::RefCell::new(None),
             #[cfg(windows)]
@@ -2202,7 +2257,7 @@ impl TerminalSession {
             }
             // Whatever it has already parsed - a key of a paste it read
             // in one gulp - before anybody waits on the fd for more.
-            if crossterm::event::poll(std::time::Duration::ZERO)? {
+            if self.hold_next_event()? {
                 return Ok(true);
             }
             let millis = poll_millis(wait);
@@ -2228,7 +2283,7 @@ impl TerminalSession {
             if watch.revents & libc::POLLIN == 0 {
                 return Ok(false);
             }
-            crossterm::event::poll(std::time::Duration::ZERO)
+            self.hold_next_event()
         }
         #[cfg(not(unix))]
         crossterm::event::poll(wait)
@@ -2252,6 +2307,63 @@ impl TerminalSession {
             return Ok(event);
         }
         crossterm::event::read()
+    }
+
+    /// Move the next event crossterm has parsed to the held queue, with
+    /// any Kitty picture reply taken out. Returns whether an event waits,
+    /// and never blocks: a reply alone leaves nothing to read.
+    ///
+    /// Every picture asks for no reply (`q=2`), but some terminals reply
+    /// anyway, once per frame. crossterm has no parser for the reply's
+    /// `ESC _ … ESC \` frame and splits it into an Alt+`_`, the reply's
+    /// characters and an Alt+`\`, which would type `_Gi=0;OK\` into the
+    /// score.
+    #[cfg(unix)]
+    fn hold_next_event(&self) -> io::Result<bool> {
+        while crossterm::event::poll(std::time::Duration::ZERO)? {
+            let event = crossterm::event::read()?;
+            if !is_alt_char(&event, '_') {
+                HELD_KEYS.with(|held| held.borrow_mut().push_back(event));
+                return Ok(true);
+            }
+            // A reply arrives in one write, so the rest of it is already
+            // read or a moment behind. A key a person typed is not.
+            let deadline = std::time::Instant::now() + PICTURE_REPLY_WAIT;
+            let mut tail = Vec::new();
+            while tail.len() < MAX_PICTURE_REPLY
+                && crossterm::event::poll(
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                )?
+            {
+                let next = crossterm::event::read()?;
+                let inside = reply_char(&next).is_some();
+                let closed = is_alt_char(&next, '\\');
+                tail.push(next);
+                if closed || !inside {
+                    break;
+                }
+            }
+            if is_picture_reply(&tail) {
+                self.pictures_answered.set(true);
+                continue;
+            }
+            HELD_KEYS.with(|held| {
+                let mut held = held.borrow_mut();
+                held.push_back(event);
+                held.extend(tail);
+            });
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Whether the terminal answered a picture that asked for no answer.
+    /// Such a terminal answers every frame, so pixels are not for it.
+    pub fn pictures_answered(&self) -> bool {
+        #[cfg(unix)]
+        return self.pictures_answered.get();
+        #[cfg(not(unix))]
+        false
     }
 
     /// New native input metrics, kept with the reader that owns query replies.
@@ -2295,9 +2407,15 @@ impl TerminalSession {
 
     /// Close the frame; pictures for it go out first, inside the update.
     pub fn end_frame(&mut self, images: &[super::graphics::PixelImage]) {
+        let answered = self.pictures_answered();
         let backend = self.terminal.backend_mut();
         if self.features.kitty_graphics {
             let _ = super::graphics::write_kitty_frame(images, backend);
+            // A terminal that answers its pictures answers each command,
+            // so after this frame clears them it is sent no more.
+            if answered && images.is_empty() {
+                self.features.kitty_graphics = false;
+            }
         }
         if self.features.sync_output {
             let _ = backend.write_all(b"\x1b[?2026l");
@@ -2457,6 +2575,56 @@ pub(crate) mod cursor_trace {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod picture_reply_tests {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    /// Text as crossterm reads it, a key per character.
+    fn typed(text: &str) -> Vec<Event> {
+        text.chars()
+            .map(|character| {
+                let shift = if character.is_ascii_uppercase() {
+                    KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::NONE
+                };
+                key(KeyCode::Char(character), shift)
+            })
+            .collect()
+    }
+
+    fn closed(text: &str) -> Vec<Event> {
+        let mut events = typed(text);
+        events.push(key(KeyCode::Char('\\'), KeyModifiers::ALT));
+        events
+    }
+
+    #[test]
+    fn a_picture_reply_split_into_keys_is_told_from_typing() {
+        assert!(super::is_alt_char(
+            &key(KeyCode::Char('_'), KeyModifiers::ALT),
+            '_'
+        ));
+        assert!(super::is_picture_reply(&closed("Gi=0;OK")));
+        assert!(super::is_picture_reply(&closed(
+            "Gi=31;ENOENT:no such image"
+        )));
+        assert!(
+            !super::is_picture_reply(&typed("Gi=0;OK")),
+            "an open reply is typing"
+        );
+        assert!(
+            !super::is_picture_reply(&closed("hello")),
+            "Alt+_ then words is typing"
+        );
+        assert!(!super::is_picture_reply(&[]), "a lone Alt+_ is typing");
     }
 }
 

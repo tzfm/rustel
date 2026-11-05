@@ -378,7 +378,7 @@ impl App {
                 "transport",
                 "auto update skipped - the edit adds no instruction".to_owned(),
             );
-            self.write_scene(id, revision, Arc::clone(&source));
+            self.write_scene(id, Arc::clone(&source));
             self.bind_live_sliders(id, revision, &source);
             return;
         }
@@ -418,7 +418,7 @@ impl App {
         // watched file already holds this text: writing it again could
         // overwrite a newer save that landed while it was read.
         if !external {
-            self.write_scene(id, revision, Arc::clone(&source));
+            self.write_scene(id, Arc::clone(&source));
         }
         self.queue_evaluation(revision, source);
     }
@@ -478,7 +478,7 @@ impl App {
         self.silence_preview();
         self.playing_pane = Some(self.focused);
         // The file is what you hear, whoever asked for the update.
-        self.write_scene(scene, revision, Arc::clone(&source));
+        self.write_scene(scene, Arc::clone(&source));
         self.queue_evaluation_for(scene, revision, source, true);
     }
 
@@ -1330,6 +1330,9 @@ pub(super) fn virtual_rows_for(
                 "scope" | "tscope" | "spectrum" => 6,
                 "spiral" => 12,
                 "pitchwheel" => 10,
+                // A small window on the clip: enough rows for its shape,
+                // not so many that a lane of videos eats the score.
+                "video" => 8,
                 other => return Some(Err(format!("unknown inline visual kind {other:?}"))),
             };
             if !alive(visual) {

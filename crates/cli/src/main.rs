@@ -1819,11 +1819,16 @@ fn exit_code_for(kind: &str) -> u8 {
     }
 }
 
-/// Serves the macOS main thread's pads and plugins while `runs` says the
-/// work is not done: the pads arrive through its run loop, and each plugin
-/// is created and released on the thread itself. Both are no-ops where the
-/// system asks nothing of the main thread.
-#[cfg(any(feature = "gamepad", feature = "vst"))]
+/// Serves the macOS main thread's pads, plugins and video windows while
+/// `runs` says the work is not done: the pads arrive through its run loop,
+/// each plugin is created and released on the thread itself, and a window
+/// exists only there. All are no-ops where the system asks nothing of the
+/// main thread.
+#[cfg(any(
+    feature = "gamepad",
+    feature = "vst",
+    all(feature = "studio", feature = "video")
+))]
 fn pump_the_main_thread(runs: impl Fn() -> bool) {
     #[cfg(feature = "gamepad")]
     let pads = rustel_runtime::gamepad::needs_the_main_thread();
@@ -1833,11 +1838,17 @@ fn pump_the_main_thread(runs: impl Fn() -> bool) {
     let plugins = rustel_runtime::vst::needs_the_main_thread();
     #[cfg(not(feature = "vst"))]
     let plugins = false;
-    while (pads || plugins) && runs() {
+    #[cfg(all(feature = "studio", feature = "video"))]
+    let windows = rustel_studio::app::video_window::needs_the_main_thread();
+    #[cfg(not(all(feature = "studio", feature = "video")))]
+    let windows = false;
+    while (pads || plugins || windows) && runs() {
         #[cfg(feature = "gamepad")]
         rustel_runtime::gamepad::pump();
         #[cfg(feature = "vst")]
         rustel_runtime::vst::pump_main();
+        #[cfg(all(feature = "studio", feature = "video"))]
+        rustel_studio::app::video_window::pump_main();
         std::thread::sleep(std::time::Duration::from_millis(4));
     }
 }
@@ -1863,9 +1874,9 @@ fn main() -> ExitCode {
     // (which the recursion bound admits) overflows the platform default
     // main-thread stack under debug-profile frame sizes. An explicit stack
     // gives every platform and build profile the same headroom.
-    // On macOS the pads arrive and the plugins are created and released
-    // only on the main thread, which would otherwise sit in the join of the
-    // worker. The service is registered before the worker starts, so no
+    // On macOS the pads arrive, the plugins are created and released, and
+    // the studio's video windows exist only on the main thread, which would
+    // otherwise sit in the join of the worker. The service is registered before the worker starts, so no
     // plugin step can run before the main thread serves it.
     #[cfg(feature = "vst")]
     rustel_runtime::vst::install_main_service();
@@ -1874,7 +1885,11 @@ fn main() -> ExitCode {
         .stack_size(rustel_runtime::QUERY_WORKER_STACK_BYTES)
         .spawn(run)
         .expect("spawn the rustel worker thread");
-    #[cfg(any(feature = "gamepad", feature = "vst"))]
+    #[cfg(any(
+        feature = "gamepad",
+        feature = "vst",
+        all(feature = "studio", feature = "video")
+    ))]
     pump_the_main_thread(|| !worker.is_finished());
     let outcome = worker
         .join()

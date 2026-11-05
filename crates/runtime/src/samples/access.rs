@@ -214,12 +214,13 @@ pub(super) fn fetch_manifest_located_with_budget(
     sample_fetch::fetch_manifest_with_budget(url, budget)
 }
 
-/// Read a sample cache entry through [`open_regular_cache_entry`], so a link
-/// at its name is refused; callers treat any `Err` as a miss.
-pub(super) fn read_sample_cache(path: &Path) -> Result<Vec<u8>, String> {
+/// Read a sample cache entry of at most `limit` bytes through
+/// [`open_regular_cache_entry`], so a link at its name is refused; callers
+/// treat any `Err` as a miss.
+pub(super) fn read_sample_cache(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
     let file = open_regular_cache_entry(path)?
         .ok_or_else(|| format!("read sample cache {}: not found", path.display()))?;
-    let mut reader = file.take(rustel_audio::sample_pcm_ceiling() as u64 + 1);
+    let mut reader = file.take(limit as u64 + 1);
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     loop {
@@ -233,7 +234,7 @@ pub(super) fn read_sample_cache(path: &Path) -> Result<Vec<u8>, String> {
             .len()
             .checked_add(read)
             .ok_or_else(|| format!("{} exceeds the sample size limit", path.display()))?;
-        if next > rustel_audio::sample_pcm_ceiling() {
+        if next > limit {
             return Err(format!("{} exceeds the sample size limit", path.display()));
         }
         bytes
@@ -369,9 +370,18 @@ pub(super) fn fetch_score_source_with_budget(
                 .map_err(|_| format!("local sample URL {url:?} is not a valid file path"))?;
             let (file, len) = root.open_score_sample_with(&path, before_local_open)?;
             if len > limit as u64 {
-                return Err(format!("{} exceeds the sample size limit", path.display()));
+                // A sound or a video past its own ceiling says which
+                // setting raises it.
+                let own = FileLimit::of(url);
+                return Err(if own.bytes == limit {
+                    own.refusal(&path.display().to_string(), Some(len))
+                } else {
+                    format!("{} exceeds the sample size limit", path.display())
+                });
             }
-            let mut bytes = Vec::new();
+            // The length is known and inside the limit: one allocation,
+            // not a buffer that doubles on the way.
+            let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0).saturating_add(1));
             file.take(limit as u64 + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|error| format!("read {}: {error}", path.display()))?;

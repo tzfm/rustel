@@ -214,6 +214,8 @@ mod stage_pixels;
 mod string_roles;
 mod theme_sheets;
 mod transport;
+#[cfg(feature = "video")]
+pub mod video_window;
 mod vim;
 mod viz_panel;
 #[cfg(feature = "vst")]
@@ -624,6 +626,7 @@ fn run_once(mut options: StudioOptions) -> Result<Session, RuntimeError> {
     // against, and a set that opens with a long sample in it must not have
     // it declined on the way in.
     rustel_audio::set_sample_pcm_ceiling(sample_settings.sample_ceiling.bytes());
+    rustel_runtime::set_video_file_ceiling(sample_settings.video_ceiling.bytes());
     let worker = StudioWorker::spawn(
         StudioConfig {
             session: options
@@ -841,6 +844,11 @@ struct App {
     worker: StudioWorker,
     save_worker: SaveWorker,
     visual: VisualState,
+    /// The detached video windows, one per clip the video widgets have
+    /// sent to the desktop. Attached is the default: a window exists
+    /// only while the player keeps it, and nothing of it persists.
+    #[cfg(feature = "video")]
+    video_windows: Vec<video_window::VideoWindow>,
     /// One or two panes, left to right. The focused one holds the caret and
     /// is always the set's current scene.
     panes: Vec<Pane>,
@@ -1685,6 +1693,8 @@ impl App {
             worker,
             save_worker,
             visual,
+            #[cfg(feature = "video")]
+            video_windows: Vec::new(),
             panes: vec![Pane {
                 scene: first_scene,
                 last_map: None,
@@ -2466,31 +2476,21 @@ mod tests {
         use super::super::*;
 
         #[test]
-        fn successful_save_hides_parent_folders_unless_enabled() {
+        fn a_save_that_lands_says_nothing() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = super::support::app_over(directory.path());
             let path = app.scenes.current().path.clone();
-            assert!(!app.ui_settings.show_full_paths);
+            app.status = "playing from the top".into();
             for full in [false, true] {
                 app.ui_settings.show_full_paths = full;
                 app.handle_save_result(SaveResult {
                     request_id: 42,
                     path: path.clone(),
-                    editor_revision: app.editor().revision(),
                     source_revision: source_revision(&app.editor().source()),
                     result: Ok(true),
                 });
-                let expected = if full {
-                    format!("saved {}", path.display())
-                } else {
-                    "saved first.strudel".to_owned()
-                };
-                assert_eq!(app.status, expected);
-                let deadline = app.status_notice.as_ref().expect("save notice").1;
-                app.expire_notice(deadline - Duration::from_millis(1));
-                assert_eq!(app.status, expected);
-                app.expire_notice(deadline);
-                assert!(app.status.is_empty());
+                assert_eq!(app.status, "playing from the top", "the line is left alone");
+                assert!(app.status_notice.is_none(), "and no notice is raised");
             }
         }
 

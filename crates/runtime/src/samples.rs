@@ -57,7 +57,14 @@ pub use catalog::{
 use manifests::*;
 
 mod codecs;
+#[cfg(feature = "video")]
+pub(crate) use codecs::container_video_track_ids;
 mod decode_cache;
+mod file_limit;
+pub(crate) use file_limit::FileLimit;
+pub use file_limit::{
+    DEFAULT_VIDEO_FILE_BYTES, MAX_VIDEO_FILE_BYTES, set_video_file_ceiling, video_file_ceiling,
+};
 mod folders;
 mod font_queue;
 mod local_names;
@@ -929,6 +936,16 @@ struct Shared {
     /// Full-screen clients own the terminal and suppress informational
     /// loader writes; failures still travel through `failures` above.
     direct_diagnostic_logging: AtomicBool,
+    /// A video container's picture, as thumbnails, by url. One decode per
+    /// url: the first ask starts it on a library thread, later asks read
+    /// it. Kept for the `video()` painters; nothing else reads a
+    /// container's picture.
+    #[cfg(feature = "video")]
+    videos: Mutex<HashMap<Arc<str>, crate::video::VideoPicture>>,
+    /// The video ceiling's moves the table has seen. A move clears the
+    /// table's refusals, so a clip the old ceiling refused is decoded again.
+    #[cfg(feature = "video")]
+    video_ceiling_seen: AtomicU64,
     /// Persistent score-selected bytes have their own namespace and budget.
     /// One library belongs to one Session, so this also owns that Session's
     /// share of the process-independent cache allowance.
@@ -1464,6 +1481,11 @@ enum Codec {
     Wav,
     Mp3,
     Ogg,
+    /// An ISO base media container: MP4, M4V or QuickTime. The sound is
+    /// its audio track.
+    Mp4,
+    /// A Matroska or WebM container. The sound is its audio track.
+    Matroska,
 }
 
 /// Take `count` slots of the sample bank: ids handed back through
@@ -1584,6 +1606,8 @@ pub(crate) enum SampleAudioKind {
     Wav,
     Mp3,
     Ogg,
+    Mp4,
+    Matroska,
 }
 
 pub(crate) const MAX_SAMPLE_MANIFEST_ENTRIES: usize = 16_384;

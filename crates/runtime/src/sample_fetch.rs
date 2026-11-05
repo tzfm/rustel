@@ -812,7 +812,8 @@ pub(crate) fn fetch(url: &str) -> Result<Vec<u8>, String> {
 }
 
 pub(crate) fn fetch_audio_with_budget(url: &str, budget: &FetchBudget) -> Result<Vec<u8>, String> {
-    fetch_following_redirects(url, budget, rustel_audio::sample_pcm_ceiling(), "sample")
+    let limit = crate::samples::FileLimit::of(url);
+    fetch_following_redirects(url, budget, limit.bytes, limit.kind())
 }
 
 /// Fetch under an absolute budget owned by the surrounding manifest batch.

@@ -13,30 +13,22 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 
-use super::editor::Revision;
 use rustel_runtime::ui_events::source_revision;
 
 #[derive(Clone, Debug)]
 pub(super) struct SaveRequest {
     pub request_id: u64,
     pub path: PathBuf,
-    pub editor_revision: Revision,
     pub source_revision: String,
     source: Arc<str>,
 }
 
 impl SaveRequest {
-    pub fn new(
-        request_id: u64,
-        path: PathBuf,
-        editor_revision: Revision,
-        source: Arc<str>,
-    ) -> Self {
+    pub fn new(request_id: u64, path: PathBuf, source: Arc<str>) -> Self {
         let source_revision = source_revision(&source);
         Self {
             request_id,
             path,
-            editor_revision,
             source_revision,
             source,
         }
@@ -47,7 +39,6 @@ impl SaveRequest {
 pub(super) struct SaveResult {
     pub request_id: u64,
     pub path: PathBuf,
-    pub editor_revision: Revision,
     pub source_revision: String,
     /// Ok(true) when the file was written, Ok(false) when the disk already
     /// held these bytes and the write was skipped.
@@ -223,7 +214,6 @@ where
         let completed = SaveResult {
             request_id: request.request_id,
             path: request.path,
-            editor_revision: request.editor_revision,
             source_revision: request.source_revision,
             result,
         };
@@ -283,17 +273,12 @@ mod tests {
 
     use super::*;
 
-    fn request(id: u64, revision: u64, source: &str) -> SaveRequest {
-        request_for(id, "unused", revision, source)
+    fn request(id: u64, source: &str) -> SaveRequest {
+        request_for(id, "unused", source)
     }
 
-    fn request_for(id: u64, path: &str, revision: u64, source: &str) -> SaveRequest {
-        SaveRequest::new(
-            id,
-            PathBuf::from(path),
-            Revision(revision),
-            Arc::<str>::from(source),
-        )
+    fn request_for(id: u64, path: &str, source: &str) -> SaveRequest {
+        SaveRequest::new(id, PathBuf::from(path), Arc::<str>::from(source))
     }
 
     #[test]
@@ -354,27 +339,27 @@ mod tests {
 
         assert!(
             !worker
-                .submit(request_for(1, "a", 10, "one"))
+                .submit(request_for(1, "a", "one"))
                 .unwrap()
                 .replaced_pending
         );
         started_rx.recv().unwrap();
         assert!(
             !worker
-                .submit(request_for(2, "a", 20, "two"))
+                .submit(request_for(2, "a", "two"))
                 .unwrap()
                 .replaced_pending
         );
         // Another scene's snapshot queues rather than replacing this one.
         assert!(
             !worker
-                .submit(request_for(4, "b", 5, "other"))
+                .submit(request_for(4, "b", "other"))
                 .unwrap()
                 .replaced_pending
         );
         assert!(
             worker
-                .submit(request_for(3, "a", 30, "three"))
+                .submit(request_for(3, "a", "three"))
                 .unwrap()
                 .replaced_pending
         );
@@ -396,7 +381,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, [1, 3, 4]);
         let third = &completions[1];
-        assert_eq!(third.editor_revision, Revision(30));
         assert_eq!(third.source_revision, source_revision("three"));
         assert_eq!(third.path, PathBuf::from("a"));
         assert_eq!(third.result, Ok(true));
@@ -405,14 +389,13 @@ mod tests {
     #[test]
     fn failure_result_keeps_revision_and_exact_source_hash() {
         let mut worker = SaveWorker::spawn_with_operation(|_, _| Err("disk full".into())).unwrap();
-        worker.submit(request(7, 42, "exact bytes")).unwrap();
+        worker.submit(request(7, "exact bytes")).unwrap();
         worker.shutdown();
 
         let completions = worker.take_completions();
         assert_eq!(completions.len(), 1);
         let result = &completions[0];
         assert_eq!(result.request_id, 7);
-        assert_eq!(result.editor_revision, Revision(42));
         assert_eq!(result.source_revision, source_revision("exact bytes"));
         assert_eq!(result.result, Err("disk full".into()));
     }
@@ -436,9 +419,9 @@ mod tests {
         })
         .unwrap();
 
-        worker.submit(request(10, 10, "persisted")).unwrap();
+        worker.submit(request(10, "persisted")).unwrap();
         started_rx.recv().unwrap();
-        worker.submit(request(11, 11, "failed")).unwrap();
+        worker.submit(request(11, "failed")).unwrap();
         release_tx.send(()).unwrap();
         worker.shutdown();
 

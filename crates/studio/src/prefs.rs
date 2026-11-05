@@ -394,6 +394,9 @@ pub struct StudioPrefs {
     /// The most one sound may hold, by rung key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_ceiling: Option<String>,
+    /// The most one video file may hold, by rung key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_ceiling: Option<String>,
     /// After this long without a sample preview, unused decoded PCM is dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unused_sample_idle: Option<String>,
@@ -900,6 +903,11 @@ impl StudioPrefs {
                 .as_deref()
                 .map(super::settings::SampleCeiling::parse)
                 .unwrap_or(defaults.sample_ceiling),
+            video_ceiling: self
+                .video_ceiling
+                .as_deref()
+                .map(super::settings::VideoCeiling::parse)
+                .unwrap_or(defaults.video_ceiling),
             preview_budget: self
                 .preview_budget
                 .as_deref()
@@ -1023,6 +1031,7 @@ impl StudioPrefs {
         }
         self.preview_budget = Some(settings.preview_budget.key().to_owned());
         self.sample_ceiling = Some(settings.sample_ceiling.key().to_owned());
+        self.video_ceiling = Some(settings.video_ceiling.key().to_owned());
         self.unused_sample_idle = Some(settings.unused_sample_idle.key().to_owned());
         self.precache_sources = Some(settings.precache_sources);
         self.reference_hidden = settings

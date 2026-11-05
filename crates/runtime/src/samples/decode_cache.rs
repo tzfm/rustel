@@ -58,6 +58,8 @@ fn sidecar_path(
         super::Codec::Wav => b"w",
         super::Codec::Mp3 => b"m",
         super::Codec::Ogg => b"o",
+        super::Codec::Mp4 => b"4",
+        super::Codec::Matroska => b"k",
     };
     let mut hasher = Sha256::new();
     hasher.update(tag);

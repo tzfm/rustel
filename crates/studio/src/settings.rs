@@ -985,6 +985,82 @@ impl SampleCeiling {
     }
 }
 
+/// The most one video file may hold.
+///
+/// A video's picture is most of its bytes and its sound little, so the file
+/// has a ceiling apart from the sound's. The whole file stays in memory
+/// while it decodes, which is what the top rung guards.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VideoCeiling {
+    Small,
+    #[default]
+    Standard,
+    Large,
+    Huge,
+    Vast,
+}
+
+impl VideoCeiling {
+    const LADDER: [Self; 5] = [
+        Self::Small,
+        Self::Standard,
+        Self::Large,
+        Self::Huge,
+        Self::Vast,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Small => "128 MiB",
+            Self::Standard => "256 MiB",
+            Self::Large => "512 MiB",
+            Self::Huge => "1 GiB",
+            Self::Vast => "2 GiB",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Small => "128mib",
+            Self::Standard => "256mib",
+            Self::Large => "512mib",
+            Self::Huge => "1gib",
+            Self::Vast => "2gib",
+        }
+    }
+
+    pub fn parse(text: &str) -> Self {
+        Self::LADDER
+            .iter()
+            .copied()
+            .find(|ceiling| ceiling.key() == text)
+            .unwrap_or_default()
+    }
+
+    pub fn bytes(self) -> usize {
+        match self {
+            Self::Small => 128 * 1024 * 1024,
+            Self::Standard => rustel_runtime::DEFAULT_VIDEO_FILE_BYTES,
+            Self::Large => 512 * 1024 * 1024,
+            Self::Huge => 1024 * 1024 * 1024,
+            Self::Vast => rustel_runtime::MAX_VIDEO_FILE_BYTES,
+        }
+    }
+
+    fn step(self, forwards: bool) -> Self {
+        let index = Self::LADDER
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(1);
+        let len = Self::LADDER.len();
+        Self::LADDER[if forwards {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        }]
+    }
+}
+
 /// How long after the last sample preview unused decoded PCM is dropped.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum UnusedSampleIdle {
@@ -1850,6 +1926,8 @@ pub struct UiSettings {
     pub preview_budget: PreviewBudget,
     /// The most one sound may hold before it is refused as not-music.
     pub sample_ceiling: SampleCeiling,
+    /// The most one video file may hold before it is refused.
+    pub video_ceiling: VideoCeiling,
     /// After this long without a sample preview, unused decoded PCM is dropped.
     pub unused_sample_idle: UnusedSampleIdle,
     /// Whether an imported source is fetched into the cache in the
@@ -1923,6 +2001,7 @@ impl Default for UiSettings {
             show_footer: true,
             preview_budget: PreviewBudget::Medium,
             sample_ceiling: SampleCeiling::default(),
+            video_ceiling: VideoCeiling::default(),
             unused_sample_idle: UnusedSampleIdle::Standard,
             precache_sources: false,
             reference_hidden: Vec::new(),
@@ -2065,6 +2144,7 @@ enum Row {
     TrimRecordings,
     PreviewBudget,
     SampleCeiling,
+    VideoCeiling,
     UnusedSampleIdle,
     PrecacheSources,
     /// Enter downloads every remote pack onto disk - defaults and user URLs.
@@ -2234,6 +2314,7 @@ const ROWS: &[Row] = &[
     Row::SliderSmoothing,
     Row::FrequencySliderLog,
     Row::SampleCeiling,
+    Row::VideoCeiling,
     Row::PreviewBudget,
     Row::UnusedSampleIdle,
 ];
@@ -2479,7 +2560,10 @@ impl Row {
             Self::BackdropSmoothing => "Rendering",
             Self::SliderSmoothing | Self::FrequencySliderLog => "Sliders",
             Self::SetPanelSide | Self::MixerEdge | Self::VizEdgeOne | Self::VizEdgeTwo => "Panels",
-            Self::SampleCeiling | Self::PreviewBudget | Self::UnusedSampleIdle => "Sample memory",
+            Self::SampleCeiling
+            | Self::VideoCeiling
+            | Self::PreviewBudget
+            | Self::UnusedSampleIdle => "Sample memory",
             Self::EvaluationAnimation => "Editor",
             Self::BeatLine => "Look",
             Self::PrecacheSources
@@ -2546,6 +2630,7 @@ impl Row {
             Self::TrimRecordings => "trim recordings",
             Self::SyncNameFromTitle => "sync with score metadata",
             Self::SampleCeiling => "biggest sound",
+            Self::VideoCeiling => "biggest video",
             Self::PreviewBudget => "preview RAM",
             Self::UnusedSampleIdle => "drop unused",
             Self::PrecacheSources => "fetch imports",
@@ -2635,6 +2720,9 @@ impl Row {
                 "default; scores may override. More voices use more CPU and may cause crackles"
             }
             Self::SampleCeiling => "longer than this is refused as not music",
+            Self::VideoCeiling => {
+                "a bigger video file is refused · the file stays in memory to decode"
+            }
             Self::PreviewBudget => "decoded samples no live tab names",
             Self::UnusedSampleIdle => "idle time before unused samples are dropped",
             Self::PrecacheSources => "download imported sounds to disk now, not on first play",
@@ -3774,6 +3862,9 @@ impl SettingsSheet {
                 | Row::SampleCache => {}
                 Row::SampleCeiling => {
                     settings.sample_ceiling = settings.sample_ceiling.step(forwards);
+                }
+                Row::VideoCeiling => {
+                    settings.video_ceiling = settings.video_ceiling.step(forwards);
                 }
                 Row::PreviewBudget => {
                     settings.preview_budget = settings.preview_budget.step(forwards);
@@ -5741,6 +5832,29 @@ mod tests {
         // Put it back, so a later test in this process is not left with
         // whatever this one wanted.
         rustel_audio::set_sample_pcm_ceiling(rustel_audio::DEFAULT_SAMPLE_PCM_BYTES);
+    }
+
+    /// The biggest-video ceiling climbs inside the runtime's guard, and
+    /// a rung survives prefs.
+    #[test]
+    fn the_video_ceiling_climbs_to_the_guard_and_survives_prefs() {
+        let mut seen = 0usize;
+        for rung in VideoCeiling::LADDER {
+            assert!(rung.bytes() > seen, "the ladder climbs: {}", rung.label());
+            seen = rung.bytes();
+            assert_eq!(VideoCeiling::parse(rung.key()), rung, "it survives prefs");
+        }
+        assert_eq!(
+            seen,
+            rustel_runtime::MAX_VIDEO_FILE_BYTES,
+            "the top rung is the guard"
+        );
+        assert_eq!(
+            VideoCeiling::default().bytes(),
+            rustel_runtime::DEFAULT_VIDEO_FILE_BYTES
+        );
+        assert_eq!(VideoCeiling::Standard.step(true), VideoCeiling::Large);
+        assert_eq!(VideoCeiling::Small.step(false), VideoCeiling::Vast);
     }
 
     /// The sheet is one height for every page of controls, and more than
