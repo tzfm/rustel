@@ -80,11 +80,6 @@ ratatui = { version = "0.30", default-features = false, features = [
   "crossterm_0_29",
   "underline-color",
 ] }
-# Native, cell-precise theme effects. The DSL is intentionally omitted:
-# theme files select a bounded Rustel preset rather than executing code.
-tachyonfx = { version = "=0.25.1", default-features = false, features = [
-  "std",
-] }
 ropey = "1.6"
 regex = "1"
 unicode-segmentation = "1.12"

@@ -1136,8 +1136,8 @@ pub(super) fn braille_dot(level: f32, dx: usize, dy: usize) -> bool {
 /// Empty is `⠀` and full is `⣿`; everything between is a dot count, which
 /// is the only shading a glyph raster has.
 ///
-/// The camera painter moved with the theme engines. The studio keeps this
-/// copy so the shading test below still has the same function to call.
+/// The camera painter moved with the theme engines and has its own. This
+/// one lets the test below check the studio's own dither the same way.
 #[cfg(test)]
 fn braille_luma_glyph(patch: [[u8; 2]; 4]) -> char {
     let mut bits = 0u8;

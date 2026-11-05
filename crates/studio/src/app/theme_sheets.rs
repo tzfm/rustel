@@ -1752,7 +1752,7 @@ mod tests {
         /// send is a beat late rather than lost. A test that asserts on what was
         /// sent has to pump too, or it is asserting on the worker thread's
         /// scheduling.
-        #[cfg(feature = "hydra")]
+        #[cfg(all(feature = "hydra", feature = "themes"))]
         fn settle_theme_sketch(app: &mut App) {
             for _ in 0..400 {
                 app.sync_theme_sketch();
@@ -2297,8 +2297,14 @@ mod tests {
 
             // Selecting a calibrated preset explicitly replaces even manually
             // claimed settings; a restart alone, above, still preserves them.
-            #[cfg(feature = "themes")]
-            for name in ["rustel-drift", "unicorn", "smoke", "randomize"] {
+            // Randomize is in every build, the calibrated pack presets in
+            // one with the theme pack.
+            let presets: &[&str] = if cfg!(feature = "themes") {
+                &["rustel-drift", "unicorn", "smoke", "randomize"]
+            } else {
+                &["randomize"]
+            };
+            for &name in presets {
                 app.ui_settings.backdrop_opacity = 0;
                 app.ui_settings.interface_opacity = 100;
                 app.ui_settings.editor_opacity = 100;

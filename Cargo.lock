@@ -4630,7 +4630,6 @@ dependencies = [
  "serde",
  "serde_json",
  "softbuffer",
- "tachyonfx",
  "tempfile",
  "termina",
  "unicode-segmentation",

@@ -209,10 +209,10 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | 6 | Unlicense OR MIT |
 | 5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | 4 | MIT OR Apache-2.0 OR Zlib |
+| 3 | AGPL-3.0-or-later |
 | 3 | BSD-3-Clause |
 | 3 | Zlib |
 | 2 | (MIT OR Apache-2.0) AND Unicode-3.0 |
-| 3 | AGPL-3.0-or-later |
 | 2 | BSD-2-Clause OR Apache-2.0 OR MIT |
 | 2 | BSD-2-Clause OR MIT OR Apache-2.0 |
 | 2 | BSD-3-Clause OR Apache-2.0 |

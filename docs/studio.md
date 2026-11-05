@@ -812,7 +812,7 @@ can list themes or select one at startup:
 
 ```sh
 rustel studio --list-themes
-rustel studio --theme strudel song.strudel
+rustel studio --theme rustel-dark song.strudel
 ```
 
 ### Minimal user theme

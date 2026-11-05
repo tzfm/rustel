@@ -202,7 +202,6 @@ mod opacity_render_tests {
             .expect("write requested render export");
     }
 
-    #[cfg(feature = "themes")]
     #[test]
     fn animated_presets_render_visibly_while_menu_labels_stay_sharp() {
         let started = Instant::now();
@@ -316,7 +315,6 @@ mod opacity_render_tests {
         export("native.json", exported);
     }
 
-    #[cfg(feature = "themes")]
     #[test]
     fn hydra_defaults_keep_text_readable_over_synthetic_bright_and_dark_frames() {
         let started = Instant::now();
@@ -405,32 +403,14 @@ const MAX_THEME_DOCUMENT_BYTES: usize = 64 * 1024;
 /// The one theme compiled into every studio.
 const CORE_THEMES: &[(&str, &str)] = &[("rustel-dark", include_str!("themes/rustel-dark.json"))];
 
+/// rustel-dark, then the pack's themes. The pack's lists are empty in a
+/// build without `themes`.
 fn fixed_themes() -> impl Iterator<Item = (&'static str, &'static str)> {
     CORE_THEMES
         .iter()
+        .chain(rustel_studio_themes::catalogue())
+        .chain(rustel_studio_themes::showroom())
         .copied()
-        .chain(pack_catalogue())
-        .chain(pack_showroom())
-}
-
-#[cfg(feature = "themes")]
-fn pack_catalogue() -> impl Iterator<Item = (&'static str, &'static str)> {
-    rustel_studio_themes::catalogue().iter().copied()
-}
-
-#[cfg(not(feature = "themes"))]
-fn pack_catalogue() -> impl Iterator<Item = (&'static str, &'static str)> {
-    std::iter::empty()
-}
-
-#[cfg(feature = "themes")]
-fn pack_showroom() -> impl Iterator<Item = (&'static str, &'static str)> {
-    rustel_studio_themes::showroom().iter().copied()
-}
-
-#[cfg(not(feature = "themes"))]
-fn pack_showroom() -> impl Iterator<Item = (&'static str, &'static str)> {
-    std::iter::empty()
 }
 /// How an active (currently sounding) source range is marked.
 ///
@@ -1241,9 +1221,17 @@ impl Theme {
         CORE_THEMES
             .iter()
             .map(|(name, _)| *name)
-            .chain(pack_catalogue().map(|(name, _)| name))
+            .chain(
+                rustel_studio_themes::catalogue()
+                    .iter()
+                    .map(|(name, _)| *name),
+            )
             .chain(std::iter::once(RANDOMIZE_THEME))
-            .chain(pack_showroom().map(|(name, _)| name))
+            .chain(
+                rustel_studio_themes::showroom()
+                    .iter()
+                    .map(|(name, _)| *name),
+            )
     }
 
     pub fn from_json(document: &str) -> Result<Self, ThemeError> {
@@ -3238,7 +3226,6 @@ mod tests {
 
     /// Every built-in says how long its sounding marks linger, and each
     /// says something its own: a sharp theme cuts, a dusk theme lets go.
-    #[cfg(feature = "themes")]
     #[test]
     fn every_built_in_theme_names_its_own_highlight_fade() {
         for name in Theme::built_in_names() {
@@ -3254,10 +3241,13 @@ mod tests {
         }
         // The sharp end and the slow end are both represented, so the key
         // is doing work rather than being copied everywhere.
-        let fade = |name: &str| Theme::built_in(name).and_then(|theme| theme.event_fade);
-        assert!(fade("powershell") < fade("rustel-dark"));
-        assert!(fade("rustel-dark") < fade("campfire"));
-        assert!(fade("campfire") < fade("lsd"));
+        #[cfg(feature = "themes")]
+        {
+            let fade = |name: &str| Theme::built_in(name).and_then(|theme| theme.event_fade);
+            assert!(fade("powershell") < fade("rustel-dark"));
+            assert!(fade("rustel-dark") < fade("campfire"));
+            assert!(fade("campfire") < fade("lsd"));
+        }
         // A theme that names none still has the studio's own.
         let mut plain = Theme::built_in_default();
         plain.event_fade = None;
