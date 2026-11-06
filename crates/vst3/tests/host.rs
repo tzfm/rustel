@@ -1760,6 +1760,32 @@ fn live_play_does_not_wait_for_a_plugin() {
     assert_eq!(prepared(NAME, false), Prepared::Unbuilt(key));
 }
 
+/// A read of the preset folders that starts during the load of a plugin
+/// puts a prepare at the end of the line again. A wait for the plugin
+/// thread follows it there.
+#[test]
+fn a_wait_ends_after_a_prepare_behind_a_preset_read() {
+    let rig = Rig::new("prepare-wait");
+    let slot = InsertSlot::effect(1, 0);
+    // SAFETY: the tests of this binary run one at a time, and the plugin
+    // thread has no work. So no other thread reads the variable now.
+    unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ENV, "300") };
+    // The preset folder is new, so the prepare waits for a read. The load
+    // takes 300 ms, so the read of the change starts before the load ends.
+    rig.host.set_preset_folder(rig.root.join("presets"));
+    rig.host.prepare(NAME, None, false, SAMPLE_RATE, slot);
+    rig.host.set_preset_folders(Vec::new());
+    rig.host.wait_idle();
+    // SAFETY: as above. The load read the variable before the wait ended.
+    unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ENV) };
+    let Resolved::Ready(plugin, _) = rig.host.resolve(NAME, false) else {
+        panic!("the fixture plugin did not load");
+    };
+    let key = InsertKey { plugin, preset: 0 };
+    let prepared = rig.host.prepared(NAME, None, false, SAMPLE_RATE, slot);
+    assert_eq!(prepared, Prepared::Ready(key));
+}
+
 #[test]
 fn different_plugins_prepared_for_one_slot_stay_ready() {
     let rig = Rig::new("shared-slot");

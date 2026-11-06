@@ -2035,20 +2035,36 @@ impl Host {
     }
 
     /// [`Host::wait_idle`] for `limit` at most, and until `cancelled` says
-    /// to stop. True means the plugin thread finished its work.
+    /// to stop. True means the plugin thread finished its work. A prepare
+    /// that waits for a load or a read of the preset folders goes to the
+    /// end of the line again, behind the wait: the wait follows it there,
+    /// [`PREPARE_TRIES`] times at most. The plugin thread reads the list
+    /// of prepares, so no prepare is in its build at the read.
     pub fn wait_idle_within(&self, limit: Duration, cancelled: impl Fn() -> bool) -> bool {
-        let finished = self.enqueue(|| {});
         let start = Instant::now();
-        loop {
-            match finished.recv_timeout(Duration::from_millis(20)) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return true,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if cancelled() || start.elapsed() >= limit {
-                        return false;
+        for _ in 0..=PREPARE_TRIES {
+            let behind = Arc::new(AtomicBool::new(false));
+            let (host, seen) = (self.clone(), Arc::clone(&behind));
+            let finished = self.enqueue(move || {
+                let preparing = !host.state().preparing.is_empty();
+                seen.store(preparing, Ordering::Relaxed);
+            });
+            loop {
+                match finished.recv_timeout(Duration::from_millis(20)) {
+                    Ok(()) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if cancelled() || start.elapsed() >= limit {
+                            return false;
+                        }
                     }
                 }
             }
+            if !behind.load(Ordering::Relaxed) {
+                break;
+            }
         }
+        true
     }
 
     /// Builds a plugin for one slot of the audio engine. With `wait`, the
