@@ -982,12 +982,8 @@ pub(crate) fn render_scalar_pcm_with_refusals(
         preroll,
         stop,
     );
-    // The render lines go out also for a render that fails. A render that
-    // fails drops the lines of its copies with no print.
-    #[cfg(feature = "vst")]
-    if rendered.is_err() {
-        let _ = plan.take_render_faults();
-    }
+    // The lines of the copies go out also for a render that fails, as in
+    // the WAV door.
     let (render_lines, warnings) = print_plugin_problems(&plan);
     let (pcm, refused) = rendered?;
     check_csound_errors(csound)?;

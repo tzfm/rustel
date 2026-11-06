@@ -648,7 +648,6 @@ impl ScalarBackend {
                 waiting = true;
                 continue;
             }
-            // The finite device path leases under the registry lock, a defect of main to fix.
             let hold = crate::partials::hold_frames(
                 event.duration_secs,
                 event.controls.envelope.release_secs,

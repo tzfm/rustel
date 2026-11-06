@@ -4383,7 +4383,8 @@ mod tests {
     /// A copy whose plugin asked for a restart for a new latency does not
     /// park at its drop. It goes home in a job of the plugin thread, which
     /// turns the plugin off and on before the copy waits for its slot
-    /// again. The restart keeps the clock of the copy. A take keeps the
+    /// again. The restart keeps the clock of the copy and ends its tail, so
+    /// the next drop with no frame parks the copy at once. A take keeps the
     /// request, and the engine then hears of it. After 2 restarts that read
     /// the latency the copy had before, the copy restarts only on its way
     /// home, and the host gives one line for its plugin.
@@ -4435,6 +4436,11 @@ mod tests {
             _ => panic!("the copy did not park"),
         };
         assert_eq!(frames, 4 * BLOCK as i64, "the clock of the copy");
+        let skips = match host.state().builds.get(&build) {
+            Some(Build::Ready(copy)) => copy.skips_flush(),
+            _ => panic!("the copy did not park"),
+        };
+        assert!(skips, "the restart ends the tail of the copy");
         let next = cell.restart_after.load(Ordering::Relaxed);
         assert!(next >= parked_at + 1_000, "the next restart at {next} ms");
 

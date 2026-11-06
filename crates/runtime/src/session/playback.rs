@@ -810,13 +810,7 @@ impl Session {
                 &session.render_stop(None),
             )
             .map(|(pcm, refused, _)| (pcm, refused))
-            .map_err(|error| {
-                if error.to_string().contains(rustel_audio::RENDER_CANCELLED) {
-                    RuntimeError::Cancelled
-                } else {
-                    RuntimeError::Io(error)
-                }
-            })
+            .map_err(render_error)
         })
         .map(|(pcm, _)| pcm)
     }
@@ -1695,6 +1689,24 @@ mod tests {
         }
         // ...and the ordinary case still works.
         assert!(!session.play(2.0).expect("play").onsets.is_empty());
+    }
+
+    /// A render in memory past its budget gives the error of a bounce to a
+    /// file, with no allocation.
+    #[test]
+    fn a_render_in_memory_past_its_budget_gives_the_error_of_a_bounce() {
+        let mut session = Session::with_config(SessionConfig {
+            sample_rate: u32::MAX,
+            ..Default::default()
+        })
+        .expect("session");
+        session.evaluate(r#"s("bd")"#).expect("evaluate");
+        let error = session.render_pcm(1.0).expect_err("past the budget");
+        assert!(
+            matches!(&error, RuntimeError::Message(message)
+                if message.starts_with("scalar audio: ") && message.contains("cannot hold")),
+            "{error:?}"
+        );
     }
 
     #[test]

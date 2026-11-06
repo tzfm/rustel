@@ -962,8 +962,9 @@ impl Instance {
     /// Plays out the tail of a copy an engine gave back, on the plugin
     /// thread, so the next note of the copy has no sound of its life before.
     /// Each note ends first. A copy whose plugin asked for a restart gets
-    /// the restart service and nothing more: see [`Self::serve_restart`].
-    /// The service gives `Some` with the latency before it. A copy that
+    /// the restart service in place of the flush: see [`Self::serve_restart`].
+    /// The service gives `Some` with the latency before it. The copy keeps
+    /// its clock, and the counts of the flush start again. A copy that
     /// skips ([`Self::skips_flush`]) runs no block. Each other copy restarts
     /// and runs silent blocks: see [`play_out`]. The blocks stop when
     /// `closed` turns true. Then the plugin thread reads the latency and the
@@ -973,7 +974,11 @@ impl Instance {
         self.reset();
         if self.state.latency_changed.load(Ordering::Acquire) {
             let before = self.latency();
-            return self.serve_restart().map(|()| Some(before));
+            let served = self.serve_restart();
+            // The restart ends the tail, so the next drop of a copy that
+            // plays no frame parks it at once.
+            self.played = Played::default();
+            return served.map(|()| Some(before));
         }
         let flushed = if !self.skips_flush() {
             let quiet_time = self.quiet_time();
