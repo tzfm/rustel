@@ -9,12 +9,15 @@ mod chains;
 mod lanes;
 
 pub(crate) use chains::{
-    Chains, NoteChain, Want, assign, ensure, forget_lanes_away, link_sliders, load, plugin_names,
-    render_chains, score_changed, slider_links, slider_moved, take_output_lines, take_problems,
-    wants,
+    Chains, NoteChain, RenderPlan, Want, assign, end_closed_documents, ensure, forget_document,
+    forget_lanes_away, latencies, lead, link_sliders, load, plan_render, plugin_names,
+    render_chains, retry_wants, returning, score_changed, slider_links, slider_moved,
+    take_output_lines, take_problems, wants,
 };
 #[cfg(feature = "device-audio")]
-pub(crate) use chains::{forget_plan, named_chains, plan, take_slider_values, tick};
+pub(crate) use chains::{
+    adopt_plan, forget_plan, named_chains, plan, retry, take_slider_values, tick,
+};
 pub(crate) use lanes::LaneTable;
 
 use std::path::PathBuf;
@@ -299,6 +302,20 @@ pub fn engine_holds_unkept(keep: &[String]) -> bool {
     started().is_some_and(|host| host.engine_holds_unkept(keep))
 }
 
+/// True while an engine holds a copy of a chain in `chains`: see
+/// [`Host::engine_holds_chains`]. False before the host starts.
+pub(crate) fn engine_holds_chains(chains: &[u64]) -> bool {
+    started().is_some_and(|host| host.engine_holds_chains(chains))
+}
+
+/// True while a copy in an engine asks for a restart now: see
+/// [`Host::restarts_pending`]. A stopped output then gives the copy back
+/// before the next start. False before the host starts. With no request
+/// since the last list of the restarts, the call takes no host lock.
+pub fn restarts_pending() -> bool {
+    started().is_some_and(Host::restarts_pending)
+}
+
 /// How long the end of the process waits for the plugin thread.
 const EXIT_LIMIT: Duration = Duration::from_secs(10);
 
@@ -356,6 +373,15 @@ pub(crate) fn controls(
         rustel_voice::plugin_value_skipped(request, &reason);
     }
     Ok(Some(controls))
+}
+
+/// The provider of the plugin copies of a render to a file: see
+/// [`Host::render_provider`]. `stop` ends each wait for a build. `None`
+/// before the host starts.
+pub(crate) fn render_provider(
+    stop: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Option<std::sync::Arc<rustel_audio::InsertProvider>> {
+    started().map(|host| host.render_provider(stop))
 }
 
 /// Starts the host and the read of each plugin bundle with no plugin names

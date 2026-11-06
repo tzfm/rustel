@@ -152,7 +152,10 @@ pub use producer::{
     PRODUCER_REPORTING_WINDOW_TURNS, ProducerLoadSnapshot, ProducerPhase, ProducerPhaseSnapshot,
     ProducerTurnOutcome,
 };
-pub use render::{MP3_EXPORT, RenderFormat, write_onset_dump, write_scalar_wav, write_silent_wav};
+pub use render::{
+    MP3_EXPORT, RENDER_ENDED_BEFORE_AUDIO, RenderFormat, write_onset_dump, write_scalar_wav,
+    write_silent_wav,
+};
 pub use rustel_audio::TakeoverCut;
 pub use samples::{
     BUILTIN_SOURCES, DEFAULT_VIDEO_FILE_BYTES, LOCAL_FILES, MAX_VIDEO_FILE_BYTES,
@@ -163,8 +166,8 @@ pub use samples::{
 };
 pub use score_import::{ScoreImportAccess, import_origin};
 pub use session::{
-    DEFAULT_HORIZON, EvaluateSource, PLUGIN_DIAGNOSTIC, PREVIEW_ONSET_ID_FLAG, RuntimeError,
-    SAMPLE_AWAITED_DIAGNOSTIC, SAMPLE_LOADING_DIAGNOSTIC, Session, SessionConfig,
+    DEFAULT_HORIZON, EvaluateSource, PLUGIN_DIAGNOSTIC, PREVIEW_DOCUMENT, PREVIEW_ONSET_ID_FLAG,
+    RuntimeError, SAMPLE_AWAITED_DIAGNOSTIC, SAMPLE_LOADING_DIAGNOSTIC, Session, SessionConfig,
     SessionDiagnostic, VOICE_NOTICE_DIAGNOSTIC, WindowSound,
 };
 
@@ -173,7 +176,7 @@ pub use session::LIVE_REPLACEMENT_MIN_HEADROOM;
 #[cfg(any(test, feature = "test-support"))]
 pub use session::SessionPanicPoint;
 #[cfg(all(feature = "vst", feature = "device-audio"))]
-pub use session::{LiveReload, PLUGIN_WAIT};
+pub use session::{LiveReload, PLUGIN_WAIT, SEAM_WAIT};
 pub use session::{catch_score_panic, panic_is_contained};
 pub use watch::{
     FileWatch, MAX_WATCH_SOURCE_BYTES, ReloadEvent, ReloadStatus, WatchLanguage, WatchPoll,

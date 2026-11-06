@@ -170,6 +170,10 @@ pub struct Ring {
     rendering_from: AtomicU64,
     rendering_until: AtomicU64,
     rendering_rate: AtomicU32,
+    /// The restart lead of the newest cutover, in frames. A restart moves a
+    /// note of its first window up to this far after its target: see
+    /// [`Ring::push`].
+    restart_lead: AtomicU32,
     /// The custom waves of pushed notes. Only the producer locks it.
     waves: Mutex<WaveLeases>,
 }
@@ -234,8 +238,21 @@ impl Ring {
             rendering_from: AtomicU64::new(0),
             rendering_until: AtomicU64::new(0),
             rendering_rate: AtomicU32::new(0),
+            restart_lead: AtomicU32::new(0),
             waves: Mutex::default(),
         }
+    }
+
+    /// Producer side: the restart lead of the newest cutover, in frames.
+    #[cfg(any(test, feature = "device-audio"))]
+    pub(crate) fn set_restart_lead(&self, frames: u32) {
+        self.restart_lead.store(frames, Ordering::Relaxed);
+    }
+
+    /// The restart lead of [`Self::set_restart_lead`].
+    #[cfg(feature = "device-audio")]
+    pub(crate) fn restart_lead(&self) -> u32 {
+        self.restart_lead.load(Ordering::Relaxed)
     }
 
     /// Consumer side: publish the chunk about to render, frames `from..until`
@@ -352,7 +369,12 @@ impl Ring {
                         .reduce(f64::max),
                     self.rendering_rate.load(Ordering::Relaxed),
                 );
-                (wave, event.target_frame, hold)
+                // The source of a note of a plugin chain starts up to the
+                // latency of the chain after its target, and a restart moves
+                // the target up to its restart lead later.
+                let later = u64::from(event.controls.chain_latency())
+                    + u64::from(self.restart_lead.load(Ordering::Relaxed));
+                (wave, event.target_frame, hold.saturating_add(later))
             });
         // SAFETY: sole producer; slot unpublished until Release store.
         unsafe {
@@ -499,6 +521,32 @@ mod tests {
         ring.publish_frontier(48_000, 48_128, 48_000);
         assert!(ring.push(ev(1)));
         assert_eq!(ring.waves.lock().unwrap().len(), 0);
+        assert!(crate::partials::lease(&mut partials).is_none());
+
+        // The source of a note of a plugin chain with 480 frames of latency
+        // starts up to that latency after its target, and a restart moves
+        // the target up to its restart lead later, 240 frames here. The wave
+        // is held 720 frames longer.
+        let mut partials = crate::register_partials(1, &[0.0], &[0.234_567_8]);
+        let ring = Ring::new(4);
+        ring.publish_frontier(0, 128, 48_000);
+        ring.set_restart_lead(240);
+        let mut note = ev(0);
+        note.controls.partials = Some(partials);
+        let stage = crate::InsertControls::new(crate::InsertKey::default());
+        note.controls.effects[0] = Some(stage.with_latency(480));
+        let release = note.controls.envelope.release_secs;
+        assert!(ring.push(note));
+        crate::partials::forget(&partials);
+        assert!(ring.pop().is_some());
+        let plain = 128 + crate::partials::hold_frames(0.1, release, 0, None, 48_000);
+        let until = plain + 480 + 240;
+        for (from, held) in [(until - 1, 1), (until, 0)] {
+            ring.publish_frontier(from, from + 128, 48_000);
+            assert!(ring.push(ev(1)));
+            assert!(ring.pop().is_some());
+            assert_eq!(ring.waves.lock().unwrap().len(), held, "from {from}");
+        }
         assert!(crate::partials::lease(&mut partials).is_none());
     }
 
@@ -970,6 +1018,10 @@ mod kabel_snapshot_tests {
             compact <= 4352 + inserts,
             "callback event grew to {compact} bytes"
         );
+        // The lead of a note finds no room in the padding of its controls.
+        // So each event grows by 8 bytes from 4944, and the live ring of
+        // 8192 events by 64 KiB.
+        assert_eq!(compact, 4952);
         assert!(compact <= size_of::<QueuedAudioEvent<()>>() + 4 * 32);
         assert_eq!(producer, compact, "producer events must share graph code");
         assert!(!needs_drop::<QueuedAudioEvent<CompactKabelControls>>());

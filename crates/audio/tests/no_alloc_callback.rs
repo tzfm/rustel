@@ -172,6 +172,9 @@ static WORKER_CALLS: AtomicU64 = AtomicU64::new(0);
 /// The calls of the [`GainInsert`] of plugin 7, on any thread.
 static PLUGIN_7_CALLS: AtomicU64 = AtomicU64::new(0);
 
+/// The drain calls of a [`GainInsert`], on any thread.
+static DRAIN_CALLS: AtomicU64 = AtomicU64::new(0);
+
 /// A gain as an orbit insert that runs on any thread. Parameter 1 is the
 /// gain.
 struct GainInsert {
@@ -203,6 +206,55 @@ impl rustel_audio::OrbitInsert for GainInsert {
         for sample in left.iter_mut().chain(right) {
             *sample *= self.gain;
         }
+    }
+
+    fn any_thread(&self) -> bool {
+        true
+    }
+
+    fn drain(&mut self, left: &mut [f32], right: &mut [f32]) {
+        DRAIN_CALLS.fetch_add(1, Ordering::Relaxed);
+        self.process(left, right);
+    }
+}
+
+/// An instrument that plays a constant 1, on any thread.
+struct Tone(rustel_audio::InsertKey);
+
+impl rustel_audio::OrbitInsert for Tone {
+    fn key(&self) -> rustel_audio::InsertKey {
+        self.0
+    }
+
+    fn set_param(&mut self, _param: rustel_audio::InsertParam, _frames: u32) {}
+
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        left.fill(1.0);
+        right.fill(1.0);
+    }
+
+    fn any_thread(&self) -> bool {
+        true
+    }
+}
+
+/// A copy whose plugin faulted: it writes silence, on any thread.
+struct Faulted(rustel_audio::InsertKey);
+
+impl rustel_audio::OrbitInsert for Faulted {
+    fn key(&self) -> rustel_audio::InsertKey {
+        self.0
+    }
+
+    fn set_param(&mut self, _param: rustel_audio::InsertParam, _frames: u32) {}
+
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        left.fill(0.0);
+        right.fill(0.0);
+    }
+
+    fn faulted(&self) -> bool {
+        true
     }
 
     fn any_thread(&self) -> bool {
@@ -382,6 +434,338 @@ fn an_orbit_insert_installs_and_processes_without_callback_allocation() {
             "a moved value allocated or freed in the callback: {delta:?}"
         );
         assert!(output.iter().all(|sample| *sample == 0.0));
+        assert_eq!(backend.missing_insert_events(), 0);
+
+        // A stopped output drains both stages with silence, on a worker when
+        // the chain has workers. A copy of a stage out of the order of the
+        // chain gets no drain. The blocks of the drain allocate and free
+        // nothing.
+        let unheard = Box::new(GainInsert {
+            key: rustel_audio::InsertKey { plugin: 10, ..key },
+            gain: 1.0,
+        });
+        let slot = rustel_audio::InsertSlot::effect(1, 2);
+        assert!(backend.install_insert(slot, unheard).is_none());
+        let drains = DRAIN_CALLS.load(Ordering::Relaxed);
+        let worker_calls = WORKER_CALLS.load(Ordering::Relaxed);
+        let before = Violations::capture();
+        tripwire::audio_scope(|| {
+            for block in 0..4 {
+                backend.reset_at(768 + block * 128);
+                backend.drain_stopped_inserts(128);
+            }
+        });
+        let delta = Violations::capture().since(before);
+        assert!(
+            delta.clean(),
+            "the drain of a stopped output allocated or freed in the callback: {delta:?}"
+        );
+        assert_eq!(DRAIN_CALLS.load(Ordering::Relaxed) - drains, 2 * 4);
+        if workers.is_some() {
+            assert!(
+                WORKER_CALLS.load(Ordering::Relaxed) > worker_calls,
+                "no drain ran on a worker"
+            );
+        }
+
+        // The stages drain until they are quiet for 0.25 s. The first block
+        // with no copy to drain ends the drain of the stop, so a copy put in
+        // place after that block gets no drain.
+        for block in 4..100 {
+            backend.reset_at(768 + block * 128);
+            backend.drain_stopped_inserts(128);
+        }
+        let late = Box::new(GainInsert {
+            key: rustel_audio::InsertKey { plugin: 11, ..key },
+            gain: 1.0,
+        });
+        let slot = rustel_audio::InsertSlot::instrument(1);
+        assert!(backend.install_insert(slot, late).is_none());
+        let drains = DRAIN_CALLS.load(Ordering::Relaxed);
+        backend.drain_stopped_inserts(128);
+        assert_eq!(
+            DRAIN_CALLS.load(Ordering::Relaxed),
+            drains,
+            "the drain went on"
+        );
+
+        // 513 short instrument notes inside one lead of 0.5 s: an instrument
+        // with 20 000 frames of latency through an effect with 4 000. Each
+        // note gives the level of the instrument and of the chain at its
+        // output. The last note finds each list of such changes full, and
+        // its changes apply at once. Nothing allocates, and the last note
+        // has its own level.
+        let mut backend = ScalarBackend::prepared(48_000, 640).expect("scalar init");
+        backend.forbid_inline_reverb();
+        let _workers = pooled.then(|| plugin_workers(&mut backend)).flatten();
+        let instrument = rustel_audio::InsertKey { plugin: 20, ..key };
+        let effect = rustel_audio::InsertKey { plugin: 21, ..key };
+        let tone = Box::new(Tone(instrument));
+        let gain = Box::new(GainInsert {
+            key: effect,
+            gain: 1.0,
+        });
+        assert!(
+            backend
+                .install_insert(rustel_audio::InsertSlot::instrument(2), tone)
+                .is_none()
+        );
+        assert!(
+            backend
+                .install_insert(rustel_audio::InsertSlot::effect(2, 0), gain)
+                .is_none()
+        );
+        for note in 0..513u64 {
+            let last = note == 512;
+            let stage = |key, latency| rustel_audio::InsertControls::new(key).with_latency(latency);
+            let mut controls = OscillatorControls {
+                insert_chain: Some(2),
+                instrument: Some(stage(instrument, 20_000)),
+                postgain: if last { 0.5 } else { 1.0 },
+                lead: 24_000,
+                ..OscillatorControls::default()
+            };
+            controls.effects[0] = Some(stage(effect, 4_000));
+            let gain = if last { 0.25 } else { 0.5 };
+            let event = OnsetEvent::new(note * 32, 440.0, gain, 0.0005).with_controls(controls);
+            assert!(backend.try_note_prepared(event));
+        }
+        let before = Violations::capture();
+        tripwire::audio_scope(|| {
+            for _ in 0..400 {
+                backend.process_block(&mut output, 128);
+            }
+        });
+        let delta = Violations::capture().since(before);
+        assert!(
+            delta.clean(),
+            "the level changes of a lead allocated or freed in the callback: {delta:?}"
+        );
+        assert!(backend.early_level_changes() > 0, "no list was full");
+        assert!(
+            output.iter().all(|sample| *sample == 0.125),
+            "the last note has no level of its own: {:?}",
+            &output[..2]
+        );
+        assert_eq!(backend.missing_insert_events(), 0);
+
+        // Notes through an effect with 480 frames of latency, aimed that much
+        // before their onsets, with a room and a delay send. Their sends wait
+        // in the send lines. Longer lines then take the place of the lines
+        // and the sends they hold, and the lines before come back. Shorter
+        // lines come back unused. A stop empties the lines of the sends that
+        // still wait. Nothing allocates, and no send goes early.
+        let mut backend = ScalarBackend::prepared(48_000, 8).expect("scalar init");
+        backend.forbid_inline_reverb();
+        let _workers = pooled.then(|| plugin_workers(&mut backend)).flatten();
+        let effect = rustel_audio::InsertKey { plugin: 22, ..key };
+        let gain = Box::new(GainInsert {
+            key: effect,
+            gain: 1.0,
+        });
+        assert!(
+            backend
+                .install_insert(rustel_audio::InsertSlot::effect(3, 0), gain)
+                .is_none()
+        );
+        let room = rustel_audio::reverb::ReverbParams {
+            ir: None,
+            size_secs: 0.05,
+            fade_secs: 0.01,
+            lp_start_hz: 8_000.0,
+            lp_end_hz: 1_000.0,
+        };
+        let reverb = Box::new(rustel_audio::reverb::OrbitReverb::generate(48_000, room));
+        assert!(backend.install_reverb(0, reverb).is_none());
+        for note in 0..4u64 {
+            let mut controls = OscillatorControls {
+                insert_chain: Some(3),
+                lead: 480,
+                reverb: Some(rustel_audio::ReverbControls {
+                    wet: 0.5,
+                    size_secs: room.size_secs,
+                    fade_secs: room.fade_secs,
+                    lp_start_hz: room.lp_start_hz,
+                    lp_end_hz: room.lp_end_hz,
+                    ir: None,
+                }),
+                delay: Some(rustel_audio::DelayControls {
+                    wet: 0.5,
+                    time_secs: 0.01,
+                    feedback: 0.25,
+                }),
+                ..OscillatorControls::default()
+            };
+            let stage = rustel_audio::InsertControls::new(effect).with_latency(480);
+            controls.effects[0] = Some(stage);
+            let event = OnsetEvent::new(note * 256, 440.0, 0.5, 0.01).with_controls(controls);
+            assert!(backend.try_note_prepared(event));
+        }
+        let lines = |latency| Box::new(rustel_audio::scalar::SendLines::new(latency, 48_000));
+        let (first, longer, shorter) = (lines(480), lines(960), lines(0));
+        let (mut heard, mut after_stop) = (false, false);
+        let before = Violations::capture();
+        let (installed, replaced, refused) = tripwire::audio_scope(|| {
+            let installed = backend.install_send_lines(first);
+            for _ in 0..4 {
+                backend.process_block(&mut output, 128);
+            }
+            let replaced = backend.install_send_lines(longer);
+            let refused = backend.install_send_lines(shorter);
+            for _ in 0..4 {
+                backend.process_block(&mut output, 128);
+                heard |= output.iter().any(|sample| sample.abs() > 1e-6);
+            }
+            backend.reset_at(1_024);
+            for _ in 0..8 {
+                backend.process_block(&mut output, 128);
+                after_stop |= output.iter().any(|sample| *sample != 0.0);
+            }
+            (installed, replaced, refused)
+        });
+        let delta = Violations::capture().since(before);
+        assert!(
+            delta.clean(),
+            "the send lines allocated or freed in the callback: {delta:?}"
+        );
+        assert!(installed.is_none());
+        assert_eq!(replaced.expect("the lines before").reach(), 896);
+        assert_eq!(refused.expect("the shorter lines").reach(), 0);
+        assert!(heard, "the notes made no sound");
+        assert!(!after_stop, "a send sounded after the stop");
+        assert_eq!(backend.early_sends(), 0);
+        assert_eq!(backend.missing_insert_events(), 0);
+
+        // A forced release fades a heard stage to silence, and its copy goes
+        // back. The stage writes silence for the voice through it until a
+        // copy of its key comes back and fades in with no note. A mark whose
+        // copy does not come back ends after 24 000 frames, and the voice
+        // then plays with no copy. Nothing allocates.
+        let mut backend = ScalarBackend::prepared(48_000, 8).expect("scalar init");
+        backend.forbid_inline_reverb();
+        let _workers = pooled.then(|| plugin_workers(&mut backend)).flatten();
+        #[cfg(feature = "test-support")]
+        backend.leave_plugin_blocks_to_workers();
+        let effect = rustel_audio::InsertKey { plugin: 23, ..key };
+        let slot = rustel_audio::InsertSlot::effect(4, 0);
+        let copy = || {
+            Box::new(GainInsert {
+                key: effect,
+                gain: 1.0,
+            })
+        };
+        let (first, second) = (copy(), copy());
+        let mut controls = OscillatorControls {
+            insert_chain: Some(4),
+            ..OscillatorControls::default()
+        };
+        controls.effects[0] = Some(rustel_audio::InsertControls::new(effect));
+        let event = OnsetEvent::new(0, 440.0, 0.5, 1.0).with_controls(controls);
+        assert!(backend.try_note_prepared(event));
+        // Whether a block sounds: before the release, after the fade, at the
+        // return, in the mark and after the mark.
+        let mut sounded = [false; 5];
+        let before = Violations::capture();
+        let (installed, prepared) = tripwire::audio_scope(|| {
+            let block = |backend: &mut ScalarBackend, output: &mut [f32; 256]| {
+                backend.process_block(output, 128);
+                output.iter().any(|sample| *sample != 0.0)
+            };
+            let installed = backend.install_insert(slot, first);
+            sounded[0] = block(&mut backend, &mut output);
+            backend.release_insert(slot, effect, false, true);
+            for _ in 0..3 {
+                sounded[1] = block(&mut backend, &mut output);
+            }
+            let prepared = backend.prepare_insert(slot, second);
+            for _ in 0..2 {
+                sounded[2] = block(&mut backend, &mut output);
+            }
+            // The mark of frame 768 ends at the block of frame 24 832.
+            backend.release_insert(slot, effect, false, true);
+            for _ in 0..2 {
+                block(&mut backend, &mut output);
+            }
+            for _ in 0..186 {
+                sounded[3] |= block(&mut backend, &mut output);
+            }
+            sounded[4] = block(&mut backend, &mut output);
+            (installed, prepared)
+        });
+        let delta = Violations::capture().since(before);
+        assert!(
+            delta.clean(),
+            "a forced release allocated or freed in the callback: {delta:?}"
+        );
+        assert!(installed.is_none() && prepared.is_none());
+        assert_eq!(sounded, [true, false, true, false, true]);
+        assert_eq!(backend.orbit_insert_key(slot), None);
+
+        // An instrument through an effect copy that faulted. The stage
+        // writes silence, also with a prepared copy of its key, until the
+        // next note of that key. The new copy then fades in, and the stage
+        // plays at its gain. Nothing allocates.
+        let mut backend = ScalarBackend::prepared(48_000, 8).expect("scalar init");
+        backend.forbid_inline_reverb();
+        let _workers = pooled.then(|| plugin_workers(&mut backend)).flatten();
+        #[cfg(feature = "test-support")]
+        backend.leave_plugin_blocks_to_workers();
+        let instrument = rustel_audio::InsertKey { plugin: 24, ..key };
+        let effect = rustel_audio::InsertKey { plugin: 25, ..key };
+        let slot = rustel_audio::InsertSlot::effect(1, 0);
+        assert!(
+            backend
+                .install_insert(
+                    rustel_audio::InsertSlot::instrument(1),
+                    Box::new(Tone(instrument))
+                )
+                .is_none()
+        );
+        for onset in [0, 256] {
+            let mut controls = OscillatorControls {
+                instrument: Some(rustel_audio::InsertControls::new(instrument)),
+                ..OscillatorControls::default()
+            };
+            controls.effects[0] = Some(rustel_audio::InsertControls::new(effect));
+            let event = OnsetEvent::new(onset, 440.0, 0.5, 1.0).with_controls(controls);
+            assert!(backend.try_note_prepared(event));
+        }
+        let faulted = Box::new(Faulted(effect));
+        let next = Box::new(GainInsert {
+            key: effect,
+            gain: 0.5,
+        });
+        // Whether a block sounds: at the first note, with the prepared copy,
+        // in the fade and after it.
+        let mut sounded = [false; 4];
+        let before = Violations::capture();
+        let (installed, prepared) = tripwire::audio_scope(|| {
+            let block = |backend: &mut ScalarBackend, output: &mut [f32; 256]| {
+                backend.process_block(output, 128);
+                output.iter().any(|sample| *sample != 0.0)
+            };
+            let installed = backend.install_insert(slot, faulted);
+            sounded[0] = block(&mut backend, &mut output);
+            let prepared = backend.prepare_insert(slot, next);
+            sounded[1] = block(&mut backend, &mut output);
+            for _ in 0..3 {
+                sounded[2] |= block(&mut backend, &mut output);
+            }
+            sounded[3] = block(&mut backend, &mut output);
+            (installed, prepared)
+        });
+        let delta = Violations::capture().since(before);
+        assert!(
+            delta.clean(),
+            "the swap of a faulted copy allocated or freed in the callback: {delta:?}"
+        );
+        assert!(installed.is_none() && prepared.is_none());
+        assert_eq!(sounded, [false, false, true, true]);
+        assert!(
+            output.iter().all(|sample| *sample == 0.25),
+            "the stage does not play at the gain of the new copy: {:?}",
+            &output[..2]
+        );
         assert_eq!(backend.missing_insert_events(), 0);
     }
 }
@@ -1055,6 +1439,7 @@ fn bundled_sample_is_preloaded_and_processed_without_callback_allocation() {
     let generation = AtomicU64::new(1);
     let takeover = AtomicU64::new(0);
     let line_arm = AtomicU64::new(0);
+    let line_fired = AtomicU64::new(0);
     let stopped = AtomicBool::new(false);
     let mut output = [0.0f32; 128 * 2];
     let before = Violations::capture();
@@ -1069,6 +1454,7 @@ fn bundled_sample_is_preloaded_and_processed_without_callback_allocation() {
                 takeover_frame: &takeover,
                 takeover_cut: &AtomicU64::new(0),
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         )
@@ -1150,6 +1536,7 @@ fn live_ring_consumer_is_fixed_capacity_and_generation_filtered() {
     let generation = AtomicU64::new(2);
     let takeover = AtomicU64::new(0);
     let line_arm = AtomicU64::new(0);
+    let line_fired = AtomicU64::new(0);
     let stopped = AtomicBool::new(false);
     let mut backend = LiveScalarBackend::new(48_000, 8).expect("live scalar");
     let mut output = [0.0f32; 128 * 2];
@@ -1166,6 +1553,7 @@ fn live_ring_consumer_is_fixed_capacity_and_generation_filtered() {
                 takeover_frame: &takeover,
                 takeover_cut: &AtomicU64::new(0),
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         )
@@ -1208,6 +1596,7 @@ fn live_held_events_survive_future_breaks_and_generation_changes_without_allocat
         let generation = AtomicU64::new(1);
         let takeover = AtomicU64::new(0);
         let line_arm = AtomicU64::new(0);
+        let line_fired = AtomicU64::new(0);
         let stopped = AtomicBool::new(false);
         let mut backend = LiveScalarBackend::new(48_000, 2).expect("live scalar");
         let mut output = [0.0f32; 128 * 2];
@@ -1223,6 +1612,7 @@ fn live_held_events_survive_future_breaks_and_generation_changes_without_allocat
                     takeover_frame: &takeover,
                     takeover_cut: &AtomicU64::new(0),
                     line_arm: &line_arm,
+                    line_fired: &line_fired,
                 },
                 &stopped,
             )
@@ -1255,6 +1645,7 @@ fn live_held_events_survive_future_breaks_and_generation_changes_without_allocat
                     takeover_frame: &takeover,
                     takeover_cut: &AtomicU64::new(0),
                     line_arm: &line_arm,
+                    line_fired: &line_fired,
                 },
                 &stopped,
             )
@@ -1284,6 +1675,7 @@ fn live_held_events_survive_future_breaks_and_generation_changes_without_allocat
                     takeover_frame: &takeover,
                     takeover_cut: &AtomicU64::new(0),
                     line_arm: &line_arm,
+                    line_fired: &line_fired,
                 },
                 &stopped,
             )
@@ -1311,6 +1703,7 @@ fn live_held_events_survive_future_breaks_and_generation_changes_without_allocat
                     takeover_frame: &takeover,
                     takeover_cut: &AtomicU64::new(0),
                     line_arm: &line_arm,
+                    line_fired: &line_fired,
                 },
                 &stopped,
             )
@@ -1381,6 +1774,7 @@ fn live_ring_preserves_the_complete_oscillator_control_bundle() {
         insert_chain: None,
         effects: [None; rustel_audio::EFFECT_CHAIN],
         instrument: None,
+        lead: 0,
         lfos: [None; rustel_audio::MAX_VOICE_MODS],
         envs: [None; rustel_audio::MAX_VOICE_MODS],
         phaser: None,
@@ -1415,6 +1809,7 @@ fn live_ring_preserves_the_complete_oscillator_control_bundle() {
     let generation = AtomicU64::new(1);
     let takeover = AtomicU64::new(0);
     let line_arm = AtomicU64::new(0);
+    let line_fired = AtomicU64::new(0);
     let stopped = AtomicBool::new(false);
     let mut backend = LiveScalarBackend::new(48_000, 1).expect("live scalar");
     let mut output = [0.0f32; 128 * 2];
@@ -1430,6 +1825,7 @@ fn live_ring_preserves_the_complete_oscillator_control_bundle() {
                 takeover_frame: &takeover,
                 takeover_cut: &AtomicU64::new(0),
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         )
@@ -1522,6 +1918,7 @@ fn live_pending_slots_reuse_retired_event_storage_without_allocating() {
     let generation = AtomicU64::new(1);
     let takeover = AtomicU64::new(0);
     let line_arm = AtomicU64::new(0);
+    let line_fired = AtomicU64::new(0);
     let stopped = AtomicBool::new(false);
     let mut backend = LiveScalarBackend::new(48_000, 8).expect("live scalar");
     let mut output = [0.0f32; BLOCK_FRAMES as usize * 2];
@@ -1538,6 +1935,7 @@ fn live_pending_slots_reuse_retired_event_storage_without_allocating() {
                 takeover_frame: &takeover,
                 takeover_cut: &AtomicU64::new(0),
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         )
@@ -1580,6 +1978,7 @@ fn live_pending_slots_reuse_retired_event_storage_without_allocating() {
                 takeover_frame: &takeover,
                 takeover_cut: &AtomicU64::new(0),
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         )
@@ -1614,6 +2013,7 @@ fn live_voice_overflow_refuses_without_allocating_or_truncating_silently() {
     let generation = AtomicU64::new(1);
     let takeover = AtomicU64::new(0);
     let line_arm = AtomicU64::new(0);
+    let line_fired = AtomicU64::new(0);
     let stopped = AtomicBool::new(false);
     let mut backend = LiveScalarBackend::new(48_000, 1).expect("live scalar");
     let mut output = [0.0f32; 128 * 2];
@@ -1630,6 +2030,7 @@ fn live_voice_overflow_refuses_without_allocating_or_truncating_silently() {
                 takeover_frame: &takeover,
                 takeover_cut: &AtomicU64::new(0),
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         )
@@ -1655,6 +2056,7 @@ fn malformed_live_block_sizes_fail_silent_without_panicking_or_allocating() {
     let generation = AtomicU64::new(1);
     let takeover = AtomicU64::new(0);
     let line_arm = AtomicU64::new(0);
+    let line_fired = AtomicU64::new(0);
     let stopped = AtomicBool::new(false);
     let mut backend = LiveScalarBackend::new(48_000, 1).expect("live scalar");
     let mut output = [];
@@ -1671,6 +2073,7 @@ fn malformed_live_block_sizes_fail_silent_without_panicking_or_allocating() {
                 takeover_frame: &takeover,
                 takeover_cut: &AtomicU64::new(0),
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         )
@@ -1686,6 +2089,7 @@ fn malformed_live_block_sizes_fail_silent_without_panicking_or_allocating() {
                 takeover_frame: &takeover,
                 takeover_cut: &AtomicU64::new(0),
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         )
@@ -1801,6 +2205,7 @@ struct Handshake {
     takeover: AtomicU64,
     cut: AtomicU64,
     line_arm: AtomicU64,
+    line_fired: AtomicU64,
     stopped: AtomicBool,
 }
 
@@ -1813,6 +2218,28 @@ impl Handshake {
     }
 
     fn push(&self, onset_id: u64, generation: u64, target_frame: u64, duration_secs: f32) {
+        self.push_with(onset_id, generation, target_frame, duration_secs, |_| {});
+    }
+
+    /// The same note, with the controls `change` gives it.
+    fn push_with(
+        &self,
+        onset_id: u64,
+        generation: u64,
+        target_frame: u64,
+        duration_secs: f32,
+        change: impl FnOnce(&mut OscillatorControls),
+    ) {
+        let mut controls = OscillatorControls {
+            envelope: Envelope {
+                attack_secs: 0.001,
+                decay_secs: 0.001,
+                sustain: 1.0,
+                release_secs: 0.01,
+            },
+            ..OscillatorControls::default()
+        };
+        change(&mut controls);
         assert!(self.ring.push(AudioEvent {
             onset_id,
             generation,
@@ -1822,15 +2249,7 @@ impl Handshake {
             gain: 0.5,
             duration_secs,
             ui_visuals: 0,
-            controls: OscillatorControls {
-                envelope: Envelope {
-                    attack_secs: 0.001,
-                    decay_secs: 0.001,
-                    sustain: 1.0,
-                    release_secs: 0.01,
-                },
-                ..OscillatorControls::default()
-            },
+            controls,
             sample: None,
             wavetable: None,
             synth: None,
@@ -1854,6 +2273,7 @@ impl Handshake {
                     takeover_frame: &self.takeover,
                     takeover_cut: &self.cut,
                     line_arm: &self.line_arm,
+                    line_fired: &self.line_fired,
                 },
                 &self.stopped,
             )
@@ -1874,8 +2294,9 @@ impl Handshake {
 /// generation, an AtFlip flip's own drop horizon and a restart's past-due
 /// downbeat retimed to its floor, an edit's flip that keeps a rewind's arm
 /// and its countdown (pending and ring) for onsets activating after it, and
-/// one at the line that lets the arm go. Frame-driven, so the same on every
-/// platform.
+/// one at the line that lets the arm go. Notes aimed before their onsets by
+/// the latency of a plugin chain take an edit and a rewind too, and a
+/// partials note plays. Frame-driven, so the same on every platform.
 #[test]
 fn takeover_cut_and_line_arm_paths_do_not_allocate() {
     use rustel_audio::{LINE_ARM_WITHDRAWN, TakeoverCut};
@@ -1887,6 +2308,7 @@ fn takeover_cut_and_line_arm_paths_do_not_allocate() {
         takeover: AtomicU64::new(0),
         cut: AtomicU64::new(0),
         line_arm: AtomicU64::new(0),
+        line_fired: AtomicU64::new(0),
         stopped: AtomicBool::new(false),
     };
     let mut live = LiveScalarBackend::new(48_000, 8).expect("live scalar");
@@ -1978,6 +2400,47 @@ fn takeover_cut_and_line_arm_paths_do_not_allocate() {
     hs.flip(8, LINE4 + 4_800, TakeoverCut::None);
     hs.block(&mut live, LINE4);
     assert_eq!(live.generation(), 8);
+
+    // F: notes aimed 480 frames before their onsets, as through a plugin
+    // chain with that latency. An edit flips at 5248 with its takeover at
+    // 5760: the outgoing note aimed before the takeover with its onset after
+    // it is left out, and the incoming note on the takeover plays. Then an
+    // immediate rewind with a restart lead of 480 frames flips at 5632: the
+    // ghost of the old score is refused, and the downbeat past due lands its
+    // onset 480 frames after the floor, not late. A partials note plays
+    // after it.
+    const LEAD: u32 = 480;
+    let latent = |controls: &mut OscillatorControls| controls.lead = LEAD;
+    hs.flip(9, 5_760, TakeoverCut::None);
+    hs.push_with(14, 8, 5_600, 0.5, latent);
+    hs.push_with(15, 9, 5_760 - u64::from(LEAD), 0.5, latent);
+    let edited = hs.block(&mut live, 5_248);
+    assert_eq!((edited.accepted, edited.stale), (1, 1));
+    for start in [5_376, 5_504] {
+        hs.block(&mut live, start);
+    }
+    const FLIP2: u64 = 5_632;
+    hs.flip(10, FLIP2 + 9_600, TakeoverCut::AtFlip);
+    // The restart lead goes in the bits above the cut.
+    let cut = (u64::from(LEAD) << 2) | TakeoverCut::AtFlip as u64;
+    hs.cut.store(cut, Ordering::Release);
+    hs.push_with(16, 9, FLIP2 + 4_800, 0.5, latent);
+    hs.push_with(17, 10, FLIP2 - u64::from(LEAD), 0.5, latent);
+    let rewound = hs.block(&mut live, FLIP2);
+    assert_eq!(
+        (rewound.accepted, rewound.stale, rewound.late),
+        (1, 1, 0),
+        "the ghost is refused and the latent downbeat lands at its floor"
+    );
+    let wave = rustel_audio::register_partials(2, &[1.0, 0.5], &[0.0, 0.0]);
+    hs.push_with(18, 10, FLIP2 + 256, 0.01, |controls| {
+        controls.lead = LEAD;
+        controls.partials = Some(wave);
+    });
+    for start in (FLIP2 + 128..=FLIP2 + 1_024).step_by(128) {
+        hs.block(&mut live, start);
+    }
+    assert_eq!(live.generation(), 10);
 }
 
 #[test]
@@ -2027,12 +2490,14 @@ fn immediate_piano_chords_and_releases_are_allocation_free() {
     let takeover_frame = AtomicU64::new(0);
     let takeover_cut = AtomicU64::new(0);
     let line_arm = AtomicU64::new(0);
+    let line_fired = AtomicU64::new(0);
     let stopped = AtomicBool::new(false);
     let atomics = LiveFlipAtomics {
         generation: &generation,
         takeover_frame: &takeover_frame,
         takeover_cut: &takeover_cut,
         line_arm: &line_arm,
+        line_fired: &line_fired,
     };
     let event = |slot, off| AudioEvent {
         onset_id: u64::MAX,

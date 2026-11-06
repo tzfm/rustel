@@ -337,6 +337,7 @@ pub fn rows(figures: &MemoryFigures) -> Vec<Row> {
             ("input", audio.input),
             ("record", audio.record),
             ("reverbs", audio.reverbs),
+            ("send lines", audio.send_lines),
             ("backend at open", audio.backend),
             ("other", audio.other),
         ] {
@@ -1073,6 +1074,37 @@ mod tests {
                 "freed memory returns when stopped"
             ]
         );
+
+        // The send lines of a plugin chain with latency are a row of the
+        // audio part, after the reverbs, and the part still adds up.
+        let mut with_lines = figures();
+        with_lines.audio = with_lines.audio.map(|audio| AudioMemory {
+            reverbs: MIB,
+            send_lines: 2 * MIB,
+            ..audio
+        });
+        let lined = super::rows(&with_lines);
+        let audio: Vec<&Row> = lined
+            .iter()
+            .filter(|row| row.kind == RowKind::Detail(Detail::Audio))
+            .collect();
+        assert_eq!(
+            audio
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "event ring",
+                "reverbs",
+                "send lines",
+                "backend at open",
+                "other"
+            ]
+        );
+        assert_eq!(row(&lined, "send lines").bytes, Some(2 * MIB as u64));
+        let details: u64 = audio.iter().filter_map(|row| row.bytes).sum();
+        assert_eq!(Some(details), row(&lined, "audio output").bytes);
+        assert_eq!(row(&lined, "audio output").value, "≈ 29.0MB");
     }
 
     /// Kept samples have no total byte cap. Piano mode keeps no samples.

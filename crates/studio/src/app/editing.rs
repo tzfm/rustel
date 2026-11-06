@@ -313,7 +313,18 @@ impl App {
                 {
                     self.rebind_unchanged_score(scene, revision, Arc::clone(&source));
                     self.finish_evaluation_feedback(true);
-                    self.status = "unchanged - already playing (stop first to restart it)".into();
+                    // A plugin row with a fault: the press asks for the new
+                    // tries, and still evaluates nothing.
+                    #[cfg(feature = "vst")]
+                    let retried = self.retry_plugin_faults();
+                    #[cfg(not(feature = "vst"))]
+                    let retried = false;
+                    self.status = if retried {
+                        "unchanged - already playing · new tries asked for the plugin faults"
+                    } else {
+                        "unchanged - already playing (stop first to restart it)"
+                    }
+                    .into();
                     self.dirty_frame = true;
                     return Ok(());
                 }

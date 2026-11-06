@@ -273,7 +273,8 @@ impl ScalarBackend {
         for controls in kabel_controls(controls) {
             let until_frame =
                 (controls.end_secs.max(0.0) * f64::from(self.sample_rate)).ceil() as u64;
-            let until_frame = until_frame.saturating_add(256);
+            // The end counts from the file, and the clock from the pre-roll.
+            let until_frame = until_frame.saturating_add(256).saturating_add(self.preroll);
             if let Some(entry) = self
                 .kabel_programs
                 .iter_mut()
@@ -405,8 +406,10 @@ impl ScalarBackend {
         self.prepare_kabel_code(&event.controls)?;
         let compact = event.clone().map_kabel(CompactKabelControls::from);
         let sr = f64::from(self.sample_rate);
+        let preroll = self.preroll as f64;
+        // The times of the interval count from the file.
         let interval = |event: &OnsetEvent<CompactKabelControls>| {
-            let begin = event.onset_frame as f64 / sr;
+            let begin = (event.onset_frame as f64 - preroll) / sr;
             let end = kabel_controls(&event.controls)
                 .map(|kabel| kabel.end_secs)
                 .fold(

@@ -23,7 +23,7 @@ impl CallbackGate {
     pub(super) fn new() -> Self {
         Self {
             state: AtomicU8::new(CALLBACK_PENDING),
-            errors_in_flight: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -33,16 +33,18 @@ impl CallbackGate {
 
     pub(super) fn retire(&self) {
         // Retire before shared status is reused. Error writers never wait.
+        // A render in flight ends first, so the backend is the producer's
+        // when this returns.
         self.state.store(CALLBACK_RETIRED, Ordering::SeqCst);
-        while self.errors_in_flight.load(Ordering::SeqCst) != 0 {
+        while self.in_flight.load(Ordering::SeqCst) != 0 {
             std::thread::yield_now();
         }
     }
 
     pub(super) fn begin_error(&self) -> CallbackErrorGuard<'_> {
         // Retirement sees this writer, or its state check sees retirement.
-        self.errors_in_flight.fetch_add(1, Ordering::SeqCst);
-        CallbackErrorGuard(&self.errors_in_flight)
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        CallbackErrorGuard(&self.in_flight)
     }
 
     pub(super) fn activate(&self) -> Result<(), DevicePlaybackError> {
@@ -66,7 +68,11 @@ impl CallbackGate {
         T: Sample + FromSample<f32>,
     {
         tripwire::audio_scope(|| {
-            if self.is_active() {
+            // Retirement sees this render, or this check sees retirement.
+            // The guard drops also in a panic, so a render that panics holds
+            // no retirement.
+            let _in_flight = self.begin_error();
+            if self.state.load(Ordering::SeqCst) == CALLBACK_ACTIVE {
                 render(output);
             } else {
                 output.fill(T::from_sample(0.0));
@@ -150,6 +156,7 @@ impl ManualLiveOutput {
             gate: Arc::clone(&gate),
             tripwire_baseline: tripwire::Violations::capture(),
             backend_bytes: backend.prepared_bytes(),
+            backend: None,
         };
         let device = LiveScalarDevice::start_prepared(shared, options, prepared)?;
         Ok(Self {
@@ -258,6 +265,8 @@ impl LiveScalarDevice {
         let mut report = self.shared.report(self.stream_id);
         report.playhead_nanos = self.clock_nanos();
         report.plugin_workers = self.ready_plugin_workers();
+        report.plugin_restarts = self.plugin_restarts.load(Ordering::Relaxed);
+        report.restarts_waiting = self.restarts_in_flight();
         let violations = tripwire::Violations::capture()
             .since(self.tripwire_baseline)
             .since(self.tripwire_canaries);
@@ -315,6 +324,7 @@ impl LiveScalarDevice {
             input: self.shared.input.touched_bytes(),
             record: self.shared.record.touched_bytes(),
             reverbs: orbit_reverbs + stage_reverbs,
+            send_lines: self.send_lines_bytes.load(Ordering::Relaxed),
             backend: self.backend_bytes
                 + self
                     .kabel_cache

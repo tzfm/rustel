@@ -925,6 +925,15 @@ impl ScalarBackend {
         self.offline = true;
     }
 
+    /// Sets the pre-roll of a render: the file starts `frames` into the
+    /// clock of the backend, a whole number of 128-frame quanta. The onset
+    /// frames of the notes count from the clock, and their times count from
+    /// the file. Each clock read and each frame seed of a note takes the
+    /// pre-roll off, so a pre-roll changes no sample of the file.
+    pub fn set_preroll(&mut self, frames: u64) {
+        self.preroll = frames;
+    }
+
     /// Hand a stage reverb, generated off the audio thread, to the pool.
     /// Returns the box when the byte budget refuses it so the CALLER can free
     /// off the audio thread - dropping here would free IR partitions under the

@@ -128,6 +128,10 @@ pub struct LiveReverbBatch {
     /// The last insert each slot asked for in this turn.
     inserts: Vec<(crate::insert::InsertSlot, crate::insert::InsertKey)>,
     refused: u64,
+    /// The largest effect latency of the notes of this turn, in frames: the
+    /// wait the send lines of the output hold. See
+    /// [`crate::scalar::SendLines`].
+    latency: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -142,6 +146,20 @@ struct KabelReservation {
 struct KabelProgramReservation {
     id: rustel_kabel::ProgramId,
     pointer: usize,
+}
+
+/// A shipped copy that a restart of its plugin asks back: see
+/// `restart_inserts`.
+#[derive(Clone, Copy)]
+struct InsertRestart {
+    slot: crate::insert::InsertSlot,
+    key: crate::insert::InsertKey,
+    /// The time of the first ask.
+    asked: Instant,
+    /// The time of the last release, and whether it was forced.
+    released: Option<(Instant, bool)>,
+    /// The copy came back. It waits for the provider in `insert_waiting`.
+    returned: bool,
 }
 
 /// One continuously running output fed by the scheduler through a
@@ -177,6 +195,14 @@ pub struct LiveScalarDevice {
     /// has, by slot and key: see `release_inserts`.
     insert_released:
         std::sync::Mutex<Vec<(crate::insert::InsertSlot, crate::insert::InsertKey, Instant)>>,
+    /// The shipped copies a restart of their plugin asks back: see
+    /// `restart_inserts`.
+    insert_restarting: std::sync::Mutex<Vec<InsertRestart>>,
+    /// The box addresses of the entries of `insert_cache` whose copy
+    /// faulted and has a new copy on its way: see `replace_inserts`.
+    insert_replaced: std::sync::Mutex<Vec<usize>>,
+    /// The restart pairs the output took into `insert_restarting`.
+    plugin_restarts: AtomicU64,
     /// Builds an insert outside the callback. With no provider, a note that
     /// asks for an insert plays dry.
     insert_provider: std::sync::Mutex<Option<Arc<crate::insert::InsertProvider>>>,
@@ -192,6 +218,17 @@ pub struct LiveScalarDevice {
     /// Set when the backend of the stream has the plugin workers. A recycle
     /// clears it, and the next turn ships them to the new backend.
     plugin_pool_shipped: AtomicBool,
+    /// The reach of the send lines shipped to the backend of the stream, in
+    /// frames: see [`crate::scalar::SendLines`]. A close clears it, and the
+    /// next turn with a chain with latency ships lines to the new backend.
+    send_lines_reach: std::sync::atomic::AtomicU32,
+    /// The size of the send lines of `send_lines_reach`, in bytes: see
+    /// [`crate::scalar::SendLines::bytes`]. A close clears it with the
+    /// reach.
+    send_lines_bytes: std::sync::atomic::AtomicUsize,
+    /// The cell of the restart lead of the score: see
+    /// [`Self::set_restart_lead`]. A lock of the producer only.
+    restart_lead_cell: std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicU32>>>,
     shared: LiveShared,
     sample_rate: u32,
     channels: u16,
@@ -212,6 +249,10 @@ pub struct LiveScalarDevice {
     /// What the callback's backend wrote when it was prepared, read before
     /// the callback took it: see [`LiveScalarBackend::prepared_bytes`].
     backend_bytes: usize,
+    /// The backend of the stream. The callback uses it until it retires,
+    /// then a close gives each insert of it back on the producer: see
+    /// [`Self::hand_back_inserts`]. None for a manual output.
+    backend: Option<Arc<BackendCell>>,
 }
 
 /// What an open output holds in memory, as the producer can see it without
@@ -232,6 +273,10 @@ pub struct LiveDeviceMemory {
     /// measured when generated. A stage reverb the callback's budget
     /// refuses is freed and not counted.
     pub reverbs: usize,
+    /// The send lines shipped to the callback for the plugin chains with
+    /// latency: see [`crate::scalar::SendLines`]. The lines of a render are
+    /// not here.
+    pub send_lines: usize,
     /// What the backend wrote when it was prepared.
     pub backend: usize,
     /// The master's analysis tap and each visual tap opened so far.
@@ -328,6 +373,10 @@ pub struct LiveDeviceReport {
     /// Plugin jobs that ran late while the callback waited for them. Each
     /// sends its worker into a cool-down.
     pub plugin_late_jobs: u64,
+    /// The copies a restart of their plugin asked back, each one time.
+    pub plugin_restarts: u64,
+    /// A copy that a restart asked back is not in the output again yet.
+    pub restarts_waiting: bool,
 }
 
 /// Why a live output cannot be trusted to report callback allocations.
@@ -404,7 +453,8 @@ struct LiveShared {
     /// rewind), or a cut at the takeover frame (a quantised rewind, where
     /// the countdown plays). The consumer reads it once at the generation
     /// flip, with the takeover frame, before the new generation admits
-    /// anything.
+    /// anything. The bits from bit 2 up hold the restart lead of the
+    /// cutover: see [`LiveScalarDevice::set_restart_lead`].
     takeover_cut: Arc<AtomicU64>,
     /// A launch's line, armed before its generation exists. The launch arms
     /// it at fire time, so the consumer cuts the outgoing rendition at the
@@ -424,6 +474,11 @@ struct LiveShared {
     /// ([`LiveScalarDevice::set_generation`]). A withdrawn arm stores
     /// [`crate::LINE_ARM_WITHDRAWN`] ([`LiveScalarDevice::clear_line_arm`]).
     line_arm: Arc<AtomicU64>,
+    /// The line arm word the callback fired, 0 when none fired since the
+    /// last flip. The callback fires an arm the lead of the plugin chains
+    /// before its line: see [`LiveScalarDevice::fired_line_frame`]. The
+    /// callback writes it at the fire, before the block renders.
+    line_fired: Arc<AtomicU64>,
     /// Asked for by the interface: silence what is sounding at the next
     /// block. A reload never does this - an edit that cut its own voices
     /// would click - so auditioning asks for it explicitly.
@@ -619,10 +674,47 @@ const CALLBACK_RETIRED: u8 = 3;
 /// Pending callbacks must not consume assets or change the running clock.
 struct CallbackGate {
     state: AtomicU8,
-    errors_in_flight: AtomicUsize,
+    /// The renders and the error reports that run now. Retirement waits
+    /// until none runs.
+    in_flight: AtomicUsize,
 }
 
 struct CallbackErrorGuard<'a>(&'a AtomicUsize);
+
+/// The backend of a stream, which its callback and the device share. One
+/// thread at a time uses it: the callback while it renders, until
+/// [`CallbackGate::retire`] returns, then the producer. So a close gives each
+/// insert of the backend back on the producer.
+struct BackendCell(std::cell::UnsafeCell<LiveScalarBackend>);
+
+// SAFETY: one thread at a time uses the backend. The callback uses it only in
+// the render of `CallbackGate::render_or_silence`, which counts itself in
+// flight before it reads the state, and renders only in the active state.
+// `retire` stores the retired state, then waits until no render is in
+// flight, also after a render that panicked. Both sides use SeqCst, so each
+// render ends before `retire` returns, or it reads the retired state and
+// leaves the backend alone. The producer uses the backend only after `retire`
+// returned. The backend is `Send`.
+unsafe impl Sync for BackendCell {}
+
+impl BackendCell {
+    fn new(backend: LiveScalarBackend) -> Self {
+        Self(std::cell::UnsafeCell::new(backend))
+    }
+
+    /// The backend, for the thread that uses it now.
+    ///
+    /// # Safety
+    ///
+    /// The calling thread uses the backend alone: the callback in its render,
+    /// or the producer after [`CallbackGate::retire`] returned. No other
+    /// reference to the backend lives.
+    #[allow(clippy::mut_from_ref, reason = "one thread at a time uses the backend")]
+    unsafe fn get(&self) -> &mut LiveScalarBackend {
+        // SAFETY: the caller uses the backend alone, as this function requires.
+        unsafe { &mut *self.0.get() }
+    }
+}
 
 enum OutputHandle {
     Native(cpal::Stream),
@@ -639,6 +731,9 @@ struct PreparedLiveOutput {
     /// See [`LiveScalarDevice::memory`]: read here, the last moment the
     /// backend is not the callback's.
     backend_bytes: usize,
+    /// The backend the callback renders with. The device takes it at the
+    /// activation. None for a manual output, which keeps its own backend.
+    backend: Option<Arc<BackendCell>>,
 }
 
 /// The silent output's handle: its stop flag and the thread running it.

@@ -447,27 +447,50 @@ impl State {
         self.program()
     }
 
+    /// The copy of the Csound program of `key` at `rate`. A copy that does
+    /// not start gives its error to [`Self::take_errors`].
+    fn instance(&self, key: InsertKey, rate: u32) -> Option<Box<dyn rustel_audio::OrbitInsert>> {
+        let program = self
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .revisions
+            .get(&key)
+            .cloned()?;
+        match program.instance(rate) {
+            Ok(instance) => Some(instance),
+            Err(message) => {
+                let mut store = self.0.lock().unwrap_or_else(|error| error.into_inner());
+                if store.errors.len() < 64 && !store.errors.contains(&message) {
+                    store.errors.push(message);
+                }
+                None
+            }
+        }
+    }
+
+    /// [`Self::provider`] for a render to a file: each plugin key goes to the
+    /// render provider of the plugin host, which waits for each build while
+    /// `stop` gives false. See [`crate::vst::render_provider`].
+    #[cfg(feature = "vst")]
+    pub(crate) fn render_provider(
+        &self,
+        stop: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Arc<InsertProvider> {
+        let (state, plugins) = (self.clone(), crate::vst::render_provider(stop));
+        Arc::new(move |key, rate, slot| {
+            if key.plugin == rustel_csound::PLUGIN_ID {
+                return state.instance(key, rate);
+            }
+            plugins.as_ref()?(key, rate, slot)
+        })
+    }
+
     pub(crate) fn provider(&self, wait: bool) -> Arc<InsertProvider> {
         let state = self.clone();
         Arc::new(move |key, rate, slot| {
             if key.plugin == rustel_csound::PLUGIN_ID {
-                let program = state
-                    .0
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .revisions
-                    .get(&key)
-                    .cloned()?;
-                return match program.instance(rate) {
-                    Ok(instance) => Some(instance),
-                    Err(message) => {
-                        let mut store = state.0.lock().unwrap_or_else(|error| error.into_inner());
-                        if store.errors.len() < 64 && !store.errors.contains(&message) {
-                            store.errors.push(message);
-                        }
-                        None
-                    }
-                };
+                return state.instance(key, rate);
             }
             #[cfg(feature = "vst")]
             {

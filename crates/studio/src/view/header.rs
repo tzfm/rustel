@@ -266,6 +266,7 @@ impl Widget for Header<'_, '_> {
             // whether there is still anything to hear.
             let total = glance.seconds.max(0.0) as u64;
             let how_far = match glance.percent {
+                _ if glance.preparing => "preparing".to_owned(),
                 Some(percent) => format!("{percent}%"),
                 None => format!("{}:{:02}", total / 60, total % 60),
             };
@@ -965,6 +966,7 @@ mod tests {
             seconds: 42.0,
             percent: Some(42),
             peaks,
+            preparing: false,
         };
         chrome.exporting = Some(&glance);
         let mut buffer = Buffer::empty(area);
@@ -974,6 +976,19 @@ mod tests {
         let at = text.find("○ take").unwrap();
         let cell = text[..at].chars().count() as u16;
         assert_eq!(buffer.cell((cell, 0)).unwrap().fg, theme.muted);
+        // Before its first frame the render prepares, with no time.
+        let preparing = ExportGlance {
+            scene_name: "drums".into(),
+            seconds: 0.0,
+            percent: None,
+            peaks: [0.0; crate::export::SCOPE_COLUMNS],
+            preparing: true,
+        };
+        chrome.exporting = Some(&preparing);
+        let mut buffer = Buffer::empty(area);
+        Header { chrome: &chrome }.render(area, &mut buffer);
+        let text = text_of(&buffer);
+        assert!(text.contains("⇣ drums preparing ▁"), "{text}");
     }
 
     #[test]

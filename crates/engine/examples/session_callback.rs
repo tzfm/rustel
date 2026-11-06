@@ -55,12 +55,14 @@ fn main() -> Result<(), String> {
     let takeover_frame = AtomicU64::new(0);
     let takeover_cut = AtomicU64::new(0);
     let line_arm = AtomicU64::new(0);
+    let line_fired = AtomicU64::new(0);
     let stopped = AtomicBool::new(false);
     let flip = LiveFlipAtomics {
         generation: &generation,
         takeover_frame: &takeover_frame,
         takeover_cut: &takeover_cut,
         line_arm: &line_arm,
+        line_fired: &line_fired,
     };
     let mut output = [0.0; 128 * 2];
     let total_frames = (window_secs * f64::from(sample_rate)) as u64;

@@ -69,6 +69,10 @@ pub(super) struct RecoveryPrebake {
 
 struct RecoveryCheckpoint {
     source: Option<(Arc<str>, bool)>,
+    /// The document of `source`: the replay reads the source in it. See
+    /// [`Session::set_plugin_document`].
+    #[cfg(feature = "vst")]
+    document: u64,
     prebakes: Arc<Vec<RecoveryPrebake>>,
     csound: crate::CsoundSnapshot,
     settings: RuntimeSettings,
@@ -204,8 +208,17 @@ impl Session {
             .audible_source
             .as_ref()
             .map_or(csound, |source| source.csound.clone());
+        #[cfg(feature = "vst")]
+        let document = self.lanes.document();
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        let document = self
+            .audible_source
+            .as_ref()
+            .map_or(document, |source| source.document);
         RecoveryCheckpoint {
             source,
+            #[cfg(feature = "vst")]
+            document,
             settings,
             prebakes: self.recovery_prebakes.clone(),
             csound,
@@ -261,7 +274,8 @@ impl Session {
         // values source read the chains of this session, so the rebuilt
         // session keeps the same chains, with the flag of their slider links.
         // Each lane keeps its number, so the replayed score has the chains it
-        // had. A plugin call of an evaluation before stays known.
+        // had. A plugin call of an evaluation before stays known. The chains
+        // keep their lead.
         #[cfg(feature = "vst")]
         {
             let live = self.plugins_live.load(std::sync::atomic::Ordering::Relaxed);
@@ -271,13 +285,19 @@ impl Session {
             fresh.chains = self.chains.clone();
             fresh.slider_links = self.slider_links.clone();
             fresh.lanes = std::mem::take(&mut self.lanes);
+            fresh.plugin_lead = self.plugin_lead;
+            fresh.cover_lead = self.cover_lead;
         }
         // An edit that waits for its plugin copies waits on, with its plan in
-        // the chains: the replay plays the score in play.
+        // the chains: the replay plays the score in play. A candidate that a
+        // panic stopped leaves no plan lead. The replay has no seam. The
+        // output reads the restart lead from the same cell.
         #[cfg(all(feature = "vst", feature = "device-audio"))]
         {
             fresh.plugin_wait = self.plugin_wait;
             fresh.plugin_hold = self.plugin_hold.take();
+            fresh.takeover_added = self.takeover_added;
+            fresh.restart_lead = Arc::clone(&self.restart_lead);
         }
         fresh.stop_when_silent = self.stop_when_silent;
         fresh.export_limiter = self.export_limiter;
@@ -341,6 +361,10 @@ impl Session {
             // Setup restores globals. The audible score keeps its later settings.
             self.js.adopt_runtime_settings(&settings);
             if let Some((source, mini)) = &checkpoint.source {
+                // The source reads in its document, so each of its lanes
+                // keeps its number and its chain.
+                #[cfg(feature = "vst")]
+                self.lanes.set_reading(checkpoint.document);
                 self.reload_at_cancellable(source, *mini, now, &NEVER_CANCELLED)?;
                 // Score evaluation resets join. Restore the later host selection.
                 let join = settings.with(rustel_core::compose::default_alignment);
@@ -370,6 +394,8 @@ impl Session {
                     cps: checkpoint.cps,
                     cycle_zero_time: now - checkpoint.cycle / checkpoint.cps,
                     evaluated_cycle: self.installed_cycle,
+                    #[cfg(feature = "vst")]
+                    document: checkpoint.document,
                 });
             }
             return Ok(checkpoint.source.is_some());
@@ -488,6 +514,8 @@ mod tests {
         let source = GOOD.to_owned();
         #[cfg(feature = "vst")]
         let source = {
+            // The source plays in document 7.
+            session.set_plugin_document(7);
             let source = format!("$: {GOOD}.vst('Delay').orbit(1)");
             session.evaluate(&source).expect("plugin source");
             // A new lane above: the plugin lane keeps its number.
@@ -497,6 +525,9 @@ mod tests {
         };
         #[cfg(feature = "vst")]
         let chain = super::super::tests::plugin_chain(&session);
+        // The next text of the host is of document 8.
+        #[cfg(feature = "vst")]
+        session.set_plugin_document(8);
         // The session plays through the plugins of a live output.
         #[cfg(feature = "vst")]
         session
@@ -506,9 +537,21 @@ mod tests {
         session
             .plugin_rate
             .store(44_100, std::sync::atomic::Ordering::Relaxed);
-        // The host of the output plays each edit at once.
+        // The host of the output plays each edit at once. A look saw a
+        // plugin chain with 0.25 s of latency, and the output reads its
+        // restart lead from the cell of the session.
         #[cfg(all(feature = "vst", feature = "device-audio"))]
         session.set_plugin_wait(false);
+        #[cfg(feature = "vst")]
+        session.set_plugin_lead_for_test(0.25);
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        let restart_lead = Arc::clone(&session.restart_lead);
+        // The seam of a candidate with a chain of 1 s set its plan lead, and
+        // a panic stops the candidate before its commit.
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        {
+            session.plan_lead = Some(1.0);
+        }
         let transport = session.transport();
         let generation = session.generation();
         session.inject_panic_for_test(SessionPanicPoint::Query);
@@ -518,7 +561,8 @@ mod tests {
         assert_panic(error, "Query");
         assert_eq!(session.active_source(), Some(source.as_str()));
         // The rebuilt session keeps the chains its output reads. A new
-        // registry gives a new number.
+        // registry gives a new number. The replay reads the source in its
+        // document.
         #[cfg(feature = "vst")]
         assert_eq!(super::super::tests::plugin_chain(&session), chain);
         #[cfg(feature = "vst")]
@@ -527,6 +571,8 @@ mod tests {
             "#0",
             "the rebuilt session lost its lanes"
         );
+        #[cfg(feature = "vst")]
+        assert_eq!(session.lanes.document(), 7, "the document of the source");
         #[cfg(feature = "vst")]
         assert!(
             Arc::ptr_eq(
@@ -555,6 +601,25 @@ mod tests {
             !session.plugin_wait,
             "the rebuilt session lost the wait setting of its host"
         );
+        #[cfg(feature = "vst")]
+        assert_eq!(
+            session.plugin_lead(),
+            0.25,
+            "the replay keeps the lead of its chains"
+        );
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        {
+            assert!(
+                Arc::ptr_eq(&session.restart_lead, &restart_lead),
+                "the output reads the restart lead from another cell"
+            );
+            let frames = || restart_lead.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(frames(), 11_025, "0.25 s at 44.1 kHz");
+            // An output that opens again at another rate.
+            session.set_plugin_rate(48_000);
+            assert_eq!(frames(), 12_000, "0.25 s at 48 kHz");
+            session.set_plugin_rate(44_100);
+        }
         assert!(Arc::ptr_eq(&session.transport(), &transport));
         assert!(session.generation() > generation);
         // Recovery resumes after the time the rebuild took, so a slow machine
@@ -567,6 +632,12 @@ mod tests {
                 .is_empty()
         });
         assert!(scheduled, "the restored score never scheduled");
+        // The table reads in the document of the source after the replay.
+        #[cfg(feature = "vst")]
+        {
+            session.evaluate(&source).expect("the source again");
+            assert_eq!(session.lanes.document(), 7);
+        }
     }
 
     #[test]
@@ -1399,6 +1470,8 @@ mod tests {
             let relaxed = std::sync::atomic::Ordering::Relaxed;
             session.plugins_live.store(true, relaxed);
             session.plugin_rate.store(48_000, relaxed);
+            // The audible plugin score is of document 1.
+            session.set_plugin_document(1);
             let source = r#"$: s("sine").vst("Delay").orbit(1)"#;
             session.evaluate(source).expect("audible plugin source");
             session
@@ -1425,11 +1498,14 @@ mod tests {
                 .expect("move to three");
             assert_eq!(plugin_note(&session)["__rustel_lane"], "#0");
             assert_eq!(plugin_chain(&session), chain);
-            // A score with no plugin lane is not audible too. The rollback
-            // gives the plugin lane the number it had.
+            // A score of document 2 with no plugin lane is not audible too.
+            // The rollback reads in document 1, and gives the plugin lane
+            // the number it had.
+            session.set_plugin_document(2);
             session
                 .reload_at(other, false, 0.25)
                 .expect("no plugin lane");
+            assert_eq!(session.lanes.document(), 2);
             assert_eq!(
                 session
                     .rollback_to_previous_source(0.3)
@@ -1439,6 +1515,7 @@ mod tests {
             assert_eq!(session.active_source(), Some(source));
             assert_eq!(plugin_note(&session)["__rustel_lane"], "#0");
             assert_eq!(plugin_chain(&session), chain);
+            assert_eq!(session.lanes.document(), 1);
 
             // A plugin with no copy ready. An edit waits, and a rollback in
             // the same state plays at once. The commit of the rollback reads
@@ -1465,6 +1542,40 @@ mod tests {
             assert_eq!(rollback.expect("rollback"), RollbackAttempt::Applied);
             assert_eq!(session.active_source(), Some(edit.as_str()));
             assert!(!session.holds_edit(&edit));
+
+            // A query panic while 2 plays and 1 is audible replays the score
+            // of 1 in document 1, and the plugin lane keeps its number.
+            let mut session = Session::new().expect("session");
+            session.set_direct_diagnostic_logging(false);
+            session.plugins_live.store(true, relaxed);
+            session.plugin_rate.store(48_000, relaxed);
+            session.set_plugin_document(1);
+            session.evaluate(source).expect("audible plugin source");
+            session
+                .mark_audible_generation(session.generation())
+                .expect("retain playing source");
+            session.set_plugin_document(2);
+            session
+                .reload_at(other, false, 0.1)
+                .expect("no plugin lane");
+            session.inject_panic_for_test(SessionPanicPoint::Query);
+            let error = session
+                .schedule_through(0.1, 0.6)
+                .expect_err("scheduler query panics");
+            assert_panic(error, "Query");
+            assert_eq!(session.active_source(), Some(source));
+            assert_eq!(session.lanes.document(), 1);
+            assert_eq!(plugin_note(&session)["__rustel_lane"], "#0");
+            // The replayed score stays the audible score of document 1, so a
+            // second panic replays it in document 1 too.
+            session.set_plugin_document(2);
+            session.inject_panic_for_test(SessionPanicPoint::Evaluation);
+            let error = session
+                .reload_at(other, false, 0.7)
+                .expect_err("evaluation panics");
+            assert_panic(error, "Evaluation");
+            assert_eq!(session.active_source(), Some(source));
+            assert_eq!(session.lanes.document(), 1);
         }
     }
 
@@ -1620,6 +1731,157 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The takeover of an edit waits the lead of the plugin chains, inside
+    /// the cover of the score in play. A publication inside the last lead
+    /// before the takeover is refused, and the edit rolls back. A takeover
+    /// the cover capped adds less lead, and goes out later. Through a live
+    /// output, an edit takes out a lane of the fixture Delay of 480 frames
+    /// and publishes more than the lead before its takeover. A note of the
+    /// lane after the takeover starts its lead early, before the takeover,
+    /// and it does not sound.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    #[test]
+    fn takeover_freshness_counts_the_lead_the_takeover_added() {
+        const PLAYING: &str = "$: note(48).s('sine').fast(8)\n$: note(60).s('triangle').fast(8)";
+        const EDIT: &str = "$: note(48).s('sine').fast(8)";
+        // With a cover, the takeover adds the lead of 0.1 s: at 0.225 s,
+        // frame 10 800. With no cover it adds nothing: at 0.125 s, frame
+        // 6 000.
+        for (covered, publication, published) in [
+            (true, 0.1, Some(10_800)),
+            (true, 0.15, None),
+            (false, 0.1, Some(6_000)),
+        ] {
+            let mut session = Session::new().expect("session");
+            session.set_continuity_margin(0.125);
+            session.evaluate(PLAYING).expect("the score in play");
+            let original = session.generation();
+            session
+                .mark_audible_generation(original)
+                .expect("replay target");
+            session.set_plugin_lead_for_test(0.1);
+            if covered {
+                session.schedule_through(0.0, 0.0).expect("the cover");
+            }
+            session.reload_at(EDIT, false, 0.0).expect("the edit");
+            let candidate = session.generation();
+            let mut producer =
+                crate::LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+            producer.arm_replacement(original, candidate);
+            let mut clocks = [0.0, publication, 0.5].into_iter();
+            let mut takeovers = Vec::new();
+            let mut events = Vec::new();
+            let result = producer.step_unwatched_with_clock_and_cutover(
+                &mut session,
+                || clocks.next().unwrap_or(0.5),
+                48_000,
+                |generation, frame, _cut| takeovers.push((generation, frame)),
+                |event| {
+                    events.push(event);
+                    true
+                },
+            );
+            match published {
+                Some(frame) => {
+                    result.expect("a window in time");
+                    assert_eq!(takeovers, [(candidate, frame)]);
+                    assert!(!events.is_empty(), "the edit plays its lane");
+                }
+                None => {
+                    let error = result.expect_err("a window inside the last lead");
+                    assert!(error.to_string().contains("takeover"), "{error}");
+                    assert!(takeovers.is_empty() && events.is_empty());
+                    assert_eq!(session.active_source(), Some(PLAYING));
+                }
+            }
+        }
+
+        // Through a live output. The lane through the fixture Delay of 480
+        // frames is on the left, and the lane the edit keeps on the right. At
+        // the default half cycle a second each lane has a note each 6 000
+        // frames, from cycle zero on frame 48 000. The edit at frame 70 656
+        // publishes at once and takes over after the margin and the lead, on
+        // frame 71 616. The note of the left lane on frame 72 000 starts 480
+        // frames early, before the takeover. It does not sound.
+        const EDIT_FRAME: usize = 70_656;
+        let (_one, folder) = fixture_plugins();
+        let presets = folder.path().join("presets");
+        let presets = presets.join(rustel_vst3_fixture::NAME);
+        std::fs::create_dir_all(&presets).expect("preset folder");
+        let delay = rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.1171875);
+        std::fs::write(presets.join("Delay.vstpreset"), delay).expect("preset file");
+        let kept = "$: note(\"c3*16\").s(\"sine\").clip(0.1).pan(1).orbit(2)";
+        let playing = format!(
+            "{kept}\n$: note(\"c4*16\").s(\"triangle\").clip(0.1).pan(0)\
+             .vst(\"rustel fixture\", {{ preset: \"delay\" }})"
+        );
+        let mut session = Session::new().expect("session");
+        session.set_direct_diagnostic_logging(false);
+        let library = crate::samples::SampleLibrary::empty();
+        session.set_sample_library_for_test(Arc::new(library));
+        session.set_schedule_lead(0.0);
+        session.set_continuity_margin(0.01);
+        session.evaluate(&playing).expect("the score in play");
+        let original = session.generation();
+        let mut output =
+            rustel_audio::device::ManualLiveOutput::new(48_000, original).expect("output");
+        session.attach_plugins(output.device());
+        // The copy of the plugin is ready, so the look reads its latency.
+        let started = Instant::now();
+        while session.plugins_pending(0.0, 1.0, Duration::from_secs(1)) > 0 {
+            assert!(started.elapsed() < Duration::from_secs(20), "no copy");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        session.restart_transport_at(1.0 - session.plugin_lead());
+        let mut producer =
+            crate::LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+        let (mut takeovers, mut aimed, mut pcm) = (Vec::new(), Vec::new(), Vec::new());
+        let mut block = [0.0_f32; 256];
+        while pcm.len() < 96_000 * 2 {
+            let device = output.device();
+            if pcm.len() / 2 == EDIT_FRAME {
+                let now = device.clock_seconds();
+                session.reload_at(kept, false, now).expect("the edit");
+                producer.arm_replacement(original, session.generation());
+            }
+            producer
+                .step_unwatched_with_clock_and_cutover_and_preparation(
+                    &mut session,
+                    || device.clock_seconds(),
+                    48_000,
+                    |_| Ok(rustel_audio::KabelPublication::default()),
+                    |events| rustel_audio::LiveReverbBatch::install_inserts(device, events),
+                    |generation, takeover, cut| {
+                        takeovers.push((generation, takeover));
+                        device.set_generation(generation, takeover, cut);
+                    },
+                    |event| {
+                        if event.controls.lead > 0 {
+                            aimed.push((event.target_frame, event.controls.lead));
+                        }
+                        device.push(event)
+                    },
+                )
+                .expect("a turn");
+            output.render(&mut block);
+            pcm.extend_from_slice(&block);
+        }
+        assert_eq!(takeovers, [(session.generation(), 71_616)]);
+        let premise = "test premise: a note aimed before the takeover";
+        assert!(aimed.contains(&(71_520, 480)), "{premise}");
+        let frames = pcm.as_chunks::<2>().0.iter();
+        let (left, right) = frames
+            .map(|[left, right]| (*left, *right))
+            .unzip::<_, _, Vec<_>, Vec<_>>();
+        let sounds = |samples: &[f32]| samples.iter().any(|sample| sample.abs() > 1e-6);
+        assert!(sounds(&left[..EDIT_FRAME]), "test premise: the lane plays");
+        assert!(
+            !sounds(&left[EDIT_FRAME..]),
+            "a note of the lane the edit took out"
+        );
+        assert!(sounds(&right[71_616..]), "the edit plays its lane");
     }
 
     #[cfg(feature = "device-audio")]

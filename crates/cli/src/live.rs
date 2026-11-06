@@ -3286,6 +3286,7 @@ pub(super) fn play_live(
                 "plugin_jobs_inline": report.plugin_jobs_inline,
                 "plugin_join_wait_nanos": report.plugin_join_wait_nanos,
                 "plugin_late_jobs": report.plugin_late_jobs,
+                "plugin_restarts": report.plugin_restarts,
                 "plugin_worker_busy_nanos": report.realtime_load.worker_busy_nanos,
                 "midi": midi_report,
                 "realtime_metrics": "available"
@@ -3330,6 +3331,7 @@ fn live_device_report_value(report: rustel_audio::LiveDeviceReport) -> serde_jso
         "plugin_jobs_inline": report.plugin_jobs_inline,
         "plugin_join_wait_nanos": report.plugin_join_wait_nanos,
         "plugin_late_jobs": report.plugin_late_jobs,
+        "plugin_restarts": report.plugin_restarts,
     })
 }
 

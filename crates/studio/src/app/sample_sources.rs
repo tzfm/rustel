@@ -107,19 +107,32 @@ struct SourceRows {
 }
 
 impl SourceRows {
-    fn measure(mut self, library: &rustel_runtime::samples::SampleLibrary) -> Self {
+    /// The counts of each row. The walk opens a cache file for each file of
+    /// a pack, so it ends early once `stop` is true: no one reads its rows.
+    fn measure(
+        mut self,
+        library: &rustel_runtime::samples::SampleLibrary,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Self {
+        let stopped = || stop.load(std::sync::atomic::Ordering::Relaxed);
         let manifests_settled = library.manifests_pending() == 0;
         let reports = library.global_source_reports();
         for shipped in &mut self.shipped {
+            if stopped() {
+                return self;
+            }
             let (sounds, urls) = library.default_source_files(&shipped.source);
             shipped.sounds = sounds;
             shipped.files = urls.len();
             shipped.seen_files.extend(urls);
-            (shipped.cached_files, shipped.cache_bytes) =
-                library.count_cached_urls(shipped.seen_files.iter());
+            let seen = shipped.seen_files.iter().take_while(|_| !stopped());
+            (shipped.cached_files, shipped.cache_bytes) = library.count_cached_urls(seen);
             shipped.counts_ready = shipped.files > 0 || manifests_settled;
         }
         for user in &mut self.users {
+            if stopped() {
+                return self;
+            }
             let (sounds, urls) = library.import_source_files(&user.spec);
             user.sounds = sounds;
             user.files = urls.len();
@@ -128,8 +141,8 @@ impl SourceRows {
                 user.cache_bytes = 0;
             } else {
                 user.seen_files.extend(urls);
-                (user.cached_files, user.cache_bytes) =
-                    library.count_cached_urls(user.seen_files.iter());
+                let seen = user.seen_files.iter().take_while(|_| !stopped());
+                (user.cached_files, user.cache_bytes) = library.count_cached_urls(seen);
             }
             // A refetch keeps the previous banks while its new list loads.
             user.counts_ready = user.local
@@ -145,23 +158,37 @@ impl SourceRows {
 }
 
 /// One source walk at a time. Invalidated work is drained before another starts.
+/// The walk stops when its measurement drops, as at the end of the app: the
+/// walk holds the sample library, and so the loader threads of the library.
 pub(super) struct SourceMeasurement {
     receiver: std::sync::mpsc::Receiver<SourceRows>,
     invalidated: bool,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SourceMeasurement {
-    fn spawn(measure: impl FnOnce() -> SourceRows + Send + 'static) -> std::io::Result<Self> {
+    fn spawn(
+        measure: impl FnOnce(&std::sync::atomic::AtomicBool) -> SourceRows + Send + 'static,
+    ) -> std::io::Result<Self> {
         let (sender, receiver) = std::sync::mpsc::channel();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
         std::thread::Builder::new()
             .name("sample-source-counts".into())
             .spawn(move || {
-                let _ = sender.send(measure());
+                let _ = sender.send(measure(&stopped));
             })?;
         Ok(Self {
             receiver,
             invalidated: false,
+            stop,
         })
+    }
+}
+
+impl Drop for SourceMeasurement {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -529,7 +556,8 @@ impl App {
                 Vec::new()
             },
         };
-        if let Ok(measurement) = SourceMeasurement::spawn(move || rows.measure(&library)) {
+        if let Ok(measurement) = SourceMeasurement::spawn(move |stop| rows.measure(&library, stop))
+        {
             self.source_measure = Some(measurement);
             self.source_refresh = SourceRefresh::default();
         }
@@ -1540,7 +1568,7 @@ mod tests {
         rows.shipped[0].counts_ready = true;
         let (release, blocked) = std::sync::mpsc::channel();
         app.source_measure = Some(
-            SourceMeasurement::spawn(move || {
+            SourceMeasurement::spawn(move |_| {
                 blocked.recv_timeout(Duration::from_secs(5)).unwrap();
                 rows
             })
@@ -1565,6 +1593,28 @@ mod tests {
         assert_eq!(app.shipped_sources[0].cache, Some(progress));
         assert!(app.source_measure.is_some(), "one follow-up walk is queued");
         assert!(!app.source_refresh.shipped);
+    }
+
+    /// A walk ends when its measurement drops, as at the end of the app: a
+    /// walk left to run holds the library and its loader threads.
+    #[test]
+    fn a_source_walk_ends_with_its_measurement() {
+        let (ended, end) = std::sync::mpsc::channel();
+        let measurement = SourceMeasurement::spawn(move |stop| {
+            let stopped = || stop.load(std::sync::atomic::Ordering::Relaxed);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !stopped() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = ended.send(stopped());
+            SourceRows {
+                shipped: Vec::new(),
+                users: Vec::new(),
+            }
+        })
+        .unwrap();
+        drop(measurement);
+        assert_eq!(end.recv_timeout(Duration::from_secs(2)), Ok(true));
     }
 
     #[test]
@@ -1594,6 +1644,7 @@ mod tests {
         app.source_measure = Some(SourceMeasurement {
             receiver,
             invalidated: false,
+            stop: Arc::default(),
         });
         app.source_refresh = SourceRefresh::default();
         app.prefs.sample_sources = vec![
@@ -1655,6 +1706,7 @@ mod tests {
         app.source_measure = Some(SourceMeasurement {
             receiver,
             invalidated: false,
+            stop: Arc::default(),
         });
         app.source_refresh = SourceRefresh::default();
 
@@ -1695,11 +1747,12 @@ mod tests {
             shipped: app.shipped_sources.clone(),
             users: Vec::new(),
         }
-        .measure(&library);
+        .measure(&library, &std::sync::atomic::AtomicBool::new(false));
         let (sender, receiver) = std::sync::mpsc::channel();
         app.source_measure = Some(SourceMeasurement {
             receiver,
             invalidated: false,
+            stop: Arc::default(),
         });
         app.source_refresh = SourceRefresh::default();
 
@@ -1748,6 +1801,7 @@ mod tests {
         app.source_measure = Some(SourceMeasurement {
             receiver,
             invalidated: false,
+            stop: Arc::default(),
         });
         app.source_refresh = SourceRefresh::default();
         std::fs::write(
@@ -1839,6 +1893,7 @@ mod tests {
         app.source_measure = Some(SourceMeasurement {
             receiver,
             invalidated: false,
+            stop: Arc::default(),
         });
         app.source_refresh = SourceRefresh::default();
 
@@ -1872,6 +1927,7 @@ mod tests {
         app.source_measure = Some(SourceMeasurement {
             receiver,
             invalidated: false,
+            stop: Arc::default(),
         });
         app.clear_sample_cache();
         sender.send(rows).unwrap();

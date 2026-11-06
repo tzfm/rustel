@@ -63,6 +63,16 @@ pub(crate) fn parse(file: &[u8]) -> Result<Preset<'_>, String> {
     })
 }
 
+/// [`parse`] for the plugin with the class id `class`: a preset of another
+/// plugin is an error.
+pub(crate) fn parse_for<'a>(file: &'a [u8], class: &str) -> Result<Preset<'a>, String> {
+    let preset = parse(file)?;
+    if !preset.class.eq_ignore_ascii_case(class) {
+        return Err("the preset is for a different plugin".into());
+    }
+    Ok(preset)
+}
+
 /// The class id of the plugin the preset is for, from the header alone:
 /// 32 hex characters. `None` when the bytes are no VST3 preset header. The
 /// header is 40 bytes, so a scan of a folder reads no whole preset file.

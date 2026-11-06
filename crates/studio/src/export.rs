@@ -572,6 +572,8 @@ struct Progress {
     sample_rate: AtomicUsize,
     /// Peak of each of the last few slices of rendered audio.
     peaks: Mutex<std::collections::VecDeque<f32>>,
+    /// The plugin lines of the report: see `RenderReport::plugin_lines`.
+    plugin_lines: Mutex<Vec<String>>,
 }
 
 /// One look at a render in progress.
@@ -583,6 +585,9 @@ pub struct ExportGlance {
     /// Of the length asked for - `None` when the end is decided by silence.
     pub percent: Option<u8>,
     pub peaks: [f32; SCOPE_COLUMNS],
+    /// True while the render wrote no frame: it loads its samples or
+    /// builds its plugin copies, and a finish now leaves no file.
+    pub preparing: bool,
 }
 
 /// The peaks of a render in progress, as one line of block heights: the
@@ -702,6 +707,7 @@ impl ExportJob {
             frames_total: AtomicUsize::new(0),
             sample_rate: AtomicUsize::new(config.sample_rate as usize),
             peaks: Mutex::new(std::collections::VecDeque::with_capacity(SCOPE_COLUMNS)),
+            plugin_lines: Mutex::new(Vec::new()),
         });
         let finish = Arc::new(AtomicBool::new(false));
         let worker_progress = Arc::clone(&progress);
@@ -758,7 +764,8 @@ impl ExportJob {
     }
 
     /// End the render now: a tenth of a second of fade, then the file is
-    /// closed with everything rendered so far.
+    /// closed with everything rendered so far. Before the first frame the
+    /// render ends with no file.
     pub fn finish(&mut self) {
         self.finished_early = true;
         self.finish.store(true, Ordering::Relaxed);
@@ -766,6 +773,44 @@ impl ExportJob {
 
     pub fn finished_early(&self) -> bool {
         self.finished_early
+    }
+
+    /// The plugin lines of the render that refuse no note: see
+    /// `RenderReport::plugin_lines`. The render keeps them for its outcome.
+    pub fn take_plugin_lines(&self) -> Vec<String> {
+        let lines = self.progress.plugin_lines.lock();
+        lines
+            .map(|mut lines| std::mem::take(&mut *lines))
+            .unwrap_or_default()
+    }
+
+    /// A job whose render landed with `outcome` and whose report gave
+    /// `plugin_lines`.
+    #[cfg(test)]
+    pub(crate) fn landed_for_test(
+        scene_name: &str,
+        outcome: Result<f64, String>,
+        plugin_lines: Vec<String>,
+    ) -> Self {
+        let (sender, receiver) = channel();
+        let _ = sender.send(outcome);
+        Self {
+            scene_name: scene_name.into(),
+            target: PathBuf::new(),
+            started: Instant::now(),
+            open_ended: false,
+            stems: false,
+            receiver,
+            progress: Arc::new(Progress {
+                frames_written: AtomicUsize::new(0),
+                frames_total: AtomicUsize::new(0),
+                sample_rate: AtomicUsize::new(48_000),
+                peaks: Mutex::new(std::collections::VecDeque::new()),
+                plugin_lines: Mutex::new(plugin_lines),
+            }),
+            finish: Arc::new(AtomicBool::new(false)),
+            finished_early: false,
+        }
     }
 
     pub fn glance(&self) -> ExportGlance {
@@ -785,6 +830,7 @@ impl ExportJob {
             percent: (!self.open_ended && total > 0)
                 .then(|| ((written as f64 / total as f64) * 100.0).round().min(100.0) as u8),
             peaks,
+            preparing: written == 0,
         }
     }
 }
@@ -795,7 +841,7 @@ fn render(
     config: SessionConfig,
     target: &Path,
     progress: &Progress,
-    finish: &AtomicBool,
+    finish: &Arc<AtomicBool>,
 ) -> Result<f64, String> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
@@ -841,7 +887,12 @@ fn render(
     .map_err(|error| error.to_string())?;
     let sounds = rustel_runtime::sounds::in_score(&score.source);
     session.prefetch_sounds(&sounds);
-    let _ = session.wait_for_sample_loads(SAMPLE_WAIT);
+    // The export chord ends this wait. No frame exists yet, so the export
+    // ends with no file.
+    let _ = session.wait_for_sample_loads_until(SAMPLE_WAIT, || finish.load(Ordering::Relaxed));
+    if finish.load(Ordering::Relaxed) {
+        return Err(rustel_runtime::RENDER_ENDED_BEFORE_AUDIO.to_owned());
+    }
     let duration = match settings.length {
         Length::Cycles(cycles) => cycles / session.config().cps,
         Length::UntilSilence {
@@ -896,9 +947,12 @@ fn render(
             format,
             false,
             Some(&mut observer),
-            Some(finish),
+            Some(Arc::clone(finish)),
         )
         .map_err(|error| error.to_string())?;
+    if let Ok(mut lines) = progress.plugin_lines.lock() {
+        lines.clone_from(&report.plugin_lines);
+    }
     // Written, but not the score: see `RenderReport::failure`.
     if let Some(message) = report.failure() {
         return Err(message);
@@ -1058,6 +1112,7 @@ impl Widget for ExportSheetView<'_> {
             // far it is, and whether there is still anything to hear.
             let seconds = glance.seconds.max(0.0) as u64;
             let how_far = match glance.percent {
+                _ if glance.preparing => "preparing".to_owned(),
                 Some(percent) => format!("{percent}%"),
                 None => format!("{}:{:02}", seconds / 60, seconds % 60),
             };
@@ -1089,10 +1144,13 @@ impl Widget for ExportSheetView<'_> {
                 width,
                 Style::default().fg(theme.accent),
             );
-            let hint = format!(
-                "{} ends it early and keeps the file · Esc runs on in the header",
-                self.export_hint
-            );
+            // Before the first frame no file exists to keep.
+            let ends = if glance.preparing {
+                "ends it with no file"
+            } else {
+                "ends it early and keeps the file"
+            };
+            let hint = format!("{} {ends} · Esc runs on in the header", self.export_hint);
             buffer.set_stringn(
                 x,
                 panel.bottom().saturating_sub(2),
@@ -1432,6 +1490,7 @@ mod tests {
                 frames_total: AtomicUsize::new(0),
                 sample_rate: AtomicUsize::new(48_000),
                 peaks: Mutex::new(std::collections::VecDeque::new()),
+                plugin_lines: Mutex::new(Vec::new()),
             }),
             finish: Arc::new(AtomicBool::new(false)),
             finished_early: false,
@@ -1579,6 +1638,7 @@ mod tests {
             seconds: 6.0,
             percent: Some(42),
             peaks,
+            preparing: false,
         };
         let text = render(Some(&bounded));
         assert!(text.contains("rendering drums · 42%"), "{text}");
@@ -1599,11 +1659,27 @@ mod tests {
             seconds: 67.0,
             percent: None,
             peaks,
+            preparing: false,
         };
         let text = render(Some(&open));
         assert!(text.contains("rendering drums · 1:07"), "{text}");
         assert!(!text.contains('%'), "{text}");
         assert!(!text.contains('░'), "{text}");
+
+        // Before the first frame the render prepares, and an end leaves no
+        // file to keep.
+        let preparing = ExportGlance {
+            seconds: 0.0,
+            preparing: true,
+            ..open
+        };
+        let text = render(Some(&preparing));
+        assert!(text.contains("rendering drums · preparing"), "{text}");
+        assert!(
+            text.contains("Ctrl+Shift+E ends it with no file · Esc runs on in the header"),
+            "{text}"
+        );
+        assert!(!text.contains("0:00"), "{text}");
     }
 
     #[test]
@@ -2064,6 +2140,32 @@ mod tests {
             .expect_err("a bounce with a missing sound is not a finished export");
         assert!(error.starts_with("nosuchsound is not loaded"), "{error}");
         assert!(target.exists(), "the file is written either way");
+
+        // A finish before the first frame ends the render with no file, so
+        // no file names the missing sound.
+        let ended = dir.path().join("ended.wav");
+        let progress = Progress {
+            frames_written: AtomicUsize::new(0),
+            frames_total: AtomicUsize::new(0),
+            sample_rate: AtomicUsize::new(48_000),
+            peaks: Mutex::new(std::collections::VecDeque::new()),
+            plugin_lines: Mutex::new(Vec::new()),
+        };
+        let error = render(
+            &plain_score(r#"s("sine nosuchsound")"#),
+            ExportSettings {
+                length: Length::Cycles(0.5),
+                mp3: false,
+                ..ExportSettings::default()
+            },
+            SessionConfig::default(),
+            &ended,
+            &progress,
+            &Arc::new(AtomicBool::new(true)),
+        )
+        .expect_err("a render that ends before its first frame is not an export");
+        assert_eq!(error, rustel_runtime::RENDER_ENDED_BEFORE_AUDIO);
+        assert!(!ended.exists(), "the render wrote no file");
     }
 
     #[test]
@@ -2192,5 +2294,98 @@ mod tests {
         let bytes = std::fs::metadata(&target).unwrap().len();
         assert_eq!(bytes, 44 + (seconds * 48_000.0).round() as u64 * 4);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plugin copy that does not start leaves its note with no plugin.
+    /// The file is written, but the job fails and names the plugin, and
+    /// the line of the export does not go to the live session. A copy with
+    /// no number in its output for 1 s fails the job the same way, with
+    /// stems too, and a short note through such a plugin gives a warning.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_job_whose_plugin_does_not_start_fails_and_names_it() {
+        let (_plugins, folder) = crate::engine::load_mode_tests::fixture_plugins();
+        let presets = folder
+            .path()
+            .join("presets")
+            .join(rustel_vst3_fixture::NAME);
+        // A preset of a different plugin: a copy with it does not start.
+        let mut other = rustel_vst3_fixture::preset(0.5, 0.0);
+        other[8] = b'0';
+        std::fs::write(presets.join("Other.vstpreset"), other).expect("preset file");
+        let host = rustel_runtime::vst::host();
+        host.set_preset_folders(Vec::new());
+        host.wait_idle();
+        let _ = host.take_errors();
+        let dir = tempfile::tempdir().expect("export dir");
+        let target = dir.path().join("other.wav");
+        let job = ExportJob::start(
+            "other".into(),
+            plain_score(r#"note("c3").s("sine").vst("rustel fixture", { preset: "Other" })"#),
+            ExportSettings {
+                length: Length::Cycles(0.5),
+                mp3: false,
+                ..ExportSettings::default()
+            },
+            SessionConfig::default(),
+            target.clone(),
+        )
+        .expect("job");
+        let error = await_outcome(&job, std::time::Duration::from_secs(120))
+            .expect_err("a bounce with a plugin that does not start is not a finished export");
+        let named = format!("vst skipped: {} did not start: ", rustel_vst3_fixture::NAME);
+        assert!(error.starts_with(&named), "{error}");
+        assert!(target.exists(), "the file is written either way");
+        assert_eq!(host.take_errors(), Vec::<String>::new());
+
+        // A copy with no number in its output for 1 s of a note plays
+        // silence to the end of the render. The job fails and names the
+        // plugin, with stems too, and the files are written either way.
+        let export = |name: &str, source: &str, stems: bool| {
+            let target = dir.path().join(format!("{name}.wav"));
+            let settings = ExportSettings {
+                length: Length::Cycles(1.0),
+                mp3: false,
+                stems,
+                ..ExportSettings::default()
+            };
+            let score = plain_score(source);
+            let job = ExportJob::start(
+                name.into(),
+                score,
+                settings,
+                SessionConfig::default(),
+                target.clone(),
+            )
+            .expect("job");
+            let outcome = await_outcome(&job, std::time::Duration::from_secs(120));
+            (outcome, job.take_plugin_lines(), target)
+        };
+        let fault = r#"note("c3").s("sine").vst("rustel fixture", { fault: 1 })"#;
+        let silent = format!(
+            "vst {}: no number in the output for 1 s, so the stage plays silence to the end",
+            rustel_vst3_fixture::NAME
+        );
+        let (outcome, _, target) = export("faulted", fault, false);
+        assert_eq!(outcome, Err(silent.clone()));
+        assert!(target.exists(), "the file is written either way");
+        let (outcome, _, target) = export("faulted-stems", fault, true);
+        assert_eq!(outcome, Err(silent));
+        let folder = rustel_audio::stems_folder(&target);
+        assert!(folder.join("main.wav").exists(), "the stems are written");
+        // A note of 0.25 s gives no fault: the copy is silent where the note
+        // is, and the job gives the line of the samples that were no number
+        // as a warning.
+        let short = r#"note("c3 ~ ~ ~ ~ ~ ~ ~").s("sine").vst("rustel fixture", { fault: 1 })"#;
+        let (outcome, lines, target) = export("short", short, false);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let not_a_number = format!(
+            "vst {}: a sample of the output was not a number and played as silence",
+            rustel_vst3_fixture::NAME
+        );
+        assert!(lines.contains(&not_a_number), "{lines:?}");
+        let pcm = rustel_runtime::test_support::read_pcm16_stereo_wav(&target).expect("WAV");
+        assert!(pcm.iter().all(|sample| *sample == 0.0));
+        assert_eq!(host.take_errors(), Vec::<String>::new());
     }
 }

@@ -393,6 +393,12 @@ impl StudioEngine {
         // As for a stop: the score is no longer kept for being the score.
         self.ask_idle_sweep();
         self.session.transport().stop();
+        // As for a stop: the score of a tab that closed while it played
+        // ends its chains.
+        #[cfg(feature = "vst")]
+        {
+            self.closed_plugin_copies |= self.session.end_closed_plugin_document();
+        }
         self.session.consume_audio_confirmations();
         self.supersede_launch();
         self.recent_rewind = None;
@@ -420,12 +426,17 @@ impl StudioEngine {
     }
 
     /// Close the parked output on failure, a route or buffer change, shutdown,
-    /// or an idle sweep outside Piano mode that unloads a plugin the output
-    /// holds a copy of.
+    /// an idle sweep outside Piano mode that unloads a plugin the output
+    /// holds a copy of, or a closed tab whose copies it holds.
     pub(super) fn close_piano_output(&mut self) {
         let Some(device) = self.piano_output.take() else {
             return;
         };
+        // Each copy the output holds goes home.
+        #[cfg(feature = "vst")]
+        {
+            self.closed_plugin_copies = false;
+        }
         device.stop_and_wait(self.config.stop_timeout);
         drop(device);
         self.piano = [None; PIANO_KEYS];
@@ -447,6 +458,7 @@ impl StudioEngine {
             self.apply_mix_gains(device);
             let levels = device.take_levels();
             self.master.publish(levels);
+            flush_waiting_restarts(device);
             let tail_done = if self.piano_has_score_tail {
                 let (sources_active, peak) = device.take_score_activity();
                 if !sources_active && peak <= GRACEFUL_STOP_SILENCE_PEAK {
@@ -777,6 +789,7 @@ impl StudioEngine {
                 &mut self.sample_use_until,
                 live.device.sample_rate(),
                 live.device.render_frontier_frames(),
+                live.device.restart_lead(),
             );
         }
         Ok(AuditionPush::Played)
@@ -1069,7 +1082,10 @@ mod tests {
         engine.live.as_mut().unwrap().audition_owned = true;
         engine.piano_note_on(0, 60, 100).unwrap();
         wait_piano_audio(&mut engine, 1);
-        engine.retire_finished_audition_transport();
+        assert!(matches!(
+            engine.tick_at(Duration::ZERO, |_| Ok(())),
+            Ok(StudioTick::Idle)
+        ));
         assert!(!engine.is_playing());
         assert!(engine.session.transport().is_stopped());
         assert!(engine.piano_output.is_some());

@@ -1118,27 +1118,26 @@ impl SampleLibrary {
     /// the deadline passes. Prefetch/offline convenience; the live path
     /// never waits.
     pub fn wait_until_idle(&self, deadline: std::time::Duration) {
-        self.wait_until_idle_cancellable(deadline, None);
+        self.wait_until_idle_cancellable(deadline, || false);
     }
 
-    /// The offline wait with an optional host stop flag. Stopping this wait
-    /// leaves the library and its background loaders available to the host.
+    /// The offline wait with a stop of the host: the wait returns once
+    /// `stop` gives true. Stopping this wait leaves the library and its
+    /// background loaders available to the host.
     pub(crate) fn wait_until_idle_cancellable(
         &self,
         deadline: std::time::Duration,
-        cancelled: Option<&AtomicBool>,
+        stop: impl Fn() -> bool,
     ) {
         let started = std::time::Instant::now();
         // A plugin a score named loads on the plugin thread. The wait has
-        // the same deadline and the same stop flag as the samples.
+        // the same deadline and the same stop as the samples.
         #[cfg(feature = "vst")]
         if let Some(plugins) = crate::vst::started() {
-            plugins.wait_idle_within(deadline, || {
-                cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed))
-            });
+            plugins.wait_idle_within(deadline, &stop);
         }
         loop {
-            if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            if stop() {
                 return;
             }
             // A manifest job starts its owned preloads before release-publishing

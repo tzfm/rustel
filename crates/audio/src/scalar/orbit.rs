@@ -221,9 +221,11 @@ impl ScalarBackend {
     /// the live path delivers through the device's SPSC sample channel and
     /// installs between blocks.
     /// Sidechain scheduling, shared by both intake paths: queue the trigger
-    /// for its ARM time (10 ms before the onset), never arm immediately.
+    /// for its ARM time (10 ms before the musical onset), never arm
+    /// immediately.
     pub(super) fn arm_duck<K>(&mut self, event: &OnsetEvent<K>) {
-        self.arm_duck_at(event.onset_frame, event.controls.duck);
+        let musical = event.controls.musical(event.onset_frame);
+        self.arm_duck_at(musical, event.controls.duck);
     }
 
     /// Arm a sidechain dip the moment its event is first seen - at SCHEDULE
@@ -242,7 +244,8 @@ impl ScalarBackend {
             }
             let hold = (0.01 * f64::from(self.sample_rate.max(1))) as u64;
             self.pending_ducks.push(PendingDuck {
-                arm_frame: onset_frame.saturating_sub(hold),
+                // The arm stops at the first frame of the file.
+                arm_frame: onset_frame.saturating_sub(hold).max(self.preroll),
                 onset_frame,
                 controls: duck,
             });

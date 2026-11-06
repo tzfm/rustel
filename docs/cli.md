@@ -70,7 +70,8 @@ loads helpers before the score, as for `play`.
 | `wav` | Silent timing file |
 
 The output extension selects MP3 or JSON. Use `--format` to choose explicitly.
-Ctrl+C stops a WAV export and finalizes a partial file if writing has started.
+Ctrl+C stops a WAV or MP3 export. A WAV export keeps a partial file once
+writing has started.
 
 `--stems` writes a `<name> stems` folder beside the file: the same bounce as
 `main.wav`, plus one stereo WAV per sounding orbit, named `1.wav` upward, in

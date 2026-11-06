@@ -118,10 +118,12 @@ impl App {
         }
         if let Some(job) = self.export_job.as_ref() {
             let glance = job.glance();
-            jobs.push(BackgroundJob {
-                name: format!("export {}", glance.scene_name),
-                percent: glance.percent,
-            });
+            let (name, percent) = if glance.preparing {
+                (format!("export {} (preparing)", glance.scene_name), None)
+            } else {
+                (format!("export {}", glance.scene_name), glance.percent)
+            };
+            jobs.push(BackgroundJob { name, percent });
         }
         // The plugin host works on threads of its own: the scan of the
         // plugins with no test yet, by the plugin in its test, each plugin

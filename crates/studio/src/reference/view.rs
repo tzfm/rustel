@@ -1017,11 +1017,19 @@ impl ReferenceView<'_> {
                 PluginRow::Plugin(index) => {
                     let plugin = &plugins[index];
                     let is_open = open.is_some_and(|open| open.name == plugin.name);
-                    let tag = match &plugin.status {
+                    let tag = match (&plugin.status, &plugin.fault) {
                         // A bundle with no load and no test yet has no kind.
-                        Status::Found if plugin.categories.is_empty() => (String::new(), muted),
-                        Status::Loading => ("loading…".to_owned(), Style::default().fg(theme.warn)),
-                        Status::Found | Status::Ready => {
+                        (Status::Found, _) if plugin.categories.is_empty() => {
+                            (String::new(), muted)
+                        }
+                        (Status::Loading, _) => {
+                            ("loading…".to_owned(), Style::default().fg(theme.warn))
+                        }
+                        // The fault of a copy shows as a load fault does.
+                        (Status::Ready, Some(fault)) => {
+                            (fault.clone(), Style::default().fg(theme.error))
+                        }
+                        (Status::Found | Status::Ready, _) => {
                             let kind = if plugin.instrument {
                                 "instrument"
                             } else {
@@ -1032,7 +1040,7 @@ impl ReferenceView<'_> {
                                 facts.into_iter().filter(|fact| !fact.is_empty()).collect();
                             (facts.join(" · "), muted)
                         }
-                        Status::Failed(reason) => {
+                        (Status::Failed(reason), _) => {
                             (reason.clone(), Style::default().fg(theme.error))
                         }
                     };

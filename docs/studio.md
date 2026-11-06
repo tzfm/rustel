@@ -1233,7 +1233,8 @@ turns them off. The status names the folder, because the take lands inside it.
 
 Press Ctrl+Shift+X again to end an export early. Studio adds a fade and keeps
 the audio already rendered. Use Transport ▸ Reveal last export or take to
-locate it.
+locate it. Before the first frame of audio, while Studio prepares the export,
+the same keys end it with no file.
 See [CLI export](cli.md#export) for command-line options.
 
 ## Log

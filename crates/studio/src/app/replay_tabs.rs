@@ -212,6 +212,7 @@ impl App {
                 self.lint.remove(&id);
                 self.live_sliders.remove(&id);
                 self.readiness.remove(&id);
+                self.closed_documents.push(id.0);
                 self.invalidate_maps();
                 self.status = format!(
                     "closed the replay - back to the set; the set panel ({}) opens it again",

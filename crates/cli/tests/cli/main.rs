@@ -304,6 +304,42 @@ fn a_render_goes_through_the_plugin_a_score_names() {
     assert!(scaled(&quarter, 0.25));
     let (half, _) = render(r#".vst("rustel fixture", { preset: "Half Level" })"#);
     assert!(scaled(&half, 0.5));
+    // A delay of the plugin is its latency, and the render starts the note
+    // early by that latency: the note sounds on its frame.
+    std::fs::write(
+        presets.join("Late.vstpreset"),
+        rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.25),
+    )
+    .expect("the file operation succeeds");
+    for effect in [
+        r#".vst("rustel fixture", { delay: 0.25 })"#,
+        r#".vst("rustel fixture", { preset: "Late" })"#,
+    ] {
+        let (late, notice) = render(effect);
+        assert!(scaled(&late, 1.0), "{effect}");
+        assert!(notice.is_empty(), "{notice}");
+    }
+    // A copy with the preset of a different plugin does not start. The
+    // render gives its line one time and plays the note with no plugin.
+    let mut other = rustel_vst3_fixture::preset(0.5, 0.0);
+    other[8] = b'0';
+    std::fs::write(presets.join("Other.vstpreset"), other).expect("the file operation succeeds");
+    let (unstarted, notice) = render(r#".vst("rustel fixture", { preset: "Other" })"#);
+    assert!(scaled(&unstarted, 1.0));
+    let line = format!("{} did not start", rustel_vst3_fixture::NAME);
+    assert_eq!(notice.matches(&line).count(), 1, "{notice}");
+    // A copy with no number in its output for 1 s of the note plays silence
+    // to the end. The render succeeds and gives its line one time.
+    let (faulted, notice) = render(r#".vst("rustel fixture", { fault: 1 })"#);
+    assert!(faulted.iter().all(|sample| *sample == 0));
+    let line = format!(
+        "{}: no number in the output for 1 s, so the stage plays silence to the end",
+        rustel_vst3_fixture::NAME
+    );
+    assert_eq!(notice.matches(&line).count(), 1, "{notice}");
+    // A preset with no file gives one line.
+    let (_, notice) = render(r#".vst("rustel fixture", { preset: "Nowhere" })"#);
+    assert_eq!(notice.lines().count(), 1, "{notice}");
     // A key that is no parameter drops its value alone. The plugin runs
     // with the other value. The warning counts the onset at the end of the
     // render too.
@@ -345,6 +381,11 @@ fn a_render_goes_through_the_plugin_a_score_names() {
     let (note, rest) = alone.split_at(48_000);
     let rises = note.windows(2).filter(|pair| pair[0] <= 0 && pair[1] > 0);
     assert_eq!(rises.count(), 440);
+    // Through the delay, the tone rises on the frame it rises on with no
+    // plugin.
+    let first_rise = |samples: &[i16]| samples.iter().position(|sample| *sample > 0);
+    let (late, _) = tone(r#".vst("rustel fixture", { delay: 0.25 })"#);
+    assert_eq!(first_rise(&late), first_rise(&alone));
     let peak = |samples: &[i16]| samples.iter().map(|sample| sample.unsigned_abs()).max();
     let level = f32::from(peak(note).expect("the peak is measured"));
     let wanted = 0.8 * rustel_vst3_fixture::TONE_LEVEL * 32_767.0;

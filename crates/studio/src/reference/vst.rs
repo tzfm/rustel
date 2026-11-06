@@ -845,6 +845,7 @@ mod tests {
             audio_thread: false,
             latency: None,
             presets: 0,
+            fault: None,
         }
     }
 

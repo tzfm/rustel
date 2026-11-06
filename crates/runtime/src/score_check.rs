@@ -86,7 +86,9 @@ pub fn check_score(
         })
         && let Some(samples) = session.sample_library()
     {
-        samples.wait_until_idle_cancellable(Duration::from_secs(5), Some(cancellation));
+        samples.wait_until_idle_cancellable(Duration::from_secs(5), || {
+            cancellation.load(Ordering::Relaxed)
+        });
     }
     // Evaluation queues imports under the session's existing sample grants.
     // The linter judges only the sources the loader has finished publishing.

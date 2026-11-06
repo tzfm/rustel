@@ -503,8 +503,9 @@ pub(super) fn env_mod_value(env: &crate::backend::EnvMod, t: f32) -> f32 {
 /// No output or phase advance occurs until the first quantum strictly past
 /// the f32-rounded begin time. Comparing it with the f64 render clock retains
 /// AudioParam timing semantics: rounding can decide whether the onset's own
-/// quantum runs.
-pub(super) fn lfo_quantum_open(quantum_start: u64, sample_rate: f64, begin_secs: f32) -> bool {
+/// quantum runs. The quantum counts from the file, so a quantum of the
+/// pre-roll is below 0.
+pub(super) fn lfo_quantum_open(quantum_start: i64, sample_rate: f64, begin_secs: f32) -> bool {
     (quantum_start as f64) / sample_rate > f64::from(begin_secs)
 }
 
@@ -514,7 +515,7 @@ pub(super) fn lfo_quantum_open(quantum_start: u64, sample_rate: f64, begin_secs:
 /// sample. Same rule as `lfo_quantum_open`, so it lands on the same quantum.
 pub(super) fn first_open_quantum(begin_secs: f32, sample_rate: f64) -> u64 {
     let floor = (f64::from(begin_secs) * sample_rate / 128.0).max(0.0) as u64 * 128;
-    if lfo_quantum_open(floor, sample_rate, begin_secs) {
+    if lfo_quantum_open(floor as i64, sample_rate, begin_secs) {
         floor
     } else {
         floor + 128
@@ -522,7 +523,7 @@ pub(super) fn first_open_quantum(begin_secs: f32, sample_rate: f64) -> u64 {
 }
 
 /// Whether this quantum begins before the f32-rounded LFO end time.
-pub(super) fn lfo_quantum_alive(quantum_start: u64, sample_rate: f64, end_secs: f32) -> bool {
+pub(super) fn lfo_quantum_alive(quantum_start: i64, sample_rate: f64, end_secs: f32) -> bool {
     (quantum_start as f64) / sample_rate < f64::from(end_secs)
 }
 
@@ -613,7 +614,7 @@ mod tests {
         #[test]
         fn the_onset_quantum_runs_only_when_f32_rounds_the_begin_down() {
             let sr = 48_000.0;
-            let opens_on_its_own_onset = |k: u64| {
+            let opens_on_its_own_onset = |k: i64| {
                 let begin = (2.0 * k as f64 / 3.0) as f32;
                 super::lfo_quantum_open(k * 32_000, sr, begin)
             };

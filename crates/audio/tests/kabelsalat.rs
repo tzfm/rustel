@@ -36,6 +36,23 @@ fn event(program: Program, start: u64, end: u64, gain: f32) -> OnsetEvent {
     })
 }
 
+/// Renders `frames` of a file with `preroll` frames before it, each onset
+/// that much later. The times of a worklet stay in the time of the file.
+fn render_after(preroll: u64, frames: usize, events: &[OnsetEvent]) -> Vec<f32> {
+    let mut backend = ScalarBackend::new();
+    backend.set_preroll(preroll);
+    let events: Vec<_> = events
+        .iter()
+        .cloned()
+        .map(|mut event| {
+            event.onset_frame += preroll;
+            event
+        })
+        .collect();
+    let pcm = render_pcm(&mut backend, RATE, frames + preroll as usize, &events).expect("render");
+    pcm[preroll as usize * 2..].to_vec()
+}
+
 fn stage(kabel: KabelControls, gain: f32) -> FxStage {
     FxStage {
         kabel: Some(kabel),
@@ -79,7 +96,13 @@ fn start_and_gate_follow_absolute_render_quanta() {
     let graph = stereo(r#"{"type":"gate"}"#);
     let mut onset = event(graph, 1, 512, 1.0);
     onset.controls.kabel = Some(worklet(graph, 1, 128, 512));
-    let pcm = render_pcm(&mut ScalarBackend::new(), RATE, 640, &[onset]).unwrap();
+    let pcm = render_pcm(
+        &mut ScalarBackend::new(),
+        RATE,
+        640,
+        std::slice::from_ref(&onset),
+    )
+    .unwrap();
     assert!(pcm[..256].iter().all(|sample| *sample == 0.0));
     assert!(
         pcm[256..512]
@@ -87,6 +110,8 @@ fn start_and_gate_follow_absolute_render_quanta() {
             .all(|sample| (*sample - 1.0).abs() < 1e-6)
     );
     assert!(pcm[512..].iter().all(|sample| *sample == 0.0));
+    // A pre-roll of 256 frames gives the same samples.
+    assert!(render_after(256, 640, &[onset]) == pcm);
 }
 
 #[test]
@@ -95,8 +120,16 @@ fn fx_worklet_precedes_stage_gain_and_main_worklet_receives_the_result() {
     let passthrough = stereo(r#"{"type":"audioin"}"#);
     let mut onset = event(passthrough, 0, 256, 0.5);
     onset.controls.fx_stages[0] = Some(stage(worklet(constant, 0, 48, 256), 0.25));
-    let pcm = render_pcm(&mut ScalarBackend::new(), RATE, 256, &[onset]).unwrap();
+    let pcm = render_pcm(
+        &mut ScalarBackend::new(),
+        RATE,
+        256,
+        std::slice::from_ref(&onset),
+    )
+    .unwrap();
     assert!(pcm.iter().all(|sample| (*sample - 0.125).abs() < 1e-6));
+    // A pre-roll of 256 frames gives the same samples.
+    assert!(render_after(256, 256, &[onset]) == pcm);
 }
 
 #[test]

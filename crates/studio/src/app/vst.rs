@@ -28,7 +28,8 @@ const PLUGIN_REFRESH: Duration = Duration::from_millis(1_000);
 const PLUGIN_LOADING_REFRESH: Duration = Duration::from_millis(100);
 
 /// The plugin rows of the memory breakdown: each plugin of the host in its
-/// load, loaded, or failed.
+/// load, loaded, or failed. A loaded plugin with the fault of a copy says
+/// the fault last.
 fn plugin_memory(plugins: &[PluginInfo]) -> Vec<PluginMemory> {
     plugins
         .iter()
@@ -43,8 +44,13 @@ fn plugin_memory(plugins: &[PluginInfo]) -> Vec<PluginMemory> {
                         .filter(|frames| *frames > 0)
                         .map(|frames| format!(" · latency {frames} samples"))
                         .unwrap_or_default();
+                    let fault = plugin
+                        .fault
+                        .as_ref()
+                        .map(|fault| format!(" · {fault}"))
+                        .unwrap_or_default();
                     format!(
-                        "{name} · {} · {} running · {} ms{latency}",
+                        "{name} · {} · {} running · {} ms{latency}{fault}",
                         if plugin.instrument {
                             "instrument"
                         } else {
@@ -361,6 +367,18 @@ impl App {
         }
     }
 
+    /// Asks the engine for a new try of each plugin copy of the score in
+    /// play that did not start or that faulted, while a row of the plugin
+    /// list shows such a fault. No evaluation runs. Starts no host. True when
+    /// the engine took the ask.
+    pub(super) fn retry_plugin_faults(&self) -> bool {
+        let faults = vst::started().is_some_and(|host| {
+            let plugins = host.plugins();
+            plugins.iter().any(|plugin| plugin.fault.is_some())
+        });
+        faults && self.worker.try_retry_plugins()
+    }
+
     /// Gives the host the folders the player added. Before the host starts,
     /// this stores the folders and reads no folder.
     pub(super) fn adopt_vst_folders(&self) {
@@ -463,7 +481,10 @@ impl App {
                 .map(|plugin| settings::VstScanned {
                     name: plugin.name.clone(),
                     state: match &plugin.status {
-                        Status::Ready => "ready".to_owned(),
+                        Status::Ready => match &plugin.fault {
+                            Some(fault) => format!("ready · {fault}"),
+                            None => "ready".to_owned(),
+                        },
                         Status::Loading => "loading".to_owned(),
                         Status::Found => "found".to_owned(),
                         Status::Failed(reason) => {
@@ -1162,8 +1183,9 @@ mod tests {
     /// The memory breakdown has one row for each plugin the host loaded, and
     /// no row for a plugin the host only found. A plugin is in the Studio
     /// process and has no figure of its own. A row shows the latency of the
-    /// copies of its plugin when the latency is above 0. An unload takes the
-    /// rows away.
+    /// copies of its plugin when the latency is above 0. A copy that did not
+    /// start gives the row of its plugin the fault, and a new scan takes the
+    /// fault away. An unload takes the rows away.
     #[test]
     fn a_loaded_plugin_is_a_row_of_the_memory_breakdown() {
         let folder = tempfile::tempdir().unwrap();
@@ -1223,6 +1245,25 @@ mod tests {
         assert!(tone.label.starts_with(facts), "{}", tone.label);
         assert!(tone.label.ends_with(" ms"), "{}", tone.label);
 
+        // A copy that did not start gives the row of its plugin the fault,
+        // and a new scan takes the fault away with the failed build.
+        let mut other = rustel_vst3_fixture::preset(1.0, 0.0);
+        other[8] = b'0';
+        std::fs::write(effect_presets.join("Other Plugin.vstpreset"), other).unwrap();
+        host.set_preset_folders(Vec::new());
+        host.wait_idle();
+        let slot = rustel_audio::InsertSlot::effect(2, 0);
+        let other = Some("Other Plugin");
+        host.prepare(rustel_vst3_fixture::NAME, other, false, rate, slot);
+        host.wait_idle();
+        let effect = || plugin_memory(&host.plugins())[0].label.clone();
+        let fault = " ms · latency 1024 samples · a copy did not start: the preset is for a \
+                     different plugin";
+        assert!(effect().ends_with(fault), "{}", effect());
+        host.scan(&[folder.path().to_path_buf()]);
+        host.wait_idle();
+        assert!(effect().ends_with(latency), "{}", effect());
+
         host.unload_unused(&[]);
         host.wait_idle();
         assert!(plugin_memory(&host.plugins()).is_empty());
@@ -1259,6 +1300,7 @@ mod tests {
             audio_thread: false,
             latency: None,
             presets: 2,
+            fault: None,
         };
         panel.vst.set_plugins(vec![plugin]);
         panel.vst.open_named("Serum 2".into());

@@ -33,11 +33,17 @@ impl App {
         }
         if let Some(job) = self.export_job.as_mut() {
             // The tail is long enough: fade over a tenth of a second and
-            // keep everything rendered so far. Over the open sheet this is
-            // the render window's own abort.
+            // keep everything rendered so far. Before the first frame the
+            // render ends with no file. Over the open sheet this is the
+            // render window's own abort.
             if !job.finished_early() {
+                let preparing = job.glance().preparing;
                 job.finish();
-                self.status = format!("ending the export of {} - fading out", job.scene_name);
+                self.status = if preparing {
+                    format!("ending the export of {} - no file yet", job.scene_name)
+                } else {
+                    format!("ending the export of {} - fading out", job.scene_name)
+                };
             }
             self.dirty_frame = true;
             return;
@@ -253,6 +259,9 @@ impl App {
         if self.export_sheet.take().is_some() {
             self.settle_focus();
         }
+        for line in job.take_plugin_lines() {
+            self.log.push(LogLevel::Warn, "export", line);
+        }
         match outcome {
             Ok(seconds) => {
                 self.status = format!(
@@ -278,6 +287,20 @@ impl App {
                 );
                 self.status.push_str(" - click the path to show it");
                 self.remember_status_file(job.output());
+            }
+            // The chord ended the render before its first frame, as asked.
+            Err(error)
+                if job.finished_early() && error == rustel_runtime::RENDER_ENDED_BEFORE_AUDIO =>
+            {
+                self.status = format!(
+                    "export of {} ended before its first frame - no file",
+                    job.scene_name
+                );
+                self.log.push(
+                    LogLevel::Info,
+                    "export",
+                    format!("{} ended before its first frame", job.scene_name),
+                );
             }
             Err(error) => {
                 self.status = format!("export of {} failed: {error}", job.scene_name);
@@ -504,7 +527,8 @@ mod tests {
         }
 
         /// The render window closes on its outcome, and the export chord
-        /// over it ends the bounce early, as the status says.
+        /// over it ends the bounce early, as the status says: before the
+        /// first frame with no file, after it with the file.
         #[test]
         fn the_render_window_closes_on_its_outcome_and_the_chord_ends_it_early() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -512,6 +536,48 @@ mod tests {
             app.frame = Rect::new(0, 0, 120, 40);
             app.toggle_export_sheet();
             assert!(app.handle_export_key(crossterm::event::KeyCode::Enter, false, false));
+            // The chord right after Enter meets a render that prepares.
+            let job = app.export_job.as_ref().expect("running");
+            let (scene, target) = (job.scene_name.clone(), job.output());
+            assert!(job.glance().preparing);
+            let row = BackgroundJob {
+                name: format!("export {scene} (preparing)"),
+                percent: None,
+            };
+            assert!(app.background_jobs().contains(&row), "the jobs panel");
+            app.toggle_export_sheet();
+            assert_eq!(
+                app.status,
+                format!("ending the export of {scene} - no file yet")
+            );
+            let landed = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while app.export_job.is_some() && std::time::Instant::now() < landed {
+                app.poll_export();
+                if app.export_job.is_some() {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            assert!(app.export_job.is_none(), "the bounce never landed");
+            assert_eq!(
+                app.status,
+                format!("export of {scene} ended before its first frame - no file")
+            );
+            let ended = format!("{scene} ended before its first frame");
+            let last = app.log.lines().back().expect("the line of the end");
+            assert_eq!((last.level, last.kind.as_str()), (LogLevel::Info, "export"));
+            assert_eq!(last.text, ended);
+            assert!(!target.exists(), "the render wrote no file");
+
+            app.toggle_export_sheet();
+            assert!(app.handle_export_key(crossterm::event::KeyCode::Enter, false, false));
+            let landed = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while app.export_job.as_ref().expect("running").glance().seconds <= 0.0 {
+                assert!(
+                    std::time::Instant::now() < landed,
+                    "the bounce wrote no frame"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             // The chord over the open render window ends the bounce, and
             // leaves the window open to watch the fade land.
             app.toggle_export_sheet();
@@ -522,8 +588,10 @@ mod tests {
                     .expect("still running")
                     .finished_early()
             );
-            assert!(app.status.contains("ending the export"), "{}", app.status);
-            let landed = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            assert_eq!(
+                app.status,
+                format!("ending the export of {scene} - fading out")
+            );
             while app.export_job.is_some() && std::time::Instant::now() < landed {
                 app.poll_export();
                 if app.export_job.is_some() {
@@ -537,6 +605,34 @@ mod tests {
             );
             assert!(app.status.starts_with("exported"), "{}", app.status);
             assert!(app.status.contains("ended early"), "{}", app.status);
+        }
+
+        /// The plugin lines of a render land in the log as warnings, before
+        /// the line of its outcome.
+        #[test]
+        fn the_plugin_lines_of_a_render_log_as_warnings_before_its_outcome() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let late = "a plugin chain has 1100 ms of latency: rustel compensates 1000 ms, \
+                        and the lane plays the rest late";
+            app.export_job = Some(crate::export::ExportJob::landed_for_test(
+                "late",
+                Err("boom".into()),
+                vec![late.to_owned()],
+            ));
+            app.poll_export();
+            assert!(app.export_job.is_none(), "the job landed");
+            let mut lines = app.log.lines().iter().rev();
+            let outcome = lines.next().expect("the line of the outcome");
+            let warning = lines.next().expect("the plugin line");
+            assert_eq!(
+                (warning.level, warning.kind.as_str(), warning.text.as_str()),
+                (LogLevel::Warn, "export", late)
+            );
+            assert_eq!(
+                (outcome.level, outcome.kind.as_str(), outcome.text.as_str()),
+                (LogLevel::Error, "export", "late failed: boom")
+            );
         }
     }
 }

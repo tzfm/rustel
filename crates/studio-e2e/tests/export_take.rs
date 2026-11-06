@@ -332,6 +332,17 @@ fn ctrl_shift_x_ends_a_running_export_early() {
         started.starts_with("exporting first (20 cycles)"),
         "{started}"
     );
+    // The chord after the first frame keeps the file, so it waits for the
+    // percent of the render row.
+    studio.pump_until(
+        EXPORT_BUDGET,
+        "the render row showed its percent",
+        |studio| {
+            let rows = studio.rows();
+            rows.iter()
+                .any(|row| row.contains("rendering first") && row.contains('%'))
+        },
+    );
 
     studio.chord("ctrl+shift+x");
     assert_eq!(
