@@ -2881,15 +2881,23 @@ impl Host {
         let wanted = (plugin, canonical(name));
         let state = self.state();
         // A note asks on each start. The answer for a name is kept, and a
-        // name with no file gets a new look after `PRESET_RETRY`.
+        // name with no file gets a new look after `PRESET_RETRY`, or at once
+        // while a load of its bundle reads the folders: that read can bring
+        // the file.
+        let row = row_of(plugin).filter(|row| *row < state.entries.len());
+        let refreshing = row.is_some_and(|row| {
+            let bundle = &state.entries[row].bundle;
+            state.preset_refresh.contains(bundle)
+        });
         match state.known_presets.get(&wanted) {
             Some(KnownPreset::Number(number)) => return FoundPreset::Number(*number),
-            Some(KnownPreset::MissingSince(since)) if since.elapsed() < PRESET_RETRY => {
+            Some(KnownPreset::MissingSince(since))
+                if since.elapsed() < PRESET_RETRY && !refreshing =>
+            {
                 return FoundPreset::Missing;
             }
             _ => {}
         }
-        let row = row_of(plugin).filter(|row| *row < state.entries.len());
         if row.is_none() {
             return FoundPreset::Missing;
         }
@@ -4821,10 +4829,11 @@ mod tests {
     }
 
     /// A plugin is ready before its load reads its preset folder. Until the
-    /// read ends, a preset of that folder has no answer, and not a miss: a
-    /// start then waits for the copy, and the score gets no false line. An
-    /// older row of the plugin, of a bundle that is gone, does not answer
-    /// for the row of the load.
+    /// read ends, a preset of that folder has no answer, and not a miss,
+    /// also after a miss of its name just before: a start then waits for
+    /// the copy, and the score gets no false line. An older row of the
+    /// plugin, of a bundle that is gone, does not answer for the row of the
+    /// load.
     #[test]
     fn a_preset_waits_for_the_read_of_the_load_of_its_plugin() {
         let root = std::env::temp_dir().join(format!("rustel-vst3-presets-{}", std::process::id()));
@@ -4873,6 +4882,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(delay(), Ok(None), "the read of the load");
+        // A miss of the name just before the load waits for the read too.
+        {
+            let mut state = host.state();
+            let number = State::number(state.find(rustel_vst3_fixture::NAME).expect("the row"));
+            let miss = KnownPreset::MissingSince(Instant::now());
+            state
+                .known_presets
+                .insert((number, canonical("Delay")), miss);
+        }
+        assert_eq!(delay(), Ok(None), "a miss during the read of the load");
         drop(saving);
         host.wait_idle();
         assert!(matches!(delay(), Ok(Some(_))));
