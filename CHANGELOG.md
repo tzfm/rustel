@@ -14,7 +14,7 @@
 - Samples, images and videos load only from allowed sources. `--allow-sample-origin` adds a source, and Settings ▸ Permissions allows a refused folder.
 - Scores render faster on small machines and on 64-bit ARM, with the same sound.
 - A decoded sample is kept in the cache, so it loads faster the next time.
-- On a slow machine, an edit of a playing score arrives late instead of being refused.
+- On a slow machine, an edit of a playing score arrives late instead of being refused. A dense synth score no longer refuses its edits.
 - On Linux, the audio keeps its priority over the studio's own work.
 - rustelup offers to install rtkit on Linux when the audio system needs it.
 - The first chord or scale preview sounds, and a scale preview keeps its tempo on a slow machine.
