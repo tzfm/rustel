@@ -405,8 +405,11 @@ impl Session {
                 .into_iter()
                 .chain([sound.s.as_str()])
             {
-                // A synth has no file to load or keep.
-                if rustel_voice::is_native_synth_sound(name) {
+                // A synth has no file to load or keep. `one` plays a sample
+                // when a bank has one, so it is warmed.
+                if rustel_voice::is_native_synth_sound(name)
+                    && !rustel_voice::native_synth_yields_to_sample(name)
+                {
                     continue;
                 }
                 let _ = rustel_voice::SampleLookup::resolve(
@@ -665,19 +668,26 @@ mod tests {
     fn a_dense_window_warms_its_samples_and_not_its_synths() {
         let mut session = Session::new().expect("session");
         let library = Arc::new(crate::samples::SampleLibrary::with_unasked_banks_for_test(
-            &["hh"],
+            &["hh", "one"],
         ));
         session.samples = Some(Arc::clone(&library));
         session
-            .evaluate(r#"stack(note("c d e f").fast(16).s("sawtooth"), s("hh*16"))"#)
+            .evaluate(r#"stack(note("c d e f").fast(16).s("sawtooth"), s("hh*16 one"))"#)
             .expect("the score installs");
 
         let window = session.kick_sample_loads_within(0.0, 4.0, std::time::Duration::from_secs(5));
 
         assert_eq!(
             window,
-            [("hh".to_owned(), crate::sounds::Variants::first())]
+            [
+                ("hh".to_owned(), crate::sounds::Variants::first()),
+                ("one".to_owned(), crate::sounds::Variants::first()),
+            ]
         );
-        assert_eq!(library.queued_loads_for_test(), (1, 0), "one load for hh");
+        assert_eq!(
+            library.queued_loads_for_test(),
+            (2, 0),
+            "one load each for hh and one"
+        );
     }
 }
