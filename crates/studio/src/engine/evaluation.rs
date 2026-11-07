@@ -32,12 +32,12 @@ impl StudioEngine {
         }
         let started = std::time::Instant::now();
         let result = self.evaluate_guarded_inner(source, mini, cancelled);
-        // Recorded whether or not the engine was live: the first save of a
-        // session prices its takeover from the evaluation that started the
-        // set, which ran while the engine was still stopped.
-        self.last_live_evaluation = started.elapsed();
-        if was_live {
-            self.widen_horizon_for_evaluation(self.last_live_evaluation);
+        // Only an evaluation that installed prices the next one. A start
+        // times its own evaluation, without the open of its output: see
+        // [`Self::start_on`].
+        if was_live && result.is_ok() {
+            self.last_live_evaluation = started.elapsed();
+            self.follow_horizon_to_evaluation(self.last_live_evaluation);
         }
         self.sync_recovered_session();
         self.sync_polyphony();
@@ -57,12 +57,15 @@ impl StudioEngine {
 
     /// Raise the session horizon when an evaluation of the playing score ran
     /// close to the audio scheduled ahead of the clock. See
-    /// [`horizon_for_evaluation`] for the window it keeps.
-    fn widen_horizon_for_evaluation(&mut self, evaluation: std::time::Duration) {
+    /// [`horizon_for_evaluation`] for the window it keeps. A faster
+    /// evaluation lowers it halfway to what it needs, so one slow edit does
+    /// not keep a long horizon for the life of the engine.
+    fn follow_horizon_to_evaluation(&mut self, evaluation: std::time::Duration) {
         let needed = horizon_for_evaluation(evaluation);
-        if needed > self.live_horizon {
-            self.live_horizon = needed;
-            self.session.set_horizon(needed);
+        let horizon = needed.max((self.live_horizon + needed) / 2.0);
+        if horizon != self.live_horizon {
+            self.live_horizon = horizon;
+            self.session.set_horizon(horizon);
         }
     }
 
@@ -407,12 +410,7 @@ impl StudioEngine {
                     if pushed {
                         let frontier = device.render_frontier_frames();
                         played.note(&event, frontier, device.restart_lead());
-                        shield_audio.push(UiAcceptedOnset {
-                            generation: event.generation,
-                            onset_id: event.onset_id,
-                            frequency_hz: Some(event.freq_hz),
-                            gain: Some(event.gain),
-                        });
+                        shield_audio.push(UiAcceptedOnset::scalar(&event));
                     }
                     pushed
                 },
@@ -528,6 +526,7 @@ impl StudioEngine {
         mini: bool,
         was_piano_output: bool,
     ) -> Result<StudioInstall, RuntimeError> {
+        let started = Instant::now();
         let mark = self.next_install.take();
         // Log what opened, once: the host, the device and the buffer
         // size. It is a log note, so it does not take the status line
@@ -655,6 +654,8 @@ impl StudioEngine {
         });
 
         self.note_install_for_played(generation, mark.preview, source);
+        // The first save of the set prices its takeover from this start.
+        self.last_live_evaluation = started.elapsed();
 
         Ok(StudioInstall {
             generation,
@@ -877,6 +878,48 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(5));
             }
+        }
+
+        /// Only a save that installed prices the edits after it. A slow
+        /// save that throws leaves the next good save one ordinary response
+        /// time ahead of the clock. The long horizon a slow good save asked
+        /// for comes back down with the fast saves after it.
+        #[test]
+        fn a_slow_save_prices_the_next_edits_only_while_it_lasts() {
+            const SLOW: &str = "const until = Date.now() + 600\nwhile (Date.now() < until) {}\n";
+            let mut engine = playing_score();
+            engine
+                .evaluate(&format!("{SLOW}throw new Error('no')"), false)
+                .expect_err("the save throws");
+            engine.evaluate(CANDIDATE, false).expect("good score");
+            let now = engine
+                .live
+                .as_ref()
+                .expect("playing")
+                .device
+                .clock_seconds();
+            let takeover = engine
+                .session
+                .take_requery_takeover_time()
+                .expect("an edit names its takeover");
+            assert!(
+                takeover - now < 0.4,
+                "the edit waits {:.3} s",
+                takeover - now
+            );
+
+            wait_for_audio(&mut engine);
+            engine
+                .evaluate(&format!("{SLOW}{GOOD}"), false)
+                .expect("slow good score");
+            let slow = engine.session.config().horizon;
+            assert!(slow > 1.0, "the slow save widens the horizon: {slow}");
+            for source in [CANDIDATE, GOOD, CANDIDATE, GOOD] {
+                wait_for_audio(&mut engine);
+                engine.evaluate(source, false).expect("fast save");
+            }
+            let after = engine.session.config().horizon;
+            assert!(after < 0.8, "the horizon came back down to {after}");
         }
 
         #[test]

@@ -828,7 +828,24 @@ fn real_time(_frames: u32, _rate: u32) -> Option<impl Sized> {
     any(target_os = "macos", target_os = "linux")
 ))]
 fn real_time(frames: u32, rate: u32) -> Option<impl Sized> {
+    #[cfg(target_os = "linux")]
+    ignore_real_time_overrun();
     audio_thread_priority::promote_current_thread_to_real_time(frames, rate).ok()
+}
+
+/// A grant through rtkit sets the soft `RLIMIT_RTTIME` of the process to
+/// one device period. A worker that runs longer than that without a
+/// blocking call, as in an overrun, gets SIGXCPU, and its default action
+/// ends the process. Ignored, an overrun only clicks. The hard limit of
+/// rtkit, 200 ms by default, still ends the process when a worker never
+/// blocks.
+#[cfg(all(feature = "device-audio", target_os = "linux"))]
+fn ignore_real_time_overrun() {
+    static IGNORED: std::sync::Once = std::sync::Once::new();
+    IGNORED.call_once(|| {
+        // SAFETY: SIG_IGN installs no handler, so no code runs in the signal.
+        unsafe { libc::signal(libc::SIGXCPU, libc::SIG_IGN) };
+    });
 }
 
 /// The other systems give a worker no real-time class, so a pool there has

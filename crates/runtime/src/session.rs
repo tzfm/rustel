@@ -1343,8 +1343,12 @@ impl Session {
     }
 
     /// Replace what a score's `samples()`, images and videos may read. The
-    /// next evaluation reads the new policy. Banks already loaded stay.
+    /// next evaluation reads the new policy. A bank from a source the policy
+    /// no longer allows is dropped, and none of its files loads again.
     pub fn set_score_sample_access(&mut self, access: ScoreSampleAccess) {
+        if let Some(library) = self.sample_library() {
+            library.withdraw_sources(&access);
+        }
         self.config.score_sample_access = access;
     }
 

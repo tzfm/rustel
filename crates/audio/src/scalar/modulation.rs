@@ -238,6 +238,28 @@ impl ModAdds {
     }
 }
 
+/// Whether a modulator moves the post gain of a note. The post gain of a
+/// note then changes while it plays.
+pub(super) fn postgain_moves<K>(controls: &crate::backend::OscillatorControls<K>) -> bool {
+    let post =
+        |fxi: Option<u8>, target| fxi.is_none() && target == crate::backend::ModTarget::Postgain;
+    controls
+        .lfos
+        .iter()
+        .flatten()
+        .any(|lfo| post(lfo.fxi, lfo.target))
+        || controls
+            .envs
+            .iter()
+            .flatten()
+            .any(|env| post(env.fxi, env.target))
+        || controls
+            .bus_mods
+            .iter()
+            .flatten()
+            .any(|bus| post(bus.fxi, bus.target))
+}
+
 /// Clamp that tolerates an inverted range. `f32::clamp` PANICS when
 /// `min > max`, which a modulator reaches legitimately: `depth = depth ·
 /// currentValue` goes negative on a negative param base (`lfo({c:'pan'})`

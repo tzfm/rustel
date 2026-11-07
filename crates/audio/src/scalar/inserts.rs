@@ -74,6 +74,37 @@ impl ServicedMarks {
     }
 }
 
+/// The clock a note gave the copy of a slot: its position in quarter notes
+/// on `frame`, and the quarter notes in one minute. A copy a forced release
+/// takes away misses the frames of its restart, so it takes the clock again
+/// when it comes back: see [`ScalarBackend::prepare_insert`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct InsertClock {
+    beats: f64,
+    tempo: f32,
+    frame: u64,
+}
+
+impl InsertClock {
+    pub(super) fn of(wanted: &crate::insert::InsertControls, frame: u64) -> Option<Self> {
+        let (beats, tempo) = wanted.clock()?;
+        Some(Self {
+            beats,
+            tempo,
+            frame,
+        })
+    }
+
+    /// Gives `insert` the clock on `now`, or on the frame of the note when
+    /// that frame is still to come.
+    fn sync(self, insert: &mut dyn crate::insert::OrbitInsert, now: u64, sample_rate: u32) {
+        let past = now.saturating_sub(self.frame) as f64 / f64::from(sample_rate);
+        let beats = self.beats + past * f64::from(self.tempo) / 60.0;
+        let ahead = u32::try_from(self.frame.saturating_sub(now)).unwrap_or(u32::MAX);
+        insert.sync(beats, self.tempo, ahead);
+    }
+}
+
 /// The wake test of an effect stage. The stage runs when a sample of its
 /// input is not zero, while its idle frames are under `limit`, while it is
 /// busy, and while a level of its slot moves. A stage at the level 0 does
@@ -528,6 +559,7 @@ impl ScalarBackend {
             self.insert_fade_from = vec![u64::MAX; crate::insert::MAX_INSERT_BUSES];
             self.insert_leads = vec![0; crate::insert::MAX_INSERT_BUSES];
             self.insert_serviced = ServicedMarks::new();
+            self.insert_clocks = vec![None; crate::insert::INSERT_SLOTS];
         }
     }
 
@@ -574,12 +606,12 @@ impl ScalarBackend {
     /// A live copy waits for a matching accepted onset before replacing one.
     /// A copy of the key of a serviced mark takes the active place at once
     /// and fades in from silence, and the mark ends with the fade: see
-    /// [`Self::release_insert`]. The caller frees a displaced or refused
-    /// copy.
+    /// [`Self::release_insert`]. It plays on from the clock of the last
+    /// note of the slot. The caller frees a displaced or refused copy.
     pub fn prepare_insert(
         &mut self,
         slot: crate::insert::InsertSlot,
-        insert: Box<dyn crate::insert::OrbitInsert>,
+        mut insert: Box<dyn crate::insert::OrbitInsert>,
     ) -> Option<Box<dyn crate::insert::OrbitInsert>> {
         let Some(bus) = self.claim_bus(slot) else {
             return Some(insert);
@@ -593,6 +625,9 @@ impl ScalarBackend {
             active.declick_from(crate::live_control::Ramp::new(0, 0.0), self.sample_rate);
             self.insert_fading |= 1u64 << bus;
             self.insert_idle_frames[at] = 0;
+            if let Some(clock) = self.insert_clocks[at] {
+                clock.sync(insert.as_mut(), self.frame, self.sample_rate);
+            }
             return self.orbit_inserts[at].replace(insert);
         }
         self.prepared_inserts[at].replace(insert)
@@ -667,7 +702,9 @@ impl ScalarBackend {
 
     /// The level changes and the instrument gain changes that a full list
     /// applied at once, before the output of their notes: see `LevelChange`
-    /// and `InstrumentGainChange`.
+    /// and `InstrumentGainChange`. A note whose post gain moves on a chain
+    /// with latency, and that finds no level line, counts too: see
+    /// [`SendLines`].
     pub fn early_level_changes(&self) -> u64 {
         self.early_level_changes
     }
@@ -2723,6 +2760,68 @@ mod tests {
             assert!(crate::tripwire::Violations::capture().since(before).clean());
         }
 
+        /// A copy that a forced release takes away misses the frames of its
+        /// restart. It comes back on the clock of the last note of its slot,
+        /// moved on by the frames since that note.
+        #[test]
+        fn a_copy_back_from_a_forced_release_takes_the_clock_of_the_score() {
+            type Syncs = Arc<std::sync::Mutex<Vec<(f64, f32, u32)>>>;
+            struct Clocked {
+                key: InsertKey,
+                syncs: Syncs,
+            }
+            impl OrbitInsert for Clocked {
+                fn key(&self) -> InsertKey {
+                    self.key
+                }
+                fn set_param(&mut self, _: InsertParam, _: u32) {}
+                fn process(&mut self, _: &mut [f32], _: &mut [f32]) {}
+                fn sync(&mut self, beats: f64, tempo: f32, frames: u32) {
+                    self.syncs.lock().unwrap().push((beats, tempo, frames));
+                }
+                fn busy(&self) -> bool {
+                    true
+                }
+            }
+            let key = InsertKey {
+                plugin: 1,
+                preset: 0,
+            };
+            let syncs = Syncs::default();
+            let taken = || std::mem::take(&mut *syncs.lock().unwrap());
+            let mut backend = ScalarBackend::prepared(48_000, 4).unwrap();
+            backend.forbid_inline_reverb();
+            let slot = crate::insert::effect_slot(1000, 0);
+            let copy = Box::new(Clocked {
+                key,
+                syncs: Arc::clone(&syncs),
+            });
+            assert!(backend.prepare_insert(slot, copy).is_none());
+            // A note on its 8th quarter note, at 120 quarter notes a minute.
+            let mut event = OnsetEvent::new(0, 440.0, 0.1, 1.0);
+            event.controls.insert_chain = Some(1000);
+            event.controls.effects[0] = Some(InsertControls::new(key).with_clock(8.0, 120.0));
+            backend.note(event);
+            let mut output = [0.0; 256];
+            backend.process_block(&mut output, 128);
+            assert_eq!(taken(), [(8.0, 120.0, 0)]);
+            backend.release_insert(slot, key, false, true);
+            while backend.orbit_inserts[slot.physical(0)].is_some() {
+                backend.process_block(&mut output, 128);
+            }
+            let copy = backend.take_retired_insert().expect("the copy went back");
+            while backend.frame < 12_000 {
+                backend.process_block(&mut output, 128);
+            }
+            assert!(backend.prepare_insert(slot, copy).is_none());
+            let [(beats, tempo, frames)] = taken()[..] else {
+                panic!("the copy that came back took no clock");
+            };
+            let expected = 8.0 + backend.frame as f64 / 48_000.0 * 2.0;
+            assert!((beats - expected).abs() < 1e-9, "{beats} is not {expected}");
+            assert_eq!((tempo, frames), (120.0, 0));
+        }
+
         /// With a list of names from the host, a chain the score has keeps its
         /// insert through a long silence, also when its plugin is never silent.
         /// A chain with no name leaves after a short silence, or after the
@@ -3622,12 +3721,20 @@ mod tests {
             // place of a note at the output of the note, 128 frames after its
             // frame. An effect with no copy and 64 frames of latency starts
             // the note 64 frames later, and the output comes 64 frames later.
-            for (missing, output_at) in [(None, 128), (Some(64), 192)] {
+            // A note aimed at 400 that comes in the block of 512 reaches the
+            // instrument on 512, and its output comes as late.
+            let cases = [
+                (None, 128, 512),
+                (Some(64), 192, 512),
+                (None, 128, 400),
+                (Some(64), 192, 400),
+            ];
+            for (missing, output_at, aimed) in cases {
                 let mut backend = make();
                 backend.note(held());
                 backend.process_block(&mut output, 512);
                 let before = output[1022];
-                let mut late = note(512, 0.5, 0.5, Some(0.0));
+                let mut late = note(aimed, 0.5, 0.5, Some(0.0));
                 late.controls.instrument = Some(InsertControls::new(key).with_latency(128));
                 let effect = InsertControls::new(InsertKey { plugin: 9, ..key });
                 late.controls.effects[0] = missing.map(|frames| effect.with_latency(frames));

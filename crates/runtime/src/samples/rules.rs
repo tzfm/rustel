@@ -103,7 +103,9 @@ impl SourceRule {
                             || host.strip_suffix(domain.as_str()).is_some_and(|rest| rest.ends_with('.')))
             }
             Self::Address { origin, path } => {
-                url.origin().ascii_serialization() == *origin && path_is_below(url.path(), path)
+                url.origin().ascii_serialization() == *origin
+                    && path_is_below(url.path(), path)
+                    && !url.path().split('/').any(climbs_on_decode)
             }
         }
     }
@@ -147,6 +149,19 @@ fn path_is_below(path: &str, folder: &str) -> bool {
         || path
             .strip_prefix(folder)
             .is_some_and(|rest| folder.ends_with('/') || rest.starts_with('/'))
+}
+
+/// Whether a path segment can leave its folder on a server that decodes the
+/// path before it resolves `..`: `..%2F`, `..%5C` or `..;`. The URL parser
+/// already resolves `..` and `%2e%2e`.
+fn climbs_on_decode(segment: &str) -> bool {
+    let lower = segment.to_ascii_lowercase();
+    let name = lower
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .replace("%2e", ".");
+    lower.contains("%2f") || lower.contains("%5c") || matches!(name.as_str(), "." | "..")
 }
 
 impl std::fmt::Display for SourceRule {
@@ -227,6 +242,21 @@ mod tests {
         assert_eq!(local.to_string(), "http://localhost:8000");
         assert!(local.allows(&url("http://localhost:8000/kit.json")));
         assert!(!local.allows(&url("http://localhost:9000/kit.json")));
+    }
+
+    #[test]
+    fn an_address_refuses_a_path_that_climbs_once_decoded() {
+        let folder = rule("http://localhost:8000/kits/");
+        for climbing in [
+            "http://localhost:8000/kits/..%2F..%2Fother/bd.wav",
+            "http://localhost:8000/kits/..%2fother.wav",
+            "http://localhost:8000/kits/..%5Cother.wav",
+            "http://localhost:8000/kits/..;/other.wav",
+            "http://localhost:8000/kits/%2E%2e;x/other.wav",
+        ] {
+            assert!(!folder.allows(&url(climbing)), "{climbing}");
+        }
+        assert!(folder.allows(&url("http://localhost:8000/kits/bd%20808.wav")));
     }
 
     #[test]

@@ -494,9 +494,15 @@ impl StudioEngine {
         let cps = self.session.cps().max(1e-6);
         let cycle_now = self.session.cycle_at_time(now);
         let headroom_cycles = self.launch_headroom() * cps;
+        #[cfg(feature = "vst")]
+        let lead = self.session.takeover_headroom();
         let Some(pending) = self.pending_launch.as_mut() else {
             return;
         };
+        #[cfg(feature = "vst")]
+        {
+            pending.lead = lead;
+        }
         pending.boundary_cycle = next_boundary(cycle_now, pending.unit_cycles, headroom_cycles);
         pending.boundary_time = now + (pending.boundary_cycle - cycle_now) / cps;
         if !std::mem::replace(&mut pending.waited, true) {

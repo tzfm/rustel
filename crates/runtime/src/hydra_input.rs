@@ -849,6 +849,11 @@ impl HydraInputs {
         self.score_sample_access = access;
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn score_sample_access(&self) -> &ScoreSampleAccess {
+        &self.score_sample_access
+    }
+
     /// Read relative image and video paths in this folder first: the open
     /// set's folder in Studio. `None` leaves only the local sample root.
     pub(crate) fn set_media_folder(&mut self, folder: Option<&Path>) {
@@ -1379,7 +1384,12 @@ fn read_media(
             )),
         },
     };
+    // With no local root, the set folder's answer stands: asking the root
+    // would offer a local folder for a file that is only missing.
     in_set.or_else(|in_set| {
+        if !access.has_local_root() {
+            return Err(in_set);
+        }
         access
             .read_hydra_local_media(source, media)
             .map_err(|_| in_set)
@@ -3137,7 +3147,7 @@ mod tests {
         let host = rustel_hydra::HydraHost::new();
         let mut inputs = HydraInputs::new(host.input_sink());
         inputs.set_media_folder(Some(folder.path()));
-        inputs.configure(video_plan(1, "clips/red.webm"));
+        inputs.configure(video_plan(1, "./clips/red.webm"));
         inputs.set_drawing(true);
         assert_eq!(
             first_event(&inputs),
@@ -3182,13 +3192,22 @@ mod tests {
                 "the set folder did not open",
             ),
         ] {
+            let access = ScoreSampleAccess::denied();
             let mut inputs = HydraInputs::new(host.input_sink());
+            inputs.set_score_sample_access(access.clone());
             inputs.set_media_folder(set_folder);
             inputs.configure(video_plan(0, url));
             inputs.set_drawing(true);
             let (slot, message, failed) = first_event(&inputs);
             assert!(failed && slot == 0, "{url}: {message}");
             assert!(message.contains(expected), "{url}: {message}");
+            // Only a read with no set folder offers to choose a local one.
+            let offered = access.take_refused_sources();
+            assert_eq!(
+                offered.is_empty(),
+                set_folder.is_some(),
+                "{url}: {offered:?}"
+            );
         }
     }
 }

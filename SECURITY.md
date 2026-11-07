@@ -119,7 +119,8 @@ adds to the command line and does not list the built-in sources. A refused
 file puts its folder on the page, turned off. An edit of a row must still
 allow what the row named, so a typing error cannot allow a different site. A
 root from `--allow-local-samples` is used instead of the root of the page.
-Studio keeps these choices in `studio.json`.
+Studio keeps these choices in `studio.json`. A source turned off takes the
+banks it allowed, and no file of theirs is read again.
 
 ### Local root
 
@@ -137,8 +138,8 @@ a read outside the grant.
 Repeat `--allow-sample-origin` once per source. A source holds no credentials,
 query, or fragment. Every manifest and audio URL reached through a sample map
 must individually pass the policy, so a manifest on one source cannot pivot
-fetches to a host the policy would refuse. A redirect must stay inside the
-source that allowed the first address.
+fetches to a host the policy would refuse. A redirect must reach an address
+that an allowed source allows, as the score could name that address itself.
 
 Connections resolve only to permitted public addresses, with one exception: explicitly
 named loopback. Loopback is available only when the allowed address names
@@ -174,7 +175,7 @@ minimal build can omit Hydra with `--no-default-features`.
 
 Hydra images and videos from a web address are host fetches. They must pass
 the session's score sample access policy, as a sample does: an allowed
-source, guarded DNS on every hop, and redirects that stay inside the source.
+source for every hop, and guarded DNS on every hop.
 A response body is limited to 16 MiB for an image, before image decoding,
 with separate decoded-image limits, and to 64 MiB for a video. A relative
 path is read in the folder of the set, then in the local root, under the

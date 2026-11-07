@@ -817,12 +817,13 @@ fn a_live_note_plays_through_its_plugin() {
     });
     assert_eq!(fixture().running, running, "a restart built a copy");
     // The sends of the notes wait in send lines, which the memory report
-    // counts: 4 lines of 2048 samples for each of 16 orbits.
+    // counts: 4 lines of 2048 samples for each of 16 orbits, and 4 level
+    // lines.
     let send_lines = engine
         .snapshot()
         .audio_memory
         .map(|memory| memory.send_lines);
-    assert_eq!(send_lines, Some(16 * 4 * 2048 * 4));
+    assert_eq!(send_lines, Some((16 * 4 + 4) * 2048 * 4));
     // The long notes below take 2 cycles each. The next service of the copy
     // comes 1 s after its last read, and an edit lands late in a pair of
     // cycles, so its first note comes soon and asks for its service at once.

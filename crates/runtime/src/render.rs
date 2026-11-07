@@ -712,9 +712,7 @@ pub(crate) fn onset_frame_edge(frame: u64, sample_rate: u32) -> f64 {
     edge
 }
 
-/// The error of an export that ends before its writer makes its file. No
-/// audio exists to keep, so the export writes no file.
-pub const RENDER_ENDED_BEFORE_AUDIO: &str = "the export ended before its first frame";
+pub use rustel_audio::RENDER_ENDED_BEFORE_AUDIO;
 
 /// The stop of a render. A stop of the transport of its session cancels the
 /// render, and the finish flag of a Studio export ends it early. Each wait

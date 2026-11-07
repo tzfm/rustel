@@ -2055,11 +2055,12 @@ mod tests {
         let replaced = &device.shared.samples.send_line_returns;
         let reach = || device.send_lines_reach.load(Ordering::Relaxed);
         // The memory report counts the lines the turns ship: 4 lines for
-        // each of 16 orbits, each a power of 2 of samples of 4 bytes.
+        // each of 16 orbits and 4 level lines, each a power of 2 of samples
+        // of 4 bytes.
         let send_lines = || device.memory().send_lines;
         turn(480);
         assert_eq!(reach(), 896);
-        assert_eq!(send_lines(), 16 * 4 * 1024 * 4);
+        assert_eq!(send_lines(), (16 * 4 + 4) * 1024 * 4);
         until("the callback did not take the send lines", || {
             lines.len() == 0
         });
@@ -2078,12 +2079,13 @@ mod tests {
             device.clock_frames() >= taken_by
         });
         assert_eq!((lines.len(), replaced.len()), (1, 1));
-        // A reclaim, not a turn: a turn frees returned lines at more than
-        // one point, so it could also free the lines the take gives back.
+        // The reclaim frees the returned lines, so the callback has room to
+        // take the next. The reclaim drains until the ring is empty, so it
+        // can also free the lines that take gives back: either count is right.
         device.reclaim_assets();
         // The message says which part waits, and if the callback ran.
         let (since, start) = (device.clock_frames(), std::time::Instant::now());
-        while (lines.len(), replaced.len()) != (0, 1) {
+        while lines.len() != 0 {
             assert!(
                 start.elapsed().as_secs() < 10,
                 "the callback did not take the next lines: {} in the line, {} returned, {} frames since the reclaim, {} leaked",
@@ -2094,11 +2096,12 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+        assert_eq!(device.shared.samples.leaked.load(Ordering::Relaxed), 0);
         LiveReverbBatch::default().flush_inserts(&device);
         assert_eq!(replaced.len(), 0);
         turn(96_000);
         assert_eq!(reach(), 65_408);
-        assert_eq!(send_lines(), 16 << 20);
+        assert_eq!(send_lines(), (16 * 4 + 4) << 18);
         until("the callback did not take the lines of 1 s", || {
             lines.len() == 0
         });
@@ -2250,7 +2253,7 @@ mod tests {
             .map(|(.., address)| *address)
             .expect("the copy of key 2");
         device.insert_replaced.lock().unwrap().push(marked);
-        assert_eq!(device.memory().send_lines, 16 << 20);
+        assert_eq!(device.memory().send_lines, (16 * 4 + 4) << 18);
         assert!(
             device
                 .recycle_output_to_with(

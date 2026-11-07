@@ -69,7 +69,16 @@ impl Editor {
                 };
                 head.min(target)..end
             };
-            self.vim_apply_operator(operator, range, linewise, head.min(target), moment)
+            // $ is inclusive: d2$ ending on an empty line still takes it.
+            let exclusive = !matches!(motion, Motion::LineEnd);
+            self.vim_apply_operator(
+                operator,
+                range,
+                linewise,
+                exclusive,
+                head.min(target),
+                moment,
+            )
         } else {
             self.vim_move(motion, count)
         }

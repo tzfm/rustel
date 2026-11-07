@@ -101,8 +101,34 @@ pub struct ScheduleTraceEvent {
     /// Filled only after the producer successfully submits the corresponding
     /// audio event. The scheduler itself deliberately leaves this unset.
     pub gain: Option<f32>,
+    /// How the onset's sample voice walks its buffer. The producer fills
+    /// it, like `gain`, from the voice it submitted. `None` for a voice that
+    /// plays no sample, and for a preview.
+    pub sample: Option<TraceSampleWalk>,
     pub ui_visuals: u64,
     pub context: Vec<(usize, usize)>,
+}
+
+/// How a sample voice walks its buffer, as the voice resolved it. The
+/// voice owns the rate (`speed`, the note's transpose and `unit:"c"`),
+/// the slice and the loop, so a picture of the same clip follows the
+/// sound by reading them here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TraceSampleWalk {
+    /// Seconds of the buffer the voice walks in one second. 0 for a voice
+    /// that is muted.
+    pub rate: f32,
+    /// Where the walk starts, as a share of the buffer. A reversed walk
+    /// counts it, and the loop, from the buffer's end.
+    pub begin: f32,
+    /// Where the slice ends the voice, as a share of the buffer. `None`
+    /// when the hap gates the voice, and the walk runs to the buffer's end.
+    pub end: Option<f32>,
+    pub reversed: bool,
+    /// The loop the walk wraps in, in seconds of the buffer.
+    pub loop_secs: Option<(f32, f32)>,
+    /// Seconds the walk holds at `begin` before it starts.
+    pub nudge_secs: f32,
 }
 
 /// Tuning metadata from `edoScale` for pitch visualizations: the number of
@@ -193,8 +219,9 @@ fn trace_edo_scale(value: &Value) -> Option<TraceEdoScale> {
 impl ScheduleTraceEvent {
     /// The trace of a hap. The scheduler captures one at queue acceptance,
     /// and a preview of a hap that is not yet queued uses the same form. The
-    /// texts are bounded, the pitch is what the score wrote, and `gain` is
-    /// left for the producer. `None` for a hap without a whole span.
+    /// texts are bounded, the pitch is what the score wrote, and `gain` and
+    /// `sample` are left for the producer. `None` for a hap without a whole
+    /// span.
     pub fn from_hap(
         hap: &Hap,
         generation: Generation,
@@ -219,6 +246,7 @@ impl ScheduleTraceEvent {
             scale: trace_edo_scale(&hap.value),
             frequency_hz: trace_pitch_hz(&hap.value),
             gain: None,
+            sample: None,
             ui_visuals: hap.ui_visuals_context(),
             context: hap
                 .context
@@ -2421,6 +2449,7 @@ mod tests {
                 scale: None,
                 frequency_hz: None,
                 gain: None,
+                sample: None,
                 ui_visuals: 0,
                 context: vec![(4, 8), (13, 21)],
             }

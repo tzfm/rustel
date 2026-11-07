@@ -163,9 +163,10 @@ rustel studio set/ --allow-sample-origin images.example
 ```
 
 A domain allows HTTPS from it and its subdomains. An address, such as
-`http://localhost:8000/media/`, allows what starts with it. Redirects must
-stay inside the source. Private and link-local addresses are refused, and a
-server on this computer needs an address that names it.
+`http://localhost:8000/media/`, allows what starts with it. A redirect must
+reach an address that an allowed source allows. Private and link-local
+addresses are refused, and a server on this computer needs an address that
+names it.
 
 ### Formats and limits
 

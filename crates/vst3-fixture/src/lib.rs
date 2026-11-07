@@ -365,6 +365,15 @@ struct Processor {
     first: Cell<bool>,
     /// The Delay value the first block after the last setActive(1) found.
     found: Cell<Option<f64>>,
+    /// See [`RATE_LATENCY_ENV`]. Read one time, with the plugin.
+    timed: bool,
+    /// The rate of the last setupProcessing.
+    rate: Cell<f64>,
+    /// The rate the first block after the last setActive(1) found, or the
+    /// rate of the first setupProcessing: see [`RATE_LATENCY_ENV`].
+    rate_found: Cell<f64>,
+    /// The rate of the delay in use: see [`RATE_LATENCY_ENV`].
+    delay_rate: Cell<f64>,
     /// The first blocks that still break: see [`EARLY_FAULT_ENV`].
     early: Cell<u32>,
 }
@@ -388,6 +397,10 @@ impl Processor {
             late: std::env::var_os(LATE_LATENCY_ENV).is_some(),
             first: Cell::new(false),
             found: Cell::new(None),
+            timed: std::env::var_os(RATE_LATENCY_ENV).is_some(),
+            rate: Cell::new(0.0),
+            rate_found: Cell::new(0.0),
+            delay_rate: Cell::new(0.0),
             early: Cell::new(if std::env::var_os(EARLY_FAULT_ENV).is_some() {
                 EARLY_FAULT_BLOCKS
             } else {
@@ -399,9 +412,14 @@ impl Processor {
     /// Asks the controller for a restart when `value` differs from the
     /// delay in use. Makes no allocation and takes no lock.
     fn check_delay(&self, value: f64) {
-        if value == self.in_use.get() {
-            return;
+        if value != self.in_use.get() {
+            self.ask_restart();
         }
+    }
+
+    /// Asks the controller for a restart. Makes no allocation and takes no
+    /// lock.
+    fn ask_restart(&self) {
         if let Some((peer, message)) = &*self.peer.borrow() {
             // SAFETY: the message lives while the processor holds it.
             unsafe { peer.notify(message.as_ptr()) };
@@ -541,7 +559,14 @@ impl IComponentTrait for Processor {
             };
             self.in_use.set(value);
             self.first.set(true);
-            let frames = value * MAX_DELAY as f64;
+            // A timed delay is a time: its frames follow the rate it found.
+            self.delay_rate.set(self.rate_found.get());
+            let scale = if self.timed {
+                self.delay_rate.get() / TIMED_DELAY_RATE
+            } else {
+                1.0
+            };
+            let frames = value * MAX_DELAY as f64 * scale;
             self.delay.borrow_mut().start(frames.round() as usize);
             self.echo.borrow_mut().start();
         }
@@ -602,6 +627,10 @@ impl IAudioProcessorTrait for Processor {
         if !self.modes.take(setup) {
             return kResultFalse;
         }
+        self.rate.set(setup.sampleRate);
+        if self.rate_found.get() == 0.0 {
+            self.rate_found.set(setup.sampleRate);
+        }
         self.echo.borrow_mut().setup(setup.sampleRate);
         kResultOk
     }
@@ -648,8 +677,14 @@ impl IAudioProcessorTrait for Processor {
             }
         }
         // A late copy reads its Delay value in the first block after it
-        // turns on, and takes it at the next setActive(1).
-        if self.late && self.first.replace(false) {
+        // turns on, and takes it at the next setActive(1). A timed copy
+        // reads its rate there.
+        let first = self.first.replace(false);
+        if self.timed && first && self.rate.get() != self.delay_rate.get() {
+            self.rate_found.set(self.rate.get());
+            self.ask_restart();
+        }
+        if self.late && first {
             let value = self.values.get(PARAM_DELAY);
             self.found.set(Some(value));
             self.check_delay(value);
@@ -1346,6 +1381,17 @@ pub const REALTIME_ONLY_ENV: &str = "RUSTEL_VST3_FIXTURE_REALTIME_ONLY";
 /// reports a new latency after one restart and one block more. The copy
 /// reads the variable at its creation.
 pub const LATE_LATENCY_ENV: &str = "RUSTEL_VST3_FIXTURE_LATE_LATENCY";
+
+/// With this variable set, each copy of the effect keeps its delay as a
+/// time: the Delay value times 4096 frames at [`TIMED_DELAY_RATE`], 4096
+/// frames at most at the rate in use. The copy finds a new rate in the first
+/// block after it turns on, as a plugin that sets itself up in its first
+/// blocks does: that block asks for a restart, and the next setActive(1)
+/// takes the delay at the new rate. The first setup gives the rate with no
+/// restart. The copy reads the variable at its creation.
+pub const RATE_LATENCY_ENV: &str = "RUSTEL_VST3_FIXTURE_RATE_LATENCY";
+/// The rate of the frames of a timed delay: see [`RATE_LATENCY_ENV`].
+pub const TIMED_DELAY_RATE: f64 = 48_000.0;
 
 /// The process modes of one copy: see [`MODE_MARK_ENV`] and
 /// [`REALTIME_ONLY_ENV`]. Read one time, with the plugin.

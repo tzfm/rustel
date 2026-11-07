@@ -55,6 +55,7 @@ fn a_complete_frame_draws_every_surface_in_solid_blocks() {
                 None
             },
             gain: Some(1.0),
+            sample: None,
             // The inline roll is the layout's first widget, slot 0; the
             // engine tags every event of its pattern with that bit.
             ui_visuals: 1,

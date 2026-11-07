@@ -21,6 +21,14 @@ pub(super) const DECODED_DIR: &str = "decoded";
 /// crash: 4 bytes magic, u32 version, u32 rate, u16 channels, u64 frames.
 const HEADER_LEN: usize = 4 + 4 + 4 + 2 + 8;
 
+/// The most bytes the sidecars hold together. A new one makes room by
+/// removing the oldest, so the folder never grows past it.
+const MAX_DECODED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// How long a staging file goes unwritten before it counts as left by a
+/// writer that ended mid-write. A writer streams its file out in seconds.
+const STALE_STAGING: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// Decode `bytes` through the decoded-PCM cache under `dir`.
 ///
 /// A cache hit returns exactly what [`super::codecs::decode_guarded`] returned
@@ -39,7 +47,7 @@ pub(super) fn decode_cached(
         return Ok(decoded);
     }
     let decoded = super::codecs::decode_guarded(url, bytes, context_rate)?;
-    write_sidecar(&path, &decoded);
+    write_sidecar(&path, &decoded, MAX_DECODED_BYTES);
     Ok(decoded)
 }
 
@@ -118,9 +126,10 @@ fn read_sidecar(path: &std::path::Path) -> Option<DecodedSample> {
 
 /// Store one decode beside its source, best-effort: a full disk or a
 /// read-only cache costs the next load its decode again, nothing more.
+/// The sidecars stay under `cap` bytes together, the oldest going first.
 /// The frames stream out in bounded chunks, so a long sample never holds
 /// itself twice in memory for the write.
-fn write_sidecar(path: &std::path::Path, decoded: &DecodedSample) {
+fn write_sidecar(path: &std::path::Path, decoded: &DecodedSample, cap: u64) {
     let Some(parent) = path.parent() else {
         return;
     };
@@ -133,12 +142,20 @@ fn write_sidecar(path: &std::path::Path, decoded: &DecodedSample) {
         // come back.
         return;
     }
+    let size = u64::try_from(HEADER_LEN + body).unwrap_or(u64::MAX);
+    if size > cap || !make_room(parent, size, cap) {
+        return;
+    }
+    // One staging file per writer: loader threads that decode the same
+    // bytes at once must not write into one file. As in the sample cache.
+    static WRITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let staged = parent.join(format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{}.tmp",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("pcm"),
-        std::process::id()
+        std::process::id(),
+        WRITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     if write_staged(&staged, decoded).is_err() {
         let _ = std::fs::remove_file(&staged);
@@ -147,9 +164,49 @@ fn write_sidecar(path: &std::path::Path, decoded: &DecodedSample) {
     let _ = std::fs::rename(&staged, path);
 }
 
+/// Remove the oldest sidecars until `size` more bytes fit under `cap`.
+/// Returns whether they fit. A staging file left by a writer that ended
+/// mid-write goes too.
+fn make_room(dir: &std::path::Path, size: u64, cap: u64) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut held = Vec::new();
+    for entry in entries.flatten() {
+        let (path, Ok(metadata)) = (entry.path(), entry.metadata()) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let written = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("pcm") => held.push((written, metadata.len(), path)),
+            Some("tmp") if written.elapsed().is_ok_and(|age| age > STALE_STAGING) => {
+                let _ = std::fs::remove_file(path);
+            }
+            _ => {}
+        }
+    }
+    held.sort_unstable_by_key(|(written, _, _)| *written);
+    let mut total: u64 = held.iter().map(|(_, len, _)| len).sum();
+    for (_, len, path) in held {
+        if total.saturating_add(size) <= cap {
+            break;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            total -= len;
+        }
+    }
+    total.saturating_add(size) <= cap
+}
+
 fn write_staged(staged: &std::path::Path, decoded: &DecodedSample) -> std::io::Result<()> {
     use std::io::Write;
-    let mut out = std::fs::File::create(staged)?;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staged)?;
     let frames = u64::try_from(decoded.frames()).unwrap_or(u64::MAX);
     let mut header = [0u8; HEADER_LEN];
     header[..4].copy_from_slice(b"RSPC");
@@ -166,7 +223,9 @@ fn write_staged(staged: &std::path::Path, decoded: &DecodedSample) -> std::io::R
         }
         out.write_all(&chunk)?;
     }
-    out.flush()
+    // On the disk before the rename names it, so a crash cannot leave a
+    // sidecar of the right length that holds no frames.
+    out.sync_all()
 }
 
 #[cfg(test)]
@@ -185,7 +244,7 @@ mod tests {
         let pcm: Vec<f32> = (0..48_000).map(|i| i as f32 * 0.5 - 1.0).collect();
         let stored = sample(48_000, 2, pcm.clone());
         let path = sidecar_path(dir.path(), b"bytes", 48_000, super::super::Codec::Wav);
-        write_sidecar(&path, &stored);
+        write_sidecar(&path, &stored, MAX_DECODED_BYTES);
         let loaded = read_sidecar(&path).expect("the sidecar reads back");
         assert_eq!(loaded.sample_rate(), 48_000);
         assert_eq!(loaded.channels(), 2);
@@ -214,7 +273,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stored = sample(48_000, 1, vec![0.25; 100]);
         let path = sidecar_path(dir.path(), b"bytes", 48_000, super::super::Codec::Wav);
-        write_sidecar(&path, &stored);
+        write_sidecar(&path, &stored, MAX_DECODED_BYTES);
         let full = std::fs::read(&path).unwrap();
         assert!(read_sidecar(&path).is_some());
 
@@ -222,5 +281,55 @@ mod tests {
         assert!(read_sidecar(&path).is_none());
         std::fs::write(&path, b"not a sidecar at all").unwrap();
         assert!(read_sidecar(&path).is_none());
+    }
+
+    /// The sidecars stay under their cap: a new one takes the place of the
+    /// oldest, and one larger than the cap is not stored.
+    #[test]
+    fn a_new_sidecar_makes_room_by_removing_the_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = sample(48_000, 1, vec![0.25; 100]);
+        let size = (HEADER_LEN + 400) as u64;
+        let path = |bytes: &[u8]| sidecar_path(dir.path(), bytes, 48_000, super::super::Codec::Wav);
+        let paths = [path(b"one"), path(b"two"), path(b"six")];
+        for (age, path) in (1..).zip(&paths) {
+            write_sidecar(path, &stored, 2 * size);
+            // A second apart, whatever the clock resolution of the disk.
+            let written = std::time::UNIX_EPOCH + std::time::Duration::from_secs(age);
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(written).unwrap();
+        }
+        assert_eq!(
+            paths.each_ref().map(|path| path.exists()),
+            [false, true, true]
+        );
+
+        let large = path(b"large");
+        write_sidecar(&large, &stored, size - 1);
+        assert!(!large.exists() && paths[1].exists() && paths[2].exists());
+    }
+
+    /// A staging file a writer left when it ended mid-write goes at the
+    /// next store. One that a writer still fills stays.
+    #[test]
+    fn a_store_removes_the_staging_a_crash_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sidecar_path(dir.path(), b"bytes", 48_000, super::super::Codec::Wav);
+        let decoded = path.parent().unwrap();
+        std::fs::create_dir_all(decoded).unwrap();
+        let (left, filling) = (
+            decoded.join(".a.pcm.1.0.tmp"),
+            decoded.join(".b.pcm.2.0.tmp"),
+        );
+        for staged in [&left, &filling] {
+            std::fs::write(staged, [0u8; 64]).unwrap();
+        }
+        let file = std::fs::File::options().write(true).open(&left).unwrap();
+        file.set_modified(std::time::SystemTime::now() - 2 * STALE_STAGING)
+            .unwrap();
+        write_sidecar(&path, &sample(48_000, 1, vec![0.5; 10]), MAX_DECODED_BYTES);
+        assert!(path.exists());
+        assert!(!left.exists(), "the staging a crash left");
+        assert!(filling.exists(), "the staging a writer fills");
     }
 }

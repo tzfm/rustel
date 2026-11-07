@@ -87,6 +87,10 @@ pub fn write_pcm16_wav(
 /// stopped this" from "the render failed".
 pub const RENDER_CANCELLED: &str = "render cancelled";
 
+/// The error of an export that ends before its writer makes its file. No
+/// audio exists to keep, so the export writes no file.
+pub const RENDER_ENDED_BEFORE_AUDIO: &str = "the export ended before its first frame";
+
 /// Stop a bounce when the music has finished, rather than when the clock runs
 /// out.
 ///
@@ -547,10 +551,13 @@ fn write_render_wav_events(
         let count = (preroll - input_offset).min(BLOCK);
         backend.process_block(&mut pcm[..count * CHANNELS as usize], count);
         input_offset += count;
-        // Read after each block, the last one too, so a cancel in the
-        // pre-roll makes no file.
+        // Read after each block, the last one too, so a cancel or a finish
+        // in the pre-roll makes no file.
         if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
             return Err(RENDER_CANCELLED.to_owned());
+        }
+        if finish.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(RENDER_ENDED_BEFORE_AUDIO.to_owned());
         }
     }
 
@@ -627,6 +634,15 @@ fn write_render_wav_events(
         if fade_from.is_none()
             && finish.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
         {
+            if offset == 0 {
+                // No frame is in the file yet: the export ends with none.
+                drop(file);
+                let _ = std::fs::remove_file(path);
+                if let Some(tracks) = stems.as_deref_mut() {
+                    tracks.sounded = [false; crate::scalar::MAX_ORBITS];
+                }
+                return Err(RENDER_ENDED_BEFORE_AUDIO.to_owned());
+            }
             fade_from = Some(offset);
         }
         let mut finished_at: Option<usize> = None;
@@ -1098,13 +1114,13 @@ mod finish_tests {
             bytes
         );
 
-        // A flag raised in the last block of the pre-roll: a cancel leaves no
-        // file, and a finish fades from the first frame of the file.
+        // A flag raised in the last block of the pre-roll leaves no file, and
+        // so does a finish raised in the first block of the file.
         std::fs::remove_file(&path).unwrap();
         let raised = AtomicBool::new(false);
         let error = write_pcm16_wav_controlled(
             &path,
-            &mut Raising(&raised),
+            &mut Raising(&raised, 128),
             48_000,
             48_000,
             &[],
@@ -1116,25 +1132,23 @@ mod finish_tests {
         .unwrap_err();
         assert_eq!(error, RENDER_CANCELLED);
         assert!(!path.exists());
-        let raised = AtomicBool::new(false);
-        let bytes = write_wav_controlled(
-            &path,
-            &mut Raising(&raised),
-            48_000,
-            48_000,
-            &[],
-            RenderControl {
-                finish: Some(&raised),
-                ..RenderControl::default()
-            },
-            WavSampleFormat::Float32,
-        )
-        .unwrap();
-        assert_eq!(bytes / 8, 4_800);
-        let file = std::fs::read(&path).unwrap();
-        for (frame, sample) in file[44..].as_chunks::<8>().0.iter().enumerate() {
-            let left = f32::from_le_bytes(sample[..4].try_into().unwrap());
-            assert_eq!(left, 0.5 * fade_gain(frame, 4_800), "frame {frame}");
+        for preroll in [128, 0] {
+            let raised = AtomicBool::new(false);
+            let error = write_wav_controlled(
+                &path,
+                &mut Raising(&raised, preroll),
+                48_000,
+                48_000,
+                &[],
+                RenderControl {
+                    finish: Some(&raised),
+                    ..RenderControl::default()
+                },
+                WavSampleFormat::Float32,
+            )
+            .unwrap_err();
+            assert_eq!(error, RENDER_ENDED_BEFORE_AUDIO, "pre-roll {preroll}");
+            assert!(!path.exists(), "pre-roll {preroll}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1142,7 +1156,8 @@ mod finish_tests {
     /// A backend with a pre-roll of one block that plays 0.5. Each block
     /// raises the flag, so the flag rises in the last block of the
     /// pre-roll.
-    struct Raising<'a>(&'a std::sync::atomic::AtomicBool);
+    /// Raises its flag in every block, after a pre-roll of this many frames.
+    struct Raising<'a>(&'a std::sync::atomic::AtomicBool, usize);
 
     impl AudioBackend for Raising<'_> {
         fn name(&self) -> &'static str {
@@ -1158,7 +1173,7 @@ mod finish_tests {
             self.0.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         fn preroll_frames(&self) -> usize {
-            128
+            self.1
         }
     }
 }
