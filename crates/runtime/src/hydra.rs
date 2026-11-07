@@ -233,7 +233,7 @@ impl HydraBridge {
 
     /// Install a score with its host-allowed sample sources. Image workers
     /// carry a snapshot and recheck it before every network fetch, and every
-    /// redirect must stay inside the source that allowed the first address.
+    /// redirect must reach an address one of the sources allows.
     pub fn apply_with_sample_access(
         &mut self,
         update: HydraUpdate,
@@ -255,6 +255,18 @@ impl HydraBridge {
         self.inputs
             .set_drawing(self.transport_drawing && self.host.is_open());
         Ok(())
+    }
+
+    /// Read later images and videos under `access`, the host's policy now: a
+    /// source it took back is not fetched again when the transport restarts.
+    pub fn set_sample_access(&mut self, access: &ScoreSampleAccess) {
+        self.inputs.set_score_sample_access(access.clone());
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn sample_access_for_test(&self) -> ScoreSampleAccess {
+        self.inputs.score_sample_access().clone()
     }
 
     /// Let a score's images and videos name files in this folder by a path

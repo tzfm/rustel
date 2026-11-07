@@ -144,10 +144,12 @@ pub(crate) struct CopyState {
     /// [`Self::latency_changed`].
     pub restart_asked: Arc<AtomicBool>,
     /// The time of the next restart service of the copy, in ms from the
-    /// start of the host: see [`crate::Host::restarts`]. 0 at the build.
+    /// start of the host: see [`crate::Host::restarts`]. 0 at the build and
+    /// at a retune.
     pub restart_after: AtomicU64,
     /// The restart services in a row that read the latency the copy had
-    /// before: see [`crate::Host::restarts`]. 0 at the build.
+    /// before: see [`crate::Host::restarts`]. 0 at the build and at a
+    /// retune.
     pub kept_restarts: AtomicU32,
     /// The stamp of the preset file at the build of the copy: see
     /// [`crate::cache::Stamp::number`]. A copy of preset 0 reads no file and
@@ -1042,8 +1044,10 @@ impl Instance {
     /// Sets the copy up again at `sample_rate`, on the plugin thread, with
     /// no new build and no preset read. Each note ends first, and the plugin
     /// takes the rate while it is off, in the mode of its build. Then silent
-    /// blocks run as at the build, the plugin thread reads the latency and
-    /// the tail again, and the clock of the copy starts again: see
+    /// blocks run as at the build, and a plugin that asks for a restart in
+    /// them gets one, as at the build. The plugin thread reads the latency
+    /// and the tail again, the restart services of the copy start again as
+    /// for a new copy, and the clock of the copy starts again: see
     /// [`Self::rebase`]. `Err` has the reason the plugin did not take the
     /// rate.
     pub(crate) fn retune(&mut self, sample_rate: u32) -> Result<(), String> {
@@ -1053,6 +1057,12 @@ impl Instance {
         }
         self.sample_rate = f64::from(sample_rate);
         self.warm_up();
+        if self.state.latency_changed.load(Ordering::Acquire) {
+            Flushed::restart(self)?;
+            self.warm_up();
+        }
+        self.state.kept_restarts.store(0, Ordering::Relaxed);
+        self.state.restart_after.store(0, Ordering::Relaxed);
         self.read_latency_and_tail();
         self.rebase();
         Ok(())

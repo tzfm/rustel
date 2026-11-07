@@ -29,6 +29,9 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// The slowest rate a file is given the time to arrive at, in bytes a
+/// second: 256 MiB takes about 17 minutes.
+const SLOWEST_TRANSFER_RATE: u64 = 256 * 1024;
 const DNS_WORKERS: usize = 2;
 const DNS_QUEUE_CAPACITY: usize = 8;
 const MAX_DNS_ANSWERS: usize = 64;
@@ -93,6 +96,9 @@ impl HydraMedia {
 #[derive(Clone)]
 pub(crate) struct FetchBudget {
     deadline: Instant,
+    /// For one transfer, how long each read may wait for bytes. The request
+    /// then has no deadline of its own, and its body stops at `deadline`.
+    stall: Option<Duration>,
     cancelled: Arc<AtomicBool>,
     exhausted: Arc<AtomicBool>,
 }
@@ -101,8 +107,31 @@ impl FetchBudget {
     pub(crate) fn until(deadline: Instant, cancelled: Arc<AtomicBool>) -> Self {
         Self {
             deadline,
+            stall: None,
             cancelled,
             exhausted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// One file of at most `bytes`, which may take as long as it keeps
+    /// arriving: no byte for [`FETCH_TIMEOUT`] fails it, and the whole of it
+    /// has the time to arrive at [`SLOWEST_TRANSFER_RATE`], and never less
+    /// than [`FETCH_TIMEOUT`]. A large video on a slow link still arrives.
+    pub(crate) fn for_transfer(bytes: usize, cancelled: Arc<AtomicBool>) -> Self {
+        let whole = u64::try_from(bytes).unwrap_or(u64::MAX) / SLOWEST_TRANSFER_RATE;
+        let whole = Duration::from_secs(whole).max(FETCH_TIMEOUT);
+        Self {
+            stall: Some(FETCH_TIMEOUT),
+            ..Self::until(Instant::now() + whole, cancelled)
+        }
+    }
+
+    /// The body of `response`, read under this budget: no read starts once
+    /// the budget is spent, so a body that keeps trickling still stops.
+    pub(crate) fn body(&self, response: ureq::Response) -> impl io::Read + '_ {
+        BudgetedBody {
+            body: response.into_reader(),
+            budget: self,
         }
     }
 
@@ -147,6 +176,19 @@ impl FetchBudget {
 
     fn exhaust(&self) {
         self.exhausted.store(true, Ordering::Release);
+    }
+}
+
+struct BudgetedBody<'a> {
+    body: Box<dyn io::Read + Send + Sync>,
+    budget: &'a FetchBudget,
+}
+
+impl io::Read for BudgetedBody<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Not the `Interrupted` of a cancelled budget, which a reader retries.
+        self.budget.remaining().map_err(io::Error::other)?;
+        self.body.read(buf)
     }
 }
 
@@ -646,7 +688,7 @@ fn manifest_agent_with_resolver(
     url: &Url,
     budget: &FetchBudget,
     resolve: impl FnOnce(&str, &FetchBudget) -> io::Result<Vec<SocketAddr>>,
-) -> Result<(ureq::Agent, Duration), String> {
+) -> Result<(ureq::Agent, Option<Duration>), String> {
     let netloc = url_netloc(url)?;
     // ureq 2.12 gives its configured connect timeout precedence over the
     // request-wide deadline, and its default connect timeout is thirty
@@ -655,6 +697,10 @@ fn manifest_agent_with_resolver(
     // budget before TCP receives a fresh copy of it.
     let addrs = resolve(&netloc, budget).map_err(|error| format!("resolve {netloc}: {error}"))?;
     let remaining = budget.remaining()?;
+    // A transfer waits its stall time at most for each read, and the request
+    // has no deadline: ureq would make every read wait for that deadline.
+    // Its body stops at the budget's deadline instead, in `FetchBudget::body`.
+    let wait = budget.stall.map_or(remaining, |stall| stall.min(remaining));
     Ok((
         ureq::AgentBuilder::new()
             .resolver(ResolvedHop { netloc, addrs })
@@ -665,11 +711,11 @@ fn manifest_agent_with_resolver(
             // This is measured AFTER the guarded DNS result. See above:
             // omitting it would restore ureq's independent thirty-second
             // default.
-            .timeout_connect(remaining)
-            .timeout_read(remaining)
-            .timeout_write(remaining)
+            .timeout_connect(wait)
+            .timeout_read(wait)
+            .timeout_write(wait)
             .build(),
-        remaining,
+        budget.stall.is_none().then_some(remaining),
     ))
 }
 
@@ -715,8 +761,11 @@ fn single_hop_get_with_resolver(
     accept: Option<&str>,
     resolve: impl FnOnce(&str, &FetchBudget) -> io::Result<Vec<SocketAddr>>,
 ) -> Result<ureq::Response, HopError> {
-    let (agent, remaining) = manifest_agent_with_resolver(url, budget, resolve)?;
-    let mut request = agent.get(url.as_str()).timeout(remaining);
+    let (agent, timeout) = manifest_agent_with_resolver(url, budget, resolve)?;
+    let mut request = agent.get(url.as_str());
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
     if let Some(accept) = accept {
         request = request.set("Accept", accept);
     }
@@ -730,6 +779,9 @@ fn single_hop_get_with_resolver(
             // reaches the same deadline. Mark every clone exhausted so a
             // recursive manifest or later batch effect cannot spend it again.
             budget.exhaust();
+            if let Some(stall) = budget.stall {
+                return format!("GET {url}: nothing arrived for {} s", stall.as_secs()).into();
+            }
             return format!("GET {url}: sample manifest deadline exceeded: {error}").into();
         }
         if budget.remaining().is_err() {
@@ -780,8 +832,8 @@ fn request_error_is_timeout(error: &ureq::Error) -> bool {
     false
 }
 
-/// Callers must check every redirect against the allowed source before this
-/// call, as the score path does. The hop's own naming is then the source's,
+/// Callers must check every redirect against the allowed sources before this
+/// call, as the score path does. The hop's own naming is then a source's,
 /// and loopback can be judged from it. A fetch that lets the server choose a
 /// new host per hop must carry the granted URL's naming across its hops
 /// itself; see [`fetch_following_redirects`].
@@ -838,8 +890,8 @@ pub(crate) fn fetch_hydra_media_with_budget(
     let label = media.label();
     let mut current = hydra_media_url(url, media)?;
     // A score-selected input starts a request only from an allowed source,
-    // and every redirect must stay inside that source.
-    let rule = access.approve_hydra_media_url(current.as_str(), media)?;
+    // and every redirect must reach an address an allowed source allows.
+    let sources = access.approve_hydra_media_url(current.as_str(), media)?;
     budget.check()?;
     for redirects in 0..=5 {
         // The source check is text. The guarded resolver judges the address
@@ -849,7 +901,7 @@ pub(crate) fn fetch_hydra_media_with_budget(
         })?;
         let action = inspect_hydra_media_response(
             &current,
-            &rule,
+            &sources,
             response.status(),
             response.header("Location"),
             media,
@@ -968,7 +1020,7 @@ fn validate_hydra_media_url(url: &Url, media: HydraMedia) -> Result<(), String> 
 #[cfg(feature = "hydra")]
 fn inspect_hydra_media_response(
     current: &Url,
-    rule: &crate::samples::SourceRule,
+    sources: &[crate::samples::SourceRule],
     status: u16,
     location: Option<&str>,
     media: HydraMedia,
@@ -988,8 +1040,8 @@ fn inspect_hydra_media_response(
         .join(location)
         .map_err(|_| format!("{label} redirect Location is invalid"))?;
     validate_hydra_media_url(&next, media)?;
-    if !rule.allows(&next) {
-        return Err(format!("{label} redirect leaves its allowed source {rule}"));
+    if !sources.iter().any(|rule| rule.allows(&next)) {
+        return Err(format!("{label} redirect leaves its allowed sources"));
     }
     next.set_fragment(None);
     Ok(HydraImageResponseAction::Redirect(next))
@@ -1126,8 +1178,8 @@ fn fetch_following_redirects_via(
                 .map_err(|_| format!("{kind} response exceeds host memory"))?;
         }
         use std::io::Read;
-        response
-            .into_reader()
+        budget
+            .body(response)
             .take(max_bytes as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|error| format!("read {url}: {error}"))?;
@@ -1162,7 +1214,13 @@ mod tests {
         status: u16,
         location: Option<&str>,
     ) -> Result<HydraImageResponseAction, String> {
-        inspect_hydra_media_response(current, rule, status, location, HydraMedia::Image)
+        inspect_hydra_media_response(
+            current,
+            std::slice::from_ref(rule),
+            status,
+            location,
+            HydraMedia::Image,
+        )
     }
 
     #[cfg(feature = "hydra")]
@@ -1237,6 +1295,24 @@ mod tests {
                 "refused {target}"
             );
         }
+    }
+
+    /// A GitHub `/raw/` link redirects to another host. With both allowed,
+    /// the image follows it, as the score could name that address itself.
+    #[cfg(feature = "hydra")]
+    #[test]
+    fn a_hydra_redirect_may_reach_another_allowed_source() {
+        let current = hydra_image_url("https://github.com/me/kit/raw/main/a.png").unwrap();
+        let sources = [source("github.com"), source("raw.githubusercontent.com")];
+        let target = Some("https://raw.githubusercontent.com/me/kit/main/a.png");
+        let inspect = |sources| {
+            inspect_hydra_media_response(&current, sources, 302, target, HydraMedia::Image)
+        };
+        assert!(matches!(
+            inspect(&sources),
+            Ok(HydraImageResponseAction::Redirect(_))
+        ));
+        assert!(inspect(&sources[..1]).is_err(), "a host no source allows");
     }
 
     #[cfg(feature = "hydra")]
@@ -2110,7 +2186,7 @@ mod tests {
         let budget = test_budget(Duration::from_secs(1));
         let resolved_at = std::cell::Cell::new(None);
 
-        let (_, remaining) = manifest_agent_with_resolver(&url, &budget, |netloc, _| {
+        let (_, timeout) = manifest_agent_with_resolver(&url, &budget, |netloc, _| {
             std::thread::sleep(Duration::from_millis(50));
             let result =
                 guard_resolved_addresses(netloc, vec![target], host_names_loopback(netloc));
@@ -2118,6 +2194,7 @@ mod tests {
             result
         })
         .expect("partly consumed budget still builds the hop");
+        let remaining = timeout.expect("a batch budget times the whole request");
 
         let available_after_dns = budget
             .deadline
@@ -2198,6 +2275,73 @@ mod tests {
             "{error}"
         );
         assert!(started.elapsed() < Duration::from_millis(250));
+        server.join().unwrap();
+    }
+
+    /// A transfer has the time to arrive at a slow rate: a large video has
+    /// many minutes, and a small file a minute.
+    #[test]
+    fn a_transfer_has_the_time_its_size_needs() {
+        let time = |bytes| {
+            FetchBudget::for_transfer(bytes, Arc::new(AtomicBool::new(false)))
+                .remaining()
+                .unwrap()
+        };
+        assert!(time(256 << 20) > Duration::from_secs(15 * 60));
+        assert!(time(1 << 20) > Duration::from_secs(55) && time(1 << 20) <= FETCH_TIMEOUT);
+    }
+
+    /// A transfer fails when nothing arrives for its stall time, and runs on
+    /// while bytes keep arriving, up to its deadline.
+    #[test]
+    fn a_transfer_waits_for_bytes_not_for_the_whole_file() {
+        // A server that sends its headers, then one byte every `gap`.
+        let trickle = |gap: Duration, bytes: usize| {
+            use std::io::{BufRead, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let url = format!("http://{}/clip.mp4", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut writer = stream.try_clone().expect("clone");
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 && !line.trim().is_empty() {
+                    line.clear();
+                }
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {bytes}\r\n\r\n");
+                let _ = writer.write_all(head.as_bytes());
+                for _ in 0..bytes {
+                    std::thread::sleep(gap);
+                    if writer.write_all(b"x").is_err() {
+                        break;
+                    }
+                }
+            });
+            (url, server)
+        };
+        let budget = |stall: u64, whole: u64| FetchBudget {
+            stall: Some(Duration::from_millis(stall)),
+            ..test_budget(Duration::from_millis(whole))
+        };
+        let gap = Duration::from_millis(100);
+
+        let (url, server) = trickle(gap, 6);
+        let bytes = fetch_following_redirects(&url, &budget(300, 5_000), 64, "video");
+        assert_eq!(bytes.expect("bytes kept arriving"), b"xxxxxx");
+        server.join().unwrap();
+
+        let (url, server) = trickle(Duration::from_secs(1), 1);
+        let started = Instant::now();
+        fetch_following_redirects(&url, &budget(300, 5_000), 64, "video")
+            .expect_err("nothing arrived for the stall time");
+        assert!(started.elapsed() < Duration::from_millis(900));
+        server.join().unwrap();
+
+        let (url, server) = trickle(gap, 20);
+        let started = Instant::now();
+        fetch_following_redirects(&url, &budget(300, 500), 64, "video")
+            .expect_err("the deadline ends a transfer that keeps trickling");
+        assert!(started.elapsed() < Duration::from_millis(1_200));
         server.join().unwrap();
     }
 

@@ -10,7 +10,7 @@ impl ScoreSampleAccess {
     pub fn permit_source(&mut self, source: &str) -> Result<(), String> {
         let rule = SourceRule::parse(source)?;
         if !self.sources.contains(&rule) {
-            self.sources.push(rule);
+            self.sources = self.sources.iter().cloned().chain([rule]).collect();
         }
         Ok(())
     }
@@ -78,7 +78,7 @@ impl ScoreSampleAccess {
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err("samples() URL contains credentials".to_owned());
         }
-        let Some(rule) = self.sources.iter().find(|rule| rule.allows(&parsed)) else {
+        if !self.sources.iter().any(|rule| rule.allows(&parsed)) {
             self.note_refused(&parsed);
             let grant = SourceRule::folder_of(&parsed)
                 .map(|rule| format!(" Allow it with --allow-sample-origin {rule} or on the Studio Permissions page."))
@@ -87,21 +87,39 @@ impl ScoreSampleAccess {
                 "{} is not an allowed sample source.{grant}",
                 parsed.origin().ascii_serialization()
             ));
-        };
+        }
         let normalized: Arc<str> = Arc::from(parsed.as_str());
-        Ok((normalized, ScoreFetchAccess::Remote { rule: rule.clone() }))
+        let sources = Arc::clone(&self.sources);
+        Ok((normalized, ScoreFetchAccess::Remote { sources }))
     }
 
-    /// Apply the same sources to a score's Hydra image or video, and give the
-    /// source that allows it. That source must also allow every redirect.
+    /// The grant this policy gives `url` in place of `grant`, which an
+    /// earlier policy gave: `Withdrawn` when nothing here allows it any more.
+    /// A remote grant takes this policy's sources, which judge its redirects.
+    pub(super) fn regrant(&self, url: &str, grant: &ScoreFetchAccess) -> ScoreFetchAccess {
+        match grant {
+            ScoreFetchAccess::Remote { .. } if matches!(self.source_for(url), Ok(Some(_))) => {
+                ScoreFetchAccess::Remote {
+                    sources: Arc::clone(&self.sources),
+                }
+            }
+            ScoreFetchAccess::Local { root } if self.local_root.as_ref() == Some(root) => {
+                grant.clone()
+            }
+            _ => ScoreFetchAccess::Withdrawn,
+        }
+    }
+
+    /// Apply the same sources to a score's Hydra image or video, and give
+    /// them back. One of them must also allow every redirect.
     #[cfg(feature = "hydra")]
     pub(crate) fn approve_hydra_media_url(
         &self,
         raw: &str,
         media: sample_fetch::HydraMedia,
-    ) -> Result<SourceRule, String> {
+    ) -> Result<Arc<[SourceRule]>, String> {
         match self.approve_remote(raw) {
-            Ok((_, ScoreFetchAccess::Remote { rule })) => Ok(rule),
+            Ok((_, ScoreFetchAccess::Remote { sources })) => Ok(sources),
             Ok(_) => Err(format!("{} URL is not a network address", media.label())),
             Err(error) => Err(error.replacen(
                 "an allowed sample source",
@@ -166,7 +184,9 @@ pub(crate) fn read_local_media(
     media: sample_fetch::HydraMedia,
 ) -> Result<Vec<u8>, String> {
     let label = media.label();
+    // `./clip.webm` names the same file as `clip.webm`.
     let relative = Path::new(path);
+    let relative = relative.strip_prefix(".").unwrap_or(relative);
     if !crate::sample_server::relative_sample_path_allowed(relative) {
         return Err(format!(
             "{label} {path:?} must be a relative path inside the folder, without `..`"
@@ -262,7 +282,7 @@ pub(super) fn fetch_score_source_cached_with_budget<T>(
     } = scope;
     budget.check()?;
     // A local grant reads the file where it lies; a copy would only go stale.
-    let ScoreFetchAccess::Remote { rule } = access else {
+    let ScoreFetchAccess::Remote { .. } = access else {
         let value = validate(&fetch_score_source_with_budget(
             url,
             access,
@@ -275,7 +295,7 @@ pub(super) fn fetch_score_source_cached_with_budget<T>(
     };
 
     let parsed = sample_fetch::wire_url(url)?;
-    if !rule.allows(&parsed) {
+    if !access.allows(&parsed) {
         return Err(format!("sample URL {url:?} is outside its allowed source"));
     }
 
@@ -391,11 +411,12 @@ pub(super) fn fetch_score_source_with_budget(
             budget.check()?;
             Ok(bytes)
         }
-        ScoreFetchAccess::Remote { rule } => {
+        ScoreFetchAccess::Withdrawn => Err(format!("{url}: its source was turned off")),
+        ScoreFetchAccess::Remote { .. } => {
             let mut current = sample_fetch::wire_url(url)?;
             for redirects in 0..=5 {
                 budget.check()?;
-                if !rule.allows(&current) {
+                if !access.allows(&current) {
                     return Err(format!(
                         "sample URL {current:?} is outside its allowed source"
                     ));
@@ -415,17 +436,18 @@ pub(super) fn fetch_score_source_with_budget(
                     let next = current.join(location).map_err(|error| {
                         format!("GET {current}: invalid redirect target: {error}")
                     })?;
-                    if !rule.allows(&next) {
+                    if !access.allows(&next) {
                         return Err(format!(
-                            "GET {current}: redirect target is outside the allowed source {rule}"
+                            "GET {current}: redirect target {} is not an allowed sample source",
+                            next.origin().ascii_serialization()
                         ));
                     }
                     current = next;
                     continue;
                 }
                 let mut bytes = Vec::new();
-                response
-                    .into_reader()
+                budget
+                    .body(response)
                     .take(limit as u64 + 1)
                     .read_to_end(&mut bytes)
                     .map_err(|error| format!("read {current}: {error}"))?;

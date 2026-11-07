@@ -59,12 +59,10 @@ impl StudioEngine {
                 // stages of the same onset.
                 self.session
                     .note_osc_handed_out(intent.generation, intent.target_time);
-                self.pending_accepted_audio.push(UiAcceptedOnset {
-                    generation: intent.generation,
-                    onset_id: intent.onset_id,
-                    frequency_hz: None,
-                    gain: None,
-                });
+                self.pending_accepted_audio.push(UiAcceptedOnset::external(
+                    intent.generation,
+                    intent.onset_id,
+                ));
             }
         }
     }
@@ -220,12 +218,10 @@ impl StudioEngine {
                 rustel_runtime::midi_bridge::onset_frame_at(intent.target_time, sample_rate),
                 batch,
             ) {
-                Ok(true) => self.pending_accepted_audio.push(UiAcceptedOnset {
-                    generation: intent.generation,
-                    onset_id: intent.onset_id,
-                    frequency_hz: None,
-                    gain: None,
-                }),
+                Ok(true) => self.pending_accepted_audio.push(UiAcceptedOnset::external(
+                    intent.generation,
+                    intent.onset_id,
+                )),
                 Ok(false) => {}
                 Err(message) => queue_diagnostic(
                     &mut self.pending_diagnostics,
@@ -503,12 +499,10 @@ impl StudioEngine {
                 // takeover stages of the same onset.
                 self.session
                     .note_serial_handed_out(intent.generation, intent.target_time);
-                self.pending_accepted_audio.push(UiAcceptedOnset {
-                    generation: intent.generation,
-                    onset_id: intent.onset_id,
-                    frequency_hz: None,
-                    gain: None,
-                });
+                self.pending_accepted_audio.push(UiAcceptedOnset::external(
+                    intent.generation,
+                    intent.onset_id,
+                ));
             }
         }
     }

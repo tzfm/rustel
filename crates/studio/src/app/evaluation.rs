@@ -785,7 +785,12 @@ impl App {
                 // evaluation time.
                 self.installed_revision = Some(hash.clone());
                 let evaluated = self.evaluation_revisions.get(&hash);
-                self.visual.install_layout(layout);
+                match &evaluated {
+                    Some(entry) => self
+                        .visual
+                        .install_layout_of(layout, Arc::clone(&entry.source)),
+                    None => self.visual.install_layout(layout),
+                }
                 match evaluated {
                     Some(entry) => {
                         // Widgets leave a scene that stopped being the

@@ -293,7 +293,9 @@ freesound sounds that shared scores name. They have no row on the page. With
 When a score loads a file that no source allows, the score plays without the
 file. The folder of the file comes onto the Permissions page as `samples off`.
 Press Enter to allow the folder and all addresses below it. Space turns a
-source off or on, and `d` removes it.
+source off or on, and `d` removes it. A source turned off or removed takes
+the banks it allowed, and their files no longer load. Packs you imported in
+Settings stay.
 
 Press `e` to edit a source. The text sets what the source allows:
 
@@ -316,8 +318,8 @@ is set. Press Enter to choose the folder, and `d` to forget it. With
 
 Studio keeps the sources and the folder in `studio.json`. If an update
 stopped on a refusal, it runs again when you give the permission. Otherwise
-the next update reads with the new permission. A redirect must stay inside
-the source that allowed the address. See
+the next update reads with the new permission. A redirect must reach an
+address that an allowed source allows. See
 [Sample access](../SECURITY.md#sample-access) for the rules.
 
 ## Checking and playback
@@ -620,10 +622,11 @@ confirmation before deleting a file. An alias must not replace an existing
 bank name. See [local samples](local-samples.md) for folder names, bank aliases,
 and stable sample order.
 
-The disk cache stores downloaded files. It is separate from decoded samples
-held in memory. Use the Samples settings to fetch imports, cache samples, or
-clear the disk cache. Clearing the cache requires confirmation. A later use
-can download the files again.
+The disk cache stores downloaded files and their decoded sound. The decoded
+sound takes 2 GiB at most, and the oldest goes first. The cache is separate
+from decoded samples held in memory. Use the Samples settings to fetch
+imports, cache samples, or clear the disk cache. Clearing the cache requires
+confirmation. A later use can download the files again.
 
 ## Sliders
 

@@ -104,11 +104,11 @@ pub use pressure::{RealtimePool, RealtimePressureSnapshot};
 #[cfg(feature = "device-audio")]
 pub use realtime::RealtimeLoadSnapshot;
 pub use render::{
-    RENDER_CANCELLED, RenderControl, RenderLimiter, RenderTick, SilenceStop, WavSampleFormat,
-    check_stems_folder, render_pcm, render_pcm_events, render_pcm_events_until, stems_folder,
-    write_pcm16_wav, write_pcm16_wav_controlled, write_pcm16_wav_reporting,
-    write_stems_wav_events_controlled, write_wav_controlled, write_wav_events_controlled,
-    write_wav_reporting,
+    RENDER_CANCELLED, RENDER_ENDED_BEFORE_AUDIO, RenderControl, RenderLimiter, RenderTick,
+    SilenceStop, WavSampleFormat, check_stems_folder, render_pcm, render_pcm_events,
+    render_pcm_events_until, stems_folder, write_pcm16_wav, write_pcm16_wav_controlled,
+    write_pcm16_wav_reporting, write_stems_wav_events_controlled, write_wav_controlled,
+    write_wav_events_controlled, write_wav_reporting,
 };
 pub use ring::{AudioEvent, QueuedAudioEvent, Ring};
 pub use sample::{

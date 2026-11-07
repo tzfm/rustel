@@ -591,14 +591,14 @@ impl Editor {
             if let Mode::Visual { linewise, .. } = self.vim.mode {
                 let range = self.primary_selection().ordered();
                 let start = range.start;
-                self.vim_apply_operator(operator, range, linewise, start, moment)?;
+                self.vim_apply_operator(operator, range, linewise, false, start, moment)?;
             } else if let Some((pending, count)) = self.vim.operator.take() {
                 if pending == operator {
                     let count = count.saturating_mul(self.vim_take_count());
                     let head = self.vim_head();
                     let line = self.document.line_of(head)?;
                     let range = self.vim_line_range(line, line.saturating_add(count - 1));
-                    self.vim_apply_operator(operator, range, true, head, moment)?;
+                    self.vim_apply_operator(operator, range, true, false, head, moment)?;
                 } else {
                     self.vim_cancel_pending();
                 }
@@ -685,7 +685,9 @@ impl Editor {
                 } else {
                     range.start
                 };
-                self.vim_apply_operator(operator, range, linewise, start, moment)?;
+                // D and C run to an inclusive $, and x and X stay on their
+                // line, so none of them is an exclusive range.
+                self.vim_apply_operator(operator, range, linewise, false, start, moment)?;
             }
             'p' | 'P' => self.vim_put(character == 'P', count, moment)?,
             'r' => {
@@ -947,21 +949,24 @@ impl Editor {
 
     /// Run `operator` over `range`. A yank leaves the caret at `start`, the
     /// start of the text as Vim takes it: where a motion back ended, or the
-    /// caret itself on the first line of a linewise command.
+    /// caret itself on the first line of a linewise command. An `exclusive`
+    /// range follows [`Self::vim_exclusive_range`].
     fn vim_apply_operator(
         &mut self,
         operator: Operator,
         range: Range<ByteOffset>,
         linewise: bool,
+        exclusive: bool,
         start: ByteOffset,
         moment: HistoryMoment,
     ) -> Result<(), EditorError> {
         self.vim_cancel_pending();
-        let (mut range, linewise) = if linewise || matches!(self.vim.mode, Mode::Visual { .. }) {
-            (range, linewise)
-        } else {
-            self.vim_exclusive_range(range)?
-        };
+        let (mut range, linewise) =
+            if linewise || !exclusive || matches!(self.vim.mode, Mode::Visual { .. }) {
+                (range, linewise)
+            } else {
+                self.vim_exclusive_range(range)?
+            };
         let mut register = self.document.slice(range.clone())?;
         let ending = self.preferred_line_ending();
         let has_line_ending = range.start < range.end
@@ -974,6 +979,17 @@ impl Editor {
             && operator != Operator::Change
         {
             self.vim_place_caret(start)?;
+            return self.vim_normalize_caret();
+        }
+        // An empty line range comes from the drawn line past a final line
+        // break, which is no Vim line: the command takes nothing and keeps
+        // the register.
+        if linewise && range.is_empty() {
+            self.vim_place_caret(start)?;
+            if operator == Operator::Change {
+                self.vim_begin_insert(moment);
+                return Ok(());
+            }
             return self.vim_normalize_caret();
         }
         if operator == Operator::Yank {
@@ -1372,21 +1388,31 @@ mod tests {
     }
 
     /// A line command made from the drawn line after a final line break
-    /// leaves every real line whole. It once took the line above, the
-    /// whole score when that was its only line.
+    /// takes nothing. It once took the line above, the whole score when
+    /// that was its only line, and then the final line break.
     #[test]
     fn line_commands_from_the_line_past_the_end_keep_the_lines_above() {
         for (source, caret) in [("ab\ncd\n", 6), ("ab\n", 3)] {
-            let lines = source.trim_end_matches('\n');
             for keys in ["dd", "cc", "Vd", "yyp"] {
                 let editor = typed(source, caret, keys);
-                assert!(
-                    editor.source().starts_with(lines),
-                    "{keys} on {source:?} gave {:?}",
-                    editor.source()
-                );
+                assert_eq!(editor.source(), source, "{keys} on {source:?}");
+                assert_eq!(editor.vim_register(), None, "{keys} on {source:?}");
             }
         }
+        // An empty line above the end is a Vim line, and goes.
+        for keys in ["dd", "Vd"] {
+            assert_eq!(typed("a\n\nb\n", 2, keys).source(), "a\nb\n", "{keys}");
+        }
+    }
+
+    /// `$` is inclusive, so a count that ends on an empty line takes it.
+    #[test]
+    fn a_counted_dollar_takes_an_empty_last_line() {
+        let source = "abc\n\nxyz\n";
+        assert_eq!(typed(source, 1, "2D").source(), "a\nxyz\n");
+        assert_eq!(typed(source, 1, "d2$").source(), "a\nxyz\n");
+        assert_eq!(typed(source, 0, "2C").source(), "\nxyz\n");
+        assert!(!typed(source, 0, "y2$").vim.linewise_register);
     }
 
     /// `p` puts a linewise register that ends in a Unicode line break. The

@@ -308,11 +308,11 @@ impl StudioUiState {
             // period budget feels first. When the audio thread reports
             // spending most of its periods rendering, the analysis thins
             // to a quarter rate until the load clears; nothing audible
-            // changes, the meters redraw a little less often.
+            // changes, the meters redraw a little less often. The slow
+            // average follows the load of the last moments, not of the
+            // whole stream.
             let load = device.report().realtime_load;
-            let analysis_interval = if load.total_period_nanos > 0
-                && load.total_busy_nanos * 4 > load.total_period_nanos * 3
-            {
+            let analysis_interval = if load.slow_load_basis_points > 7_500 {
                 self.audio_interval * 4
             } else {
                 self.audio_interval

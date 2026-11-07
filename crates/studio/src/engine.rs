@@ -1035,6 +1035,11 @@ struct PendingLaunch {
     /// prepare: see [`StudioEngine::prepare_launch`].
     #[cfg(feature = "vst")]
     prepared: bool,
+    /// The lead of the plugin chains its line was chosen with: see
+    /// [`rustel_runtime::Session::takeover_headroom`]. Only a lead that grew
+    /// past it can leave the fire too little room before the line.
+    #[cfg(feature = "vst")]
+    lead: f64,
 }
 
 /// What the worker says of the score it hands over next, for its install.
@@ -1222,9 +1227,9 @@ pub struct StudioEngine {
     session: Session,
     /// The horizon the session keeps filled, raised when an evaluation of the
     /// playing score runs longer than the audio scheduled ahead of the clock
-    /// (see [`Self::widen_horizon_for_evaluation`]).
+    /// (see [`Self::follow_horizon_to_evaluation`]).
     live_horizon: f64,
-    /// The last evaluation of the playing score, wall-clock. The first
+    /// The last evaluation that installed a score, wall-clock. The first
     /// replacement of a score sizes its takeover from this until the
     /// producer has measured a cutover of its own (see
     /// [`Self::match_replacement_headroom_to_producer`]).
@@ -2454,12 +2459,7 @@ impl StudioEngine {
                         if pushed {
                             let frontier = device.render_frontier_frames();
                             played.note(&event, frontier, device.restart_lead());
-                            accepted_audio.push(UiAcceptedOnset {
-                                generation: event.generation,
-                                onset_id: event.onset_id,
-                                frequency_hz: Some(event.freq_hz),
-                                gain: Some(event.gain),
-                            });
+                            accepted_audio.push(UiAcceptedOnset::scalar(&event));
                         }
                         pushed
                     },
@@ -3994,6 +3994,8 @@ pub(super) mod tests {
             waited: false,
             #[cfg(feature = "vst")]
             prepared: true,
+            #[cfg(feature = "vst")]
+            lead: 0.0,
         });
     }
 

@@ -591,6 +591,39 @@ pub(crate) fn saw_blep(phase: f32, mut dt: f32) -> f32 {
     v - blep
 }
 
+/// The phase of a saw lane one step of `dt` after `phase`. An exact cycle
+/// end stays 1.0, as [`wrap_phase`] keeps it.
+#[inline]
+pub(crate) fn next_saw_phase(phase: f32, dt: f32) -> f32 {
+    wrap_phase(f64::from(phase + dt)) as f32
+}
+
+/// One frame of the first `count` lanes of a supersaw with a static spread:
+/// the left and right sums, each lane panned to the other side of the lane
+/// before it. Each phase steps on. The supersaw kernels match this loop bit
+/// for bit: see [`crate::supersaw_kernel`].
+#[inline]
+pub(crate) fn render_static_supersaw_lanes(
+    phases: &mut [f32],
+    detune_ratios: &[f32],
+    count: usize,
+    frequency_hz: f32,
+    sample_rate: f32,
+    (mut gain_l, mut gain_r): (f32, f32),
+) -> (f32, f32) {
+    let mut left = 0.0f32;
+    let mut right = 0.0f32;
+    for (phase, ratio) in phases.iter_mut().zip(detune_ratios).take(count) {
+        let dt = saw_step(frequency_hz * ratio / sample_rate);
+        let value = saw_blep(*phase, dt);
+        left += value * gain_l;
+        right += value * gain_r;
+        *phase = next_saw_phase(*phase, dt);
+        std::mem::swap(&mut gain_l, &mut gain_r);
+    }
+    (left, right)
+}
+
 #[inline]
 pub(super) fn supersaw_spread_geometry(voices: f32, spread: f32) -> (f32, f32) {
     if voices < 2.0 {
@@ -1558,9 +1591,17 @@ impl ScalarBackend {
     ///
     /// Without a cap, dense music grows steadily louder as voices pile up:
     /// a generated 916-onset score measured +3.899 dB overall.
-    pub(super) fn cull_for_polyphony(
+    ///
+    /// When the note or a voice has a lead, the oldest voice is the voice of
+    /// the earliest musical onset, ties by id, as in [`Self::choke_previous`].
+    /// It fades at the musical onset of the note less its own output lead,
+    /// so its output starts to fade on that onset, and not before `frame`.
+    /// `lead` is the output lead of the note.
+    pub(super) fn cull_for_polyphony<K>(
         voices: &mut [Voice],
-        onset_frame: u64,
+        event: &OnsetEvent<K>,
+        frame: u64,
+        lead: u32,
         sample_rate: u32,
         max_polyphony: usize,
     ) -> usize {
@@ -1568,30 +1609,55 @@ impl ScalarBackend {
             .iter()
             .filter(|voice| voice.polyphony_fade_frame.is_none())
             .count();
+        let musical = event.controls.musical(event.onset_frame);
+        let led = Self::led(voices, event.controls.lead.max(lead));
+        let fade_at = |oldest: &Voice| match led {
+            false => event.onset_frame,
+            true => musical.saturating_sub(u64::from(oldest.lead)).max(frame),
+        };
         Self::fade_oldest_voices(
             voices,
             polyphony_kills(active, max_polyphony),
-            onset_frame,
+            led,
+            fade_at,
             sample_rate,
         )
     }
 
+    /// Whether a note with `lead`, or a voice, orders the voices by their
+    /// musical onsets: see [`Self::cull_for_polyphony`].
+    pub(super) fn led(voices: &[Voice], lead: u32) -> bool {
+        lead > 0
+            || voices
+                .iter()
+                .any(|voice| voice.aimed_early || voice.lead > 0)
+    }
+
+    /// Fades the `count` oldest voices still counted, each from the frame
+    /// `fade_at` gives it. With `led` the oldest voice is the voice of the
+    /// earliest musical onset, and else the first triggered.
     pub(super) fn fade_oldest_voices(
         voices: &mut [Voice],
         count: usize,
-        onset_frame: u64,
+        led: bool,
+        fade_at: impl Fn(&Voice) -> u64,
         sample_rate: u32,
     ) -> usize {
         let mut faded = 0;
         for _ in 0..count {
             // `voices` is pushed in trigger order and `retain_mut` keeps it, so
-            // the first still-counted voice is the oldest.
-            let Some(oldest) = voices
+            // the first still-counted voice is the first triggered.
+            let mut counted = voices
                 .iter_mut()
-                .find(|voice| voice.polyphony_fade_frame.is_none())
-            else {
+                .filter(|voice| voice.polyphony_fade_frame.is_none());
+            let oldest = match led {
+                false => counted.next(),
+                true => counted.min_by_key(|voice| (voice.musical, voice.id)),
+            };
+            let Some(oldest) = oldest else {
                 break;
             };
+            let onset_frame = fade_at(oldest);
             oldest.polyphony_fade_frame = Some(onset_frame);
             let stop_at = (onset_frame.saturating_sub(oldest.start_frame)) as f32
                 / sample_rate as f32
@@ -2644,6 +2710,60 @@ mod tests {
                 backend.process_block(&mut [0.0; 256], 128);
             }
             assert_eq!(backend.voices.len(), 64);
+        }
+
+        /// A note through a chain with latency starts its lead before its
+        /// musical onset. The cap fades the voice of the earliest musical
+        /// onset, and from the musical onset of the new note, as a choke does.
+        #[test]
+        fn the_cap_culls_by_musical_onset_when_a_note_has_a_lead() {
+            const LEAD: u32 = 480;
+            let latent = |musical: u64, frequency: f32| {
+                let aimed = musical - u64::from(LEAD);
+                let mut event = OnsetEvent::new(aimed, frequency, 0.1, 2.0);
+                let key = crate::InsertKey {
+                    plugin: 1,
+                    preset: 0,
+                };
+                event.controls.lead = LEAD;
+                event.controls.effects[0] =
+                    Some(crate::InsertControls::new(key).with_latency(LEAD));
+                event
+            };
+            // The fade frame of each voice by its frequency, after `events`
+            // at the cap of `limit`.
+            let fades = |limit: usize, events: Vec<OnsetEvent>| {
+                let mut backend = ScalarBackend::prepared(48_000, 16).expect("backend");
+                backend.set_max_polyphony(limit);
+                for event in events {
+                    backend.note(event);
+                }
+                for _ in 0..24 {
+                    backend.process_block(&mut [0.0; 256], 128);
+                }
+                let mut fades: Vec<_> = backend
+                    .voices
+                    .iter()
+                    .map(|voice| (voice.freq_hz as u32, voice.polyphony_fade_frame))
+                    .collect();
+                fades.sort_unstable();
+                fades
+            };
+            // A pad, then a latent note on 2 048 that starts on 1 568. The
+            // pad fades on 2 048, where the latent note sounds.
+            let pad = OnsetEvent::new(0, 220.0, 0.1, 2.0);
+            assert_eq!(
+                fades(1, vec![pad.clone(), latent(2_048, 330.0)]),
+                [(220, Some(2_048)), (330, None)]
+            );
+            // A latent note on 1 324 starts on 844, before a pad on 1 000. A
+            // note on 2 048 then fades the pad, the earlier onset.
+            let later = OnsetEvent::new(2_048, 440.0, 0.1, 2.0);
+            let pad = OnsetEvent::new(1_000, 220.0, 0.1, 2.0);
+            assert_eq!(
+                fades(2, vec![latent(1_324, 330.0), pad, later]),
+                [(220, Some(2_048)), (330, None), (440, None)]
+            );
         }
 
         #[test]

@@ -187,8 +187,8 @@ impl ManifestContext {
 
     fn publish_score_custom(
         &self,
-        sources: Vec<(Arc<str>, ScoreFetchAccess)>,
-        staged: Vec<(String, Bank)>,
+        mut sources: Vec<(Arc<str>, ScoreFetchAccess)>,
+        mut staged: Vec<(String, Bank)>,
         unsupported: Vec<String>,
         budget: &sample_fetch::FetchBudget,
         import: Option<&str>,
@@ -239,6 +239,7 @@ impl ManifestContext {
                 .extend(unsupported.into_iter().map(SampleFailure::from));
             return Ok(());
         }
+        catalog::under_current_policy(&self.shared, &source_table, &mut sources, &mut staged);
         let mut custom = self.custom.write().expect("custom banks");
         let additional_banks = staged
             .iter()
@@ -2453,7 +2454,8 @@ pub(super) mod tests {
             assert_eq!(
                 approved_access,
                 ScoreFetchAccess::Remote {
-                    rule: SourceRule::parse("https://example.com").expect("a test source"),
+                    sources: [SourceRule::parse("https://example.com").expect("a test source")]
+                        .into(),
                 }
             );
             assert_eq!(
@@ -2479,14 +2481,13 @@ pub(super) mod tests {
             let mut access = ScoreSampleAccess::denied();
             access.permit_builtin_sources();
             assert!(!access.is_denied(), "the built-in sources are not a denial");
-            let (_, github) = access
-                .approve_remote("https://raw.githubusercontent.com/a/b/main/strudel.json")
-                .expect("a built-in domain");
+            let github = "https://raw.githubusercontent.com/a/b/main/strudel.json";
+            access.approve_remote(github).expect("a built-in domain");
             assert_eq!(
-                github,
-                ScoreFetchAccess::Remote {
-                    rule: SourceRule::parse("raw.githubusercontent.com").expect("a test source"),
-                }
+                access.source_for(github),
+                Ok(Some(
+                    &SourceRule::parse("raw.githubusercontent.com").unwrap()
+                ))
             );
             access
                 .approve_remote("https://cdn.freesound.org/previews/182/182967_529852-lq.mp3")
@@ -2509,14 +2510,13 @@ pub(super) mod tests {
             access
                 .permit_source("http://localhost:9000")
                 .expect("an address on this computer");
-            let (_, granted) = access
-                .approve_remote("http://localhost:9000/kit.json")
+            let local = "http://localhost:9000/kit.json";
+            access
+                .approve_remote(local)
                 .expect("a source that spells out loopback reaches it");
             assert_eq!(
-                granted,
-                ScoreFetchAccess::Remote {
-                    rule: SourceRule::parse("http://localhost:9000").expect("a test source"),
-                }
+                access.source_for(local),
+                Ok(Some(&SourceRule::parse("http://localhost:9000").unwrap()))
             );
         }
 
@@ -2554,7 +2554,7 @@ pub(super) mod tests {
             });
 
             let allowed = ScoreFetchAccess::Remote {
-                rule: SourceRule::parse(&origin).expect("a test source"),
+                sources: [SourceRule::parse(&origin).expect("a test source")].into(),
             };
             assert_eq!(
                 fetch_score_source(&url, &allowed, 4096).expect("an allowed fetch"),
@@ -3401,7 +3401,8 @@ pub(super) mod tests {
                 .insert(
                     Arc::from(url),
                     ScoreFetchAccess::Remote {
-                        rule: SourceRule::parse("http://127.0.0.1:9").expect("a test source"),
+                        sources: [SourceRule::parse("http://127.0.0.1:9").expect("a test source")]
+                            .into(),
                     },
                 );
             let path = library.shared.score_cache.path(url, ScoreCacheKind::Audio);
