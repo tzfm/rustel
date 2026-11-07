@@ -269,7 +269,8 @@ fn run_sample_loader(shared: Weak<Shared>, jobs: Arc<LoadQueue>, dir: PathBuf) {
             .lock()
             .expect("loading sample")
             .insert(Arc::clone(&url));
-        let budget = sample_fetch::FetchBudget::for_one_fetch_with_cancellation(
+        let budget = sample_fetch::FetchBudget::for_transfer(
+            FileLimit::of(&url).bytes,
             shared.publication.cancellation(),
         );
         let LoadKind::Install { id, decode_rate } = kind else {
@@ -582,6 +583,7 @@ impl SampleLibrary {
             global_generation: std::sync::atomic::AtomicU64::new(0),
             global_source_of: RwLock::new(HashMap::new()),
             import_policy: Mutex::new(None),
+            score_policy: Mutex::new(None),
             font_jobs: Arc::clone(&font_jobs),
             failures: Mutex::new(Vec::new()),
             direct_diagnostic_logging: AtomicBool::new(
@@ -2246,6 +2248,7 @@ pub(super) mod tests {
                 global_generation: std::sync::atomic::AtomicU64::new(0),
                 global_source_of: RwLock::new(HashMap::new()),
                 import_policy: Mutex::new(None),
+                score_policy: Mutex::new(None),
                 font_jobs: FontQueue::new(),
                 failures: Mutex::new(Vec::new()),
                 direct_diagnostic_logging: AtomicBool::new(true),

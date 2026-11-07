@@ -33,10 +33,10 @@ pub(crate) use video::VIDEO_MEDIA_TYPES;
 const MAX_IMAGE_EDGE: u32 = 2048;
 const MAX_IMAGE_PIXELS: u64 = 4_194_304;
 const MAX_DECODE_ALLOC: u64 = 32 * 1024 * 1024;
-/// How long one image or video may take to arrive. A video file is read whole
-/// before it plays.
+/// How long one image may take to arrive. A video file, read whole before
+/// it plays, arrives as a video sample does: see
+/// [`sample_fetch::FetchBudget::for_transfer`].
 const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
-const VIDEO_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const CAMERA_POLL: Duration = Duration::from_millis(100);
 /// How many capture modes a worker tries before giving up on a device.
 ///
@@ -849,6 +849,11 @@ impl HydraInputs {
         self.score_sample_access = access;
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn score_sample_access(&self) -> &ScoreSampleAccess {
+        &self.score_sample_access
+    }
+
     /// Read relative image and video paths in this folder first: the open
     /// set's folder in Studio. `None` leaves only the local sample root.
     pub(crate) fn set_media_folder(&mut self, folder: Option<&Path>) {
@@ -1316,11 +1321,7 @@ fn run_media_job(job: MediaJob, diagnostics: &mpsc::Sender<InputDiagnostic>) -> 
         cancel,
         lease,
     } = job;
-    let timeout = match media {
-        HydraMedia::Image => IMAGE_FETCH_TIMEOUT,
-        HydraMedia::Video => VIDEO_FETCH_TIMEOUT,
-    };
-    let budget = sample_fetch::FetchBudget::until(Instant::now() + timeout, Arc::clone(&cancel));
+    let budget = media_budget(media, Arc::clone(&cancel));
     let bytes = read_media(&url, &access, folder.as_deref(), &budget, media)?;
     budget.check()?;
     let ready = |width: u32, height: u32| {
@@ -1356,6 +1357,17 @@ fn run_media_job(job: MediaJob, diagnostics: &mpsc::Sender<InputDiagnostic>) -> 
     }
 }
 
+/// The time one input has to arrive. A video may take as long as its bytes
+/// keep arriving, up to the time its largest file takes on a slow link.
+fn media_budget(media: HydraMedia, cancel: Arc<AtomicBool>) -> sample_fetch::FetchBudget {
+    match media {
+        HydraMedia::Image => {
+            sample_fetch::FetchBudget::until(Instant::now() + IMAGE_FETCH_TIMEOUT, cancel)
+        }
+        HydraMedia::Video => sample_fetch::FetchBudget::for_transfer(media.limit(), cancel),
+    }
+}
+
 /// The bytes an image or video input names. A URL goes through the network
 /// policy. A relative path is read in the set folder, then in the local
 /// sample root, under the rules a local sample follows.
@@ -1379,7 +1391,12 @@ fn read_media(
             )),
         },
     };
+    // With no local root, the set folder's answer stands: asking the root
+    // would offer a local folder for a file that is only missing.
     in_set.or_else(|in_set| {
+        if !access.has_local_root() {
+            return Err(in_set);
+        }
         access
             .read_hydra_local_media(source, media)
             .map_err(|_| in_set)
@@ -2100,6 +2117,21 @@ fn clamp_u8(value: i32) -> u8 {
 mod tests {
     use super::*;
     use image::ImageEncoder;
+
+    /// A video input has the time its largest file takes on a slow link,
+    /// not a fixed minute. An image keeps its short wait.
+    #[test]
+    fn a_video_input_has_the_time_a_slow_link_takes() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let video = media_budget(HydraMedia::Video, Arc::clone(&cancel))
+            .remaining()
+            .expect("time left");
+        assert!(video > Duration::from_secs(4 * 60), "{video:?}");
+        let image = media_budget(HydraMedia::Image, cancel)
+            .remaining()
+            .expect("time left");
+        assert!(image <= IMAGE_FETCH_TIMEOUT, "{image:?}");
+    }
 
     fn frame(format: PixelFormat, width: u32, height: u32, planes: Vec<Plane>) -> VideoFrame {
         let mut frame = VideoFrame::new(format, width, height);
@@ -3137,7 +3169,7 @@ mod tests {
         let host = rustel_hydra::HydraHost::new();
         let mut inputs = HydraInputs::new(host.input_sink());
         inputs.set_media_folder(Some(folder.path()));
-        inputs.configure(video_plan(1, "clips/red.webm"));
+        inputs.configure(video_plan(1, "./clips/red.webm"));
         inputs.set_drawing(true);
         assert_eq!(
             first_event(&inputs),
@@ -3182,13 +3214,22 @@ mod tests {
                 "the set folder did not open",
             ),
         ] {
+            let access = ScoreSampleAccess::denied();
             let mut inputs = HydraInputs::new(host.input_sink());
+            inputs.set_score_sample_access(access.clone());
             inputs.set_media_folder(set_folder);
             inputs.configure(video_plan(0, url));
             inputs.set_drawing(true);
             let (slot, message, failed) = first_event(&inputs);
             assert!(failed && slot == 0, "{url}: {message}");
             assert!(message.contains(expected), "{url}: {message}");
+            // Only a read with no set folder offers to choose a local one.
+            let offered = access.take_refused_sources();
+            assert_eq!(
+                offered.is_empty(),
+                set_folder.is_some(),
+                "{url}: {offered:?}"
+            );
         }
     }
 }

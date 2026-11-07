@@ -665,11 +665,7 @@ mod tests {
     /// `gm_*` voice an octave low.
     #[test]
     fn a_noteless_soundfont_defaults_an_octave_above_a_noteless_sample() {
-        let midi_for = |name: &str| {
-            let value = serde_json::json!({ "s": name });
-            let object = value.as_object().expect("object");
-            super::sample_default_midi(object, name)
-        };
+        let midi_for = super::sample_default_midi;
         assert_eq!(
             midi_for("gm_flute"),
             48.0,
@@ -3518,6 +3514,11 @@ fn fm_controls(
     Ok(Some(rustel_audio::FmControls { operators, routes }))
 }
 
+/// The spelling the voice looks a sound up by in a bank: `{bank}_{s}`.
+pub fn banked_name(bank: &str, name: &str) -> String {
+    format!("{bank}_{name}")
+}
+
 /// The whole bank rule: `s` becomes `{bank}_{s}`.
 ///
 /// Returns `None` when there is no bank to apply, so the caller keeps the name
@@ -3531,12 +3532,12 @@ pub fn bank_prefixed(
         return Ok(None);
     }
     match object.get("bank") {
-        Some(serde_json::Value::String(bank)) => Ok(Some(format!("{bank}_{name}"))),
+        Some(serde_json::Value::String(bank)) => Ok(Some(banked_name(bank, name))),
         Some(serde_json::Value::Null) | None => Ok(None),
         Some(other) => match other.as_f64() {
             // `.bank('9000')` numerifies under miniAllStrings; the prefix
             // rule stringifies it right back.
-            Some(bank) => Ok(Some(format!("{bank}_{name}"))),
+            Some(bank) => Ok(Some(banked_name(&bank.to_string(), name))),
             _ => Err("bank must be a scalar bank name".to_owned()),
         },
     }
@@ -4066,7 +4067,7 @@ fn sample_controls(
     let plain = name;
     let name = match object.get("bank") {
         Some(serde_json::Value::String(bank)) if !name.is_empty() => {
-            banked = format!("{bank}_{name}");
+            banked = banked_name(bank, name);
             banked.as_str()
         }
         Some(serde_json::Value::Null) | None => name,
@@ -4074,7 +4075,7 @@ fn sample_controls(
             // `.bank('9000')` numerifies under miniAllStrings; the prefix
             // rule stringifies it right back.
             Some(bank) if !name.is_empty() => {
-                banked = format!("{bank}_{name}");
+                banked = banked_name(&bank.to_string(), name);
                 banked.as_str()
             }
             _ => {
@@ -4099,7 +4100,7 @@ fn sample_controls(
     // kind of sound. An ordinary sample bank falls back to midi 36; a gm_*
     // soundfont falls back to c3, which is midi 48 - the soundfont loader
     // carries its own default and it is an octave up from the sampler's.
-    let default_midi = sample_default_midi(object, name);
+    let default_midi = sample_default_midi(name);
     let midi = match object.get("freq") {
         Some(serde_json::Value::Number(freq)) => {
             let freq = freq
@@ -7233,12 +7234,13 @@ mod unplayable_tests {
     }
 }
 
-/// The pitch a sample voice takes when the score names no note.
+/// The pitch a sample voice takes when the score names no note, by the
+/// name it looks the sound up with.
 ///
 /// An ordinary sample bank uses midi 36; a `gm_*` soundfont uses c3, midi 48,
 /// because the soundfont loader carries its own default an octave above the
 /// sampler's.
-fn sample_default_midi(_object: &serde_json::Map<String, serde_json::Value>, name: &str) -> f64 {
+pub fn sample_default_midi(name: &str) -> f64 {
     if name.starts_with("gm_") { 48.0 } else { 36.0 }
 }
 

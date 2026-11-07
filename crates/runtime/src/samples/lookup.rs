@@ -10,23 +10,26 @@ pub(super) fn pick_from_bank(bank: &Bank, n: f64, midi: f64) -> Option<(Arc<str>
             Some((url, midi - 36.0))
         }
         Bank::Notes(notes) => {
-            // Closest key wins; strict `<` keeps the FIRST of equals.
-            let mut closest: Option<&(f64, Vec<Arc<str>>)> = None;
-            for candidate in notes {
-                let better = match closest {
-                    None => true,
-                    Some(current) => (candidate.0 - midi).abs() < (current.0 - midi).abs(),
-                };
-                if better {
-                    closest = Some(candidate);
-                }
-            }
-            let (key_midi, urls) = closest?;
+            let (key_midi, urls) =
+                &notes[closest_note_key(notes.iter().map(|(key, _)| *key), midi)?];
             let url = urls.get(sound_index(n, urls.len()))?.clone();
             // `transpose = -(noteToMidi(key) - midi)`.
             Some((url, midi - key_midi))
         }
     }
+}
+
+/// Which key of a bank picked by note `midi` plays, by its place among
+/// `keys`: the closest, and the first of equals. `None` with no keys.
+pub fn closest_note_key(keys: impl IntoIterator<Item = f64>, midi: f64) -> Option<usize> {
+    let mut closest: Option<(usize, f64)> = None;
+    for (index, key) in keys.into_iter().enumerate() {
+        // Strict `<` keeps the FIRST of equals.
+        if closest.is_none_or(|(_, held)| (key - midi).abs() < (held - midi).abs()) {
+            closest = Some((index, key));
+        }
+    }
+    closest.map(|(index, _)| index)
 }
 
 impl FoldedNames {

@@ -70,6 +70,8 @@ pub struct VideoThumbnails {
     times: Box<[f32]>,
     /// `width * height * 4` RGBA bytes per kept frame, in `times` order.
     frames: Box<[u8]>,
+    /// The clip's length in seconds, at least the last kept frame's time.
+    length: f32,
 }
 
 impl VideoThumbnails {
@@ -108,6 +110,7 @@ impl VideoThumbnails {
             height,
             times: times.into(),
             frames: packed.into(),
+            length: last,
         })
     }
 
@@ -123,9 +126,12 @@ impl VideoThumbnails {
         self.times.len()
     }
 
-    /// The picture's last kept frame time, or 0 for an empty strip.
+    /// The clip's length in seconds. A decoded clip runs a frame past its
+    /// last picture, however few frames the strip kept, or as long as its
+    /// container says when the decode stopped early. A strip built from
+    /// frames runs to its last.
     pub fn duration(&self) -> f32 {
-        self.times.last().copied().unwrap_or(0.0)
+        self.length
     }
 
     /// The frame showing `seconds` into the clip: the newest kept frame at
@@ -149,6 +155,14 @@ pub enum VideoPicture {
     Ready(Arc<VideoThumbnails>),
     /// Why there is no strip. Names the codec when the build cannot decode it.
     Failed(String),
+    /// The name is a sound with no picture: a sound file, a synth, or a
+    /// container with no video track.
+    NotVideo,
+    /// The name is a bank the note picks its file from, with these keys
+    /// as MIDI numbers. Each key is a clip of its own: ask for
+    /// `name note:key`, the key the note picks by
+    /// [`crate::samples::closest_note_key`].
+    ByNote(Vec<f64>),
 }
 
 /// Thumbnail dimensions for a frame `width` by `height`: the largest fit
@@ -219,7 +233,16 @@ impl Strip {
 
     /// Whether a frame shown at `time` is due.
     fn wants(&self, time: f32) -> bool {
-        self.times.is_empty() || (time > self.last_time && time - self.last_time >= self.min_gap)
+        self.times.is_empty() || (time > self.last_time && time >= self.next_due())
+    }
+
+    /// When the next kept frame is due: at the start of the next slot of
+    /// `min_gap` after the last kept frame's. A slot, not a gap from the
+    /// last frame, so a 30 fps clip keeps 24 frames a second, not 15. Each
+    /// slot starts a tenth early, so a frame time rounded to the
+    /// millisecond still lands in its own slot.
+    fn next_due(&self) -> f32 {
+        ((self.last_time / self.min_gap + 0.1).floor() + 0.9) * self.min_gap
     }
 
     /// The kept frames due in a keyframe group shown from `start` until
@@ -228,7 +251,7 @@ impl Strip {
         let first = if self.times.is_empty() {
             start
         } else {
-            (self.last_time + self.min_gap).max(start)
+            self.next_due().max(start)
         };
         if first >= end {
             0
@@ -282,12 +305,15 @@ impl Strip {
         self.min_gap *= 2.0;
     }
 
-    fn finish(self) -> VideoThumbnails {
+    /// The strip of a clip `length` seconds long.
+    fn finish(self, length: f32) -> VideoThumbnails {
+        let last = self.times.last().copied().unwrap_or(0.0);
         VideoThumbnails {
             width: self.width,
             height: self.height,
             times: self.times.into(),
             frames: self.frames.into(),
+            length: length.max(last),
         }
     }
 }
@@ -323,6 +349,8 @@ struct Clip {
     /// it arrives.
     streaming: bool,
     strip: Strip,
+    /// The earliest and latest packet times, and how many packets came.
+    packet_times: (u64, u64, u64),
     /// Why the first failed packet failed, in case none ever decodes.
     first_failure: Option<String>,
 }
@@ -338,11 +366,14 @@ impl Clip {
             group_bytes: 0,
             streaming: false,
             strip: Strip::new(duration),
+            packet_times: (u64::MAX, 0, 0),
             first_failure: None,
         }
     }
 
     fn push(&mut self, ts: u64, data: Box<[u8]>) {
+        let (first, latest, count) = self.packet_times;
+        self.packet_times = (first.min(ts), latest.max(ts), count + 1);
         if self.track.is_keyframe(&data) && (self.streaming || !self.group.is_empty()) {
             self.close_group(seconds(ts, self.time_base));
         }
@@ -471,7 +502,11 @@ impl Clip {
         });
     }
 
-    fn finish(mut self) -> Result<VideoThumbnails, String> {
+    /// The strip, once the packets stop. A clip whose container `ended`
+    /// lasts a frame past its latest packet, one average step, the
+    /// timeline its frames are on. A decode cut short lasts as long as the
+    /// container says.
+    fn finish(mut self, ended: bool) -> Result<VideoThumbnails, String> {
         // The last group ends a frame after its last packet.
         if let Some(&(last, _)) = self.group.last() {
             self.close_group(seconds(last, self.time_base) + 1.0 / MAX_KEPT_FPS);
@@ -484,7 +519,14 @@ impl Clip {
                 format!("the {codec} picture decoded no frames ({failures} packets failed)")
             }));
         }
-        Ok(self.strip.finish())
+        let (first, latest, count) = self.packet_times;
+        let step = latest.saturating_sub(first) / count.saturating_sub(1).max(1);
+        let shown = seconds(latest.saturating_add(step), self.time_base);
+        let length = match self.strip.duration {
+            Some(container) if !ended => container.max(shown),
+            _ => shown,
+        };
+        Ok(self.strip.finish(length))
     }
 }
 
@@ -526,13 +568,14 @@ fn seconds(ts: u64, time_base: TimeBase) -> f32 {
 ///
 /// `extension` names the container family, `mp4` or `mkv`, the way the
 /// sample loader names it for the audio track. Symphonia probes by it.
-/// A container with no video track, or one this build cannot decode, is
-/// refused by name. The decode stops early once `cancelled` is set.
+/// A container with no video track has no picture: `None`. One this build
+/// cannot decode is refused by name. The decode stops early once
+/// `cancelled` is set.
 pub fn decode_thumbnails(
     bytes: Vec<u8>,
     extension: &str,
     cancelled: &AtomicBool,
-) -> Result<VideoThumbnails, String> {
+) -> Result<Option<VideoThumbnails>, String> {
     // Decoders parse untrusted input on a library thread, so a panic is
     // contained the same refusal as any other decode failure. See
     // `samples::codecs::decode_guarded`.
@@ -560,7 +603,7 @@ fn decode_thumbnails_inner(
     bytes: Vec<u8>,
     extension: &str,
     cancelled: &AtomicBool,
-) -> Result<VideoThumbnails, String> {
+) -> Result<Option<VideoThumbnails>, String> {
     // Symphonia names a codec only for sound, so the container's own
     // header names the picture's.
     let entries = match extension {
@@ -586,7 +629,7 @@ fn decode_thumbnails_inner(
     // does not refuse the clip.
     let ids = crate::samples::container_video_track_ids(format.as_ref());
     if ids.is_empty() {
-        return Err(format!("{extension} has no video track"));
+        return Ok(None);
     }
     let candidates: HashMap<u32, Candidate> = format
         .tracks()
@@ -608,12 +651,14 @@ fn decode_thumbnails_inner(
     let mut skipped: HashSet<u32> = HashSet::new();
     let mut refused: Option<String> = None;
     let mut packets = 0u64;
+    let mut ended = false;
     while packets < MAX_PICTURE_PACKETS && started.elapsed() < MAX_DECODE_TIME {
         if cancelled.load(Ordering::Acquire) {
             return Err("the picture decode was cancelled".to_owned());
         }
         // The end of the container ends the strip, whatever it holds.
         let Ok(packet) = format.next_packet() else {
+            ended = true;
             break;
         };
         let id = packet.track_id();
@@ -652,8 +697,8 @@ fn decode_thumbnails_inner(
         }
     }
     match clip {
-        Some((_, clip)) => clip.finish(),
-        None => Err(refused.unwrap_or_else(|| format!("{extension} has no video track"))),
+        Some((_, clip)) => clip.finish(ended).map(Some),
+        None => refused.map_or(Ok(None), Err),
     }
 }
 
@@ -710,7 +755,8 @@ mod tests {
     ];
 
     fn decode(clip: &[u8], extension: &str) -> Result<VideoThumbnails, String> {
-        decode_thumbnails(clip.to_vec(), extension, &AtomicBool::new(false))
+        decode_thumbnails(clip.to_vec(), extension, &AtomicBool::new(false))?
+            .ok_or_else(|| "no picture".to_owned())
     }
 
     #[test]
@@ -718,7 +764,11 @@ mod tests {
         let strip = decode(TINY_VP8, "mkv").expect("the picture must decode");
         assert_eq!((strip.width(), strip.height()), (64, 36));
         assert_eq!(strip.frame_count(), 6, "every frame fits the budget");
-        assert!((strip.duration() - 0.5).abs() < 0.05, "ten frames a second");
+        assert!(
+            (strip.duration() - 0.6).abs() < 0.01,
+            "six frames of a tenth of a second each: {}",
+            strip.duration()
+        );
         let first = strip.frame_at(0.0).expect("the first frame");
         let last = strip.frame_at(0.6).expect("the last frame holds");
         assert_ne!(first, last, "the test pattern moves");
@@ -740,6 +790,11 @@ mod tests {
             let strip = decode(clip, extension).unwrap_or_else(|error| panic!("{name}: {error}"));
             assert_eq!((strip.width(), strip.height()), (64, 36), "{name}");
             assert_eq!(strip.frame_count(), 6, "{name}");
+            assert!(
+                (strip.duration() - 0.6).abs() < 0.01,
+                "{name} lasts 0.6 s, not {}",
+                strip.duration()
+            );
             for step in 0..6u32 {
                 let frame = strip.frame_at(step as f32 / 10.0 + 0.01).expect("a frame");
                 let grey = frame
@@ -811,11 +866,11 @@ mod tests {
     }
 
     #[test]
-    fn a_container_without_a_video_track_says_so() {
-        let error = decode(AUDIO_ONLY, "mkv").expect_err("there is no picture");
+    fn a_container_without_a_video_track_has_no_picture() {
+        let picture = decode_thumbnails(AUDIO_ONLY.to_vec(), "mkv", &AtomicBool::new(false));
         assert!(
-            error.contains("no video track"),
-            "says what is missing: {error}"
+            matches!(picture, Ok(None)),
+            "a sound, not a refusal: {picture:?}"
         );
     }
 
@@ -873,10 +928,27 @@ mod tests {
         assert_eq!(strip.due_between(0.0, 2.0), 1, "the first frame is due");
         strip.times.push(0.0);
         strip.last_time = 0.0;
-        assert_eq!(strip.due_between(2.0, 4.0), 0, "nothing due before 4 s");
+        assert_eq!(strip.due_between(2.0, 3.5), 0, "nothing due before 3.6 s");
         assert_eq!(strip.due_between(4.0, 6.0), 1, "one due at 4 s");
         assert_eq!(strip.due_between(4.0, 12.5), 3, "4, 8 and 12 s");
         assert_eq!(strip.due_between(6.0, 4.0), 0, "an empty group");
+    }
+
+    /// A clip faster than the kept rate keeps 24 frames a second, also with
+    /// frame times rounded to the millisecond.
+    #[test]
+    fn common_frame_rates_keep_24_frames_a_second() {
+        for fps in [24.0f32, 25.0, 30.0, 60.0] {
+            let mut strip = Strip::new(None);
+            for frame in 0..fps as usize {
+                let time = (frame as f32 / fps * 1000.0).round() / 1000.0;
+                if strip.wants(time) {
+                    strip.times.push(time);
+                    strip.last_time = time;
+                }
+            }
+            assert_eq!(strip.times.len(), 24, "{fps} fps");
+        }
     }
 
     /// A decode behind the pace that finishes the clip in time reduces its

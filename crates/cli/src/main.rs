@@ -1395,8 +1395,8 @@ struct SampleAccessArgs {
     /// domain, such as example.com, allows https from it and its
     /// subdomains. An address, such as example.com/kits/, allows that
     /// folder and below. Plain http needs the scheme, such as
-    /// http://localhost:8000/. Repeatable. Redirects must stay inside the
-    /// same source.
+    /// http://localhost:8000/. Repeatable. A redirect must reach an address
+    /// that an allowed source allows.
     #[arg(
         long = "allow-sample-origin",
         value_name = "SOURCE",

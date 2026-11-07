@@ -203,7 +203,7 @@ fn render_plain_voice(
             (0.0, 0.0)
         }
         VoiceSource::Supersaw { plan, phases } => {
-            let (mut gain_l, mut gain_r) = plan.pan_gains(0.0);
+            let (gain_l, gain_r) = plan.pan_gains(0.0);
             let freq = (v.freq_hz + 0.0) * 1.0;
             // A plain voice carries no spread modulator, so the spread is
             // static and the fast kernel takes it when this machine has
@@ -225,19 +225,14 @@ fn render_plain_voice(
                     )
                 }
             } else {
-                let mut left = 0.0f32;
-                let mut right = 0.0f32;
-                for (n, phase) in phases.iter_mut().enumerate().take(plan.count) {
-                    let ratio = plan.detune_ratios[n];
-                    let voice_freq = freq * ratio;
-                    let dt = saw_step(voice_freq / sr as f32);
-                    let value = saw_blep(*phase, dt);
-                    left += value * gain_l;
-                    right += value * gain_r;
-                    *phase = wrap_phase(f64::from(*phase + dt)) as f32;
-                    std::mem::swap(&mut gain_l, &mut gain_r);
-                }
-                (left, right)
+                render_static_supersaw_lanes(
+                    phases,
+                    &plan.detune_ratios,
+                    plan.count,
+                    freq,
+                    sr as f32,
+                    (gain_l, gain_r),
+                )
             }
         }
         _ => return,
@@ -824,6 +819,7 @@ impl ScalarBackend {
         let early_sends = &mut self.early_sends;
         let insert_leads = &mut self.insert_leads;
         let insert_serviced = &mut self.insert_serviced;
+        let insert_clocks = &mut self.insert_clocks;
         let insert_provider = self.insert_provider.as_deref();
         let missing_insert_events = &mut self.missing_insert_events;
         let allow_inline_reverb = self.allow_inline_reverb;
@@ -1528,6 +1524,8 @@ impl ScalarBackend {
                             }
                             if !(to_instrument && left_out) {
                                 deliver(held.as_mut(), logical, wanted, e.generation, insert_values, frames);
+                                let delivered = start.saturating_add(u64::from(frames));
+                                insert_clocks[logical.physical(bus)] = InsertClock::of(wanted, delivered);
                             }
                         }
                         ahead = ahead.saturating_add(u64::from(wanted.latency()));
@@ -1600,9 +1598,15 @@ impl ScalarBackend {
                         quiet: 0,
                         send_lead,
                     };
-                    // A note that came late takes its values at the start of
-                    // the segment.
-                    let frame = onset.max(start);
+                    // The note reaches the instrument after its start delay,
+                    // from the start of the segment for a note that came late,
+                    // as its values do. Its level changes at the output of
+                    // that frame.
+                    let frame = e
+                        .onset_frame
+                        .max(start)
+                        .saturating_add(u64::from(delay))
+                        .saturating_add(u64::from(wanted.latency()));
                     if instrument_gain_changes.len() < instrument_gain_changes.capacity() {
                         let index = instrument_gain_changes.partition_point(|change| {
                             (change.bus, change.frame) <= (bus, frame)
@@ -1701,7 +1705,7 @@ impl ScalarBackend {
                     self.orbit_channels[orbit] = Some(e.controls.channels.unwrap_or([1, 2]));
                 }
                 let faded =
-                    Self::cull_for_polyphony(&mut self.voices, e.onset_frame, self.sample_rate, self.max_polyphony.0);
+                    Self::cull_for_polyphony(&mut self.voices, e, start, output_lead, self.sample_rate, self.max_polyphony.0);
                 pressure.semantic_polyphony_fades = pressure
                     .semantic_polyphony_fades
                     .saturating_add(u64::try_from(faded).unwrap_or(u64::MAX));
@@ -1856,6 +1860,8 @@ impl ScalarBackend {
                     start_frame,
                     musical,
                     lead: output_lead,
+                    output_frame: start_frame.max(start).saturating_add(u64::from(output_lead)),
+                    level_line: None,
                     aimed_early: e.controls.lead > 0,
                     generation: e.generation,
                     replayed_by: None,
@@ -2064,7 +2070,7 @@ impl ScalarBackend {
                     .insert_bus
                     .filter(|_| voice.through_insert && !voice.piano && voice.lead > 0)
                 {
-                    let frame = voice.start_frame.saturating_add(u64::from(voice.lead));
+                    let frame = voice.output_frame;
                     let change = LevelChange {
                         bus,
                         frame,
@@ -2080,6 +2086,20 @@ impl ScalarBackend {
                         // owner test.
                         insert_postgains[bus].own(change.owner, change.postgain, true, sample_rate);
                         *early_level_changes += 1;
+                    }
+                    // A post gain that moves gives each level at its output,
+                    // through a level line. With no line it moves early.
+                    if postgain_moves(&e.controls) {
+                        let voices = &self.voices;
+                        let held = |id| voices.iter().any(|voice| voice.id == id);
+                        voice.level_line = self
+                            .send_lines
+                            .as_deref_mut()
+                            .filter(|lines| voice.lead <= lines.reach())
+                            .and_then(|lines| lines.claim_level(voice.id, bus, voice.output_frame, start, held));
+                        if voice.level_line.is_none() {
+                            *early_level_changes += 1;
+                        }
                     }
                 }
                 // The sends of a note through effects with latency wait for
@@ -2742,12 +2762,21 @@ impl ScalarBackend {
                             let post_gain = v.controls.postgain * mod_adds.postgain_factor();
                             let post_insert = v.through_insert && !v.piano;
                             // The voice owns the level of its chain from the frame
-                            // of its output: its start, and its output lead.
-                            let output = v.start_frame.saturating_add(u64::from(v.lead));
+                            // of its output. A voice with a level line gives each
+                            // level at its output, and owns the level it gave for
+                            // this frame.
+                            let output = v.output_frame;
+                            let mut level = post_gain;
+                            if let Some(line) = v.level_line
+                                && let Some(lines) = send_lines.as_deref_mut()
+                            {
+                                lines.set_level(line, v.id, abs + u64::from(v.lead), post_gain);
+                                level = lines.level(line, v.id, abs).unwrap_or(level);
+                            }
                             if post_insert && abs >= output {
                                 let gain =
                                     &mut insert_postgains[v.insert_bus.expect("insert voice bus")];
-                                gain.own((output, v.id), post_gain, v.lead > 0, sample_rate);
+                                gain.own((output, v.id), level, v.lead > 0, sample_rate);
                             }
                             // Pan modulators ride the StereoPanner's pan param
                             // (base 2·pan−1, clamped to the param's [-1, 1] range).
@@ -3045,15 +3074,20 @@ impl ScalarBackend {
                                                 (gain_l, gain_r),
                                             )
                                         }
+                                    } else if static_spread {
+                                        render_static_supersaw_lanes(
+                                            phases,
+                                            &plan.detune_ratios,
+                                            plan.count,
+                                            freq,
+                                            sr as f32,
+                                            (gain_l, gain_r),
+                                        )
                                     } else {
-                                        let (scale, center) = if static_spread {
-                                            (0.0, 0.0)
-                                        } else {
-                                            supersaw_spread_geometry(
-                                                plan.voices,
-                                                (plan.freqspread + mod_adds.freqspread).max(0.0),
-                                            )
-                                        };
+                                        let (scale, center) = supersaw_spread_geometry(
+                                            plan.voices,
+                                            (plan.freqspread + mod_adds.freqspread).max(0.0),
+                                        );
                                         let mut left = 0.0f32;
                                         let mut right = 0.0f32;
                                         // `count` is clamped to MAX_UNISON when the
@@ -3062,11 +3096,7 @@ impl ScalarBackend {
                                         for (n, phase) in
                                             phases.iter_mut().enumerate().take(plan.count)
                                         {
-                                            let ratio = if static_spread {
-                                                plan.detune_ratios[n]
-                                            } else {
-                                                supersaw_detune_ratio(n, scale, center)
-                                            };
+                                            let ratio = supersaw_detune_ratio(n, scale, center);
                                             let voice_freq = freq * ratio;
                                             // Euclidean remainder, not `fract` - dt
                                             // must stay non-negative.
@@ -3074,7 +3104,7 @@ impl ScalarBackend {
                                             let value = saw_blep(*phase, dt);
                                             left += value * gain_l;
                                             right += value * gain_r;
-                                            *phase = wrap_phase(f64::from(*phase + dt)) as f32;
+                                            *phase = next_saw_phase(*phase, dt);
                                             std::mem::swap(&mut gain_l, &mut gain_r);
                                         }
                                         (left, right)
@@ -3879,6 +3909,9 @@ impl ScalarBackend {
                     let level = &mut insert_postgains[change.bus];
                     level.own(change.owner, change.postgain, true, sample_rate);
                     due += 1;
+                }
+                if let Some(lines) = send_lines.as_deref() {
+                    lines.apply_levels(abs, insert_postgains);
                 }
                 let mut buses = effect_buses;
                 while buses != 0 {

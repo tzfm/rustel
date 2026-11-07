@@ -142,7 +142,7 @@ mod tests {
             state,
             feed,
             windows,
-            theme: THEME.get_or_init(|| Theme::built_in("terminal").expect("terminal ships")),
+            theme: THEME.get_or_init(Theme::built_in_default),
         }
     }
 

@@ -2253,12 +2253,7 @@ pub(super) fn play_live(
             reverbs.observe_prepared(&device, &event);
             let pushed = device.push(event.clone());
             if pushed && ui_events_enabled {
-                pushed_ui_ids.push(rustel_runtime::ui_events::UiAcceptedOnset {
-                    generation: event.generation,
-                    onset_id: event.onset_id,
-                    frequency_hz: Some(event.freq_hz),
-                    gain: Some(event.gain),
-                });
+                pushed_ui_ids.push(rustel_runtime::ui_events::UiAcceptedOnset::scalar(&event));
             }
             pushed
         };
@@ -2809,12 +2804,12 @@ pub(super) fn play_live(
                     }
                 };
                 if sent && ui_events_enabled {
-                    accepted_external_ui_ids.push(rustel_runtime::ui_events::UiAcceptedOnset {
-                        generation: intent.generation,
-                        onset_id: intent.onset_id,
-                        frequency_hz: None,
-                        gain: None,
-                    });
+                    accepted_external_ui_ids.push(
+                        rustel_runtime::ui_events::UiAcceptedOnset::external(
+                            intent.generation,
+                            intent.onset_id,
+                        ),
+                    );
                 }
             }
             let midi_report = midi_outputs.report();
@@ -2907,12 +2902,12 @@ pub(super) fn play_live(
                         session.note_osc_handed_out(intent.generation, intent.target_time);
                     }
                     if sent && ui_events_enabled {
-                        accepted_external_ui_ids.push(rustel_runtime::ui_events::UiAcceptedOnset {
-                            generation: intent.generation,
-                            onset_id: intent.onset_id,
-                            frequency_hz: None,
-                            gain: None,
-                        });
+                        accepted_external_ui_ids.push(
+                            rustel_runtime::ui_events::UiAcceptedOnset::external(
+                                intent.generation,
+                                intent.onset_id,
+                            ),
+                        );
                     }
                 }
             }
@@ -2999,12 +2994,12 @@ pub(super) fn play_live(
                     session.note_serial_handed_out(intent.generation, intent.target_time);
                 }
                 if submitted.accepted && ui_events_enabled {
-                    accepted_external_ui_ids.push(rustel_runtime::ui_events::UiAcceptedOnset {
-                        generation: intent.generation,
-                        onset_id: intent.onset_id,
-                        frequency_hz: None,
-                        gain: None,
-                    });
+                    accepted_external_ui_ids.push(
+                        rustel_runtime::ui_events::UiAcceptedOnset::external(
+                            intent.generation,
+                            intent.onset_id,
+                        ),
+                    );
                 }
             }
         }

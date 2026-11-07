@@ -368,9 +368,10 @@ names a plugin only with its whole name, as in `const fx = 'ott'`.
 
 The `room` and `delay` sends of a note through effects with latency wait in
 send lines of the output, so they reach the orbit with the output of the
-chain. The lines take the size of the largest latency of the effects of a
-chain that played, 1 second at most: 8 MiB for 0.5 seconds at 48 kHz,
-16 MiB for 1 second at 48 kHz, and 64 MiB for 1 second at 192 kHz. They
+chain. The level of a note whose post gain moves waits in them too. The
+lines take the size of the largest latency of the effects of a chain that
+played, 1 second at most: 8.5 MiB for 0.5 seconds at 48 kHz, 17 MiB for
+1 second at 48 kHz, and 68 MiB for 1 second at 192 kHz. They
 keep their size until the output closes, and the memory viewer shows them
 as `send lines`. An export with effects with latency holds send lines of
 that size while it renders.

@@ -6448,6 +6448,11 @@ fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
     swept.controls.lfos[1] = Some(lfo(rustel_audio::ModTarget::Gain, 0.5, 0.25, None));
     swept.controls.filter_lfo_end_secs = 2.02;
     swept.controls.lfo_end_secs = 2.03;
+    let mut post = sine(96_000, 0.05);
+    post.controls.postgain = 0.5;
+    post.controls.lfos[0] = Some(lfo(rustel_audio::ModTarget::Postgain, 0.5, 0.25, None));
+    post.controls.lfo_end_secs = 2.1;
+    post.controls.worklet_begin_secs = 2.0;
     let mut tremolo = sine(96_000, 0.05);
     tremolo.controls.tremolo = Some(rustel_audio::TremoloControls {
         frequency_hz: 8.0,
@@ -6494,6 +6499,25 @@ fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
         assert_eq!(missed, 0);
         assert!(wet == dry, "the {kind} note through the chain differs");
     }
+    // The post gain sits after the chain, so an LFO on it moves the output
+    // of the chain on the frames the note is heard: its levels wait in a
+    // level line of the send lines. With no lines they move early, and the
+    // note counts.
+    let moved = |lines: bool| {
+        let mut backend = ScalarBackend::new();
+        backend.set_insert_provider(Arc::clone(&chain));
+        if lines {
+            let lines = rustel_audio::scalar::SendLines::new(384, 48_000);
+            assert!(backend.install_send_lines(Box::new(lines)).is_none());
+        }
+        let event = latent(post.clone(), [128, 256], 384);
+        let pcm = render_pcm(&mut backend, 48_000, 100_800, &[event]).expect("render");
+        (pcm, backend.early_level_changes())
+    };
+    let (dry, _) = play(100_800, std::slice::from_ref(&post), None);
+    assert!(moved(true) == (dry.clone(), 0), "the post gain LFO differs");
+    let (early, count) = moved(false);
+    assert!(early != dry && count == 1, "the post gain LFO waited");
     // The same for a wavetable note with two voices at random phases. The
     // backend holds its table, a saw.
     let wavetable = |event: OnsetEvent, provider: Option<&Arc<InsertProvider>>| {
@@ -6577,6 +6601,39 @@ fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
         kept[OUTPUT * 2],
         "the level did not move"
     );
+    // A note that comes late plays from the block it comes in, so its output
+    // comes its lead after that block. The level of the chain moves on that
+    // frame, and not on the output of the frame the note was aimed at. The
+    // later note here aims at 19 200 and comes in the block of 20 480.
+    let chain = delays([Some(4_800), Some(0)]);
+    let late_level = |postgain: f32| {
+        use rustel_audio::AudioBackend as _;
+        let mut backend = ScalarBackend::new();
+        backend.set_insert_provider(Arc::clone(&chain));
+        backend.init(48_000).expect("init");
+        backend.reset();
+        backend.note(latent(sine(9_600, 1.0), [4_800, 0], 4_800));
+        let mut later = sine(24_000, 0.05);
+        later.controls.postgain = postgain;
+        let mut later = Some(latent(later, [4_800, 0], 4_800));
+        let mut pcm = vec![0.0; 2 * 48_000];
+        for (block, out) in pcm.chunks_mut(256).enumerate() {
+            if block == 160
+                && let Some(later) = later.take()
+            {
+                backend.note(later);
+            }
+            backend.process_block(out, 128);
+        }
+        pcm
+    };
+    let (moved, kept) = (late_level(0.25), late_level(1.0));
+    const LATE_OUTPUT: usize = 20_480 + 4_800;
+    assert!(
+        moved[..LATE_OUTPUT * 2] == kept[..LATE_OUTPUT * 2],
+        "the level of a late note moved early"
+    );
+    assert!(moved != kept, "the level of a late note did not move");
     // The reverb and delay sends of a note wait in the send lines, and join
     // the orbit on the frame of the output of the note. The sine above, a
     // voice of one channel, sends 1.3 s after it starts. A supersaw, a voice

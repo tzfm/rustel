@@ -176,6 +176,8 @@ impl StudioEngine {
         let cps = self.session.cps().max(1e-6);
         let cycle_now = self.session.cycle_at_time(now);
         let headroom_cycles = self.launch_headroom() * cps;
+        #[cfg(feature = "vst")]
+        let lead = self.session.takeover_headroom();
         let boundary_cycle = next_boundary(cycle_now, unit_cycles, headroom_cycles);
         let boundary_time = now + (boundary_cycle - cycle_now) / cps;
         // The countdown gives the decoder a head start: the incoming
@@ -199,6 +201,8 @@ impl StudioEngine {
             waited: false,
             #[cfg(feature = "vst")]
             prepared: false,
+            #[cfg(feature = "vst")]
+            lead,
         });
         // The plugin copies of the launch build during the countdown too,
         // for the cycles it plays first.
@@ -455,7 +459,9 @@ impl StudioEngine {
     /// until the line and the new one is queried from it. The lead of the
     /// plugin chains grows when a copy becomes ready in the countdown. A
     /// fire that then has less room than the lead and the margin before
-    /// its line would land past it, so the launch takes the next line.
+    /// its line would land past it, so the launch takes the next line. A
+    /// late tick with the lead the line was chosen with fires as a launch
+    /// with no plugin does.
     pub(super) fn advance_launch(&mut self) {
         let Some(pending) = self.pending_launch.as_ref() else {
             return;
@@ -467,6 +473,8 @@ impl StudioEngine {
         };
         let now = live.device.clock_seconds();
         let boundary_time = self.pending_line_time(pending, now);
+        #[cfg(feature = "vst")]
+        let lead = pending.lead;
         if now < boundary_time - self.launch_headroom() {
             // A launch armed while a new score waited for its first window
             // prepares now.
@@ -478,7 +486,7 @@ impl StudioEngine {
             return;
         }
         #[cfg(feature = "vst")]
-        if self.session.takeover_headroom() > 0.0
+        if self.session.takeover_headroom() > lead
             && boundary_time - now < self.launch_headroom() - LAUNCH_HEADROOM_SECS
         {
             self.launch_takes_next_line(
@@ -691,6 +699,38 @@ mod tests {
             hold_clock(&engine, false);
             engine.supersede_launch();
         }
+    }
+
+    /// A tick can come late. A lead that did not grow since the line was
+    /// chosen leaves the launch the room it had, so it fires on its line as
+    /// a launch with no plugin does.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_late_tick_with_the_lead_of_the_arm_fires_on_its_line() {
+        let mut engine = silent_engine_with_pattern(rustel_core::silence());
+        engine.session.set_plugin_lead_for_test(0.1);
+        engine
+            .arm_launch("s(\"hh\")", false, 1.0, false)
+            .expect("arm")
+            .expect("armed");
+        let line = engine
+            .pending_launch
+            .as_ref()
+            .expect("armed")
+            .boundary_cycle;
+        // The tick comes 0.1 s after the fire time, past the evaluation's
+        // share of the head-room.
+        hold_clock_until(&engine, |engine| {
+            let pending = engine.pending_launch.as_ref().expect("armed");
+            let now = engine.device_time();
+            now >= engine.pending_line_time(pending, now) - engine.launch_headroom() + 0.1
+        });
+        engine.advance_launch();
+        assert!(engine.pending_launch.is_none(), "the launch fired");
+        let landing = engine.landing.as_ref().expect("the launch is in flight");
+        assert_eq!(landing.boundary_cycle, line, "on the line it was armed for");
+        hold_clock(&engine, false);
+        engine.supersede_launch();
     }
 
     /// A quantised rewind whose incoming score still loads a sample must

@@ -24,6 +24,7 @@ use effects::bandpass_coefs;
 use effects::notch_coefs;
 use effects::reserve_fx_reverb_returns;
 use effects::voice_fx_pre_distort;
+use inserts::InsertClock;
 use inserts::claim_insert_bus;
 use inserts::deliver;
 use inserts::displace_insert;
@@ -50,6 +51,7 @@ use modulation::lfo_shape;
 use modulation::lfo_waveshape;
 use modulation::lfo_waveshape_f64;
 use modulation::nan_param_default;
+use modulation::postgain_moves;
 use modulation::wrap_phase;
 use orbit::stereo_pan;
 pub(crate) use render::enable_denormal_flush;
@@ -67,7 +69,7 @@ use voice::sbd_saturation_curve;
 use voice::seeded_phase;
 use voice::supersaw_detune_ratio;
 use voice::supersaw_spread_geometry;
-pub(crate) use voice::{saw_blep, saw_step};
+pub(crate) use voice::{next_saw_phase, render_static_supersaw_lanes, saw_blep, saw_step};
 
 use crate::biquad::FilterChain;
 use crate::periodic_wave::{PeriodicWaveTables, TableSelection, prepared_tables};
@@ -272,6 +274,14 @@ struct Voice {
     /// delay its output. The output of the voice comes on `start_frame`
     /// plus this lead. See [`OscillatorControls::chain_latency`].
     lead: u32,
+    /// The first frame of the output of the voice: its start plus its lead.
+    /// A note that came late starts on the block it came in, so its output
+    /// comes that much later. The voice owns the level of its chain from
+    /// this frame: see [`LevelChange`].
+    output_frame: u64,
+    /// The level line of a voice whose post gain moves on a chain with
+    /// latency: see [`SendLines::claim_level`].
+    level_line: Option<u8>,
     /// The note is aimed its lead before its musical onset: see
     /// [`OscillatorControls::lead`]. A takeover pairs such a voice with a
     /// copy of its sound: see [`ScalarBackend::kept_onset_stands_for`].
@@ -1186,6 +1196,23 @@ const SEND_LINES: usize = 4;
 const REVERB_SEND: usize = 0;
 /// The first line of the delay send of an orbit.
 const DELAY_SEND: usize = 2;
+/// The level lines in [`SendLines`]: one for each note with a moving post
+/// gain on a chain with latency, while its output plays.
+const LEVEL_LINES: usize = 4;
+
+/// The level line of one note in [`SendLines`]: see
+/// [`SendLines::claim_level`].
+#[derive(Clone, Copy, Default)]
+struct LevelLine {
+    /// The id of the voice of the note, or 0 for a free line.
+    voice: u64,
+    bus: usize,
+    /// The first frame of the output of the note, and the frame after the
+    /// last level the note gave. The line holds a level for each frame
+    /// from the one to the other.
+    from: u64,
+    until: u64,
+}
 
 /// The sends of the notes of plugin chains with latency, on their way to
 /// their orbits. Such a note starts its output lead before its output: see
@@ -1197,14 +1224,18 @@ const DELAY_SEND: usize = 2;
 /// latency of its notes, and ships them to the callback: see
 /// [`ScalarBackend::install_send_lines`]. A send that waits longer than the
 /// reach of the lines goes in at once.
+///
+/// The post gain of such a note sits after its chain, so its level waits
+/// too when it moves: see [`Self::claim_level`].
 pub struct SendLines {
-    /// The lines of each orbit, one after another. A send sits at its
-    /// frame, masked by `mask`.
+    /// The lines of each orbit, one after another, then the level lines. A
+    /// send or a level sits at its frame, masked by `mask`.
     samples: Box<[f32]>,
     mask: usize,
     /// The frame after the last send of each orbit. An orbit at 0 had no
     /// send since the lines were made or last emptied.
     until: [u64; MAX_ORBITS],
+    levels: [LevelLine; LEVEL_LINES],
 }
 
 impl SendLines {
@@ -1219,10 +1250,12 @@ impl SendLines {
         // to its first write. The opaque zero keeps the compiler from making
         // the writes a zeroed allocation again.
         let zero = std::hint::black_box(0.0);
+        let lines = MAX_ORBITS * SEND_LINES + LEVEL_LINES;
         Self {
-            samples: std::iter::repeat_n(zero, MAX_ORBITS * SEND_LINES * frames).collect(),
+            samples: std::iter::repeat_n(zero, lines * frames).collect(),
             mask: frames - 1,
             until: [0; MAX_ORBITS],
+            levels: [LevelLine::default(); LEVEL_LINES],
         }
     }
 
@@ -1240,6 +1273,76 @@ impl SendLines {
     /// The first sample of `line` of `orbit`.
     fn line(&self, orbit: usize, line: usize) -> usize {
         (orbit * SEND_LINES + line) * (self.mask + 1)
+    }
+
+    /// The first sample of the level line `line`.
+    fn level_line(&self, line: usize) -> usize {
+        (MAX_ORBITS * SEND_LINES + line) * (self.mask + 1)
+    }
+
+    /// Gives a level line to the voice `voice` of a note on `bus` whose
+    /// output starts on `from`, when a line is free: a line with no voice,
+    /// or a line whose voice `held` says is gone and whose last level is
+    /// before `frame`. The voice then gives its post gain at each frame of
+    /// its output, and the chain takes it on that frame: see
+    /// [`Self::set_level`] and [`Self::apply_levels`].
+    fn claim_level(
+        &mut self,
+        voice: u64,
+        bus: usize,
+        from: u64,
+        frame: u64,
+        held: impl Fn(u64) -> bool,
+    ) -> Option<u8> {
+        let free = |line: &LevelLine| line.voice == 0 || (line.until <= frame && !held(line.voice));
+        let at = self.levels.iter().position(free)?;
+        self.levels[at] = LevelLine {
+            voice,
+            bus,
+            from,
+            until: from,
+        };
+        u8::try_from(at).ok()
+    }
+
+    /// Puts the post gain `value` of the voice `voice` in its level line
+    /// `line`, for the output `frame`. A line another voice took since
+    /// takes nothing.
+    #[inline]
+    fn set_level(&mut self, line: u8, voice: u64, frame: u64, value: f32) {
+        let line = usize::from(line);
+        if self.levels[line].voice != voice {
+            return;
+        }
+        let at = self.level_line(line) + (frame & self.mask as u64) as usize;
+        self.samples[at] = value;
+        let held = &mut self.levels[line];
+        held.until = held.until.max(frame + 1);
+    }
+
+    /// The level the voice `voice` gave for the output `frame` in its level
+    /// line `line`.
+    #[inline]
+    fn level(&self, line: u8, voice: u64, frame: u64) -> Option<f32> {
+        let held = self.levels.get(usize::from(line))?;
+        (held.voice == voice && (held.from..held.until).contains(&frame)).then(|| {
+            self.samples[self.level_line(usize::from(line)) + (frame & self.mask as u64) as usize]
+        })
+    }
+
+    /// Gives each chain whose level a voice with a level line owns the
+    /// level of that voice for the output `frame`, also after the voice
+    /// ended, while its output plays on.
+    #[inline]
+    fn apply_levels(&self, frame: u64, levels: &mut [InsertPostgain]) {
+        for (line, held) in self.levels.iter().enumerate() {
+            if held.voice == 0 || levels[held.bus].owner.1 != held.voice {
+                continue;
+            }
+            if let Some(value) = self.level(line as u8, held.voice, frame) {
+                levels[held.bus].value = value;
+            }
+        }
     }
 
     /// Adds a send of `orbit` that joins the orbit on `frame`: `send` is the
@@ -1302,6 +1405,21 @@ impl SendLines {
             }
             self.until[orbit] = until;
         }
+        for (line, held) in lines.levels.iter().enumerate() {
+            let (from, to) = (lines.level_line(line), self.level_line(line));
+            let mut at = frame.max(held.from);
+            while held.voice != 0 && at < held.until {
+                let old = (at & lines.mask as u64) as usize;
+                let new = (at & self.mask as u64) as usize;
+                let run = usize::try_from(held.until - at)
+                    .unwrap_or(usize::MAX)
+                    .min(lines.mask + 1 - old);
+                self.samples[to + new..to + new + run]
+                    .copy_from_slice(&lines.samples[from + old..from + old + run]);
+                at += run as u64;
+            }
+            self.levels[line] = *held;
+        }
     }
 
     /// Empties the lines of each orbit that had a send: a reset of the clock
@@ -1314,6 +1432,8 @@ impl SendLines {
                 *until = 0;
             }
         }
+        // A level line holds levels only from its first frame to its last.
+        self.levels = [LevelLine::default(); LEVEL_LINES];
     }
 }
 
@@ -1350,8 +1470,9 @@ struct InstrumentGain {
 
 struct InstrumentGainChange {
     bus: usize,
-    /// The frame the change applies on: the onset of its value, or the
-    /// start of the segment for a note that came late.
+    /// The frame the change applies on: the output of the note at the
+    /// instrument. A note that came late reaches the instrument that much
+    /// later.
     frame: u64,
     value: InstrumentGain,
 }
@@ -1526,6 +1647,9 @@ pub struct ScalarBackend {
     /// The serviced marks of the slots that a forced release emptied: see
     /// [`Self::release_insert`].
     insert_serviced: inserts::ServicedMarks,
+    /// The clock the last note gave the copy of each slot: see
+    /// [`inserts::InsertClock`].
+    insert_clocks: Vec<Option<inserts::InsertClock>>,
     /// The stages of each chain that run, in signal order, with
     /// [`crate::insert::NO_STAGE`] after the last: the stages that served
     /// the newest note with an effect, in the order of its calls, and each
@@ -1750,10 +1874,13 @@ impl ScalarBackend {
             .iter()
             .filter(|voice| voice.polyphony_fade_frame.is_none())
             .count();
+        let led = Self::led(&self.voices, 0);
+        let frame = self.frame;
         let faded = Self::fade_oldest_voices(
             &mut self.voices,
             active.saturating_sub(limit),
-            self.frame,
+            led,
+            |_| frame,
             self.sample_rate,
         );
         self.pressure.semantic_polyphony_fades = self
@@ -2105,6 +2232,7 @@ impl ScalarBackend {
         self.instrument_gain_changes.clear();
         self.level_changes.clear();
         self.insert_leads.fill(0);
+        self.insert_clocks.fill(None);
         if let Some(lines) = self.send_lines.as_deref_mut() {
             lines.clear();
         }

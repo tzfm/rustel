@@ -1397,7 +1397,7 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
     assert_eq!(prepared(refused), Prepared::Unavailable(reason));
 
     // After the failures the bound ends the oldest copy of a chain no
-    // caller names, and never a copy of a named chain. The first caller
+    // caller names, and never a copy a named chain asks for. The first caller
     // names the chain of the parked copy: its name and its preset resolve
     // as a call does, so the copy of the file `default` is the copy the
     // chain wants. A second caller names one more chain, and unnames no

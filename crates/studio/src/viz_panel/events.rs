@@ -237,6 +237,7 @@ mod tests {
             scale: None,
             frequency_hz: None,
             gain: None,
+            sample: None,
             ui_visuals: 0,
             context: Vec::new(),
         }

@@ -136,6 +136,8 @@ impl StudioEngine {
                 _ => {}
             }
         }
+        // A source the permissions page turned off is not read again.
+        hydra.set_sample_access(&self.session.config().score_sample_access);
         // A stopped set wipes the picture, the way the strudel.cc editor does.
         // The shelf's own picture is a second renderer with its own liveness,
         // so browsing does not keep the score's visuals alive - and inserting

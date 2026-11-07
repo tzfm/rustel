@@ -6,6 +6,18 @@ use super::*;
 #[cfg(feature = "video")]
 const MAX_TRACKED_VIDEO_CLIPS: usize = 8;
 
+/// Drop the clips no host shows: a strip only this table holds, a
+/// refusal, and a sound with no picture. A decode under way stays.
+#[cfg(feature = "video")]
+fn make_room_for_a_clip(videos: &mut HashMap<Arc<str>, crate::video::VideoPicture>) {
+    use crate::video::VideoPicture;
+    videos.retain(|_, picture| match picture {
+        VideoPicture::Decoding => true,
+        VideoPicture::Ready(strip) => Arc::strong_count(strip) > 1,
+        VideoPicture::Failed(_) | VideoPicture::NotVideo | VideoPicture::ByNote(_) => false,
+    });
+}
+
 /// Picture decodes that run at once. Each takes a few cores beside the
 /// audio engine, so a set of many clips decodes them a few at a time.
 #[cfg(feature = "video")]
@@ -53,14 +65,16 @@ impl Drop for PictureTurn {
 /// A file read where it lies goes straight to the picture. A fetched
 /// one is checked by its audio decode first, as for any sample: the
 /// picture decode refuses codecs this build cannot read, and a refused
-/// picture must not evict cache bytes the sound still plays from.
+/// picture must not evict cache bytes the sound still plays from. A
+/// container with no video track has no picture: `None`.
 #[cfg(feature = "video")]
 fn decode_video_picture(
     shared: &Shared,
     url: &Arc<str>,
-) -> Result<crate::video::VideoThumbnails, String> {
+) -> Result<Option<crate::video::VideoThumbnails>, String> {
     let _turn = PictureTurn::take();
-    let budget = sample_fetch::FetchBudget::for_one_fetch_with_cancellation(
+    let budget = sample_fetch::FetchBudget::for_transfer(
+        FileLimit::of(url).bytes,
         shared.publication.cancellation(),
     );
     let score_access = shared
@@ -934,6 +948,78 @@ impl SampleLibrary {
         *self.shared.import_policy.lock().expect("import policy") = Some(access);
     }
 
+    /// Take back what a score's sources no longer allow under `access`: each
+    /// bank a score registered from a source that is gone, and the grant of
+    /// its files, so none of them is fetched again. A file already in the
+    /// loader's line is refused when the loader reaches it. The open set's
+    /// folder and the sources of Settings are the player's own and stay.
+    pub fn withdraw_sources(&self, access: &ScoreSampleAccess) {
+        let mut own: HashSet<Arc<str>> = HashSet::new();
+        for bank in self.global.read().expect("global banks").values() {
+            own.extend(bank_file_urls(bank).into_iter().cloned());
+        }
+        {
+            let custom = self.custom.read().expect("custom banks");
+            for name in self.shared.set_banks.read().expect("set banks").keys() {
+                if let Some(bank) = custom.get(name) {
+                    own.extend(bank_file_urls(bank).into_iter().cloned());
+                }
+            }
+        }
+        // The lock order of `publish_score_custom`: grants, banks, set banks.
+        let mut grants = self
+            .shared
+            .score_sources
+            .write()
+            .expect("score sample sources");
+        // Stored under the lock of the grants, so a registration that
+        // publishes after this reads it: see [`under_current_policy`].
+        *self.shared.score_policy.lock().expect("score policy") = Some(access.clone());
+        let mut withdrawn = HashSet::new();
+        for (url, grant) in grants.iter_mut().filter(|(url, _)| !own.contains(*url)) {
+            *grant = access.regrant(url, grant);
+            if *grant == ScoreFetchAccess::Withdrawn {
+                withdrawn.insert(Arc::clone(url));
+            }
+        }
+        if withdrawn.is_empty() {
+            return;
+        }
+        let taken = |bank: &Bank| {
+            bank_file_urls(bank)
+                .into_iter()
+                .any(|url| withdrawn.contains(url))
+        };
+        let mut custom = self.custom.write().expect("custom banks");
+        let mut adopted = self.shared.set_banks.write().expect("set banks");
+        // A bank the set hid comes back when the set closes, but not one
+        // taken back.
+        for displaced in adopted.values_mut() {
+            if displaced.as_ref().is_some_and(taken) {
+                *displaced = None;
+            }
+        }
+        let mut dropped = Vec::new();
+        custom.retain(|name, bank| {
+            let keep = adopted.contains_key(name) || !taken(bank);
+            if !keep {
+                dropped.push(name.clone());
+            }
+            keep
+        });
+        *self
+            .shared
+            .custom_file_names
+            .write()
+            .expect("custom filenames") = local_names::index(custom.values());
+        drop((adopted, custom, grants));
+        self.shared
+            .bank_imports
+            .write()
+            .expect("bank imports")
+            .retain(|name, _| !dropped.contains(name));
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn import_policy_for_test(&self) -> Option<ScoreSampleAccess> {
@@ -1572,13 +1658,27 @@ impl SampleLibrary {
 
     /// The picture of the video sample `s("name")` names, as thumbnails.
     ///
-    /// `None` when the name is no video container this build reads. The
+    /// `None` while no bank has the name, which a bank on its way can
+    /// still give. [`VideoPicture::NotVideo`] for a sound with no picture:
+    /// a file that is no video container, a font, or a synth. The
     /// first ask for a url starts one decode on a library thread and
     /// answers [`VideoPicture::Decoding`]; a later poll reads what it
-    /// produced. The strip stays for the library's life, so a stopped set
-    /// keeps its picture.
+    /// produced. The strip stays while a host holds it, so a stopped set
+    /// keeps its picture. A strip only the library holds, or a refusal,
+    /// gives its place to a new clip when the table is full.
+    ///
+    /// A bank the note picks from answers [`crate::video::VideoPicture::ByNote`]
+    /// to its name. `name note:60` is the clip of the key MIDI 60 picks, the
+    /// way the voice picks it. A sound name from a score has no space.
     #[cfg(feature = "video")]
     pub fn video_thumbnails(&self, name: &str) -> Option<crate::video::VideoPicture> {
+        let (name, midi) = match name.rsplit_once(" note:") {
+            Some((head, tail)) => match tail.parse::<f64>() {
+                Ok(midi) if midi.is_finite() && !head.is_empty() => (head, Some(midi)),
+                _ => (name, None),
+            },
+            None => (name, None),
+        };
         let (bank, n) = match name.rsplit_once(':') {
             Some((head, tail)) => match tail.parse::<f64>() {
                 Ok(n) if !head.is_empty() => (head, n),
@@ -1586,13 +1686,30 @@ impl SampleLibrary {
             },
             None => (name, 0.0),
         };
-        let url = self.look_up(bank, |named| match named {
-            Named::Bank(bank) => pick_from_bank(bank, n, 36.0).map(|(url, _)| url),
-            Named::Font(_) => None,
-        })??;
-        if !matches!(codec_for(&url), Codec::Mp4 | Codec::Matroska) {
-            return None;
-        }
+        let Some(url) = self.look_up(bank, |named| match named {
+            Named::Bank(Bank::Notes(notes)) if midi.is_none() => Err(
+                crate::video::VideoPicture::ByNote(notes.iter().map(|(key, _)| *key).collect()),
+            ),
+            // A browser preview carries no note, so it shows the clip of
+            // the sampler's MIDI 36 default, as it sounds.
+            Named::Bank(bank) => {
+                Ok(pick_from_bank(bank, n, midi.unwrap_or(36.0)).map(|(url, _)| url))
+            }
+            Named::Font(_) => Ok(None),
+        }) else {
+            // The voice makes a synth's sound by itself, so no bank on its
+            // way gives it a picture.
+            return rustel_voice::is_native_synth_sound(bank)
+                .then_some(crate::video::VideoPicture::NotVideo);
+        };
+        let url = match url {
+            Ok(url) => url,
+            Err(by_note) => return Some(by_note),
+        };
+        let Some(url) = url.filter(|url| matches!(codec_for(url), Codec::Mp4 | Codec::Matroska))
+        else {
+            return Some(crate::video::VideoPicture::NotVideo);
+        };
         {
             let mut videos = self.shared.videos.lock().expect("video thumbnails");
             let moves = file_limit::video_ceiling_moves();
@@ -1603,6 +1720,9 @@ impl SampleLibrary {
             }
             if let Some(picture) = videos.get(&url) {
                 return Some(picture.clone());
+            }
+            if videos.len() >= MAX_TRACKED_VIDEO_CLIPS {
+                make_room_for_a_clip(&mut videos);
             }
             if videos.len() >= MAX_TRACKED_VIDEO_CLIPS {
                 return Some(crate::video::VideoPicture::Failed(
@@ -1622,10 +1742,11 @@ impl SampleLibrary {
                 let Some(shared) = shared.upgrade() else {
                     return;
                 };
-                let picture = decode_video_picture(&shared, &decoding)
-                    .map_or_else(crate::video::VideoPicture::Failed, |strip| {
-                        crate::video::VideoPicture::Ready(Arc::new(strip))
-                    });
+                let picture = match decode_video_picture(&shared, &decoding) {
+                    Ok(Some(strip)) => crate::video::VideoPicture::Ready(Arc::new(strip)),
+                    Ok(None) => crate::video::VideoPicture::NotVideo,
+                    Err(message) => crate::video::VideoPicture::Failed(message),
+                };
                 let mut videos = shared.videos.lock().expect("video thumbnails");
                 // A decode the library cancelled is not the clip's answer.
                 if shared.publication.cancellation().load(Ordering::Acquire) {
@@ -2137,6 +2258,43 @@ impl SampleLibrary {
     }
 }
 
+/// The grants and banks of a score registration under the policy the last
+/// [`SampleLibrary::withdraw_sources`] took. A registration that was on its
+/// way when a source was turned off loses what that source allowed, as the
+/// registrations before it did. A file `held` already grants keeps that
+/// grant: the withdrawal judged it, and kept the files of the player's own
+/// banks. The caller holds the write lock of `held`, the grants, so no
+/// withdrawal runs between this and the publication.
+pub(super) fn under_current_policy(
+    shared: &Shared,
+    held: &HashMap<Arc<str>, ScoreFetchAccess>,
+    sources: &mut [(Arc<str>, ScoreFetchAccess)],
+    staged: &mut Vec<(String, Bank)>,
+) {
+    let policy = shared.score_policy.lock().expect("score policy").clone();
+    let Some(policy) = policy else {
+        return;
+    };
+    for (url, grant) in sources.iter_mut() {
+        *grant = match held.get(url) {
+            Some(judged) => judged.clone(),
+            None => policy.regrant(url, grant),
+        };
+    }
+    let withdrawn: HashSet<&str> = sources
+        .iter()
+        .filter(|(_, grant)| *grant == ScoreFetchAccess::Withdrawn)
+        .map(|(url, _)| url.as_ref())
+        .collect();
+    if !withdrawn.is_empty() {
+        staged.retain(|(_, bank)| {
+            !bank_file_urls(bank)
+                .into_iter()
+                .any(|url| withdrawn.contains(url.as_ref()))
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2163,6 +2321,92 @@ mod tests {
         }
     }
 
+    /// A full table of clips makes room from the strips no host holds and
+    /// from refusals, never from a strip in use or a decode under way.
+    #[cfg(feature = "video")]
+    #[test]
+    fn a_full_clip_table_gives_back_what_no_host_shows() {
+        use crate::video::{VideoPicture, VideoThumbnails};
+        let strip = || {
+            Arc::new(VideoThumbnails::from_frames(1, 1, vec![(0.0, vec![0; 4])]).expect("strip"))
+        };
+        let shown = strip();
+        let mut videos: HashMap<Arc<str>, VideoPicture> = HashMap::new();
+        videos.insert("shown".into(), VideoPicture::Ready(Arc::clone(&shown)));
+        videos.insert("left".into(), VideoPicture::Ready(strip()));
+        videos.insert("refused".into(), VideoPicture::Failed("no".into()));
+        videos.insert("decoding".into(), VideoPicture::Decoding);
+        make_room_for_a_clip(&mut videos);
+        let mut kept: Vec<&str> = videos.keys().map(|url| &**url).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["decoding", "shown"]);
+    }
+
+    /// A sound file and a synth answer that they have no picture, so a
+    /// painter stops asking for them and lists only the clips. A name no
+    /// bank has yet may still arrive as a clip.
+    #[cfg(feature = "video")]
+    #[test]
+    fn a_sound_with_no_picture_says_so() {
+        use crate::video::VideoPicture;
+        let library = SampleLibrary::with_unasked_banks_for_test(&["bd"]);
+        assert!(matches!(
+            library.video_thumbnails("bd"),
+            Some(VideoPicture::NotVideo)
+        ));
+        assert!(matches!(
+            library.video_thumbnails("sine"),
+            Some(VideoPicture::NotVideo)
+        ));
+        assert!(
+            library.video_thumbnails("clip").is_none(),
+            "a bank on its way"
+        );
+    }
+
+    /// A bank the note picks from names its keys, and each key's clip is
+    /// the file the voice plays for a note nearest it.
+    #[cfg(feature = "video")]
+    #[test]
+    fn a_bank_keyed_by_note_shows_the_clip_of_each_key() {
+        use crate::video::{VideoPicture, VideoThumbnails};
+        let library = SampleLibrary::empty_without_loading();
+        let low: Arc<str> = Arc::from("https://clips.example/c2.webm");
+        let high: Arc<str> = Arc::from("https://clips.example/c4.webm");
+        library.banks.write().expect("banks").insert(
+            "keys".to_owned(),
+            Bank::Notes(vec![(36.0, vec![low.clone()]), (60.0, vec![high.clone()])]),
+        );
+        let strip = || {
+            Arc::new(VideoThumbnails::from_frames(1, 1, vec![(0.0, vec![0; 4])]).expect("strip"))
+        };
+        let (low_strip, high_strip) = (strip(), strip());
+        {
+            let mut videos = library.shared.videos.lock().expect("video thumbnails");
+            videos.insert(low, VideoPicture::Ready(Arc::clone(&low_strip)));
+            videos.insert(high, VideoPicture::Ready(Arc::clone(&high_strip)));
+        }
+        assert!(matches!(
+            library.video_thumbnails("keys"),
+            Some(VideoPicture::ByNote(keys)) if keys == [36.0, 60.0]
+        ));
+        let shows = |name: &str, expected: &Arc<VideoThumbnails>| {
+            matches!(
+                library.video_thumbnails(name),
+                Some(VideoPicture::Ready(strip)) if Arc::ptr_eq(&strip, expected)
+            )
+        };
+        assert!(
+            shows("keys note:60", &high_strip),
+            "the voice plays c4 at MIDI 60"
+        );
+        assert!(shows("keys note:36", &low_strip));
+        assert!(
+            shows("keys:1 note:60", &high_strip),
+            "n wraps in the key's files"
+        );
+    }
+
     #[cfg(test)]
     mod loading_name_tests {
         use super::file_name_of_url;
@@ -2181,5 +2425,128 @@ mod tests {
             assert_eq!(file_name_of_url("bad%zz.wav"), "bad%zz.wav");
             assert_eq!(file_name_of_url("dir/"), "");
         }
+    }
+
+    /// A source turned off takes its banks with it, and the grant of each
+    /// of their files. The source still allowed keeps its bank, and a pack
+    /// imported in Settings keeps loading.
+    #[test]
+    fn a_withdrawn_source_takes_its_banks_and_leaves_the_rest() {
+        use crate::samples::manifest_worker_tests::drain_request;
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind server");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let body = format!(r#"{{"_base":"{origin}/","pack":"p.wav"}}"#);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut stream = drain_request(stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write response");
+        });
+        let library = SampleLibrary::empty();
+        let reports = library.adopt_global_sources_settled(&[GlobalSource {
+            spec: format!("{origin}/withdraw-{}.json", std::process::id()),
+            enabled: true,
+        }]);
+        server.join().expect("server");
+        assert!(library.knows("pack"), "{reports:?}");
+
+        let mut before = ScoreSampleAccess::denied();
+        before.permit_source("http://kit.invalid").unwrap();
+        before.permit_source("http://kept.invalid").unwrap();
+        for (map, base) in [
+            (r#"{"kit":"a.wav"}"#, "http://kit.invalid/"),
+            (r#"{"kept":"b.wav"}"#, "http://kept.invalid/"),
+        ] {
+            library
+                .register_score_custom(map, Some(base), &before)
+                .expect("an allowed bank");
+        }
+        let mut after = ScoreSampleAccess::denied();
+        after.permit_source("http://kept.invalid").unwrap();
+        library.withdraw_sources(&after);
+
+        assert!(!library.knows("kit"), "the bank of the source turned off");
+        assert!(library.knows("kept") && library.knows("pack"));
+        let grant = |url: &str| library.shared.score_sources.read().unwrap()[url].clone();
+        let error = fetch_score_source(
+            "http://kit.invalid/a.wav",
+            &grant("http://kit.invalid/a.wav"),
+            64,
+        )
+        .expect_err("no request for a file of the source turned off");
+        assert!(error.contains("turned off"), "{error}");
+        let kept = "http://kept.invalid/b.wav";
+        assert_eq!(grant(kept), after.approve_remote(kept).unwrap().1);
+        let pack = grant(&format!("{origin}/p.wav"));
+        assert!(matches!(pack, ScoreFetchAccess::Remote { .. }), "{pack:?}");
+    }
+
+    /// A registration that was on its way under the policy before a source
+    /// was turned off, and publishes after, brings no bank of that source
+    /// back and no grant that reads its files. A file of a pack imported in
+    /// Settings that it names keeps the grant of the pack.
+    #[test]
+    fn a_registration_armed_before_a_withdrawal_publishes_under_the_new_policy() {
+        use crate::samples::manifest_worker_tests::drain_request;
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind server");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let body = format!(r#"{{"_base":"{origin}/","pack":"p.wav"}}"#);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut stream = drain_request(stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write response");
+        });
+        let library = SampleLibrary::empty();
+        let reports = library.adopt_global_sources_settled(&[GlobalSource {
+            spec: format!("{origin}/late-{}.json", std::process::id()),
+            enabled: true,
+        }]);
+        server.join().expect("server");
+        assert!(library.knows("pack"), "{reports:?}");
+
+        let mut before = ScoreSampleAccess::denied();
+        before.permit_source("http://kit.invalid").unwrap();
+        before.permit_source("http://kept.invalid").unwrap();
+        before.permit_source(&origin).unwrap();
+        let mut after = ScoreSampleAccess::denied();
+        after.permit_source("http://kept.invalid").unwrap();
+        library.withdraw_sources(&after);
+
+        let pack_map = r#"{"also":"p.wav"}"#;
+        let pack_base = format!("{origin}/");
+        for (map, base) in [
+            (r#"{"late":"c.wav"}"#, "http://kit.invalid/"),
+            (r#"{"kept":"b.wav"}"#, "http://kept.invalid/"),
+            (pack_map, pack_base.as_str()),
+        ] {
+            library
+                .register_score_custom(map, Some(base), &before)
+                .expect("a registration armed under the old policy");
+        }
+        assert!(!library.knows("late"), "the bank of the source turned off");
+        assert!(library.knows("kept"));
+        let grant = |url: &str| library.shared.score_sources.read().unwrap()[url].clone();
+        let late = "http://kit.invalid/c.wav";
+        let error = fetch_score_source(late, &grant(late), 64)
+            .expect_err("no request for a file of the source turned off");
+        assert!(error.contains("turned off"), "{error}");
+        let kept = "http://kept.invalid/b.wav";
+        assert_eq!(grant(kept), after.approve_remote(kept).unwrap().1);
+        let pack = grant(&format!("{origin}/p.wav"));
+        assert!(matches!(pack, ScoreFetchAccess::Remote { .. }), "{pack:?}");
+        assert!(library.knows("also") && library.knows("pack"));
     }
 }

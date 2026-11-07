@@ -163,9 +163,10 @@ rustel studio set/ --allow-sample-origin images.example
 ```
 
 A domain allows HTTPS from it and its subdomains. An address, such as
-`http://localhost:8000/media/`, allows what starts with it. Redirects must
-stay inside the source. Private and link-local addresses are refused, and a
-server on this computer needs an address that names it.
+`http://localhost:8000/media/`, allows what starts with it. A redirect must
+reach an address that an allowed source allows. Private and link-local
+addresses are refused, and a server on this computer needs an address that
+names it.
 
 ### Formats and limits
 
@@ -183,9 +184,11 @@ as some real-time encoders write, can also fail. MP4 files do not play, even
 with VP9 inside: their demuxer can be made to ask for gigabytes of memory by
 a small file.
 
-An image may be 16 MiB and a video 64 MiB, read or downloaded. A picture may
-be 2048 pixels per edge and 4,194,304 pixels. A video holds its whole file in
-memory while it plays, so four videos hold at most 256 MiB.
+An image may be 16 MiB and a video 64 MiB, read or downloaded. An image
+download has 15 seconds. A video download stops when no data arrives for 60
+seconds. A picture may be 2048 pixels per edge and 4,194,304 pixels. A video
+holds its whole file in memory while it plays, so four videos hold at most
+256 MiB.
 
 An explicit camera, image or video on `s0` takes precedence over
 `feedStrudel`. Removing it restores the terminal feed on the next evaluation.

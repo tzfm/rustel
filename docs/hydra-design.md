@@ -39,13 +39,14 @@ pixels. Clearing an old lease cannot erase a replacement source.
 
 Each image and video job carries the session's sample-access policy. For a
 URL, the worker checks that a source allows it, pins guarded DNS on every
-hop, and keeps redirects inside the source before decoding.
+hop, and keeps redirects inside the allowed sources before decoding.
 `HydraBridge::apply_with_sample_access` supplies that policy. Plain `apply` grants no image origins. A path without
 `://` is read beneath the set folder that `HydraBridge::set_media_folder`
 names, then beneath the local sample root, through the same confined open as
 a local sample. Each slot has one active job and one replaceable pending job.
 Cancellation prevents publication. Active OS I/O can continue until the
-shared deadline: 15 seconds for an image, 60 for a video.
+deadline: 15 seconds for an image. A video read waits at most 60 seconds for
+data, and the whole file has the time 64 MiB takes at 256 KiB/s.
 
 A video job keeps its worker while it plays. It decodes one frame at a time
 and publishes each at its timestamp, then starts again at the end. Its

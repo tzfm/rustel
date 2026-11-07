@@ -367,7 +367,7 @@ impl StudioEngine {
 
     /// Replace what the permissions page permits a score's `samples()`,
     /// images and videos to read. The next evaluation and the next pack
-    /// import read it. Banks already loaded stay.
+    /// import read it. A bank from a source turned off is dropped.
     pub fn set_sample_grants(&mut self, grants: SampleGrants) {
         let access = sample_access(&self.config.session, &grants);
         self.config.sample_grants = grants;
@@ -1188,6 +1188,49 @@ mod tests {
             .evaluate("samples('http://other.invalid/kit.json')\n$: s(\"bd\")")
             .expect("the score");
         assert_eq!(refused.take_refused_sources(), ["http://other.invalid"]);
+    }
+
+    /// A source turned off on the page takes the banks it allowed, and the
+    /// pictures read under the new grants from the next turn, so Stop and
+    /// Play fetch nothing from it.
+    #[test]
+    fn a_source_turned_off_takes_its_banks_and_pictures() {
+        let mut engine = StudioEngine::new(StudioConfig::default()).expect("engine");
+        engine.set_sample_grants(SampleGrants {
+            sources: vec!["http://kit.invalid".to_owned()],
+            ..SampleGrants::default()
+        });
+        let library = Arc::clone(engine.session.sample_library().expect("library"));
+        library
+            .register_score_custom(
+                r#"{"kit":"a.wav"}"#,
+                Some("http://kit.invalid/"),
+                &engine.session.config().score_sample_access,
+            )
+            .expect("an allowed bank");
+        #[cfg(feature = "hydra")]
+        let mut hydra = rustel_runtime::hydra::HydraBridge::new();
+        #[cfg(feature = "hydra")]
+        let pictures = |hydra: &rustel_runtime::hydra::HydraBridge| {
+            hydra
+                .sample_access_for_test()
+                .source_for("http://kit.invalid/a.png")
+                .expect("an address")
+                .is_some()
+        };
+        #[cfg(feature = "hydra")]
+        {
+            engine.drive_hydra(&mut hydra, None);
+            assert!(pictures(&hydra));
+        }
+
+        engine.set_sample_grants(SampleGrants::default());
+        assert!(!library.knows("kit"), "the bank goes with its source");
+        #[cfg(feature = "hydra")]
+        {
+            engine.drive_hydra(&mut hydra, None);
+            assert!(!pictures(&hydra), "the pictures read under the new grants");
+        }
     }
 
     mod sample_reclamation {
@@ -2011,6 +2054,8 @@ mod tests {
             waited: false,
             #[cfg(feature = "vst")]
             prepared: true,
+            #[cfg(feature = "vst")]
+            lead: 0.0,
         });
         assert!(
             protected_afresh(&mut engine).contains(&SampleId(74)),

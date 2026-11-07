@@ -521,8 +521,21 @@ impl App {
                         .visual
                         .install_video(&name, super::super::visuals::VideoEntry::Failed(message));
                 }
-                Some(VideoPicture::Decoding) | None => {
-                    changed |= self.visual.note_video_ask(&name);
+                Some(VideoPicture::NotVideo) => {
+                    changed |= self
+                        .visual
+                        .install_video(&name, super::super::visuals::VideoEntry::NotVideo);
+                }
+                Some(VideoPicture::ByNote(keys)) => {
+                    changed |= self
+                        .visual
+                        .install_video(&name, super::super::visuals::VideoEntry::ByNote(keys));
+                }
+                Some(VideoPicture::Decoding) => {
+                    changed |= self.visual.note_video_ask(&name, true);
+                }
+                None => {
+                    changed |= self.visual.note_video_ask(&name, false);
                 }
             }
         }

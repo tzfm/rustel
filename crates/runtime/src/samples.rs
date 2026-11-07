@@ -44,6 +44,7 @@ use catalog::*;
 mod loading;
 use loading::*;
 mod lookup;
+pub use lookup::closest_note_key;
 use lookup::*;
 mod manifests;
 pub use cache::{
@@ -135,7 +136,8 @@ const SCORE_CACHE_KEY_DOMAIN_V1: &[u8] = b"strudel-score-cache-v1\0";
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScoreSampleAccess {
     local_root: Option<Arc<crate::sample_server::ServedRoot>>,
-    sources: Vec<SourceRule>,
+    /// Shared by each address it allows, which judges its redirects by it.
+    sources: Arc<[SourceRule]>,
     refused: RefusedSources,
 }
 
@@ -184,12 +186,22 @@ impl std::fmt::Debug for RefusedSources {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ScoreFetchAccess {
-    /// An address the policy allows, and the source that allows it. Every
-    /// redirect must stay inside that source.
-    Remote { rule: SourceRule },
+    /// An address the policy allows, and the sources of that policy. Every
+    /// redirect must reach an address one of them allows, as the score
+    /// could name that address itself.
+    Remote { sources: Arc<[SourceRule]> },
     Local {
         root: Arc<crate::sample_server::ServedRoot>,
     },
+    /// An address whose source the host took back. It is not read again.
+    Withdrawn,
+}
+
+impl ScoreFetchAccess {
+    /// Whether a source of a remote grant allows `url`.
+    fn allows(&self, url: &Url) -> bool {
+        matches!(self, Self::Remote { sources } if sources.iter().any(|rule| rule.allows(url)))
+    }
 }
 
 use crate::sample_fetch;
@@ -930,6 +942,10 @@ struct Shared {
     /// pack is granted no less than a score would be: the exact origin the
     /// player typed on top of it.
     import_policy: Mutex<Option<ScoreSampleAccess>>,
+    /// The score policy the last [`SampleLibrary::withdraw_sources`] took.
+    /// A registration armed under an older policy publishes its grants
+    /// under this one.
+    score_policy: Mutex<Option<ScoreSampleAccess>>,
     font_jobs: Arc<FontQueue>,
     /// One loud log line per failed url, never per onset.
     failures: Mutex<Vec<SampleFailure>>,

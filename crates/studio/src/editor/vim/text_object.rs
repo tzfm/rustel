@@ -29,7 +29,7 @@ impl Editor {
         };
         if let Some(operator) = operator {
             let start = range.start;
-            self.vim_apply_operator(operator, range, false, start, moment)?;
+            self.vim_apply_operator(operator, range, false, true, start, moment)?;
         } else {
             let head = if range.is_empty() {
                 range.start

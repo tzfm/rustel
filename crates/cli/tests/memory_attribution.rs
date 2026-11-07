@@ -962,6 +962,7 @@ fn tui_visual_timeline_stays_bounded() {
                 scale: None,
                 frequency_hz: None,
                 gain: Some(1.0),
+                sample: None,
                 ui_visuals: 1,
                 context: vec![(0, 2)],
             });

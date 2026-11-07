@@ -10,7 +10,7 @@ use std::arch::aarch64::{
 };
 
 use super::{StaticSupersawKernel, SupersawKernelKind};
-use crate::scalar::{saw_blep, saw_step};
+use crate::scalar::{next_saw_phase, render_static_supersaw_lanes, saw_blep, saw_step};
 
 const LANES_PER_VECTOR: usize = 4;
 
@@ -42,7 +42,7 @@ unsafe fn neon_render_static_lanes(
         && maximum_frequency.is_finite()
         && maximum_frequency < sample_rate)
     {
-        return scalar_render_static_lanes(
+        return render_static_supersaw_lanes(
             phases,
             detune_ratios,
             count,
@@ -107,8 +107,9 @@ unsafe fn neon_render_static_lanes(
             let blep = vbslq_f32(low_mask, low_blep, vbslq_f32(high_mask, high_blep, zero));
             let samples = vsubq_f32(value, blep);
 
+            // An exact cycle end stays 1.0, as `next_saw_phase` keeps it.
             let advanced = vaddq_f32(phase, dt);
-            let next = vbslq_f32(vcgeq_f32(advanced, one), vsubq_f32(advanced, one), advanced);
+            let next = vbslq_f32(vcgtq_f32(advanced, one), vsubq_f32(advanced, one), advanced);
             vst1q_f32(phases.as_mut_ptr().add(lane), next);
 
             let mut values = [0.0f32; LANES_PER_VECTOR];
@@ -130,36 +131,7 @@ unsafe fn neon_render_static_lanes(
         let value = saw_blep(*phase, dt);
         left += value * gain_l;
         right += value * gain_r;
-        let mut next = *phase + dt;
-        if next >= 1.0 {
-            next -= 1.0;
-        }
-        *phase = next;
-        std::mem::swap(&mut gain_l, &mut gain_r);
-    }
-    (left, right)
-}
-
-fn scalar_render_static_lanes(
-    phases: &mut [f32],
-    detune_ratios: &[f32],
-    count: usize,
-    frequency_hz: f32,
-    sample_rate: f32,
-    (mut gain_l, mut gain_r): (f32, f32),
-) -> (f32, f32) {
-    let mut left = 0.0f32;
-    let mut right = 0.0f32;
-    for (phase, ratio) in phases[..count].iter_mut().zip(&detune_ratios[..count]) {
-        let dt = saw_step(frequency_hz * ratio / sample_rate);
-        let value = saw_blep(*phase, dt);
-        left += value * gain_l;
-        right += value * gain_r;
-        let mut next = *phase + dt;
-        if next >= 1.0 {
-            next -= 1.0;
-        }
-        *phase = next;
+        *phase = next_saw_phase(*phase, dt);
         std::mem::swap(&mut gain_l, &mut gain_r);
     }
     (left, right)
@@ -199,7 +171,7 @@ mod tests {
                 let mut expected_phases = phases();
                 let mut actual_phases = expected_phases;
                 for frame in 0..frames {
-                    let expected = scalar_render_static_lanes(
+                    let expected = render_static_supersaw_lanes(
                         &mut expected_phases,
                         &ratios,
                         count,
@@ -254,7 +226,7 @@ mod tests {
         for frequency_hz in [0.0, -220.0, 100_000.0, f32::INFINITY, f32::NAN] {
             let mut expected_phases = phases();
             let mut actual_phases = expected_phases;
-            let expected = scalar_render_static_lanes(
+            let expected = render_static_supersaw_lanes(
                 &mut expected_phases,
                 &ratios,
                 TEST_LANES,
@@ -289,6 +261,49 @@ mod tests {
                 } else {
                     assert_eq!(actual.to_bits(), expected.to_bits());
                 }
+            }
+        }
+    }
+
+    /// A step of exactly 0.25 takes a phase of 0.75 onto 1.0. The render
+    /// path keeps that phase as the end of the cycle, and so does the
+    /// kernel, in the vectors and in the lanes after them.
+    #[test]
+    fn neon_keeps_an_exact_cycle_end_as_the_render_path_does() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+        let ratios = [1.0f32; TEST_LANES];
+        let mut expected_phases = [0.75f32; TEST_LANES];
+        let mut actual_phases = expected_phases;
+        for frame in 0..8 {
+            let expected = render_static_supersaw_lanes(
+                &mut expected_phases,
+                &ratios,
+                9,
+                12_000.0,
+                48_000.0,
+                (0.3, 0.7),
+            );
+            if frame == 0 {
+                assert_eq!(expected_phases[0], 1.0);
+            }
+            // SAFETY: the test checked the feature and provides valid arrays.
+            let actual = unsafe {
+                neon_render_static_lanes(
+                    &mut actual_phases,
+                    &ratios,
+                    9,
+                    12_000.0,
+                    48_000.0,
+                    (0.3, 0.7),
+                )
+            };
+            assert_eq!(actual.0.to_bits(), expected.0.to_bits(), "left {frame}");
+            assert_eq!(actual.1.to_bits(), expected.1.to_bits(), "right {frame}");
+            for (lane, (actual, expected)) in actual_phases.iter().zip(&expected_phases).enumerate()
+            {
+                assert_eq!(actual.to_bits(), expected.to_bits(), "phase {frame}:{lane}");
             }
         }
     }

@@ -423,7 +423,10 @@ impl Wait {
 /// builds: the lowest rank ends first. See [`State::make_room`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Rank {
-    /// A failed build, by the count of the builds at the failure.
+    /// A failed build, by the count of the builds at the failure. A failure
+    /// that a live copy of a named chain asks for has no rank, as a copy of
+    /// it would have none: its slot keeps the reason and the wait of its
+    /// next try. See [`Host::retry`].
     Failed(u64),
     /// A copy of a chain no caller names, by the order of the copy.
     Unnamed(u64),
@@ -942,15 +945,14 @@ impl State {
     }
 
     /// The row [`State::find`] gives for each name [`State::rank`] reads: the
-    /// name of each copy at rest, and of each live copy of a chain with
-    /// copies at rest. [`State::make_room`] finds each name one time, and not
-    /// one time for each build it ranks.
+    /// name of each copy a caller lists, live or at rest. [`State::make_room`]
+    /// finds each name one time, and not one time for each build it ranks.
     fn rank_rows(&self) -> HashMap<String, Option<usize>> {
         let mut rows = HashMap::new();
-        let lists = || self.callers.values();
-        for (chain, rest) in lists().flat_map(|kept| &kept.rest) {
-            let live = lists().filter_map(|kept| kept.wanted.get(chain)).flatten();
-            for copy in rest.iter().map(|(copy, _)| copy).chain(live) {
+        for kept in self.callers.values() {
+            let live = kept.wanted.values().flatten();
+            let rest = kept.rest.values().flatten().map(|(copy, _)| copy);
+            for copy in live.chain(rest) {
                 rows.entry(copy.name.clone())
                     .or_insert_with(|| self.find(&copy.name));
             }
@@ -960,12 +962,15 @@ impl State {
 
     /// The rank of a ready copy of `build` with the order `order` at the
     /// bound of the parked copies: see [`State::make_room`]. A ready copy
-    /// of a chain a caller names has no rank and stays, unless only copies
-    /// at rest ask for its key. When copies at rest ask for the key of a
-    /// ready copy, the copy ranks by the highest rest order among them.
-    /// Each other ready copy ranks under each such copy. `rows` has the row
-    /// of each name from [`State::rank_rows`]. A name not in `rows` resolves
-    /// here.
+    /// of a chain a caller names has no rank and stays while a live copy of
+    /// the chain asks for its key, or while no caller lists the chain: such
+    /// a chain asks for each key, as in [`State::unwanted`]. When copies at
+    /// rest ask for the key of a ready copy and no such live copy does, the
+    /// copy ranks by the highest rest order among them. Each other ready
+    /// copy ranks under each such copy, also a copy of a named chain that no
+    /// copy asks for: a preset name can give another file with no new call
+    /// of [`Host::keep`]. `rows` has the row of each name from
+    /// [`State::rank_rows`]. A name not in `rows` resolves here.
     fn rank(
         &self,
         build: &(InsertKey, u32, InsertSlot),
@@ -983,15 +988,18 @@ impl State {
         let rest = lists().filter_map(|kept| kept.rest.get(&slot.chain));
         let rest = rest.flatten().filter(|(copy, _)| asks(copy));
         let rest = rest.map(|(_, rest)| *rest).max();
-        let named = self.named(slot.chain);
-        let live = || {
-            let live = lists().filter_map(|kept| kept.wanted.get(&slot.chain));
-            live.flatten().any(asks)
-        };
+        let chain = &slot.chain;
+        let listed =
+            || lists().any(|kept| kept.wanted.contains_key(chain) || kept.rest.contains_key(chain));
+        let live = self.named(*chain)
+            && (!listed() || {
+                let live = lists().filter_map(|kept| kept.wanted.get(chain));
+                live.flatten().any(asks)
+            });
         match rest {
-            Some(rest) if !named || !live() => Some(Rank::Rest(rest, order)),
-            _ if named => None,
-            _ => Some(Rank::Unnamed(order)),
+            _ if live => None,
+            Some(rest) => Some(Rank::Rest(rest, order)),
+            None => Some(Rank::Unnamed(order)),
         }
     }
 
@@ -1027,8 +1035,8 @@ impl State {
     /// Ends the build of the lowest rank under `below` until the bound of
     /// the parked copies has room for one more build: see [`MAX_PARKED`].
     /// With no `below`, a build of any rank ends. A build that runs or tries
-    /// again has no rank, and a copy of a named chain has none: see
-    /// [`State::rank`]. A build of a render has no rank and does not count:
+    /// again has no rank, and a copy or a failure of a named chain that a
+    /// live copy asks for has none: see [`State::rank`]. A build of a render has no rank and does not count:
     /// see [`State::of_render`]. False when the bound has no room and no
     /// build ranks under `below`. The names of the copies resolve one time
     /// for the whole call: see [`State::rank_rows`].
@@ -1041,7 +1049,10 @@ impl State {
             let ranks = self.builds.iter().filter_map(|(build, built)| {
                 let rank = match built {
                     _ if self.of_render(build) => None,
-                    Build::Failed { order, .. } => Some(Rank::Failed(*order)),
+                    Build::Failed { order, .. } => {
+                        let rank = self.rank(build, *order, &rows);
+                        rank.map(|_| Rank::Failed(*order))
+                    }
                     Build::Ready(copy) => self.rank(build, copy.order(), &rows),
                     Build::Running | Build::Retrying(_) => None,
                 };
@@ -1072,8 +1083,9 @@ impl State {
     /// copies does not count: a copy at rest ends a failed build, a copy of
     /// a chain no caller names or a copy at rest of a lower rest order. A
     /// copy of a chain no caller names ends a failed build only. A copy of
-    /// a named chain has no rank: it ends a build of any rank, and parks
-    /// past the bound when no build ranks. See [`State::make_room`]. Gives
+    /// a named chain that a live copy asks for has no rank: it ends a build
+    /// of any rank, and parks past the bound when no build ranks. See
+    /// [`State::make_room`]. Gives
     /// the copy back when it ends at its park or finds no room: the caller
     /// ends it on the plugin thread. A copy the bound ends leaves the list
     /// here, and its plugin ends on the plugin thread too.
@@ -2568,9 +2580,9 @@ impl Host {
     /// at rest, for an open score that does not play now, with the rest
     /// order of the score: a score that went to rest later has a higher
     /// order. A copy at rest keeps its build as a live copy does. The bound
-    /// of the parked copies ends no copy of a named chain, unless only a
-    /// copy at rest asks for it. It ends the copies at rest after each copy
-    /// of a chain no caller names, the lowest order first. A call takes the
+    /// of the parked copies ends no copy or failure of a named chain that a
+    /// live copy asks for. It ends the copies at rest after each other copy,
+    /// the lowest order first. A call takes the
     /// place of the last call of the same caller, so a second caller
     /// unnames no chain of the first. `ended` has the chains that ended: no
     /// score has these chains now.
@@ -4895,6 +4907,175 @@ mod tests {
         drop(saving);
         host.wait_idle();
         assert!(matches!(delay(), Ok(Some(_))));
+        drop(host);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A copy that waits for its slot at another rate takes the new rate
+    /// with no new build. A plugin that finds the new rate in its first
+    /// blocks asks for a restart there, and the retune serves it as a build
+    /// does: the slot then has the latency of the new rate. The restart
+    /// services of the copy start again, as for a new copy.
+    #[test]
+    fn a_retune_serves_the_restart_the_new_rate_asks_for() {
+        let (root, host, plugin) = fixture_host("retune");
+        let slot = InsertSlot::effect(1, 0);
+        let key = InsertKey { plugin, preset: 0 };
+        let take = |rate| host.insert(key, rate, slot, false);
+        // SAFETY: the tests of this binary run one at a time, and the
+        // plugin thread reads the variable in the build below.
+        unsafe { std::env::set_var(rustel_vst3_fixture::RATE_LATENCY_ENV, "1") };
+        assert!(take(48_000).is_none(), "the build starts");
+        host.wait_idle();
+        // SAFETY: as above. The copy read the variable at its build.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::RATE_LATENCY_ENV) };
+        let mut held = take(48_000).expect("the built copy");
+        let delay = InsertParam {
+            id: rustel_vst3_fixture::PARAM_DELAY,
+            value: 0.5,
+        };
+        held.set_param(delay, 0);
+        let (mut left, mut right) = ([0.0f32; 128], [0.0f32; 128]);
+        held.process(&mut left, &mut right);
+        let cell = Arc::clone(host.state().taken.get(&(key, 48_000, slot)).expect("held"));
+        drop(held);
+        host.wait_idle();
+        assert_eq!(host.latency(key, 48_000, slot), Some(2048));
+        // The copy kept its latency at its last services.
+        cell.kept_restarts.store(KEPT_RESTARTS, Ordering::Relaxed);
+        assert_ne!(cell.restart_after.load(Ordering::Relaxed), 0);
+
+        assert!(take(44_100).is_none(), "the retune starts");
+        host.wait_idle();
+        let frames = (0.5 * 4096.0 * 44_100.0 / rustel_vst3_fixture::TIMED_DELAY_RATE).round();
+        assert_eq!(host.latency(key, 44_100, slot), Some(frames as u32));
+        assert!(!cell.latency_changed.load(Ordering::Acquire), "the restart");
+        assert_eq!(cell.kept_restarts.load(Ordering::Relaxed), 0);
+        assert_eq!(cell.restart_after.load(Ordering::Relaxed), 0);
+        drop(host);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A plugin folder with the fixture bundle under a new temporary folder
+    /// with `tag` in its name, a host that scanned it, and the number of the
+    /// effect, loaded.
+    fn fixture_host(tag: &str) -> (PathBuf, Host, u32) {
+        let root = std::env::temp_dir().join(format!("rustel-vst3-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("plugin folder");
+        rustel_vst3_fixture::install(&root);
+        let host = Host::new();
+        host.scan(std::slice::from_ref(&root));
+        host.wait_idle();
+        let Resolved::Ready(plugin, _) = host.resolve(rustel_vst3_fixture::NAME, true) else {
+            panic!("the fixture plugin did not load");
+        };
+        (root, host, plugin)
+    }
+
+    /// The key of the fixture effect with the preset `preset`, once the
+    /// host read the preset folders.
+    fn preset_key(host: &Host, preset: &str) -> InsertKey {
+        let start = Instant::now();
+        loop {
+            match host.key(rustel_vst3_fixture::NAME, Some(preset), false) {
+                Ok(Some((key, _))) => return key,
+                Ok(None) => assert!(start.elapsed() < WAIT_LIMIT, "the read of the presets"),
+                Err(error) => panic!("{error}"),
+            }
+            host.wait_idle();
+        }
+    }
+
+    /// Fills the bound of the parked copies with builds that run, for slots
+    /// of a chain no caller lists. Such builds have no rank.
+    fn fill_the_bound(host: &Host, key: InsertKey) {
+        let mut state = host.state();
+        let mut chain = 1_000;
+        while state.parked() < MAX_PARKED {
+            let slot = InsertSlot::effect(chain, 0);
+            state.builds.insert((key, 48_000, slot), Build::Running);
+            chain += 1;
+        }
+    }
+
+    /// A preset name can give another file with no new call of `keep`: here
+    /// a file of the root takes the place of an added file with the same
+    /// name. The parked copy of the file before then has a rank at the
+    /// bound, as no copy asks for it. So the build of the copy the name
+    /// gives now ends it at a full bound.
+    #[test]
+    fn the_bound_ends_a_copy_its_preset_name_no_longer_gives() {
+        use rustel_vst3_fixture::NAME;
+        let (root, host, _) = fixture_host("renamed");
+        let added = root.join("added");
+        std::fs::create_dir_all(&added).expect("added folder");
+        let bytes = rustel_vst3_fixture::preset(0.5, 0.0);
+        std::fs::write(added.join("Warm.vstpreset"), bytes).expect("preset file");
+        host.set_preset_folder(root.join("presets"));
+        host.set_preset_folders(vec![added]);
+        let slot = InsertSlot::effect(1, 0);
+        let wanted = WantedCopy {
+            slot,
+            name: NAME.to_owned(),
+            preset: Some("Warm".to_owned()),
+        };
+        host.keep(1, vec![wanted], vec![slot.chain], Vec::new(), Vec::new());
+        let prepared = || host.prepared(NAME, Some("Warm"), false, 48_000, slot);
+        let before = preset_key(&host, "Warm");
+        host.prepare(NAME, Some("Warm"), false, 48_000, slot);
+        host.wait_idle();
+        assert_eq!(prepared(), Prepared::Ready(before));
+
+        let source = root.join("Warm.vstpreset");
+        let bytes = rustel_vst3_fixture::preset(0.25, 0.0);
+        std::fs::write(&source, bytes).expect("preset file");
+        host.add_preset(&source).expect("the root file");
+        let now = preset_key(&host, "Warm");
+        assert_ne!(now, before);
+        fill_the_bound(&host, before);
+        host.prepare(NAME, Some("Warm"), false, 48_000, slot);
+        host.wait_idle();
+        assert_eq!(prepared(), Prepared::Ready(now));
+        let parked = host.state().builds.contains_key(&(before, 48_000, slot));
+        assert!(!parked, "the copy of the file before");
+        assert!(host.take_errors().is_empty());
+        drop(host);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// At a full bound, a build for another slot does not end the failure
+    /// of a build that a live copy of a named chain asks for, as it would
+    /// not end a copy of it. So the slot keeps its reason, and its next
+    /// build waits for a new try: see [`Host::retry`].
+    #[test]
+    fn the_bound_keeps_the_failure_a_named_chain_asks_for() {
+        use rustel_vst3_fixture::NAME;
+        let (root, host, plugin) = fixture_host("failure");
+        let folder = root.join("presets").join(NAME);
+        std::fs::create_dir_all(&folder).expect("preset folder");
+        // A state of 8 bytes: the plugin refuses it.
+        let bytes = rustel_vst3_fixture::preset_file(&[0.5]);
+        std::fs::write(folder.join("Bad.vstpreset"), bytes).expect("preset file");
+        host.set_preset_folder(root.join("presets"));
+        let slot = InsertSlot::effect(1, 0);
+        let wanted = WantedCopy {
+            slot,
+            name: NAME.to_owned(),
+            preset: Some("Bad".to_owned()),
+        };
+        host.keep(1, vec![wanted], vec![slot.chain], Vec::new(), Vec::new());
+        preset_key(&host, "Bad");
+        let prepared = || host.prepared(NAME, Some("Bad"), false, 48_000, slot);
+        host.prepare(NAME, Some("Bad"), false, 48_000, slot);
+        host.wait_idle();
+        let reason = format!("{NAME} did not start: the plugin refused the preset");
+        assert_eq!(prepared(), Prepared::Unavailable(reason.clone()));
+
+        fill_the_bound(&host, InsertKey { plugin, preset: 0 });
+        host.prepare(NAME, None, false, 48_000, InsertSlot::effect(2, 0));
+        host.wait_idle();
+        assert_eq!(prepared(), Prepared::Unavailable(reason));
         drop(host);
         let _ = std::fs::remove_dir_all(&root);
     }
