@@ -1349,6 +1349,11 @@ mod tests {
             std::fs::write(&elsewhere, SOURCE).expect("the other set's score");
             let set = SceneSet::open(&elsewhere, "// starter").expect("set");
             app.switch_set(set, "opened set");
+            assert!(
+                app.pending_switch.is_none(),
+                "the set opened: {}",
+                app.status
+            );
             let scene = app.scenes.current().id;
             app.audible_scene = Some(scene);
             app.live_sliders.insert(

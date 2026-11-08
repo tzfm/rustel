@@ -127,7 +127,10 @@ pub(super) fn sample_detail_lines(panel: &ReferencePanel) -> Vec<String> {
                 many => format!("{many} channels"),
             }));
             if files.is_none() {
-                how.extend(sound.seconds.map(length_label));
+                how.extend(sound.seconds.map(|seconds| match details.played {
+                    Some(played) if seconds >= 60.0 => position_label(played, seconds),
+                    _ => length_label(seconds),
+                }));
             }
         }
         if files.is_none()
@@ -182,6 +185,13 @@ fn length_label(seconds: f64) -> String {
     } else {
         super::super::replay::clock(seconds)
     }
+}
+
+/// Where a preview stands in a sound of a minute or more, beside its
+/// length: `0:13 / 9:33`.
+fn position_label(played: f64, seconds: f64) -> String {
+    let clock = super::super::replay::clock;
+    format!("{} / {}", clock(played.clamp(0.0, seconds)), clock(seconds))
 }
 
 fn size_label(bytes: u64) -> String {
@@ -1524,8 +1534,17 @@ impl ReferenceView<'_> {
                     .right()
                     .saturating_sub(UnicodeWidthStr::width(tag) as u16 + 1);
                 let text_width = UnicodeWidthStr::width(text.as_str()) as u16;
+                // A name too long for its tag keeps the origin tags out of
+                // its way. The wait for the sample is said over the end of
+                // the name: a press that seems to do nothing is worse.
                 if tag_x > list.x + text_width {
                     buffer.set_stringn(tag_x, y, tag, tag.len(), Style::default().fg(color));
+                } else if loading_here && tag_x > list.x {
+                    // A blank each side, from the name and from the edge. A
+                    // style patches the cell, so the row keeps its ground.
+                    let framed = format!(" {tag} ");
+                    let width = UnicodeWidthStr::width(framed.as_str());
+                    buffer.set_stringn(tag_x - 1, y, &framed, width, Style::default().fg(color));
                 }
             }
         }

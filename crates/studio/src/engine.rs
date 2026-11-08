@@ -92,8 +92,14 @@ pub const DEFAULT_STUDIO_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long the mix has to stay below the silence floor before a graceful
 /// stop concludes that nothing is left to hear.
 const GRACEFUL_STOP_SILENCE_HOLD: Duration = Duration::from_millis(250);
-/// How long a preview waits for its sample to load before giving up.
-const AUDITION_LOAD_TIMEOUT: Duration = Duration::from_secs(4);
+/// How long a preview waits for its sample to load before giving up. A
+/// long recording or a video decodes for seconds, and the list says
+/// `loading` while it does: the wait is the studio's stop window, so a
+/// preview that comes late is one Space can still stop.
+const AUDITION_LOAD_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a chord preview waits for the bank it plays on. A chord heard
+/// long after its key is no preview of it.
+const CHORD_AUDITION_LOAD_TIMEOUT: Duration = Duration::from_secs(4);
 /// Default ceiling on decoded PCM the sounding score does not name.
 pub const DEFAULT_PREVIEW_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// Default pause after the last preview before unused samples are dropped.

@@ -513,10 +513,15 @@ impl StudioEngine {
                 Ok(())
             }
             AuditionPush::Loading => {
+                let wait = if request.notes.is_empty() {
+                    AUDITION_LOAD_TIMEOUT
+                } else {
+                    CHORD_AUDITION_LOAD_TIMEOUT
+                };
                 if let Some(live) = self.live.as_mut() {
                     live.audition = Some(PendingAudition {
                         request,
-                        deadline: Instant::now() + AUDITION_LOAD_TIMEOUT,
+                        deadline: Instant::now() + wait,
                     });
                 }
                 Ok(())
@@ -829,7 +834,10 @@ impl StudioEngine {
                 live.audition = None;
                 queue_diagnostic(
                     &mut self.pending_diagnostics,
-                    StudioDiagnostic::message("preview", error.to_string()),
+                    StudioDiagnostic::message(
+                        "preview",
+                        format!("could not preview {}: {error}", pending.request.sound),
+                    ),
                 );
             }
         }

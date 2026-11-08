@@ -2888,6 +2888,14 @@ impl Host {
         }
     }
 
+    /// The name, as [`Host::plugins`] lists it, of the plugin a score
+    /// names: by its whole name, a part of it or its bundle name. The call
+    /// loads nothing.
+    pub fn found_name(&self, name: &str) -> Option<String> {
+        let state = self.state();
+        Some(state.entries[state.find(name)?].name.clone())
+    }
+
     /// The number of a preset of a plugin, from the name of its file.
     pub fn preset(&self, plugin: u32, name: &str) -> FoundPreset {
         let wanted = (plugin, canonical(name));

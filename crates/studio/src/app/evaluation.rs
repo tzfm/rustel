@@ -903,6 +903,9 @@ impl App {
                         if diagnostic.kind == "gamepad" {
                             self.toast(diagnostic.message.clone());
                         }
+                        if diagnostic.kind == "preview" {
+                            self.end_failed_preview(&diagnostic.message);
+                        }
                         self.status = if diagnostic.kind == "sample-failed" {
                             status_sample_failure(
                                 &diagnostic.message,
@@ -1000,6 +1003,7 @@ impl App {
                     if let Some(device) = snapshot.device.as_ref() {
                         self.resting_output = Some(device.name().to_owned());
                     }
+                    self.follow_preview_loading(snapshot.audition_loading.as_deref());
                     self.snapshot = Some(*snapshot);
                     self.dirty_frame = true;
                 }

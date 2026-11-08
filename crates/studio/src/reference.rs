@@ -4026,6 +4026,7 @@ mod tests {
                 url: url.into(),
                 facts: Some(facts),
                 stale: false,
+                played: None,
             })
         }
 
@@ -4080,6 +4081,13 @@ mod tests {
                     && lines[1].ends_with(" video limit · this score"),
                 "{lines:?}"
             );
+            // A preview of a sound of a minute or more says where it stands.
+            panel.sample_details.as_mut().expect("details").played = Some(13.0);
+            assert!(
+                sample_detail_lines(&panel)[1].starts_with("0:13 / 1:05 · 4096 MB"),
+                "{:?}",
+                sample_detail_lines(&panel)
+            );
 
             panel.set_sounds(vec![scored("kick", 1)]);
             panel.sample_details = read(
@@ -4092,6 +4100,51 @@ mod tests {
             assert_eq!(
                 sample_detail_lines(&panel),
                 ["wav · not downloaded yet", "this score"]
+            );
+        }
+
+        /// The row of a sound whose preview waits for its sample says so,
+        /// also when the name is too long to leave the word any room.
+        #[test]
+        fn a_sound_that_loads_says_so_however_long_its_name() {
+            let reference = Reference::load_all();
+            let name = "a-dystopian-short-movie-with-a-name-longer-than-any-column";
+            let panel = ReferencePanel::samples(&reference, vec![scored(name, 1)]);
+            let area = Rect::new(0, 0, 50, 24);
+            let mut buffer = Buffer::empty(area);
+            ReferenceView {
+                keybinds: &crate::keybinds::Keybinds::default(),
+                focused: true,
+                vim: false,
+                anchored: false,
+                pulse: None,
+                sounding_note: None,
+                loading: Some(format!("{name}:0")),
+                caching: 0,
+                importing: 0,
+                library_loading: false,
+                #[cfg(feature = "hydra")]
+                playing: None,
+                #[cfg(feature = "hydra")]
+                preview_note: None,
+                #[cfg(feature = "hydra")]
+                preview_progress: None,
+                #[cfg(feature = "hydra")]
+                preview_row: None,
+                picture: false,
+                refused: None,
+                reference: &reference,
+                panel: &panel,
+                theme: &Theme::built_in_default(),
+            }
+            .render(area, &mut buffer);
+            let rows: Vec<String> = (0..area.height)
+                .map(|y| (0..area.width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("a-dystopian") && row.contains(" loading ")),
+                "{rows:#?}"
             );
         }
 

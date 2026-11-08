@@ -244,7 +244,7 @@ use pointer_shape::{SHAPE_DEFAULT, SHAPE_GRABBING, SHAPE_POINTER, SHAPE_TEXT};
 use prebakes::PrebakeRequest;
 #[cfg(feature = "hydra")]
 use previews::SnippetPreview;
-use previews::{PREVIEW_STOP_WINDOW, nudge_preview_gain};
+use previews::nudge_preview_gain;
 use prompt_paste::{
     MAX_RAW_PASTE_KEY_EVENTS_PER_TURN, MAX_RAW_PASTE_TERMINAL_EVENTS_PER_TURN, poll_after_input,
     read_raw_paste_chunk,

@@ -10,7 +10,7 @@
 - Hydra callbacks read `mouse.x`, `mouse.y`, `width`, `height`, more operators and more `Math` functions. Pattern code reads the mouse as `mousex` and `mousey`.
 - A Hydra sketch can set `speed`, `bpm`, `fps` and `time`. A shared sketch with calls Rustel does not support still runs.
 - The reference knows the Hydra names, with their parameters and defaults.
-- Picking a plugin from the reference opens its presets.
+- Picking a plugin from the reference opens its presets and closes the call. A parameter pick works with a part of the plugin's name too.
 - Samples, images and videos load only from allowed sources. `--allow-sample-origin` adds a source, and Settings ▸ Permissions allows a refused folder.
 - Scores render faster on small machines and on 64-bit ARM, with the same sound.
 - A decoded sample is kept in the cache, so it loads faster the next time.
@@ -18,7 +18,9 @@
 - On Linux, the audio keeps its priority over the studio's own work.
 - rustelup offers to install rtkit on Linux when the audio system needs it.
 - The first chord or scale preview sounds, and a scale preview keeps its tempo on a slow machine.
+- A sample preview says when it waits for its sample, and the samples tab shows where a long preview is.
 - A save no longer shows "saved" and the file name on the status line.
+- A studio.json that another rustel version wrote keeps all of its settings.
 - A terminal that answers Kitty pictures no longer types its answers into the score. The studio draws in text cells there and says so.
 - Vim mode follows Vim more closely in motions, operators, text objects, Visual mode, search, paste, undo and vimrc files.
 - With Vim keys on, a key typed into a search box cancels a pending delete, so a later Enter cannot delete without asking.

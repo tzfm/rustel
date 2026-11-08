@@ -12,6 +12,9 @@ pub struct SampleDetails {
     /// not on this machine yet, or a trim rewrote it. They stay on show
     /// until the next read answers.
     pub stale: bool,
+    /// How far into the file a preview of it has got, in seconds, while
+    /// one sounds.
+    pub played: Option<f64>,
 }
 
 impl SampleDetails {
@@ -20,6 +23,7 @@ impl SampleDetails {
             url,
             facts: None,
             stale: true,
+            played: None,
         }
     }
 }

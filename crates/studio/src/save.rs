@@ -12,6 +12,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use rustel_runtime::ui_events::source_revision;
 
@@ -265,7 +266,7 @@ pub(super) fn atomic_write(path: &Path, source: &str) -> io::Result<bool> {
     // attribute the new file was created with.
     let (file, kept) = pending.keep().map_err(|error| error.error)?;
     drop(file);
-    if let Err(error) = std::fs::rename(&kept, path) {
+    if let Err(error) = rename_into_place(&kept, path) {
         let _ = std::fs::remove_file(&kept);
         return Err(error);
     }
@@ -275,6 +276,34 @@ pub(super) fn atomic_write(path: &Path, source: &str) -> io::Result<bool> {
         let _ = directory.sync_all();
     }
     Ok(true)
+}
+
+/// How many more times a rename that Windows refused is tried, and the
+/// pause before each try: one second in all.
+const RENAME_RETRIES: u32 = 20;
+const RENAME_PAUSE: Duration = Duration::from_millis(50);
+
+/// Moves the written file over the score. On Windows, a program can hold
+/// the new file for a short time after the save closes it: a virus scan
+/// reads each new file. Windows then refuses the rename, so the rename is
+/// tried again until the program lets go of the file.
+fn rename_into_place(from: &Path, to: &Path) -> io::Result<()> {
+    let mut retries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(error) if cfg!(windows) && held(&error) && retries < RENAME_RETRIES => {
+                retries += 1;
+                thread::sleep(RENAME_PAUSE);
+            }
+            result => return result,
+        }
+    }
+}
+
+/// True for the refusals of Windows when another program has the file
+/// open: ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION.
+fn held(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32))
 }
 
 #[cfg(test)]
@@ -341,6 +370,33 @@ mod tests {
             1,
             "no temporary file is left beside the score"
         );
+    }
+
+    /// A program that opened the new file and shares nothing, as a virus
+    /// scan does, holds the save only until it lets go of the file.
+    #[cfg(windows)]
+    #[test]
+    fn a_save_waits_for_a_program_that_holds_the_new_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let written = directory.path().join("written");
+        let path = directory.path().join("score.strudel");
+        std::fs::write(&written, "new score").unwrap();
+        std::fs::write(&path, "old score").unwrap();
+        let scan = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&written)
+            .unwrap();
+        let done = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            drop(scan);
+        });
+
+        rename_into_place(&written, &path).unwrap();
+        done.join().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new score");
     }
 
     #[test]

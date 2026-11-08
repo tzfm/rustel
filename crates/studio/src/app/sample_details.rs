@@ -7,7 +7,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use rustel_runtime::samples::SampleFacts;
 
 use super::*;
-use crate::reference::{SampleDetails, Tab};
+use crate::reference::{PanelAction, SampleDetails, Tab};
 
 /// How long a read may take before its file is shown with no facts and the
 /// next file's read may start. A share that stopped answering holds its
@@ -76,6 +76,23 @@ impl App {
                 .map(|details| details.url.as_str())
         {
             panel.sample_details = url.map(SampleDetails::unread);
+            self.dirty_frame = true;
+        }
+        // Where a preview of the sound under the cursor stands, in whole
+        // seconds rounded as its length is: the line changes once a
+        // second, not each turn, and ends on the length.
+        let played = match (panel.preview(), &self.preview_armed, &self.preview_shape) {
+            (PanelAction::Preview(selected), Some((sound, started)), Some((_, seconds)))
+                if selected == *sound && started.elapsed().as_secs_f64() <= *seconds =>
+            {
+                Some(started.elapsed().as_secs_f64().round())
+            }
+            _ => None,
+        };
+        if let Some(details) = panel.sample_details.as_mut()
+            && details.played != played
+        {
+            details.played = played;
             self.dirty_frame = true;
         }
         if self.details_read.is_some() {

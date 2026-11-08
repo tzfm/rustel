@@ -1091,7 +1091,7 @@ impl App {
             KeyCode::Char(' ') if !primary && !alt && !panel.wants_text() => {
                 match (panel.preview(), &self.preview_armed) {
                     (PanelAction::Preview(sound), Some((sounding, started)))
-                        if *sounding == sound && started.elapsed() <= PREVIEW_STOP_WINDOW =>
+                        if *sounding == sound && started.elapsed() <= self.preview_window() =>
                     {
                         self.stop_preview();
                         return ReferenceKey::Handled;
@@ -1115,7 +1115,7 @@ impl App {
                         | PanelAction::PreviewScale(name)
                         | PanelAction::PreviewTuning(name),
                         Some((sounding, started)),
-                    ) if *sounding == name && started.elapsed() <= PREVIEW_STOP_WINDOW => {
+                    ) if *sounding == name && started.elapsed() <= self.preview_window() => {
                         self.stop_preview();
                         return ReferenceKey::Handled;
                     }

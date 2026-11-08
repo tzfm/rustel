@@ -505,7 +505,9 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
 /// from a choice. A plugin the read of the preset folders holds no preset
 /// for goes to its parameters instead, where Enter picks one of them: the
 /// panel never stands in a half that offers nothing. The pick into a call
-/// open at its bracket closes the call.
+/// open at its bracket closes the call. The pick into a string still open
+/// closes the string and the call after the name, and leaves the line
+/// below as it was.
 #[test]
 fn a_pick_of_a_plugin_with_no_preset_opens_its_parameters() {
     let mut studio = hermetic();
@@ -536,12 +538,33 @@ fn a_pick_of_a_plugin_with_no_preset_opens_its_parameters() {
     let rows = studio.rows();
     row_containing(&rows, "Rustel Fixture > parameters");
     row_containing(&rows, "gain  Gain");
+
+    // The string open after its quote, with a line below that has quotes
+    // of its own. Enter on a parameter then adds it to the closed call.
+    let text = "$: s(\"bd\").vst(\"\n$: s(\"hh*4\")";
+    complete_after(&mut studio, text, ".vst(\"");
+    wait_for_row(&mut studio, "1 of 1 plugins");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    assert_eq!(
+        studio.score(),
+        "$: s(\"bd\").vst(\"Rustel Fixture\")\n$: s(\"hh*4\")"
+    );
+    wait_for_row(&mut studio, "gain  Gain");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    assert_eq!(
+        studio.score(),
+        "$: s(\"bd\").vst(\"Rustel Fixture\", { gain: 1 })\n$: s(\"hh*4\")"
+    );
 }
 
 /// Switching from plugin-name completion to the vst tab keeps the plugin
 /// of the call open. Ctrl+F in a call opens the parameters of its plugin
 /// as the view of the tab, so Enter picks from them, regardless of the
-/// caret's position, and never replaces a value already written there.
+/// caret's position, and never replaces a value already written there. A
+/// call that names its plugin by a part of the name, as the host finds it,
+/// takes the choice too.
 #[test]
 fn a_plugins_parameters_are_available_throughout_its_call() {
     let mut studio = hermetic();
@@ -591,6 +614,12 @@ fn a_plugins_parameters_are_available_throughout_its_call() {
             "$: s(\"bd\").vst(\"Rustel Fixture\", {})",
             ".vs",
             "$: s(\"bd\").vst(\"Rustel Fixture\", { gain: 1 })",
+        ),
+        // A part of the name finds the plugin, in a chain of plugins.
+        (
+            "$: s(\"bd\").vst(\"Crystalline\").vst(\"fixture\").vst(\"Ozone 12\")",
+            "Crystalline\").vs",
+            "$: s(\"bd\").vst(\"Crystalline\").vst(\"fixture\", { gain: 1 }).vst(\"Ozone 12\")",
         ),
     ] {
         studio.set_score(text);
