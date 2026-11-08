@@ -7,25 +7,25 @@
 - The visuals docks show the clips of `_video()` and `video()` lanes. Enter opens a clip in a desktop window.
 - Settings ▸ General ▸ biggest video sets the largest video file that loads. The default is 256 MiB.
 - `s0.initVideo()` plays WebM or MKV video and animated GIF, PNG or WebP. `initImage()` and `initVideo()` read files from the set folder.
-- Hydra callbacks read the mouse, `width`, `height` and more `Math` functions, and a sketch can set `speed`, `bpm`, `fps` and `time`. Pattern code reads the mouse as `mousex` and `mousey`.
+- Hydra sketches read the mouse, `width` and `height`, and set `speed`, `bpm`, `fps` and `time`. Patterns read the mouse as `mousex` and `mousey`.
 - The reference knows the Hydra names, and a shared sketch with calls Rustel does not support still runs.
 - Picking a plugin from the reference opens its presets and closes the call.
-- Each open scene keeps its plugins loaded, so a scene you play again loads nothing. A scene you close frees its plugins.
-- Plugins stay loaded when the output device or buffer size changes, or the device stops. An undo within 5 seconds of play brings back the previous plugin copy with no load.
-- A plugin chain with up to 1 second of latency plays in time, also in exports. While it plays, edits and sliders take effect that much later.
-- A plugin that sends invalid audio for 1 second, or does not start, plays silence with one warning and shows the fault in its row. The next evaluation gives it a new copy.
-- A Studio export fails and names the plugin when a plugin does not load or start. Ctrl+C stops `rustel export` to MP3 too.
+- Each open scene keeps its plugins loaded, and a scene you close frees them.
+- Plugins stay loaded when the output device or buffer size changes, and an undo within 5 seconds reuses the previous plugin copy.
+- A plugin chain with up to 1 second of latency plays in time, also in exports, and edits reach it that much later.
+- A plugin that fails or sends invalid audio goes silent with one warning, and the next evaluation loads it again.
+- A Studio export names a plugin that does not load, and Ctrl+C stops `rustel export` to MP3.
 - Samples, images and videos load only from allowed sources. `--allow-sample-origin` adds a source, and Settings ▸ Permissions allows a refused folder.
-- Scores render faster on small machines and on 64-bit ARM, with the same sound. A decoded sample loads faster the next time.
+- Scores render faster on small machines and 64-bit ARM, and decoded samples load faster the next time.
 - On a slow machine, an edit of a playing score arrives late instead of being refused. A dense synth score no longer refuses its edits.
-- On Linux, the audio keeps its priority over the studio's own work, and rustelup offers to install rtkit when the audio system needs it.
+- On Linux, the audio keeps its priority over the studio, and rustelup offers to install rtkit when needed.
 - Vim mode follows Vim more closely in motions, operators, text objects, Visual mode, search, paste, undo and vimrc files.
 - The studio themes, except rustel-dark, live in [rustel-studio-themes](https://github.com/tzfm/rustel-studio-themes). A build without the `themes` feature keeps rustel-dark.
 - Fixed: a studio.json that another rustel version wrote keeps its settings.
 - Fixed: the first chord or scale preview sounds, a scale preview keeps its tempo on a slow machine, and a sample preview says when it waits for its sample.
-- Fixed: the first notes of a plugin with a named preset play through the plugin, and a parameter pick works in a call that names a part of the plugin's name.
+- Fixed: the first notes of a plugin with a named preset go through it, and a parameter pick works with a partial plugin name.
 - Fixed: a terminal that answers Kitty pictures no longer types its answers into the score, and Edit ▸ Find chosen with a click takes typing.
-- Fixed: with Vim keys on, a key in a search box cancels a pending delete, `p` no longer crashes on a Unicode line separator, and a pick on the quote that opens a string writes inside it.
+- Fixed: in Vim mode, a key in a search box cancels a pending delete, `p` handles a Unicode line separator, and a pick on an opening quote writes inside the string.
 - Fixed: a Hydra callback with a round number such as `mouse.x / 3000` compiles.
 
 ### Sound changes

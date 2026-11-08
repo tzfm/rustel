@@ -924,20 +924,17 @@ impl App {
     }
 
     /// The engine holds a preview while its sample loads, and each
-    /// snapshot names the sound it holds. The status line says the wait,
-    /// and says the preview once the sound goes out. A status line that
-    /// says something else since is left as it is. The preview's clock
-    /// starts when the sound goes out, so its position and its stop
-    /// window do not count the load.
-    pub(super) fn follow_preview_loading(&mut self, loading: Option<&str>) {
-        let held = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.audition_loading.clone());
+    /// snapshot names the sound it holds: `held` at the last snapshot and
+    /// `loading` at the new one. The status line says the wait, and says
+    /// the preview once the sound goes out. A status line that says
+    /// something else since is left as it is. The preview's clock starts
+    /// when the sound goes out, so its position and its stop window do not
+    /// count the load.
+    pub(super) fn follow_preview_loading(&mut self, held: Option<&str>, loading: Option<&str>) {
         let Some((sound, started)) = self.preview_armed.as_mut() else {
             return;
         };
-        if loading == Some(sound.as_str()) || held.as_deref() == Some(sound.as_str()) {
+        if loading == Some(sound.as_str()) || held == Some(sound.as_str()) {
             *started = Instant::now();
         }
         let playing = format!("preview {sound}");
@@ -3712,16 +3709,16 @@ mod tests {
             app.preview_armed = Some(("clip:0".into(), Instant::now()));
             app.status = "preview clip:0".into();
 
-            app.follow_preview_loading(Some("clip:0"));
+            app.follow_preview_loading(None, Some("clip:0"));
             assert_eq!(app.status, "loading clip:0 to preview...");
-            app.follow_preview_loading(Some("clip:0"));
+            app.follow_preview_loading(Some("clip:0"), Some("clip:0"));
             assert_eq!(app.status, "loading clip:0 to preview...");
-            app.follow_preview_loading(None);
+            app.follow_preview_loading(Some("clip:0"), None);
             assert_eq!(app.status, "preview clip:0");
 
-            app.follow_preview_loading(Some("clip:0"));
+            app.follow_preview_loading(None, Some("clip:0"));
             app.status = "saved".into();
-            app.follow_preview_loading(None);
+            app.follow_preview_loading(Some("clip:0"), None);
             assert_eq!(app.status, "saved");
         }
 
@@ -3733,15 +3730,11 @@ mod tests {
             let mut app = app_over(directory.path());
             let long_ago = Instant::now() - PREVIEW_STOP_WINDOW - Duration::from_secs(1);
             app.preview_armed = Some(("clip:0".into(), long_ago));
-            app.follow_preview_loading(Some("clip:0"));
+            app.follow_preview_loading(None, Some("clip:0"));
             assert!(app.stop_preview(), "a preview that still loads is stopped");
 
             app.preview_armed = Some(("clip:0".into(), long_ago));
-            app.snapshot = Some(crate::engine::StudioSnapshot {
-                audition_loading: Some("clip:0".into()),
-                ..crate::engine::StudioSnapshot::default()
-            });
-            app.follow_preview_loading(None);
+            app.follow_preview_loading(Some("clip:0"), None);
             assert!(app.stop_preview(), "a sound that just went out is stopped");
         }
 

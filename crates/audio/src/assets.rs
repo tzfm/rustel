@@ -415,7 +415,9 @@ impl SampleChannel {
     /// Producer side: free every returned sample. Call only from the single
     /// producer thread (before pushing new installs). The return rings are
     /// SPSC - a second reclaiming thread races the consumer head and can
-    /// double-free.
+    /// double-free. It also frees the returned rooms of the chains, without
+    /// the count of their bytes, so a live producer reclaims with
+    /// [`Self::reclaim_with_inserts`] and [`Self::reclaim_chain_rooms`].
     pub fn reclaim(&self) {
         self.reclaim_with_fx(|_| {});
     }
@@ -448,7 +450,7 @@ impl SampleChannel {
     /// Like [`Self::reclaim_with_programs`], and `returned_insert` takes each
     /// insert the callback gave back. The caller frees it. The rooms of the
     /// chains stay in their ring for [`Self::reclaim_chain_rooms`]: the
-    /// producer that ships them keeps the books of their budget there.
+    /// producer that ships them counts their bytes against the budget there.
     pub fn reclaim_with_inserts(
         &self,
         mut returned_fx: impl FnMut(*mut crate::reverb::OrbitReverb),

@@ -1003,7 +1003,12 @@ impl App {
                     if let Some(device) = snapshot.device.as_ref() {
                         self.resting_output = Some(device.name().to_owned());
                     }
-                    self.follow_preview_loading(snapshot.audition_loading.as_deref());
+                    let last = self.snapshot.take();
+                    self.follow_preview_loading(
+                        last.as_ref()
+                            .and_then(|last| last.audition_loading.as_deref()),
+                        snapshot.audition_loading.as_deref(),
+                    );
                     self.snapshot = Some(*snapshot);
                     self.dirty_frame = true;
                 }

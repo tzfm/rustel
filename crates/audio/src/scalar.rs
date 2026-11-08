@@ -2140,7 +2140,7 @@ impl ScalarBackend {
                         .flatten()
                         .flat_map(|room| &room.delay),
                 )
-                .any(|delay| delay.active && delay.energized != 0)
+                .any(OrbitDelay::rings)
     }
 
     #[cfg(feature = "device-audio")]
@@ -2164,7 +2164,7 @@ impl ScalarBackend {
                     // An allocated line can be silent between an onset and
                     // its first echo. Stored energy, rather than the sticky
                     // routing flag, says whether Stop still owes an echo.
-                    .filter(|delay| delay.active && delay.energized != 0)
+                    .filter(|delay| delay.rings())
                     .count(),
             )
             .unwrap_or(u64::MAX),

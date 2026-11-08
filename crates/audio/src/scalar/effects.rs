@@ -30,6 +30,12 @@ fn storable(sample: f32) -> f32 {
 impl OrbitDelay {
     pub(super) const SILENCE_FLOOR: f32 = 0.000_001;
 
+    /// Whether the line can still give a sample other than zero with no
+    /// more sends: it is routed and holds energy.
+    pub(super) fn rings(&self) -> bool {
+        self.active && self.energized != 0
+    }
+
     /// DelayNode linearly interpolates an a-rate delay between adjacent
     /// samples. A node in a feedback cycle cannot read inside the current
     /// quantum, so the effective delay is at least 128 frames.

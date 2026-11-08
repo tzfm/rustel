@@ -597,6 +597,13 @@ impl ChainRoom {
         OrbitDelay::line_bytes(sample_rate)
     }
 
+    /// Whether rooms that hold `resident` bytes stay within `budget` when a
+    /// part of `freed` bytes leaves them and a part of `added` bytes comes in:
+    /// see [`super::MAX_CHAIN_ROOM_BYTES`].
+    pub(crate) fn fits(resident: usize, freed: usize, added: usize, budget: usize) -> bool {
+        resident.saturating_sub(freed).saturating_add(added) <= budget
+    }
+
     /// The memory of the reverb and the delay line of the room, in bytes.
     pub(crate) fn bytes(&self) -> usize {
         let reverb = self
@@ -613,10 +620,7 @@ impl ChainRoom {
     /// more sends: its reverb rings, or its delay line holds energy.
     pub(super) fn rings(&self) -> bool {
         self.reverb.as_ref().is_some_and(|reverb| reverb.rings())
-            || self
-                .delay
-                .as_ref()
-                .is_some_and(|delay| delay.active && delay.energized != 0)
+            || self.delay.as_ref().is_some_and(OrbitDelay::rings)
     }
 
     /// Empties the sends of the first `frames` of the sub-block.
@@ -732,7 +736,7 @@ pub(super) fn chain_room_takes_reverb(
         .reverb
         .as_ref()
         .map_or(0, |reverb| reverb.approx_bytes());
-    let fits = |bytes: usize| resident.saturating_sub(freed).saturating_add(bytes) <= inline.budget;
+    let fits = |bytes: usize| ChainRoom::fits(resident, freed, bytes, inline.budget);
     if let Some((refused, bytes)) = room.refused
         && refused == wanted
         && !fits(bytes)
@@ -765,7 +769,7 @@ pub(super) fn chain_room_delay<'a>(
     {
         let resident: usize = rooms.iter().flatten().map(|room| room.bytes()).sum();
         let bytes = OrbitDelay::line_bytes(inline.sample_rate);
-        if resident.saturating_add(bytes) <= inline.budget {
+        if ChainRoom::fits(resident, 0, bytes, inline.budget) {
             let room =
                 rooms[bus].get_or_insert_with(|| Box::new(ChainRoom::new(chain, 0, None, None)));
             room.delay = Some(OrbitDelay::line(inline.sample_rate));

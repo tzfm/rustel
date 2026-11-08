@@ -421,12 +421,14 @@ impl LiveScalarDevice {
         // A new reverb takes the place of the reverb of the room, which goes
         // back to be freed.
         let freed = new_reverb.and(entry.reverb).map_or(0, |(_, bytes)| bytes);
-        let resident = cache.bytes().saturating_sub(freed);
+        let resident = cache.bytes();
         let budget = cache.budget;
         let line = crate::scalar::ChainRoom::delay_bytes(self.sample_rate);
-        let new_delay = new_delay && resident.saturating_add(line) <= budget;
+        let new_delay = new_delay && crate::scalar::ChainRoom::fits(resident, freed, line, budget);
         let lines = if new_delay { line } else { 0 };
-        let fits = |bytes: usize| resident.saturating_add(lines + bytes) <= budget;
+        let fits = |bytes: usize| {
+            crate::scalar::ChainRoom::fits(resident, freed, lines.saturating_add(bytes), budget)
+        };
         let mut refused = entry.refused;
         let made = new_reverb.and_then(|wanted| {
             let known = refused.filter(|(held, _)| *held == wanted);
