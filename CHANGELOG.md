@@ -1,36 +1,35 @@
 # Changelog
 
 ## Unreleased
-- The studio themes, except rustel-dark, live in [rustel-studio-themes](https://github.com/tzfm/rustel-studio-themes). A build without the `themes` feature keeps rustel-dark.
+
 - A video file plays as a sample: `mp4`, `m4v`, `mov`, `mkv` and `webm` play their audio track.
 - `_video()` and `video()` draw a video sample's picture in sync with its sound. H.264, HEVC, AV1, VP9, VP8 and Motion JPEG decode natively.
-- The visuals docks have a video widget for the clips of `_video()` and `video()` lanes. Enter opens the clip in a desktop window.
+- The visuals docks show the clips of `_video()` and `video()` lanes. Enter opens a clip in a desktop window.
 - Settings ▸ General ▸ biggest video sets the largest video file that loads. The default is 256 MiB.
-- `s0.initVideo()` plays a WebM or MKV video in VP8 or VP9, or an animated GIF, PNG or WebP. `initImage()` and `initVideo()` read files from the set folder.
-- Hydra callbacks read `mouse.x`, `mouse.y`, `width`, `height`, more operators and more `Math` functions. Pattern code reads the mouse as `mousex` and `mousey`.
-- A Hydra sketch can set `speed`, `bpm`, `fps` and `time`. A shared sketch with calls Rustel does not support still runs.
-- The reference knows the Hydra names, with their parameters and defaults.
-- Picking a plugin from the reference opens its presets and closes the call. A parameter pick works with a part of the plugin's name too.
+- `s0.initVideo()` plays WebM or MKV video and animated GIF, PNG or WebP. `initImage()` and `initVideo()` read files from the set folder.
+- Hydra callbacks read the mouse, `width`, `height` and more `Math` functions, and a sketch can set `speed`, `bpm`, `fps` and `time`. Pattern code reads the mouse as `mousex` and `mousey`.
+- The reference knows the Hydra names, and a shared sketch with calls Rustel does not support still runs.
+- Picking a plugin from the reference opens its presets and closes the call.
+- Each open scene keeps its plugins loaded, so a scene you play again loads nothing. A scene you close frees its plugins.
+- Plugins stay loaded when the output device or buffer size changes, or the device stops. An undo within 5 seconds of play brings back the previous plugin copy with no load.
+- A plugin chain with up to 1 second of latency plays in time, also in exports. While it plays, edits and sliders take effect that much later.
+- A plugin that sends invalid audio for 1 second, or does not start, plays silence with one warning and shows the fault in its row. The next evaluation gives it a new copy.
+- A Studio export fails and names the plugin when a plugin does not load or start. Ctrl+C stops `rustel export` to MP3 too.
 - Samples, images and videos load only from allowed sources. `--allow-sample-origin` adds a source, and Settings ▸ Permissions allows a refused folder.
-- Scores render faster on small machines and on 64-bit ARM, with the same sound.
-- A decoded sample is kept in the cache, so it loads faster the next time.
+- Scores render faster on small machines and on 64-bit ARM, with the same sound. A decoded sample loads faster the next time.
 - On a slow machine, an edit of a playing score arrives late instead of being refused. A dense synth score no longer refuses its edits.
-- On Linux, the audio keeps its priority over the studio's own work.
-- rustelup offers to install rtkit on Linux when the audio system needs it.
-- The first chord or scale preview sounds, and a scale preview keeps its tempo on a slow machine.
-- A sample preview says when it waits for its sample, and the samples tab shows where a long preview is.
-- A save no longer shows "saved" and the file name on the status line.
-- A studio.json that another rustel version wrote keeps all of its settings.
-- A terminal that answers Kitty pictures no longer types its answers into the score. The studio draws in text cells there and says so.
+- On Linux, the audio keeps its priority over the studio's own work, and rustelup offers to install rtkit when the audio system needs it.
 - Vim mode follows Vim more closely in motions, operators, text objects, Visual mode, search, paste, undo and vimrc files.
-- With Vim keys on, a key typed into a search box cancels a pending delete, so a later Enter cannot delete without asking.
-- Fixed: Edit ▸ Find chosen with a click takes typing, Vim `p` no longer crashes on a Unicode line separator, and a Hydra callback with a round number such as `mouse.x / 3000` compiles.
-- The first play of a plugin with a named preset waits for its copy. Before, a look at the preset in the moment the plugin ended its load could read the preset as missing: the score printed a false line, and the first notes played with no plugin.
-- A plugin copy with no number in its output for 1 second of play plays silence, with one warning, and the next evaluation, or a start after a Stop, gives its stage a new copy. A copy that did not start gets a new try at the next evaluation, in the background, and a copy whose try fails waits longer for each next try, until its preset file changes. The row of the plugin shows such a fault while it lasts, an update of the text in play asks for the new tries, a faulted copy fails a Studio export, and the memory viewer counts the send lines of a chain with latency.
-- An export plays a plugin with latency in time, as play does. Before, an export played the chain of such a plugin late by its latency. An export loads each plugin copy and reads its latency before the first note, in the offline mode of VST3. A plugin that does not load or start fails a Studio export, and the message names the plugin. Until its first frame, a Studio export shows `preparing`, and the export chord ends it with no file. Ctrl+C stops a `rustel export` to MP3 too. A latency change in play restarts the plugin copy at a quiet moment, 2 seconds at most, and the chain plays in time again.
-- A plugin with latency plays in time: rustel starts the notes of its chain early by the latency of the chain, up to 1 second. While such a chain plays, an edit, a key, a start and a slider that asks the score again take effect that much later.
-- Each open scene keeps its plugin copies, as an open project of a DAW keeps its plugins: a scene you play again loads nothing, and a lane 2 scenes share keeps one copy. A scene you close gives its copies back at once, also the stopped score in play, and the next cleanup unloads its plugins. The plugin host keeps 320 copies ready at most, and a copy for the scene in play ends the copies of the scene you left first. When Studio holds more than half of the memory of the machine, the scene that waited longest gives its copies back.
-- A new output takes the plugin copies of the score back with no load: for another device, for a new buffer size, after a device stops, and for the Linux default device after a Stop. While the output is stopped, each plugin plays out its tail with no sound. A start after that has no old tail under its first note. An undo in 5 seconds of play takes the copy before back with no load, also through a Stop or a new output, and a run of preset changes keeps the preset it started from ready. A preset file you save again ends the waiting copies of its old state.
+- The studio themes, except rustel-dark, live in [rustel-studio-themes](https://github.com/tzfm/rustel-studio-themes). A build without the `themes` feature keeps rustel-dark.
+- Fixed: a studio.json that another rustel version wrote keeps its settings.
+- Fixed: the first chord or scale preview sounds, a scale preview keeps its tempo on a slow machine, and a sample preview says when it waits for its sample.
+- Fixed: the first notes of a plugin with a named preset play through the plugin, and a parameter pick works in a call that names a part of the plugin's name.
+- Fixed: a terminal that answers Kitty pictures no longer types its answers into the score, and Edit ▸ Find chosen with a click takes typing.
+- Fixed: with Vim keys on, a key in a search box cancels a pending delete, `p` no longer crashes on a Unicode line separator, and a pick on the quote that opens a string writes inside it.
+- Fixed: a Hydra callback with a round number such as `mouse.x / 3000` compiles.
+
+### Sound changes
+
 - The room and the delay of a note through `.vst()` go through the plugin, as its dry sound does.
 
 ## v0.1.6

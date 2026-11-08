@@ -46,7 +46,8 @@ pub(super) enum Landing {
 impl App {
     /// The caret as a name lookup reads it. A bar caret stands between two
     /// characters. Vim's block caret in Normal covers one, so on a name it
-    /// reads as just past the letter it covers, inside that name.
+    /// reads as just past the letter it covers, inside that name. On the
+    /// quote that opens a string, it reads as just inside that string.
     pub(super) fn name_caret(&self) -> ByteOffset {
         let editor = self.editor();
         let selection = editor.primary_selection();
@@ -55,18 +56,26 @@ impl App {
             return head;
         }
         let document = editor.document();
-        document
+        let Some(next) = document
             .next_grapheme_boundary(head)
             .ok()
-            .filter(|next| {
-                *next > head
-                    && document.slice(head..*next).is_ok_and(|letter| {
-                        letter
-                            .chars()
-                            .all(|character| character.is_alphanumeric() || character == '_')
-                    })
-            })
-            .unwrap_or(head)
+            .filter(|next| *next > head)
+        else {
+            return head;
+        };
+        let Ok(covered) = document.slice(head..next) else {
+            return head;
+        };
+        let letter = covered
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '_');
+        let opens_string = matches!(covered.as_str(), "\"" | "'")
+            && document
+                .line_of(head)
+                .ok()
+                .and_then(|line| document.slice(document.line_start(line)..head).ok())
+                .is_some_and(|before| open_quote(before.as_bytes()).is_none());
+        if letter || opens_string { next } else { head }
     }
 
     /// The word under the caret and where it sits, when there is one.
@@ -167,7 +176,7 @@ impl App {
     /// unrelated strings such as `lfo({ control: "gain" })`.
     pub(super) fn object_key_before_string_at_caret(&self) -> Option<String> {
         let editor = self.editor();
-        let caret = editor.primary_selection().head;
+        let caret = self.name_caret();
         let document = editor.document();
         let line = document.line_of(caret).ok()?;
         let start = document.line_start(line);
@@ -203,7 +212,7 @@ impl App {
     /// or chords - never functions.
     pub(super) fn string_completion_at_caret(&self) -> Option<(String, String, Range<ByteOffset>)> {
         let editor = self.editor();
-        let caret = editor.primary_selection().head;
+        let caret = self.name_caret();
         let document = editor.document();
         let line = document.line_of(caret).ok()?;
         let start = document.line_start(line);
@@ -1277,6 +1286,34 @@ mod scoped_completion_tests {
             }
             assert_eq!(app.status, format!("reference - {name}"), "{marked}");
         }
+    }
+
+    /// Vim's block caret on the quote that opens a string stands in that
+    /// string, so a pick from Normal writes what a pick just past the quote
+    /// writes, with no second pair of quotes.
+    #[test]
+    fn a_pick_on_the_quote_that_opens_a_string_writes_inside_it() {
+        let pick = |marked: &str, vim: bool| {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            if vim {
+                app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+                app.vim_config.set_mappings_for_test(
+                    crate::vim_config::VimMappings::parse_with_defaults("").expect("mappings"),
+                );
+            }
+            seed(&mut app, marked);
+            app.sync_editor_keybindings();
+            crate::app::tests::support::press(&mut app, KeyCode::Char(' '), KeyModifiers::CONTROL);
+            crate::app::tests::support::press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            app.editor().source().to_string()
+        };
+        let typed = pick("$: s(\"bd\").warpmode(\"|\n", false);
+        assert_ne!(
+            typed, "$: s(\"bd\").warpmode(\"\n",
+            "the pick writes a choice"
+        );
+        assert_eq!(pick("$: s(\"bd\").warpmode(|\"\n", true), typed);
     }
 
     #[test]

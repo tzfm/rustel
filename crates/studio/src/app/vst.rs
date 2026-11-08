@@ -280,8 +280,8 @@ impl App {
             + 1
             + rustel_runtime::sounds::string_end(&source[quote + 1..], char::from(opening));
         // The pick leaves the caret in the name, or after the quote it wrote
-        // to close the name.
-        let caret = self.editor().primary_selection().head.0;
+        // to close the name, as a name lookup reads the caret.
+        let caret = self.name_caret().0;
         if !(quote < caret && caret <= end + 1) {
             return Ok(());
         }
