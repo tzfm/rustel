@@ -258,7 +258,17 @@ pub(super) fn atomic_write(path: &Path, source: &str) -> io::Result<bool> {
     pending.write_all(source.as_bytes())?;
     pending.flush()?;
     pending.as_file_mut().sync_all()?;
-    pending.persist(path).map_err(|error| error.error)?;
+    // tempfile's persist replaces with MoveFileExW alone, which Windows
+    // refuses while a reader holds the score open. std's rename retries a
+    // refused replacement with POSIX semantics, which a reader that shares
+    // delete access does not block. Keeping first clears the temporary
+    // attribute the new file was created with.
+    let (file, kept) = pending.keep().map_err(|error| error.error)?;
+    drop(file);
+    if let Err(error) = std::fs::rename(&kept, path) {
+        let _ = std::fs::remove_file(&kept);
+        return Err(error);
+    }
     // Opening a directory is not supported by every target. Where it is, run
     // the rename durability barrier on this worker as part of the save.
     if let Ok(directory) = std::fs::File::open(parent) {
