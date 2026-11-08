@@ -317,6 +317,23 @@ mod tests {
     }
 
     #[test]
+    fn a_save_replaces_a_score_that_a_reader_holds_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("score.strudel");
+        std::fs::write(&path, "old score").unwrap();
+        let reader = std::fs::File::open(&path).unwrap();
+
+        assert!(atomic_write(&path, "new score").unwrap(), "it wrote");
+        drop(reader);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new score");
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "no temporary file is left beside the score"
+        );
+    }
+
+    #[test]
     fn burst_coalesces_to_the_newest_waiting_snapshot_per_file() {
         let (started_tx, started_rx) = sync_channel(0);
         let (release_tx, release_rx) = sync_channel(0);
