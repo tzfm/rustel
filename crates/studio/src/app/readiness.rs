@@ -438,6 +438,9 @@ impl App {
         self.poll_source_reports_precache_and_aliases();
         self.poll_cache_results();
         self.poll_preview_shape();
+        // A remote file under the samples tab's cursor reaches the cache
+        // when it loads; its details follow.
+        self.refresh_sample_details(true);
         let loading = self.poll_library_loading();
         self.retry_failed_imports(self.scenes.current().id, true);
         self.poll_lint_knowledge();

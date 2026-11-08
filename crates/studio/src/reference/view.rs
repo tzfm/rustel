@@ -86,11 +86,115 @@ pub(super) fn generator_action_label(action: super::super::ideas::Action) -> Str
     }
 }
 
-pub(super) fn sample_source_line(panel: &ReferencePanel) -> String {
-    panel.selected_sample_source().map_or_else(
-        || "source: select a sound".to_owned(),
-        |source| format!("source: {source}"),
+/// The details of the sound under the samples tab's cursor, top first:
+/// what the file is, then how long and how big it is, and where it came
+/// from. The name is the list's to say, so the details do not repeat it.
+/// A sound with no file - a font, a synth, the input - has its source
+/// alone, and a file not read yet has what its address says.
+pub(super) fn sample_detail_lines(panel: &ReferencePanel) -> Vec<String> {
+    let Some(source) = panel.selected_sample_source() else {
+        return vec!["select a sound".to_owned()];
+    };
+    let Some(details) = &panel.sample_details else {
+        return vec![source];
+    };
+    let mut what: Vec<String> = file_extension(&details.url).into_iter().collect();
+    let mut how: Vec<String> = Vec::new();
+    // A bank's row stands for all its files: the count, not the first
+    // file's length and size.
+    let files = panel.selected_bank_files().filter(|files| *files > 1);
+    if let Some(files) = files {
+        how.push(format!("{files} files"));
+    }
+    if let Some(facts) = &details.facts {
+        if facts.remote {
+            what.push("not downloaded yet".to_owned());
+        }
+        if facts.picture {
+            what.push("video".to_owned());
+        }
+        if let Some(sound) = &facts.sound {
+            what.extend(sound.codec.map(str::to_owned));
+            what.extend(sound.bits.map(|bits| format!("{bits}-bit")));
+            what.extend(
+                sound
+                    .rate
+                    .map(|rate| format!("{} kHz", f64::from(rate) / 1000.0)),
+            );
+            what.extend(sound.channels.map(|channels| match channels {
+                1 => "mono".to_owned(),
+                2 => "stereo".to_owned(),
+                many => format!("{many} channels"),
+            }));
+            if files.is_none() {
+                how.extend(sound.seconds.map(length_label));
+            }
+        }
+        if files.is_none()
+            && let Some(bytes) = facts.bytes
+        {
+            how.push(size_label(bytes));
+            let ceiling = rustel_runtime::samples::video_file_ceiling();
+            if is_video_container(&details.url) && bytes > ceiling as u64 {
+                how.push(format!(
+                    "over the {} video limit",
+                    rustel_audio::format_sample_bytes(ceiling)
+                ));
+            }
+        }
+    }
+    how.push(source);
+    [what, how]
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.join(" · "))
+        .collect()
+}
+
+/// The extension of the file an address names, as the details call the
+/// file's kind.
+fn file_extension(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let (_, extension) = name.rsplit_once('.')?;
+    (!extension.is_empty()
+        && extension.len() <= 5
+        && extension
+            .chars()
+            .all(|letter| letter.is_ascii_alphanumeric()))
+    .then(|| extension.to_ascii_lowercase())
+}
+
+fn is_video_container(url: &str) -> bool {
+    matches!(
+        file_extension(url).as_deref(),
+        Some("mp4" | "m4v" | "mov" | "mkv" | "webm")
     )
+}
+
+/// A sound's length: hundredths for a hit, tenths for a phrase, a clock
+/// past a minute.
+fn length_label(seconds: f64) -> String {
+    if seconds < 10.0 {
+        format!("{seconds:.2} s")
+    } else if seconds < 60.0 {
+        format!("{seconds:.1} s")
+    } else {
+        super::super::replay::clock(seconds)
+    }
+}
+
+fn size_label(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    } else if (bytes as f64) < 10.0 * MB {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else {
+        format!("{:.0} MB", bytes as f64 / MB)
+    }
 }
 
 impl ReferenceView<'_> {
@@ -1425,6 +1529,50 @@ impl ReferenceView<'_> {
                 }
             }
         }
+        let details = samples_details_area(inner);
+        if list.height > 0 && details.height > 0 {
+            let mut y = details.y;
+            if details.height > 2 {
+                for x in details.x..details.right() {
+                    if let Some(cell) = buffer.cell_mut((x, y)) {
+                        cell.set_char('─');
+                        cell.set_fg(theme.rule);
+                    }
+                }
+                y += 1;
+            }
+            let rows = usize::from(details.bottom() - y);
+            // A deletion asks its question in the details' place: on one
+            // row when that is all there is, so the question is never cut.
+            let lines = match &self.panel.confirm_delete {
+                Some((_, _, path)) => {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    if rows > 1 {
+                        vec!["Delete permanently?".to_owned(), name.into_owned()]
+                    } else {
+                        vec![format!("Delete permanently? {name}")]
+                    }
+                }
+                None => sample_detail_lines(self.panel),
+            };
+            // With one row, the last line is the one kept: it names the
+            // source, as the tab always has.
+            let shown = lines.len().saturating_sub(rows);
+            for (offset, line) in lines.iter().skip(shown).enumerate() {
+                let colour = if shown + offset == 0 && lines.len() > 1 {
+                    theme.foreground
+                } else {
+                    theme.muted
+                };
+                buffer.set_stringn(
+                    inner.x,
+                    y + offset as u16,
+                    line,
+                    usize::from(inner.width),
+                    Style::default().fg(colour),
+                );
+            }
+        }
         if list.height > 0 {
             if !self.focused {
                 let return_hint = self.return_hint();
@@ -1437,20 +1585,7 @@ impl ReferenceView<'_> {
                 );
                 return;
             }
-            if let Some((_, _, path)) = &self.panel.confirm_delete {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                for (y, text) in [
-                    (inner.bottom() - 3, "Delete permanently?"),
-                    (inner.bottom() - 2, name.as_ref()),
-                ] {
-                    buffer.set_stringn(
-                        inner.x,
-                        y,
-                        text,
-                        usize::from(inner.width),
-                        Style::default().fg(theme.muted),
-                    );
-                }
+            if self.panel.confirm_delete.is_some() {
                 render_footer(
                     buffer,
                     inner,
@@ -1474,14 +1609,6 @@ impl ReferenceView<'_> {
                     "Alt+± volume",
                 ],
                 theme,
-            );
-            let source_line = sample_source_line(self.panel);
-            buffer.set_stringn(
-                inner.x,
-                inner.bottom() - 3,
-                &source_line,
-                usize::from(inner.width),
-                Style::default().fg(theme.muted),
             );
             use super::super::keybinds::BindAction;
             let hint = |action, does: &str| {

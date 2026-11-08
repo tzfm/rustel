@@ -40,7 +40,7 @@ pub(super) fn codec_for(url: &str) -> Codec {
 /// An `.ogg` is a container, not a codec: the same extension carries Vorbis
 /// and Opus, and a phone or messaging app writes Opus. Reporting the codec is
 /// the difference between "your file is broken" and "convert this one".
-fn codec_name(codec: symphonia::core::codecs::CodecType) -> &'static str {
+pub(super) fn codec_name(codec: symphonia::core::codecs::CodecType) -> &'static str {
     use symphonia::core::codecs;
     match codec {
         codecs::CODEC_TYPE_VORBIS => "Vorbis",
@@ -520,7 +520,7 @@ fn decode_compressed(bytes: &[u8], extension: &str) -> Result<DecodedSample, Str
 /// Why [`decode_compressed_with`] gave up. A header [`guard_vorbis_setup`]
 /// refused is refused whatever the trimming, so it skips the non-gapless
 /// retry; any other failure may be the gapless arithmetic and earns one.
-enum CompressedFailure {
+pub(super) enum CompressedFailure {
     Refused(String),
     Failed(String),
 }
@@ -542,7 +542,7 @@ impl From<String> for CompressedFailure {
 /// Whether a container track carries audio. Symphonia has no single
 /// "audio" flag, but every audio codec it can describe gives the track a
 /// rate or a channel layout; a video track has neither.
-fn is_audio_track(track: &symphonia::core::formats::Track) -> bool {
+pub(super) fn is_audio_track(track: &symphonia::core::formats::Track) -> bool {
     track.codec_params.sample_rate.is_some() || track.codec_params.channels.is_some()
 }
 
@@ -552,7 +552,7 @@ fn is_audio_track(track: &symphonia::core::formats::Track) -> bool {
 /// A video container's default track is the picture. Refusing it with
 /// "unsupported codec: H.264" would be technically true and useless - the
 /// sound is in the next track.
-fn audio_track<'a>(
+pub(super) fn audio_track<'a>(
     format: &'a dyn symphonia::core::formats::FormatReader,
     extension: &str,
 ) -> Result<&'a symphonia::core::formats::Track, CompressedFailure> {

@@ -201,6 +201,7 @@ mod replay_edit;
 mod replay_pointer;
 mod replay_tabs;
 mod sample_delete;
+mod sample_details;
 mod sample_import;
 mod sample_sources;
 mod scene_strip;
@@ -1537,6 +1538,9 @@ struct App {
     /// while it is still `None`: a sound heard for the first time is being
     /// decoded at the moment it is asked for.
     preview_shape: Option<(std::sync::Arc<[u8]>, f64)>,
+    /// The read of the samples tab's selected file for its details, while
+    /// one is out.
+    details_read: Option<sample_details::DetailsRead>,
     /// How long the studio has had sound, in seconds, and when that was
     /// last counted.
     ///
@@ -1993,6 +1997,7 @@ impl App {
             preview_armed: None,
             preview_lit_until: None,
             preview_shape: None,
+            details_read: None,
             sound_seconds: std::cell::Cell::new(0.0),
             sound_counted_at: std::cell::Cell::new(Instant::now()),
             #[cfg(feature = "hydra")]

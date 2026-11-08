@@ -285,6 +285,7 @@ impl App {
         self.watch_take();
         self.poll_export();
         self.poll_reveal();
+        self.poll_sample_details();
         self.poll_vim_config(now);
         self.poll_external_changes(now);
         if let Err(error) = super::vim::flush_timeout(self) {

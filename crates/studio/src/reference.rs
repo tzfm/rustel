@@ -64,8 +64,8 @@ pub use geometry::{
 };
 #[cfg(feature = "hydra")]
 pub use geometry::{generator_rail, preview_area, snippet_layout};
-pub(super) use geometry::{sample_pulse_rows, tab_layout};
-pub use samples::{section_labels, source_labels};
+pub(super) use geometry::{sample_pulse_rows, samples_details_area, tab_layout};
+pub use samples::{SampleDetails, section_labels, source_labels};
 pub use text::entry_body;
 #[cfg(any(feature = "hydra", test))]
 use text::render_code_span;
@@ -77,7 +77,7 @@ use text::{parse_inline, wrap_code, wrap_inline};
 #[cfg(feature = "hydra")]
 use view::generator_action_label;
 #[cfg(test)]
-use view::sample_source_line;
+use view::sample_detail_lines;
 #[cfg(all(test, feature = "hydra"))]
 use view::{ALIASES_SHOWN, aliases_text};
 use vocabulary::CHORD_PREVIEW_OCTAVE;
@@ -621,6 +621,9 @@ pub struct ReferencePanel {
     /// A deletion awaits Enter for this bank, variant and exact local file.
     /// Keep the path so a catalogue refresh cannot change the target.
     pub confirm_delete: Option<(String, usize, std::path::PathBuf)>,
+    /// The file under the samples tab's cursor, and what it says about
+    /// itself once the App has read it.
+    pub sample_details: Option<SampleDetails>,
 }
 
 /// Why the panel was opened, which decides what Enter does to a sound.
@@ -3975,8 +3978,7 @@ mod tests {
         fn sample_source_labels_preserve_import_specs_and_compact_local_folders() {
             let reference = Reference::load_all();
             let empty = ReferencePanel::samples(&reference, Vec::new());
-            assert_eq!(sample_source_line(&empty), "source: select a sound");
-            assert!(!sample_source_line(&empty).contains('-'));
+            assert_eq!(sample_detail_lines(&empty), ["select a sound"]);
 
             let mut panel = ReferencePanel::samples(
                 &reference,
@@ -4005,6 +4007,143 @@ mod tests {
                 import: Some(folder(&["Users", "player", "Music", "sessions"])),
             }]);
             assert_eq!(panel.selected_sample_source().as_deref(), Some("sessions"));
+        }
+
+        fn scored(name: &str, variants: usize) -> SoundEntry {
+            SoundEntry {
+                name: name.into(),
+                variants,
+                variant_names: Vec::new(),
+                origin: SoundOrigin::Score,
+                category: SoundCategory::Other,
+                location: None,
+                import: None,
+            }
+        }
+
+        fn read(url: &str, facts: rustel_runtime::samples::SampleFacts) -> Option<SampleDetails> {
+            Some(SampleDetails {
+                url: url.into(),
+                facts: Some(facts),
+                stale: false,
+            })
+        }
+
+        #[test]
+        fn sample_details_say_a_banks_files_a_videos_limit_and_a_file_not_downloaded() {
+            use rustel_runtime::samples::{SampleFacts, SoundFacts};
+            let reference = Reference::load_all();
+
+            // A bank of many files: how many, not its first file's length.
+            let mut panel = ReferencePanel::samples(&reference, vec![scored("kit", 3)]);
+            panel.sample_details = read(
+                "file:///kits/kit/a.wav",
+                SampleFacts {
+                    bytes: Some(2048),
+                    sound: Some(SoundFacts {
+                        rate: Some(44_100),
+                        channels: Some(2),
+                        bits: Some(24),
+                        seconds: Some(0.5),
+                        codec: None,
+                    }),
+                    ..SampleFacts::default()
+                },
+            );
+            assert_eq!(
+                sample_detail_lines(&panel),
+                ["wav · 24-bit · 44.1 kHz · stereo", "3 files · this score"]
+            );
+
+            // One file: its length and size, and a video past the most any
+            // ceiling allows says it cannot load.
+            panel.set_sounds(vec![scored("clip", 1)]);
+            panel.sample_details = read(
+                "file:///clips/clip.webm",
+                SampleFacts {
+                    bytes: Some(4 << 30),
+                    picture: true,
+                    sound: Some(SoundFacts {
+                        rate: Some(48_000),
+                        channels: Some(2),
+                        seconds: Some(65.0),
+                        codec: Some("Opus"),
+                        bits: None,
+                    }),
+                    ..SampleFacts::default()
+                },
+            );
+            let lines = sample_detail_lines(&panel);
+            assert_eq!(lines[0], "webm · video · Opus · 48 kHz · stereo");
+            assert!(
+                lines[1].starts_with("1:05 · 4096 MB · over the ")
+                    && lines[1].ends_with(" video limit · this score"),
+                "{lines:?}"
+            );
+
+            panel.set_sounds(vec![scored("kick", 1)]);
+            panel.sample_details = read(
+                "https://host/kits/kick.wav?v=2",
+                SampleFacts {
+                    remote: true,
+                    ..SampleFacts::default()
+                },
+            );
+            assert_eq!(
+                sample_detail_lines(&panel),
+                ["wav · not downloaded yet", "this score"]
+            );
+        }
+
+        #[test]
+        fn a_deletion_asks_its_whole_question_in_a_short_column() {
+            let reference = Reference::load_all();
+            let mut panel = ReferencePanel::samples(&reference, vec![scored("take", 1)]);
+            panel.confirm_delete = Some((
+                "take".into(),
+                0,
+                std::path::PathBuf::from("/Users/player/take.wav"),
+            ));
+            let area = Rect::new(0, 0, 50, 17);
+            let inner = inner_area(area);
+            assert_eq!(geometry::samples_detail_rows(inner), 1, "one details row");
+            assert!(panel.geometry(inner).list.height > 0, "a list to draw");
+
+            let mut buffer = Buffer::empty(area);
+            ReferenceView {
+                keybinds: &crate::keybinds::Keybinds::default(),
+                focused: true,
+                vim: false,
+                anchored: false,
+                pulse: None,
+                sounding_note: None,
+                loading: None,
+                caching: 0,
+                importing: 0,
+                library_loading: false,
+                #[cfg(feature = "hydra")]
+                playing: None,
+                #[cfg(feature = "hydra")]
+                preview_note: None,
+                #[cfg(feature = "hydra")]
+                preview_progress: None,
+                #[cfg(feature = "hydra")]
+                preview_row: None,
+                picture: false,
+                refused: None,
+                reference: &reference,
+                panel: &panel,
+                theme: &Theme::built_in_default(),
+            }
+            .render(area, &mut buffer);
+            let rows: Vec<String> = (0..area.height)
+                .map(|y| (0..area.width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("Delete permanently? take.wav")),
+                "{rows:#?}"
+            );
         }
     }
     mod samples {

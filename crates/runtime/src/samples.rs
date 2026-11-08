@@ -61,6 +61,8 @@ mod codecs;
 #[cfg(feature = "video")]
 pub(crate) use codecs::container_video_track_ids;
 mod decode_cache;
+mod facts;
+pub use facts::{SampleFacts, SoundFacts};
 mod file_limit;
 pub(crate) use file_limit::FileLimit;
 pub use file_limit::{

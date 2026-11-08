@@ -220,6 +220,7 @@ impl ReferencePanel {
             hold_scroll: false,
             confirm_trim: None,
             confirm_delete: None,
+            sample_details: None,
         };
         // One writer for the results and the rows over them, so the two can
         // never be built by different rules.
