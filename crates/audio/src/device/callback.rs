@@ -312,6 +312,11 @@ impl LiveScalarDevice {
                 .fx_reverb_resident_bytes
                 .load(Ordering::Acquire),
         );
+        let chain_rooms = self
+            .chain_room_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bytes();
         let master = &self.shared.analysis;
         let visual_taps = self
             .shared
@@ -323,7 +328,7 @@ impl LiveScalarDevice {
             event_rings: ring(&self.shared.ring) + ring(&self.shared.immediate),
             input: self.shared.input.touched_bytes(),
             record: self.shared.record.touched_bytes(),
-            reverbs: orbit_reverbs + stage_reverbs,
+            reverbs: orbit_reverbs + stage_reverbs + chain_rooms,
             send_lines: self.send_lines_bytes.load(Ordering::Relaxed),
             backend: self.backend_bytes
                 + self

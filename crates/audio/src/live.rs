@@ -308,10 +308,10 @@ impl LiveScalarBackend {
     /// Stage prepared inserts between audio blocks and return displaced
     /// copies to the producer. A full return ring defers new installs. The
     /// plugin workers of the output come first, then the send lines, then
-    /// the releases of the copies the score no longer has: see
-    /// [`ScalarBackend::release_insert`]. After the installs, the channel
-    /// gets the insert refusals since it got them last: of the copies, and of
-    /// the notes the blocks had no bus for.
+    /// the rooms of the chains, then the releases of the copies the score no
+    /// longer has: see [`ScalarBackend::release_insert`]. After the
+    /// installs, the channel gets the insert refusals since it got them last:
+    /// of the copies, and of the notes the blocks had no bus for.
     #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
     pub(crate) fn drain_insert_installs(&mut self, channel: &crate::assets::SampleChannel) {
         if let Some(install) = channel.pool_installs.pop() {
@@ -336,6 +336,7 @@ impl LiveScalarBackend {
                 }
             }
         }
+        self.drain_chain_rooms(channel);
         // A stopped output past its ramp makes no sound. A copy a release
         // gives back goes back in this drain.
         let stopped = self.stop_ramp_complete();
@@ -391,6 +392,46 @@ impl LiveScalarBackend {
             std::sync::atomic::Ordering::Relaxed,
         );
         self.published_refusals = refusals;
+    }
+
+    /// Gives back the rooms of the chains that left their bus, then takes
+    /// the rooms the producer made: see [`ScalarBackend::install_chain_room`].
+    /// Each install can give one box back, so a place in the return ring is
+    /// free before each take. A full return ring defers the installs.
+    fn drain_chain_rooms(&mut self, channel: &crate::assets::SampleChannel) {
+        let returns = &channel.chain_room_returns;
+        let give_back = |room: Box<crate::scalar::ChainRoom>| {
+            let returned = crate::assets::ReturnedChainRoom(Box::into_raw(room));
+            // Only this callback fills the ring, and a place was free.
+            if returns.push(returned).is_err() {
+                channel.leaked.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        while returns.len() < returns.capacity()
+            && let Some(room) = self.scalar.take_retired_chain_room()
+        {
+            give_back(room);
+        }
+        let pending = channel.chain_room_installs.len();
+        for _ in 0..pending {
+            if returns.len() == returns.capacity() {
+                break;
+            }
+            let Some(install) = channel.chain_room_installs.pop() else {
+                break;
+            };
+            // SAFETY: producer-boxed pointer handed over via the SPSC ring.
+            let room = unsafe { Box::from_raw(install.room) };
+            // A room made before the output changed its rate goes back.
+            let back = if install.sample_rate == self.scalar.sample_rate() {
+                self.scalar.install_chain_room(room)
+            } else {
+                Some(crate::scalar::ChainRoom::refuse(room))
+            };
+            if let Some(back) = back {
+                give_back(back);
+            }
+        }
     }
 
     /// Takes each insert this backend holds, for the producer once the
@@ -1553,6 +1594,151 @@ mod tests {
                 channel.fx_reverb_resident_bytes.load(Ordering::Acquire),
                 2 * bytes
             );
+        }
+    }
+
+    #[cfg(feature = "device-audio")]
+    mod chain_room {
+        use super::*;
+        use crate::assets::{ChainRoomInstall, SampleChannel};
+        use crate::insert::{InsertControls, InsertKey, InsertParam, OrbitInsert};
+        use crate::reverb::{OrbitReverb, ReverbParams};
+        use crate::scalar::{ChainRoom, ChainRoomReturn};
+        use std::sync::atomic::Ordering;
+
+        /// An effect that mutes its input.
+        struct Mute(InsertKey);
+
+        impl OrbitInsert for Mute {
+            fn key(&self) -> InsertKey {
+                self.0
+            }
+            fn set_param(&mut self, _: InsertParam, _: u32) {}
+            fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+                left.fill(0.0);
+                right.fill(0.0);
+            }
+        }
+
+        fn reverb(size_secs: f32) -> Box<OrbitReverb> {
+            let params = ReverbParams {
+                size_secs,
+                fade_secs: 0.01,
+                lp_start_hz: 8_000.0,
+                lp_end_hz: 1_000.0,
+                ir: None,
+            };
+            Box::new(OrbitReverb::generate(48_000, params))
+        }
+
+        fn ship(channel: &SampleChannel, room: ChainRoom) {
+            let install = ChainRoomInstall {
+                room: Box::into_raw(Box::new(room)),
+                sample_rate: 48_000,
+            };
+            assert!(channel.chain_room_installs.push(install).is_ok());
+        }
+
+        fn returned(channel: &SampleChannel) -> Vec<(u64, u64, ChainRoomReturn, usize)> {
+            let mut rooms = Vec::new();
+            channel.reclaim_chain_rooms(|room| {
+                rooms.push((room.chain(), room.serial(), room.returned(), room.bytes()));
+            });
+            rooms
+        }
+
+        /// The callback takes the rooms the producer made for chain 7. A
+        /// second room keeps the delay line of the first and takes its new
+        /// reverb, and the old reverb goes back. Notes through an effect that
+        /// mutes its input then make no sound: the effect takes the room and
+        /// the echoes too. The room goes back when the chain leaves its bus.
+        /// With no room, the same notes send their echoes to the orbit. The
+        /// callback allocates and frees nothing.
+        #[test]
+        fn chain_rooms_cross_the_callback_with_no_allocation() {
+            let _guard = crate::device::tests::tripwire_assertion_guard();
+            assert!(crate::tripwire::allocator_is_armed());
+            let key = InsertKey {
+                plugin: 3,
+                preset: 0,
+            };
+            let mut controls = crate::OscillatorControls {
+                insert_chain: Some(7),
+                reverb: Some(crate::ReverbControls {
+                    wet: 0.5,
+                    size_secs: 0.1,
+                    fade_secs: 0.01,
+                    lp_start_hz: 8_000.0,
+                    lp_end_hz: 1_000.0,
+                    ir: None,
+                }),
+                delay: Some(crate::DelayControls {
+                    wet: 0.5,
+                    time_secs: 0.01,
+                    feedback: 0.5,
+                }),
+                ..crate::OscillatorControls::default()
+            };
+            controls.effects[0] = Some(InsertControls::new(key));
+            let (small, large) = (reverb(0.05), reverb(0.1));
+            let (small_bytes, large_bytes) = (small.approx_bytes(), large.approx_bytes());
+            let line = ChainRoom::delay_bytes(48_000);
+            for shipped in [true, false] {
+                let channel = SampleChannel::new();
+                let mut live = LiveScalarBackend::new(48_000, 8).expect("live backend");
+                let slot = crate::insert::effect_slot(7, 0);
+                assert!(
+                    live.scalar
+                        .install_insert(slot, Box::new(Mute(key)))
+                        .is_none()
+                );
+                if shipped {
+                    ship(
+                        &channel,
+                        ChainRoom::new(7, 1, Some(reverb(0.05)), Some(48_000)),
+                    );
+                    ship(&channel, ChainRoom::new(7, 2, Some(reverb(0.1)), None));
+                }
+                let mut output = [0.0f32; 256];
+                let mut sounded = false;
+                let before = crate::tripwire::Violations::capture();
+                crate::tripwire::audio_scope(|| {
+                    live.drain_insert_installs(&channel);
+                    for note in 0..4u64 {
+                        let event = OnsetEvent::new(note * 128, 440.0, 0.5, 0.01);
+                        assert!(live.scalar.try_note_prepared(event.with_controls(controls)));
+                    }
+                    for _ in 0..40 {
+                        live.scalar.process_block(&mut output, 128);
+                        sounded |= output.iter().any(|sample| *sample != 0.0);
+                    }
+                    live.scalar.reset_at(40 * 128);
+                    // A chain with no name leaves after 1 s of silence.
+                    live.scalar.set_named_insert_chains(1, &[]);
+                    for _ in 0..400 {
+                        live.scalar.process_block(&mut output, 128);
+                    }
+                    live.drain_insert_installs(&channel);
+                });
+                let delta = crate::tripwire::Violations::capture().since(before);
+                assert!(delta.clean(), "shipped {shipped}: {delta:?}");
+                assert_eq!(channel.leaked.load(Ordering::Relaxed), 0);
+                if !shipped {
+                    assert!(sounded, "the notes sent no echo to the orbit");
+                    assert_eq!(live.scalar.chain_room_fallbacks(), 4);
+                    assert!(returned(&channel).is_empty());
+                    continue;
+                }
+                assert!(!sounded, "the room sounded past the effect");
+                assert_eq!(live.scalar.chain_room_fallbacks(), 0);
+                assert_eq!(
+                    returned(&channel),
+                    [
+                        (7, 2, ChainRoomReturn::Merged, small_bytes),
+                        (7, 2, ChainRoomReturn::Released, large_bytes + line),
+                    ]
+                );
+            }
         }
     }
 

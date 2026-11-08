@@ -13,11 +13,17 @@
 //! an insert that makes sound from notes. The instrument goes through the
 //! chain when its note asks for an effect too.
 //!
+//! The `room` and the `delay` of a note through effects go to the reverb
+//! and the delay of its chain, in front of the effects, so the effects
+//! process them too: see `crate::scalar::ChainRoom`. A chain with no room
+//! of its own sends them to the orbit after the postgain, as a note with no
+//! chain and an instrument with no effect do.
+//!
 //! ```text
-//!   voice/instrument -> gain --+-> dry -> [VST effects] -> postgain --+
-//!                             +-> postgain -> delay/reverb ---------+
-//!                                                                   |
-//!                      mix <- fader <- duck <- DJ filter <- orbit <-+
+//!   voice/instrument -> gain -+-> dry ------------+-> [VST effects] -> postgain -+
+//!                             +-> delay/reverb ---+                              |
+//!                                 of the chain                                   |
+//!                      mix <- fader <- duck <- DJ filter <- orbit <--------------+
 //! ```
 
 /// The parameter values one note carries for its insert.

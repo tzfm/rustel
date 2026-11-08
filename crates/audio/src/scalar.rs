@@ -21,10 +21,14 @@ use crate::sample::{
 use crate::wavetable_kernel::WavetableKernel;
 use effects::apply_fx_stage;
 use effects::bandpass_coefs;
+use effects::inline_reverb;
 use effects::notch_coefs;
 use effects::reserve_fx_reverb_returns;
 use effects::voice_fx_pre_distort;
+use inserts::InlineRoom;
 use inserts::InsertClock;
+use inserts::chain_room_delay;
+use inserts::chain_room_takes_reverb;
 use inserts::claim_insert_bus;
 use inserts::deliver;
 use inserts::displace_insert;
@@ -115,6 +119,70 @@ struct FxDelayLine {
     left: Vec<f32>,
     right: Vec<f32>,
     write: usize,
+}
+
+/// The room of a plugin chain with effects: the reverb and the feedback
+/// delay that the `room` and `delay` sends of its notes go to. Their output
+/// joins the input of the effects, so the effects process the reverb and
+/// the echoes with the dry signal.
+///
+/// ```text
+///   note -+-> dry ----------------+-> [effects] -> postgain -> orbit
+///         +-> room  -> reverb ----+
+///         +-> delay -> delay line +
+/// ```
+///
+/// A live output makes the box on its producer with the parts its notes ask
+/// for, and ships it to the callback: see [`ScalarBackend::install_chain_room`].
+/// An offline render makes it at the first note that sends to it. The last
+/// note of the chain sets the parameters of the reverb and the delay, as the
+/// last note of an orbit sets those of the orbit. A note whose chain has no
+/// room, or no part for one of its sends, sends that part to its orbit.
+pub(crate) struct ChainRoom {
+    chain: u64,
+    /// The number the producer gave the box: see [`Self::serial`].
+    serial: u64,
+    returned: ChainRoomReturn,
+    reverb: Option<Box<crate::reverb::OrbitReverb>>,
+    /// The reverb sends of the notes, for the sub-block in hand.
+    reverb_send: [[f32; crate::reverb::REVERB_BLOCK]; 2],
+    /// The delay line. Its block holds the delay sends of the notes for the
+    /// sub-block in hand.
+    delay: Option<OrbitDelay>,
+    /// Offline only: a reverb the budget refused, and its size in bytes. A
+    /// next note with the same parameters does not make it again while the
+    /// budget has no room for it.
+    refused: Option<(crate::reverb::ReverbParams, usize)>,
+}
+
+/// Why the callback gave a room back to the producer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChainRoomReturn {
+    /// The chain holds a room: the room took the parts of the box, and the
+    /// box holds the parts the room gave up.
+    Merged,
+    /// No bus was free for the chain, or the box was made for another rate.
+    Refused,
+    /// The chain left its bus.
+    Released,
+}
+
+/// The most memory the rooms of the chains may hold together: their reverbs
+/// and their delay lines. A reverb at the default `roomsize` of 2 holds
+/// 7 MiB, so about 18 such rooms fit. A delay line holds 375 KiB at 48 kHz.
+/// The producer of a live output makes no room past this budget, and an
+/// offline render keeps to it too. The notes of a chain with no room send
+/// to their orbit.
+pub const MAX_CHAIN_ROOM_BYTES: usize = 128 * 1024 * 1024;
+
+/// The budget of the rooms an offline render makes: see
+/// [`ScalarBackend::set_chain_room_budget`].
+struct ChainRoomBudget(usize);
+
+impl Default for ChainRoomBudget {
+    fn default() -> Self {
+        Self(MAX_CHAIN_ROOM_BYTES)
+    }
 }
 
 /// How much memory `.FX()` stage reverbs may hold between them.
@@ -314,6 +382,10 @@ struct Voice {
     /// The dry path feeds the orbit insert, not the orbit.
     through_insert: bool,
     insert_bus: Option<usize>,
+    /// The reverb send and the delay send go to the room of the chain, in
+    /// front of its effects: see [`ChainRoom`]. Else they go to the orbit.
+    chain_reverb: bool,
+    chain_delay: bool,
     dry_gain: f32,
     kabel: Option<KabelState>,
     stretch: Option<Box<[crate::stretch::Stretch; 2]>>,
@@ -1582,6 +1654,20 @@ pub struct ScalarBackend {
     /// hold point it contains, so order and timing match the live path.
     pending_ducks: Vec<PendingDuck>,
     orbit_reverbs: Vec<Option<Box<crate::reverb::OrbitReverb>>>,
+    /// The room of the chain of each bus: see [`ChainRoom`].
+    chain_rooms: Vec<Option<Box<ChainRoom>>>,
+    /// The rooms of the chains that left their bus, on their way back to the
+    /// producer. Reserved before rendering.
+    ///
+    /// The `Box` is the box the producer made and frees, so a room moves
+    /// through the list as a pointer.
+    #[allow(clippy::vec_box)]
+    retired_chain_rooms: Vec<Box<ChainRoom>>,
+    /// Offline only: the memory the rooms of the chains may hold together.
+    chain_room_budget: ChainRoomBudget,
+    /// Notes through effects that sent their room or their delay to their
+    /// orbit, because their chain had no room for it.
+    chain_room_fallbacks: u64,
     /// The outside effects and the instrument of each chain. The notes that
     /// ask for an effect feed `insert_blocks`, and the output of the chain
     /// joins the orbit.
@@ -2048,6 +2134,12 @@ impl ScalarBackend {
             || self
                 .orbit_delays
                 .iter()
+                .chain(
+                    self.chain_rooms
+                        .iter()
+                        .flatten()
+                        .flat_map(|room| &room.delay),
+                )
                 .any(|delay| delay.active && delay.energized != 0)
     }
 
@@ -2246,6 +2338,10 @@ impl ScalarBackend {
                 bus.active = false;
                 bus.energized = 0;
             }
+        }
+        // The rooms of the chains drop their tails as the orbits do.
+        for room in self.chain_rooms.iter_mut().flatten() {
+            room.reset();
         }
         self.frame = frame;
     }

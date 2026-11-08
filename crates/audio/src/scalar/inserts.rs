@@ -546,6 +546,234 @@ impl InsertMix {
     }
 }
 
+impl ChainRoom {
+    /// The room of `chain`, made off the callback: with `reverb` when its
+    /// notes send to a reverb, and with a delay line of one second at
+    /// `delay`, a sample rate, when they send to a delay. `serial` is the
+    /// number the producer gives the box.
+    pub(crate) fn new(
+        chain: u64,
+        serial: u64,
+        reverb: Option<Box<crate::reverb::OrbitReverb>>,
+        delay: Option<u32>,
+    ) -> Self {
+        Self {
+            chain,
+            serial,
+            returned: ChainRoomReturn::Merged,
+            reverb,
+            reverb_send: [[0.0; crate::reverb::REVERB_BLOCK]; 2],
+            delay: delay.map(OrbitDelay::line),
+            refused: None,
+        }
+    }
+
+    #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
+    pub(crate) fn chain(&self) -> u64 {
+        self.chain
+    }
+
+    /// The number of the last box the room took parts from. The producer
+    /// knows from it which of its boxes came back.
+    #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
+    pub(crate) fn returned(&self) -> ChainRoomReturn {
+        self.returned
+    }
+
+    /// The box of a room the callback does not take, on its way back.
+    pub(crate) fn refuse(mut room: Box<Self>) -> Box<Self> {
+        room.returned = ChainRoomReturn::Refused;
+        room
+    }
+
+    /// The memory of a delay line of a room at `sample_rate`, in bytes.
+    #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
+    pub(crate) fn delay_bytes(sample_rate: u32) -> usize {
+        OrbitDelay::line_bytes(sample_rate)
+    }
+
+    /// The memory of the reverb and the delay line of the room, in bytes.
+    pub(crate) fn bytes(&self) -> usize {
+        let reverb = self
+            .reverb
+            .as_ref()
+            .map_or(0, |reverb| reverb.approx_bytes());
+        let delay = self.delay.as_ref().map_or(0, |delay| {
+            std::mem::size_of_val(&*delay.left) + std::mem::size_of_val(&*delay.right)
+        });
+        reverb + delay
+    }
+
+    /// Whether the room can still give a sample other than zero with no
+    /// more sends: its reverb rings, or its delay line holds energy.
+    pub(super) fn rings(&self) -> bool {
+        self.reverb.as_ref().is_some_and(|reverb| reverb.rings())
+            || self
+                .delay
+                .as_ref()
+                .is_some_and(|delay| delay.active && delay.energized != 0)
+    }
+
+    /// Empties the sends of the first `frames` of the sub-block.
+    pub(super) fn clear_sends(&mut self, frames: usize) {
+        for channel in &mut self.reverb_send {
+            channel[..frames].fill(0.0);
+        }
+        if let Some(delay) = self.delay.as_mut() {
+            let block = &mut delay.block;
+            for channel in &mut block.input {
+                channel[..frames].fill(0.0);
+            }
+            block.time_mod[..frames].fill(0.0);
+            block.feedback_mod[..frames].fill(0.0);
+        }
+    }
+
+    /// Runs the delay and the reverb of the room on the sends of the
+    /// sub-block of `frames`, and adds their output to `block`, the input of
+    /// the effects of the chain. The silence of the room must not wake the
+    /// effects: a delay line with no energy and no send does not run, and
+    /// echoes below the silence floor add nothing. The line keeps such
+    /// cells until it writes them again, a second later, and their echoes
+    /// go round in the meantime. The reverb gives exact zeros once idle.
+    pub(super) fn run(
+        &mut self,
+        block: &mut [[f32; crate::reverb::REVERB_BLOCK]; 2],
+        frames: usize,
+        sample_rate: u32,
+    ) {
+        let [left, right] = block;
+        let (left, right) = (&mut left[..frames], &mut right[..frames]);
+        if let Some(delay) = self.delay.as_mut().filter(|delay| delay.active) {
+            let sent = (delay.block.input.iter())
+                .flat_map(|channel| &channel[..frames])
+                .any(|send| *send != 0.0);
+            if delay.energized != 0 || sent {
+                let mut echoes = [[0.0f32; crate::reverb::REVERB_BLOCK]; 2];
+                let [echo_left, echo_right] = &mut echoes;
+                delay.run_block(
+                    &mut echo_left[..frames],
+                    &mut echo_right[..frames],
+                    sample_rate,
+                );
+                let audible = (echoes.iter())
+                    .flat_map(|channel| &channel[..frames])
+                    .any(|echo| echo.abs() > OrbitDelay::SILENCE_FLOOR);
+                if audible {
+                    for (out, echoes) in [&mut *left, &mut *right].into_iter().zip(&echoes) {
+                        for (out, echo) in out.iter_mut().zip(echoes) {
+                            *out += *echo;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(reverb) = self.reverb.as_deref_mut() {
+            let [send_left, send_right] = &self.reverb_send;
+            reverb.process_block(&send_left[..frames], &send_right[..frames], left, right);
+        }
+    }
+
+    /// Drops the tails of the room, as a reset of the clock drops those of
+    /// the orbits.
+    pub(super) fn reset(&mut self) {
+        if let Some(reverb) = self.reverb.as_mut() {
+            reverb.reset();
+        }
+        // An inactive line is silent already: see `reset_at`.
+        if let Some(delay) = self.delay.as_mut().filter(|delay| delay.active) {
+            delay.left.fill(0.0);
+            delay.right.fill(0.0);
+            delay.active = false;
+            delay.energized = 0;
+        }
+    }
+}
+
+/// What an offline render needs to make the room of a chain at a note: the
+/// sounds of a custom impulse response, the rate, the kernels and the
+/// budget of the rooms.
+pub(super) struct InlineRoom<'a> {
+    pub(super) bank: &'a SampleBank,
+    pub(super) sample_rate: u32,
+    pub(super) dispatch: DspDispatch,
+    pub(super) budget: usize,
+}
+
+/// Whether the room of the chain on `bus` takes the reverb send of a note
+/// of `chain` that asks for the reverb `wanted`. A live room takes it when
+/// it holds a reverb. An offline render, with `inline`, gives the chain a
+/// room with a reverb for `wanted`, when the room holds no reverb or
+/// another one and the rooms stay within the budget.
+pub(super) fn chain_room_takes_reverb(
+    rooms: &mut [Option<Box<ChainRoom>>],
+    bus: usize,
+    chain: u64,
+    wanted: crate::reverb::ReverbParams,
+    inline: Option<&InlineRoom<'_>>,
+) -> bool {
+    let Some(inline) = inline else {
+        return rooms[bus]
+            .as_ref()
+            .is_some_and(|room| room.reverb.is_some());
+    };
+    let held = |room: &ChainRoom| room.reverb.as_ref().map(|reverb| reverb.params());
+    if rooms[bus].as_deref().and_then(held) == Some(wanted) {
+        return true;
+    }
+    let resident: usize = rooms.iter().flatten().map(|room| room.bytes()).sum();
+    let room = rooms[bus].get_or_insert_with(|| Box::new(ChainRoom::new(chain, 0, None, None)));
+    let freed = room
+        .reverb
+        .as_ref()
+        .map_or(0, |reverb| reverb.approx_bytes());
+    let fits = |bytes: usize| resident.saturating_sub(freed).saturating_add(bytes) <= inline.budget;
+    if let Some((refused, bytes)) = room.refused
+        && refused == wanted
+        && !fits(bytes)
+    {
+        return false;
+    }
+    let reverb = inline_reverb(inline.sample_rate, wanted, inline.bank, inline.dispatch);
+    let bytes = reverb.approx_bytes();
+    if !fits(bytes) {
+        room.refused = Some((wanted, bytes));
+        return false;
+    }
+    room.refused = None;
+    room.reverb = Some(Box::new(reverb));
+    true
+}
+
+/// The delay line of the room of the chain on `bus`, for a note of `chain`
+/// that sends to a delay. A live room gives the line it holds. An offline
+/// render, with `inline`, gives the chain a room with a line when the rooms
+/// stay within the budget.
+pub(super) fn chain_room_delay<'a>(
+    rooms: &'a mut [Option<Box<ChainRoom>>],
+    bus: usize,
+    chain: u64,
+    inline: Option<&InlineRoom<'_>>,
+) -> Option<&'a mut OrbitDelay> {
+    if let Some(inline) = inline
+        && rooms[bus].as_ref().is_none_or(|room| room.delay.is_none())
+    {
+        let resident: usize = rooms.iter().flatten().map(|room| room.bytes()).sum();
+        let bytes = OrbitDelay::line_bytes(inline.sample_rate);
+        if resident.saturating_add(bytes) <= inline.budget {
+            let room =
+                rooms[bus].get_or_insert_with(|| Box::new(ChainRoom::new(chain, 0, None, None)));
+            room.delay = Some(OrbitDelay::line(inline.sample_rate));
+        }
+    }
+    rooms[bus].as_deref_mut()?.delay.as_mut()
+}
+
 impl ScalarBackend {
     pub(super) fn init_insert_pool(&mut self) {
         if self.orbit_inserts.is_empty() {
@@ -560,6 +788,8 @@ impl ScalarBackend {
             self.insert_leads = vec![0; crate::insert::MAX_INSERT_BUSES];
             self.insert_serviced = ServicedMarks::new();
             self.insert_clocks = vec![None; crate::insert::INSERT_SLOTS];
+            self.chain_rooms = (0..crate::insert::MAX_INSERT_BUSES).map(|_| None).collect();
+            self.retired_chain_rooms = Vec::with_capacity(crate::insert::MAX_INSERT_BUSES);
         }
     }
 
@@ -654,6 +884,44 @@ impl ScalarBackend {
 
     pub(crate) fn take_retired_insert(&mut self) -> Option<Box<dyn crate::insert::OrbitInsert>> {
         self.retired_inserts.pop()
+    }
+
+    /// Takes the room of a chain, made off the callback: see [`ChainRoom`].
+    /// The room claims the bus of its chain. A chain that holds a room
+    /// already keeps that room with its delay line and takes the new reverb,
+    /// so a new reverb ends the tail of the reverb only. The box then goes
+    /// back with the parts the room gave up or did not need. With no free
+    /// bus the box goes back whole. Allocates and frees nothing: the caller
+    /// frees a box that comes back.
+    pub(crate) fn install_chain_room(
+        &mut self,
+        mut room: Box<ChainRoom>,
+    ) -> Option<Box<ChainRoom>> {
+        self.init_insert_pool();
+        let Some(bus) = self.claim_bus(crate::insert::instrument_slot(room.chain)) else {
+            return Some(ChainRoom::refuse(room));
+        };
+        if let Some(reverb) = room.reverb.as_mut() {
+            reverb.set_dispatch(self.dispatch);
+        }
+        let Some(held) = self.chain_rooms[bus].as_mut() else {
+            self.chain_rooms[bus] = Some(room);
+            return None;
+        };
+        if room.reverb.is_some() {
+            std::mem::swap(&mut held.reverb, &mut room.reverb);
+        }
+        if held.delay.is_none() {
+            std::mem::swap(&mut held.delay, &mut room.delay);
+        }
+        held.serial = room.serial;
+        room.returned = ChainRoomReturn::Merged;
+        Some(room)
+    }
+
+    /// A room of a chain that left its bus, for the producer to free.
+    pub(crate) fn take_retired_chain_room(&mut self) -> Option<Box<ChainRoom>> {
+        self.retired_chain_rooms.pop()
     }
 
     /// Takes each copy the backend holds: the active, the waiting, the
@@ -838,8 +1106,18 @@ impl ScalarBackend {
                 });
                 copies.sum()
             };
-            if !leaves || self.retired_inserts.len() + copies() > self.retired_inserts.capacity() {
+            // The room of the chain needs a place in its list too.
+            let rooms_full = self.chain_rooms[bus].is_some()
+                && self.retired_chain_rooms.len() == self.retired_chain_rooms.capacity();
+            if !leaves
+                || self.retired_inserts.len() + copies() > self.retired_inserts.capacity()
+                || rooms_full
+            {
                 continue;
+            }
+            if let Some(mut room) = self.chain_rooms[bus].take() {
+                room.returned = ChainRoomReturn::Released;
+                self.retired_chain_rooms.push(room);
             }
             for stage in 0..=crate::insert::EFFECT_CHAIN {
                 let slot = stage * crate::insert::MAX_INSERT_BUSES + bus;
@@ -2186,7 +2464,20 @@ mod tests {
                     }
                 }
                 assert_eq!(deferred.missing_insert_events(), 0);
-                assert!(deferred.orbit_reverbs[1].is_some());
+                // The notes through effects send to the rooms of their
+                // chains. Only the instruments with no effect send to the
+                // orbit.
+                for chain in [101, 102, 103] {
+                    let bus = deferred
+                        .insert_chains
+                        .iter()
+                        .position(|held| *held == Some(chain));
+                    let room = deferred.chain_rooms[bus.expect("the bus of the chain")].as_deref();
+                    let room = room.expect("the room of the chain");
+                    assert!(room.reverb.is_some() && room.delay.is_some(), "{chain}");
+                }
+                assert_eq!(deferred.orbit_reverbs[1].is_some(), include_dry);
+                assert_eq!(deferred.chain_room_fallbacks(), 0);
             }
         }
 
@@ -3053,8 +3344,11 @@ mod tests {
             assert!(backend.instrument_gain_changes.is_empty());
         }
 
+        /// The output of a chain follows the orbit of its newest note. The
+        /// copy keeps its state, and the delay of a native note through the
+        /// chain is the delay of the chain: its echoes move with the chain.
         #[test]
-        fn an_orbit_move_keeps_the_insert_state_and_old_native_delay() {
+        fn an_orbit_move_keeps_the_insert_state_and_the_chain_delay() {
             for instrument in [false, true] {
                 let key = InsertKey {
                     plugin: 7,
@@ -3130,9 +3424,16 @@ mod tests {
                     for (expected, actual) in expected.iter().zip(actual) {
                         assert!((expected - actual).abs() < 1e-6, "block {block}");
                     }
-                    assert_eq!(moved.orbit_delays[1].left, baseline.orbit_delays[1].left);
-                    assert_eq!(moved.orbit_delays[1].right, baseline.orbit_delays[1].right);
-                    assert!(!moved.orbit_delays[2].active);
+                    // The line of the chain holds the same echoes after a move,
+                    // and no orbit delay runs.
+                    let line = |backend: &ScalarBackend| {
+                        let room = backend.chain_rooms[1].as_deref();
+                        let delay = room.and_then(|room| room.delay.as_ref());
+                        delay.map(|delay| [delay.left.clone(), delay.right.clone()])
+                    };
+                    assert_eq!(line(&moved).is_some(), !instrument);
+                    assert!(line(&moved) == line(&baseline), "block {block}");
+                    assert!(!moved.orbit_delays[1].active && !moved.orbit_delays[2].active);
                     if block == 3 {
                         assert_eq!(moved.insert_outputs[1], 1);
                         assert!(
@@ -3154,11 +3455,12 @@ mod tests {
                                 .any(|value| value.abs() > 0.01)
                         );
                         if !instrument {
+                            // The echoes of the old note go with its chain.
                             assert!(
                                 moved.orbit_blocks[1]
                                     .iter()
                                     .flatten()
-                                    .any(|value| value.abs() > 0.001)
+                                    .all(|value| *value == 0.0)
                             );
                             let old = moved
                                 .voices
@@ -3979,12 +4281,16 @@ mod tests {
             }
             /// The latency of the effect of the notes aimed early, in frames.
             const LATE: u32 = 96;
-            for room in [false, true] {
+            for (room, rooms) in [(false, false), (true, false), (false, true), (true, true)] {
                 // `effect` gives the latency of the effect of the notes, and
                 // a note through an effect with latency is aimed that much
                 // before its onset. Before each chunk, send lines made for
                 // the next latency of `lines` take the place of the lines.
-                // Gives the output and the notes whose sends went in at once.
+                // With `rooms` the chain has a room of its own for the sends,
+                // in front of its effect. With no room, as with a full
+                // budget, the sends go to the orbit. Gives the output, the
+                // notes whose sends went in at once, and the notes that had
+                // no room.
                 let render = |gain,
                               postgain,
                               effect: Option<u32>,
@@ -3995,18 +4301,20 @@ mod tests {
                         preset: 0,
                     };
                     let mut backend = ScalarBackend::prepared(48_000, 5).unwrap();
+                    if !rooms {
+                        backend.set_chain_room_budget(0);
+                    }
                     backend.set_insert_provider(Arc::new(move |key, _, _| {
-                        let insert: Box<dyn OrbitInsert> = match effect {
-                            Some(frames) if frames > 0 && key.plugin == 8 => {
-                                let line = std::iter::repeat_n([0.0; 2], frames as usize);
-                                Box::new(Late(key, line.collect()))
-                            }
-                            _ => Box::new(StatefulInsert {
+                        let insert: Box<dyn OrbitInsert> = if key.plugin == 8 {
+                            let frames = effect.unwrap_or(0) as usize;
+                            Box::new(Late(key, std::iter::repeat_n([0.0; 2], frames).collect()))
+                        } else {
+                            Box::new(StatefulInsert {
                                 key,
                                 memory: [0.0; 2],
                                 held: 0,
                                 resets: Arc::new(AtomicUsize::new(0)),
-                            }),
+                            })
                         };
                         Some(insert)
                     }));
@@ -4062,9 +4370,13 @@ mod tests {
                     }
                     assert_eq!(cursor, 1024);
                     assert_eq!(backend.missing_insert_events(), 0);
-                    (output, backend.early_sends())
+                    (
+                        output,
+                        backend.early_sends(),
+                        backend.chain_room_fallbacks(),
+                    )
                 };
-                let (expected, _) = render(1.0, 1.0, None, &[], &[1024]);
+                let (expected, ..) = render(1.0, 1.0, None, &[], &[1024]);
                 assert!(expected.iter().any(|sample| sample.abs() > 0.0001));
                 let prefix_peak = expected[..63 * 2]
                     .iter()
@@ -4087,7 +4399,8 @@ mod tests {
                     {
                         assert!(
                             (actual - expected * gain).abs() < 1e-6,
-                            "room {room}, effect {effect:?}, frame {}: {actual} expected {}",
+                            "room {room}, rooms {rooms}, effect {effect:?}, frame {}: {actual} \
+                             expected {}",
                             index / 2 + from,
                             expected * gain
                         );
@@ -4096,19 +4409,20 @@ mod tests {
                 for (gain, postgain, effect) in
                     [(1.0, 1.0, Some(0)), (0.5, 0.25, None), (0.5, 0.25, Some(0))]
                 {
-                    let (actual, early) = render(gain, postgain, effect, &[], chunks);
+                    let (actual, early, _) = render(gain, postgain, effect, &[], chunks);
                     matches(&actual, 0, gain * postgain, effect);
                     assert_eq!(early, 0);
                 }
                 // Notes through an effect that passes its input `LATE` frames
-                // late, aimed that much before their onsets. Their sends wait
-                // in the send lines for the output of the effect, so the room
-                // and the delay sound as for the notes with no effect, that
-                // much later. Longer lines after the first chunk take the
-                // sends that wait.
+                // late, aimed that much before their onsets. The room of the
+                // chain takes their sends in front of the effect. With no
+                // room, the sends wait in the send lines for the output of
+                // the effect. So the room and the delay sound as for the
+                // notes with no effect, that much later. Longer lines after
+                // the first chunk take the sends that wait.
                 let late = Some(LATE);
                 for lines in [&[LATE][..], &[LATE, 2 * LATE]] {
-                    let (actual, early) = render(0.5, 0.25, late, lines, chunks);
+                    let (actual, early, _) = render(0.5, 0.25, late, lines, chunks);
                     matches(&actual, LATE as usize, 0.125, late);
                     let prefix_peak = actual[..(63 + LATE as usize) * 2]
                         .iter()
@@ -4116,13 +4430,19 @@ mod tests {
                     assert!(prefix_peak <= if room { 1e-8 } else { 0.0 }, "room {room}");
                     assert_eq!(early, 0);
                 }
-                // With no lines, or with lines that do not reach that far,
-                // the sends go at once, that much early. Each of the 3 notes
-                // with a send counts.
+                // With no room, and with no lines or with lines that do not
+                // reach that far, the sends go at once, that much early. Each
+                // of the 3 notes with a send counts, and each one had no room.
+                // The room of the chain needs no lines.
                 for lines in [&[][..], &[0]] {
-                    let (actual, early) = render(0.5, 0.25, late, lines, chunks);
-                    matches(&actual, 0, 0.125, late);
-                    assert_eq!(early, 3, "room {room}, lines {lines:?}");
+                    let (actual, early, missed) = render(0.5, 0.25, late, lines, chunks);
+                    if rooms {
+                        matches(&actual, LATE as usize, 0.125, late);
+                        assert_eq!((early, missed), (0, 0), "room {room}, lines {lines:?}");
+                    } else {
+                        matches(&actual, 0, 0.125, late);
+                        assert_eq!((early, missed), (3, 3), "room {room}, lines {lines:?}");
+                    }
                 }
             }
         }
@@ -5737,6 +6057,232 @@ mod tests {
             backend.note(note(448, 1));
             block(&mut backend);
             assert_eq!(take(&played), [(3, 0.25, 64), (4, 0.5, 64)]);
+        }
+    }
+
+    mod chain_room_tests {
+        use super::*;
+        use crate::insert::{InsertControls, InsertKey, InsertNote, InsertParam, OrbitInsert};
+
+        const EFFECT: InsertKey = InsertKey {
+            plugin: 1,
+            preset: 0,
+        };
+        const INSTRUMENT: InsertKey = InsertKey {
+            plugin: 2,
+            preset: 0,
+        };
+
+        /// The effect gives its input times `gain`. The instrument plays a
+        /// square of 0.25 for the frames of its note.
+        struct Scale {
+            key: InsertKey,
+            gain: f32,
+            held: u32,
+            frame: u32,
+        }
+
+        impl OrbitInsert for Scale {
+            fn key(&self) -> InsertKey {
+                self.key
+            }
+            fn set_param(&mut self, _: InsertParam, _: u32) {}
+            fn note(&mut self, note: InsertNote, _: u32) {
+                self.held = note.frames;
+            }
+            fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+                for (left, right) in left.iter_mut().zip(right) {
+                    if self.key == INSTRUMENT {
+                        let sign = if (self.frame / 64).is_multiple_of(2) {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                        let tone = if self.held > 0 { 0.25 * sign } else { 0.0 };
+                        self.held = self.held.saturating_sub(1);
+                        self.frame += 1;
+                        (*left, *right) = (tone, tone * 0.5);
+                    } else {
+                        *left *= self.gain;
+                        *right *= self.gain;
+                    }
+                }
+            }
+        }
+
+        /// The note of the tests, at frame 0 on orbit 1, with a room and a
+        /// delay and a dry level of `dry`: a sine, or the note of the
+        /// instrument with `instrument`. It goes through the effect on chain
+        /// 100 with `effect`.
+        fn note(instrument: bool, effect: bool, dry: f32) -> OnsetEvent {
+            let mut event = OnsetEvent::new(0, 440.0, 0.5, 0.02);
+            event.controls.orbit = 1;
+            event.controls.dry = Some(dry);
+            event.controls.reverb = Some(crate::backend::ReverbControls {
+                wet: 0.5,
+                size_secs: 0.05,
+                fade_secs: 0.01,
+                lp_start_hz: 8_000.0,
+                lp_end_hz: 1_000.0,
+                ir: None,
+            });
+            event.controls.delay = Some(crate::backend::DelayControls {
+                wet: 0.5,
+                time_secs: 0.01,
+                feedback: 0.25,
+            });
+            if instrument || effect {
+                event.controls.insert_chain = Some(100);
+            }
+            if instrument {
+                let note = InsertNote {
+                    pitch: 69.0,
+                    velocity: 1.0,
+                    frames: 960,
+                };
+                event.controls.instrument = Some(InsertControls::new(INSTRUMENT).with_note(note));
+            }
+            if effect {
+                event.controls.effects[0] = Some(InsertControls::new(EFFECT));
+            }
+            event
+        }
+
+        /// A backend whose effect gives its input times `gain`, and whose
+        /// rooms keep within `budget`.
+        fn backend(gain: f32, budget: usize) -> ScalarBackend {
+            let mut backend = ScalarBackend::prepared(48_000, 4).unwrap();
+            backend.set_chain_room_budget(budget);
+            backend.set_insert_provider(Arc::new(move |key, _, _| {
+                Some(Box::new(Scale {
+                    key,
+                    gain,
+                    held: 0,
+                    frame: 0,
+                }))
+            }));
+            backend
+        }
+
+        /// Renders 188 blocks, 0.5 s, of `event`. Gives the output and the
+        /// notes that sent to their orbit for want of a room.
+        fn render(mut backend: ScalarBackend, event: OnsetEvent) -> (Vec<f32>, u64) {
+            backend.note(event);
+            let mut output = vec![0.0; 188 * 256];
+            for block in output.chunks_mut(256) {
+                backend.process_block(block, 128);
+            }
+            assert_eq!(backend.missing_insert_events(), 0);
+            assert_eq!(backend.missing_reverb_events(), 0);
+            (output, backend.chain_room_fallbacks())
+        }
+
+        /// The effects of a chain take the room and the delay of its notes,
+        /// also of its instrument: an effect that inverts its input inverts
+        /// the reverb and the echoes too, and an effect that mutes its input
+        /// leaves no tail. With no room for the chain, as with a full budget,
+        /// the note sends to its orbit and counts: the effect that mutes then
+        /// leaves the tail of the orbit.
+        #[test]
+        fn the_effects_of_a_chain_take_the_room_and_the_delay_of_its_notes() {
+            for instrument in [false, true] {
+                // The room drops the echoes below the silence floor of 1e-6.
+                let near = |actual: &[f32], expected: &[f32], gain: f32, what: &str| {
+                    for (frame, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                        assert!(
+                            (actual - expected * gain).abs() < 4e-6,
+                            "instrument {instrument}, {what}, sample {frame}: {actual} \
+                             against {expected}"
+                        );
+                    }
+                };
+                let full = MAX_CHAIN_ROOM_BYTES;
+                let (plain, missed) = render(backend(1.0, full), note(instrument, false, 1.0));
+                assert_eq!(missed, 0);
+                // The note ends within 0.05 s, and its tail sounds after it.
+                let tail = &plain[2 * 2_400..];
+                assert!(
+                    tail.iter().any(|sample| sample.abs() > 1e-4),
+                    "{instrument}"
+                );
+                let (inverted, missed) = render(backend(-1.0, full), note(instrument, true, 1.0));
+                assert_eq!(missed, 0);
+                near(&inverted, &plain, -1.0, "inverted");
+                let (muted, missed) = render(backend(0.0, full), note(instrument, true, 1.0));
+                assert_eq!(missed, 0);
+                assert!(muted.iter().all(|sample| *sample == 0.0), "{instrument}");
+                // The wet signal alone, from the orbit.
+                let (wet, _) = render(backend(1.0, full), note(instrument, false, 0.0));
+                let (fallback, missed) = render(backend(0.0, 0), note(instrument, true, 1.0));
+                assert_eq!(missed, 1);
+                near(&fallback, &wet, 1.0, "fallback");
+                assert!(
+                    fallback[2 * 2_400..]
+                        .iter()
+                        .any(|sample| sample.abs() > 1e-4)
+                );
+            }
+        }
+
+        /// The room of a chain wakes its effect while its tail sounds, after
+        /// the note too, and lets the effect sleep once the tail is silent:
+        /// the effect then counts its idle frames.
+        #[test]
+        fn a_chain_room_wakes_its_effects_until_its_tail_is_silent() {
+            // The idle frames of the effect after each block.
+            let idle = |event: OnsetEvent| {
+                let mut backend = backend(1.0, MAX_CHAIN_ROOM_BYTES);
+                backend.note(event);
+                let mut output = [0.0; 256];
+                let mut idle = Vec::new();
+                // 2 s: the line of the delay holds its last echoes for 1 s.
+                for _ in 0..750 {
+                    backend.process_block(&mut output, 128);
+                    let bus = backend
+                        .insert_chains
+                        .iter()
+                        .position(|chain| *chain == Some(100));
+                    let slot = crate::insert::effect_slot(100, 0).physical(bus.unwrap());
+                    idle.push(backend.insert_idle_frames[slot]);
+                }
+                let bus = backend
+                    .insert_chains
+                    .iter()
+                    .position(|chain| *chain == Some(100));
+                let room = backend.chain_rooms[bus.unwrap()].as_deref();
+                assert!(
+                    room.is_none_or(|room| !room.rings()),
+                    "the tail never ended"
+                );
+                idle
+            };
+            let mut dry = note(false, true, 1.0);
+            dry.controls.reverb = None;
+            dry.controls.delay = None;
+            let dry = idle(dry);
+            let wet = idle(note(false, true, 1.0));
+            // The last block that fed the effect.
+            let awake = |idle: &[u32]| idle.iter().rposition(|idle| *idle == 0).unwrap();
+            let (dry_awake, wet_awake) = (awake(&dry), awake(&wet));
+            assert!(dry_awake < 16, "the note lasts 0.03 s: {dry_awake}");
+            // The reverb alone rings 0.075 s, 28 blocks, after the note. The
+            // echoes fall below the silence floor within 0.15 s. What is left
+            // of them in the line wakes nothing.
+            assert!(
+                wet_awake > dry_awake + 20,
+                "{wet_awake} against {dry_awake}"
+            );
+            assert!(
+                wet_awake < 100,
+                "the silence of the room woke the effect: {wet_awake}"
+            );
+            for (blocks, idle) in wet[wet_awake..].iter().enumerate() {
+                assert_eq!(
+                    *idle,
+                    blocks as u32 * 128,
+                    "the silent room woke the effect"
+                );
+            }
         }
     }
 }

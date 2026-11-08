@@ -105,6 +105,7 @@ impl LiveScalarDevice {
             input: None,
             reverb_cache: std::sync::Mutex::new(vec![None; crate::scalar::MAX_ORBITS]),
             fx_reverb_cache: std::sync::Mutex::new(Vec::with_capacity(8)),
+            chain_room_cache: std::sync::Mutex::new(ChainRoomCache::new()),
             kabel_cache: std::sync::Mutex::new(Vec::with_capacity(crate::MAX_KABEL_GRAPHS)),
             program_cache: std::sync::Mutex::new(Vec::new()),
             insert_cache: std::sync::Mutex::new(Vec::with_capacity(

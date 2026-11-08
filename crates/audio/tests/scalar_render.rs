@@ -6634,11 +6634,14 @@ fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
         "the level of a late note moved early"
     );
     assert!(moved != kept, "the level of a late note did not move");
-    // The reverb and delay sends of a note wait in the send lines, and join
-    // the orbit on the frame of the output of the note. The sine above, a
-    // voice of one channel, sends 1.3 s after it starts. A supersaw, a voice
-    // of 2 channels, through delays of 0.8 s and 0.2 s with a lead of 1 s
-    // sends on its onset. With no lines, or with lines that do not reach that
+    // The reverb and delay sends of a note go to the room of its chain, in
+    // front of the effects, so they reach the orbit with the output of the
+    // note, with or without send lines. The sine above, a voice of one
+    // channel, sends 1.3 s after it starts. A supersaw, a voice of 2 channels,
+    // through delays of 0.8 s and 0.2 s with a lead of 1 s sends on its
+    // onset. A chain with no room, as with a full budget, sends to the orbit:
+    // the sends wait in the send lines, and join the orbit on the frame of the
+    // output of the note. With no lines, or with lines that do not reach that
     // far, the sends go at once, early, and the note counts.
     let sends = |mut note: OnsetEvent| {
         note.controls.reverb = Some(rustel_audio::ReverbControls {
@@ -6674,35 +6677,52 @@ fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
     for (note, latencies, heard) in cases {
         let chain = delays(latencies.map(Some));
         let note = latent(sends(note), latencies, 48_000);
-        // The note through the chain, with send lines made for `lines`.
-        // Gives the output and the notes whose sends went at once.
-        let through = |lines: Option<u32>| {
+        // The note through the chain, with send lines made for `lines`, and
+        // with a room of its own with `room`. Gives the output and the notes
+        // whose sends went at once.
+        let through = |lines: Option<u32>, room: bool| {
             let mut backend = ScalarBackend::new();
             backend.set_insert_provider(Arc::clone(&chain));
+            if !room {
+                backend.set_chain_room_budget(0);
+            }
             if let Some(latency) = lines {
                 let lines = rustel_audio::scalar::SendLines::new(latency, 48_000);
                 assert!(backend.install_send_lines(Box::new(lines)).is_none());
             }
             let events = std::slice::from_ref(&note);
             let pcm = render_pcm(&mut backend, 48_000, 76_800, events).expect("render");
+            assert_eq!(backend.chain_room_fallbacks(), u64::from(!room));
             (pcm, backend.early_sends())
         };
-        let (late, early_sends) = through(Some(latencies.iter().sum()));
-        assert_eq!(early_sends, 0);
         let (dry, _) = play(76_800, &[sends(heard.clone())], None);
         let (plain, _) = play(76_800, &[heard], None);
         assert!(dry != plain, "the note has no sends");
         // The rooms of the 2 renders start on other frames, so their sums
         // round apart in the last bits.
         let near = |pcm: &[f32]| pcm.iter().zip(&dry).all(|(a, b)| (a - b).abs() < 1e-6);
+        let reach = latencies.iter().sum();
+        for lines in [None, Some(0), Some(reach)] {
+            let (pcm, early_sends) = through(lines, true);
+            assert_eq!(early_sends, 0);
+            assert!(
+                near(&pcm),
+                "the room is not on the frame of the output: {latencies:?}, {lines:?}"
+            );
+        }
+        let (late, early_sends) = through(Some(reach), false);
+        assert_eq!(early_sends, 0);
         assert!(
             near(&late),
             "the sends are not on the frame of the output: {latencies:?}"
         );
-        let early = through(None);
+        let early = through(None, false);
         assert_eq!(early.1, 1);
         assert!(!near(&early.0), "the sends waited with no send lines");
-        assert!(through(Some(0)) == early, "the sends waited past the reach");
+        assert!(
+            through(Some(0), false) == early,
+            "the sends waited past the reach"
+        );
     }
 }
 

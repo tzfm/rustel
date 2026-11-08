@@ -28,7 +28,7 @@ fn storable(sample: f32) -> f32 {
 }
 
 impl OrbitDelay {
-    const SILENCE_FLOOR: f32 = 0.000_001;
+    pub(super) const SILENCE_FLOOR: f32 = 0.000_001;
 
     /// DelayNode linearly interpolates an a-rate delay between adjacent
     /// samples. A node in a feedback cycle cannot read inside the current
@@ -68,6 +68,92 @@ impl OrbitDelay {
         self.left[self.write] = left;
         self.right[self.write] = right;
         self.write = (self.write + 1) % self.left.len();
+    }
+
+    /// A silent line of one second at `sample_rate`, made off the callback
+    /// for the room of a chain. Each sample is written here, so the callback
+    /// finds the pages of the line in memory: a zeroed allocation leaves a
+    /// page to its first write. The opaque zero keeps the compiler from
+    /// making the writes a zeroed allocation again.
+    pub(super) fn line(sample_rate: u32) -> Self {
+        let zero = std::hint::black_box(0.0);
+        let frames = sample_rate as usize;
+        Self {
+            left: std::iter::repeat_n(zero, frames).collect(),
+            right: std::iter::repeat_n(zero, frames).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// The size of the samples of a line at `sample_rate`, in bytes.
+    pub(crate) fn line_bytes(sample_rate: u32) -> usize {
+        2 * sample_rate as usize * std::mem::size_of::<f32>()
+    }
+
+    /// Adds the output of the line to `left` and `right`, a frame for each
+    /// frame of its block, and stores the sends of the block with the
+    /// feedback.
+    pub(super) fn run_block(&mut self, left: &mut [f32], right: &mut [f32], sample_rate: u32) {
+        for (i, (left, right)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
+            // WebAudio cycles carry an implicit render-quantum (128
+            // frames) of extra latency on the FEEDBACK edge, so the n-th
+            // echo lands at n·time + (n−1)·128 frames. The line stores
+            // the delay INPUT stream: out(t) = in(t−D), and the feedback
+            // term re-injects out delayed by one quantum
+            // (in(t−D−128)·feedback).
+            const FEEDBACK_QUANTUM: usize = 128;
+            let delay_frames =
+                self.time_frames as f32 + self.block.time_mod[i] * sample_rate as f32;
+            let out_left = Self::read(&self.left, self.write, delay_frames);
+            let out_right = Self::read(&self.right, self.write, delay_frames);
+            *left += out_left;
+            *right += out_right;
+
+            let feedback_left = Self::read(
+                &self.left,
+                self.write,
+                delay_frames + FEEDBACK_QUANTUM as f32,
+            );
+            let feedback_right = Self::read(
+                &self.right,
+                self.write,
+                delay_frames + FEEDBACK_QUANTUM as f32,
+            );
+            // Each voice adds its modulator sum. A feedback above 1
+            // makes the delay line grow without limit.
+            let feedback = (self.feedback + self.block.feedback_mod[i]).clamp(-1.0, 1.0);
+            let input = [self.block.input[0][i], self.block.input[1][i]];
+            self.store(
+                input[0] + feedback * feedback_left,
+                input[1] + feedback * feedback_right,
+            );
+        }
+    }
+}
+
+/// A reverb an offline render makes at a note: with the custom impulse
+/// response of `wanted` when its sound is decoded, else the generated one.
+pub(super) fn inline_reverb(
+    sample_rate: u32,
+    wanted: crate::reverb::ReverbParams,
+    bank: &SampleBank,
+    dispatch: DspDispatch,
+) -> crate::reverb::OrbitReverb {
+    match wanted.ir {
+        Some(params_ir) => match bank.get(params_ir.sample) {
+            Some(decoded) => crate::reverb::OrbitReverb::generate_custom_with_dispatch(
+                sample_rate,
+                wanted,
+                decoded,
+                dispatch,
+            ),
+            None => crate::reverb::OrbitReverb::generate_with_dispatch(
+                sample_rate,
+                crate::reverb::ReverbParams { ir: None, ..wanted },
+                dispatch,
+            ),
+        },
+        None => crate::reverb::OrbitReverb::generate_with_dispatch(sample_rate, wanted, dispatch),
     }
 }
 
@@ -997,6 +1083,21 @@ impl ScalarBackend {
     /// Onsets that played dry because their orbit reverb was not ready.
     pub fn missing_reverb_events(&self) -> u64 {
         self.missing_reverb_events
+    }
+
+    /// Notes through effects that sent their room or their delay to their
+    /// orbit, because their chain had no room for it: see `ChainRoom`.
+    pub fn chain_room_fallbacks(&self) -> u64 {
+        self.chain_room_fallbacks
+    }
+
+    /// The most memory the rooms of the chains may hold together when this
+    /// backend makes them at their notes, as an offline render does:
+    /// [`MAX_CHAIN_ROOM_BYTES`] by default. A note whose chain has no room
+    /// for its reverb or its delay sends that part to its orbit. A live
+    /// output keeps the budget on its producer, which makes the rooms.
+    pub fn set_chain_room_budget(&mut self, bytes: usize) {
+        self.chain_room_budget = ChainRoomBudget(bytes);
     }
 }
 

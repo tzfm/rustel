@@ -585,6 +585,14 @@ impl MonoConvolver {
         }
     }
 
+    /// Whether the output can still be other than zero while the input is
+    /// zero from now on. A hop is skipped once the input was silent for the
+    /// response and its margin, see [`Self::run_hop`], and the wet FIFO
+    /// still holds the output of the hop before for one more block.
+    fn rings(&self) -> bool {
+        self.silent_frames < self.ir_frames + TAIL_BLOCK + 2 * REVERB_BLOCK
+    }
+
     /// Convolve one ≤128-frame block and ADD the wet result into `out`.
     /// Allocation-free. Hops run on the absolute input-sample grid (every
     /// 128 gathered frames), independent of how the caller chunks the
@@ -914,6 +922,12 @@ impl OrbitReverb {
     pub fn reset(&mut self) {
         self.left.reset();
         self.right.reset();
+    }
+
+    /// Whether the reverb can still give a sample other than zero while its
+    /// input is zero from now on: its tail still sounds.
+    pub(crate) fn rings(&self) -> bool {
+        self.left.rings() || self.right.rings()
     }
 
     /// Convolve one ≤128-frame block of the orbit's stereo send and ADD the
@@ -1431,6 +1445,60 @@ mod tests {
                 (partitioned[n] as f64 - direct).abs() < 1e-3,
                 "sample {n}: partitioned {} vs direct {direct}",
                 partitioned[n]
+            );
+        }
+    }
+
+    /// A reverb rings while its tail can still give a sample other than
+    /// zero. Once it says it does not, it gives exact zeros, also on input
+    /// blocks that do not line up with its hops.
+    #[test]
+    fn a_reverb_gives_zeros_once_it_no_longer_rings() {
+        let params = ReverbParams {
+            ir: None,
+            size_secs: 0.05,
+            fade_secs: 0.01,
+            lp_start_hz: 8_000.0,
+            lp_end_hz: 1_000.0,
+        };
+        for first in [REVERB_BLOCK, 100] {
+            let mut reverb = OrbitReverb::generate(48_000, params);
+            assert!(!reverb.rings(), "a new reverb is idle");
+            let burst = [0.5f32; REVERB_BLOCK];
+            let [mut left, mut right] = [[0.0f32; REVERB_BLOCK]; 2];
+            let (sent_left, sent_right) = (&burst[..first], &burst[..first]);
+            reverb.process_block(
+                sent_left,
+                sent_right,
+                &mut left[..first],
+                &mut right[..first],
+            );
+            assert!(reverb.rings());
+            let silence = [0.0f32; REVERB_BLOCK];
+            let (mut last_sound, mut quiet_from) = (0, None);
+            for block in 1..100 {
+                let [mut left, mut right] = [[0.0f32; REVERB_BLOCK]; 2];
+                reverb.process_block(&silence, &silence, &mut left, &mut right);
+                let sounds = left.iter().chain(&right).any(|sample| *sample != 0.0);
+                if sounds {
+                    last_sound = block;
+                }
+                if quiet_from.is_none() && !reverb.rings() {
+                    quiet_from = Some(block);
+                }
+                assert!(
+                    quiet_from.is_none() || !sounds,
+                    "block {block} sounds after the reverb went quiet"
+                );
+            }
+            let quiet_from = quiet_from.expect("the tail never ended");
+            // The response is 3 600 frames, 28 blocks.
+            assert!(last_sound >= 28, "the tail sounded {last_sound} blocks");
+            // The margin of the idle skip.
+            let margin = (TAIL_BLOCK + 2 * REVERB_BLOCK) / REVERB_BLOCK + 1;
+            assert!(
+                quiet_from <= last_sound + margin,
+                "{quiet_from} after {last_sound}"
             );
         }
     }

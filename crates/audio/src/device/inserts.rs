@@ -14,6 +14,7 @@ impl Default for LiveReverbBatch {
             requested: [None; crate::scalar::MAX_ORBITS],
             publication: None,
             // A turn with no plugin makes no allocation here.
+            rooms: Vec::new(),
             inserts: Vec::new(),
             refused: 0,
             latency: 0,
@@ -24,6 +25,27 @@ impl Default for LiveReverbBatch {
 impl LiveReverbBatch {
     pub(super) fn request_orbit(&mut self, orbit: usize, params: crate::reverb::ReverbParams) {
         self.requested[orbit.min(crate::scalar::MAX_ORBITS - 1)] = Some(params);
+    }
+
+    /// Asks for the room of `chain`: the last reverb a note of the turn
+    /// asks for, and a delay line when a note sends to a delay. A turn asks
+    /// for the rooms of as many chains as the output has buses.
+    fn request_room(
+        &mut self,
+        chain: u64,
+        reverb: Option<crate::reverb::ReverbParams>,
+        delay: bool,
+    ) {
+        if let Some(held) = self.rooms.iter_mut().find(|held| held.chain == chain) {
+            held.reverb = reverb.or(held.reverb);
+            held.delay |= delay;
+        } else if self.rooms.len() < crate::insert::MAX_INSERT_BUSES {
+            self.rooms.push(ChainRoomRequest {
+                chain,
+                reverb,
+                delay,
+            });
+        }
     }
 
     /// Observe one event without constructing an orbit impulse response.
@@ -45,17 +67,33 @@ impl LiveReverbBatch {
     /// scheduling window before generation publication.
     pub fn observe_prepared(&mut self, device: &LiveScalarDevice, event: &crate::AudioEvent) {
         self.observe_inserts(event);
-        if let Some(reverb) = event.controls.reverb {
-            self.request_orbit(
-                usize::from(event.controls.orbit),
-                crate::reverb::ReverbParams {
-                    ir: None,
-                    size_secs: reverb.size_secs,
-                    fade_secs: reverb.fade_secs,
-                    lp_start_hz: reverb.lp_start_hz,
-                    lp_end_hz: reverb.lp_end_hz,
-                },
-            );
+        let reverb = event
+            .controls
+            .reverb
+            .map(|reverb| crate::reverb::ReverbParams {
+                ir: None,
+                size_secs: reverb.size_secs,
+                fade_secs: reverb.fade_secs,
+                lp_start_hz: reverb.lp_start_hz,
+                lp_end_hz: reverb.lp_end_hz,
+            });
+        // The orbit keeps its reverb for a note through effects too: the
+        // note sends to its orbit while its chain has no room.
+        if let Some(params) = reverb {
+            self.request_orbit(usize::from(event.controls.orbit), params);
+        }
+        // A note through effects sends to the room of its chain, in front of
+        // the effects: see `ChainRoom`. A send of 0 asks for no room: the
+        // callback sends nothing for it.
+        let sent_reverb = event
+            .controls
+            .reverb
+            .filter(|reverb| reverb.wet > 0.0)
+            .and(reverb);
+        let delay = event.controls.delay.is_some_and(|delay| delay.wet != 0.0);
+        let effects = event.controls.effects.iter().any(Option::is_some);
+        if effects && !event.controls.piano && (sent_reverb.is_some() || delay) {
+            self.request_room(event.controls.insert_chain(), sent_reverb, delay);
         }
         for stage in event.controls.fx_stages.iter().flatten() {
             let Some(room) = stage.room else { continue };
@@ -103,12 +141,16 @@ impl LiveReverbBatch {
         batch.flush_inserts(device);
     }
 
-    /// Prepare and ship each requested reverb and logical insert slot.
+    /// Prepare and ship each requested reverb, room of a chain and logical
+    /// insert slot.
     pub fn flush(&mut self, device: &LiveScalarDevice) {
         for (orbit, request) in self.requested.iter_mut().enumerate() {
             if let Some(params) = request.take() {
                 device.ensure_reverb(orbit, params);
             }
+        }
+        for room in self.rooms.drain(..) {
+            device.ensure_chain_room(room.chain, room.reverb, room.delay);
         }
         self.flush_inserts(device);
     }
@@ -166,6 +208,77 @@ impl LiveReverbBatch {
         self.refused = 0;
         device.ship_plugin_pool();
         device.ship_send_lines(self.latency);
+    }
+}
+
+impl ChainRoomCache {
+    pub(super) fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            serial: 0,
+            budget: crate::scalar::MAX_CHAIN_ROOM_BYTES,
+        }
+    }
+
+    /// The bytes of the rooms shipped to the callback.
+    pub(super) fn bytes(&self) -> usize {
+        let entry =
+            |entry: &ChainRoomEntry| entry.reverb.map_or(0, |(_, bytes)| bytes) + entry.delay;
+        self.entries.iter().map(entry).sum()
+    }
+
+    /// The place of the entry of `chain`, made when the chain has none. A
+    /// full list drops an entry that holds no room for the new one, and a
+    /// list that holds a room in each entry gives none.
+    fn entry(&mut self, chain: u64) -> Option<usize> {
+        if let Some(at) = self.entries.iter().position(|entry| entry.chain == chain) {
+            return Some(at);
+        }
+        if self.entries.len() == 2 * crate::insert::MAX_INSERT_BUSES {
+            let empty = |entry: &ChainRoomEntry| entry.reverb.is_none() && entry.delay == 0;
+            let at = self.entries.iter().position(empty)?;
+            self.entries.swap_remove(at);
+        }
+        self.entries.push(ChainRoomEntry {
+            chain,
+            reverb: None,
+            delay: 0,
+            serial: 0,
+            refused: None,
+            no_bus: None,
+        });
+        Some(self.entries.len() - 1)
+    }
+
+    /// The callback gave `room` back. A room that left with its chain frees
+    /// its part of the budget. A refused room waits a second for its next
+    /// try. An older box than the last one shipped leaves the parts of the
+    /// room unknown: the last box may hold only the parts the room lacked,
+    /// so the next request ships each part again.
+    fn returned(&mut self, room: &crate::scalar::ChainRoom) {
+        let Some(at) = self
+            .entries
+            .iter()
+            .position(|entry| entry.chain == room.chain())
+        else {
+            return;
+        };
+        let entry = &mut self.entries[at];
+        match room.returned() {
+            crate::scalar::ChainRoomReturn::Merged => {}
+            _ if entry.serial != room.serial() => {
+                entry.reverb = None;
+                entry.delay = 0;
+            }
+            crate::scalar::ChainRoomReturn::Refused => {
+                entry.reverb = None;
+                entry.delay = 0;
+                entry.no_bus = Some(Instant::now());
+            }
+            crate::scalar::ChainRoomReturn::Released => {
+                self.entries.swap_remove(at);
+            }
+        }
     }
 }
 
@@ -267,6 +380,106 @@ impl LiveScalarDevice {
                 // Ring full: free and retry on a later batch.
                 // SAFETY: never left this thread; unique owner.
                 drop(unsafe { Box::from_raw(install.reverb) });
+            }
+        }
+    }
+
+    /// Makes sure the room of `chain` holds a reverb with `reverb` and a
+    /// delay line when `delay`, and ships the parts the room lacks: see
+    /// `crate::scalar::ChainRoom`. Producer-side and potentially SLOW, as
+    /// [`Self::ensure_reverb`]. A request the room holds already is a cache
+    /// hit. The rooms keep within [`crate::scalar::MAX_CHAIN_ROOM_BYTES`]
+    /// together. A part past the budget is not made, and neither is a room
+    /// while the ring is full or within a second after the callback found
+    /// no bus for it. The notes of the chain then send that part to their
+    /// orbit.
+    pub fn ensure_chain_room(
+        &self,
+        chain: u64,
+        reverb: Option<crate::reverb::ReverbParams>,
+        delay: bool,
+    ) {
+        self.reclaim_assets();
+        let mut cache = locked(&self.chain_room_cache);
+        let Some(at) = cache.entry(chain) else {
+            return;
+        };
+        let entry = cache.entries[at];
+        if entry
+            .no_bus
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        let new_reverb =
+            reverb.filter(|wanted| entry.reverb.is_none_or(|(held, _)| held != *wanted));
+        let new_delay = delay && entry.delay == 0;
+        let installs = &self.shared.samples.chain_room_installs;
+        if (new_reverb.is_none() && !new_delay) || installs.len() == installs.capacity() {
+            return;
+        }
+        // A new reverb takes the place of the reverb of the room, which goes
+        // back to be freed.
+        let freed = new_reverb.and(entry.reverb).map_or(0, |(_, bytes)| bytes);
+        let resident = cache.bytes().saturating_sub(freed);
+        let budget = cache.budget;
+        let line = crate::scalar::ChainRoom::delay_bytes(self.sample_rate);
+        let new_delay = new_delay && resident.saturating_add(line) <= budget;
+        let lines = if new_delay { line } else { 0 };
+        let fits = |bytes: usize| resident.saturating_add(lines + bytes) <= budget;
+        let mut refused = entry.refused;
+        let made = new_reverb.and_then(|wanted| {
+            let known = refused.filter(|(held, _)| *held == wanted);
+            if known.is_some_and(|(_, bytes)| !fits(bytes)) {
+                return None;
+            }
+            let reverb = Box::new(crate::reverb::OrbitReverb::generate_with_dispatch(
+                self.sample_rate,
+                wanted,
+                self.dispatch(),
+            ));
+            let bytes = reverb.approx_bytes();
+            if !fits(bytes) {
+                // Keep the size, or each later turn makes the room again.
+                refused = Some((wanted, bytes));
+                return None;
+            }
+            refused = None;
+            Some((wanted, bytes, reverb))
+        });
+        cache.entries[at].refused = refused;
+        if made.is_none() && !new_delay {
+            return;
+        }
+        // The serial only grows, so a box that comes back names the box
+        // the entry knows, or an older one.
+        cache.serial += 1;
+        let serial = cache.serial;
+        let (held, reverb) = match made {
+            Some((wanted, bytes, reverb)) => (Some((wanted, bytes)), Some(reverb)),
+            None => (entry.reverb, None),
+        };
+        let room = crate::scalar::ChainRoom::new(
+            chain,
+            serial,
+            reverb,
+            new_delay.then_some(self.sample_rate),
+        );
+        let install = crate::assets::ChainRoomInstall {
+            room: Box::into_raw(Box::new(room)),
+            sample_rate: self.sample_rate,
+        };
+        match installs.push(install) {
+            Ok(()) => {
+                let entry = &mut cache.entries[at];
+                entry.reverb = held;
+                entry.delay += lines;
+                entry.serial = serial;
+            }
+            Err(install) => {
+                // Only this thread fills the ring, and a place was free.
+                // SAFETY: never left this thread. Unique owner.
+                drop(unsafe { Box::from_raw(install.room) });
             }
         }
     }
@@ -684,6 +897,14 @@ impl LiveScalarDevice {
     }
 
     pub(super) fn reclaim_assets(&self) {
+        {
+            // A room the callback gave back changes what the producer knows
+            // of the room of its chain before the box is freed.
+            let mut rooms = locked(&self.chain_room_cache);
+            self.shared
+                .samples
+                .reclaim_chain_rooms(|room| rooms.returned(&room));
+        }
         let mut boxes = Vec::new();
         {
             // The drop of the device reclaims too, so a lock that a panic
@@ -933,6 +1154,12 @@ impl LiveScalarDevice {
             // SAFETY: the old callback joined. These lines have one owner.
             drop(unsafe { Box::from_raw(install.0) });
         }
+        // The rooms of the chains go with the backend. The next turn ships
+        // rooms to the new backend.
+        for install in self.shared.samples.chain_room_installs.drain_available() {
+            // SAFETY: the old callback joined. This unconsumed box has one owner.
+            drop(unsafe { Box::from_raw(install.room) });
+        }
         *self.send_lines_reach.get_mut() = 0;
         *self.send_lines_bytes.get_mut() = 0;
         if let Some(cell) = self.backend.take() {
@@ -955,6 +1182,7 @@ impl LiveScalarDevice {
             .lock()
             .expect("producer fx reverb cache")
             .clear();
+        locked(&self.chain_room_cache).entries.clear();
         locked(&self.insert_cache).clear();
         locked(&self.insert_waiting).clear();
         locked(&self.insert_released).clear();
@@ -1246,6 +1474,138 @@ mod tests {
         let recycled = device.memory();
         assert_eq!(recycled.reverbs, 0, "a fresh backend has none yet");
         assert_eq!(recycled.backend, opened.backend, "the same backend again");
+    }
+
+    /// The producer ships what the room of a chain lacks. The same request
+    /// ships nothing, and a new reverb ships alone, so the room keeps its
+    /// delay line. The memory report counts each part once. A room past the
+    /// budget is not made. A box the callback gives back with no bus for it
+    /// frees its part of the budget, and its chain waits before its next try.
+    /// A recycled backend holds no room.
+    #[test]
+    fn the_room_of_a_chain_ships_what_it_lacks_within_the_budget() {
+        let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+        device.silent.take().expect("silent callback").stop();
+        let small = crate::reverb::ReverbParams {
+            size_secs: 0.025,
+            fade_secs: 0.01,
+            lp_start_hz: 15_000.0,
+            lp_end_hz: 1_000.0,
+            ir: None,
+        };
+        let large = crate::reverb::ReverbParams {
+            size_secs: 0.5,
+            ..small
+        };
+        // The boxes on their way to the callback.
+        let take = |device: &LiveScalarDevice| -> Vec<Box<crate::scalar::ChainRoom>> {
+            let installs = device.shared.samples.chain_room_installs.drain_available();
+            // SAFETY: the callback is stopped. This thread owns the popped box.
+            installs
+                .map(|install| unsafe { Box::from_raw(install.room) })
+                .collect()
+        };
+        let line = crate::scalar::ChainRoom::delay_bytes(48_000);
+        device.ensure_chain_room(3, Some(small), true);
+        let first = take(&device);
+        assert_eq!(first.len(), 1);
+        let one = first[0].bytes();
+        assert!(one > line, "a reverb and a line");
+        assert_eq!(device.memory().reverbs, one);
+        device.ensure_chain_room(3, Some(small), true);
+        device.ensure_chain_room(3, None, true);
+        assert!(take(&device).is_empty(), "the same room");
+
+        device.ensure_chain_room(3, Some(large), true);
+        let mut second = take(&device);
+        assert_eq!(second.len(), 1);
+        let larger = second[0].bytes();
+        assert!(larger > one - line, "the larger reverb alone");
+        assert_eq!(device.memory().reverbs, larger + line);
+
+        locked(&device.chain_room_cache).budget = larger + line;
+        device.ensure_chain_room(4, Some(small), false);
+        assert!(take(&device).is_empty(), "past the budget");
+        assert_eq!(device.memory().reverbs, larger + line);
+
+        let refused = crate::scalar::ChainRoom::refuse(second.remove(0));
+        let returned = crate::assets::ReturnedChainRoom(Box::into_raw(refused));
+        let returns = &device.shared.samples.chain_room_returns;
+        assert!(returns.push(returned).is_ok());
+        device.ensure_chain_room(3, Some(large), true);
+        assert!(take(&device).is_empty(), "the chain with no bus waits");
+        assert_eq!(device.memory().reverbs, 0);
+        device.ensure_chain_room(4, Some(small), false);
+        let third = take(&device);
+        assert_eq!(third.len(), 1);
+        assert_eq!(device.memory().reverbs, third[0].bytes());
+
+        device.recycle_output().expect("recycle silent output");
+        assert_eq!(device.memory().reverbs, 0, "a fresh backend has no room");
+    }
+
+    /// A note through effects with a send of 0 ships no room: the callback
+    /// sends nothing to it, so the megabytes of a reverb would wait for
+    /// nothing. A send above 0 ships the room.
+    #[test]
+    fn a_send_of_zero_ships_no_room() {
+        let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+        device.silent.take().expect("silent callback").stop();
+        let mut controls = crate::OscillatorControls {
+            orbit: 1,
+            insert_chain: Some(3),
+            reverb: Some(crate::ReverbControls {
+                wet: 0.0,
+                size_secs: 0.025,
+                fade_secs: 0.01,
+                lp_start_hz: 15_000.0,
+                lp_end_hz: 1_000.0,
+                ir: None,
+            }),
+            delay: Some(crate::DelayControls {
+                wet: 0.0,
+                time_secs: 0.25,
+                feedback: 0.5,
+            }),
+            ..Default::default()
+        };
+        controls.effects[0] = Some(crate::insert::InsertControls::new(
+            crate::insert::InsertKey {
+                plugin: 1,
+                preset: 0,
+            },
+        ));
+        let shipped = |controls: crate::OscillatorControls| {
+            let event = AudioEvent {
+                onset_id: 1,
+                generation: device.generation(),
+                target_frame: device.clock_frames() + 4_800,
+                onset_lead: 0.0,
+                freq_hz: 220.0,
+                gain: 0.5,
+                duration_secs: 0.05,
+                ui_visuals: 0,
+                controls,
+                sample: None,
+                synth: None,
+                wavetable: None,
+                cut: None,
+            };
+            let mut batch = LiveReverbBatch::default();
+            batch.observe_prepared(&device, &event);
+            batch.flush(&device);
+            let installs = device.shared.samples.chain_room_installs.drain_available();
+            // SAFETY: the callback is stopped. This thread owns the popped box.
+            let rooms: Vec<Box<crate::scalar::ChainRoom>> = installs
+                .map(|install| unsafe { Box::from_raw(install.room) })
+                .collect();
+            rooms.len()
+        };
+        assert_eq!(shipped(controls.clone()), 0, "no send, no room");
+        if let Some(reverb) = controls.reverb.as_mut() {
+            reverb.wet = 0.3;
+        }
+        assert_eq!(shipped(controls), 1, "a room for the reverb");
     }
 
     /// More than eight room settings remain usable across repeated cache cycles.

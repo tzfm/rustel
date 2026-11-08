@@ -125,6 +125,9 @@ const INPUT_RETRY_MAX_SHIFT: u64 = 5;
 pub struct LiveReverbBatch {
     publication: Option<crate::KabelPublication>,
     requested: [Option<crate::reverb::ReverbParams>; crate::scalar::MAX_ORBITS],
+    /// The room each chain with effects asks for in this turn: see
+    /// [`crate::scalar::ChainRoom`].
+    rooms: Vec<ChainRoomRequest>,
     /// The last insert each slot asked for in this turn.
     inserts: Vec<(crate::insert::InsertSlot, crate::insert::InsertKey)>,
     refused: u64,
@@ -132,6 +135,48 @@ pub struct LiveReverbBatch {
     /// wait the send lines of the output hold. See
     /// [`crate::scalar::SendLines`].
     latency: u32,
+}
+
+/// The room the notes of one turn ask for a chain: see
+/// [`crate::scalar::ChainRoom`].
+#[derive(Clone, Copy)]
+struct ChainRoomRequest {
+    chain: u64,
+    /// The reverb of the last note of the chain with a reverb send.
+    reverb: Option<crate::reverb::ReverbParams>,
+    /// A note of the chain sends to a delay.
+    delay: bool,
+}
+
+/// What the producer shipped of the rooms of the chains: see
+/// [`LiveScalarDevice::ensure_chain_room`].
+struct ChainRoomCache {
+    entries: Vec<ChainRoomEntry>,
+    /// The number of the last box shipped. It only grows, so a box of a
+    /// closed output matches no entry.
+    serial: u64,
+    /// The most bytes the rooms may hold together:
+    /// [`crate::scalar::MAX_CHAIN_ROOM_BYTES`].
+    budget: usize,
+}
+
+/// What the producer knows of the room of one chain.
+#[derive(Clone, Copy)]
+struct ChainRoomEntry {
+    chain: u64,
+    /// The reverb the room holds, or will hold once its box arrives, and its
+    /// size in bytes.
+    reverb: Option<(crate::reverb::ReverbParams, usize)>,
+    /// The size of the delay line of the room in bytes, 0 with no line.
+    delay: usize,
+    /// The number of the last box shipped for the chain.
+    serial: u64,
+    /// A reverb the budget refused, and its size. The same request waits for
+    /// room in the budget, and the producer does not make it again.
+    refused: Option<(crate::reverb::ReverbParams, usize)>,
+    /// When the callback last found no bus for the room. The chain waits a
+    /// second before the next try.
+    no_bus: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -182,6 +227,8 @@ pub struct LiveScalarDevice {
     /// Recently shipped `.FX()` stage reverbs. The pointer identity lets the
     /// producer forget a fingerprint when the callback returns that box.
     fx_reverb_cache: std::sync::Mutex<Vec<(crate::reverb::ReverbParams, usize, usize)>>,
+    /// The rooms of the chains shipped to the callback, and their size.
+    chain_room_cache: std::sync::Mutex<ChainRoomCache>,
     kabel_cache: std::sync::Mutex<Vec<KabelReservation>>,
     program_cache: std::sync::Mutex<Vec<KabelProgramReservation>>,
     /// Shipped logical slots and box addresses, one entry for each copy the
@@ -271,7 +318,9 @@ pub struct LiveDeviceMemory {
     pub record: usize,
     /// The orbit and `.FX()` reverbs shipped to the callback, as they were
     /// measured when generated. A stage reverb the callback's budget
-    /// refuses is freed and not counted.
+    /// refuses is freed and not counted. The rooms of the plugin chains
+    /// count here too, with their delay lines: see
+    /// `crate::scalar::ChainRoom`.
     pub reverbs: usize,
     /// The send lines shipped to the callback for the plugin chains with
     /// latency: see [`crate::scalar::SendLines`]. The lines of a render are

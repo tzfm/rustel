@@ -82,6 +82,52 @@ fn plain_sample_voice(v: &Voice) -> bool {
         && v.ui_visuals == 0
 }
 
+/// The delay line of the room of the chain of `v`, when the delay send of
+/// the voice goes there: see [`ChainRoom`].
+#[inline]
+fn chain_delay_of<'a>(
+    rooms: &'a mut [Option<Box<ChainRoom>>],
+    v: &Voice,
+) -> Option<&'a mut OrbitDelay> {
+    let bus = v.insert_bus.filter(|_| v.chain_delay)?;
+    rooms.get_mut(bus)?.as_deref_mut()?.delay.as_mut()
+}
+
+/// The reverb sends of the room of the chain of `v`, when the reverb send of
+/// the voice goes there: see [`ChainRoom`].
+#[inline]
+fn chain_reverb_of<'a>(
+    rooms: &'a mut [Option<Box<ChainRoom>>],
+    v: &Voice,
+) -> Option<&'a mut [[f32; crate::reverb::REVERB_BLOCK]; 2]> {
+    let bus = v.insert_bus.filter(|_| v.chain_reverb)?;
+    let room = rooms.get_mut(bus)?.as_deref_mut()?;
+    room.reverb.is_some().then_some(&mut room.reverb_send)
+}
+
+/// Runs the room of the chain on `bus` for the sub-block of `frames`, once,
+/// when the chain has an output, and adds the room to `block`, the input of
+/// its effects: see [`ChainRoom::run`]. `run` marks each chain whose room
+/// ran in the sub-block.
+fn run_chain_room(
+    rooms: &mut [Option<Box<ChainRoom>>],
+    bus: usize,
+    effect_buses: u64,
+    block: &mut [[f32; crate::reverb::REVERB_BLOCK]; 2],
+    frames: usize,
+    sample_rate: u32,
+    run: &mut u64,
+) {
+    let bit = 1u64 << bus;
+    if effect_buses & bit == 0 || *run & bit != 0 {
+        return;
+    }
+    *run |= bit;
+    if let Some(room) = rooms.get_mut(bus).and_then(Option::as_deref_mut) {
+        room.run(block, frames, sample_rate);
+    }
+}
+
 /// The tight path a plain voice takes, one frame at a time.
 ///
 /// Kept out of line so it earns its own registers: the general body in
@@ -783,6 +829,9 @@ impl ScalarBackend {
         let ducks = &mut self.orbit_ducks;
         let pending_ducks = &mut self.pending_ducks;
         let reverbs = &mut self.orbit_reverbs;
+        let chain_rooms = &mut self.chain_rooms;
+        let chain_room_budget = self.chain_room_budget.0;
+        let chain_room_fallbacks = &mut self.chain_room_fallbacks;
         let insert_chains = &mut self.insert_chains;
         let insert_last_used = &mut self.insert_last_used;
         let insert_fade_from = &mut self.insert_fade_from;
@@ -1283,63 +1332,6 @@ impl ScalarBackend {
                     has_filters || e.controls.vowel.is_some(),
                     self.sample_rate as f32,
                 );
-                let reverb_wet = match e.controls.reverb {
-                    Some(reverb) if reverb.wet > 0.0 => {
-                        let orbit = (e.controls.orbit as usize).min(MAX_ORBITS - 1);
-                        // A custom IR whose sample is not decoded yet
-                        // falls back to the generated IR for THIS trigger
-                        // (never-die: no awaiting a fetch mid-render). The
-                        // LIVE path's producer installs generated-IR reverbs
-                        // only, so live strips the ir instead of playing dry.
-                        let ir = if allow_inline_reverb {
-                            reverb.ir.filter(|ir| bank.get(ir.sample).is_some())
-                        } else {
-                            None
-                        };
-                        let wanted = crate::reverb::ReverbParams {
-                            size_secs: reverb.size_secs,
-                            fade_secs: reverb.fade_secs,
-                            lp_start_hz: reverb.lp_start_hz,
-                            lp_end_hz: reverb.lp_end_hz,
-                            ir,
-                        };
-                        let installed = reverbs.get(orbit).and_then(|slot| slot.as_ref());
-                        if installed.is_some_and(|existing| {
-                            !allow_inline_reverb || existing.params() == wanted
-                        }) {
-                            reverb.wet
-                        } else if allow_inline_reverb {
-                            // Offline: synthesise at activation, on the
-                            // producer side of the pipeline.
-                            reverbs[orbit] = Some(Box::new(match ir {
-                                Some(params_ir) => match bank.get(params_ir.sample) {
-                                    Some(decoded) => crate::reverb::OrbitReverb::generate_custom_with_dispatch(
-                                        sample_rate,
-                                        wanted,
-                                        decoded,
-                                        dispatch,
-                                    ),
-                                    None => crate::reverb::OrbitReverb::generate_with_dispatch(
-                                        sample_rate,
-                                        crate::reverb::ReverbParams { ir: None, ..wanted },
-                                        dispatch,
-                                    ),
-                                },
-                                None => crate::reverb::OrbitReverb::generate_with_dispatch(sample_rate, wanted, dispatch),
-                            }));
-                            reverb.wet
-                        } else {
-                            // Live and not installed yet: this onset plays
-                            // dry; the producer's install lands for later
-                            // triggers. Never fatal.
-                            *missing_reverb_events += 1;
-                            pressure.orbit_reverb_misses =
-                                pressure.orbit_reverb_misses.saturating_add(1);
-                            0.0
-                        }
-                    }
-                    _ => 0.0,
-                };
                 // Takes the copy of a slot for what the note asks for. False
                 // means the slot does not hold the insert, and the note
                 // plays with no insert.
@@ -1469,6 +1461,66 @@ impl ScalarBackend {
                 }
                 let through_insert = order[0] != crate::insert::NO_STAGE;
                 let instrument = e.controls.instrument.filter(|wanted| serve(wanted, crate::insert::instrument_slot(chain)));
+                // The room of the chain takes the room and the delay of a note
+                // through its effects, in front of them: see `ChainRoom`. A
+                // part the chain has no room for goes to the orbit, and the
+                // note counts.
+                let room_bus = insert_bus.filter(|_| through_insert && !e.controls.piano);
+                let inline_room = allow_inline_reverb.then_some(InlineRoom {
+                    bank,
+                    sample_rate,
+                    dispatch,
+                    budget: chain_room_budget,
+                });
+                let mut room_missed = false;
+                let (reverb_wet, chain_reverb) = match e.controls.reverb {
+                    Some(reverb) if reverb.wet > 0.0 => {
+                        let orbit = (e.controls.orbit as usize).min(MAX_ORBITS - 1);
+                        // A custom IR whose sample is not decoded yet
+                        // falls back to the generated IR for THIS trigger
+                        // (never-die: no awaiting a fetch mid-render). The
+                        // LIVE path's producer installs generated-IR reverbs
+                        // only, so live strips the ir instead of playing dry.
+                        let ir = if allow_inline_reverb {
+                            reverb.ir.filter(|ir| bank.get(ir.sample).is_some())
+                        } else {
+                            None
+                        };
+                        let wanted = crate::reverb::ReverbParams {
+                            size_secs: reverb.size_secs,
+                            fade_secs: reverb.fade_secs,
+                            lp_start_hz: reverb.lp_start_hz,
+                            lp_end_hz: reverb.lp_end_hz,
+                            ir,
+                        };
+                        if room_bus.is_some_and(|bus| chain_room_takes_reverb(chain_rooms, bus, chain, wanted, inline_room.as_ref())) {
+                            (reverb.wet, true)
+                        } else {
+                            room_missed |= room_bus.is_some();
+                            let installed = reverbs.get(orbit).and_then(|slot| slot.as_ref());
+                            let wet = if installed.is_some_and(|existing| {
+                                !allow_inline_reverb || existing.params() == wanted
+                            }) {
+                                reverb.wet
+                            } else if allow_inline_reverb {
+                                // Offline: synthesise at activation, on the
+                                // producer side of the pipeline.
+                                reverbs[orbit] = Some(Box::new(inline_reverb(sample_rate, wanted, bank, dispatch)));
+                                reverb.wet
+                            } else {
+                                // Live and not installed yet: this onset plays
+                                // dry; the producer's install lands for later
+                                // triggers. Never fatal.
+                                *missing_reverb_events += 1;
+                                pressure.orbit_reverb_misses =
+                                    pressure.orbit_reverb_misses.saturating_add(1);
+                                0.0
+                            };
+                            (wet, false)
+                        }
+                    }
+                    _ => (0.0, false),
+                };
                 // The stages that serve the note, in signal order.
                 let instrument_stage = instrument.as_ref().map(|wanted| (crate::insert::instrument_slot(chain), wanted));
                 let stages = || instrument_stage.into_iter().chain(effects.into_iter().flatten());
@@ -1546,10 +1598,18 @@ impl ScalarBackend {
                     insert_outputs[bus] = usize::from(e.controls.orbit).min(MAX_ORBITS - 1);
                 }
                 let muted = e.sample.is_some_and(|sample| sample.muted);
-                let (delay_wet, orbit) = match e.controls.delay {
+                let (delay_wet, orbit, chain_delay) = match e.controls.delay {
                     Some(delay) => {
                         let orbit = (e.controls.orbit as usize).min(MAX_ORBITS - 1);
-                        let bus = &mut self.orbit_delays[orbit];
+                        // The delay of the chain takes the time and the
+                        // feedback of the note, as the delay of the orbit does.
+                        let line = room_bus.and_then(|bus| chain_room_delay(chain_rooms, bus, chain, inline_room.as_ref()));
+                        room_missed |= room_bus.is_some() && line.is_none() && delay.wet != 0.0;
+                        let chain_delay = line.is_some();
+                        let bus = match line {
+                            Some(line) => line,
+                            None => &mut self.orbit_delays[orbit],
+                        };
                         // Round, never truncate. The resolved time is f32,
                         // so 0.08 arrives as 3839.9999 frames and 0.15 as
                         // 7200.0003. A truncation leaves the first one
@@ -1563,13 +1623,16 @@ impl ScalarBackend {
                             .clamp(1, (self.sample_rate as usize).max(2) - 1);
                         bus.feedback = delay.feedback.clamp(0.0, 0.98);
                         bus.active = true;
-                        (delay.wet.abs(), orbit)
+                        (delay.wet.abs(), orbit, chain_delay)
                     }
                     // The voice's orbit routes its output mix (duck stage)
                     // as well as the delay send, so it is always the real
                     // orbit, also when the voice has no delay.
-                    None => (0.0, (e.controls.orbit as usize).min(MAX_ORBITS - 1)),
+                    None => (0.0, (e.controls.orbit as usize).min(MAX_ORBITS - 1), false),
                 };
+                if room_missed {
+                    *chain_room_fallbacks += 1;
+                }
                 if let Some(wanted) = instrument.filter(|_| !left_out)
                     && let Some(bus) = insert_bus
                 {
@@ -1876,6 +1939,8 @@ impl ScalarBackend {
                     reverb_wet,
                     through_insert,
                     insert_bus,
+                    chain_reverb,
+                    chain_delay,
                     dry_gain: e.controls.dry.unwrap_or(1.0),
                     kabel,
                     // Leased from the pool built at init. An exhausted pool
@@ -2104,9 +2169,12 @@ impl ScalarBackend {
                 }
                 // The sends of a note through effects with latency wait for
                 // its output in the send lines. With no lines, or with lines
-                // that do not reach that far, they go at once.
+                // that do not reach that far, they go at once. A send to the
+                // room of the chain goes through the effects, and waits in
+                // them.
                 if send_lead > 0
-                    && (voice.reverb_wet > 0.0 || voice.delay_wet > 0.0)
+                    && ((voice.reverb_wet > 0.0 && !voice.chain_reverb)
+                        || (voice.delay_wet > 0.0 && !voice.chain_delay))
                     && self.send_lines.as_ref().is_none_or(|lines| send_lead > lines.reach())
                 {
                     *early_sends += 1;
@@ -2212,14 +2280,20 @@ impl ScalarBackend {
         // capable of producing ModAdds can leave them untouched.
         let any_param_modulators = self.voices.iter().any(|voice| voice.has_param_modulators);
         // The chains with an output: the order has a stage, or voices still
-        // feed the chain. An empty order passes these voices dry.
+        // feed the chain, or its room still rings. An empty order passes
+        // these voices and the room dry.
         let effect_buses = effect_order
             .iter()
             .zip(insert_postgains.iter())
             .enumerate()
             .fold(0u64, |mask, (bus, (order, level))| {
-                let output =
-                    order[0] != crate::insert::NO_STAGE || level.unfed < INSERT_QUIET_FRAMES;
+                let rings = chain_rooms
+                    .get(bus)
+                    .and_then(Option::as_deref)
+                    .is_some_and(ChainRoom::rings);
+                let output = order[0] != crate::insert::NO_STAGE
+                    || level.unfed < INSERT_QUIET_FRAMES
+                    || rings;
                 mask | (u64::from(output) << bus)
             });
 
@@ -2283,9 +2357,13 @@ impl ScalarBackend {
             }
             let mut buses = effect_buses;
             while buses != 0 {
-                let buffer = &mut insert_blocks[buses.trailing_zeros() as usize];
+                let bus = buses.trailing_zeros() as usize;
+                let buffer = &mut insert_blocks[bus];
                 buffer[0][..sub_len].fill(0.0);
                 buffer[1][..sub_len].fill(0.0);
+                if let Some(room) = chain_rooms[bus].as_deref_mut() {
+                    room.clear_sends(sub_len);
+                }
                 buses &= buses - 1;
             }
             // An insert that renders ahead counts its own frames from the
@@ -3681,27 +3759,41 @@ impl ScalarBackend {
                                 let (send_left, send_right) = (left * send_gain, right * send_gain);
                                 let delay_wet = (v.delay_wet + mod_adds.delay_send).max(0.0);
                                 if delay_wet > 0.0 && v.delay_wet > 0.0 {
-                                    let send = [send_left * delay_wet, send_right * delay_wet];
-                                    match lines.as_deref_mut() {
-                                        Some(lines) => {
-                                            lines.add(v.orbit, DELAY_SEND, send_frame, send);
-                                        }
-                                        None => {
-                                            orbit_inputs[v.orbit][0] += send[0];
-                                            orbit_inputs[v.orbit][1] += send[1];
+                                    // The room of the chain takes the send in
+                                    // front of the effects, with no post gain:
+                                    // the chain applies it after them.
+                                    if let Some(line) = chain_delay_of(chain_rooms, v) {
+                                        line.block.input[0][i] += left * delay_wet;
+                                        line.block.input[1][i] += right * delay_wet;
+                                    } else {
+                                        let send = [send_left * delay_wet, send_right * delay_wet];
+                                        match lines.as_deref_mut() {
+                                            Some(lines) => {
+                                                lines.add(v.orbit, DELAY_SEND, send_frame, send);
+                                            }
+                                            None => {
+                                                orbit_inputs[v.orbit][0] += send[0];
+                                                orbit_inputs[v.orbit][1] += send[1];
+                                            }
                                         }
                                     }
                                 }
                                 let reverb_wet = (v.reverb_wet + mod_adds.room_send).max(0.0);
                                 if reverb_wet > 0.0 && v.reverb_wet > 0.0 {
-                                    let send = [send_left * reverb_wet, send_right * reverb_wet];
-                                    match lines {
-                                        Some(lines) => {
-                                            lines.add(v.orbit, REVERB_SEND, send_frame, send);
-                                        }
-                                        None => {
-                                            sends[v.orbit][0][i] += send[0];
-                                            sends[v.orbit][1][i] += send[1];
+                                    if let Some(room) = chain_reverb_of(chain_rooms, v) {
+                                        room[0][i] += left * reverb_wet;
+                                        room[1][i] += right * reverb_wet;
+                                    } else {
+                                        let send =
+                                            [send_left * reverb_wet, send_right * reverb_wet];
+                                        match lines {
+                                            Some(lines) => {
+                                                lines.add(v.orbit, REVERB_SEND, send_frame, send);
+                                            }
+                                            None => {
+                                                sends[v.orbit][0][i] += send[0];
+                                                sends[v.orbit][1][i] += send[1];
+                                            }
                                         }
                                     }
                                 }
@@ -3818,33 +3910,45 @@ impl ScalarBackend {
                                 // post-gain, so echoes keep the voice's stereo image.
                                 let delay_wet = (v.delay_wet + mod_adds.delay_send).max(0.0);
                                 if delay_wet > 0.0 && v.delay_wet > 0.0 {
-                                    let send = [
-                                        send_sample * lg * delay_wet,
-                                        send_sample * rg * delay_wet,
-                                    ];
-                                    match lines.as_deref_mut() {
-                                        Some(lines) => {
-                                            lines.add(v.orbit, DELAY_SEND, send_frame, send);
-                                        }
-                                        None => {
-                                            orbit_inputs[v.orbit][0] += send[0];
-                                            orbit_inputs[v.orbit][1] += send[1];
+                                    // As in the stereo branch, the room of the
+                                    // chain takes the send with no post gain.
+                                    if let Some(line) = chain_delay_of(chain_rooms, v) {
+                                        line.block.input[0][i] += sample * lg * delay_wet;
+                                        line.block.input[1][i] += sample * rg * delay_wet;
+                                    } else {
+                                        let send = [
+                                            send_sample * lg * delay_wet,
+                                            send_sample * rg * delay_wet,
+                                        ];
+                                        match lines.as_deref_mut() {
+                                            Some(lines) => {
+                                                lines.add(v.orbit, DELAY_SEND, send_frame, send);
+                                            }
+                                            None => {
+                                                orbit_inputs[v.orbit][0] += send[0];
+                                                orbit_inputs[v.orbit][1] += send[1];
+                                            }
                                         }
                                     }
                                 }
                                 let reverb_wet = (v.reverb_wet + mod_adds.room_send).max(0.0);
                                 if reverb_wet > 0.0 && v.reverb_wet > 0.0 {
-                                    let send = [
-                                        send_sample * lg * reverb_wet,
-                                        send_sample * rg * reverb_wet,
-                                    ];
-                                    match lines {
-                                        Some(lines) => {
-                                            lines.add(v.orbit, REVERB_SEND, send_frame, send);
-                                        }
-                                        None => {
-                                            sends[v.orbit][0][i] += send[0];
-                                            sends[v.orbit][1][i] += send[1];
+                                    if let Some(room) = chain_reverb_of(chain_rooms, v) {
+                                        room[0][i] += sample * lg * reverb_wet;
+                                        room[1][i] += sample * rg * reverb_wet;
+                                    } else {
+                                        let send = [
+                                            send_sample * lg * reverb_wet,
+                                            send_sample * rg * reverb_wet,
+                                        ];
+                                        match lines {
+                                            Some(lines) => {
+                                                lines.add(v.orbit, REVERB_SEND, send_frame, send);
+                                            }
+                                            None => {
+                                                sends[v.orbit][0][i] += send[0];
+                                                sends[v.orbit][1][i] += send[1];
+                                            }
                                         }
                                     }
                                 }
@@ -3890,8 +3994,15 @@ impl ScalarBackend {
                                 if abs & 127 == 0 {
                                     djf_mods[v.orbit] += mod_adds.djf;
                                 }
-                                delay_time_mods[v.orbit] += mod_adds.delay_time;
-                                delay_feedback_mods[v.orbit] += mod_adds.delay_feedback;
+                                // A voice that sends to the delay of its
+                                // chain moves that delay.
+                                if let Some(line) = chain_delay_of(chain_rooms, v) {
+                                    line.block.time_mod[i] += mod_adds.delay_time;
+                                    line.block.feedback_mod[i] += mod_adds.delay_feedback;
+                                } else {
+                                    delay_time_mods[v.orbit] += mod_adds.delay_time;
+                                    delay_feedback_mods[v.orbit] += mod_adds.delay_feedback;
+                                }
                             }
                         }
                     };
@@ -4136,9 +4247,27 @@ impl ScalarBackend {
                     }
                 };
             let mut pending = [None; crate::insert::MAX_INSERT_BUSES];
+            // The room of each chain runs once its sends are in, before its
+            // effects: see `ChainRoom`. The chains whose room ran.
+            let mut rooms_run = 0u64;
             // Native chains can run while instruments produce their input.
             for (bus, pending) in pending.iter_mut().enumerate() {
-                if submitted & (1u64 << bus) != 0 && instrument_to_effect[bus] {
+                let waits = submitted & (1u64 << bus) != 0 && instrument_to_effect[bus];
+                // An instrument through the effects sends to the room of its
+                // chain too, so that room runs after the instrument.
+                if !(waits && effect_order[bus][0] != crate::insert::NO_STAGE) {
+                    let block = &mut insert_blocks[bus];
+                    run_chain_room(
+                        chain_rooms,
+                        bus,
+                        effect_buses,
+                        block,
+                        sub_len,
+                        sample_rate,
+                        &mut rooms_run,
+                    );
+                }
+                if waits {
                     continue;
                 }
                 *pending = start_effects(
@@ -4257,6 +4386,10 @@ impl ScalarBackend {
                         (change.bus, change.frame) < (bus, start + sub_start as u64)
                     });
                     let mut taken = first;
+                    // The room of the chain of an instrument through its
+                    // effects takes the sends of the instrument: see
+                    // `ChainRoom`.
+                    let mut room = chain_rooms[bus].as_deref_mut().filter(|_| through_effect);
                     for (i, (left, right)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
                         let frame = start + (sub_start + i) as u64;
                         while let Some(change) = instrument_gain_changes.get(taken)
@@ -4332,10 +4465,36 @@ impl ScalarBackend {
                         };
                         let send_left = *left * (level * postgain);
                         let send_right = *right * (level * postgain);
-                        instrument_reverb_sends[bus][0][i] = send_left * reverb_wet;
-                        instrument_reverb_sends[bus][1][i] = send_right * reverb_wet;
-                        instrument_delay_sends[bus][0][i] = send_left * delay_wet;
-                        instrument_delay_sends[bus][1][i] = send_right * delay_wet;
+                        // The room takes the sends in front of the effects,
+                        // with no post gain: the chain applies it after them.
+                        // The sends of the instrument move from note to note,
+                        // so the part the room holds takes them, also the ramp
+                        // of a note with no send.
+                        let input = [*left * level, *right * level];
+                        match room.as_deref_mut().filter(|room| room.reverb.is_some()) {
+                            Some(room) => {
+                                room.reverb_send[0][i] += input[0] * reverb_wet;
+                                room.reverb_send[1][i] += input[1] * reverb_wet;
+                                instrument_reverb_sends[bus][0][i] = 0.0;
+                                instrument_reverb_sends[bus][1][i] = 0.0;
+                            }
+                            None => {
+                                instrument_reverb_sends[bus][0][i] = send_left * reverb_wet;
+                                instrument_reverb_sends[bus][1][i] = send_right * reverb_wet;
+                            }
+                        }
+                        match room.as_deref_mut().and_then(|room| room.delay.as_mut()) {
+                            Some(line) => {
+                                line.block.input[0][i] += input[0] * delay_wet;
+                                line.block.input[1][i] += input[1] * delay_wet;
+                                instrument_delay_sends[bus][0][i] = 0.0;
+                                instrument_delay_sends[bus][1][i] = 0.0;
+                            }
+                            None => {
+                                instrument_delay_sends[bus][0][i] = send_left * delay_wet;
+                                instrument_delay_sends[bus][1][i] = send_right * delay_wet;
+                            }
+                        }
                         if through_effect {
                             // On a chain whose newest note has an output
                             // lead, a note gives its level at its output:
@@ -4368,6 +4527,16 @@ impl ScalarBackend {
                         0
                     };
                     if through_effect {
+                        let block = &mut insert_blocks[bus];
+                        run_chain_room(
+                            chain_rooms,
+                            bus,
+                            effect_buses,
+                            block,
+                            sub_len,
+                            sample_rate,
+                            &mut rooms_run,
+                        );
                         pending[bus] = start_effects(
                             bus,
                             effects,
@@ -4440,43 +4609,11 @@ impl ScalarBackend {
                     continue;
                 }
                 let (left, right) = block.split_at_mut(1);
-                for (i, (left, right)) in left[0][..sub_len]
-                    .iter_mut()
-                    .zip(&mut right[0][..sub_len])
-                    .enumerate()
-                {
-                    // WebAudio cycles carry an implicit render-quantum (128
-                    // frames) of extra latency on the FEEDBACK edge, so the n-th
-                    // echo lands at n·time + (n−1)·128 frames. The line stores
-                    // the delay INPUT stream: out(t) = in(t−D), and the feedback
-                    // term re-injects out delayed by one quantum
-                    // (in(t−D−128)·feedback).
-                    const FEEDBACK_QUANTUM: usize = 128;
-                    let delay_frames =
-                        bus.time_frames as f32 + bus.block.time_mod[i] * self.sample_rate as f32;
-                    let out_left = OrbitDelay::read(&bus.left, bus.write, delay_frames);
-                    let out_right = OrbitDelay::read(&bus.right, bus.write, delay_frames);
-                    *left += out_left;
-                    *right += out_right;
-
-                    let feedback_left = OrbitDelay::read(
-                        &bus.left,
-                        bus.write,
-                        delay_frames + FEEDBACK_QUANTUM as f32,
-                    );
-                    let feedback_right = OrbitDelay::read(
-                        &bus.right,
-                        bus.write,
-                        delay_frames + FEEDBACK_QUANTUM as f32,
-                    );
-                    // Each voice adds its modulator sum. A feedback above 1
-                    // makes the delay line grow without limit.
-                    let feedback = (bus.feedback + bus.block.feedback_mod[i]).clamp(-1.0, 1.0);
-                    bus.store(
-                        bus.block.input[0][i] + feedback * feedback_left,
-                        bus.block.input[1][i] + feedback * feedback_right,
-                    );
-                }
+                bus.run_block(
+                    &mut left[0][..sub_len],
+                    &mut right[0][..sub_len],
+                    self.sample_rate,
+                );
             }
             for (orbit, slot) in reverbs.iter_mut().enumerate() {
                 if let Some(reverb) = slot {
@@ -4533,6 +4670,23 @@ impl ScalarBackend {
                         effect_mixes[slot] = job.mixes[stage];
                     }
                 }
+            }
+            // A chain whose effects did not start in this sub-block passes its
+            // input dry, and its room joins that input here.
+            let mut buses = effect_buses & !rooms_run;
+            while buses != 0 {
+                let bus = buses.trailing_zeros() as usize;
+                buses &= buses - 1;
+                let block = &mut insert_blocks[bus];
+                run_chain_room(
+                    chain_rooms,
+                    bus,
+                    effect_buses,
+                    block,
+                    sub_len,
+                    sample_rate,
+                    &mut rooms_run,
+                );
             }
             // Preserve bus order when independent chains join an orbit.
             let mut buses = effect_buses;
@@ -4662,6 +4816,7 @@ impl ScalarBackend {
         self.frame = end;
         if self.allow_inline_reverb {
             self.retired_inserts.clear();
+            self.retired_chain_rooms.clear();
         }
         self.reclaim_insert_chains();
     }

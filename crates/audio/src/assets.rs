@@ -225,6 +225,29 @@ pub(crate) struct ReturnedSendLines(pub *mut crate::scalar::SendLines);
 unsafe impl Send for SendLineInstall {}
 unsafe impl Send for ReturnedSendLines {}
 
+/// The room of a chain on its way to the callback, with the same baton
+/// discipline as a reverb: see [`crate::scalar::ChainRoom`]. The box names
+/// its chain.
+#[derive(Clone, Copy)]
+pub(crate) struct ChainRoomInstall {
+    pub room: *mut crate::scalar::ChainRoom,
+    /// The rate the room was made for. An output at another rate gives the
+    /// room back.
+    pub sample_rate: u32,
+}
+
+/// A room the callback gave back, on its way to be freed: the parts a room
+/// gave up, a room the callback refused, or the room of a chain that left
+/// its bus. The box says which.
+#[derive(Clone, Copy)]
+pub(crate) struct ReturnedChainRoom(pub *mut crate::scalar::ChainRoom);
+
+// SAFETY: same SPSC baton pass: the producer boxes the room, the callback
+// takes it and gives back each box it does not keep, and the producer frees
+// those. One side owns each box at a time. `ChainRoom` is `Send`.
+unsafe impl Send for ChainRoomInstall {}
+unsafe impl Send for ReturnedChainRoom {}
+
 const KABEL_RETIRING: usize = 1 << (usize::BITS - 1);
 
 /// Keeps prepared graph programs alive until a scheduling window has been
@@ -321,6 +344,10 @@ pub(crate) struct SampleChannel {
     /// lines they replaced on their way back.
     pub send_line_installs: AssetRing<SendLineInstall>,
     pub send_line_returns: AssetRing<ReturnedSendLines>,
+    /// A place for each bus: the rooms of the chains on their way to the
+    /// callback, and the rooms it gives back.
+    pub chain_room_installs: AssetRing<ChainRoomInstall>,
+    pub chain_room_returns: AssetRing<ReturnedChainRoom>,
     /// Stage reverbs refused by the install queue or callback byte budget.
     pub fx_reverb_refusals: AtomicU64,
     pub insert_refusals: AtomicU64,
@@ -368,6 +395,8 @@ impl SampleChannel {
             pool_installs: AssetRing::with_capacity(1),
             send_line_installs: AssetRing::with_capacity(1),
             send_line_returns: AssetRing::with_capacity(1),
+            chain_room_installs: AssetRing::with_capacity(crate::insert::MAX_INSERT_BUSES),
+            chain_room_returns: AssetRing::with_capacity(crate::insert::MAX_INSERT_BUSES),
             fx_reverb_refusals: AtomicU64::new(0),
             insert_refusals: AtomicU64::new(0),
             kabel_installs: AssetRing::new(),
@@ -413,10 +442,13 @@ impl SampleChannel {
         returned_program: impl FnMut(*mut PreparedKabelProgram),
     ) {
         self.reclaim_with_inserts(returned_fx, returned_kabel, returned_program, drop);
+        self.reclaim_chain_rooms(drop);
     }
 
     /// Like [`Self::reclaim_with_programs`], and `returned_insert` takes each
-    /// insert the callback gave back. The caller frees it.
+    /// insert the callback gave back. The caller frees it. The rooms of the
+    /// chains stay in their ring for [`Self::reclaim_chain_rooms`]: the
+    /// producer that ships them keeps the books of their budget there.
     pub fn reclaim_with_inserts(
         &self,
         mut returned_fx: impl FnMut(*mut crate::reverb::OrbitReverb),
@@ -456,6 +488,19 @@ impl SampleChannel {
         while let Some(returned) = self.send_line_returns.pop() {
             // SAFETY: same pass for send lines the callback replaced.
             drop(unsafe { Box::from_raw(returned.0) });
+        }
+    }
+
+    /// Producer side: `returned` takes each room the callback gave back and
+    /// frees it. Call it from the producer thread only, as
+    /// [`Self::reclaim`].
+    pub(crate) fn reclaim_chain_rooms(
+        &self,
+        mut returned: impl FnMut(Box<crate::scalar::ChainRoom>),
+    ) {
+        while let Some(room) = self.chain_room_returns.pop() {
+            // SAFETY: same pass for the rooms the callback did not keep.
+            returned(unsafe { Box::from_raw(room.0) });
         }
     }
 }
@@ -499,6 +544,10 @@ impl Drop for SampleChannel {
         while let Some(install) = self.send_line_installs.pop() {
             // SAFETY: never reached the consumer. Unique ownership here.
             drop(unsafe { Box::from_raw(install.0) });
+        }
+        while let Some(install) = self.chain_room_installs.pop() {
+            // SAFETY: never reached the consumer. Unique ownership here.
+            drop(unsafe { Box::from_raw(install.room) });
         }
     }
 }

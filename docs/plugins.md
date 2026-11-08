@@ -204,8 +204,17 @@ it leaves the output.
   same orbit. One pattern used again in the same lane shares its copies.
 - `gain` sets the level before the effects. `postgain` sets the level after
   the chain.
-- `lpf`, `hpf`, `bpf`, `pan`, `room` and `delay` act on the instrument output,
-  before the effects. The last note sets them for the shared instrument.
+- `lpf`, `hpf`, `bpf` and `pan` act on the instrument output, before the
+  effects. The last note sets them for the shared instrument.
+- Everything before `.vst()` goes through the plugin, also `room` and
+  `delay`. Each chain has a reverb and a delay of its own, in front of its
+  effects, so the plugin processes the reverb and the echoes with the dry
+  sound: in `s("bd").room(.3).delay(.5).vst("bitcrush", { mix: 1 })` the
+  bitcrusher crushes the tail too. The last note of the chain sets
+  `roomsize`, `roomfade`, `roomlp`, `roomdim`, `delaytime`, `delayfeedback`
+  and `delaysync` for the chain, as the last note of an orbit does for the
+  orbit. An instrument with no `.vst()` effect sends `room` and `delay` to
+  its orbit, after `postgain`.
 - A note with a new level or a new pan moves the value in 5 ms while the
   notes before still sound.
 - The plugin output joins the orbit before the orbit fader, the DJ filter and
@@ -366,7 +375,18 @@ a prebake, an import or a name the score computes stays loaded. A plugin
 call in a tab names its plugin, also with a part of the name. Another string
 names a plugin only with its whole name, as in `const fx = 'ott'`.
 
-The `room` and `delay` sends of a note through effects with latency wait in
+The reverb and the delay of a chain sit in front of its effects, so the
+reverb and the echoes go through the latency of the effects with the dry
+sound. A chain with `room` holds a reverb of its own: 7 MiB at the default
+`roomsize` of 2, 25 MiB at a `roomsize` of 6. A chain with `delay` holds a
+delay line of 1 second: 375 KiB at 48 kHz. The memory viewer counts them
+with the reverbs, and they go with the chain. The reverbs and the delay lines
+of the chains hold 128 MiB at most together, in play and in an export. A
+chain past that, or a chain whose reverb is not ready yet, sends its notes
+to the reverb and the delay of the orbit, after `postgain`, and the plugin
+does not process them.
+
+Such `room` and `delay` sends of a note through effects with latency wait in
 send lines of the output, so they reach the orbit with the output of the
 chain. The level of a note whose post gain moves waits in them too. The
 lines take the size of the largest latency of the effects of a chain that
@@ -624,10 +644,11 @@ other presets of its plugin until its copy is ready.
 
 - A plugin shows no window. Activate a plugin with a licence window in a
   different host first.
-- On a chain with latency, a `bus` send, the `delaytime`, `delayfeedback` and
-  `djf` of its orbit, the voice limit and a modulator on `postgain` act early
-  by the latency of the chain. The `scope` and `spectrum` of its lane show its
-  notes early by that latency.
+- On a chain with latency, a `bus` send, the `djf` of its orbit, the voice
+  limit and a modulator on `postgain` act early by the latency of the chain.
+  So do the `delaytime` and the `delayfeedback` of its orbit when the chain
+  sends to its orbit for want of a delay of its own. The `scope` and
+  `spectrum` of its lane show its notes early by that latency.
 - When a chain that sounds changes a plugin with latency, in play and in a
   render, the sound of the chain has a gap up to that latency.
 - In the async mode, rustel knows the latency of a plugin once its first copy
