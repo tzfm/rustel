@@ -903,7 +903,14 @@ impl App {
                         if diagnostic.kind == "gamepad" {
                             self.toast(diagnostic.message.clone());
                         }
-                        self.status = diagnostic.message;
+                        self.status = if diagnostic.kind == "sample-failed" {
+                            status_sample_failure(
+                                &diagnostic.message,
+                                self.ui_settings.show_full_paths,
+                            )
+                        } else {
+                            diagnostic.message
+                        };
                     }
                     (StudioDiagnosticLevel::Info, _) => {
                         self.log.push_with(
@@ -2252,6 +2259,42 @@ mod tests {
                     .all(|line| line.level == LogLevel::Info && line.text.contains("[hap] "))
             );
             assert_eq!(app.status, "ready", "the status line keeps its own words");
+        }
+
+        /// A local sound that failed to load is named by its file on the
+        /// status line, so the reason is not pushed off it. The Log and the
+        /// full paths setting keep the whole URL.
+        #[test]
+        fn a_failed_local_sample_is_named_by_its_file_on_the_status_line() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let reason = "1335 MB is over the 128 MB video limit - raise biggest video in Settings";
+            let message = format!("file:///Users/player/Downloads/long take [1].webm: {reason}");
+            let failed = || {
+                StudioControlEvent::Diagnostic(crate::engine::StudioDiagnostic::message(
+                    "sample-failed",
+                    message.clone(),
+                ))
+            };
+
+            app.handle_control(failed());
+            assert_eq!(app.status, format!("long take [1].webm: {reason}"));
+            assert_eq!(
+                app.log.lines().back().map(|line| line.text.as_str()),
+                Some(message.as_str()),
+                "the Log keeps the whole URL"
+            );
+
+            app.ui_settings.show_full_paths = true;
+            app.handle_control(failed());
+            assert_eq!(app.status, message);
+
+            let remote = "https://host/kits/kick.wav: connection refused";
+            app.ui_settings.show_full_paths = false;
+            app.handle_control(StudioControlEvent::Diagnostic(
+                crate::engine::StudioDiagnostic::message("sample-failed", remote),
+            ));
+            assert_eq!(app.status, remote, "a remote address stays whole");
         }
 
         #[test]

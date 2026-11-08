@@ -362,6 +362,26 @@ pub(super) fn status_sample_source_error(spec: &str, reason: &str, full: bool) -
     }
 }
 
+/// A sound that failed to load is said as its URL, then why. A local file
+/// keeps only its file name on the status line, as saved files do, so the
+/// reason fits the line; the Log keeps the whole URL. Any other shape is
+/// shown as it came.
+pub(super) fn status_sample_failure(message: &str, full: bool) -> String {
+    if full {
+        return message.to_owned();
+    }
+    match message
+        .strip_prefix("file://")
+        .and_then(|rest| rest.split_once(": "))
+    {
+        Some((path, reason)) => format!(
+            "{}: {reason}",
+            status_file_path(std::path::Path::new(path), false)
+        ),
+        None => message.to_owned(),
+    }
+}
+
 impl App {
     /// Show the report already observed for this import. A local scan can
     /// finish before adoption returns, so its receipt must not wait for a

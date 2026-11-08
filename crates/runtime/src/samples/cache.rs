@@ -906,7 +906,7 @@ pub(crate) fn fetch_located(url: &str) -> Result<Vec<u8>, String> {
         if let Some(length) = length
             && length > ceiling as u64
         {
-            return Err(limit.refusal(path, Some(length)));
+            return Err(limit.refusal(Some(length)));
         }
         // The read stays bounded, because the reported length is not
         // reliable: a pipe or a device reports none (`/dev/zero` reports
@@ -925,7 +925,7 @@ pub(crate) fn fetch_located(url: &str) -> Result<Vec<u8>, String> {
         if bytes.len() > ceiling {
             // The reader stopped at the ceiling, so this one cannot say the
             // size: nothing measured it, which is the point.
-            return Err(limit.refusal(path, None));
+            return Err(limit.refusal(None));
         }
         return Ok(bytes);
     }

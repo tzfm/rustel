@@ -260,7 +260,7 @@ use replay_tabs::SetStash;
 use sample_import::dropped_paths;
 use sample_sources::{
     ShippedSource, SourceMeasurement, SourceRefresh, UserSource, sample_source_folder,
-    status_sample_source, status_sample_source_error,
+    status_sample_failure, status_sample_source, status_sample_source_error,
 };
 use sessions::TAPE_GESTURE_SETTLE;
 use sets::{SetPrompt, SetSwitch};

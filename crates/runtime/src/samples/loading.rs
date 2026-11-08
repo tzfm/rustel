@@ -1805,7 +1805,7 @@ pub(super) mod tests {
             let error =
                 fetch_located("file:///dev/zero").expect_err("an endless file must be refused");
             assert!(
-                error.contains("the most one sound can hold"),
+                error.contains(" sound limit"),
                 "the refusal did not name the size limit: {error}"
             );
             // And it says the ceiling in the units a reader thinks in, so a
@@ -1828,7 +1828,7 @@ pub(super) mod tests {
                 .expect("fixture");
             let error = fetch_located(&format!("file://{}", big.display()))
                 .expect_err("a file past the ceiling must be refused");
-            assert!(error.contains("past the"), "{error}");
+            assert!(error.contains(" is over the "), "{error}");
             assert!(
                 error.contains(&rustel_audio::format_sample_bytes(
                     rustel_audio::MIN_SAMPLE_PCM_BYTES + 1

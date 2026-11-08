@@ -70,20 +70,22 @@ impl FileLimit {
         if self.video { "video" } else { "sample" }
     }
 
-    /// Why `name` is refused. `size` is the file's own length, or `None`
-    /// when the read stopped at the limit and nothing measured it.
-    pub(crate) fn refusal(self, name: &str, size: Option<u64>) -> String {
+    /// Why the file is refused, without naming it: every caller names the
+    /// file in front of this, and a path said twice pushed the reason off
+    /// the line. `size` is the file's own length, or `None` when the read
+    /// stopped at the limit and nothing measured it.
+    pub(crate) fn refusal(self, size: Option<u64>) -> String {
         let limit = rustel_audio::format_sample_bytes(self.bytes);
-        let holder = if self.video { "one video" } else { "one sound" };
+        let kind = if self.video { "video" } else { "sound" };
         let refusal = match size {
             Some(size) => format!(
-                "{name} is {}, past the {limit} {holder} can hold",
+                "{} is over the {limit} {kind} limit",
                 rustel_audio::format_sample_bytes(usize::try_from(size).unwrap_or(usize::MAX))
             ),
-            None => format!("{name} is over {limit}, the most {holder} can hold"),
+            None => format!("over the {limit} {kind} limit"),
         };
         if self.video {
-            format!("{refusal}. Raise biggest video in Settings to load it")
+            format!("{refusal} - raise biggest video in Settings")
         } else {
             refusal
         }
@@ -98,17 +100,14 @@ mod tests {
     fn a_video_file_names_the_setting_that_raises_its_limit() {
         let video = FileLimit::of("file:///clips/take.MOV");
         assert_eq!(video.kind(), "video");
-        let refusal = video.refusal("take.MOV", Some(3 << 30));
-        assert!(refusal.contains("one video can hold"), "{refusal}");
+        let refusal = video.refusal(Some(3 << 30));
+        assert!(refusal.starts_with("3072 MB is over the "), "{refusal}");
         assert!(
-            refusal.ends_with("Raise biggest video in Settings to load it"),
+            refusal.ends_with(" video limit - raise biggest video in Settings"),
             "{refusal}"
         );
-        assert!(
-            FileLimit::of("https://host/clip.webm?v=2")
-                .refusal("clip.webm", None)
-                .contains("the most one video can hold")
-        );
+        let unmeasured = FileLimit::of("https://host/clip.webm?v=2").refusal(None);
+        assert!(unmeasured.starts_with("over the "), "{unmeasured}");
     }
 
     #[test]
@@ -116,8 +115,8 @@ mod tests {
         let sound = FileLimit::of("file:///kits/kick.wav");
         assert_eq!(sound.kind(), "sample");
         assert_eq!(sound.bytes, rustel_audio::sample_pcm_ceiling());
-        let refusal = sound.refusal("kick.wav", None);
-        assert!(refusal.contains("the most one sound can hold"), "{refusal}");
+        let refusal = sound.refusal(None);
+        assert!(refusal.ends_with(" sound limit"), "{refusal}");
         assert!(!refusal.contains("Settings"), "{refusal}");
     }
 
@@ -135,13 +134,9 @@ mod tests {
             rustel_audio::MIN_SAMPLE_PCM_BYTES
         );
         let refusal = crate::samples::fetch_located(&url).expect_err("past the ceiling");
-        assert!(
-            refusal.contains("5.0 MB, past the 4.0 MB one video can hold"),
-            "{refusal}"
-        );
-        assert!(
-            refusal.contains("Raise biggest video in Settings"),
-            "{refusal}"
+        assert_eq!(
+            refusal, "5.0 MB is over the 4.0 MB video limit - raise biggest video in Settings",
+            "the loader names the file in front of the reason, so the reason does not"
         );
 
         set_video_file_ceiling(8 << 20);

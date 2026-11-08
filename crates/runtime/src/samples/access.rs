@@ -394,7 +394,7 @@ pub(super) fn fetch_score_source_with_budget(
                 // setting raises it.
                 let own = FileLimit::of(url);
                 return Err(if own.bytes == limit {
-                    own.refusal(&path.display().to_string(), Some(len))
+                    own.refusal(Some(len))
                 } else {
                     format!("{} exceeds the sample size limit", path.display())
                 });
