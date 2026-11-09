@@ -129,6 +129,9 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     /// queries - see [`crate::purity::Purity::volatile`]. What a body that
     /// reads mutable host state at query time calls on its result.
     fn mark_volatile(&self) -> Self;
+    /// Declare that this pattern reads the default voicing dictionary - see
+    /// [`crate::purity::Purity::host_voicings`].
+    fn mark_host_voicings(&self) -> Self;
     fn discrete_only(&self) -> Self;
     fn onsets_only(&self) -> Self;
     fn remove_undefineds(&self) -> Self;
@@ -378,6 +381,9 @@ impl PatOps for Pattern {
     }
     fn mark_volatile(&self) -> Self {
         Pattern::mark_volatile(self)
+    }
+    fn mark_host_voicings(&self) -> Self {
+        Pattern::mark_host_voicings(self)
     }
     fn discrete_only(&self) -> Self {
         Pattern::discrete_only(self)
@@ -657,6 +663,9 @@ impl PatOps for PurePattern {
     }
     fn mark_volatile(&self) -> Self {
         PurePattern::assert_pure(self.pattern().mark_volatile())
+    }
+    fn mark_host_voicings(&self) -> Self {
+        PurePattern::assert_pure(self.pattern().mark_host_voicings())
     }
     fn discrete_only(&self) -> Self {
         PurePattern::assert_pure(self.pattern().discrete_only())

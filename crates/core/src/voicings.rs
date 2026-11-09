@@ -988,8 +988,9 @@ pub fn root_notes<P: crate::ops::PatOps>(pat: &P, octave: Value) -> P {
 /// `{note, ...rest}` (rest = value minus the voicing controls), exactly
 /// `stack(...notes).note().set(rest)` + outerJoin.
 pub fn voicing<P: crate::ops::PatOps>(pat: &P) -> P {
-    // A host-owned dictionary is refreshed in place at query entry, so the
-    // answer can move without any settings snapshot changing: volatile.
+    // A host-owned default dictionary is refreshed in place at query entry,
+    // so while one is selected the answer can move without any settings
+    // snapshot changing.
     let voiced = pat.expand_pitch_haps_native(|hap| {
         // A plain string value is `{chord: value}`.
         let owned;
@@ -1041,7 +1042,7 @@ pub fn voicing<P: crate::ops::PatOps>(pat: &P) -> P {
             })
             .collect()
     });
-    voiced.mark_volatile()
+    voiced.mark_host_voicings()
 }
 
 /// Every chord symbol a dictionary knows, sorted by name.

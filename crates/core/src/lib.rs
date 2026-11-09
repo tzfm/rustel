@@ -1883,7 +1883,7 @@ impl ConstructionMemo {
         // can hand a graph its own ancestor as a value, and keeping that
         // would tie the cycle no worklist can take apart.
         let keep = plain_key(value)
-            && !built.pattern().purity().volatile
+            && !built.pattern().is_volatile()
             && !query_error_pending()
             && !budget_exhausted();
         if keep {
@@ -3929,6 +3929,59 @@ fn pick_property_key(value: &Value) -> String {
     }
 }
 
+/// The haps of `pattern.late(by)` inside `part`, from the tables of
+/// `pattern`, or `None` to leave them to the graph.
+///
+/// The graph asks the moved pattern over the whole query span and keeps what
+/// meets `part`. Tables answer a span as the clip of a wider one, so asking
+/// them over `part` alone gives the same haps in the same order. They answer
+/// only when the walk of the whole span stays within every limit, two levels
+/// down, so a refusal stays the graph's.
+fn restarted_from_tables(
+    pattern: &Pattern,
+    by: Fraction,
+    state: &State,
+    part: TimeSpan,
+) -> Option<Vec<Hap>> {
+    if query_error_pending()
+        || budget_exhausted()
+        || cancellation_requested()
+        || query_deadline_expired()
+    {
+        return None;
+    }
+    // The moved pattern, then `pattern` below it.
+    let depth = QUERY_DEPTH.with(std::cell::Cell::get).checked_add(2)?;
+    let tables = pattern.tables_for_query()?;
+    let moved = |span: TimeSpan| {
+        Some(TimeSpan::new(
+            span.begin.checked_sub(by)?,
+            span.end.checked_sub(by)?,
+        ))
+    };
+    let mut stop = table::Stop::query(depth);
+    if !tables.answerable(moved(state.span)?, &stop)? {
+        return None;
+    }
+    let answer = tables.query(&state.set_span(moved(part)?), &mut stop);
+    stop.finish();
+    if take_query_error().is_some() {
+        return None;
+    }
+    let mut haps = answer?;
+    note_materialised(haps.len());
+    for hap in &mut haps {
+        hap.part = TimeSpan::new(
+            hap.part.begin.checked_add(by)?,
+            hap.part.end.checked_add(by)?,
+        );
+        if let Some(whole) = &mut hap.whole {
+            *whole = TimeSpan::new(whole.begin.checked_add(by)?, whole.end.checked_add(by)?);
+        }
+    }
+    Some(haps)
+}
+
 /// The hap a pick join makes of an `outer` hap and one `inner` hap of the
 /// pattern it picked, at `whole` and `part`, for every join but `squeeze`.
 fn picked_hap(outer: &Hap, inner: Hap, whole: Option<TimeSpan>, part: TimeSpan) -> Hap {
@@ -4055,7 +4108,9 @@ fn query_pick(
                 } else {
                     outer_whole.begin.cycle_pos()
                 };
-                for inner in inner_pattern.late(shift).query(state) {
+                let inner_haps = restarted_from_tables(inner_pattern, shift, state, outer.part)
+                    .unwrap_or_else(|| inner_pattern.late(shift).query(state));
+                for inner in inner_haps {
                     let Some(part) = inner.part.intersection(&outer.part) else {
                         continue;
                     };
@@ -4353,7 +4408,7 @@ enum Node {
     /// One hap expands to N haps sharing its span - `voicing()`'s
     /// `stack(...notes).note().set(rest)` + outerJoin collapses to exactly
     /// this shape natively (each note covers the source hap's whole/part).
-    ExpandHapsNative(Pattern, HapExpandFn),
+    ExpandHapsNative(Pattern, HapExpandFn, SpanUse),
     Collect(Pattern),
     /// `isobite`: the onsets in the cycle of the query, each valued by its
     /// position among them. An onset is a hap with a value not loosely 0.
@@ -4492,7 +4547,7 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
         | Node::MapHapsNative(pattern, _, _)
         | Node::MapHapsOwned(pattern, _, _)
         | Node::MapHapsWithState(pattern, _)
-        | Node::ExpandHapsNative(pattern, _)
+        | Node::ExpandHapsNative(pattern, _, _)
         | Node::Collect(pattern)
         | Node::CycleOnsetIndex(pattern)
         | Node::CycleOnsetCount(pattern)
@@ -4723,7 +4778,15 @@ impl Pattern {
     /// JavaScript, and nothing reachable that answers differently to the
     /// same query. See [`purity::Purity::volatile`].
     pub fn is_cacheable(&self) -> bool {
-        !self.purity.impure && !self.purity.volatile
+        !self.purity.impure && !self.is_volatile()
+    }
+
+    /// Whether two identical queries may answer differently under the
+    /// settings in force. See [`purity::Purity::volatile`] and
+    /// [`purity::Purity::host_voicings`].
+    fn is_volatile(&self) -> bool {
+        self.purity.volatile
+            || (self.purity.host_voicings && settings::default_voicings_is_host_owned())
     }
 
     /// This handle, declared volatile - see [`purity::Purity::volatile`].
@@ -4734,6 +4797,14 @@ impl Pattern {
     pub fn mark_volatile(&self) -> Self {
         let mut pattern = self.clone();
         pattern.purity.volatile = true;
+        pattern
+    }
+
+    /// This handle, marked as reading the default voicing dictionary. See
+    /// [`purity::Purity::host_voicings`].
+    pub(crate) fn mark_host_voicings(&self) -> Self {
+        let mut pattern = self.clone();
+        pattern.purity.host_voicings = true;
         pattern
     }
 
@@ -4814,7 +4885,7 @@ impl Pattern {
     /// holds data only.
     fn answer_in(&self, state: &State, order: table::Order) -> (Vec<Hap>, bool) {
         let outermost = QUERY_DEPTH.with(|depth| depth.get() == 0);
-        if self.purity.volatile {
+        if self.is_volatile() {
             note_uncacheable();
         }
         match &self.runtime_settings {
@@ -5127,7 +5198,7 @@ impl Pattern {
                 .filter_map(|hap| f(state, &hap))
                 .collect(),
 
-            Node::ExpandHapsNative(pat, f) => {
+            Node::ExpandHapsNative(pat, f, _) => {
                 // One hap expands into N, so the output can outgrow the
                 // input's own charge; each push is charged as it lands.
                 let mut out = Vec::new();
@@ -7287,6 +7358,7 @@ impl Pattern {
                     .map(|mapped| mapped.with_pitch_live_controls(hap))
                     .collect()
             }),
+            SpanUse::Ignores,
         ))
     }
 
@@ -7305,6 +7377,7 @@ impl Pattern {
         Pattern::of(Node::ExpandHapsNative(
             self.clone(),
             Arc::new(move |hap| f(hap).into_iter().map(Hap::without_live_controls).collect()),
+            SpanUse::Reads,
         ))
     }
 
@@ -7754,7 +7827,7 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         | Node::MapHapsNative(pattern, _, _)
         | Node::MapHapsOwned(pattern, _, _)
         | Node::MapHapsWithState(pattern, _)
-        | Node::ExpandHapsNative(pattern, _)
+        | Node::ExpandHapsNative(pattern, _, _)
         | Node::Collect(pattern)
         | Node::CycleOnsetIndex(pattern)
         | Node::CycleOnsetCount(pattern)
@@ -7986,7 +8059,7 @@ fn compute_purity(node: &Node) -> purity::Purity {
         | Node::MapHapsNative(p, _, _)
         | Node::MapHapsOwned(p, _, _)
         | Node::MapHapsWithState(p, _)
-        | Node::ExpandHapsNative(p, _)
+        | Node::ExpandHapsNative(p, _, _)
         | Node::Collect(p)
         | Node::CycleOnsetIndex(p)
         | Node::CycleOnsetCount(p)
