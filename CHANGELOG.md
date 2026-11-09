@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Release archives and installers include signed build provenance for independent verification with GitHub CLI.
 - A video file plays as a sample: `mp4`, `m4v`, `mov`, `mkv` and `webm` play their audio track.
 - `_video()` and `video()` draw a video sample's picture in sync with its sound. H.264, HEVC, AV1, VP9, VP8 and Motion JPEG decode natively.
 - The visuals docks show the clips of `_video()` and `video()` lanes. Enter opens a clip in a desktop window.

@@ -53,6 +53,87 @@ latest release. Both it and `rustelup` verify the release asset against its
 verification leaves the previous installation in place. Releases without
 checksums cannot be installed by this updater.
 
+These checks detect corrupt downloads. They do not prove who made a file:
+someone who replaces both the file and its checksum can pass the check.
+The Bash and PowerShell scripts do not verify attestation signatures.
+They need no GitHub CLI, Cosign, signing key or extra service.
+
+## Verify release provenance
+
+Releases made by the attesting release workflow include signed build
+provenance for every platform archive and all four installer files. A
+Sigstore bundle contains the signature and certificate for this provenance.
+GitHub also stores it in the repository's attestations API.
+
+For an independent check, install [GitHub CLI](https://cli.github.com/) from
+a trusted source. Download an archive, then verify it before extraction or
+execution. For Linux x86_64 in Bash:
+
+```sh
+tag=$(gh release view --repo tzfm/rustel --json tagName --jq .tagName)
+archive="rustel_${tag}_linux_amd64.tar.gz"
+gh release download "$tag" --repo tzfm/rustel --pattern "$archive"
+gh attestation verify "$archive" --repo tzfm/rustel --signer-workflow tzfm/rustel/.github/workflows/release.yml --source-ref "refs/tags/$tag" --deny-self-hosted-runners
+```
+
+Use `darwin_amd64` or `darwin_arm64` for macOS, or `linux_arm64` for Linux
+ARM64. On Windows, in PowerShell:
+
+```powershell
+$tag = gh release view --repo tzfm/rustel --json tagName --jq .tagName
+if ($LASTEXITCODE -ne 0) { throw 'Release lookup failed' }
+$archive = "rustel_${tag}_win32_amd64.tar.gz"
+gh release download $tag --repo tzfm/rustel --pattern $archive
+if ($LASTEXITCODE -ne 0) { throw 'Download failed' }
+gh attestation verify $archive --repo tzfm/rustel --signer-workflow tzfm/rustel/.github/workflows/release.yml --source-ref "refs/tags/$tag" --deny-self-hosted-runners
+if ($LASTEXITCODE -ne 0) { throw 'Provenance verification failed' }
+```
+
+The [official verification command](https://cli.github.com/manual/gh_attestation_verify)
+checks the artifact digest, cryptographic signature, certificate trust and
+repository/workflow identity. It requires SLSA build provenance by default.
+The source-ref option also binds the check to the chosen tag. For an exact
+reviewed commit, also use `--source-digest` and `--signer-digest` with its full
+SHA. These checks do not prove that the code or build dependencies are safe.
+
+To use a downloaded bundle, add `--bundle` with the archive's
+`.sigstore.json` file. The four scripts share `installers.sigstore.json`.
+Keep the same repository, workflow and source restrictions. A bundle next to
+an asset is untrusted until this command verifies it.
+
+If verification fails, stop. Do not extract or execute the download.
+Older releases, including v0.1.6, do not have this build provenance. They
+cannot pass this check. For both old and new releases, the current scripts
+check only the checksum. Use independent verification when you require
+authenticity. The release workflow has no unsigned fallback for new releases.
+
+The normal commands above execute a website script first. A compromised
+rustel.cc can execute arbitrary code before any asset check. Release
+signatures do not remove that risk. A separately downloaded script can be
+reviewed and verified with GitHub CLI before execution.
+
+### Automatic signature verification
+
+The current scripts lack a trusted verifier for Sigstore certificates,
+signature bundles and transparency evidence on all three operating systems.
+Reading a checksum out of an attestation JSON file does not verify a
+signature. Downloading an unchecked verifier would move the same trust gap.
+
+The smallest viable next step is a small Rust updater using a maintained
+Sigstore verification library, as in
+[Foundry's updater](https://github.com/foundry-rs/foundryup/blob/master/src/install.rs).
+It needs embedded trust roots with a reviewed update process, exact
+repository/workflow and release-ref checks, a fixed policy for legacy
+releases, and tests with real valid and invalid signed bundles. It must
+verify before extraction or execution, then use the current staged install
+and rollback behavior. Missing or invalid provenance for a required release
+must stop the update, including when the network fails.
+
+That is a separate updater change. It must also define how the first
+verifier is trusted. Keeping the website bootstrap preserves its initial
+trust risk. See [release and hosting setup](../docs/releasing.md#owner-setup)
+for the controls that reduce this risk today.
+
 ## Update
 
 Run `rustelup` again. It always fetches the newest release.

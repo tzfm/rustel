@@ -16,12 +16,19 @@ cargo fmt --all -- --check
 bash .github/scripts/check-panic-unwind.sh
 bash .github/scripts/check-engine.sh
 bash .github/scripts/tests/release-notes.sh
+bash .github/scripts/tests/release-security.sh
+bash .github/scripts/tests/installer-security.sh
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features --exclude rustel-studio-e2e -- --test-threads=1
 cargo test --release -p rustel-runtime --test e2e
 cargo build -p rustel
 cargo test -p rustel-studio-e2e --features pty -- --test-threads=1
 ```
+
+On Windows, also run `.github/scripts/tests/installer-security.ps1` in
+PowerShell. The release tests use a local repository and a CLI double to
+check publication order and rejection handling. GitHub CLI owns cryptographic
+verification. A release run verifies the real bundles before and after upload.
 
 The last two commands build the product binary and run the studio's end-to-end
 suite. Most tests open a real studio headlessly, type into it, and assert on
@@ -267,7 +274,7 @@ source-location span count, duration and frame count exactly.
 
 The workflows use GitHub-hosted Linux, macOS and Windows runners. `.github/workflows/ci.yml` runs ordinary checks on every pull request and push to `main`. It checks formatting, Clippy, supported feature sets and the serial workspace tests, and runs the tests of the hand-written `unsafe` code under Miri. `.github/workflows/heavy.yml` runs the release-mode corpus in portable and automatic acceleration modes and the Studio end-to-end suite. Heavy CI runs on pushes to `main`, twice weekly for cache warming, and when a maintainer dispatches it for an exact pull request commit.
 
-A pull request with only Markdown changes skips the build and test jobs, except changes to `SECURITY.md`, `docs/cli.md`, `docs/hardware.md` or `docs/studio.md`, which run the full checks. The `main` ruleset requires one check, `CI result`. This job passes when the build and test jobs pass or are skipped.
+A pull request with only Markdown changes skips the build and test jobs, except changes to `SECURITY.md`, `docs/cli.md`, `docs/hardware.md` or `docs/studio.md`, which run the full checks. Configure the `main` ruleset to require `CI result`, as described in [release setup](docs/releasing.md#branch-and-tag-rules). This job passes when the build and test jobs pass or are skipped.
 
 The CI workflows declare read-only repository tokens. Checkouts do not persist credentials, and the jobs do not receive repository secrets. No CI workflow uses a self-hosted runner.
 

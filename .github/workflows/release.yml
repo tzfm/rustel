@@ -7,10 +7,45 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  validate:
+    name: Validate release commit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Require owner setup
+        env:
+          ENABLED: ${{ vars.RELEASE_PUBLISH_ENABLED }}
+        run: |
+          test "$ENABLED" = true || {
+            echo 'Configure the release environment and set RELEASE_PUBLISH_ENABLED=true. See docs/releasing.md.' >&2
+            exit 1
+          }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check tag, main ancestry and CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/validate-release.sh "$GITHUB_REF_NAME" "$GITHUB_SHA"
+      - name: Check deployed installers
+        run: bash .github/scripts/check-installers.sh
+
   build:
     name: Build (${{ matrix.os_name }} ${{ matrix.arch }})
+    needs: validate
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +74,16 @@ jobs:
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Put Git Bash ahead of WSL on PATH
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $root = Split-Path (Split-Path (Get-Command git).Source)
+          $bash = Join-Path $root 'bin\bash.exe'
+          if (-not (Test-Path $bash)) { throw 'Git Bash is required' }
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $bash)
       - name: Linux audio and serial headers
         if: matrix.os_name == 'linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
@@ -79,52 +124,90 @@ jobs:
               exit 1
             }
           done
+      - name: Attest archive
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: rustel_${{ github.ref_name }}_${{ matrix.os_name }}_${{ matrix.arch }}.tar.gz
+          create-storage-record: false
+      - name: Preserve signature bundle and checksum
+        shell: bash
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          archive="rustel_${GITHUB_REF_NAME}_${{ matrix.os_name }}_${{ matrix.arch }}.tar.gz"
+          cp "$BUNDLE" "$archive.sigstore.json"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$archive" | cut -d ' ' -f1 > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" | cut -d ' ' -f1 > "$archive.sha256"
+          fi
       - name: Preserve package for publication
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rustel-${{ matrix.os_name }}-${{ matrix.arch }}
-          path: rustel_${{ github.ref_name }}_${{ matrix.os_name }}_${{ matrix.arch }}.tar.gz
+          path: rustel_${{ github.ref_name }}_${{ matrix.os_name }}_${{ matrix.arch }}.tar.gz*
           if-no-files-found: error
 
-  publish:
-    name: Publish verified release
-    needs: build
-    runs-on: ubuntu-latest
+  scripts:
+    name: Attest installers
+    needs: validate
+    runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Prepare installers and checksums
+        run: |
+          mkdir dist
+          for name in install install.ps1 rustelup rustelup.ps1; do
+            cp "rustelup/$name" "dist/$name"
+            sha256sum "dist/$name" | cut -d ' ' -f1 > "dist/$name.sha256"
+          done
+      - name: Attest installers
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            dist/install
+            dist/install.ps1
+            dist/rustelup
+            dist/rustelup.ps1
+          create-storage-record: false
+      - name: Preserve signature bundle
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "$BUNDLE" dist/installers.sigstore.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rustel-installers
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish verified release
+    needs: [build, scripts]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: rustel-*
           merge-multiple: true
           path: dist
-      - name: Prepare assets and checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          for archive in dist/*.tar.gz; do
-            [ -f "$archive" ] || { echo "No release archives found" >&2; exit 1; }
-            sha256sum "$archive" | cut -d ' ' -f1 > "$archive.sha256"
-          done
-          cp rustelup/rustelup dist/rustelup
-          cp rustelup/rustelup.ps1 dist/rustelup.ps1
-          sha256sum dist/rustelup | cut -d ' ' -f1 > dist/rustelup.sha256
-          sha256sum dist/rustelup.ps1 | cut -d ' ' -f1 > dist/rustelup.ps1.sha256
       - name: Publish release after all assets are ready
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
-        # gh keeps the release a draft until every asset is uploaded, and
-        # deletes the draft if an upload fails.
-        run: |
-          set -euo pipefail
-          bash .github/scripts/release-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/release-notes.md"
-          notes=(--generate-notes)
-          if [ -s "$RUNNER_TEMP/release-notes.md" ]; then
-            notes=(--notes-file "$RUNNER_TEMP/release-notes.md")
-          fi
-          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 dist/rustelup dist/rustelup.ps1 \
-            --verify-tag "${notes[@]}"
+        run: bash .github/scripts/publish-release.sh "$GITHUB_REF_NAME" "$GITHUB_SHA"
