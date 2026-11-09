@@ -248,12 +248,7 @@ impl ScheduleTraceEvent {
             gain: None,
             sample: None,
             ui_visuals: hap.ui_visuals_context(),
-            context: hap
-                .context
-                .iter()
-                .copied()
-                .take(MAX_TRACE_CONTEXT_RANGES)
-                .collect(),
+            context: hap.context.iter().take(MAX_TRACE_CONTEXT_RANGES).collect(),
         })
     }
 }

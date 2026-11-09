@@ -235,7 +235,8 @@ fn pure_metadata_keeps_nested_patterns_and_functions_in_the_owner_runtime() {
             pattern.fmap(move |_| Value::F64(size))
         }),
     );
-    let carrier = rustel_core::pure(Value::Function(function)).with_runtime_settings(owner.clone());
+    let carrier =
+        rustel_core::pure(Value::Function(Box::new(function))).with_runtime_settings(owner.clone());
     assert!(carrier.is_pure());
     let Value::Function(function) = carrier.as_pure().expect("pure function value") else {
         panic!("pure metadata did not contain its Function value");
@@ -298,7 +299,7 @@ fn explicit_scopes_own_unwrapped_pure_and_lookup_extractors() {
     );
     let carrier = rustel_core::pure(Value::List(vec![
         Value::Pattern(Box::new(PatternValue::new(25, voicing_size_signal()))),
-        Value::Function(function),
+        Value::Function(Box::new(function)),
     ]))
     .with_added_context(vec![(1, 2)]);
     let Value::List(extracted) = owner
@@ -366,8 +367,8 @@ fn an_owned_function_keeps_its_lexical_runtime_with_a_foreign_receiver() {
         Arc::new(|pattern| pattern.fmap(|_| Value::F64(settings_tuple().2 as f64))),
     );
     let unowned_function = function.clone();
-    let carrier =
-        rustel_core::pure(Value::Function(function)).with_runtime_settings(function_owner.clone());
+    let carrier = rustel_core::pure(Value::Function(Box::new(function)))
+        .with_runtime_settings(function_owner.clone());
     let Value::Function(function) = carrier.as_pure().expect("owned function metadata") else {
         panic!("carrier did not contain its Function");
     };

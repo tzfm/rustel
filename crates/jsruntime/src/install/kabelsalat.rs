@@ -118,7 +118,7 @@ mod tests {
 
     fn graph(source: &str, inputs: &[f64], frequency: f64) -> String {
         let runtime = JsRuntime::new().expect("runtime");
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(&runtime, |ctx| {
             install(&ctx).expect("graph bindings");
             compile_graph(&ctx, source, inputs, frequency).expect("graph")
         })
@@ -127,7 +127,7 @@ mod tests {
     fn assert_graph(source: &str, predicate: &str) {
         let json = graph(source, &[3.0], 220.0);
         let runtime = JsRuntime::new().expect("runtime");
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(&runtime, |ctx| {
             let check: Function = ctx
                 .eval(format!(
                     "(json) => {{ const {{nodes}} = JSON.parse(json); return {predicate}; }}"
@@ -205,7 +205,7 @@ mod tests {
         )))
         .expect("fixtures");
         let runtime = JsRuntime::new().expect("runtime");
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(&runtime, |ctx| {
             install(&ctx).expect("graph bindings");
             for fixture in fixtures.as_array().expect("cases") {
                 let name = fixture["name"].as_str().expect("name");
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn repeated_inspection_charges_the_construction_budget() {
         let runtime = JsRuntime::new().expect("runtime");
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(&runtime, |ctx| {
             install(&ctx).expect("graph bindings");
             for source in [
                 "let x = n(0); for (let i = 0; i < 100; i++) x = x.add(1); for (let i = 0; i < 1000; i++) x.select('missing')",
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn oversized_and_nonfinite_graphs_fail() {
         let runtime = JsRuntime::new().expect("runtime");
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(&runtime, |ctx| {
             install(&ctx).expect("graph bindings");
             for source in [
                 "n(Infinity).out()",
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn construction_limits_and_throwing_getters_leave_the_next_graph_usable() {
         let runtime = JsRuntime::new().expect("runtime");
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(&runtime, |ctx| {
             install(&ctx).expect("graph bindings");
             for source in [
                 "const x = []; x.push(x); n(x).out()",
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn escaped_registration_cannot_resolve_to_a_later_graph() {
         let runtime = JsRuntime::new().expect("runtime");
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(&runtime, |ctx| {
             install(&ctx).expect("graph bindings");
             compile_graph(
                 &ctx,
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn graph_registrations_do_not_escape_the_event() {
         let runtime = JsRuntime::new().expect("runtime");
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(&runtime, |ctx| {
             install(&ctx).expect("graph bindings");
             compile_graph(
                 &ctx,

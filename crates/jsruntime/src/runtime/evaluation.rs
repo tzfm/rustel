@@ -13,7 +13,7 @@ impl JsRuntime {
     pub fn install_query_binding(&self) -> Result<(), String> {
         let _settings = self.core_settings.bind();
         let me: *const JsRuntime = self;
-        with_ctx(&self.ctx, |ctx| -> Result<(), String> {
+        with_ctx(self, |ctx| -> Result<(), String> {
             let f = Function::new(ctx.clone(), move |index: usize, b: f64, e: f64| {
                 // SAFETY: the binding lives on the runtime's own context, so
                 // the runtime outlives every call made through it.
@@ -38,7 +38,7 @@ impl JsRuntime {
 
     pub fn install_voicings_prebake(&self) -> Result<(), String> {
         let _settings = self.core_settings.bind();
-        with_ctx(&self.ctx, |ctx| voicing_surface::install(&ctx))
+        with_ctx(self, |ctx| voicing_surface::install(&ctx))
     }
     /// Transpile and execute one user setup/prebake file without replacing the
     /// active graph.
@@ -133,7 +133,7 @@ impl JsRuntime {
     /// prelude keeps what it registers as the surface the scores after it
     /// start from, so it must start from the engine's names, not a score's.
     pub fn restore_score_registrations(&self) -> Result<(), QueryError> {
-        with_ctx(&self.ctx, |ctx| restore_registration_surface(&ctx))
+        with_ctx(self, |ctx| restore_registration_surface(&ctx))
             .map_err(|error| QueryError::Message(error.to_string()))
     }
 
@@ -152,7 +152,7 @@ impl JsRuntime {
         // fail BEFORE applying any new synchronous side effect, and let the
         // caller retry. This also makes raw/legacy queue creation recoverable
         // without silently attributing its job to the next setup file.
-        let stale_jobs = with_ctx(&self.ctx, |ctx| discard_pending_jobs(&ctx));
+        let stale_jobs = with_ctx(self, |ctx| discard_pending_jobs(&ctx));
         if stale_jobs > 0 {
             return Err(QueryError::Message(format!(
                 "discarded {stale_jobs} queued JavaScript job(s) before prebake setup; retry the setup"
@@ -208,7 +208,7 @@ impl JsRuntime {
         };
         let evaluation = self.with_heap_boundary(|| {
             let alloc = self.ids.clone();
-            with_ctx(&self.ctx, |ctx| {
+            with_ctx(self, |ctx| {
                 struct PendingJobGuard {
                     runtime: *mut rquickjs::qjs::JSRuntime,
                 }
@@ -375,7 +375,7 @@ impl JsRuntime {
                 // A prelude declares names for the scores that follow it,
                 // not for itself: what it registered is the surface they
                 // start from, and no score turn gives it back.
-                with_ctx(&self.ctx, |ctx| keep_registration_surface(&ctx))
+                with_ctx(self, |ctx| keep_registration_surface(&ctx))
                     .map_err(|error| QueryError::Message(error.to_string()))?;
                 Ok((output, effect_transaction.finish()))
             }
@@ -616,7 +616,7 @@ impl JsRuntime {
             QueryError::Message(remap_reported_position(message, shim_lines, line_map))
         };
         let alloc = self.ids.clone();
-        with_ctx(&self.ctx, |ctx| -> Result<(), QueryError> {
+        with_ctx(self, |ctx| -> Result<(), QueryError> {
             // The REPL re-injects these exact objects
             // before every score evaluation. Restore every repairable
             // public destination from private roots without invoking a planted
@@ -987,7 +987,7 @@ impl JsRuntime {
     }
 
     pub(super) fn clear_staged_score(&self) {
-        with_ctx(&self.ctx, |ctx| {
+        with_ctx(self, |ctx| {
             if let Ok(candidate) = host_score_candidate(&ctx) {
                 let _ = candidate.set(0, rquickjs::Value::new_undefined(ctx.clone()));
                 let _ = candidate.as_object().set("length", 0);
@@ -1001,7 +1001,7 @@ impl JsRuntime {
     /// replacement is attempted, so callback sidecars and object identity are
     /// never reconstructed from a bare Rust Pattern.
     pub(super) fn commit_staged_score(&self, millis: u64) -> Result<(), QueryError> {
-        with_ctx(&self.ctx, |ctx| -> Result<(), QueryError> {
+        with_ctx(self, |ctx| -> Result<(), QueryError> {
             if self.bounded_evaluation_interrupted() {
                 return if self.cancelled.get() {
                     Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled))
@@ -1204,7 +1204,7 @@ impl JsRuntime {
         // A job predating this score has no attributable owner. Discard it and
         // refuse before this score executes any JavaScript, matching the setup
         // turn's fail-closed ownership rule.
-        let stale_jobs = with_ctx(&self.ctx, |ctx| discard_pending_jobs(&ctx));
+        let stale_jobs = with_ctx(self, |ctx| discard_pending_jobs(&ctx));
 
         // `register()` writes onto the shared Pattern prototype and the score
         // scope, and both outlive the evaluation that wrote them. Give the
@@ -1212,7 +1212,7 @@ impl JsRuntime {
         // line and playing again means what it says: the engine's name
         // answers again, and a name of the score's own goes away with it.
         if allow_score_effects {
-            with_ctx(&self.ctx, |ctx| restore_registration_surface(&ctx))
+            with_ctx(self, |ctx| restore_registration_surface(&ctx))
                 .map_err(|error| QueryError::Message(error.to_string()))?;
         }
 
@@ -1223,7 +1223,7 @@ impl JsRuntime {
         #[cfg(feature = "hydra")]
         if allow_score_effects {
             let chains = self.hydra_chains.clone();
-            with_ctx(&self.ctx, |ctx| {
+            with_ctx(self, |ctx| {
                 crate::install::restore_hydra_surface(&ctx, &chains)
             })
             .map_err(|error| QueryError::Message(error.to_string()))?;

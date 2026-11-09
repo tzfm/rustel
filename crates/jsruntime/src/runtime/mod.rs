@@ -346,6 +346,9 @@ pub struct JsRuntime {
     pub(super) last_good_timeline: RefCell<Option<BTreeMap<String, Fraction>>>,
     /// The host's pointer that `mousex` and `mousey` read, if it has one.
     pub(super) pointer: Option<rustel_core::host_value::Pointer>,
+    /// Whether score JavaScript may have run since the last check for a
+    /// native panic it caught. See [`JsRuntime::raise_caught_native_panic`].
+    pub(super) script_may_have_run: Cell<bool>,
 }
 
 /// Effects staged by a successful Session-owned JavaScript score or setup.
@@ -699,7 +702,7 @@ impl<'a> QueryScope<'a> {
     /// Push the active native wrapper, whose sidecar owns the callbacks a
     /// host-built graph can reach.
     pub(super) fn push_active_native(rt: &'a JsRuntime) -> Result<Self, String> {
-        with_ctx(&rt.ctx, |ctx| -> Result<(), String> {
+        with_ctx(rt, |ctx| -> Result<(), String> {
             let active: rquickjs::Value = host_active(&ctx)
                 .map_err(|error| error.to_string())?
                 .get(0)
@@ -712,7 +715,7 @@ impl<'a> QueryScope<'a> {
     }
 
     pub(super) fn push(rt: &'a JsRuntime, slot: Slot, index: usize) -> Result<Self, String> {
-        with_ctx(&rt.ctx, |ctx| -> Result<(), String> {
+        with_ctx(rt, |ctx| -> Result<(), String> {
             let w = JsRuntime::wrapper_at(&ctx, slot, index)?;
             let stack = host_stack(&ctx).map_err(|e| e.to_string())?;
             let n = stack.len();
@@ -724,7 +727,7 @@ impl<'a> QueryScope<'a> {
 
 impl Drop for QueryScope<'_> {
     fn drop(&mut self) {
-        with_ctx(&self.rt.ctx, |ctx| {
+        with_ctx(self.rt, |ctx| {
             if let Ok(stack) = host_stack(&ctx) {
                 let n = stack.len();
                 if n > 0 {
@@ -764,7 +767,7 @@ mod caught_panic_tests {
 
     fn runtime_with_panicking_native() -> JsRuntime {
         let runtime = JsRuntime::new().expect("runtime");
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(&runtime, |ctx| {
             let boom = rquickjs::Function::new(ctx.clone(), || -> i32 { panic!("native boom") })
                 .expect("native function");
             ctx.globals().set("boom", boom).expect("global");

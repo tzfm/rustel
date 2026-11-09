@@ -2401,7 +2401,7 @@ mod tests {
                 Arc::new(|pattern| pattern.fmap(|_| default_voicing_value())),
                 Arc::new(|pattern| pattern.fmap(|_| default_voicing_value())),
             );
-            let carrier = rustel_core::pure(Value::Function(function));
+            let carrier = rustel_core::pure(Value::Function(Box::new(function)));
             let mut session = Session::new().expect("session");
             session.set_pattern(carrier).expect("install Rust pattern");
 

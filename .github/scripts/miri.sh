@@ -30,8 +30,12 @@ miri() {
   fi
 }
 
-# Callback host, metrics and cancel pointers.
-miri -p rustel-core --lib -- callback_query_metrics_tests value::tests
+# Callback host, metrics and cancel pointers. The byte copies of table
+# entries, the meetings made in those copies, and the sort that moves each
+# hap once.
+miri -p rustel-core --lib -- callback_query_metrics_tests value::tests \
+  table::tests::bitwise_copies table::tests::meetings_made_in_byte_copies \
+  stable_sort_tests
 miri -p rustel-core --test js_query_refusal --test stack_failure_isolation \
   --test review_remediations
 

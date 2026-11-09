@@ -124,7 +124,7 @@ mod ownership_cap_tests {
             before,
             "rollback left the active graph reading the candidate registry"
         );
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(&runtime, |ctx| {
             let same: Function = ctx.eval("(a, b) => a === b").expect("identity helper");
             for sets in [host_slider_sets(&ctx), host_voicing_sets(&ctx)] {
                 let sets = sets.expect("private candidate roots");
@@ -223,7 +223,7 @@ mod ownership_cap_tests {
         runtime
             .install_semantic_bindings()
             .expect("semantic bindings");
-        with_ctx(&runtime.ctx, |ctx| -> Result<(), String> {
+        with_ctx(&runtime, |ctx| -> Result<(), String> {
             let wrapper = |ids: Vec<CallbackId>, excluded: HashSet<CallbackId>| {
                 rquickjs::Class::instance(
                     ctx.clone(),
@@ -290,7 +290,7 @@ mod ownership_cap_tests {
     /// ownership refusal (`ownership_limit()`) and throws, as a capped harvest
     /// does.
     pub(crate) fn install_ownership_refusal(runtime: &JsRuntime, name: &str) {
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(runtime, |ctx| {
             let refuse = Function::new(ctx.clone(), || -> rquickjs::Result<()> {
                 Err(ownership_set_error_to_js(OwnershipSetError::Limit(
                     ownership_limit(),
@@ -438,7 +438,7 @@ mod ownership_cap_tests {
             runtime
                 .evaluate_score(&source, &options)
                 .expect("replacement slider score");
-            let count = with_ctx(&runtime.ctx, |ctx| {
+            let count = with_ctx(&runtime, |ctx| {
                 let sets = host_slider_sets(&ctx).expect("slider sets");
                 let active: rquickjs::Object = sets.get(0).expect("active sliders");
                 active

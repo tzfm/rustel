@@ -775,7 +775,7 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
                 for arg in &args.0 {
                     let (pattern, sidecar) = reify_bridged(&ctx, arg)?;
                     let function = pattern.as_pure().and_then(|v| match v {
-                        Value::Function(f) => Some(f),
+                        Value::Function(f) => Some(*f),
                         _ => None,
                     });
                     match function {

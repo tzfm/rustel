@@ -76,7 +76,7 @@ impl HapJson {
             whole: hap.whole.map(SpanJson::from_span),
             part: SpanJson::from_span(hap.part),
             value: ValueJson::from_value(&hap.value),
-            context: hap.context.clone(),
+            context: hap.context.to_vec(),
             has_onset: hap.has_onset(),
             show: hap.show(),
         }

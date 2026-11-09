@@ -3117,7 +3117,8 @@ mod tests {
         assert_eq!(haps.len(), 2, "{haps:?}");
         for (hap, token) in haps.iter().zip(["bd:3", "gm_acoustic_guitar_steel:1"]) {
             assert_eq!(hap.context.len(), 1, "{:?}", hap.context);
-            assert_eq!(hap.context[0].1 - hap.context[0].0, token.len(), "{token}");
+            let (begin, end) = hap.context.first().expect("one location");
+            assert_eq!(end - begin, token.len(), "{token}");
         }
         assert_eq!(
             haps[0].value,
@@ -3131,7 +3132,8 @@ mod tests {
             .expect("parses")
             .query_arc(Fraction::ZERO, Fraction::ONE);
         assert_eq!(haps[0].context.len(), 1, "{:?}", haps[0].context);
-        assert_eq!(haps[0].context[0].1 - haps[0].context[0].0, "a:b:c".len());
+        let (begin, end) = haps[0].context.first().expect("one location");
+        assert_eq!(end - begin, "a:b:c".len());
         assert_eq!(
             haps[0].value,
             rustel_core::Value::List(vec![

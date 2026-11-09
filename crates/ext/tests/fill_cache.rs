@@ -47,7 +47,7 @@ type Shape = (Option<TimeSpan>, TimeSpan, String, Vec<(usize, usize)>);
 /// The observable shape of an answer.
 fn shape(haps: &[Hap]) -> Vec<Shape> {
     haps.iter()
-        .map(|hap| (hap.whole, hap.part, hap.value.show(), hap.context.clone()))
+        .map(|hap| (hap.whole, hap.part, hap.value.show(), hap.context.to_vec()))
         .collect()
 }
 

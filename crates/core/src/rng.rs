@@ -110,13 +110,35 @@ pub fn rands_at_time(time: f64, count: usize, seed: f64) -> Vec<f64> {
     }
 }
 
+/// The first value of [`rands_at_time`], without a list.
 pub fn rand_at_time(time: f64, seed: f64) -> f64 {
-    rands_at_time(time, 1, seed)[0]
+    match rng_mode() {
+        RngMode::Legacy => legacy_seed_rand(legacy_time_seed(time + seed)).abs(),
+        RngMode::Precise => precise_at(time_key(time), 0, crate::compose::to_int32(seed)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_value_is_the_first_of_the_list() {
+        crate::settings::RuntimeSettings::default().with(|| {
+            for mode in [RngMode::Legacy, RngMode::Precise] {
+                use_rng(mode);
+                for time in [0.0, 0.25, 7.5, 299.9, 1234.5678, -3.25] {
+                    for seed in [0.0, 1.0, -2.5, 4.0e9] {
+                        assert_eq!(
+                            rand_at_time(time, seed).to_bits(),
+                            rands_at_time(time, 1, seed)[0].to_bits(),
+                            "{mode:?} {time} {seed}"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     #[test]
     fn legacy_repeats_every_300_cycles() {

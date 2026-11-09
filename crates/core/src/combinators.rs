@@ -68,13 +68,7 @@ pub(crate) fn checked_fast<P: PatOps>(pat: &P, factor: Fraction, operation: &'st
         // `fast(0)` is silence; there is no arithmetic to check.
         return P::pat_silence();
     }
-    let refused = move || {
-        crate::mark_stepwise_refusal(crate::QueryLimit::NativeFraction { operation });
-        Fraction::ZERO
-    };
-    pat.with_query_time(move |time| time.checked_mul(factor).unwrap_or_else(refused))
-        .with_hap_time(move |time| time.checked_div(factor).unwrap_or_else(refused))
-        .set_steps(pat.pat_steps())
+    pat.fast_node(factor, operation).set_steps(pat.pat_steps())
 }
 
 /// Implements [`PatOps::zoom`] with its query-span and hap-span maps checked.
@@ -2455,7 +2449,7 @@ mod degrade_tests {
     use crate::{Hap, State, TimeSpan, Value, fastcat, pure, silence, stack};
     use rustel_fraction::Fraction;
 
-    type HapSignature = (Option<TimeSpan>, TimeSpan, Value, Vec<(usize, usize)>);
+    type HapSignature = (Option<TimeSpan>, TimeSpan, Value, crate::Locations);
 
     fn signature(haps: Vec<Hap>) -> Vec<HapSignature> {
         haps.into_iter()
@@ -3367,11 +3361,11 @@ mod tests {
                 .to_vec()
         };
         let bd = OrderedMap::from_entries([("s".into(), Value::Str("bd".into()))]);
-        let function = Value::Function(FunctionRef::registered(
+        let function = Value::Function(Box::new(FunctionRef::registered(
             "id",
             std::sync::Arc::new(|pat| pat),
             true,
-        ));
+        )));
         for (value, base) in [
             (Value::Object(bd.clone()), bd),
             (function, OrderedMap::new()),

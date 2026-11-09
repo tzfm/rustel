@@ -152,8 +152,8 @@ fn modifiers(pattern: Option<&Pattern>) -> Result<Vec<(Pattern, Pattern)>, &'sta
                 return Err("blockArrange modifier callback must be a function");
             };
             Ok((
-                rustel_core::pure(Value::Function(predicate.clone())),
-                rustel_core::pure(Value::Function(transform.clone())),
+                rustel_core::pure(Value::Function(Box::new(predicate.clone()))),
+                rustel_core::pure(Value::Function(Box::new(transform.clone()))),
             ))
         })
         .collect()

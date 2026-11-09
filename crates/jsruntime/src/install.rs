@@ -116,7 +116,7 @@ impl JsRuntime {
     /// same-named control aliases on the prototype.
     pub fn install_semantic_bindings(&self) -> Result<(), String> {
         let _settings = self.core_settings.bind();
-        with_ctx(&self.ctx, |ctx| -> Result<(), String> {
+        with_ctx(self, |ctx| -> Result<(), String> {
             let surface = foundation::install(self, ctx.clone())?;
             install_logger(self, &ctx, &surface.globals)?;
             kabelsalat::install(&ctx).map_err(|error| error.to_string())?;

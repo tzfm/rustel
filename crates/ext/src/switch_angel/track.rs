@@ -168,7 +168,10 @@ fn modifiers(pattern: &Pattern) -> Option<Vec<(Value, Pattern)>> {
         };
         let marker = pair.first()?.clone();
         let callback = pair.get(1)?.as_function()?.clone();
-        output.push((marker, rustel_core::pure(Value::Function(callback))));
+        output.push((
+            marker,
+            rustel_core::pure(Value::Function(Box::new(callback))),
+        ));
     }
     Some(output)
 }
