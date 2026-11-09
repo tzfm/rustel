@@ -733,6 +733,25 @@ impl fmt::Debug for Hap {
 /// A value-preserving bind may rebuild `pure(value)` to retime the hap. Carry
 /// the exact lookup only when the inner result kept the SAME identity-bearing
 /// value; a merely equal user value must not inherit hidden Pattern entries.
+/// The hap an inner, outer or mix join makes of an outer hap `outer` and one
+/// hap `inner` of the pattern it names, at `whole`. See `Node::Join`.
+fn joined_hap(outer: &Hap, inner: Hap, whole: Option<TimeSpan>) -> Hap {
+    let pick_lookup = joined_pick_lookup(outer, &inner);
+    let mut context = outer.context.clone();
+    context.append(&inner.context);
+    Hap {
+        whole,
+        part: inner.part,
+        pick_lookup,
+        keys: ContextKeys::merge(&inner.keys, &outer.keys),
+        value: inner.value,
+        context,
+        ui_visuals: outer.ui_visuals | inner.ui_visuals,
+        live_controls: inner.live_controls,
+        slider_binding: inner.slider_binding,
+    }
+}
+
 fn joined_pick_lookup(outer: &Hap, inner: &Hap) -> Option<Arc<PickLookup>> {
     inner.pick_lookup.clone().or_else(|| {
         (outer.pick_lookup.is_some() && inner.value == outer.value)
@@ -1804,10 +1823,21 @@ const CONSTRUCTION_MEMO_ENTRIES: usize = 32;
 /// onto the destruction worklist like any other child.
 #[derive(Default)]
 struct ConstructionMemo {
-    entries: Mutex<Vec<ConstructionEntry>>,
+    entries: Mutex<Constructions>,
     /// Round-robin victim once full. The key set is a handful of argument
     /// values, so plain replacement is enough and never thrashes on it.
     victim: std::sync::atomic::AtomicUsize,
+}
+
+/// What a [`ConstructionMemo`] holds.
+#[derive(Default)]
+struct Constructions {
+    kept: Vec<ConstructionEntry>,
+    /// A construction a table build made and could not keep. The next
+    /// construction of the same value takes it instead of building, so a
+    /// build adds no construction to those the graph makes, and the
+    /// construction still answers one query only.
+    handed: Option<ConstructionEntry>,
 }
 
 struct ConstructionEntry {
@@ -1854,7 +1884,7 @@ fn plain_key(value: &Value) -> bool {
 }
 
 impl ConstructionMemo {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<ConstructionEntry>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Constructions> {
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1868,12 +1898,49 @@ impl ConstructionMemo {
         settings: &settings::SettingsStateId,
         construct: impl FnOnce(&Value) -> purity::PurePattern,
     ) -> purity::PurePattern {
-        if let Some(kept) = self
-            .lock()
-            .iter()
-            .find(|entry| entry.settings == *settings && same_key(&entry.value, value))
+        self.construct_handing(value, settings, construct, false).0
+    }
+
+    /// The kept construction for `value`, building it when none is kept, for
+    /// a table build. A table shares one construction among all its queries,
+    /// so it may use only one the memo keeps and shares too. `None` for any
+    /// other: a key that is never kept is not built at all, and a built
+    /// construction the memo cannot keep goes to the next construction of the
+    /// same value, so a build adds no construction to those the graph makes.
+    fn kept_for_table(
+        &self,
+        value: &Value,
+        settings: &settings::SettingsStateId,
+        construct: impl FnOnce(&Value) -> purity::PurePattern,
+    ) -> Option<purity::PurePattern> {
+        if !plain_key(value) {
+            return None;
+        }
+        let (pattern, kept) = self.construct_handing(value, settings, construct, true);
+        kept.then_some(pattern)
+    }
+
+    /// The construction for `value`, and whether the memo keeps it.
+    fn construct_handing(
+        &self,
+        value: &Value,
+        settings: &settings::SettingsStateId,
+        construct: impl FnOnce(&Value) -> purity::PurePattern,
+        hand: bool,
+    ) -> (purity::PurePattern, bool) {
         {
-            return kept.pattern.clone();
+            let mut constructions = self.lock();
+            let names = |entry: &ConstructionEntry| {
+                entry.settings == *settings && same_key(&entry.value, value)
+            };
+            if let Some(kept) = constructions.kept.iter().find(|entry| names(entry)) {
+                return (kept.pattern.clone(), true);
+            }
+            if constructions.handed.as_ref().is_some_and(names)
+                && let Some(handed) = constructions.handed.take()
+            {
+                return (handed.pattern, false);
+            }
         }
         // Built outside the lock: construction is arbitrary native code.
         let built = construct(value);
@@ -1886,29 +1953,39 @@ impl ConstructionMemo {
             && !built.pattern().is_volatile()
             && !query_error_pending()
             && !budget_exhausted();
+        let entry = ConstructionEntry {
+            value: value.clone(),
+            settings: settings.clone(),
+            pattern: built.clone(),
+        };
+        let mut constructions = self.lock();
         if keep {
-            let mut entries = self.lock();
-            let entry = ConstructionEntry {
-                value: value.clone(),
-                settings: settings.clone(),
-                pattern: built.clone(),
-            };
-            if entries.len() < CONSTRUCTION_MEMO_ENTRIES {
-                entries.push(entry);
+            if constructions.kept.len() < CONSTRUCTION_MEMO_ENTRIES {
+                constructions.kept.push(entry);
             } else {
                 let victim = self
                     .victim
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     % CONSTRUCTION_MEMO_ENTRIES;
-                entries[victim] = entry;
+                constructions.kept[victim] = entry;
             }
+        } else if hand && plain_key(value) {
+            constructions.handed = Some(entry);
         }
-        built
+        (built, keep)
     }
 
     /// Hand every kept pattern to the destruction worklist.
     fn drain_into(&self, out: &mut Vec<Pattern>) {
-        out.extend(self.lock().drain(..).map(|entry| entry.pattern.0));
+        let mut constructions = self.lock();
+        let handed = constructions.handed.take();
+        out.extend(
+            constructions
+                .kept
+                .drain(..)
+                .chain(handed)
+                .map(|entry| entry.pattern.0),
+        );
     }
 }
 /// A native value transform.
@@ -5753,22 +5830,7 @@ impl Pattern {
                                     },
                                     _ => unreachable!("handled by the outer match"),
                                 };
-                                let mut ctx = a.context.clone();
-                                ctx.append(&b.context);
-                                if !push_budgeted(
-                                    &mut out,
-                                    Hap {
-                                        whole,
-                                        part: b.part,
-                                        pick_lookup: joined_pick_lookup(&a, &b),
-                                        keys: ContextKeys::merge(&b.keys, &a.keys),
-                                        value: b.value.clone(),
-                                        context: ctx,
-                                        ui_visuals: a.ui_visuals | b.ui_visuals,
-                                        live_controls: b.live_controls,
-                                        slider_binding: b.slider_binding,
-                                    },
-                                ) {
+                                if !push_budgeted(&mut out, joined_hap(&a, b, whole)) {
                                     return Vec::new();
                                 }
                             }

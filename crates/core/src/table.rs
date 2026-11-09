@@ -26,7 +26,7 @@ use crate::settings::SettingsStateId;
 use crate::{
     CombineFn, Hap, HapExpandFn, HapMapFn, JoinMode, LookupFlow, Meeting, Node, OwnedHapMapFn,
     Pattern, PickIndexMode, PickLookup, SignalFn, SpanUse, State, TimeSpan, ValueFn,
-    ValuePredicate, applied_hap, picked_hap,
+    ValuePredicate, applied_hap, joined_hap, picked_hap,
 };
 use rustel_fraction::Fraction;
 use std::sync::{Arc, OnceLock};
@@ -1842,6 +1842,10 @@ pub(crate) fn build(node: &Node) -> Option<Tables> {
             index_mode,
             mode,
         } => picked(selector.tables()?, lookup, *index_mode, *mode),
+        Node::Join(inner, mode) => match inner.node_kind() {
+            Node::PatternOfPure(carrier, f, memo) => joined(carrier.tables()?, f, memo, *mode),
+            _ => None,
+        },
         Node::FmapNative(pattern, f) => stepped(pattern.tables()?, Step::Map(f.clone())),
         Node::FilterValues(pattern, keep) => stepped(pattern.tables()?, Step::Keep(keep.clone())),
         Node::MapHapsNative(pattern, f, SpanUse::Ignores) => {
@@ -2302,6 +2306,91 @@ fn picked(
                         .and_then(|inner_whole| inner_whole.intersection(&whole)),
                 };
                 entries.push(picked_hap(&outer, inner, joined, part));
+                if entries.len() > MAX_ENTRIES {
+                    return None;
+                }
+            }
+        }
+        Layer::new(period, entries)
+    })
+}
+
+/// An inner, outer or mix join of a carrier whose values name patterns
+/// through a pure construction: each carrier hap asks the pattern its value
+/// names over the carrier hap's part. The construction is the one the graph
+/// keeps, so both ask the same pattern. See `Node::Join`.
+fn joined(
+    carrier: &Tables,
+    construct: &crate::ToPurePatternFn,
+    memo: &crate::ConstructionMemo,
+    mode: JoinMode,
+) -> Option<Tables> {
+    if !matches!(mode, JoinMode::Inner | JoinMode::Outer | JoinMode::Mix) {
+        return None;
+    }
+    let settings = crate::settings::current_state_id();
+    // The pattern each carrier value names, each built once.
+    let mut named: Vec<(&crate::Value, Pattern)> = Vec::new();
+    let mut period = carrier.period()?;
+    let mut inner: Option<Work> = None;
+    for layer in &carrier.layers {
+        for entry in &layer.entries {
+            if named
+                .iter()
+                .any(|(value, _)| crate::same_key(value, &entry.value))
+            {
+                continue;
+            }
+            let pattern = memo
+                .kept_for_table(&entry.value, &settings, |value| construct(value))?
+                .pattern()
+                .clone();
+            let tables = pattern.tables()?;
+            period = lcm(period, tables.period()?)?;
+            inner = Some(inner.map_or(tables.work, |work| work.max(tables.work)));
+            named.push((&entry.value, pattern));
+        }
+    }
+    let named = |value: &crate::Value| {
+        named
+            .iter()
+            .find(|(named, _)| crate::same_key(named, value))
+            .map(|(_, pattern)| pattern)
+    };
+    let inner = inner.unwrap_or(Work::leaf(Cycles::NONE));
+    // The join resolves the carrier through one more level, and asks each
+    // pattern over the part of a carrier hap.
+    let work = Work {
+        cycles: carrier.work.cycles.max(inner.cycles),
+        haps: carrier.work.haps.max(inner.haps),
+        levels: carrier
+            .work
+            .levels
+            .saturating_add(1)
+            .max(inner.levels)
+            .saturating_add(1),
+        times: carrier
+            .work
+            .times
+            .max(inner.times.finer(carrier.entry_bits)),
+    };
+    let mut scanned = 0usize;
+    carrier.map_layers(work, |layer| {
+        let mut entries = Vec::new();
+        for outer in layer.repeated(period)? {
+            let answer = named(&outer.value)?.tables()?.answer(outer.part)?;
+            scanned = scanned.saturating_add(answer.len());
+            if scanned > MAX_BUILD_SCAN {
+                return None;
+            }
+            for hap in answer {
+                let whole = match mode {
+                    JoinMode::Inner => hap.whole,
+                    JoinMode::Outer => outer.whole,
+                    // Wholes that do not meet throw, which the graph handles.
+                    _ => Some(outer.whole?.intersection(&hap.whole?)?),
+                };
+                entries.push(joined_hap(&outer, hap, whole));
                 if entries.len() > MAX_ENTRIES {
                     return None;
                 }
@@ -4280,6 +4369,32 @@ mod tests {
             let begin = Fraction::int(1 << 40) + frac(1, (1 << tail) + 1);
             let end = Fraction::int(1 << 40) + frac(2, (1 << tail) + 1);
             assert_same_outcome("fastGap below one", &gap, TimeSpan::new(begin, end));
+        }
+    }
+
+    #[test]
+    fn a_join_of_named_patterns_matches_the_graph() {
+        // `fast("<1 2>")` and `ply`-like patterned arguments join the patterns
+        // a pure construction names for each carrier value.
+        let speeds = map(vec![leaf(1.0, 70), leaf(2.0, 72), leaf(3.0, 74)], slowcat);
+        let carried = |carrier: Pattern, body: Pattern| {
+            carrier.fmap_to_pure_pattern(move |value| {
+                let factor = crate::util::parse_numeral(value).unwrap_or(1.0);
+                body.as_pure_pattern()
+                    .expect("a pure body")
+                    .fast(Fraction::from_f64(factor).expect("a factor"))
+            })
+        };
+        for mode in [JoinMode::Inner, JoinMode::Outer, JoinMode::Mix] {
+            let body = seq(&[0.0, 1.0]);
+            let twin = Twin {
+                tabled: Pattern::of(Node::Join(
+                    carried(speeds.tabled.clone(), body.tabled),
+                    mode,
+                )),
+                graph: Pattern::of(Node::Join(carried(speeds.graph.clone(), body.graph), mode)),
+            };
+            assert_twins(&format!("{mode:?} join"), &twin);
         }
     }
 }
