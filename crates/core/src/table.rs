@@ -97,8 +97,8 @@ struct Layer {
     /// clone of them. See [`Hap::owns_no_heap`].
     copyable: bool,
     /// For haps whose values a signal gives at query time: the entries are
-    /// the structure, and this makes each value. See [`Sampler`].
-    sampler: Option<Arc<Sampler>>,
+    /// the structure, and these make each value. See [`Sampled`].
+    sampled: Option<Arc<Sampled>>,
     /// Every entry is a whole hap: its part is its whole.
     whole_haps: bool,
     /// For entries out of time order that come cycle by cycle, each in one
@@ -131,6 +131,8 @@ enum Find<'a> {
 /// lie in it whole. The others may need clipping, or not meet it at all.
 struct Near<'a> {
     haps: &'a [Hap],
+    /// Where `haps` begin among the entries.
+    start: usize,
     inside: std::ops::Range<usize>,
 }
 
@@ -142,7 +144,7 @@ impl Answering<'_> {
         let back = shift.checked_neg()?;
         let begin = span.begin.checked_add_int(back)?;
         let end = span.end.checked_add_int(back)?;
-        let (haps, first, last) = match self.find {
+        let (haps, start, first, last) = match self.find {
             Find::Search => {
                 let from = self.haps.partition_point(|hap| hap.part.end <= begin);
                 let to = from + self.haps[from..].partition_point(|hap| hap.part.begin < end);
@@ -150,6 +152,7 @@ impl Answering<'_> {
                 // Begins and ends both rise, so the parts inside come together.
                 (
                     haps,
+                    from,
                     haps.partition_point(|hap| hap.part.begin < begin),
                     haps.partition_point(|hap| hap.part.end <= end),
                 )
@@ -165,14 +168,16 @@ impl Answering<'_> {
                 // span hold the parts inside it.
                 (
                     &self.haps[from..at(end.ceil().numer())],
+                    from,
                     at(begin.ceil().numer()) - from,
                     at(end.floor().numer()) - from,
                 )
             }
-            Find::Scan => (self.haps, 0, 0),
+            Find::Scan => (self.haps, 0, 0, 0),
         };
         Some(Near {
             haps,
+            start,
             inside: first..last.max(first),
         })
     }
@@ -232,6 +237,78 @@ impl std::fmt::Debug for Sampler {
     }
 }
 
+/// The samplers of a sampled layer's entries: entry `i` runs
+/// `samplers[of[i]]`. An entry whose value is its own has a sampler with no
+/// meeting.
+#[derive(Debug)]
+struct Sampled {
+    samplers: Vec<Arc<Sampler>>,
+    of: Vec<u32>,
+}
+
+impl Sampled {
+    /// `sampler` for every one of `entries` entries.
+    fn one(sampler: Sampler, entries: usize) -> Self {
+        Self {
+            samplers: vec![Arc::new(sampler)],
+            of: vec![0; entries],
+        }
+    }
+
+    /// Whether every entry runs the same sampler.
+    fn is_uniform(&self) -> bool {
+        self.samplers.len() == 1
+    }
+
+    /// The sampler every entry runs, when they all run one.
+    fn uniform(&self) -> Option<&Sampler> {
+        match self.samplers.as_slice() {
+            [sampler] => Some(sampler),
+            _ => None,
+        }
+    }
+
+    /// The sampler entry `index` runs.
+    fn of(&self, index: usize) -> Option<&Sampler> {
+        let sampler = usize::try_from(*self.of.get(index)?).ok()?;
+        self.samplers.get(sampler).map(|sampler| &**sampler)
+    }
+
+    /// The most haps one entry becomes.
+    fn most(&self) -> u64 {
+        self.samplers
+            .iter()
+            .map(|sampler| sampler.most)
+            .max()
+            .unwrap_or(1)
+    }
+
+    /// Every sampler changed by `change`.
+    fn map(&self, change: impl Fn(&Sampler) -> Option<Sampler>) -> Option<Self> {
+        Some(Self {
+            samplers: self
+                .samplers
+                .iter()
+                .map(|sampler| change(sampler).map(Arc::new))
+                .collect::<Option<_>>()?,
+            of: self.of.clone(),
+        })
+    }
+
+    /// The samplers of `copies` copies of the entries, as
+    /// [`Layer::copies`] repeats them.
+    fn repeated(&self, copies: usize) -> Option<Self> {
+        let mut of = Vec::with_capacity(self.of.len().checked_mul(copies)?);
+        for _ in 0..copies {
+            of.extend_from_slice(&self.of);
+        }
+        Some(Self {
+            samplers: self.samplers.clone(),
+            of,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Side {
     /// `appRight`: the signal gives the function values.
@@ -255,6 +332,17 @@ enum Source {
     Signal(SignalFn),
     /// A constant: one whole hap a cycle, which is `hap` in cycle zero.
     Constant(Box<Hap>),
+    /// The haps a pattern answers over one whole. See [`Fixed`].
+    Fixed(Arc<Fixed>),
+}
+
+/// The haps a pattern answers over `whole`, a whole of period zero, with the
+/// sampler of each one a query makes the value of. Asked over the same
+/// whole in another period, it answers the same haps moved there.
+struct Fixed {
+    whole: TimeSpan,
+    haps: Vec<Hap>,
+    samplers: Vec<Option<Arc<Sampler>>>,
 }
 
 /// One node between a signal and its meeting.
@@ -266,6 +354,14 @@ enum SignalOp {
     Fast(Fraction),
     /// A shift by `by` of what lies inside: it is asked at `t - by`.
     Shift(Fraction),
+    /// A map of each cycle of what lies inside, chosen by the cycle that the
+    /// hap's part lies in at this level, as the node chooses by the cycle of
+    /// its query.
+    Cycle(CycleMap),
+    /// `pickRestart`: what lies inside is moved to start where its selector
+    /// hap starts. That hap starts at `begin` in period zero and every
+    /// `period` cycles on; the hap's part says which one it is in.
+    Restart { begin: Fraction, period: i128 },
     /// A meeting with a constant, a pattern of one whole hap a cycle: `hap`
     /// is its hap of cycle zero, on `side` of the meeting. The signal keeps
     /// the structure, so its hap is cut at the cycle bounds.
@@ -279,6 +375,81 @@ enum SignalOp {
     },
 }
 
+/// How a node maps each cycle of its child. See [`SignalOp::Cycle`].
+#[derive(Clone, Copy, Debug)]
+enum CycleMap {
+    /// `rev`: reflected in the cycle.
+    Reflect,
+    /// `slowcat` of this many constituents: cycle `c` plays cycle
+    /// `floor(c / count)` of its constituent.
+    SlowCat(i128),
+    /// `fastGap(factor)`: the cycle plays its child sped up from its start.
+    Gap(Fraction),
+    /// `repeatCycles(count)`: cycle `c` plays cycle `floor(c / count)`.
+    Repeat(Fraction),
+}
+
+impl CycleMap {
+    /// The span inside for `span` outside, in cycle `c`.
+    fn inward(self, span: TimeSpan, c: i128) -> Option<TimeSpan> {
+        let cycle = Fraction::int(c);
+        Some(match self {
+            Self::Reflect => reflected(span, c)?,
+            Self::Gap(factor) => {
+                let map = |t: Fraction| {
+                    t.checked_sub(cycle)?
+                        .checked_mul(factor)?
+                        .checked_add(cycle)
+                };
+                TimeSpan::new(map(span.begin)?, map(span.end)?)
+            }
+            Self::SlowCat(_) | Self::Repeat(_) => {
+                let by = Fraction::int(self.offset(c)?);
+                TimeSpan::new(span.begin.checked_sub(by)?, span.end.checked_sub(by)?)
+            }
+        })
+    }
+
+    /// `hap` inside, in cycle `c` outside, moved back out.
+    fn outward(self, hap: &mut Hap, c: i128) -> Option<()> {
+        let cycle = Fraction::int(c);
+        let span = |span: TimeSpan| -> Option<TimeSpan> {
+            Some(match self {
+                Self::Reflect => reflected(span, c)?,
+                Self::Gap(factor) => {
+                    let map = |t: Fraction| {
+                        t.checked_sub(cycle)?
+                            .checked_div(factor)?
+                            .checked_add(cycle)
+                    };
+                    TimeSpan::new(map(span.begin)?, map(span.end)?)
+                }
+                Self::SlowCat(_) | Self::Repeat(_) => {
+                    let by = Fraction::int(self.offset(c)?);
+                    TimeSpan::new(span.begin.checked_add(by)?, span.end.checked_add(by)?)
+                }
+            })
+        };
+        hap.part = span(hap.part)?;
+        hap.whole = match hap.whole {
+            Some(whole) => Some(span(whole)?),
+            None => None,
+        };
+        Some(())
+    }
+
+    /// The whole cycles a shifting map moves cycle `c` by.
+    fn offset(self, c: i128) -> Option<i128> {
+        match self {
+            Self::SlowCat(count) => c.checked_sub(c.div_euclid(count)),
+            Self::Repeat(count) => {
+                c.checked_sub(Fraction::int(c).checked_div(count)?.floor().numer())
+            }
+            Self::Reflect | Self::Gap(_) => None,
+        }
+    }
+}
+
 impl Signal {
     /// The signal alone, whose hap only its value changes.
     fn bare(&self) -> Option<&SignalFn> {
@@ -289,21 +460,57 @@ impl Signal {
     }
 
     /// The haps this signal's graph answers for `span`, in its order, into
-    /// `out`, which it clears first.
-    fn answer(&self, span: TimeSpan, probe: &mut State, out: &mut Vec<Hap>) -> Option<()> {
-        // The span each level is asked over, from the outermost in.
+    /// `out`, which it clears first. `part` is the part of the hap that asks,
+    /// which says where a per-cycle node is.
+    fn answer(
+        &self,
+        span: TimeSpan,
+        part: TimeSpan,
+        probe: &mut State,
+        out: &mut Vec<Hap>,
+    ) -> Option<()> {
+        let scaled = |span: TimeSpan, factor: Fraction| {
+            Some(TimeSpan::new(
+                span.begin.checked_mul(factor)?,
+                span.end.checked_mul(factor)?,
+            ))
+        };
+        let moved = |span: TimeSpan, by: Fraction| {
+            Some(TimeSpan::new(
+                span.begin.checked_sub(by)?,
+                span.end.checked_sub(by)?,
+            ))
+        };
+        // The span and part each level is asked over, from the outermost
+        // in, and what each per-cycle node chose there.
         let mut asked = span;
+        let mut cut = part;
+        let mut chosen: Vec<Fraction> = Vec::new();
         for op in self.ops.iter().rev() {
-            asked = match op {
-                SignalOp::Fast(factor) => TimeSpan::new(
-                    asked.begin.checked_mul(*factor)?,
-                    asked.end.checked_mul(*factor)?,
-                ),
-                SignalOp::Shift(by) => {
-                    TimeSpan::new(asked.begin.checked_sub(*by)?, asked.end.checked_sub(*by)?)
+            match op {
+                SignalOp::Fast(factor) => {
+                    asked = scaled(asked, *factor)?;
+                    cut = scaled(cut, *factor)?;
                 }
-                SignalOp::Step(_) | SignalOp::Constant { .. } => asked,
-            };
+                SignalOp::Shift(by) => {
+                    asked = moved(asked, *by)?;
+                    cut = moved(cut, *by)?;
+                }
+                SignalOp::Cycle(map) => {
+                    let c = cut.begin.floor().numer();
+                    asked = map.inward(asked, c)?;
+                    cut = map.inward(cut, c)?;
+                    chosen.push(Fraction::int(c));
+                }
+                SignalOp::Restart { begin, period } => {
+                    let copy = periods_below(cut.begin, *begin, *period)?;
+                    let by = begin.checked_add(Fraction::int(copy.checked_mul(*period)?))?;
+                    asked = moved(asked, by)?;
+                    cut = moved(cut, by)?;
+                    chosen.push(by);
+                }
+                SignalOp::Step(_) | SignalOp::Constant { .. } => {}
+            }
         }
         out.clear();
         match &self.source {
@@ -311,6 +518,19 @@ impl Signal {
                 probe.span = asked;
                 let value = sample(probe);
                 out.push(Hap::new(None, asked, value));
+            }
+            Source::Fixed(fixed) => {
+                let by = asked.begin.checked_sub(fixed.whole.begin)?;
+                let mut scratch = Vec::new();
+                for (hap, sampler) in fixed.haps.iter().zip(&fixed.samplers) {
+                    let hap = retimed(hap, |t| t.checked_add(by))?;
+                    match sampler {
+                        Some(sampler) => {
+                            sampler.run(&hap, hap.whole?, hap.part, probe, &mut scratch, out)?
+                        }
+                        None => out.push(hap),
+                    }
+                }
             }
             Source::Constant(constant) => {
                 for cycle in
@@ -336,6 +556,18 @@ impl Signal {
                 SignalOp::Shift(by) => {
                     for hap in out.iter_mut() {
                         *hap = retimed(hap, |t| t.checked_add(*by))?;
+                    }
+                }
+                SignalOp::Cycle(map) => {
+                    let c = chosen.pop()?.numer();
+                    for hap in out.iter_mut() {
+                        map.outward(hap, c)?;
+                    }
+                }
+                SignalOp::Restart { .. } => {
+                    let by = chosen.pop()?;
+                    for hap in out.iter_mut() {
+                        *hap = retimed(hap, |t| t.checked_add(by))?;
                     }
                 }
                 SignalOp::Constant {
@@ -392,7 +624,15 @@ impl Sampler {
         out: &mut Vec<Hap>,
     ) -> Option<()> {
         let start = out.len();
-        let mut met_once = false;
+        // Until a meeting or a step, the entry at `whole` and `part` stands
+        // for the hap; it is pushed only when something needs it there.
+        let structure = |out: &mut Vec<Hap>| {
+            let mut hap = entry.clone();
+            hap.whole = Some(whole);
+            hap.part = part;
+            out.push(hap);
+        };
+        let mut pushed = false;
         for stage in &self.stages {
             match stage {
                 Stage::Meet {
@@ -401,7 +641,7 @@ impl Sampler {
                     apply,
                     flow,
                 } => {
-                    source.answer(whole, probe, signal)?;
+                    source.answer(whole, part, probe, signal)?;
                     let meet = |structure: &Hap, cut: TimeSpan, met: &Hap| match side {
                         Side::Function => {
                             applied_hap(met, structure, Some(whole), cut, apply, *flow)
@@ -409,7 +649,7 @@ impl Sampler {
                         Side::Value => applied_hap(structure, met, Some(whole), cut, apply, *flow),
                     };
                     let mut next = Vec::with_capacity(signal.len());
-                    if met_once {
+                    if pushed {
                         for structure in &out[start..] {
                             for met in signal.iter() {
                                 if let Some(cut) = structure.part.intersection(&met.part) {
@@ -428,9 +668,13 @@ impl Sampler {
                         }
                     }
                     out.append(&mut next);
-                    met_once = true;
+                    pushed = true;
                 }
                 Stage::Step(step) => {
+                    if !pushed {
+                        structure(out);
+                        pushed = true;
+                    }
                     let mut kept = start;
                     for index in start..out.len() {
                         if step.run_in_place(&mut out[index]) {
@@ -443,6 +687,9 @@ impl Sampler {
                     out.truncate(kept);
                 }
             }
+        }
+        if !pushed {
+            structure(out);
         }
         out[start..]
             .iter()
@@ -674,7 +921,7 @@ impl Count {
             // A meeting with a signal can cut one entry into several haps.
             let entries = u64::try_from(layer.entries.len())
                 .unwrap_or(u64::MAX)
-                .saturating_mul(layer.sampler.as_ref().map_or(1, |sampler| sampler.most));
+                .saturating_mul(layer.sampled.as_ref().map_or(1, |sampled| sampled.most()));
             let period = u64::try_from(layer.period).unwrap_or(u64::MAX).max(1);
             let reach = layer.reach.map_or(0, |reach| {
                 reach
@@ -950,20 +1197,38 @@ impl Layer {
             ordered,
             sorted,
             copyable,
-            sampler: None,
+            sampled: None,
             whole_haps,
             cycle_starts,
         })
     }
 
-    fn with_sampler(mut self, sampler: Option<Arc<Sampler>>) -> Self {
-        self.sampler = sampler;
+    fn with_sampled(mut self, sampled: Option<Sampled>) -> Self {
+        // A sorted form holds the entries in another order than the samplers
+        // of each entry are kept in.
+        if sampled
+            .as_ref()
+            .is_some_and(|sampled| !sampled.is_uniform())
+        {
+            self.sorted = None;
+        }
+        self.sampled = sampled.map(Arc::new);
         self
     }
 
     /// The entries to answer from: in graph order, or sorted. `None` when
     /// this layer has no sorted form that clipping keeps sorted.
     fn entries_in(&self, order: Order) -> Option<Answering<'_>> {
+        // A sampler that cuts one entry into several haps gives them in the
+        // order of its meetings, which need not be the sorted one.
+        if order == Order::Sorted
+            && self
+                .sampled
+                .as_ref()
+                .is_some_and(|sampled| sampled.most() > 1)
+        {
+            return None;
+        }
         match order {
             Order::Graph | Order::Sorted if self.ordered => Some(Answering {
                 haps: &self.entries,
@@ -992,7 +1257,7 @@ impl Layer {
     /// The entries of `cycles` consecutive periods from cycle zero.
     fn repeated(&self, cycles: i128) -> Option<Vec<Hap>> {
         // A sampled layer's values exist only in a query.
-        if self.sampler.is_some() {
+        if self.sampled.is_some() {
             return None;
         }
         self.copies(cycles)
@@ -1034,11 +1299,13 @@ impl Layer {
         };
         let entries = self.entries_in(order)?;
         let start = out.len();
-        let answered = match &self.sampler {
-            Some(sampler) if self.copyable && sampler.in_place().is_some() => {
-                self.emit_sampled_in_place(sampler, entries, state, reach, out, stop)
-            }
-            Some(sampler) => self.emit_sampled(sampler, entries, state, reach, out, stop),
+        let answered = match &self.sampled {
+            Some(sampled) => match sampled.uniform().filter(|_| self.copyable) {
+                Some(sampler) if sampler.in_place().is_some() => {
+                    self.emit_sampled_in_place(sampler, entries, state, reach, out, stop)
+                }
+                _ => self.emit_sampled(sampled, entries, state, reach, out, stop),
+            },
             None => self.emit(entries, state.span, reach, out, stop),
         };
         if answered.is_none() {
@@ -1094,10 +1361,57 @@ impl Layer {
         Some(clipped)
     }
 
+    /// Append the haps for `span` to `out` in the graph's order, each with
+    /// its sampler, not run.
+    fn structure_into(&self, span: TimeSpan, out: &mut Structure, stop: &mut Stop) -> Option<()> {
+        let Some(reach) = self.reach else {
+            return Some(());
+        };
+        let entries = self.entries_in(Order::Graph)?;
+        let Some(sampled) = &self.sampled else {
+            self.emit(entries, span, reach, &mut out.haps, stop)?;
+            out.samplers.resize(out.haps.len(), None);
+            return Some(());
+        };
+        let periods = self.periods(span, reach)?;
+        if periods.first > periods.last {
+            return Some(());
+        }
+        for k in periods.first..=periods.last {
+            let shift = k.checked_mul(self.period)?;
+            let from = out.haps.len();
+            let (near, first) = if periods.is_inside(k) {
+                (entries.haps, 0)
+            } else {
+                let near = entries.near(span, shift)?;
+                (near.haps, near.start)
+            };
+            for (index, entry) in (first..).zip(near) {
+                let Some(part) = shifted_span(entry.part, shift)?.intersection(&span) else {
+                    continue;
+                };
+                let mut hap = entry.clone();
+                hap.whole = match entry.whole {
+                    Some(whole) => Some(shifted_span(whole, shift)?),
+                    None => None,
+                };
+                hap.part = part;
+                out.haps.push(hap);
+                let sampler = usize::try_from(*sampled.of.get(index)?).ok()?;
+                out.samplers
+                    .push(Some(Arc::clone(sampled.samplers.get(sampler)?)));
+            }
+            if !stop.allows(from, out.haps.len() - from) {
+                return Some(());
+            }
+        }
+        Some(())
+    }
+
     /// [`Self::emit`] for a sampled layer: each hap meets the signal.
     fn emit_sampled(
         &self,
-        sampler: &Sampler,
+        sampled: &Sampled,
         entries: Answering<'_>,
         state: &State,
         reach: TimeSpan,
@@ -1117,12 +1431,13 @@ impl Layer {
             let inside = periods.is_inside(k);
             let from = out.len();
             let mut met = 0;
-            let near = if inside {
-                entries.haps
+            let (near, first) = if inside {
+                (entries.haps, 0)
             } else {
-                entries.near(span, shift)?.haps
+                let near = entries.near(span, shift)?;
+                (near.haps, near.start)
             };
-            for entry in near {
+            for (index, entry) in (first..).zip(near) {
                 let shifted = shifted_span(entry.part, shift)?;
                 let part = if inside {
                     shifted
@@ -1138,7 +1453,9 @@ impl Layer {
                     whole => shifted_span(whole, shift)?,
                 };
                 met += 1;
-                sampler.run(entry, whole, part, &mut probe, &mut signal, out)?;
+                sampled
+                    .of(index)?
+                    .run(entry, whole, part, &mut probe, &mut signal, out)?;
             }
             // Every meeting counts, also one that a step dropped after.
             if !stop.allows(from, met) {
@@ -1278,6 +1595,97 @@ impl Layer {
         out.push(hap);
         Some(part != shifted)
     }
+}
+
+/// The haps a child answers for a rule that takes them in: in the graph's
+/// order, each with the sampler that makes its value in a query, not run.
+#[derive(Default)]
+struct Structure {
+    haps: Vec<Hap>,
+    samplers: Vec<Option<Arc<Sampler>>>,
+}
+
+impl Structure {
+    /// The haps moved by `map`, and every sampler under `ops`, the time map
+    /// of its haps, innermost first, so that each signal is still asked where
+    /// it was.
+    fn retimed(self, map: impl Fn(&Hap) -> Option<Hap>, ops: &[SignalOp]) -> Option<Self> {
+        let haps = self.haps.iter().map(map).collect::<Option<_>>()?;
+        // Each sampler is moved once, however many haps run it.
+        let mut moved: Vec<(*const Sampler, Arc<Sampler>)> = Vec::new();
+        let samplers = self
+            .samplers
+            .into_iter()
+            .map(|sampler| {
+                let sampler = sampler?;
+                let key = Arc::as_ptr(&sampler);
+                if let Some((_, done)) = moved.iter().find(|(seen, _)| *seen == key) {
+                    return Some(Arc::clone(done));
+                }
+                let mut changed = Sampler::clone(&sampler);
+                for stage in &mut changed.stages {
+                    if let Stage::Meet { signal, .. } = stage {
+                        signal.ops.extend_from_slice(ops);
+                    }
+                }
+                let changed = Arc::new(changed);
+                moved.push((key, Arc::clone(&changed)));
+                Some(changed)
+            })
+            .collect();
+        Some(Self { haps, samplers })
+    }
+
+    fn append(&mut self, mut other: Self) {
+        self.haps.append(&mut other.haps);
+        self.samplers.append(&mut other.samplers);
+    }
+
+    /// One layer of these haps, repeating every `period` cycles.
+    fn into_layer(self, period: i128) -> Option<Layer> {
+        let sampled = if self.samplers.iter().any(Option::is_some) {
+            Some(sampled_of(&self.samplers)?)
+        } else {
+            None
+        };
+        Some(Layer::new(period, self.haps)?.with_sampled(sampled))
+    }
+}
+
+/// The samplers of entries that each run `samplers[i]`. An entry whose
+/// value is its own runs a sampler with no stage.
+fn sampled_of(samplers: &[Option<Arc<Sampler>>]) -> Option<Sampled> {
+    let mut distinct: Vec<Arc<Sampler>> = Vec::new();
+    let mut own: Option<u32> = None;
+    let mut of = Vec::with_capacity(samplers.len());
+    for sampler in samplers {
+        let index = match sampler {
+            Some(sampler) => match distinct.iter().position(|seen| Arc::ptr_eq(seen, sampler)) {
+                Some(index) => u32::try_from(index).ok()?,
+                None => {
+                    distinct.push(Arc::clone(sampler));
+                    u32::try_from(distinct.len() - 1).ok()?
+                }
+            },
+            None => match own {
+                Some(index) => index,
+                None => {
+                    distinct.push(Arc::new(Sampler {
+                        stages: Vec::new(),
+                        most: 1,
+                    }));
+                    let index = u32::try_from(distinct.len() - 1).ok()?;
+                    own = Some(index);
+                    index
+                }
+            },
+        };
+        of.push(index);
+    }
+    Some(Sampled {
+        samplers: distinct,
+        of,
+    })
 }
 
 /// The periods a span meets: from `first` to `last` each has a part in it,
@@ -1752,11 +2160,28 @@ impl Tables {
             .as_ref()
     }
 
+    /// The haps for `span` while a table is built, sampled ones with their
+    /// samplers not run, or `None` past [`MAX_ENTRIES`] haps.
+    fn structure(&self, span: TimeSpan) -> Option<Structure> {
+        let mut stop = Stop::build();
+        if !self.answerable(span, &stop)? {
+            return None;
+        }
+        let mut out = Structure::default();
+        for layer in &self.layers {
+            layer.structure_into(span, &mut out, &mut stop)?;
+            if stop.stopped() {
+                return None;
+            }
+        }
+        Some(out)
+    }
+
     /// The whole answer for `span` while a table is built, or `None` past
     /// [`MAX_ENTRIES`] haps.
     fn answer(&self, span: TimeSpan) -> Option<Vec<Hap>> {
         // A sampled layer's values exist only in a query.
-        if self.layers.iter().any(|layer| layer.sampler.is_some()) {
+        if self.layers.iter().any(|layer| layer.sampled.is_some()) {
             return None;
         }
         let mut stop = Stop::build();
@@ -1786,16 +2211,16 @@ impl Tables {
         cycles: i128,
         children: Work,
         levels_above: u32,
-        mut cycle: impl FnMut(i128) -> Option<Vec<Hap>>,
+        mut cycle: impl FnMut(i128) -> Option<Structure>,
     ) -> Option<Self> {
         // Every cycle is asked, an empty one too.
         if cycles > i128::try_from(MAX_ENTRIES).ok()? {
             return None;
         }
-        let mut entries = Vec::new();
+        let mut entries = Structure::default();
         for c in 0..cycles {
-            entries.extend(cycle(c)?);
-            if entries.len() > MAX_ENTRIES {
+            entries.append(cycle(c)?);
+            if entries.haps.len() > MAX_ENTRIES {
                 return None;
             }
         }
@@ -1805,7 +2230,7 @@ impl Tables {
             levels: children.levels.saturating_add(levels_above),
             times: children.times.cycled(),
         };
-        Some(Self::new(vec![Layer::new(cycles, entries)?], work))
+        Some(Self::new(vec![entries.into_layer(cycles)?], work))
     }
 
     /// The longest whole over every layer's entries.
@@ -1857,8 +2282,8 @@ pub(crate) fn build(node: &Node) -> Option<Tables> {
         Node::ExpandHapsNative(pattern, f, SpanUse::Ignores) => expanded(pattern.tables()?, f),
         Node::AppLeft(functions, values, apply, flow) => match signal_of(values) {
             Some(signal) => sampled(functions.tables()?, signal, Side::Value, apply, *flow),
-            None if sampling(functions) => {
-                met_constant(functions, values, Side::Value, apply, *flow)
+            None if sampling(functions) || sampling(values) => {
+                met(functions, values, Side::Value, apply, *flow)
             }
             None => applied(functions.tables()?, values.tables()?, |function, value| {
                 let part = function.part.intersection(&value.part)?;
@@ -1874,8 +2299,8 @@ pub(crate) fn build(node: &Node) -> Option<Tables> {
         },
         Node::AppRight(functions, values, apply, flow) => match signal_of(functions) {
             Some(signal) => sampled(values.tables()?, signal, Side::Function, apply, *flow),
-            None if sampling(values) => {
-                met_constant(values, functions, Side::Function, apply, *flow)
+            None if sampling(values) || sampling(functions) => {
+                met(values, functions, Side::Function, apply, *flow)
             }
             None => applied(values.tables()?, functions.tables()?, |value, function| {
                 let part = function.part.intersection(&value.part)?;
@@ -1907,10 +2332,13 @@ fn pure(value: &crate::Value) -> Option<Tables> {
 /// layer's steps, since its values exist only in a query.
 fn stepped(tables: &Tables, step: Step) -> Option<Tables> {
     tables.map_layers(tables.work.above(), |layer| {
-        if let Some(sampler) = &layer.sampler {
-            let mut stepped = Sampler::clone(sampler);
-            stepped.stages.push(Stage::Step(step.clone()));
-            return Some(layer.clone().with_sampler(Some(Arc::new(stepped))));
+        if let Some(sampled) = &layer.sampled {
+            let stepped = sampled.map(|sampler| {
+                let mut stepped = Sampler::clone(sampler);
+                stepped.stages.push(Stage::Step(step.clone()));
+                Some(stepped)
+            });
+            return Some(layer.clone().with_sampled(stepped));
         }
         let mut entries = Vec::with_capacity(layer.entries.len());
         for entry in &layer.entries {
@@ -1930,7 +2358,7 @@ fn stepped(tables: &Tables, step: Step) -> Option<Tables> {
 fn expanded(tables: &Tables, expand: &HapExpandFn) -> Option<Tables> {
     tables.map_layers(tables.work.above(), |layer| {
         // A sampled layer's values exist only in a query.
-        if layer.sampler.is_some() {
+        if layer.sampled.is_some() {
             return None;
         }
         let mut entries = Vec::with_capacity(layer.entries.len());
@@ -2026,7 +2454,8 @@ fn constant_of(pattern: &Pattern) -> Option<(Box<Hap>, u32)> {
     };
     let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
     (layer.period == 1
-        && layer.sampler.is_none()
+        && layer.sampled.is_none()
+        && entry.keys.is_empty()
         && entry.whole == Some(cycle)
         && entry.part == cycle)
         .then(|| (Box::new(entry.clone()), tables.work.levels))
@@ -2056,7 +2485,11 @@ fn signal_work(signal: &Signal, width: Fraction, extent: f64, bits: u32) -> Opti
                 let below = u32::try_from(depth).ok()?.saturating_add(1);
                 levels = levels.max(below.saturating_add(*constant));
             }
-            SignalOp::Step(_) | SignalOp::Shift(_) => {}
+            SignalOp::Cycle(CycleMap::Gap(factor)) => wide = wide.checked_mul(*factor)?,
+            SignalOp::Step(_)
+            | SignalOp::Shift(_)
+            | SignalOp::Cycle(_)
+            | SignalOp::Restart { .. } => {}
         }
     }
     if let Source::Constant(_) = signal.source {
@@ -2069,6 +2502,7 @@ fn signal_work(signal: &Signal, width: Fraction, extent: f64, bits: u32) -> Opti
         times = match op {
             SignalOp::Fast(factor) => times.scaled(*factor),
             SignalOp::Shift(by) => times.shifted(*by),
+            SignalOp::Cycle(_) | SignalOp::Restart { .. } => times.cycled(),
             SignalOp::Step(_) | SignalOp::Constant { .. } => times,
         };
     }
@@ -2112,19 +2546,22 @@ fn sampled(
         flow,
     };
     structure.map_layers(work, |layer| {
-        let sampler = match &layer.sampler {
-            Some(sampler) => {
+        let sampled = match &layer.sampled {
+            Some(sampled) => sampled.map(|sampler| {
                 let mut sampler = Sampler::clone(sampler);
                 sampler.stages.push(stage.clone());
                 sampler.most = sampler.most.saturating_mul(most);
-                sampler
-            }
-            None => Sampler {
-                stages: vec![stage.clone()],
-                most,
-            },
+                Some(sampler)
+            })?,
+            None => Sampled::one(
+                Sampler {
+                    stages: vec![stage.clone()],
+                    most,
+                },
+                layer.entries.len(),
+            ),
         };
-        Some(layer.clone().with_sampler(Some(Arc::new(sampler))))
+        Some(layer.clone().with_sampled(Some(sampled)))
     })
 }
 
@@ -2132,7 +2569,103 @@ fn sampled(
 fn sampling(pattern: &Pattern) -> bool {
     pattern
         .tables()
-        .is_some_and(|tables| tables.layers.iter().any(|layer| layer.sampler.is_some()))
+        .is_some_and(|tables| tables.layers.iter().any(|layer| layer.sampled.is_some()))
+}
+
+/// A `structure` meeting `other` on `side` where either holds layers whose
+/// values a query makes: a constant meets as one more stage of every
+/// sampler, and anything else as a stage of each entry's own, which holds
+/// the haps `other` answers over that entry's whole.
+fn met(
+    structure: &Pattern,
+    other: &Pattern,
+    side: Side,
+    apply: &CombineFn,
+    flow: LookupFlow,
+) -> Option<Tables> {
+    if sampling(structure) && constant_of(other).is_some() {
+        return met_constant(structure, other, side, apply, flow);
+    }
+    let structure = structure.tables()?;
+    let other = other.tables()?;
+    let period = lcm(structure.period()?, other.period()?)?;
+    // The other side is asked over each whole of the structure side.
+    let longest = structure.longest_whole()?;
+    let work = Work {
+        cycles: structure
+            .work
+            .cycles
+            .max(other.work.cycles.bounded(longest)?),
+        haps: structure.work.haps.max(other.work.haps.bounded(longest)),
+        levels: structure
+            .work
+            .levels
+            .max(other.work.levels)
+            .saturating_add(1),
+        times: structure.work.times.max(
+            other
+                .work
+                .times
+                .reaching(structure.extent)
+                .finer(structure.entry_bits),
+        ),
+    };
+    let mut scanned = 0usize;
+    structure.map_layers(work, |layer| {
+        let copies = usize::try_from(period.checked_div(layer.period)?).ok()?;
+        let entries = layer.copies(period)?;
+        let samplers = match &layer.sampled {
+            Some(sampled) => {
+                let sampled = sampled.repeated(copies)?;
+                (0..entries.len())
+                    .map(|index| {
+                        let sampler = usize::try_from(*sampled.of.get(index)?).ok()?;
+                        Some(Some(Arc::clone(sampled.samplers.get(sampler)?)))
+                    })
+                    .collect::<Option<Vec<_>>>()?
+            }
+            None => vec![None; entries.len()],
+        };
+        let mut out = Structure::default();
+        for (entry, sampler) in entries.into_iter().zip(samplers) {
+            let whole = entry.whole?;
+            let fixed = other.structure(whole)?;
+            scanned = scanned.saturating_add(fixed.haps.len());
+            if scanned > MAX_BUILD_SCAN {
+                return None;
+            }
+            let most = fixed
+                .samplers
+                .iter()
+                .map(|sampler| sampler.as_ref().map_or(1, |sampler| sampler.most))
+                .fold(0u64, u64::saturating_add)
+                .max(1);
+            let mut sampler = match sampler {
+                Some(sampler) => Sampler::clone(&sampler),
+                None => Sampler {
+                    stages: Vec::new(),
+                    most: 1,
+                },
+            };
+            sampler.stages.push(Stage::Meet {
+                signal: Signal {
+                    source: Source::Fixed(Arc::new(Fixed {
+                        whole,
+                        haps: fixed.haps,
+                        samplers: fixed.samplers,
+                    })),
+                    ops: Vec::new(),
+                },
+                side,
+                apply: apply.clone(),
+                flow,
+            });
+            sampler.most = sampler.most.saturating_mul(most);
+            out.haps.push(entry);
+            out.samplers.push(Some(Arc::new(sampler)));
+        }
+        out.into_layer(period)
+    })
 }
 
 /// A `structure` with sampled layers meeting a constant on `side`: the
@@ -2269,7 +2802,7 @@ fn picked(
     };
     let mut scanned = 0usize;
     selectors.map_layers(work, |layer| {
-        let mut entries = Vec::new();
+        let mut entries = Structure::default();
         for outer in layer.repeated(period)? {
             let whole = outer.whole?;
             let tables = lookup.select(&outer.value, index_mode)?.tables()?;
@@ -2282,17 +2815,32 @@ fn picked(
                 outer.part.begin.checked_sub(by)?,
                 outer.part.end.checked_sub(by)?,
             );
-            let answer = tables.answer(span)?;
-            scanned = scanned.saturating_add(answer.len());
+            let mut answer = tables.structure(span)?;
+            scanned = scanned.saturating_add(answer.haps.len());
             if scanned > MAX_BUILD_SCAN {
                 return None;
             }
-            for inner in answer {
-                let inner = if moved {
-                    retimed(&inner, |t| t.checked_add(by))?
+            if moved {
+                // A signal inside is asked where the moved pattern was. A
+                // restart moves each copy of the selector hap by its own
+                // start, which a selector hap no longer than the period
+                // names.
+                let op = if mode == JoinMode::Restart {
+                    if whole.end.checked_sub(whole.begin)? > Fraction::int(period)
+                        && answer.samplers.iter().any(Option::is_some)
+                    {
+                        return None;
+                    }
+                    SignalOp::Restart {
+                        begin: whole.begin,
+                        period,
+                    }
                 } else {
-                    inner
+                    SignalOp::Shift(by)
                 };
+                answer = answer.retimed(|hap| retimed(hap, |t| t.checked_add(by)), &[op])?;
+            }
+            for (inner, sampler) in answer.haps.into_iter().zip(answer.samplers) {
                 let Some(part) = inner.part.intersection(&outer.part) else {
                     continue;
                 };
@@ -2305,13 +2853,19 @@ fn picked(
                         .whole
                         .and_then(|inner_whole| inner_whole.intersection(&whole)),
                 };
-                entries.push(picked_hap(&outer, inner, joined, part));
-                if entries.len() > MAX_ENTRIES {
+                // A sampled hap samples its signals over its own whole, and
+                // its keys merge with the selector's after its meetings.
+                if sampler.is_some() && (joined != inner.whole || !outer.keys.is_empty()) {
+                    return None;
+                }
+                entries.haps.push(picked_hap(&outer, inner, joined, part));
+                entries.samplers.push(sampler);
+                if entries.haps.len() > MAX_ENTRIES {
                     return None;
                 }
             }
         }
-        Layer::new(period, entries)
+        entries.into_layer(period)
     })
 }
 
@@ -2376,27 +2930,35 @@ fn joined(
     };
     let mut scanned = 0usize;
     carrier.map_layers(work, |layer| {
-        let mut entries = Vec::new();
+        let mut entries = Structure::default();
         for outer in layer.repeated(period)? {
-            let answer = named(&outer.value)?.tables()?.answer(outer.part)?;
-            scanned = scanned.saturating_add(answer.len());
+            let answer = named(&outer.value)?.tables()?.structure(outer.part)?;
+            scanned = scanned.saturating_add(answer.haps.len());
             if scanned > MAX_BUILD_SCAN {
                 return None;
             }
-            for hap in answer {
+            for (hap, sampler) in answer.haps.into_iter().zip(answer.samplers) {
                 let whole = match mode {
                     JoinMode::Inner => hap.whole,
                     JoinMode::Outer => outer.whole,
                     // Wholes that do not meet throw, which the graph handles.
                     _ => Some(outer.whole?.intersection(&hap.whole?)?),
                 };
-                entries.push(joined_hap(&outer, hap, whole));
-                if entries.len() > MAX_ENTRIES {
+                // A sampled hap samples its signals over its own whole, and
+                // its value and keys meet the carrier's after its meetings.
+                if sampler.is_some()
+                    && (whole != hap.whole || outer.pick_lookup.is_some() || !outer.keys.is_empty())
+                {
+                    return None;
+                }
+                entries.haps.push(joined_hap(&outer, hap, whole));
+                entries.samplers.push(sampler);
+                if entries.haps.len() > MAX_ENTRIES {
                     return None;
                 }
             }
         }
-        Layer::new(period, entries)
+        entries.into_layer(period)
     })
 }
 
@@ -2422,23 +2984,29 @@ fn fast(tables: &Tables, factor: Fraction) -> Option<Tables> {
             .map(|entry| retimed(entry, |t| t.checked_div(factor)))
             .collect::<Option<_>>()?;
         // A signal is sampled where its meeting is, so it speeds up with it.
-        Some(
-            Layer::new(period, entries)?
-                .with_sampler(moved(&layer.sampler, SignalOp::Fast(factor))),
-        )
+        let sampled = match &layer.sampled {
+            Some(sampled) => Some(moved(
+                &sampled.repeated(usize::try_from(copies).ok()?)?,
+                SignalOp::Fast(factor),
+            )?),
+            None => None,
+        };
+        Some(Layer::new(period, entries)?.with_sampled(sampled))
     })
 }
 
-/// `sampler` under one more time map of its layer, `op`: each meeting's
-/// signal is asked through it.
-fn moved(sampler: &Option<Arc<Sampler>>, op: SignalOp) -> Option<Arc<Sampler>> {
-    let mut sampler = Sampler::clone(sampler.as_ref()?);
-    for stage in &mut sampler.stages {
-        if let Stage::Meet { signal, .. } = stage {
-            signal.ops.push(op.clone());
+/// The samplers of a layer under one more time map of that layer, `op`:
+/// each meeting's signal is asked through it.
+fn moved(sampled: &Sampled, op: SignalOp) -> Option<Sampled> {
+    sampled.map(|sampler| {
+        let mut sampler = Sampler::clone(sampler);
+        for stage in &mut sampler.stages {
+            if let Stage::Meet { signal, .. } = stage {
+                signal.ops.push(op.clone());
+            }
         }
-    }
-    Some(Arc::new(sampler))
+        Some(sampler)
+    })
 }
 
 /// A shift by `by` cycles: every time plus `by`.
@@ -2455,10 +3023,11 @@ fn shift(tables: &Tables, by: Fraction) -> Option<Tables> {
             .map(|entry| retimed(entry, |t| t.checked_add(by)))
             .collect::<Option<_>>()?;
         // A signal is sampled where its meeting is, so it moves with it.
-        Some(
-            Layer::new(layer.period, entries)?
-                .with_sampler(moved(&layer.sampler, SignalOp::Shift(by))),
-        )
+        let sampled = match &layer.sampled {
+            Some(sampled) => Some(moved(sampled, SignalOp::Shift(by))?),
+            None => None,
+        };
+        Some(Layer::new(layer.period, entries)?.with_sampled(sampled))
     })
 }
 
@@ -2488,7 +3057,7 @@ fn split_queries(inner: &Pattern) -> Option<Tables> {
     }
     let tables = inner.tables()?;
     let period = tables.period()?;
-    Tables::by_cycle(period, tables.work, 1, |c| tables.answer(cycle_span(c)?))
+    Tables::by_cycle(period, tables.work, 1, |c| tables.structure(cycle_span(c)?))
 }
 
 /// One constituent per cycle, each continuing from its own last cycle: cycle
@@ -2512,11 +3081,10 @@ fn slowcat(patterns: &[Pattern]) -> Option<Tables> {
         let child = &children[usize::try_from(c.rem_euclid(count)).ok()?];
         let local = c.div_euclid(count);
         let offset = c.checked_sub(local)?;
-        child
-            .answer(cycle_span(local)?)?
-            .iter()
-            .map(|hap| shifted(hap, offset))
-            .collect()
+        child.structure(cycle_span(local)?)?.retimed(
+            |hap| shifted(hap, offset),
+            &[SignalOp::Cycle(CycleMap::SlowCat(count))],
+        )
     })
 }
 
@@ -2537,7 +3105,7 @@ fn slowcat_prime(patterns: &[Pattern]) -> Option<Tables> {
     }
     let work = constituents(&children);
     Tables::by_cycle(cycles, work, 2, |c| {
-        children[usize::try_from(c.rem_euclid(count)).ok()?].answer(cycle_span(c)?)
+        children[usize::try_from(c.rem_euclid(count)).ok()?].structure(cycle_span(c)?)
     })
 }
 
@@ -2554,26 +3122,18 @@ fn constituents(children: &[&Tables]) -> Work {
 fn rev(tables: &Tables) -> Option<Tables> {
     let period = tables.period()?;
     Tables::by_cycle(period, tables.work, 2, |c| {
-        let cycle = Fraction::int(c);
-        let next = Fraction::int(c.checked_add(1)?);
-        let reflect = |span: TimeSpan| {
-            Some(TimeSpan::new(
-                cycle.checked_add(next.checked_sub(span.end)?)?,
-                cycle.checked_add(next.checked_sub(span.begin)?)?,
-            ))
-        };
-        tables
-            .answer(cycle_span(c)?)?
-            .into_iter()
-            .map(|mut hap| {
-                hap.part = reflect(hap.part)?;
+        tables.structure(cycle_span(c)?)?.retimed(
+            |hap| {
+                let mut hap = hap.clone();
+                hap.part = reflected(hap.part, c)?;
                 hap.whole = match hap.whole {
-                    Some(whole) => Some(reflect(whole)?),
+                    Some(whole) => Some(reflected(whole, c)?),
                     None => None,
                 };
                 Some(hap)
-            })
-            .collect()
+            },
+            &[SignalOp::Cycle(CycleMap::Reflect)],
+        )
     })
 }
 
@@ -2598,11 +3158,13 @@ fn fast_gap(tables: &Tables, factor: Fraction) -> Option<Tables> {
     };
     Tables::by_cycle(period, children, 2, |c| {
         let begin = Fraction::int(c);
+        // A signal inside is asked at `(t - c) * factor + c`.
         tables
-            .answer(TimeSpan::new(begin, begin.checked_add(reach)?))?
-            .iter()
-            .map(|hap| Pattern::fast_gap_unmap_hap(hap, factor))
-            .collect()
+            .structure(TimeSpan::new(begin, begin.checked_add(reach)?))?
+            .retimed(
+                |hap| Pattern::fast_gap_unmap_hap(hap, factor),
+                &[SignalOp::Cycle(CycleMap::Gap(factor))],
+            )
     })
 }
 
@@ -2622,12 +3184,21 @@ fn repeat_cycles(tables: &Tables, count: Fraction) -> Option<Tables> {
     Tables::by_cycle(period, children, 2, |c| {
         let source = Fraction::int(c).checked_div(count)?.floor().numer();
         let delta = c.checked_sub(source)?;
-        tables
-            .answer(cycle_span(source)?)?
-            .iter()
-            .map(|hap| shifted(hap, delta))
-            .collect()
+        tables.structure(cycle_span(source)?)?.retimed(
+            |hap| shifted(hap, delta),
+            &[SignalOp::Cycle(CycleMap::Repeat(count))],
+        )
     })
+}
+
+/// `span` reflected in cycle `c`, as `rev` reflects it.
+fn reflected(span: TimeSpan, c: i128) -> Option<TimeSpan> {
+    let cycle = Fraction::int(c);
+    let next = Fraction::int(c.checked_add(1)?);
+    Some(TimeSpan::new(
+        cycle.checked_add(next.checked_sub(span.end)?)?,
+        cycle.checked_add(next.checked_sub(span.begin)?)?,
+    ))
 }
 
 /// The span of cycle `c`.
@@ -3213,7 +3784,7 @@ mod tests {
             tables
                 .layers
                 .iter()
-                .all(|layer| layer.copyable && layer.sampler.is_some())
+                .all(|layer| layer.copyable && layer.sampled.is_some())
         );
         for (begin, end) in [(frac(0, 1), frac(2, 1)), (frac(1, 3), frac(7, 4))] {
             assert_eq!(
@@ -4396,5 +4967,137 @@ mod tests {
             };
             assert_twins(&format!("{mode:?} join"), &twin);
         }
+    }
+
+    /// Notes met by a signal: a sampled layer.
+    fn sampled_notes(values: &[f64]) -> Twin {
+        controlled(
+            named(seq(values), "n"),
+            signal_twin(crate::signal::sine),
+            "lpf",
+        )
+    }
+
+    #[test]
+    fn sampled_layers_under_per_cycle_nodes_match_the_graph_in_every_period() {
+        assert_twins("rev", &one(sampled_notes(&[0.0, 1.0, 2.0]), |p| p.rev()));
+        assert_twins(
+            "slowcat",
+            &map(
+                vec![
+                    sampled_notes(&[0.0, 1.0]),
+                    seq(&[5.0]),
+                    sampled_notes(&[7.0]),
+                ],
+                slowcat,
+            ),
+        );
+        assert_twins(
+            "fastGap",
+            &one(sampled_notes(&[0.0, 1.0]), |p| p.fast_gap(frac(3, 2))),
+        );
+        assert_twins(
+            "fastGap below one",
+            &one(sampled_notes(&[0.0, 1.0]), |p| p.fast_gap(frac(2, 3))),
+        );
+        assert_twins(
+            "repeatCycles",
+            &one(
+                controlled(
+                    named(map(vec![seq(&[0.0, 1.0]), seq(&[2.0])], slowcat), "n"),
+                    rand_twin(),
+                    "gain",
+                ),
+                |p| p.repeat_cycles(frac(3, 2)),
+            ),
+        );
+        assert_twins(
+            "rev then slow then a signal",
+            &controlled(
+                one(sampled_notes(&[0.0, 1.0]), |p| p.rev().slow(frac(3, 1))),
+                signal_twin(crate::signal::saw),
+                "gain",
+            ),
+        );
+    }
+
+    #[test]
+    fn picks_of_sampled_choices_match_the_graph_in_every_period() {
+        let choices = || {
+            vec![
+                sampled_notes(&[0.0, 1.0]),
+                seq(&[3.0]),
+                sampled_notes(&[4.0, 5.0, 6.0]),
+            ]
+        };
+        for mode in [JoinMode::Restart, JoinMode::Reset, JoinMode::Inner] {
+            // A selector hap that cuts a sampled hap's whole leaves the pick
+            // to the graph. Every pick answers as the graph does.
+            for (name, selector) in selectors() {
+                let pick = picked_from(selector, choices(), PickIndexMode::Clamp, mode);
+                for (begin, end) in spans() {
+                    assert_same_outcome(
+                        &format!("{mode:?} pick of sampled choices by {name}"),
+                        &pick,
+                        TimeSpan::new(begin, end),
+                    );
+                }
+            }
+            // Selector haps of whole cycles hold whole notes, so the pick
+            // answers from tables.
+            let cycles = map(vec![leaf(0.0, 80), leaf(2.0, 82), leaf(1.0, 84)], slowcat);
+            assert_twins(
+                &format!("{mode:?} pick of sampled choices by cycles"),
+                &picked_from(cycles, choices(), PickIndexMode::Clamp, mode),
+            );
+        }
+    }
+
+    /// A signal held over `steps` segments a cycle, as `segment` holds it.
+    fn segmented(signal: Twin, steps: i128) -> Twin {
+        one(signal, |p| crate::combinators::segment(p, frac(steps, 1)))
+    }
+
+    #[test]
+    fn meetings_with_sampled_or_patterned_sides_match_the_graph() {
+        let notes = || named(seq(&[0.0, 1.0, 2.0, 3.0]), "note");
+        assert_twins(
+            "a segmented signal as a control",
+            &controlled(
+                notes(),
+                ranged(
+                    segmented(signal_twin(crate::signal::sine), 6),
+                    200.0,
+                    8000.0,
+                ),
+                "lpf",
+            ),
+        );
+        assert_twins(
+            "a segmented random signal under a constant",
+            &controlled(
+                controlled(notes(), segmented(rand_twin(), 8), "gain"),
+                constant_twin(0.5),
+                "room",
+            ),
+        );
+        assert_twins(
+            "a patterned control after a signal",
+            &controlled(
+                sampled_notes(&[0.0, 1.0]),
+                named(seq(&[0.5, 1.0, 0.25]), "gain"),
+                "gain",
+            ),
+        );
+        // A long whole cut into pieces that `rev` gives back in falling time.
+        let long = named(map(vec![leaf(0.0, 90), leaf(4.0, 92)], slowcat), "note");
+        let long = one(long, |p| p.slow(frac(2, 1)));
+        assert_twins(
+            "pieces of a segmented signal under rev",
+            &one(
+                controlled(long, segmented(signal_twin(crate::signal::sine), 3), "gain"),
+                |p| p.rev(),
+            ),
+        );
     }
 }
