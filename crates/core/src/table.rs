@@ -226,6 +226,30 @@ enum Stage {
         flow: LookupFlow,
     },
     Step(Step),
+    /// The outer hap of a pick or a join, met by each hap after the inner
+    /// pattern's own meetings, as the graph meets it.
+    Outer(Arc<Outer>),
+}
+
+/// The outer hap of a pick or a join, which a [`Stage::Outer`] merges into
+/// each hap: its context first, then the inner hap's.
+struct Outer {
+    hap: Hap,
+    /// A pick's merge, or else a join's. See `picked_hap` and `joined_hap`.
+    picked: bool,
+}
+
+impl Outer {
+    /// `inner` as the pick or the join makes it of the outer hap, at the
+    /// whole and part the rule gave it.
+    fn merge(&self, inner: Hap) -> Hap {
+        let (whole, part) = (inner.whole, inner.part);
+        if self.picked {
+            picked_hap(&self.hap, inner, whole, part)
+        } else {
+            joined_hap(&self.hap, inner, whole)
+        }
+    }
 }
 
 impl std::fmt::Debug for Sampler {
@@ -272,6 +296,19 @@ impl Sampled {
     fn of(&self, index: usize) -> Option<&Sampler> {
         let sampler = usize::try_from(*self.of.get(index)?).ok()?;
         self.samplers.get(sampler).map(|sampler| &**sampler)
+    }
+
+    /// The most haps all the entries become together.
+    fn total(&self) -> u64 {
+        let mosts: Vec<u64> = self.samplers.iter().map(|sampler| sampler.most).collect();
+        self.of.iter().fold(0u64, |total, &sampler| {
+            let most = usize::try_from(sampler)
+                .ok()
+                .and_then(|sampler| mosts.get(sampler))
+                .copied()
+                .unwrap_or(u64::MAX);
+            total.saturating_add(most)
+        })
     }
 
     /// The most haps one entry becomes.
@@ -686,6 +723,17 @@ impl Sampler {
                     }
                     out.truncate(kept);
                 }
+                Stage::Outer(outer) => {
+                    if !pushed {
+                        structure(out);
+                        pushed = true;
+                    }
+                    for hap in &mut out[start..] {
+                        let inner =
+                            std::mem::replace(hap, Hap::new(None, part, crate::Value::Undefined));
+                        *hap = outer.merge(inner);
+                    }
+                }
             }
         }
         if !pushed {
@@ -919,9 +967,10 @@ impl Count {
     fn of(layers: &[Layer]) -> Self {
         layers.iter().fold(Self::default(), |count, layer| {
             // A meeting with a signal can cut one entry into several haps.
-            let entries = u64::try_from(layer.entries.len())
-                .unwrap_or(u64::MAX)
-                .saturating_mul(layer.sampled.as_ref().map_or(1, |sampled| sampled.most()));
+            let entries = match &layer.sampled {
+                Some(sampled) => sampled.total(),
+                None => u64::try_from(layer.entries.len()).unwrap_or(u64::MAX),
+            };
             let period = u64::try_from(layer.period).unwrap_or(u64::MAX).max(1);
             let reach = layer.reach.map_or(0, |reach| {
                 reach
@@ -1346,7 +1395,7 @@ impl Layer {
             met.settle(hap);
             if then.iter().all(|stage| match stage {
                 Stage::Step(step) => step.run_in_place(hap),
-                Stage::Meet { .. } => false,
+                Stage::Meet { .. } | Stage::Outer(_) => false,
             }) {
                 if !hap.value.is_data(0) {
                     return None;
@@ -2804,6 +2853,7 @@ fn picked(
     selectors.map_layers(work, |layer| {
         let mut entries = Structure::default();
         for outer in layer.repeated(period)? {
+            let mut met = Vec::new();
             let whole = outer.whole?;
             let tables = lookup.select(&outer.value, index_mode)?.tables()?;
             let by = match mode {
@@ -2853,13 +2903,26 @@ fn picked(
                         .whole
                         .and_then(|inner_whole| inner_whole.intersection(&whole)),
                 };
-                // A sampled hap samples its signals over its own whole, and
-                // its keys merge with the selector's after its meetings.
-                if sampler.is_some() && (joined != inner.whole || !outer.keys.is_empty()) {
-                    return None;
+                match sampler {
+                    None => {
+                        entries.haps.push(picked_hap(&outer, inner, joined, part));
+                        entries.samplers.push(None);
+                    }
+                    Some(sampler) => {
+                        // A sampled hap samples its signals over its own
+                        // whole, and meets the selector hap after its own
+                        // meetings.
+                        if joined != inner.whole {
+                            return None;
+                        }
+                        let mut inner = inner;
+                        inner.part = part;
+                        entries.haps.push(inner);
+                        entries
+                            .samplers
+                            .push(Some(outered(&sampler, &outer, true, &mut met)));
+                    }
                 }
-                entries.haps.push(picked_hap(&outer, inner, joined, part));
-                entries.samplers.push(sampler);
                 if entries.haps.len() > MAX_ENTRIES {
                     return None;
                 }
@@ -2867,6 +2930,29 @@ fn picked(
         }
         entries.into_layer(period)
     })
+}
+
+/// `sampler` with the outer hap `outer` of a pick (`picked`) or a join
+/// merged in last. `met` keeps those made for one outer hap, so that its
+/// inner haps share them.
+fn outered(
+    sampler: &Arc<Sampler>,
+    outer: &Hap,
+    picked: bool,
+    met: &mut Vec<(*const Sampler, Arc<Sampler>)>,
+) -> Arc<Sampler> {
+    let key = Arc::as_ptr(sampler);
+    if let Some((_, done)) = met.iter().find(|(seen, _)| *seen == key) {
+        return Arc::clone(done);
+    }
+    let mut changed = Sampler::clone(sampler);
+    changed.stages.push(Stage::Outer(Arc::new(Outer {
+        hap: outer.clone(),
+        picked,
+    })));
+    let changed = Arc::new(changed);
+    met.push((key, Arc::clone(&changed)));
+    changed
 }
 
 /// An inner, outer or mix join of a carrier whose values name patterns
@@ -2932,6 +3018,7 @@ fn joined(
     carrier.map_layers(work, |layer| {
         let mut entries = Structure::default();
         for outer in layer.repeated(period)? {
+            let mut met = Vec::new();
             let answer = named(&outer.value)?.tables()?.structure(outer.part)?;
             scanned = scanned.saturating_add(answer.haps.len());
             if scanned > MAX_BUILD_SCAN {
@@ -2944,15 +3031,24 @@ fn joined(
                     // Wholes that do not meet throw, which the graph handles.
                     _ => Some(outer.whole?.intersection(&hap.whole?)?),
                 };
-                // A sampled hap samples its signals over its own whole, and
-                // its value and keys meet the carrier's after its meetings.
-                if sampler.is_some()
-                    && (whole != hap.whole || outer.pick_lookup.is_some() || !outer.keys.is_empty())
-                {
-                    return None;
+                match sampler {
+                    None => {
+                        entries.haps.push(joined_hap(&outer, hap, whole));
+                        entries.samplers.push(None);
+                    }
+                    Some(sampler) => {
+                        // A sampled hap samples its signals over its own
+                        // whole, and meets the carrier hap after its own
+                        // meetings.
+                        if whole != hap.whole {
+                            return None;
+                        }
+                        entries.haps.push(hap);
+                        entries
+                            .samplers
+                            .push(Some(outered(&sampler, &outer, false, &mut met)));
+                    }
                 }
-                entries.haps.push(joined_hap(&outer, hap, whole));
-                entries.samplers.push(sampler);
                 if entries.haps.len() > MAX_ENTRIES {
                     return None;
                 }
@@ -5099,5 +5195,31 @@ mod tests {
                 |p| p.rev(),
             ),
         );
+    }
+
+    #[test]
+    fn a_sampled_choice_meets_its_selector_after_its_own_meetings() {
+        // A meeting puts the other side's locations first, so a located
+        // control after a signal comes before the choice's own locations, and
+        // the selector's come before both.
+        let located = || {
+            controlled(
+                sampled_notes(&[0.0, 1.0]),
+                named(leaf(0.5, 60), "room"),
+                "room",
+            )
+        };
+        let cycles = || map(vec![leaf(0.0, 80), leaf(1.0, 84)], slowcat);
+        for mode in [JoinMode::Restart, JoinMode::Reset, JoinMode::Inner] {
+            assert_twins(
+                &format!("{mode:?} pick of a located sampled choice"),
+                &picked_from(
+                    cycles(),
+                    vec![located(), seq(&[3.0])],
+                    PickIndexMode::Clamp,
+                    mode,
+                ),
+            );
+        }
     }
 }
