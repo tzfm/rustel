@@ -7,8 +7,11 @@ sha=${2:?release commit required}
   echo 'Release tags must use vX.Y.Z' >&2
   exit 1
 }
-[[ "$sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
-[ "${GITHUB_REPOSITORY:-tzfm/rustel}" = tzfm/rustel ] || exit 1
+[[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo 'The release commit must be a full SHA' >&2; exit 1; }
+[ "${GITHUB_REPOSITORY:-tzfm/rustel}" = tzfm/rustel ] || {
+  echo 'Releases run only in tzfm/rustel' >&2
+  exit 1
+}
 
 # Fetch again after environment approval to catch moved or deleted tags.
 git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
@@ -19,7 +22,7 @@ git fetch --no-tags origin "refs/tags/$tag"
   echo 'Release tag no longer points to the workflow commit' >&2
   exit 1
 }
-[ "$(git rev-parse HEAD)" = "$sha" ] || exit 1
+[ "$(git rev-parse HEAD)" = "$sha" ] || { echo 'The checkout is not the release commit' >&2; exit 1; }
 git merge-base --is-ancestor "$sha" refs/remotes/origin/main || {
   echo 'Release commit must be on main' >&2
   exit 1

@@ -8,7 +8,7 @@ export FIXTURE="$work"
 export GITHUB_REPOSITORY=tzfm/rustel
 mkdir -p "$work/bin" "$work/repo/.github" "$work/repo/rustelup"
 cp -R "$root/.github/scripts" "$work/repo/.github/"
-cp "$root/rustelup/install" "$root/rustelup/install.ps1" "$work/repo/rustelup/"
+cp "$root"/rustelup/{install,install.ps1,rustelup,rustelup.ps1} "$work/repo/rustelup/"
 export PATH="$work/bin:$PATH"
 if ! command -v sha256sum >/dev/null 2>&1; then
   printf '#!/usr/bin/env bash\nexec shasum -a 256 "$@"\n' > "$work/bin/sha256sum"
@@ -22,7 +22,10 @@ cat > "$work/bin/gh" <<'MOCK'
 set -euo pipefail
 printf '%s\n' "$*" >> "$FIXTURE/calls"
 case "$1 $2" in
-  'api repos/tzfm/rustel/actions/'*) echo "${CI_COUNT:-1}" ;;
+  'api repos/tzfm/rustel/actions/'*)
+    if [ -d "$FIXTURE/uploaded" ] && [ -n "${CI_AFTER_UPLOAD:-}" ]; then echo "$CI_AFTER_UPLOAD"
+    else echo "${CI_COUNT:-1}"; fi ;;
+  'api repos/tzfm/rustel/releases'*) echo "${EXISTING_RELEASES:-0}" ;;
   'attestation verify')
     [[ " $* " = *' --repo tzfm/rustel '* ]]
     [[ " $* " = *' --signer-workflow tzfm/rustel/.github/workflows/release.yml '* ]]
@@ -62,8 +65,13 @@ MOCK
 chmod +x "$work/bin/gh" "$work/bin/curl"
 
 fail() { echo "$*" >&2; exit 1; }
+# Runs a command that must fail, and checks that it failed for the reason given.
 reject() {
+  local reason=$1
+  shift
   if "$@" > "$work/output" 2>&1; then fail "Accepted invalid input: $*"; fi
+  grep -q -- "$reason" "$work/output" ||
+    fail "Rejected for another reason than '$reason': $(cat "$work/output")"
 }
 not_published() {
   if grep -q '^release edit ' "$work/calls"; then fail 'Published an invalid release'; fi
@@ -72,8 +80,8 @@ not_published() {
 cd "$work/repo"
 git init -q -b main
 git config core.autocrlf false
-git config user.name undy-aeon
-git config user.email 200824315+undy-aeon@users.noreply.github.com
+git config user.name 'Release Fixture'
+git config user.email fixture@example.invalid
 printf '[workspace.package]\nversion = "1.2.3"\n' > Cargo.toml
 printf '# Changelog\n\n## v1.2.3\n\n- Release fixture.\n' > CHANGELOG.md
 git add .
@@ -85,21 +93,24 @@ git clone -q --bare . "$work/origin.git"
 git remote add origin "$work/origin.git"
 scripts="$PWD/.github/scripts"
 bash "$scripts/validate-release.sh" v1.2.3 "$RELEASE_SHA" > "$work/output" 2>&1
-reject bash "$scripts/validate-release.sh" 'v1.2.3;bad' "$RELEASE_SHA"
-reject env CI_COUNT=0 bash "$scripts/validate-release.sh" v1.2.3 "$RELEASE_SHA"
-reject env GITHUB_REPOSITORY=other/repo bash "$scripts/validate-release.sh" v1.2.3 "$RELEASE_SHA"
-reject bash "$scripts/validate-release.sh" v1.2.3 0000000000000000000000000000000000000000
+reject 'must use vX.Y.Z' bash "$scripts/validate-release.sh" 'v1.2.3;bad' "$RELEASE_SHA"
+reject 'full SHA' bash "$scripts/validate-release.sh" v1.2.3 HEAD
+reject 'needs a successful CI push run' env CI_COUNT=0 bash "$scripts/validate-release.sh" v1.2.3 "$RELEASE_SHA"
+reject 'only in tzfm/rustel' env GITHUB_REPOSITORY=other/repo bash "$scripts/validate-release.sh" v1.2.3 "$RELEASE_SHA"
+reject 'no longer points' bash "$scripts/validate-release.sh" v1.2.3 0000000000000000000000000000000000000000
+reject 'missing on origin' bash "$scripts/validate-release.sh" v1.2.5 "$RELEASE_SHA"
 git -c tag.gpgsign=false tag v1.2.4
 git push -q origin v1.2.4
-reject bash "$scripts/validate-release.sh" v1.2.4 "$RELEASE_SHA"
+reject 'version differ' bash "$scripts/validate-release.sh" v1.2.4 "$RELEASE_SHA"
 git checkout -qb side
 git -c commit.gpgsign=false commit --allow-empty -qm 'Side branch fixture'
 side_sha=$(git rev-parse HEAD)
+reject 'not the release commit' bash "$scripts/validate-release.sh" v1.2.3 "$RELEASE_SHA"
 git -c tag.gpgsign=false tag -f v1.2.3 >/dev/null
 git push -q --force origin v1.2.3
-reject bash "$scripts/validate-release.sh" v1.2.3 "$side_sha"
+reject 'must be on main' bash "$scripts/validate-release.sh" v1.2.3 "$side_sha"
 git checkout -q main
-reject bash "$scripts/validate-release.sh" v1.2.3 "$RELEASE_SHA"
+reject 'no longer points' bash "$scripts/validate-release.sh" v1.2.3 "$RELEASE_SHA"
 git -c tag.gpgsign=false tag -f v1.2.3 >/dev/null
 git push -q --force origin v1.2.3
 
@@ -107,9 +118,13 @@ make_assets() {
   mkdir -p dist
   for name in install install.ps1 rustelup rustelup.ps1 \
     rustel_v1.2.3_{linux_amd64,linux_arm64,darwin_amd64,darwin_arm64,win32_amd64}.tar.gz; do
-    printf 'fixture: %s\n' "$name" > "dist/$name"
+    if [[ "$name" = *.tar.gz ]]; then
+      printf 'fixture: %s\n' "$name" > "dist/$name"
+      echo '{}' > "dist/$name.sigstore.json"
+    else
+      cp "rustelup/$name" "dist/$name"
+    fi
     sha256sum "dist/$name" | cut -d ' ' -f1 > "dist/$name.sha256"
-    if [[ "$name" = *.tar.gz ]]; then echo '{}' > "dist/$name.sigstore.json"; fi
   done
   echo '{}' > dist/installers.sigstore.json
   : > "$work/calls"
@@ -117,31 +132,44 @@ make_assets() {
 make_assets
 bash "$scripts/verify-release-assets.sh" dist v1.2.3 "$RELEASE_SHA"
 [ "$(grep -c '^attestation verify ' "$work/calls")" = 9 ] || fail 'Some assets were not verified'
+echo changed >> dist/rustelup
+sha256sum dist/rustelup | cut -d ' ' -f1 > dist/rustelup.sha256
+reject 'Installer differs' bash "$scripts/verify-release-assets.sh" dist v1.2.3 "$RELEASE_SHA"
+make_assets
 echo tampered >> dist/rustel_v1.2.3_linux_amd64.tar.gz
-reject bash "$scripts/publish-release.sh" v1.2.3 "$RELEASE_SHA"
+reject 'Checksum mismatch' bash "$scripts/publish-release.sh" v1.2.3 "$RELEASE_SHA"
 not_published
 make_assets
 rm dist/rustel_v1.2.3_linux_amd64.tar.gz.sigstore.json
-reject bash "$scripts/publish-release.sh" v1.2.3 "$RELEASE_SHA"
+reject 'asset count' bash "$scripts/publish-release.sh" v1.2.3 "$RELEASE_SHA"
 not_published
 make_assets
 echo unexpected > dist/extra
-reject bash "$scripts/publish-release.sh" v1.2.3 "$RELEASE_SHA"
+reject 'asset count' bash "$scripts/publish-release.sh" v1.2.3 "$RELEASE_SHA"
 not_published
 rm dist/extra
 for reason in 'invalid signature' 'wrong repository' 'wrong workflow' 'wrong source commit' 'wrong source ref'; do
   : > "$work/calls"
-  reject env VERIFY_FAILURE="$reason" bash "$scripts/publish-release.sh" v1.2.3 "$RELEASE_SHA"
-  grep -q "$reason" "$work/output"
+  reject "$reason" env VERIFY_FAILURE="$reason" bash "$scripts/publish-release.sh" v1.2.3 "$RELEASE_SHA"
   not_published
   if grep -q '^release create ' "$work/calls"; then fail 'Created a draft before verification'; fi
 done
-reject env SITE_CHANGED=1 bash "$scripts/check-installers.sh"
-reject env FETCH_FAILURE=1 bash "$scripts/check-installers.sh"
+reject 'differs from the reviewed' env SITE_CHANGED=1 bash "$scripts/check-installers.sh"
+reject 'download of rustel.cc' env FETCH_FAILURE=1 bash "$scripts/check-installers.sh"
+: > "$work/calls"
+reject 'differs from the reviewed' env SITE_CHANGED=1 bash "$scripts/publish-release.sh" v1.2.3 "$RELEASE_SHA"
+not_published
+: > "$work/calls"
+reject 'already has a release or draft' env EXISTING_RELEASES=1 bash "$scripts/publish-release.sh" v1.2.3 "$RELEASE_SHA"
+if grep -q '^release create ' "$work/calls"; then fail 'Created a second draft for the tag'; fi
 make_assets
-reject env FAIL_DOWNLOAD=1 bash "$scripts/publish-release.sh" v1.2.3 "$RELEASE_SHA"
+reject 'Provenance check failed' env FAIL_DOWNLOAD=1 bash "$scripts/publish-release.sh" v1.2.3 "$RELEASE_SHA"
 not_published
 [ -d "$work/uploaded" ] || fail 'Failure did not reach the uploaded draft'
+rm -r "$work/uploaded"
+make_assets
+reject 'needs a successful CI push run' env CI_AFTER_UPLOAD=0 bash "$scripts/publish-release.sh" v1.2.3 "$RELEASE_SHA"
+not_published
 rm -r "$work/uploaded"
 make_assets
 bash "$scripts/publish-release.sh" v1.2.3 "$RELEASE_SHA" > "$work/output" 2>&1
