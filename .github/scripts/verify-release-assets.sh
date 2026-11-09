@@ -27,7 +27,9 @@ done
 for asset in "${assets[@]}"; do
   digest=$(cat "$asset.sha256")
   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "Invalid checksum: $asset" >&2; exit 1; }
-  printf '%s  %s\n' "$digest" "$asset" | sha256sum --check --status
+  # BSD sha256sum reads a checklist only from a named operand, so pass
+  # stdin explicitly. GNU reads stdin the same way.
+  printf '%s  %s\n' "$digest" "$asset" | sha256sum --check --status -
   bundle=installers.sigstore.json
   if [[ "$asset" = *.tar.gz ]]; then bundle="$asset.sigstore.json"; fi
   gh attestation verify "$asset" --bundle "$bundle" \
