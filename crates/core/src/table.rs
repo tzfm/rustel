@@ -24,8 +24,9 @@ later version.
 
 use crate::settings::SettingsStateId;
 use crate::{
-    CombineFn, Hap, HapMapFn, LookupFlow, Meeting, Node, OwnedHapMapFn, Pattern, SignalFn, SpanUse,
-    State, TimeSpan, ValueFn, ValuePredicate, applied_hap,
+    CombineFn, Hap, HapMapFn, JoinMode, LookupFlow, Meeting, Node, OwnedHapMapFn, Pattern,
+    PickIndexMode, PickLookup, SignalFn, SpanUse, State, TimeSpan, ValueFn, ValuePredicate,
+    applied_hap, picked_hap,
 };
 use rustel_fraction::Fraction;
 use std::sync::{Arc, OnceLock};
@@ -126,19 +127,32 @@ enum Find<'a> {
     Scan,
 }
 
+/// The entries of one period that may meet a span. The ones in `inside`
+/// lie in it whole. The others may need clipping, or not meet it at all.
+struct Near<'a> {
+    haps: &'a [Hap],
+    inside: std::ops::Range<usize>,
+}
+
 impl Answering<'_> {
     /// The entries of the period `shift` cycles on that may meet `span`. A
     /// narrow query of a long period looks at its own cycle only, as the
     /// graph does.
-    fn near(&self, span: TimeSpan, shift: i128) -> Option<&[Hap]> {
+    fn near(&self, span: TimeSpan, shift: i128) -> Option<Near<'_>> {
         let back = shift.checked_neg()?;
         let begin = span.begin.checked_add_int(back)?;
         let end = span.end.checked_add_int(back)?;
-        Some(match self.find {
+        let (haps, first, last) = match self.find {
             Find::Search => {
                 let from = self.haps.partition_point(|hap| hap.part.end <= begin);
                 let to = from + self.haps[from..].partition_point(|hap| hap.part.begin < end);
-                &self.haps[from..to]
+                let haps = &self.haps[from..to];
+                // Begins and ends both rise, so the parts inside come together.
+                (
+                    haps,
+                    haps.partition_point(|hap| hap.part.begin < begin),
+                    haps.partition_point(|hap| hap.part.end <= end),
+                )
             }
             Find::ByCycle(starts) => {
                 let cycles = starts.len() - 1;
@@ -146,10 +160,40 @@ impl Answering<'_> {
                     let cycle = usize::try_from(cycle.max(0)).unwrap_or(usize::MAX);
                     starts[cycle.min(cycles)] as usize
                 };
-                &self.haps[at(begin.floor().numer())..at(end.ceil().numer())]
+                let from = at(begin.floor().numer());
+                // Each part lies in its own cycle, so the cycles inside the
+                // span hold the parts inside it.
+                (
+                    &self.haps[from..at(end.ceil().numer())],
+                    at(begin.ceil().numer()) - from,
+                    at(end.floor().numer()) - from,
+                )
             }
-            Find::Scan => self.haps,
+            Find::Scan => (self.haps, 0, 0),
+        };
+        Some(Near {
+            haps,
+            inside: first..last.max(first),
         })
+    }
+
+    /// At most how many haps the period `shift` cycles on gives `span`.
+    fn most(&self, span: TimeSpan, shift: i128) -> Option<usize> {
+        let near = self.near(span, shift)?;
+        if !matches!(self.find, Find::Scan) {
+            return Some(near.haps.len());
+        }
+        // A scan may look at many more entries than meet the span.
+        let mut count = 0usize;
+        for entry in near.haps {
+            if shifted_span(entry.part, shift)?
+                .intersection(&span)
+                .is_some()
+            {
+                count += 1;
+            }
+        }
+        Some(count)
     }
 }
 
@@ -303,6 +347,11 @@ pub(crate) struct Tables {
     /// sorted answer of several layers. Built when first asked for. See
     /// [`Tables::union`].
     union: OnceLock<Option<Layer>>,
+    /// Which layers meet each cycle, for tables of many layers. Built when
+    /// first asked for. See [`LayerIndex`].
+    index: OnceLock<Option<LayerIndex>>,
+    /// Every layer answers in sorted order. See [`Layer::answers_in`].
+    sorted: bool,
     /// The settings snapshot the cached table was built under, the only one
     /// it answers for. See [`crate::settings::SettingsStateId`].
     state: Option<SettingsStateId>,
@@ -537,6 +586,18 @@ impl Times {
         }
     }
 
+    /// A child asked at `t - s`, and its haps moved by `s` after, where `s`
+    /// is a time of an entry that reaches `extent` cycles past the query
+    /// span, with at most `bits` bits in its denominator. `|s|` is at most
+    /// `|t| + extent`.
+    fn restarted(self, extent: f64, bits: u32) -> Self {
+        Self {
+            scale: self.scale * 2.0 + 1.0,
+            shift: self.shift + (self.scale + 1.0) * extent,
+            denominator_bits: self.denominator_bits.saturating_add(bits),
+        }
+    }
+
     /// A child asked over the wholes of haps that reach `extent` cycles past
     /// the query span.
     fn reaching(self, extent: f64) -> Self {
@@ -544,6 +605,56 @@ impl Times {
             shift: self.shift + self.scale * extent,
             ..self
         }
+    }
+}
+
+/// Whether clipping parts to a query span can never make two of `entries`
+/// tie in the sorted order when they did not tie before. Two haps tie when
+/// their parts and wholes are equal, and clipping changes only parts. Two
+/// entries with one whole and overlapping parts that differ can be clipped
+/// to equal parts, so the entries that share a whole must have equal or
+/// disjoint parts.
+fn ties_survive_clipping(entries: &[Hap]) -> bool {
+    if entries.iter().all(|entry| entry.whole == Some(entry.part)) {
+        return true;
+    }
+    let mut spans = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(whole) = entry.whole else {
+            return false;
+        };
+        spans.push((whole.begin, whole.end, entry.part.begin, entry.part.end));
+    }
+    spans.sort_unstable();
+    spans.windows(2).all(|pair| {
+        let (before, after) = (pair[0], pair[1]);
+        // Sorted by whole and then part, the parts of one whole are equal or
+        // disjoint when each one equals the one before it, or begins at its
+        // end or later.
+        (before.0, before.1) != (after.0, after.1)
+            || (before.2, before.3) == (after.2, after.3)
+            || before.3 <= after.2
+    })
+}
+
+/// `floor((a - b) / period)` for a positive `period`, exact, and with no
+/// fraction reduced on the way: a query asks this of every layer.
+fn periods_below(a: Fraction, b: Fraction, period: i128) -> Option<i128> {
+    // `a - b` over the product of the denominators, which are positive.
+    let numerator = a
+        .numer()
+        .checked_mul(b.denom())?
+        .checked_sub(b.numer().checked_mul(a.denom())?)?;
+    let denominator = a.denom().checked_mul(b.denom())?;
+    // `floor(floor(x) / n)` is `floor(x / n)` for a whole `n > 0`.
+    floor_div(floor_div(numerator, denominator)?, period)
+}
+
+/// `floor(n / d)` for a positive `d`, in 64 bits when both fit.
+fn floor_div(n: i128, d: i128) -> Option<i128> {
+    match (i64::try_from(n), i64::try_from(d)) {
+        (Ok(n), Ok(d)) => Some(i128::from(n.div_euclid(d))),
+        _ => n.checked_div_euclid(d),
     }
 }
 
@@ -696,16 +807,17 @@ impl Layer {
     }
 
     /// Append the haps for `span` (`begin < end`) in `order`. `None` means
-    /// the graph must answer, and `out` is then unchanged.
+    /// the graph must answer, and `out` is then unchanged. `Some(true)` when
+    /// the span may have clipped a part, which can change the sorted order.
     fn query_into(
         &self,
         state: &State,
         order: Order,
         out: &mut Vec<Hap>,
         stop: &mut Stop,
-    ) -> Option<()> {
+    ) -> Option<bool> {
         let Some(reach) = self.reach else {
-            return Some(());
+            return Some(false);
         };
         let entries = self.entries_in(order)?;
         let start = out.len();
@@ -734,9 +846,9 @@ impl Layer {
         reach: TimeSpan,
         out: &mut Vec<Hap>,
         stop: &mut Stop,
-    ) -> Option<()> {
+    ) -> Option<bool> {
         let from = out.len();
-        self.emit(entries, state.span, reach, out, stop)?;
+        let clipped = self.emit(entries, state.span, reach, out, stop)?;
         let mut probe = state.clone();
         let mut signal = Hap::new(None, state.span, crate::Value::Undefined);
         let mut kept = from;
@@ -762,7 +874,7 @@ impl Layer {
             }
         }
         out.truncate(kept);
-        Some(())
+        Some(clipped)
     }
 
     /// [`Self::emit`] for a sampled layer: each hap meets the signal.
@@ -774,13 +886,13 @@ impl Layer {
         reach: TimeSpan,
         out: &mut Vec<Hap>,
         stop: &mut Stop,
-    ) -> Option<()> {
+    ) -> Option<bool> {
         let span = state.span;
         let periods = self.periods(span, reach)?;
         if periods.first > periods.last {
-            return Some(());
+            return Some(false);
         }
-        out.reserve(self.meetings(entries, span, periods)?.min(MAX_RESERVED));
+        out.reserve(self.most(entries, span, periods)?.min(MAX_RESERVED));
         let mut probe = state.clone();
         let mut signal = Hap::new(None, span, crate::Value::Undefined);
         for k in periods.first..=periods.last {
@@ -791,7 +903,7 @@ impl Layer {
             let near = if inside {
                 entries.haps
             } else {
-                entries.near(span, shift)?
+                entries.near(span, shift)?.haps
             };
             for entry in near {
                 let shifted = shifted_span(entry.part, shift)?;
@@ -813,41 +925,24 @@ impl Layer {
             }
             // Every meeting counts, also one that a step dropped after.
             if !stop.allows(from, met) {
-                return Some(());
+                return Some(true);
             }
         }
-        Some(())
+        Some(true)
     }
 
     /// The periods `span` meets, for parts that stay within `reach`.
     fn periods(&self, span: TimeSpan, reach: TimeSpan) -> Option<Periods> {
-        let period = Fraction::int(self.period);
-        let first = span
-            .begin
-            .checked_sub(reach.end)?
-            .checked_div(period)?
-            .floor()
-            .numer()
-            .checked_add(1)?;
-        let last = span
-            .end
-            .checked_sub(reach.begin)?
-            .checked_div(period)?
-            .ceil()
-            .numer()
+        let period = self.period;
+        // `ceil(x)` is `-floor(-x)`.
+        let first = periods_below(span.begin, reach.end, period)?.checked_add(1)?;
+        let last = periods_below(reach.begin, span.end, period)?
+            .checked_neg()?
             .checked_sub(1)?;
         // Period `k` lies inside when `reach` moved by `k` periods does.
         let inside = (
-            span.begin
-                .checked_sub(reach.begin)?
-                .checked_div(period)?
-                .ceil()
-                .numer(),
-            span.end
-                .checked_sub(reach.end)?
-                .checked_div(period)?
-                .floor()
-                .numer(),
+            periods_below(reach.begin, span.begin, period)?.checked_neg()?,
+            periods_below(span.end, reach.end, period)?,
         );
         Some(Periods {
             first,
@@ -856,20 +951,13 @@ impl Layer {
         })
     }
 
-    /// How many entries of every period meet `span`: all of them in a period
-    /// that lies inside, and those counted one by one in a period it cuts.
-    fn meetings(&self, entries: Answering<'_>, span: TimeSpan, periods: Periods) -> Option<usize> {
+    /// At most how many haps `span` takes from `entries`: all of them in a
+    /// period that lies inside, and the near ones of a period it cuts.
+    fn most(&self, entries: Answering<'_>, span: TimeSpan, periods: Periods) -> Option<usize> {
         let mut total = periods.inside_count()?.saturating_mul(entries.haps.len());
         for k in periods.cut() {
             let shift = k.checked_mul(self.period)?;
-            for entry in entries.near(span, shift)? {
-                if shifted_span(entry.part, shift)?
-                    .intersection(&span)
-                    .is_some()
-                {
-                    total = total.saturating_add(1);
-                }
-            }
+            total = total.saturating_add(entries.most(span, shift)?);
         }
         Some(total)
     }
@@ -881,78 +969,97 @@ impl Layer {
         reach: TimeSpan,
         out: &mut Vec<Hap>,
         stop: &mut Stop,
-    ) -> Option<()> {
+    ) -> Option<bool> {
         let all = entries.haps;
         let periods = self.periods(span, reach)?;
         if periods.first > periods.last {
-            return Some(());
+            return Some(false);
         }
-        // The exact size first, so the room is reserved once.
-        out.reserve(self.meetings(entries, span, periods)?.min(MAX_RESERVED));
+        // The size first, so the room is reserved once.
+        out.reserve(self.most(entries, span, periods)?.min(MAX_RESERVED));
+        let mut clipped = false;
         for k in periods.first..=periods.last {
             let shift = k.checked_mul(self.period)?;
             if periods.is_inside(k) {
                 if !stop.allows(out.len(), all.len()) {
-                    return Some(());
+                    return Some(clipped);
                 }
-                // A whole period: clone the entries in one go, then shift them.
-                let from = out.len();
-                if self.copyable {
-                    out.reserve(all.len());
-                    // SAFETY: every entry owns no heap memory (`copyable`), so
-                    // a byte copy of it is a clone. `reserve` made room for
-                    // all of them, and they are initialised before the length
-                    // covers them.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            all.as_ptr(),
-                            out.as_mut_ptr().add(from),
-                            all.len(),
-                        );
-                        out.set_len(from + all.len());
-                    }
-                } else {
-                    out.extend_from_slice(all);
-                }
-                if self.whole_haps {
-                    for hap in &mut out[from..] {
-                        let part = shifted_span(hap.part, shift)?;
-                        hap.part = part;
-                        hap.whole = Some(part);
-                    }
-                } else {
-                    for hap in &mut out[from..] {
-                        let part = shifted_span(hap.part, shift)?;
-                        if let Some(whole) = &mut hap.whole {
-                            *whole = if *whole == hap.part {
-                                part
-                            } else {
-                                shifted_span(*whole, shift)?
-                            };
-                        }
-                        hap.part = part;
-                    }
-                }
+                self.copy_shifted(all, shift, out)?;
                 continue;
             }
             let from = out.len();
-            for entry in entries.near(span, shift)? {
-                let Some(part) = shifted_span(entry.part, shift)?.intersection(&span) else {
-                    continue;
-                };
-                let mut hap = entry.clone();
-                hap.whole = match entry.whole {
-                    Some(whole) => Some(shifted_span(whole, shift)?),
-                    None => None,
-                };
-                hap.part = part;
-                out.push(hap);
+            let near = entries.near(span, shift)?;
+            for entry in &near.haps[..near.inside.start] {
+                clipped |= Self::push_clipped(entry, span, shift, out)?;
+            }
+            self.copy_shifted(&near.haps[near.inside.clone()], shift, out)?;
+            for entry in &near.haps[near.inside.end..] {
+                clipped |= Self::push_clipped(entry, span, shift, out)?;
             }
             if !stop.allows(from, out.len() - from) {
-                return Some(());
+                return Some(clipped);
+            }
+        }
+        Some(clipped)
+    }
+
+    /// Append `entries` moved `shift` cycles on: cloned in one go, then
+    /// shifted where they are.
+    fn copy_shifted(&self, entries: &[Hap], shift: i128, out: &mut Vec<Hap>) -> Option<()> {
+        let from = out.len();
+        if self.copyable {
+            out.reserve(entries.len());
+            // SAFETY: every entry owns no heap memory (`copyable`), so a byte
+            // copy of it is a clone. `reserve` made room for all of them, and
+            // they are initialised before the length covers them.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    entries.as_ptr(),
+                    out.as_mut_ptr().add(from),
+                    entries.len(),
+                );
+                out.set_len(from + entries.len());
+            }
+        } else {
+            out.extend_from_slice(entries);
+        }
+        if self.whole_haps {
+            for hap in &mut out[from..] {
+                let part = shifted_span(hap.part, shift)?;
+                hap.part = part;
+                hap.whole = Some(part);
+            }
+        } else {
+            for hap in &mut out[from..] {
+                let part = shifted_span(hap.part, shift)?;
+                if let Some(whole) = &mut hap.whole {
+                    *whole = if *whole == hap.part {
+                        part
+                    } else {
+                        shifted_span(*whole, shift)?
+                    };
+                }
+                hap.part = part;
             }
         }
         Some(())
+    }
+
+    /// Append `entry` moved `shift` cycles on with its part clipped to
+    /// `span`, if they meet. `Some(true)` when the clip changed the part.
+    fn push_clipped(entry: &Hap, span: TimeSpan, shift: i128, out: &mut Vec<Hap>) -> Option<bool> {
+        let shifted = shifted_span(entry.part, shift)?;
+        let Some(part) = shifted.intersection(&span) else {
+            return Some(false);
+        };
+        let mut hap = entry.clone();
+        hap.whole = match entry.whole {
+            Some(whole) => Some(shifted_span(whole, shift)?),
+            None => None,
+        };
+        hap.part = part;
+        out.push(hap);
+        Some(part != shifted)
     }
 }
 
@@ -994,6 +1101,89 @@ impl Periods {
             (end, end)
         };
         (self.first..head).chain(tail..end)
+    }
+}
+
+/// Tables with this many layers or more find the layers a query meets
+/// through a [`LayerIndex`].
+const INDEXED_LAYERS: usize = 8;
+
+/// The layers whose parts meet each cycle of the layers' shared period. A
+/// weighted sequence of `n` steps is a stack of `n` layers, and a query
+/// looks only at those its cycles meet.
+#[derive(Clone, Debug)]
+struct LayerIndex {
+    period: i128,
+    /// The layers that meet cycle `c` of the period are
+    /// `layers[starts[c]..starts[c + 1]]`, in layer order.
+    starts: Vec<u32>,
+    layers: Vec<u32>,
+}
+
+impl LayerIndex {
+    /// `None` for a shared period of more than [`MAX_ENTRIES`] cycles, or an
+    /// index of more than [`MAX_BUILD_SCAN`] items.
+    fn new(layers: &[Layer]) -> Option<Self> {
+        let period = layers
+            .iter()
+            .try_fold(1i128, |period, layer| lcm(period, layer.period))?;
+        let cycles = usize::try_from(period).ok()?;
+        if cycles > MAX_ENTRIES || cycles.checked_mul(layers.len())? > MAX_BUILD_SCAN {
+            return None;
+        }
+        // The cycles of its own period that each layer's parts meet.
+        let mut meets = Vec::with_capacity(layers.len());
+        for layer in layers {
+            let own = usize::try_from(layer.period).ok()?;
+            let mut cycles = vec![false; own];
+            for entry in &layer.entries {
+                let first = entry.part.begin.floor().numer();
+                let last = entry.part.end.ceil().numer().checked_sub(1)?;
+                if last.checked_sub(first)? >= layer.period.checked_sub(1)? {
+                    cycles.fill(true);
+                    break;
+                }
+                for cycle in first..=last {
+                    cycles[usize::try_from(cycle.rem_euclid(layer.period)).ok()?] = true;
+                }
+            }
+            meets.push(cycles);
+        }
+        let mut starts = Vec::with_capacity(cycles + 1);
+        let mut ids = Vec::new();
+        for cycle in 0..cycles {
+            starts.push(u32::try_from(ids.len()).ok()?);
+            for (id, own) in meets.iter().enumerate() {
+                if own[cycle % own.len()] {
+                    ids.push(u32::try_from(id).ok()?);
+                }
+            }
+        }
+        starts.push(u32::try_from(ids.len()).ok()?);
+        Some(Self {
+            period,
+            starts,
+            layers: ids,
+        })
+    }
+
+    /// The layers that may meet `span`, in layer order, or `None` when the
+    /// span meets every cycle of the period. A part meets `span` only inside
+    /// one of the cycles from `floor(begin)` to `ceil(end) - 1`.
+    fn meeting(&self, span: TimeSpan) -> Option<Vec<u32>> {
+        let first = span.begin.floor().numer();
+        let last = span.end.ceil().numer().checked_sub(1)?;
+        if last.checked_sub(first)? >= self.period.checked_sub(1)? {
+            return None;
+        }
+        let mut ids = Vec::new();
+        for cycle in first..=last {
+            let cycle = usize::try_from(cycle.rem_euclid(self.period)).ok()?;
+            ids.extend_from_slice(&self.layers[self.starts[cycle] as usize..self.starts[cycle + 1] as usize]);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Some(ids)
     }
 }
 
@@ -1170,6 +1360,7 @@ impl Tables {
                 entry_bits = entry_bits.max(denominator_bits(time));
             }
         }
+        let sorted = layers.iter().all(|layer| layer.answers_in(Order::Sorted));
         // The node's own answer is one of the walk's vectors.
         let work = Work {
             haps: work.haps.max(Count::of(&layers)),
@@ -1181,6 +1372,8 @@ impl Tables {
             extent,
             entry_bits,
             union: OnceLock::new(),
+            index: OnceLock::new(),
+            sorted,
             state: None,
         }
     }
@@ -1217,17 +1410,29 @@ impl Tables {
                 return None;
             }
             let mut haps = Vec::new();
+            let mut clipped = false;
             if stop.begin() {
-                union.query_into(state, Order::Graph, &mut haps, stop)?;
+                clipped = union.query_into(state, Order::Graph, &mut haps, stop)?;
             }
-            // Clipping at the span's ends can reorder a few haps. The sort
-            // checks the order first and keeps it when nothing moved.
-            return Some(crate::sort_haps_for_query(haps));
+            // The union's haps come sorted. Clipping at the span's ends can
+            // reorder a few, and the sort keeps the order when none moved.
+            return Some(if clipped {
+                crate::sort_haps_for_query(haps)
+            } else {
+                haps
+            });
         }
-        let haps = self.query_in(state, Order::Sorted, stop)?;
+        // A layer without a sorted form answers in the graph's order, and the
+        // stable sort below makes that the graph's answer sorted.
+        let order = if self.sorted {
+            Order::Sorted
+        } else {
+            Order::Graph
+        };
+        let haps = self.query_in(state, order, stop)?;
         // Each layer is sorted. Equal haps keep the layer order a stable
         // sort of the graph's answer keeps.
-        Some(if self.layers.len() > 1 {
+        Some(if self.layers.len() > 1 || order == Order::Graph {
             crate::sort_haps_for_query(haps)
         } else {
             haps
@@ -1236,9 +1441,9 @@ impl Tables {
 
     /// Every layer's haps over one shared period, stably sorted: equal haps
     /// keep their layer's order, as a stable sort of the graph's answer
-    /// keeps them. Only for layers of whole haps inside that period, so that
-    /// a clipped hap can never tie with one of another layer it did not
-    /// tie with before.
+    /// keeps them. Only for haps inside that period that clipping cannot
+    /// make tie with a hap they did not tie with before. See
+    /// [`ties_survive_clipping`].
     fn union(&self) -> Option<&Layer> {
         self.union
             .get_or_init(|| {
@@ -1252,9 +1457,7 @@ impl Tables {
                 }
                 let window = TimeSpan::new(Fraction::ZERO, Fraction::int(period));
                 let inside = |span: TimeSpan| span.begin >= window.begin && span.end <= window.end;
-                if !entries
-                    .iter()
-                    .all(|entry| entry.whole == Some(entry.part) && inside(entry.part))
+                if !entries.iter().all(|entry| inside(entry.part)) || !ties_survive_clipping(&entries)
                 {
                     return None;
                 }
@@ -1296,22 +1499,35 @@ impl Tables {
     }
 
     fn query_in(&self, state: &State, order: Order, stop: &mut Stop) -> Option<Vec<Hap>> {
-        if !self.answerable(state.span, stop)?
-            || !self.layers.iter().all(|layer| layer.answers_in(order))
-        {
+        if !self.answerable(state.span, stop)? || !(order == Order::Graph || self.sorted) {
             return None;
         }
         let mut out = Vec::new();
         if !stop.begin() {
             return Some(out);
         }
-        for layer in &self.layers {
+        let meeting = self.layer_index().and_then(|index| index.meeting(state.span));
+        let layers: &mut dyn Iterator<Item = &Layer> = match &meeting {
+            Some(ids) => &mut ids.iter().map(|&id| &self.layers[id as usize]),
+            None => &mut self.layers.iter(),
+        };
+        for layer in layers {
             layer.query_into(state, order, &mut out, stop)?;
             if stop.stopped() {
                 break;
             }
         }
         Some(out)
+    }
+
+    /// The [`LayerIndex`] of tables with many layers.
+    fn layer_index(&self) -> Option<&LayerIndex> {
+        if self.layers.len() < INDEXED_LAYERS {
+            return None;
+        }
+        self.index
+            .get_or_init(|| LayerIndex::new(&self.layers))
+            .as_ref()
     }
 
     /// The whole answer for `span` while a table is built, or `None` past
@@ -1398,6 +1614,12 @@ pub(crate) fn build(node: &Node) -> Option<Tables> {
         Node::Shift(pattern, by, _) => shift(pattern.tables()?, *by),
         Node::Stack(patterns) => stack(patterns),
         Node::SplitQueries(inner) => split_queries(inner),
+        Node::Pick {
+            selector,
+            lookup,
+            index_mode,
+            mode,
+        } => picked(selector.tables()?, lookup, *index_mode, *mode),
         Node::FmapNative(pattern, f) => stepped(pattern.tables()?, Step::Map(f.clone())),
         Node::FilterValues(pattern, keep) => stepped(pattern.tables()?, Step::Keep(keep.clone())),
         Node::MapHapsNative(pattern, f, SpanUse::Ignores) => {
@@ -1587,6 +1809,101 @@ fn applied(
     })
 }
 
+/// `pick`: each selector hap's value picks a pattern from `lookup`, and the
+/// join keeps that pattern's haps inside the selector hap. `restart` moves
+/// the pattern to start where the selector hap starts, and `reset` to start
+/// where that hap's cycle starts. The other joins keep it in place.
+fn picked(
+    selectors: &Tables,
+    lookup: &PickLookup,
+    index_mode: PickIndexMode,
+    mode: JoinMode,
+) -> Option<Tables> {
+    let moved = match mode {
+        JoinMode::Restart | JoinMode::Reset => true,
+        JoinMode::Inner | JoinMode::Outer | JoinMode::Mix => false,
+        JoinMode::Squeeze => return None,
+    };
+    // A restarted pattern moves with its selector hap, so the answer repeats
+    // with the selector. Any other join repeats when both do.
+    let mut period = selectors.period()?;
+    let mut picked: Option<Work> = None;
+    for layer in &selectors.layers {
+        for entry in &layer.entries {
+            let tables = lookup.select(&entry.value, index_mode)?.tables()?;
+            if mode != JoinMode::Restart {
+                period = lcm(period, tables.period()?)?;
+            }
+            picked = Some(picked.map_or(tables.work, |work| work.max(tables.work)));
+        }
+    }
+    let picked = picked.unwrap_or(Work::leaf(Cycles::NONE));
+    // The graph asks a moved pattern over the whole query span, through one
+    // more level, and any other over the part of each selector hap.
+    let work = Work {
+        cycles: selectors.work.cycles.max(picked.cycles),
+        haps: selectors.work.haps.max(picked.haps),
+        levels: selectors
+            .work
+            .levels
+            .max(picked.levels.saturating_add(u32::from(moved)))
+            .saturating_add(1),
+        times: selectors.work.times.max(if moved {
+            picked
+                .times
+                .restarted(selectors.extent, selectors.entry_bits)
+        } else {
+            picked.times
+        }),
+    };
+    let mut scanned = 0usize;
+    selectors.map_layers(work, |layer| {
+        let mut entries = Vec::new();
+        for outer in layer.repeated(period)? {
+            let whole = outer.whole?;
+            let tables = lookup.select(&outer.value, index_mode)?.tables()?;
+            let by = match mode {
+                JoinMode::Restart => whole.begin,
+                JoinMode::Reset => whole.begin.cycle_pos(),
+                _ => Fraction::ZERO,
+            };
+            let span = TimeSpan::new(
+                outer.part.begin.checked_sub(by)?,
+                outer.part.end.checked_sub(by)?,
+            );
+            let answer = tables.answer(span)?;
+            scanned = scanned.saturating_add(answer.len());
+            if scanned > MAX_BUILD_SCAN {
+                return None;
+            }
+            for inner in answer {
+                let inner = if moved {
+                    retimed(&inner, |t| t.checked_add(by))?
+                } else {
+                    inner
+                };
+                let Some(part) = inner.part.intersection(&outer.part) else {
+                    continue;
+                };
+                let joined = match mode {
+                    JoinMode::Inner => inner.whole,
+                    JoinMode::Outer => outer.whole,
+                    // Wholes that do not meet throw, which the graph handles.
+                    JoinMode::Mix => Some(whole.intersection(&inner.whole?)?),
+                    _ => inner
+                        .whole
+                        .and_then(|inner_whole| inner_whole.intersection(&whole)),
+                };
+                entries.push(picked_hap(&outer, inner, joined, part));
+                if entries.len() > MAX_ENTRIES {
+                    return None;
+                }
+            }
+        }
+        Layer::new(period, entries)
+    })
+}
+
 /// `fast(factor)`: every time divided by `factor`. The new period is the
 /// least whole number of cycles that holds a whole number of old periods.
 fn fast(tables: &Tables, factor: Fraction) -> Option<Tables> {
@@ -1653,6 +1970,8 @@ fn split_queries(inner: &Pattern) -> Option<Tables> {
         Node::SlowCat(patterns) => return slowcat(patterns),
         Node::SlowCatPrime(patterns) => return slowcat_prime(patterns),
         Node::Rev(pattern) => return rev(pattern.tables()?),
+        Node::FastGap(pattern, factor) => return fast_gap(pattern.tables()?, *factor),
+        Node::RepeatCycles(pattern, count) => return repeat_cycles(pattern.tables()?, *count),
         _ => {}
     }
     let tables = inner.tables()?;
@@ -1742,6 +2061,57 @@ fn rev(tables: &Tables) -> Option<Tables> {
                 };
                 Some(hap)
             })
+            .collect()
+    })
+}
+
+/// `fastGap(factor)`: cycle `c` plays the inner pattern from the start of
+/// cycle `c`, `factor` times as fast, and then nothing until the cycle ends.
+/// A factor below one plays only the start of the inner cycle.
+fn fast_gap(tables: &Tables, factor: Fraction) -> Option<Tables> {
+    if factor <= Fraction::ZERO {
+        return None;
+    }
+    let period = tables.period()?;
+    let reach = factor.min(Fraction::ONE);
+    // The inner pattern is asked at `c + (t - c) * factor`.
+    let children = Work {
+        times: tables.work.times.scaled(factor),
+        ..tables.work
+    };
+    Tables::by_cycle(period, children, 2, |c| {
+        let begin = Fraction::int(c);
+        tables
+            .answer(TimeSpan::new(begin, begin.checked_add(reach)?))?
+            .iter()
+            .map(|hap| Pattern::fast_gap_unmap_hap(hap, factor))
+            .collect()
+    })
+}
+
+/// `repeatCycles(count)`: cycle `c` plays cycle `floor(c / count)` of the
+/// inner pattern. The answer repeats after `numer(count)` inner periods.
+fn repeat_cycles(tables: &Tables, count: Fraction) -> Option<Tables> {
+    if count <= Fraction::ZERO {
+        return None;
+    }
+    let period = tables.period()?.checked_mul(count.numer())?;
+    // The walk divides the cycle by `count`, and asks the inner pattern up
+    // to `1 / count` times as far out.
+    let children = Work {
+        times: tables
+            .work
+            .times
+            .scaled(Fraction::ONE.checked_div(count)?),
+        ..tables.work
+    };
+    Tables::by_cycle(period, children, 2, |c| {
+        let source = Fraction::int(c).checked_div(count)?.floor().numer();
+        let delta = c.checked_sub(source)?;
+        tables
+            .answer(cycle_span(source)?)?
+            .iter()
+            .map(|hap| shifted(hap, delta))
             .collect()
     })
 }
@@ -2469,7 +2839,7 @@ mod tests {
             };
             let entries = layer.entries_in(Order::Graph).expect("graph order");
             assert_eq!(
-                entries.near(tick, 0).map(<[Hap]>::len),
+                entries.near(tick, 0).map(|near| near.haps.len()),
                 Some(per_cycle),
                 "{name}"
             );

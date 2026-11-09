@@ -3929,6 +3929,24 @@ fn pick_property_key(value: &Value) -> String {
     }
 }
 
+/// The hap a pick join makes of an `outer` hap and one `inner` hap of the
+/// pattern it picked, at `whole` and `part`, for every join but `squeeze`.
+fn picked_hap(outer: &Hap, inner: Hap, whole: Option<TimeSpan>, part: TimeSpan) -> Hap {
+    let mut context = outer.context.clone();
+    context.append(&inner.context);
+    Hap {
+        whole,
+        part,
+        keys: ContextKeys::merge(&inner.keys, &outer.keys),
+        pick_lookup: inner.pick_lookup,
+        value: inner.value,
+        context,
+        ui_visuals: inner.ui_visuals | outer.ui_visuals,
+        live_controls: inner.live_controls,
+        slider_binding: inner.slider_binding,
+    }
+}
+
 /// `_pick(...).{inner,outer,squeeze,reset,restart}Join()` out of line, so the
 /// join's nested locals do not enlarge every recursive `query_node` frame.
 #[inline(never)]
@@ -3986,22 +4004,8 @@ fn query_pick(
                         },
                         _ => unreachable!(),
                     };
-                    let mut context = outer.context.clone();
-                    context.append(&inner.context);
-                    if !push_budgeted(
-                        &mut out,
-                        Hap {
-                            whole,
-                            part: inner.part,
-                            pick_lookup: inner.pick_lookup.clone(),
-                            keys: ContextKeys::merge(&inner.keys, &outer.keys),
-                            value: inner.value,
-                            context,
-                            ui_visuals: inner.ui_visuals | outer.ui_visuals,
-                            live_controls: inner.live_controls,
-                            slider_binding: inner.slider_binding,
-                        },
-                    ) {
+                    let part = inner.part;
+                    if !push_budgeted(&mut out, picked_hap(&outer, inner, whole, part)) {
                         return Vec::new();
                     }
                 }
@@ -4058,22 +4062,7 @@ fn query_pick(
                     let whole = inner
                         .whole
                         .and_then(|inner_whole| inner_whole.intersection(&outer_whole));
-                    let mut context = outer.context.clone();
-                    context.append(&inner.context);
-                    if !push_budgeted(
-                        &mut out,
-                        Hap {
-                            whole,
-                            part,
-                            pick_lookup: inner.pick_lookup.clone(),
-                            keys: ContextKeys::merge(&inner.keys, &outer.keys),
-                            value: inner.value,
-                            context,
-                            ui_visuals: inner.ui_visuals | outer.ui_visuals,
-                            live_controls: inner.live_controls,
-                            slider_binding: inner.slider_binding,
-                        },
-                    ) {
+                    if !push_budgeted(&mut out, picked_hap(&outer, inner, whole, part)) {
                         return Vec::new();
                     }
                 }
