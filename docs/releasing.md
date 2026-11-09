@@ -100,9 +100,11 @@ release, make a new patch release.
 Wait for the `ci.yml` push run on this exact `main` commit to succeed before
 pushing the tag. The release gate requires a `vX.Y.Z` tag that matches the
 workspace version, still points to the workflow commit, and is reachable
-from `main`. It requires a successful CI push run for that SHA. An ancestor
-check proves main membership, not human approval. The ruleset and publishing
-environment provide approval when configured below.
+from `main`. It requires a successful CI push run for that SHA, Miri
+included. A later push to `main` cancels a push run that is still going, so
+rerun a cancelled run for the release commit. An ancestor check proves main
+membership, not human approval. The ruleset and publishing environment
+provide approval when configured below.
 
 Review the run's tag, SHA, source changes and build results in the `release`
 environment approval screen. The publishing job checks the tag and CI again
@@ -142,7 +144,9 @@ their caller. Review and update the pins when upstream fixes are needed.
 
 Only the publishing job has `contents: write`. It has no signing permission
 and compiles or executes no downloaded release binary. It verifies the exact
-asset inventory, checksums and signatures with GitHub CLI. Verification pins
+asset inventory, checksums and signatures with GitHub CLI. It also compares
+the four installer assets with the `rustelup/` files of the release commit,
+because a build job can sign files too. Verification pins
 the repository, release workflow, source tag, source commit and signer commit,
 and rejects self-hosted runner identities. There is no continue-on-error path.
 
@@ -173,9 +177,10 @@ automatic signature verification to the Bash or PowerShell updater.
 - An attestation, checksum or identity check fails. Stop and inspect the
   build and asset. Do not publish it by hand or remove verification.
 - Draft upload or downloaded-asset verification fails. The draft can remain
-  for inspection. The workflow never updates an existing release. After
-  confirming that it is unpublished, the owner can delete that draft without
-  deleting its tag, then rerun. Never alter a published immutable release.
+  for inspection. The workflow stops when the tag already has a release or a
+  draft, so it never updates an existing one. After confirming that the draft
+  is unpublished, the owner can delete it without deleting its tag, then
+  rerun. Never alter a published immutable release.
 
 ## Owner setup
 
@@ -204,8 +209,8 @@ the exact SHA and workflow changes before approval.
 
 With one maintainer, self-review prevention would block all releases. A
 required self-approval with that option off adds a deliberate pause but does
-not stop an attacker who controls the same account. Use the existing YubiKey
-for the account. Independent review is the smallest extra trust boundary
+not stop an attacker who controls the same account. Protect the account with
+a hardware security key. Independent review is the smallest extra trust boundary
 when a second maintainer is available. Do not use a second account owned by
 the same person as a claim of independent review.
 
@@ -219,33 +224,31 @@ the name alone is not an approval control. See
 
 ### Branch and tag rules
 
-The rulesets inspected on 2026-11-09 have these gaps:
+Set these rulesets:
 
-| Ruleset | Current control | Smallest useful change |
-| --- | --- | --- |
-| `protect main` | PR required, zero approvals, no required status check, no bypass actors | Require `CI result` from GitHub Actions and require the branch to be up to date. |
-| `protect main` with a second maintainer | No independent approval required | Require one approval, dismiss stale approvals, require approval of the most recent push and resolve review threads. |
-| `protect release tags` | Creation, update and deletion restricted for `v*`, administrators always bypass | Split tag creation from tag immutability as described below. |
+| Ruleset | Settings |
+| --- | --- |
+| `main` | Require a pull request. Require the `CI result` check from GitHub Actions and an up-to-date branch. Block force pushes and deletion. Add no bypass actors. |
+| `main`, with a second maintainer | Also require one approval, dismiss stale approvals, require approval of the most recent push and require resolved review threads. |
+| `v*` tag creation | Restrict creation. Put only the role or team that makes releases on the bypass list. |
+| `v*` tag changes | Restrict updates and deletion. Add no bypass actors. |
 
-Keep the existing no-force-push and no-deletion rules for `main`. Keep its
-bypass list empty. A solo maintainer cannot approve their own PR. Keep zero
-required approvals only while accepting that a stolen owner account can
-merge malicious changes that pass CI. Require review of release workflows,
-installer files and deployment configuration when a second maintainer joins.
+A solo maintainer cannot approve their own PR, so `main` needs zero
+approvals until a second maintainer joins. Until then, a stolen owner
+account can merge a change that passes CI. When a second maintainer joins,
+require review of release workflows, installer files and deployment
+configuration.
 
-For tags, keep a creation-only ruleset for `v*` with the minimum maintainer
-role or team that can create a release tag on its bypass list. Add a second
-`v*` ruleset that restricts updates and deletions with no bypass actors.
-This lets the owner create tags without also bypassing their update and
-deletion rules. Immutable releases add protection after publication.
+The two tag rulesets let the owner create a tag without also bypassing the
+update and deletion rules. Immutable releases add protection after publication.
 An administrator can still edit repository rules. Limit administrator access
 and monitor rule changes. A workflow cannot prevent a write-capable account
 from creating a release outside that workflow. Limit write access too.
 
 ### rustel.cc deployment checklist
 
-- Use the existing YubiKey as a FIDO2 security key or passkey for GitHub, the
-  hosting account, DNS provider and domain registrar wherever supported.
+- Use a hardware security key or a passkey for GitHub, the hosting account,
+  DNS provider and domain registrar wherever supported.
   Keep recovery codes offline. Check recovery email and fallback methods.
 - Use a dedicated site deployment identity. Prefer short-lived OIDC access
   where the host supports it. Otherwise scope its token to this one site
