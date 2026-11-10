@@ -76,7 +76,7 @@ pub(super) fn install_registration<'js>(
             reject_unexpected_registered_functions(
                 &ctx,
                 name,
-                method_registration.takes_function,
+                method_registration.takes_function(),
                 &args.0,
             )?;
             let expected = method_registration.arity.saturating_sub(1);

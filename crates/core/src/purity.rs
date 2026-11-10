@@ -158,6 +158,20 @@ impl PurePattern {
         );
         PurePattern(p)
     }
+
+    /// What a callback host built for a compiled callback in a pure graph
+    /// after the program stopped standing for it.
+    ///
+    /// The graph was pure when it was built and stays classified pure. The
+    /// runtime that issued the program queries every graph that can reach a
+    /// stale program through its host while the program is alive, so the
+    /// script graph is queried with a host installed. The handle keeps the
+    /// callbacks it reaches and is volatile, so no memo or table keeps it.
+    pub(crate) fn host_built(pattern: crate::Pattern) -> Self {
+        let mut pattern = pattern.mark_volatile();
+        pattern.purity.impure = false;
+        PurePattern(pattern)
+    }
 }
 
 /// Purity-preserving combinators.

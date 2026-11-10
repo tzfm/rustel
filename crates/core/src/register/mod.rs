@@ -213,16 +213,23 @@ impl CombinatorFn {
     /// A native body applied to an impure operand still yields an impure
     /// result, because `Pattern`'s own construction rules propagate the
     /// operand's impurity - no special case is needed.
-    fn apply(&self, args: &[Value], pat: Pattern) -> Pattern {
+    ///
+    /// `pure_view` is the caller's verdict that every argument may enter the
+    /// pure view. See [`Registration::admits_pure_view`].
+    fn apply(&self, args: &[Value], pat: Pattern, pure_view: bool) -> Pattern {
         match self {
-            // Use the pure view when the operand is pure and no argument contains
-            // a JS function. Binds through the `Pattern` view use the opaque dynamic
+            // Use the pure view when the operand is pure and the arguments
+            // admit it. Binds through the `Pattern` view use the opaque dynamic
             // constructor and mark their results impure. The `PurePattern` return
             // type preserves the proof needed for tight-lookahead scheduling.
             CombinatorFn::Native(n) => match pat.as_pure_pattern() {
-                Some(pure) if !args.iter().any(Value::has_js_function) => {
-                    (n.pure)(args, pure).pattern().clone()
-                }
+                Some(pure) if pure_view => (n.pure)(args, pure)
+                    .pattern()
+                    .clone()
+                    .retaining_callbacks(args.iter().filter_map(|value| match value {
+                        Value::Function(function) => function.callback_kept_by_pure_view(),
+                        _ => None,
+                    })),
                 _ => (n.any)(args, pat),
             },
             CombinatorFn::NativePatterned(n) => {
@@ -246,14 +253,9 @@ pub struct Registration {
     /// The declaration layer, which decides precedence against a same-named
     /// control. See [`DeclaredIn`].
     pub declared_in: DeclaredIn,
-    /// True when a leading argument is a pattern TRANSFORMER (`every(4, rev)`).
-    ///
-    /// The general path cannot see argument values at construction time, so it
-    /// cannot tell a native transformer from a JavaScript one. Declaring the
-    /// possibility makes it take the opaque dynamic constructor, which is
-    /// conservative: a false-impure costs latency, a false-pure costs
-    /// correctness.
-    pub takes_function: bool,
+    /// What a leading function argument is to the body, if the body takes
+    /// one. See [`FunctionArgument`].
+    pub function_argument: FunctionArgument,
     /// The arity, INCLUDING the trailing pattern.
     pub arity: usize,
     pub patternify: bool,
@@ -262,7 +264,67 @@ pub struct Registration {
     pub func: CombinatorFn,
 }
 
+/// What a leading function argument is to a registration's body.
+///
+/// The general path cannot see argument values at construction time, so it
+/// cannot tell a native function from a JavaScript one. A registration that
+/// takes a function in any role takes the opaque dynamic constructor there,
+/// which is conservative: a false-impure costs latency, a false-pure costs
+/// correctness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FunctionArgument {
+    /// The body takes no function.
+    None,
+    /// A pattern transformer, as in `every(4, rev)`. The body applies it to
+    /// patterns, through its pure view when the body runs in its own.
+    Transformer,
+    /// A predicate the body asks about each hap or time, as in `filter`. A
+    /// predicate has no pure view, so the body's pure view cannot run it.
+    Predicate,
+}
+
+/// Whether one argument value may enter a native body's pure view.
+///
+/// A function in a transformer role needs only a pure view of its own, which
+/// a lowered JavaScript callback has. Any other value must carry no
+/// JavaScript at all, because the body may keep it in the graph it builds or
+/// ask it about each hap.
+fn admits_pure_view(function_argument: FunctionArgument, value: &Value) -> bool {
+    match value {
+        Value::Function(function) if function_argument == FunctionArgument::Transformer => {
+            function.is_native()
+        }
+        value => !value.has_js_function(),
+    }
+}
+
 impl Registration {
+    /// Whether a leading argument is a function, in any role.
+    pub fn takes_function(&self) -> bool {
+        self.function_argument != FunctionArgument::None
+    }
+
+    /// Whether these argument values may enter the body's pure view. Only a
+    /// registration that takes a transformer gives a function argument that
+    /// role.
+    pub fn admits_pure_view(&self, args: &[Value]) -> bool {
+        args.iter()
+            .all(|value| admits_pure_view(self.function_argument, value))
+    }
+
+    /// Whether [`Self::call`] with these leading arguments keeps a pure
+    /// operand pure.
+    ///
+    /// The body must be native and every argument pure. A registration that
+    /// takes a function also needs every argument constant: a patterned
+    /// argument chooses the function per hap, through the opaque dynamic
+    /// constructor.
+    pub fn preserves_purity_with(&self, args: &[Pattern]) -> bool {
+        matches!(self.func, CombinatorFn::Native(_))
+            && args.iter().all(Pattern::is_pure)
+            && (!self.takes_function() || args.iter().all(|arg| arg.as_pure().is_some()))
+    }
+
     /// The patternified entry point.
     ///
     /// `args` are the leading arguments as *patterns* (already `reify`d).
@@ -270,7 +332,7 @@ impl Registration {
         let result = if let CombinatorFn::NativePatterned(body) = &self.func {
             body.apply(args, pat.clone())
         } else if self.arity == 1 || args.is_empty() {
-            self.func.apply(&[], pat.clone())
+            self.func.apply(&[], pat.clone(), true)
         } else if !self.patternify {
             // Non-patternified: leading args must be pure values. A non-pure
             // one keeps its position as Null. Dropping it would shift every
@@ -280,7 +342,8 @@ impl Registration {
                 .iter()
                 .map(|p| p.as_pure().unwrap_or(Value::Null))
                 .collect();
-            self.func.apply(&vals, pat.clone())
+            let pure_view = self.admits_pure_view(&vals);
+            self.func.apply(&vals, pat.clone(), pure_view)
         } else if args.len() > self.arity.saturating_sub(1) && all_pure(args).is_none() {
             // Over-applied call: with more leading arguments than the arity
             // allows, the curry chain ends up applying a Pattern as if it
@@ -295,7 +358,8 @@ impl Registration {
             // context.
             let locs: Vec<(usize, usize)> =
                 args.iter().flat_map(|p| p.pure_loc().into_iter()).collect();
-            let out = self.func.apply(&pures, pat.clone());
+            let pure_view = self.admits_pure_view(&pures);
+            let out = self.func.apply(&pures, pat.clone(), pure_view);
             if locs.is_empty() {
                 out
             } else {
@@ -312,6 +376,7 @@ impl Registration {
             let func = self.func.clone();
             let pat_for_fn = pat.clone();
             let n_args = args.len();
+            let function_argument = self.function_argument;
 
             // Accumulate argument values positionally.
             let mut acc: Pattern = args[0].fmap_collect();
@@ -331,13 +396,18 @@ impl Registration {
                 debug_assert_eq!(vals.len(), n_args);
                 vals
             };
-            let inner = match (&func, pat_for_fn.as_pure_pattern()) {
+            let apply = move |v: &Value| {
+                let values = unpack(v);
+                let pure_view = values
+                    .iter()
+                    .all(|value| admits_pure_view(function_argument, value));
+                func.apply(&values, pat_for_fn.clone(), pure_view)
+            };
+            let inner = match (&self.func, pat.as_pure_pattern()) {
                 // A body that consumes a transformer cannot take the pure
                 // route: the argument values are only known at query time, so
                 // there is no way to know the transformer is native.
-                _ if self.takes_function => {
-                    acc.fmap_to_pattern(move |v| func.apply(&unpack(v), pat_for_fn.clone()))
-                }
+                _ if self.takes_function() => acc.fmap_to_pattern(apply),
                 // Native body + pure operand: the closure's return type proves
                 // no JavaScript can appear, so purity is inherited SOUNDLY.
                 (CombinatorFn::Native(n), Some(pure_operand)) => {
@@ -345,7 +415,7 @@ impl Registration {
                     acc.fmap_to_pure_pattern(move |v| pf(&unpack(v), pure_operand.clone()))
                 }
                 // Anything else is an opaque closure -> always impure.
-                _ => acc.fmap_to_pattern(move |v| func.apply(&unpack(v), pat_for_fn.clone())),
+                _ => acc.fmap_to_pattern(apply),
             };
             match self.join {
                 JoinKind::Inner => inner.inner_join(),
@@ -364,7 +434,9 @@ impl Registration {
 
     /// The unpatternified `_name` form, calling `func` directly.
     pub fn call_unpatternified(&self, args: &[Value], pat: Pattern) -> Pattern {
-        let result = self.func.apply(args, pat.clone());
+        let result = self
+            .func
+            .apply(args, pat.clone(), self.admits_pure_view(args));
         if self.preserve_steps {
             result.with_steps(pat.steps)
         } else {
@@ -457,7 +529,7 @@ pub fn registration(
         names: names.iter().map(|n| Arc::from(*n)).collect(),
         reference,
         declared_in: DeclaredIn::PatternModule,
-        takes_function: false,
+        function_argument: FunctionArgument::None,
         arity,
         patternify: true,
         preserve_steps: false,
@@ -496,7 +568,7 @@ pub fn register_fast(reg: &mut Registry) {
         names: vec![Arc::from("fast"), Arc::from("density")],
         reference: FAST,
         declared_in: DeclaredIn::PatternModule,
-        takes_function: false,
+        function_argument: FunctionArgument::None,
         arity: 2,
         patternify: true,
         preserve_steps: true,
@@ -589,7 +661,7 @@ pub fn add_in(
         reference,
         arity,
         preserve_steps,
-        false,
+        FunctionArgument::None,
         func,
     );
 }
@@ -631,7 +703,29 @@ pub fn add_fn_in(
         reference,
         arity,
         preserve_steps,
-        true,
+        FunctionArgument::Transformer,
+        func,
+    );
+}
+
+/// `register(...)` for a combinator that consumes a PREDICATE, as `filter`
+/// does.
+pub(super) fn add_predicate_fn(
+    r: &mut Registry,
+    names: &[&str],
+    reference: crate::reference::ReferenceEntry,
+    arity: usize,
+    preserve_steps: bool,
+    func: CombinatorFn,
+) {
+    add_full(
+        r,
+        DeclaredIn::PatternModule,
+        names,
+        reference,
+        arity,
+        preserve_steps,
+        FunctionArgument::Predicate,
         func,
     );
 }
@@ -644,14 +738,14 @@ fn add_full(
     reference: crate::reference::ReferenceEntry,
     arity: usize,
     preserve_steps: bool,
-    takes_function: bool,
+    function_argument: FunctionArgument,
     func: CombinatorFn,
 ) {
     r.register(Registration {
         names: names.iter().map(|n| Arc::from(*n)).collect(),
         reference,
         declared_in,
-        takes_function,
+        function_argument,
         arity,
         patternify: true,
         preserve_steps,
@@ -674,7 +768,7 @@ pub(super) fn add_step(
         names: names.iter().map(|n| Arc::from(*n)).collect(),
         reference,
         declared_in: DeclaredIn::PatternModule,
-        takes_function: false,
+        function_argument: FunctionArgument::None,
         arity,
         patternify: true,
         preserve_steps,
@@ -697,7 +791,7 @@ pub(super) fn add_unpatternified(
         names: names.iter().map(|n| Arc::from(*n)).collect(),
         reference,
         declared_in: DeclaredIn::PatternModule,
-        takes_function: false,
+        function_argument: FunctionArgument::None,
         arity,
         patternify: false,
         preserve_steps,
@@ -1041,6 +1135,86 @@ mod numeric_string_tests {
                 .is_ok(),
             "the accepted boundary must not carry a latent resource refusal"
         );
+    }
+}
+
+#[cfg(test)]
+mod purity_rule_tests {
+    use super::default_registry;
+    use crate::callback_ir::PatternTransformProgram;
+    use crate::value::FunctionRef;
+    use crate::{Value, pure};
+    use std::sync::Arc;
+
+    fn lowered() -> Value {
+        Value::Function(Box::new(FunctionRef::lowered_js(
+            1,
+            PatternTransformProgram::new([]).unwrap(),
+        )))
+    }
+
+    #[test]
+    fn only_a_transformer_role_admits_a_lowered_callback_into_the_pure_view() {
+        let registry = default_registry();
+        let sometimes = registry.get("sometimes").expect("registered sometimes");
+        let fast = registry.get("fast").expect("registered fast");
+        assert!(sometimes.admits_pure_view(&[lowered()]));
+        assert!(sometimes.admits_pure_view(&[Value::F64(0.5), lowered()]));
+        assert!(!sometimes.admits_pure_view(&[Value::Function(Box::new(FunctionRef::js(1)))]));
+        assert!(!sometimes.admits_pure_view(&[Value::List(vec![lowered()])]));
+        assert!(!fast.admits_pure_view(&[lowered()]));
+        assert!(fast.admits_pure_view(&[Value::F64(2.0)]));
+    }
+
+    #[test]
+    fn a_predicate_role_keeps_a_lowered_callback_out_of_the_pure_view() {
+        let registry = default_registry();
+        for name in ["filter", "filterWhen"] {
+            let registration = registry.get(name).expect("registered predicate");
+            assert_eq!(
+                registration.function_argument,
+                super::FunctionArgument::Predicate
+            );
+            assert!(registration.takes_function(), "{name}");
+            assert!(!registration.admits_pure_view(&[lowered()]), "{name}");
+        }
+        // Applied to a pure receiver, the predicate stays a script callback,
+        // so the graph is impure and asks it about each hap.
+        let filter = registry.get("filter").expect("registered filter");
+        let receiver = crate::fastcat(vec![pure(Value::F64(1.0)), pure(Value::F64(2.0))]);
+        let filtered = filter.call(&[pure(lowered())], receiver);
+        assert!(!filtered.is_pure());
+    }
+
+    #[test]
+    fn purity_is_preserved_only_for_native_bodies_with_pure_constant_transformers() {
+        let registry = default_registry();
+        let fast = registry.get("fast").expect("registered fast");
+        let every = registry.get("every").expect("registered every");
+        let rev = pure(Value::Function(Box::new(FunctionRef::registered(
+            "rev",
+            Arc::new(|pattern| pattern.rev()),
+            true,
+        ))));
+        let patterned = crate::fastcat(vec![pure(Value::F64(2.0)), pure(Value::F64(4.0))]);
+        assert!(fast.preserves_purity_with(&[pure(Value::F64(2.0))]));
+        assert!(fast.preserves_purity_with(std::slice::from_ref(&patterned)));
+        assert!(every.preserves_purity_with(&[pure(Value::F64(2.0)), rev.clone()]));
+        assert!(!every.preserves_purity_with(&[patterned, rev]));
+        assert!(!every.preserves_purity_with(&[pure(Value::F64(2.0)), pure(lowered())]));
+        let receiver = pure(Value::Str("a".into()));
+        let every_two = every.call(
+            &[
+                pure(Value::F64(2.0)),
+                pure(Value::Function(Box::new(FunctionRef::registered(
+                    "rev",
+                    Arc::new(|pattern| pattern.rev()),
+                    true,
+                )))),
+            ],
+            receiver,
+        );
+        assert!(every_two.is_pure());
     }
 }
 

@@ -205,7 +205,7 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     /// Under the `PurePattern` instantiation this REQUIRES a native function.
     /// A JS function reaching it is a classification bug, not a user error, and
     /// panics rather than silently producing a false-pure pattern; see
-    /// `Registration::takes_function`, which keeps it unreachable.
+    /// `Registration::function_argument`, which keeps it unreachable.
     fn apply_fn(&self, f: &crate::value::FunctionRef) -> Self;
 
     /// Apply one indexed transformer to a complete `echoWith` batch.
@@ -857,7 +857,7 @@ impl PatOps for PurePattern {
     fn apply_fn(&self, f: &crate::value::FunctionRef) -> Self {
         f.apply_pure(self.clone()).unwrap_or_else(|| {
             // Unreachable: a registration that consumes a function argument
-            // declares `takes_function`, which keeps the general path on the
+            // declares `function_argument`, which keeps the general path on the
             // dynamic constructor, and the fast path checks the argument
             // values. Kept as the self-check that keeps that claim honest.
             PurePattern::assert_pure(f.apply(self.pattern().clone()))

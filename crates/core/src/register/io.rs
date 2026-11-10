@@ -4,7 +4,7 @@
 //! https://strudel.cc, where an entry carries upstream's words; entries this
 //! port wrote itself say so in their own words.
 
-use super::{DeclaredIn, JoinKind, Registration, Registry, add, arg_text};
+use super::{DeclaredIn, FunctionArgument, JoinKind, Registration, Registry, add, arg_text};
 use crate::Value;
 use crate::combinators as c;
 use std::sync::Arc;
@@ -178,7 +178,7 @@ pub(super) fn register(r: &mut Registry) {
         names: vec![Arc::from("serial")],
         reference: SERIAL,
         declared_in: DeclaredIn::PatternModule,
-        takes_function: false,
+        function_argument: FunctionArgument::None,
         arity: 5,
         patternify: false,
         preserve_steps: false,
@@ -208,7 +208,7 @@ pub(super) fn register(r: &mut Registry) {
         names: vec![Arc::from("midi")],
         reference: MIDI,
         declared_in: DeclaredIn::PatternModule,
-        takes_function: false,
+        function_argument: FunctionArgument::None,
         arity: 2,
         patternify: false,
         preserve_steps: false,
@@ -226,7 +226,7 @@ pub(super) fn register(r: &mut Registry) {
         names: vec![Arc::from("osc")],
         reference: OSC,
         declared_in: DeclaredIn::PatternModule,
-        takes_function: false,
+        function_argument: FunctionArgument::None,
         arity: 2,
         patternify: false,
         preserve_steps: false,

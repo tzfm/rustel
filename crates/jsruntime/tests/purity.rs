@@ -154,14 +154,16 @@ fn reachable_set_is_deduplicated_union() {
 /// The exact reproducer. Kept verbatim so it cannot be lost to refactoring.
 #[test]
 fn reproducer_js_callback_under_register_general_path() {
-    use rustel_core::register::{CombinatorFn, DeclaredIn, JoinKind, Registration, Registry};
+    use rustel_core::register::{
+        CombinatorFn, DeclaredIn, FunctionArgument, JoinKind, Registration, Registry,
+    };
     use std::sync::Arc;
 
     const CB: usize = 0;
     let mut reg = Registry::new();
     reg.register(Registration {
         declared_in: DeclaredIn::PatternModule,
-        takes_function: false,
+        function_argument: FunctionArgument::None,
         names: vec![Arc::from("tagged")],
         reference: rustel_core::reference::ReferenceEntry::blank("tagged"),
         arity: 2,
@@ -192,14 +194,16 @@ fn reproducer_js_callback_under_register_general_path() {
 /// Both `register()` paths, with a JS callback in each position.
 #[test]
 fn js_callback_impure_under_both_register_paths() {
-    use rustel_core::register::{CombinatorFn, DeclaredIn, JoinKind, Registration, Registry};
+    use rustel_core::register::{
+        CombinatorFn, DeclaredIn, FunctionArgument, JoinKind, Registration, Registry,
+    };
     use std::sync::Arc;
 
     const CB: usize = 4;
     let mut reg = Registry::new();
     reg.register(Registration {
         declared_in: DeclaredIn::PatternModule,
-        takes_function: false,
+        function_argument: FunctionArgument::None,
         names: vec![Arc::from("jsfn")],
         reference: rustel_core::reference::ReferenceEntry::blank("jsfn"),
         arity: 2,
@@ -300,9 +304,10 @@ fn query_time_javascript_is_always_impure() {
         // Patterned first argument: the transformer is chosen per hap.
         r#"s("bd sd").every("<2 3>", x => x.fast(2))"#,
         r#"s("bd sd").sometimesBy("<0.3 0.6>", x => x.speed(2))"#,
-        // Scalar probability: the combinator body's own fmap is lazy.
-        r#"s("bd sd").sometimesBy(1, x => x.speed(2))"#,
-        r#"s("bd sd").someCyclesBy(1, x => x.speed(2))"#,
+        // Scalar probability: the combinator body's own fmap is lazy. A free
+        // variable keeps the callback JavaScript.
+        r#"const k = 2; s("bd sd").sometimesBy(1, x => x.speed(k))"#,
+        r#"const k = 2; s("bd sd").someCyclesBy(1, x => x.speed(k))"#,
     ] {
         let rt = JsRuntime::new().unwrap();
         rt.install_semantic_bindings().unwrap();
@@ -324,17 +329,34 @@ fn query_time_javascript_is_always_impure() {
 /// The executable form of the purity claim: anything classified PURE must
 /// query with **no callback host installed**. If the classification were
 /// wrong, the host lookup panics instead of silently entering JS.
+///
+/// A callback that eagerly applied JavaScript built leaves a pure graph, and
+/// so does a callback compiled to a native program, even where the
+/// combinator applies it lazily. A block body keeps a callback JavaScript.
 #[test]
-fn eagerly_applied_callbacks_leave_a_genuinely_pure_graph() {
-    for source in [
-        r#"s("bd sd hh cp").every(2, x => x.fast(2))"#,
-        r#"s("bd sd").jux(x => x.rev())"#,
-        r#"s("bd sd").superimpose(x => x.fast(2))"#,
+fn eager_and_compiled_callbacks_leave_a_genuinely_pure_graph() {
+    for (source, compiled) in [
+        (
+            r#"s("bd sd hh cp").every(2, x => { return x.fast(2) })"#,
+            false,
+        ),
+        (r#"s("bd sd").jux(x => { return x.rev() })"#, false),
+        (
+            r#"s("bd sd").superimpose(x => { return x.fast(2) })"#,
+            false,
+        ),
+        (r#"s("bd sd hh cp").every(2, x => x.fast(2))"#, true),
+        (r#"s("bd sd").jux(x => x.rev())"#, true),
+        (r#"s("bd sd").superimpose(x => x.fast(2))"#, true),
+        (r#"s("bd sd").sometimesBy(1, x => x.speed(2))"#, true),
+        (r#"s("bd sd").someCyclesBy(1, x => x.speed(2))"#, true),
     ] {
         let rt = JsRuntime::new().unwrap();
         rt.install_semantic_bindings().unwrap();
         rt.evaluate_score(source, &rustel_transpiler::TranspileOptions::default())
             .unwrap_or_else(|e| panic!("{source}: {e}"));
+        let stats = rt.pattern_transform_ir_stats();
+        assert_eq!(stats.lowered > 0, compiled, "{source}: {stats:?}");
         let pattern = rt.active_pattern().expect("active pattern");
         let pure_view = pattern
             .as_pure_pattern()
@@ -1668,7 +1690,7 @@ fn raw_signal_quartet_tagged_transformers_remain_host_free_after_runtime_teardow
         rt.evaluate_score(
             &format!(
                 r#"(() => {{
-                     const wrapper = x => x.rev();
+                     const wrapper = x => {{ return x.rev(); }};
                      delete wrapper.__pure;
                      delete wrapper.__pure_loc;
                      return sequence('a','b','c').setSteps(7).{raw_name}(wrapper);

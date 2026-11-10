@@ -34,11 +34,13 @@ use std::path::Path;
 mod arrange_marks;
 mod callback_ir;
 mod frequency_sliders;
+mod surface_writes;
 pub use callback_ir::{
-    MAX_CALLBACK_IR_SOURCE_BYTES, PatternTransformCandidate, PatternTransformFallbackReason,
-    lower_pattern_transform_callback,
+    CallbackArgument, CallbackMethodCall, MAX_CALLBACK_IR_SOURCE_BYTES, PatternTransformCandidate,
+    PatternTransformFallbackReason, lower_pattern_transform_callback,
 };
 pub use frequency_sliders::is_frequency_control;
+pub use surface_writes::{SurfaceWrites, surface_writes};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseDiagnostic {
@@ -54,6 +56,8 @@ pub struct ParseOutput {
     pub panicked: bool,
     /// Static names published by score-level `register(...)` calls.
     pub registrations: RegistrationHints,
+    /// What the program can write on the surface compiled callbacks read.
+    pub surface_writes: SurfaceWrites,
     /// Printed position → source position, from the printer's own map.
     pub line_map: LineMap,
 }
@@ -1161,6 +1165,9 @@ pub struct TranspileOutput {
     pub diagnostics: Vec<ParseDiagnostic>,
     pub widgets: Vec<WidgetRecord>,
     pub registrations: RegistrationHints,
+    /// What the output can write on the surface compiled callbacks read.
+    /// The runtime reads it before the output runs.
+    pub surface_writes: SurfaceWrites,
     /// Positions in `output` mapped back to the score's own lines.
     pub line_map: LineMap,
     /// Each KabelSalat call outside another call's graph, in source order;
@@ -1317,7 +1324,13 @@ fn parse_and_print_here(
             ..ParseOutput::default()
         };
     }
-    let registrations = registration_hints_from_program(&parsed.program);
+    let (registrations, surface_writes) = {
+        let semantic = SemanticBuilder::new().build(&parsed.program).semantic;
+        (
+            registration_hints_with(&parsed.program, semantic.scoping()),
+            surface_writes::program_surface_writes(&parsed.program, semantic.scoping()),
+        )
+    };
     let mut diagnostics = parsed
         .diagnostics
         .iter()
@@ -1398,6 +1411,7 @@ fn parse_and_print_here(
         diagnostics,
         panicked: parsed.panicked,
         registrations,
+        surface_writes,
         line_map,
     }
 }
@@ -2069,8 +2083,12 @@ pub fn awaits_in_code(source: &str) -> bool {
 
 fn registration_hints_from_program(program: &Program<'_>) -> RegistrationHints {
     let semantic = SemanticBuilder::new().build(program).semantic;
+    registration_hints_with(program, semantic.scoping())
+}
+
+fn registration_hints_with(program: &Program<'_>, scoping: &Scoping) -> RegistrationHints {
     let mut collector = RegistrationCollector {
-        scoping: semantic.scoping(),
+        scoping,
         aliases: HashSet::new(),
         names: Vec::new(),
         has_dynamic_names: false,
@@ -2565,6 +2583,7 @@ fn transpile_here(source: &str, options: &TranspileOptions) -> TranspileOutput {
         diagnostics,
         line_map: parsed.line_map,
         registrations: parsed.registrations,
+        surface_writes: parsed.surface_writes,
         widgets: if options.emit_widgets {
             widgets
         } else {

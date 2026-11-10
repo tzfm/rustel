@@ -7,6 +7,7 @@
 pub mod callback_ir;
 pub mod combinators;
 pub mod compose;
+mod construction;
 mod context_keys;
 pub mod controls;
 pub mod gamepad;
@@ -1439,6 +1440,11 @@ pub fn with_callback_host<R>(host: &dyn CallbackHost, f: impl FnOnce() -> R) -> 
     f()
 }
 
+/// Whether a callback host is installed on this thread.
+pub(crate) fn host_installed() -> bool {
+    CURRENT_HOST.with(|host| host.get().is_some())
+}
+
 fn host_call_value(id: CallbackId, v: &Value) -> Value {
     CURRENT_HOST.with(|h| match h.get() {
         // SAFETY: set only by `with_callback_host`, which outlives this call.
@@ -1578,6 +1584,10 @@ pub(crate) fn host_call_pattern(id: CallbackId, pattern: Pattern) -> Pattern {
 /// The host retains the original JavaScript function and owns selection and
 /// differential policy. A missing host remains a false-pure classification,
 /// exactly like the compatibility-only pattern callback path.
+///
+/// Only the identity callback was a candidate before method chains, and its
+/// failures keep their wording. A chain stands for an ordinary callback, so a
+/// failure of its JavaScript fallback reads as that callback's would.
 pub(crate) fn host_call_pattern_ir(
     id: CallbackId,
     program: &callback_ir::PatternTransformProgram,
@@ -1589,8 +1599,12 @@ pub(crate) fn host_call_pattern_ir(
             unsafe { &*pointer }.call_pattern_ir(id, program, pattern)
         }) {
             Ok(result) => result,
-            Err(error) => {
+            Err(error) if program.is_empty() => {
                 signal_query_error(move || format!("pattern callback IR {id} failed: {error}"));
+                silence()
+            }
+            Err(error) => {
+                signal_query_error(move || format!("pattern callback {id} failed: {error}"));
                 silence()
             }
         },
@@ -1863,6 +1877,9 @@ struct Constructions {
 struct ConstructionEntry {
     value: Value,
     settings: settings::SettingsStateId,
+    /// The standings of the compiled programs the construction applied. See
+    /// [`callback_ir::recording_reads`].
+    read: Box<[Arc<callback_ir::Standing>]>,
     pattern: purity::PurePattern,
 }
 
@@ -1951,19 +1968,23 @@ impl ConstructionMemo {
         {
             let mut constructions = self.lock();
             let names = |entry: &ConstructionEntry| {
-                entry.settings == *settings && same_key(&entry.value, value)
+                entry.settings == *settings
+                    && same_key(&entry.value, value)
+                    && callback_ir::reads_hold(&entry.read)
             };
             if let Some(kept) = constructions.kept.iter().find(|entry| names(entry)) {
+                callback_ir::note_read(&kept.read);
                 return (kept.pattern.clone(), true);
             }
             if constructions.handed.as_ref().is_some_and(names)
                 && let Some(handed) = constructions.handed.take()
             {
+                callback_ir::note_read(&handed.read);
                 return (handed.pattern, false);
             }
         }
         // Built outside the lock: construction is arbitrary native code.
-        let built = construct(value);
+        let (built, read) = callback_ir::recording_reads(|| construct(value));
         // A construction that raised a query error or a refusal is what the
         // boundary is about to discard, and NaN would never be found again.
         // A key that holds a pattern handle is not kept either: a callback
@@ -1976,6 +1997,7 @@ impl ConstructionMemo {
         let entry = ConstructionEntry {
             value: value.clone(),
             settings: settings.clone(),
+            read,
             pattern: built.clone(),
         };
         let mut constructions = self.lock();
@@ -4825,13 +4847,20 @@ impl Pattern {
                 self.node
                     .tables
                     .get_or_init(|| {
-                        without_query_signals(|| table::build(self.node_kind()))
-                            .map(|tables| Box::new(tables.built_under(state)))
+                        let (built, read) = callback_ir::recording_reads(|| {
+                            without_query_signals(|| table::build(self.node_kind()))
+                        });
+                        built.map(|tables| Box::new(tables.built_under(state, read)))
                     })
                     .as_deref()?
             }
         };
-        tables.current().then_some(tables)
+        if !tables.current() {
+            return None;
+        }
+        // A build that uses these tables reads what they read.
+        callback_ir::note_read(tables.read());
+        Some(tables)
     }
 
     /// Whether this handle may answer from tables at all: a cacheable graph
@@ -4957,6 +4986,23 @@ impl Pattern {
         pattern
     }
 
+    /// This handle, also reaching the callbacks `ids`, with its purity kept.
+    ///
+    /// A pure view that captured a lowered callback can still need its
+    /// script callback once the program goes stale, so every wrapper that
+    /// owns the graph has to keep the callback alive. On the handle, so the
+    /// ids propagate upward as the rest of the classification does.
+    pub(crate) fn retaining_callbacks(self, ids: impl IntoIterator<Item = CallbackId>) -> Self {
+        let mut pattern = self;
+        let before = pattern.purity.reachable.len();
+        pattern.purity.reachable.extend(ids);
+        if pattern.purity.reachable.len() != before {
+            pattern.purity.reachable.sort_unstable();
+            pattern.purity.reachable.dedup();
+        }
+        pattern
+    }
+
     /// This handle, marked as reading the default voicing dictionary. See
     /// [`purity::Purity::host_voicings`].
     pub(crate) fn mark_host_voicings(&self) -> Self {
@@ -4978,19 +5024,6 @@ impl Pattern {
         } else {
             None
         }
-    }
-
-    /// Exact graph-handle comparison for callback-IR differential checks.
-    ///
-    /// This is intentionally stronger than output equivalence: the initial
-    /// identity IR is valid only when its JavaScript fallback returns the
-    /// callback argument unchanged, including metadata and runtime ownership.
-    #[doc(hidden)]
-    pub fn same_graph_handle(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.node, &other.node)
-            && self.steps == other.steps
-            && self.pure_loc == other.pure_loc
-            && self.same_runtime_owner(other)
     }
 
     fn same_runtime_owner(&self, other: &Self) -> bool {

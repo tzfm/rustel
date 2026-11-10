@@ -419,9 +419,13 @@ fn array_index(key: &str) -> Option<u32> {
 /// The kind decides purity. The two basic kinds:
 ///
 /// * `Native` carries the same two typed views `native_combinator!` produces,
-///   so applying it to a pure pattern is provably still pure;
+///   so applying it to a pure pattern is provably still pure.
 /// * `Js` carries only an opaque callback id, so applying it can materialise
 ///   anything and the result is impure.
+///
+/// A JavaScript callback compiled to a native program keeps its callback id
+/// as a value and gains a pure view as a transformer. See
+/// [`FunctionRef::lowered_js`].
 ///
 /// [`Value`] derives `Debug` and `PartialEq`, so both are implemented here by
 /// **identity**: two closures are the same function only if they are the same
@@ -449,6 +453,14 @@ enum FunctionKind {
     /// A bounded native candidate whose exact JavaScript callable remains
     /// owned by the callback sidecar as the compatibility fallback.
     JsPatternIr {
+        fallback: crate::CallbackId,
+        program: crate::callback_ir::PatternTransformProgram,
+    },
+    /// A JavaScript callback whose source compiled to a native program that
+    /// builds the same graph. As a transformer it has a pure view that runs
+    /// the program while the program stands for the callback. As a value it
+    /// is still the JavaScript function.
+    LoweredJs {
         fallback: crate::CallbackId,
         program: crate::callback_ir::PatternTransformProgram,
     },
@@ -527,6 +539,27 @@ impl FunctionRef {
         }
     }
 
+    /// A JavaScript callback with a native program that stands for it.
+    ///
+    /// The owning runtime issues the program only while it can prove that
+    /// the program builds the graph the callback builds, and marks the
+    /// program stale before that can change. While the program is current,
+    /// the pure view runs it and never enters JavaScript. A stale function
+    /// takes no pure view, and a pure graph built before asks the host for
+    /// the callback. The ordinary view asks the host, which runs the program
+    /// or the callback.
+    pub fn lowered_js(
+        fallback: crate::CallbackId,
+        program: crate::callback_ir::PatternTransformProgram,
+    ) -> Self {
+        Self {
+            id: NEXT_FUNCTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name: None,
+            kind: FunctionKind::LoweredJs { fallback, program },
+            runtime_settings: None,
+        }
+    }
+
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
@@ -539,12 +572,30 @@ impl FunctionRef {
         }
     }
 
-    /// True when applying this cannot introduce JavaScript.
+    /// True when this has a pure view as a transformer: applying that view
+    /// cannot introduce JavaScript.
+    ///
+    /// A lowered JavaScript callback is native here while its program stands
+    /// for it, and still carries its callback id as a value. See
+    /// [`Value::has_js_function`].
     pub fn is_native(&self) -> bool {
         match &self.kind {
             FunctionKind::Native { .. } => true,
+            FunctionKind::LoweredJs { program, .. } => program.is_current(),
             FunctionKind::Registered { provable_pure, .. } => *provable_pure,
             FunctionKind::Js(_) | FunctionKind::JsPatternIr { .. } => false,
+        }
+    }
+
+    /// The script callback a pure view of this function may still need: a
+    /// lowered callback whose program can go stale. See
+    /// [`crate::Pattern::retaining_callbacks`].
+    pub(crate) fn callback_kept_by_pure_view(&self) -> Option<crate::CallbackId> {
+        match &self.kind {
+            FunctionKind::LoweredJs { fallback, program } if program.can_go_stale() => {
+                Some(*fallback)
+            }
+            _ => None,
         }
     }
 
@@ -552,7 +603,8 @@ impl FunctionRef {
     pub fn callback_id(&self) -> Option<crate::CallbackId> {
         match self.kind {
             FunctionKind::Js(id) => Some(id),
-            FunctionKind::JsPatternIr { fallback, .. } => Some(fallback),
+            FunctionKind::JsPatternIr { fallback, .. }
+            | FunctionKind::LoweredJs { fallback, .. } => Some(fallback),
             _ => None,
         }
     }
@@ -593,7 +645,8 @@ impl FunctionRef {
     fn apply_value_unbound(&self, value: &Value) -> Value {
         match &self.kind {
             FunctionKind::Js(id) => crate::host_call_value(*id, value),
-            FunctionKind::JsPatternIr { fallback, .. } => crate::host_call_value(*fallback, value),
+            FunctionKind::JsPatternIr { fallback, .. }
+            | FunctionKind::LoweredJs { fallback, .. } => crate::host_call_value(*fallback, value),
             FunctionKind::Native { .. } | FunctionKind::Registered { .. } => {
                 crate::signal_query_error(|| {
                     "pattern transformer cannot be called as a value predicate".into()
@@ -603,13 +656,26 @@ impl FunctionRef {
         }
     }
 
-    fn apply_unbound(&self, pattern: crate::Pattern) -> crate::Pattern {
+    /// Apply with no runtime settings bound to the result.
+    pub(crate) fn apply_unbound(&self, pattern: crate::Pattern) -> crate::Pattern {
         match &self.kind {
             FunctionKind::Native { any, .. } => any(pattern),
             FunctionKind::Registered { apply, .. } => apply(pattern),
             FunctionKind::Js(id) => crate::host_call_pattern(*id, pattern),
             FunctionKind::JsPatternIr { fallback, program } => {
                 crate::host_call_pattern_ir(*fallback, program, pattern)
+            }
+            // The host owns the choice between the program and the callback.
+            // With no host, nothing can run the callback, and only a current
+            // program stands for it.
+            FunctionKind::LoweredJs { fallback, program } => {
+                if crate::host_installed() {
+                    crate::host_call_pattern_ir(*fallback, program, pattern)
+                } else if program.is_current() {
+                    program.apply(pattern)
+                } else {
+                    stale_without_host(*fallback)
+                }
             }
         }
     }
@@ -646,6 +712,7 @@ impl FunctionRef {
         if let Some(id) = match self.kind {
             FunctionKind::Js(id) => Some(id),
             FunctionKind::JsPatternIr { fallback, .. } => Some(fallback),
+            FunctionKind::LoweredJs { fallback, .. } if crate::host_installed() => Some(fallback),
             _ => None,
         } {
             return crate::host_call_pattern_indexed_batch(id, patterns);
@@ -655,11 +722,26 @@ impl FunctionRef {
         if out.try_reserve_exact(patterns.len()).is_err() {
             return vec![crate::query_limit_pattern(crate::QueryLimit::HostMemory)];
         }
+        // The JavaScript batch calls the callback for every pattern, and the
+        // callback ignores the index it is handed.
+        if let FunctionKind::LoweredJs { fallback, program } = &self.kind {
+            if !program.is_current() {
+                return vec![stale_without_host(*fallback)];
+            }
+            out.extend(
+                patterns
+                    .into_iter()
+                    .map(|(pattern, _)| program.apply(pattern)),
+            );
+            return out;
+        }
         for (pattern, _) in patterns {
             let transformed = match &self.kind {
                 FunctionKind::Native { any, .. } => any(pattern),
                 FunctionKind::Registered { apply, .. } => apply(pattern),
-                FunctionKind::Js(_) | FunctionKind::JsPatternIr { .. } => {
+                FunctionKind::Js(_)
+                | FunctionKind::JsPatternIr { .. }
+                | FunctionKind::LoweredJs { .. } => {
                     unreachable!("handled above")
                 }
             };
@@ -696,12 +778,27 @@ impl FunctionRef {
         self.apply_pure_unbound(pattern)
     }
 
-    fn apply_pure_unbound(
+    /// The pure view with no runtime settings bound to the result.
+    pub(crate) fn apply_pure_unbound(
         &self,
         pattern: crate::purity::PurePattern,
     ) -> Option<crate::purity::PurePattern> {
         match &self.kind {
             FunctionKind::Native { pure, .. } => Some(pure(pattern)),
+            FunctionKind::LoweredJs { fallback, program } => Some(if program.is_current() {
+                // A construction kept with what the program built answers
+                // only while the program stands for its callback.
+                crate::callback_ir::note_read(program.standings());
+                program.apply_pure(pattern)
+            } else if crate::host_installed() {
+                crate::purity::PurePattern::host_built(crate::host_call_pattern_ir(
+                    *fallback,
+                    program,
+                    pattern.pattern().clone(),
+                ))
+            } else {
+                crate::purity::PurePattern::assert_pure(stale_without_host(*fallback))
+            }),
             FunctionKind::Registered {
                 apply,
                 provable_pure,
@@ -773,11 +870,52 @@ impl FunctionRef {
                 }
                 Some(out)
             }
+            // The callback ignores the index it would be handed, so the unary
+            // program stands for each call. The JavaScript batch calls the
+            // callback for every pattern, whatever an earlier call signaled.
+            FunctionKind::LoweredJs { program, .. } if program.is_current() => {
+                crate::callback_ir::note_read(program.standings());
+                out.extend(
+                    patterns
+                        .into_iter()
+                        .map(|(pattern, _)| program.apply_pure(pattern)),
+                );
+                Some(out)
+            }
+            FunctionKind::LoweredJs { fallback, .. } => Some(if crate::host_installed() {
+                crate::host_call_pattern_indexed_batch(
+                    *fallback,
+                    patterns
+                        .into_iter()
+                        .map(|(pattern, index)| (pattern.pattern().clone(), index))
+                        .collect(),
+                )
+                .into_iter()
+                .map(crate::purity::PurePattern::host_built)
+                .collect()
+            } else {
+                vec![crate::purity::PurePattern::assert_pure(stale_without_host(
+                    *fallback,
+                ))]
+            }),
             FunctionKind::Registered { .. }
             | FunctionKind::Js(_)
             | FunctionKind::JsPatternIr { .. } => None,
         }
     }
+}
+
+/// What a stale lowered callback answers when no host can run its
+/// JavaScript. The runtime that issued the program queries every graph that
+/// can reach it through its host, so only a query outside that runtime gets
+/// here.
+fn stale_without_host(fallback: crate::CallbackId) -> crate::Pattern {
+    crate::signal_query_error(move || {
+        format!(
+            "pattern callback {fallback} needs its script host, because a method it calls changed after it was compiled"
+        )
+    });
+    crate::silence()
 }
 
 impl fmt::Debug for FunctionRef {
@@ -791,6 +929,13 @@ impl fmt::Debug for FunctionRef {
             (FunctionKind::JsPatternIr { fallback, program }, _) => write!(
                 f,
                 "js fn #{} (cb {fallback}, ir v{}:{} ops)",
+                self.id,
+                program.version(),
+                program.len()
+            ),
+            (FunctionKind::LoweredJs { fallback, program }, _) => write!(
+                f,
+                "js fn #{} (cb {fallback}, native ir v{}:{} ops)",
                 self.id,
                 program.version(),
                 program.len()
@@ -1163,10 +1308,12 @@ impl Value {
     ///
     /// The purity machinery keys off this: a combinator body run under the
     /// `PurePattern` view must not be handed a callable it cannot classify, so
-    /// the dispatcher checks the ARGUMENTS as well as the operand.
+    /// the dispatcher checks the ARGUMENTS as well as the operand. A lowered
+    /// callback counts here, because as a value it is the JavaScript
+    /// function. Only a transformer role may use its pure view.
     pub fn has_js_function(&self) -> bool {
         match self {
-            Self::Function(f) => !f.is_native(),
+            Self::Function(f) => !f.is_native() || f.callback_id().is_some(),
             // Even a native-pure inner pattern carries the identity of its
             // original JS wrapper. Keep it off every host-less fast path.
             Self::Pattern(_) => true,
@@ -1650,6 +1797,73 @@ mod tests {
         assert!(!std::ptr::eq(zero.entries(), minus.entries()));
         let kept = minus.get("n").and_then(Value::as_f64).expect("a number");
         assert_eq!(kept.to_bits(), (-0.0f64).to_bits());
+    }
+
+    #[test]
+    fn a_lowered_callback_is_a_native_transformer_and_a_javascript_value() {
+        let program = crate::callback_ir::PatternTransformProgram::new([]).unwrap();
+        let lowered = super::FunctionRef::lowered_js(9, program);
+        assert!(lowered.is_native());
+        assert_eq!(lowered.callback_id(), Some(9));
+        let value = Value::Function(Box::new(lowered.clone()));
+        assert!(value.has_js_function());
+        assert!(!crate::pure(value).is_pure());
+        assert!(super::is_rendered_function(&format!("{lowered:?}")));
+        assert!(format!("{lowered:?}").ends_with("(cb 9, native ir v12:0 ops)"));
+
+        let pattern = crate::pure(Value::F64(4.0));
+        let pure = crate::purity::PurePattern::assert_pure(pattern.clone());
+        let transformed = lowered.apply_pure(pure).expect("a pure view");
+        assert!(transformed.pattern().is_pure());
+        // With no host installed, the program stands for the callback.
+        assert_eq!(
+            lowered.apply(pattern).query_arc(
+                rustel_fraction::Fraction::ZERO,
+                rustel_fraction::Fraction::ONE
+            )[0]
+            .value,
+            Value::F64(4.0)
+        );
+    }
+
+    #[test]
+    fn a_stale_lowered_callback_leaves_the_pure_view_and_needs_its_host() {
+        let standing = crate::callback_ir::Standing::new();
+        let program = crate::callback_ir::PatternTransformProgram::new([])
+            .unwrap()
+            .with_standings([standing.clone()]);
+        let lowered = super::FunctionRef::lowered_js(9, program);
+        assert!(lowered.is_native());
+        standing.mark_stale();
+        assert!(!lowered.is_native(), "a stale program takes no pure view");
+        assert!(Value::Function(Box::new(lowered.clone())).has_js_function());
+
+        // A pure graph built before the change still applies it. With no
+        // host, nothing can run the callback, so it answers with an error.
+        let _ = crate::take_query_error();
+        let pattern = crate::pure(Value::F64(4.0));
+        let pure = crate::purity::PurePattern::assert_pure(pattern.clone());
+        let applied = lowered.apply_pure(pure).expect("a pure view");
+        assert!(
+            applied
+                .query_arc(
+                    rustel_fraction::Fraction::ZERO,
+                    rustel_fraction::Fraction::ONE
+                )
+                .is_empty()
+        );
+        let error = crate::take_query_error().expect("a query error");
+        assert!(error.contains("needs its script host"), "{error}");
+        assert!(
+            lowered
+                .apply(pattern)
+                .query_arc(
+                    rustel_fraction::Fraction::ZERO,
+                    rustel_fraction::Fraction::ONE
+                )
+                .is_empty()
+        );
+        assert!(crate::take_query_error().is_some());
     }
 
     #[test]

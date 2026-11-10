@@ -146,7 +146,7 @@ mod tests {
         }
     }
 
-    /// Every combinator registered with `takes_function` declares it, so its own
+    /// Every combinator registered with a function argument declares it, so its own
     /// entry reads as replacing the sounds.
     #[test]
     fn a_combinator_that_takes_a_function_declares_it() {
@@ -160,7 +160,7 @@ mod tests {
                 let Some(registration) = registry.get(entry.name) else {
                     continue;
                 };
-                if !registration.takes_function || registration.reference.name != entry.name {
+                if !registration.takes_function() || registration.reference.name != entry.name {
                     continue;
                 }
                 let alone = Reference::default().with_entry(super::super::Entry::from(entry));

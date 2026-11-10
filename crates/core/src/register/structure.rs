@@ -4,7 +4,7 @@
 //! https://strudel.cc, where an entry carries upstream's words; entries this
 //! port wrote itself say so in their own words.
 
-use super::{Registry, add, add_fn, arg_function, arg_number};
+use super::{Registry, add, add_fn, add_predicate_fn, arg_function, arg_number};
 use crate::Value;
 use crate::combinators as c;
 use crate::ops::PatOps;
@@ -513,7 +513,7 @@ pub(super) fn register(r: &mut Registry) {
         crate::native_combinator!(|_args, pat| c::when_key(&pat)),
     );
 
-    add_fn(
+    add_predicate_fn(
         r,
         &["filter"],
         FILTER,
@@ -531,7 +531,7 @@ pub(super) fn register(r: &mut Registry) {
         crate::native_combinator!(|_args, pat| c::key_down(&pat)),
     );
 
-    add_fn(
+    add_predicate_fn(
         r,
         &["filterWhen"],
         FILTER_WHEN,

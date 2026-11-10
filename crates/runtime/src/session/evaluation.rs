@@ -1576,7 +1576,11 @@ impl Session {
                 "{candidate} is too heavy to schedule live; {disposition} ({limit})"
             ))
         };
-        let outcome = if pattern.is_pure() {
+        // A pure graph can still reach a compiled callback that no longer
+        // stands for its JavaScript, and then needs the host like any other.
+        let outcome = if pattern.is_pure()
+            && !(uses_js_host && self.js.compiled_callbacks_need_host())
+        {
             let query = || {
                 rustel_core::with_query_deadline(ceiling, || {
                     let budget = self.scheduler.query_hap_budget();

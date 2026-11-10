@@ -1070,6 +1070,10 @@ pub(crate) struct Tables {
     /// The settings snapshot the cached table was built under, the only one
     /// it answers for. See [`crate::settings::SettingsStateId`].
     state: Option<SettingsStateId>,
+    /// The standings of the compiled programs the build applied. The table
+    /// answers only while they all hold. See
+    /// [`crate::callback_ir::recording_reads`].
+    read: Box<[Arc<crate::callback_ir::Standing>]>,
 }
 
 /// What the graph's walk does for a query, as bounds a table checks before
@@ -2332,23 +2336,39 @@ impl Tables {
             index: OnceLock::new(),
             sorted,
             state: None,
+            read: Box::new([]),
         }
     }
 
     /// These tables, kept for the settings snapshot `state`, which was in
-    /// force when their build began.
-    pub(crate) fn built_under(self, state: SettingsStateId) -> Self {
+    /// force when their build began, and for the standings `read` of the
+    /// compiled programs the build applied.
+    pub(crate) fn built_under(
+        self,
+        state: SettingsStateId,
+        read: Box<[Arc<crate::callback_ir::Standing>]>,
+    ) -> Self {
         Self {
             state: Some(state),
+            read,
             ..self
         }
     }
 
-    /// Whether the settings in force are those the table was built under.
+    /// Whether the settings in force are those the table was built under,
+    /// and every compiled program the build applied still stands for its
+    /// callback.
     pub(crate) fn current(&self) -> bool {
-        self.state
-            .as_ref()
-            .is_some_and(crate::settings::is_current_state)
+        crate::callback_ir::reads_hold(&self.read)
+            && self
+                .state
+                .as_ref()
+                .is_some_and(crate::settings::is_current_state)
+    }
+
+    /// The standings of the compiled programs the build applied.
+    pub(crate) fn read(&self) -> &[Arc<crate::callback_ir::Standing>] {
+        &self.read
     }
 
     /// The haps for `span` in graph order, or `None` when the graph must
