@@ -86,11 +86,125 @@ pub(super) fn generator_action_label(action: super::super::ideas::Action) -> Str
     }
 }
 
-pub(super) fn sample_source_line(panel: &ReferencePanel) -> String {
-    panel.selected_sample_source().map_or_else(
-        || "source: select a sound".to_owned(),
-        |source| format!("source: {source}"),
+/// The details of the sound under the samples tab's cursor, top first:
+/// what the file is, then how long and how big it is, and where it came
+/// from. The name is the list's to say, so the details do not repeat it.
+/// A sound with no file - a font, a synth, the input - has its source
+/// alone, and a file not read yet has what its address says.
+pub(super) fn sample_detail_lines(panel: &ReferencePanel) -> Vec<String> {
+    let Some(source) = panel.selected_sample_source() else {
+        return vec!["select a sound".to_owned()];
+    };
+    let Some(details) = &panel.sample_details else {
+        return vec![source];
+    };
+    let mut what: Vec<String> = file_extension(&details.url).into_iter().collect();
+    let mut how: Vec<String> = Vec::new();
+    // A bank's row stands for all its files: the count, not the first
+    // file's length and size.
+    let files = panel.selected_bank_files().filter(|files| *files > 1);
+    if let Some(files) = files {
+        how.push(format!("{files} files"));
+    }
+    if let Some(facts) = &details.facts {
+        if facts.remote {
+            what.push("not downloaded yet".to_owned());
+        }
+        if facts.picture {
+            what.push("video".to_owned());
+        }
+        if let Some(sound) = &facts.sound {
+            what.extend(sound.codec.map(str::to_owned));
+            what.extend(sound.bits.map(|bits| format!("{bits}-bit")));
+            what.extend(
+                sound
+                    .rate
+                    .map(|rate| format!("{} kHz", f64::from(rate) / 1000.0)),
+            );
+            what.extend(sound.channels.map(|channels| match channels {
+                1 => "mono".to_owned(),
+                2 => "stereo".to_owned(),
+                many => format!("{many} channels"),
+            }));
+            if files.is_none() {
+                how.extend(sound.seconds.map(|seconds| match details.played {
+                    Some(played) if seconds >= 60.0 => position_label(played, seconds),
+                    _ => length_label(seconds),
+                }));
+            }
+        }
+        if files.is_none()
+            && let Some(bytes) = facts.bytes
+        {
+            how.push(size_label(bytes));
+            let ceiling = rustel_runtime::samples::video_file_ceiling();
+            if is_video_container(&details.url) && bytes > ceiling as u64 {
+                how.push(format!(
+                    "over the {} video limit",
+                    rustel_audio::format_sample_bytes(ceiling)
+                ));
+            }
+        }
+    }
+    how.push(source);
+    [what, how]
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.join(" · "))
+        .collect()
+}
+
+/// The extension of the file an address names, as the details call the
+/// file's kind.
+fn file_extension(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let (_, extension) = name.rsplit_once('.')?;
+    (!extension.is_empty()
+        && extension.len() <= 5
+        && extension
+            .chars()
+            .all(|letter| letter.is_ascii_alphanumeric()))
+    .then(|| extension.to_ascii_lowercase())
+}
+
+fn is_video_container(url: &str) -> bool {
+    matches!(
+        file_extension(url).as_deref(),
+        Some("mp4" | "m4v" | "mov" | "mkv" | "webm")
     )
+}
+
+/// A sound's length: hundredths for a hit, tenths for a phrase, a clock
+/// past a minute.
+fn length_label(seconds: f64) -> String {
+    if seconds < 10.0 {
+        format!("{seconds:.2} s")
+    } else if seconds < 60.0 {
+        format!("{seconds:.1} s")
+    } else {
+        super::super::replay::clock(seconds)
+    }
+}
+
+/// Where a preview stands in a sound of a minute or more, beside its
+/// length: `0:13 / 9:33`.
+fn position_label(played: f64, seconds: f64) -> String {
+    let clock = super::super::replay::clock;
+    format!("{} / {}", clock(played.clamp(0.0, seconds)), clock(seconds))
+}
+
+fn size_label(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    } else if (bytes as f64) < 10.0 * MB {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else {
+        format!("{:.0} MB", bytes as f64 / MB)
+    }
 }
 
 impl ReferenceView<'_> {
@@ -331,7 +445,7 @@ impl ReferenceView<'_> {
                             direction.name()
                         ),
                         Row::Generate(_) | Row::Similar => {
-                            let action = row.action().unwrap();
+                            let action = row.action().expect("these rows carry an action");
                             let back = if panel.generator.can_history(action, false) {
                                 super::super::terminal::symbol("◀")
                             } else {
@@ -920,8 +1034,9 @@ impl ReferenceView<'_> {
         }
     }
 
-    /// The plugins the host found. The open plugin lists its parameters,
-    /// its parameter groups and its presets under its row.
+    /// The plugins the host found. The open plugin holds two rows under
+    /// its own, its presets and its parameters, and each of the two opens
+    /// as the view of the tab, named by the trail on the search line.
     #[cfg(feature = "vst")]
     fn render_vst(&self, inner: Rect, buffer: &mut Buffer) {
         use rustel_runtime::vst::Status;
@@ -934,6 +1049,23 @@ impl ReferenceView<'_> {
             usize::from(inner.width),
             Style::default().fg(theme.foreground),
         );
+        // The trail says which half of which plugin the tab is in, on the
+        // search line, in the colour of the tabs, as far from the search
+        // text as the width allows.
+        if let Some(trail) = tab.breadcrumb() {
+            let width = UnicodeWidthStr::width(trail.as_str()) as u16;
+            let at = inner.right().saturating_sub(width);
+            let search_ends = inner.x + ("search: ".len() + tab.query().chars().count()) as u16 + 1;
+            if at > search_ends {
+                buffer.set_stringn(
+                    at,
+                    inner.y + 1,
+                    &trail,
+                    usize::from(inner.right() - at),
+                    Style::default().fg(theme.accent),
+                );
+            }
+        }
         let rows = tab.rows();
         let plugins = tab.plugins();
         let open = tab.open_plugin();
@@ -943,20 +1075,14 @@ impl ReferenceView<'_> {
             .count();
         let count = if plugins.is_empty() {
             "no plugin found · add a folder in settings, vst tab".to_owned()
+        } else if let Some(section) = tab.inside() {
+            let name = open.map_or_else(
+                || tab.open_name().unwrap_or_default().to_owned(),
+                |plugin| plugin.name.clone(),
+            );
+            format!("{} {} of {name} · Tab flips", rows.len(), section.said())
         } else if rows.is_empty() {
             format!("no plugin named {:?}", tab.query().trim())
-        } else if let Some(open) = open {
-            // The half under the open plugin, named so Tab has something to
-            // flip and the reader can see it did.
-            let half = match tab.section() {
-                VstSection::Params => "parameters",
-                VstSection::Presets => "presets",
-            };
-            format!(
-                "{shown} of {} plugins · {half} of {} · Tab flips",
-                plugins.len(),
-                open.name
-            )
         } else {
             format!("{shown} of {} plugins", plugins.len())
         };
@@ -968,6 +1094,14 @@ impl ReferenceView<'_> {
                 format!("reading the plugin folders · {read} of {bundles} bundles…")
             }
             Some((read, bundles)) => format!("{count} · reading {read} of {bundles} bundles…"),
+        };
+        // The preset folders read on the plugin thread too, most of all
+        // after the player changed them: the count line says it, and no
+        // ask of the host waits for the read.
+        let count = if tab.presets_reading() {
+            format!("{count} · reading the preset folders…")
+        } else {
+            count
         };
         buffer.set_stringn(
             inner.x,
@@ -997,11 +1131,19 @@ impl ReferenceView<'_> {
                 PluginRow::Plugin(index) => {
                     let plugin = &plugins[index];
                     let is_open = open.is_some_and(|open| open.name == plugin.name);
-                    let tag = match &plugin.status {
+                    let tag = match (&plugin.status, &plugin.fault) {
                         // A bundle with no load and no test yet has no kind.
-                        Status::Found if plugin.categories.is_empty() => (String::new(), muted),
-                        Status::Loading => ("loading…".to_owned(), Style::default().fg(theme.warn)),
-                        Status::Found | Status::Ready => {
+                        (Status::Found, _) if plugin.categories.is_empty() => {
+                            (String::new(), muted)
+                        }
+                        (Status::Loading, _) => {
+                            ("loading…".to_owned(), Style::default().fg(theme.warn))
+                        }
+                        // The fault of a copy shows as a load fault does.
+                        (Status::Ready, Some(fault)) => {
+                            (fault.clone(), Style::default().fg(theme.error))
+                        }
+                        (Status::Found | Status::Ready, _) => {
                             let kind = if plugin.instrument {
                                 "instrument"
                             } else {
@@ -1012,12 +1154,24 @@ impl ReferenceView<'_> {
                                 facts.into_iter().filter(|fact| !fact.is_empty()).collect();
                             (facts.join(" · "), muted)
                         }
-                        Status::Failed(reason) => {
+                        (Status::Failed(reason), _) => {
                             (reason.clone(), Style::default().fg(theme.error))
                         }
                     };
                     let text = format!(" {} {} ", marker(is_open), plugin.name);
                     (vec![(text, heading)], tag)
+                }
+                PluginRow::Section(section) => {
+                    // The row names one half of the open plugin, with how
+                    // much the half holds beside the name: `presets (0)`.
+                    let held = match (section, open) {
+                        (VstSection::Presets, Some(plugin)) => plugin.presets,
+                        (VstSection::Params, Some(plugin)) => plugin.params.len(),
+                        _ => 0,
+                    };
+                    let text = format!("   {} {} ({held}) ", marker(false), section.said());
+                    let style = foreground.add_modifier(Modifier::BOLD);
+                    (vec![(text, style)], (String::new(), muted))
                 }
                 PluginRow::Group(index) => {
                     let (name, count) = &tab.groups()[index];
@@ -1087,6 +1241,8 @@ impl ReferenceView<'_> {
             let return_hint = self.return_hint();
             let segments: &[&str] = if !self.focused {
                 &[&return_hint, "Esc closes"]
+            } else if tab.inside().is_some() {
+                &["↑↓ move", "← Esc back", "Enter inserts", "Tab flips"]
             } else {
                 &["↑↓ move", "→ loads or opens", "← folds", "Enter inserts"]
             };
@@ -1378,9 +1534,62 @@ impl ReferenceView<'_> {
                     .right()
                     .saturating_sub(UnicodeWidthStr::width(tag) as u16 + 1);
                 let text_width = UnicodeWidthStr::width(text.as_str()) as u16;
+                // A name too long for its tag keeps the origin tags out of
+                // its way. The wait for the sample is said over the end of
+                // the name: a press that seems to do nothing is worse.
                 if tag_x > list.x + text_width {
                     buffer.set_stringn(tag_x, y, tag, tag.len(), Style::default().fg(color));
+                } else if loading_here && tag_x > list.x {
+                    // A blank each side, from the name and from the edge. A
+                    // style patches the cell, so the row keeps its ground.
+                    let framed = format!(" {tag} ");
+                    let width = UnicodeWidthStr::width(framed.as_str());
+                    buffer.set_stringn(tag_x - 1, y, &framed, width, Style::default().fg(color));
                 }
+            }
+        }
+        let details = samples_details_area(inner);
+        if list.height > 0 && details.height > 0 {
+            let mut y = details.y;
+            if details.height > 2 {
+                for x in details.x..details.right() {
+                    if let Some(cell) = buffer.cell_mut((x, y)) {
+                        cell.set_char('─');
+                        cell.set_fg(theme.rule);
+                    }
+                }
+                y += 1;
+            }
+            let rows = usize::from(details.bottom() - y);
+            // A deletion asks its question in the details' place: on one
+            // row when that is all there is, so the question is never cut.
+            let lines = match &self.panel.confirm_delete {
+                Some((_, _, path)) => {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    if rows > 1 {
+                        vec!["Delete permanently?".to_owned(), name.into_owned()]
+                    } else {
+                        vec![format!("Delete permanently? {name}")]
+                    }
+                }
+                None => sample_detail_lines(self.panel),
+            };
+            // With one row, the last line is the one kept: it names the
+            // source, as the tab always has.
+            let shown = lines.len().saturating_sub(rows);
+            for (offset, line) in lines.iter().skip(shown).enumerate() {
+                let colour = if shown + offset == 0 && lines.len() > 1 {
+                    theme.foreground
+                } else {
+                    theme.muted
+                };
+                buffer.set_stringn(
+                    inner.x,
+                    y + offset as u16,
+                    line,
+                    usize::from(inner.width),
+                    Style::default().fg(colour),
+                );
             }
         }
         if list.height > 0 {
@@ -1395,20 +1604,7 @@ impl ReferenceView<'_> {
                 );
                 return;
             }
-            if let Some((_, _, path)) = &self.panel.confirm_delete {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                for (y, text) in [
-                    (inner.bottom() - 3, "Delete permanently?"),
-                    (inner.bottom() - 2, name.as_ref()),
-                ] {
-                    buffer.set_stringn(
-                        inner.x,
-                        y,
-                        text,
-                        usize::from(inner.width),
-                        Style::default().fg(theme.muted),
-                    );
-                }
+            if self.panel.confirm_delete.is_some() {
                 render_footer(
                     buffer,
                     inner,
@@ -1432,14 +1628,6 @@ impl ReferenceView<'_> {
                     "Alt+± volume",
                 ],
                 theme,
-            );
-            let source_line = sample_source_line(self.panel);
-            buffer.set_stringn(
-                inner.x,
-                inner.bottom() - 3,
-                &source_line,
-                usize::from(inner.width),
-                Style::default().fg(theme.muted),
             );
             use super::super::keybinds::BindAction;
             let hint = |action, does: &str| {
@@ -1545,8 +1733,9 @@ impl ReferenceView<'_> {
                     // Hidden entries are not in the count. The empty box
                     // says how many are hidden, so a short list does not
                     // look broken.
-                    let hidden = self.reference.hidden_len();
-                    let shown = self.reference.len() - hidden;
+                    let scope = self.panel.scope;
+                    let hidden = self.reference.hidden_len_in(scope);
+                    let shown = self.reference.len_in(scope) - hidden;
                     match filter.label() {
                         // Naming the filter is what tells a reader the short
                         // list is the whole answer and not a search that went
@@ -1554,7 +1743,7 @@ impl ReferenceView<'_> {
                         Some(label) => format!(
                             "{} of {} functions · {label}",
                             self.panel.results.len(),
-                            self.reference.len()
+                            self.reference.len_in(scope)
                         ),
                         // An empty box has nothing to count: the number is
                         // the same on both sides of the `of`. The row

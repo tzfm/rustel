@@ -183,6 +183,26 @@ const TAIL_FFT: usize = 2 * TAIL_BLOCK;
 /// Head hops in one tail block.
 const HOPS_PER_TAIL: usize = TAIL_BLOCK / REVERB_BLOCK;
 
+/// Fill a spectrum's upper half with the conjugates of its lower half.
+///
+/// Both convolvers multiply-accumulate only the bins up to the middle and
+/// let this build the rest: the transform of real audio is Hermitian, so
+/// the bins above the middle hold the conjugates of the bins below it.
+/// The transform's own rounding means a directly computed upper bin can
+/// differ from the conjugate by its last bit; filling by conjugation
+/// makes the output differ from the full computation by float rounding
+/// alone, well below hearing.
+fn fill_conjugate_half(spectrum: &mut [Complex<f32>]) {
+    let len = spectrum.len();
+    for k in 1..len / 2 {
+        let lower = spectrum[k];
+        spectrum[len - k] = Complex {
+            re: lower.re,
+            im: -lower.im,
+        };
+    }
+}
+
 /// The tail half of a non-uniform partitioned convolution.
 ///
 /// Handles impulse-response offsets `[TAIL_START, end)` only. Because every
@@ -309,15 +329,18 @@ impl TailConvolver {
         let older = self.partitions.len() - 1;
         let due = (older * hops).div_ceil(HOPS_PER_TAIL - 1).min(older);
         let count = self.history.len();
+        // The same Hermitian half the flush uses: only the bins below the
+        // middle multiply, conjugation fills the rest.
+        let bins = self.accumulator.len() / 2 + 1;
         while self.summed < due {
             let lag = self.summed + 1;
             // `head` is the newest stored block until this tail block ends,
             // so it is lag 1 of the hop that ends it.
             let slot = (self.head + 1 + count - lag) % count;
             self.kernel.multiply_accumulate(
-                &mut self.accumulator,
-                &self.history[slot],
-                &self.partitions[lag],
+                &mut self.accumulator[..bins],
+                &self.history[slot][..bins],
+                &self.partitions[lag][..bins],
             );
             self.summed = lag;
         }
@@ -366,11 +389,20 @@ impl TailConvolver {
         self.sum_older(HOPS_PER_TAIL - 1);
         self.head = (self.head + 1) % self.history.len();
         self.history[self.head].copy_from_slice(&self.work);
+        // A transform of real audio is Hermitian: the bins above the
+        // middle carry the conjugates of the bins below it. Multiply-
+        // accumulate the lower half and fill the upper half by
+        // conjugation, which is half the work for the same spectrum -
+        // the products differ only in the transform's own rounding.
+        let bins = self.accumulator.len() / 2 + 1;
+        // The newest lag lands on the hop that ends the block; sum_older
+        // spread the older lags over the hops before it.
         self.kernel.multiply_accumulate(
-            &mut self.accumulator,
-            &self.history[self.head],
-            &self.partitions[0],
+            &mut self.accumulator[..bins],
+            &self.history[self.head][..bins],
+            &self.partitions[0][..bins],
         );
+        fill_conjugate_half(&mut self.accumulator);
         self.ifft
             .process_with_scratch(&mut self.accumulator, &mut self.scratch);
         let scale = 1.0 / TAIL_FFT as f32;
@@ -596,6 +628,14 @@ impl MonoConvolver {
         }
     }
 
+    /// Whether the output can still be other than zero while the input is
+    /// zero from now on. A hop is skipped once the input was silent for the
+    /// response and its margin, see [`Self::run_hop`], and the wet FIFO
+    /// still holds the output of the hop before for one more block.
+    fn rings(&self) -> bool {
+        self.silent_frames < self.ir_frames + TAIL_BLOCK + 2 * REVERB_BLOCK
+    }
+
     /// Convolve one ≤128-frame block and ADD the wet result into `out`.
     /// Allocation-free. Hops run on the absolute input-sample grid (every
     /// 128 gathered frames), independent of how the caller chunks the
@@ -687,12 +727,19 @@ impl MonoConvolver {
 
         self.accumulator.fill(Complex::default());
         let count = self.partitions.len();
+        // The same Hermitian half as the tail: the head's spectra come off
+        // real audio too, so its upper half is filled by conjugation.
+        let bins = self.accumulator.len() / 2 + 1;
         for (lag, partition) in self.partitions.iter().enumerate() {
             let slot = (self.head + count - lag) % count;
             let spectrum = &self.history[slot];
-            self.kernel
-                .multiply_accumulate(&mut self.accumulator, spectrum, partition);
+            self.kernel.multiply_accumulate(
+                &mut self.accumulator[..bins],
+                &spectrum[..bins],
+                &partition[..bins],
+            );
         }
+        fill_conjugate_half(&mut self.accumulator);
         self.ifft
             .process_with_scratch(&mut self.accumulator, &mut self.scratch);
         // rustfft's inverse is unnormalized; the valid overlap-save half is
@@ -918,6 +965,12 @@ impl OrbitReverb {
     pub fn reset(&mut self) {
         self.left.reset();
         self.right.reset();
+    }
+
+    /// Whether the reverb can still give a sample other than zero while its
+    /// input is zero from now on: its tail still sounds.
+    pub(crate) fn rings(&self) -> bool {
+        self.left.rings() || self.right.rings()
     }
 
     /// Convolve one ≤128-frame block of the orbit's stereo send and ADD the
@@ -1435,6 +1488,60 @@ mod tests {
                 (partitioned[n] as f64 - direct).abs() < 1e-3,
                 "sample {n}: partitioned {} vs direct {direct}",
                 partitioned[n]
+            );
+        }
+    }
+
+    /// A reverb rings while its tail can still give a sample other than
+    /// zero. Once it says it does not, it gives exact zeros, also on input
+    /// blocks that do not line up with its hops.
+    #[test]
+    fn a_reverb_gives_zeros_once_it_no_longer_rings() {
+        let params = ReverbParams {
+            ir: None,
+            size_secs: 0.05,
+            fade_secs: 0.01,
+            lp_start_hz: 8_000.0,
+            lp_end_hz: 1_000.0,
+        };
+        for first in [REVERB_BLOCK, 100] {
+            let mut reverb = OrbitReverb::generate(48_000, params);
+            assert!(!reverb.rings(), "a new reverb is idle");
+            let burst = [0.5f32; REVERB_BLOCK];
+            let [mut left, mut right] = [[0.0f32; REVERB_BLOCK]; 2];
+            let (sent_left, sent_right) = (&burst[..first], &burst[..first]);
+            reverb.process_block(
+                sent_left,
+                sent_right,
+                &mut left[..first],
+                &mut right[..first],
+            );
+            assert!(reverb.rings());
+            let silence = [0.0f32; REVERB_BLOCK];
+            let (mut last_sound, mut quiet_from) = (0, None);
+            for block in 1..100 {
+                let [mut left, mut right] = [[0.0f32; REVERB_BLOCK]; 2];
+                reverb.process_block(&silence, &silence, &mut left, &mut right);
+                let sounds = left.iter().chain(&right).any(|sample| *sample != 0.0);
+                if sounds {
+                    last_sound = block;
+                }
+                if quiet_from.is_none() && !reverb.rings() {
+                    quiet_from = Some(block);
+                }
+                assert!(
+                    quiet_from.is_none() || !sounds,
+                    "block {block} sounds after the reverb went quiet"
+                );
+            }
+            let quiet_from = quiet_from.expect("the tail never ended");
+            // The response is 3 600 frames, 28 blocks.
+            assert!(last_sound >= 28, "the tail sounded {last_sound} blocks");
+            // The margin of the idle skip.
+            let margin = (TAIL_BLOCK + 2 * REVERB_BLOCK) / REVERB_BLOCK + 1;
+            assert!(
+                quiet_from <= last_sound + margin,
+                "{quiet_from} after {last_sound}"
             );
         }
     }

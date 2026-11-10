@@ -138,7 +138,23 @@ pub(super) fn discard_eager_callback_exception() {
     let _ = take_held_eager_callback_exception();
 }
 
-pub(super) fn with_ctx<R>(ctx_owner: &Context, f: impl FnOnce(Ctx<'_>) -> R) -> R {
+pub(super) fn with_ctx<R>(runtime: &JsRuntime, f: impl FnOnce(Ctx<'_>) -> R) -> R {
+    runtime.script_may_have_run.set(true);
+    enter_ctx(&runtime.ctx, f)
+}
+
+/// [`with_ctx`] for host reads that run no score code: reading a host slot,
+/// or discarding queued jobs without running them. Score JavaScript cannot
+/// run inside, so no native panic it caught can be left behind. See
+/// [`JsRuntime::raise_caught_native_panic`].
+pub(super) fn with_ctx_running_no_script<R>(
+    runtime: &JsRuntime,
+    f: impl FnOnce(Ctx<'_>) -> R,
+) -> R {
+    enter_ctx(&runtime.ctx, f)
+}
+
+fn enter_ctx<R>(ctx_owner: &Context, f: impl FnOnce(Ctx<'_>) -> R) -> R {
     let current = CURRENT_CTX.with(Cell::get);
     match current {
         Some(pointer) => {
@@ -186,7 +202,7 @@ mod tests {
         runtime
             .install_semantic_bindings()
             .expect("semantic bindings");
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(&runtime, |ctx| {
             let apply = Function::new(ctx.clone(), apply_without_rethrow)
                 .expect("eager apply without a rethrow");
             ctx.globals()

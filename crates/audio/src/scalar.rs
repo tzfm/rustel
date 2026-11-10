@@ -21,18 +21,25 @@ use crate::sample::{
 use crate::wavetable_kernel::WavetableKernel;
 use effects::apply_fx_stage;
 use effects::bandpass_coefs;
+use effects::inline_reverb;
 use effects::notch_coefs;
 use effects::reserve_fx_reverb_returns;
 use effects::voice_fx_pre_distort;
+use inserts::InlineRoom;
+use inserts::InsertClock;
+use inserts::chain_room_delay;
+use inserts::chain_room_takes_reverb;
 use inserts::claim_insert_bus;
 use inserts::deliver;
 use inserts::displace_insert;
+pub(crate) use inserts::drain_insert_block;
 pub(crate) use inserts::effect_stage_wakes;
 pub(crate) use inserts::fade_effect_stage;
 use inserts::order_insert_stages;
 pub(crate) use inserts::ordered_stages;
 pub(crate) use inserts::render_leaving_insert;
 pub(crate) use inserts::settle_insert_block;
+use inserts::start_delay;
 use kabelsalat::kabel_available;
 pub(crate) use kabelsalat::kabel_controls;
 #[cfg(feature = "device-audio")]
@@ -48,6 +55,8 @@ use modulation::lfo_shape;
 use modulation::lfo_waveshape;
 use modulation::lfo_waveshape_f64;
 use modulation::nan_param_default;
+use modulation::postgain_moves;
+use modulation::wrap_phase;
 use orbit::stereo_pan;
 pub(crate) use render::enable_denormal_flush;
 use std::sync::Arc;
@@ -64,7 +73,7 @@ use voice::sbd_saturation_curve;
 use voice::seeded_phase;
 use voice::supersaw_detune_ratio;
 use voice::supersaw_spread_geometry;
-pub(crate) use voice::{saw_blep, saw_step};
+pub(crate) use voice::{next_saw_phase, render_static_supersaw_lanes, saw_blep, saw_step};
 
 use crate::biquad::FilterChain;
 use crate::periodic_wave::{PeriodicWaveTables, TableSelection, prepared_tables};
@@ -110,6 +119,70 @@ struct FxDelayLine {
     left: Vec<f32>,
     right: Vec<f32>,
     write: usize,
+}
+
+/// The room of a plugin chain with effects: the reverb and the feedback
+/// delay that the `room` and `delay` sends of its notes go to. Their output
+/// joins the input of the effects, so the effects process the reverb and
+/// the echoes with the dry signal.
+///
+/// ```text
+///   note -+-> dry ----------------+-> [effects] -> postgain -> orbit
+///         +-> room  -> reverb ----+
+///         +-> delay -> delay line +
+/// ```
+///
+/// A live output makes the box on its producer with the parts its notes ask
+/// for, and ships it to the callback: see [`ScalarBackend::install_chain_room`].
+/// An offline render makes it at the first note that sends to it. The last
+/// note of the chain sets the parameters of the reverb and the delay, as the
+/// last note of an orbit sets those of the orbit. A note whose chain has no
+/// room, or no part for one of its sends, sends that part to its orbit.
+pub(crate) struct ChainRoom {
+    chain: u64,
+    /// The number the producer gave the box: see [`Self::serial`].
+    serial: u64,
+    returned: ChainRoomReturn,
+    reverb: Option<Box<crate::reverb::OrbitReverb>>,
+    /// The reverb sends of the notes, for the sub-block in hand.
+    reverb_send: [[f32; crate::reverb::REVERB_BLOCK]; 2],
+    /// The delay line. Its block holds the delay sends of the notes for the
+    /// sub-block in hand.
+    delay: Option<OrbitDelay>,
+    /// Offline only: a reverb the budget refused, and its size in bytes. A
+    /// next note with the same parameters does not make it again while the
+    /// budget has no room for it.
+    refused: Option<(crate::reverb::ReverbParams, usize)>,
+}
+
+/// Why the callback gave a room back to the producer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChainRoomReturn {
+    /// The chain holds a room: the room took the parts of the box, and the
+    /// box holds the parts the room gave up.
+    Merged,
+    /// No bus was free for the chain, or the box was made for another rate.
+    Refused,
+    /// The chain left its bus.
+    Released,
+}
+
+/// The most memory the rooms of the chains may hold together: their reverbs
+/// and their delay lines. A reverb at the default `roomsize` of 2 holds
+/// 7 MiB, so about 18 such rooms fit. A delay line holds 375 KiB at 48 kHz.
+/// The producer of a live output makes no room past this budget, and an
+/// offline render keeps to it too. The notes of a chain with no room send
+/// to their orbit.
+pub const MAX_CHAIN_ROOM_BYTES: usize = 128 * 1024 * 1024;
+
+/// The budget of the rooms an offline render makes: see
+/// [`ScalarBackend::set_chain_room_budget`].
+struct ChainRoomBudget(usize);
+
+impl Default for ChainRoomBudget {
+    fn default() -> Self {
+        Self(MAX_CHAIN_ROOM_BYTES)
+    }
 }
 
 /// How much memory `.FX()` stage reverbs may hold between them.
@@ -167,6 +240,9 @@ const INSERT_SILENCE: f32 = 1e-6;
 /// An insert output with this many silent frames in a row makes no sound:
 /// a sound that goes through zero is silent for 1 frame or 2.
 const INSERT_QUIET_FRAMES: u16 = 64;
+/// The drain of a stop lasts this long at most, in seconds, also for an
+/// insert with a longer tail.
+const INSERT_DRAIN_SECONDS: u32 = 3;
 /// The values sliders moved that the notes in the queue take: see
 /// [`ScalarBackend::set_insert_value`].
 const MAX_INSERT_VALUES: usize = 64;
@@ -246,12 +322,38 @@ struct Voice {
     live_gain: crate::live_control::Ramp,
     live_cutoff: crate::live_control::Ramp,
     live_resonance: crate::live_control::Ramp,
+    /// The direct FM route's index; see [`VoiceSource`] for the routes it
+    /// rides. Inert while the voice carries no such route.
+    live_fm_index: crate::live_control::Ramp,
     /// Frame at which the connected graph begins producing output. This is
     /// normally the source onset. SBD is the exception: its graph begins one
     /// scheduler lead earlier because its asymmetric WaveShaper curve produces
     /// a tiny non-zero value before the oscillator starts.
     graph_start_frame: u64,
+    /// The frame the source starts on: the frame the note is aimed at plus
+    /// the latency of each stage of its chain that no copy serves. So the
+    /// output of the note still comes on its frame.
     start_frame: u64,
+    /// The musical onset of the note: the frame it is aimed at plus the lead
+    /// of the note. A takeover and a kept voice judge the voice by this
+    /// frame, and the seeds and the begin gates read it.
+    musical: u64,
+    /// The output lead of the voice: the frames the stages that serve it
+    /// delay its output. The output of the voice comes on `start_frame`
+    /// plus this lead. See [`OscillatorControls::chain_latency`].
+    lead: u32,
+    /// The first frame of the output of the voice: its start plus its lead.
+    /// A note that came late starts on the block it came in, so its output
+    /// comes that much later. The voice owns the level of its chain from
+    /// this frame: see [`LevelChange`].
+    output_frame: u64,
+    /// The level line of a voice whose post gain moves on a chain with
+    /// latency: see [`SendLines::claim_level`].
+    level_line: Option<u8>,
+    /// The note is aimed its lead before its musical onset: see
+    /// [`OscillatorControls::lead`]. A takeover pairs such a voice with a
+    /// copy of its sound: see [`ScalarBackend::kept_onset_stands_for`].
+    aimed_early: bool,
     generation: u64,
     /// The generation whose takeover kept this voice and plays its onset
     /// again. `None` once the voice stands in for that copy. See
@@ -263,6 +365,9 @@ struct Voice {
     ui_visuals: u64,
     preview_epoch: u64,
     piano: bool,
+    /// Whether the tight sample path of `render_plain_stereo_sample` may
+    /// render this voice; recomputed every render by `plain_sample_voice`.
+    plain: bool,
     /// Sub-sample onset placement: how far the source has already advanced at
     /// `start_frame` (see OnsetEvent::onset_lead). Rounding this away costs up
     /// to half a sample per onset, which `crush` then magnifies into whole
@@ -277,6 +382,10 @@ struct Voice {
     /// The dry path feeds the orbit insert, not the orbit.
     through_insert: bool,
     insert_bus: Option<usize>,
+    /// The reverb send and the delay send go to the room of the chain, in
+    /// front of its effects: see [`ChainRoom`]. Else they go to the orbit.
+    chain_reverb: bool,
+    chain_delay: bool,
     dry_gain: f32,
     kabel: Option<KabelState>,
     stretch: Option<Box<[crate::stretch::Stretch; 2]>>,
@@ -828,6 +937,16 @@ struct OrbitDuck {
     previous: DuckSegments,
 }
 
+/// Per-frame DC removal of an input voice's FM phase, one ring window per
+/// e-fold: slow enough to leave musical rates alone, fast enough to keep the
+/// integrated bend from walking the read into the writer or out of the ring.
+const INPUT_FM_LEAK: f64 = 1.0 / crate::input::INPUT_RING_FRAMES as f64;
+
+/// Input-ring frames reserved beside the callback's own while any input
+/// voice runs the FM matrix: room for the integrated bend to read ahead of
+/// the shared cursor without crossing the writer.
+const INPUT_FM_HEADROOM: u64 = 512;
+
 #[derive(Clone, Debug)]
 // The wavetable variant carries 32 f64 phases, which makes it much larger
 // than the rest. Boxing it would put a pointer chase in the per-sample voice
@@ -836,7 +955,15 @@ struct OrbitDuck {
 enum VoiceSource {
     /// `s("in")` - one channel of the audio input, read from the ring the
     /// input callback fills.
-    Input { channel: u8 },
+    Input {
+        channel: u8,
+        /// The FM matrix's integrated read-rate deviation, in input frames:
+        /// how far this voice reads from the shared cursor. Each sample adds
+        /// the FM sum against the voice's nominal frequency, so the voice
+        /// plays the ring back at a bent rate while `note` still does not
+        /// retune the input.
+        fm_phase: f64,
+    },
     /// `s("bus")` - the voice's source is bus N's mix rather than a generator.
     /// Receivers are evaluated after the senders, so the
     /// sum for this sample is already complete when it is read.
@@ -862,7 +989,8 @@ enum VoiceSource {
         /// First frame the source may emit on: the begin gate holds through
         /// the quantum containing the onset, so output starts at the next
         /// 128-frame boundary strictly after it - and `t` still begins at
-        /// the onset frame, not at the gate.
+        /// the onset frame, not at the gate. The gate reads the musical
+        /// onset of the note: see `Voice::musical`.
         gate: u64,
     },
     Oscillator {
@@ -1072,6 +1200,315 @@ struct PendingEventSlot {
 #[derive(Clone, Copy, Debug)]
 pub struct OrbitGains(pub [f32; MAX_ORBITS]);
 
+/// The orbit taps of a stems render: every orbit's finished stereo for the
+/// block in hand, beside which orbits have made sound. Kept only while an
+/// offline stems render asks for them - the live path never pays for taps
+/// it cannot use.
+#[derive(Default)]
+pub struct Stems {
+    /// Interleaved stereo per orbit: `MAX_ORBITS` blocks of
+    /// [`crate::reverb::REVERB_BLOCK`] frames.
+    taps: Vec<f32>,
+    /// Which orbits put a nonzero sample into their tap: only those are
+    /// worth a stem file.
+    sounded: [bool; MAX_ORBITS],
+}
+
+impl Stems {
+    fn new() -> Self {
+        Self {
+            taps: vec![0.0; MAX_ORBITS * crate::reverb::REVERB_BLOCK * 2],
+            sounded: [false; MAX_ORBITS],
+        }
+    }
+
+    /// One orbit's taps for the last block rendered: `frames` interleaved
+    /// stereo frames. Past the block's end the taps are not the render's.
+    pub fn orbit(&self, orbit: usize, frames: usize) -> &[f32] {
+        let span = frames.min(crate::reverb::REVERB_BLOCK) * 2;
+        let from = orbit * crate::reverb::REVERB_BLOCK * 2;
+        &self.taps[from..from + span]
+    }
+
+    /// Which orbits have made sound this render.
+    pub fn sounded(&self) -> &[bool; MAX_ORBITS] {
+        &self.sounded
+    }
+
+    /// Zero the taps for the block in hand: a frame an orbit did not sound
+    /// must read as silence, not as the last block again.
+    fn start_block(&mut self) {
+        self.taps.fill(0.0);
+    }
+
+    /// A reused backend starts no render with an old verdict on an orbit.
+    fn reset(&mut self) {
+        self.sounded = [false; MAX_ORBITS];
+    }
+
+    /// The orbit's finished stereo for one frame of the block in hand.
+    fn tap(&mut self, orbit: usize, frame: usize, left: f32, right: f32) {
+        if frame >= crate::reverb::REVERB_BLOCK {
+            return;
+        }
+        let at = (orbit * crate::reverb::REVERB_BLOCK + frame) * 2;
+        self.taps[at] = left;
+        self.taps[at + 1] = right;
+        if left != 0.0 || right != 0.0 {
+            self.sounded[orbit] = true;
+        }
+    }
+}
+
+/// The lines of one orbit in [`SendLines`]: the reverb send, then the delay
+/// send, each left and right.
+const SEND_LINES: usize = 4;
+/// The first line of the reverb send of an orbit. The right channel is the
+/// line after.
+const REVERB_SEND: usize = 0;
+/// The first line of the delay send of an orbit.
+const DELAY_SEND: usize = 2;
+/// The level lines in [`SendLines`]: one for each note with a moving post
+/// gain on a chain with latency, while its output plays.
+const LEVEL_LINES: usize = 4;
+
+/// The level line of one note in [`SendLines`]: see
+/// [`SendLines::claim_level`].
+#[derive(Clone, Copy, Default)]
+struct LevelLine {
+    /// The id of the voice of the note, or 0 for a free line.
+    voice: u64,
+    bus: usize,
+    /// The first frame of the output of the note, and the frame after the
+    /// last level the note gave. The line holds a level for each frame
+    /// from the one to the other.
+    from: u64,
+    until: u64,
+}
+
+/// The sends of the notes of plugin chains with latency, on their way to
+/// their orbits. Such a note starts its output lead before its output: see
+/// [`OscillatorControls::chain_latency`]. Its reverb and delay sends wait
+/// that long in the lines of their orbit, so they join the orbit on the
+/// frame of the output of the note.
+///
+/// A live output makes the lines on its producer for the largest effect
+/// latency of its notes, and ships them to the callback: see
+/// [`ScalarBackend::install_send_lines`]. A send that waits longer than the
+/// reach of the lines goes in at once.
+///
+/// The post gain of such a note sits after its chain, so its level waits
+/// too when it moves: see [`Self::claim_level`].
+pub struct SendLines {
+    /// The lines of each orbit, one after another, then the level lines. A
+    /// send or a level sits at its frame, masked by `mask`.
+    samples: Box<[f32]>,
+    mask: usize,
+    /// The frame after the last send of each orbit. An orbit at 0 had no
+    /// send since the lines were made or last emptied.
+    until: [u64; MAX_ORBITS],
+    levels: [LevelLine; LEVEL_LINES],
+}
+
+impl SendLines {
+    /// Lines for the sends of notes with `latency` frames of effect latency,
+    /// 1 s at most at `sample_rate`. Each orbit has 4 lines, and each line
+    /// holds a power of 2 of frames: the latency and one block at least.
+    pub fn new(latency: u32, sample_rate: u32) -> Self {
+        let frames =
+            (latency.min(sample_rate) as usize + crate::reverb::REVERB_BLOCK).next_power_of_two();
+        // Each sample is written here, on the producer, so the callback finds
+        // the pages of the lines in memory. A zeroed allocation leaves a page
+        // to its first write. The opaque zero keeps the compiler from making
+        // the writes a zeroed allocation again.
+        let zero = std::hint::black_box(0.0);
+        let lines = MAX_ORBITS * SEND_LINES + LEVEL_LINES;
+        Self {
+            samples: std::iter::repeat_n(zero, lines * frames).collect(),
+            mask: frames - 1,
+            until: [0; MAX_ORBITS],
+            levels: [LevelLine::default(); LEVEL_LINES],
+        }
+    }
+
+    /// The longest wait of a send, in frames: a line less one block, the
+    /// frames a block takes from the lines while its voices add to them.
+    pub fn reach(&self) -> u32 {
+        u32::try_from(self.mask + 1 - crate::reverb::REVERB_BLOCK).unwrap_or(u32::MAX)
+    }
+
+    /// The size of the samples of the lines, in bytes.
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.samples)
+    }
+
+    /// The first sample of `line` of `orbit`.
+    fn line(&self, orbit: usize, line: usize) -> usize {
+        (orbit * SEND_LINES + line) * (self.mask + 1)
+    }
+
+    /// The first sample of the level line `line`.
+    fn level_line(&self, line: usize) -> usize {
+        (MAX_ORBITS * SEND_LINES + line) * (self.mask + 1)
+    }
+
+    /// Gives a level line to the voice `voice` of a note on `bus` whose
+    /// output starts on `from`, when a line is free: a line with no voice,
+    /// or a line whose voice `held` says is gone and whose last level is
+    /// before `frame`. The voice then gives its post gain at each frame of
+    /// its output, and the chain takes it on that frame: see
+    /// [`Self::set_level`] and [`Self::apply_levels`].
+    fn claim_level(
+        &mut self,
+        voice: u64,
+        bus: usize,
+        from: u64,
+        frame: u64,
+        held: impl Fn(u64) -> bool,
+    ) -> Option<u8> {
+        let free = |line: &LevelLine| line.voice == 0 || (line.until <= frame && !held(line.voice));
+        let at = self.levels.iter().position(free)?;
+        self.levels[at] = LevelLine {
+            voice,
+            bus,
+            from,
+            until: from,
+        };
+        u8::try_from(at).ok()
+    }
+
+    /// Puts the post gain `value` of the voice `voice` in its level line
+    /// `line`, for the output `frame`. A line another voice took since
+    /// takes nothing.
+    #[inline]
+    fn set_level(&mut self, line: u8, voice: u64, frame: u64, value: f32) {
+        let line = usize::from(line);
+        if self.levels[line].voice != voice {
+            return;
+        }
+        let at = self.level_line(line) + (frame & self.mask as u64) as usize;
+        self.samples[at] = value;
+        let held = &mut self.levels[line];
+        held.until = held.until.max(frame + 1);
+    }
+
+    /// The level the voice `voice` gave for the output `frame` in its level
+    /// line `line`.
+    #[inline]
+    fn level(&self, line: u8, voice: u64, frame: u64) -> Option<f32> {
+        let held = self.levels.get(usize::from(line))?;
+        (held.voice == voice && (held.from..held.until).contains(&frame)).then(|| {
+            self.samples[self.level_line(usize::from(line)) + (frame & self.mask as u64) as usize]
+        })
+    }
+
+    /// Gives each chain whose level a voice with a level line owns the
+    /// level of that voice for the output `frame`, also after the voice
+    /// ended, while its output plays on.
+    #[inline]
+    fn apply_levels(&self, frame: u64, levels: &mut [InsertPostgain]) {
+        for (line, held) in self.levels.iter().enumerate() {
+            if held.voice == 0 || levels[held.bus].owner.1 != held.voice {
+                continue;
+            }
+            if let Some(value) = self.level(line as u8, held.voice, frame) {
+                levels[held.bus].value = value;
+            }
+        }
+    }
+
+    /// Adds a send of `orbit` that joins the orbit on `frame`: `send` is the
+    /// first line of the send, and `sample` its left and right.
+    #[inline]
+    fn add(&mut self, orbit: usize, send: usize, frame: u64, sample: [f32; 2]) {
+        let at = (frame & self.mask as u64) as usize;
+        for (channel, sample) in sample.into_iter().enumerate() {
+            let line = self.line(orbit, send + channel);
+            self.samples[line + at] += sample;
+        }
+        self.until[orbit] = self.until[orbit].max(frame + 1);
+    }
+
+    /// Adds the sends of `orbit` due in the `frames` frames from `start` to
+    /// the input of its reverb and of its delay, and empties their places.
+    fn take(
+        &mut self,
+        orbit: usize,
+        start: u64,
+        frames: usize,
+        reverb: &mut [[f32; crate::reverb::REVERB_BLOCK]; 2],
+        delay: &mut [[f32; crate::reverb::REVERB_BLOCK]; 2],
+    ) {
+        if self.until[orbit] <= start {
+            return;
+        }
+        for (send, input) in [(REVERB_SEND, reverb), (DELAY_SEND, delay)] {
+            for (channel, input) in input.iter_mut().enumerate() {
+                let line = self.line(orbit, send + channel);
+                for (i, input) in input[..frames].iter_mut().enumerate() {
+                    let at = ((start + i as u64) & self.mask as u64) as usize;
+                    *input += std::mem::take(&mut self.samples[line + at]);
+                }
+            }
+        }
+    }
+
+    /// Takes the sends `lines` holds for `frame` and later. These lines
+    /// reach as far as `lines` at least. The callback runs it, so it copies
+    /// runs of samples: a run ends where a line of `lines` wraps. Each line
+    /// holds a power of 2 of frames, so a line here wraps only where a line
+    /// of `lines` wraps too.
+    fn take_in_flight(&mut self, lines: &Self, frame: u64) {
+        for orbit in 0..MAX_ORBITS {
+            let until = lines.until[orbit];
+            for line in 0..SEND_LINES {
+                let (from, to) = (lines.line(orbit, line), self.line(orbit, line));
+                let mut at = frame;
+                while at < until {
+                    let old = (at & lines.mask as u64) as usize;
+                    let new = (at & self.mask as u64) as usize;
+                    let run = usize::try_from(until - at)
+                        .unwrap_or(usize::MAX)
+                        .min(lines.mask + 1 - old);
+                    self.samples[to + new..to + new + run]
+                        .copy_from_slice(&lines.samples[from + old..from + old + run]);
+                    at += run as u64;
+                }
+            }
+            self.until[orbit] = until;
+        }
+        for (line, held) in lines.levels.iter().enumerate() {
+            let (from, to) = (lines.level_line(line), self.level_line(line));
+            let mut at = frame.max(held.from);
+            while held.voice != 0 && at < held.until {
+                let old = (at & lines.mask as u64) as usize;
+                let new = (at & self.mask as u64) as usize;
+                let run = usize::try_from(held.until - at)
+                    .unwrap_or(usize::MAX)
+                    .min(lines.mask + 1 - old);
+                self.samples[to + new..to + new + run]
+                    .copy_from_slice(&lines.samples[from + old..from + old + run]);
+                at += run as u64;
+            }
+            self.levels[line] = *held;
+        }
+    }
+
+    /// Empties the lines of each orbit that had a send: a reset of the clock
+    /// ends the notes, and their sends go with them.
+    fn clear(&mut self) {
+        let orbit_samples = SEND_LINES * (self.mask + 1);
+        for (orbit, until) in self.until.iter_mut().enumerate() {
+            if *until > 0 {
+                self.samples[orbit * orbit_samples..(orbit + 1) * orbit_samples].fill(0.0);
+                *until = 0;
+            }
+        }
+        // A level line holds levels only from its first frame to its last.
+        self.levels = [LevelLine::default(); LEVEL_LINES];
+    }
+}
+
 /// The level, the place and the sends of an instrument, from its last note.
 /// A note that changes one of them while the instrument sounds moves the
 /// value in a short ramp: a step is a click on the notes before.
@@ -1090,16 +1527,37 @@ struct InstrumentGain {
     /// The place of the pan from 0 to 1. A note with no pan has the
     /// middle, where the pan changes nothing.
     pan_at: crate::live_control::Ramp,
+    /// The frame of the note at the output of the instrument: its frame plus
+    /// the start delay of the note plus the latency of the instrument. See
+    /// [`start_delay`].
     onset: u64,
     duration_secs: f32,
     /// The silent frames of the instrument in a row, up to now.
     quiet: u16,
+    /// The latency of the effects that serve the note after the instrument.
+    /// The sends of the instrument wait that long in the send lines: see
+    /// [`SendLines`].
+    send_lead: u32,
 }
 
 struct InstrumentGainChange {
     bus: usize,
-    frame: usize,
+    /// The frame the change applies on: the output of the note at the
+    /// instrument. A note that came late reaches the instrument that much
+    /// later.
+    frame: u64,
     value: InstrumentGain,
+}
+
+/// The level a note with an output lead gives its chain on the frame of its
+/// output. A voice shorter than its lead ends before its output, so the
+/// voice does not set the level itself.
+#[derive(Clone, Copy)]
+struct LevelChange {
+    bus: usize,
+    frame: u64,
+    owner: (u64, u64),
+    postgain: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -1139,6 +1597,10 @@ pub(crate) struct InsertMix {
 /// computed one sample at a time.
 #[derive(Default)]
 pub struct ScalarBackend {
+    /// Turns the plain-voice tight path off, for the bit-exactness test
+    /// that compares it against the general body.
+    #[cfg(test)]
+    disable_plain_path: bool,
     #[allow(clippy::vec_box)]
     kabel_programs: Vec<Box<crate::assets::PreparedKabelProgram>>,
     kabel_program_protected: Vec<bool>,
@@ -1158,6 +1620,9 @@ pub struct ScalarBackend {
     sample_rate: u32,
     sample_resampling_mode: SampleResamplingMode,
     frame: u64,
+    /// The frame of the clock at the first frame of a render file: see
+    /// [`Self::set_preroll`]. Kept through init and each reset.
+    preroll: u64,
     dispatch: DspDispatch,
     pending: PendingEvents,
     #[cfg(feature = "device-audio")]
@@ -1189,6 +1654,20 @@ pub struct ScalarBackend {
     /// hold point it contains, so order and timing match the live path.
     pending_ducks: Vec<PendingDuck>,
     orbit_reverbs: Vec<Option<Box<crate::reverb::OrbitReverb>>>,
+    /// The room of the chain of each bus: see [`ChainRoom`].
+    chain_rooms: Vec<Option<Box<ChainRoom>>>,
+    /// The rooms of the chains that left their bus, on their way back to the
+    /// producer. Reserved before rendering.
+    ///
+    /// The `Box` is the box the producer made and frees, so a room moves
+    /// through the list as a pointer.
+    #[allow(clippy::vec_box)]
+    retired_chain_rooms: Vec<Box<ChainRoom>>,
+    /// Offline only: the memory the rooms of the chains may hold together.
+    chain_room_budget: ChainRoomBudget,
+    /// Notes through effects that sent their room or their delay to their
+    /// orbit, because their chain had no room for it.
+    chain_room_fallbacks: u64,
     /// The outside effects and the instrument of each chain. The notes that
     /// ask for an effect feed `insert_blocks`, and the output of the chain
     /// joins the orbit.
@@ -1212,6 +1691,22 @@ pub struct ScalarBackend {
     instrument_delay_sends: Vec<[[f32; crate::reverb::REVERB_BLOCK]; 2]>,
     /// The latest onset owns the chain level, including its remaining tail.
     insert_postgains: Vec<InsertPostgain>,
+    /// The levels the notes with an output lead give their chains at their
+    /// output, in the order of their frames: see [`LevelChange`].
+    level_changes: Vec<LevelChange>,
+    /// The output lead of the newest note each chain served, one for each
+    /// bus. A cut ends the notes of an instrument that much before its
+    /// frame.
+    insert_leads: Vec<u32>,
+    /// The level changes and the instrument gain changes that a full list
+    /// applied at once, before their frame.
+    early_level_changes: u64,
+    /// The sends of the notes with an output lead, until the frame of their
+    /// output: see [`SendLines`]. None until the producer ships lines.
+    send_lines: Option<Box<SendLines>>,
+    /// The notes whose sends went in at once, before the output of the
+    /// note: with no send lines, or with lines that do not reach that far.
+    early_sends: u64,
     insert_postgain_blocks: Vec<[f32; crate::reverb::REVERB_BLOCK]>,
     /// Output orbit of each physical insert bus, selected by its latest onset.
     insert_outputs: Vec<usize>,
@@ -1231,6 +1726,16 @@ pub struct ScalarBackend {
     /// Frames each insert had no input and no output. A long idle insert
     /// sleeps until a note asks for the effect again.
     insert_idle_frames: Vec<u32>,
+    /// The frames a stopped output drained its inserts since the stop. A
+    /// block with no copy to drain sets the whole time of the drain: see
+    /// [`Self::drain_stopped_inserts`].
+    insert_drained: u32,
+    /// The serviced marks of the slots that a forced release emptied: see
+    /// [`Self::release_insert`].
+    insert_serviced: inserts::ServicedMarks,
+    /// The clock the last note gave the copy of each slot: see
+    /// [`inserts::InsertClock`].
+    insert_clocks: Vec<Option<inserts::InsertClock>>,
     /// The stages of each chain that run, in signal order, with
     /// [`crate::insert::NO_STAGE`] after the last: the stages that served
     /// the newest note with an effect, in the order of its calls, and each
@@ -1249,7 +1754,9 @@ pub struct ScalarBackend {
     /// A shared instrument's latest onset controls its output and tail.
     instrument_gains: Vec<InstrumentGain>,
     instrument_filters: Vec<[FilterChain; 2]>,
-    /// At most one change per accepted onset, reserved before rendering.
+    /// One change for each instrument note, at the output of the
+    /// instrument, in the order of bus and frame. A change leaves the list
+    /// when it applies. Reserved before rendering.
     instrument_gain_changes: Vec<InstrumentGainChange>,
     /// Offline only: builds a missing insert at activation, as the inline
     /// reverb does.
@@ -1275,6 +1782,9 @@ pub struct ScalarBackend {
     /// `MAX_ORBITS` blocks of `ORBIT_MIX_FRAMES * 2`. Only written while
     /// some orbit is routed away.
     orbit_mix: Vec<f32>,
+    /// The orbit taps of a stems render, when one asked for them. `None`
+    /// costs the mix loop one register flag.
+    stems: Option<Stems>,
     /// Per-visual dry stereo sums for the current live render quantum.
     /// These are post-voice-DSP and pre-orbit: shared delay, reverb, ducking,
     /// DJF and orbit gain cannot be assigned to one receiver without mixing
@@ -1450,10 +1960,13 @@ impl ScalarBackend {
             .iter()
             .filter(|voice| voice.polyphony_fade_frame.is_none())
             .count();
+        let led = Self::led(&self.voices, 0);
+        let frame = self.frame;
         let faded = Self::fade_oldest_voices(
             &mut self.voices,
             active.saturating_sub(limit),
-            self.frame,
+            led,
+            |_| frame,
             self.sample_rate,
         );
         self.pressure.semantic_polyphony_fades = self
@@ -1471,6 +1984,7 @@ impl ScalarBackend {
             voice.live_gain.retarget(update, self.sample_rate);
             voice.live_cutoff.retarget(update, self.sample_rate);
             voice.live_resonance.retarget(update, self.sample_rate);
+            voice.live_fm_index.retarget(update, self.sample_rate);
         }
         for instrument in &mut self.instrument_gains {
             instrument.gain.retarget(update, self.sample_rate);
@@ -1490,7 +2004,10 @@ impl ScalarBackend {
             // a mouse update allocate inside the callback. Existing voices
             // already received the update above; new queries read the cell.
             self.live_control_targets.rotate_left(1);
-            *self.live_control_targets.last_mut().unwrap() = update;
+            *self
+                .live_control_targets
+                .last_mut()
+                .expect("the list has the entry") = update;
         }
     }
 
@@ -1521,13 +2038,19 @@ impl ScalarBackend {
         if let Some(at) = self.insert_values.iter().position(same) {
             // The new move goes last, so a full table drops the oldest move.
             self.insert_values[at..].rotate_left(1);
-            *self.insert_values.last_mut().unwrap() = value;
+            *self
+                .insert_values
+                .last_mut()
+                .expect("the list has the entry") = value;
         } else if self.insert_values.len() < self.insert_values.capacity() {
             self.insert_values.push(value);
         } else if !self.insert_values.is_empty() {
             // Bounded, so a move never allocates in the callback.
             self.insert_values.rotate_left(1);
-            *self.insert_values.last_mut().unwrap() = value;
+            *self
+                .insert_values
+                .last_mut()
+                .expect("the list has the entry") = value;
         }
     }
 
@@ -1611,7 +2134,13 @@ impl ScalarBackend {
             || self
                 .orbit_delays
                 .iter()
-                .any(|delay| delay.active && delay.energized != 0)
+                .chain(
+                    self.chain_rooms
+                        .iter()
+                        .flatten()
+                        .flat_map(|room| &room.delay),
+                )
+                .any(OrbitDelay::rings)
     }
 
     #[cfg(feature = "device-audio")]
@@ -1635,7 +2164,7 @@ impl ScalarBackend {
                     // An allocated line can be silent between an onset and
                     // its first echo. Stored energy, rather than the sticky
                     // routing flag, says whether Stop still owes an echo.
-                    .filter(|delay| delay.active && delay.energized != 0)
+                    .filter(|delay| delay.rings())
                     .count(),
             )
             .unwrap_or(u64::MAX),
@@ -1698,6 +2227,8 @@ impl ScalarBackend {
     ) -> Result<Self, String> {
         let mut backend = Self {
             dispatch,
+            #[cfg(test)]
+            disable_plain_path: false,
             pending: PendingEvents::with_capacity(voice_capacity),
             voices: Vec::with_capacity(voice_capacity),
             ..Self::default()
@@ -1713,6 +2244,9 @@ impl ScalarBackend {
         self.pending.clear();
         self.pending_chokes.fill(None);
         self.preview_epoch = 0;
+        if let Some(stems) = self.stems.as_mut() {
+            stems.reset();
+        }
         self.live_control_targets.clear();
         self.insert_values.clear();
         while let Some(mut voice) = self.voices.pop() {
@@ -1757,6 +2291,9 @@ impl ScalarBackend {
             }
         }
         self.finish_insert_fades();
+        // A stopped output keeps no mark: each serviced stage leaves the
+        // order, and its copy comes back at the next note of the stage.
+        self.end_serviced_marks(true);
         self.insert_generations.fill(0);
         for insert in self.orbit_inserts.iter_mut().flatten() {
             insert.reset();
@@ -1767,21 +2304,30 @@ impl ScalarBackend {
         self.insert_last_used.fill(frame);
         self.insert_fade_from.fill(u64::MAX);
         // Each chain is silent until a note owns it again. Some inserts keep a
-        // tail through their reset. The level of 0 keeps that tail silent
-        // after a resume. The next note of the chain moves the level up from
-        // 0, and the kept tail then sounds under that note.
+        // tail through their reset, and a stopped output drains it. The level
+        // of 0 keeps a tail that is still there silent after a resume. The
+        // next note of the chain moves the level up from 0, and that tail
+        // then sounds under the note.
         for gain in &mut self.instrument_gains {
             gain.gain = crate::live_control::Ramp::new(0, 0.0);
             // An instrument that feeds effects sets the level after them.
             gain.postgain = crate::live_control::Ramp::new(0, 0.0);
         }
         self.instrument_filters.fill([FilterChain::default(); 2]);
-        // No insert runs while the output is stopped, so each chain keeps its
-        // count of silent frames.
+        // Each chain keeps its count of silent frames. The drain of a stopped
+        // output adds to it: see `drain_stopped_inserts`.
         for gain in &mut self.insert_postgains {
             *gain = InsertPostgain::silent(gain.quiet);
         }
+        // The levels the notes give at their output go with the notes, and so
+        // do their sends.
         self.instrument_gain_changes.clear();
+        self.level_changes.clear();
+        self.insert_leads.fill(0);
+        self.insert_clocks.fill(None);
+        if let Some(lines) = self.send_lines.as_deref_mut() {
+            lines.clear();
+        }
         for bus in &mut self.orbit_delays {
             // Skip inactive lines: after the stop ramp reset_at runs on every
             // stopped block, and re-zeroing 16 one-second stereo lines would
@@ -1792,6 +2338,10 @@ impl ScalarBackend {
                 bus.active = false;
                 bus.energized = 0;
             }
+        }
+        // The rooms of the chains drop their tails as the orbits do.
+        for room in self.chain_rooms.iter_mut().flatten() {
+            room.reset();
         }
         self.frame = frame;
     }

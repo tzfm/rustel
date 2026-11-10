@@ -14,7 +14,7 @@ description = "Native host library behind the rustel command and studio: Session
 # explicitly with `--no-default-features` and adds back only the capabilities
 # it needs. Internal benchmark instrumentation remains opt-in even for the
 # complete product.
-default = ["mp3-export", "extensions", "opus", "osc", "serial", "hydra", "gamepad", "vst"]
+default = ["mp3-export", "extensions", "opus", "osc", "serial", "hydra", "video", "gamepad", "vst"]
 # Recording and replaying a live-coding set (`session_log`). The rustel
 # command and the studio record; a host that records nothing leaves it out.
 session-log = []
@@ -46,12 +46,28 @@ vst = ["dep:rustel-vst3"]
 # Hydra visuals, drawn behind the code. A minimal/headless build can omit the
 # GPU stack.
 hydra = [
+  "dep:bytes",
   "dep:image",
   "dep:oximedia-capture",
   "dep:oximedia-codec",
+  "dep:oximedia-container",
   "dep:oximedia-core",
+  "dep:oximedia-io",
+  "dep:pollster",
   "dep:rustel-hydra",
   "rustel-jsruntime/hydra",
+]
+# The picture half of a video sample: `video()` and `_video()` painters.
+# H.264, HEVC, AV1, VP9, VP8 and Motion JPEG, all through pure-Rust decoders.
+video = [
+  "dep:image",
+  "dep:oximedia-codec",
+  "dep:oximedia-core",
+  "dep:rav1d",
+  "dep:rust_h264",
+  "dep:rusty_h265",
+  "oximedia-codec/vp8",
+  "oximedia-codec/vp9",
 ]
 
 [[test]]
@@ -109,6 +125,10 @@ rustel-scheduler = { path = "../scheduler" }
 rustel-audio = { path = "../audio" }
 rustel-csound = { path = "../csound" }
 rustel-voice = { path = "../voice" }
+# The talkit speech synthesizer, from its own repository. Default features
+# stay off: the runtime renders, it never plays through an output device of
+# its own.
+rustel-talkit = { git = "https://github.com/tzfm/rustel-talkit.git", tag = "v0.1.1", default-features = false }
 rustel-serial = { path = "../serial", optional = true }
 rustel-midi = { path = "../midi", optional = true }
 # Only for `midir::Ignore` on the input path; the MIDI stack itself is behind
@@ -127,13 +147,32 @@ log = { version = "0.4", optional = true }
 
 rustel-osc = { path = "../osc", optional = true }
 rustel-vst3 = { path = "../vst3", optional = true }
-rustel-hydra = { path = "../hydra", optional = true }
+rustel-hydra = { git = "https://github.com/tzfm/rustel-hydra.git", tag = "v0.2.3", optional = true }
 # Native Hydra sources. OxiMedia is one pure-Rust capture surface across
 # V4L2, AVFoundation and Media Foundation; pin the young API until its frame
 # contract has settled. `image` decodes guarded HTTP images and MJPEG frames.
+# Video inputs use the same stack: its container demuxers and its VP8 and VP9
+# decoders, which are pure Rust. `pollster` runs the async demuxer API on the
+# input worker thread.
 oximedia-capture = { version = "=0.2.1", optional = true }
-oximedia-codec = { version = "=0.2.1", default-features = false, optional = true }
+oximedia-codec = { version = "=0.2.1", default-features = false, features = [
+  "vp8",
+  "vp9",
+], optional = true }
+oximedia-container = { version = "=0.2.1", optional = true }
 oximedia-core = { version = "=0.2.1", optional = true }
+oximedia-io = { version = "=0.2.1", optional = true }
+# The video sample picture decoders that OxiMedia lacks: H.264, HEVC and AV1.
+# rav1d is the Rust port of dav1d, built here without its assembly.
+rav1d = { version = "=1.1.0", default-features = false, features = [
+  "bitdepth_8",
+  "bitdepth_16",
+], optional = true }
+rust_h264 = { version = "=0.6.1", optional = true }
+rusty_h265 = { version = "=0.6.2", optional = true }
+pollster = { version = "0.4", optional = true }
+# Shares one video file between loop passes without a copy each pass.
+bytes = { version = "1", optional = true }
 image = { version = "=0.25.10", default-features = false, features = [
   "gif",
   "jpeg",
@@ -152,6 +191,11 @@ symphonia = { version = "0.5", default-features = false, features = [
   "mp3",
   "ogg",
   "vorbis",
+  # Video containers, for their audio track: a folder of clips is also a
+  # folder of sounds, and the score names one the way it names a wav.
+  "isomp4",
+  "aac",
+  "mkv",
 ] }
 # symphonia demuxes Ogg Opus but ships no Opus decoder. opuscule is a pure-Rust,
 # decode-only implementation with no C or CMake dependency. Its MPL-2.0 license
@@ -209,6 +253,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_Console",
   "Win32_System_ProcessStatus",
+  "Win32_System_SystemInformation",
   "Win32_System_Threading",
 ] }
 
@@ -220,3 +265,6 @@ rustel-vst3-fixture = { path = "../vst3-fixture" }
 # Temp directories for session-log and cache tests.
 tempfile = "3"
 libc = "0.2"
+
+[lints]
+workspace = true

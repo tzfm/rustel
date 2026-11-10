@@ -138,6 +138,14 @@ pub(super) fn run_midi_monitor(
                 MidiEvent::ProgramChange { channel, program } => {
                     format!("program   ch{channel:<2} {program:>3}")
                 }
+                MidiEvent::Raw => format!(
+                    "raw       {}",
+                    bytes
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
                 other => other.kind().to_string(),
             };
             outln!("{at:8.3}  {line}");

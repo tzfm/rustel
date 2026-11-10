@@ -1,9 +1,9 @@
 //! Vim outside the editor.
 //!
 //! One package owns every Vim decision the studio makes outside the
-//! score's text engine: key dispatch, panel text surfaces, insert
-//! mappings, and list navigation. The generic routing calls this package,
-//! never a Vim module directly.
+//! score's text engine: key dispatch, panel text surfaces, and list
+//! navigation. The generic routing calls this package, never a Vim
+//! module directly.
 //!
 //! [`enabled`] is the settings switch. [`applies`] adds the event rule:
 //! a machine's key is a normal key. With either off, no Vim alias, modal
@@ -14,9 +14,10 @@ use super::*;
 mod config;
 mod dispatch;
 mod keys;
-mod mappings;
 
-pub(super) use dispatch::{dispatch, flush_pending, flush_timeout, interrupt, mappings};
+pub(super) use dispatch::{
+    dispatch, flush_pending, flush_timeout, interrupt, learned_layer_shortcut, mappings,
+};
 pub(super) use keys::{
     VimTextKey, enter_insert, focus_changed, handle_text_key, panel_takes_list_navigation,
     surface_typing,

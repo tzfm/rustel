@@ -281,11 +281,11 @@ pub(crate) fn from_js_bridged_value<'js>(
         if let Some(object) = value.as_object()
             && let Some(reference) = combinator_reference(object.clone())
         {
-            return Ok((Value::Function(reference), Vec::new(), false));
+            return Ok((Value::Function(Box::new(reference)), Vec::new(), false));
         }
         let (id, sidecar) = bridge_callable(ctx, function.clone())?;
         return Ok((
-            Value::Function(rustel_core::value::FunctionRef::js(id)),
+            Value::Function(Box::new(rustel_core::value::FunctionRef::js(id))),
             vec![sidecar],
             false,
         ));

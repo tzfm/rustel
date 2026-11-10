@@ -5,15 +5,16 @@ fn enter_supervised_child(test_name: &str, marker: &str, timeout: Duration) -> b
         return true;
     }
 
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg(test_name)
-        .arg("--nocapture")
-        .env(marker, "1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn supervised query child");
+    let mut child =
+        std::process::Command::new(std::env::current_exe().expect("the test binary path"))
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(marker, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn supervised query child");
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait().expect("poll supervised query child") {
@@ -549,7 +550,7 @@ fn scheduler_style_caught_heap_then_spin(
     let pattern = runtime.active_pattern().expect("active Pattern");
     runtime
         .set_memory_limit(runtime.heap_live().saturating_add(8 * 1024 * 1024))
-        .unwrap();
+        .expect("the limit is accepted");
     before_query();
     let outcome = match runtime.with_active_scope_cancellable(budget, cancellation, || {
         pattern.try_query_arc_sorted(Fraction::ZERO, Fraction::ONE)
@@ -1138,7 +1139,7 @@ fn legacy_query_inherits_an_enclosing_raw_deadline() {
 }
 
 fn legacy_pending_job_runtime() -> JsRuntime {
-    let runtime = JsRuntime::new().unwrap();
+    let runtime = JsRuntime::new().expect("the runtime builds");
     let mut builder = runtime.builder();
     let callback = builder.callback(
         &runtime,
@@ -1159,10 +1160,10 @@ fn legacy_pending_job_runtime() -> JsRuntime {
     );
     runtime
         .set_active(&builder, rustel_core::js_query(callback))
-        .unwrap();
+        .expect("the activation registers");
     runtime
         .eval("globalThis.queueLegacyPendingJob = true;")
-        .unwrap();
+        .expect("the activation registers");
     runtime
 }
 
@@ -1171,7 +1172,7 @@ fn exercise_typed_legacy_pending_job_entry(
     invoke: impl Fn(&JsRuntime) -> Result<Vec<rustel_core::Hap>, QueryError>,
 ) {
     let runtime = legacy_pending_job_runtime();
-    let error = invoke(&runtime).unwrap_err();
+    let error = invoke(&runtime).expect_err("the deadline error is the test");
     assert!(
         matches!(error, QueryError::Limit(QueryLimit::JsPendingJobs)),
         "{label}: callback-created job lost its typed refusal: {error:?}"
@@ -1182,16 +1183,16 @@ fn exercise_typed_legacy_pending_job_entry(
 
     runtime
         .eval("globalThis.queueLegacyPendingJob = false;")
-        .unwrap();
+        .expect("the script evaluates");
     let recovered = invoke(&runtime).expect("same heap must recover after job refusal");
     assert_eq!(recovered[0].value.show(), "legacy!");
     assert_eq!(runtime.get_number("legacyPendingCalls"), Some(2.0));
 
     runtime
         .eval("queueMicrotask(() => { globalThis.staleLegacyJobRan = 1; });")
-        .unwrap();
+        .expect("the script evaluates");
     assert!(runtime.jobs_pending(), "{label}: stale job was not queued");
-    let stale = invoke(&runtime).unwrap_err();
+    let stale = invoke(&runtime).expect_err("the deadline error is the test");
     assert!(
         matches!(stale, QueryError::Limit(QueryLimit::JsPendingJobs)),
         "{label}: stale job lost its typed refusal: {stale:?}"
@@ -1217,7 +1218,7 @@ fn exercise_string_legacy_pending_job_entry(
 ) {
     let runtime = legacy_pending_job_runtime();
     let expected = QueryLimit::JsPendingJobs.to_string();
-    let error = invoke(&runtime).unwrap_err();
+    let error = invoke(&runtime).expect_err("the deadline error is the test");
     assert_eq!(error, expected, "{label}: wrong compatibility error");
     assert_eq!(runtime.get_number("legacyPendingCalls"), Some(1.0));
     assert_eq!(runtime.get_number("legacyPendingJobRan"), None);
@@ -1225,16 +1226,16 @@ fn exercise_string_legacy_pending_job_entry(
 
     runtime
         .eval("globalThis.queueLegacyPendingJob = false;")
-        .unwrap();
+        .expect("the script evaluates");
     let recovered = invoke(&runtime).expect("same heap must recover after job refusal");
     assert_eq!(recovered[0].value.show(), "legacy!");
     assert_eq!(runtime.get_number("legacyPendingCalls"), Some(2.0));
 
     runtime
         .eval("queueMicrotask(() => { globalThis.staleLegacyJobRan = 1; });")
-        .unwrap();
+        .expect("the script evaluates");
     assert!(runtime.jobs_pending(), "{label}: stale job was not queued");
-    let stale = invoke(&runtime).unwrap_err();
+    let stale = invoke(&runtime).expect_err("the deadline error is the test");
     assert_eq!(stale, expected, "{label}: wrong stale-job error");
     assert_eq!(
         runtime.get_number("legacyPendingCalls"),

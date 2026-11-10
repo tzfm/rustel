@@ -52,7 +52,9 @@ fn js_string(value: &str) -> String {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             ' '..='~' => out.push(ch),
-            other => write!(out, "\\u{{{:X}}}", other as u32).unwrap(),
+            other => {
+                write!(out, "\\u{{{:X}}}", other as u32).expect("writing to a string cannot fail")
+            }
         }
     }
     out.push('"');
@@ -397,7 +399,7 @@ fn parity_script() -> String {
             js_number(value),
             js_string(&encode(Fraction::from_f64(value)))
         )
-        .unwrap();
+        .expect("writing to a string cannot fail");
     }
     script.push_str(
         "  ];\n  for (const [value, expected] of numbers) {\n    check(\"Fraction(\" + \
@@ -412,7 +414,7 @@ fn parity_script() -> String {
             js_string(&value),
             js_string(&encode(value.parse().ok()))
         )
-        .unwrap();
+        .expect("writing to a string cannot fail");
     }
     script.push_str(
         "  ];\n  for (const [value, expected] of strings) {\n    check(\"Fraction(\" + \
@@ -428,7 +430,7 @@ fn parity_script() -> String {
             js_string(&value.show()),
             js_string(&unary_expectation(*value))
         )
-        .unwrap();
+        .expect("writing to a string cannot fail");
     }
     script.push_str(
         r#"  ].map(([text, unary]) => [Fraction(text), text, unary]);
@@ -447,7 +449,7 @@ fn parity_script() -> String {
                 "    [{i}, {j}, {}],",
                 js_string(&binary_expectation(*a, *b))
             )
-            .unwrap();
+            .expect("writing to a string cannot fail");
         }
     }
     script.push_str(

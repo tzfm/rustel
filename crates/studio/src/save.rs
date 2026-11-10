@@ -12,31 +12,24 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-use super::editor::Revision;
 use rustel_runtime::ui_events::source_revision;
 
 #[derive(Clone, Debug)]
 pub(super) struct SaveRequest {
     pub request_id: u64,
     pub path: PathBuf,
-    pub editor_revision: Revision,
     pub source_revision: String,
     source: Arc<str>,
 }
 
 impl SaveRequest {
-    pub fn new(
-        request_id: u64,
-        path: PathBuf,
-        editor_revision: Revision,
-        source: Arc<str>,
-    ) -> Self {
+    pub fn new(request_id: u64, path: PathBuf, source: Arc<str>) -> Self {
         let source_revision = source_revision(&source);
         Self {
             request_id,
             path,
-            editor_revision,
             source_revision,
             source,
         }
@@ -47,7 +40,6 @@ impl SaveRequest {
 pub(super) struct SaveResult {
     pub request_id: u64,
     pub path: PathBuf,
-    pub editor_revision: Revision,
     pub source_revision: String,
     /// Ok(true) when the file was written, Ok(false) when the disk already
     /// held these bytes and the write was skipped.
@@ -223,7 +215,6 @@ where
         let completed = SaveResult {
             request_id: request.request_id,
             path: request.path,
-            editor_revision: request.editor_revision,
             source_revision: request.source_revision,
             result,
         };
@@ -245,7 +236,13 @@ where
 /// files - and the changed dates the open list orders by - as they were.
 /// True when it wrote.
 pub(super) fn atomic_write(path: &Path, source: &str) -> io::Result<bool> {
-    if std::fs::read(path).is_ok_and(|kept| kept == source.as_bytes()) {
+    // The length decides before any read: an externally enlarged or sparse
+    // file cannot hold these bytes, and reading it whole only to learn that
+    // would cost the save an unbounded read.
+    let same_length = std::fs::metadata(path)
+        .map(|metadata| metadata.len() == source.len() as u64)
+        .unwrap_or(false);
+    if same_length && std::fs::read(path).is_ok_and(|kept| kept == source.as_bytes()) {
         return Ok(false);
     }
     let parent = path
@@ -262,7 +259,17 @@ pub(super) fn atomic_write(path: &Path, source: &str) -> io::Result<bool> {
     pending.write_all(source.as_bytes())?;
     pending.flush()?;
     pending.as_file_mut().sync_all()?;
-    pending.persist(path).map_err(|error| error.error)?;
+    // tempfile's persist replaces with MoveFileExW alone, which Windows
+    // refuses while a reader holds the score open. std's rename retries a
+    // refused replacement with POSIX semantics, which a reader that shares
+    // delete access does not block. Keeping first clears the temporary
+    // attribute the new file was created with.
+    let (file, kept) = pending.keep().map_err(|error| error.error)?;
+    drop(file);
+    if let Err(error) = rename_into_place(&kept, path) {
+        let _ = std::fs::remove_file(&kept);
+        return Err(error);
+    }
     // Opening a directory is not supported by every target. Where it is, run
     // the rename durability barrier on this worker as part of the save.
     if let Ok(directory) = std::fs::File::open(parent) {
@@ -271,23 +278,46 @@ pub(super) fn atomic_write(path: &Path, source: &str) -> io::Result<bool> {
     Ok(true)
 }
 
+/// How many more times a rename that Windows refused is tried, and the
+/// pause before each try: one second in all.
+const RENAME_RETRIES: u32 = 20;
+const RENAME_PAUSE: Duration = Duration::from_millis(50);
+
+/// Moves the written file over the score. On Windows, a program can hold
+/// the new file for a short time after the save closes it: a virus scan
+/// reads each new file. Windows then refuses the rename, so the rename is
+/// tried again until the program lets go of the file.
+fn rename_into_place(from: &Path, to: &Path) -> io::Result<()> {
+    let mut retries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(error) if cfg!(windows) && held(&error) && retries < RENAME_RETRIES => {
+                retries += 1;
+                thread::sleep(RENAME_PAUSE);
+            }
+            result => return result,
+        }
+    }
+}
+
+/// True for the refusals of Windows when another program has the file
+/// open: ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION.
+fn held(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc::sync_channel;
 
     use super::*;
 
-    fn request(id: u64, revision: u64, source: &str) -> SaveRequest {
-        request_for(id, "unused", revision, source)
+    fn request(id: u64, source: &str) -> SaveRequest {
+        request_for(id, "unused", source)
     }
 
-    fn request_for(id: u64, path: &str, revision: u64, source: &str) -> SaveRequest {
-        SaveRequest::new(
-            id,
-            PathBuf::from(path),
-            Revision(revision),
-            Arc::<str>::from(source),
-        )
+    fn request_for(id: u64, path: &str, source: &str) -> SaveRequest {
+        SaveRequest::new(id, PathBuf::from(path), Arc::<str>::from(source))
     }
 
     #[test]
@@ -317,6 +347,56 @@ mod tests {
             past,
             "a skipped write leaves the changed date alone"
         );
+
+        // An externally enlarged file differs by its length alone, so the
+        // equality read is skipped and the replacement happens without it.
+        std::fs::write(&path, "new score with a longer tail").unwrap();
+        assert!(atomic_write(&path, "new score").unwrap(), "it wrote");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new score");
+    }
+
+    #[test]
+    fn a_save_replaces_a_score_that_a_reader_holds_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("score.strudel");
+        std::fs::write(&path, "old score").unwrap();
+        let reader = std::fs::File::open(&path).unwrap();
+
+        assert!(atomic_write(&path, "new score").unwrap(), "it wrote");
+        drop(reader);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new score");
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "no temporary file is left beside the score"
+        );
+    }
+
+    /// A program that opened the new file and shares nothing, as a virus
+    /// scan does, holds the save only until it lets go of the file.
+    #[cfg(windows)]
+    #[test]
+    fn a_save_waits_for_a_program_that_holds_the_new_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let written = directory.path().join("written");
+        let path = directory.path().join("score.strudel");
+        std::fs::write(&written, "new score").unwrap();
+        std::fs::write(&path, "old score").unwrap();
+        let scan = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&written)
+            .unwrap();
+        let done = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            drop(scan);
+        });
+
+        rename_into_place(&written, &path).unwrap();
+        done.join().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new score");
     }
 
     #[test]
@@ -342,27 +422,27 @@ mod tests {
 
         assert!(
             !worker
-                .submit(request_for(1, "a", 10, "one"))
+                .submit(request_for(1, "a", "one"))
                 .unwrap()
                 .replaced_pending
         );
         started_rx.recv().unwrap();
         assert!(
             !worker
-                .submit(request_for(2, "a", 20, "two"))
+                .submit(request_for(2, "a", "two"))
                 .unwrap()
                 .replaced_pending
         );
         // Another scene's snapshot queues rather than replacing this one.
         assert!(
             !worker
-                .submit(request_for(4, "b", 5, "other"))
+                .submit(request_for(4, "b", "other"))
                 .unwrap()
                 .replaced_pending
         );
         assert!(
             worker
-                .submit(request_for(3, "a", 30, "three"))
+                .submit(request_for(3, "a", "three"))
                 .unwrap()
                 .replaced_pending
         );
@@ -384,7 +464,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, [1, 3, 4]);
         let third = &completions[1];
-        assert_eq!(third.editor_revision, Revision(30));
         assert_eq!(third.source_revision, source_revision("three"));
         assert_eq!(third.path, PathBuf::from("a"));
         assert_eq!(third.result, Ok(true));
@@ -393,14 +472,13 @@ mod tests {
     #[test]
     fn failure_result_keeps_revision_and_exact_source_hash() {
         let mut worker = SaveWorker::spawn_with_operation(|_, _| Err("disk full".into())).unwrap();
-        worker.submit(request(7, 42, "exact bytes")).unwrap();
+        worker.submit(request(7, "exact bytes")).unwrap();
         worker.shutdown();
 
         let completions = worker.take_completions();
         assert_eq!(completions.len(), 1);
         let result = &completions[0];
         assert_eq!(result.request_id, 7);
-        assert_eq!(result.editor_revision, Revision(42));
         assert_eq!(result.source_revision, source_revision("exact bytes"));
         assert_eq!(result.result, Err("disk full".into()));
     }
@@ -424,9 +502,9 @@ mod tests {
         })
         .unwrap();
 
-        worker.submit(request(10, 10, "persisted")).unwrap();
+        worker.submit(request(10, "persisted")).unwrap();
         started_rx.recv().unwrap();
-        worker.submit(request(11, 11, "failed")).unwrap();
+        worker.submit(request(11, "failed")).unwrap();
         release_tx.send(()).unwrap();
         worker.shutdown();
 

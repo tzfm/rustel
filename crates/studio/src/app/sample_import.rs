@@ -1222,15 +1222,10 @@ mod tests {
             assert!(app.set_prompt.is_none());
         }
 
-        /// The first Alt+T on a local take arms the trim, and a second Alt+T on
-        /// the same row cuts the silence. A move off the row, even one that
-        /// cannot move the cursor, disarms it.
-        #[test]
-        fn alt_t_arms_then_trims_and_any_other_key_disarms_it() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = crate::app::tests::support::app_over(directory.path());
-
-            let takes = directory.path().join("takes");
+        /// A take padded with silence on both sides, imported as the
+        /// `takes` bank, with the samples tab focused on its row.
+        fn a_padded_take_on_the_samples_tab(app: &mut App, directory: &std::path::Path) -> PathBuf {
+            let takes = directory.join("takes");
             std::fs::create_dir_all(&takes).expect("takes dir");
             let path = takes.join("solo.wav");
             let mut writer = crate::wav::TakeWriter::start(path.clone(), 48_000).expect("writer");
@@ -1256,6 +1251,17 @@ mod tests {
             app.reference_panel = Some(ReferencePanel::samples(&app.reference, sounds));
             app.focus = Focus::Panel(PanelKind::Reference);
             select_bank_row(app.reference_panel.as_mut().unwrap(), "takes");
+            path
+        }
+
+        /// The first Alt+T on a local take arms the trim, and a second Alt+T on
+        /// the same row cuts the silence. A move off the row, even one that
+        /// cannot move the cursor, disarms it.
+        #[test]
+        fn alt_t_arms_then_trims_and_any_other_key_disarms_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let path = a_padded_take_on_the_samples_tab(&mut app, directory.path());
             let row = app.reference_panel.as_ref().unwrap().sound_selected;
 
             let before = std::fs::read(&path).expect("fixture bytes");
@@ -1320,6 +1326,63 @@ mod tests {
                 after.len() < before.len(),
                 "the padded silence either side was cut"
             );
+        }
+
+        /// In Vim a key the search box's modes take disarms a trim, as any
+        /// other key does. After `i`, the Esc that leaves Insert, or a letter
+        /// typed in Insert, the next Alt+T asks again.
+        #[test]
+        fn vim_mode_keys_disarm_a_trim() {
+            use crate::app::tests::support::press;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            let path = a_padded_take_on_the_samples_tab(&mut app, directory.path());
+            let before = std::fs::read(&path).expect("fixture bytes");
+            let armed = |app: &App| app.reference_panel.as_ref().unwrap().confirm_trim.is_some();
+
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::ALT);
+            assert!(armed(&app), "Alt+T asks: {}", app.status);
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert!(!armed(&app), "i disarmed the trim");
+
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::ALT);
+            assert!(armed(&app), "Alt+T in Insert asks: {}", app.status);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(!armed(&app), "the Esc that leaves Insert disarmed it");
+
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::ALT);
+            assert!(armed(&app), "Alt+T asks again: {}", app.status);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+            assert!(!armed(&app), "a letter typed in Insert disarmed it");
+
+            assert!(app.trim_jobs.is_empty(), "no trim started");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "the take is whole");
+        }
+
+        /// A paste into the Samples search moves the rows, so a trim armed on
+        /// one of them goes and the next Alt+T asks again.
+        #[test]
+        fn a_paste_into_the_samples_search_disarms_a_trim() {
+            use crate::app::tests::support::press;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let path = a_padded_take_on_the_samples_tab(&mut app, directory.path());
+            let before = std::fs::read(&path).expect("fixture bytes");
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::ALT);
+            assert!(
+                app.reference_panel.as_ref().unwrap().confirm_trim.is_some(),
+                "Alt+T asks: {}",
+                app.status
+            );
+            app.handle_terminal_event(Event::Paste("so".into()))
+                .expect("paste");
+            assert_eq!(app.reference_panel.as_ref().unwrap().confirm_trim, None);
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::ALT);
+            assert!(app.trim_jobs.is_empty(), "no trim started");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "the take is whole");
         }
 
         /// A downloaded pack sample is shared and re-fetchable, not this

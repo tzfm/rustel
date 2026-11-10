@@ -78,7 +78,7 @@ impl Music {
             .into_iter()
             .filter(|note| *note != self.notes[7])
             .nth(rng.index(2))
-            .unwrap();
+            .expect("two of the three notes remain");
         // Recipes use response palettes of different sizes. Avoid choosing a
         // new index that aliases to the same bass, phrase or ghost-note pattern.
         let choices: Vec<_> = (0..24)

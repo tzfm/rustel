@@ -21,8 +21,11 @@ use super::*;
 /// plugin copies waits by the same rule: see [`Session::plugins_pending`].
 pub const PLUGIN_WAIT: Duration = Duration::from_secs(20);
 /// The longest wait at the commit seam. A light plugin builds one more copy
-/// in this time, so the edit goes in play with no second evaluation.
-const SEAM_WAIT: Duration = Duration::from_millis(150);
+/// in this time, so the edit goes in play with no second evaluation. With
+/// the wait off, a caller holds the first window of a new output, or a
+/// start, this long at most for the copies on their way home: see
+/// [`Session::plugins_returning`].
+pub const SEAM_WAIT: Duration = Duration::from_millis(150);
 /// The time between 2 looks of the wait at the commit seam.
 const SEAM_LOOK_EVERY: Duration = Duration::from_millis(2);
 /// The cycles of a candidate the commit seam reads first: the cycle in play
@@ -52,10 +55,23 @@ pub(super) struct PluginHold {
     wants: Vec<crate::vst::Want>,
     /// The count of the copies not ready, at the last look.
     pending: usize,
-    /// The last time a copy became ready, or the start of the wait.
+    /// The last time a copy became ready, the start of the wait, or the last
+    /// press of the text in another document: see
+    /// [`Session::adopt_plugin_hold`].
     progress: Instant,
     /// The last look at the copies.
     looked: Instant,
+}
+
+impl PluginHold {
+    /// The lead of the plugin chains of the lanes of the text that play, in
+    /// seconds, at the rate `rate`: see [`crate::vst::lead`]. Each call asks
+    /// the plugin host again, so a copy that became ready after the hold
+    /// gives its latency. See [`Session::takeover_headroom`].
+    pub(super) fn lead(&self, rate: u32) -> f64 {
+        let playing = self.wants.iter().take_while(|want| want.sounds()).count();
+        crate::vst::lead(&self.wants[..playing], rate)
+    }
 }
 
 /// The looks at the cycles ahead of the score in play: see
@@ -205,7 +221,12 @@ impl Session {
     /// session holds the text. The caller asks again with the same text when
     /// [`Self::waits_for_plugins`] is false. The text then evaluates a second
     /// time and goes in play. A new text takes the place of the text that
-    /// waits.
+    /// waits. The same text in another document takes its place too, and
+    /// evaluates in that document with the read and the plan of the hold:
+    /// see [`Self::adopt_plugin_hold`]. A text the session does not hold
+    /// gives each copy of its plan that did not start, or that faulted, one
+    /// new try in the background, after its own copies: see
+    /// [`crate::vst::Host::retry`].
     pub fn reload_live<F>(
         &mut self,
         source: &str,
@@ -216,7 +237,8 @@ impl Session {
     where
         F: FnMut() -> f64,
     {
-        if self.waits_for_plugins(source) {
+        let adopted = self.adopt_plugin_hold(source);
+        if !adopted && self.waits_for_plugins(source) {
             return Ok(LiveReload::Waiting);
         }
         let mut first_clock = Some(clock());
@@ -249,11 +271,19 @@ impl Session {
     /// text goes in play, also with each copy ready. The commit seam of the
     /// launch looks at them when no cycle fits before its line: see
     /// [`Self::plugin_seam`]. A new text, a cancel or the commit ends them.
+    /// The launch fires the lead of the plan earlier: see
+    /// [`Self::takeover_headroom`].
+    /// The same text in another document keeps them, and evaluates in that
+    /// document: see [`Self::adopt_plugin_hold`].
     /// True when a copy of a lane that plays is not ready and the wait is
     /// on. The session then holds the text as [`Self::reload_live`] does,
     /// and the launch waits while [`Self::waits_for_plugins`] is true. A
-    /// wait of the same text that ended stays. The commit of the text ends
-    /// it with one line.
+    /// wait of the same text in the same document that ended stays. The
+    /// commit of the text ends it with one line. In another document the
+    /// wait counts again from the arm: see [`Self::adopt_plugin_hold`].
+    /// A text the session does not hold gives each copy of its plan that did
+    /// not start, or that faulted, one new try in the background, after its
+    /// own copies, as [`Self::reload_live`] does.
     pub fn prepare_reload<F>(
         &mut self,
         source: &str,
@@ -265,7 +295,8 @@ impl Session {
     where
         F: FnMut() -> f64,
     {
-        if self.waits_for_plugins(source) {
+        let adopted = self.adopt_plugin_hold(source);
+        if !adopted && self.waits_for_plugins(source) {
             return Ok(true);
         }
         // A mini score has no plugin, and a session with no live output
@@ -295,6 +326,8 @@ impl Session {
             .plugin_hold
             .take()
             .filter(|held| *held.source == *source);
+        let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+        let held_lead = held.as_ref().map_or(0.0, |held| held.lead(rate));
         let evaluation_started = Instant::now();
         let evaluated = self.evaluate_score_cancellable(
             source,
@@ -312,7 +345,7 @@ impl Session {
                 let cps = Self::evaluated_realtime_cps(&evaluated, self.scheduler.cps());
                 // The evaluation took time from the cover of the score in
                 // play. The read gets only the rest, as at the commit seam.
-                let spare = self.seam_time(clock(), LIVE_REPLACEMENT_MIN_HEADROOM, None);
+                let spare = self.seam_time(clock(), LIVE_REPLACEMENT_MIN_HEADROOM, None, held_lead);
                 let window = Self::live_replacement_probe_budget(cps).min(spare);
                 let from = from_cycle.floor() as i64;
                 let deadline = Instant::now() + window;
@@ -337,7 +370,15 @@ impl Session {
             }
         };
         self.restore_score_in_play()?;
-        let pending = self.ensure_wants(&wants);
+        let (pending, mut lines) = crate::vst::ensure(&wants, rate);
+        self.load_ran_plugins();
+        // A text the session does not hold gives each failed or faulted copy
+        // of its plan one new try, as at the commit seam: see
+        // `Self::plugin_seam`.
+        if held.is_none() && crate::vst::retry(&self.chains, Some(source), rate) > 0 {
+            lines = crate::vst::ensure(&wants, rate).1;
+        }
+        self.report_plugin_lines(lines);
         let first = pending.first().map(|want| want.name().to_owned());
         let pending = pending.len();
         // A wait of this text that ended stays as it is. The commit of the
@@ -347,15 +388,18 @@ impl Session {
             .is_some_and(|held| held.pending > 0 && held.progress.elapsed() >= PLUGIN_WAIT);
         match first {
             Some(_) if ended => {
+                self.lanes.hold(Some(source));
                 self.plugin_hold = held;
                 Ok(false)
             }
             Some(first) if self.plugin_wait => {
                 Ok(self.hold_edit(source, wants, pending, &first, held))
             }
-            // Nothing waits. The fire of the launch looks at the copies.
+            // Nothing waits. The fire of the launch looks at the copies, and
+            // comes the lead of the plan earlier.
             _ => {
                 let now = Instant::now();
+                self.lanes.hold(Some(source));
                 self.plugin_hold = Some(PluginHold {
                     source: Arc::from(source),
                     wants,
@@ -373,8 +417,9 @@ impl Session {
     /// ready and one became ready in the last [`PLUGIN_WAIT`]. A copy not
     /// ready after a look with each copy ready starts a new wait, with one
     /// line. A call asks the plugin host again when [`PLUGIN_LOOK_EVERY`]
-    /// passed since the last look. False with the wait off or a stopped
-    /// transport.
+    /// passed since the last look. The latency of the copies a look finds
+    /// raises the lead the cover keeps room for: see [`Self::plugin_lead`].
+    /// False with the wait off or a stopped transport.
     pub fn waits_for_plugins(&mut self, source: &str) -> bool {
         if !self.plugin_wait || self.transport.is_stopped() {
             return false;
@@ -389,6 +434,7 @@ impl Session {
         };
         let now = Instant::now();
         let mut first = None;
+        let mut lead = 0.0;
         if now.duration_since(hold.looked) >= PLUGIN_LOOK_EVERY {
             let (pending, _) = crate::vst::ensure(&hold.wants, rate);
             if hold.pending == 0 {
@@ -398,11 +444,15 @@ impl Session {
                 hold.progress = now;
             }
             (hold.pending, hold.looked) = (pending.len(), now);
+            lead = hold.lead(rate);
         }
         let waits = hold.pending > 0 && now.duration_since(hold.progress) < PLUGIN_WAIT;
         if let Some(first) = first {
             self.report_plugin_wait(&first);
         }
+        // A copy that became ready gives its latency. The cover keeps room
+        // for the lead of the held text, as at the hold.
+        self.raise_cover_lead(lead);
         waits
     }
 
@@ -414,21 +464,59 @@ impl Session {
     /// plan.
     pub fn cancel_plugin_hold(&mut self) {
         self.plugin_hold = None;
+        self.lanes.hold(None);
         crate::vst::forget_plan(&self.chains);
     }
 
     /// Whether an edit waits for its plugin copies. On at the start. With the
     /// wait off, an edit goes in play at once, and a note plays with no
     /// plugin until its copy is ready. An edit that waits goes in play at
-    /// the next call of its door.
+    /// the next call of its door. With the wait on, the first window of a
+    /// new output waits for the copies its close sent home, until no copy
+    /// became ready in [`PLUGIN_WAIT`]. With the wait off, it waits
+    /// [`SEAM_WAIT`] at most. The first install of a producer that never
+    /// published waits for its copies only with the wait on.
     pub fn set_plugin_wait(&mut self, on: bool) {
         self.plugin_wait = on;
+    }
+
+    /// True when the wait is on: see [`Self::set_plugin_wait`].
+    pub(crate) fn plugin_wait(&self) -> bool {
+        self.plugin_wait
     }
 
     /// True when the session holds the edit with the text `source`.
     pub(super) fn holds_edit(&self, source: &str) -> bool {
         let hold = self.plugin_hold.as_ref();
         hold.is_some_and(|hold| *hold.source == *source)
+    }
+
+    /// The same text in another document takes the place of the text that
+    /// waits, with its read and its plan: see [`crate::vst::adopt_plan`].
+    /// True when the read of the text was of another document. The door
+    /// then evaluates the text in that document. The lanes of that document
+    /// come first, then the lanes of the read of the hold, and the plan
+    /// starts from the plan of the hold. So the text waits only for a copy
+    /// it plays, and no copy builds again. The wait counts from the press,
+    /// with no second line. So a copy of a lane of that document gets the
+    /// whole [`PLUGIN_WAIT`], also a copy the hold did not wait for. The
+    /// plan moves only with its read, and the read of the hold moves with
+    /// them. A read of another text, such as a text that failed, leaves the
+    /// read of the hold: see [`crate::vst::LaneTable::hold`]. So an
+    /// evaluation that fails after the move leaves the read and the plan in
+    /// the document of the move, and the next door of the text takes both
+    /// from there. The caller sets the document of the text before each
+    /// door: see [`Self::set_plugin_document`].
+    fn adopt_plugin_hold(&mut self, source: &str) -> bool {
+        let adopted = self.holds_edit(source) && self.lanes.adopt_read(source);
+        if adopted {
+            crate::vst::adopt_plan(&self.chains, &self.lanes, source);
+            self.lanes.hold(Some(source));
+            if let Some(hold) = self.plugin_hold.as_mut() {
+                hold.progress = Instant::now();
+            }
+        }
+        adopted
     }
 
     /// The plugin copies the edit or the launch with the text `source` waits
@@ -452,6 +540,11 @@ impl Session {
     /// make when the candidate goes on to its commit: the commit forgets each
     /// plugin line said before, so the caller says these after the commit.
     /// `None` when the session holds the text: the lines go out at once.
+    /// With `hold`, a text the session does not hold gives each copy of its
+    /// plan that did not start, or that faulted, one new try after the looks
+    /// and the loads: see [`crate::vst::Host::retry`]. The lines are then the
+    /// lines of a look after the tries, and the count of the copies not ready
+    /// stays the count of the look before.
     ///
     /// The seam reads and waits only while the cover of the score in play
     /// lasts, and before the line of a launch, so a launch keeps its line. A
@@ -469,6 +562,11 @@ impl Session {
     /// Nothing waits for a first score, a score with no pattern, a stopped
     /// transport or a session with no live output. Such a candidate makes no
     /// plan, and the plan of the text before ends.
+    ///
+    /// The commit of the candidate takes the lead of the plugin chains of
+    /// its plan, and a candidate with no plan has no lead: see
+    /// [`Self::plugin_lead`]. The reads and the wait keep room for the lead
+    /// in the cover of the score in play.
     pub(super) fn plugin_seam<F>(
         &mut self,
         evaluated: &EvaluatedScore,
@@ -491,12 +589,14 @@ impl Session {
         } = evaluated
         else {
             // A text with no plan of its own ends the plan of the text
-            // before.
+            // before, and has no lead.
             crate::vst::forget_plan(&self.chains);
+            self.plan_lead = Some(0.0);
             return Ok(Some(Vec::new()));
         };
         if !self.plugins_live() || self.generation() == 0 || self.transport.is_stopped() {
             crate::vst::forget_plan(&self.chains);
+            self.plan_lead = Some(0.0);
             return Ok(Some(Vec::new()));
         }
         let started = Instant::now();
@@ -509,13 +609,16 @@ impl Session {
         // launch, or from an earlier hold of the text.
         let arm = line.is_some() && held.is_some();
         // The seam ends before the takeover of the commit leaves the cover
-        // of the score in play, and before the line of a launch.
-        let spare = self.seam_time(seam_now, headroom, line);
+        // of the score in play, and before the line of a launch. The lead
+        // of the kept copies counts.
+        let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+        let held_lead = held.as_ref().map_or(0.0, |held| held.lead(rate));
+        let spare = self.seam_time(seam_now, headroom, line, held_lead);
         // A launch with no time before its line misses the line in any
         // case. With no kept copies, its first read then takes the cover,
         // so a copy that is not ready holds the launch.
         let first_spare = if spare.is_zero() {
-            self.seam_time(seam_now, headroom, None)
+            self.seam_time(seam_now, headroom, None, held_lead)
         } else {
             spare
         };
@@ -559,7 +662,6 @@ impl Session {
                 &shadow,
             ),
         };
-        let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
         // The count of the copies not ready and the plugin of the first, and
         // the lines of the copies the host cannot make.
         let look = |wants: &[crate::vst::Want]| {
@@ -608,6 +710,15 @@ impl Session {
         }
         // The plugins the candidate ran load after its copies.
         self.load_ran_plugins();
+        // A text the session does not hold gives each failed or faulted copy
+        // of its plan one new try, behind its own copies and loads. A copy in
+        // its try gives no line. The count stays the count of the look
+        // before, so the edit waits for no new copy that look did not count.
+        if hold && held.is_none() && crate::vst::retry(&self.chains, Some(source), rate) > 0 {
+            lines = look(&wants).1;
+        }
+        // The commit takes the lead of the plan.
+        self.plan_lead = Some(self.leads_of(&wants).0);
         if pending.is_none() || !(hold && self.plugin_wait) {
             return Ok(Some(lines));
         }
@@ -621,6 +732,8 @@ impl Session {
             std::thread::sleep(SEAM_LOOK_EVERY);
             (pending, lines) = look(&wants);
         }
+        // A copy that became ready gives its latency.
+        self.plan_lead = Some(self.leads_of(&wants).0);
         let Some((pending, first)) = pending else {
             return Ok(Some(lines));
         };
@@ -635,12 +748,15 @@ impl Session {
     /// Holds the text of an edit with `pending` copies not ready, the copy
     /// of the plugin `first` among them. `held` is the wait of the same text
     /// before, or the copies its arm prepared, as the look of its door saw
-    /// it: see [`Self::waits_for_plugins`]. A wait with a copy not ready
-    /// keeps the last time a copy became ready. A wait with each copy ready
-    /// is over, so a copy not ready now starts a new wait. False when the
-    /// wait ends: no copy became ready in [`PLUGIN_WAIT`]. The edit then
-    /// plays, with one line. A text gives one line at the start of each
-    /// wait.
+    /// it, or as a press in another document left it: see
+    /// [`Self::waits_for_plugins`] and [`Self::adopt_plugin_hold`]. A wait
+    /// with a copy not ready keeps the last time a copy became ready. A wait
+    /// with each copy ready is over, so a copy not ready now starts a new
+    /// wait. False when the wait ends: no copy became ready in
+    /// [`PLUGIN_WAIT`]. The edit then plays, with one line. A text gives one
+    /// line at the start of each wait. The cover of the score in play keeps
+    /// room for the lead of the plan of a held text: see
+    /// [`Self::plugin_lead`] and [`Self::waits_for_plugins`].
     fn hold_edit(
         &mut self,
         source: &str,
@@ -666,6 +782,13 @@ impl Session {
         if held.as_ref().is_none_or(|held| held.pending == 0) {
             self.report_plugin_wait(first);
         }
+        // The text does not go in play now, so no commit takes the lead of
+        // its plan. The cover keeps room for that lead.
+        let (lead, _) = self.leads_of(&wants);
+        self.plan_lead = None;
+        self.raise_cover_lead(lead);
+        // A read of another text leaves the read of the hold.
+        self.lanes.hold(Some(source));
         self.plugin_hold = Some(PluginHold {
             source: Arc::from(source),
             wants,
@@ -685,11 +808,14 @@ impl Session {
 
     /// The longest time at the commit seam from `now`. The takeover of the
     /// commit comes the margin of the output or `headroom` after the commit,
-    /// and stays inside the cover of the score in play. With `line`, the
-    /// line of a launch, the takeover comes at the line or before it.
-    fn seam_time(&self, now: f64, headroom: Duration, line: Option<f64>) -> Duration {
+    /// and the lead of the plugin chains after that: the lead of the score
+    /// in play, or `lead`, the lead of a plan of the text, when that is
+    /// larger. The takeover stays inside the cover of the score in play.
+    /// With `line`, the line of a launch, the takeover comes at the line or
+    /// before it.
+    fn seam_time(&self, now: f64, headroom: Duration, line: Option<f64>, lead: f64) -> Duration {
         let margin = self.continuity_margin.unwrap_or(self.schedule_lead);
-        let margin = margin.max(headroom.as_secs_f64());
+        let margin = margin.max(headroom.as_secs_f64()) + self.plugin_lead().max(lead);
         let cover = self.scheduler.horizon_remaining(now);
         let cover = line.map_or(cover, |line| cover.min(line - now));
         let spare = cover - margin;
@@ -850,7 +976,9 @@ impl Session {
     /// twice the time. At [`LOOK_MOST`] the next look reads half of the
     /// part, so the looks skip no part of a cycle. Each copy the host cannot
     /// make gives its reason as a plugin line. The console lines of a look
-    /// go.
+    /// go. The latency of the copies raises the lead the cover keeps room
+    /// for, so the first notes of such a lane find room for their lead: see
+    /// [`Self::plugin_lead`].
     fn look_ahead_for_plugins(&mut self, now: f64, continuation_reserve: Duration) {
         let play = self.scheduler.cycle_at_time(now).floor() as i64;
         let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
@@ -884,11 +1012,15 @@ impl Session {
         let Some(haps) = read else {
             return;
         };
-        if shadow {
-            self.ensure_plugins(&[], &haps);
+        let wants = if shadow {
+            crate::vst::wants(&self.chains, &self.lanes, &self.csound, &[], &haps)
         } else {
-            self.ensure_plugins(&haps, &[]);
-        }
+            crate::vst::wants(&self.chains, &self.lanes, &self.csound, &haps, &[])
+        };
+        self.ensure_wants(&wants);
+        // These notes play later: the cover keeps room for their lead.
+        let (lead, shadow_lead) = self.leads_of(&wants);
+        self.raise_cover_lead(lead.max(shadow_lead));
     }
 
     /// Puts the score in play in play again after a candidate that does not
@@ -1118,7 +1250,8 @@ mod tests {
     /// starts the looks again at the cycle in play. A shield looks at
     /// nothing, also with its cover full. A look that does not end in its
     /// time reads its cycle again. A score that a panic recovery restored
-    /// looks at nothing until the next commit.
+    /// looks at nothing until the next commit. A new output starts the looks
+    /// again at the cycle in play.
     #[test]
     fn the_looks_ahead_load_the_copies_of_later_notes() {
         let (_one, folder) = fixture_plugins();
@@ -1212,6 +1345,10 @@ mod tests {
         assert_eq!(session.plugin_ahead.next, None, "a restored score");
         session.reload_at(score, false, 5.0).expect("a commit");
         look_until(&mut session, 5.0, 3, false);
+        // A new output starts the looks again at the cycle in play.
+        let requery = session.requery_after_output_recycle_at(5.0);
+        assert!(requery.expect("a new output").is_some());
+        assert_eq!(session.plugin_ahead.next, None, "a new output");
     }
 
     /// The plan of a start, of an edit and of a launch has the notes of the
@@ -1225,6 +1362,15 @@ mod tests {
     /// the host and the plan give the same text. A new score and a direct
     /// pattern start the looks again. The plugins an evaluation ran load at
     /// the next look, not at the evaluation.
+    ///
+    /// An edit of a new text gives each copy of its plan that did not start
+    /// one new try, after its own copies, and a copy in its try gives no
+    /// line. A prepare of a new text gives the same tries. The landing of a
+    /// held edit, a prepare of the held text, a door with no hold, a
+    /// rollback, a panic replay, a reload and a count give no try. A start
+    /// gives a try only to the copies of the window it looks at, and a rest
+    /// copy of another document gets none. A try that builds gives the other
+    /// copies of its key their tries at once, so no edit waits for them.
     #[test]
     fn the_plans_load_the_copies_of_the_lanes_that_do_not_play() {
         let (_one, folder) = fixture_plugins();
@@ -1269,12 +1415,15 @@ mod tests {
 
         let tone = format!("{score}\n_$: note(\"a3\").s(\"sine\").vsti(\"rustel fixture tone\")");
         let stopped = AtomicBool::new(false);
+        // The edit gives the copy that did not start its first try at once.
+        // The copy in its try gives no line, and the line of the try that
+        // fails comes at a turn.
         let edit = session.reload_live(&tone, false, &stopped, || 0.0);
         assert!(matches!(edit, Ok(LiveReload::Installed(_))));
         assert_eq!(copies_in(folder.path()), 2, "the copy of the muted lane");
-        assert_eq!(plugin_lines(&mut session), [missing, failed]);
+        assert_eq!(plugin_lines(&mut session), [missing]);
         look_until(&mut session, 0.0, 1, true);
-        assert!(plugin_lines(&mut session).is_empty(), "a second line");
+        assert_eq!(plugin_lines(&mut session), [failed], "the line of the try");
 
         // A held edit counts the copies of the lanes that play.
         let double =
@@ -1302,7 +1451,7 @@ mod tests {
         let more = format!("{tone}{double}{later}");
         assert_eq!(session.plugin_ahead.next, Some(Fraction::from(PLAN_CYCLES)));
         let edit = session.reload_live(&more, false, &stopped, || 0.0);
-        assert!(matches!(edit, Ok(LiveReload::Installed(_))));
+        assert!(matches!(edit, Ok(LiveReload::Installed(_))), "{edit:?}");
         assert_eq!(session.plugin_ahead.next, None, "a new score");
         assert_eq!(copies_in(folder.path()), 5, "a copy of cycle 8");
 
@@ -1334,6 +1483,251 @@ mod tests {
             .set_pattern(rustel_core::silence())
             .expect("a direct pattern");
         assert_eq!(session.plugin_ahead.next, None, "a direct pattern");
+
+        // A held text whose muted lane has a copy that does not start. The
+        // try of the hold comes while the build waits or runs, so the build
+        // fails one time with one line. Each build takes 300 ms or more here,
+        // so no try races a build. A score with no plugin lane comes first,
+        // so each plugin lane of the part is a new lane with a new chain. A
+        // turn before an edit gives the seam the cover it reads the muted
+        // lanes in.
+        let kick = "$: s(\"sine\").gain(0)";
+        session.reload_at(kick, false, 0.0).expect("no plugin lane");
+        let steady = LiveQueryBudgetMode::Steady;
+        turn(&mut session, 0.0, steady);
+        let read_folders = || {
+            crate::vst::set_preset_folders(Vec::new());
+            host.wait_idle();
+        };
+        let refused = presets.join("Refused.vstpreset");
+        let bad = rustel_vst3_fixture::preset_file(&[0.5]);
+        std::fs::write(&refused, &bad).expect("preset file");
+        read_folders();
+        // SAFETY: as above.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_CLASS_ENV, "300") };
+        let muted =
+            "\n_$: note(\"c3\").s(\"sine\").vst(\"rustel fixture\", { preset: \"refused\" })";
+        let fresh = "\n$: note(\"e4\").s(\"sine\").vst(\"rustel fixture\")";
+        // A new lane with no plugin makes a new text.
+        let quiet = |speed: u8| format!("\n$: s(\"sine\").gain(0).fast({speed})");
+        let held = format!("{kick}{muted}{fresh}");
+        let edit = session.reload_live(&held, false, &stopped, past_the_cover(0.0));
+        assert_eq!(edit.expect("a held edit"), LiveReload::Waiting);
+        let copies = copies_in(folder.path());
+        let did_not_start =
+            "vst skipped: Rustel Fixture did not start: the plugin refused the preset";
+        assert_eq!(host.take_errors(), [did_not_start]);
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_CLASS_ENV) };
+        // A prepare of the held text gives no try.
+        let prepared = session.prepare_reload(&held, false, 0.0, &stopped, || 0.0);
+        prepared.expect("a prepare of the held text");
+        host.wait_idle();
+        assert!(host.take_errors().is_empty(), "a prepare of the held text");
+        let good = rustel_vst3_fixture::preset(0.5, 0.0);
+        std::fs::write(&refused, &good).expect("preset file");
+
+        // These give no try: an update press, the landing of the held text,
+        // a door with no hold, a rollback, a panic replay, a reload and a
+        // count. An update press tries the copies of the score in play, and
+        // not those of the held text.
+        assert_eq!(session.retry_plugins(), 0, "an update press");
+        let landed = session.reload_live(&held, false, &stopped, || 0.0);
+        assert!(matches!(landed, Ok(LiveReload::Installed(_))), "{landed:?}");
+        assert_eq!(copies_in(folder.path()), copies, "the landing");
+        session
+            .mark_audible_generation(session.generation())
+            .expect("the score in play");
+        let again = format!("{held}{}", quiet(2));
+        session
+            .reload_with_clock_cancellable(&again, false, &stopped, || 0.0)
+            .expect("a door with no hold");
+        assert_eq!(copies_in(folder.path()), copies, "a door with no hold");
+        let rollback = session.rollback_to_previous_source(0.0);
+        assert_eq!(rollback.expect("a rollback"), RollbackAttempt::Applied);
+        assert_eq!(copies_in(folder.path()), copies, "a rollback");
+        session.inject_panic_for_test(SessionPanicPoint::Query);
+        let reserve = Duration::from_millis(25);
+        let panicked = session.schedule_audio_live_at(0.0, 48_000, reserve, steady);
+        assert!(panicked.is_err(), "a turn that panics");
+        assert_eq!(copies_in(folder.path()), copies, "a panic replay");
+        session.reload_at(&again, false, 0.0).expect("a reload");
+        assert_eq!(copies_in(folder.path()), copies, "a reload");
+        session.plugins_pending(0.0, 1.0, ceiling);
+        assert_eq!(copies_in(folder.path()), copies, "a count");
+        turn(&mut session, 0.0, steady);
+        assert_eq!(copies_in(folder.path()), copies, "a look");
+        // A new text gives the copy its first try at once, and the try
+        // builds.
+        let edit = session.reload_live(&format!("{again}{}", quiet(3)), false, &stopped, || 0.0);
+        assert!(matches!(edit, Ok(LiveReload::Installed(_))), "{edit:?}");
+        assert_eq!(copies_in(folder.path()), copies + 1, "the first try");
+
+        // A second key on a new muted lane fails the same way. A start gives
+        // a new try only to the copies of the window it looks at.
+        let without = format!("{kick}{fresh}");
+        session
+            .reload_at(&without, false, 0.0)
+            .expect("no muted lane");
+        let refused = presets.join("Refused2.vstpreset");
+        std::fs::write(&refused, &bad).expect("preset file");
+        read_folders();
+        // SAFETY: as above.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_CLASS_ENV, "300") };
+        let muted =
+            "\n_$: note(\"d3\").s(\"sine\").vst(\"rustel fixture\", { preset: \"refused2\" })";
+        let with_lane = format!("{without}{muted}");
+        turn(&mut session, 0.0, steady);
+        let edit = session.reload_live(&with_lane, false, &stopped, || 0.0);
+        assert!(matches!(edit, Ok(LiveReload::Installed(_))), "{edit:?}");
+        let copies = copies_in(folder.path());
+        assert_eq!(host.take_errors(), [did_not_start]);
+        session.reload_at(&without, false, 0.0).expect("a start");
+        session.plugins_pending_with_tries(0.0, 1.0, ceiling);
+        assert_eq!(
+            copies_in(folder.path()),
+            copies,
+            "a key the start does not name"
+        );
+        assert!(host.take_errors().is_empty(), "a try of a start");
+        session.reload_at(&with_lane, false, 0.0).expect("a start");
+        // A count of the score right before gives no try, and the start
+        // does not take the count of that look.
+        session.plugins_pending(0.0, 1.0, ceiling);
+        session.plugins_pending_with_tries(0.0, 1.0, ceiling);
+        host.wait_idle();
+        assert_eq!(host.take_errors(), [did_not_start], "the try of a start");
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_CLASS_ENV) };
+        // The try took 300 ms or more, so the key waits that long, and the
+        // next start gives it no try.
+        session.plugins_pending_with_tries(0.0, 1.0, ceiling);
+        host.wait_idle();
+        assert!(host.take_errors().is_empty(), "a key that waits");
+        // A save of the file ends that wait at the next read, so the next
+        // new text tries the key at once. A rest copy gets no try: in
+        // document 2 the copy is a copy of document 0 at rest.
+        std::fs::write(&refused, &good).expect("preset file");
+        read_folders();
+        session.set_plugin_document(2);
+        let edit = session.reload_live(&without, false, &stopped, || 0.0);
+        assert!(matches!(edit, Ok(LiveReload::Installed(_))), "{edit:?}");
+        assert_eq!(copies_in(folder.path()), copies, "a rest copy");
+        session.set_plugin_document(0);
+        let back = format!("{with_lane}{}", quiet(2));
+        turn(&mut session, 0.0, steady);
+        let edit = session.reload_live(&back, false, &stopped, || 0.0);
+        assert!(matches!(edit, Ok(LiveReload::Installed(_))), "{edit:?}");
+        assert_eq!(
+            copies_in(folder.path()),
+            copies + 1,
+            "the try in document 0"
+        );
+        // A prepare of a new text gives the same tries. The copy of a new
+        // muted lane with a third key does not start, and the prepare gives
+        // it a try.
+        std::fs::write(presets.join("Refused3.vstpreset"), &bad).expect("preset file");
+        read_folders();
+        // SAFETY: as above.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_CLASS_ENV, "300") };
+        let lane =
+            "\n_$: note(\"g3\").s(\"sine\").vst(\"rustel fixture\", { preset: \"refused3\" })";
+        let third = format!("{back}{lane}");
+        turn(&mut session, 0.0, steady);
+        let edit = session.reload_live(&third, false, &stopped, || 0.0);
+        assert!(matches!(edit, Ok(LiveReload::Installed(_))), "{edit:?}");
+        host.wait_idle();
+        assert_eq!(host.take_errors(), [did_not_start]);
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_CLASS_ENV) };
+        turn(&mut session, 0.0, steady);
+        let launch = format!("{third}{}", quiet(3));
+        let prepared = session.prepare_reload(&launch, false, 0.0, &stopped, || 0.0);
+        prepared.expect("a prepare of a new text");
+        host.wait_idle();
+        assert_eq!(host.take_errors(), [did_not_start], "the try of a prepare");
+
+        // 2 copies of a key that does not start, each on a new lane that
+        // plays. A try that builds gives the other copy its try at once, so
+        // no edit waits for that copy: the seam waits 150 ms at most, and
+        // each build takes 300 ms or more.
+        session.reload_at(kick, false, 0.0).expect("no plugin lane");
+        turn(&mut session, 0.0, steady);
+        let twice = presets.join("Twice.vstpreset");
+        std::fs::write(&twice, &bad).expect("preset file");
+        read_folders();
+        // SAFETY: as above.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_CLASS_ENV, "300") };
+        let lane = |note: &str| {
+            format!(
+                "\n$: note(\"{note}\").s(\"sine\").vst(\"rustel fixture\", {{ preset: \"twice\" }})"
+            )
+        };
+        let both = format!("{kick}{}{}", lane("f4"), lane("g4"));
+        let edit = session.reload_live(&both, false, &stopped, past_the_cover(0.0));
+        assert_eq!(edit.expect("a held edit"), LiveReload::Waiting);
+        host.wait_idle();
+        assert_eq!(host.take_errors(), [did_not_start; 2]);
+        let landed = session.reload_live(&both, false, &stopped, || 0.0);
+        assert!(matches!(landed, Ok(LiveReload::Installed(_))), "{landed:?}");
+        std::fs::write(&twice, &good).expect("preset file");
+        read_folders();
+        let copies = copies_in(folder.path());
+        // The slot of the effect of each lane, as a window of the live
+        // output gives the chains.
+        let report = session.query_report(Fraction::ZERO, Fraction::ONE);
+        let report = report.expect("a query");
+        let notes = report.haps.iter().map(|hap| &hap.value);
+        let notes = notes.filter(|value| {
+            let value = serde_json::to_string(value).expect("a note");
+            value.contains("twice")
+        });
+        let live = session.plugins_live();
+        let chains = crate::vst::assign(
+            &session.chains,
+            &session.lanes,
+            &session.csound,
+            notes,
+            live,
+        );
+        let mut slots: Vec<rustel_audio::InsertSlot> = chains
+            .into_iter()
+            .filter_map(|chain| match chain {
+                crate::vst::NoteChain::Seat(seat) => Some(rustel_audio::effect_slot(seat.chain, 0)),
+                _ => None,
+            })
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let slots: [rustel_audio::InsertSlot; 2] = slots.try_into().expect("a slot for each lane");
+        let prepared = |slot| host.prepared("rustel fixture", Some("twice"), false, 48_000, slot);
+        let ready =
+            |answer: &rustel_vst3::Prepared| matches!(answer, rustel_vst3::Prepared::Ready(_));
+        let edit = session.reload_live(&format!("{both}{}", quiet(3)), false, &stopped, || 0.0);
+        assert!(matches!(edit, Ok(LiveReload::Installed(_))), "{edit:?}");
+        // Each read of a slot answers that its try runs or that it is ready.
+        let started = Instant::now();
+        loop {
+            let answers = slots.map(&prepared);
+            for answer in &answers {
+                let tries = ready(answer) || *answer == rustel_vst3::Prepared::Retrying;
+                assert!(tries, "{answer:?}");
+            }
+            if answers.iter().any(ready) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the try did not build"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let edit = session.reload_live(&format!("{both}{}", quiet(4)), false, &stopped, || 0.0);
+        assert!(matches!(edit, Ok(LiveReload::Installed(_))), "{edit:?}");
+        assert_eq!(copies_in(folder.path()), copies + 2, "2 tries");
+        assert!(slots.map(&prepared).iter().all(ready), "the 2 copies");
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_CLASS_ENV) };
     }
 
     /// A lane plays a pattern that a setup text built, so no evaluation ran
@@ -1348,8 +1742,16 @@ mod tests {
     /// chain that a Csound orbit ends to make room. A turn of an output with
     /// no plugins counts nothing. A session with no live output keeps no
     /// plugin. A live output gives back a copy the chain no longer wants, 5 s
-    /// after the chain lost its key. A session that ends tells the host, so
-    /// the slot of its chain takes the copy then.
+    /// after the chain lost its key. The score rests while a score of another
+    /// document plays. After 5 s of play the output names its chain no more,
+    /// and the chain keeps the copy of its preset. Its slot takes no copy of
+    /// another preset. The score plays again, and its tab closes while it
+    /// plays. When a score of another document plays, its chain is a closed
+    /// chain in its grace, and it keeps its copy. A session that ends ends
+    /// its chains at the host, a closed chain too. Its copy ends, and the
+    /// slot of its chain takes no copy then. A copy of a setup pattern that
+    /// does not start gives one line, and an edit of a new text gives it its
+    /// first try at once.
     #[test]
     fn a_chain_of_a_setup_pattern_leaves_after_its_time() {
         let (_one, folder) = fixture_plugins();
@@ -1503,12 +1905,720 @@ mod tests {
         rustel_audio::LiveReverbBatch::install_inserts(output.device(), &[]);
         assert!(!output.device().holds_insert(slot, key));
         drop(output);
+        // The score rests while a score of another document plays. After
+        // 5 s of play the output names its chain no more, and the chain
+        // keeps the copy of its preset. Its slot takes no copy of another
+        // preset.
+        host.prepare(fixture, Some("half"), false, 48_000, slot);
+        session.set_plugin_document(1);
+        session.evaluate(kick).expect("a score of another document");
+        for now in 35..41 {
+            turn(&mut session, f64::from(now), steady);
+        }
+        assert!(insert_chains(&session).named.is_empty(), "a rest chain");
+        assert_eq!(copies_in(folder.path()), 1, "the copy of a rest chain");
+        host.prepare(fixture, None, false, 48_000, slot);
+        assert_eq!(
+            copies_in(folder.path()),
+            1,
+            "a copy the rest chain does not want"
+        );
+        // The score plays again, and its tab closes while the transport
+        // runs, so the score plays on. A score of another document plays:
+        // the chain is a closed chain in its grace. No call of the host
+        // names it, and the host keeps its copy.
+        session.set_plugin_document(0);
+        session.evaluate(&score).expect("the score again");
+        assert_eq!(plugin_chain(&session), slot.chain);
+        assert!(
+            !session.forget_plugin_document(0),
+            "the closed score plays on"
+        );
+        session.set_plugin_document(1);
+        session.evaluate(kick).expect("a score of another document");
+        assert_eq!(copies_in(folder.path()), 1, "the copy of a closed chain");
         drop(session);
         host.prepare(fixture, Some("half"), false, 48_000, slot);
         assert_eq!(
             copies_in(folder.path()),
-            1,
+            0,
             "a slot of a session that ended"
         );
+
+        // A setup text names a preset of another class. The window of a
+        // turn names the copy, its build fails, and the next turn gives one
+        // line. An edit of a new text gives the copy its first try at once.
+        let other = presets.join("Other.vstpreset");
+        let mut bytes = rustel_vst3_fixture::preset(0.5, 0.0);
+        bytes[8] = b'0';
+        std::fs::write(&other, bytes).expect("preset file");
+        crate::vst::set_preset_folders(Vec::new());
+        host.wait_idle();
+        let mut session = Session::new().expect("session");
+        session.set_direct_diagnostic_logging(false);
+        session.plugins_live.store(true, relaxed);
+        session.plugin_rate.store(48_000, relaxed);
+        let setup =
+            "globalThis.other = note('c3').s('sine').vst('rustel fixture', {preset: 'other'})";
+        session.evaluate_prebake(setup).expect("setup");
+        let score = format!("{kick}\n$: other");
+        session.evaluate(&score).expect("score");
+        turn(&mut session, 0.0, steady);
+        // The session has no sample library, so its notes play with no
+        // plugin, with one line.
+        let none = "vst skipped: this host has no plugins";
+        assert_eq!(plugin_lines(&mut session), [none]);
+        let slot = rustel_audio::effect_slot(plugin_chain(&session), 0);
+        host.prepare(fixture, Some("other"), false, 48_000, slot);
+        host.wait_idle();
+        turn(&mut session, 1.0, steady);
+        let failed =
+            "vst skipped: Rustel Fixture did not start: the preset is for a different plugin";
+        assert_eq!(plugin_lines(&mut session), [failed]);
+        let good = rustel_vst3_fixture::preset(0.5, 0.0);
+        std::fs::write(&other, good).expect("preset file");
+        let copies = copies_in(folder.path());
+        let stopped = AtomicBool::new(false);
+        let edit = format!("{score}\n$: s(\"sine\").gain(0).fast(2)");
+        let edit = session.reload_live(&edit, false, &stopped, || 1.0);
+        assert!(matches!(edit, Ok(LiveReload::Installed(_))), "{edit:?}");
+        assert_eq!(copies_in(folder.path()), copies + 1, "the first try");
+    }
+
+    /// 2 documents with one text share one copy. The text waits in
+    /// document 2, and the session holds it while its copy builds. The same
+    /// text in document 3 takes its place, with its read and its plan. A
+    /// text that throws in document 4 before that press leaves the read of
+    /// the hold. The copy of the hold serves that press: no second wait
+    /// starts, and the text lands in document 3 with one copy. A launch of a
+    /// held text in another document takes its place too: its arm builds
+    /// nothing, and nothing waits. A text that throws before the landing
+    /// leaves the plan in its document. A cancel ends the hold. The same
+    /// text in another document then takes no lane of the cancelled read,
+    /// and its new lane gets a new number. A document with a lane of its own
+    /// reads that lane first. A lane of its own with a new body comes first
+    /// too. The text waits in another document for a new copy, and the same
+    /// text in the document with the lane lands at once on its own copy. A
+    /// launch there arms from that lane too, and its arm waits for no copy.
+    /// A launch of a held text in another document needs a copy the hold
+    /// did not wait for. Its wait counts from its arm, with no second line,
+    /// also after the time of the wait before is over. A press in another
+    /// document whose evaluation fails after it took the read and the plan
+    /// leaves both there. The text pressed again in its first document takes
+    /// them back, and lands on the copy of the hold.
+    #[test]
+    fn the_held_text_pressed_in_another_document_lands_on_the_same_copy() {
+        let (_one, folder) = fixture_plugins();
+        let (host, fixture) = (crate::vst::host(), rustel_vst3_fixture::NAME);
+        // The plugin loads first. So each look puts the build of its copy in
+        // the line at once, and a wait for the plugin thread waits for it.
+        let loaded = host.resolve(fixture, true);
+        assert!(matches!(loaded, crate::vst::Resolved::Ready(..)));
+        assert!(
+            host.key(fixture, None, false)
+                .is_ok_and(|key| key.is_some())
+        );
+        host.wait_idle();
+        // Each new copy takes 300 ms in its build, so the copy of a text is
+        // not ready at its commit seam.
+        // SAFETY: one fixture test runs at a time, and the plugin thread has
+        // no work. So no other thread reads the variable now.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV, "300") };
+        let mut session = Session::new().expect("session");
+        session.set_direct_diagnostic_logging(false);
+        session.set_plugin_document(1);
+        let kick = r#"kick: s("sine").gain(0)"#;
+        session.evaluate(kick).expect("score in play");
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        session.plugins_live.store(true, relaxed);
+        session.plugin_rate.store(48_000, relaxed);
+        let stopped = AtomicBool::new(false);
+        session.schedule_through(0.1, 0.1).expect("cover");
+        let generation = session.generation();
+        let text = format!("{kick}\nlead: note(\"c3\").s(\"sine\").vst(\"rustel fixture\")");
+        let waits = |session: &mut Session| {
+            let mut lines = session.take_diagnostics().into_iter();
+            lines.any(|line| line.kind == SAMPLE_AWAITED_DIAGNOSTIC)
+        };
+        session.set_plugin_document(2);
+        let reload = session.reload_live(&text, false, &stopped, past_the_cover(0.15));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 2");
+        // A text that throws in document 4 takes the last read. The read of
+        // the hold stays.
+        session.set_plugin_document(4);
+        let typo = format!("{text}\nthrow new Error(\"typo\")");
+        let failed = session.reload_live(&typo, false, &stopped, || 0.15);
+        assert!(failed.is_err(), "the text that throws");
+        // The copy is ready, and the next look sees it.
+        let ready = |session: &mut Session| {
+            host.wait_idle();
+            let hold = session.plugin_hold.as_mut().expect("the wait");
+            hold.looked = hold.looked.checked_sub(PLUGIN_LOOK_EVERY).expect("uptime");
+            session.take_diagnostics();
+        };
+        ready(&mut session);
+        // The same text in document 3 evaluates there with the read and the
+        // plan of the hold. It lands at once on the copy of the hold.
+        session.set_plugin_document(3);
+        session.schedule_through(0.2, 0.2).expect("cover");
+        let landed = session.reload_live(&text, false, &stopped, || 0.25);
+        assert_eq!(
+            landed.expect("landing"),
+            LiveReload::Installed(generation + 1)
+        );
+        assert!(!waits(&mut session), "a second wait");
+        assert_eq!(session.lanes.document(), 3);
+        assert_eq!(copies_in(folder.path()), 1);
+
+        // A text with a new lane waits in document 4. A launch arms it in
+        // document 5 when its copy is ready, and keeps that copy.
+        let more = format!("{text}\npad: note(\"e3\").s(\"sine\").vst(\"rustel fixture\")");
+        session.set_plugin_document(4);
+        session.schedule_through(0.3, 0.3).expect("cover");
+        let reload = session.reload_live(&more, false, &stopped, past_the_cover(0.35));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        ready(&mut session);
+        session.set_plugin_document(5);
+        session.schedule_through(0.4, 0.4).expect("cover");
+        let prepared = session.prepare_reload(&more, false, 0.0, &stopped, || 0.4);
+        assert!(!prepared.expect("prepare"), "the arm waits");
+        assert!(!waits(&mut session), "a wait of the arm");
+        // A text that throws in document 5 takes the last read. The plan of
+        // the held text stays in 5, so its landing builds no copy.
+        let broken = format!("{more}\nthrow new Error(\"typo\")");
+        let failed = session.reload_live(&broken, false, &stopped, || 0.42);
+        assert!(failed.is_err(), "the text that throws");
+        let landed = session.reload_live(&more, false, &stopped, || 0.45);
+        assert_eq!(
+            landed.expect("landing"),
+            LiveReload::Installed(generation + 2)
+        );
+        assert!(!waits(&mut session), "a wait after the throw");
+        assert_eq!(session.lanes.document(), 5);
+        assert_eq!(copies_in(folder.path()), 2);
+
+        // A cancel ends the hold of a text with a new lane in document 6.
+        // The same text in document 7 then reads its own lanes and the lanes
+        // in play: its new lane gets a new number, not the number of the
+        // cancelled read.
+        let last = format!("{more}\nbass: note(\"g2\").s(\"sine\").vst(\"rustel fixture\")");
+        session.set_plugin_document(6);
+        session.schedule_through(0.5, 0.5).expect("cover");
+        let reload = session.reload_live(&last, false, &stopped, past_the_cover(0.55));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 6");
+        let cancelled = session.lanes.read(&last);
+        session.cancel_plugin_hold();
+        session.set_plugin_document(7);
+        session.schedule_through(0.6, 0.6).expect("cover");
+        let reload = session.reload_live(&last, false, &stopped, past_the_cover(0.65));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 7");
+        let read = session.lanes.read(&last);
+        assert_eq!(read[..3], cancelled[..3], "the lanes in play");
+        assert_ne!(read[3], cancelled[3], "a lane of the cancelled read");
+        session.cancel_plugin_hold();
+        assert_eq!(copies_in(folder.path()), 2);
+
+        // Document 3 rests with its lane and its copy, and document 1 plays
+        // and is heard. The text waits in document 2, with no lane of its
+        // own, for a new copy. The same text in document 3 reads its own lane
+        // first: it lands at once on its copy, with no wait.
+        session.set_plugin_document(1);
+        session.schedule_through(0.7, 0.7).expect("cover");
+        let played = session.reload_live(kick, false, &stopped, || 0.75);
+        assert_eq!(played.expect("kick"), LiveReload::Installed(generation + 3));
+        session
+            .mark_audible_generation(generation + 3)
+            .expect("heard");
+        session.set_plugin_document(2);
+        session.schedule_through(0.8, 0.8).expect("cover");
+        let reload = session.reload_live(&text, false, &stopped, past_the_cover(0.85));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 2");
+        session.set_plugin_document(3);
+        session.schedule_through(0.9, 0.9).expect("cover");
+        let landed = session.reload_live(&text, false, &stopped, || 0.95);
+        assert_eq!(
+            landed.expect("landing"),
+            LiveReload::Installed(generation + 4)
+        );
+        assert!(!waits(&mut session), "a wait of document 3");
+        assert_eq!(session.plugins_waited_for(&text), None);
+        assert_eq!(session.lanes.document(), 3);
+        // The copy of the lead, the copy of the pad and the new copy of
+        // document 2: document 3 builds none.
+        assert_eq!(copies_in(folder.path()), 3);
+
+        // A text with a new lane waits in document 4. Document 5 rests with
+        // the lanes of that text, and a launch arms it there from those
+        // lanes: the arm waits for no copy, and the text lands.
+        session.set_plugin_document(4);
+        session.schedule_through(1.0, 1.0).expect("cover");
+        let reload = session.reload_live(&more, false, &stopped, past_the_cover(1.05));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 4");
+        session.set_plugin_document(5);
+        session.schedule_through(1.1, 1.1).expect("cover");
+        let prepared = session.prepare_reload(&more, false, 0.0, &stopped, || 1.1);
+        assert!(!prepared.expect("prepare"), "the arm of document 5 waits");
+        assert!(!waits(&mut session), "a wait of the arm of document 5");
+        let landed = session.reload_live(&more, false, &stopped, || 1.15);
+        assert_eq!(
+            landed.expect("landing"),
+            LiveReload::Installed(generation + 5)
+        );
+        assert_eq!(session.lanes.document(), 5);
+        // The new copy of document 4 joins the 3: document 5 builds none.
+        assert_eq!(copies_in(folder.path()), 4);
+
+        // Document 3 rests with the lead on c3 and its copy, and document 1
+        // plays and is heard. The lead on e3 waits in document 2 for a new
+        // copy. In document 3 the lead on e3 is its own lane with a new
+        // body: it keeps the number of that lane, and lands at once on its
+        // copy.
+        let other = text.replace("c3", "e3");
+        session.set_plugin_document(3);
+        let own = session.lanes.read(&other);
+        session.set_plugin_document(1);
+        session.schedule_through(1.2, 1.2).expect("cover");
+        let played = session.reload_live(kick, false, &stopped, || 1.25);
+        assert_eq!(played.expect("kick"), LiveReload::Installed(generation + 6));
+        session
+            .mark_audible_generation(generation + 6)
+            .expect("heard");
+        session.set_plugin_document(2);
+        session.schedule_through(1.3, 1.3).expect("cover");
+        let reload = session.reload_live(&other, false, &stopped, past_the_cover(1.35));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 2");
+        session.set_plugin_document(3);
+        session.schedule_through(1.4, 1.4).expect("cover");
+        let landed = session.reload_live(&other, false, &stopped, || 1.45);
+        assert_eq!(
+            landed.expect("landing"),
+            LiveReload::Installed(generation + 7)
+        );
+        assert!(!waits(&mut session), "a wait of document 3");
+        assert_eq!(session.lanes.read(&other), own, "the lead of document 3");
+        // The new copy of document 2 joins the 4: document 3 builds none.
+        assert_eq!(copies_in(folder.path()), 5);
+
+        // A text with a new hat and a lane that plays from cycle 16 waits in
+        // document 8 for the copy of the hat, and the wait is at its end. A
+        // launch arms the text in document 9 from cycle 16. Its arm needs the
+        // copy of the late lane, which the hold did not wait for, and waits
+        // from the arm with no second line.
+        let part = |label: &str, notes: &str| {
+            format!("\n{label}: note(\"{notes}\").s(\"sine\").vst(\"rustel fixture\")")
+        };
+        let sections = format!(
+            "{other}{}{}",
+            part("hat", "g3"),
+            part("late", "<~!16 c5!16>")
+        );
+        session.set_plugin_document(8);
+        session.schedule_through(1.5, 1.5).expect("cover");
+        let reload = session.reload_live(&sections, false, &stopped, past_the_cover(1.55));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 8");
+        let hold = session.plugin_hold.as_mut().expect("the wait");
+        hold.progress = hold.progress.checked_sub(PLUGIN_WAIT).expect("uptime");
+        session.set_plugin_document(9);
+        session.schedule_through(1.6, 1.6).expect("cover");
+        let prepared = session.prepare_reload(&sections, false, 16.0, &stopped, || 1.6);
+        assert!(prepared.expect("prepare"), "the arm of document 9 waits");
+        assert!(!waits(&mut session), "a second wait");
+        assert!(
+            session.waits_for_plugins(&sections),
+            "the wait of document 9"
+        );
+        // The cancel ends the copies of the hat and of the late lane.
+        session.cancel_plugin_hold();
+        assert_eq!(copies_in(folder.path()), 5);
+
+        // A text with a new tom waits in document 10. The same text in
+        // document 11 takes the read and the plan of the hold, and its
+        // evaluation fails on its clock. A text that throws in document 12
+        // takes the last read. The same text in document 10 again takes the
+        // read and the plan back from document 11, and lands on the copy of
+        // the hold.
+        let tom = format!("{text}{}", part("tom", "a3"));
+        session.set_plugin_document(10);
+        session.schedule_through(1.7, 1.7).expect("cover");
+        let reload = session.reload_live(&tom, false, &stopped, past_the_cover(1.75));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 10");
+        session.set_plugin_document(11);
+        let failed = session.reload_live(&tom, false, &stopped, || f64::NAN);
+        assert!(failed.is_err(), "a clock that fails");
+        session.set_plugin_document(12);
+        let typo = format!("{tom}\nthrow new Error(\"typo\")");
+        let failed = session.reload_live(&typo, false, &stopped, || 1.8);
+        assert!(failed.is_err(), "the text that throws");
+        ready(&mut session);
+        session.set_plugin_document(10);
+        session.schedule_through(1.9, 1.9).expect("cover");
+        let landed = session.reload_live(&tom, false, &stopped, || 1.95);
+        assert_eq!(
+            landed.expect("landing"),
+            LiveReload::Installed(generation + 8)
+        );
+        assert!(!waits(&mut session), "a second wait of document 10");
+        assert_eq!(session.lanes.document(), 10);
+        // The copy of the tom joins the 5: the landing builds none.
+        assert_eq!(copies_in(folder.path()), 6);
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV) };
+    }
+
+    /// The lead of the plugin chains follows their copies. The Delay preset
+    /// of the fixture has 480 frames of latency, 10 ms at 48 kHz, and a
+    /// chain of 2 such stages has 20 ms. A look at the copies of the score
+    /// raises the lead by the lanes that play, and the lead the cover keeps
+    /// room for by the lanes that do not play. An edit takes over with the
+    /// lead of its plan when that is larger, and its commit sets the lead.
+    /// The commit seam keeps room in the cover for the lead in play, or for
+    /// the lead of the kept copies when that is larger. An edit with no plan
+    /// takes over with the lead of the score in play, and ends it. At a rate
+    /// with no copy of the plugin, an edit waits at the seam while its copy
+    /// builds, and takes over with the latency of the copy. A look at the
+    /// cycles ahead raises the lead the cover keeps room for. A held edit
+    /// keeps the lead of its plan for the cover, and a launch its arm
+    /// prepared keeps it for its head-room. Both read the copies again: a
+    /// copy that becomes ready after the arm gives its latency to the
+    /// head-room, and a look of the wait gives it to the cover. A copy whose
+    /// plugin asks for a restart goes to the output of its own session, and
+    /// a look after the restart reads its new latency. The new copy of a
+    /// copy that faulted goes to the output of its own session too. A
+    /// prepare or an edit of a new text gives a copy that faulted its new
+    /// copy, and does not wait for it.
+    #[test]
+    fn the_lead_of_the_chains_follows_their_copies() {
+        let (_one, folder) = fixture_plugins();
+        let presets = folder.path().join("presets");
+        let presets = presets.join(rustel_vst3_fixture::NAME);
+        std::fs::create_dir_all(&presets).expect("preset folder");
+        let delay = rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.1171875);
+        for name in ["Delay", "Late", "Arm", "Launch", "Edit"] {
+            let file = presets.join(format!("{name}.vstpreset"));
+            std::fs::write(file, &delay).expect("preset file");
+        }
+        let long = rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 1.0);
+        std::fs::write(presets.join("Long.vstpreset"), long).expect("preset file");
+        let host = crate::vst::host();
+        let mut session = Session::new().expect("session");
+        session.set_direct_diagnostic_logging(false);
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        session.plugins_live.store(true, relaxed);
+        session.plugin_rate.store(48_000, relaxed);
+        session.set_continuity_margin(0.01);
+        // A lane of `stages` Delay stages that plays `notes`.
+        let lane = |notes: &str, stages: usize| {
+            let stage = r#".vst("rustel fixture", { preset: "delay" })"#;
+            format!("$: note(\"{notes}\").s(\"sine\"){}", stage.repeat(stages))
+        };
+        let near = |left: f64, right: f64| (left - right).abs() < 1e-9;
+        // The cover of the producer: the horizon, the margin and a lead.
+        let cover = |session: &Session, lead: f64| {
+            near(session.live_producer_schedule_cover(), 0.5 + 0.01 + lead)
+        };
+
+        // The lane of 1 stage plays, and the lane of 2 is muted.
+        let score = format!("{}\n_{}", lane("c3", 1), lane("e3", 2));
+        session.evaluate(&score).expect("score");
+        let ceiling = Duration::from_secs(1);
+        let started = Instant::now();
+        while session.plugins_pending(0.0, 1.0, ceiling) > 0 || session.plugin_lead() == 0.0 {
+            assert!(started.elapsed() < Duration::from_secs(20), "no copy");
+            host.wait_idle();
+            std::thread::sleep(PLUGIN_LOOK_EVERY);
+        }
+        assert_eq!(copies_in(folder.path()), 3);
+        assert!(near(session.plugin_lead(), 0.01));
+        assert!(cover(&session, 0.02), "the muted lane");
+
+        // The edit plays the lane of 2 stages: its plan has 20 ms of lead.
+        // The takeover waits it in the cover, and the commit sets it. A
+        // smaller lead keeps it.
+        let stopped = AtomicBool::new(false);
+        let floor = LIVE_REPLACEMENT_MIN_HEADROOM.as_secs_f64();
+        let edit = |session: &mut Session, text: &str, mini: bool| {
+            session.schedule_through(0.0, 0.0).expect("cover");
+            let started = Instant::now();
+            let edit = session.reload_live(text, mini, &stopped, || 0.0);
+            let took = started.elapsed();
+            assert!(
+                matches!(edit, Ok(LiveReload::Installed(_))),
+                "{text}: {edit:?} in {took:?}"
+            );
+            session.take_requery_takeover_time().expect("takeover")
+        };
+        let both = format!("{}\n{}", lane("c3", 1), lane("e3", 2));
+        let takeover = edit(&mut session, &both, false);
+        assert!(takeover >= floor + 0.02 - 1e-9, "{takeover}");
+        assert!(near(session.plugin_lead(), 0.02));
+        assert!(cover(&session, 0.02));
+        session.raise_plugin_lead(0.01);
+        assert!(near(session.plugin_lead(), 0.02), "a smaller lead");
+        // The seam keeps room in the cover for the lead in play, or for the
+        // lead of the kept copies when that is larger. So a seam that waits
+        // leaves its commit room for the whole lead.
+        session.schedule_through(0.0, 0.0).expect("cover");
+        let room = session.scheduler.horizon_remaining(0.0) - floor;
+        let spare = |session: &Session, lead: f64| {
+            let spare = session.seam_time(0.0, LIVE_REPLACEMENT_MIN_HEADROOM, None, lead);
+            spare.as_secs_f64()
+        };
+        assert!(near(spare(&session, 0.0), room - 0.02), "the lead in play");
+        let kept = spare(&session, 0.03);
+        assert!(near(kept, room - 0.03), "the lead of the kept copies");
+        // A mini edit has no plan: it takes over with the lead in play, and
+        // its commit ends the lead.
+        let takeover = edit(&mut session, "sine", true);
+        assert!(takeover >= floor + 0.02 - 1e-9, "{takeover}");
+        assert_eq!(session.plugin_lead(), 0.0);
+        assert!(cover(&session, 0.0));
+        // At 44.1 kHz the plugin has no copy yet, and the host knows no
+        // latency of it at that rate. The seam waits while the copy of the
+        // edit builds, and the edit takes over with the latency of the copy:
+        // 480 frames. The Late preset is the Delay preset under a new name,
+        // so its copy is a new build. The build takes 50 ms.
+        host.wait_idle();
+        // SAFETY: one fixture test runs at a time, and the plugin thread has
+        // no work. So no other thread reads the variable now.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV, "50") };
+        session.plugin_rate.store(44_100, relaxed);
+        let first = 480.0 / 44_100.0;
+        let late = r#"$: note("c3").s("sine").vst("rustel fixture", { preset: "late" })"#;
+        session.schedule_through(0.0, 0.0).expect("cover");
+        let landed = session.reload_live(late, false, &stopped, || 0.0);
+        host.wait_idle();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV) };
+        // A slow machine builds the copy past the seam wait. The edit then
+        // waits, and a press after the build takes over with the same lead.
+        let takeover = match landed {
+            Ok(LiveReload::Installed(_)) => session.take_requery_takeover_time().expect("takeover"),
+            Ok(LiveReload::Waiting) => {
+                let hold = session.plugin_hold.as_mut().expect("the wait");
+                hold.looked = hold.looked.checked_sub(PLUGIN_LOOK_EVERY).expect("uptime");
+                edit(&mut session, late, false)
+            }
+            other => panic!("{late}: {other:?}"),
+        };
+        assert!(takeover >= floor + first - 1e-9, "{takeover}");
+        assert!(near(session.plugin_lead(), first));
+        session.plugin_rate.store(48_000, relaxed);
+
+        // A lane with its first note at cycle 6. The plan of the commit
+        // reads 2 cycles, and a look at the cycles ahead finds the note.
+        let dry = r#"$: s("sine").gain(0)"#;
+        let ahead = format!("{dry}\n{}.mask(\"<0!6 1>\")", lane("c3", 1));
+        let edit = session.reload_live(&ahead, false, &stopped, || 0.0);
+        assert!(matches!(edit, Ok(LiveReload::Installed(_))));
+        assert_eq!(session.plugin_lead(), 0.0);
+        assert!(cover(&session, 0.0));
+        look_until(&mut session, 0.0, PLAN_CYCLES, false);
+        assert_eq!(session.plugin_lead(), 0.0);
+        assert!(cover(&session, 0.01), "the cycles ahead");
+        session.raise_cover_lead(0.0);
+        assert!(cover(&session, 0.01), "a smaller lead");
+
+        // A new lane of 2 stages: its copies build for 800 ms, and the edit
+        // waits. The cover keeps room for the lead of the held text.
+        host.wait_idle();
+        // SAFETY: one fixture test runs at a time, and the plugin thread has
+        // no work. So no other thread reads the variable now.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV, "400") };
+        let held = format!("{ahead}\n{}", lane("g3", 2));
+        let edit = session.reload_live(&held, false, &stopped, past_the_cover(0.0));
+        assert_eq!(edit.expect("a held edit"), LiveReload::Waiting);
+        assert_eq!(session.plugin_lead(), 0.0);
+        assert!(cover(&session, 0.02), "the held text");
+        assert!(near(session.takeover_headroom(), 0.02));
+        // A commit with no seam takes no lead of the held text.
+        session.reload_at(&ahead, false, 0.0).expect("a reload");
+        assert_eq!(session.plugin_lead(), 0.0);
+        session.cancel_plugin_hold();
+        host.wait_idle();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV) };
+
+        // A launch its arm prepared fires the lead of its plan earlier.
+        assert_eq!(session.takeover_headroom(), 0.0);
+        session.set_plugin_wait(false);
+        let launch = format!("{dry}\n{}", lane("e3", 2));
+        let prepared = session.prepare_reload(&launch, false, 0.0, &stopped, || 0.0);
+        assert!(!prepared.expect("prepare"));
+        assert!(near(session.takeover_headroom(), 0.02));
+        session.cancel_plugin_hold();
+
+        // The Arm preset is the Delay preset under a new name, so no slot
+        // holds a copy of it. A launch through 2 stages of it at a rate with
+        // no copy builds 2 new copies for 800 ms after its arm. The
+        // head-room reads them again: 2 stages of 480 frames are 30 ms at
+        // 32 kHz. A launch that waits for its copies looks at them again,
+        // and the cover keeps room for their lead: 40 ms at 24 kHz.
+        host.wait_idle();
+        // SAFETY: one fixture test runs at a time, and the plugin thread has
+        // no work. So no other thread reads the variable now.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV, "400") };
+        session.plugin_rate.store(32_000, relaxed);
+        let arm = r#".vst("rustel fixture", { preset: "arm" })"#;
+        let launch = format!("{dry}\n$: note(\"a3\").s(\"sine\"){}", arm.repeat(2));
+        let prepared = session.prepare_reload(&launch, false, 0.0, &stopped, || 0.0);
+        assert!(!prepared.expect("prepare"));
+        assert_eq!(session.takeover_headroom(), 0.0, "no copy at the rate");
+        host.wait_idle();
+        assert!(near(session.takeover_headroom(), 0.03));
+        session.cancel_plugin_hold();
+        session.set_plugin_wait(true);
+        session.plugin_rate.store(24_000, relaxed);
+        let prepared = session.prepare_reload(&launch, false, 0.0, &stopped, || 0.0);
+        assert!(prepared.expect("prepare"), "the launch waits");
+        assert_eq!(session.takeover_headroom(), 0.0);
+        host.wait_idle();
+        let hold = session.plugin_hold.as_mut().expect("the wait");
+        hold.looked = hold.looked.checked_sub(PLUGIN_LOOK_EVERY).expect("uptime");
+        assert!(!session.waits_for_plugins(&launch));
+        assert!(near(session.takeover_headroom(), 0.04));
+        assert!(cover(&session, 0.04), "the copies of the held launch");
+        session.cancel_plugin_hold();
+        host.wait_idle();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV) };
+
+        // At 8 kHz a stage of the Long preset has 4096 frames, 512 ms. A
+        // chain of 2 such stages has 1024 ms, and the lead is 1 s at most.
+        session.plugin_rate.store(8_000, relaxed);
+        let stage = r#".vst("rustel fixture", { preset: "long" })"#;
+        let longest = format!("$: note(\"c3\").s(\"sine\"){}", stage.repeat(2));
+        session.reload_at(&longest, false, 0.0).expect("a reload");
+        let started = Instant::now();
+        while session.plugins_pending(0.0, 1.0, ceiling) > 0 || session.plugin_lead() == 0.0 {
+            assert!(started.elapsed() < Duration::from_secs(20), "no copy");
+            host.wait_idle();
+            std::thread::sleep(PLUGIN_LOOK_EVERY);
+        }
+        assert_eq!(session.plugin_lead(), 1.0);
+
+        // A copy in an engine takes a Delay value of 0.5, so its plugin asks
+        // for a restart. The names source of the session lists the copy, and
+        // the names source of a session with no chain of the copy does not.
+        // The park of the copy restarts it, and a look after the restart
+        // reads its new latency: 2048 frames, 43 ms at 48 kHz.
+        session.plugin_rate.store(48_000, relaxed);
+        let delay = lane("c3", 1);
+        session.reload_at(&delay, false, 0.0).expect("a reload");
+        session.end_plugin_leads();
+        let started = Instant::now();
+        while session.plugins_pending(0.0, 1.0, ceiling) > 0 || session.plugin_lead() == 0.0 {
+            assert!(started.elapsed() < Duration::from_secs(20), "no copy");
+            host.wait_idle();
+            std::thread::sleep(PLUGIN_LOOK_EVERY);
+        }
+        assert!(near(session.plugin_lead(), 0.01));
+        let slot = rustel_audio::effect_slot(plugin_chain(&session), 0);
+        let key = host.key("rustel fixture", Some("delay"), false);
+        let (key, _) = key.expect("a key").expect("a loaded plugin");
+        let mut copy = (host.provider(false))(key, 48_000, slot).expect("a copy");
+        let id = rustel_vst3_fixture::PARAM_DELAY;
+        copy.set_param(rustel_audio::InsertParam { id, value: 0.5 }, 0);
+        copy.process(&mut [0.0; 128], &mut [0.0; 128]);
+        let restarts = |session: &Session| {
+            let turn = rustel_audio::InsertTurn::default();
+            crate::vst::named_chains(&session.chains, turn).restart
+        };
+        let mut other = Session::new().expect("session");
+        other.evaluate(&delay).expect("score");
+        assert_ne!(plugin_chain(&other), slot.chain);
+        assert!(restarts(&other).is_empty(), "a copy of another session");
+        assert_eq!(restarts(&session), [(slot, key)]);
+        drop(copy);
+        host.wait_idle();
+        assert!(restarts(&session).is_empty(), "a copy at home");
+        session.plugins_pending(0.0, 1.0, ceiling);
+        assert!(near(session.plugin_lead(), 2048.0 / 48_000.0));
+
+        // The copy in an engine has no number in its output for 1 s of
+        // sound, so it faults. A try gives it a new copy, and the names
+        // source of the session lists the pair. The names source of the
+        // session with no chain of the copy does not.
+        let mut copy = (host.provider(false))(key, 48_000, slot).expect("a copy");
+        let id = rustel_vst3_fixture::PARAM_FAULT;
+        copy.set_param(rustel_audio::InsertParam { id, value: 1.0 }, 0);
+        for _ in 0..48_000 / 128 {
+            copy.process(&mut [1.0; 128], &mut [1.0; 128]);
+        }
+        assert!(copy.faulted());
+        assert_eq!(session.retry_plugins(), 1);
+        host.wait_idle();
+        let replacements = |session: &Session| {
+            let turn = rustel_audio::InsertTurn::default();
+            crate::vst::named_chains(&session.chains, turn).replace
+        };
+        assert!(replacements(&other).is_empty(), "a copy of another session");
+        assert_eq!(replacements(&session), [(slot, key)]);
+        drop(copy);
+        host.wait_idle();
+        let fault = [
+            "vst Rustel Fixture: a sample of the output was not a number and played as silence",
+            "vst Rustel Fixture: the plugin refused a block",
+            "vst Rustel Fixture: no number in the output for 1 s, so the stage plays silence until \
+             a new copy takes over",
+        ];
+        assert_eq!(host.take_errors(), fault);
+
+        // A prepare and an edit of a new text give a copy in an engine that
+        // faulted its new copy. The look before the try found the copy
+        // ready, so neither waits for the new copy, which builds for 400 ms.
+        for preset in ["launch", "edit"] {
+            let stage = format!(".vst(\"rustel fixture\", {{ preset: \"{preset}\" }})");
+            let score = format!("$: note(\"c3\").s(\"sine\"){stage}");
+            session.reload_at(&score, false, 0.0).expect("a reload");
+            let started = Instant::now();
+            while session.plugins_pending(0.0, 1.0, ceiling) > 0 {
+                assert!(started.elapsed() < Duration::from_secs(20), "no copy");
+                host.wait_idle();
+                std::thread::sleep(PLUGIN_LOOK_EVERY);
+            }
+            let slot = rustel_audio::effect_slot(plugin_chain(&session), 0);
+            let key = host.key("rustel fixture", Some(preset), false);
+            let (key, _) = key.expect("a key").expect("a loaded plugin");
+            let mut copy = (host.provider(false))(key, 48_000, slot).expect("a copy");
+            let id = rustel_vst3_fixture::PARAM_FAULT;
+            copy.set_param(rustel_audio::InsertParam { id, value: 1.0 }, 0);
+            for _ in 0..48_000 / 128 {
+                copy.process(&mut [1.0; 128], &mut [1.0; 128]);
+            }
+            assert!(copy.faulted());
+            host.wait_idle();
+            // SAFETY: one fixture test runs at a time, and the plugin thread
+            // has no work. So no other thread reads the variable now.
+            unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV, "400") };
+            let text = format!("{score}\n{dry}");
+            if preset == "launch" {
+                let prepared = session.prepare_reload(&text, false, 0.0, &stopped, || 0.0);
+                assert!(!prepared.expect("prepare"), "the prepare waits");
+                session.cancel_plugin_hold();
+            } else {
+                let edit = session.reload_live(&text, false, &stopped, || 0.0);
+                assert!(matches!(edit, Ok(LiveReload::Installed(_))), "{edit:?}");
+            }
+            host.wait_idle();
+            // SAFETY: as above.
+            unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV) };
+            let pair = (slot, key);
+            assert!(
+                replacements(&session).contains(&pair),
+                "the try of the {preset}"
+            );
+            drop(copy);
+            host.wait_idle();
+            // The lines of the fault, so its Made leaves.
+            let _ = host.take_errors();
+        }
     }
 }

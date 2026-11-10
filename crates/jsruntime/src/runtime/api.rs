@@ -161,6 +161,7 @@ impl JsRuntime {
             last_good_active: RefCell::new(None),
             last_good_timeline: RefCell::new(None),
             pointer: None,
+            script_may_have_run: Cell::new(true),
         })
     }
 
@@ -367,7 +368,7 @@ impl JsRuntime {
     /// returns, the dangerous frame has already closed.
     pub fn install_gc_binding(&self) -> Result<(), String> {
         let _settings = self.core_settings.bind();
-        with_ctx(&self.ctx, |ctx| -> Result<(), String> {
+        with_ctx(self, |ctx| -> Result<(), String> {
             // `Ctx::run_gc`, not `Runtime::run_gc`: the latter takes the
             // runtime lock, which is already held while JavaScript is running,
             // and re-entering it aborts.
@@ -467,7 +468,7 @@ impl JsRuntime {
         let effect_policy_owner = EffectPolicyOwner::enter(self);
         let _effect_transaction =
             EffectTransactionOwner::enter(self, EffectPolicy::NONE).map_err(|e| e.to_string())?;
-        let result = with_ctx(&self.ctx, |ctx| {
+        let result = with_ctx(self, |ctx| {
             ctx.eval::<rquickjs::Value, _>(src)
                 .map(|_| ())
                 .map_err(|error| describe_js_error(&ctx, error))
@@ -482,13 +483,13 @@ impl JsRuntime {
     /// Read a global as a string - for asserting on descriptors and identity.
     pub fn get_string(&self, name: &str) -> Option<String> {
         let _settings = self.core_settings.bind();
-        with_ctx(&self.ctx, |ctx| ctx.globals().get::<_, String>(name).ok())
+        with_ctx(self, |ctx| ctx.globals().get::<_, String>(name).ok())
     }
 
     /// Read a global as an f64 - for asserting on partial side effects.
     pub fn get_number(&self, name: &str) -> Option<f64> {
         let _settings = self.core_settings.bind();
-        with_ctx(&self.ctx, |ctx| ctx.globals().get::<_, f64>(name).ok())
+        with_ctx(self, |ctx| ctx.globals().get::<_, f64>(name).ok())
     }
 
     /// The bounded native MIDI-map registry as deterministic JSON, or `None`
@@ -521,7 +522,7 @@ impl JsRuntime {
             return Err("slider value must be finite".into());
         }
         let _settings = self.core_settings.bind();
-        with_ctx(&self.ctx, |ctx| -> Result<bool, String> {
+        with_ctx(self, |ctx| -> Result<bool, String> {
             let sets = host_slider_sets(&ctx).map_err(|error| error.to_string())?;
             let values: rquickjs::Object = sets
                 .get(0)
@@ -541,8 +542,14 @@ impl JsRuntime {
     /// QuickJS hands such a panic back only when the next exception reaches
     /// the host, which can be any later call. A recovery boundary calls this
     /// before it returns, so the panic surfaces where it can be recovered.
+    ///
+    /// Only score JavaScript can catch such a panic, so with no script run
+    /// since the last call there is nothing to raise.
     pub fn raise_caught_native_panic(&self) {
-        with_ctx(&self.ctx, |ctx| {
+        if !self.script_may_have_run.replace(false) {
+            return;
+        }
+        with_ctx_running_no_script(self, |ctx| {
             if ctx.eval::<(), _>("throw 0").is_err() {
                 let _ = ctx.catch();
             }
@@ -553,7 +560,7 @@ impl JsRuntime {
     /// invoking score code.
     pub fn slider_values(&self) -> Result<Vec<(String, f64)>, String> {
         let _settings = self.core_settings.bind();
-        with_ctx(&self.ctx, |ctx| -> Result<Vec<(String, f64)>, String> {
+        with_ctx(self, |ctx| -> Result<Vec<(String, f64)>, String> {
             let sets = host_slider_sets(&ctx).map_err(|error| error.to_string())?;
             let values: rquickjs::Object = sets
                 .get(0)
@@ -590,7 +597,7 @@ impl JsRuntime {
             return Err("slider id is invalid".into());
         }
         let _settings = self.core_settings.bind();
-        with_ctx(&self.ctx, |ctx| -> Result<Option<f64>, String> {
+        with_ctx(self, |ctx| -> Result<Option<f64>, String> {
             let sets = host_slider_sets(&ctx).map_err(|error| error.to_string())?;
             let values: rquickjs::Object = sets
                 .get(0)
@@ -619,7 +626,7 @@ impl JsRuntime {
         {
             return None;
         }
-        with_ctx(&self.ctx, |ctx| {
+        with_ctx(self, |ctx| {
             let sets = host_slider_sets(&ctx).ok()?;
             let values: rquickjs::Object = sets.get(0).ok()?;
             if !slider_cell_is_plain_number(&ctx, &values, id).ok()? {
@@ -636,7 +643,7 @@ impl JsRuntime {
     }
 
     pub(crate) fn begin_slider_candidate(&self) -> Result<(), String> {
-        with_ctx(&self.ctx, |ctx| -> Result<(), String> {
+        with_ctx(self, |ctx| -> Result<(), String> {
             let values = rquickjs::Object::new(ctx.clone()).map_err(|error| error.to_string())?;
             values
                 .set_prototype(None)
@@ -654,7 +661,7 @@ impl JsRuntime {
     }
 
     pub(super) fn discard_slider_candidate(&self) {
-        with_ctx(&self.ctx, |ctx| {
+        with_ctx(self, |ctx| {
             if let Ok(sets) = host_slider_sets(&ctx)
                 && let Ok(active) = sets.get::<rquickjs::Value>(0)
             {
@@ -667,7 +674,7 @@ impl JsRuntime {
     }
 
     pub(crate) fn begin_voicing_candidate(&self) -> Result<(), String> {
-        with_ctx(&self.ctx, |ctx| -> Result<(), String> {
+        with_ctx(self, |ctx| -> Result<(), String> {
             let sets = host_voicing_sets(&ctx).map_err(|error| error.to_string())?;
             // Direct JsRuntime embedders may evaluate before installing the
             // optional voicings compatibility surface. There is no registry
@@ -712,7 +719,7 @@ impl JsRuntime {
     }
 
     pub(super) fn discard_voicing_candidate(&self) {
-        with_ctx(&self.ctx, |ctx| {
+        with_ctx(self, |ctx| {
             let Ok(sets) = host_voicing_sets(&ctx) else {
                 return;
             };
@@ -740,7 +747,7 @@ impl JsRuntime {
         &self,
         after_voicing: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
-        with_ctx(&self.ctx, |ctx| -> Result<(), String> {
+        with_ctx(self, |ctx| -> Result<(), String> {
             let slider_sets = host_slider_sets(&ctx).map_err(|error| error.to_string())?;
             let old_sliders: rquickjs::Value = slider_sets
                 .get(0)
@@ -860,7 +867,7 @@ impl JsRuntime {
         pattern: Pattern,
     ) -> Result<usize, String> {
         let _settings = self.core_settings.bind();
-        with_ctx(&self.ctx, |ctx| -> Result<usize, String> {
+        with_ctx(self, |ctx| -> Result<usize, String> {
             // 1. Cells inherited from composed graphs. The new wrapper holds
             //    its own reference, so the source may be released right after.
             let mut ids: Vec<CallbackId> = Vec::new();
@@ -974,7 +981,7 @@ impl JsRuntime {
     ) -> Result<(), String> {
         let idx = self.install(Slot::Held, b, pattern)?;
         let _settings = self.core_settings.bind();
-        with_ctx(&self.ctx, |ctx| -> Result<(), String> {
+        with_ctx(self, |ctx| -> Result<(), String> {
             let arr = host_held(&ctx).map_err(|error| error.to_string())?;
             let w: rquickjs::Value = arr.get(idx).map_err(|e| e.to_string())?;
             arr.set(index, w).map_err(|e| e.to_string())?;
@@ -987,7 +994,7 @@ impl JsRuntime {
     /// `delete globalThis.p` - release a held graph entirely.
     pub fn release_held(&self, index: usize) -> Result<(), String> {
         let _settings = self.core_settings.bind();
-        with_ctx(&self.ctx, |ctx| -> Result<(), String> {
+        with_ctx(self, |ctx| -> Result<(), String> {
             let arr = host_held(&ctx).map_err(|error| error.to_string())?;
             arr.set(index, rquickjs::Value::new_null(ctx.clone()))
                 .map_err(|e| e.to_string())
@@ -1041,7 +1048,7 @@ impl JsRuntime {
     ) -> Result<R, QueryError> {
         self.sync_host_voicing_default()?;
         let _scope = QueryScope::push_active_native(self).map_err(QueryError::Message)?;
-        Ok(with_ctx(&self.ctx, |_ctx| {
+        Ok(with_ctx(self, |_ctx| {
             let frame = BridgeFrame::new(self.ids.clone());
             let _bridge = BridgeScope::push(&frame);
             rustel_core::with_callback_host(self, f)
@@ -1081,7 +1088,7 @@ impl JsRuntime {
         if !rustel_core::voicings::selected_default_voicings_is_host_owned() {
             return Ok(());
         }
-        with_ctx(&self.ctx, |ctx| -> Result<(), QueryError> {
+        with_ctx(self, |ctx| -> Result<(), QueryError> {
             let sets =
                 host_voicing_sets(&ctx).map_err(|error| QueryError::Message(error.to_string()))?;
             if sets.len() < 6 {
@@ -1262,7 +1269,7 @@ impl JsRuntime {
 
         // A stale job has no attributable query owner. Always discard it, but
         // preserve caller cancellation as the dominant public reason.
-        let stale_jobs = with_ctx(&self.ctx, |ctx| discard_pending_jobs(&ctx));
+        let stale_jobs = with_ctx_running_no_script(self, |ctx| discard_pending_jobs(&ctx));
         if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled));
         }
@@ -1287,7 +1294,7 @@ impl JsRuntime {
             fn drop(&mut self) {
                 // Cleanup never executes jobs or JavaScript and is therefore
                 // safe after a deadline/cancellation interrupt and on unwind.
-                with_ctx(&self.rt.ctx, |ctx| {
+                with_ctx_running_no_script(self.rt, |ctx| {
                     let _ = discard_pending_jobs(&ctx);
                 });
                 self.rt.cancel_flag.set(self.previous_cancel);
@@ -1322,7 +1329,7 @@ impl JsRuntime {
         // reason for direct callers; they deliberately do not inspect the
         // current clock or cancellation flag after `f`, which could
         // retroactively reject an already-committed scheduler tick.
-        let jobs = with_ctx(&self.ctx, |ctx| discard_pending_jobs(&ctx));
+        let jobs = with_ctx_running_no_script(self, |ctx| discard_pending_jobs(&ctx));
         let effect_policy = effect_policy_owner.newly_raised_policy();
         if !translate_latched {
             // Scheduler ticks carry the structural refusal in `TickStatus` and
@@ -1426,7 +1433,8 @@ impl JsRuntime {
     ) -> Result<Vec<Hap>, QueryError> {
         self.sync_host_voicing_default()?;
         if matches!(slot, Slot::Active) {
-            let native = with_ctx(&self.ctx, |ctx| -> Option<Pattern> {
+            // Reading the slot runs no score code.
+            let native = with_ctx_running_no_script(self, |ctx| -> Option<Pattern> {
                 let value: rquickjs::Value = host_active(&ctx).ok()?.get(0).ok()?;
                 let wrapper = rquickjs::Class::<NativePatternWrapper>::from_value(&value).ok()?;
                 let pattern = wrapper.borrow().pattern.clone();
@@ -1461,7 +1469,7 @@ impl JsRuntime {
                 // A patterned transformer resolves at QUERY time and can build
                 // new cells then. They belong to this query only, so the frame
                 // is torn down with it rather than accumulating across queries.
-                return with_ctx(&self.ctx, |_ctx| {
+                return with_ctx(self, |_ctx| {
                     let frame = BridgeFrame::new(self.ids.clone());
                     let _bridge = BridgeScope::push(&frame);
                     rustel_core::with_callback_host(self, || {
@@ -1471,13 +1479,13 @@ impl JsRuntime {
                 .map_err(QueryError::from);
             }
         }
-        let pattern = with_ctx(&self.ctx, |ctx| -> Result<Pattern, String> {
+        let pattern = with_ctx(self, |ctx| -> Result<Pattern, String> {
             let w = Self::wrapper_at(&ctx, slot, index)?;
             let p = w.borrow().pattern.clone();
             Ok(p)
         })?;
         let _scope = QueryScope::push(self, slot, index)?;
-        let haps = with_ctx(&self.ctx, |_ctx| {
+        let haps = with_ctx(self, |_ctx| {
             let frame = BridgeFrame::new(self.ids.clone());
             let _bridge = BridgeScope::push(&frame);
             rustel_core::with_callback_host(self, || {
@@ -1521,7 +1529,7 @@ impl JsRuntime {
 
     fn query_shadow_inner(&self, begin: Fraction, end: Fraction) -> Result<Vec<Hap>, QueryError> {
         self.sync_host_voicing_default()?;
-        with_ctx(&self.ctx, |ctx| -> Result<Vec<Hap>, QueryError> {
+        with_ctx(self, |ctx| -> Result<Vec<Hap>, QueryError> {
             let active: rquickjs::Value = host_active(&ctx)
                 .map_err(|error| QueryError::Message(error.to_string()))?
                 .get(0)
@@ -1555,14 +1563,15 @@ impl JsRuntime {
         end: Fraction,
     ) -> Result<Vec<Hap>, rustel_core::QueryLimit> {
         let state = State::new(rustel_core::TimeSpan::new(begin, end));
-        let outcome = pattern.query_arc_outcome_with_budget(&state, self.hap_budget.get())?;
+        let outcome =
+            pattern.query_arc_outcome_sorted_with_budget(&state, self.hap_budget.get())?;
         let threw = match &outcome {
             rustel_core::QueryArcOutcome::Thrown(message) => Some(message.clone()),
             rustel_core::QueryArcOutcome::Haps(_) => None,
         };
         *self.query_threw.borrow_mut() = threw;
         match outcome {
-            rustel_core::QueryArcOutcome::Haps(haps) => Ok(rustel_core::sort_haps_for_query(haps)),
+            rustel_core::QueryArcOutcome::Haps(haps) => Ok(haps),
             rustel_core::QueryArcOutcome::Thrown(_) => Ok(Vec::new()),
         }
     }

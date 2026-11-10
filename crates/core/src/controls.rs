@@ -50,7 +50,7 @@ impl ControlSpec {
         let mut bag = match &value {
             Value::Object(object) if object.contains_key("value") => {
                 let mut object = object.clone();
-                value = object.remove("value").unwrap();
+                value = object.remove("value").expect("the key was just checked");
                 Some(object)
             }
             _ => None,

@@ -47,7 +47,7 @@ impl JsRuntime {
         id: CallbackId,
         pattern: Pattern,
     ) -> Result<Pattern, String> {
-        let out = with_ctx(&self.ctx, |ctx| {
+        let out = with_ctx(self, |ctx| {
             let eager = self.enter_transformer_call(&ctx)?;
             Self::with_callback(&ctx, id, |f| {
                 // The callback may KEEP this wrapper, so it owns the cells
@@ -89,7 +89,7 @@ impl CallbackHost for JsRuntime {
     }
 
     fn call_value(&self, id: CallbackId, v: &Value) -> Result<Value, String> {
-        let out = with_ctx(&self.ctx, |ctx| {
+        let out = with_ctx(self, |ctx| {
             Self::with_callback(&ctx, id, |f| {
                 let arg = to_js(&ctx, v).map_err(|e| describe_js_error(&ctx, e))?;
                 let out: rquickjs::Value = f
@@ -109,7 +109,7 @@ impl CallbackHost for JsRuntime {
     }
 
     fn call_ref(&self, id: CallbackId) -> Result<Pattern, String> {
-        let out = with_ctx(&self.ctx, |ctx| {
+        let out = with_ctx(self, |ctx| {
             Self::with_callback(&ctx, id, |function| {
                 let value: rquickjs::Value = function
                     .call(())
@@ -132,7 +132,7 @@ impl CallbackHost for JsRuntime {
     }
 
     fn call_hap_predicate(&self, id: CallbackId, hap: &Hap) -> Result<bool, String> {
-        let out = with_ctx(&self.ctx, |ctx| {
+        let out = with_ctx(self, |ctx| {
             Self::with_callback(&ctx, id, |function| {
                 let argument =
                     callback_hap(&ctx, hap).map_err(|error| describe_js_error(&ctx, error))?;
@@ -148,7 +148,7 @@ impl CallbackHost for JsRuntime {
     }
 
     fn call_time_predicate(&self, id: CallbackId, time: Fraction) -> Result<bool, String> {
-        let out = with_ctx(&self.ctx, |ctx| {
+        let out = with_ctx(self, |ctx| {
             Self::with_callback(&ctx, id, |function| {
                 let stack = host_stack(&ctx).map_err(|error| describe_js_error(&ctx, error))?;
                 let factory: Function = stack
@@ -175,7 +175,7 @@ impl CallbackHost for JsRuntime {
         id: CallbackId,
         span: rustel_core::TimeSpan,
     ) -> Result<rustel_core::TimeSpan, String> {
-        let out = with_ctx(&self.ctx, |ctx| {
+        let out = with_ctx(self, |ctx| {
             Self::with_callback(&ctx, id, |function| {
                 let stack = host_stack(&ctx).map_err(|error| describe_js_error(&ctx, error))?;
                 let state_factory: Function = stack
@@ -210,7 +210,7 @@ impl CallbackHost for JsRuntime {
     }
 
     fn call_pick_lookup(&self, id: CallbackId) -> Result<rustel_core::PickLookup, String> {
-        let out = with_ctx(&self.ctx, |ctx| {
+        let out = with_ctx(self, |ctx| {
             Self::with_js_value(&ctx, id, |value| {
                 let (lookup, sidecars) = native_pick_lookup(&ctx, &value)
                     .map_err(|error| describe_js_error(&ctx, error))?;
@@ -222,7 +222,7 @@ impl CallbackHost for JsRuntime {
     }
 
     fn call_materialize_value(&self, id: CallbackId) -> Result<Value, String> {
-        let out = with_ctx(&self.ctx, |ctx| {
+        let out = with_ctx(self, |ctx| {
             Self::with_js_value(&ctx, id, |value| {
                 let (value, sidecars) = materialize_js_value(&ctx, &value)
                     .map_err(|error| describe_js_error(&ctx, error))?;
@@ -307,7 +307,7 @@ impl CallbackHost for JsRuntime {
         id: CallbackId,
         patterns: Vec<(Pattern, i64)>,
     ) -> Result<Vec<Pattern>, String> {
-        let out = with_ctx(&self.ctx, |ctx| {
+        let out = with_ctx(self, |ctx| {
             let eager = self.enter_transformer_call(&ctx)?;
             Self::with_callback(&ctx, id, |function| {
                 let mut returned = Vec::new();
@@ -367,7 +367,7 @@ impl CallbackHost for JsRuntime {
     /// stored as the hap's value and the join is what fails. Only a throw
     /// is `Err`.
     fn call_bind(&self, id: CallbackId, arg: BindArg<'_>) -> Result<BindResult, String> {
-        let out = with_ctx(&self.ctx, |ctx| {
+        let out = with_ctx(self, |ctx| {
             Self::with_callback(&ctx, id, |f| {
                 let arg: rquickjs::Value = match arg {
                     BindArg::Value(value) => {
@@ -413,7 +413,7 @@ impl CallbackHost for JsRuntime {
     /// sidecar. The latter is harvested into the live query frame because the
     /// core node queries it immediately after this call.
     fn call_haps(&self, id: CallbackId, haps: &[Hap]) -> Result<Pattern, String> {
-        let out = with_ctx(&self.ctx, |ctx| {
+        let out = with_ctx(self, |ctx| {
             Self::with_callback(&ctx, id, |f| {
                 let array = rquickjs::Array::new(ctx.clone())
                     .map_err(|error| describe_js_error(&ctx, error))?;

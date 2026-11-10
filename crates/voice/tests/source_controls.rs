@@ -32,8 +32,13 @@ fn value(sound: &str, controls: Value) -> Value {
     let mut value = json!({"s": sound, "note": 60});
     value
         .as_object_mut()
-        .unwrap()
-        .extend(controls.as_object().unwrap().clone());
+        .expect("the value is an object")
+        .extend(
+            controls
+                .as_object()
+                .expect("the value is an object")
+                .clone(),
+        );
     value
 }
 
@@ -53,9 +58,9 @@ fn render_events(events: &[OnsetEvent]) -> Vec<f32> {
     backend
         .install_sample(
             SAMPLE,
-            Box::new(DecodedSample::from_parts(SAMPLE_RATE, 1, pcm).unwrap()),
+            Box::new(DecodedSample::from_parts(SAMPLE_RATE, 1, pcm).expect("the sample builds")),
         )
-        .unwrap();
+        .expect("the sample installs");
     let table = (0..4096)
         .map(|frame| {
             let phase = (frame % 2048) as f32 / 2048.0;
@@ -69,9 +74,9 @@ fn render_events(events: &[OnsetEvent]) -> Vec<f32> {
     backend
         .install_sample(
             TABLE,
-            Box::new(DecodedSample::from_parts(SAMPLE_RATE, 1, table).unwrap()),
+            Box::new(DecodedSample::from_parts(SAMPLE_RATE, 1, table).expect("the sample builds")),
         )
-        .unwrap();
+        .expect("the sample installs");
     render_pcm(&mut backend, SAMPLE_RATE, SAMPLE_RATE as usize / 2, events)
         .expect("reference controls render")
 }

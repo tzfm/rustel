@@ -3471,6 +3471,7 @@ fn assembled_live_route_survives_two_valid_saves_one_invalid_and_backpressure() 
     let takeover_cut = AtomicU64::new(0);
     let stopped = AtomicBool::new(false);
     let line_arm = AtomicU64::new(0);
+    let line_fired = AtomicU64::new(0);
     let mut backend = LiveScalarBackend::new(SAMPLE_RATE, 64).expect("live backend");
     let mut log = LiveProducerLog::default();
 
@@ -3507,6 +3508,7 @@ fn assembled_live_route_survives_two_valid_saves_one_invalid_and_backpressure() 
             takeover_frame: &takeover,
             takeover_cut: &takeover_cut,
             line_arm: &line_arm,
+            line_fired: &line_fired,
         },
         &stopped,
     );
@@ -3606,6 +3608,7 @@ fn assembled_live_route_survives_two_valid_saves_one_invalid_and_backpressure() 
             takeover_frame: &takeover,
             takeover_cut: &takeover_cut,
             line_arm: &line_arm,
+            line_fired: &line_fired,
         },
         &stopped,
     );
@@ -3643,6 +3646,7 @@ fn assembled_live_route_survives_two_valid_saves_one_invalid_and_backpressure() 
                 takeover_frame: &takeover,
                 takeover_cut: &takeover_cut,
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         );
@@ -3683,6 +3687,7 @@ fn assembled_live_route_survives_two_valid_saves_one_invalid_and_backpressure() 
                 takeover_frame: &takeover,
                 takeover_cut: &takeover_cut,
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         );
@@ -3797,6 +3802,7 @@ fn assembled_live_route_survives_two_valid_saves_one_invalid_and_backpressure() 
                 takeover_frame: &takeover,
                 takeover_cut: &takeover_cut,
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         );
@@ -3895,6 +3901,7 @@ fn assembled_live_route_survives_two_valid_saves_one_invalid_and_backpressure() 
             takeover_frame: &takeover,
             takeover_cut: &takeover_cut,
             line_arm: &line_arm,
+            line_fired: &line_fired,
         },
         &stopped,
     );
@@ -3928,6 +3935,7 @@ fn assembled_live_route_survives_two_valid_saves_one_invalid_and_backpressure() 
                 takeover_frame: &takeover,
                 takeover_cut: &takeover_cut,
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         );
@@ -4278,6 +4286,7 @@ fn watched_tempo_commit_reaches_the_consumer_and_rejection_keeps_that_clock() {
     let takeover_cut = AtomicU64::new(0);
     let stopped = AtomicBool::new(false);
     let line_arm = AtomicU64::new(0);
+    let line_fired = AtomicU64::new(0);
     let ring = Ring::new(16);
     let mut pushed = Vec::new();
     let mut cutovers = Vec::new();
@@ -4420,6 +4429,7 @@ fn watched_tempo_commit_reaches_the_consumer_and_rejection_keeps_that_clock() {
             takeover_frame: &takeover,
             takeover_cut: &takeover_cut,
             line_arm: &line_arm,
+            line_fired: &line_fired,
         },
         &stopped,
     );
@@ -4549,6 +4559,7 @@ fn watched_tempo_commit_reaches_the_consumer_and_rejection_keeps_that_clock() {
                 takeover_frame: &takeover,
                 takeover_cut: &takeover_cut,
                 line_arm: &line_arm,
+                line_fired: &line_fired,
             },
             &stopped,
         );

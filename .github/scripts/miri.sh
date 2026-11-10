@@ -30,8 +30,12 @@ miri() {
   fi
 }
 
-# Callback host, metrics and cancel pointers.
-miri -p rustel-core --lib -- callback_query_metrics_tests value::tests
+# Callback host, metrics and cancel pointers. The byte copies of table
+# entries, the meetings made in those copies, and the sort that moves each
+# hap once.
+miri -p rustel-core --lib -- callback_query_metrics_tests value::tests \
+  table::tests::bitwise_copies table::tests::meetings_made_in_byte_copies \
+  stable_sort_tests
 miri -p rustel-core --test js_query_refusal --test stack_failure_isolation \
   --test review_remediations
 
@@ -67,6 +71,11 @@ RUSTFLAGS="-C target-feature=+avx2" miri -p rustel-audio --lib -- _kernel::
 # plain Rust; the macOS run-loop calls behind it are FFI and stay outside
 # Miri.
 miri -p rustel-vst3 --lib -- main_thread::tests
+
+# The AV1 picture decoder's unsafe calls into rav1d stay out. rav1d finds its
+# default picture allocator by comparing function pointers, and Miri gives
+# each use of a function its own address on purpose, so a decode under Miri
+# stops inside rav1d before it reaches this code.
 
 # QuickJS allocator and bridge frame stack.
 miri -p rustel-jsruntime --lib -- alloc:: bridge:: runtime::inspection::

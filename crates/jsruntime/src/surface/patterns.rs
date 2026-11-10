@@ -29,7 +29,9 @@ pub(crate) fn native_pure<'js>(
         let (id, sidecar) = bridge_callable(&ctx, function.clone())?;
         return derive_wrapper(
             ctx,
-            rustel_core::pure(Value::Function(rustel_core::value::FunctionRef::js(id))),
+            rustel_core::pure(Value::Function(Box::new(
+                rustel_core::value::FunctionRef::js(id),
+            ))),
             &[sidecar],
         );
     }

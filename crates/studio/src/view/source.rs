@@ -1464,6 +1464,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn light_themes_render_visible_readable_sounding_marks() {
         for name in [
@@ -1911,6 +1912,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn an_armed_mono_slider_uses_the_themes_contrasting_selection_pair() {
         let theme = Theme::built_in("mono").expect("the bundled monochrome theme");
@@ -1953,7 +1955,14 @@ mod tests {
             notch: 0.25,
             armed: false,
         };
-        for theme in [theme(), Theme::built_in("mono").unwrap()] {
+        #[cfg(feature = "themes")]
+        let themes = vec![
+            theme(),
+            Theme::built_in("mono").expect("the bundled monochrome theme"),
+        ];
+        #[cfg(not(feature = "themes"))]
+        let themes = vec![theme()];
+        for theme in themes {
             // Full and partial cover selections, a selection starting at
             // the value, and an ordinary caret outside the slider call.
             for (anchor, selected_cover) in [

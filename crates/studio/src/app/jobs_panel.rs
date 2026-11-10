@@ -118,14 +118,16 @@ impl App {
         }
         if let Some(job) = self.export_job.as_ref() {
             let glance = job.glance();
-            jobs.push(BackgroundJob {
-                name: format!("export {}", glance.scene_name),
-                percent: glance.percent,
-            });
+            let (name, percent) = if glance.preparing {
+                (format!("export {} (preparing)", glance.scene_name), None)
+            } else {
+                (format!("export {}", glance.scene_name), glance.percent)
+            };
+            jobs.push(BackgroundJob { name, percent });
         }
         // The plugin host works on threads of its own: the scan of the
-        // plugins with no test yet, by the plugin in its test, and each
-        // plugin in its load.
+        // plugins with no test yet, by the plugin in its test, each plugin
+        // in its load, and the read of the preset folders.
         #[cfg(feature = "vst")]
         {
             if let Some(scan) = &self.plugin_scan {
@@ -139,6 +141,12 @@ impl App {
                 name: format!("load {name}"),
                 percent: None,
             }));
+            if self.plugin_presets_reading {
+                jobs.push(BackgroundJob {
+                    name: "read presets".to_owned(),
+                    percent: None,
+                });
+            }
         }
         // Loader line with no named pack/import progress yet.
         if jobs.is_empty() && self.caching_samples > 0 {
@@ -148,5 +156,31 @@ impl App {
             });
         }
         jobs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::support;
+
+    /// The read of the preset folders, which a change of the folders runs
+    /// on the plugin thread, is a row of the sheet while it runs.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn the_read_of_the_preset_folders_is_a_background_job() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (mut app, _) = support::plain_app(directory.path(), "$: s(\"bd\")\n");
+        let running = |app: &App| {
+            app.background_jobs()
+                .into_iter()
+                .find(|job| job.name == "read presets")
+        };
+        assert!(running(&app).is_none(), "no read runs");
+        app.plugin_presets_reading = true;
+        let job = running(&app).expect("the row of the read");
+        assert_eq!(job.percent, None);
+        app.plugin_presets_reading = false;
+        assert!(running(&app).is_none(), "the read ended");
     }
 }

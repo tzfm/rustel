@@ -41,6 +41,7 @@ pub fn reference_entries() -> impl Iterator<Item = &'static rustel_core::referen
 {
     unsupported::REFERENCE_ENTRIES
         .iter()
+        .chain(unsupported::ABSENT_VISUALS_ENTRIES.iter())
         .chain(slider::REFERENCE_ENTRIES.iter())
         .chain(generators::REFERENCE_ENTRIES.iter())
         .chain(csound::REFERENCE_ENTRIES.iter())
@@ -55,6 +56,13 @@ pub fn reference_entries() -> impl Iterator<Item = &'static rustel_core::referen
 pub fn kabelsalat_reference_entries()
 -> impl Iterator<Item = &'static rustel_core::reference::ReferenceEntry> {
     kabelsalat::reference_entries()
+}
+
+/// Hydra-scoped reference entries, separate from same-named pattern functions.
+#[cfg(feature = "hydra")]
+pub fn hydra_reference_entries()
+-> impl Iterator<Item = &'static rustel_core::reference::ReferenceEntry> {
+    hydra::reference_entries()
 }
 
 fn install_logger<'js>(
@@ -108,7 +116,7 @@ impl JsRuntime {
     /// same-named control aliases on the prototype.
     pub fn install_semantic_bindings(&self) -> Result<(), String> {
         let _settings = self.core_settings.bind();
-        with_ctx(&self.ctx, |ctx| -> Result<(), String> {
+        with_ctx(self, |ctx| -> Result<(), String> {
             let surface = foundation::install(self, ctx.clone())?;
             install_logger(self, &ctx, &surface.globals)?;
             kabelsalat::install(&ctx).map_err(|error| error.to_string())?;

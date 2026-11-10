@@ -5,6 +5,11 @@
 //! `--automation-hz=30 'Plugin:param'` adds parameter edits.
 //! The device receives silence. The measured chain receives a continuous sine.
 //! Timing misses describe this callback, not confirmed hardware underruns.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "the example prints its measurements"
+)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -118,7 +123,7 @@ fn load(host: &Host, options: &Options) -> Result<Vec<Loaded>, String> {
                         .params()
                         .iter()
                         .find(|param| param.id == id)
-                        .unwrap()
+                        .expect("the parameter list has the id")
                         .default as f32;
                     Ok::<_, String>(InsertParam { id, value })
                 })
@@ -230,8 +235,10 @@ impl Chain {
             }
         }
         if update {
-            self.edit = (self.frame as f64 * self.automation_hz.unwrap() / f64::from(self.rate))
-                .floor() as u64
+            self.edit = (self.frame as f64
+                * self.automation_hz.expect("the automation rate is set")
+                / f64::from(self.rate))
+            .floor() as u64
                 + 1;
         }
         if note_due {

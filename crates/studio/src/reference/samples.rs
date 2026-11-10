@@ -2,6 +2,32 @@
 
 use super::*;
 
+/// The file of the sound under the samples tab's cursor, and its facts:
+/// `None` until the App has read them off its thread.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SampleDetails {
+    pub url: String,
+    pub facts: Option<rustel_runtime::samples::SampleFacts>,
+    /// The facts can be out of date: they were never read, the file was
+    /// not on this machine yet, or a trim rewrote it. They stay on show
+    /// until the next read answers.
+    pub stale: bool,
+    /// How far into the file a preview of it has got, in seconds, while
+    /// one sounds.
+    pub played: Option<f64>,
+}
+
+impl SampleDetails {
+    pub fn unread(url: String) -> Self {
+        Self {
+            url,
+            facts: None,
+            stale: true,
+            played: None,
+        }
+    }
+}
+
 /// What a family is remembered by: its section and its shared name.
 ///
 /// The discriminant keeps an import whose spec reads like a category name
@@ -476,6 +502,26 @@ impl ReferencePanel {
                 .sounds
                 .get(*index)
                 .map(|entry| SelectedSound::Variant(entry.name.clone(), *variant)),
+        }
+    }
+
+    /// The sound the details describe: a bank and its numbered file, or a
+    /// bank alone, which the details show by its first file. `None` on a
+    /// kind or a family of sounds.
+    pub fn details_target(&self) -> Option<(String, Option<usize>)> {
+        let (index, variant) = match self.sound_rows().get(self.sound_selected)? {
+            SoundRow::Bank(index) => (*index, None),
+            SoundRow::Variant(index, variant) => (*index, Some(*variant)),
+            SoundRow::Category(_) | SoundRow::Family(_) => return None,
+        };
+        Some((self.sounds.get(index)?.name.clone(), variant))
+    }
+
+    /// How many files the bank under the cursor holds, on a bank's own row.
+    pub(super) fn selected_bank_files(&self) -> Option<usize> {
+        match self.sound_rows().get(self.sound_selected)? {
+            SoundRow::Bank(index) => self.sounds.get(*index).map(|entry| entry.variants),
+            _ => None,
         }
     }
 

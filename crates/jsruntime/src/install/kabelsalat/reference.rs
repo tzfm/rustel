@@ -1859,7 +1859,7 @@ mod tests {
     fn catalog_matches_installed_globals_members_and_properties() {
         let runtime = JsRuntime::new().expect("runtime");
         runtime.install_semantic_bindings().expect("bindings");
-        let (mut globals, methods, values) = with_ctx(&runtime.ctx, |ctx| {
+        let (mut globals, methods, values) = with_ctx(&runtime, |ctx| {
             let state = Rc::new(graph::State::new(&ctx).expect("graph state"));
             ctx.userdata::<GraphCompiler>()
                 .expect("graph compiler")

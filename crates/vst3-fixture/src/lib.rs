@@ -1,8 +1,8 @@
 //! Two small VST3 plugins in one bundle, for the plugin host tests.
 //!
-//! The first is an effect: a gain with a beat gate and a delay. The effect
-//! has a processor class and a controller class, as most plugins do. The
-//! state is 24 bytes: the gain, the gate and the delay as three
+//! The first is an effect: a gain with a beat gate, a delay and a fault.
+//! The effect has a processor class and a controller class, as most plugins
+//! do. The state is 24 bytes: the gain, the gate and the delay as three
 //! little-endian `f64` values. A state of 16 bytes has the gain and the
 //! gate, and loads with a delay of 0.
 //!
@@ -22,7 +22,7 @@ use std::{ptr, slice};
 
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
-use vst3::{Class, ComRef, ComWrapper, uid};
+use vst3::{Class, ComPtr, ComRef, ComWrapper, Interface, uid};
 
 /// The name of the effect, and the name of the bundle.
 pub const NAME: &str = "Rustel Fixture";
@@ -41,10 +41,18 @@ pub const PARAM_GATE: u32 = 101;
 pub const PARAM_BYPASS: u32 = 102;
 /// Parameter "Delay": the effect delays its output by the value times 4096
 /// frames, to the nearest frame, and gives that delay as its latency. The
-/// delay takes the value the parameter has when the plugin turns on.
+/// delay takes the value the parameter has when the plugin turns on. A
+/// block whose last Delay value differs from the delay in use asks the host
+/// for a restart, through a message to the controller, as a plugin with a
+/// latency from a value does. See also [`LATE_LATENCY_ENV`].
 pub const PARAM_DELAY: u32 = 103;
 /// The longest delay of the effect in frames: see [`PARAM_DELAY`].
 const MAX_DELAY: usize = 4096;
+/// Parameter "Fault": at 0.5 and above, each sample of the output is no
+/// number and the block is refused, as a plugin that breaks. From 0.25 to
+/// 0.5, the effect plays as before and refuses the block. A state carries
+/// no fault, so a preset never breaks the plugin.
+pub const PARAM_FAULT: u32 = 104;
 
 const PROCESSOR: TUID = uid(0x52757374, 0x656C4669, 0x78747572, 0x65507263);
 const CONTROLLER: TUID = uid(0x52757374, 0x656C4669, 0x78747572, 0x6543746C);
@@ -111,8 +119,9 @@ pub fn preset_with_delay(gain: f64, gate: f64, delay: f64) -> Vec<u8> {
 }
 
 /// The bytes of a `.vstpreset` file with `values` as the state, each one a
-/// little-endian `f64`.
-fn preset_file(values: &[f64]) -> Vec<u8> {
+/// little-endian `f64`. A state of 16 or 24 bytes loads, and the effect
+/// refuses each other state.
+pub fn preset_file(values: &[f64]) -> Vec<u8> {
     let state: Vec<u8> = values
         .iter()
         .flat_map(|value| value.to_le_bytes())
@@ -157,6 +166,7 @@ struct Values {
     gate: AtomicU64,
     bypass: AtomicU64,
     delay: AtomicU64,
+    fault: AtomicU64,
 }
 
 impl Values {
@@ -166,6 +176,7 @@ impl Values {
             gate: AtomicU64::new(0.0f64.to_bits()),
             bypass: AtomicU64::new(0.0f64.to_bits()),
             delay: AtomicU64::new(0.0f64.to_bits()),
+            fault: AtomicU64::new(0.0f64.to_bits()),
         }
     }
 
@@ -175,6 +186,7 @@ impl Values {
             PARAM_GATE => Some(&self.gate),
             PARAM_BYPASS => Some(&self.bypass),
             PARAM_DELAY => Some(&self.delay),
+            PARAM_FAULT => Some(&self.fault),
             _ => None,
         }
     }
@@ -209,7 +221,13 @@ impl Values {
         if result != kResultOk || !matches!(count, 16 | 24) {
             return kResultFalse;
         }
-        let value = |at: usize| f64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let value = |at: usize| {
+            f64::from_le_bytes(
+                bytes[at..at + 8]
+                    .try_into()
+                    .expect("the slice has the right length"),
+            )
+        };
         self.set(PARAM_GAIN, value(0));
         self.set(PARAM_GATE, value(8));
         self.set(PARAM_DELAY, value(16));
@@ -270,15 +288,143 @@ impl Delay {
     }
 }
 
+/// The echo of the effect: see [`ECHO_ENV`].
+struct Echo {
+    /// The time of the echo in milliseconds, read one time, with the
+    /// plugin.
+    millis: u32,
+    /// The place in the ring of the next frame.
+    at: usize,
+    /// The frames of the time of the echo. The ring takes its size at
+    /// `setupProcessing`, so the audio call allocates nothing.
+    ring: Vec<[f32; 2]>,
+}
+
+impl Echo {
+    fn new() -> Self {
+        let millis = std::env::var(ECHO_ENV)
+            .ok()
+            .and_then(|text| text.parse().ok());
+        Self {
+            millis: millis.unwrap_or(0),
+            at: 0,
+            ring: Vec::new(),
+        }
+    }
+
+    /// Gives the ring the frames of the echo at `sample_rate`.
+    fn setup(&mut self, sample_rate: f64) {
+        let frames = f64::from(self.millis) * sample_rate / 1000.0;
+        self.ring = vec![[0.0; 2]; frames.round() as usize];
+        self.at = 0;
+    }
+
+    /// Starts the echo with silence in the ring.
+    fn start(&mut self) {
+        self.ring.fill([0.0; 2]);
+        self.at = 0;
+    }
+
+    /// Takes one frame in, and gives the frame that came in the time of the
+    /// echo before it, or silence with no echo.
+    fn pass(&mut self, frame: [f32; 2]) -> [f32; 2] {
+        let Some(place) = self.ring.get_mut(self.at) else {
+            return [0.0; 2];
+        };
+        let out = std::mem::replace(place, frame);
+        self.at = (self.at + 1) % self.ring.len();
+        out
+    }
+}
+
 struct Processor {
     values: Values,
     delay: RefCell<Delay>,
+    /// See [`ECHO_ENV`].
+    echo: RefCell<Echo>,
     /// Read one time, with the plugin: the audio call reads no variable.
     prints: bool,
     /// The spin of each process call: see [`COST_ENV`].
     cost: Duration,
+    /// The sleep of each setActive call: see [`SLOW_ACTIVATE_ENV`].
+    activate: Duration,
     /// See [`PROCESS_MARK_ENV`].
     mark: Option<ProcessMark>,
+    /// See [`MODE_MARK_ENV`] and [`REALTIME_ONLY_ENV`].
+    modes: Modes,
+    /// The host context of `initialize`: it makes the message of `connect`.
+    host: RefCell<Option<ComPtr<IHostApplication>>>,
+    /// The controller and the message that asks it for a restart, from
+    /// `connect` to `disconnect`: see [`PARAM_DELAY`].
+    peer: RefCell<Option<(ComPtr<IConnectionPoint>, ComPtr<IMessage>)>>,
+    /// The Delay value of the last setActive(1): the delay in use.
+    in_use: Cell<f64>,
+    /// See [`LATE_LATENCY_ENV`]. Read one time, with the plugin.
+    late: bool,
+    /// True from a setActive(1) to the end of the first block after it.
+    first: Cell<bool>,
+    /// The Delay value the first block after the last setActive(1) found.
+    found: Cell<Option<f64>>,
+    /// See [`RATE_LATENCY_ENV`]. Read one time, with the plugin.
+    timed: bool,
+    /// The rate of the last setupProcessing.
+    rate: Cell<f64>,
+    /// The rate the first block after the last setActive(1) found, or the
+    /// rate of the first setupProcessing: see [`RATE_LATENCY_ENV`].
+    rate_found: Cell<f64>,
+    /// The rate of the delay in use: see [`RATE_LATENCY_ENV`].
+    delay_rate: Cell<f64>,
+    /// The first blocks that still break: see [`EARLY_FAULT_ENV`].
+    early: Cell<u32>,
+}
+
+impl Processor {
+    /// A new copy. The copy reads each variable here, so a block reads
+    /// none.
+    fn new() -> Self {
+        Self {
+            values: Values::new(),
+            delay: RefCell::new(Delay::new()),
+            echo: RefCell::new(Echo::new()),
+            prints: std::env::var_os(PRINT_ENV).is_some(),
+            cost: process_cost(),
+            activate: activate_time(),
+            mark: ProcessMark::new(),
+            modes: Modes::new(),
+            host: RefCell::new(None),
+            peer: RefCell::new(None),
+            in_use: Cell::new(0.0),
+            late: std::env::var_os(LATE_LATENCY_ENV).is_some(),
+            first: Cell::new(false),
+            found: Cell::new(None),
+            timed: std::env::var_os(RATE_LATENCY_ENV).is_some(),
+            rate: Cell::new(0.0),
+            rate_found: Cell::new(0.0),
+            delay_rate: Cell::new(0.0),
+            early: Cell::new(if std::env::var_os(EARLY_FAULT_ENV).is_some() {
+                EARLY_FAULT_BLOCKS
+            } else {
+                0
+            }),
+        }
+    }
+
+    /// Asks the controller for a restart when `value` differs from the
+    /// delay in use. Makes no allocation and takes no lock.
+    fn check_delay(&self, value: f64) {
+        if value != self.in_use.get() {
+            self.ask_restart();
+        }
+    }
+
+    /// Asks the controller for a restart. Makes no allocation and takes no
+    /// lock.
+    fn ask_restart(&self) {
+        if let Some((peer, message)) = &*self.peer.borrow() {
+            // SAFETY: the message lives while the processor holds it.
+            unsafe { peer.notify(message.as_ptr()) };
+        }
+    }
 }
 
 /// The final release of the object, wherever it runs: a host that ends the
@@ -290,12 +436,15 @@ impl Drop for Processor {
 }
 
 impl Class for Processor {
-    type Interfaces = (IComponent, IAudioProcessor);
+    type Interfaces = (IComponent, IAudioProcessor, IConnectionPoint);
 }
 
 impl IPluginBaseTrait for Processor {
-    unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
+    unsafe fn initialize(&self, context: *mut FUnknown) -> tresult {
         slow_load(SLOW_CLASS_ENV);
+        // SAFETY: the host gives a context that lives for the call.
+        let host = unsafe { ComRef::from_raw(context) }.and_then(|context| context.cast());
+        *self.host.borrow_mut() = host;
         kResultOk
     }
 
@@ -304,6 +453,42 @@ impl IPluginBaseTrait for Processor {
         if let Some(mark) = &self.mark {
             mark.write();
         }
+        self.peer.borrow_mut().take();
+        self.host.borrow_mut().take();
+        kResultOk
+    }
+}
+
+impl IConnectionPointTrait for Processor {
+    unsafe fn connect(&self, other: *mut IConnectionPoint) -> tresult {
+        // SAFETY: the host gives a connection point that lives for the call.
+        let Some(other) = (unsafe { ComRef::from_raw(other) }) else {
+            return kInvalidArgument;
+        };
+        let Some(host) = &*self.host.borrow() else {
+            return kResultFalse;
+        };
+        let mut class: TUID = IMessage::IID.map(|byte| byte as c_char);
+        let mut interface = class;
+        let mut made = ptr::null_mut();
+        // SAFETY: the ids and the out-pointer live for the call.
+        if unsafe { host.createInstance(&mut class, &mut interface, &mut made) } != kResultOk {
+            return kResultFalse;
+        }
+        // SAFETY: the host made an IMessage with one reference for the caller.
+        let Some(message) = (unsafe { ComPtr::from_raw(made.cast::<IMessage>()) }) else {
+            return kResultFalse;
+        };
+        *self.peer.borrow_mut() = Some((other.to_com_ptr(), message));
+        kResultOk
+    }
+
+    unsafe fn disconnect(&self, _other: *mut IConnectionPoint) -> tresult {
+        self.peer.borrow_mut().take();
+        kResultOk
+    }
+
+    unsafe fn notify(&self, _message: *mut IMessage) -> tresult {
         kResultOk
     }
 }
@@ -365,9 +550,25 @@ impl IComponentTrait for Processor {
     }
 
     unsafe fn setActive(&self, state: TBool) -> tresult {
+        sleep(self.activate);
         if state != 0 {
-            let frames = self.values.get(PARAM_DELAY) * MAX_DELAY as f64;
+            let now = self.values.get(PARAM_DELAY);
+            let value = match self.found.take() {
+                Some(found) if self.late => found,
+                _ => now,
+            };
+            self.in_use.set(value);
+            self.first.set(true);
+            // A timed delay is a time: its frames follow the rate it found.
+            self.delay_rate.set(self.rate_found.get());
+            let scale = if self.timed {
+                self.delay_rate.get() / TIMED_DELAY_RATE
+            } else {
+                1.0
+            };
+            let frames = value * MAX_DELAY as f64 * scale;
             self.delay.borrow_mut().start(frames.round() as usize);
+            self.echo.borrow_mut().start();
         }
         kResultOk
     }
@@ -420,7 +621,17 @@ impl IAudioProcessorTrait for Processor {
         self.delay.borrow().frames as u32
     }
 
-    unsafe fn setupProcessing(&self, _setup: *mut ProcessSetup) -> tresult {
+    unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
+        // SAFETY: the host gives a setup that lives for the call.
+        let setup = unsafe { &*setup };
+        if !self.modes.take(setup) {
+            return kResultFalse;
+        }
+        self.rate.set(setup.sampleRate);
+        if self.rate_found.get() == 0.0 {
+            self.rate_found.set(setup.sampleRate);
+        }
+        self.echo.borrow_mut().setup(setup.sampleRate);
         kResultOk
     }
 
@@ -440,6 +651,8 @@ impl IAudioProcessorTrait for Processor {
         let mut gain = self.values.get(PARAM_GAIN) as f32;
         let mut gain_points = [(0usize, 0.0f32); 8];
         let mut gain_count = 0;
+        // The last Delay value of the block: see `PARAM_DELAY`.
+        let mut delay_point = None;
         if let Some(changes) = unsafe { ComRef::from_raw(data.inputParameterChanges) } {
             for index in 0..unsafe { changes.getParameterCount() } {
                 let Some(queue) = (unsafe { ComRef::from_raw(changes.getParameterData(index)) })
@@ -457,19 +670,58 @@ impl IAudioProcessorTrait for Processor {
                         gain_points[gain_count] = (offset.max(0) as usize, value as f32);
                         gain_count += 1;
                     }
+                    if id == PARAM_DELAY {
+                        delay_point = Some(value);
+                    }
                 }
             }
         }
-        if data.numInputs != 1 || data.numOutputs != 1 || data.numSamples <= 0 {
-            return kResultOk;
+        // A late copy reads its Delay value in the first block after it
+        // turns on, and takes it at the next setActive(1). A timed copy
+        // reads its rate there.
+        let first = self.first.replace(false);
+        if self.timed && first && self.rate.get() != self.delay_rate.get() {
+            self.rate_found.set(self.rate.get());
+            self.ask_restart();
         }
-        if self.values.get(PARAM_BYPASS) >= 0.5 {
+        if self.late && first {
+            let value = self.values.get(PARAM_DELAY);
+            self.found.set(Some(value));
+            self.check_delay(value);
+        } else if let Some(value) = delay_point {
+            self.check_delay(value);
+        }
+        if data.numInputs != 1 || data.numOutputs != 1 || data.numSamples <= 0 {
             return kResultOk;
         }
         let frames = data.numSamples as usize;
         let (input, output) = unsafe { (&*data.inputs, &*data.outputs) };
         if input.numChannels != 2 || output.numChannels != 2 {
             return kResultOk;
+        }
+        let channel = |buses: &AudioBusBuffers, channel: usize| unsafe {
+            *buses.__field0.channelBuffers32.add(channel)
+        };
+        // A broken copy writes no number and refuses the block: see
+        // `PARAM_FAULT` and `EARLY_FAULT_ENV`.
+        let fault = self.values.get(PARAM_FAULT);
+        let early = self.early.get();
+        self.early.set(early.saturating_sub(1));
+        if fault >= 0.5 || early > 0 {
+            for side in 0..2 {
+                // SAFETY: each channel holds the samples of the block, and the
+                // checks above found 2 channels on each bus.
+                unsafe { slice::from_raw_parts_mut(channel(output, side), frames) }.fill(f32::NAN);
+            }
+            return kResultFalse;
+        }
+        let done = if fault >= 0.25 {
+            kResultFalse
+        } else {
+            kResultOk
+        };
+        if self.values.get(PARAM_BYPASS) >= 0.5 {
+            return done;
         }
         // The beat position of the first frame, and the beats per frame.
         let mut clock = None;
@@ -485,10 +737,8 @@ impl IAudioProcessorTrait for Processor {
                 ));
             }
         }
-        let channel = |buses: &AudioBusBuffers, channel: usize| unsafe {
-            *buses.__field0.channelBuffers32.add(channel)
-        };
         let mut delay = self.delay.borrow_mut();
+        let mut echo = self.echo.borrow_mut();
         let mut next_point = 0;
         for frame in 0..frames {
             while next_point < gain_count && gain_points[next_point].0 <= frame {
@@ -501,21 +751,24 @@ impl IAudioProcessorTrait for Processor {
             // SAFETY: each channel holds the samples of the block, and the
             // checks above found 2 channels on each bus.
             let samples = [0, 1].map(|side| unsafe { *channel(input, side).add(frame) } * level);
+            let echoed = echo.pass(samples);
             for (side, sample) in delay.pass(samples).into_iter().enumerate() {
                 // SAFETY: as above.
-                unsafe { *channel(output, side).add(frame) = sample };
+                unsafe { *channel(output, side).add(frame) = sample + echoed[side] };
             }
         }
-        kResultOk
+        done
     }
 
     unsafe fn getTailSamples(&self) -> u32 {
-        0
+        self.echo.borrow().ring.len() as u32
     }
 }
 
 struct Controller {
     values: Values,
+    /// The handler of the host, from `setComponentHandler`.
+    handler: RefCell<Option<ComPtr<IComponentHandler>>>,
 }
 
 impl Drop for Controller {
@@ -525,7 +778,29 @@ impl Drop for Controller {
 }
 
 impl Class for Controller {
-    type Interfaces = (IEditController,);
+    type Interfaces = (IEditController, IConnectionPoint);
+}
+
+/// The processor holds the controller. The controller keeps no processor,
+/// so the two objects make no cycle of references. A message from the
+/// processor asks for a restart for a new latency: see [`PARAM_DELAY`].
+impl IConnectionPointTrait for Controller {
+    unsafe fn connect(&self, _other: *mut IConnectionPoint) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn disconnect(&self, _other: *mut IConnectionPoint) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn notify(&self, _message: *mut IMessage) -> tresult {
+        if let Some(handler) = &*self.handler.borrow() {
+            let flags = RestartFlags_::kLatencyChanged as i32;
+            // SAFETY: the call takes no pointer.
+            unsafe { handler.restartComponent(flags) };
+        }
+        kResultOk
+    }
 }
 
 impl IPluginBaseTrait for Controller {
@@ -552,7 +827,7 @@ impl IEditControllerTrait for Controller {
     }
 
     unsafe fn getParameterCount(&self) -> i32 {
-        4
+        5
     }
 
     unsafe fn getParameterInfo(&self, index: i32, info: *mut ParameterInfo) -> tresult {
@@ -561,6 +836,7 @@ impl IEditControllerTrait for Controller {
             1 => (PARAM_GATE, "Beat Gate", 0.0),
             2 => (PARAM_BYPASS, "Bypass", 0.0),
             3 => (PARAM_DELAY, "Delay", 0.0),
+            4 => (PARAM_FAULT, "Fault", 0.0),
             _ => return kInvalidArgument,
         };
         let info = unsafe { &mut *info };
@@ -618,7 +894,10 @@ impl IEditControllerTrait for Controller {
         }
     }
 
-    unsafe fn setComponentHandler(&self, _handler: *mut IComponentHandler) -> tresult {
+    unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
+        // SAFETY: the host gives a handler that lives for the call, or none.
+        let handler = unsafe { ComRef::from_raw(handler) }.map(|handler| handler.to_com_ptr());
+        *self.handler.borrow_mut() = handler;
         kResultOk
     }
 
@@ -650,8 +929,12 @@ struct Tone {
     calls: Cell<u32>,
     /// The spin of each process call: see [`COST_ENV`].
     cost: Duration,
+    /// The sleep of each setActive call: see [`SLOW_ACTIVATE_ENV`].
+    activate: Duration,
     /// See [`PROCESS_MARK_ENV`].
     mark: Option<ProcessMark>,
+    /// See [`MODE_MARK_ENV`] and [`REALTIME_ONLY_ENV`].
+    modes: Modes,
 }
 
 impl Drop for Tone {
@@ -669,7 +952,9 @@ impl Tone {
             voices: RefCell::new(Vec::with_capacity(128)),
             calls: Cell::new(0),
             cost: process_cost(),
+            activate: activate_time(),
             mark: ProcessMark::new(),
+            modes: Modes::new(),
         }
     }
 
@@ -770,6 +1055,7 @@ impl IComponentTrait for Tone {
     }
 
     unsafe fn setActive(&self, _state: TBool) -> tresult {
+        sleep(self.activate);
         kResultOk
     }
 
@@ -821,7 +1107,12 @@ impl IAudioProcessorTrait for Tone {
     }
 
     unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
-        self.sample_rate.set(unsafe { (*setup).sampleRate });
+        // SAFETY: the host gives a setup that lives for the call.
+        let setup = unsafe { &*setup };
+        if !self.modes.take(setup) {
+            return kResultFalse;
+        }
+        self.sample_rate.set(setup.sampleRate);
         kResultOk
     }
 
@@ -952,17 +1243,11 @@ impl IPluginFactoryTrait for Factory {
         let instance = match unsafe { *(cid as *const TUID) } {
             PROCESSOR => {
                 thread_mark("make");
-                ComWrapper::new(Processor {
-                    values: Values::new(),
-                    delay: RefCell::new(Delay::new()),
-                    prints: std::env::var_os(PRINT_ENV).is_some(),
-                    cost: process_cost(),
-                    mark: ProcessMark::new(),
-                })
-                .to_com_ptr::<FUnknown>()
+                ComWrapper::new(Processor::new()).to_com_ptr::<FUnknown>()
             }
             CONTROLLER => ComWrapper::new(Controller {
                 values: Values::new(),
+                handler: RefCell::new(None),
             })
             .to_com_ptr::<FUnknown>(),
             TONE => {
@@ -1023,6 +1308,25 @@ pub const ABORT_ENV: &str = "RUSTEL_VST3_FIXTURE_ABORT";
 /// many milliseconds more, as the load of a large plugin does.
 pub const SLOW_ENV: &str = "RUSTEL_VST3_FIXTURE_SLOW";
 
+/// With this variable set to a number, each new copy of the effect and the
+/// instrument takes that many milliseconds more in each setActive call, as
+/// a large plugin does when it turns on or off. The copy reads the variable
+/// at its creation.
+pub const SLOW_ACTIVATE_ENV: &str = "RUSTEL_VST3_FIXTURE_SLOW_ACTIVATE";
+
+/// With this variable set to a number, each new copy of the effect adds
+/// its input of that many milliseconds before to its output, after the
+/// gain, one time, as an echo. The copy gives that time as its tail.
+pub const ECHO_ENV: &str = "RUSTEL_VST3_FIXTURE_ECHO";
+
+/// With this variable set, each new copy of the effect writes no number
+/// and refuses its first [`EARLY_FAULT_BLOCKS`] blocks, as a plugin that
+/// does its setup in its first blocks. The host runs more silent blocks
+/// than that at a build. The copy reads the variable at its creation.
+pub const EARLY_FAULT_ENV: &str = "RUSTEL_VST3_FIXTURE_EARLY_FAULT";
+/// The blocks of [`EARLY_FAULT_ENV`].
+pub const EARLY_FAULT_BLOCKS: u32 = 4;
+
 /// With this variable set to a number, the start of each audio class of
 /// the plugin takes that many milliseconds more, as each class of a large
 /// bundle does at its own load. The class of the controller adds none.
@@ -1058,6 +1362,63 @@ pub const COST_ENV: &str = "RUSTEL_VST3_FIXTURE_COST";
 /// tests read the line.
 pub const PROCESS_MARK_ENV: &str = "RUSTEL_VST3_FIXTURE_MARK_PROCESS";
 
+/// With this variable set to a path, each copy of the effect and the
+/// instrument appends one line to the file at each setupProcessing call:
+/// `setup offline` for the offline mode of a render, `setup realtime` for
+/// each other mode. The copy reads the variable at its creation.
+pub const MODE_MARK_ENV: &str = "RUSTEL_VST3_FIXTURE_MARK_MODE";
+
+/// With this variable set, each copy of the effect and the instrument
+/// refuses the offline mode at setupProcessing, as a plugin with no offline
+/// mode does. The copy reads the variable at its creation.
+pub const REALTIME_ONLY_ENV: &str = "RUSTEL_VST3_FIXTURE_REALTIME_ONLY";
+
+/// With this variable set, each copy of the effect finds its Delay value in
+/// the first block after it turns on, as a plugin that finds its latency in
+/// its first blocks does. A setActive(1) takes the value that the first
+/// block after the setActive(1) before it found, and that block asks for a
+/// restart when it finds a value other than the delay in use. So the copy
+/// reports a new latency after one restart and one block more. The copy
+/// reads the variable at its creation.
+pub const LATE_LATENCY_ENV: &str = "RUSTEL_VST3_FIXTURE_LATE_LATENCY";
+
+/// With this variable set, each copy of the effect keeps its delay as a
+/// time: the Delay value times 4096 frames at [`TIMED_DELAY_RATE`], 4096
+/// frames at most at the rate in use. The copy finds a new rate in the first
+/// block after it turns on, as a plugin that sets itself up in its first
+/// blocks does: that block asks for a restart, and the next setActive(1)
+/// takes the delay at the new rate. The first setup gives the rate with no
+/// restart. The copy reads the variable at its creation.
+pub const RATE_LATENCY_ENV: &str = "RUSTEL_VST3_FIXTURE_RATE_LATENCY";
+/// The rate of the frames of a timed delay: see [`RATE_LATENCY_ENV`].
+pub const TIMED_DELAY_RATE: f64 = 48_000.0;
+
+/// The process modes of one copy: see [`MODE_MARK_ENV`] and
+/// [`REALTIME_ONLY_ENV`]. Read one time, with the plugin.
+struct Modes {
+    mark: Option<PathBuf>,
+    realtime_only: bool,
+}
+
+impl Modes {
+    fn new() -> Self {
+        Self {
+            mark: std::env::var_os(MODE_MARK_ENV).map(PathBuf::from),
+            realtime_only: std::env::var_os(REALTIME_ONLY_ENV).is_some(),
+        }
+    }
+
+    /// Marks the mode of a setup, and gives true when the copy takes it.
+    fn take(&self, setup: &ProcessSetup) -> bool {
+        let offline = setup.processMode == ProcessModes_::kOffline as i32;
+        if let Some(file) = &self.mark {
+            let mode = if offline { "offline" } else { "realtime" };
+            append_line(file, &format!("setup {mode}"));
+        }
+        !(offline && self.realtime_only)
+    }
+}
+
 /// Writes the mark of one moment of the lifecycle, naming the thread that
 /// runs it.
 fn thread_mark(step: &str) {
@@ -1091,6 +1452,23 @@ fn process_cost() -> Duration {
         .ok()
         .and_then(|text| text.parse().ok());
     Duration::from_micros(micros.unwrap_or(0))
+}
+
+/// The sleep of each setActive call of a new copy: see
+/// [`SLOW_ACTIVATE_ENV`].
+fn activate_time() -> Duration {
+    let millis = std::env::var(SLOW_ACTIVATE_ENV)
+        .ok()
+        .and_then(|text| text.parse().ok());
+    Duration::from_millis(millis.unwrap_or(0))
+}
+
+/// Sleeps for `time`, as a plugin that turns on or off slowly. No time
+/// sleeps nothing.
+fn sleep(time: Duration) {
+    if !time.is_zero() {
+        std::thread::sleep(time);
+    }
 }
 
 /// Spins for `cost`, as a plugin with that much work in each call.
@@ -1219,6 +1597,7 @@ fn slow_load(name: &str) {
 
 /// One line through the standard library and one through the C runtime. On
 /// Windows the two have a path of their own to the standard output.
+#[allow(clippy::print_stdout, reason = "the fixture tests both output paths")]
 fn print_line() {
     unsafe extern "C" {
         fn puts(text: *const c_char) -> i32;
@@ -1310,5 +1689,26 @@ mod tests {
         let delta = Violations::capture().since(before);
         assert!(delta.clean(), "the delay allocated or freed: {delta:?}");
         assert_eq!(last, [1023.0, -1023.0]);
+    }
+
+    /// Each setActive call of a slow copy sleeps its time, on and off, in
+    /// the effect and in the instrument: see [`SLOW_ACTIVATE_ENV`].
+    #[test]
+    fn each_set_active_call_of_a_slow_copy_sleeps() {
+        let time = Duration::from_millis(20);
+        let mut effect = Processor::new();
+        effect.activate = time;
+        let mut tone = Tone::new();
+        tone.activate = time;
+        for state in [1, 0] {
+            let start = Instant::now();
+            // SAFETY: the calls take no pointer.
+            unsafe { effect.setActive(state) };
+            assert!(start.elapsed() >= time, "the effect: {state}");
+            let start = Instant::now();
+            // SAFETY: as above.
+            unsafe { tone.setActive(state) };
+            assert!(start.elapsed() >= time, "the instrument: {state}");
+        }
     }
 }

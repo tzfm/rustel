@@ -1,8 +1,8 @@
 //! Sample-clock transitions for live gain and continuous score controls.
 //!
 //! The UI commits the exact number immediately. Only the sounding gain,
-//! low-pass cutoff and low-pass resonance move through a short ramp. Note
-//! timing and pattern values never do.
+//! low-pass cutoff, low-pass resonance and direct FM route index move
+//! through a short ramp. Note timing and pattern values never do.
 //!
 //! ```text
 //! slider move --> LiveControlUpdate --> control ring --> audio callback

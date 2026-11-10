@@ -38,8 +38,8 @@ mod watch;
 mod worker;
 
 pub use host::{
-    FoundPreset, Host, Plugin, PluginInfo, Prepared, Resolved, ScanProgress, Status, WantedCopy,
-    WorkerProgram,
+    FoundPreset, Host, NotQueued, Plugin, PluginInfo, Prepared, RenderFaults, Resolved,
+    ScanProgress, Status, WantedCopy, WorkerProgram,
 };
 pub use main_thread::{install_main_service, needs_the_main_thread, pump_main};
 pub use scan::{default_folders, find_bundles};

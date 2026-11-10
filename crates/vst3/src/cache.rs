@@ -39,9 +39,10 @@ pub(crate) struct Scanned {
     pub fault: Option<String>,
 }
 
-/// The files of a bundle at one time: the count, and a mark from the path,
-/// the size and the change time of each file. A different stamp is a
-/// different plugin.
+/// The files of a bundle or of one file at one time: the count, and a mark
+/// from the path, the size and the change time of each file. A different
+/// stamp is a changed bundle or file. A changed bundle is a different
+/// plugin.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Stamp {
     files: u32,
@@ -56,11 +57,19 @@ impl Stamp {
             self.mark = (self.mark ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
         }
     }
+
+    /// The stamp as one number, as the cell of a plugin copy keeps the
+    /// stamp of its preset file. A file that is not there has a number of
+    /// its own.
+    pub(crate) fn number(self) -> u64 {
+        self.mark
+    }
 }
 
-/// Reads the stamp of a bundle. A link counts as its target, so the stamp
-/// of a bridge bundle changes with the plugin behind the bridge.
-pub(crate) fn stamp(bundle: &Path) -> Stamp {
+/// Reads the stamp of a bundle or of a file. A link counts as its target,
+/// so the stamp of a bridge bundle changes with the plugin behind the
+/// bridge.
+pub(crate) fn stamp(path: &Path) -> Stamp {
     fn add(path: &Path, depth: usize, stamp: &mut Stamp) {
         let Ok(data) = std::fs::metadata(path) else {
             return;
@@ -90,7 +99,7 @@ pub(crate) fn stamp(bundle: &Path) -> Stamp {
         files: 0,
         mark: 0xcbf2_9ce4_8422_2325,
     };
-    add(bundle, MAX_DEPTH, &mut stamp);
+    add(path, MAX_DEPTH, &mut stamp);
     stamp
 }
 
@@ -124,11 +133,18 @@ impl Cache {
     }
 
     /// Writes the cache file: a new file first, then the name change, so a
-    /// reader never finds a half file.
+    /// reader never finds a half file. The file's own entries come in
+    /// first: another host can have written since this one read the file,
+    /// and its bundles must not vanish behind this write. Where both have
+    /// an answer for one bundle, this cache's own wins.
     pub(crate) fn write(&self, file: &Path) {
+        let mut merged = Self::read(file);
+        for (path, tested) in &self.bundles {
+            merged.bundles.insert(path.clone(), tested.clone());
+        }
         let cache = Self {
             version: VERSION,
-            bundles: self.bundles.clone(),
+            bundles: merged.bundles,
         };
         let Ok(json) = serde_json::to_vec(&cache) else {
             return;
@@ -296,6 +312,50 @@ mod tests {
         let second = stamp(&bundle);
         assert_ne!(first, second);
         assert_eq!(cache.fault(&bundle, second), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_later_writer_keeps_the_entries_of_an_earlier_one() {
+        let root =
+            std::env::temp_dir().join(format!("rustel-vst3-cache-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let one = root.join("One.vst3");
+        let two = root.join("Two.vst3");
+        std::fs::write(&one, [0u8; 16]).unwrap();
+        std::fs::write(&two, [0u8; 16]).unwrap();
+        let file = root.join(FILE_NAME);
+
+        // Two hosts that each read an empty file before either writes: the
+        // second write must not erase the first's answer.
+        let mut first = Cache::read(&file);
+        let mut second = Cache::read(&file);
+        assert!(first.store(
+            &one,
+            stamp(&one),
+            &[Scanned {
+                name: "One".into(),
+                vendor: "Maker".into(),
+                categories: "Fx".into(),
+                class: String::new(),
+                fault: None,
+            }]
+        ));
+        assert!(second.store_fault(&two, stamp(&two), "no audio plugin"));
+        first.write(&file);
+        second.write(&file);
+
+        let merged = Cache::read(&file);
+        assert!(
+            merged.plugins(&one, stamp(&one)).is_some(),
+            "bundle one is kept"
+        );
+        assert_eq!(
+            merged.fault(&two, stamp(&two)),
+            Some("no audio plugin"),
+            "bundle two is kept"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

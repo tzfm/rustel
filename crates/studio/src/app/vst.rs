@@ -12,7 +12,7 @@
 use rustel_runtime::lint::scan;
 use rustel_runtime::vst::{self, PluginInfo, Status, canonical};
 
-use super::args::parameter_edit;
+use super::args::{members, parameter_edit};
 use super::sets::shorten_home;
 use super::*;
 use crate::memory::PluginMemory;
@@ -28,7 +28,8 @@ const PLUGIN_REFRESH: Duration = Duration::from_millis(1_000);
 const PLUGIN_LOADING_REFRESH: Duration = Duration::from_millis(100);
 
 /// The plugin rows of the memory breakdown: each plugin of the host in its
-/// load, loaded, or failed.
+/// load, loaded, or failed. A loaded plugin with the fault of a copy says
+/// the fault last.
 fn plugin_memory(plugins: &[PluginInfo]) -> Vec<PluginMemory> {
     plugins
         .iter()
@@ -43,8 +44,13 @@ fn plugin_memory(plugins: &[PluginInfo]) -> Vec<PluginMemory> {
                         .filter(|frames| *frames > 0)
                         .map(|frames| format!(" · latency {frames} samples"))
                         .unwrap_or_default();
+                    let fault = plugin
+                        .fault
+                        .as_ref()
+                        .map(|fault| format!(" · {fault}"))
+                        .unwrap_or_default();
                     format!(
-                        "{name} · {} · {} running · {} ms{latency}",
+                        "{name} · {} · {} running · {} ms{latency}{fault}",
                         if plugin.instrument {
                             "instrument"
                         } else {
@@ -106,6 +112,17 @@ fn plugin_words(words: &PluginWords) -> (Vec<String>, Vec<String>) {
             (presets.collect(), Vec::new())
         }
     }
+}
+
+/// True when `named`, the plugin name of a call, names the plugin that the
+/// list shows as `plugin`. The host also finds a plugin by a part of its
+/// name or by its bundle name, so `.vst("fixture")` is a call of Rustel
+/// Fixture. The call starts no host.
+fn names_plugin(named: &str, plugin: &str) -> bool {
+    canonical(named) == canonical(plugin)
+        || vst::started()
+            .and_then(|host| host.found_name(named))
+            .is_some_and(|found| found == plugin)
 }
 
 /// The nearest plugin call, including a caret on its name or inside a
@@ -189,10 +206,10 @@ impl App {
     }
 
     /// Anywhere else in a named plugin call, open its parameters directly:
-    /// the plugin of the call opens with the cursor under its row, so one
-    /// Enter picks from it. A plugin still loading keeps the cursor on its
-    /// row, and Enter dives under it when the load lands. Name and preset
-    /// strings keep their more specific completion lists.
+    /// the plugin of the call opens with the tab in its parameters, so one
+    /// Enter picks from them. A plugin still loading fills the view when
+    /// the load lands. Name and preset strings keep their more specific
+    /// completion lists.
     pub(super) fn open_plugin_parameters(&mut self) -> bool {
         let Some((name, _)) = self.plugin_call_at_caret() else {
             return false;
@@ -200,7 +217,7 @@ impl App {
         let mut panel = ReferencePanel::browse(&self.reference);
         panel.select_tab(Tab::Vst);
         panel.vst.open_named(name);
-        panel.vst.select_under();
+        panel.vst.show_section(VstSection::Params);
         self.reference_anchor = None;
         self.set_reference_panel(Some(panel));
         self.sync_plugins();
@@ -212,21 +229,89 @@ impl App {
         true
     }
 
-    /// The pick of a plugin name wrote the call: the panel stays open, on
+    /// The pick of a plugin name wrote the call: the panel stays open, in
     /// the presets of the plugin, so the next Enter picks one for the call.
+    /// A plugin the read of the preset folders holds no preset for goes to
+    /// its parameters, where Enter picks one of them.
     pub(super) fn open_plugin_presets(&mut self, name: String) {
         let mut panel = ReferencePanel::browse(&self.reference);
         panel.select_tab(Tab::Vst);
         panel.vst.open_named(name);
-        panel.vst.show_section(VstSection::Presets);
+        panel.vst.show_picked_presets();
         self.reference_anchor = None;
         self.set_reference_panel(Some(panel));
+        self.status = "plugin presets - Enter picks one for this call".into();
         self.sync_plugins();
         self.install_catalogue();
-        self.status = "plugin presets - Enter picks one for this call".into();
         self.focus_panel(PanelKind::Reference);
         self.invalidate_maps();
         self.dirty_frame = true;
+    }
+
+    /// The pick of a plugin name wrote the name into a call the reader had
+    /// opened and not closed: `.vst("OTT` with no `)`. The pick closes the
+    /// call after the name, so a reader who picks no parameter does not
+    /// have to type the bracket, and a parameter a later Enter picks lands
+    /// inside a closed call. A string still open, as after `.vst("`, gets
+    /// its quote at the end of the name too. A call already closed, or
+    /// with more arguments typed, stays as it is.
+    pub(super) fn close_picked_plugin_call(&mut self) -> Result<(), RuntimeError> {
+        let Some((_, open)) = self.plugin_call_at_caret() else {
+            return Ok(());
+        };
+        let source = self.editor().source();
+        let code = rustel_runtime::lint::code_only(&source);
+        if members(&code, open, false).is_some() {
+            return Ok(());
+        }
+        // The name argument, read as the call reads it: a plain string
+        // ends on its own line, so a quote on a line below is not its end.
+        // A comma after a closed name says more arguments are typed.
+        let rest = &source[open + 1..];
+        let quote = open + 1 + (rest.len() - rest.trim_start().len());
+        let Some(&opening) = source
+            .as_bytes()
+            .get(quote)
+            .filter(|&byte| matches!(byte, b'"' | b'\'' | b'`'))
+        else {
+            return Ok(());
+        };
+        let end = quote
+            + 1
+            + rustel_runtime::sounds::string_end(&source[quote + 1..], char::from(opening));
+        // The pick leaves the caret in the name, or after the quote it wrote
+        // to close the name, as a name lookup reads the caret.
+        let caret = self.name_caret().0;
+        if !(quote < caret && caret <= end + 1) {
+            return Ok(());
+        }
+        // A quote on a line below the name closes another string.
+        let closed = source.as_bytes().get(end) == Some(&opening)
+            && !source[caret.min(end)..end].contains('\n');
+        let (at, text) = if closed {
+            if code[end + 1..].trim_start().starts_with(',') {
+                return Ok(());
+            }
+            (end + 1, ")".to_owned())
+        } else if caret <= end {
+            // The name is what the pick wrote, up to the caret.
+            (caret, format!("{})", char::from(opening)))
+        } else {
+            return Ok(());
+        };
+        // The caret goes before the bracket: after the quote this wrote.
+        let inside = at + text.len() - 1;
+        self.dispatch_editor(Command::ReplaceRange {
+            from: ByteOffset(at),
+            to: ByteOffset(at),
+            text,
+        })?;
+        let _ = self
+            .scenes
+            .current_mut()
+            .editor
+            .set_selection(crate::editor::Selection::caret(ByteOffset(inside)));
+        Ok(())
     }
 
     /// The plugin and the range of the key at the caret, when the caret is
@@ -295,6 +380,18 @@ impl App {
             self.plugin_memory = measured;
             self.dirty_frame = true;
         }
+    }
+
+    /// Asks the engine for a new try of each plugin copy of the score in
+    /// play that did not start or that faulted, while a row of the plugin
+    /// list shows such a fault. No evaluation runs. Starts no host. True when
+    /// the engine took the ask.
+    pub(super) fn retry_plugin_faults(&self) -> bool {
+        let faults = vst::started().is_some_and(|host| {
+            let plugins = host.plugins();
+            plugins.iter().any(|plugin| plugin.fault.is_some())
+        });
+        faults && self.worker.try_retry_plugins()
     }
 
     /// Gives the host the folders the player added. Before the host starts,
@@ -399,7 +496,10 @@ impl App {
                 .map(|plugin| settings::VstScanned {
                     name: plugin.name.clone(),
                     state: match &plugin.status {
-                        Status::Ready => "ready".to_owned(),
+                        Status::Ready => match &plugin.fault {
+                            Some(fault) => format!("ready · {fault}"),
+                            None => "ready".to_owned(),
+                        },
                         Status::Loading => "loading".to_owned(),
                         Status::Found => "found".to_owned(),
                         Status::Failed(reason) => {
@@ -672,9 +772,9 @@ impl App {
     /// The text of a row of the vst tab, as the text goes in at the caret.
     /// The text is no spelling of the word the column opened on, so the
     /// anchor goes. Enter on the row of the plugin the call at the caret
-    /// names writes nothing: the name stays as written, and the cursor goes
-    /// under the row, to the half of the plugin the tab holds, where the
-    /// next Enter picks.
+    /// names writes nothing: the name stays as written, and the cursor
+    /// goes under the row, to the rows of the halves of the plugin, where
+    /// the next Enter opens one of them.
     pub(super) fn plugin_text_at_caret(&mut self, text: String) -> Option<String> {
         self.reference_anchor = None;
         let keys = self.reference_panel.as_ref().is_some_and(|panel| {
@@ -729,17 +829,19 @@ impl App {
         let same = call.as_ref().is_some_and(|(named, _)| {
             open_plugin
                 .as_ref()
-                .is_some_and(|(name, _, _)| canonical(named) == canonical(name))
+                .is_some_and(|(name, _, _)| names_plugin(named, name))
         });
         // The row of the plugin the call at the caret already names: the
-        // dive under the row. Nothing goes in.
+        // plugin of the row opens, and the cursor dives under the row.
+        // Nothing goes in, also while the plugin loads and has no row
+        // under it yet.
         if let (Some(selected), Some((named, _))) = (&selected, &call)
-            && canonical(named) == canonical(selected)
-            && self
-                .reference_panel
-                .as_mut()
-                .is_some_and(|panel| panel.vst.select_under())
+            && names_plugin(named, selected)
         {
+            if let Some(panel) = self.reference_panel.as_mut() {
+                panel.vst.expand();
+                panel.vst.select_under();
+            }
             self.dirty_frame = true;
             return None;
         }
@@ -863,15 +965,21 @@ impl App {
                 self.dirty_frame = true;
             }
         }
-        // The list of background jobs has a row for the scan and a row
-        // for each load. A test of the scan gives the list new names.
-        let (loads, scan) = (vst::loads(), vst::scan_progress());
-        if loads != self.plugin_loads || scan != self.plugin_scan {
+        // The list of background jobs has a row for the scan, a row for
+        // each load, and a row for the read of the preset folders. A test
+        // of the scan gives the list new names.
+        let (loads, scan, reading) = (vst::loads(), vst::scan_progress(), vst::presets_reading());
+        if loads != self.plugin_loads
+            || scan != self.plugin_scan
+            || reading != self.plugin_presets_reading
+        {
             self.plugin_loads = loads;
             self.plugin_scan = scan;
+            self.plugin_presets_reading = reading;
             self.dirty_frame = true;
         }
         let loading = scanning
+            || reading
             || self
                 .reference_panel
                 .as_ref()
@@ -907,6 +1015,17 @@ impl App {
         }
         self.plugins_polled_at = Instant::now();
         let host = vst::host();
+        // The tab opens the plugin that the host finds for the name of the
+        // call, so the tab shows the plugin that the score plays: a part of
+        // a name or a bundle name finds a plugin with another name.
+        if let Some(found) = panel
+            .vst
+            .plugin_to_load()
+            .and_then(|name| host.found_name(name))
+            .filter(|found| panel.vst.open_name() != Some(found.as_str()))
+        {
+            panel.vst.open_named(found);
+        }
         if let Some(name) = panel.vst.plugin_to_load() {
             host.resolve(name, false);
         }
@@ -915,11 +1034,21 @@ impl App {
         changed |= panel
             .vst
             .set_scan(vst::scan_progress().map(|scan| (scan.read, scan.bundles)));
+        changed |= panel.vst.set_presets_reading(host.presets_reading());
         // The host reads the preset folder on its own thread. The tab asks
         // again on the next read of the list until the names are here.
+        let mut picked_params = false;
         if let Some(presets) = panel.vst.presets_due().and_then(|name| host.presets(name)) {
+            let before = panel.vst.inside();
             panel.vst.set_presets(presets);
+            // A pick that found no preset moved to the parameters: the
+            // status line says what Enter picks now.
+            picked_params = before == Some(VstSection::Presets)
+                && panel.vst.inside() == Some(VstSection::Params);
             changed = true;
+        }
+        if picked_params {
+            self.status = "plugin parameters - Enter adds the choice to this call".into();
         }
         self.dirty_frame |= changed;
     }
@@ -1004,6 +1133,60 @@ mod tests {
         assert_eq!(sheet.vst_open_listed, None);
     }
 
+    /// The pick of a plugin name closes the call the reader had left open:
+    /// `.vst("OTT` gains its `)`, with the caret before the bracket, so a
+    /// choice of the open panel lands inside the call. A call already
+    /// closed stays, a string still open stays, and a call with more
+    /// arguments typed stays: the bracket is not the pick's to place there.
+    #[test]
+    fn the_pick_of_a_plugin_name_closes_the_call_left_open() {
+        fn app_with(source: &str) -> App {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _) = crate::app::tests::support::plain_app(directory.path(), "");
+            let end = app.editor().source().len();
+            app.dispatch_editor(Command::ReplaceRange {
+                from: ByteOffset(0),
+                to: ByteOffset(end),
+                text: source.to_owned(),
+            })
+            .expect("the score");
+            app.editor_mut()
+                .set_selection(crate::editor::Selection::caret(ByteOffset(source.len())))
+                .expect("the caret");
+            app
+        }
+
+        // The call open after its name string: the bracket goes in after
+        // the closing quote.
+        let mut app = app_with("$: s(\"bd\").vst(\"OTT\"");
+        app.close_picked_plugin_call().expect("the close");
+        assert_eq!(app.editor().source(), "$: s(\"bd\").vst(\"OTT\")");
+        assert_eq!(
+            app.editor().primary_selection().head.0,
+            app.editor().source().len() - 1,
+            "the caret stands before the bracket"
+        );
+        // The call now closed: a second pick closes nothing.
+        app.close_picked_plugin_call().expect("the close");
+        assert_eq!(app.editor().source(), "$: s(\"bd\").vst(\"OTT\")");
+
+        // A string still open after the name: its quote and the bracket go
+        // in after the name, and the caret stands before the bracket.
+        let mut app = app_with("$: s(\"bd\").vst(\"OTT");
+        app.close_picked_plugin_call().expect("the close");
+        assert_eq!(app.editor().source(), "$: s(\"bd\").vst(\"OTT\")");
+        assert_eq!(
+            app.editor().primary_selection().head.0,
+            app.editor().source().len() - 1
+        );
+
+        // More arguments typed leave the bracket to the reader.
+        let source = "$: s(\"bd\").vst(\"OTT\", ";
+        let mut app = app_with(source);
+        app.close_picked_plugin_call().expect("the close");
+        assert_eq!(app.editor().source(), source);
+    }
+
     #[test]
     fn a_plugin_call_contains_its_name_and_nested_values() {
         let source = "s('bd').vst ('Kickstart 2').vsti(\"Synth\", {cutoff: saw.range(.1, .5)})";
@@ -1031,8 +1214,9 @@ mod tests {
     /// The memory breakdown has one row for each plugin the host loaded, and
     /// no row for a plugin the host only found. A plugin is in the Studio
     /// process and has no figure of its own. A row shows the latency of the
-    /// copies of its plugin when the latency is above 0. An unload takes the
-    /// rows away.
+    /// copies of its plugin when the latency is above 0. A copy that did not
+    /// start gives the row of its plugin the fault, and a new scan takes the
+    /// fault away. An unload takes the rows away.
     #[test]
     fn a_loaded_plugin_is_a_row_of_the_memory_breakdown() {
         let folder = tempfile::tempdir().unwrap();
@@ -1092,6 +1276,25 @@ mod tests {
         assert!(tone.label.starts_with(facts), "{}", tone.label);
         assert!(tone.label.ends_with(" ms"), "{}", tone.label);
 
+        // A copy that did not start gives the row of its plugin the fault,
+        // and a new scan takes the fault away with the failed build.
+        let mut other = rustel_vst3_fixture::preset(1.0, 0.0);
+        other[8] = b'0';
+        std::fs::write(effect_presets.join("Other Plugin.vstpreset"), other).unwrap();
+        host.set_preset_folders(Vec::new());
+        host.wait_idle();
+        let slot = rustel_audio::InsertSlot::effect(2, 0);
+        let other = Some("Other Plugin");
+        host.prepare(rustel_vst3_fixture::NAME, other, false, rate, slot);
+        host.wait_idle();
+        let effect = || plugin_memory(&host.plugins())[0].label.clone();
+        let fault = " ms · latency 1024 samples · a copy did not start: the preset is for a \
+                     different plugin";
+        assert!(effect().ends_with(fault), "{}", effect());
+        host.scan(&[folder.path().to_path_buf()]);
+        host.wait_idle();
+        assert!(effect().ends_with(latency), "{}", effect());
+
         host.unload_unused(&[]);
         host.wait_idle();
         assert!(plugin_memory(&host.plugins()).is_empty());
@@ -1128,6 +1331,7 @@ mod tests {
             audio_thread: false,
             latency: None,
             presets: 2,
+            fault: None,
         };
         panel.vst.set_plugins(vec![plugin]);
         panel.vst.open_named("Serum 2".into());
@@ -1151,10 +1355,68 @@ mod tests {
             Some(PluginRow::Plugin(0))
         );
         // Enter on the row of the plugin the call names: nothing goes in,
-        // the panel stays, and the cursor goes under the row.
+        // the panel stays, and the cursor goes under the row, to the rows
+        // of the halves of the plugin.
         assert_eq!(app.plugin_text_at_caret(".vsti(\"Serum 2\")".into()), None);
         let panel = app.reference_panel.as_ref().expect("the panel stays");
-        assert_eq!(panel.vst.row(panel.vst.selected), Some(PluginRow::Param(0)));
+        assert_eq!(
+            panel.vst.row(panel.vst.selected),
+            Some(PluginRow::Section(VstSection::Presets))
+        );
+        assert_eq!(app.editor().source(), before);
+    }
+
+    /// The row of the plugin the call names, with no plugin open or with
+    /// another plugin open: Enter opens the plugin of the row, the cursor
+    /// goes under its row, and nothing goes in.
+    #[test]
+    fn enter_on_the_plugin_the_call_names_opens_it_and_writes_nothing() {
+        let source = "$: n(\"c\").vsti(\"Serum 2\", {preset: \"Init\"})\n";
+        let caret = source.find("Serum 2").expect("the name") + 3;
+        let mut app = vst_app(source, caret);
+        let before = app.editor().source().to_owned();
+        let panel = app.reference_panel.as_mut().expect("the vst tab");
+        let serum = panel.vst.plugins()[0].clone();
+        let vital = PluginInfo {
+            name: "Vital".into(),
+            bundle: "/plugins/Vital.vst3".into(),
+            ..serum.clone()
+        };
+        panel.vst.set_plugins(vec![serum, vital]);
+        // ← on the row of the open plugin closes it.
+        assert!(panel.vst.collapse());
+        assert_eq!(panel.vst.open_name(), None);
+        let call = ".vsti(\"Serum 2\")";
+        assert_eq!(
+            app.plugin_text_at_caret(call.into()),
+            None,
+            "no plugin open"
+        );
+        let panel = app.reference_panel.as_mut().expect("the panel stays");
+        assert_eq!(panel.vst.open_name(), Some("Serum 2"));
+        assert_eq!(
+            panel.vst.row(panel.vst.selected),
+            Some(PluginRow::Section(VstSection::Presets))
+        );
+
+        // → on the row of Vital opens Vital, and the cursor goes back to
+        // the row of Serum 2.
+        assert_eq!(panel.vst.row(3), Some(PluginRow::Plugin(1)));
+        panel.vst.selected = 3;
+        assert!(panel.vst.expand());
+        assert_eq!(panel.vst.open_name(), Some("Vital"));
+        panel.vst.selected = 0;
+        assert_eq!(
+            app.plugin_text_at_caret(call.into()),
+            None,
+            "another plugin open"
+        );
+        let panel = app.reference_panel.as_ref().expect("the panel stays");
+        assert_eq!(panel.vst.open_name(), Some("Serum 2"));
+        assert_eq!(
+            panel.vst.row(panel.vst.selected),
+            Some(PluginRow::Section(VstSection::Presets))
+        );
         assert_eq!(app.editor().source(), before);
     }
 
@@ -1166,10 +1428,10 @@ mod tests {
         let before = app.editor().source().to_owned();
         let panel = app.reference_panel.as_mut().expect("the vst tab");
         panel.vst.show_section(VstSection::Presets);
-        // The rows under the plugin are its two presets; the cursor goes to
-        // `Lead`.
-        panel.vst.selected = 2;
-        assert_eq!(panel.vst.row(2), Some(PluginRow::Preset(1)));
+        // The view of the presets holds the two presets of the plugin; the
+        // cursor goes to `Lead`.
+        panel.vst.selected = 1;
+        assert_eq!(panel.vst.row(1), Some(PluginRow::Preset(1)));
         let said = app.plugin_text_at_caret("preset: \"Lead\"".into());
         assert_eq!(said.as_deref(), Some("preset: \"Lead\""));
         // The pair the call holds is the anchor the pick replaces.
@@ -1185,7 +1447,7 @@ mod tests {
         {
             let panel = app.reference_panel.as_mut().expect("the vst tab");
             panel.vst.show_section(VstSection::Presets);
-            panel.vst.selected = 2;
+            panel.vst.selected = 1;
         }
         assert_eq!(
             app.plugin_text_at_caret("preset: \"Lead\"".into())
@@ -1197,7 +1459,7 @@ mod tests {
             .as_mut()
             .expect("the vst tab")
             .vst
-            .selected = 1;
+            .selected = 0;
         assert_eq!(
             app.plugin_text_at_caret("preset: \"Default\"".into())
                 .as_deref(),

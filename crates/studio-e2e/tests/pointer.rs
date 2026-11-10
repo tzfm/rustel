@@ -472,3 +472,20 @@ fn the_wheel_over_the_samples_pulse_row_is_the_preview_volume() {
     wheel(&mut studio, false, x, y as u16);
     assert_eq!(studio.status(), "preview 0.0dB", "and back up to unity");
 }
+
+/// The pointer over the terminal is what `mousex` in patterns and `mouse` in
+/// Hydra read, in the session the engine was given: from 0 to 1 across the
+/// frame, at the middle of the cell. A press moves it too.
+#[test]
+fn the_pointer_over_the_terminal_reaches_the_score() {
+    let mut studio = hermetic();
+    assert_eq!(
+        studio.score_pointer(),
+        Some((0.0, 0.0)),
+        "the corner at start"
+    );
+    studio.mouse(MouseEventKind::Moved, 74, 19, KeyModifiers::NONE);
+    assert_eq!(studio.score_pointer(), Some((74.5 / 150.0, 19.5 / 40.0)));
+    studio.click(149, 39);
+    assert_eq!(studio.score_pointer(), Some((149.5 / 150.0, 39.5 / 40.0)));
+}

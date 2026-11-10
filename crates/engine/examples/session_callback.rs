@@ -1,6 +1,7 @@
 //! A finite, prefilled callback window using a Session worker and host-owned
 //! DSP. No device is opened. A desktop host keeps the worker alive and schedules
 //! ahead of its device's sample clock while the callback consumes the ring.
+#![allow(clippy::print_stdout, reason = "the example prints its result")]
 
 use std::sync::{
     Arc,
@@ -12,6 +13,10 @@ use rustel_engine::{
     audio::{LiveFlipAtomics, LiveScalarBackend, Ring},
 };
 
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "the final assertion is the check"
+)]
 fn main() -> Result<(), String> {
     let sample_rate = 48_000;
     let window_secs = 0.1;
@@ -50,12 +55,14 @@ fn main() -> Result<(), String> {
     let takeover_frame = AtomicU64::new(0);
     let takeover_cut = AtomicU64::new(0);
     let line_arm = AtomicU64::new(0);
+    let line_fired = AtomicU64::new(0);
     let stopped = AtomicBool::new(false);
     let flip = LiveFlipAtomics {
         generation: &generation,
         takeover_frame: &takeover_frame,
         takeover_cut: &takeover_cut,
         line_arm: &line_arm,
+        line_fired: &line_fired,
     };
     let mut output = [0.0; 128 * 2];
     let total_frames = (window_secs * f64::from(sample_rate)) as u64;

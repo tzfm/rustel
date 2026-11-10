@@ -70,7 +70,16 @@ loads helpers before the score, as for `play`.
 | `wav` | Silent timing file |
 
 The output extension selects MP3 or JSON. Use `--format` to choose explicitly.
-Ctrl+C stops a WAV export and finalizes a partial file if writing has started.
+Ctrl+C stops a WAV or MP3 export. A WAV export keeps a partial file once
+writing has started.
+
+`--stems` writes a `<name> stems` folder beside the file: the same bounce as
+`main.wav`, plus one stereo WAV per sounding orbit, named `1.wav` upward, in
+the export format.
+The stems are tapped after each orbit's delay, reverb, filter, duck and fader,
+before the master, so they sum back to an unmastered main and mastering stays
+in the DAW. Stems need a WAV format and refuse to overwrite an existing
+folder.
 
 CLI export has no master limiter. Its voice limit is 128 unless the score
 calls `setMaxPolyphony`. Score-level `.limit()` still applies.
@@ -105,9 +114,12 @@ rustel play song.strudel --watch --save-session debug
 rustel play song.strudel --watch --no-save-session
 rustel replay take.rustel-session
 rustel replay take.rustel-session --export set.wav
+rustel replay take.rustel-session --output silent
 ```
 
 See [Sessions](sessions.md) for recording and replay limits.
+`--output silent` plays the tape with no audio device, the way a server or
+an ssh session does; the clock and the event protocol still run.
 To show the active code in the terminal that plays the score, use `--follow`.
 To render it in a separate process, pipe the score events to `watch-code`:
 
@@ -175,9 +187,12 @@ rustel samples cache
 rustel samples clear --dry-run
 ```
 
-Public HTTPS sample packs with CORS enabled load by default. Other access needs
-an explicit grant. See [Local samples](local-samples.md) and
-[Security](../SECURITY.md).
+A score loads samples only from an allowed source.
+`raw.githubusercontent.com`, `strudel.b-cdn.net`, `shabda.ndre.gr` and
+`cdn.freesound.org` are allowed from the start. `--allow-sample-origin` adds
+a domain or an address, and `--strict-sample-origins` turns off the four
+built-in sources. See
+[Local samples](local-samples.md) and [Security](../SECURITY.md).
 
 `samples cache` downloads the shipped packs for offline use. Repeat it to
 resume an interrupted download. `samples clear` removes all downloaded samples;

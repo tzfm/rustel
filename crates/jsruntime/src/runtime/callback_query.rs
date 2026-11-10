@@ -6,7 +6,7 @@ impl JsRuntime {
         id: CallbackId,
         state: &State,
     ) -> Result<Vec<Hap>, String> {
-        with_ctx(&self.ctx, |ctx| {
+        with_ctx(self, |ctx| {
             Self::with_callback(&ctx, id, |f| {
                 let controls = rquickjs::Object::new(ctx.clone())
                     .map_err(|error| describe_js_error(&ctx, error))?;

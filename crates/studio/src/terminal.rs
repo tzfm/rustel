@@ -261,6 +261,8 @@ impl TerminalFeatures {
         // `TerminalFeatures` of its own to ask - the mixer and device
         // panels keep only a `Theme` - reads it back through `symbol`.
         symbol_state::set(symbols);
+        // Only the unix probe below writes answers back into the features.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut features = Self {
             name,
             truecolor,
@@ -273,7 +275,19 @@ impl TerminalFeatures {
             pixel_mouse: false,
             symbols,
         };
+        // The probe owns stdin on unix; the Windows build does not ask, and
+        // the probe's helpers stay unix-only beside this block.
+        #[cfg(unix)]
         if let Some(answers) = ask_terminal() {
+            // The byte split and the held-key queue are Unix-only; the
+            // Windows probe path above never reads stdin itself.
+            #[cfg(unix)]
+            {
+                let (replies, keys) = split_probe_bytes(&answers);
+                features.apply_answers(parse_answers(&replies));
+                HELD_KEYS.with(|held| held.borrow_mut().extend(keys));
+            }
+            #[cfg(not(unix))]
             features.apply_answers(parse_answers(&answers));
         }
         features
@@ -796,18 +810,6 @@ pub mod profiles {
             .map(|row| row.reason.as_str())
     }
 
-    /// An Option chord this terminal composes into text instead of sending
-    /// as Alt. The physical chord is still named, such as `alt+t`.
-    pub fn alt_input_limitation(terminal: &str, chord: &str) -> Option<&'static str> {
-        table()
-            .terminals
-            .iter()
-            .filter(|known| matches_profile(terminal, &known.terminal))
-            .flat_map(|known| &known.alt_input)
-            .find(|row| row.chord.eq_ignore_ascii_case(chord))
-            .map(|row| row.reason.as_str())
-    }
-
     /// The Option letter a composed character stands for, where the
     /// terminal profile names one. This is how iTerm2's Option+T, which
     /// arrives as `†`, still reaches the panel that answers to Alt+T.
@@ -942,6 +944,7 @@ pub mod profiles {
 
     #[cfg(test)]
     mod tests {
+
         use super::super::super::keybinds::KeyCombo;
 
         /// The shipped table parses, and every row is a chord the preferences
@@ -1016,18 +1019,29 @@ pub mod profiles {
         fn iterm2_option_letters_compose_and_recover() {
             for (letter, composed) in [('t', '†'), ('o', 'ø'), ('r', '®'), ('d', '∂'), ('a', 'å')]
             {
-                assert!(
-                    super::alt_input_limitation("iTerm2", &format!("alt+{letter}")).is_some(),
-                    "alt+{letter} is missing from the iTerm2 profile"
-                );
                 assert_eq!(
                     super::alt_input_letter("iTerm2", composed),
                     Some(letter),
                     "{composed} does not recover alt+{letter}"
                 );
             }
-            assert!(super::alt_input_limitation("Ghostty", "alt+t").is_none());
             assert_eq!(super::alt_input_letter("Ghostty", '†'), None);
+        }
+
+        /// A composed Option digit is also a key of some layout - `§` on
+        /// every ISO Mac keyboard, `£` on UK, `¡` on Spanish - and a legacy
+        /// terminal sends both the same way, so the character types.
+        #[test]
+        fn option_digits_type_their_character_on_the_mac_terminals() {
+            for composed in ['¡', '™', '£', '¢', '∞', '§', '¶', '•', 'ª'] {
+                for terminal in ["iTerm2", "Apple Terminal"] {
+                    assert_eq!(
+                        super::alt_input_letter(terminal, composed),
+                        None,
+                        "{composed} became a chord on {terminal}"
+                    );
+                }
+            }
         }
 
         #[test]
@@ -1588,9 +1602,220 @@ fn parse_answers(bytes: &[u8]) -> Answers {
     answers
 }
 
+#[cfg(unix)]
+thread_local! {
+    /// Keys typed while the startup probe owned stdin, handed back to the
+    /// reader one by one so they reach the editor exactly once.
+    static HELD_KEYS: std::cell::RefCell<std::collections::VecDeque<crossterm::event::Event>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// The most characters a Kitty picture reply holds between its `ESC _`
+/// and its `ESC \`: an id, a placement and an error message.
+#[cfg(unix)]
+const MAX_PICTURE_REPLY: usize = 256;
+
+/// How long the rest of a picture reply may take after its `ESC _`.
+#[cfg(unix)]
+const PICTURE_REPLY_WAIT: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// Whether `event` is `character` with Alt alone: how crossterm reads an
+/// `ESC` followed by that character.
+#[cfg(unix)]
+fn is_alt_char(event: &crossterm::event::Event, character: char) -> bool {
+    matches!(
+        event,
+        crossterm::event::Event::Key(key)
+            if key.code == crossterm::event::KeyCode::Char(character)
+                && key.modifiers == crossterm::event::KeyModifiers::ALT
+    )
+}
+
+/// The character a reply's body puts in `event`, if it is one.
+#[cfg(unix)]
+fn reply_char(event: &crossterm::event::Event) -> Option<char> {
+    use crossterm::event::{Event, KeyCode, KeyModifiers};
+    match event {
+        Event::Key(key) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
+            match key.code {
+                KeyCode::Char(character) if character.is_ascii_graphic() || character == ' ' => {
+                    Some(character)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether the events after an Alt+`_` spell the rest of a Kitty picture
+/// reply: `G`, its keys and message, and the closing Alt+`\`.
+#[cfg(unix)]
+fn is_picture_reply(tail: &[crossterm::event::Event]) -> bool {
+    let Some((last, body)) = tail.split_last() else {
+        return false;
+    };
+    let text: Option<String> = body.iter().map(reply_char).collect();
+    is_alt_char(last, '\\') && text.is_some_and(|text| text.starts_with('G') && text.contains(';'))
+}
+
+/// Split the probe window's bytes into the terminal's replies and the keys
+/// typed while it ran. A key is a bare byte, or a CSI sequence a terminal
+/// never answers a capability query with: an arrow, home, end, or a `~`
+/// form. Everything else stays a reply, as the whole window was before.
+#[cfg(unix)]
+fn split_probe_bytes(bytes: &[u8]) -> (Vec<u8>, Vec<crossterm::event::Event>) {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let plain_key = |byte: u8| {
+        let (code, modifiers) = match byte {
+            b'\r' | b'\n' => (KeyCode::Enter, KeyModifiers::NONE),
+            b'\t' => (KeyCode::Tab, KeyModifiers::NONE),
+            0x7f => (KeyCode::Backspace, KeyModifiers::NONE),
+            0x20..=0x7e => {
+                let code = KeyCode::Char(byte as char);
+                let modifiers = if byte.is_ascii_uppercase() {
+                    KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::NONE
+                };
+                (code, modifiers)
+            }
+            0x01..=0x1a => (
+                // Ctrl plus a letter arrives as the letter's control value:
+                // 0x03 is Ctrl+C, and it must reach the editor as 'c'.
+                KeyCode::Char((byte + b'a' - 1) as char),
+                KeyModifiers::CONTROL,
+            ),
+            _ => return None,
+        };
+        Some(KeyEvent::new(code, modifiers))
+    };
+    let csi_key = |params: &[u8], final_byte: u8| {
+        let code = match final_byte {
+            b'A' if params.is_empty() => KeyCode::Up,
+            b'B' if params.is_empty() => KeyCode::Down,
+            b'C' if params.is_empty() => KeyCode::Right,
+            b'D' if params.is_empty() => KeyCode::Left,
+            b'H' if params.is_empty() => KeyCode::Home,
+            b'F' if params.is_empty() => KeyCode::End,
+            b'~' => match params {
+                b"1" | b"7" => KeyCode::Home,
+                b"2" => KeyCode::Insert,
+                b"3" => KeyCode::Delete,
+                b"4" | b"8" => KeyCode::End,
+                b"5" => KeyCode::PageUp,
+                b"6" => KeyCode::PageDown,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(KeyEvent::new(code, KeyModifiers::NONE))
+    };
+
+    let mut replies = Vec::new();
+    let mut keys = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != 0x1b {
+            match plain_key(bytes[index]) {
+                Some(event) => keys.push(crossterm::event::Event::Key(event)),
+                None => replies.push(bytes[index]),
+            }
+            index += 1;
+            continue;
+        }
+        match bytes.get(index + 1) {
+            Some(b'[') => {
+                // Scan to the CSI final byte in 0x40..=0x7e.
+                let mut end = index + 2;
+                while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+                    end += 1;
+                }
+                if end >= bytes.len() {
+                    replies.extend_from_slice(&bytes[index..]);
+                    break;
+                }
+                if let Some(event) = csi_key(&bytes[index + 2..end], bytes[end]) {
+                    keys.push(crossterm::event::Event::Key(event));
+                } else {
+                    replies.extend_from_slice(&bytes[index..=end]);
+                }
+                index = end + 1;
+            }
+            // SS3: F1-F4 arrive as ESC O P/Q/R/S.
+            Some(b'O') => match bytes.get(index + 2) {
+                Some(b'P') => {
+                    keys.push(crossterm::event::Event::Key(KeyEvent::new(
+                        KeyCode::F(1),
+                        KeyModifiers::NONE,
+                    )));
+                    index += 3;
+                }
+                Some(b'Q') => {
+                    keys.push(crossterm::event::Event::Key(KeyEvent::new(
+                        KeyCode::F(2),
+                        KeyModifiers::NONE,
+                    )));
+                    index += 3;
+                }
+                Some(b'R') => {
+                    keys.push(crossterm::event::Event::Key(KeyEvent::new(
+                        KeyCode::F(3),
+                        KeyModifiers::NONE,
+                    )));
+                    index += 3;
+                }
+                Some(b'S') => {
+                    keys.push(crossterm::event::Event::Key(KeyEvent::new(
+                        KeyCode::F(4),
+                        KeyModifiers::NONE,
+                    )));
+                    index += 3;
+                }
+                _ => {
+                    replies.extend_from_slice(&bytes[index..(index + 3).min(bytes.len())]);
+                    index = (index + 3).min(bytes.len());
+                }
+            },
+            Some(b']' | b'P' | b'_' | b'^' | b'X') => {
+                // OSC and friends run to ST (ESC \) or BEL.
+                let mut end = index + 2;
+                while end < bytes.len() {
+                    if bytes[end] == 0x07 {
+                        end += 1;
+                        break;
+                    }
+                    if bytes[end] == 0x1b && bytes.get(end + 1) == Some(&b'\\') {
+                        end += 2;
+                        break;
+                    }
+                    end += 1;
+                }
+                replies.extend_from_slice(&bytes[index..end.min(bytes.len())]);
+                index = end.min(bytes.len());
+            }
+            Some(_) => {
+                replies.extend_from_slice(&bytes[index..index + 2]);
+                index += 2;
+            }
+            None => {
+                replies.push(0x1b);
+                break;
+            }
+        }
+    }
+    (replies, keys)
+}
+
+/// The startup questions. A terminal that cannot read some of them prints
+/// their text: Apple Terminal shows `pp` and the graphics query on the
+/// shell's screen, where it stays after the studio quits. The cursor is
+/// saved before the questions and put back after them, and what they left
+/// is erased.
 #[cfg(any(unix, windows))]
 const TERMINAL_CAPABILITY_QUERY: &[u8] =
-    b"\x1b[?2026$p\x1b[?1016$p\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[c";
+    b"\x1b7\x1b[?2026$p\x1b[?1016$p\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[c\x1b8\x1b[J";
 
 /// A wait as poll(2)'s whole milliseconds, rounded up. A floor would turn
 /// the last sub-millisecond of each paced wait into a zero-timeout poll,
@@ -1650,11 +1875,6 @@ fn ask_terminal() -> Option<Vec<u8>> {
         }
     }
     Some(answers)
-}
-
-#[cfg(not(unix))]
-fn ask_terminal() -> Option<Vec<u8>> {
-    None
 }
 
 #[cfg(windows)]
@@ -1792,6 +2012,10 @@ pub struct TerminalSession {
     /// see [`Self::poll_event`].
     #[cfg(unix)]
     hung_up: std::cell::Cell<bool>,
+    /// The terminal answered a picture that asked for no answer. Sticky:
+    /// a terminal that does it once does it for every frame.
+    #[cfg(unix)]
+    pictures_answered: std::cell::Cell<bool>,
     #[cfg(windows)]
     windows_input: std::cell::RefCell<Option<windows_input::WindowsInput>>,
     #[cfg(windows)]
@@ -1886,6 +2110,8 @@ impl TerminalSession {
             entered: true,
             #[cfg(unix)]
             hung_up: std::cell::Cell::new(false),
+            #[cfg(unix)]
+            pictures_answered: std::cell::Cell::new(false),
             #[cfg(windows)]
             windows_input: std::cell::RefCell::new(None),
             #[cfg(windows)]
@@ -2023,12 +2249,15 @@ impl TerminalSession {
         }
         #[cfg(unix)]
         {
+            if HELD_KEYS.with(|held| !held.borrow().is_empty()) {
+                return Ok(true);
+            }
             if self.note_hangup() {
                 return Ok(false);
             }
             // Whatever it has already parsed - a key of a paste it read
             // in one gulp - before anybody waits on the fd for more.
-            if crossterm::event::poll(std::time::Duration::ZERO)? {
+            if self.hold_next_event()? {
                 return Ok(true);
             }
             let millis = poll_millis(wait);
@@ -2054,13 +2283,17 @@ impl TerminalSession {
             if watch.revents & libc::POLLIN == 0 {
                 return Ok(false);
             }
-            crossterm::event::poll(std::time::Duration::ZERO)
+            self.hold_next_event()
         }
         #[cfg(not(unix))]
         crossterm::event::poll(wait)
     }
 
     pub fn read_event(&self) -> io::Result<crossterm::event::Event> {
+        #[cfg(unix)]
+        if let Some(event) = HELD_KEYS.with(|held| held.borrow_mut().pop_front()) {
+            return Ok(event);
+        }
         #[cfg(windows)]
         if let Some(input) = self.windows_input.borrow_mut().as_mut() {
             let event = input.read()?;
@@ -2074,6 +2307,63 @@ impl TerminalSession {
             return Ok(event);
         }
         crossterm::event::read()
+    }
+
+    /// Move the next event crossterm has parsed to the held queue, with
+    /// any Kitty picture reply taken out. Returns whether an event waits,
+    /// and never blocks: a reply alone leaves nothing to read.
+    ///
+    /// Every picture asks for no reply (`q=2`), but some terminals reply
+    /// anyway, once per frame. crossterm has no parser for the reply's
+    /// `ESC _ … ESC \` frame and splits it into an Alt+`_`, the reply's
+    /// characters and an Alt+`\`, which would type `_Gi=0;OK\` into the
+    /// score.
+    #[cfg(unix)]
+    fn hold_next_event(&self) -> io::Result<bool> {
+        while crossterm::event::poll(std::time::Duration::ZERO)? {
+            let event = crossterm::event::read()?;
+            if !is_alt_char(&event, '_') {
+                HELD_KEYS.with(|held| held.borrow_mut().push_back(event));
+                return Ok(true);
+            }
+            // A reply arrives in one write, so the rest of it is already
+            // read or a moment behind. A key a person typed is not.
+            let deadline = std::time::Instant::now() + PICTURE_REPLY_WAIT;
+            let mut tail = Vec::new();
+            while tail.len() < MAX_PICTURE_REPLY
+                && crossterm::event::poll(
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                )?
+            {
+                let next = crossterm::event::read()?;
+                let inside = reply_char(&next).is_some();
+                let closed = is_alt_char(&next, '\\');
+                tail.push(next);
+                if closed || !inside {
+                    break;
+                }
+            }
+            if is_picture_reply(&tail) {
+                self.pictures_answered.set(true);
+                continue;
+            }
+            HELD_KEYS.with(|held| {
+                let mut held = held.borrow_mut();
+                held.push_back(event);
+                held.extend(tail);
+            });
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Whether the terminal answered a picture that asked for no answer.
+    /// Such a terminal answers every frame, so pixels are not for it.
+    pub fn pictures_answered(&self) -> bool {
+        #[cfg(unix)]
+        return self.pictures_answered.get();
+        #[cfg(not(unix))]
+        false
     }
 
     /// New native input metrics, kept with the reader that owns query replies.
@@ -2117,9 +2407,15 @@ impl TerminalSession {
 
     /// Close the frame; pictures for it go out first, inside the update.
     pub fn end_frame(&mut self, images: &[super::graphics::PixelImage]) {
+        let answered = self.pictures_answered();
         let backend = self.terminal.backend_mut();
         if self.features.kitty_graphics {
             let _ = super::graphics::write_kitty_frame(images, backend);
+            // A terminal that answers its pictures answers each command,
+            // so after this frame clears them it is sent no more.
+            if answered && images.is_empty() {
+                self.features.kitty_graphics = false;
+            }
         }
         if self.features.sync_output {
             let _ = backend.write_all(b"\x1b[?2026l");
@@ -2279,6 +2575,56 @@ pub(crate) mod cursor_trace {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod picture_reply_tests {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    /// Text as crossterm reads it, a key per character.
+    fn typed(text: &str) -> Vec<Event> {
+        text.chars()
+            .map(|character| {
+                let shift = if character.is_ascii_uppercase() {
+                    KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::NONE
+                };
+                key(KeyCode::Char(character), shift)
+            })
+            .collect()
+    }
+
+    fn closed(text: &str) -> Vec<Event> {
+        let mut events = typed(text);
+        events.push(key(KeyCode::Char('\\'), KeyModifiers::ALT));
+        events
+    }
+
+    #[test]
+    fn a_picture_reply_split_into_keys_is_told_from_typing() {
+        assert!(super::is_alt_char(
+            &key(KeyCode::Char('_'), KeyModifiers::ALT),
+            '_'
+        ));
+        assert!(super::is_picture_reply(&closed("Gi=0;OK")));
+        assert!(super::is_picture_reply(&closed(
+            "Gi=31;ENOENT:no such image"
+        )));
+        assert!(
+            !super::is_picture_reply(&typed("Gi=0;OK")),
+            "an open reply is typing"
+        );
+        assert!(
+            !super::is_picture_reply(&closed("hello")),
+            "Alt+_ then words is typing"
+        );
+        assert!(!super::is_picture_reply(&[]), "a lone Alt+_ is typing");
     }
 }
 
@@ -2924,6 +3270,53 @@ mod tests {
         assert_eq!(
             parse_answers(b"\x1b_Gi=32;OK\x1b\\\x1b[?2026;20$y\x1b[6;20;10;99t"),
             Answers::default()
+        );
+    }
+    /// Keys typed while the startup probe owned stdin must survive: the
+    /// probe window splits into the terminal's replies and the keys, and
+    /// the keys come back as events exactly once.
+    #[cfg(unix)]
+    #[test]
+    fn probe_bytes_split_into_replies_and_typed_keys() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        // A DECRQM reply, a typed x, an arrow, another reply fragment, a
+        // typed Enter, and the DA1 close.
+        let stream = b"\x1b[?2026;2$yx\x1b[D\x1b[?1016;2$y\r\x1b[?62;4c";
+        let (replies, keys) = crate::terminal::split_probe_bytes(stream);
+        assert_eq!(
+            replies, b"\x1b[?2026;2$y\x1b[?1016;2$y\x1b[?62;4c",
+            "the capability replies stay whole for the parser"
+        );
+        assert_eq!(
+            keys,
+            vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ],
+            "the typed keys come back in order"
+        );
+
+        // A split reply at the window's end is a reply, not a key.
+        let (replies, _) = crate::terminal::split_probe_bytes(b"\x1b[?20");
+        assert_eq!(replies, b"\x1b[?20");
+
+        // SS3 function keys come through as themselves.
+        let (_, keys) = crate::terminal::split_probe_bytes(b"\x1bOP");
+        assert_eq!(
+            keys,
+            vec![Event::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))]
+        );
+
+        // A control chord names its letter: 0x03 is Ctrl+C, 0x13 Ctrl+S.
+        let (_, keys) = crate::terminal::split_probe_bytes(&[0x03, 0x13]);
+        assert_eq!(
+            keys,
+            vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            ]
         );
     }
 }

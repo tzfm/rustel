@@ -31,6 +31,7 @@ impl<K> From<OscillatorControls<K>> for VoiceRenderControls {
             insert_chain: _,
             effects: _,
             instrument: _,
+            lead: _,
             lfos,
             bus_mods,
             bus,
@@ -88,6 +89,23 @@ impl Voice {
     pub(super) fn reads_a_bus(&self) -> bool {
         matches!(self.source, VoiceSource::Bus { .. })
             || self.controls.bus_mods.iter().any(Option::is_some)
+    }
+
+    /// Whether `event` has the sound of this voice: the same frequency, and
+    /// the same sample or table, or none on both. The event picks its source
+    /// as the activation does: a synth first, then a table, then a sample.
+    pub(super) fn has_the_sound_of<K>(&self, event: &crate::AudioEvent<K>) -> bool {
+        let played = match &self.source {
+            VoiceSource::Sample { sample, .. } => Some(*sample),
+            VoiceSource::Wavetable { controls, .. } => Some(controls.table),
+            _ => None,
+        };
+        let asked = match (event.synth, event.wavetable, event.sample) {
+            (Some(_), _, _) => None,
+            (None, Some(wavetable), _) => Some(wavetable.table),
+            (None, None, sample) => sample.map(|sample| sample.sample),
+        };
+        self.freq_hz.to_bits() == event.freq_hz.to_bits() && played == asked
     }
 }
 
@@ -463,17 +481,21 @@ impl FmState {
         }
     }
 
+    /// Starts the operators of a note with the musical onset `musical`,
+    /// counted from the file, whose source starts on `start_frame`.
     pub(super) fn restart(
         &mut self,
-        onset_frame: u64,
+        musical: u64,
+        start_frame: u64,
         sample_rate: u32,
         fm: &crate::backend::FmControls,
         freq_hz: f32,
     ) {
-        // Strudel runs its modulator oscillators from context time zero, so
-        // a note mid-render begins mid-cycle: seed each operator with the
-        // phase it has accumulated by the onset.
-        let onset_secs = onset_frame as f64 / f64::from(sample_rate);
+        // The modulator oscillators run from context time zero, so a note
+        // mid-render begins mid-cycle: seed each operator with the phase it
+        // has accumulated by the musical onset. A note of a chain with
+        // latency then sounds as the same note with no chain.
+        let onset_secs = musical as f64 / f64::from(sample_rate);
         for (phase, operator) in self.phases.iter_mut().zip(fm.operators.iter()) {
             *phase = match operator {
                 Some(operator) if operator.waveform.oscillator().is_some() => {
@@ -482,7 +504,8 @@ impl FmState {
                 _ => 0.0,
             };
         }
-        self.quantum_skip = (onset_frame % 128) as u8;
+        // The quanta stay on the frames the voice runs on.
+        self.quantum_skip = (start_frame % 128) as u8;
         self.noise.fill(NoiseGen::new(sample_rate));
     }
 }
@@ -568,6 +591,39 @@ pub(crate) fn saw_blep(phase: f32, mut dt: f32) -> f32 {
     v - blep
 }
 
+/// The phase of a saw lane one step of `dt` after `phase`. An exact cycle
+/// end stays 1.0, as [`wrap_phase`] keeps it.
+#[inline]
+pub(crate) fn next_saw_phase(phase: f32, dt: f32) -> f32 {
+    wrap_phase(f64::from(phase + dt)) as f32
+}
+
+/// One frame of the first `count` lanes of a supersaw with a static spread:
+/// the left and right sums, each lane panned to the other side of the lane
+/// before it. Each phase steps on. The supersaw kernels match this loop bit
+/// for bit: see [`crate::supersaw_kernel`].
+#[inline]
+pub(crate) fn render_static_supersaw_lanes(
+    phases: &mut [f32],
+    detune_ratios: &[f32],
+    count: usize,
+    frequency_hz: f32,
+    sample_rate: f32,
+    (mut gain_l, mut gain_r): (f32, f32),
+) -> (f32, f32) {
+    let mut left = 0.0f32;
+    let mut right = 0.0f32;
+    for (phase, ratio) in phases.iter_mut().zip(detune_ratios).take(count) {
+        let dt = saw_step(frequency_hz * ratio / sample_rate);
+        let value = saw_blep(*phase, dt);
+        left += value * gain_l;
+        right += value * gain_r;
+        *phase = next_saw_phase(*phase, dt);
+        std::mem::swap(&mut gain_l, &mut gain_r);
+    }
+    (left, right)
+}
+
 #[inline]
 pub(super) fn supersaw_spread_geometry(voices: f32, spread: f32) -> (f32, f32) {
     if voices < 2.0 {
@@ -625,6 +681,13 @@ pub(super) fn seeded_phase(onset_id: u64, voice: usize) -> f32 {
 }
 
 impl PendingEvents {
+    /// Reserve room for `additional` more events. A producer-side
+    /// operation: the callback refuses rather than allocating.
+    pub(super) fn reserve(&mut self, additional: usize) {
+        self.slots.reserve(additional);
+        self.order.reserve(additional);
+    }
+
     pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {
             slots: Vec::with_capacity(capacity),
@@ -790,8 +853,8 @@ impl ScalarBackend {
                 lo.min(lo + controls.lfo_depth),
                 lo.max(lo + controls.lfo_depth),
             );
-            let next = phase + f64::from(rate) / f64::from(sample_rate);
-            *lfo_phase = Some(if next > 1.0 { next - 1.0 } else { next });
+            let next = wrap_phase(phase + f64::from(rate) / f64::from(sample_rate));
+            *lfo_phase = Some(next);
         }
         position += adds.position;
         let position = position.clamp(0.0, 1.0);
@@ -824,8 +887,8 @@ impl ScalarBackend {
                 lo.min(lo + controls.warp_lfo_depth),
                 lo.max(lo + controls.warp_lfo_depth),
             );
-            let next = phase + f64::from(rate) / f64::from(sample_rate);
-            *warp_lfo_phase = Some(if next > 1.0 { next - 1.0 } else { next });
+            let next = wrap_phase(phase + f64::from(rate) / f64::from(sample_rate));
+            *warp_lfo_phase = Some(next);
         }
         let warp = (warp + adds.warp).clamp(0.0, 1.0);
 
@@ -999,6 +1062,42 @@ impl ScalarBackend {
         Some((left, right))
     }
 
+    /// The producer-side half of a finite playback's event list: every
+    /// effect `note` applies before the pending push, so the callback can
+    /// admit the events themselves as the output reaches them and a list
+    /// longer than the pending ceiling still plays in full. Sidechains arm
+    /// at admission, as the live path arms at ring intake: the duck queue
+    /// is bounded, and arming the whole list up front would spend it on
+    /// far-future onsets before a single block sounds.
+    pub fn prepare_finite_playback(&mut self, events: &[OnsetEvent]) -> Result<(), String> {
+        // `note` grew the pending queue and the voice vector on the
+        // producer as it queued the whole list, and the callback must
+        // refuse rather than allocate: reserve the same need here, held by
+        // the ceilings the engine already enforces. Without this a backend
+        // from `with_dispatch`, whose init reserves every pool but these,
+        // refuses every in-callback admission.
+        let pending_need = events.len().min(crate::scalar::MAX_PENDING_EVENTS);
+        self.pending.reserve(pending_need);
+        let voices_need = events.len().min(crate::scalar::MAX_ACTIVE_VOICES);
+        if self.voices.capacity() < voices_need {
+            self.voices.reserve(voices_need - self.voices.len());
+        }
+        // Pools sized for everything the backend can sound, so the
+        // in-callback admission never allocates.
+        let capacity = self.voices.capacity();
+        self.ensure_fx_stage_state_pool(capacity);
+        self.ensure_fm_state_pool(capacity);
+        for event in events {
+            if event.controls.choke_only {
+                // Admitted as a choke by the callback itself.
+                continue;
+            }
+            self.prepare_kabel_event(event)?;
+            self.leasing_waves |= event.controls.partials.is_some();
+        }
+        Ok(())
+    }
+
     /// Submit only if the preallocated real-time capacity is sufficient.
     /// Returns false rather than allocating inside the callback.
     pub fn try_note_prepared(&mut self, event: OnsetEvent<CompactKabelControls>) -> bool {
@@ -1044,12 +1143,16 @@ impl ScalarBackend {
             .len()
             .saturating_add(self.pending.len())
             .saturating_add(1);
+        // A receipt names the musical onset of its event, the frame the
+        // producer counts the event at.
+        #[cfg(feature = "device-audio")]
+        let musical = event.controls.musical(event.onset_frame);
         if self.pending.len() == self.pending.capacity() {
             self.pressure.pending_ceiling_drops =
                 self.pressure.pending_ceiling_drops.saturating_add(1);
             #[cfg(feature = "device-audio")]
             if let (Some(consumer), Some(tag)) = (&mut self.confirmations, confirmation) {
-                consumer.admission(tag, event.onset_frame, event.generation, false);
+                consumer.admission(tag, musical, event.generation, false);
             }
             return false;
         }
@@ -1057,13 +1160,13 @@ impl ScalarBackend {
             self.pressure.voice_ceiling_drops = self.pressure.voice_ceiling_drops.saturating_add(1);
             #[cfg(feature = "device-audio")]
             if let (Some(consumer), Some(tag)) = (&mut self.confirmations, confirmation) {
-                consumer.admission(tag, event.onset_frame, event.generation, false);
+                consumer.admission(tag, musical, event.generation, false);
             }
             return false;
         }
         #[cfg(feature = "device-audio")]
         if let (Some(consumer), Some(tag)) = (&mut self.confirmations, confirmation) {
-            consumer.admission(tag, event.onset_frame, event.generation, true);
+            consumer.admission(tag, musical, event.generation, true);
         }
         self.pending
             .push_with_confirmation(event, confirmation, expected_sample_identity);
@@ -1089,63 +1192,114 @@ impl ScalarBackend {
     /// being replaced must stop, not play under the one asked for - so it
     /// has its own verb rather than a flag on the reload. The ramp is the
     /// choke group's, which is what a cut already sounds like here.
+    ///
+    /// A voice fades its output lead before `at_frame`, so its output falls
+    /// silent on that frame, and not before the block.
     pub fn cut_sounding_voices(&mut self, at_frame: u64) {
         self.cut_instrument_notes(at_frame);
         for voice in &mut self.voices {
+            let fade = at_frame
+                .saturating_sub(u64::from(voice.lead))
+                .max(self.frame);
             if voice.cut_fade_frame.is_none() {
-                voice.cut_fade_frame = Some(at_frame);
+                voice.cut_fade_frame = Some(fade);
             }
-            let stop_at = (at_frame.saturating_sub(voice.start_frame)) as f32
-                / self.sample_rate as f32
+            let stop_at = (fade.saturating_sub(voice.start_frame)) as f32 / self.sample_rate as f32
                 + CUT_FADE_SECS;
             voice.stop_secs = voice.stop_secs.min(stop_at);
         }
     }
 
     /// An instrument holds its own notes. A cut of the engine voices at
-    /// `at_frame` ends them at the same frame.
+    /// `at_frame` ends them there: the output lead of the newest note of the
+    /// chain before that frame, and not before the block. A note of the
+    /// restarted score that starts before that frame moves the cut of its
+    /// instrument to its start: see the activation.
     fn cut_instrument_notes(&mut self, at_frame: u64) {
-        let frames = at_frame.saturating_sub(self.frame).min(u64::from(u32::MAX)) as u32;
         let instruments = crate::insert::EFFECT_CHAIN * crate::insert::MAX_INSERT_BUSES;
-        for instrument in self.orbit_inserts.iter_mut().skip(instruments).flatten() {
-            instrument.cut_notes(frames);
+        let slots = self.orbit_inserts.iter_mut().skip(instruments);
+        for (instrument, lead) in slots.zip(&self.insert_leads) {
+            let Some(instrument) = instrument else {
+                continue;
+            };
+            let cut = at_frame.saturating_sub(u64::from(*lead)).max(self.frame);
+            instrument.cut_notes((cut - self.frame).min(u64::from(u32::MAX)) as u32);
         }
     }
 
     /// A choke is also used as an internal note-off. It never needs a
     /// voice slot and must remain possible when the polyphony cap is full.
+    ///
+    /// The note chokes the voice of its group before it. When the note or a
+    /// voice of the group has a lead, the order of the group is the order of
+    /// the musical onsets, ties by id: a note of a chain with latency starts
+    /// up to its lead before a note with no chain that comes before it. The
+    /// voice before the note fades at the musical onset of the note less its
+    /// own output lead, so its output falls silent on that onset. The voice
+    /// after the note chokes the note in the same way: the frame of that fade
+    /// comes back, for the activation to set on the voice of the note.
+    /// `lead` is the output lead of the note. A group with no lead takes the
+    /// newest voice by id.
+    ///
+    /// A voice with more lead than the note fades before the note starts.
+    /// A note that waits passes the end of its block as `until`. The voice
+    /// before it then fades only when the frame of its fade is before
+    /// `until`, and no frame comes back. The activation passes `None`.
     pub(super) fn choke_previous<K>(
         voices: &mut [Voice],
         event: &OnsetEvent<K>,
         frame: u64,
+        until: Option<u64>,
+        lead: u32,
         sample_rate: u32,
-    ) {
-        let Some(cut) = event
+    ) -> Option<u64> {
+        let cut = event
             .cut
-            .or_else(|| event.sample.and_then(|sample| sample.cut))
-        else {
-            return;
-        };
+            .or_else(|| event.sample.and_then(|sample| sample.cut))?;
         let nudge = event
             .sample
             .map(|sample| (f64::from(sample.nudge_secs) * f64::from(sample_rate)) as u64)
             .unwrap_or(0);
-        let cut_at = event.onset_frame.saturating_add(nudge).max(frame);
         let key = cut.to_bits();
-        // Voices retain trigger order, with no lifetime group registry limit.
-        if let Some(previous) = voices
+        let musical = event.controls.musical(event.onset_frame);
+        let led = event.controls.lead > 0
+            || lead > 0
+            || voices
+                .iter()
+                .any(|voice| voice.cut_group == Some(key) && (voice.aimed_early || voice.lead > 0));
+        let group = voices
             .iter_mut()
-            .filter(|voice| voice.cut_group == Some(key))
-            .max_by_key(|voice| voice.id)
-        {
-            let fade = previous
-                .cut_fade_frame
-                .map_or(cut_at, |running| running.min(cut_at));
-            previous.cut_fade_frame = Some(fade);
-            let fade_end =
-                fade.saturating_sub(previous.start_frame) as f32 / sample_rate as f32 + 0.011;
-            previous.stop_secs = previous.stop_secs.min(fade_end);
+            .filter(|voice| voice.cut_group == Some(key));
+        // Voices retain trigger order, with no lifetime group registry limit.
+        let previous = match led {
+            false => group.max_by_key(|voice| voice.id),
+            true => group
+                .filter(|voice| voice.musical <= musical)
+                .max_by_key(|voice| (voice.musical, voice.id)),
+        };
+        if let Some(previous) = previous {
+            let cut_at = musical
+                .saturating_add(nudge)
+                .saturating_sub(u64::from(previous.lead));
+            if until.is_none_or(|until| cut_at < until) {
+                let cut_at = cut_at.max(frame);
+                let fade = previous
+                    .cut_fade_frame
+                    .map_or(cut_at, |running| running.min(cut_at));
+                previous.cut_fade_frame = Some(fade);
+                let fade_end =
+                    fade.saturating_sub(previous.start_frame) as f32 / sample_rate as f32 + 0.011;
+                previous.stop_secs = previous.stop_secs.min(fade_end);
+            }
         }
+        if until.is_some() {
+            return None;
+        }
+        let next = voices
+            .iter()
+            .filter(|voice| led && voice.cut_group == Some(key) && voice.musical > musical)
+            .min_by_key(|voice| (voice.musical, voice.id))?;
+        Some(next.musical.saturating_sub(u64::from(lead)).max(frame))
     }
 
     /// Takeover cut - the from-zero reload's (a rewind's) signature.
@@ -1181,6 +1335,9 @@ impl ScalarBackend {
     /// the ramp while the new one opens hands the monitored signal over
     /// without a gap, where leaving it out of the cut would sound the input
     /// twice, at double level, until the old window's end.
+    ///
+    /// A voice of a plugin chain with latency fades its output lead before
+    /// `cut_frame`, so its output falls silent on the cut.
     pub fn begin_takeover_cut(&mut self, cut_frame: u64, outgoing_generation: u64) {
         // A cut frame already behind the clock (a quantised flip published
         // late, or a line arm whose block has passed it) still fades from
@@ -1188,9 +1345,11 @@ impl ScalarBackend {
         // pinned in the past is already at zero - a step to silence, the
         // click the choke ramp exists to avoid. The arm keeps the requested
         // frame so a late-activating outgoing onset is pre-faded to it.
-        let fade_from = cut_frame.max(self.frame);
-        self.cut_instrument_notes(fade_from);
+        self.cut_instrument_notes(cut_frame);
         for voice in self.voices.iter_mut().filter(|voice| !voice.piano) {
+            let fade_from = cut_frame
+                .saturating_sub(u64::from(voice.lead))
+                .max(self.frame);
             voice.cut_fade_frame = Some(match voice.cut_fade_frame {
                 Some(fade) => fade.min(fade_from),
                 None => fade_from,
@@ -1250,18 +1409,37 @@ impl ScalarBackend {
         self.keep_started_onsets(incoming, at_frame, horizon);
     }
 
-    /// Retire every pending onset at or after the frame `horizon` names for
-    /// its generation, reporting each as superseded, and sync the clock to
-    /// `at_frame`. A borrowed closure over a fixed pool: nothing allocates.
+    /// Retire every pending onset whose musical onset is at or after the
+    /// frame `horizon` names for its generation, reporting each as
+    /// superseded and retracting its early score from the inserts that render
+    /// ahead, and sync the clock to `at_frame`. A note of a plugin chain
+    /// with latency is aimed its lead before its musical onset, so its target
+    /// is at times before the horizon. A borrowed closure over a fixed pool:
+    /// nothing allocates.
     ///
     /// A voice is never retired here, also not an SBD voice whose graph runs
     /// ahead of its source: see [`Self::keep_started_onsets`].
     fn retire_pending_by(&mut self, at_frame: u64, horizon: impl Fn(u64) -> u64) {
+        let retires = |event: &OnsetEvent<CompactKabelControls>| {
+            !event.controls.piano
+                && event.controls.musical(event.onset_frame) >= horizon(event.generation)
+        };
+        for position in 0..self.pending.order.len() {
+            let index = self.pending.order[position];
+            let event = self.pending.slots[index]
+                .event
+                .as_ref()
+                .filter(|event| retires(event))
+                .copied();
+            if let Some(event) = event {
+                self.cancel_inserts_early(&event);
+            }
+        }
         #[cfg(feature = "device-audio")]
         let confirmations = &mut self.confirmations;
         self.pending
             .retain_with_confirmation(|event, confirmation, _| {
-                let keep = event.controls.piano || event.onset_frame < horizon(event.generation);
+                let keep = !retires(event);
                 #[cfg(feature = "device-audio")]
                 if !keep && let (Some(consumer), Some(tag)) = (&mut *confirmations, confirmation) {
                     consumer.superseded(tag);
@@ -1277,14 +1455,16 @@ impl ScalarBackend {
     /// generation an edit's flip installs on the block at `at_frame`.
     ///
     /// The incoming generation plays every onset from its takeover frame
-    /// again. A voice of an older generation with its onset on that frame or
-    /// after it has started, so the takeover keeps it and the onset sounds.
-    /// The caller leaves out the incoming copy, or the onset sounds twice.
-    /// Such a voice is one of two kinds:
+    /// again. A voice of an older generation with its musical onset on that
+    /// frame or after it has started, so the takeover keeps it and the onset
+    /// sounds. The caller leaves out the incoming copy, or the onset sounds
+    /// twice. Such a voice is one of three kinds:
     ///
     /// - An SBD voice. Its graph starts one lead before its onset.
     /// - Any voice, when the flip lands after its takeover frame. A control
     ///   requery can publish that late.
+    /// - A voice of a plugin chain with latency. It starts the lead of its
+    ///   note before its musical onset.
     ///
     /// ```text
     ///              flip      takeover         onset
@@ -1307,14 +1487,13 @@ impl ScalarBackend {
             .filter(|voice| !voice.piano && voice.generation < incoming)
         {
             let takeover_frame = horizon(voice.generation);
-            let one_frame_before = takeover_frame.checked_sub(1) == Some(voice.start_frame)
+            let one_frame_before = takeover_frame.checked_sub(1) == Some(voice.musical)
                 && voice.graph_start_frame < voice.start_frame;
-            let kept =
-                one_frame_before || (takeover_frame != 0 && voice.start_frame >= takeover_frame);
+            let kept = one_frame_before || (takeover_frame != 0 && voice.musical >= takeover_frame);
             voice.replayed_by = kept.then_some(incoming);
             voice.replayed_on_next_frame = one_frame_before;
             if kept {
-                last_onset = last_onset.max(Some(voice.start_frame));
+                last_onset = last_onset.max(Some(voice.musical));
             }
         }
         let reach = kept_onset_reach_frames(self.sample_rate);
@@ -1322,55 +1501,66 @@ impl ScalarBackend {
             last_onset.map(|frame| (incoming, at_frame, frame.saturating_add(reach)));
     }
 
-    /// Whether a kept voice stands in for the event of `generation` aimed
-    /// at `onset_frame`. It is the nearest voice that
-    /// [`Self::keep_started_onsets`] marked for that generation, at most
-    /// [`KEPT_ONSET_REACH_SECS`] away. The voice then stands in for no
-    /// other event, so an event with no voice of its own near it sounds.
+    /// Whether a kept voice stands in for `event`. It is the nearest voice
+    /// that [`Self::keep_started_onsets`] marked for the generation of the
+    /// event, at most [`KEPT_ONSET_REACH_SECS`] from its musical onset. The
+    /// voice then stands in for no other event, so an event with no voice of
+    /// its own near it sounds.
     ///
-    /// `early_graph` says that the event is an SBD hit, and an event pairs
-    /// only with a voice of its kind. Any other voice started before the
-    /// block the flip landed on. It pairs only with an event aimed before
-    /// that block, so an event that is on time always sounds.
+    /// An SBD hit pairs only with an SBD voice, and any other event only
+    /// with a voice of another kind. Such a voice of a note with no lead
+    /// started before the block the flip landed on. It pairs only with an
+    /// event aimed before that block, so an event that is on time always
+    /// sounds. A note with a lead is aimed before its musical onset, through
+    /// a plugin chain with latency, and the copy of its onset is at times
+    /// aimed at or after that block: a copy with no such chain is aimed at
+    /// the musical onset. So its voice pairs only with an event of its sound,
+    /// whatever the target of the event: see [`Voice::has_the_sound_of`]. An
+    /// event of another sound on that frame sounds.
     ///
     /// A voice one frame before the takeover frame pairs only with the
     /// event on that frame, so it never takes the next hit of a roll.
     ///
     /// A voice that a cut silences from its onset stands in for nothing. For
     /// a voice one frame before the takeover frame, that is a cut on the
-    /// takeover frame or before it.
+    /// takeover frame or before it. A cut fades a voice its output lead
+    /// before the output falls silent.
     /// Runs on the audio callback: a scan of the voice pool, no allocation.
-    pub(crate) fn kept_onset_stands_for(
-        &mut self,
-        onset_frame: u64,
-        generation: u64,
-        early_graph: bool,
-    ) -> bool {
+    pub(crate) fn kept_onset_stands_for<K>(&mut self, event: &crate::AudioEvent<K>) -> bool {
         let Some((incoming, landed_at, last_frame)) = self.kept_onsets else {
             return false;
         };
-        if generation != incoming
-            || onset_frame > last_frame
-            || (!early_graph && onset_frame >= landed_at)
-        {
+        let musical = event.controls.musical(event.target_frame);
+        if event.generation != incoming || musical > last_frame {
             return false;
         }
+        let early_graph = matches!(event.synth, Some(crate::backend::SynthSource::Sbd { .. }));
+        let on_time = !early_graph && event.target_frame >= landed_at;
         let reach = kept_onset_reach_frames(self.sample_rate);
         let nearest = self
             .voices
             .iter_mut()
             .filter(|voice| {
                 let (copy_frame, reach) = if voice.replayed_on_next_frame {
-                    (voice.start_frame.saturating_add(1), 0)
+                    (voice.musical.saturating_add(1), 0)
                 } else {
-                    (voice.start_frame, reach)
+                    (voice.musical, reach)
                 };
-                voice.replayed_by == Some(generation)
+                let pairs = if voice.aimed_early {
+                    voice.has_the_sound_of(event)
+                } else {
+                    !on_time
+                };
+                let silent_from = |fade: u64| fade.saturating_add(u64::from(voice.lead));
+                voice.replayed_by == Some(incoming)
                     && (voice.graph_start_frame < voice.start_frame) == early_graph
-                    && voice.cut_fade_frame.is_none_or(|fade| fade > copy_frame)
-                    && copy_frame.abs_diff(onset_frame) <= reach
+                    && voice
+                        .cut_fade_frame
+                        .is_none_or(|fade| silent_from(fade) > copy_frame)
+                    && copy_frame.abs_diff(musical) <= reach
+                    && pairs
             })
-            .min_by_key(|voice| voice.start_frame.abs_diff(onset_frame));
+            .min_by_key(|voice| voice.musical.abs_diff(musical));
         match nearest {
             Some(voice) => {
                 voice.replayed_by = None;
@@ -1380,24 +1570,28 @@ impl ScalarBackend {
         }
     }
 
-    /// Whether an older generation started the SBD graph of the onset at
-    /// `onset_frame`, at most one frame away. This is the rule for an event
-    /// of a generation that a newer flip replaced. Two flips can land before
-    /// the device reads the events of the first one, and then no voice is
-    /// marked for that generation: see [`Self::keep_started_onsets`]. The
-    /// event is still a copy of the onset that the voice plays.
+    /// Whether an older generation started the SBD graph of the onset with
+    /// the musical onset `musical`, at most one frame away. This is the rule
+    /// for an event of a generation that a newer flip replaced. When two
+    /// flips land before the device reads the events of the first one, no
+    /// voice is marked for that generation: see
+    /// [`Self::keep_started_onsets`]. The event is still a copy of the onset
+    /// that the voice plays.
     ///
     /// A voice that a cut silences from its onset stands in for nothing.
     /// Runs on the audio callback: a scan of the voice pool, no allocation.
-    pub(crate) fn started_graph_plays(&self, onset_frame: u64, generation: u64) -> bool {
+    pub(crate) fn started_graph_plays(&self, musical: u64, generation: u64) -> bool {
         self.voices.iter().any(|voice| {
+            // A cut fades a voice its output lead before the output falls
+            // silent.
+            let silent_from = |fade: u64| fade.saturating_add(u64::from(voice.lead));
             !voice.piano
                 && voice.graph_start_frame < voice.start_frame
                 && voice.generation < generation
                 && voice
                     .cut_fade_frame
-                    .is_none_or(|fade| fade > voice.start_frame)
-                && voice.start_frame.abs_diff(onset_frame) <= 1
+                    .is_none_or(|fade| silent_from(fade) > voice.musical)
+                && voice.musical.abs_diff(musical) <= 1
         })
     }
 
@@ -1412,9 +1606,17 @@ impl ScalarBackend {
     ///
     /// Without a cap, dense music grows steadily louder as voices pile up:
     /// a generated 916-onset score measured +3.899 dB overall.
-    pub(super) fn cull_for_polyphony(
+    ///
+    /// When the note or a voice has a lead, the oldest voice is the voice of
+    /// the earliest musical onset, ties by id, as in [`Self::choke_previous`].
+    /// It fades at the musical onset of the note less its own output lead,
+    /// so its output starts to fade on that onset, and not before `frame`.
+    /// `lead` is the output lead of the note.
+    pub(super) fn cull_for_polyphony<K>(
         voices: &mut [Voice],
-        onset_frame: u64,
+        event: &OnsetEvent<K>,
+        frame: u64,
+        lead: u32,
         sample_rate: u32,
         max_polyphony: usize,
     ) -> usize {
@@ -1422,30 +1624,55 @@ impl ScalarBackend {
             .iter()
             .filter(|voice| voice.polyphony_fade_frame.is_none())
             .count();
+        let musical = event.controls.musical(event.onset_frame);
+        let led = Self::led(voices, event.controls.lead.max(lead));
+        let fade_at = |oldest: &Voice| match led {
+            false => event.onset_frame,
+            true => musical.saturating_sub(u64::from(oldest.lead)).max(frame),
+        };
         Self::fade_oldest_voices(
             voices,
             polyphony_kills(active, max_polyphony),
-            onset_frame,
+            led,
+            fade_at,
             sample_rate,
         )
     }
 
+    /// Whether a note with `lead`, or a voice, orders the voices by their
+    /// musical onsets: see [`Self::cull_for_polyphony`].
+    pub(super) fn led(voices: &[Voice], lead: u32) -> bool {
+        lead > 0
+            || voices
+                .iter()
+                .any(|voice| voice.aimed_early || voice.lead > 0)
+    }
+
+    /// Fades the `count` oldest voices still counted, each from the frame
+    /// `fade_at` gives it. With `led` the oldest voice is the voice of the
+    /// earliest musical onset, and else the first triggered.
     pub(super) fn fade_oldest_voices(
         voices: &mut [Voice],
         count: usize,
-        onset_frame: u64,
+        led: bool,
+        fade_at: impl Fn(&Voice) -> u64,
         sample_rate: u32,
     ) -> usize {
         let mut faded = 0;
         for _ in 0..count {
             // `voices` is pushed in trigger order and `retain_mut` keeps it, so
-            // the first still-counted voice is the oldest.
-            let Some(oldest) = voices
+            // the first still-counted voice is the first triggered.
+            let mut counted = voices
                 .iter_mut()
-                .find(|voice| voice.polyphony_fade_frame.is_none())
-            else {
+                .filter(|voice| voice.polyphony_fade_frame.is_none());
+            let oldest = match led {
+                false => counted.next(),
+                true => counted.min_by_key(|voice| (voice.musical, voice.id)),
+            };
+            let Some(oldest) = oldest else {
                 break;
             };
+            let onset_frame = fade_at(oldest);
             oldest.polyphony_fade_frame = Some(onset_frame);
             let stop_at = (onset_frame.saturating_sub(oldest.start_frame)) as f32
                 / sample_rate as f32
@@ -1506,6 +1733,7 @@ impl ScalarBackend {
         quantum_skip: u8,
         phases: &mut [f64; crate::backend::MAX_FM_OPERATORS + 1],
         noise: &mut [NoiseGen; crate::backend::MAX_FM_OPERATORS + 1],
+        live_index: Option<f32>,
         mod_adds: &ModAdds,
         tables: &PeriodicWaveTables,
         sample_rate: f64,
@@ -1555,14 +1783,21 @@ impl ScalarBackend {
         }
 
         // The route depth uses the source's static nominal frequency. Live
-        // frequency modulation moves that oscillator but not the gain of the
-        // route carrying it.
+        // frequency modulation moves that oscillator but not the gain of
+        // the route carrying it.
         let mut incoming = [0.0f32; crate::backend::MAX_FM_OPERATORS + 1];
         for route in fm.routes.iter().flatten() {
             let Some(Some(op)) = fm.operators.get(usize::from(route.source) - 1) else {
                 continue;
             };
-            let amount = route.amount
+            // A live slider on the direct route replaces its base amount;
+            // a modulator aimed at the index still adds on top, as on the
+            // other routes.
+            let base_amount = match (route.mod_slot, live_index) {
+                (Some(0), Some(index)) => index,
+                _ => route.amount,
+            };
+            let amount = base_amount
                 + route
                     .mod_slot
                     .and_then(|slot| mod_adds.fm_index.get(usize::from(slot)).copied())
@@ -2492,6 +2727,60 @@ mod tests {
             assert_eq!(backend.voices.len(), 64);
         }
 
+        /// A note through a chain with latency starts its lead before its
+        /// musical onset. The cap fades the voice of the earliest musical
+        /// onset, and from the musical onset of the new note, as a choke does.
+        #[test]
+        fn the_cap_culls_by_musical_onset_when_a_note_has_a_lead() {
+            const LEAD: u32 = 480;
+            let latent = |musical: u64, frequency: f32| {
+                let aimed = musical - u64::from(LEAD);
+                let mut event = OnsetEvent::new(aimed, frequency, 0.1, 2.0);
+                let key = crate::InsertKey {
+                    plugin: 1,
+                    preset: 0,
+                };
+                event.controls.lead = LEAD;
+                event.controls.effects[0] =
+                    Some(crate::InsertControls::new(key).with_latency(LEAD));
+                event
+            };
+            // The fade frame of each voice by its frequency, after `events`
+            // at the cap of `limit`.
+            let fades = |limit: usize, events: Vec<OnsetEvent>| {
+                let mut backend = ScalarBackend::prepared(48_000, 16).expect("backend");
+                backend.set_max_polyphony(limit);
+                for event in events {
+                    backend.note(event);
+                }
+                for _ in 0..24 {
+                    backend.process_block(&mut [0.0; 256], 128);
+                }
+                let mut fades: Vec<_> = backend
+                    .voices
+                    .iter()
+                    .map(|voice| (voice.freq_hz as u32, voice.polyphony_fade_frame))
+                    .collect();
+                fades.sort_unstable();
+                fades
+            };
+            // A pad, then a latent note on 2 048 that starts on 1 568. The
+            // pad fades on 2 048, where the latent note sounds.
+            let pad = OnsetEvent::new(0, 220.0, 0.1, 2.0);
+            assert_eq!(
+                fades(1, vec![pad.clone(), latent(2_048, 330.0)]),
+                [(220, Some(2_048)), (330, None)]
+            );
+            // A latent note on 1 324 starts on 844, before a pad on 1 000. A
+            // note on 2 048 then fades the pad, the earlier onset.
+            let later = OnsetEvent::new(2_048, 440.0, 0.1, 2.0);
+            let pad = OnsetEvent::new(1_000, 220.0, 0.1, 2.0);
+            assert_eq!(
+                fades(2, vec![latent(1_324, 330.0), pad, later]),
+                [(220, Some(2_048)), (330, None), (440, None)]
+            );
+        }
+
         #[test]
         fn polyphony_is_bounded_per_backend_and_survives_reset_and_init() {
             let mut first = ScalarBackend::new();
@@ -3131,6 +3420,27 @@ mod tests {
             output.into_iter().step_by(2).collect()
         }
 
+        /// The copy of a hit that `generation` aims at `frame`, as the ring
+        /// gives it. With `sbd` false, a note of another kind.
+        fn copy(frame: u64, generation: u64, sbd: bool) -> crate::AudioEvent {
+            let hit = event(1.0);
+            crate::AudioEvent {
+                onset_id: 0,
+                generation,
+                ui_visuals: 0,
+                target_frame: frame,
+                onset_lead: 0.0,
+                freq_hz: hit.freq_hz,
+                gain: hit.gain,
+                duration_secs: hit.duration_secs,
+                controls: Default::default(),
+                sample: None,
+                wavetable: None,
+                synth: hit.synth.filter(|_| sbd),
+                cut: None,
+            }
+        }
+
         /// A takeover keeps an SBD voice whose graph already runs. The voice
         /// stands in for one copy of its onset from the newer generation, also
         /// when a changed tempo moved the copy.
@@ -3143,23 +3453,32 @@ mod tests {
             hit.generation = 1;
             let mut backend = ScalarBackend::prepared(48_000, 2).expect("backend");
             assert!(backend.try_note_prepared(hit.into_prepared()));
-            assert!(!backend.kept_onset_stands_for(ONSET, 2, true), "pending");
+            assert!(
+                !backend.kept_onset_stands_for(&copy(ONSET, 2, true)),
+                "pending"
+            );
             // 150 ms: the graph is running, 50 ms before its source starts.
             let mut output = vec![0.0; 7_200 * 2];
             backend.process_block(&mut output, 7_200);
             backend.hand_over_from(2, 8_000, 7_200);
             assert_eq!(backend.voices.len(), 1, "a started graph is kept");
-            assert!(!backend.kept_onset_stands_for(ONSET, 1, true), "its own");
             assert!(
-                !backend.kept_onset_stands_for(ONSET, 2, false),
+                !backend.kept_onset_stands_for(&copy(ONSET, 1, true)),
+                "its own"
+            );
+            assert!(
+                !backend.kept_onset_stands_for(&copy(ONSET, 2, false)),
                 "no SBD hit"
             );
-            assert!(!backend.kept_onset_stands_for(ONSET + reach + 1, 2, true));
-            assert!(backend.kept_onset_stands_for(ONSET + reach, 2, true));
-            assert!(!backend.kept_onset_stands_for(ONSET, 2, true), "one event");
+            assert!(!backend.kept_onset_stands_for(&copy(ONSET + reach + 1, 2, true)));
+            assert!(backend.kept_onset_stands_for(&copy(ONSET + reach, 2, true)));
+            assert!(
+                !backend.kept_onset_stands_for(&copy(ONSET, 2, true)),
+                "one event"
+            );
             // The next generation plays the onset again.
             backend.hand_over_from(3, 8_200, 7_200);
-            assert!(backend.kept_onset_stands_for(ONSET - reach, 3, true));
+            assert!(backend.kept_onset_stands_for(&copy(ONSET - reach, 3, true)));
         }
 
         /// The takeover gives an onset before its frame to the outgoing
@@ -3176,12 +3495,12 @@ mod tests {
             let mut output = vec![0.0; 7_200 * 2];
             backend.process_block(&mut output, 7_200);
             backend.hand_over_from(2, ONSET + 2, 7_200);
-            assert!(!backend.kept_onset_stands_for(ONSET, 2, true));
-            assert!(!backend.kept_onset_stands_for(ONSET + 1, 2, true));
-            assert!(!backend.kept_onset_stands_for(ONSET + 200, 2, true));
+            assert!(!backend.kept_onset_stands_for(&copy(ONSET, 2, true)));
+            assert!(!backend.kept_onset_stands_for(&copy(ONSET + 1, 2, true)));
+            assert!(!backend.kept_onset_stands_for(&copy(ONSET + 200, 2, true)));
             // Frame zero names no takeover.
             backend.hand_over_from(3, 0, 7_200);
-            assert!(!backend.kept_onset_stands_for(ONSET, 3, true));
+            assert!(!backend.kept_onset_stands_for(&copy(ONSET, 3, true)));
         }
 
         /// Only an SBD graph starts before its onset. A voice of another kind
@@ -3197,7 +3516,7 @@ mod tests {
             backend.process_block(&mut output, 9_700);
             backend.hand_over_from(2, ONSET + 1, 9_700);
             assert_eq!(backend.voices.len(), 1, "the voice has started");
-            assert!(!backend.kept_onset_stands_for(ONSET + 1, 2, false));
+            assert!(!backend.kept_onset_stands_for(&copy(ONSET + 1, 2, false)));
         }
 
         /// A roll of hits 25 ms apart, moved 300 frames by the takeover. Each
@@ -3219,7 +3538,7 @@ mod tests {
             assert_eq!(backend.voices.len(), 3, "the last graph has not started");
             assert_eq!(backend.pending.len(), 0);
             for (index, onset) in HITS.into_iter().enumerate() {
-                let stands_in = backend.kept_onset_stands_for(onset - 300, 2, true);
+                let stands_in = backend.kept_onset_stands_for(&copy(onset - 300, 2, true));
                 assert_eq!(stands_in, index < 3, "hit {index}");
                 let waiting = backend
                     .voices
@@ -3434,5 +3753,176 @@ mod tests {
         ] {
             assert_eq!(saw_step(x).to_bits(), x.rem_euclid(1.0).to_bits(), "{x}");
         }
+    }
+
+    /// A kept voice of a note through a plugin chain with latency, aimed its
+    /// lead before its musical onset. It stands in only for a copy of its
+    /// sound on that onset, whatever the target of the copy: the same
+    /// frequency, and the same sample or table, or none on both. A cut that
+    /// silences its output from the onset leaves it standing in for nothing.
+    #[test]
+    fn a_kept_voice_with_a_lead_stands_in_only_for_a_copy_of_its_sound() {
+        const MUSICAL: u64 = 1_024;
+        let sample = |id| crate::SampleControls {
+            sample: SampleId(id),
+            playback_rate: 1.0,
+            begin: 0.0,
+            end: 1.0,
+            hold: crate::SampleHold::Slice,
+            muted: false,
+            loop_secs: None,
+            envelope_peak: 1.0,
+            reversed: false,
+            nudge_secs: 0.0,
+            cut: None,
+        };
+        let mut backend = ScalarBackend::prepared(48_000, 2).expect("backend");
+        let decoded = DecodedSample::from_parts(48_000, 1, vec![0.5; 9_600]).expect("sample");
+        assert!(
+            backend
+                .install_sample(SampleId(9), Box::new(decoded))
+                .is_ok()
+        );
+        // The note is aimed 480 frames before its musical onset, and before
+        // the flip. No copy serves its chain, so its source starts on the
+        // musical onset.
+        let key = crate::InsertKey {
+            plugin: 1,
+            preset: 0,
+        };
+        let mut hit = OnsetEvent::new(MUSICAL - 480, 440.0, 1.0, 0.1);
+        hit.generation = 1;
+        hit.sample = Some(sample(9));
+        hit.controls.lead = 480;
+        hit.controls.effects[0] = Some(crate::InsertControls::new(key).with_latency(480));
+        assert!(backend.try_note_prepared(hit.into_prepared()));
+        let mut output = vec![0.0; 768 * 2];
+        backend.process_block(&mut output, 768);
+        backend.hand_over_from(2, 896, 768);
+        // A copy with no plugin chain is aimed at the musical onset, after
+        // the block the flip landed on.
+        let copy = |freq_hz, sample| -> crate::AudioEvent {
+            crate::AudioEvent {
+                onset_id: 2,
+                generation: 2,
+                ui_visuals: 0,
+                target_frame: MUSICAL,
+                onset_lead: 0.0,
+                freq_hz,
+                gain: 1.0,
+                duration_secs: 0.1,
+                controls: Default::default(),
+                sample,
+                wavetable: None,
+                synth: None,
+                cut: None,
+            }
+        };
+        assert!(
+            !backend.kept_onset_stands_for(&copy(440.0, None)),
+            "no sample"
+        );
+        let other = copy(440.0, Some(sample(8)));
+        assert!(!backend.kept_onset_stands_for(&other), "another sample");
+        let other = copy(220.0, Some(sample(9)));
+        assert!(!backend.kept_onset_stands_for(&other), "another frequency");
+        assert!(backend.kept_onset_stands_for(&copy(440.0, Some(sample(9)))));
+        let again = copy(440.0, Some(sample(9)));
+        assert!(!backend.kept_onset_stands_for(&again), "one copy");
+
+        // A copy serves the chain and the instrument of the note, so the
+        // voice starts its lead before its musical onset. A cut fades the
+        // voice and ends the notes of the instrument that lead before the
+        // cut, and the output falls silent on the cut. A cut 100 frames
+        // after the musical onset leaves the onset sounding: the kept voice
+        // stands in for its copy.
+        struct Pass(crate::InsertKey, Arc<std::sync::atomic::AtomicU32>);
+        impl crate::OrbitInsert for Pass {
+            fn key(&self) -> crate::InsertKey {
+                self.0
+            }
+            fn set_param(&mut self, _: crate::InsertParam, _: u32) {}
+            fn process(&mut self, _: &mut [f32], _: &mut [f32]) {}
+            fn cut_notes(&mut self, frames: u32) {
+                self.1.store(frames, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let cut_in = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+        let served = |cut_first: bool| {
+            let mut backend = ScalarBackend::prepared(48_000, 2).expect("backend");
+            let cut_in = Arc::clone(&cut_in);
+            backend.set_insert_provider(Arc::new(move |key, _, _| {
+                Some(Box::new(Pass(key, Arc::clone(&cut_in))) as Box<dyn crate::OrbitInsert>)
+            }));
+            let decoded = DecodedSample::from_parts(48_000, 1, vec![0.5; 9_600]).expect("sample");
+            assert!(
+                backend
+                    .install_sample(SampleId(9), Box::new(decoded))
+                    .is_ok()
+            );
+            let mut hit = OnsetEvent::new(MUSICAL - 480, 440.0, 1.0, 0.1);
+            hit.generation = 1;
+            hit.sample = Some(sample(9));
+            hit.controls.lead = 480;
+            hit.controls.effects[0] = Some(crate::InsertControls::new(key).with_latency(480));
+            hit.controls.instrument = Some(crate::InsertControls::new(crate::InsertKey {
+                plugin: 2,
+                preset: 0,
+            }));
+            assert!(backend.try_note_prepared(hit.into_prepared()));
+            // An armed cut fades the voice at its activation.
+            if cut_first {
+                backend.begin_takeover_cut(MUSICAL + 100, 1);
+            }
+            let mut output = vec![0.0; 640 * 2];
+            backend.process_block(&mut output, 640);
+            backend
+        };
+        let mut backend = served(false);
+        backend.begin_takeover_cut(MUSICAL + 100, 1);
+        assert_eq!(backend.voices[0].cut_fade_frame, Some(MUSICAL + 100 - 480));
+        assert_eq!(cut_in.load(std::sync::atomic::Ordering::Relaxed), 4);
+        backend.hand_over_from(2, 896, 640);
+        // A tempo change moved the copy 100 frames past the musical onset, 580
+        // frames after the start of the voice. The voice pairs with it by its
+        // musical onset.
+        let moved = crate::AudioEvent {
+            target_frame: MUSICAL + 100,
+            ..copy(440.0, Some(sample(9)))
+        };
+        assert!(backend.kept_onset_stands_for(&moved));
+        let backend = served(true);
+        assert_eq!(backend.voices[0].cut_fade_frame, Some(MUSICAL + 100 - 480));
+        let mut backend = served(false);
+        backend.cut_sounding_voices(MUSICAL + 100);
+        assert_eq!(backend.voices[0].cut_fade_frame, Some(MUSICAL + 100 - 480));
+
+        // An SBD voice of the note starts its graph before its source. For a
+        // copy of a generation that a newer flip replaced, the graph plays
+        // the onset while a cut leaves the onset sounding.
+        let graph_plays = |cut: u64| {
+            let mut backend = ScalarBackend::prepared(48_000, 2).expect("backend");
+            let cut_in = Arc::clone(&cut_in);
+            backend.set_insert_provider(Arc::new(move |key, _, _| {
+                Some(Box::new(Pass(key, Arc::clone(&cut_in))) as Box<dyn crate::OrbitInsert>)
+            }));
+            let mut hit = OnsetEvent::new(MUSICAL - 480, 55.0, 1.0, 0.1);
+            hit.generation = 1;
+            hit.synth = Some(crate::SynthSource::Sbd {
+                decay_secs: 0.2,
+                pdecay_secs: 0.3,
+                penv_semitones: 36.0,
+                stop_secs: 0.21,
+            });
+            hit.controls.lead = 480;
+            hit.controls.effects[0] = Some(crate::InsertControls::new(key).with_latency(480));
+            assert!(backend.try_note_prepared(hit.into_prepared()));
+            let mut output = vec![0.0; 512 * 2];
+            backend.process_block(&mut output, 512);
+            backend.begin_takeover_cut(cut, 1);
+            backend.started_graph_plays(MUSICAL, 3)
+        };
+        assert!(graph_plays(MUSICAL + 100), "a cut after the onset");
+        assert!(!graph_plays(MUSICAL), "a cut on the onset");
     }
 }

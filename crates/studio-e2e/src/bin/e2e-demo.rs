@@ -19,6 +19,11 @@
 //! support). When it is not, the frames are encoded into an animated GIF
 //! entirely in Rust - no Python, no external tool needed, just a larger
 //! file. Either way the result lands beside the recordings.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "the demo is a terminal program"
+)]
 
 use std::collections::BTreeMap;
 use std::io::Write as _;

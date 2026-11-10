@@ -4,8 +4,10 @@ use rustel_jsruntime::{JsRuntime, Slot};
 use rustel_transpiler::TranspileOptions;
 
 fn runtime(source: &str) -> JsRuntime {
-    let runtime = JsRuntime::new().unwrap();
-    runtime.install_semantic_bindings().unwrap();
+    let runtime = JsRuntime::new().expect("the runtime builds");
+    runtime
+        .install_semantic_bindings()
+        .expect("the bindings install");
     runtime
         .evaluate_score(source, &TranspileOptions::default())
         .unwrap_or_else(|error| panic!("{source}: {error}"));
@@ -13,12 +15,19 @@ fn runtime(source: &str) -> JsRuntime {
 }
 
 fn query(runtime: &JsRuntime, begin: Fraction, end: Fraction) -> Vec<Hap> {
-    runtime.query(Slot::Active, 0, begin, end).unwrap()
+    runtime
+        .query(Slot::Active, 0, begin, end)
+        .expect("the query succeeds")
 }
 
 fn frequencies(haps: &[Hap]) -> Vec<f64> {
     haps.iter()
-        .map(|hap| hap.value.get("freq").and_then(Value::as_f64).unwrap())
+        .map(|hap| {
+            hap.value
+                .get("freq")
+                .and_then(Value::as_f64)
+                .expect("every hap carries a numeric freq")
+        })
         .collect()
 }
 

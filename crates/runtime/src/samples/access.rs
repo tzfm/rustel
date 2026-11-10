@@ -5,30 +5,36 @@ impl ScoreSampleAccess {
         Self::default()
     }
 
-    /// Permit score-selected URLs on one exact HTTP(S) origin.
-    ///
-    /// The origin must not contain credentials, a path, query, or fragment.
-    /// Redirects are confined to the same origin.
-    pub fn permit_origin(&mut self, origin: &str) -> Result<(), String> {
-        let parsed =
-            Url::parse(origin).map_err(|error| format!("invalid sample origin: {error}"))?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-            return Err("sample origin must be an http or https origin".to_owned());
-        }
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err("sample origin must not contain credentials".to_owned());
-        }
-        if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
-            return Err("sample origin must not contain a path, query, or fragment".to_owned());
-        }
-        let canonical = parsed.origin().ascii_serialization();
-        if canonical == "null" {
-            return Err("sample origin is not a network origin".to_owned());
-        }
-        if !self.allowed_origins.contains(&canonical) {
-            self.allowed_origins.push(canonical);
+    /// Allow one source: a domain such as `example.com`, or an address such
+    /// as `https://example.com/kits/`. See [`SourceRule`].
+    pub fn permit_source(&mut self, source: &str) -> Result<(), String> {
+        let rule = SourceRule::parse(source)?;
+        if !self.sources.contains(&rule) {
+            self.sources = self.sources.iter().cloned().chain([rule]).collect();
         }
         Ok(())
+    }
+
+    /// Allow the domains of [`BUILTIN_SOURCES`], which the `github:`,
+    /// `bubo:` and `shabda:` shorthands, the default banks and freesound
+    /// sounds read.
+    pub fn permit_builtin_sources(&mut self) {
+        for source in BUILTIN_SOURCES {
+            self.permit_source(source)
+                .expect("a built-in source is a domain");
+        }
+    }
+
+    /// The sources this policy allows, in the order they were given.
+    pub fn sources(&self) -> &[SourceRule] {
+        &self.sources
+    }
+
+    /// The source that allows `raw`, or `None` when no source does. It does
+    /// not note a refusal, so a host can ask before it fetches.
+    pub fn source_for(&self, raw: &str) -> Result<Option<&SourceRule>, String> {
+        let parsed = sample_fetch::wire_url(raw)?;
+        Ok(self.sources.iter().find(|rule| rule.allows(&parsed)))
     }
 
     /// Permit `samples('local:...')` beneath one host-selected directory.
@@ -38,23 +44,32 @@ impl ScoreSampleAccess {
         Ok(())
     }
 
-    /// Permit any public **https** origin whose server consents to
-    /// cross-origin reads - the strudel.cc parity policy.
-    ///
-    /// Consent is checked at the wire, per response: every hop of every
-    /// manifest and audio fetch must answer with
-    /// `Access-Control-Allow-Origin: *` (or `https://strudel.cc`), exactly the
-    /// header without which the same URL fails on strudel.cc. The reachable
-    /// set is therefore the browser's, not "everything": a host that never
-    /// opted into scripted fetching stays unreachable. The address boundary
-    /// is unchanged - only public addresses, and URLs that *name* loopback or
-    /// use plain http still require an exact [`Self::permit_origin`] grant.
-    pub fn permit_public_cors_origins(&mut self) {
-        self.open_public = true;
+    /// Whether `samples('local:')` has a root to read.
+    pub fn has_local_root(&self) -> bool {
+        self.local_root.is_some()
+    }
+
+    /// The sources this policy refused since the last call, newest last,
+    /// each written as the [`SourceRule`] that allows the refused file's
+    /// folder, or as [`LOCAL_FILES`] for `local:` files with no folder.
+    pub fn take_refused_sources(&self) -> Vec<String> {
+        self.refused.take()
+    }
+
+    /// Note that a score asked for `local:` files with no folder chosen.
+    pub(super) fn note_local_refused(&self) {
+        self.refused.note(LOCAL_FILES.to_owned());
+    }
+
+    fn note_refused(&self, url: &Url) {
+        // An opaque address, such as a `data:` URL, has no source to allow.
+        if let Some(rule) = SourceRule::folder_of(url) {
+            self.refused.note(rule.to_string());
+        }
     }
 
     pub fn is_denied(&self) -> bool {
-        self.local_root.is_none() && self.allowed_origins.is_empty() && !self.open_public
+        self.local_root.is_none() && self.sources.is_empty()
     }
 
     pub(super) fn approve_remote(&self, raw: &str) -> Result<(Arc<str>, ScoreFetchAccess), String> {
@@ -63,44 +78,75 @@ impl ScoreSampleAccess {
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err("samples() URL contains credentials".to_owned());
         }
-        let origin = parsed.origin().ascii_serialization();
-        let access = if self.allowed_origins.contains(&origin) {
-            // An exact operator grant carries its own trust: no consent
-            // header is demanded, which is what lets a personal server
-            // without CORS configuration be granted at all.
-            ScoreFetchAccess::Remote {
-                origin,
-                cors_required: false,
-            }
-        } else if self.open_public
-            && parsed.scheme() == "https"
-            && !sample_fetch::url_names_loopback(&parsed)
-        {
-            ScoreFetchAccess::Remote {
-                origin,
-                cors_required: true,
-            }
-        } else if self.open_public {
-            return Err(
-                "samples() URL is outside the permitted sample origins (the default policy \
-                 fetches public https origins that consent via CORS; grant this one \
-                 explicitly with --allow-sample-origin)"
-                    .to_owned(),
-            );
-        } else {
-            return Err("samples() URL is outside the permitted sample origins".to_owned());
-        };
+        if !self.sources.iter().any(|rule| rule.allows(&parsed)) {
+            self.note_refused(&parsed);
+            let grant = SourceRule::folder_of(&parsed)
+                .map(|rule| format!(" Allow it with --allow-sample-origin {rule} or on the Studio Permissions page."))
+                .unwrap_or_default();
+            return Err(format!(
+                "{} is not an allowed sample source.{grant}",
+                parsed.origin().ascii_serialization()
+            ));
+        }
         let normalized: Arc<str> = Arc::from(parsed.as_str());
-        Ok((normalized, access))
+        let sources = Arc::clone(&self.sources);
+        Ok((normalized, ScoreFetchAccess::Remote { sources }))
     }
 
-    /// Apply the same host-granted origin scope to a score's Hydra image.
-    /// The image loader independently keeps its stricter HTTPS and CORS rules.
+    /// The grant this policy gives `url` in place of `grant`, which an
+    /// earlier policy gave: `Withdrawn` when nothing here allows it any more.
+    /// A remote grant takes this policy's sources, which judge its redirects.
+    pub(super) fn regrant(&self, url: &str, grant: &ScoreFetchAccess) -> ScoreFetchAccess {
+        match grant {
+            ScoreFetchAccess::Remote { .. } if matches!(self.source_for(url), Ok(Some(_))) => {
+                ScoreFetchAccess::Remote {
+                    sources: Arc::clone(&self.sources),
+                }
+            }
+            ScoreFetchAccess::Local { root } if self.local_root.as_ref() == Some(root) => {
+                grant.clone()
+            }
+            _ => ScoreFetchAccess::Withdrawn,
+        }
+    }
+
+    /// Apply the same sources to a score's Hydra image or video, and give
+    /// them back. One of them must also allow every redirect.
     #[cfg(feature = "hydra")]
-    pub(crate) fn approve_hydra_image_url(&self, raw: &str) -> Result<(), String> {
-        self.approve_remote(raw)
-            .map(|_| ())
-            .map_err(|_| "Hydra image URL is outside the permitted sample origins".to_owned())
+    pub(crate) fn approve_hydra_media_url(
+        &self,
+        raw: &str,
+        media: sample_fetch::HydraMedia,
+    ) -> Result<Arc<[SourceRule]>, String> {
+        match self.approve_remote(raw) {
+            Ok((_, ScoreFetchAccess::Remote { sources })) => Ok(sources),
+            Ok(_) => Err(format!("{} URL is not a network address", media.label())),
+            Err(error) => Err(error.replacen(
+                "an allowed sample source",
+                &format!("an allowed source for a {}", media.label()),
+                1,
+            )),
+        }
+    }
+
+    /// Read a score's Hydra image or video from the local sample root, the
+    /// folder `samples('local:')` reads. `path` is relative to that root,
+    /// under the same rules: no absolute path, no `..`, no hidden or linked
+    /// entry, and no read outside the root.
+    #[cfg(feature = "hydra")]
+    pub(crate) fn read_hydra_local_media(
+        &self,
+        path: &str,
+        media: sample_fetch::HydraMedia,
+    ) -> Result<Vec<u8>, String> {
+        let root = self.local_root.as_ref().ok_or_else(|| {
+            self.note_local_refused();
+            format!(
+                "{} {path:?} is a local file; keep it in the set folder, or grant its folder with --allow-local-samples or on the Studio Permissions page",
+                media.label()
+            )
+        })?;
+        read_local_media(root, path, media)
     }
 
     /// The textual half of approval, run at enqueue time so a refused source
@@ -115,8 +161,9 @@ impl ScoreSampleAccess {
         match read_source(&source, GITHUB_SAMPLE_MANIFEST) {
             SampleSource::LocalFolder(_) => {
                 if self.local_root.is_none() {
+                    self.note_local_refused();
                     return Err(
-                        "samples('local:') requires a host-selected local sample root".to_owned(),
+                        "samples('local:') requires a host-selected local sample root (--allow-local-samples, or the Studio Permissions page)".to_owned(),
                     );
                 }
                 Ok(())
@@ -124,6 +171,46 @@ impl ScoreSampleAccess {
             SampleSource::Url(url) => self.approve_remote(&url).map(|_| ()),
         }
     }
+}
+
+/// Read a Hydra image or video at `path` beneath `root`. The path is
+/// relative and made of plain names: no absolute path, no `..`, and no
+/// hidden entry. The open is confined to the root the same way a local
+/// sample's is, so a link or a rename cannot lead a read outside it.
+#[cfg(feature = "hydra")]
+pub(crate) fn read_local_media(
+    root: &crate::sample_server::ServedRoot,
+    path: &str,
+    media: sample_fetch::HydraMedia,
+) -> Result<Vec<u8>, String> {
+    let label = media.label();
+    // `./clip.webm` names the same file as `clip.webm`.
+    let relative = Path::new(path);
+    let relative = relative.strip_prefix(".").unwrap_or(relative);
+    if !crate::sample_server::relative_sample_path_allowed(relative) {
+        return Err(format!(
+            "{label} {path:?} must be a relative path inside the folder, without `..`"
+        ));
+    }
+    let (file, length) = root
+        .open_score_file(&root.path().join(relative))
+        .map_err(|_| format!("{label} {path:?} is not a file in the permitted folder"))?;
+    let limit = media.limit();
+    let too_large = || format!("{label} {path:?} exceeds the {} MiB limit", limit >> 20);
+    if length > limit as u64 {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length as usize)
+        .map_err(|_| format!("{label} {path:?} exceeds host memory"))?;
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| format!("{label} {path:?} could not be read"))?;
+    if bytes.len() > limit {
+        return Err(too_large());
+    }
+    Ok(bytes)
 }
 
 pub(super) fn fetch_manifest_located_with_budget(
@@ -147,12 +234,13 @@ pub(super) fn fetch_manifest_located_with_budget(
     sample_fetch::fetch_manifest_with_budget(url, budget)
 }
 
-/// Read a sample cache entry through [`open_regular_cache_entry`], so a link
-/// at its name is refused; callers treat any `Err` as a miss.
-pub(super) fn read_sample_cache(path: &Path) -> Result<Vec<u8>, String> {
+/// Read a sample cache entry of at most `limit` bytes through
+/// [`open_regular_cache_entry`], so a link at its name is refused; callers
+/// treat any `Err` as a miss.
+pub(super) fn read_sample_cache(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
     let file = open_regular_cache_entry(path)?
         .ok_or_else(|| format!("read sample cache {}: not found", path.display()))?;
-    let mut reader = file.take(rustel_audio::sample_pcm_ceiling() as u64 + 1);
+    let mut reader = file.take(limit as u64 + 1);
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     loop {
@@ -166,7 +254,7 @@ pub(super) fn read_sample_cache(path: &Path) -> Result<Vec<u8>, String> {
             .len()
             .checked_add(read)
             .ok_or_else(|| format!("{} exceeds the sample size limit", path.display()))?;
-        if next > rustel_audio::sample_pcm_ceiling() {
+        if next > limit {
             return Err(format!("{} exceeds the sample size limit", path.display()));
         }
         bytes
@@ -194,11 +282,7 @@ pub(super) fn fetch_score_source_cached_with_budget<T>(
     } = scope;
     budget.check()?;
     // A local grant reads the file where it lies; a copy would only go stale.
-    let ScoreFetchAccess::Remote {
-        origin,
-        cors_required,
-    } = access
-    else {
+    let ScoreFetchAccess::Remote { .. } = access else {
         let value = validate(&fetch_score_source_with_budget(
             url,
             access,
@@ -211,18 +295,11 @@ pub(super) fn fetch_score_source_cached_with_budget<T>(
     };
 
     let parsed = sample_fetch::wire_url(url)?;
-    if parsed.origin().ascii_serialization() != *origin
-        || !matches!(parsed.scheme(), "http" | "https")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
-        return Err(format!(
-            "sample URL {url:?} is outside its permitted origin"
-        ));
+    if !access.allows(&parsed) {
+        return Err(format!("sample URL {url:?} is outside its allowed source"));
     }
 
-    let trust = ScoreCacheTrust::from_cors_required(*cors_required);
-    let path = cache.path(url, kind, trust);
+    let path = cache.path(url, kind);
     if let Some(file) = cache.open(&path)? {
         budget.check()?;
         let mut bytes = Vec::new();
@@ -251,21 +328,17 @@ pub(super) fn fetch_score_source_cached_with_budget<T>(
 
     // Before score-selected bytes had a dedicated namespace they shared the
     // host-trusted cache root. Keep offline renders working across the
-    // transition for exact grants only: the old namespace holds pinned and
-    // host-trusted data with no CORS provenance, so a cors_required fetch
-    // must not read it. A valid legacy hit is copied under both quotas. The
-    // old namespace is never removed during migration. If admission is full
-    // it still serves this run from its original location.
-    if !*cors_required {
-        let legacy = cache_path(&cache.base, url);
-        if let Some(bytes) = cache.read_legacy(&legacy, limit)?
-            && let Ok(value) = validate(&bytes)
-        {
-            budget.check()?;
-            cache.copy_legacy_with_publication(&path, &bytes, publication, budget);
-            budget.check()?;
-            return Ok(value);
-        }
+    // transition: a valid legacy hit is copied under both quotas. The old
+    // namespace is never removed during migration. If admission is full it
+    // still serves this run from its original location.
+    let legacy = cache_path(&cache.base, url);
+    if let Some(bytes) = cache.read_legacy(&legacy, limit)?
+        && let Ok(value) = validate(&bytes)
+    {
+        budget.check()?;
+        cache.copy_legacy_with_publication(&path, &bytes, publication, budget);
+        budget.check()?;
+        return Ok(value);
     }
 
     let bytes = fetch_score_source_with_budget(url, access, limit, budget, || {})?;
@@ -317,9 +390,18 @@ pub(super) fn fetch_score_source_with_budget(
                 .map_err(|_| format!("local sample URL {url:?} is not a valid file path"))?;
             let (file, len) = root.open_score_sample_with(&path, before_local_open)?;
             if len > limit as u64 {
-                return Err(format!("{} exceeds the sample size limit", path.display()));
+                // A sound or a video past its own ceiling says which
+                // setting raises it.
+                let own = FileLimit::of(url);
+                return Err(if own.bytes == limit {
+                    own.refusal(Some(len))
+                } else {
+                    format!("{} exceeds the sample size limit", path.display())
+                });
             }
-            let mut bytes = Vec::new();
+            // The length is known and inside the limit: one allocation,
+            // not a buffer that doubles on the way.
+            let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0).saturating_add(1));
             file.take(limit as u64 + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|error| format!("read {}: {error}", path.display()))?;
@@ -329,43 +411,21 @@ pub(super) fn fetch_score_source_with_budget(
             budget.check()?;
             Ok(bytes)
         }
-        ScoreFetchAccess::Remote {
-            origin,
-            cors_required,
-        } => {
+        ScoreFetchAccess::Withdrawn => Err(format!("{url}: its source was turned off")),
+        ScoreFetchAccess::Remote { .. } => {
             let mut current = sample_fetch::wire_url(url)?;
             for redirects in 0..=5 {
                 budget.check()?;
-                if current.origin().ascii_serialization() != *origin
-                    || !matches!(current.scheme(), "http" | "https")
-                    || !current.username().is_empty()
-                    || current.password().is_some()
-                {
+                if !access.allows(&current) {
                     return Err(format!(
-                        "sample URL {current:?} is outside its permitted origin"
+                        "sample URL {current:?} is outside its allowed source"
                     ));
                 }
-                // The guarded agent, not a bare one: the origin check above is
+                // The guarded agent, not a bare one: the source check above is
                 // text, and says nothing about the address the name resolves
-                // to. A granted origin can still point at a private target,
+                // to. An allowed name can still point at a private target,
                 // and can point somewhere different on the next lookup.
-                let response = sample_fetch::guarded_single_hop_get(
-                    &current,
-                    budget,
-                    cors_required.then_some(CORS_REQUEST_ORIGIN),
-                )?;
-                // Consent is per RESPONSE, redirects included, exactly as a
-                // browser applies its access check to every hop: a consenting
-                // server must not become a pivot through a non-consenting one.
-                if *cors_required && !cors_consents(response.header("Access-Control-Allow-Origin"))
-                {
-                    return Err(format!(
-                        "GET {current}: the server does not consent to cross-origin reads \
-                         (no `Access-Control-Allow-Origin: *`), so this URL would fail on \
-                         strudel.cc as well; pass --allow-sample-origin {origin} to trust \
-                         it anyway"
-                    ));
-                }
+                let response = sample_fetch::guarded_single_hop_get(&current, budget)?;
                 if (300..400).contains(&response.status()) {
                     if redirects == 5 {
                         return Err(format!("GET {url}: too many redirects"));
@@ -376,20 +436,18 @@ pub(super) fn fetch_score_source_with_budget(
                     let next = current.join(location).map_err(|error| {
                         format!("GET {current}: invalid redirect target: {error}")
                     })?;
-                    if next.origin().ascii_serialization() != *origin
-                        || !next.username().is_empty()
-                        || next.password().is_some()
-                    {
+                    if !access.allows(&next) {
                         return Err(format!(
-                            "GET {current}: redirect target is outside the permitted sample origin"
+                            "GET {current}: redirect target {} is not an allowed sample source",
+                            next.origin().ascii_serialization()
                         ));
                     }
                     current = next;
                     continue;
                 }
                 let mut bytes = Vec::new();
-                response
-                    .into_reader()
+                budget
+                    .body(response)
                     .take(limit as u64 + 1)
                     .read_to_end(&mut bytes)
                     .map_err(|error| format!("read {current}: {error}"))?;
@@ -738,6 +796,60 @@ pub(super) fn expand_case_insensitive(banks: &mut HashMap<String, Bank>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tried address says what it loaded in words a player reads.
+    /// A refusal names the folder of the refused file once, for every clone
+    /// of the policy, and allowing that folder lets the same URL through.
+    #[test]
+    fn refused_sources_are_noted_once_and_allowing_one_clears_the_refusal() {
+        let mut access = ScoreSampleAccess::denied();
+        access.permit_builtin_sources();
+        let clone = access.clone();
+        for url in [
+            "http://samples.example/a.json",
+            "http://samples.example/b.json",
+            "https://127.0.0.1/kit.json",
+            "https://cdn.public.example/kits/808/kit.json",
+        ] {
+            assert!(clone.approve_remote(url).is_err(), "{url}");
+        }
+        assert!(
+            access
+                .approve_remote("https://raw.githubusercontent.com/a/b/main/strudel.json")
+                .is_ok()
+        );
+        assert_eq!(
+            access.take_refused_sources(),
+            [
+                "http://samples.example",
+                "127.0.0.1/",
+                "cdn.public.example/kits/808/"
+            ]
+        );
+        assert!(access.take_refused_sources().is_empty(), "taken once");
+
+        access
+            .permit_source("http://samples.example")
+            .expect("an address");
+        assert!(
+            access
+                .approve_remote("http://samples.example/a.json")
+                .is_ok()
+        );
+        assert_eq!(
+            access.source_for("https://cdn.strudel.b-cdn.net/x.wav"),
+            Ok(Some(&SourceRule::parse("strudel.b-cdn.net").unwrap()))
+        );
+        assert!(
+            access.take_refused_sources().is_empty(),
+            "asking notes nothing"
+        );
+
+        // `local:` files with no folder chosen are noted as such.
+        assert!(access.preapprove_effect("\"local:kit\"").is_err());
+        assert_eq!(access.take_refused_sources(), [LOCAL_FILES]);
+    }
+
     #[cfg(test)]
     mod base_url_tests {
         use super::{

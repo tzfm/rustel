@@ -4,7 +4,7 @@ use super::run;
 fn validate_explains_a_function_valued_score() {
     let output = run(&["validate", "-e", "s('bd').noise"]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    let message = String::from_utf8(output.stderr).unwrap();
+    let message = String::from_utf8(output.stderr).expect("utf-8 output");
     assert!(message.contains("ends on a function"), "{message}");
     assert!(!message.contains("NativePatternWrapper"), "{message}");
 }

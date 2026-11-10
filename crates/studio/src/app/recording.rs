@@ -538,6 +538,9 @@ impl App {
         target: TrimTarget,
         result: Result<Option<super::super::wav::Trimmed>, String>,
     ) {
+        // A trim rewrites its file in place: the details of the file under
+        // the samples tab's cursor are read again.
+        self.refresh_sample_details(false);
         match target {
             TrimTarget::Take { path, sample } => {
                 let note = match result {

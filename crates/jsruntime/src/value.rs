@@ -306,14 +306,14 @@ pub(super) fn span_seed<'js>(
 
 pub(super) fn context_to_js<'js>(
     ctx: &Ctx<'js>,
-    context: &[(usize, usize)],
+    context: impl IntoIterator<Item = (usize, usize)>,
 ) -> rquickjs::Result<rquickjs::Object<'js>> {
     let out = rquickjs::Object::new(ctx.clone())?;
     let locations = rquickjs::Array::new(ctx.clone())?;
-    for (index, (start, end)) in context.iter().enumerate() {
+    for (index, (start, end)) in context.into_iter().enumerate() {
         let location = rquickjs::Object::new(ctx.clone())?;
-        location.set("start", *start)?;
-        location.set("end", *end)?;
+        location.set("start", start)?;
+        location.set("end", end)?;
         locations.set(index, location)?;
     }
     out.set("locations", locations)?;
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn nonthrowing_conversion_fails_closed_on_cycles_and_deep_objects() {
         let runtime = JsRuntime::new().expect("runtime");
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(&runtime, |ctx| {
             for source in [
                 "(() => { const o = {}; o.self = o; return o; })()",
                 "(() => { let o = 1; for (let i = 0; i < 300; i++) o = {next: o}; return o; })()",

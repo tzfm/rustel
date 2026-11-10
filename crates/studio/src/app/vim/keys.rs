@@ -22,10 +22,20 @@ pub(crate) trait VimTextSurface {
     fn space_command(&self) -> bool {
         false
     }
+    /// A key the list beside the box answers in Command, so Command leaves
+    /// it to the surface instead of saying how to type.
+    fn list_key(&self, _code: KeyCode) -> bool {
+        false
+    }
     /// The surface's own anchored completion, if it has one.
     fn anchored(&self) -> bool {
         false
     }
+    /// Call off a question the surface waits to have answered, such as a
+    /// delete that the next Enter would confirm. The surface's own keys
+    /// call it off for any key that is not the answer. A key the modes
+    /// take never reaches them, so the modes call it off instead.
+    fn withdraw_question(&mut self) {}
 }
 
 impl VimTextSurface for ReferencePanel {
@@ -48,6 +58,61 @@ impl VimTextSurface for ReferencePanel {
     fn space_command(&self) -> bool {
         !matches!(self.preview(), PanelAction::Nothing)
     }
+
+    // The samples tab asks before it deletes a file or cuts a take.
+    fn withdraw_question(&mut self) {
+        self.confirm_delete = None;
+        self.confirm_trim = None;
+    }
+}
+
+impl VimTextSurface for SetPanel {
+    fn panel_kind(&self) -> PanelKind {
+        PanelKind::Set
+    }
+
+    fn text_wanted(&self) -> bool {
+        self.search.is_some()
+    }
+
+    fn insert(&self) -> bool {
+        self.vim_insert
+    }
+
+    fn set_insert(&mut self, insert: bool) {
+        self.vim_insert = insert;
+        // The box types exactly while it is in Insert: the keyboard it
+        // takes and the one it gives back move together, so `/`, i, and
+        // a retype, and Esc hands the list its keys back with the
+        // filter standing.
+        if let Some(search) = self.search.as_mut() {
+            search.typing = insert;
+        }
+    }
+
+    // A filter standing leaves the list the keys it has without Vim:
+    // Space folds the tapes, Delete asks, a digit opens a strip's score,
+    // `n` starts a tape, +/- size the panel, and Backspace takes the box
+    // back up to delete from the query.
+    fn space_command(&self) -> bool {
+        true
+    }
+
+    fn list_key(&self, code: KeyCode) -> bool {
+        matches!(
+            code,
+            KeyCode::Delete
+                | KeyCode::Backspace
+                | KeyCode::Char('1'..='9' | 'n' | '+' | '=' | '-' | '_')
+        )
+    }
+
+    // A score's delete, and the question a set asks when a score could
+    // not be saved as it went.
+    fn withdraw_question(&mut self) {
+        self.deleting = None;
+        self.unsaved = None;
+    }
 }
 
 impl VimTextSurface for ThemePicker {
@@ -65,6 +130,10 @@ impl VimTextSurface for ThemePicker {
 
     fn set_insert(&mut self, insert: bool) {
         self.set_vim_insert(insert);
+    }
+
+    fn withdraw_question(&mut self) {
+        self.deleting = None;
     }
 }
 
@@ -95,6 +164,9 @@ impl VimTextSurface for ExportSheet {
 macro_rules! text_surfaces {
     ($($kind:pat => $field:ident),* $(,)?) => {
         fn surface_mut(app: &mut App) -> Option<&mut dyn VimTextSurface> {
+            if rendering(app) {
+                return None;
+            }
             match app.focus {
                 $(Focus::Panel($kind) => app.$field.as_mut().map(|panel| panel as &mut dyn VimTextSurface),)*
                 _ => None,
@@ -102,6 +174,9 @@ macro_rules! text_surfaces {
         }
 
         fn surface_ref(app: &App) -> Option<&dyn VimTextSurface> {
+            if rendering(app) {
+                return None;
+            }
             match app.focus {
                 $(Focus::Panel($kind) => app.$field.as_ref().map(|panel| panel as &dyn VimTextSurface),)*
                 _ => None,
@@ -112,8 +187,15 @@ macro_rules! text_surfaces {
 
 text_surfaces! {
     PanelKind::Reference => reference_panel,
+    PanelKind::Set => set_panel,
     PanelKind::Theme => theme_picker,
     PanelKind::Export => export_sheet,
+}
+
+/// The export sheet over a running bounce shows the render, not its
+/// fields. No text mode applies there, and its keys stay the sheet's.
+fn rendering(app: &App) -> bool {
+    app.focus == Focus::Panel(PanelKind::Export) && app.export_job.is_some()
 }
 
 /// An anchored completion always types: the search is the word being
@@ -143,7 +225,6 @@ pub(crate) fn focus_changed(app: &mut App) {
     if !super::enabled(app) {
         return;
     }
-    super::mappings::reset(app);
     let insert = anchored(app);
     if let Some(surface) = surface_mut(app) {
         surface.set_insert(insert);
@@ -156,7 +237,6 @@ pub(crate) fn enter_insert(app: &mut App) {
     if !super::enabled(app) {
         return;
     }
-    super::mappings::reset(app);
     if let Some(surface) = surface_mut(app)
         && surface.text_wanted()
         && !surface.anchored()
@@ -171,7 +251,6 @@ pub(crate) fn leave_insert(app: &mut App) {
     if let Some(surface) = surface_mut(app) {
         surface.set_insert(false);
     }
-    super::mappings::reset(app);
     app.status = "command mode - i or a types".into();
     app.dirty_frame = true;
 }
@@ -190,17 +269,18 @@ enum TextAction {
     Paste,
     Arrow(PanelKind, KeyCode),
     EnterInsert,
-    /// Feed a plain character to the insert mapping table.
-    InsertKey,
-    /// A mapping prefix waited for a key this field cannot map.
-    FlushThenIgnored,
-    /// Flush a mapping prefix, then leave Insert for Command.
-    FlushThenCommand,
+    /// A character for the field, typed at once.
+    Type(char),
+    /// Leave Insert for Command.
+    Command,
 }
 
-/// The modal keys of a search box. `i` and `a` enter Insert, `p` pastes the
+/// The modal keys of a search box. `i`, `a`, and `/` enter Insert, `p` pastes the
 /// clipboard, Esc returns to Command, and Command keeps j k h l for the
-/// list and every other letter out of the query.
+/// list and every other letter out of the query. Insert types every letter
+/// at once, the way Vim's command line does: the score's insert mappings
+/// never reach a search box, so `jk` stays two letters rather than
+/// leaving Insert.
 pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
     if key.kind == KeyEventKind::Release
         || matches!(key.code, KeyCode::Modifier(_))
@@ -216,9 +296,9 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
         if !surface.text_wanted() || surface.anchored() {
             return VimTextKey::Ignored;
         }
-        if surface.insert() {
+        let action = if surface.insert() {
             if key.code == KeyCode::Esc && key.modifiers.is_empty() {
-                TextAction::FlushThenCommand
+                TextAction::Command
             } else if let KeyCode::Char(character) = key.code
                 && !character.is_control()
                 && !key.modifiers.intersects(
@@ -229,10 +309,13 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
                         | KeyModifiers::META,
                 )
             {
-                // Insert text, or a mapping first, through one table.
-                TextAction::InsertKey
+                // Insert types at once, the way Vim's own command line
+                // does: the insert mappings of the score's engine do not
+                // reach a search box, so no letter waits for a `jk` that
+                // might follow it.
+                TextAction::Type(character)
             } else {
-                TextAction::FlushThenIgnored
+                TextAction::Ignored
             }
         } else if key.modifiers.intersects(
             KeyModifiers::CONTROL
@@ -243,41 +326,56 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
         ) {
             TextAction::Ignored
         } else {
+            // The set panel shows this only over an open search box,
+            // where `/` retypes the standing query. The other surfaces
+            // take `/` as one more way into Insert, which the standing
+            // hint already covers.
+            let typing_hint = match surface.panel_kind() {
+                PanelKind::Set => "press i or a to type, or / to retype",
+                _ => "press i or a to type",
+            };
             match key.code {
                 KeyCode::Char('i' | 'a') => TextAction::EnterInsert,
+                // `/` retypes: the key that opened the box takes it
+                // back up, the way Vim's own search does.
+                KeyCode::Char('/') => TextAction::EnterInsert,
                 // Vim's paste, into the search or the field the form edits.
                 KeyCode::Char('p') => TextAction::Paste,
                 // Space keeps its surface meaning, such as auditioning
                 // the selected row or toggling a choice. Where it has
                 // none, it is text and Command keeps it out.
                 KeyCode::Char(' ') if surface.space_command() => TextAction::Ignored,
+                // The list's own keys, such as the set panel's Delete.
+                code if surface.list_key(code) => TextAction::Ignored,
                 KeyCode::Char(' ') | KeyCode::Backspace | KeyCode::Delete => {
-                    TextAction::Message("press i or a to type")
+                    TextAction::Message(typing_hint)
                 }
                 KeyCode::Char(character) if !character.is_control() => {
                     if let Some(alias) = alias {
                         TextAction::Arrow(surface.panel_kind(), alias.code)
                     } else {
-                        TextAction::Message("press i or a to type")
+                        TextAction::Message(typing_hint)
                     }
                 }
                 _ => TextAction::Ignored,
             }
+        };
+        // The surface's own keys call a pending question off. A key the
+        // modes take never reaches them, so it is called off here. An
+        // arrow still reaches them.
+        if !matches!(action, TextAction::Ignored | TextAction::Arrow(..)) {
+            surface.withdraw_question();
         }
+        action
     };
     match action {
-        TextAction::Ignored => {
-            super::mappings::reset(app);
-            VimTextKey::Ignored
-        }
+        TextAction::Ignored => VimTextKey::Ignored,
         TextAction::Message(message) => {
-            super::mappings::reset(app);
             app.status = message.into();
             app.dirty_frame = true;
             VimTextKey::Consumed
         }
         TextAction::Paste => {
-            super::mappings::reset(app);
             let text = app.clipboard.get_text().unwrap_or_default();
             if text.is_empty() {
                 app.status = "the clipboard has no text".into();
@@ -287,26 +385,21 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
             app.dirty_frame = true;
             VimTextKey::Consumed
         }
-        TextAction::Arrow(kind, code) => {
-            super::mappings::reset(app);
-            VimTextKey::Arrow(kind, code)
-        }
+        TextAction::Arrow(kind, code) => VimTextKey::Arrow(kind, code),
         TextAction::EnterInsert => {
             enter_insert(app);
             app.status = "insert mode - Esc returns to command".into();
             app.dirty_frame = true;
             VimTextKey::Consumed
         }
-        TextAction::InsertKey => {
-            let _ = super::mappings::insert_key(app, key);
+        TextAction::Type(character) => {
+            let typed = app.paste_to_prompt(&character.to_string());
+            if typed {
+                app.dirty_frame = true;
+            }
             VimTextKey::Consumed
         }
-        TextAction::FlushThenIgnored => {
-            super::mappings::flush(app);
-            VimTextKey::Ignored
-        }
-        TextAction::FlushThenCommand => {
-            super::mappings::flush(app);
+        TextAction::Command => {
             leave_insert(app);
             VimTextKey::Consumed
         }
@@ -342,20 +435,28 @@ impl App {
     }
 }
 
-/// The panels whose rows j k h l walk.
-pub(crate) fn panel_takes_list_navigation(kind: PanelKind) -> bool {
-    matches!(
-        kind,
+/// The panels whose rows j k h l walk. The knobs column walks the same
+/// way: h and l stand in for its ← and →, the nudge of a rail and the
+/// chords of its presets section. A visuals dock walks only its add list.
+/// In the dock's body the arrows change a widget and `j` aligns the art,
+/// so the body keeps its own reading of the letters.
+pub(crate) fn panel_takes_list_navigation(app: &App, kind: PanelKind) -> bool {
+    match kind {
         PanelKind::Settings
-            | PanelKind::Set
-            | PanelKind::Devices
-            | PanelKind::Log
-            | PanelKind::Jobs
-            | PanelKind::Reference
-            | PanelKind::Theme
-            | PanelKind::Export
-            | PanelKind::Memory
-    )
+        | PanelKind::Set
+        | PanelKind::Devices
+        | PanelKind::Log
+        | PanelKind::Jobs
+        | PanelKind::Reference
+        | PanelKind::Knobs
+        | PanelKind::Theme
+        | PanelKind::Export
+        | PanelKind::Memory => true,
+        PanelKind::Viz => app.viz_docks[app.viz_focus]
+            .as_ref()
+            .is_some_and(|dock| dock.adding.is_some()),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +464,8 @@ mod tests {
     use super::*;
     use crate::app::tests::support::*;
     use crate::editor::{ByteOffset, Selection};
+    #[cfg(feature = "vst")]
+    use crate::reference::{PluginRow, VstSection};
 
     fn vim_app() -> (tempfile::TempDir, App) {
         let directory = tempfile::tempdir().expect("temp dir");
@@ -467,6 +570,125 @@ mod tests {
         );
     }
 
+    /// l and h walk the vst tab the way → and ← do: a plugin opens onto
+    /// the rows of its halves, a half opens as the view of the tab, and h
+    /// goes back to the plugin list. The plugins are the test fixture, in
+    /// the one host of the process.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn hl_opens_a_plugin_and_its_halves_of_the_vst_tab() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+        app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+        app.ui_settings.vim_list_navigation = true;
+        app.sync_editor_keybindings();
+        let plugins = tempfile::tempdir().expect("plugin folder");
+        rustel_vst3_fixture::install(plugins.path());
+        rustel_runtime::vst::pin_standard_folders(vec![plugins.path().to_path_buf()]);
+        let host = rustel_runtime::vst::host();
+        host.wait_idle();
+        host.resolve(rustel_vst3_fixture::NAME, true);
+        host.wait_idle();
+        let mut panel = ReferencePanel::browse(&app.reference);
+        panel.select_tab(Tab::Vst);
+        app.set_reference_panel(Some(panel));
+        app.focus_panel(PanelKind::Reference);
+        app.sync_plugins();
+        let vst = |app: &App| {
+            let panel = app.reference_panel.as_ref().expect("panel");
+            (
+                panel.vst.inside(),
+                panel.vst.rows().to_vec(),
+                panel.vst.selected,
+            )
+        };
+
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        let (inside, rows, selected) = vst(&app);
+        assert_eq!(inside, None, "l opened the plugin, not a half");
+        assert_eq!(rows[selected], PluginRow::Plugin(0));
+        assert_eq!(
+            &rows[1..3],
+            &[
+                PluginRow::Section(VstSection::Presets),
+                PluginRow::Section(VstSection::Params)
+            ][..]
+        );
+
+        // j j reaches the row of the parameters, l opens them as the view,
+        // and h goes back to the row of the half.
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        let (inside, rows, selected) = vst(&app);
+        assert_eq!(inside, Some(VstSection::Params));
+        assert_eq!(rows[selected], PluginRow::Param(0));
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        let (inside, rows, selected) = vst(&app);
+        assert_eq!(inside, None);
+        assert_eq!(rows[selected], PluginRow::Section(VstSection::Params));
+    }
+
+    /// j k h l drive the knobs column the way the arrows do: the rows
+    /// walk, and the chords of the presets section open and close it. The
+    /// names of the section are set by hand: no plugin host is needed for
+    /// the keys.
+    #[test]
+    fn jkhl_drive_the_knobs_column_and_its_presets() {
+        use crate::knobs_panel::KnobPresets;
+        let directory = tempfile::tempdir().expect("temp dir");
+        let score = "$: s(\"bd\").vst(\"FX\", { gain: 1 })\n";
+        let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+        app.scenes.current_mut().editor = crate::editor::Editor::new(score).expect("score");
+        let _ = app
+            .editor_mut()
+            .set_selection(crate::editor::Selection::caret(crate::editor::ByteOffset(
+                score.len() - 3,
+            )));
+        app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+        app.ui_settings.vim_list_navigation = true;
+        app.sync_editor_keybindings();
+        app.open_knobs_panel(true);
+        app.refresh_knobs(Rect::default());
+        if let Some(panel) = app.knobs_panel.as_mut() {
+            panel.presets = Some(KnobPresets {
+                names: vec!["Dark Bass".into()],
+                version: 0,
+                open: false,
+            });
+        }
+        let knobs = app.knobs_rows.as_ref().expect("rows").knobs.len();
+        if let Some(panel) = app.knobs_panel.as_mut() {
+            panel.selected = knobs;
+        }
+        let presets = |app: &App| {
+            let panel = app.knobs_panel.as_ref().expect("panel");
+            (
+                panel.presets.as_ref().expect("the section").open,
+                panel.selected,
+            )
+        };
+
+        // l opens the heading, j walks to the name, Enter writes the
+        // preset into the call, and h closes the section.
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        assert_eq!(presets(&app), (true, knobs), "l opened the heading");
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(presets(&app), (true, knobs + 1), "j walked to the name");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            app.editor().source().contains("preset: \"Dark Bass\""),
+            "Enter wrote the preset:\n{}",
+            app.editor().source()
+        );
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(
+            presets(&app),
+            (false, knobs),
+            "h closed the section and stands on the heading"
+        );
+    }
+
     #[test]
     fn h_goes_back_from_a_reference_entry() {
         let directory = tempfile::tempdir().expect("temp dir");
@@ -551,40 +773,34 @@ mod tests {
     }
 
     #[test]
-    fn an_insert_mapping_leaves_the_search_in_command() {
+    fn insert_types_every_letter_at_once_with_no_mapping_wait() {
         let (_directory, mut app) = vim_app();
+        // The shipped `inoremap jk <Esc>` among the mappings: made for the
+        // score, where it leaves Insert. A search box is a command line,
+        // and Vim's command line does not read insert mappings.
         app.vim_config.set_mappings_for_test(
-            crate::vim_config::VimMappings::parse("inoremap jk <Esc>\n").expect("mapping"),
+            crate::vim_config::VimMappings::parse("inoremap jk <Esc>\ninoremap ,, ()\n")
+                .expect("mappings"),
         );
         press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
         let panel = app.reference_panel.as_ref().expect("panel");
-        assert_eq!(panel.chord_query, "", "j waits for the mapping");
-        assert!(panel.vim_insert(), "still Insert while it waits");
+        assert_eq!(panel.chord_query, "j", "j typed at once, not held for a k");
+        assert!(panel.vim_insert(), "still Insert");
 
         press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
         let panel = app.reference_panel.as_ref().expect("panel");
-        assert!(!panel.vim_insert(), "jk leaves Insert");
-        assert_eq!(panel.chord_query, "", "jk never reached the query");
-        assert!(app.status.contains("command mode"), "{}", app.status);
+        assert!(panel.vim_insert(), "jk stays two letters, not Esc");
+        assert_eq!(panel.chord_query, "jk", "both letters reached the query");
 
-        // A replacement with text types it and stays in Insert.
-        app.vim_config.set_mappings_for_test(
-            crate::vim_config::VimMappings::parse("inoremap ,, ()\n").expect("mapping"),
-        );
-        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        // A mapping that types text is held to the score as well: the box
+        // reads the keys it is given.
         press(&mut app, KeyCode::Char(','), KeyModifiers::NONE);
         press(&mut app, KeyCode::Char(','), KeyModifiers::NONE);
-        let panel = app.reference_panel.as_ref().expect("panel");
-        assert_eq!(panel.chord_query, "()", "the replacement typed");
-        assert!(panel.vim_insert(), "text mappings stay in Insert");
-
-        // A prefix that starts nothing types once it is settled.
-        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
-        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
         assert_eq!(
             app.reference_panel.as_ref().expect("panel").chord_query,
-            "()jx"
+            "jk,,",
+            "no replacement stood in for the keys"
         );
     }
 
@@ -859,5 +1075,41 @@ mod tests {
             app.reference_panel.is_none(),
             "the second Command Esc closes"
         );
+    }
+
+    /// A filter standing over the set list leaves the list its own keys in
+    /// Command, as it does without Vim: Delete asks, Space folds the tapes,
+    /// and a digit opens that strip's score. A letter the list has no use
+    /// for still says how to type.
+    #[test]
+    fn a_standing_set_filter_leaves_the_list_its_keys() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = app_over(directory.path());
+        app.new_scene(false);
+        app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+        app.ui_settings.vim_list_navigation = true;
+        app.sync_editor_keybindings();
+        fn panel(app: &App) -> &SetPanel {
+            app.set_panel.as_ref().expect("panel")
+        }
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+        assert!(!panel(&app).vim_insert, "Esc left Insert");
+        assert_eq!(panel(&app).search.as_ref().expect("filter").query, "f");
+
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(app.status.contains("press i or a"), "{}", app.status);
+        press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+        assert!(panel(&app).deleting.is_some(), "Delete asks");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(panel(&app).deleting.is_none(), "Esc keeps the score");
+        assert!(panel(&app).search.is_some(), "the filter still stands");
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(panel(&app).sessions_open, "Space opens the tapes");
+        press(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(app.scenes.current().name(), "first", "1 opens strip 1");
     }
 }

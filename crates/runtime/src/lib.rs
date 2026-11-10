@@ -84,6 +84,9 @@ pub mod ui_analysis;
 /// Bounded, versioned live-editor event protocol.
 pub mod ui_events;
 pub mod updates;
+/// A video container's picture as thumbnails, for the `video()` painters.
+#[cfg(feature = "video")]
+pub mod video;
 #[cfg(feature = "vst")]
 pub mod vst;
 mod watch;
@@ -149,17 +152,22 @@ pub use producer::{
     PRODUCER_REPORTING_WINDOW_TURNS, ProducerLoadSnapshot, ProducerPhase, ProducerPhaseSnapshot,
     ProducerTurnOutcome,
 };
-pub use render::{MP3_EXPORT, RenderFormat, write_onset_dump, write_scalar_wav, write_silent_wav};
+pub use render::{
+    MP3_EXPORT, RENDER_ENDED_BEFORE_AUDIO, RenderFormat, write_onset_dump, write_scalar_wav,
+    write_silent_wav,
+};
 pub use rustel_audio::TakeoverCut;
 pub use samples::{
+    BUILTIN_SOURCES, DEFAULT_VIDEO_FILE_BYTES, LOCAL_FILES, MAX_VIDEO_FILE_BYTES,
     SCORE_SAMPLE_CACHE_MAX_BYTES, SCORE_SAMPLE_CACHE_MAX_ENTRIES,
     SCORE_SAMPLE_CACHE_SESSION_MAX_BYTES, SCORE_SAMPLE_CACHE_SESSION_MAX_ENTRIES,
-    ScoreSampleAccess, clear_score_sample_cache, sample_cache_dir, score_sample_cache_dir,
+    ScoreSampleAccess, SourceRule, clear_score_sample_cache, sample_cache_dir,
+    score_sample_cache_dir, set_video_file_ceiling, video_file_ceiling,
 };
 pub use score_import::{ScoreImportAccess, import_origin};
 pub use session::{
-    EvaluateSource, PLUGIN_DIAGNOSTIC, PREVIEW_ONSET_ID_FLAG, RuntimeError,
-    SAMPLE_AWAITED_DIAGNOSTIC, SAMPLE_LOADING_DIAGNOSTIC, Session, SessionConfig,
+    DEFAULT_HORIZON, EvaluateSource, PLUGIN_DIAGNOSTIC, PREVIEW_DOCUMENT, PREVIEW_ONSET_ID_FLAG,
+    RuntimeError, SAMPLE_AWAITED_DIAGNOSTIC, SAMPLE_LOADING_DIAGNOSTIC, Session, SessionConfig,
     SessionDiagnostic, VOICE_NOTICE_DIAGNOSTIC, WindowSound,
 };
 
@@ -168,7 +176,7 @@ pub use session::LIVE_REPLACEMENT_MIN_HEADROOM;
 #[cfg(any(test, feature = "test-support"))]
 pub use session::SessionPanicPoint;
 #[cfg(all(feature = "vst", feature = "device-audio"))]
-pub use session::{LiveReload, PLUGIN_WAIT};
+pub use session::{LiveReload, PLUGIN_WAIT, SEAM_WAIT};
 pub use session::{catch_score_panic, panic_is_contained};
 pub use watch::{
     FileWatch, MAX_WATCH_SOURCE_BYTES, ReloadEvent, ReloadStatus, WatchLanguage, WatchPoll,

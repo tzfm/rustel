@@ -68,5 +68,5 @@ name = "e2e-demo"
 path = "src/bin/e2e-demo.rs"
 required-features = ["demo"]
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(pty_available)'] }
+[lints]
+workspace = true

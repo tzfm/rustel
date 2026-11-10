@@ -192,7 +192,7 @@ fn compile_stage<'js>(
     let values: rquickjs::Value = object.get("workletInputs")?;
     let mut inputs = Vec::new();
     if let Some(array) = values.as_array() {
-        if array.len() > 1024 {
+        if js_array_len(array)? > 1024 {
             return Err(rquickjs::Exception::throw_range(
                 ctx,
                 "KabelSalat pattern inputs exceed 1024 values",
@@ -224,7 +224,7 @@ fn compile_event<'js>(
     }
     let mut has_graph = !source.is_undefined();
     if let Some(effects) = effects.as_array() {
-        if effects.len() > 64 {
+        if js_array_len(effects)? > 64 {
             return Err(rquickjs::Exception::throw_range(
                 &ctx,
                 "KabelSalat effect chain exceeds 64 stages",

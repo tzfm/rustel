@@ -153,7 +153,7 @@ pub(crate) fn hold_frames(
     // The renderer's age clock is f32: round past its boundary, then add a
     // worklet quantum.
     let frames = (stop_secs.max(0.0) as f32).next_up() * sample_rate as f32;
-    f64::from(frames.next_up()).ceil() as u64 + 256
+    (f64::from(frames.next_up()).ceil() as u64).saturating_add(256)
 }
 
 /// Waves held for the notes a producer has handed to a renderer.
@@ -325,4 +325,15 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
     // The registry stays consistent across a panic: every update finishes
     // before the next lock.
     REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A note too long to count in frames holds its wave for good.
+    #[test]
+    fn a_note_too_long_to_count_holds_its_wave_for_good() {
+        assert_eq!(hold_frames(1.0e20, 0.0, 0, None, 48_000), u64::MAX);
+    }
 }

@@ -64,8 +64,8 @@ pub use geometry::{
 };
 #[cfg(feature = "hydra")]
 pub use geometry::{generator_rail, preview_area, snippet_layout};
-pub(super) use geometry::{sample_pulse_rows, tab_layout};
-pub use samples::{section_labels, source_labels};
+pub(super) use geometry::{sample_pulse_rows, samples_details_area, tab_layout};
+pub use samples::{SampleDetails, section_labels, source_labels};
 pub use text::entry_body;
 #[cfg(any(feature = "hydra", test))]
 use text::render_code_span;
@@ -77,7 +77,7 @@ use text::{parse_inline, wrap_code, wrap_inline};
 #[cfg(feature = "hydra")]
 use view::generator_action_label;
 #[cfg(test)]
-use view::sample_source_line;
+use view::sample_detail_lines;
 #[cfg(all(test, feature = "hydra"))]
 use view::{ALIASES_SHOWN, aliases_text};
 use vocabulary::CHORD_PREVIEW_OCTAVE;
@@ -186,6 +186,10 @@ pub struct Reference {
     entries: Vec<Entry>,
     by_name: HashMap<String, usize>,
     by_kabel_name: HashMap<String, usize>,
+    /// Hydra names written first in a statement or argument: `osc`, `o0`.
+    by_hydra_name: HashMap<String, usize>,
+    /// Hydra names written after a dot: `kaleid`, `out`, `initCam`.
+    by_hydra_member: HashMap<String, usize>,
     revision: String,
     /// Documented but filtered out by the `known` predicate; reported,
     /// not shown.
@@ -195,7 +199,9 @@ pub struct Reference {
     hidden: Vec<Category>,
 }
 
-/// The namespace available at the editor caret. The full browser keeps both.
+/// The namespace available at the editor caret. The full browser keeps
+/// pattern and graph entries. Hydra entries appear only in the Hydra scopes,
+/// and pattern and graph entries never appear there.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReferenceScope {
     #[default]
@@ -203,11 +209,36 @@ pub enum ReferenceScope {
     Pattern,
     Kabelsalat,
     KabelsalatMember,
+    /// Hydra names that start a statement or an argument.
+    Hydra,
+    /// Hydra names written after a dot.
+    HydraMember,
+    /// The Hydra browser: every Hydra name, as `All` is for pattern code.
+    HydraAll,
 }
 
 impl ReferenceScope {
     pub fn is_kabelsalat(self) -> bool {
         matches!(self, Self::Kabelsalat | Self::KabelsalatMember)
+    }
+
+    pub fn is_hydra(self) -> bool {
+        matches!(self, Self::Hydra | Self::HydraMember | Self::HydraAll)
+    }
+
+    /// Whether this scope is a whole browser rather than one position's
+    /// completion list.
+    pub fn is_browser(self) -> bool {
+        matches!(self, Self::All | Self::HydraAll)
+    }
+
+    /// The browser for the language of this scope.
+    pub fn browser(self) -> Self {
+        if self.is_hydra() {
+            Self::HydraAll
+        } else {
+            Self::All
+        }
     }
 }
 
@@ -228,16 +259,19 @@ pub enum Category {
     Internals,
     /// KabelSalat graph builders, nodes and inputs.
     Kabelsalat,
+    /// Hydra visuals: the Hydra namespace, `initHydra` and `clearHydra`.
+    Hydra,
 }
 
 impl Category {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Osc,
         Self::Serial,
         Self::FmMatrix,
         Self::Bind,
         Self::Internals,
         Self::Kabelsalat,
+        Self::Hydra,
     ];
 
     /// The tag an entry carries to belong to this category.
@@ -249,6 +283,7 @@ impl Category {
             Self::Bind => "bind",
             Self::Internals => "internals",
             Self::Kabelsalat => "kabelsalat",
+            Self::Hydra => "hydra",
         }
     }
 
@@ -586,6 +621,9 @@ pub struct ReferencePanel {
     /// A deletion awaits Enter for this bank, variant and exact local file.
     /// Keep the path so a catalogue refresh cannot change the target.
     pub confirm_delete: Option<(String, usize, std::path::PathBuf)>,
+    /// The file under the samples tab's cursor, and what it says about
+    /// itself once the App has read it.
+    pub sample_details: Option<SampleDetails>,
 }
 
 /// Why the panel was opened, which decides what Enter does to a sound.
@@ -1290,7 +1328,8 @@ mod tests {
                     }
                     let covered = if *label == "engine names" {
                         // S and audioin are installed score guards whose use is
-                        // documented in the graph namespace.
+                        // documented in the graph namespace, and H is
+                        // documented in the Hydra namespace.
                         reference.documents(name)
                     } else if *exact {
                         reference.by_name.contains_key(name)
@@ -1388,10 +1427,12 @@ mod tests {
             let mut stray: Vec<&str> = Vec::new();
             for index in 0..reference.len() {
                 let entry = reference.entry(index).expect("entry");
-                // Snippets are lines to paste. Graph names live in a separate
-                // namespace, whose installation coverage is checked by jsruntime.
+                // Snippets are lines to paste. Graph and Hydra names live in
+                // separate namespaces, installed only inside `K` or after
+                // `initHydra()`.
                 if entry.snippet.is_some()
                     || reference.by_kabel_name.get(&entry.name) == Some(&index)
+                    || entry.is_hydra()
                 {
                     continue;
                 }
@@ -1473,10 +1514,10 @@ mod tests {
                 reference.by_name.get("setcpm"),
                 reference.by_name.get("setCpm")
             );
-            // The VST3 calls are experimental. So is each call whose text
-            // says so, and the body says it one time. A stable call has no
-            // mark.
-            for name in ["vst", "vsti"] {
+            // The VST3 calls and talkit are experimental. So is each call
+            // whose text says so, and the body says it one time. A stable
+            // call has no mark.
+            for name in ["vst", "vsti", "talkit"] {
                 assert_eq!(body(name, BodyKind::Origin), ["experimental"], "{name}");
             }
             for index in 0..reference.len() {
@@ -3937,8 +3978,7 @@ mod tests {
         fn sample_source_labels_preserve_import_specs_and_compact_local_folders() {
             let reference = Reference::load_all();
             let empty = ReferencePanel::samples(&reference, Vec::new());
-            assert_eq!(sample_source_line(&empty), "source: select a sound");
-            assert!(!sample_source_line(&empty).contains('-'));
+            assert_eq!(sample_detail_lines(&empty), ["select a sound"]);
 
             let mut panel = ReferencePanel::samples(
                 &reference,
@@ -3967,6 +4007,196 @@ mod tests {
                 import: Some(folder(&["Users", "player", "Music", "sessions"])),
             }]);
             assert_eq!(panel.selected_sample_source().as_deref(), Some("sessions"));
+        }
+
+        fn scored(name: &str, variants: usize) -> SoundEntry {
+            SoundEntry {
+                name: name.into(),
+                variants,
+                variant_names: Vec::new(),
+                origin: SoundOrigin::Score,
+                category: SoundCategory::Other,
+                location: None,
+                import: None,
+            }
+        }
+
+        fn read(url: &str, facts: rustel_runtime::samples::SampleFacts) -> Option<SampleDetails> {
+            Some(SampleDetails {
+                url: url.into(),
+                facts: Some(facts),
+                stale: false,
+                played: None,
+            })
+        }
+
+        #[test]
+        fn sample_details_say_a_banks_files_a_videos_limit_and_a_file_not_downloaded() {
+            use rustel_runtime::samples::{SampleFacts, SoundFacts};
+            let reference = Reference::load_all();
+
+            // A bank of many files: how many, not its first file's length.
+            let mut panel = ReferencePanel::samples(&reference, vec![scored("kit", 3)]);
+            panel.sample_details = read(
+                "file:///kits/kit/a.wav",
+                SampleFacts {
+                    bytes: Some(2048),
+                    sound: Some(SoundFacts {
+                        rate: Some(44_100),
+                        channels: Some(2),
+                        bits: Some(24),
+                        seconds: Some(0.5),
+                        codec: None,
+                    }),
+                    ..SampleFacts::default()
+                },
+            );
+            assert_eq!(
+                sample_detail_lines(&panel),
+                ["wav · 24-bit · 44.1 kHz · stereo", "3 files · this score"]
+            );
+
+            // One file: its length and size, and a video past the most any
+            // ceiling allows says it cannot load.
+            panel.set_sounds(vec![scored("clip", 1)]);
+            panel.sample_details = read(
+                "file:///clips/clip.webm",
+                SampleFacts {
+                    bytes: Some(4 << 30),
+                    picture: true,
+                    sound: Some(SoundFacts {
+                        rate: Some(48_000),
+                        channels: Some(2),
+                        seconds: Some(65.0),
+                        codec: Some("Opus"),
+                        bits: None,
+                    }),
+                    ..SampleFacts::default()
+                },
+            );
+            let lines = sample_detail_lines(&panel);
+            assert_eq!(lines[0], "webm · video · Opus · 48 kHz · stereo");
+            assert!(
+                lines[1].starts_with("1:05 · 4096 MB · over the ")
+                    && lines[1].ends_with(" video limit · this score"),
+                "{lines:?}"
+            );
+            // A preview of a sound of a minute or more says where it stands.
+            panel.sample_details.as_mut().expect("details").played = Some(13.0);
+            assert!(
+                sample_detail_lines(&panel)[1].starts_with("0:13 / 1:05 · 4096 MB"),
+                "{:?}",
+                sample_detail_lines(&panel)
+            );
+
+            panel.set_sounds(vec![scored("kick", 1)]);
+            panel.sample_details = read(
+                "https://host/kits/kick.wav?v=2",
+                SampleFacts {
+                    remote: true,
+                    ..SampleFacts::default()
+                },
+            );
+            assert_eq!(
+                sample_detail_lines(&panel),
+                ["wav · not downloaded yet", "this score"]
+            );
+        }
+
+        /// The row of a sound whose preview waits for its sample says so,
+        /// also when the name is too long to leave the word any room.
+        #[test]
+        fn a_sound_that_loads_says_so_however_long_its_name() {
+            let reference = Reference::load_all();
+            let name = "a-dystopian-short-movie-with-a-name-longer-than-any-column";
+            let panel = ReferencePanel::samples(&reference, vec![scored(name, 1)]);
+            let area = Rect::new(0, 0, 50, 24);
+            let mut buffer = Buffer::empty(area);
+            ReferenceView {
+                keybinds: &crate::keybinds::Keybinds::default(),
+                focused: true,
+                vim: false,
+                anchored: false,
+                pulse: None,
+                sounding_note: None,
+                loading: Some(format!("{name}:0")),
+                caching: 0,
+                importing: 0,
+                library_loading: false,
+                #[cfg(feature = "hydra")]
+                playing: None,
+                #[cfg(feature = "hydra")]
+                preview_note: None,
+                #[cfg(feature = "hydra")]
+                preview_progress: None,
+                #[cfg(feature = "hydra")]
+                preview_row: None,
+                picture: false,
+                refused: None,
+                reference: &reference,
+                panel: &panel,
+                theme: &Theme::built_in_default(),
+            }
+            .render(area, &mut buffer);
+            let rows: Vec<String> = (0..area.height)
+                .map(|y| (0..area.width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("a-dystopian") && row.contains(" loading ")),
+                "{rows:#?}"
+            );
+        }
+
+        #[test]
+        fn a_deletion_asks_its_whole_question_in_a_short_column() {
+            let reference = Reference::load_all();
+            let mut panel = ReferencePanel::samples(&reference, vec![scored("take", 1)]);
+            panel.confirm_delete = Some((
+                "take".into(),
+                0,
+                std::path::PathBuf::from("/Users/player/take.wav"),
+            ));
+            let area = Rect::new(0, 0, 50, 17);
+            let inner = inner_area(area);
+            assert_eq!(geometry::samples_detail_rows(inner), 1, "one details row");
+            assert!(panel.geometry(inner).list.height > 0, "a list to draw");
+
+            let mut buffer = Buffer::empty(area);
+            ReferenceView {
+                keybinds: &crate::keybinds::Keybinds::default(),
+                focused: true,
+                vim: false,
+                anchored: false,
+                pulse: None,
+                sounding_note: None,
+                loading: None,
+                caching: 0,
+                importing: 0,
+                library_loading: false,
+                #[cfg(feature = "hydra")]
+                playing: None,
+                #[cfg(feature = "hydra")]
+                preview_note: None,
+                #[cfg(feature = "hydra")]
+                preview_progress: None,
+                #[cfg(feature = "hydra")]
+                preview_row: None,
+                picture: false,
+                refused: None,
+                reference: &reference,
+                panel: &panel,
+                theme: &Theme::built_in_default(),
+            }
+            .render(area, &mut buffer);
+            let rows: Vec<String> = (0..area.height)
+                .map(|y| (0..area.width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("Delete permanently? take.wav")),
+                "{rows:#?}"
+            );
         }
     }
     mod samples {
@@ -4848,23 +5078,20 @@ mod tests {
         }
 
         #[test]
-        fn mouse_signal_search_explains_the_missing_input() {
+        fn mouse_signal_search_explains_where_the_pointer_is_read() {
             let reference = Reference::load(engine_knows());
             for name in ["mousex", "mouseX", "mousey", "mouseY"] {
                 let index = reference.lookup(name).expect("mouse signal entry");
                 assert_eq!(reference.search(name).first(), Some(&index), "{name}");
                 let entry = reference.entry(index).unwrap();
-                assert!(entry.summary.contains("not supported"), "{name}");
+                assert!(entry.summary.contains("pointer"), "{name}");
                 let body = entry_body(entry, 80)
                     .into_iter()
                     .map(|line| line.text)
                     .collect::<Vec<_>>()
                     .join(" ");
-                assert!(body.contains("always returns 0"), "{name}: {body}");
-                assert!(
-                    body.contains("does not track the pointer"),
-                    "{name}: {body}"
-                );
+                assert!(body.contains("follows the mouse"), "{name}: {body}");
+                assert!(body.contains("returns 0"), "{name}: {body}");
             }
         }
 
@@ -5014,7 +5241,11 @@ mod tests {
             let bypasses = reference.search("tag:bypass");
             assert!(!bypasses.is_empty());
             assert!(bypasses.iter().all(|index| !listed.contains(index)));
-            assert_eq!(listed.len() + bypasses.len(), reference.len());
+            // Hydra names are listed only in Hydra code.
+            let hydra = (0..reference.len())
+                .filter(|&index| reference.entry(index).unwrap().is_hydra())
+                .count();
+            assert_eq!(listed.len() + bypasses.len() + hydra, reference.len());
             assert!(reference.search("zzzzqqq").is_empty());
         }
 
@@ -6776,5 +7007,147 @@ mod kabelsalat_tests {
             .unwrap();
         assert!(reference.entry(midi).unwrap().no_autocomplete);
         assert!(tagged.contains(&midi));
+    }
+}
+
+#[cfg(all(test, feature = "hydra"))]
+mod hydra_tests {
+    use super::*;
+
+    fn names(reference: &Reference, query: &str, scope: ReferenceScope) -> Vec<String> {
+        reference
+            .search_in(query, false, scope)
+            .into_iter()
+            .map(|index| reference.entry(index).expect("a listed entry").name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn hydra_and_pattern_names_never_share_a_list() {
+        let reference = Reference::load_all();
+        for query in ["", "os", "sha", "tag:hydra", "tag:", "kaleid"] {
+            for scope in [ReferenceScope::All, ReferenceScope::Pattern] {
+                for index in reference.search_in(query, false, scope) {
+                    let entry = reference.entry(index).unwrap();
+                    assert!(
+                        !entry.is_hydra(),
+                        "{query:?} in {scope:?} lists {}",
+                        entry.name
+                    );
+                }
+            }
+            for scope in [
+                ReferenceScope::Hydra,
+                ReferenceScope::HydraMember,
+                ReferenceScope::HydraAll,
+            ] {
+                for index in reference.search_in(query, false, scope) {
+                    let entry = reference.entry(index).unwrap();
+                    assert!(
+                        entry.is_hydra(),
+                        "{query:?} in {scope:?} lists {}",
+                        entry.name
+                    );
+                    assert_eq!(entry.heading(), "hydra", "{}", entry.name);
+                }
+            }
+        }
+        assert!(
+            names(&reference, "tag:hydra", ReferenceScope::Pattern)
+                .contains(&"initHydra".to_owned())
+        );
+    }
+
+    #[test]
+    fn hydra_names_resolve_in_their_own_namespace() {
+        let reference = Reference::load_all();
+        for name in ["osc", "noise", "shape", "src"] {
+            let hydra = reference.lookup_in(name, ReferenceScope::Hydra).unwrap();
+            assert!(reference.entry(hydra).unwrap().is_hydra(), "{name}");
+            assert!(reference.is_hydra_global(name), "{name}");
+            if let Some(pattern) = reference.lookup_in(name, ReferenceScope::Pattern) {
+                assert_ne!(pattern, hydra, "{name} needs separate documentation");
+            }
+        }
+        let kaleid = reference
+            .lookup_in("kaleid", ReferenceScope::HydraMember)
+            .unwrap();
+        assert!(reference.entry(kaleid).unwrap().inserts_as_call());
+        assert!(
+            reference
+                .lookup_in("kaleid", ReferenceScope::Pattern)
+                .is_none()
+        );
+        let o0 = reference.lookup_in("o2", ReferenceScope::Hydra).unwrap();
+        assert_eq!(reference.entry(o0).unwrap().name, "o0");
+        assert!(!reference.entry(o0).unwrap().inserts_as_call());
+        // `a` is the analyser as a global and the alpha channel after a dot.
+        let analyser = reference.lookup_in("a", ReferenceScope::Hydra).unwrap();
+        let alpha = reference
+            .lookup_in("a", ReferenceScope::HydraMember)
+            .unwrap();
+        assert_ne!(analyser, alpha);
+        assert!(!reference.entry(analyser).unwrap().inserts_as_call());
+        assert!(reference.entry(alpha).unwrap().inserts_as_call());
+    }
+
+    #[test]
+    fn hydra_completion_separates_statement_heads_from_methods() {
+        let reference = Reference::load_all();
+        let heads = names(&reference, "", ReferenceScope::Hydra);
+        let methods = names(&reference, "", ReferenceScope::HydraMember);
+        for head in ["osc", "src", "o0", "s0", "render", "H"] {
+            assert!(
+                heads.contains(&head.to_owned()),
+                "{head} starts a statement"
+            );
+            assert!(
+                !methods.contains(&head.to_owned()),
+                "{head} is not a method"
+            );
+        }
+        for method in ["kaleid", "out", "modulate", "initCam", "setBins", "fast"] {
+            assert!(methods.contains(&method.to_owned()), "{method} is a method");
+            assert!(
+                !heads.contains(&method.to_owned()),
+                "{method} is not a head"
+            );
+        }
+        assert!(
+            !methods.contains(&"sum".to_owned()),
+            "refused names are not offered"
+        );
+        assert!(
+            reference
+                .lookup_in("sum", ReferenceScope::HydraMember)
+                .is_some()
+        );
+    }
+
+    /// Each browser counts only the entries it can list.
+    #[test]
+    fn each_browser_counts_its_own_language() {
+        let reference = Reference::load_all();
+        let hydra = reference.len_in(ReferenceScope::HydraAll);
+        assert!(hydra > 0);
+        assert_eq!(
+            reference
+                .search_in("", false, ReferenceScope::HydraAll)
+                .len(),
+            hydra
+        );
+        assert_eq!(
+            reference.len_in(ReferenceScope::All) + hydra,
+            reference.len()
+        );
+    }
+
+    #[test]
+    fn hiding_hydra_leaves_lookup_and_its_tag() {
+        let mut reference = Reference::load_all();
+        reference.set_hidden([Category::Hydra]);
+        assert!(names(&reference, "", ReferenceScope::Hydra).is_empty());
+        assert!(!names(&reference, "tag:hydra", ReferenceScope::Hydra).is_empty());
+        assert!(reference.lookup_in("osc", ReferenceScope::Hydra).is_some());
     }
 }

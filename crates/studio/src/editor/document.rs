@@ -254,13 +254,23 @@ impl Document {
             .to_string()
     }
 
+    /// The line's first non-whitespace character, or its start when it has
+    /// none.
     pub fn first_non_whitespace(&self, line: usize) -> ByteOffset {
+        let range = self.line_content_range(line);
+        let end = self.indent_end(line);
+        if end == range.end { range.start } else { end }
+    }
+
+    /// Where the line's leading whitespace ends: its first other character,
+    /// or the line end when it holds only whitespace.
+    pub fn indent_end(&self, line: usize) -> ByteOffset {
         let range = self.line_content_range(line);
         let text = self.line_content(line);
         let relative = text
             .char_indices()
             .find_map(|(index, character)| (!character.is_whitespace()).then_some(index))
-            .unwrap_or(0);
+            .unwrap_or(text.len());
         ByteOffset(range.start.0 + relative)
     }
 
@@ -483,19 +493,28 @@ pub(crate) fn validate_edits(document: &Document, edits: &[Edit]) -> Result<(), 
 
 fn rope_line_ending_len(line: RopeSlice<'_>) -> usize {
     let character_count = line.len_chars();
-    if character_count == 0 {
-        return 0;
-    }
-    match line.char(character_count - 1) {
-        '\n' if character_count >= 2 && line.char(character_count - 2) == '\r' => 2,
-        character
-            if matches!(
-                character,
-                '\n' | '\r' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
-            ) =>
-        {
-            character.len_utf8()
-        }
+    let from_end = |back: usize| {
+        character_count
+            .checked_sub(back)
+            .map(|index| line.char(index))
+    };
+    ending_len(from_end(1), from_end(2))
+}
+
+/// The byte length of the line ending that closes `text`, or zero. CRLF
+/// and Ropey's supported Unicode line breaks each count as one ending.
+pub(crate) fn line_ending_len(text: &str) -> usize {
+    let mut characters = text.chars().rev();
+    ending_len(characters.next(), characters.next())
+}
+
+fn ending_len(last: Option<char>, before: Option<char>) -> usize {
+    match last {
+        Some('\n') if before == Some('\r') => 2,
+        Some(
+            character @ ('\n' | '\r' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}'
+            | '\u{2029}'),
+        ) => character.len_utf8(),
         _ => 0,
     }
 }

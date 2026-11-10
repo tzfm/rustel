@@ -184,7 +184,7 @@ pub(crate) fn fetch(url: &Url) -> Result<String, String> {
     let mut current = url.clone();
     for _ in 0..=5 {
         budget.check().map_err(timed_out)?;
-        let response = sample_fetch::guarded_single_hop_get(&current, &budget, None)?;
+        let response = sample_fetch::guarded_single_hop_get(&current, &budget)?;
         if (300..400).contains(&response.status()) {
             let location = response
                 .header("Location")

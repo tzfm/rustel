@@ -5,8 +5,10 @@
 //!
 //! Plugins are part of the same wait, and the session decides it. A start
 //! waits for the plugin copies of its first window: see
-//! [`rustel_runtime::Session::plugins_pending`]. An edit and a launch wait
-//! while the session holds their text for its plugin copies: see
+//! [`rustel_runtime::Session::plugins_pending`]. In [`LoadMode::Async`] a
+//! start waits a short time for the copies a close of the output sent home:
+//! see [`rustel_runtime::Session::plugins_returning`]. An edit and a launch
+//! wait while the session holds their text for its plugin copies: see
 //! [`rustel_runtime::Session::reload_live`].
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,8 +20,9 @@ use rustel_runtime::{RuntimeError, SAMPLE_LOADING_DIAGNOSTIC};
 
 use super::super::settings::LoadMode;
 use super::{
-    STARTUP_SAMPLE_WARM_BUDGET, StudioDiagnostic, StudioEngine, StudioInstall, StudioUpdate,
-    StudioUpdateSendResult, TakeoverCut, next_boundary, queue_diagnostic, source_revision,
+    InstallMark, STARTUP_SAMPLE_WARM_BUDGET, StudioDiagnostic, StudioEngine, StudioInstall,
+    StudioUpdate, StudioUpdateSendResult, TakeoverCut, next_boundary, queue_diagnostic,
+    source_revision,
 };
 
 /// How far a start's first window reaches, in cycles.
@@ -93,7 +96,7 @@ pub(super) struct HeldEdit {
     source: String,
     mini: bool,
     rewind: bool,
-    preview: bool,
+    mark: InstallMark,
     followed: Vec<Followed>,
 }
 
@@ -113,6 +116,10 @@ pub(super) struct LoadState {
     /// of the wait: see [`StudioEngine::look_at_start_copies`].
     #[cfg(feature = "vst")]
     start_progress: Option<Instant>,
+    /// The start of the wait of a start in [`LoadMode::Async`] for the
+    /// copies a close sent home: see [`StudioEngine::start_returns`].
+    #[cfg(feature = "vst")]
+    start_returning: Option<Instant>,
     pub(super) held_edit: Option<HeldEdit>,
     /// Sounds skipped as still loading since the last late-sounds line.
     late: BTreeSet<String>,
@@ -238,14 +245,23 @@ impl StudioEngine {
     }
 
     /// One look of a start at the plugin copies of its first window: see
-    /// [`rustel_runtime::Session::plugins_pending`]. The start waits while a
-    /// copy became ready in the last [`rustel_runtime::PLUGIN_WAIT`]. After
-    /// it, the start goes on, and a note with no copy plays with no plugin.
+    /// [`rustel_runtime::Session::plugins_pending`]. With `tries`, the look
+    /// also gives each copy of the window that did not start, or that
+    /// faulted, one new try: see
+    /// [`rustel_runtime::Session::plugins_pending_with_tries`]. The start
+    /// waits while a copy became ready in the last
+    /// [`rustel_runtime::PLUGIN_WAIT`]. After it, the start goes on, and a
+    /// note with no copy plays with no plugin.
     #[cfg(feature = "vst")]
-    fn look_at_start_copies(&mut self) -> Result<(), RuntimeError> {
+    fn look_at_start_copies(&mut self, tries: bool) -> Result<(), RuntimeError> {
         let now = self.device_time();
         let pending = self.session.with_panic_recovery(now, |session| {
-            Ok(session.plugins_pending(0.0, FIRST_WINDOW_CYCLES, STARTUP_SAMPLE_WARM_BUDGET))
+            let (from, cycles, ceiling) = (0.0, FIRST_WINDOW_CYCLES, STARTUP_SAMPLE_WARM_BUDGET);
+            Ok(if tries {
+                session.plugins_pending_with_tries(from, cycles, ceiling)
+            } else {
+                session.plugins_pending(from, cycles, ceiling)
+            })
         })?;
         let progress = match self.load.start_progress {
             Some(progress) if pending >= self.load.start_plugins => progress,
@@ -341,7 +357,8 @@ impl StudioEngine {
         #[cfg(feature = "vst")]
         let plugins = {
             let cycle = self.session.cycle_at_time(self.device_time());
-            self.prepare_live(source, mini, if rewind { 0.0 } else { cycle });
+            let from_cycle = if rewind { 0.0 } else { cycle };
+            self.prepare_live(source, mini, from_cycle, self.next_install.document);
             self.session.waits_for_plugins(source)
         };
         #[cfg(not(feature = "vst"))]
@@ -350,7 +367,7 @@ impl StudioEngine {
             source: source.to_owned(),
             mini,
             rewind,
-            preview: std::mem::take(&mut self.next_install_preview),
+            mark: self.next_install.take(),
             followed,
         });
         self.ask_for_waited();
@@ -363,14 +380,14 @@ impl StudioEngine {
     /// [`rustel_runtime::Session::reload_live`]. The last score keeps
     /// playing, [`Self::advance_held_edit`] lands the edit when its copies
     /// are ready, and [`Self::take_launch_outcome`] answers it then. The
-    /// edit keeps its from-zero request and its preview mark.
+    /// edit keeps its from-zero request and its install mark.
     pub(super) fn hold_for_plugins(&mut self, source: &str, mini: bool) -> StudioInstall {
         self.launch_outcome = None;
         self.load.held_edit = Some(HeldEdit {
             source: source.to_owned(),
             mini,
             rewind: self.session.take_next_from_zero(),
-            preview: std::mem::take(&mut self.next_install_preview),
+            mark: self.next_install.take(),
             followed: Vec::new(),
         });
         self.log_launch("update waits for its plugins");
@@ -429,14 +446,14 @@ impl StudioEngine {
         if held.rewind {
             self.session.start_next_from_zero();
         }
-        self.next_install_preview = held.preview;
+        self.next_install = held.mark;
         match self.reload_live(&held.source, held.mini) {
             Ok(Some(install)) => self.launch_outcome = Some(Ok(install)),
             // The session holds the edit for its plugin copies again: the
-            // edit keeps its from-zero request and its preview mark.
+            // edit keeps its from-zero request and its install mark.
             Ok(None) => {
                 self.session.clear_next_from_zero();
-                held.preview = std::mem::take(&mut self.next_install_preview);
+                held.mark = self.next_install.take();
                 self.load.held_edit = Some(held);
             }
             Err(error) => {
@@ -477,9 +494,15 @@ impl StudioEngine {
         let cps = self.session.cps().max(1e-6);
         let cycle_now = self.session.cycle_at_time(now);
         let headroom_cycles = self.launch_headroom() * cps;
+        #[cfg(feature = "vst")]
+        let lead = self.session.takeover_headroom();
         let Some(pending) = self.pending_launch.as_mut() else {
             return;
         };
+        #[cfg(feature = "vst")]
+        {
+            pending.lead = lead;
+        }
         pending.boundary_cycle = next_boundary(cycle_now, pending.unit_cycles, headroom_cycles);
         pending.boundary_time = now + (pending.boundary_cycle - cycle_now) / cps;
         if !std::mem::replace(&mut pending.waited, true) {
@@ -507,17 +530,43 @@ impl StudioEngine {
 
     /// Follow what a start's first window plays, and hold its cycle zero
     /// for it in [`LoadMode::Wait`]. The plugin copies of the window hold
-    /// the start too.
-    pub(super) fn follow_start(&mut self, source: &str) -> Result<(), RuntimeError> {
+    /// the start too. In [`LoadMode::Async`] the start waits a short time
+    /// for the copies a close sent home: see [`Self::start_returns`]. It
+    /// also looks at the copies of the window, for the lead of their plugin
+    /// chains alone: cycle zero comes that lead later, so the first notes of
+    /// a chain with latency have room for it. See
+    /// [`rustel_runtime::Session::plugin_lead`]. A `mini` text, or a text of
+    /// a set with no plugin, asks the plugin host nothing. This first look
+    /// gives each copy of the window that did not start, or that faulted,
+    /// one new try, and the later looks of a held start give none: see
+    /// [`rustel_runtime::Session::plugins_pending_with_tries`].
+    pub(super) fn follow_start(&mut self, source: &str, mini: bool) -> Result<(), RuntimeError> {
         self.load.installed = self.followed_in_first_window(source)?;
         #[cfg(feature = "vst")]
         {
             self.load.start_plugins = 0;
             self.load.start_progress = None;
+            self.load.start_returning = None;
             if self.waits_for_sounds() {
-                self.look_at_start_copies()?;
+                self.look_at_start_copies(true)?;
+            } else {
+                if self.session.plugins_returning() > 0 {
+                    self.load.start_returning = Some(Instant::now());
+                }
+                if self.plays_plugins(source, mini) {
+                    let now = self.device_time();
+                    self.session.with_panic_recovery(now, |session| {
+                        Ok(session.plugins_pending_with_tries(
+                            0.0,
+                            FIRST_WINDOW_CYCLES,
+                            STARTUP_SAMPLE_WARM_BUDGET,
+                        ))
+                    })?;
+                }
             }
         }
+        #[cfg(not(feature = "vst"))]
+        let _ = mini;
         self.load.start_held = self.waits_for_sounds()
             && (self.loading_among(&self.load.installed) || self.load.start_plugins > 0);
         Ok(())
@@ -532,19 +581,24 @@ impl StudioEngine {
     /// sliders can move, and cycle zero stays just ahead. False once the
     /// first window's sounds have loaded and its plugin copies are ready,
     /// when the start goes on. A look that fails ends the wait for the
-    /// copies.
+    /// copies. In [`LoadMode::Async`] a start holds while it waits for the
+    /// copies a close sent home: see [`Self::start_returns`].
     pub(super) fn hold_start(
         &mut self,
         emit: &mut impl FnMut(StudioUpdate) -> StudioUpdateSendResult,
     ) -> bool {
-        if !self.start_is_held() {
+        #[cfg(feature = "vst")]
+        let returning = self.start_returns();
+        #[cfg(not(feature = "vst"))]
+        let returning = false;
+        if !returning && !self.start_is_held() {
             return false;
         }
         #[cfg(feature = "vst")]
-        if self.load.start_plugins > 0 && self.look_at_start_copies().is_err() {
+        if self.load.start_plugins > 0 && self.look_at_start_copies(false).is_err() {
             self.load.start_plugins = 0;
         }
-        if !self.loading_among(&self.load.installed) && self.load.start_plugins == 0 {
+        if !returning && !self.loading_among(&self.load.installed) && self.load.start_plugins == 0 {
             self.load.start_held = false;
             return false;
         }
@@ -558,15 +612,43 @@ impl StudioEngine {
         true
     }
 
+    /// True while a start in [`LoadMode::Async`] waits for the plugin copies
+    /// a close of the output sent home: the door of the copies on their way
+    /// home gives more than 0, and less than [`rustel_runtime::SEAM_WAIT`]
+    /// passed since the start. Each turn asks the door again: see
+    /// [`rustel_runtime::Session::plugins_returning`]. Then the start goes
+    /// on, and a note of a copy not yet home plays with no plugin.
+    #[cfg(feature = "vst")]
+    fn start_returns(&mut self) -> bool {
+        let Some(since) = self.load.start_returning else {
+            return false;
+        };
+        if since.elapsed() < rustel_runtime::SEAM_WAIT && self.session.plugins_returning() > 0 {
+            return true;
+        }
+        self.load.start_returning = None;
+        false
+    }
+
+    /// Ends the wait of a start in [`LoadMode::Async`] for the copies a close
+    /// sent home, so the start goes on: an edit or a launch comes first.
+    #[cfg(feature = "vst")]
+    pub(super) fn end_start_returning(&mut self) {
+        self.load.start_returning = None;
+    }
+
     /// Replace a held start with `source`, from its own cycle zero and
     /// waiting for its own first window. A score that fails to evaluate
-    /// leaves the held start as it was.
+    /// leaves the held start as it was. The lead of the held text ends. When
+    /// the look of its first window raises the lead of the plugin chains,
+    /// cycle zero moves by that lead: see
+    /// [`rustel_runtime::Session::plugin_lead`].
     pub(super) fn replace_held_start(
         &mut self,
         source: &str,
         mini: bool,
     ) -> Result<StudioInstall, RuntimeError> {
-        let preview = std::mem::take(&mut self.next_install_preview);
+        let mark = self.next_install.take();
         let transport = self.session.transport();
         let now = self
             .live
@@ -574,9 +656,15 @@ impl StudioEngine {
             .expect("a held start is live")
             .device
             .clock_seconds();
+        #[cfg(feature = "vst")]
+        self.session.set_plugin_document(mark.document);
         let generation =
             self.session
                 .reload_at_cancellable(source, mini, now, transport.stopped_flag())?;
+        // The held text never sounded, so its lead does not count. The look
+        // of the first window of `source` gives the lead again.
+        #[cfg(feature = "vst")]
+        self.session.end_plugin_leads();
         let live = self.live.as_mut().expect("a held start is live");
         let anchor = live.device.clock_seconds()
             + live.device.schedule_lead_seconds()
@@ -587,8 +675,12 @@ impl StudioEngine {
         live.initial_start_generation = Some(generation);
         live.audition_owned = false;
         self.warm_source(source, STARTUP_SAMPLE_WARM_BUDGET)?;
-        self.note_install_for_played(generation, preview, source);
-        self.follow_start(source)?;
+        self.note_install_for_played(generation, mark.preview, source);
+        self.follow_start(source, mini)?;
+        #[cfg(feature = "vst")]
+        if self.session.plugin_lead() > 0.0 {
+            self.session.finish_transport_start_at(anchor);
+        }
         Ok(StudioInstall {
             generation,
             source_revision: source_revision(source),
@@ -735,7 +827,10 @@ impl StudioEngine {
         self.load.start_held = false;
         self.load.start_plugins = 0;
         #[cfg(feature = "vst")]
-        self.session.cancel_plugin_hold();
+        {
+            self.load.start_returning = None;
+            self.session.cancel_plugin_hold();
+        }
         let late = self.late_sounds();
         self.say_late(late);
         self.resolve_alerts();
@@ -1097,7 +1192,9 @@ pub(super) mod tests {
         }
 
         /// Async: the start plays at once, the loading kick is skipped, and
-        /// its lateness is said once, in one line, when the load is over.
+        /// its lateness is said once, in one line, when the load is over. On
+        /// an output with plugins, a start of a text with no plugin makes no
+        /// look at the plugin copies. A text with `vst` makes one.
         #[test]
         fn an_async_start_plays_at_once_and_says_the_late_sound_once() {
             let library = loading_kick();
@@ -1127,6 +1224,27 @@ pub(super) mod tests {
                         == Some(DiagnosticAlert::Resolve(key.clone()))),
                 "and resolves it, its sounds being in"
             );
+
+            // On an output with plugins, the start of a text with no plugin
+            // makes no look at the plugin copies of its first window. A text
+            // with `vst` makes one, for the lead of its plugin chains.
+            #[cfg(feature = "vst")]
+            for (source, looks) in [("s(\"sine\")", false), ("// vst\ns(\"sine\")", true)] {
+                let mut engine = studio(LoadMode::Async, &library);
+                engine.session.transport().start();
+                let device = LiveScalarDevice::start_silent(48_000, engine.generation())
+                    .expect("silent output");
+                engine.session.attach_instruments(&device);
+                engine
+                    .session
+                    .bind_audio_confirmations(device.confirmations())
+                    .expect("bind the silent output");
+                let install = engine
+                    .start_on(device, source, false, false)
+                    .expect("the start");
+                let look = looks.then_some(install.generation);
+                assert_eq!(engine.session.plugin_look_for_test(), look, "{source}");
+            }
         }
 
         /// A rewind whose first window waits whole for its sound skips nothing:
@@ -1414,6 +1532,13 @@ pub(super) mod tests {
             });
             rustel_runtime::vst::host().wait_idle();
             slots
+        }
+
+        /// The document the next install reads in: see
+        /// [`StudioEngine::mark_next_install_document`].
+        #[cfg(feature = "vst")]
+        pub(crate) fn document_mark(engine: &StudioEngine) -> u64 {
+            engine.next_install.document
         }
 
         /// Changing controls must not wait again for the plugin copies of the
@@ -1890,7 +2015,7 @@ $: s("supersaw").seg(16)"#;
             let mut session = SessionConfig::default();
             session
                 .score_sample_access
-                .permit_origin("http://127.0.0.1:9")
+                .permit_source("http://127.0.0.1:9")
                 .expect("the test origin");
             let mut engine = studio_with(LoadMode::Wait, &library, session);
             start(&mut engine, "s(\"sine\")");
@@ -1917,7 +2042,11 @@ $: s("supersaw").seg(16)"#;
 
         /// An update with a mistake sent while a start waits leaves the held
         /// start exactly as it was; a good one replaces it from its own cycle
-        /// zero and waits for its own first window.
+        /// zero and waits for its own first window. An update through a
+        /// plugin chain with latency whose copy is ready goes on at once, and
+        /// its cycle zero comes that latency after its anchor. An update with
+        /// no plugin that replaces a held start through such a chain has its
+        /// cycle zero on its anchor.
         #[test]
         fn an_update_during_a_held_start_replaces_it_only_if_it_evaluates() {
             let library = loading_kick();
@@ -1947,6 +2076,72 @@ $: s("supersaw").seg(16)"#;
                 engine.played_by_text.contains(&kick)
             });
             assert!(engine.session.cycle_at_time(arrived) < 0.0);
+
+            // The Delay preset of the fixture has 480 frames. A start played
+            // its copy before a Stop, so the copy is ready.
+            #[cfg(feature = "vst")]
+            {
+                let (_plugins, folder) = fixture_plugins();
+                let presets = folder.path().join("presets");
+                let delay = rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.1171875);
+                let file = presets
+                    .join(rustel_vst3_fixture::NAME)
+                    .join("Delay.vstpreset");
+                std::fs::write(file, delay).expect("preset");
+                let host = rustel_runtime::vst::host();
+                host.set_preset_folder(presets);
+                host.presets(rustel_vst3_fixture::NAME);
+                host.wait_idle();
+                let library = loading_kick();
+                let mut engine = studio(LoadMode::Wait, &library);
+                let update =
+                    r#"$: note("c3").s("sine").vst("rustel fixture", { preset: "Delay" })"#;
+                start_with_plugins(&mut engine, update);
+                assert!(copies() > 0, "the start waits for its copy");
+                engine.stop(Duration::ZERO).expect("stop");
+                let anchor_of = |engine: &StudioEngine| {
+                    let device = &engine.live.as_ref().expect("playing").device;
+                    device.clock_seconds()
+                        + device.schedule_lead_seconds()
+                        + engine.config.start_preroll.as_secs_f64()
+                };
+                // A held start through the Delay, its kick loading, and an
+                // update with no plugin. The held text never sounded, so its
+                // lead does not count: cycle zero is on the anchor.
+                start(&mut engine, &format!("{update}\n$: s(\"kick\")"));
+                assert!(engine.start_is_held());
+                // The message asks the host only when the assert fails.
+                assert!(
+                    engine.session.plugin_lead() > 0.0,
+                    "the look of the held start: key {:?}, {} copies, {} returning",
+                    host.key("rustel fixture", Some("Delay"), false)
+                        .map(|found| found.map(|(key, _)| key)),
+                    copies(),
+                    engine.session.plugins_returning(),
+                );
+                tests::hold_clock(&engine, true);
+                let anchor = anchor_of(&engine);
+                engine
+                    .evaluate("s(\"kick\")", false)
+                    .expect("an update with no plugin");
+                assert!(engine.start_is_held(), "it waits for its kick");
+                assert_eq!(engine.session.plugin_lead(), 0.0);
+                let zero = engine.session.cycle_at_time(anchor);
+                assert!(zero.abs() < 1e-9, "cycle zero on its anchor: {zero}");
+                tests::hold_clock(&engine, false);
+                library.finish_loading_sample_for_test();
+                // The held start of the kick that the update left, its kick
+                // loaded, and an update through the Delay.
+                tests::hold_clock(&engine, true);
+                let anchor = anchor_of(&engine);
+                engine.evaluate(update, false).expect("the update");
+                assert!(!engine.start_is_held(), "the update goes on at once");
+                let zero = engine.session.cycle_at_time(anchor + 480.0 / 48_000.0);
+                assert!(zero.abs() < 1e-9, "cycle zero 480 frames after: {zero}");
+                tests::hold_clock(&engine, false);
+                drop(engine);
+                rustel_runtime::vst::pin_standard_folders(Vec::new());
+            }
         }
 
         /// A slider moved while a start waits is part of the running score, its

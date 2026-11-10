@@ -42,6 +42,7 @@ mod tests {
             panic!("a Csound event must not resolve a native sound")
         }
 
+        #[expect(clippy::panic_in_result_fn, reason = "the assertions are the test")]
         fn csound(&self, request: &CsoundRequest<'_>) -> Result<InsertControls, String> {
             assert_eq!(request.frequency, 440.0);
             assert_eq!(request.duration_secs, 0.25);

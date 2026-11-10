@@ -13,6 +13,7 @@ One small binary. No browser. No server.
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-c45ec8)](LICENSE)
 [![Platforms: Linux, macOS, Windows](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-6eb8c2)](rustelup/README.md)
 [![Rust 1.98+](https://img.shields.io/badge/rust-1.98%2B-d8dde6)](docs/building.md)
+[![Donate: Ethereum](https://img.shields.io/badge/donate-Ethereum-8a92b2?logo=ethereum&logoColor=white)](#support-rustel)
 
 [Website](https://rustel.cc) ·
 [Install](rustelup/README.md) ·

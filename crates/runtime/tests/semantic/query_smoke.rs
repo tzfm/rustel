@@ -240,6 +240,28 @@ fn within_is_callable_as_a_free_function_too() {
     );
 }
 
+/// A setup run between two scores keeps none of a score's `register`
+/// replacements: removing the call still gives the engine's name back.
+#[test]
+fn a_prebake_keeps_no_register_of_a_score() {
+    let mut session = Session::new().expect("session");
+    session
+        .evaluate("register('fast', (n, pat) => pat)\n$: s(\"bd*4\").fast(2)")
+        .expect("a score with its own fast");
+    session.evaluate_prebake("// setup").expect("setup");
+    session
+        .evaluate("$: s(\"bd*4\").fast(2)")
+        .expect("the score without it");
+    assert_eq!(
+        session
+            .query(Fraction::ZERO, Fraction::ONE)
+            .expect("query")
+            .len(),
+        8,
+        "the engine's fast is back"
+    );
+}
+
 /// `f` is a flat, and note parsing does not trim its input.
 #[test]
 fn note_helpers_accept_flats_and_do_not_trim() {

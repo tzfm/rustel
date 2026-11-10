@@ -9,7 +9,9 @@ impl App {
     /// open, so a modal profile closes it on Enter and repeats with `n`.
     pub(super) fn open_find(&mut self) {
         self.focus_editor_for_locator();
-        self.editor_mut().interrupt_key_mode();
+        if let Err(error) = self.editor_mut().leave_key_mode_for_find() {
+            self.set_error(ErrorOwner::Editor, error.to_string());
+        }
         let keeps_open = self.editor().find_bar_keeps_open();
         self.editor_mut()
             .begin_find(FindDirection::Forward, keeps_open, 0);
@@ -180,6 +182,43 @@ mod tests {
             assert_eq!(head(&app), first, "N walks back");
         }
 
+        /// A click on Edit > Find opens the bar on its press. Its release
+        /// is the end of that click, so the typing after it goes to the
+        /// bar, in either profile. The release once closed the bar again,
+        /// and the pattern went into the score as text or as Vim commands.
+        #[test]
+        fn the_release_of_the_find_click_leaves_the_bar_open() {
+            use crossterm::event::{MouseButton, MouseEventKind};
+            for vim in [false, true] {
+                let directory = tempfile::tempdir().expect("temp dir");
+                let (mut app, _scene) = plain_app(directory.path(), "one two one three one\n");
+                if vim {
+                    app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+                    app.sync_editor_keybindings();
+                }
+                let before = app.editor().source();
+                app.dispatch_menu_action(crate::menu::MenuAction::Find)
+                    .expect("the menu row");
+                mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 8, 1);
+                assert!(
+                    app.editor().find_open(),
+                    "the release closed the bar (vim: {vim})"
+                );
+                type_text(&mut app, "three");
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                assert_eq!(
+                    app.editor().source(),
+                    before,
+                    "the pattern went into the score"
+                );
+                assert_eq!(
+                    app.editor().primary_selection().head.0,
+                    12,
+                    "Enter found the match (vim: {vim})"
+                );
+            }
+        }
+
         #[test]
         fn backspace_keeps_the_non_vim_find_bar_open() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -238,6 +277,91 @@ mod tests {
             })
             .expect("composed text");
             assert_eq!(app.editor().find_footer_label().as_deref(), Some("FIND t"));
+        }
+
+        /// The wheel only moves the view. A find prompt stays open under it
+        /// in either profile, and the typing after it goes on into the
+        /// pattern. A wheel step once closed the prompt.
+        #[test]
+        fn a_wheel_step_keeps_the_find_prompt_open() {
+            use crossterm::event::MouseEventKind;
+            for vim in [false, true] {
+                let directory = tempfile::tempdir().expect("temp dir");
+                let (mut app, _scene) = plain_app(directory.path(), "foo foobar\n");
+                let score = app.editor().source();
+                if vim {
+                    app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+                    app.sync_editor_keybindings();
+                    type_text(&mut app, "/");
+                } else {
+                    chord(&mut app);
+                }
+                type_text(&mut app, "foo");
+                let editor = app.regions.panes[0].editor;
+                mouse(
+                    &mut app,
+                    MouseEventKind::ScrollDown,
+                    editor.x + 2,
+                    editor.y + 1,
+                );
+                assert!(
+                    app.editor().find_open(),
+                    "the wheel closed the prompt (vim: {vim})"
+                );
+                type_text(&mut app, "bar");
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                assert_eq!(app.editor().source(), score, "vim: {vim}");
+                assert_eq!(
+                    app.editor().primary_selection().head.0,
+                    4,
+                    "Enter found foobar (vim: {vim})"
+                );
+            }
+        }
+
+        /// Focus leaving the window is no input. The find bar stays open
+        /// through it, and a paste after it lands in the pattern. Focus
+        /// loss once closed the bar, so the paste went into the score.
+        #[test]
+        fn focus_loss_keeps_the_find_bar_open() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "one two one\n");
+            let score = app.editor().source();
+            chord(&mut app);
+            app.handle_terminal_event(Event::FocusLost)
+                .expect("focus lost");
+            app.handle_terminal_event(Event::FocusGained)
+                .expect("focus gained");
+            assert!(app.editor().find_open(), "focus loss closed the bar");
+            app.handle_terminal_event(Event::Paste("tw".into()))
+                .expect("paste handled");
+            assert_eq!(app.editor().find_footer_label().as_deref(), Some("FIND tw"));
+            assert_eq!(app.editor().source(), score);
+        }
+
+        /// Find opened from Vim's Insert leaves Insert, as `/` searches from
+        /// Normal. Enter closes the prompt and `n` walks the matches. The
+        /// chord once kept Insert, so `n` typed a letter into the score.
+        #[test]
+        fn vim_find_from_insert_lands_in_normal() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "one two one three one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            let score = app.editor().source();
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            chord(&mut app);
+            type_text(&mut app, "one");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.editor().vim_is_normal(), "Enter lands in Normal");
+            let first = app.editor().primary_selection().head.0;
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+            assert_eq!(app.editor().source(), score, "n typed into the score");
+            assert_ne!(
+                app.editor().primary_selection().head.0,
+                first,
+                "n walks forward"
+            );
         }
     }
 }

@@ -220,12 +220,22 @@ impl Session {
     /// passed). A deadline that passes is not an error: the set starts and
     /// the late hits play when their samples arrive.
     pub fn wait_for_sample_loads(&mut self, deadline: Duration) -> (usize, bool) {
+        self.wait_for_sample_loads_until(deadline, || false)
+    }
+
+    /// [`Self::wait_for_sample_loads`] that also returns once `stop` gives
+    /// true, as for an export that ends before its first frame.
+    pub fn wait_for_sample_loads_until(
+        &mut self,
+        deadline: Duration,
+        stop: impl Fn() -> bool,
+    ) -> (usize, bool) {
         let requested = std::mem::take(&mut self.preload_requested);
         let Some(library) = self.samples.clone() else {
             return (requested, false);
         };
         let started = Instant::now();
-        library.wait_until_idle(deadline);
+        library.wait_until_idle_cancellable(deadline, stop);
         (requested, started.elapsed() >= deadline)
     }
 
@@ -382,7 +392,19 @@ impl Session {
         let haps = self.window_haps(from_cycle, cycles, ceiling);
         let mut resolved: std::collections::BTreeMap<String, std::collections::BTreeSet<i64>> =
             std::collections::BTreeMap::new();
+        // A dense window plays one sound at many onsets. A name that misses
+        // its exact spelling scans every bank, and one scan per onset held
+        // the engine past a live edit's takeover. Look each sound up once.
+        let mut seen = std::collections::HashSet::new();
         for sound in Self::sounds_in(&haps) {
+            if !seen.insert((
+                sound.s.clone(),
+                sound.banked.clone(),
+                sound.n.to_bits(),
+                sound.midi.to_bits(),
+            )) {
+                continue;
+            }
             // `.bank("tr909")` makes the sound `tr909_bd`. Warming only `bd`
             // fetches a different bank's files, and the lane's first hit is
             // refused. Warm the banked spelling too, as the voice looks it up.
@@ -393,6 +415,13 @@ impl Session {
                 .into_iter()
                 .chain([sound.s.as_str()])
             {
+                // A synth has no file to load or keep. `one` plays a sample
+                // when a bank has one, so it is warmed.
+                if rustel_voice::is_native_synth_sound(name)
+                    && !rustel_voice::native_synth_yields_to_sample(name)
+                {
+                    continue;
+                }
                 let _ = rustel_voice::SampleLookup::resolve(
                     library.as_ref(),
                     name,
@@ -430,14 +459,50 @@ impl Session {
     /// after the look of the same score gives the count of that look. A
     /// session with no live output waits for no copy: the count is 0, with
     /// no call to the plugin host.
+    ///
+    /// The latency of the copies the call sees raises the lead of the
+    /// plugin chains, so a start moves its cycle zero by that lead: see
+    /// [`Self::plugin_lead`]. The copies of the lanes that do not play raise
+    /// the lead the cover keeps room for. The call gives no copy a new try:
+    /// see [`Self::plugins_pending_with_tries`].
     #[cfg(feature = "vst")]
     pub fn plugins_pending(&mut self, from_cycle: f64, cycles: f64, ceiling: Duration) -> usize {
+        self.look_at_plugins(from_cycle, cycles, ceiling, false)
+    }
+
+    /// [`Self::plugins_pending`] for the first look of a start, which gives
+    /// each copy of the window that did not start, or that faulted, one new
+    /// try in the background, after the copies of the window and the loads:
+    /// see [`crate::vst::Host::retry`]. The call never gives the count of the
+    /// look before. A copy in its try gives no line, and the count has the
+    /// new copy of a copy that faulted, so a start that waits holds for it.
+    #[cfg(feature = "vst")]
+    pub fn plugins_pending_with_tries(
+        &mut self,
+        from_cycle: f64,
+        cycles: f64,
+        ceiling: Duration,
+    ) -> usize {
+        self.look_at_plugins(from_cycle, cycles, ceiling, true)
+    }
+
+    /// The look of [`Self::plugins_pending`], with the tries of
+    /// [`Self::plugins_pending_with_tries`] when `tries` is true.
+    #[cfg(feature = "vst")]
+    fn look_at_plugins(
+        &mut self,
+        from_cycle: f64,
+        cycles: f64,
+        ceiling: Duration,
+        tries: bool,
+    ) -> usize {
         if !self.plugins_live() {
             return 0;
         }
         let now = Instant::now();
         let generation = self.generation();
         if let Some((looked, of, pending)) = self.plugin_look
+            && !tries
             && of == generation
             && now.duration_since(looked) < PLUGIN_LOOK_EVERY
         {
@@ -450,24 +515,58 @@ impl Session {
             .with_logs_dropped(|| self.window_haps(from_cycle, cycles, ceiling));
         let (begin, end) = Self::window(from_cycle, cycles);
         let shadow = self.shadow_haps(begin, end, now + ceiling);
-        let pending = self.ensure_plugins(&haps, &shadow.unwrap_or_default());
+        let shadow = shadow.unwrap_or_default();
+        let wants = crate::vst::wants(&self.chains, &self.lanes, &self.csound, &haps, &shadow);
+        let pending = if tries {
+            let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+            let (mut pending, mut lines) = crate::vst::ensure(&wants, rate);
+            self.load_ran_plugins();
+            // The tries join the line of the plugin thread behind the copies
+            // and the loads of the look.
+            if crate::vst::retry_wants(&wants, rate) > 0 {
+                (pending, lines) = crate::vst::ensure(&wants, rate);
+            }
+            self.report_plugin_lines(lines);
+            pending.len()
+        } else {
+            self.ensure_wants(&wants).len()
+        };
+        let (lead, shadow_lead) = self.leads_of(&wants);
+        self.raise_plugin_lead(lead);
+        self.raise_cover_lead(shadow_lead);
         self.plugin_look = Some((now, generation, pending));
         pending
     }
 
-    /// Makes the plugin host build each plugin copy that the haps of the
-    /// score in play need, at the rate of the output: see
-    /// [`Self::ensure_wants`]. `shadow` has the haps of the lanes that do not
-    /// play. Gives the count of the copies of lanes that play and that are
-    /// not ready.
+    /// The plugin copies a close of the live output sent home that the
+    /// chains of this session still want, at the rate of the output: see
+    /// [`crate::vst::Host::returning`]. A caller that holds the first window
+    /// of a new output, or a start, counts them. The call queries no score,
+    /// and starts the retune of a copy that waits at another rate. Chains
+    /// that want no copy ask the host nothing. A session with no live output
+    /// waits for no copy: the count is 0, with no call to the plugin host.
     #[cfg(feature = "vst")]
-    pub(super) fn ensure_plugins(
-        &mut self,
-        haps: &[crate::HapJson],
-        shadow: &[crate::HapJson],
-    ) -> usize {
-        let wants = crate::vst::wants(&self.chains, &self.lanes, &self.csound, haps, shadow);
-        self.ensure_wants(&wants).len()
+    pub fn plugins_returning(&self) -> usize {
+        if !self.plugins_live() {
+            return 0;
+        }
+        let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+        crate::vst::returning(&self.chains, rate)
+    }
+
+    /// The leads of the plugin chains of `wants` at the rate of the output,
+    /// in seconds: of the lanes that play, and of the lanes that do not play
+    /// now. The wants of the lanes that play come first. See
+    /// [`crate::vst::lead`].
+    #[cfg(feature = "vst")]
+    pub(super) fn leads_of(&self, wants: &[crate::vst::Want]) -> (f64, f64) {
+        let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+        let playing = wants.iter().take_while(|want| want.sounds()).count();
+        let (playing, shadow) = wants.split_at(playing);
+        (
+            crate::vst::lead(playing, rate),
+            crate::vst::lead(shadow, rate),
+        )
     }
 
     /// Makes the plugin host build each copy in `wants` that is not ready,
@@ -630,6 +729,46 @@ mod tests {
                 assert!(library.knows(name), "{name}");
             }
         }
+
+        /// A wait for the samples behind a busy loader returns on its stop,
+        /// before its deadline, as for an export that ends before its first
+        /// frame.
+        #[test]
+        fn a_sample_wait_behind_a_busy_loader_returns_on_its_stop() {
+            let mut session = Session::new().expect("session");
+            let library = Arc::new(crate::samples::SampleLibrary::empty());
+            session.samples = Some(Arc::clone(&library));
+            let hold = library.hold_manifest_worker_for_test();
+            let stop = Arc::new(AtomicBool::new(false));
+            let entered = crate::samples::wait_tests::watch_next_wait();
+            let stopper = std::thread::spawn({
+                let stop = Arc::clone(&stop);
+                move || {
+                    entered
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("the wait started");
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+            let started = Instant::now();
+            let (_, timed_out) = session
+                .wait_for_sample_loads_until(std::time::Duration::from_secs(30), || {
+                    stop.load(std::sync::atomic::Ordering::Relaxed)
+                });
+            let elapsed = started.elapsed();
+            let pending = library.manifests_pending();
+            drop(hold);
+            stopper.join().expect("the stopper");
+            assert!(!timed_out);
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "the wait ran on after its stop: {elapsed:?}"
+            );
+            assert!(
+                pending > 0,
+                "the wait returned while the loader held its job"
+            );
+        }
     }
 
     #[test]
@@ -641,6 +780,34 @@ mod tests {
         assert!(
             session.sample_library().is_none(),
             "a denied score-level samples() call initialized an I/O subsystem"
+        );
+    }
+
+    /// A warm loads the samples a window plays and passes over its synths.
+    #[test]
+    fn a_dense_window_warms_its_samples_and_not_its_synths() {
+        let mut session = Session::new().expect("session");
+        let library = Arc::new(crate::samples::SampleLibrary::with_unasked_banks_for_test(
+            &["hh", "one"],
+        ));
+        session.samples = Some(Arc::clone(&library));
+        session
+            .evaluate(r#"stack(note("c d e f").fast(16).s("sawtooth"), s("hh*16 one"))"#)
+            .expect("the score installs");
+
+        let window = session.kick_sample_loads_within(0.0, 4.0, std::time::Duration::from_secs(5));
+
+        assert_eq!(
+            window,
+            [
+                ("hh".to_owned(), crate::sounds::Variants::first()),
+                ("one".to_owned(), crate::sounds::Variants::first()),
+            ]
+        );
+        assert_eq!(
+            library.queued_loads_for_test(),
+            (2, 0),
+            "one load each for hh and one"
         );
     }
 }

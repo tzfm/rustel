@@ -33,6 +33,12 @@ fn rename_tape(old: &std::path::Path, stem: &str) -> Result<PathBuf, String> {
     if !metadata.file_type().is_file() {
         return Err("only regular session files can be renamed".into());
     }
+    // A case-only change of this tape's own name renames directly: the
+    // hard-link step below must not mistake the tape for another one.
+    if crate::scenes::same_file_system_path(old, &new) {
+        std::fs::rename(old, &new).map_err(|error| format!("cannot rename session: {error}"))?;
+        return Ok(new);
+    }
     std::fs::hard_link(old, &new).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
             "a session with that name already exists".into()

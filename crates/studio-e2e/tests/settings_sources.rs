@@ -86,7 +86,11 @@ fn import_folder(studio: &mut Hermetic, folder: &Path) {
     studio.paste(&folder.display().to_string());
     studio.settle();
     wait_for_import(studio);
-    let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+    let name = folder
+        .file_name()
+        .expect("the path has a name")
+        .to_string_lossy()
+        .into_owned();
     assert_eq!(
         studio.focus(),
         Some(rustel_studio_e2e::PanelKind::Settings),

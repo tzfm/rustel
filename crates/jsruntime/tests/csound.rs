@@ -159,3 +159,26 @@ fn definition_only_scores_commit_orchestras_and_still_refuse_invalid_results() {
             .expect_err("invalid score refuses orchestra effects");
     }
 }
+
+/// A template parts array with a `length` past `i32::MAX` must meet the
+/// substitution-count check through the guarded length read, not rquickjs'
+/// own, which panics on such an array.
+#[test]
+fn an_oversized_template_parts_claim_is_refused_without_panicking() {
+    let runtime = runtime();
+    let error = runtime
+        .evaluate_score_with_effects_cancellable(
+            "const parts = ['instr Bell\\nendin'];\
+             parts.raw = ['instr Bell\\nendin'];\
+             parts.length = 2 ** 31;\
+             loadCSound(parts, 'x')",
+            &TranspileOptions::default(),
+            Duration::from_secs(1),
+            &AtomicBool::new(false),
+        )
+        .expect_err("an oversized parts claim must be refused");
+    assert!(
+        error.to_string().contains("substitutions do not match"),
+        "{error}"
+    );
+}

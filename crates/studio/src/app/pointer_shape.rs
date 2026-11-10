@@ -83,7 +83,7 @@ impl App {
             return Some(POINTER);
         }
         if panel.tab == Tab::Samples {
-            let (_, meter_y) = super::super::reference::samples_pulse_rows(inner);
+            let (_, meter_y) = super::super::reference::sample_pulse_rows(inner);
             if y == meter_y {
                 return Some(POINTER);
             }

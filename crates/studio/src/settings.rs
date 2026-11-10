@@ -985,6 +985,82 @@ impl SampleCeiling {
     }
 }
 
+/// The most one video file may hold.
+///
+/// A video's picture is most of its bytes and its sound little, so the file
+/// has a ceiling apart from the sound's. The whole file stays in memory
+/// while it decodes, which is what the top rung guards.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VideoCeiling {
+    Small,
+    #[default]
+    Standard,
+    Large,
+    Huge,
+    Vast,
+}
+
+impl VideoCeiling {
+    const LADDER: [Self; 5] = [
+        Self::Small,
+        Self::Standard,
+        Self::Large,
+        Self::Huge,
+        Self::Vast,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Small => "128 MiB",
+            Self::Standard => "256 MiB",
+            Self::Large => "512 MiB",
+            Self::Huge => "1 GiB",
+            Self::Vast => "2 GiB",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Small => "128mib",
+            Self::Standard => "256mib",
+            Self::Large => "512mib",
+            Self::Huge => "1gib",
+            Self::Vast => "2gib",
+        }
+    }
+
+    pub fn parse(text: &str) -> Self {
+        Self::LADDER
+            .iter()
+            .copied()
+            .find(|ceiling| ceiling.key() == text)
+            .unwrap_or_default()
+    }
+
+    pub fn bytes(self) -> usize {
+        match self {
+            Self::Small => 128 * 1024 * 1024,
+            Self::Standard => rustel_runtime::DEFAULT_VIDEO_FILE_BYTES,
+            Self::Large => 512 * 1024 * 1024,
+            Self::Huge => 1024 * 1024 * 1024,
+            Self::Vast => rustel_runtime::MAX_VIDEO_FILE_BYTES,
+        }
+    }
+
+    fn step(self, forwards: bool) -> Self {
+        let index = Self::LADDER
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(1);
+        let len = Self::LADDER.len();
+        Self::LADDER[if forwards {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        }]
+    }
+}
+
 /// How long after the last sample preview unused decoded PCM is dropped.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum UnusedSampleIdle {
@@ -1687,6 +1763,10 @@ pub struct UiSettings {
     /// What the studio does when another program saves the open score's
     /// file. Off by default: reading the file again is opted into.
     pub external_changes: ExternalChanges,
+    /// Whether an update renames the score's file to its `@title` field.
+    /// Off by default: a file's name is the player's own arrangement, and
+    /// files that moved on their own would be a surprise the first time.
+    pub sync_name_from_title: bool,
     pub load_mode: LoadMode,
     /// MIDI clock out, by port; none to send none.
     pub clock_out: Option<String>,
@@ -1846,6 +1926,8 @@ pub struct UiSettings {
     pub preview_budget: PreviewBudget,
     /// The most one sound may hold before it is refused as not-music.
     pub sample_ceiling: SampleCeiling,
+    /// The most one video file may hold before it is refused.
+    pub video_ceiling: VideoCeiling,
     /// After this long without a sample preview, unused decoded PCM is dropped.
     pub unused_sample_idle: UnusedSampleIdle,
     /// Whether an imported source is fetched into the cache in the
@@ -1869,6 +1951,7 @@ impl Default for UiSettings {
             auto_evaluate: false,
             typing_pause: TypingPause::Medium,
             external_changes: ExternalChanges::Off,
+            sync_name_from_title: true,
             load_mode: LoadMode::Wait,
             clock_out: None,
             clock_in: None,
@@ -1918,6 +2001,7 @@ impl Default for UiSettings {
             show_footer: true,
             preview_budget: PreviewBudget::Medium,
             sample_ceiling: SampleCeiling::default(),
+            video_ceiling: VideoCeiling::default(),
             unused_sample_idle: UnusedSampleIdle::Standard,
             precache_sources: false,
             reference_hidden: Vec::new(),
@@ -1989,6 +2073,8 @@ enum Row {
     TypingPause,
     /// What happens when another program saves the open score's file.
     ExternalChanges,
+    /// Whether an update renames the score's file to its `@title` field.
+    SyncNameFromTitle,
     /// How a start or an edit meets sounds still loading.
     LoadMode,
     Animation,
@@ -2058,6 +2144,7 @@ enum Row {
     TrimRecordings,
     PreviewBudget,
     SampleCeiling,
+    VideoCeiling,
     UnusedSampleIdle,
     PrecacheSources,
     /// Enter downloads every remote pack onto disk - defaults and user URLs.
@@ -2214,6 +2301,7 @@ const ROWS: &[Row] = &[
     Row::GlobalPrebake,
     Row::LocalPrebake,
     Row::TrimRecordings,
+    Row::SyncNameFromTitle,
     Row::ShowFullPaths,
     Row::LoadMode,
     Row::OutputLatency,
@@ -2226,6 +2314,7 @@ const ROWS: &[Row] = &[
     Row::SliderSmoothing,
     Row::FrequencySliderLog,
     Row::SampleCeiling,
+    Row::VideoCeiling,
     Row::PreviewBudget,
     Row::UnusedSampleIdle,
 ];
@@ -2276,6 +2365,7 @@ const REFERENCE_ROWS: &[Row] = &[
     Row::ReferenceCategory(Category::Bind),
     Row::ReferenceCategory(Category::Internals),
     Row::ReferenceCategory(Category::Kabelsalat),
+    Row::ReferenceCategory(Category::Hydra),
 ];
 
 /// Cache controls at the top of the Sources page, before imports and
@@ -2463,13 +2553,17 @@ impl Row {
             | Self::GlobalPrebake
             | Self::LocalPrebake
             | Self::TrimRecordings
+            | Self::SyncNameFromTitle
             | Self::ShowFullPaths => "Set",
             Self::Rendering | Self::FrameRate => "Rendering",
             #[cfg(feature = "hydra")]
             Self::BackdropSmoothing => "Rendering",
             Self::SliderSmoothing | Self::FrequencySliderLog => "Sliders",
             Self::SetPanelSide | Self::MixerEdge | Self::VizEdgeOne | Self::VizEdgeTwo => "Panels",
-            Self::SampleCeiling | Self::PreviewBudget | Self::UnusedSampleIdle => "Sample memory",
+            Self::SampleCeiling
+            | Self::VideoCeiling
+            | Self::PreviewBudget
+            | Self::UnusedSampleIdle => "Sample memory",
             Self::EvaluationAnimation => "Editor",
             Self::BeatLine => "Look",
             Self::PrecacheSources
@@ -2534,7 +2628,9 @@ impl Row {
             Self::GlobalPrebake => "global prebake",
             Self::LocalPrebake => "local prebake",
             Self::TrimRecordings => "trim recordings",
+            Self::SyncNameFromTitle => "sync with score metadata",
             Self::SampleCeiling => "biggest sound",
+            Self::VideoCeiling => "biggest video",
             Self::PreviewBudget => "preview RAM",
             Self::UnusedSampleIdle => "drop unused",
             Self::PrecacheSources => "fetch imports",
@@ -2549,6 +2645,7 @@ impl Row {
             Self::ReferenceCategory(Category::Bind) => "bind & join",
             Self::ReferenceCategory(Category::Internals) => "pattern internals",
             Self::ReferenceCategory(Category::Kabelsalat) => "KabelSalat",
+            Self::ReferenceCategory(Category::Hydra) => "Hydra",
         }
     }
 
@@ -2616,12 +2713,16 @@ impl Row {
             Self::GlobalPrebake => "setup run before every set · Enter opens it",
             Self::LocalPrebake => "this set's own setup · Enter opens it",
             Self::TrimRecordings => "a take's silence is trimmed before it is saved",
+            Self::SyncNameFromTitle => "an update renames the file to the score's @title field",
             Self::PianoSound => "instrument played by the F12 keyboard",
             Self::PianoVolume => "F12 volume · 100% is the original level · default 130%",
             Self::MaxPolyphony => {
                 "default; scores may override. More voices use more CPU and may cause crackles"
             }
             Self::SampleCeiling => "longer than this is refused as not music",
+            Self::VideoCeiling => {
+                "a bigger video file is refused · the file stays in memory to decode"
+            }
             Self::PreviewBudget => "decoded samples no live tab names",
             Self::UnusedSampleIdle => "idle time before unused samples are dropped",
             Self::PrecacheSources => "download imported sounds to disk now, not on first play",
@@ -2651,6 +2752,9 @@ impl Row {
             }
             Self::ReferenceCategory(Category::Kabelsalat) => {
                 "K() graphs, nodes and inputs · tag:kabelsalat lists them anyway"
+            }
+            Self::ReferenceCategory(Category::Hydra) => {
+                "Hydra names, offered only in Hydra code · tag:hydra lists them there"
             }
         }
     }
@@ -2733,7 +2837,8 @@ pub enum SettingsPage {
     Vst,
     /// Which kinds of entry the reference and the suggestions offer.
     Reference,
-    /// What a score may reach: import origins, and native orchestras.
+    /// What a score may reach: import origins, sample origins, the local
+    /// folder, and native orchestras.
     Permissions,
     About,
 }
@@ -2829,8 +2934,8 @@ pub struct SettingsSheet {
     /// How many keybind rows the keybinds page is showing, for the same
     /// reason as `source_count`.
     pub keybind_count: usize,
-    /// How many rows the permissions page is showing: the trusted origins,
-    /// then the ones refused in this studio.
+    /// How many rows the permissions page is showing: the origins, the
+    /// switches and the local folder.
     pub permissions_count: usize,
     /// How many folders the player added on the vst page, for the same
     /// reason as `source_count`.
@@ -2994,6 +3099,9 @@ pub enum SettingsAction {
     ToggleRow(usize),
     /// Delete, Backspace or `d` on a row: take it off the page.
     ForgetRow(usize),
+    /// `e` on a source row: open it in a prompt, to cut it down to its
+    /// domain.
+    EditRow(usize),
     /// Ask before replacing all overrides with this terminal's defaults.
     AskResetKeybinds,
     /// The second Enter on the reset row confirmed replacing all overrides.
@@ -3029,10 +3137,10 @@ impl SettingsSheet {
         matches!(self.page, SettingsPage::Permissions)
     }
 
-    /// The arrows walk the rows and wrap. Enter permits, Space or either
+    /// The arrows walk the rows and wrap. Enter allows, Space or either
     /// sideways arrow flips a row where it stands, the way every switch
-    /// on the controls pages flips, and Delete, Backspace or `d` takes a
-    /// row off the page. Esc and Tab stay the sheet's.
+    /// on the controls pages flips, Delete, Backspace or `d` takes a row
+    /// off the page, and `e` edits a source. Esc and Tab stay the sheet's.
     fn permissions_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
         let len = self.permissions_count;
@@ -3054,6 +3162,7 @@ impl SettingsSheet {
             KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('d' | 'D') => {
                 SettingsAction::ForgetRow(at)
             }
+            KeyCode::Char('e' | 'E') => SettingsAction::EditRow(at),
             _ => SettingsAction::Ignored,
         }
     }
@@ -3666,6 +3775,7 @@ impl SettingsSheet {
                     settings.evaluation_flash = settings.evaluation_flash.step(forwards);
                 }
                 Row::TrimRecordings => set_switch(&mut settings.trim_recordings),
+                Row::SyncNameFromTitle => set_switch(&mut settings.sync_name_from_title),
                 Row::HighlightFade => {
                     settings.highlight_fade = settings.highlight_fade.step(forwards);
                 }
@@ -3752,6 +3862,9 @@ impl SettingsSheet {
                 | Row::SampleCache => {}
                 Row::SampleCeiling => {
                     settings.sample_ceiling = settings.sample_ceiling.step(forwards);
+                }
+                Row::VideoCeiling => {
+                    settings.video_ceiling = settings.video_ceiling.step(forwards);
                 }
                 Row::PreviewBudget => {
                     settings.preview_budget = settings.preview_budget.step(forwards);
@@ -4401,8 +4514,8 @@ pub struct SettingsSheetView<'a> {
     pub mappings: [SlotView; MAPPING_SLOTS],
     /// The shortcut rows, as the keybinds page reads them.
     pub bindings: Vec<KeybindRow>,
-    /// The rows of the permissions page: the trusted origins, then the
-    /// refused, then the orchestra switch.
+    /// The rows of the permissions page: the script origins, the sample
+    /// origins, the CORS switch, the local folder, then the orchestra switch.
     pub permissions: Vec<PermissionRow>,
     /// The plugin folders and the two facts under them, as the vst page
     /// reads them.
@@ -4657,6 +4770,20 @@ pub enum PermissionRow {
         /// one key.
         allowed: bool,
     },
+    /// A source a score's `samples()`, images and videos load from, as
+    /// `--allow-sample-origin` allows one: an address such as
+    /// `github.com/me/kit/`, or a domain such as `github.com`. A refused
+    /// source is on the page until the studio closes. `fixed` when the
+    /// command line named it for the run.
+    Source {
+        rule: String,
+        allowed: bool,
+        fixed: bool,
+    },
+    /// The folder `samples('local:')` and a Hydra file outside the set
+    /// read, as the page shows it. `fixed` when `--allow-local-samples`
+    /// named one for the run.
+    LocalFolder { folder: Option<String>, fixed: bool },
     /// The native orchestra switch. It lasts one studio run: the studio
     /// does not keep it, and the next start turns it on.
     Csound { allowed: bool },
@@ -4666,7 +4793,22 @@ impl PermissionRow {
     /// Whether the row's permission is on.
     pub fn allowed(&self) -> bool {
         match self {
-            Self::Origin { allowed, .. } | Self::Csound { allowed } => *allowed,
+            Self::Origin { allowed, .. }
+            | Self::Source { allowed, .. }
+            | Self::Csound { allowed } => *allowed,
+            Self::LocalFolder { folder, fixed } => *fixed || folder.is_some(),
+        }
+    }
+
+    /// Whether `other` is this row, on or off: a source or an origin moves
+    /// between the allowed and the refused, and the selection follows it.
+    pub fn is_same_row(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Origin { origin, .. }, Self::Origin { origin: other, .. })
+            | (Self::Source { rule: origin, .. }, Self::Source { rule: other, .. }) => {
+                origin == other
+            }
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
     }
 }
@@ -4725,7 +4867,8 @@ fn keybinds_footer_hint(
     if settings.editor_keybindings == EditorKeybindings::Vim {
         match keybind_action_at(sheet.selected) {
             Some(BindAction::Docs) => {
-                return "Vim: gd (default mapping) · Ctrl+D pages down · Enter: rebind".to_owned();
+                return "Vim: gd unless the vimrc maps it · Ctrl+D pages down · Enter: rebind"
+                    .to_owned();
             }
             Some(BindAction::Wrap) => {
                 return "Vim: no chord · Ctrl+U pages up · Enter: rebind".to_owned();
@@ -5691,6 +5834,29 @@ mod tests {
         rustel_audio::set_sample_pcm_ceiling(rustel_audio::DEFAULT_SAMPLE_PCM_BYTES);
     }
 
+    /// The biggest-video ceiling climbs inside the runtime's guard, and
+    /// a rung survives prefs.
+    #[test]
+    fn the_video_ceiling_climbs_to_the_guard_and_survives_prefs() {
+        let mut seen = 0usize;
+        for rung in VideoCeiling::LADDER {
+            assert!(rung.bytes() > seen, "the ladder climbs: {}", rung.label());
+            seen = rung.bytes();
+            assert_eq!(VideoCeiling::parse(rung.key()), rung, "it survives prefs");
+        }
+        assert_eq!(
+            seen,
+            rustel_runtime::MAX_VIDEO_FILE_BYTES,
+            "the top rung is the guard"
+        );
+        assert_eq!(
+            VideoCeiling::default().bytes(),
+            rustel_runtime::DEFAULT_VIDEO_FILE_BYTES
+        );
+        assert_eq!(VideoCeiling::Standard.step(true), VideoCeiling::Large);
+        assert_eq!(VideoCeiling::Small.step(false), VideoCeiling::Vast);
+    }
+
     /// The sheet is one height for every page of controls, and more than
     /// one test wants a terminal tall enough to draw all of it.
     fn tallest_page() -> u16 {
@@ -6249,6 +6415,11 @@ mod tests {
         assert!(
             keybinds_footer_hint(sheet, &settings, &features).contains("Ctrl+D pages down"),
             "the Docs row names the key it gave up"
+        );
+        assert!(
+            keybinds_footer_hint(sheet, &settings, &features)
+                .contains("gd unless the vimrc maps it"),
+            "a vimrc line can replace gd, so the row does not promise it"
         );
         sheet.selected = row(BindAction::Wrap);
         assert!(
@@ -8954,6 +9125,10 @@ mod tests {
             permissions_key(KeyCode::Char('d')),
             SettingsAction::ForgetRow(0)
         );
+        assert_eq!(
+            permissions_key(KeyCode::Char('e')),
+            SettingsAction::EditRow(0)
+        );
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
         assert_eq!(sheet.page, SettingsPage::About);
         // The About page reads; a key it has no use for is the score's.
@@ -9018,7 +9193,7 @@ mod tests {
     /// The permissions page's hint leads with its keys and keeps its whole
     /// text. The keys closed the hint before, so a terminal narrow
     /// enough to wrap it cut them off the page, and a player who cannot
-    /// see "Enter permits" cannot work the page.
+    /// see "Enter allows" cannot work the page.
     #[test]
     fn the_permissions_page_hint_leads_with_its_keys_and_stays_whole() {
         let sheet = SettingsSheet {
@@ -9083,7 +9258,7 @@ mod tests {
                 .join(" ");
             let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
             let keys = flat
-                .find("Enter permits")
+                .find("Enter allows")
                 .unwrap_or_else(|| panic!("the keys are on the page at {width}x{height}"));
             let explain = flat
                 .find("a score loads a script")
@@ -9097,7 +9272,7 @@ mod tests {
                 "the whole hint fits at {width}x{height}: {flat}"
             );
             assert!(
-                flat.contains("https://example.com off"),
+                flat.contains("https://example.com scripts off"),
                 "the row reads as a switch: {flat}"
             );
         }
@@ -9245,7 +9420,7 @@ mod tests {
             Category::ALL
         );
         sheet.key(KeyCode::Left, &mut settings, &features);
-        assert!(settings.shows_category(Category::Kabelsalat));
+        assert!(settings.shows_category(Category::Hydra), "the last row");
     }
 
     #[test]

@@ -45,6 +45,23 @@ const MIN_RUNWAY_FRAMES: u64 = 256;
 const RING_FRAMES: u64 = 4096;
 /// Commands the callback may post before the worker drains them.
 const COMMAND_CAPACITY: u64 = 256;
+/// Cancellations have their own queue, sized from the existing scheduled-event
+/// and command ceilings. Repeated or unknown IDs share this bound. A full queue
+/// refuses requests without cutting notes, as reported by `refused_commands`.
+/// Under Miri the queue is small, because every worker test builds one.
+const CANCEL_CAPACITY: usize = if cfg!(miri) {
+    2 * COMMAND_CAPACITY as usize
+} else {
+    super::MAX_EVENTS + COMMAND_CAPACITY as usize
+};
+
+#[derive(Clone, Copy, Debug)]
+struct Cancellation {
+    id: u64,
+    /// Only scores posted before this command cursor can be retracted. An
+    /// unknown ID must not cancel a later submission of that ID.
+    through: u64,
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Command {
@@ -65,6 +82,9 @@ struct Channel {
     commands: UnsafeCell<Box<[Command; COMMAND_CAPACITY as usize]>>,
     command_head: AtomicU64,
     command_tail: AtomicU64,
+    cancellations: Box<[UnsafeCell<Cancellation>]>,
+    cancellation_head: AtomicU64,
+    cancellation_tail: AtomicU64,
     samples: UnsafeCell<Box<[f32; RING_FRAMES as usize * 2]>>,
     written: AtomicU64,
     read: AtomicU64,
@@ -89,9 +109,9 @@ struct Channel {
     dead: AtomicBool,
 }
 
-// The callback owns a command slot and a ring frame until it publishes the
-// index that hands them over; the worker owns them from there until the
-// index that takes them back. Release stores and acquire loads of the
+// The callback owns each command, cancellation and ring slot until it
+// publishes the index that hands it over. The worker owns it until it
+// publishes the index that returns it. Release stores and acquire loads of the
 // indices order the slot writes before the slot reads.
 unsafe impl Sync for Channel {}
 
@@ -103,6 +123,13 @@ impl Channel {
             )),
             command_head: AtomicU64::new(0),
             command_tail: AtomicU64::new(0),
+            cancellations: std::iter::repeat_with(|| {
+                UnsafeCell::new(Cancellation { id: 0, through: 0 })
+            })
+            .take(CANCEL_CAPACITY)
+            .collect(),
+            cancellation_head: AtomicU64::new(0),
+            cancellation_tail: AtomicU64::new(0),
             samples: UnsafeCell::new(Box::new([0.0; RING_FRAMES as usize * 2])),
             written: AtomicU64::new(0),
             read: AtomicU64::new(0),
@@ -140,6 +167,35 @@ impl Channel {
         let command = unsafe { (*self.commands.get())[(head % COMMAND_CAPACITY) as usize] };
         self.command_head.store(head + 1, Ordering::Release);
         Some(command)
+    }
+
+    /// Posts a cancellation without taking space from score or transport commands.
+    fn cancel(&self, id: u64) -> bool {
+        let tail = self.cancellation_tail.load(Ordering::Relaxed);
+        let head = self.cancellation_head.load(Ordering::Acquire);
+        if tail - head >= CANCEL_CAPACITY as u64 {
+            return false;
+        }
+        let cancellation = Cancellation {
+            id,
+            through: self.command_tail.load(Ordering::Relaxed),
+        };
+        unsafe {
+            *self.cancellations[(tail % CANCEL_CAPACITY as u64) as usize].get() = cancellation;
+        }
+        self.cancellation_tail.store(tail + 1, Ordering::Release);
+        true
+    }
+
+    fn take_cancellation(&self, tail: u64) -> Option<Cancellation> {
+        let head = self.cancellation_head.load(Ordering::Relaxed);
+        if head == tail {
+            return None;
+        }
+        let cancellation =
+            unsafe { *self.cancellations[(head % CANCEL_CAPACITY as u64) as usize].get() };
+        self.cancellation_head.store(head + 1, Ordering::Release);
+        Some(cancellation)
     }
 
     /// Stores one frame and publishes it. The worker calls this for frame
@@ -371,6 +427,17 @@ impl OrbitInsert for Insert {
         self.post(Command::Score { id, due });
     }
 
+    fn cancel_score(&mut self, id: u64) {
+        if self.failed || self.stopped() {
+            return;
+        }
+        if !self.channel.cancel(id) {
+            self.counters
+                .refused_commands
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn cut_notes(&mut self, frames: u32) {
         let due = self.frame.saturating_add(u64::from(frames));
         self.post(Command::Cut { due, mask: 0 });
@@ -502,7 +569,11 @@ impl Drop for Insert {
 }
 
 enum Action {
-    Score(String),
+    Score {
+        id: u64,
+        submitted: u64,
+        score: String,
+    },
     Cut,
 }
 
@@ -525,6 +596,7 @@ struct State {
 impl State {
     fn run(&mut self) {
         let mut spins = 0u16;
+        let mut cancelled = Vec::new();
         loop {
             if self.channel.stopping.load(Ordering::Acquire) {
                 return;
@@ -553,40 +625,7 @@ impl State {
             } else {
                 read.saturating_add(runway)
             };
-            while let Some(command) = self.channel.drain() {
-                match command {
-                    Command::Score { id, due } => {
-                        if let Some(score) = self.program.take(id)
-                            && let Err(error) = self.schedule(due, Action::Score(score))
-                        {
-                            self.program.report_error(error);
-                        }
-                    }
-                    Command::Cut { due, mask } => {
-                        self.pending.retain(|event| {
-                            if event.frame >= due
-                                && let Action::Score(score) = &event.action
-                            {
-                                self.pending_bytes -= score.len();
-                                false
-                            } else {
-                                true
-                            }
-                        });
-                        if let Err(error) = self.schedule(due, Action::Cut) {
-                            self.program.report_error(error);
-                        }
-                        self.confirm_cut(mask, due);
-                    }
-                    Command::Reset { due, mask } => {
-                        self.clear_pending();
-                        if self.engine.is_some() {
-                            let _ = self.schedule(due, Action::Cut);
-                        }
-                        self.confirm_cut(mask, due);
-                    }
-                }
-            }
+            self.drain_commands(&mut cancelled);
             let mut rendered = false;
             while self.write < target {
                 self.step();
@@ -613,9 +652,87 @@ impl State {
         }
     }
 
+    fn drain_commands(&mut self, cancelled: &mut Vec<Cancellation>) {
+        // Acquire the cancellation batch before draining commands: every score
+        // covered by its cursors must be visible before cancellation is applied.
+        let tail = self.channel.cancellation_tail.load(Ordering::Acquire);
+        cancelled.clear();
+        while let Some(cancellation) = self.channel.take_cancellation(tail) {
+            cancelled.push(cancellation);
+        }
+        cancelled.sort_unstable_by_key(|cancellation| (cancellation.id, cancellation.through));
+        let retract = |id: u64, submitted: u64| {
+            let position = cancelled.partition_point(|cancellation| cancellation.id <= id);
+            position > 0
+                && cancelled[position - 1].id == id
+                && submitted < cancelled[position - 1].through
+        };
+        // Free retired entries before accepting replacement scores, including
+        // when the schedule was at its ceiling. Never touch a transport cut.
+        if !cancelled.is_empty() {
+            self.pending.retain(|event| {
+                if let Action::Score {
+                    id,
+                    submitted,
+                    score,
+                } = &event.action
+                    && retract(*id, *submitted)
+                {
+                    self.pending_bytes -= score.len();
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        while let Some(command) = self.channel.drain() {
+            let submitted = self.channel.command_head.load(Ordering::Relaxed) - 1;
+            match command {
+                Command::Score { id, due } => {
+                    if let Some(score) = self.program.take(id)
+                        && !retract(id, submitted)
+                        && let Err(error) = self.schedule(
+                            due,
+                            Action::Score {
+                                id,
+                                submitted,
+                                score,
+                            },
+                        )
+                    {
+                        self.program.report_error(error);
+                    }
+                }
+                Command::Cut { due, mask } => {
+                    self.pending.retain(|event| {
+                        if event.frame >= due
+                            && let Action::Score { score, .. } = &event.action
+                        {
+                            self.pending_bytes -= score.len();
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if let Err(error) = self.schedule(due, Action::Cut) {
+                        self.program.report_error(error);
+                    }
+                    self.confirm_cut(mask, due);
+                }
+                Command::Reset { due, mask } => {
+                    self.clear_pending();
+                    if self.engine.is_some() {
+                        let _ = self.schedule(due, Action::Cut);
+                    }
+                    self.confirm_cut(mask, due);
+                }
+            }
+        }
+    }
+
     fn schedule(&mut self, due: u64, action: Action) -> Result<(), String> {
         let bytes = match &action {
-            Action::Score(score) => score.len(),
+            Action::Score { score, .. } => score.len(),
             Action::Cut => 0,
         };
         if matches!(action, Action::Cut) && self.pending.len() >= super::MAX_EVENTS {
@@ -623,8 +740,8 @@ impl State {
             if let Some(position) = self
                 .pending
                 .iter()
-                .rposition(|event| matches!(event.action, Action::Score(_)))
-                && let Action::Score(score) = self.pending.remove(position).action
+                .rposition(|event| matches!(event.action, Action::Score { .. }))
+                && let Action::Score { score, .. } = self.pending.remove(position).action
             {
                 self.pending_bytes -= score.len();
                 self.program.report_error(error);
@@ -654,7 +771,7 @@ impl State {
             && let Some(onset) = self
                 .pending
                 .iter()
-                .find(|event| matches!(event.action, Action::Score(_)))
+                .find(|event| matches!(event.action, Action::Score { .. }))
                 .map(|event| event.frame)
         {
             // A cut took the orchestra, and a note has asked for it again.
@@ -672,7 +789,7 @@ impl State {
             .is_some_and(|event| event.frame <= self.write)
         {
             match self.pending.remove(0).action {
-                Action::Score(score) => {
+                Action::Score { score, .. } => {
                     self.pending_bytes -= score.len();
                     if self.engine.is_none()
                         && let Err(error) = self.start_orchestra(self.write)
@@ -847,6 +964,42 @@ mod tests {
             channel.stopping.store(true, Ordering::Release);
             worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn the_cancellation_queue_keeps_order_across_threads_and_wraps() {
+        let channel = Arc::new(Channel::new());
+        for id in 0..CANCEL_CAPACITY as u64 {
+            assert!(channel.cancel(id));
+        }
+        assert!(!channel.cancel(u64::MAX));
+        let tail = channel.cancellation_tail.load(Ordering::Acquire);
+        for id in 0..CANCEL_CAPACITY as u64 {
+            let cancellation = channel.take_cancellation(tail).unwrap();
+            assert_eq!(cancellation.id, id);
+            assert_eq!(cancellation.through, 0);
+        }
+        assert!(channel.take_cancellation(tail).is_none());
+        let writer = Arc::clone(&channel);
+        let count = CANCEL_CAPACITY as u64 + 17;
+        let worker = thread::spawn(move || {
+            for id in 0..count {
+                while !writer.cancel(id) {
+                    thread::yield_now();
+                }
+            }
+        });
+        for id in 0..count {
+            let cancellation = loop {
+                let tail = channel.cancellation_tail.load(Ordering::Acquire);
+                if let Some(cancellation) = channel.take_cancellation(tail) {
+                    break cancellation;
+                }
+                thread::yield_now();
+            };
+            assert_eq!(cancellation.id, id);
+        }
+        worker.join().unwrap();
     }
 
     #[test]
@@ -1089,6 +1242,176 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow under Miri")]
+    fn a_full_command_queue_does_not_turn_cancellation_into_a_reset() {
+        let channel = Arc::new(Channel::new());
+        let program = Program::without_orchestra();
+        let mut state = State {
+            program: program.clone(),
+            sample_rate: 48_000,
+            channel: Arc::clone(&channel),
+            engine: None,
+            pending: Vec::new(),
+            pending_bytes: 0,
+            write: 0,
+        };
+        let mut cancelled = Vec::new();
+        let mut ids = Vec::new();
+        for frame in 0..COMMAND_CAPACITY + 2 {
+            if frame == 2 {
+                state.drain_commands(&mut cancelled);
+            }
+            let id = program
+                .prepare(crate::Event {
+                    instrument: crate::Instrument::Named("probe".into()),
+                    p4: 440.0,
+                    p5: 0.2,
+                    p6: String::new(),
+                    duration: 0.01,
+                })
+                .unwrap();
+            ids.push(id);
+            assert!(channel.post(Command::Score {
+                id,
+                due: frame * 128
+            }));
+        }
+        let mut insert = reader(&channel);
+        assert!(rustel_audio::tripwire::allocator_is_armed());
+        let before = rustel_audio::tripwire::Violations::capture();
+        // The first note precedes the takeover. Retract every later onset,
+        // including more IDs than the full command queue could have held.
+        rustel_audio::tripwire::audio_scope(|| {
+            for id in &ids[1..] {
+                insert.cancel_score(*id);
+            }
+        });
+        assert!(
+            rustel_audio::tripwire::Violations::capture()
+                .since(before)
+                .clean()
+        );
+        assert!(insert.pending_control.is_none());
+        assert!(insert.masks.iter().all(Option::is_none));
+        assert_eq!(insert.counters.refused_commands.load(Ordering::Relaxed), 0);
+        state.drain_commands(&mut cancelled);
+        let held: Vec<_> = state
+            .pending
+            .iter()
+            .map(|event| {
+                let Action::Score { id, .. } = event.action else {
+                    panic!("cancellation posted a cut")
+                };
+                id
+            })
+            .collect();
+        assert_eq!(held, [ids[0]], "the pre-takeover note must survive");
+        let bytes: usize = state
+            .pending
+            .iter()
+            .map(|event| match &event.action {
+                Action::Score { score, .. } => score.len(),
+                Action::Cut => 0,
+            })
+            .sum();
+        assert_eq!(state.pending_bytes, bytes);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow to fill the schedule under Miri")]
+    fn cancellation_frees_schedule_capacity_before_admitting_replacement_scores() {
+        let channel = Arc::new(Channel::new());
+        let program = Program::without_orchestra();
+        let replacement = program
+            .prepare(crate::Event {
+                instrument: crate::Instrument::Named("probe".into()),
+                p4: 880.0,
+                p5: 0.2,
+                p6: String::new(),
+                duration: 0.01,
+            })
+            .unwrap();
+        let mut state = State {
+            program,
+            sample_rate: 48_000,
+            channel: Arc::clone(&channel),
+            engine: None,
+            pending: Vec::new(),
+            pending_bytes: 0,
+            write: 0,
+        };
+        for index in 0..crate::MAX_EVENTS as u64 {
+            state
+                .schedule(
+                    640,
+                    Action::Score {
+                        id: replacement + index + 1,
+                        submitted: index,
+                        score: "old".into(),
+                    },
+                )
+                .unwrap();
+        }
+        // The cursors name the commands that built the full pending schedule.
+        channel
+            .command_head
+            .store(crate::MAX_EVENTS as u64, Ordering::Relaxed);
+        channel
+            .command_tail
+            .store(crate::MAX_EVENTS as u64, Ordering::Relaxed);
+        assert!(channel.cancel(replacement + 1));
+        assert!(channel.post(Command::Score {
+            id: replacement,
+            due: 640
+        }));
+        state.drain_commands(&mut Vec::new());
+        assert_eq!(state.pending.len(), crate::MAX_EVENTS);
+        assert!(
+            state
+                .pending
+                .iter()
+                .any(|event| matches!(event.action, Action::Score { id, .. } if id == replacement))
+        );
+        assert!(
+            state.program.take_errors().is_empty(),
+            "replacement score must not hit the schedule ceiling"
+        );
+    }
+
+    #[test]
+    fn an_unknown_cancellation_cannot_retract_a_later_submission() {
+        let channel = Arc::new(Channel::new());
+        let program = Program::without_orchestra();
+        let id = program
+            .prepare(crate::Event {
+                instrument: crate::Instrument::Named("probe".into()),
+                p4: 440.0,
+                p5: 0.2,
+                p6: String::new(),
+                duration: 0.01,
+            })
+            .unwrap();
+        assert!(channel.cancel(id));
+        assert!(channel.post(Command::Score { id, due: 640 }));
+        let mut state = State {
+            program,
+            sample_rate: 48_000,
+            channel: Arc::clone(&channel),
+            engine: None,
+            pending: Vec::new(),
+            pending_bytes: 0,
+            write: 0,
+        };
+        let mut cancelled = Vec::new();
+        state.drain_commands(&mut cancelled);
+        assert_eq!(state.pending.len(), 1);
+        assert!(channel.cancel(id));
+        state.drain_commands(&mut cancelled);
+        assert!(state.pending.is_empty());
+        assert_eq!(state.pending_bytes, 0);
+    }
+
+    #[test]
     fn the_first_runway_of_an_orchestra_reads_dry_without_starving() {
         let channel = Arc::new(Channel::new());
         // This worker renders nothing, so each frame reads dry.
@@ -1129,7 +1452,16 @@ mod tests {
         let score = "i \"triangle\" 0 0.1 440 0.2 \"\"\n".to_owned();
         // The note sounds past the frontier, and the frames before it are
         // silent.
-        state.schedule(900, Action::Score(score)).unwrap();
+        state
+            .schedule(
+                900,
+                Action::Score {
+                    id: 1,
+                    submitted: 0,
+                    score,
+                },
+            )
+            .unwrap();
         // The mark comes before the compile, which fails with no library.
         state.step();
         assert_eq!(channel.started.load(Ordering::Acquire), 900);

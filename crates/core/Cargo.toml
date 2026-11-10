@@ -28,7 +28,5 @@ serde = { version = "1", features = ["derive"] }
 # JavaScript object iterates, in every dependency graph.
 serde_json = { version = "1", features = ["preserve_order"] }
 
-# Allow the integration test to verify the `Node` thread-safety assertion with
-# a deliberately non-Send payload.
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(non_send_node_mutation)'] }
+[lints]
+workspace = true

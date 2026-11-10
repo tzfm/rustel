@@ -9,3 +9,6 @@ description = "Serial output: patterns driving microcontrollers over USB/UART"
 
 [dependencies]
 serialport = { version = "4", default-features = false }
+
+[lints]
+workspace = true

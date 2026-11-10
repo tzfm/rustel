@@ -57,6 +57,9 @@ pub enum Length {
 pub struct ExportSettings {
     pub length: Length,
     pub mp3: bool,
+    /// Writes a `<name> stems` folder beside the bounce instead of the one
+    /// file, so it needs the wav format; the sheet keeps the two in step.
+    pub stems: bool,
     pub limiter_enabled: bool,
     /// Snapshot of the mixer, kept even when bypassed so the export can enable it.
     pub limiter: rustel_audio::RenderLimiter,
@@ -67,6 +70,7 @@ impl Default for ExportSettings {
         Self {
             length: Length::Cycles(16.0),
             mp3: false,
+            stems: false,
             limiter_enabled: false,
             limiter: rustel_audio::RenderLimiter {
                 settings: rustel_audio::LimiterSettings {
@@ -114,6 +118,7 @@ pub enum Field {
     Second,
     Format,
     Limiter,
+    Stems,
     /// The `to` line: the path itself, typed.
     Target,
 }
@@ -125,7 +130,8 @@ impl Field {
             (Self::First, true) => Self::Second,
             (Self::First, false) | (Self::Second, _) => Self::Format,
             (Self::Format, _) => Self::Limiter,
-            (Self::Limiter, _) => Self::Target,
+            (Self::Limiter, _) => Self::Stems,
+            (Self::Stems, _) => Self::Target,
             (Self::Target, _) => Self::Length,
         }
     }
@@ -138,7 +144,8 @@ impl Field {
             (Self::Format, true) => Self::Second,
             (Self::Format, false) => Self::First,
             (Self::Limiter, _) => Self::Format,
-            (Self::Target, _) => Self::Limiter,
+            (Self::Stems, _) => Self::Limiter,
+            (Self::Target, _) => Self::Stems,
         }
     }
 }
@@ -159,6 +166,8 @@ pub struct SheetLayout {
     pub mp3: Rect,
     pub limiter_off: Rect,
     pub limiter_on: Rect,
+    pub stems_off: Rect,
+    pub stems_on: Rect,
     pub target: Rect,
 }
 
@@ -169,6 +178,7 @@ pub enum Hit {
     Number(Field),
     Format { mp3: bool },
     Limiter { enabled: bool },
+    Stems { on: bool },
     Target,
 }
 
@@ -265,7 +275,10 @@ impl ExportSheet {
     /// Space toggles a choice on these lines. On a number or the path it
     /// is text, so Command keeps it out until Insert.
     pub(crate) fn space_changes_a_choice(&self) -> bool {
-        matches!(self.field, Field::Length | Field::Format | Field::Limiter)
+        matches!(
+            self.field,
+            Field::Length | Field::Format | Field::Limiter | Field::Stems
+        )
     }
 
     fn silence(&self) -> bool {
@@ -282,6 +295,16 @@ impl ExportSheet {
             .map(str::to_ascii_lowercase);
         if matches!(extension.as_deref(), None | Some("wav" | "mp3")) {
             self.target.set_extension(self.settings.extension());
+        }
+    }
+
+    /// Stems need the wav format, so the pair moves together: stems on
+    /// takes the format back to wav, and mp3 turns stems off.
+    fn set_stems(&mut self, stems: bool) {
+        self.settings.stems = stems;
+        if stems && self.settings.mp3 {
+            self.settings.mp3 = false;
+            self.retarget();
         }
     }
 
@@ -322,6 +345,9 @@ impl ExportSheet {
                 let mp3 = mp3 && MP3_EXPORT;
                 if self.settings.mp3 != mp3 {
                     self.settings.mp3 = mp3;
+                    if mp3 {
+                        self.settings.stems = false;
+                    }
                     self.retarget();
                 }
             }
@@ -329,6 +355,10 @@ impl ExportSheet {
             Hit::Limiter { enabled } => {
                 self.field = Field::Limiter;
                 self.settings.limiter_enabled = enabled;
+            }
+            Hit::Stems { on } => {
+                self.field = Field::Stems;
+                self.set_stems(on);
             }
         }
     }
@@ -371,10 +401,14 @@ impl ExportSheet {
                 let mp3 = direction > 0 && MP3_EXPORT;
                 if self.settings.mp3 != mp3 {
                     self.settings.mp3 = mp3;
+                    if mp3 {
+                        self.settings.stems = false;
+                    }
                     self.retarget();
                 }
             }
             Field::Limiter => self.settings.limiter_enabled = direction > 0,
+            Field::Stems => self.set_stems(direction > 0),
             Field::First => match &mut self.settings.length {
                 Length::Cycles(cycles) => {
                     *cycles = (*cycles
@@ -409,9 +443,16 @@ impl ExportSheet {
             }
             Field::Format => {
                 self.settings.mp3 = !self.settings.mp3 && MP3_EXPORT;
+                if self.settings.mp3 {
+                    self.settings.stems = false;
+                }
                 self.retarget();
             }
             Field::Limiter => self.settings.limiter_enabled = !self.settings.limiter_enabled,
+            Field::Stems => {
+                let stems = !self.settings.stems;
+                self.set_stems(stems);
+            }
             Field::First | Field::Second | Field::Target => {}
         }
     }
@@ -486,7 +527,10 @@ impl ExportSheet {
             KeyCode::Right => self.step(1),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Char(' ')
-                if matches!(self.field, Field::Length | Field::Format | Field::Limiter) =>
+                if matches!(
+                    self.field,
+                    Field::Length | Field::Format | Field::Limiter | Field::Stems
+                ) =>
             {
                 self.toggle_choice()
             }
@@ -528,6 +572,8 @@ struct Progress {
     sample_rate: AtomicUsize,
     /// Peak of each of the last few slices of rendered audio.
     peaks: Mutex<std::collections::VecDeque<f32>>,
+    /// The plugin lines of the report: see `RenderReport::plugin_lines`.
+    plugin_lines: Mutex<Vec<String>>,
 }
 
 /// One look at a render in progress.
@@ -539,20 +585,39 @@ pub struct ExportGlance {
     /// Of the length asked for - `None` when the end is decided by silence.
     pub percent: Option<u8>,
     pub peaks: [f32; SCOPE_COLUMNS],
+    /// True while the render wrote no frame: it loads its samples or
+    /// builds its plugin copies, and a finish now leaves no file.
+    pub preparing: bool,
+}
+
+/// The peaks of a render in progress, as one line of block heights: the
+/// picture a DAW's render window gives of what it is writing.
+pub(crate) fn scope_line(peaks: &[f32; SCOPE_COLUMNS]) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    peaks
+        .iter()
+        .map(|peak| {
+            let level = peak.clamp(0.0, 1.0).sqrt();
+            BARS[((level * 7.0).round() as usize).min(7)]
+        })
+        .collect()
 }
 
 /// Snapshot the host default and any persisted score override for an isolated
 /// export. Re-evaluating source text can then override this inherited value.
-/// The export imports scripts from the origins of the permissions page, and
-/// runs orchestras under its switch, too.
+/// The export imports scripts from the origins of the permissions page,
+/// reads samples and media under its grants, and runs orchestras under its
+/// switch, too. An export renders faster than time, so it never follows the
+/// pointer: `mousex` reads 0, the same in every bounce.
 pub(super) fn session_config(
     default: &SessionConfig,
     host_default: usize,
     score_override: Option<usize>,
     import_origins: &[String],
+    sample_grants: &super::engine::SampleGrants,
     csound_allowed: bool,
 ) -> SessionConfig {
-    default
+    let mut config = default
         .clone()
         .with_max_polyphony(score_override.unwrap_or(host_default))
         .with_score_import_access(super::engine::import_access(
@@ -560,6 +625,9 @@ pub(super) fn session_config(
             import_origins,
             csound_allowed,
         ))
+        .with_score_sample_access(super::engine::sample_access(default, sample_grants));
+    config.pointer = None;
+    config
 }
 
 /// What one bounce plays: the score's source, the flag that says how to
@@ -607,6 +675,8 @@ pub struct ExportJob {
     pub started: Instant,
     /// Ends by silence, so a percentage would be of a ceiling nobody chose.
     open_ended: bool,
+    /// Writes a stems folder beside the target instead of the one file.
+    stems: bool,
     receiver: Receiver<Result<f64, String>>,
     progress: Arc<Progress>,
     finish: Arc<AtomicBool>,
@@ -637,6 +707,7 @@ impl ExportJob {
             frames_total: AtomicUsize::new(0),
             sample_rate: AtomicUsize::new(config.sample_rate as usize),
             peaks: Mutex::new(std::collections::VecDeque::with_capacity(SCOPE_COLUMNS)),
+            plugin_lines: Mutex::new(Vec::new()),
         });
         let finish = Arc::new(AtomicBool::new(false));
         let worker_progress = Arc::clone(&progress);
@@ -663,11 +734,22 @@ impl ExportJob {
             target,
             started: Instant::now(),
             open_ended: matches!(settings.length, Length::UntilSilence { .. }),
+            stems: settings.stems,
             receiver,
             progress,
             finish,
             finished_early: false,
         })
+    }
+
+    /// Where the files land: the stems folder when the bounce is stems, the
+    /// target itself when it is the one file.
+    pub fn output(&self) -> PathBuf {
+        if self.stems {
+            rustel_audio::stems_folder(&self.target)
+        } else {
+            self.target.clone()
+        }
     }
 
     /// Seconds rendered, or why not. `None` while it is still going.
@@ -682,7 +764,8 @@ impl ExportJob {
     }
 
     /// End the render now: a tenth of a second of fade, then the file is
-    /// closed with everything rendered so far.
+    /// closed with everything rendered so far. Before the first frame the
+    /// render ends with no file.
     pub fn finish(&mut self) {
         self.finished_early = true;
         self.finish.store(true, Ordering::Relaxed);
@@ -690,6 +773,44 @@ impl ExportJob {
 
     pub fn finished_early(&self) -> bool {
         self.finished_early
+    }
+
+    /// The plugin lines of the render that refuse no note: see
+    /// `RenderReport::plugin_lines`. The render keeps them for its outcome.
+    pub fn take_plugin_lines(&self) -> Vec<String> {
+        let lines = self.progress.plugin_lines.lock();
+        lines
+            .map(|mut lines| std::mem::take(&mut *lines))
+            .unwrap_or_default()
+    }
+
+    /// A job whose render landed with `outcome` and whose report gave
+    /// `plugin_lines`.
+    #[cfg(test)]
+    pub(crate) fn landed_for_test(
+        scene_name: &str,
+        outcome: Result<f64, String>,
+        plugin_lines: Vec<String>,
+    ) -> Self {
+        let (sender, receiver) = channel();
+        let _ = sender.send(outcome);
+        Self {
+            scene_name: scene_name.into(),
+            target: PathBuf::new(),
+            started: Instant::now(),
+            open_ended: false,
+            stems: false,
+            receiver,
+            progress: Arc::new(Progress {
+                frames_written: AtomicUsize::new(0),
+                frames_total: AtomicUsize::new(0),
+                sample_rate: AtomicUsize::new(48_000),
+                peaks: Mutex::new(std::collections::VecDeque::new()),
+                plugin_lines: Mutex::new(plugin_lines),
+            }),
+            finish: Arc::new(AtomicBool::new(false)),
+            finished_early: false,
+        }
     }
 
     pub fn glance(&self) -> ExportGlance {
@@ -709,6 +830,7 @@ impl ExportJob {
             percent: (!self.open_ended && total > 0)
                 .then(|| ((written as f64 / total as f64) * 100.0).round().min(100.0) as u8),
             peaks,
+            preparing: written == 0,
         }
     }
 }
@@ -719,7 +841,7 @@ fn render(
     config: SessionConfig,
     target: &Path,
     progress: &Progress,
-    finish: &AtomicBool,
+    finish: &Arc<AtomicBool>,
 ) -> Result<f64, String> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
@@ -729,6 +851,7 @@ fn render(
     // Seed cached files before setups can request them again.
     session.restore_csound_snapshot(&score.csound);
     session.set_export_limiter(settings.limiter_enabled.then_some(settings.limiter));
+    session.set_stems_export(settings.stems);
     // The render does not care what the CLI would print. A library that
     // cannot be reached leaves the synths sounding, and the export fails on
     // each sample it lacks.
@@ -764,7 +887,12 @@ fn render(
     .map_err(|error| error.to_string())?;
     let sounds = rustel_runtime::sounds::in_score(&score.source);
     session.prefetch_sounds(&sounds);
-    let _ = session.wait_for_sample_loads(SAMPLE_WAIT);
+    // The export chord ends this wait. No frame exists yet, so the export
+    // ends with no file.
+    let _ = session.wait_for_sample_loads_until(SAMPLE_WAIT, || finish.load(Ordering::Relaxed));
+    if finish.load(Ordering::Relaxed) {
+        return Err(rustel_runtime::RENDER_ENDED_BEFORE_AUDIO.to_owned());
+    }
     let duration = match settings.length {
         Length::Cycles(cycles) => cycles / session.config().cps,
         Length::UntilSilence {
@@ -819,9 +947,12 @@ fn render(
             format,
             false,
             Some(&mut observer),
-            Some(finish),
+            Some(Arc::clone(finish)),
         )
         .map_err(|error| error.to_string())?;
+    if let Ok(mut lines) = progress.plugin_lines.lock() {
+        lines.clone_from(&report.plugin_lines);
+    }
     // Written, but not the score: see `RenderReport::failure`.
     if let Some(message) = report.failure() {
         return Err(message);
@@ -839,11 +970,16 @@ pub struct ExportSheetView<'a> {
     pub theme: &'a Theme,
     /// Vim text modes own the fields and the list keys.
     pub vim: bool,
+    /// The bounce the sheet stays open over, when one runs: the sheet
+    /// turns from its settings to the render's progress.
+    pub exporting: Option<&'a ExportGlance>,
+    /// The chord that ends the bounce early, as the keybind table spells it.
+    pub export_hint: &'a str,
 }
 
 impl ExportSheetView<'_> {
     pub fn geometry(available: Rect) -> Option<Rect> {
-        let height = 8;
+        let height = 9;
         if available.height < height + 2 || available.width < 44 {
             return None;
         }
@@ -892,7 +1028,10 @@ impl ExportSheetView<'_> {
             y,
             &radio(sheet.settings.limiter_enabled, "on"),
         );
-        let target = Rect::new(x + 9, panel.y + 5, right.saturating_sub(x + 9), 1);
+        let y = panel.y + 5;
+        let stems_off = span(x + 9, y, &radio(!sheet.settings.stems, "off"));
+        let stems_on = span(stems_off.right() + 3, y, &radio(sheet.settings.stems, "on"));
+        let target = Rect::new(x + 9, panel.y + 6, right.saturating_sub(x + 9), 1);
         Some(SheetLayout {
             panel,
             cycles,
@@ -903,6 +1042,8 @@ impl ExportSheetView<'_> {
             mp3,
             limiter_off,
             limiter_on,
+            stems_off,
+            stems_on,
             target,
         })
     }
@@ -927,6 +1068,10 @@ impl ExportSheetView<'_> {
             Some(Hit::Limiter { enabled: false })
         } else if on(layout.limiter_on) {
             Some(Hit::Limiter { enabled: true })
+        } else if on(layout.stems_off) {
+            Some(Hit::Stems { on: false })
+        } else if on(layout.stems_on) {
+            Some(Hit::Stems { on: true })
         } else if y == layout.target.y && x >= layout.panel.x && x < layout.panel.right() {
             // The whole row: a short path is still the line to type on.
             Some(Hit::Target)
@@ -962,6 +1107,59 @@ impl Widget for ExportSheetView<'_> {
         );
         let x = panel.x + 2;
         let width = usize::from(panel.width.saturating_sub(4));
+        if let Some(glance) = self.exporting {
+            // The render face, as a DAW's render window shows a render: how
+            // far it is, and whether there is still anything to hear.
+            let seconds = glance.seconds.max(0.0) as u64;
+            let how_far = match glance.percent {
+                _ if glance.preparing => "preparing".to_owned(),
+                Some(percent) => format!("{percent}%"),
+                None => format!("{}:{:02}", seconds / 60, seconds % 60),
+            };
+            buffer.set_stringn(
+                x,
+                panel.y + 1,
+                format!("rendering {} · {}", glance.scene_name, how_far),
+                width,
+                Style::default().fg(theme.foreground),
+            );
+            // A bar asks for a ceiling nobody chose with an open end, so
+            // there the moving scope alone carries the picture.
+            if let Some(percent) = glance.percent {
+                let filled = ((width as f64) * f64::from(percent) / 100.0).round() as usize;
+                let filled = filled.min(width);
+                let bar = format!("{}{}", "█".repeat(filled), "░".repeat(width - filled),);
+                buffer.set_stringn(
+                    x,
+                    panel.y + 2,
+                    bar,
+                    width,
+                    Style::default().fg(theme.accent),
+                );
+            }
+            buffer.set_stringn(
+                x,
+                panel.y + 3,
+                scope_line(&glance.peaks),
+                width,
+                Style::default().fg(theme.accent),
+            );
+            // Before the first frame no file exists to keep.
+            let ends = if glance.preparing {
+                "ends it with no file"
+            } else {
+                "ends it early and keeps the file"
+            };
+            let hint = format!("{} {ends} · Esc runs on in the header", self.export_hint);
+            buffer.set_stringn(
+                x,
+                panel.bottom().saturating_sub(2),
+                &hint,
+                width,
+                Style::default().fg(theme.muted),
+            );
+            return;
+        }
         let label = |buffer: &mut Buffer, y: u16, text: &str| {
             buffer.set_stringn(x, y, text, width, Style::default().fg(theme.muted));
         };
@@ -1071,13 +1269,25 @@ impl Widget for ExportSheetView<'_> {
             usize::from(panel.right().saturating_sub(2).saturating_sub(details_x)),
             Style::default().fg(theme.muted),
         );
+        // stems: one wav a sounding orbit, beside the bounce
+        label(buffer, panel.y + 5, "stems  ");
+        let active = sheet.field == Field::Stems;
+        paint_radio(
+            buffer,
+            layout.stems_off,
+            "off",
+            !sheet.settings.stems,
+            active,
+        );
+        paint_radio(buffer, layout.stems_on, "on", sheet.settings.stems, active);
         // The active field carries the same marker as the other sheets.
         let active_y = match sheet.field {
             Field::Length => panel.y + 1,
             Field::First | Field::Second => panel.y + 2,
             Field::Format => panel.y + 3,
             Field::Limiter => panel.y + 4,
-            Field::Target => panel.y + 5,
+            Field::Stems => panel.y + 5,
+            Field::Target => panel.y + 6,
         };
         buffer.set_string(
             panel.x + 1,
@@ -1086,7 +1296,7 @@ impl Widget for ExportSheetView<'_> {
             Style::default().fg(theme.accent),
         );
         // target: a text field, with the caret up while it is the one typed into
-        label(buffer, panel.y + 5, "to     ");
+        label(buffer, panel.y + 6, "to     ");
         let editing = sheet.field == Field::Target;
         let typing = editing && (!self.vim || sheet.vim_insert());
         let mut path = sheet.target.display().to_string();
@@ -1174,6 +1384,8 @@ mod tests {
         );
         sheet.key(KeyCode::Tab, false);
         assert_eq!(sheet.field, Field::Limiter);
+        sheet.key(KeyCode::Tab, false);
+        assert_eq!(sheet.field, Field::Stems);
         sheet.key(KeyCode::Tab, false);
         assert_eq!(sheet.field, Field::Target, "the to line is a field too");
         sheet.key(KeyCode::Tab, false);
@@ -1271,12 +1483,14 @@ mod tests {
             target: PathBuf::new(),
             started: Instant::now(),
             open_ended: false,
+            stems: false,
             receiver,
             progress: Arc::new(Progress {
                 frames_written: AtomicUsize::new(0),
                 frames_total: AtomicUsize::new(0),
                 sample_rate: AtomicUsize::new(48_000),
                 peaks: Mutex::new(std::collections::VecDeque::new()),
+                plugin_lines: Mutex::new(Vec::new()),
             }),
             finish: Arc::new(AtomicBool::new(false)),
             finished_early: false,
@@ -1353,6 +1567,8 @@ mod tests {
                 sheet,
                 theme: &theme,
                 vim,
+                exporting: None,
+                export_hint: "Ctrl+Shift+E",
             }
             .render(area, &mut buffer);
             (0..area.height)
@@ -1371,6 +1587,7 @@ mod tests {
         assert!(text.contains("● wav"), "{text}");
         assert_eq!(text.contains("mp3"), MP3_EXPORT, "{text}");
         assert!(text.contains("limiter  ● off   ○ on"), "{text}");
+        assert!(text.contains("stems    ● off   ○ on"), "{text}");
         assert!(text.contains("drums-1970-01-01T00-00-00.wav"), "{text}");
 
         let command = render(&sheet, true);
@@ -1381,6 +1598,88 @@ mod tests {
         let insert = render(&sheet, true);
         assert!(insert.contains("VIM INSERT"), "{insert}");
         assert!(insert.contains("Esc returns to Command"), "{insert}");
+    }
+
+    /// The sheet over a running bounce is the render window: how far, a
+    /// bar under a chosen ceiling, a moving scope, and the way out.
+    #[test]
+    fn the_sheet_draws_the_render_over_its_bounce() {
+        let theme = Theme::default();
+        let sheet = ExportSheet::open(
+            "drums".into(),
+            ExportSettings::default(),
+            Path::new("exports"),
+            0,
+        );
+        let area = Rect::new(0, 0, 100, 20);
+        let render = |glance: Option<&ExportGlance>| {
+            let mut buffer = Buffer::empty(area);
+            ExportSheetView {
+                sheet: &sheet,
+                theme: &theme,
+                vim: false,
+                exporting: glance,
+                export_hint: "Ctrl+Shift+E",
+            }
+            .render(area, &mut buffer);
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut peaks = [0.0f32; SCOPE_COLUMNS];
+        peaks.fill(0.25);
+        let bounded = ExportGlance {
+            scene_name: "drums".into(),
+            seconds: 6.0,
+            percent: Some(42),
+            peaks,
+            preparing: false,
+        };
+        let text = render(Some(&bounded));
+        assert!(text.contains("rendering drums · 42%"), "{text}");
+        assert!(text.contains('█'), "{text}");
+        assert!(text.contains('░'), "{text}");
+        assert!(text.contains("▅▅▅▅"), "{text}");
+        assert!(
+            text.contains("Ctrl+Shift+E ends it early and keeps the file"),
+            "{text}"
+        );
+        assert!(text.contains("Esc runs on in the header"), "{text}");
+        assert!(!text.contains("Enter renders"), "{text}");
+
+        // An open end has no ceiling anyone chose, so no bar and no
+        // percent: the clock and the moving scope carry the picture.
+        let open = ExportGlance {
+            scene_name: "drums".into(),
+            seconds: 67.0,
+            percent: None,
+            peaks,
+            preparing: false,
+        };
+        let text = render(Some(&open));
+        assert!(text.contains("rendering drums · 1:07"), "{text}");
+        assert!(!text.contains('%'), "{text}");
+        assert!(!text.contains('░'), "{text}");
+
+        // Before the first frame the render prepares, and an end leaves no
+        // file to keep.
+        let preparing = ExportGlance {
+            seconds: 0.0,
+            preparing: true,
+            ..open
+        };
+        let text = render(Some(&preparing));
+        assert!(text.contains("rendering drums · preparing"), "{text}");
+        assert!(
+            text.contains("Ctrl+Shift+E ends it with no file · Esc runs on in the header"),
+            "{text}"
+        );
+        assert!(!text.contains("0:00"), "{text}");
     }
 
     #[test]
@@ -1423,6 +1722,16 @@ mod tests {
                 "no mp3 radio without the encoder"
             );
         }
+        let hit = ExportSheetView::hit(&sheet, area, layout.stems_on.x + 1, layout.stems_on.y);
+        assert_eq!(hit, Some(Hit::Stems { on: true }));
+        sheet.click(hit.expect("hit"));
+        assert!(sheet.settings.stems);
+        assert!(!sheet.settings.mp3, "stems need the wav format");
+        assert!(
+            sheet.target.to_string_lossy().ends_with(".wav"),
+            "{}",
+            sheet.target.display()
+        );
         assert_eq!(
             ExportSheetView::hit(&sheet, area, layout.panel.x + 3, layout.target.y),
             Some(Hit::Target),
@@ -1436,6 +1745,31 @@ mod tests {
     }
 
     #[test]
+    fn stems_need_the_wav_format_so_the_choices_move_together() {
+        let mut sheet = ExportSheet::open(
+            "drums".into(),
+            ExportSettings::default(),
+            Path::new("exports"),
+            0,
+        );
+        sheet.field = Field::Stems;
+        sheet.key(KeyCode::Char(' '), false);
+        assert!(sheet.settings.stems, "Space toggles the stems choice");
+        if MP3_EXPORT {
+            sheet.field = Field::Format;
+            sheet.key(KeyCode::Right, false);
+            assert!(sheet.settings.mp3);
+            assert!(!sheet.settings.stems, "mp3 turns stems off");
+            assert!(sheet.target.to_string_lossy().ends_with(".mp3"));
+            sheet.field = Field::Stems;
+            sheet.key(KeyCode::Right, false);
+            assert!(sheet.settings.stems);
+            assert!(!sheet.settings.mp3, "stems take the format back to wav");
+            assert!(sheet.target.to_string_lossy().ends_with(".wav"));
+        }
+    }
+
+    #[test]
     fn the_to_line_is_typed_into_and_keeps_its_own_extension() {
         let mut sheet = ExportSheet::open(
             "drums".into(),
@@ -1443,7 +1777,7 @@ mod tests {
             Path::new("exports"),
             0,
         );
-        for _ in 0..4 {
+        for _ in 0..5 {
             sheet.key(KeyCode::Tab, false);
         }
         assert_eq!(sheet.field, Field::Target);
@@ -1459,8 +1793,9 @@ mod tests {
         assert_eq!(sheet.target, PathBuf::from("/tmp/bounces/take one.wav"));
         // …and a flip of the format follows it, but never rewrites a
         // deliberate extension.
-        sheet.key(KeyCode::Tab, true);
-        sheet.key(KeyCode::Tab, true);
+        while sheet.field != Field::Format {
+            sheet.key(KeyCode::Tab, true);
+        }
         sheet.key(KeyCode::Right, false);
         let extension = if MP3_EXPORT { "mp3" } else { "wav" };
         assert_eq!(
@@ -1470,11 +1805,10 @@ mod tests {
         sheet.target = PathBuf::from("/tmp/bounces/take.final");
         sheet.key(KeyCode::Left, false);
         assert_eq!(sheet.target, PathBuf::from("/tmp/bounces/take.final"));
-        // Tab wraps back to the top through the limiter and to lines.
-        sheet.key(KeyCode::Tab, false);
-        sheet.key(KeyCode::Tab, false);
-        sheet.key(KeyCode::Tab, false);
-        assert_eq!(sheet.field, Field::Length);
+        // Tab wraps back to the top through the limiter, stems and to lines.
+        while sheet.field != Field::Length {
+            sheet.key(KeyCode::Tab, false);
+        }
     }
 
     #[test]
@@ -1557,6 +1891,10 @@ mod tests {
     }
 
     /// The job's outcome, polled until it arrives or `within` runs out.
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "the deadline is the test failure"
+    )]
     fn await_outcome(job: &ExportJob, within: std::time::Duration) -> Result<f64, String> {
         let deadline = Instant::now() + within;
         loop {
@@ -1652,7 +1990,14 @@ mod tests {
                     mp3: false,
                     ..ExportSettings::default()
                 },
-                session_config(&config, config.max_polyphony, None, &[], allowed),
+                session_config(
+                    &config,
+                    config.max_polyphony,
+                    None,
+                    &[],
+                    &Default::default(),
+                    allowed,
+                ),
                 target.clone(),
             )
             .expect("job");
@@ -1795,6 +2140,32 @@ mod tests {
             .expect_err("a bounce with a missing sound is not a finished export");
         assert!(error.starts_with("nosuchsound is not loaded"), "{error}");
         assert!(target.exists(), "the file is written either way");
+
+        // A finish before the first frame ends the render with no file, so
+        // no file names the missing sound.
+        let ended = dir.path().join("ended.wav");
+        let progress = Progress {
+            frames_written: AtomicUsize::new(0),
+            frames_total: AtomicUsize::new(0),
+            sample_rate: AtomicUsize::new(48_000),
+            peaks: Mutex::new(std::collections::VecDeque::new()),
+            plugin_lines: Mutex::new(Vec::new()),
+        };
+        let error = render(
+            &plain_score(r#"s("sine nosuchsound")"#),
+            ExportSettings {
+                length: Length::Cycles(0.5),
+                mp3: false,
+                ..ExportSettings::default()
+            },
+            SessionConfig::default(),
+            &ended,
+            &progress,
+            &Arc::new(AtomicBool::new(true)),
+        )
+        .expect_err("a render that ends before its first frame is not an export");
+        assert_eq!(error, rustel_runtime::RENDER_ENDED_BEFORE_AUDIO);
+        assert!(!ended.exists(), "the render wrote no file");
     }
 
     #[test]
@@ -1813,7 +2184,7 @@ mod tests {
                 "polyphony".into(),
                 plain_score(&format!("{setter} stack(note('c3'), note('e3'), note('g3'), note('c4')).s('sine').gain(0.05).attack(0).decay(0).sustain(1)")),
                 ExportSettings { length: Length::Cycles(0.025), mp3: false, ..ExportSettings::default() },
-                session_config(&SessionConfig::default(), voices, inherited, &[], false),
+                session_config(&SessionConfig::default(), voices, inherited, &[], &Default::default(), false),
                 target.clone(),
             ).expect("start export job");
             let deadline = Instant::now() + std::time::Duration::from_secs(30);
@@ -1835,11 +2206,32 @@ mod tests {
             limited, unrestricted,
             "the job must use the passed host budget"
         );
-        // The origins of the permissions page reach the export.
+        // The origins and the sources of the permissions page reach the
+        // export.
         let origins = ["https://glossing.dev".to_owned()];
-        let config = session_config(&SessionConfig::default(), 192, None, &origins, false);
+        let grants = crate::engine::SampleGrants {
+            sources: vec!["cdn.kit.example".to_owned()],
+            ..Default::default()
+        };
+        let config = session_config(
+            &SessionConfig::default(),
+            192,
+            None,
+            &origins,
+            &grants,
+            false,
+        );
         assert_eq!(config.max_polyphony, 192);
         assert_eq!(config.score_import_access.origins(), origins);
+        assert_eq!(
+            config
+                .score_sample_access
+                .sources()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["cdn.kit.example"]
+        );
         let mut live = Session::new().expect("live session");
         live.evaluate("setMaxPolyphony(1); s('sine')")
             .expect("set persistent override");
@@ -1902,5 +2294,98 @@ mod tests {
         let bytes = std::fs::metadata(&target).unwrap().len();
         assert_eq!(bytes, 44 + (seconds * 48_000.0).round() as u64 * 4);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plugin copy that does not start leaves its note with no plugin.
+    /// The file is written, but the job fails and names the plugin, and
+    /// the line of the export does not go to the live session. A copy with
+    /// no number in its output for 1 s fails the job the same way, with
+    /// stems too, and a short note through such a plugin gives a warning.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_job_whose_plugin_does_not_start_fails_and_names_it() {
+        let (_plugins, folder) = crate::engine::load_mode_tests::fixture_plugins();
+        let presets = folder
+            .path()
+            .join("presets")
+            .join(rustel_vst3_fixture::NAME);
+        // A preset of a different plugin: a copy with it does not start.
+        let mut other = rustel_vst3_fixture::preset(0.5, 0.0);
+        other[8] = b'0';
+        std::fs::write(presets.join("Other.vstpreset"), other).expect("preset file");
+        let host = rustel_runtime::vst::host();
+        host.set_preset_folders(Vec::new());
+        host.wait_idle();
+        let _ = host.take_errors();
+        let dir = tempfile::tempdir().expect("export dir");
+        let target = dir.path().join("other.wav");
+        let job = ExportJob::start(
+            "other".into(),
+            plain_score(r#"note("c3").s("sine").vst("rustel fixture", { preset: "Other" })"#),
+            ExportSettings {
+                length: Length::Cycles(0.5),
+                mp3: false,
+                ..ExportSettings::default()
+            },
+            SessionConfig::default(),
+            target.clone(),
+        )
+        .expect("job");
+        let error = await_outcome(&job, std::time::Duration::from_secs(120))
+            .expect_err("a bounce with a plugin that does not start is not a finished export");
+        let named = format!("vst skipped: {} did not start: ", rustel_vst3_fixture::NAME);
+        assert!(error.starts_with(&named), "{error}");
+        assert!(target.exists(), "the file is written either way");
+        assert_eq!(host.take_errors(), Vec::<String>::new());
+
+        // A copy with no number in its output for 1 s of a note plays
+        // silence to the end of the render. The job fails and names the
+        // plugin, with stems too, and the files are written either way.
+        let export = |name: &str, source: &str, stems: bool| {
+            let target = dir.path().join(format!("{name}.wav"));
+            let settings = ExportSettings {
+                length: Length::Cycles(1.0),
+                mp3: false,
+                stems,
+                ..ExportSettings::default()
+            };
+            let score = plain_score(source);
+            let job = ExportJob::start(
+                name.into(),
+                score,
+                settings,
+                SessionConfig::default(),
+                target.clone(),
+            )
+            .expect("job");
+            let outcome = await_outcome(&job, std::time::Duration::from_secs(120));
+            (outcome, job.take_plugin_lines(), target)
+        };
+        let fault = r#"note("c3").s("sine").vst("rustel fixture", { fault: 1 })"#;
+        let silent = format!(
+            "vst {}: no number in the output for 1 s, so the stage plays silence to the end",
+            rustel_vst3_fixture::NAME
+        );
+        let (outcome, _, target) = export("faulted", fault, false);
+        assert_eq!(outcome, Err(silent.clone()));
+        assert!(target.exists(), "the file is written either way");
+        let (outcome, _, target) = export("faulted-stems", fault, true);
+        assert_eq!(outcome, Err(silent));
+        let folder = rustel_audio::stems_folder(&target);
+        assert!(folder.join("main.wav").exists(), "the stems are written");
+        // A note of 0.25 s gives no fault: the copy is silent where the note
+        // is, and the job gives the line of the samples that were no number
+        // as a warning.
+        let short = r#"note("c3 ~ ~ ~ ~ ~ ~ ~").s("sine").vst("rustel fixture", { fault: 1 })"#;
+        let (outcome, lines, target) = export("short", short, false);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let not_a_number = format!(
+            "vst {}: a sample of the output was not a number and played as silence",
+            rustel_vst3_fixture::NAME
+        );
+        assert!(lines.contains(&not_a_number), "{lines:?}");
+        let pcm = rustel_runtime::test_support::read_pcm16_stereo_wav(&target).expect("WAV");
+        assert!(pcm.iter().all(|sample| *sample == 0.0));
+        assert_eq!(host.take_errors(), Vec::<String>::new());
     }
 }

@@ -42,6 +42,10 @@ impl Session {
         })
     }
 
+    #[allow(
+        clippy::print_stderr,
+        reason = "log lines are the direct diagnostic channel"
+    )]
     fn play_window_guarded(
         &mut self,
         start_secs: f64,
@@ -424,7 +428,7 @@ impl Session {
                 .collect(),
             None => Vec::new(),
         };
-        match device.play_with_samples_dispatch_polyphony_and_inserts(
+        let played = device.play_with_samples_dispatch_polyphony_and_inserts(
             &events,
             duration_secs,
             self.transport.stopped_flag(),
@@ -432,7 +436,13 @@ impl Session {
             self.config.dsp_dispatch,
             self.max_polyphony(),
             Some(csound.provider(true)),
-        ) {
+        );
+        // The lines of the plugin host go out before the outcome of the
+        // run, as plugin lines: a copy that did not start, and the counts
+        // and the faults of the copies of the run.
+        #[cfg(feature = "vst")]
+        self.report_plugin_lines(crate::vst::take_errors());
+        match played {
             Ok(()) => {}
             Err(rustel_audio::DevicePlaybackError::Cancelled) => {
                 return Err(RuntimeError::Cancelled);
@@ -650,7 +660,7 @@ impl Session {
 
         // The mp3 door is the same render; only the container differs, so a
         // tape bounced either way is the same audio.
-        let (_, voices_refused) = self.render_under_diagnostic_policy(|session| {
+        let (plugin_lines, voices_refused) = self.render_under_diagnostic_policy(|session| {
             if mp3 {
                 crate::render::write_scalar_mp3_with_dispatch(
                     out_path,
@@ -662,6 +672,7 @@ impl Session {
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
                     Some(&csound),
+                    &session.render_stop(None),
                 )
             } else {
                 crate::render::write_scalar_wav_controlled_with_dispatch(
@@ -674,7 +685,7 @@ impl Session {
                     print_progress,
                     rustel_audio::RenderControl {
                         observer: None,
-                        cancelled: Some(session.transport.stopped_flag()),
+                        cancelled: None,
                         finish: None,
                         stop_when_silent: None,
                         limiter: None,
@@ -683,8 +694,13 @@ impl Session {
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
                     Some(&csound),
+                    // A set bounce writes no stems: the folder layout is the
+                    // single score export's.
+                    false,
+                    &session.render_stop(None),
                 )
             }
+            .map(|(_, refused, lines)| (lines, refused))
             .map_err(render_error)
         })?;
         self.log_sample_failures();
@@ -712,6 +728,7 @@ impl Session {
             ),
             onset_count: onsets.len(),
             voices_refused,
+            plugin_lines,
         })
     }
 
@@ -731,6 +748,13 @@ impl Session {
     /// score-level `.limit()` effects are independent of this setting.
     pub fn set_export_limiter(&mut self, limiter: Option<rustel_audio::RenderLimiter>) {
         self.export_limiter = limiter;
+    }
+
+    /// Write a `<name> stems` folder beside each scalar WAV export:
+    /// `main.wav` plus one WAV a sounding orbit, tapped before the export
+    /// limiter. A format other than a scalar WAV refuses the render.
+    pub fn set_stems_export(&mut self, stems: bool) {
+        self.stems_export = stems;
     }
 
     pub fn stop_export_when_silent(&mut self, floor: f32, hold: std::time::Duration) {
@@ -768,6 +792,9 @@ impl Session {
     /// Samples other than the bundled `bd` need
     /// [`Self::enable_default_samples`] first unless the score loads them
     /// itself.
+    ///
+    /// A stop of the transport ends the render with
+    /// [`RuntimeError::Cancelled`], as it ends a bounce to a file.
     pub fn render_pcm(&mut self, duration_secs: f64) -> Result<Vec<f32>, RuntimeError> {
         let play = self.play(duration_secs)?;
         self.render_under_diagnostic_policy(|session| {
@@ -780,10 +807,21 @@ impl Session {
                 session.config.dsp_dispatch,
                 session.max_polyphony(),
                 Some(&session.csound),
+                &session.render_stop(None),
             )
-            .map_err(RuntimeError::Io)
+            .map(|(pcm, refused, _)| (pcm, refused))
+            .map_err(render_error)
         })
         .map(|(pcm, _)| pcm)
+    }
+
+    /// The stop of a render of this session: its transport, and the finish
+    /// flag of an export that asks to end early.
+    fn render_stop(&self, finish: Option<Arc<AtomicBool>>) -> crate::render::RenderStop {
+        crate::render::RenderStop {
+            transport: Some(Arc::clone(&self.transport)),
+            finish,
+        }
     }
 
     /// Run an offline render under this Session's diagnostic policy: with
@@ -816,6 +854,9 @@ impl Session {
     /// with a short fade and keeps the file, and `report` decides whether
     /// progress is also printed to stderr as the CLI does. An mp3 is
     /// rendered the same way, to a WAV beside the target, then encoded.
+    ///
+    /// A `finish` before the first frame ends the bounce with no file and
+    /// the error [`crate::RENDER_ENDED_BEFORE_AUDIO`].
     pub fn render_controlled<'o>(
         &mut self,
         duration_secs: f64,
@@ -823,10 +864,17 @@ impl Session {
         format: RenderFormat,
         report: bool,
         observer: Option<&'o mut (dyn FnMut(rustel_audio::RenderTick<'_>) + 'o)>,
-        finish: Option<&std::sync::atomic::AtomicBool>,
+        finish: Option<Arc<AtomicBool>>,
     ) -> Result<RenderReport, RuntimeError> {
         if format == RenderFormat::ScalarMp3 {
             crate::render::ensure_mp3_available()?;
+        }
+        if self.stems_export
+            && !matches!(format, RenderFormat::ScalarWav | RenderFormat::ScalarF32Wav)
+        {
+            return Err(RuntimeError::Message(
+                "stems are written for a scalar WAV export, not another format".into(),
+            ));
         }
         let play = self.play(duration_secs)?;
         // `--until-silence` ends the file early, so the requested duration is
@@ -843,6 +891,7 @@ impl Session {
             },
             ..stop
         });
+        let stop = self.render_stop(finish);
         let rendered = self.render_under_diagnostic_policy(|session| match format {
             RenderFormat::Wav => {
                 // A silent skeleton has no tail to ring out.
@@ -852,18 +901,18 @@ impl Session {
                     session.config.channels,
                     duration_secs,
                 )?;
-                Ok((None, Vec::new()))
+                Ok(((None, Vec::new()), Vec::new()))
             }
             // The unwatched mp3 shortcut renders the whole length blind; a
             // silence stop or a tail needs the controlled path.
             RenderFormat::ScalarMp3
                 if observer.is_none()
-                    && finish.is_none()
+                    && stop.finish.is_none()
                     && stop_when_silent.is_none()
                     && session.export_limiter.is_none()
                     && session.render_tail_secs == 0.0 =>
             {
-                let (_, refused) = crate::render::write_scalar_mp3_with_dispatch(
+                let (_, refused, lines) = crate::render::write_scalar_mp3_with_dispatch(
                     out_path,
                     session.config.sample_rate,
                     audio_secs,
@@ -873,14 +922,10 @@ impl Session {
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
                     Some(&session.csound),
+                    &stop,
                 )
-                .map_err(|error| match error.kind() {
-                    std::io::ErrorKind::InvalidInput => {
-                        RuntimeError::Message(format!("scalar audio: {error}"))
-                    }
-                    _ => RuntimeError::Io(error),
-                })?;
-                Ok((None, refused))
+                .map_err(render_error)?;
+                Ok(((None, lines), refused))
             }
             RenderFormat::ScalarMp3 => {
                 // Watched or steerable: render as WAV beside the target so
@@ -898,8 +943,8 @@ impl Session {
                     report,
                     rustel_audio::RenderControl {
                         observer,
-                        cancelled: Some(session.transport.stopped_flag()),
-                        finish,
+                        cancelled: None,
+                        finish: None,
                         stop_when_silent,
                         limiter: session.export_limiter,
                     },
@@ -907,14 +952,18 @@ impl Session {
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
                     Some(&session.csound),
+                    // The staged WAV feeds the mp3 encoder; stems are refused
+                    // for mp3 before this point.
+                    false,
+                    &stop,
                 )
                 .map_err(render_error);
-                let encoded = rendered.and_then(|(bytes, refused)| {
+                let encoded = rendered.and_then(|(bytes, refused, lines)| {
                     let pcm =
                         crate::render::read_pcm16_stereo_wav(&staged).map_err(RuntimeError::Io)?;
                     crate::render::encode_mp3(out_path, session.config.sample_rate, &pcm)
                         .map_err(RuntimeError::Io)?;
-                    Ok((Some(bytes), refused))
+                    Ok(((Some(bytes), lines), refused))
                 });
                 let _ = std::fs::remove_file(&staged);
                 encoded
@@ -933,8 +982,8 @@ impl Session {
                     report,
                     rustel_audio::RenderControl {
                         observer,
-                        cancelled: Some(session.transport.stopped_flag()),
-                        finish,
+                        cancelled: None,
+                        finish: None,
                         stop_when_silent,
                         limiter: session.export_limiter,
                     },
@@ -945,16 +994,18 @@ impl Session {
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
                     Some(&session.csound),
+                    session.stems_export,
+                    &stop,
                 )
-                .map(|(bytes, refused)| (Some(bytes), refused))
+                .map(|(bytes, refused, lines)| ((Some(bytes), lines), refused))
                 .map_err(render_error)
             }
             RenderFormat::OnsetJson => {
                 write_onset_dump(out_path, &play.onsets)?;
-                Ok((None, Vec::new()))
+                Ok(((None, Vec::new()), Vec::new()))
             }
         })?;
-        let (written_bytes, voices_refused) = rendered;
+        let ((written_bytes, plugin_lines), voices_refused) = rendered;
         self.log_sample_failures();
         Ok(RenderReport {
             query_threw: play.query_threw.clone(),
@@ -983,7 +1034,14 @@ impl Session {
                 RenderFormat::OnsetJson => "onset-json".into(),
                 RenderFormat::ScalarMp3 => "mp3-scalar-320k".into(),
             },
-            path: out_path.display().to_string(),
+            path: if self.stems_export {
+                rustel_audio::stems_folder(out_path)
+                    .join("main.wav")
+                    .display()
+                    .to_string()
+            } else {
+                out_path.display().to_string()
+            },
             audio_backend: match format {
                 RenderFormat::ScalarWav | RenderFormat::ScalarF32Wav | RenderFormat::ScalarMp3 => {
                     "scalar-rust".into()
@@ -992,7 +1050,16 @@ impl Session {
             },
             device_audio: "not-requested".into(),
             note: match format {
+                RenderFormat::ScalarWav if self.stems_export => {
+                    "Deterministic scalar PCM render, with a stem per sounding orbit beside it."
+                        .into()
+                }
                 RenderFormat::ScalarWav => "Deterministic scalar PCM render.".into(),
+                RenderFormat::ScalarF32Wav if self.stems_export => {
+                    "Deterministic scalar render, 32-bit float and unclamped, with a stem per \
+                     sounding orbit beside it."
+                        .into()
+                }
                 RenderFormat::ScalarF32Wav => {
                     "Deterministic scalar render, 32-bit float and unclamped.".into()
                 }
@@ -1000,6 +1067,7 @@ impl Session {
             },
             onset_count: play.onsets.len(),
             voices_refused,
+            plugin_lines,
         })
     }
 }
@@ -1089,9 +1157,9 @@ impl Session {
         self.collect_pending_osc(&onsets, now, cps);
 
         let mut input_warnings: Vec<String> = Vec::new();
-        // The note of each event, for its plugin chain.
+        // The onset of each event, for its plugin chain and its lead.
         #[cfg(feature = "vst")]
-        let mut values = Vec::new();
+        let mut event_onsets = Vec::new();
         // Only a plugin chain changes an event.
         #[cfg_attr(not(feature = "vst"), allow(unused_mut))]
         let (mut events, notices) =
@@ -1102,7 +1170,7 @@ impl Session {
                         match self.live_audio_event(onset, sample_rate, cps, lookup) {
                             Ok(event) => {
                                 #[cfg(feature = "vst")]
-                                values.push(&onset.value);
+                                event_onsets.push(onset);
                                 if let Some(warning) = self.input_channel_warning(&event)
                                     && !input_warnings.contains(&warning)
                                 {
@@ -1121,8 +1189,17 @@ impl Session {
                     })
                     .collect::<Vec<_>>()
             });
+        // A note whose lead does not fit after `now` plays late, so this
+        // window leaves out no note.
         #[cfg(feature = "vst")]
-        self.chain_live_events(&mut events, &values);
+        self.chain_live_events(
+            &mut events,
+            &event_onsets,
+            lookup,
+            sample_rate,
+            now,
+            LeadWindow::Steady,
+        );
         self.record_csound_chains(&events);
         self.report_voice_notices(notices);
         // Said once per score text, like a plugin line: the set plays on,
@@ -1510,6 +1587,31 @@ mod tests {
             elapsed < std::time::Duration::from_secs(60),
             "the cancelled run took {elapsed:?}; Stop must end it promptly"
         );
+
+        // A stop ends an in-memory render as it ends a bounce to a file.
+        // The mp3 door renders in memory too, and writes no file.
+        let directory = tempfile::tempdir().expect("render directory");
+        let path = directory.path().join("stopped.mp3");
+        for mp3 in [false, true] {
+            if mp3 && !crate::render::MP3_EXPORT {
+                continue;
+            }
+            let mut session = Session::new().expect("session");
+            session.evaluate(r#"s("bd*8")"#).expect("evaluate");
+            let handle = session.transport();
+            let stopper = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                handle.stop();
+            });
+            let error = if mp3 {
+                session.render(60.0, &path, RenderFormat::ScalarMp3).err()
+            } else {
+                session.render_pcm(60.0).err()
+            };
+            stopper.join().expect("stopper thread");
+            assert!(matches!(error, Some(RuntimeError::Cancelled)), "{error:?}");
+            assert!(!path.exists(), "a stopped mp3 render wrote its file");
+        }
     }
 
     #[test]
@@ -1589,6 +1691,24 @@ mod tests {
         assert!(!session.play(2.0).expect("play").onsets.is_empty());
     }
 
+    /// A render in memory past its budget gives the error of a bounce to a
+    /// file, with no allocation.
+    #[test]
+    fn a_render_in_memory_past_its_budget_gives_the_error_of_a_bounce() {
+        let mut session = Session::with_config(SessionConfig {
+            sample_rate: u32::MAX,
+            ..Default::default()
+        })
+        .expect("session");
+        session.evaluate(r#"s("bd")"#).expect("evaluate");
+        let error = session.render_pcm(1.0).expect_err("past the budget");
+        assert!(
+            matches!(&error, RuntimeError::Message(message)
+                if message.starts_with("scalar audio: ") && message.contains("cannot hold")),
+            "{error:?}"
+        );
+    }
+
     #[test]
     fn max_polyphony_changes_the_voices_in_offline_pcm() {
         fn render(voices: usize, script_override: bool) -> Vec<f32> {
@@ -1619,5 +1739,444 @@ mod tests {
                 .any(|(a, b)| (a - b).abs() > 0.0001),
             "limiting polyphony must change actual audio"
         );
+    }
+}
+
+#[cfg(test)]
+mod stems_export_tests {
+    use super::*;
+    use crate::session::test_support::quiet_session;
+
+    const TWO_ORBITS: &str = r#"stack(
+        s("bd").orbit(1),
+        note("c3").s("sawtooth").orbit(2).gain(0.25),
+    )"#;
+
+    /// A stems bounce writes its main file inside the stems folder, one wav
+    /// a sounding orbit beside it, and the report says where the main went.
+    #[test]
+    fn a_stems_export_writes_main_and_one_wav_a_sounding_orbit() {
+        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("render directory");
+        let out = directory.path().join("bounce.wav");
+        let mut session = quiet_session(TWO_ORBITS);
+        session.set_stems_export(true);
+        let report = session
+            .render(1.0, &out, RenderFormat::ScalarWav)
+            .expect("render");
+        let folder = rustel_audio::stems_folder(&out);
+        let mut names: Vec<String> = std::fs::read_dir(&folder)
+            .expect("stems folder")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, ["2.wav", "3.wav", "main.wav"]);
+        assert_eq!(
+            report.path,
+            folder.join("main.wav").display().to_string(),
+            "the report names the folder's main file"
+        );
+    }
+
+    /// Stems are a WAV-only mode: the one-file formats refuse the render
+    /// rather than half-write it.
+    #[test]
+    fn stems_are_refused_for_anything_but_a_scalar_wav() {
+        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("render directory");
+        let mut session = quiet_session(TWO_ORBITS);
+        session.set_stems_export(true);
+        let error = session
+            .render(
+                1.0,
+                &directory.path().join("bounce.json"),
+                RenderFormat::OnsetJson,
+            )
+            .expect_err("onset-json stems must be refused");
+        assert!(
+            error.to_string().contains("scalar WAV"),
+            "the refusal names the format it needs: {error}"
+        );
+        assert!(
+            !directory.path().join("bounce stems").exists(),
+            "the refusal writes no folder"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "vst", feature = "device-audio"))]
+mod plugin_render_tests {
+    use super::*;
+
+    const DRY: &str = "note('c3').s('sine')";
+
+    /// A session of `score` that serves its plugins through an empty sample
+    /// library, as a render asks the plugin host through its library.
+    fn plugin_session(score: &str) -> Session {
+        let mut session = Session::new().expect("session");
+        session.set_direct_diagnostic_logging(false);
+        let library = crate::samples::SampleLibrary::empty();
+        session.set_sample_library_for_test(Arc::new(library));
+        session.evaluate(score).expect("score");
+        session
+    }
+
+    /// The largest difference of 2 renders of one length.
+    fn largest_difference(one: &[f32], other: &[f32]) -> f32 {
+        assert_eq!(one.len(), other.len());
+        let differences = one
+            .iter()
+            .zip(other)
+            .map(|(one, other)| (one - other).abs());
+        differences.fold(0.0, f32::max)
+    }
+
+    /// The samples of a 32-bit float WAV.
+    fn f32_wav(path: &Path) -> Vec<f32> {
+        let bytes = std::fs::read(path).expect("the file");
+        let at = bytes
+            .windows(4)
+            .position(|word| word == b"data")
+            .expect("data");
+        let length = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().expect("length"));
+        let data = &bytes[at + 8..at + 8 + length as usize];
+        let samples = data.as_chunks::<4>().0.iter();
+        samples.map(|sample| f32::from_le_bytes(*sample)).collect()
+    }
+
+    /// The names of the files in `folder`, in order.
+    fn names(folder: &Path) -> Vec<String> {
+        let entries = std::fs::read_dir(folder).expect("the folder");
+        let mut names: Vec<String> = entries
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Sets the variable `name` of the fixture to `value`, or removes it.
+    fn fixture_variable(name: &str, value: Option<&str>) {
+        crate::vst::host().wait_idle();
+        // SAFETY: one fixture test runs at a time, and the plugin thread has
+        // no work. So no other thread reads the variable now.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    /// A render builds each plugin copy of its notes and reads its latency
+    /// before its first note, and each note starts early by the latency of
+    /// its chain. A note with a lead above the admission window of the
+    /// writer starts before the notes before it in the music. So a render
+    /// through a delay plugin equals its dry render, the reverb send too, a
+    /// stretched note at 0 s too, and each file of a stems export. A copy
+    /// that faults refuses its note, in a stems export and in memory. A
+    /// preset read during a render changes no note. A stems folder that
+    /// exists refuses the export before any build. A stop ends the builds,
+    /// and a finish before the first frame leaves no file.
+    #[test]
+    fn a_render_builds_its_plugin_copies_before_their_notes() {
+        let (_one, folder) = super::super::tests::fixture_plugins();
+        let host = crate::vst::host();
+        let running = || {
+            let plugins = host.plugins().into_iter();
+            let plugins = plugins.filter(|plugin| plugin.bundle.starts_with(folder.path()));
+            plugins.map(|plugin| plugin.running).sum::<usize>()
+        };
+        let delayed = |score: &str| format!("{score}.vst('rustel fixture', {{ delay: 0.25 }})");
+        for score in [
+            DRY.to_owned(),
+            format!("{DRY}.room(0.5)"),
+            format!("{DRY}.stretch(0)"),
+        ] {
+            let dry = plugin_session(&score).render_pcm(1.0).expect("dry render");
+            assert!(dry.iter().any(|sample| sample.abs() > 0.1), "{score}");
+            let wet = plugin_session(&delayed(&score)).render_pcm(1.0);
+            let wet = wet.expect("render");
+            assert!(largest_difference(&dry, &wet) <= 1e-6, "{score}");
+            host.wait_idle();
+            assert_eq!(running(), 0, "a copy runs after the render");
+        }
+
+        // A lane takes 2 presets in turn, with the gain 1 and 0.5 and the
+        // same delay. Each note has the level of its preset from its onset
+        // to the start of the next note, 1024 frames before its onset.
+        let presets = folder
+            .path()
+            .join("presets")
+            .join(rustel_vst3_fixture::NAME);
+        std::fs::create_dir_all(&presets).expect("the preset folder");
+        let half = presets.join("Half.vstpreset");
+        std::fs::write(
+            presets.join("Full.vstpreset"),
+            rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.25),
+        )
+        .expect("a preset");
+        std::fs::write(
+            &half,
+            rustel_vst3_fixture::preset_with_delay(0.5, 0.0, 0.25),
+        )
+        .expect("a preset");
+        host.set_preset_folders(Vec::new());
+        host.wait_idle();
+        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("render directory");
+        let take =
+            |score: &str,
+             name: &str,
+             observer: Option<&mut dyn FnMut(rustel_audio::RenderTick<'_>)>| {
+                let path = directory.path().join(name);
+                let mut session = plugin_session(score);
+                session
+                    .render_controlled(
+                        1.0,
+                        &path,
+                        RenderFormat::ScalarF32Wav,
+                        false,
+                        observer,
+                        None,
+                    )
+                    .expect("render");
+                f32_wav(&path)
+            };
+        let clipped = format!("{DRY}.clip(0.5)");
+        let lane =
+            |preset: &str| format!("{clipped}.vst('rustel fixture', {{ preset: '{preset}' }})");
+        let in_turn = format!("cat({}, {}).fast(20)", lane("Full"), lane("Half"));
+        let dry = take(
+            &format!("cat({clipped}, {clipped}).fast(20)"),
+            "dry.wav",
+            None,
+        );
+        let wet = take(&in_turn, "wet.wav", None);
+        assert!(dry.iter().any(|sample| sample.abs() > 0.1));
+        // A note each 0.1 s, 4800 frames.
+        for note in 0..10 {
+            let gain = if note % 2 == 0 { 1.0 } else { 0.5 };
+            let frames = note * 4800..(note + 1) * 4800 - 1024;
+            let samples = frames.start * 2..frames.end * 2;
+            let level = |at: usize| (wet[at] - gain * dry[at]).abs();
+            assert!(samples.clone().all(|at| level(at) <= 1e-6), "note {note}");
+        }
+        // A save of the second preset with a new length in a folder of the
+        // player, and a read of the preset folders, between 2 notes of the
+        // render. A new ask of the preset then gets the new file.
+        let moved = directory.path().join("moved");
+        std::fs::create_dir_all(&moved).expect("the folder of the player");
+        let mut read = false;
+        let mut save = |tick: rustel_audio::RenderTick<'_>| {
+            if !read && tick.frames_written >= 24_000 {
+                read = true;
+                std::fs::remove_file(&half).expect("the preset");
+                let saved = rustel_vst3_fixture::preset(0.25, 0.0);
+                std::fs::write(moved.join("Half.vstpreset"), saved).expect("a preset");
+                host.set_preset_folders(vec![moved.clone()]);
+                host.wait_idle();
+            }
+        };
+        let saved = take(&in_turn, "saved.wav", Some(&mut save));
+        assert!(read, "the read ran during the render");
+        assert!(largest_difference(&wet, &saved) <= 1e-6);
+        // A note whose lead passes the admission window of the writer
+        // comes before the notes of the music before it. The window is one
+        // scheduler lead and 256 frames, 5056 frames at 48 kHz. 2 stages of
+        // 4096 frames give a lead of 8192 frames, so the note at 0.02 s
+        // starts before the note at 0 s, and both play on their frames.
+        let late = "note('e3').s('sine').late(0.01)";
+        let stage = ".vst('rustel fixture', { delay: 1 })";
+        let dry = take(&format!("stack({DRY}, {late})"), "first-dry.wav", None);
+        let wet = take(
+            &format!("stack({DRY}, {late}{stage}{stage})"),
+            "first-wet.wav",
+            None,
+        );
+        assert!(largest_difference(&dry, &wet) <= 1e-6);
+        host.wait_idle();
+        assert_eq!(running(), 0, "a copy runs after the render");
+
+        // The stems of the render equal the stems of its dry render.
+        let stems = |score: &str, name: &str| {
+            let path = directory.path().join(name);
+            let mut session = plugin_session(score);
+            session.set_stems_export(true);
+            let report = session.render_controlled(
+                1.0,
+                &path,
+                RenderFormat::ScalarF32Wav,
+                false,
+                None,
+                None,
+            );
+            report.map(|_| rustel_audio::stems_folder(&path))
+        };
+        let dry = stems(DRY, "dry.wav").expect("dry stems");
+        let wet = stems(&delayed(DRY), "wet.wav").expect("stems");
+        assert_eq!(names(&dry), ["2.wav", "main.wav"]);
+        assert_eq!(names(&wet), names(&dry));
+        for name in names(&dry) {
+            let (dry, wet) = (f32_wav(&dry.join(&name)), f32_wav(&wet.join(&name)));
+            assert!(largest_difference(&dry, &wet) <= 1e-6, "{name}");
+        }
+        // A copy with no number in its output for 1 s of a note plays
+        // silence to the end, and refuses the note. Its counts refuse no
+        // note. The stems are written either way.
+        let faulted = format!("{DRY}.vst('rustel fixture', {{ fault: 1 }})");
+        let name = rustel_vst3_fixture::NAME;
+        let refusals = [format!(
+            "vst {name}: no number in the output for 1 s, so the stage plays silence to the end"
+        )];
+        let warnings = [
+            format!("vst {name}: a sample of the output was not a number and played as silence"),
+            format!("vst {name}: the plugin refused a block"),
+        ];
+        let path = directory.path().join("faulted.wav");
+        let mut session = plugin_session(&faulted);
+        session.set_stems_export(true);
+        let report = session
+            .render_controlled(2.0, &path, RenderFormat::ScalarF32Wav, false, None, None)
+            .expect("render");
+        assert_eq!(report.voices_refused, refusals);
+        assert_eq!(report.plugin_lines, warnings);
+        let folder = rustel_audio::stems_folder(&path);
+        assert!(folder.join("main.wav").exists(), "the stems are written");
+        // A bounce of a set to mp3 renders in memory, with the same lines.
+        #[cfg(feature = "mp3-export")]
+        {
+            let path = directory.path().join("faulted.mp3");
+            let report = plugin_session(&faulted)
+                .render_session(&[(0.0, faulted.as_str())], 0.0, Some(2.0), &path, true)
+                .expect("render");
+            assert_eq!(report.voices_refused, refusals);
+            assert_eq!(report.plugin_lines, warnings);
+        }
+        // A second stems export to the same target is refused before its
+        // plan: no copy starts, and the files of the first export stay.
+        let marks = directory.path().join("marks.txt");
+        fixture_variable(rustel_vst3_fixture::MODE_MARK_ENV, marks.to_str());
+        let refused = stems(&delayed(DRY), "wet.wav").expect_err("an existing stems folder");
+        assert!(refused.to_string().contains("already exists"), "{refused}");
+        host.wait_idle();
+        assert!(!marks.exists(), "a copy started");
+        assert!(wet.join("main.wav").exists() && wet.join("2.wav").exists());
+        // The plan parks the copy it builds for the first note, so a render
+        // with one copy builds it one time.
+        let plain = plugin_session(&format!("{DRY}.vst('rustel fixture')")).render_pcm(1.0);
+        plain.expect("render");
+        host.wait_idle();
+        let lines = std::fs::read_to_string(&marks).expect("the marks");
+        assert_eq!(lines.lines().collect::<Vec<_>>(), ["setup offline"]);
+        std::fs::remove_file(&marks).expect("the marks of the render");
+
+        // A stop during a build ends the render at once, and the build ends.
+        // Each setActive call of a copy takes 600 ms more.
+        fixture_variable(rustel_vst3_fixture::SLOW_ACTIVATE_ENV, Some("600"));
+        let stop_after = |session: &Session, when: Box<dyn Fn() -> bool + Send>| {
+            let transport = session.transport();
+            std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+                while !when() && start.elapsed() < Duration::from_secs(20) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                transport.stop();
+                std::time::Instant::now()
+            })
+        };
+        let soon = Duration::from_millis(300);
+        let mut session = plugin_session(&delayed(DRY));
+        let start = std::time::Instant::now();
+        let stopper = stop_after(
+            &session,
+            Box::new(move || start.elapsed() >= Duration::from_millis(100)),
+        );
+        let stopped = session.render_pcm(1.0);
+        let stop = stopper.join().expect("the stop");
+        assert!(
+            matches!(stopped, Err(RuntimeError::Cancelled)),
+            "{stopped:?}"
+        );
+        assert!(stop.elapsed() < soon, "the render waits for its build");
+        host.wait_idle();
+        assert_eq!(running(), 0, "a copy runs after the stop");
+        // A stop while the render provider builds the copy of a later key
+        // of a slot ends the render too: the plan built that copy for its
+        // read only. The saves keep the lane and change its preset.
+        let lane = |preset: &str| {
+            format!(
+                "lead: note(\"c3*4\").s('sine').vst('rustel fixture', {{ preset: '{preset}' }})"
+            )
+        };
+        std::fs::write(&half, rustel_vst3_fixture::preset(0.5, 0.0)).expect("a preset");
+        std::fs::write(
+            presets.join("Full.vstpreset"),
+            rustel_vst3_fixture::preset(1.0, 0.0),
+        )
+        .expect("a preset");
+        host.set_preset_folders(Vec::new());
+        host.wait_idle();
+        std::fs::remove_file(&marks).expect("the marks of the stop");
+        let watched = marks.clone();
+        let third_line = move || {
+            let lines = std::fs::read_to_string(&watched).unwrap_or_default();
+            lines.lines().count() >= 3
+        };
+        let mut session = plugin_session(&lane("Full"));
+        let stopper = stop_after(&session, Box::new(third_line));
+        let saves = [(0.0, lane("Full")), (1.0, lane("Half"))];
+        let out = directory.path().join("session.wav");
+        let stopped = session.render_session(&saves, 0.0, Some(2.0), &out, false);
+        let stop = stopper.join().expect("the stop");
+        assert!(
+            matches!(stopped, Err(RuntimeError::Cancelled)),
+            "{stopped:?}"
+        );
+        assert!(
+            stop.elapsed() < soon,
+            "the render waits for the build of its copy"
+        );
+        let lines = std::fs::read_to_string(&marks).expect("the marks");
+        assert_eq!(
+            lines.lines().take(3).collect::<Vec<_>>(),
+            ["setup offline"; 3]
+        );
+        host.wait_idle();
+        assert_eq!(running(), 0, "a copy runs after the stop");
+        fixture_variable(rustel_vst3_fixture::MODE_MARK_ENV, None);
+        // A finish before the first frame ends the export with no file.
+        let mut session = plugin_session(&delayed(DRY));
+        let finish = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&finish);
+        let finisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            std::time::Instant::now()
+        });
+        let target = directory.path().join("finished.wav");
+        let finished = session.render_controlled(
+            1.0,
+            &target,
+            RenderFormat::ScalarWav,
+            false,
+            None,
+            Some(finish),
+        );
+        let ended = finisher.join().expect("the finish");
+        let error = finished.expect_err("a finish before the first frame");
+        assert_eq!(error.to_string(), crate::render::RENDER_ENDED_BEFORE_AUDIO);
+        assert!(ended.elapsed() < soon, "the render waits for its build");
+        assert!(!target.exists());
+        fixture_variable(rustel_vst3_fixture::SLOW_ACTIVATE_ENV, None);
+        assert_eq!(running(), 0, "a copy runs after the finish");
     }
 }

@@ -218,7 +218,7 @@ fn native_event(event: &FixtureEvent, sample_rate: u32) -> OnsetEvent {
     .with_controls(OscillatorControls {
         kabel: None,
         limit: None,
-        live_controls: [0; 3],
+        live_controls: [0; 4],
         preview_epoch: 0,
         choke_only: false,
         piano: false,
@@ -310,6 +310,7 @@ fn native_event(event: &FixtureEvent, sample_rate: u32) -> OnsetEvent {
         insert_chain: None,
         effects: [None; rustel_audio::EFFECT_CHAIN],
         instrument: None,
+        lead: 0,
         lfos: [None; rustel_audio::MAX_VOICE_MODS],
         envs: [None; rustel_audio::MAX_VOICE_MODS],
         phaser: None,

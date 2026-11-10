@@ -27,20 +27,21 @@ fn event(sound: &str, unison: f64, detune: f64, spread: f64) -> OnsetEvent {
         json!({"s": "basique", "bank": "wt_digital", "note": 60,
             "unison": unison, "detune": detune, "spread": spread})
     };
-    resolve_voice_with_samples(&value, 1, 0.2, 0.0, 48_000, 1.0, &Wavetable).unwrap()
+    resolve_voice_with_samples(&value, 1, 0.2, 0.0, 48_000, 1.0, &Wavetable)
+        .expect("the voice resolves")
 }
 
 fn render(event: OnsetEvent) -> Vec<f32> {
-    let mut backend = ScalarBackend::prepared(48_000, 1).unwrap();
+    let mut backend = ScalarBackend::prepared(48_000, 1).expect("the backend prepares");
     let pcm = (0..2048)
         .map(|i| ((i as f32 / 2048.0) * std::f32::consts::TAU).sin())
         .collect();
     backend
         .install_sample(
             SampleId(9),
-            Box::new(DecodedSample::from_parts(48_000, 1, pcm).unwrap()),
+            Box::new(DecodedSample::from_parts(48_000, 1, pcm).expect("the sample builds")),
         )
-        .unwrap();
+        .expect("the sample installs");
     backend.note(event);
     let mut output = vec![0.0; 2048 * 2];
     backend.process_block(&mut output, 2048);

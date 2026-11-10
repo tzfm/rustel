@@ -118,7 +118,7 @@ impl App {
     }
 
     /// Hand one scene's text to the save worker.
-    pub(super) fn write_scene(&mut self, scene_id: SceneId, revision: Revision, source: Arc<str>) {
+    pub(super) fn write_scene(&mut self, scene_id: SceneId, source: Arc<str>) {
         let Some(scene) = self.scenes.get_mut(scene_id) else {
             return;
         };
@@ -131,7 +131,7 @@ impl App {
         let request_id = self.next_save_request_id;
         self.next_save_request_id = self.next_save_request_id.saturating_add(1);
         let path = scene.path.clone();
-        let request = SaveRequest::new(request_id, path.clone(), revision, source);
+        let request = SaveRequest::new(request_id, path.clone(), source);
         let pending = PendingSave {
             request_id,
             source_revision: request.source_revision.clone(),
@@ -157,12 +157,11 @@ impl App {
                 (
                     scene.id,
                     scene.prebake(),
-                    scene.editor.revision(),
                     Arc::<str>::from(scene.editor.source()),
                 )
             })
             .collect::<Vec<_>>();
-        for (id, prebake, revision, source) in dirty {
+        for (id, prebake, source) in dirty {
             match prebake {
                 // Kept where its scope keeps it, and checked on the way out
                 // so a broken setup says so now rather than at the next
@@ -171,7 +170,7 @@ impl App {
                     self.persist_prebake(scope, &source);
                     self.check_stored_prebake(scope);
                 }
-                None => self.write_scene(id, revision, source),
+                None => self.write_scene(id, source),
             }
         }
     }
@@ -226,7 +225,6 @@ impl App {
         let SaveResult {
             request_id,
             path,
-            editor_revision,
             source_revision,
             result,
         } = result;
@@ -277,26 +275,19 @@ impl App {
                 scene.saved_source_revision = source_revision;
                 scene.refresh_dirty();
                 self.clear_error(ErrorOwner::Save);
-                if still_pending {
-                    self.status = format!(
-                        "saved editor revision {}; a newer save is still pending…",
-                        editor_revision.0
-                    );
-                } else if wrote {
-                    self.set_notice(format!(
-                        "saved {}",
-                        status_file_path(&path, self.ui_settings.show_full_paths)
-                    ));
-                } else if self.status == "save failed - the editor buffer is unchanged" {
-                    // A skip stays quiet - playing a set you only opened says
-                    // nothing - but a failure left by an earlier save would
-                    // go stale here: the file came to hold this score since,
-                    // so the buffer is on disk and the line must not say
-                    // otherwise.
-                    self.set_notice(format!(
-                        "{} already holds this score",
-                        status_file_path(&path, self.ui_settings.show_full_paths)
-                    ));
+                // The write changed the file, so the panel's foot may hold
+                // fields that moved. Re-read it where the panel is open,
+                // keeping the row the reader has selected.
+                if wrote {
+                    let keep = self.set_panel_selection();
+                    self.refresh_set_panel(keep);
+                }
+                // A save that lands says nothing: a file that holds its
+                // score is the normal case. A failure an earlier save left
+                // on the line goes stale here, because the file came to hold
+                // the score since, so the line must not say otherwise.
+                if self.status.starts_with("save failed") {
+                    self.status.clear();
                 }
             }
             Err(error) => {
@@ -509,12 +500,11 @@ mod tests {
             );
         }
 
-        /// A save that finds the file already holding the score stays quiet -
-        /// unless the status still says the last save failed. The file came
-        /// to hold the buffer after that failure, so the failure line must
-        /// not outlive it.
+        /// A save that finds the file already holding the score clears the
+        /// failure line an earlier save left. The file came to hold the
+        /// buffer after that failure, so the line must not outlive it.
         #[test]
-        fn a_skip_replaces_a_stale_save_failure_line() {
+        fn a_skip_clears_a_stale_save_failure_line() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = app_over(directory.path());
             let scene_id = app.scenes.current().id;
@@ -522,9 +512,8 @@ mod tests {
 
             // A real write, so the completion can be matched to a pending
             // save and reaches the branches under test.
-            let revision = app.scenes.current().editor.revision();
             let source = Arc::<str>::from(app.scenes.current().editor.source());
-            app.write_scene(scene_id, revision, source);
+            app.write_scene(scene_id, source);
             let request_id = app
                 .scenes
                 .current()
@@ -539,18 +528,13 @@ mod tests {
             app.handle_save_result(SaveResult {
                 request_id,
                 path,
-                editor_revision: app.scenes.current().editor.revision(),
                 source_revision: "current".to_owned(),
                 result: Ok(false),
             });
 
-            assert_ne!(
-                app.status, "save failed - the editor buffer is unchanged",
-                "the skip must not leave a failure that no longer stands"
-            );
             assert!(
-                app.status.contains("already holds this score"),
-                "the line says where the score is: {}",
+                app.status.is_empty(),
+                "the skip clears a failure that no longer stands: {}",
                 app.status
             );
         }
@@ -569,9 +553,8 @@ mod tests {
             // A real write, so the scene carries a pending save the completion
             // can be matched to. Without one, `handle_save_result` cannot find
             // the scene at all and returns before reaching the mismatch at issue.
-            let revision = app.scenes.current().editor.revision();
             let source = Arc::<str>::from(app.scenes.current().editor.source());
-            app.write_scene(scene_id, revision, source);
+            app.write_scene(scene_id, source);
             let in_flight = app
                 .scenes
                 .current()
@@ -587,7 +570,6 @@ mod tests {
             app.handle_save_result(SaveResult {
                 request_id: in_flight,
                 path: stale.clone(),
-                editor_revision: app.scenes.current().editor.revision(),
                 source_revision: "stale".to_owned(),
                 result: Ok(true),
             });

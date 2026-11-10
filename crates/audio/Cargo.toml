@@ -48,6 +48,13 @@ audio_thread_priority = { version = "0.38", default-features = false, optional =
 # worker.
 libc = { version = "0.2", optional = true }
 
+# On Linux the dbus feature is what makes the real-time class real: rtkit
+# grants it over dbus, and without the backend every promotion call is a
+# silent no-op. The library is present wherever rtkit is; a machine
+# without it fails the probe and the threads stay ordinary, as before.
+[target.'cfg(target_os = "linux")'.dependencies]
+audio_thread_priority = { version = "0.38", default-features = false, optional = true, features = ["with_dbus"] }
+
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -59,3 +66,6 @@ audio_thread_priority = { version = "0.38", default-features = false }
 # The worker probe reads the core under each thread.
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Kernel"] }
+
+[lints]
+workspace = true

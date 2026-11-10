@@ -6,11 +6,9 @@ crates/runtime/tests/e2e/** text eol=lf
 # Some imported scores intentionally retain upstream trailing whitespace.
 crates/runtime/tests/e2e/scores/** whitespace=-trailing-space,-blank-at-eof
 
-# The studio's ASCII art is read with `include_bytes!` and measured against a
-# stride of WIDTH + 1, so the renderer can index a row without parsing one. A
-# checkout that rewrote these to CRLF adds a byte to every row: eighteen rows,
-# eighteen bytes, and `rustel-logo.txt` arrives 1368 long where the shape says
-# 1350. The picture is data, so its line endings are LF wherever it lands.
+# The built-in theme document is data, so its line endings are LF wherever
+# it lands. The ASCII art it once sat beside moved to rustel-studio-themes,
+# whose own attributes keep those files byte-exact.
 crates/studio/src/themes/** text eol=lf
 
 # The studio e2e suite compares its goldens as text; the comparison also
@@ -20,3 +18,11 @@ crates/studio-e2e/goldens/** text eol=lf
 # check-engine.sh compares the base engine profile's dependency snapshot with
 # cargo's output line for line, so the snapshot is LF wherever it lands.
 .github/scripts/engine-base-dependencies.txt text eol=lf
+
+# Release scripts execute in Bash and deployed installers must match byte for byte.
+.github/scripts/**/*.sh text eol=lf
+.github/scripts/*.sh text eol=lf
+rustelup/install text eol=lf
+rustelup/install.ps1 text eol=lf
+rustelup/rustelup text eol=lf
+rustelup/rustelup.ps1 text eol=lf

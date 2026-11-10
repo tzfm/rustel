@@ -85,11 +85,32 @@ impl App {
         };
         let kept = match kind {
             PanelKind::Set => {
-                let Some((_, picker)) = &mut self.set_prompt else {
-                    return false;
-                };
-                picker.paste_text(text);
-                true
+                // The prompt is the field while it has the keyboard;
+                // otherwise the search box is, standing or typing, and a
+                // paste lands in the query from either mode.
+                if self.set_prompt.is_none()
+                    && self
+                        .set_panel
+                        .as_ref()
+                        .is_some_and(|panel| panel.search.is_some())
+                {
+                    super::vim::enter_insert(self);
+                    let Some(panel) = self.set_panel.as_mut() else {
+                        return false;
+                    };
+                    let Some(search) = panel.search.as_mut() else {
+                        return false;
+                    };
+                    search.query.push_str(&single_line_paste(text));
+                    panel.refilter();
+                    true
+                } else {
+                    let Some((_, picker)) = &mut self.set_prompt else {
+                        return false;
+                    };
+                    picker.paste_text(text);
+                    true
+                }
             }
             PanelKind::Viz => return self.paste_viz_prompt(text),
             PanelKind::ThemeEditor => {

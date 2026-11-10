@@ -1124,7 +1124,8 @@ impl App {
             // themes are a fixed vocabulary.
             KeyCode::Char('n' | 'N') if primary => {
                 let current = self.theme.clone();
-                let from_built_in = Theme::built_in_names().any(|known| known == current.name);
+                let from_built_in = Theme::built_in_names().any(|known| known == current.name)
+                    && !super::super::theme::user_theme_exists(&current.name);
                 self.open_theme_editor(&current, String::new(), from_built_in);
                 return true;
             }
@@ -1145,7 +1146,8 @@ impl App {
                         // The ROW is the identity: a file is a user theme
                         // whatever its inner name field claims (older saves
                         // wrote the base theme's name in there).
-                        let built_in = Theme::built_in_names().any(|known| known == name);
+                        let built_in = Theme::built_in_names().any(|known| known == name)
+                            && !super::super::theme::user_theme_exists(&name);
                         if !built_in {
                             theme.name = name.clone();
                         }
@@ -1157,14 +1159,16 @@ impl App {
                 return true;
             }
             // Deleting asks twice: the first d names what would go, the
-            // second lets it. A theme the studio ships has no file behind
-            // its name, so the first d says that and never arms: only a
+            // second lets it. A name only the studio ships has no file
+            // behind it, so the first d says that and never arms: only a
             // theme of the player's own is a file there is to remove.
             KeyCode::Char('d' | 'D') if primary => {
                 let Some(name) = picker.selected_name().map(str::to_owned) else {
                     return true;
                 };
-                if Theme::built_in_names().any(|known| known == name) {
+                if Theme::built_in_names().any(|known| known == name)
+                    && !super::super::theme::user_theme_exists(&name)
+                {
                     picker.deleting = None;
                     self.status =
                         format!("theme {name} ships with the studio and cannot be deleted");
@@ -1291,6 +1295,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             let names = crate::theme::Theme::available_names();
+            #[cfg(feature = "themes")]
             for required in ["forest", "rustel-live"] {
                 assert!(names.iter().any(|name| name == required));
                 crate::theme::Theme::resolve(Some(required)).expect("bundled theme");
@@ -1442,24 +1447,29 @@ mod tests {
             let directory = tempfile::tempdir().expect("temp dir");
             let mut app = app_over(directory.path());
             app.toggle_theme_picker();
-            for character in "snow".chars() {
-                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
-            }
-            let picker = app.theme_picker.as_ref().expect("picker open");
-            assert_eq!(picker.query, "snow");
-            assert_eq!(picker.match_count(), 1);
-            assert_eq!(picker.selected_name(), Some("snow"));
-            // Typing waits for the settle, like the arrows; settled, it previews
-            // the only match.
-            app.theme_apply_due = None;
-            app.preview_theme();
-            assert_eq!(app.theme.name, "snow", "typing previews the only match");
+            // `snow` is one document in the theme pack. A build without the
+            // pack still has the filter, and the arrows below exercise it.
+            #[cfg(feature = "themes")]
+            {
+                for character in "snow".chars() {
+                    press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+                }
+                let picker = app.theme_picker.as_ref().expect("picker open");
+                assert_eq!(picker.query, "snow");
+                assert_eq!(picker.match_count(), 1);
+                assert_eq!(picker.selected_name(), Some("snow"));
+                // Typing waits for the settle, like the arrows; settled, it previews
+                // the only match.
+                app.theme_apply_due = None;
+                app.preview_theme();
+                assert_eq!(app.theme.name, "snow", "typing previews the only match");
 
-            for _ in 0..4 {
-                press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+                for _ in 0..4 {
+                    press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+                }
+                app.theme_apply_due = None;
+                app.preview_theme();
             }
-            app.theme_apply_due = None;
-            app.preview_theme();
 
             // ↑/↓ walk the list.
             let before = app.theme.name.clone();
@@ -1492,8 +1502,14 @@ mod tests {
                 .position(|name| name == crate::theme::RANDOMIZE_THEME)
                 .expect("the randomize row is in the list");
             let at = app.theme_picker.as_ref().expect("picker").selected;
-            for _ in at..chance {
-                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            if at <= chance {
+                for _ in at..chance {
+                    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+                }
+            } else {
+                for _ in chance..at {
+                    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+                }
             }
             assert!(app.theme_picker.as_ref().expect("picker").on_randomize());
             assert!(!app.theme_picker.as_ref().expect("picker").rolled);
@@ -1627,6 +1643,108 @@ mod tests {
             );
         }
 
+        /// In Vim the Esc that leaves Insert calls a pending theme delete
+        /// off, as any other key does. The next Ctrl+D asks again.
+        #[test]
+        fn the_esc_that_leaves_vim_insert_calls_a_theme_delete_off() {
+            let _theme_dir = THEME_DIR_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let directory = tempfile::tempdir().expect("temp dir");
+            let themes = directory.path().join("themes");
+            std::fs::create_dir_all(&themes).expect("theme directory");
+            std::fs::write(themes.join("a-yours.json"), "{}").expect("theme file");
+            let _scoped = ScopedThemeDir::set(&themes);
+            let mut app = app_over(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.toggle_theme_picker();
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            type_text(&mut app, "a-yours");
+            assert_eq!(
+                app.theme_picker
+                    .as_ref()
+                    .expect("picker open")
+                    .selected_name(),
+                Some("a-yours")
+            );
+
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(app.status.contains("again"), "asks first: {}", app.status);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            let picker = app.theme_picker.as_ref().expect("picker open");
+            assert!(!picker.vim_insert(), "Esc left Insert");
+            assert_eq!(picker.deleting, None, "Esc called the delete off");
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(
+                themes.join("a-yours.json").is_file(),
+                "the file stays after a fresh Ctrl+D"
+            );
+            assert!(app.status.contains("again"), "asks again: {}", app.status);
+        }
+
+        /// A theme of the player's own saved under a name the studio ships
+        /// too stays theirs: the editor opens it under its name, a new
+        /// theme from it is no built-in's variation, and the modified d
+        /// deletes the file. Without the file the name is the shipped
+        /// theme's again.
+        #[cfg(feature = "themes")]
+        #[test]
+        fn a_user_theme_under_a_shipped_name_is_edited_and_deleted_as_its_own() {
+            let _theme_dir = THEME_DIR_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let directory = tempfile::tempdir().expect("temp dir");
+            let themes = directory.path().join("themes");
+            std::fs::create_dir_all(&themes).expect("theme directory");
+            let mine = themes.join("terminal.json");
+            // A save names the file and the theme inside it alike.
+            let mut theme = Theme::built_in_default();
+            theme.name = "terminal".into();
+            std::fs::write(&mine, theme.to_json()).expect("theme file");
+            let _scoped = ScopedThemeDir::set(&themes);
+            let mut app = app_over(directory.path());
+            app.toggle_theme_picker();
+            for character in "terminal".chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            assert_eq!(
+                app.theme_picker
+                    .as_ref()
+                    .expect("picker open")
+                    .selected_name(),
+                Some("terminal")
+            );
+            // The selection settles, as the event loop lets it.
+            app.preview_theme();
+
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+            let editor = app.theme_editor.as_ref().expect("editor open");
+            assert!(!editor.from_built_in, "the file is the player's");
+            assert_eq!(editor.name, "terminal", "a save keeps its name");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            assert!(
+                !app.theme_editor
+                    .as_ref()
+                    .expect("editor open")
+                    .from_built_in,
+                "a new theme from the player's file is not a built-in's variation"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(app.status.contains("again"), "asks first: {}", app.status);
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(!mine.is_file(), "the file is gone");
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(
+                app.status.contains("cannot be deleted"),
+                "the shipped theme is left: {}",
+                app.status
+            );
+        }
+
         /// Hand the sketch to the worker the way the event loop does.
         ///
         /// `sync_theme_sketch` sends over the shared two-slot command queue and
@@ -1634,7 +1752,7 @@ mod tests {
         /// send is a beat late rather than lost. A test that asserts on what was
         /// sent has to pump too, or it is asserting on the worker thread's
         /// scheduling.
-        #[cfg(feature = "hydra")]
+        #[cfg(all(feature = "hydra", feature = "themes"))]
         fn settle_theme_sketch(app: &mut App) {
             for _ in 0..400 {
                 app.sync_theme_sketch();
@@ -1681,7 +1799,7 @@ mod tests {
             assert_eq!(app.focus, Focus::Panel(PanelKind::ThemeEditor));
         }
 
-        #[cfg(feature = "hydra")]
+        #[cfg(all(feature = "hydra", feature = "themes"))]
         #[test]
         fn keyboard_and_mouse_theme_previews_never_confirm_camera_acquisition() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -1776,6 +1894,7 @@ mod tests {
             ));
         }
 
+        #[cfg(feature = "themes")]
         #[test]
         fn keyboard_theme_browsing_applies_only_the_last_row() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -1926,7 +2045,7 @@ mod tests {
 
         /// Keeping a camera theme says what to expect: the picture in a moment,
         /// or the setting that stands in its way.
-        #[cfg(feature = "hydra")]
+        #[cfg(all(feature = "hydra", feature = "themes"))]
         #[test]
         fn keeping_a_camera_theme_says_what_stands_between_the_reader_and_it() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -1975,17 +2094,20 @@ mod tests {
                 .expect("mouse");
             };
             // The picker opens on the theme in use, wherever that is in the list.
-            let start = app.theme_picker.as_ref().expect("picker").selected;
+            // A short list wraps, so the steps are counted modulo its length.
+            let picker = app.theme_picker.as_ref().expect("picker");
+            let start = picker.selected;
+            let count = picker.match_count();
             wheel(&mut app, MouseEventKind::ScrollDown);
             wheel(&mut app, MouseEventKind::ScrollDown);
             assert_eq!(
                 app.theme_picker.as_ref().expect("picker").selected,
-                start + 2
+                (start + 2) % count
             );
             wheel(&mut app, MouseEventKind::ScrollUp);
             assert_eq!(
                 app.theme_picker.as_ref().expect("picker").selected,
-                start + 1
+                (start + 1) % count
             );
             assert!(app.status.starts_with("theme - "), "{}", app.status);
         }
@@ -2175,7 +2297,14 @@ mod tests {
 
             // Selecting a calibrated preset explicitly replaces even manually
             // claimed settings; a restart alone, above, still preserves them.
-            for name in ["rustel-drift", "unicorn", "smoke", "randomize"] {
+            // Randomize is in every build, the calibrated pack presets in
+            // one with the theme pack.
+            let presets: &[&str] = if cfg!(feature = "themes") {
+                &["rustel-drift", "unicorn", "smoke", "randomize"]
+            } else {
+                &["randomize"]
+            };
+            for &name in presets {
                 app.ui_settings.backdrop_opacity = 0;
                 app.ui_settings.interface_opacity = 100;
                 app.ui_settings.editor_opacity = 100;

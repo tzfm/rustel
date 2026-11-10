@@ -10,11 +10,18 @@ description = "The terminal studio behind `rustel studio`: editor, visuals, mixe
 [features]
 # The complete studio. `--no-default-features` keeps the editor and live
 # playback; each feature below adds one capability back and turns on the
-# runtime feature of the same name.
-default = ["extensions", "gamepad", "hydra", "osc", "serial", "remote-control", "vst"]
+# runtime feature of the same name when the runtime has one.
+default = ["extensions", "gamepad", "hydra", "video", "osc", "serial", "remote-control", "vst", "themes"]
 extensions = ["dep:rustel-ext", "rustel-runtime/extensions"]
 gamepad = ["rustel-runtime/gamepad"]
-hydra = ["dep:rustel-hydra", "rustel-runtime/hydra"]
+hydra = ["dep:rustel-hydra", "rustel-runtime/hydra", "rustel-studio-themes/hydra"]
+# Theme documents beyond `rustel-dark`. On in an ordinary build.
+# The engines compile either way, so a user theme can still name one.
+themes = ["rustel-studio-themes/pack"]
+# The picture half of a video sample: the painters, the dock's video
+# widget, and the detached desktop window it opens. `winit` and
+# `softbuffer` are the window itself, pure Rust, no GPU stack.
+video = ["rustel-runtime/video", "dep:winit", "dep:softbuffer"]
 osc = ["dep:rustel-osc", "rustel-runtime/osc"]
 serial = ["dep:rustel-serial", "rustel-runtime/serial"]
 vst = ["rustel-runtime/vst"]
@@ -39,7 +46,8 @@ rustel-runtime = { path = "../runtime", default-features = false, features = [
 rustel-audio = { path = "../audio" }
 rustel-core = { path = "../core" }
 rustel-ext = { path = "../ext", optional = true }
-rustel-hydra = { path = "../hydra", optional = true }
+rustel-hydra = { git = "https://github.com/tzfm/rustel-hydra.git", tag = "v0.2.3", optional = true }
+rustel-studio-themes = { git = "https://github.com/tzfm/rustel-studio-themes.git", tag = "v0.2.0", default-features = false }
 rustel-jsruntime = { path = "../jsruntime", default-features = false }
 rustel-midi = { path = "../midi" }
 rustel-osc = { path = "../osc", optional = true }
@@ -55,6 +63,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
 getrandom = { version = "0.4", optional = true }
 url = "2.5.8"
+# The detached video window's surface: winit opens the desktop window and
+# softbuffer presents the frame, both pure Rust and neither a GPU stack.
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
 # The terminal studio is intentionally a Rust-only surface. Ratatui shares the
 # exact Crossterm 0.29 event types used for enhanced-keyboard negotiation.
 arboard = { version = "3.6", default-features = false }
@@ -67,11 +79,6 @@ miniz_oxide = "0.8"
 ratatui = { version = "0.30", default-features = false, features = [
   "crossterm_0_29",
   "underline-color",
-] }
-# Native, cell-precise theme effects. The DSL is intentionally omitted:
-# theme files select a bounded Rustel preset rather than executing code.
-tachyonfx = { version = "=0.25.1", default-features = false, features = [
-  "std",
 ] }
 ropey = "1.6"
 regex = "1"
@@ -113,3 +120,6 @@ rustel-audio = { path = "../audio", features = ["test-support"] }
 rustel-fraction = { path = "../fraction" }
 rustel-vst3-fixture = { path = "../vst3-fixture" }
 rustel-mini = { path = "../mini" }
+
+[lints]
+workspace = true

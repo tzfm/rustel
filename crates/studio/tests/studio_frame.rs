@@ -55,6 +55,7 @@ fn a_complete_frame_draws_every_surface_in_solid_blocks() {
                 None
             },
             gain: Some(1.0),
+            sample: None,
             // The inline roll is the layout's first widget, slot 0; the
             // engine tags every event of its pattern with that bit.
             ui_visuals: 1,
@@ -138,6 +139,8 @@ fn a_complete_frame_draws_every_surface_in_solid_blocks() {
             view::render(
                 frame,
                 StudioView {
+                    #[cfg(feature = "video")]
+                    video_windows: Vec::new(),
                     show_scrollbars: true,
                     prebake_rows: Default::default(),
                     keybind_rows: Vec::new(),
@@ -481,6 +484,8 @@ fn a_sheet_paints_over_a_visuals_dock() {
             view::render(
                 frame,
                 StudioView {
+                    #[cfg(feature = "video")]
+                    video_windows: Vec::new(),
                     show_scrollbars: true,
                     prebake_rows: Default::default(),
                     keybind_rows: Vec::new(),
@@ -538,7 +543,10 @@ fn a_sheet_paints_over_a_visuals_dock() {
                     memory: None,
                     lanes: None,
                     log_memory: None,
-                    export: Some(&sheet),
+                    export: Some(view::ExportView {
+                        sheet: &sheet,
+                        glance: None,
+                    }),
                     theme_picker: None,
                     set_panel: None,
                     set_prompt: None,
