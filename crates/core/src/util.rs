@@ -48,7 +48,7 @@ fn tokenize_note_impl(note: &str, signed_octave: bool) -> Option<NoteToken> {
     }
     let mut accidentals = String::new();
     while matches!(chars.peek(), Some('#' | 'b' | 's' | 'f')) {
-        accidentals.push(chars.next().unwrap());
+        accidentals.push(chars.next().expect("the iterator yields the element"));
     }
     let rest: String = chars.collect();
     let octave = if rest.is_empty() {

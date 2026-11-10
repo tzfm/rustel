@@ -13,6 +13,8 @@ use unicode_width::UnicodeWidthStr;
 use super::super::graphics;
 use super::super::theme::Theme;
 use super::super::visuals::VisualState;
+#[cfg(feature = "video")]
+use super::VideoView;
 use super::{
     ArtView, EventsView, Look, ScopeView, SpectrumView, VectorView, VizPanel, WidgetKind,
     WidgetSpec,
@@ -64,8 +66,11 @@ pub struct VizDockView<'a> {
     pub focused: bool,
     /// What the mixer widget draws, when a dock has one.
     pub mixer: Option<&'a super::MixerFacts>,
+    /// The clips playing in detached video windows: a video widget folds
+    /// to a note while its clip plays elsewhere.
+    #[cfg(feature = "video")]
+    pub windows: &'a [String],
 }
-
 impl VizDockView<'_> {
     /// One widget drawn whole into a scratch buffer of its slot's size:
     /// its header on the first row while the dock has the keyboard, its
@@ -151,6 +156,26 @@ impl VizDockView<'_> {
                 memory,
             }
             .render(widget_area, &mut scratch),
+            #[cfg(feature = "video")]
+            WidgetKind::Video => VideoView {
+                state: self.state,
+                feed: spec.feed.as_deref(),
+                windows: self.windows,
+                theme: self.theme,
+            }
+            .render(widget_area, &mut scratch),
+            #[cfg(not(feature = "video"))]
+            WidgetKind::Video => {
+                // The widget itself is ordinary preferences; its picture
+                // is what the feature carries.
+                scratch.set_stringn(
+                    widget_area.x,
+                    widget_area.y,
+                    "the video picture needs a build with the video feature",
+                    usize::from(widget_area.width),
+                    Style::default().fg(self.theme.muted),
+                );
+            }
             WidgetKind::Events => EventsView {
                 state: self.state,
                 theme,
@@ -199,6 +224,25 @@ impl VizDockView<'_> {
         }
         items.extend(if self.widgets.is_empty() {
             ["a adds a widget", "e moves", "+/- size", "Esc"].as_slice()
+        } else if self
+            .widgets
+            .get(self.panel.selected)
+            .is_some_and(|spec| spec.kind == WidgetKind::Video)
+        {
+            // The video widget's arrows pick its clip, and its Enter is
+            // the desktop window.
+            [
+                "Tab picks",
+                "↑/↓ kind",
+                "←/→ feed",
+                "Enter window",
+                "a adds",
+                "Delete removes",
+                "e moves",
+                "+/- size",
+                "Esc",
+            ]
+            .as_slice()
         } else {
             [
                 "Tab picks",
@@ -488,6 +532,8 @@ mod tests {
                 ..VizPanel::default()
             };
             let view = VizDockView {
+                #[cfg(feature = "video")]
+                windows: &[],
                 panel: &panel,
                 index: 0,
                 widgets: &widgets,
@@ -593,6 +639,8 @@ mod tests {
         assert_eq!(stack[1].0, 2, "the next widget remains reachable");
         let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 30));
         VizDockView {
+            #[cfg(feature = "video")]
+            windows: &[],
             panel: &panel,
             index: 0,
             widgets: &widgets,
@@ -629,6 +677,8 @@ mod tests {
             Some(1)
         );
         VizDockView {
+            #[cfg(feature = "video")]
+            windows: &[],
             panel: &panel,
             index: 0,
             widgets: &widgets,
@@ -651,6 +701,8 @@ mod tests {
             None
         );
         VizDockView {
+            #[cfg(feature = "video")]
+            windows: &[],
             panel: &panel,
             index: 0,
             widgets: &widgets,

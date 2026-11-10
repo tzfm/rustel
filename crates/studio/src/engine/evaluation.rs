@@ -23,7 +23,22 @@ impl StudioEngine {
         // installs nothing. A flag that stays set would rewind the next
         // unrelated save, so a failed evaluation clears it below.
         self.sync_polyphony();
+        // The evaluation and the producer turns share this thread, so a slow
+        // compile drains the scheduled ring. Time it only while playing: a
+        // stopped engine has no ring to drain.
+        let was_live = self.live.is_some();
+        if was_live {
+            self.match_replacement_headroom_to_producer();
+        }
+        let started = std::time::Instant::now();
         let result = self.evaluate_guarded_inner(source, mini, cancelled);
+        // Only an evaluation that installed prices the next one. A start
+        // times its own evaluation, without the open of its output: see
+        // [`Self::start_on`].
+        if was_live && result.is_ok() {
+            self.last_live_evaluation = started.elapsed();
+            self.follow_horizon_to_evaluation(self.last_live_evaluation);
+        }
         self.sync_recovered_session();
         self.sync_polyphony();
         if result.is_ok() {
@@ -35,8 +50,51 @@ impl StudioEngine {
             self.session.clear_next_from_zero();
         }
         // Taken by the install; one that never ran leaves it for nobody.
-        self.next_install_preview = false;
+        // The document stays for the next install.
+        self.next_install.preview = false;
         result
+    }
+
+    /// Raise the session horizon when an evaluation of the playing score ran
+    /// close to the audio scheduled ahead of the clock. See
+    /// [`horizon_for_evaluation`] for the window it keeps. A faster
+    /// evaluation lowers it halfway to what it needs, so one slow edit does
+    /// not keep a long horizon for the life of the engine.
+    fn follow_horizon_to_evaluation(&mut self, evaluation: std::time::Duration) {
+        let needed = horizon_for_evaluation(evaluation);
+        let horizon = needed.max((self.live_horizon + needed) / 2.0);
+        if horizon != self.live_horizon {
+            self.live_horizon = horizon;
+            self.session.set_horizon(horizon);
+        }
+    }
+
+    /// Put the producer's measured turn time under a replacement's takeover
+    /// headroom. The default pricing answers an edit in 80 ms, which a
+    /// machine whose producer turns take longer cannot meet: the first
+    /// window publishes after its takeover and the edit rolls back. One
+    /// measured turn plus the default response time keeps the window open as
+    /// long as the machine needs, and no longer.
+    ///
+    /// Until the producer has measured a cutover of its own, the last
+    /// evaluation stands in for one: an evaluation and a first window cost
+    /// the same machine the same order of work, and the probe that prices
+    /// the takeover covers the query but not the conversion of the voices
+    /// the window installs. A first save on a slow machine bounced once and
+    /// landed on the retry before this; with the evaluation in the floor it
+    /// lands the first time.
+    fn match_replacement_headroom_to_producer(&mut self) {
+        let Some(playback) = self.live.as_ref() else {
+            return;
+        };
+        let floor = playback
+            .producer
+            .observed_turn_high_water()
+            .map(|turn| turn + LIVE_REPLACEMENT_MIN_HEADROOM)
+            .unwrap_or(Duration::ZERO)
+            .max(self.last_live_evaluation + LIVE_REPLACEMENT_MIN_HEADROOM)
+            .min(Duration::from_secs_f64(MAX_LIVE_HORIZON));
+        self.session.set_replacement_headroom_floor(floor);
     }
 
     fn evaluate_guarded_inner(
@@ -62,6 +120,10 @@ impl StudioEngine {
         if cancelled() {
             return Err(RuntimeError::Cancelled);
         }
+        // The edit comes before the copies a close sent home: the start goes
+        // on, and the edit plays as in the async mode.
+        #[cfg(feature = "vst")]
+        self.end_start_returning();
         if self.start_is_held() {
             return self.replace_held_start(source, mini);
         }
@@ -126,13 +188,13 @@ impl StudioEngine {
     /// producer publishes the cutover transactionally. `None` when the
     /// session holds the edit for its plugin copies: see
     /// [`rustel_runtime::Session::reload_live`]. Nothing installs then, and
-    /// the preview mark stays for the next install.
+    /// the install mark stays for the next install.
     pub(super) fn reload_live(
         &mut self,
         source: &str,
         mini: bool,
     ) -> Result<Option<StudioInstall>, RuntimeError> {
-        let preview = std::mem::take(&mut self.next_install_preview);
+        let mark = self.next_install.take();
         self.ensure_input();
         // A reload evaluates the score's own tempo; when an outside clock is
         // followed the next tick puts it straight back, not a fifth of a
@@ -157,13 +219,14 @@ impl StudioEngine {
             #[cfg(feature = "vst")]
             let generation_after = {
                 self.session.set_plugin_wait(waits);
+                self.session.set_plugin_document(mark.document);
                 let reloaded =
                     self.session
                         .reload_live(source, mini, transport.stopped_flag(), clock)?;
                 match reloaded {
                     rustel_runtime::LiveReload::Installed(generation) => generation,
                     rustel_runtime::LiveReload::Waiting => {
-                        self.next_install_preview = preview;
+                        self.next_install = mark;
                         return Ok(None);
                     }
                 }
@@ -188,7 +251,7 @@ impl StudioEngine {
         // running after the audition finishes.
         live.audition_owned = false;
         self.warm_source(source, LIVE_RELOAD_SAMPLE_WARM_BUDGET)?;
-        self.note_install_for_played(generation_after, preview, source);
+        self.note_install_for_played(generation_after, mark.preview, source);
         self.follow_edit(source, mini);
         // The room has been replaced by `source`, whatever the launch or edit
         // that asked for it: a fired rewind remembered for the grace no
@@ -205,11 +268,12 @@ impl StudioEngine {
 
     /// Prepares the plugin copies of a text that plays later: see
     /// [`rustel_runtime::Session::prepare_reload`]. The text plays from
-    /// `from_cycle`. In the wait mode the session holds the text while a
-    /// copy is not ready. In the async mode the builds start, and nothing
-    /// waits. The shield keeps the score in play sounding through the
-    /// evaluation. A text that fails here fails again when it plays, and
-    /// says so then.
+    /// `from_cycle`, and is of `document`: see
+    /// [`Self::mark_next_install_document`]. In the wait mode the session
+    /// holds the text while a copy is not ready. In the async mode the
+    /// builds start, and nothing waits. The shield keeps the score in play
+    /// sounding through the evaluation. A text that fails here fails again
+    /// when it plays, and says so then.
     ///
     /// The call prepares nothing for a session with no plugins on its
     /// output, or for a text with no `vst` in a session where no evaluation
@@ -225,11 +289,9 @@ impl StudioEngine {
         source: &str,
         mini: bool,
         from_cycle: f64,
+        document: u64,
     ) -> Option<bool> {
-        if mini
-            || !self.session.plugins_live()
-            || !(source.contains("vst") || self.session.ran_plugin_calls())
-        {
+        if !self.plays_plugins(source, mini) {
             return Some(false);
         }
         // A new score that waits for its first window publishes it before
@@ -243,6 +305,7 @@ impl StudioEngine {
             return Some(false);
         }
         self.session.set_plugin_wait(self.waits_for_sounds());
+        self.session.set_plugin_document(document);
         let live = self.live.as_ref().expect("checked live playback");
         let transport = self.session.transport();
         let _ =
@@ -251,6 +314,17 @@ impl StudioEngine {
                     live.device.clock_seconds()
                 });
         Some(true)
+    }
+
+    /// True for a text that asks the plugin host: a text that is not `mini`,
+    /// on an output with plugins, with `vst` in the text or in a session
+    /// where an evaluation ran a plugin call. A set with no plugin asks the
+    /// plugin host nothing for its texts.
+    #[cfg(feature = "vst")]
+    pub(super) fn plays_plugins(&self, source: &str, mini: bool) -> bool {
+        !mini
+            && self.session.plugins_live()
+            && (source.contains("vst") || self.session.ran_plugin_calls())
     }
 
     /// Prepares the plugin copies of the armed launch, in each mode: see
@@ -275,7 +349,8 @@ impl StudioEngine {
         } else {
             pending.boundary_cycle
         };
-        let Some(ran) = self.prepare_live(&source, mini, from_cycle) else {
+        let document = pending.mark.document;
+        let Some(ran) = self.prepare_live(&source, mini, from_cycle, document) else {
             return;
         };
         if let Some(pending) = self.pending_launch.as_mut() {
@@ -333,13 +408,9 @@ impl StudioEngine {
                     reverbs.observe_prepared(device, &event);
                     let pushed = device.push(event.clone());
                     if pushed {
-                        played.note(&event, device.render_frontier_frames());
-                        shield_audio.push(UiAcceptedOnset {
-                            generation: event.generation,
-                            onset_id: event.onset_id,
-                            frequency_hz: Some(event.freq_hz),
-                            gain: Some(event.gain),
-                        });
+                        let frontier = device.render_frontier_frames();
+                        played.note(&event, frontier, device.restart_lead());
+                        shield_audio.push(UiAcceptedOnset::scalar(&event));
                     }
                     pushed
                 },
@@ -455,7 +526,8 @@ impl StudioEngine {
         mini: bool,
         was_piano_output: bool,
     ) -> Result<StudioInstall, RuntimeError> {
-        let preview = std::mem::take(&mut self.next_install_preview);
+        let started = Instant::now();
+        let mark = self.next_install.take();
         // Log what opened, once: the host, the device and the buffer
         // size. It is a log note, so it does not take the status line
         // from the install that follows ("playing from the top").
@@ -469,6 +541,8 @@ impl StudioEngine {
             .set_continuity_margin(device.continuity_margin_seconds());
 
         let transport = self.session.transport();
+        #[cfg(feature = "vst")]
+        self.session.set_plugin_document(mark.document);
         let evaluation = self.session.reload_at_cancellable(
             source,
             mini,
@@ -490,7 +564,7 @@ impl StudioEngine {
 
         if let Err(error) = self
             .warm_source(source, STARTUP_SAMPLE_WARM_BUDGET)
-            .and_then(|_| self.follow_start(source))
+            .and_then(|_| self.follow_start(source, mini))
         {
             transport.stop();
             self.restore_failed_start_device(device, was_piano_output);
@@ -550,6 +624,12 @@ impl StudioEngine {
         self.piano_has_score_tail = false;
         self.piano_tail_silent_since = None;
         self.stopped_device_time = None;
+        // The output plays now, and gives back each copy its chains do not
+        // name.
+        #[cfg(feature = "vst")]
+        {
+            self.closed_plugin_copies = false;
+        }
         // The install below starts the performer's score, unless it is a
         // preview's.
         self.awaiting_score = true;
@@ -573,7 +653,9 @@ impl StudioEngine {
             audition_owned: false,
         });
 
-        self.note_install_for_played(generation, preview, source);
+        self.note_install_for_played(generation, mark.preview, source);
+        // The first save of the set prices its takeover from this start.
+        self.last_live_evaluation = started.elapsed();
 
         Ok(StudioInstall {
             generation,
@@ -675,10 +757,17 @@ impl StudioEngine {
 
     /// Open the output on silence, for a preview or a take while nothing
     /// plays. Silence is no score of the performer's, so what the last one
-    /// sounded stays kept for it.
+    /// sounded stays kept for it. It is of no scene either: it installs in
+    /// [`rustel_runtime::PREVIEW_DOCUMENT`], and the document mark stays.
     pub(super) fn start_silence(&mut self) -> Result<(), RuntimeError> {
-        self.next_install_preview = true;
-        self.evaluate_and_start("silence", false).map(drop)
+        let document = self.next_install.document;
+        self.next_install = InstallMark {
+            preview: true,
+            document: rustel_runtime::PREVIEW_DOCUMENT,
+        };
+        let started = self.evaluate_and_start("silence", false).map(drop);
+        self.next_install.document = document;
+        started
     }
 
     /// Say whether the score handed over next is a snippet previewed under
@@ -686,7 +775,18 @@ impl StudioEngine {
     /// [`Self::played_before_preview`]. The worker says it with every
     /// evaluation, the way it plants a rewind.
     pub fn mark_next_install_preview(&mut self, preview: bool) {
-        self.next_install_preview = preview;
+        self.next_install.preview = preview;
+    }
+
+    /// Say the document of the score handed over next: the scene id of its
+    /// tab, or [`rustel_runtime::PREVIEW_DOCUMENT`] for a snippet heard
+    /// alone. The session keeps the plugin copies of each open scene that
+    /// does not play: see [`rustel_runtime::Session::set_plugin_document`].
+    /// The worker says it with every evaluation. The mark stays until the
+    /// next mark, so an install with no mark of its own is of the document
+    /// before.
+    pub fn mark_next_install_document(&mut self, document: u64) {
+        self.next_install.document = document;
     }
 
     pub(super) fn restore_failed_start_device(
@@ -731,6 +831,25 @@ mod tests {
         use super::*;
         use rustel_runtime::SessionPanicPoint;
 
+        #[test]
+        fn a_slow_evaluation_widens_the_horizon_it_drew_down() {
+            assert_eq!(
+                horizon_for_evaluation(Duration::from_millis(50)),
+                DEFAULT_HORIZON,
+                "a fast compile keeps the default horizon"
+            );
+            assert_eq!(
+                horizon_for_evaluation(Duration::from_millis(600)),
+                1.3,
+                "twice the compile plus a tenth"
+            );
+            assert_eq!(
+                horizon_for_evaluation(Duration::from_secs(30)),
+                MAX_LIVE_HORIZON,
+                "and never past the cap"
+            );
+        }
+
         const GOOD: &str = "note('c3').s('sine').fast(8)";
         const CANDIDATE: &str = "note('g4').s('triangle').fast(8)";
 
@@ -759,6 +878,48 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(5));
             }
+        }
+
+        /// Only a save that installed prices the edits after it. A slow
+        /// save that throws leaves the next good save one ordinary response
+        /// time ahead of the clock. The long horizon a slow good save asked
+        /// for comes back down with the fast saves after it.
+        #[test]
+        fn a_slow_save_prices_the_next_edits_only_while_it_lasts() {
+            const SLOW: &str = "const until = Date.now() + 600\nwhile (Date.now() < until) {}\n";
+            let mut engine = playing_score();
+            engine
+                .evaluate(&format!("{SLOW}throw new Error('no')"), false)
+                .expect_err("the save throws");
+            engine.evaluate(CANDIDATE, false).expect("good score");
+            let now = engine
+                .live
+                .as_ref()
+                .expect("playing")
+                .device
+                .clock_seconds();
+            let takeover = engine
+                .session
+                .take_requery_takeover_time()
+                .expect("an edit names its takeover");
+            assert!(
+                takeover - now < 0.4,
+                "the edit waits {:.3} s",
+                takeover - now
+            );
+
+            wait_for_audio(&mut engine);
+            engine
+                .evaluate(&format!("{SLOW}{GOOD}"), false)
+                .expect("slow good score");
+            let slow = engine.session.config().horizon;
+            assert!(slow > 1.0, "the slow save widens the horizon: {slow}");
+            for source in [CANDIDATE, GOOD, CANDIDATE, GOOD] {
+                wait_for_audio(&mut engine);
+                engine.evaluate(source, false).expect("fast save");
+            }
+            let after = engine.session.config().horizon;
+            assert!(after < 0.8, "the horizon came back down to {after}");
         }
 
         #[test]
@@ -873,7 +1034,9 @@ mod tests {
             engine
                 .session
                 .inject_panic_for_test(SessionPanicPoint::Query);
-            let error = engine.follow_start(GOOD).expect_err("loading query panic");
+            let error = engine
+                .follow_start(GOOD, false)
+                .expect_err("loading query panic");
             assert!(matches!(error, RuntimeError::Panic(_)));
             assert_eq!(engine.active_source(), Some(GOOD));
             wait_for_audio(&mut engine);

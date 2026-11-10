@@ -1,5 +1,9 @@
 //! An offline host using only native patterns and DSP, without JavaScript or
 //! a device backend. Run with `cargo run -p rustel-engine --example native_pattern`.
+#![allow(
+    clippy::print_stdout,
+    reason = "the example prints the pattern it built"
+)]
 
 use std::sync::Arc;
 

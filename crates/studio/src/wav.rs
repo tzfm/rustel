@@ -447,22 +447,46 @@ fn write_wave_header(
     bits_per_sample: u16,
     data_bytes: u32,
 ) -> io::Result<()> {
-    let block_align = channels * (bits_per_sample / 8);
+    let (block_align, byte_rate, riff_bytes) =
+        wave_header_fields(channels, sample_rate, bits_per_sample, data_bytes)
+            .map_err(io::Error::other)?;
     let mut header = Vec::with_capacity(HEADER_BYTES as usize);
     header.extend_from_slice(b"RIFF");
-    header.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    header.extend_from_slice(&riff_bytes.to_le_bytes());
     header.extend_from_slice(b"WAVE");
     header.extend_from_slice(b"fmt ");
     header.extend_from_slice(&16u32.to_le_bytes());
     header.extend_from_slice(&format_tag.to_le_bytes());
     header.extend_from_slice(&channels.to_le_bytes());
     header.extend_from_slice(&sample_rate.to_le_bytes());
-    header.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+    header.extend_from_slice(&byte_rate.to_le_bytes());
     header.extend_from_slice(&block_align.to_le_bytes());
     header.extend_from_slice(&bits_per_sample.to_le_bytes());
     header.extend_from_slice(b"data");
     header.extend_from_slice(&data_bytes.to_le_bytes());
     file.write_all(&header)
+}
+
+/// The derived header fields, each checked against the field it must fit.
+/// A source whose channel count, sample rate or kept data does not fit is
+/// rejected rather than wrapped into a nonsensical header.
+fn wave_header_fields(
+    channels: u16,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    data_bytes: u32,
+) -> Result<(u16, u32, u32), String> {
+    let block_align = u16::try_from(u32::from(channels) * u32::from(bits_per_sample / 8))
+        .map_err(|_| "the wav's channels and bit depth do not fit a block alignment".to_owned())?;
+    let byte_rate = sample_rate
+        .checked_mul(u32::from(block_align))
+        .ok_or_else(|| {
+            "the wav's sample rate and block alignment do not fit a byte rate".to_owned()
+        })?;
+    let riff_bytes = 36u32.checked_add(data_bytes).ok_or_else(|| {
+        "the wav's kept data does not fit the RIFF size alongside its header".to_owned()
+    })?;
+    Ok((block_align, byte_rate, riff_bytes))
 }
 
 /// The name a take gets: the set's, the moment it started, `.wav`.
@@ -752,6 +776,14 @@ pub fn trim_silence(path: &Path) -> Result<Option<Trimmed>, String> {
     let kept = &data[start * bytes_per_frame..(end + 1) * bytes_per_frame];
     let kept_bytes = u32::try_from(kept.len())
         .map_err(|_| "the trimmed take is too large for a wav data chunk".to_owned())?;
+    // Before any temporary output exists: a source whose fields the fresh
+    // header cannot hold is rejected with the original untouched.
+    wave_header_fields(
+        header.channels,
+        header.sample_rate,
+        header.format.bits_per_sample(),
+        kept_bytes,
+    )?;
 
     let mut tmp_name = path
         .file_name()
@@ -1666,6 +1698,48 @@ mod tests {
             &after[kept_loud_start..kept_loud_start + 1_000 * 6],
             &loud_bytes[..],
             "the kept span is a slice of the original bytes, not a re-encoding"
+        );
+    }
+
+    #[test]
+    fn trim_silence_refuses_a_header_whose_derived_fields_do_not_fit() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let path = dir.path().join("wide-channels.wav");
+        // A legal PCM24 take whose 40 000 channels make the block
+        // alignment leave the u16 the fresh header must write it into. The
+        // span really does trim: 15 frames of silence, one loud frame,
+        // 14 more of silence at a rate whose pad is a single frame.
+        let channels: u16 = 40_000;
+        let bytes_per_frame = usize::from(channels) * 3;
+        let mut frames = vec![0_u8; 30 * bytes_per_frame];
+        let loud = &mut frames[15 * bytes_per_frame..16 * bytes_per_frame];
+        loud[2] = 0x40; // half of full 24-bit scale, on the first channel
+        let mut bytes = Vec::with_capacity(44 + frames.len());
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + frames.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&1_000u32.to_le_bytes()); // rate, pad of 1 frame
+        bytes.extend_from_slice(&1_000u32.to_le_bytes()); // byte rate, unused by trim
+        bytes.extend_from_slice(&(bytes_per_frame as u16).to_le_bytes()); // also out of range
+        bytes.extend_from_slice(&24u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&frames);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = trim_silence(&path).unwrap_err();
+        assert!(
+            error.contains("block alignment"),
+            "the refusal names the field that does not fit: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "a refused trim leaves the original untouched"
         );
     }
 

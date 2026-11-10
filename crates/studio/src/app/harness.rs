@@ -139,7 +139,9 @@ impl Studio {
         let studio_options = StudioOptions {
             path: Some(directory.clone()),
             mini: false,
-            session: Default::default(),
+            // As `run_once` does: the session reads the terminal pointer.
+            session: rustel_runtime::SessionConfig::default()
+                .with_pointer(rustel_core::host_value::Pointer::default()),
             theme: options.theme,
             output: Some("silent".to_owned()),
             output_buffer_frames: None,
@@ -182,8 +184,13 @@ impl Studio {
                 // ^H would open the host's default input; a hermetic
                 // studio answers it as a machine with no input does.
                 open_default_input: false,
+                // The studio reads refused origins from the policy it was
+                // given, so the engine must hold that one, as `run_once`
+                // gives it.
+                session: studio_options.session.clone(),
                 // As `run_once` does: the permissions page of the last studio.
                 import_origins: crate::prefs::StudioPrefs::load().import_origins,
+                sample_grants: crate::prefs::StudioPrefs::load().sample_grants(),
                 ..Default::default()
             },
             #[cfg(feature = "hydra")]
@@ -511,6 +518,14 @@ impl Studio {
         &self.app.status
     }
 
+    /// Where the pointer is, as the engine's session reads it for `mousex`
+    /// and Hydra's `mouse`: from 0 to 1 across the frame, from the top-left
+    /// corner. `None` when the session follows no pointer.
+    pub fn score_pointer(&self) -> Option<(f64, f64)> {
+        let pointer = self.app.options.session.pointer.as_ref()?;
+        Some((pointer.x.get(), pointer.y.get()))
+    }
+
     /// Clear the status bar so a test can wait for the next notice.
     pub fn clear_status(&mut self) {
         self.app.status.clear();
@@ -721,6 +736,17 @@ impl Studio {
     /// The focused scene's whole score, as text.
     pub fn score(&self) -> String {
         self.app.editor().document().text()
+    }
+
+    /// The log's line texts, oldest first: the durable record of what the
+    /// engine and the studio said, beyond the transient status line.
+    pub fn log_texts(&self) -> Vec<String> {
+        self.app
+            .log
+            .lines()
+            .iter()
+            .map(|line| line.text.clone())
+            .collect()
     }
 
     /// Put the caret at a byte offset of the focused scene - the way a
@@ -1164,6 +1190,56 @@ mod tests {
         #[should_panic(expected = "unknown key")]
         fn a_made_up_key_is_a_panic_not_a_silent_nothing() {
             let _ = parse_chord("ctrl+makebelieve");
+        }
+
+        /// An external edit that lands while a studio save is still in
+        /// flight must not be lost: the watch re-reads once the save's
+        /// completion clears, or the next studio save overwrites the
+        /// external text on disk.
+        #[test]
+        fn an_external_edit_under_a_pending_save_is_still_adopted() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut studio =
+                Studio::open(HarnessOptions::new(directory.path().join("set"))).expect("studio");
+            studio.app.ui_settings.external_changes = crate::settings::ExternalChanges::Sync;
+            // The first look only baselines the file.
+            std::thread::sleep(crate::app::external_changes::POLL);
+            studio.pump();
+
+            let path = directory.path().join("set/first.strudel");
+            std::fs::write(&path, "$: s(\"bd sd\")\n").expect("write");
+            let scene_id = studio.app.scenes.current().id;
+            // A save whose completion has not landed yet. The request id
+            // matches no worker result, so no drain clears it but the test.
+            studio.app.scenes.get_mut(scene_id).unwrap().latest_save =
+                Some(crate::scenes::PendingSave {
+                    request_id: u64::MAX,
+                    source_revision: "pending".into(),
+                });
+            // The watch sees the change, settles, and must refuse without
+            // consuming it.
+            for _ in 0..6 {
+                std::thread::sleep(crate::app::external_changes::POLL);
+                studio.pump();
+            }
+            assert!(
+                !studio.score().contains("bd sd"),
+                "a pending save must still gate the read"
+            );
+            // The completion lands; the retry the refusal kept alive reads
+            // the external text.
+            studio.app.scenes.get_mut(scene_id).unwrap().latest_save = None;
+            for _ in 0..6 {
+                std::thread::sleep(crate::app::external_changes::POLL);
+                studio.pump();
+                if studio.score().contains("bd sd") {
+                    return;
+                }
+            }
+            panic!(
+                "the external edit was never adopted - score {:?}",
+                studio.score()
+            );
         }
     }
 }

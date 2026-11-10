@@ -53,6 +53,10 @@ pub fn serve_until(
 ///
 /// An empty list uses `https://strudel.cc`. A non-empty list replaces that
 /// default, so every permitted browser origin must be named explicitly.
+#[allow(
+    clippy::print_stderr,
+    reason = "the server prints its status records on stderr"
+)]
 pub fn serve_until_with_origins(
     root: &Path,
     host: &str,
@@ -492,6 +496,10 @@ fn is_timeout(error: &std::io::Error) -> bool {
     )
 }
 
+#[allow(
+    clippy::print_stderr,
+    reason = "the server prints its status records on stderr"
+)]
 fn handle(
     mut stream: TcpStream,
     root: &ServedRoot,
@@ -1002,7 +1010,7 @@ fn request_path(target: &str) -> Option<PathBuf> {
     relative_sample_path_allowed(&relative).then_some(relative)
 }
 
-fn relative_sample_path_allowed(relative: &Path) -> bool {
+pub(crate) fn relative_sample_path_allowed(relative: &Path) -> bool {
     let mut saw_component = false;
     for component in relative.components() {
         let Component::Normal(component) = component else {
@@ -1041,6 +1049,11 @@ fn audio_content_type(path: &Path) -> Option<&'static str> {
         SampleAudioKind::Wav => "audio/wav",
         SampleAudioKind::Mp3 => "audio/mpeg",
         SampleAudioKind::Ogg => "audio/ogg",
+        // The route serves the container's audio for a score. Naming the
+        // container rather than `audio/mp4` keeps the response honest about
+        // what the bytes are.
+        SampleAudioKind::Mp4 => "video/mp4",
+        SampleAudioKind::Matroska => "video/x-matroska",
     })
 }
 

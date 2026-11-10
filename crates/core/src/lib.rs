@@ -7,8 +7,10 @@
 pub mod callback_ir;
 pub mod combinators;
 pub mod compose;
+mod context_keys;
 pub mod controls;
 pub mod gamepad;
+pub mod locations;
 pub mod midi_in;
 pub mod midimap;
 #[rustfmt::skip]
@@ -37,6 +39,10 @@ pub mod value;
 pub mod voicings;
 pub mod xen;
 
+mod table;
+
+use context_keys::ContextKeys;
+pub use locations::Locations;
 use rustel_fraction::Fraction;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -182,8 +188,8 @@ pub const MAX_QUERY_SPAN_CYCLES: i128 = 1_000_000;
 ///
 /// The limit is sized for unoptimised stack frames, which are substantially
 /// larger than release frames. A value of 512 leaves conservative headroom on
-/// the CLI's 64 MiB worker stack and still permits roughly 128 chained
-/// operations because a combinator such as `fast` creates multiple nodes.
+/// the CLI's 64 MiB worker stack. Some combinators create several nodes, so
+/// a chain of them reaches the limit in fewer than 512 operations.
 pub const MAX_PATTERN_DEPTH: u32 = 512;
 
 /// `sortHapsByPart()`, including its throw on analog haps.
@@ -191,7 +197,7 @@ pub const MAX_PATTERN_DEPTH: u32 = 512;
 /// Shared by every entry point that claims this ordering, so a second path
 /// cannot quietly use a more tolerant comparator. See
 /// [`Pattern::query_arc_sorted`] for why the throw is preserved.
-pub fn sort_haps_by_part(mut haps: Vec<Hap>) -> Vec<Hap> {
+pub fn sort_haps_by_part(haps: Vec<Hap>) -> Vec<Hap> {
     // One element: `Array.prototype.sort` never calls the comparator, so an
     // analog hap survives.
     if haps.len() < 2 {
@@ -203,34 +209,58 @@ pub fn sort_haps_by_part(mut haps: Vec<Hap>) -> Vec<Hap> {
         });
         return Vec::new();
     }
-    haps.sort_by(|a, b| {
-        // Safe: the analog case returned above.
-        let (aw, bw) = (a.whole.expect("discrete"), b.whole.expect("discrete"));
-        a.part
-            .begin
-            .cmp(&b.part.begin)
-            .then_with(|| a.part.end.cmp(&b.part.end))
-            .then_with(|| aw.begin.cmp(&bw.begin))
-            .then_with(|| aw.end.cmp(&bw.end))
-    });
-    haps
+    // Every hap is discrete here, so `query_order` compares part begin, part
+    // end, whole begin and whole end.
+    stable_sorted(haps, query_order)
 }
 
 /// Sort host results without discarding continuous haps that have no whole span.
 /// Explicit `sortHapsByPart()` calls keep the comparator above.
-pub fn sort_haps_for_query(mut haps: Vec<Hap>) -> Vec<Hap> {
-    haps.sort_by(|a, b| {
-        a.part
-            .begin
-            .cmp(&b.part.begin)
-            .then_with(|| a.part.end.cmp(&b.part.end))
-            .then_with(|| {
-                a.whole
-                    .map(|whole| (whole.begin, whole.end))
-                    .cmp(&b.whole.map(|whole| (whole.begin, whole.end)))
-            })
-    });
-    haps
+pub fn sort_haps_for_query(haps: Vec<Hap>) -> Vec<Hap> {
+    stable_sorted(haps, query_order)
+}
+
+/// Part begin, part end, then the whole. An analog hap's missing whole
+/// sorts first.
+fn query_order(a: &Hap, b: &Hap) -> std::cmp::Ordering {
+    a.part
+        .begin
+        .cmp(&b.part.begin)
+        .then_with(|| a.part.end.cmp(&b.part.end))
+        .then_with(|| {
+            a.whole
+                .map(|whole| (whole.begin, whole.end))
+                .cmp(&b.whole.map(|whole| (whole.begin, whole.end)))
+        })
+}
+
+/// A stable sort of `haps` by `order` that moves each hap once.
+///
+/// The sort orders indices and then moves each hap once. A hap is large, and
+/// a stable sort moves each element many times. Equal haps keep their input
+/// order, exactly as `sort_by` keeps them.
+fn stable_sorted(mut haps: Vec<Hap>, order: impl Fn(&Hap, &Hap) -> std::cmp::Ordering) -> Vec<Hap> {
+    if haps.is_sorted_by(|a, b| order(a, b) != std::cmp::Ordering::Greater) {
+        return haps;
+    }
+    let Ok(len) = u32::try_from(haps.len()) else {
+        haps.sort_by(order);
+        return haps;
+    };
+    let mut indices: Vec<u32> = (0..len).collect();
+    indices.sort_by(|&a, &b| order(&haps[a as usize], &haps[b as usize]));
+    let mut sorted = Vec::with_capacity(haps.len());
+    // SAFETY: `indices` is a permutation of `0..haps.len()`, so every hap is
+    // read exactly once, and `set_len(0)` makes `haps` forget them before it
+    // drops. Nothing between the reads and `set_len` can unwind: `sorted`
+    // holds room for every push.
+    unsafe {
+        for index in indices {
+            sorted.push(std::ptr::read(haps.as_ptr().add(index as usize)));
+        }
+        haps.set_len(0);
+    }
+    sorted
 }
 
 /// The whole cycle containing `t`.
@@ -251,37 +281,20 @@ pub struct Hap {
     pub value: Value,
     /// Source spans, concatenated on every bind. Drives editor highlighting,
     /// so it must survive every combinator that carries context.
-    pub context: Vec<(usize, usize)>,
-    /// Direct live slider bindings: gain, low-pass cutoff, then low-pass
-    /// resonance. Zero is unbound.
+    pub context: Locations,
+    /// Direct live slider bindings: gain, low-pass cutoff, low-pass
+    /// resonance, then the direct FM route's index. Zero is unbound.
     /// These are host tokens, never score values or source-location guesses.
-    pub live_controls: [u64; 3],
+    pub live_controls: [u64; 4],
     slider_binding: u64,
     ui_visuals: u64,
     /// Exact JavaScript lookup shape (holes, length, enumerable keys) when the
     /// visible value alone cannot represent it. Nested Patterns also live in
     /// `value`; this side channel is shape metadata, not their only owner.
     pick_lookup: Option<Arc<PickLookup>>,
-    /// `hap.context.scale`: set by `.scale()`, read by `.scaleTranspose()`.
-    /// Context merges are extending-side-wins, which `Option::or` mirrors at
-    /// each combine site.
-    scale: Option<Arc<str>>,
-    /// `hap.context.edoSize`: set by xen's `.xen()`/`.edo()`, read by
-    /// `.ftrans()`. Same merge contract as `scale`.
-    edo_size: Option<f64>,
-    scale_definition: Option<Arc<Value>>,
-    /// `hap.context.tags`: appended by `.tag()`, read by `hap.hasTag()` inside
-    /// a `filter`. Same merge rule as `scale`. Shared rather than cloned: a
-    /// tag list is copied at every combine site and never mutated in place.
-    tags: Option<Arc<[Arc<str>]>>,
-    /// `hap.context.logLine`: the text `.log()` will print when this hap
-    /// TRIGGERS. Same merge rule as `scale`.
-    ///
-    /// It rides the context rather than the value because a value is what a
-    /// score means: `"0 1".log()` carries a bare number, and adding a key to
-    /// it would make the pattern mean something else. The formatter runs when
-    /// the hap is produced; only the printing waits for the onset.
-    log_line: Option<Arc<str>>,
+    /// `scale`, `edoSize`, `scaleDefinition`, `tags` and `logLine`. A merge
+    /// keeps the extending side's key. See [`ContextKeys::merge`].
+    keys: ContextKeys,
 }
 
 /// Read a `tags` key off a JS context object: an array of strings, anything
@@ -307,17 +320,37 @@ impl Hap {
             whole,
             part,
             value,
-            context: Vec::new(),
-            live_controls: [0; 3],
+            context: Locations::new(),
+            live_controls: [0; 4],
             slider_binding: 0,
             ui_visuals: 0,
             pick_lookup: None,
-            scale: None,
-            tags: None,
-            log_line: None,
-            edo_size: None,
-            scale_definition: None,
+            keys: ContextKeys::default(),
         }
+    }
+
+    /// Whether this hap owns no heap memory: a number, flag, empty or
+    /// interned value, its locations in place, and no lookup or context key.
+    /// A byte copy of such a hap is a clone of it.
+    pub(crate) fn owns_no_heap(&self) -> bool {
+        // Every field is named, so a new one cannot skip this check.
+        let Hap {
+            whole: _,
+            part: _,
+            value,
+            context,
+            live_controls: _,
+            slider_binding: _,
+            ui_visuals: _,
+            pick_lookup,
+            keys,
+        } = self;
+        let value = match value {
+            Value::Undefined | Value::Null | Value::Bool(_) | Value::F64(_) => true,
+            Value::Object(object) => object.is_interned(),
+            _ => false,
+        };
+        value && context.is_inline() && pick_lookup.is_none() && keys.is_empty()
     }
 
     fn with_pick_lookup(mut self, lookup: Arc<PickLookup>) -> Self {
@@ -327,71 +360,73 @@ impl Hap {
 
     /// `hap.context.scale`, exactly as `.scale()` tagged it.
     pub fn scale_context(&self) -> Option<&str> {
-        self.scale.as_deref()
+        self.keys.get().scale.as_deref()
     }
 
     /// Set the scale context tag.
     pub fn with_scale_context(mut self, scale: Arc<str>) -> Self {
-        self.scale = Some(scale);
+        self.keys.edit().scale = Some(scale);
         self
     }
 
     /// `hap.context.edoSize`, exactly as `.xen()` tagged it.
     pub fn edo_size_context(&self) -> Option<f64> {
-        self.edo_size
+        self.keys.get().edo_size
     }
 
     /// Every tag this hap carries, oldest first.
     pub fn tags_context(&self) -> Option<&[Arc<str>]> {
-        self.tags.as_deref()
+        self.keys.get().tags.as_deref()
     }
 
     /// The text `.log()` will print when this hap triggers, if any.
     pub fn log_line(&self) -> Option<&str> {
-        self.log_line.as_deref()
+        self.keys.get().log_line.as_deref()
     }
 
     /// `hap.hasTag(t)` - what a `filter` callback asks.
     pub fn has_tag(&self, tag: &str) -> bool {
-        self.tags
+        self.keys
+            .get()
+            .tags
             .as_deref()
             .is_some_and(|tags| tags.iter().any(|held| &**held == tag))
     }
 
     /// Append a tag - never replaces, so tagging twice keeps both.
     pub fn with_tag_context(mut self, tag: Arc<str>) -> Self {
-        let mut tags: Vec<Arc<str>> = self.tags.as_deref().unwrap_or_default().to_vec();
+        let mut tags: Vec<Arc<str>> = self.tags_context().unwrap_or_default().to_vec();
         tags.push(tag);
-        self.tags = Some(Arc::from(tags));
+        self.keys.edit().tags = Some(Arc::from(tags));
         self
     }
 
     /// `.log()`'s already-formatted text, to be printed when this hap
     /// triggers.
     pub fn with_log_line_context(mut self, line: impl Into<Arc<str>>) -> Self {
-        self.log_line = Some(line.into());
+        self.keys.edit().log_line = Some(line.into());
         self
     }
 
     pub fn with_edo_size_context(mut self, edo_size: f64) -> Self {
-        self.edo_size = Some(edo_size);
+        self.keys.edit().edo_size = Some(edo_size);
         self
     }
 
     /// `hap.context.scaleDefinition`, as `edoScale` tagged it. Stored behind
     /// an `Arc`; callback-visible JSON matches the raw argument object.
     pub fn scale_definition_context(&self) -> Option<&Value> {
-        self.scale_definition.as_deref()
+        self.keys.get().scale_definition.as_deref()
     }
 
     /// Set the scale-definition context tag.
     pub fn with_scale_definition_context(mut self, definition: Arc<Value>) -> Self {
-        self.scale_definition = Some(definition);
+        self.keys.edit().scale_definition = Some(definition);
         self
     }
 
-    pub fn with_context(mut self, ctx: Vec<(usize, usize)>) -> Self {
-        self.context = ctx;
+    pub fn with_context(mut self, ctx: impl Into<Locations>) -> Self {
+        self.context = ctx.into();
         self
     }
 
@@ -488,11 +523,7 @@ impl Hap {
             live_controls: self.live_controls,
             slider_binding: self.slider_binding,
             pick_lookup: self.pick_lookup.clone(),
-            scale: self.scale.clone(),
-            tags: self.tags.clone(),
-            log_line: self.log_line.clone(),
-            edo_size: self.edo_size,
-            scale_definition: self.scale_definition.clone(),
+            keys: self.keys.clone(),
         }
     }
 
@@ -518,7 +549,7 @@ impl Hap {
     /// value while merging the other hap's contextual metadata.
     pub fn combine_context(&self, other: &Hap) -> Hap {
         let mut context = self.context.clone();
-        context.extend_from_slice(&other.context);
+        context.append(&other.context);
         Hap {
             whole: self.whole,
             part: self.part,
@@ -528,14 +559,7 @@ impl Hap {
             live_controls: self.live_controls,
             slider_binding: self.slider_binding,
             pick_lookup: self.pick_lookup.clone(),
-            scale: other.scale.clone().or_else(|| self.scale.clone()),
-            tags: other.tags.clone().or_else(|| self.tags.clone()),
-            log_line: other.log_line.clone().or_else(|| self.log_line.clone()),
-            edo_size: other.edo_size.or(self.edo_size),
-            scale_definition: other
-                .scale_definition
-                .clone()
-                .or_else(|| self.scale_definition.clone()),
+            keys: ContextKeys::merge(&other.keys, &self.keys),
         }
     }
 
@@ -551,37 +575,29 @@ impl Hap {
                 .cloned(),
             value,
             context: self.context.clone(),
-            live_controls: [0; 3],
+            live_controls: [0; 4],
             slider_binding: 0,
             ui_visuals: self.ui_visuals,
-            scale: self.scale.clone(),
-            tags: self.tags.clone(),
-            log_line: self.log_line.clone(),
-            edo_size: self.edo_size,
-            scale_definition: self.scale_definition.clone(),
+            keys: self.keys.clone(),
         }
     }
 
     /// Changes the value of an owned hap. The context moves instead of
     /// cloning. The lookup shape survives only when the value is unchanged.
-    fn map_value(self, f: impl FnOnce(&Value) -> Value) -> Hap {
+    fn map_value(mut self, f: impl FnOnce(&Value) -> Value) -> Hap {
+        self.map_value_in_place(f);
+        self
+    }
+
+    /// [`Self::map_value`] without moving the hap.
+    fn map_value_in_place(&mut self, f: impl FnOnce(&Value) -> Value) {
         let value = f(&self.value);
-        let keep_lookup = value == self.value;
-        Hap {
-            whole: self.whole,
-            part: self.part,
-            pick_lookup: if keep_lookup { self.pick_lookup } else { None },
-            value,
-            context: self.context,
-            live_controls: [0; 3],
-            slider_binding: 0,
-            ui_visuals: self.ui_visuals,
-            scale: self.scale,
-            tags: self.tags,
-            log_line: self.log_line,
-            edo_size: self.edo_size,
-            scale_definition: self.scale_definition,
+        if value != self.value {
+            self.pick_lookup = None;
         }
+        self.value = value;
+        self.live_controls = [0; 4];
+        self.slider_binding = 0;
     }
 
     /// The owned hap with a new value and the same live control bindings.
@@ -596,16 +612,12 @@ impl Hap {
             live_controls: self.live_controls,
             slider_binding: self.slider_binding,
             ui_visuals: self.ui_visuals,
-            scale: self.scale,
-            tags: self.tags,
-            log_line: self.log_line,
-            edo_size: self.edo_size,
-            scale_definition: self.scale_definition,
+            keys: self.keys,
         }
     }
 
     fn without_live_controls(mut self) -> Self {
-        self.live_controls = [0; 3];
+        self.live_controls = [0; 4];
         self.slider_binding = 0;
         self
     }
@@ -613,9 +625,12 @@ impl Hap {
     /// Trusted pitch rewrites can carry named audio controls unchanged.
     /// A raw slider value still loses its identity when its pitch changes.
     fn with_pitch_live_controls(mut self, input: &Hap) -> Self {
-        self.live_controls = [0; 3];
+        self.live_controls = [0; 4];
         self.slider_binding = 0;
-        for (index, key) in ["gain", "cutoff", "resonance"].into_iter().enumerate() {
+        for (index, key) in ["gain", "cutoff", "resonance", "fmi"]
+            .into_iter()
+            .enumerate()
+        {
             if input.live_controls[index] != 0
                 && let Some(before) = input.value.get(key).and_then(Value::as_f64)
                 && self.value.get(key).and_then(Value::as_f64) == Some(before)
@@ -785,7 +800,7 @@ impl State {
 
 #[derive(Clone)]
 pub struct Pattern {
-    node: Arc<Node>,
+    node: Arc<NodeCell>,
     /// `_steps` metadata, used by `pace`/`expand`/`contract`/`stepcat`.
     pub steps: Option<Fraction>,
     /// `__pure_loc`: source span of a pure value, merged by `register()`'s
@@ -799,6 +814,38 @@ pub struct Pattern {
     /// stay flat, and a derived query-time callback remains inside the same
     /// runtime scope as its receiver.
     runtime_settings: Option<settings::RuntimeSettings>,
+}
+
+/// A graph node and its precomputed answer, shared by every handle to it.
+struct NodeCell {
+    kind: Node,
+    /// Whether the next query of this node builds its tables. A node made
+    /// while a query runs is often made for that query alone, such as the
+    /// inner pattern of a join, so its first query answers from the graph
+    /// and only a second one pays for a build.
+    build_next: std::sync::atomic::AtomicBool,
+    /// Whether a thread builds `tables` now. A query that finds a build under
+    /// way answers from the graph instead of waiting for it.
+    building: std::sync::atomic::AtomicBool,
+    /// Built by the query that `build_next` allows, or by a parent's build.
+    /// `None` inside means the graph answers. See the `table` module.
+    tables: std::sync::OnceLock<Option<Box<table::Tables>>>,
+}
+
+/// A table build under way on a node, marked until dropped, also on unwind.
+struct Building<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> Building<'a> {
+    fn start(flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        Self(flag)
+    }
+}
+
+impl Drop for Building<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1719,6 +1766,17 @@ fn host_call_query(id: CallbackId, state: &State) -> Vec<Hap> {
 /// Combines an accumulator value with the next positional argument during
 /// `register()`'s appLeft fold.
 type CombineFn = Arc<dyn Fn(&Value, &Value) -> Value + Send + Sync>;
+
+/// Whether a per-hap map looks at the spans of the hap it is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpanUse {
+    /// The map may read or replace the spans.
+    Reads,
+    /// The map keeps the spans and reads none of them. Its result for a hap
+    /// is then the same wherever the hap sits in time, so a precomputed
+    /// table may run it once per entry.
+    Ignores,
+}
 /// Maps a value to a whole pattern, for a `PatternOf` awaiting a join.
 type ToPatternFn = Arc<dyn Fn(&Value) -> Pattern + Send + Sync>;
 type HapToPatternFn = Arc<dyn Fn(&Hap) -> Pattern + Send + Sync>;
@@ -2185,6 +2243,9 @@ fn map_js_haps(
         // Every iteration can enter QuickJS, and a wide query holds tens of
         // thousands of haps. Check inside the loop so callback and GC work
         // cannot keep the producer occupied after cancellation or a deadline.
+        // A pending query error is deliberately NOT a stop: the turn
+        // boundary turns a throwing callback into silence after every hap
+        // had its turn, which the `and`/`or` lazy-truthy contracts pin.
         if budget_exhausted() || cancellation_requested() || query_deadline_expired() {
             return Vec::new();
         }
@@ -2515,6 +2576,76 @@ pub fn mark_stepwise_refusal(limit: QueryLimit) -> QueryLimit {
     limit
 }
 
+/// Run `f` apart from the query around it, for work whose result outlives that
+/// query. A query error or a resource refusal raised inside makes the result
+/// `None`, and the enclosing query sees neither.
+fn without_query_signals<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
+    /// Holds the enclosing query's refusal and puts it back, also on unwind.
+    struct RefusalScope {
+        outer: Option<QueryLimit>,
+        finished: bool,
+    }
+    impl RefusalScope {
+        fn enter() -> Self {
+            Self {
+                outer: REFUSAL.with(|slot| slot.borrow_mut().take()),
+                finished: false,
+            }
+        }
+        /// Whether a refusal was raised inside.
+        fn finish(mut self) -> bool {
+            self.finished = true;
+            let outer = self.outer.take();
+            REFUSAL
+                .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), outer))
+                .is_some()
+        }
+    }
+    impl Drop for RefusalScope {
+        fn drop(&mut self) {
+            if !self.finished {
+                let outer = self.outer.take();
+                REFUSAL.with(|slot| *slot.borrow_mut() = outer);
+            }
+        }
+    }
+    let boundary = QueryErrorBoundary::enter();
+    let refusal = RefusalScope::enter();
+    let result = f();
+    let refused = refusal.finish();
+    let thrown = boundary.finish();
+    if refused || thrown.is_some() {
+        return None;
+    }
+    result
+}
+
+/// One time map of [`Node::Fast`] or [`Node::Shift`]. A result outside the
+/// native fraction range marks the `NativeFraction` refusal for `operation`
+/// and becomes time zero until the query boundary reports the refusal.
+fn checked_time(time: Option<Fraction>, operation: &'static str) -> Fraction {
+    time.unwrap_or_else(|| {
+        mark_stepwise_refusal(QueryLimit::NativeFraction { operation });
+        Fraction::ZERO
+    })
+}
+
+fn fast_query_time(time: Fraction, factor: Fraction, operation: &'static str) -> Fraction {
+    checked_time(time.checked_mul(factor), operation)
+}
+
+fn fast_hap_time(time: Fraction, factor: Fraction, operation: &'static str) -> Fraction {
+    checked_time(time.checked_div(factor), operation)
+}
+
+fn shift_query_time(time: Fraction, by: Fraction, operation: &'static str) -> Fraction {
+    checked_time(time.checked_sub(by), operation)
+}
+
+fn shift_hap_time(time: Fraction, by: Fraction, operation: &'static str) -> Fraction {
+    checked_time(time.checked_add(by), operation)
+}
+
 pub fn note_stepwise_entries_materialised(entries: u64) {
     STEPWISE_ENTRIES_MATERIALISED.with(|count| {
         count.set(count.get().saturating_add(entries));
@@ -2574,6 +2705,11 @@ pub(crate) fn charge_haps(n: usize) -> bool {
     })
 }
 
+/// The hap budget of the current top-level query, or `None` outside one.
+pub(crate) fn hap_budget() -> Option<u64> {
+    HAP_BUDGET.with(std::cell::Cell::get)
+}
+
 /// Push into an accumulating result, refusing before the budget is exceeded.
 ///
 /// Returns `false` when the caller must STOP producing. The generic charge in
@@ -2600,8 +2736,8 @@ pub(crate) fn push_budgeted(out: &mut Vec<Hap>, hap: Hap) -> bool {
 ///
 /// Returns `None` once the budget is spent, so callers propagate rather than
 /// truncate.
-pub(crate) fn extend_budgeted(branches: impl IntoIterator<Item = Vec<Hap>>) -> Option<Vec<Hap>> {
-    let mut out: Vec<Hap> = Vec::new();
+pub(crate) fn extend_budgeted<T>(branches: impl IntoIterator<Item = Vec<T>>) -> Option<Vec<T>> {
+    let mut out: Vec<T> = Vec::new();
     for branch in branches {
         if !charge_haps(out.len() + branch.len()) {
             return None;
@@ -2648,6 +2784,13 @@ pub fn refuse_js_pending_jobs() {
 /// Refuse an oversized Euclidean mask through the typed resource channel.
 pub fn refuse_euclid_steps(steps: u64, limit: u64) {
     refuse(QueryLimit::EuclidSteps { steps, limit });
+}
+
+/// Refuse a native-fraction overflow through the typed resource channel.
+/// Extension nodes use this where their span shifts leave the range an
+/// `i128` numerator can hold.
+pub fn refuse_native_fraction(operation: &'static str) {
+    refuse(QueryLimit::NativeFraction { operation });
 }
 
 /// Charge a growing collection outside this crate, by its current length.
@@ -2817,6 +2960,14 @@ impl Drop for ExpiryGuard {
 /// Whether the installed native query deadline has passed. Sampled every
 /// 64th call so the clock read stays off the hot path.
 pub(crate) fn query_deadline_expired() -> bool {
+    query_deadline_after(1)
+}
+
+/// [`query_deadline_expired`] for `checks` checks at once. A table answer
+/// advances the sampling by the haps it made, as the graph advances it by
+/// the leaves it visits, so a deadline is seen after the same amount of
+/// work.
+pub(crate) fn query_deadline_after(checks: u32) -> bool {
     // Once expired, STAY expired: every remaining query in this scope returns
     // empty immediately, so a deep recursion unwinds in microseconds instead
     // of continuing to build haps nobody will hear. Re-refusing is harmless
@@ -2832,10 +2983,12 @@ pub(crate) fn query_deadline_expired() -> bool {
         let Some(deadline) = slot.get() else {
             return false;
         };
+        // The clock is read when the count passes a multiple of 64.
         let due = DEADLINE_TICK.with(|tick| {
-            let next = tick.get().wrapping_add(1);
-            tick.set(next);
-            next % 64 == 0
+            let before = tick.get();
+            let after = before.wrapping_add(checks);
+            tick.set(after);
+            after / 64 != before / 64
         });
         if !due {
             return false;
@@ -3079,7 +3232,7 @@ fn query_weight_sequence(cumulative: &[Pattern], state: &State) -> Vec<Hap> {
                     _ => None,
                 };
                 let mut context = outer.context.clone();
-                context.extend_from_slice(&inner.context);
+                context.append(&inner.context);
                 let mut values = match &outer.value {
                     Value::List(values) => values.clone(),
                     _ => Vec::new(),
@@ -3093,17 +3246,10 @@ fn query_weight_sequence(cumulative: &[Pattern], state: &State) -> Vec<Hap> {
                         value: Value::List(values),
                         context,
                         ui_visuals: inner.ui_visuals | outer.ui_visuals,
-                        live_controls: [0; 3],
+                        live_controls: [0; 4],
                         slider_binding: 0,
                         pick_lookup: None,
-                        scale: inner.scale.clone().or_else(|| outer.scale.clone()),
-                        tags: inner.tags.clone().or_else(|| outer.tags.clone()),
-                        log_line: inner.log_line.clone().or_else(|| outer.log_line.clone()),
-                        edo_size: inner.edo_size.or(outer.edo_size),
-                        scale_definition: inner
-                            .scale_definition
-                            .clone()
-                            .or(outer.scale_definition.clone()),
+                        keys: ContextKeys::merge(&inner.keys, &outer.keys),
                     },
                 ) {
                     return Vec::new();
@@ -3125,13 +3271,9 @@ struct WChooseCarrier {
     selected: Option<usize>,
     outer_whole: Option<TimeSpan>,
     part: TimeSpan,
-    context: Vec<(usize, usize)>,
+    context: Locations,
     ui_visuals: u64,
-    scale: Option<Arc<str>>,
-    edo_size: Option<f64>,
-    scale_definition: Option<Arc<Value>>,
-    tags: Option<Arc<[Arc<str>]>>,
-    log_line: Option<Arc<str>>,
+    keys: ContextKeys,
 }
 
 #[derive(Clone)]
@@ -3213,7 +3355,7 @@ fn query_wchoose(
                 // find context first.
                 let chooser_whole = weights_hap.whole;
                 let mut chooser_context = total_hap.context.clone();
-                chooser_context.extend_from_slice(&weights_hap.context);
+                chooser_context.append(&weights_hap.context);
 
                 // `pat.bind(match)`: MIX the random hap with the
                 // selected-pattern carrier.
@@ -3228,7 +3370,7 @@ fn query_wchoose(
                     _ => None,
                 };
                 let mut outer_context = random_hap.context.clone();
-                outer_context.extend(chooser_context);
+                outer_context.append(&chooser_context);
 
                 if !charge_haps(carriers.len() + 1) {
                     return Vec::new();
@@ -3241,30 +3383,10 @@ fn query_wchoose(
                     ui_visuals: weights_hap.ui_visuals
                         | total_hap.ui_visuals
                         | random_hap.ui_visuals,
-                    scale: weights_hap
-                        .scale
-                        .clone()
-                        .or_else(|| total_hap.scale.clone())
-                        .or_else(|| random_hap.scale.clone()),
-                    tags: weights_hap
-                        .tags
-                        .clone()
-                        .or_else(|| total_hap.tags.clone())
-                        .or_else(|| random_hap.tags.clone()),
-                    log_line: weights_hap
-                        .log_line
-                        .clone()
-                        .or_else(|| total_hap.log_line.clone())
-                        .or_else(|| random_hap.log_line.clone()),
-                    edo_size: weights_hap
-                        .edo_size
-                        .or(total_hap.edo_size)
-                        .or(random_hap.edo_size),
-                    scale_definition: weights_hap
-                        .scale_definition
-                        .clone()
-                        .or_else(|| total_hap.scale_definition.clone())
-                        .or_else(|| random_hap.scale_definition.clone()),
+                    keys: ContextKeys::merge(
+                        &weights_hap.keys,
+                        &ContextKeys::merge(&total_hap.keys, &random_hap.keys),
+                    ),
                 });
             }
         }
@@ -3286,7 +3408,7 @@ fn query_wchoose(
         }
         for chosen in chosen_haps {
             let mut context = carrier.context.clone();
-            context.extend_from_slice(&chosen.context);
+            context.append(&chosen.context);
             if !push_budgeted(
                 &mut out,
                 Hap {
@@ -3297,14 +3419,7 @@ fn query_wchoose(
                     },
                     part: chosen.part,
                     pick_lookup: chosen.pick_lookup.clone(),
-                    scale: chosen.scale.clone().or_else(|| carrier.scale.clone()),
-                    tags: chosen.tags.clone().or_else(|| carrier.tags.clone()),
-                    log_line: chosen.log_line.clone().or_else(|| carrier.log_line.clone()),
-                    edo_size: chosen.edo_size.or(carrier.edo_size),
-                    scale_definition: chosen
-                        .scale_definition
-                        .clone()
-                        .or(carrier.scale_definition.clone()),
+                    keys: ContextKeys::merge(&chosen.keys, &carrier.keys),
                     value: chosen.value,
                     context,
                     ui_visuals: chosen.ui_visuals | carrier.ui_visuals,
@@ -3609,7 +3724,7 @@ fn applied_pick_lookup(
 }
 
 /// Provenance follows semantic ownership, never equality of sampled numbers.
-fn applied_live_controls(flow: LookupFlow, left: &Hap, right: &Hap) -> ([u64; 3], u64) {
+fn applied_live_controls(flow: LookupFlow, left: &Hap, right: &Hap) -> ([u64; 4], u64) {
     match flow {
         LookupFlow::Left => (left.live_controls, left.slider_binding),
         LookupFlow::LeftControls => (left.live_controls, 0),
@@ -3618,7 +3733,7 @@ fn applied_live_controls(flow: LookupFlow, left: &Hap, right: &Hap) -> ([u64; 3]
             // Opaque objects can run score code when materialized. Refuse the
             // optional binding rather than inspecting them a second time.
             if matches!(left.value, Value::JsValue(_)) || matches!(right.value, Value::JsValue(_)) {
-                return ([0; 3], 0);
+                return ([0; 4], 0);
             }
             if !matches!(
                 (&left.value, &right.value),
@@ -3628,7 +3743,7 @@ fn applied_live_controls(flow: LookupFlow, left: &Hap, right: &Hap) -> ([u64; 3]
             }
             let mut bindings = left.live_controls;
             if let Value::Object(values) = &right.value {
-                for (slot, key) in ["gain", "cutoff", "resonance"].iter().enumerate() {
+                for (slot, key) in ["gain", "cutoff", "resonance", "fmi"].iter().enumerate() {
                     if values.contains_key(key) {
                         bindings[slot] = right.live_controls[slot];
                     }
@@ -3636,7 +3751,68 @@ fn applied_live_controls(flow: LookupFlow, left: &Hap, right: &Hap) -> ([u64; 3]
             }
             (bindings, 0)
         }
-        LookupFlow::Infer | LookupFlow::Add => ([0; 3], 0),
+        LookupFlow::Infer | LookupFlow::Add => ([0; 4], 0),
+    }
+}
+
+/// The hap an `app*` node makes from a function hap `hf` and a value hap `hv`
+/// that meet in `part`. The context lists the value side's locations first.
+/// For every context tag, the function side wins.
+fn applied_hap(
+    hf: &Hap,
+    hv: &Hap,
+    whole: Option<TimeSpan>,
+    part: TimeSpan,
+    apply: &CombineFn,
+    flow: LookupFlow,
+) -> Hap {
+    let mut context = hv.context.clone();
+    context.append(&hf.context);
+    let met = Meeting::of(hf, hv, apply, flow);
+    Hap {
+        whole,
+        part,
+        value: met.value,
+        context,
+        ui_visuals: hf.ui_visuals | hv.ui_visuals,
+        live_controls: met.live_controls,
+        slider_binding: met.slider_binding,
+        pick_lookup: met.pick_lookup,
+        keys: ContextKeys::merge(&hf.keys, &hv.keys),
+    }
+}
+
+/// What a function hap and a value hap decide together when they meet: the
+/// value, its lookup shape and its live bindings. The rest of a met hap is
+/// the two haps' metadata merged, as in [`applied_hap`].
+pub(crate) struct Meeting {
+    pub(crate) value: Value,
+    pub(crate) pick_lookup: Option<Arc<PickLookup>>,
+    pub(crate) live_controls: [u64; 4],
+    pub(crate) slider_binding: u64,
+}
+
+impl Meeting {
+    pub(crate) fn of(hf: &Hap, hv: &Hap, apply: &CombineFn, flow: LookupFlow) -> Self {
+        let value = apply(&hf.value, &hv.value);
+        let pick_lookup = applied_pick_lookup(flow, &value, hf, hv);
+        let (live_controls, slider_binding) = applied_live_controls(flow, hf, hv);
+        Self {
+            value,
+            pick_lookup,
+            live_controls,
+            slider_binding,
+        }
+    }
+
+    /// Turn `hap`, one side of the meeting, into the met hap. Only valid when
+    /// the other side carries no locations, visuals or context keys: the
+    /// merge then keeps `hap`'s own.
+    pub(crate) fn settle(self, hap: &mut Hap) {
+        hap.value = self.value;
+        hap.pick_lookup = self.pick_lookup;
+        hap.live_controls = self.live_controls;
+        hap.slider_binding = self.slider_binding;
     }
 }
 
@@ -3811,21 +3987,14 @@ fn query_pick(
                         _ => unreachable!(),
                     };
                     let mut context = outer.context.clone();
-                    context.extend_from_slice(&inner.context);
+                    context.append(&inner.context);
                     if !push_budgeted(
                         &mut out,
                         Hap {
                             whole,
                             part: inner.part,
                             pick_lookup: inner.pick_lookup.clone(),
-                            scale: inner.scale.clone().or_else(|| outer.scale.clone()),
-                            tags: inner.tags.clone().or_else(|| outer.tags.clone()),
-                            log_line: inner.log_line.clone().or_else(|| outer.log_line.clone()),
-                            edo_size: inner.edo_size.or(outer.edo_size),
-                            scale_definition: inner
-                                .scale_definition
-                                .clone()
-                                .or(outer.scale_definition.clone()),
+                            keys: ContextKeys::merge(&inner.keys, &outer.keys),
                             value: inner.value,
                             context,
                             ui_visuals: inner.ui_visuals | outer.ui_visuals,
@@ -3854,21 +4023,14 @@ fn query_pick(
                         continue;
                     };
                     let mut context = inner.context.clone();
-                    context.extend_from_slice(&outer.context);
+                    context.append(&outer.context);
                     if !push_budgeted(
                         &mut out,
                         Hap {
                             whole,
                             part,
                             pick_lookup: inner.pick_lookup.clone(),
-                            scale: outer.scale.clone().or_else(|| inner.scale.clone()),
-                            tags: outer.tags.clone().or_else(|| inner.tags.clone()),
-                            log_line: outer.log_line.clone().or_else(|| inner.log_line.clone()),
-                            edo_size: outer.edo_size.or(inner.edo_size),
-                            scale_definition: outer
-                                .scale_definition
-                                .clone()
-                                .or(inner.scale_definition.clone()),
+                            keys: ContextKeys::merge(&outer.keys, &inner.keys),
                             value: inner.value,
                             context,
                             ui_visuals: inner.ui_visuals | outer.ui_visuals,
@@ -3897,21 +4059,14 @@ fn query_pick(
                         .whole
                         .and_then(|inner_whole| inner_whole.intersection(&outer_whole));
                     let mut context = outer.context.clone();
-                    context.extend_from_slice(&inner.context);
+                    context.append(&inner.context);
                     if !push_budgeted(
                         &mut out,
                         Hap {
                             whole,
                             part,
                             pick_lookup: inner.pick_lookup.clone(),
-                            scale: inner.scale.clone().or_else(|| outer.scale.clone()),
-                            tags: inner.tags.clone().or_else(|| outer.tags.clone()),
-                            log_line: inner.log_line.clone().or_else(|| outer.log_line.clone()),
-                            edo_size: inner.edo_size.or(outer.edo_size),
-                            scale_definition: inner
-                                .scale_definition
-                                .clone()
-                                .or(outer.scale_definition.clone()),
+                            keys: ContextKeys::merge(&inner.keys, &outer.keys),
                             value: inner.value,
                             context,
                             ui_visuals: inner.ui_visuals | outer.ui_visuals,
@@ -3989,24 +4144,14 @@ fn query_patternified_pick(
         }
         for inner in selected {
             let mut context = lookup_hap.hap.context.clone();
-            context.extend_from_slice(&inner.context);
+            context.append(&inner.context);
             if !push_budgeted(
                 &mut out,
                 Hap {
                     whole: inner.whole,
                     part: inner.part,
                     pick_lookup: inner.pick_lookup.clone(),
-                    scale: inner.scale.clone().or_else(|| lookup_hap.hap.scale.clone()),
-                    tags: inner.tags.clone().or_else(|| lookup_hap.hap.tags.clone()),
-                    log_line: inner
-                        .log_line
-                        .clone()
-                        .or_else(|| lookup_hap.hap.log_line.clone()),
-                    edo_size: inner.edo_size.or(lookup_hap.hap.edo_size),
-                    scale_definition: inner
-                        .scale_definition
-                        .clone()
-                        .or(lookup_hap.hap.scale_definition.clone()),
+                    keys: ContextKeys::merge(&inner.keys, &lookup_hap.hap.keys),
                     value: inner.value,
                     context,
                     ui_visuals: inner.ui_visuals | lookup_hap.hap.ui_visuals,
@@ -4099,6 +4244,7 @@ const _: fn() = || {
     assert_send_sync::<Node>();
     assert_send_sync::<Pattern>();
     assert_send_sync::<std::sync::Arc<Node>>();
+    assert_send_sync::<std::sync::Arc<NodeCell>>();
     assert_send_sync::<Value>();
     assert_send_sync::<Hap>();
 };
@@ -4122,7 +4268,7 @@ enum Node {
     /// of throwing at the host boundary: an expression the language can
     /// build must build here too, and it must empty the query rather than
     /// abort the evaluation.
-    QueryError(&'static str),
+    QueryError(Arc<str>),
     /// A resource refusal whose construction is valid but whose query cannot
     /// be answered within the native runtime's bound. The refusal is emitted
     /// here, inside the top-level query boundary; setting the thread-local at
@@ -4132,6 +4278,12 @@ enum Node {
     /// `fast`/`slow` are expressed with these two.
     WithQueryTime(Pattern, TimeFn),
     WithHapTime(Pattern, TimeFn),
+    /// `fast` by an exact factor: query times are multiplied by it and hap
+    /// times divided by it. See [`checked_time`] for overflow.
+    Fast(Pattern, Fraction, &'static str),
+    /// `late` by an exact offset (`early` is a negative one): subtracted from
+    /// query times and added to hap times. See [`checked_time`] for overflow.
+    Shift(Pattern, Fraction, &'static str),
     /// `withQuerySpan` / `withHapSpan` - begin and end mapped jointly.
     WithQuerySpan(Pattern, SpanFn),
     WithQuerySpanJs(Pattern, CallbackId),
@@ -4204,10 +4356,10 @@ enum Node {
     /// shape (`scale` uses it). A closure that hits a query-time throw signals
     /// through `signal_query_error` and returns `None`; the flag surfaces at
     /// the query boundary like every other query-time error.
-    MapHapsNative(Pattern, HapMapFn),
+    MapHapsNative(Pattern, HapMapFn, SpanUse),
     /// A native per-hap map that takes ownership of the incoming hap, so a
     /// value or context change does not clone them.
-    MapHapsOwned(Pattern, OwnedHapMapFn),
+    MapHapsOwned(Pattern, OwnedHapMapFn, SpanUse),
     MapHapsWithState(Pattern, StateHapMapFn),
     /// One hap expands to N haps sharing its span - `voicing()`'s
     /// `stack(...notes).note().set(rest)` + outerJoin collapses to exactly
@@ -4330,6 +4482,8 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
         Node::NonSendMutation(_) => None,
         Node::WithQueryTime(pattern, _)
         | Node::WithHapTime(pattern, _)
+        | Node::Fast(pattern, _, _)
+        | Node::Shift(pattern, _, _)
         | Node::WithQuerySpan(pattern, _)
         | Node::WithQuerySpanJs(pattern, _)
         | Node::WithHapSpan(pattern, _)
@@ -4346,8 +4500,8 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
         | Node::FilterHapsJs(pattern, _)
         | Node::FilterWhenJs(pattern, _)
         | Node::SortHapsByPart(pattern)
-        | Node::MapHapsNative(pattern, _)
-        | Node::MapHapsOwned(pattern, _)
+        | Node::MapHapsNative(pattern, _, _)
+        | Node::MapHapsOwned(pattern, _, _)
         | Node::MapHapsWithState(pattern, _)
         | Node::ExpandHapsNative(pattern, _)
         | Node::Collect(pattern)
@@ -4426,12 +4580,144 @@ impl Pattern {
         let purity = compute_purity(&node);
         let runtime_settings = inherited_runtime_settings(&node);
         Pattern {
-            node: Arc::new(node),
+            node: Arc::new(NodeCell {
+                kind: node,
+                build_next: std::sync::atomic::AtomicBool::new(
+                    QUERY_DEPTH.with(|depth| depth.get() == 0),
+                ),
+                building: std::sync::atomic::AtomicBool::new(false),
+                tables: std::sync::OnceLock::new(),
+            }),
             steps: None,
             pure_loc: None,
             purity,
             runtime_settings,
         }
+    }
+
+    fn node_kind(&self) -> &Node {
+        &self.node.kind
+    }
+
+    /// The precomputed answer of this graph, built on first use. Only a
+    /// cacheable graph has one: no script, nothing that answers differently
+    /// to the same query. A table answers only under the settings snapshot
+    /// it was built under, the key of every result cache, and never for a
+    /// handle that binds another runtime, whose snapshot moves on its own.
+    fn tables(&self) -> Option<&table::Tables> {
+        if !self.tables_may_answer() {
+            return None;
+        }
+        let tables = match self.node.tables.get() {
+            Some(tables) => tables.as_deref()?,
+            None => {
+                // A build asks each child for its tables in turn, one native
+                // frame per level. A graph deeper than the bound gets none
+                // and is answered by the graph, which refuses it past
+                // `MAX_PATTERN_DEPTH`. A stack overflow would abort the
+                // process instead.
+                let _depth = table::BuildDepth::enter()?;
+                let _building = Building::start(&self.node.building);
+                // The snapshot in force when the build begins is the one its
+                // closures read.
+                let state = settings::current_state_id();
+                self.node
+                    .tables
+                    .get_or_init(|| {
+                        without_query_signals(|| table::build(self.node_kind()))
+                            .map(|tables| Box::new(tables.built_under(state)))
+                    })
+                    .as_deref()?
+            }
+        };
+        tables.current().then_some(tables)
+    }
+
+    /// Whether this handle may answer from tables at all: a cacheable graph
+    /// queried under the runtime in force, as its graph would be.
+    fn tables_may_answer(&self) -> bool {
+        self.is_cacheable()
+            && self
+                .runtime_settings
+                .as_ref()
+                .is_none_or(settings::RuntimeSettings::is_current_requested)
+    }
+
+    /// The tables built so far that may answer now, building none.
+    #[cfg(test)]
+    fn built_tables(&self) -> Option<&table::Tables> {
+        if !self.tables_may_answer() {
+            return None;
+        }
+        self.node
+            .tables
+            .get()?
+            .as_deref()
+            .filter(|tables| tables.current())
+    }
+
+    /// [`Self::tables`] for a query of this node, built only when
+    /// `NodeCell::build_next` allows it.
+    fn tables_for_query(&self) -> Option<&table::Tables> {
+        if self.node.tables.get().is_none() {
+            let relaxed = std::sync::atomic::Ordering::Relaxed;
+            if !self.node.build_next.load(relaxed) {
+                self.node.build_next.store(true, relaxed);
+                return None;
+            }
+            // Another thread builds it. The graph answers now.
+            if self
+                .node
+                .building
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return None;
+            }
+        }
+        self.tables()
+    }
+
+    /// Whether a query of `span` is answered from precomputed tables, in
+    /// the order the scheduler asks in and in the sorted order of a host
+    /// query. It builds them when needed. For tests that hold the fast path.
+    #[doc(hidden)]
+    pub fn answers_from_tables(&self, span: TimeSpan) -> bool {
+        let answers = || {
+            let state = State::new(span);
+            self.query_tables(&state, table::Order::Graph, 1).is_some()
+                && self.query_tables(&state, table::Order::Sorted, 1).is_some()
+        };
+        match &self.runtime_settings {
+            Some(settings) => settings.with(answers),
+            None => answers(),
+        }
+    }
+
+    /// The query, `depth` frames down, answered from
+    /// [`Self::tables_for_query`] in `order`, or `None` when the graph must
+    /// answer it.
+    fn query_tables(&self, state: &State, order: table::Order, depth: u32) -> Option<Vec<Hap>> {
+        // A pending error is the graph's to handle: building a table runs
+        // score closures.
+        if state.span.begin >= state.span.end || query_error_pending() {
+            return None;
+        }
+        let tables = self.tables_for_query()?;
+        let mut stop = table::Stop::query(depth);
+        let answer = match order {
+            table::Order::Graph => tables.query(state, &mut stop),
+            table::Order::Sorted => tables.query_sorted(state, &mut stop),
+        };
+        stop.finish();
+        // A step that threw while a signal was sampled, also in an answer
+        // given up later: the graph answers again, and a stack keeps the
+        // siblings of the child that threw.
+        if take_query_error().is_some() {
+            return None;
+        }
+        let haps = answer?;
+        note_materialised(haps.len());
+        Some(haps)
     }
 
     /// The cached classification. Impurity is monotonic: once impure, a
@@ -4527,6 +4813,17 @@ impl Pattern {
 
     /// The query. Everything else is built on this.
     pub fn query(&self, state: &State) -> Vec<Hap> {
+        self.query_in(state, table::Order::Graph)
+    }
+
+    /// [`Self::query`], with the haps in `order`.
+    fn query_in(&self, state: &State, order: table::Order) -> Vec<Hap> {
+        self.answer_in(state, order).0
+    }
+
+    /// [`Self::query_in`], and whether a table gave the answer, so that it
+    /// holds data only.
+    fn answer_in(&self, state: &State, order: table::Order) -> (Vec<Hap>, bool) {
         let outermost = QUERY_DEPTH.with(|depth| depth.get() == 0);
         if self.purity.volatile {
             note_uncacheable();
@@ -4543,6 +4840,7 @@ impl Pattern {
                     self.query_with_bound_runtime(
                         state,
                         (outermost || crosses_runtime).then_some(settings),
+                        order,
                     )
                 })
             }
@@ -4552,7 +4850,7 @@ impl Pattern {
                 } else {
                     None
                 };
-                self.query_with_bound_runtime(state, metadata_owner.as_ref())
+                self.query_with_bound_runtime(state, metadata_owner.as_ref(), order)
             }
         }
     }
@@ -4561,7 +4859,8 @@ impl Pattern {
         &self,
         state: &State,
         metadata_owner: Option<&settings::RuntimeSettings>,
-    ) -> Vec<Hap> {
+        order: table::Order,
+    ) -> (Vec<Hap>, bool) {
         // Restores the counter however this frame leaves - including on a
         // panic, so a caught query error cannot leave the thread's depth
         // permanently charged and refuse every later query.
@@ -4582,7 +4881,7 @@ impl Pattern {
                 depth,
                 limit: MAX_PATTERN_DEPTH,
             });
-            return Vec::new();
+            return (Vec::new(), true);
         }
         // Every node's result is charged, and an exhausted budget short-circuits
         // the recursion so it unwinds immediately rather than continuing to
@@ -4593,13 +4892,20 @@ impl Pattern {
         // Combined with `MAX_QUERY_SPAN_CYCLES`, which bounds what a single leaf
         // can produce in one pass, no unbounded `Vec<Hap>` can form.
         if budget_exhausted() || cancellation_requested() || query_deadline_expired() {
-            return Vec::new();
+            return (Vec::new(), true);
         }
-        let mut haps = self.query_node(state);
-        if let Some(settings) = metadata_owner {
+        // A table holds data only, which carries no runtime to attach.
+        let (mut haps, data_only) = match self.query_tables(state, order, depth) {
+            Some(haps) => (haps, true),
+            None => match order {
+                table::Order::Graph => (self.query_node(state), false),
+                table::Order::Sorted => (sort_haps_for_query(self.query_node(state)), false),
+            },
+        };
+        if let Some(settings) = metadata_owner.filter(|_| !data_only) {
             for hap in &mut haps {
                 if !hap.value.attach_runtime_settings(settings, 0) {
-                    return Vec::new();
+                    return (Vec::new(), true);
                 }
             }
         }
@@ -4607,17 +4913,17 @@ impl Pattern {
         // grows without an incremental check is visible as the vector it made.
         note_accumulated(haps.len());
         if !charge_haps(haps.len()) {
-            return Vec::new();
+            return (Vec::new(), true);
         }
-        haps
+        (haps, data_only)
     }
 
     fn query_node(&self, state: &State) -> Vec<Hap> {
-        match &*self.node {
+        match self.node_kind() {
             Node::Silence => Vec::new(),
 
             Node::QueryError(message) => {
-                signal_query_error(|| (*message).into());
+                signal_query_error(|| message.to_string());
                 Vec::new()
             }
 
@@ -4639,7 +4945,7 @@ impl Pattern {
                     return Vec::new();
                 }
                 note_materialised(spans.len());
-                let lookup = match &*self.node {
+                let lookup = match self.node_kind() {
                     Node::PurePickLookup(_, _) => {
                         let Some(lookup) = self.as_pick_lookup().map(Arc::new) else {
                             return Vec::new();
@@ -4680,6 +4986,29 @@ impl Pattern {
                     h
                 })
                 .collect(),
+
+            Node::Fast(pat, factor, operation) => {
+                let s =
+                    state.with_span(|sp| sp.with_time(|t| fast_query_time(t, *factor, operation)));
+                pat.query(&s)
+                    .into_iter()
+                    .map(|mut h| {
+                        h.update_span(|sp| sp.with_time(|t| fast_hap_time(t, *factor, operation)));
+                        h
+                    })
+                    .collect()
+            }
+
+            Node::Shift(pat, by, operation) => {
+                let s = state.with_span(|sp| sp.with_time(|t| shift_query_time(t, *by, operation)));
+                pat.query(&s)
+                    .into_iter()
+                    .map(|mut h| {
+                        h.update_span(|sp| sp.with_time(|t| shift_hap_time(t, *by, operation)));
+                        h
+                    })
+                    .collect()
+            }
 
             Node::WithQuerySpan(pat, f) => pat.query(&state.with_span(|sp| f(sp))),
 
@@ -4795,11 +5124,11 @@ impl Pattern {
 
             Node::SortHapsByPart(pat) => sort_haps_by_part(pat.query(state)),
 
-            Node::MapHapsNative(pat, f) => {
+            Node::MapHapsNative(pat, f, _) => {
                 pat.query(state).into_iter().filter_map(|h| f(&h)).collect()
             }
 
-            Node::MapHapsOwned(pat, f) => {
+            Node::MapHapsOwned(pat, f, _) => {
                 pat.query(state).into_iter().filter_map(|h| f(h)).collect()
             }
 
@@ -4810,7 +5139,17 @@ impl Pattern {
                 .collect(),
 
             Node::ExpandHapsNative(pat, f) => {
-                pat.query(state).into_iter().flat_map(|h| f(&h)).collect()
+                // One hap expands into N, so the output can outgrow the
+                // input's own charge; each push is charged as it lands.
+                let mut out = Vec::new();
+                for h in pat.query(state) {
+                    for expanded in f(&h) {
+                        if !push_budgeted(&mut out, expanded) {
+                            return Vec::new();
+                        }
+                    }
+                }
+                out
             }
 
             Node::Collect(pat) => collect_congruent(pat.query(state))
@@ -4824,10 +5163,8 @@ impl Pattern {
                     // collected chord is heard as one thing and was typed
                     // as several, and an editor lighting only the first of
                     // them says a note sounded that did not.
-                    let mut context: Vec<(usize, usize)> = group
-                        .iter()
-                        .flat_map(|hap| hap.context.iter().copied())
-                        .collect();
+                    let mut context: Vec<(usize, usize)> =
+                        group.iter().flat_map(|hap| hap.context.iter()).collect();
                     context.sort_unstable();
                     context.dedup();
                     Some(
@@ -5003,21 +5340,14 @@ impl Pattern {
                     let inner_pat = f(&outer.value);
                     for inner in inner_pat.query(&state.set_span(outer.part)) {
                         let mut ctx = outer.context.clone();
-                        ctx.extend_from_slice(&inner.context);
+                        ctx.append(&inner.context);
                         if !push_budgeted(
                             &mut out,
                             Hap {
                                 whole: inner.whole, // innerJoin: (_, b) => b
                                 part: inner.part,
                                 pick_lookup: joined_pick_lookup(&outer, &inner),
-                                scale: inner.scale.clone().or_else(|| outer.scale.clone()),
-                                tags: inner.tags.clone().or_else(|| outer.tags.clone()),
-                                log_line: inner.log_line.clone().or_else(|| outer.log_line.clone()),
-                                edo_size: inner.edo_size.or(outer.edo_size),
-                                scale_definition: inner
-                                    .scale_definition
-                                    .clone()
-                                    .or(outer.scale_definition.clone()),
+                                keys: ContextKeys::merge(&inner.keys, &outer.keys),
                                 value: inner.value.clone(),
                                 context: ctx,
                                 ui_visuals: inner.ui_visuals | outer.ui_visuals,
@@ -5108,15 +5438,44 @@ impl Pattern {
             }
 
             Node::RepeatCycles(pattern, count) => {
+                // Every shift is checked: a span at the far edge of the
+                // native range refuses rather than unwinds, as `fastGap`
+                // does.
+                let refuse_shift = || {
+                    refuse(QueryLimit::NativeFraction {
+                        operation: "repeatCycles",
+                    });
+                };
                 let cycle = state.span.begin.sam();
-                let source_cycle = cycle.div(*count).sam();
-                let delta = cycle.sub(source_cycle);
-                let shifted = state.with_span(|span| span.with_time(|time| time.sub(delta)));
+                let Some(delta) = cycle
+                    .checked_div(*count)
+                    .and_then(|source| cycle.checked_sub(source.sam()))
+                else {
+                    refuse_shift();
+                    return Vec::new();
+                };
+                let shifted = state.with_span(|span| {
+                    match (span.begin.checked_sub(delta), span.end.checked_sub(delta)) {
+                        (Some(begin), Some(end)) => TimeSpan::new(begin, end),
+                        _ => {
+                            refuse_shift();
+                            *span
+                        }
+                    }
+                });
                 pattern
                     .query(&shifted)
                     .into_iter()
                     .map(|mut hap| {
-                        hap.update_span(|span| span.with_time(|time| time.add(delta)));
+                        hap.update_span(|span| {
+                            span.with_time(|time| match time.checked_add(delta) {
+                                Some(shifted) => shifted,
+                                None => {
+                                    refuse_shift();
+                                    time
+                                }
+                            })
+                        });
                         hap
                     })
                     .collect()
@@ -5130,38 +5489,14 @@ impl Pattern {
                     let inner = pat_val.query(&state.set_span(hf.whole_or_part()));
                     for hv in inner {
                         if let Some(part) = hf.part.intersection(&hv.part) {
-                            let mut ctx = hv.context.clone();
-                            ctx.extend_from_slice(&hf.context);
-                            let value = apply(&hf.value, &hv.value);
-                            let pick_lookup = applied_pick_lookup(*lookup_flow, &value, &hf, &hv);
-                            let live_controls = applied_live_controls(*lookup_flow, &hf, &hv);
+                            let hap = applied_hap(&hf, &hv, hf.whole, part, apply, *lookup_flow);
                             if budget_exhausted()
                                 || cancellation_requested()
                                 || query_deadline_expired()
                             {
                                 return Vec::new();
                             }
-                            if !push_budgeted(
-                                &mut out,
-                                Hap {
-                                    whole: hf.whole,
-                                    part,
-                                    value,
-                                    context: ctx,
-                                    ui_visuals: hf.ui_visuals | hv.ui_visuals,
-                                    live_controls: live_controls.0,
-                                    slider_binding: live_controls.1,
-                                    pick_lookup,
-                                    scale: hf.scale.clone().or_else(|| hv.scale.clone()),
-                                    tags: hf.tags.clone().or_else(|| hv.tags.clone()),
-                                    log_line: hf.log_line.clone().or_else(|| hv.log_line.clone()),
-                                    edo_size: hf.edo_size.or(hv.edo_size),
-                                    scale_definition: hf
-                                        .scale_definition
-                                        .clone()
-                                        .or(hv.scale_definition.clone()),
-                                },
-                            ) {
+                            if !push_budgeted(&mut out, hap) {
                                 return Vec::new();
                             }
                         }
@@ -5178,38 +5513,14 @@ impl Pattern {
                     let funcs = pat_func.query(&state.set_span(hv.whole_or_part()));
                     for hf in funcs {
                         if let Some(part) = hf.part.intersection(&hv.part) {
-                            let mut ctx = hv.context.clone();
-                            ctx.extend_from_slice(&hf.context);
-                            let value = apply(&hf.value, &hv.value);
-                            let pick_lookup = applied_pick_lookup(*lookup_flow, &value, &hf, &hv);
-                            let live_controls = applied_live_controls(*lookup_flow, &hf, &hv);
+                            let hap = applied_hap(&hf, &hv, hv.whole, part, apply, *lookup_flow);
                             if budget_exhausted()
                                 || cancellation_requested()
                                 || query_deadline_expired()
                             {
                                 return Vec::new();
                             }
-                            if !push_budgeted(
-                                &mut out,
-                                Hap {
-                                    whole: hv.whole,
-                                    part,
-                                    value,
-                                    context: ctx,
-                                    ui_visuals: hf.ui_visuals | hv.ui_visuals,
-                                    live_controls: live_controls.0,
-                                    slider_binding: live_controls.1,
-                                    pick_lookup,
-                                    scale: hf.scale.clone().or_else(|| hv.scale.clone()),
-                                    tags: hf.tags.clone().or_else(|| hv.tags.clone()),
-                                    log_line: hf.log_line.clone().or_else(|| hv.log_line.clone()),
-                                    edo_size: hf.edo_size.or(hv.edo_size),
-                                    scale_definition: hf
-                                        .scale_definition
-                                        .clone()
-                                        .or(hv.scale_definition.clone()),
-                                },
-                            ) {
+                            if !push_budgeted(&mut out, hap) {
                                 return Vec::new();
                             }
                         }
@@ -5241,38 +5552,14 @@ impl Pattern {
                             },
                             _ => None,
                         };
-                        let mut ctx = hv.context.clone();
-                        ctx.extend_from_slice(&hf.context);
-                        let value = apply(&hf.value, &hv.value);
-                        let pick_lookup = applied_pick_lookup(*lookup_flow, &value, hf, hv);
-                        let live_controls = applied_live_controls(*lookup_flow, hf, hv);
+                        let hap = applied_hap(hf, hv, whole, part, apply, *lookup_flow);
                         if budget_exhausted()
                             || cancellation_requested()
                             || query_deadline_expired()
                         {
                             return Vec::new();
                         }
-                        if !push_budgeted(
-                            &mut out,
-                            Hap {
-                                whole,
-                                part,
-                                value,
-                                context: ctx,
-                                ui_visuals: hf.ui_visuals | hv.ui_visuals,
-                                live_controls: live_controls.0,
-                                slider_binding: live_controls.1,
-                                pick_lookup,
-                                scale: hf.scale.clone().or_else(|| hv.scale.clone()),
-                                tags: hf.tags.clone().or_else(|| hv.tags.clone()),
-                                log_line: hf.log_line.clone().or_else(|| hv.log_line.clone()),
-                                edo_size: hf.edo_size.or(hv.edo_size),
-                                scale_definition: hf
-                                    .scale_definition
-                                    .clone()
-                                    .or(hv.scale_definition.clone()),
-                            },
-                        ) {
+                        if !push_budgeted(&mut out, hap) {
                             return Vec::new();
                         }
                     }
@@ -5314,7 +5601,7 @@ impl Pattern {
                     }
                     for hap in pattern.late(offset).query(&state.set_span(time_hap.part)) {
                         let mut context = hap.context.clone();
-                        context.extend_from_slice(&time_hap.context);
+                        context.append(&time_hap.context);
                         if !push_budgeted(
                             &mut result,
                             Hap {
@@ -5326,14 +5613,7 @@ impl Pattern {
                                 live_controls: hap.live_controls,
                                 slider_binding: hap.slider_binding,
                                 pick_lookup: hap.pick_lookup,
-                                scale: time_hap.scale.clone().or(hap.scale),
-                                tags: time_hap.tags.clone().or(hap.tags),
-                                log_line: time_hap.log_line.clone().or(hap.log_line),
-                                edo_size: time_hap.edo_size.or(hap.edo_size),
-                                scale_definition: time_hap
-                                    .scale_definition
-                                    .clone()
-                                    .or(hap.scale_definition),
+                                keys: ContextKeys::merge(&time_hap.keys, &hap.keys),
                             },
                         ) {
                             return Vec::new();
@@ -5414,21 +5694,14 @@ impl Pattern {
                                     _ => unreachable!("handled by the outer match"),
                                 };
                                 let mut ctx = a.context.clone();
-                                ctx.extend_from_slice(&b.context);
+                                ctx.append(&b.context);
                                 if !push_budgeted(
                                     &mut out,
                                     Hap {
                                         whole,
                                         part: b.part,
                                         pick_lookup: joined_pick_lookup(&a, &b),
-                                        scale: b.scale.clone().or_else(|| a.scale.clone()),
-                                        tags: b.tags.clone().or_else(|| a.tags.clone()),
-                                        log_line: b.log_line.clone().or_else(|| a.log_line.clone()),
-                                        edo_size: b.edo_size.or(a.edo_size),
-                                        scale_definition: b
-                                            .scale_definition
-                                            .clone()
-                                            .or(a.scale_definition.clone()),
+                                        keys: ContextKeys::merge(&b.keys, &a.keys),
                                         value: b.value.clone(),
                                         context: ctx,
                                         ui_visuals: a.ui_visuals | b.ui_visuals,
@@ -5467,24 +5740,14 @@ impl Pattern {
                                     continue;
                                 };
                                 let mut ctx = inner.context.clone();
-                                ctx.extend_from_slice(&outer.context);
+                                ctx.append(&outer.context);
                                 if !push_budgeted(
                                     &mut out,
                                     Hap {
                                         whole,
                                         part,
                                         pick_lookup: joined_pick_lookup(&outer, &inner),
-                                        scale: outer.scale.clone().or_else(|| inner.scale.clone()),
-                                        tags: outer.tags.clone().or_else(|| inner.tags.clone()),
-                                        log_line: outer
-                                            .log_line
-                                            .clone()
-                                            .or_else(|| inner.log_line.clone()),
-                                        edo_size: outer.edo_size.or(inner.edo_size),
-                                        scale_definition: outer
-                                            .scale_definition
-                                            .clone()
-                                            .or(inner.scale_definition.clone()),
+                                        keys: ContextKeys::merge(&outer.keys, &inner.keys),
                                         value: inner.value.clone(),
                                         context: ctx,
                                         ui_visuals: outer.ui_visuals | inner.ui_visuals,
@@ -5522,24 +5785,14 @@ impl Pattern {
                                 let whole =
                                     inner.whole.and_then(|iw| iw.intersection(&outer_whole));
                                 let mut ctx = outer.context.clone();
-                                ctx.extend_from_slice(&inner.context);
+                                ctx.append(&inner.context);
                                 if !push_budgeted(
                                     &mut out,
                                     Hap {
                                         whole,
                                         part,
                                         pick_lookup: joined_pick_lookup(&outer, &inner),
-                                        scale: inner.scale.clone().or_else(|| outer.scale.clone()),
-                                        tags: inner.tags.clone().or_else(|| outer.tags.clone()),
-                                        log_line: inner
-                                            .log_line
-                                            .clone()
-                                            .or_else(|| outer.log_line.clone()),
-                                        edo_size: inner.edo_size.or(outer.edo_size),
-                                        scale_definition: inner
-                                            .scale_definition
-                                            .clone()
-                                            .or(outer.scale_definition.clone()),
+                                        keys: ContextKeys::merge(&inner.keys, &outer.keys),
                                         value: inner.value.clone(),
                                         context: ctx,
                                         ui_visuals: outer.ui_visuals | inner.ui_visuals,
@@ -5601,21 +5854,14 @@ impl Pattern {
                     let extended = poly_extend(&inner, outer_steps);
                     for b in extended.query(&state.set_span(outer.part)) {
                         let mut ctx = outer.context.clone();
-                        ctx.extend_from_slice(&b.context);
+                        ctx.append(&b.context);
                         if !push_budgeted(
                             &mut out,
                             Hap {
                                 whole: outer.whole,
                                 part: b.part,
                                 pick_lookup: b.pick_lookup.clone(),
-                                scale: b.scale.clone().or_else(|| outer.scale.clone()),
-                                tags: b.tags.clone().or_else(|| outer.tags.clone()),
-                                log_line: b.log_line.clone().or_else(|| outer.log_line.clone()),
-                                edo_size: b.edo_size.or(outer.edo_size),
-                                scale_definition: b
-                                    .scale_definition
-                                    .clone()
-                                    .or(outer.scale_definition.clone()),
+                                keys: ContextKeys::merge(&b.keys, &outer.keys),
                                 value: b.value.clone(),
                                 context: ctx,
                                 ui_visuals: b.ui_visuals | outer.ui_visuals,
@@ -5652,7 +5898,7 @@ impl Pattern {
                         // `withHap`: the joined hap's context first, then the
                         // selected hap's - `h.combineContext(h.value)`.
                         let mut context = index_hap.context.clone();
-                        context.extend_from_slice(&picked.context);
+                        context.append(&picked.context);
                         if !push_budgeted(
                             &mut out,
                             Hap {
@@ -5660,17 +5906,7 @@ impl Pattern {
                                 whole: index_hap.whole,
                                 part: index_hap.part,
                                 pick_lookup: picked.pick_lookup.clone(),
-                                scale: picked.scale.clone().or_else(|| index_hap.scale.clone()),
-                                tags: picked.tags.clone().or_else(|| index_hap.tags.clone()),
-                                log_line: picked
-                                    .log_line
-                                    .clone()
-                                    .or_else(|| index_hap.log_line.clone()),
-                                edo_size: picked.edo_size.or(index_hap.edo_size),
-                                scale_definition: picked
-                                    .scale_definition
-                                    .clone()
-                                    .or(index_hap.scale_definition.clone()),
+                                keys: ContextKeys::merge(&picked.keys, &index_hap.keys),
                                 value: picked.value.clone(),
                                 context,
                                 ui_visuals: picked.ui_visuals | index_hap.ui_visuals,
@@ -5743,6 +5979,7 @@ impl Pattern {
                         if let Some(Value::List(items)) =
                             context.and_then(|context| context.get("locations"))
                         {
+                            let mut added = Vec::new();
                             for item in items {
                                 let Some(location) = item.as_object() else {
                                     continue;
@@ -5763,9 +6000,12 @@ impl Pattern {
                                     && start <= usize::MAX as f64
                                     && end <= usize::MAX as f64
                                 {
-                                    locations.push((start as usize, end as usize));
+                                    added.push((start as usize, end as usize));
                                 }
                             }
+                            // One extend: past the inline ranges, each call
+                            // copies the whole list.
+                            locations.extend_from_slice(&added);
                         }
                         if !push_budgeted(
                             &mut out,
@@ -5775,50 +6015,41 @@ impl Pattern {
                                 value,
                                 context: locations,
                                 ui_visuals: inner.ui_visuals,
-                                live_controls: [0; 3],
+                                live_controls: [0; 4],
                                 slider_binding: 0,
                                 pick_lookup: None,
-                                // `combineContext(h.value)`: a scale key on
-                                // the value-side context object wins; the
-                                // receiving hap's tag survives otherwise.
-                                scale: context
-                                    .and_then(|context| context.get("scale"))
-                                    .and_then(|scale| match scale {
-                                        Value::Str(name) => Some(Arc::from(name.as_str())),
-                                        _ => None,
-                                    })
-                                    .or_else(|| inner.scale.clone()),
-                                // `combineContext(h.value)`: a numeric
-                                // edoSize on the value-side context wins;
-                                // otherwise the receiving hap's tag survives.
-                                edo_size: context
-                                    .and_then(|context| context.get("edoSize"))
-                                    .and_then(Value::as_f64)
-                                    .or(inner.edo_size),
-                                // `combineContext(h.value)`: a value-side
-                                // scaleDefinition wins the same way.
-                                scale_definition: context
-                                    .and_then(|context| context.get("scaleDefinition"))
-                                    .cloned()
-                                    .map(Arc::new)
-                                    .or_else(|| inner.scale_definition.clone()),
-                                // A tag list arriving on the value-side
-                                // context wins the same way; otherwise the
-                                // receiving hap keeps its own.
-                                tags: context
-                                    .and_then(|context| context.get("tags"))
-                                    .and_then(tags_from_value)
-                                    .or_else(|| inner.tags.clone()),
-                                // `.log()` writes its already-formatted text
-                                // here; the runtime prints it when the hap
-                                // triggers. Same value-side-wins rule.
-                                log_line: context
-                                    .and_then(|context| context.get("logLine"))
-                                    .and_then(|value| match value {
-                                        Value::Str(text) => Some(Arc::from(text.as_str())),
-                                        _ => None,
-                                    })
-                                    .or_else(|| inner.log_line.clone()),
+                                // `combineContext(h.value)`: each key on the
+                                // value-side context wins, and the receiving
+                                // hap keeps each key that side lacks. `.log()`
+                                // writes its formatted text under `logLine`,
+                                // which the runtime prints on the onset.
+                                keys: ContextKeys::merge(
+                                    &ContextKeys::of(context_keys::Keys {
+                                        scale: context
+                                            .and_then(|context| context.get("scale"))
+                                            .and_then(|scale| match scale {
+                                                Value::Str(name) => Some(Arc::from(name.as_str())),
+                                                _ => None,
+                                            }),
+                                        edo_size: context
+                                            .and_then(|context| context.get("edoSize"))
+                                            .and_then(Value::as_f64),
+                                        scale_definition: context
+                                            .and_then(|context| context.get("scaleDefinition"))
+                                            .cloned()
+                                            .map(Arc::new),
+                                        tags: context
+                                            .and_then(|context| context.get("tags"))
+                                            .and_then(tags_from_value),
+                                        log_line: context
+                                            .and_then(|context| context.get("logLine"))
+                                            .and_then(|value| match value {
+                                                Value::Str(text) => Some(Arc::from(text.as_str())),
+                                                _ => None,
+                                            }),
+                                    }),
+                                    &inner.keys,
+                                ),
                             },
                         ) {
                             return Vec::new();
@@ -5849,7 +6080,7 @@ impl Pattern {
                     }
                     for mut hap in selected {
                         let mut context = callback_hap.context.clone();
-                        context.append(&mut hap.context);
+                        context.append(&hap.context);
                         hap.context = context;
                         if !push_budgeted(&mut out, hap) {
                             return Vec::new();
@@ -5909,7 +6140,7 @@ impl Pattern {
     }
 
     fn resolve_pattern_of_inner(&self, state: &State) -> Option<Vec<ResolvedHap>> {
-        match &*self.node {
+        match self.node_kind() {
             Node::PatternOfPure(outer, f, memo) => {
                 let mut resolved = Vec::new();
                 let settings = settings::current_state_id();
@@ -5954,20 +6185,32 @@ impl Pattern {
                 Some(resolved)
             }
             // `pure(pattern)`: one hap per cycle, each carrying the same known
-            // inner pattern. Mirrors `Node::Pure`'s query exactly.
-            Node::PurePattern(inner) => Some(
-                state
-                    .span
-                    .span_cycles()
-                    .into_iter()
-                    .map(|subspan| {
-                        ResolvedHap::of(
-                            Hap::new(Some(whole_cycle(subspan.begin)), subspan, Value::Undefined),
-                            inner.clone(),
-                        )
-                    })
-                    .collect(),
-            ),
+            // inner pattern. Mirrors `Node::Pure`'s query exactly, including
+            // its pre-charge: if every inner pattern is silent, the join's
+            // output stays empty and no later vector exists for the generic
+            // check to catch, so the charge belongs here.
+            Node::PurePattern(inner) => {
+                let spans = state.span.span_cycles();
+                if !charge_haps(spans.len()) {
+                    return Some(Vec::new());
+                }
+                note_materialised(spans.len());
+                Some(
+                    spans
+                        .into_iter()
+                        .map(|subspan| {
+                            ResolvedHap::of(
+                                Hap::new(
+                                    Some(whole_cycle(subspan.begin)),
+                                    subspan,
+                                    Value::Undefined,
+                                ),
+                                inner.clone(),
+                            )
+                        })
+                        .collect(),
+                )
+            }
 
             // `fmap(func)` with a user callback. `fmap` is representation-
             // agnostic: whatever the outer hap carries is what `func`
@@ -6060,15 +6303,49 @@ impl Pattern {
                     })
                     .collect()
             }),
+            Node::Fast(inner, factor, operation) => inner
+                .resolve_pattern_of(
+                    &state.with_span(|sp| sp.with_time(|t| fast_query_time(t, *factor, operation))),
+                )
+                .map(|resolved| {
+                    resolved
+                        .into_iter()
+                        .map(|resolved| ResolvedHap {
+                            hap: resolved.hap.with_span(|sp| {
+                                sp.with_time(|t| fast_hap_time(t, *factor, operation))
+                            }),
+                            inner: resolved.inner,
+                        })
+                        .collect()
+                }),
+            Node::Shift(inner, by, operation) => inner
+                .resolve_pattern_of(
+                    &state.with_span(|sp| sp.with_time(|t| shift_query_time(t, *by, operation))),
+                )
+                .map(|resolved| {
+                    resolved
+                        .into_iter()
+                        .map(|resolved| ResolvedHap {
+                            hap: resolved.hap.with_span(|sp| {
+                                sp.with_time(|t| shift_hap_time(t, *by, operation))
+                            }),
+                            inner: resolved.inner,
+                        })
+                        .collect()
+                }),
             // `stack` resolves each branch and concatenates, mirroring the
             // query's flatten. `seqPLoop` (and any join over a stacked
             // pattern-of-patterns) otherwise fell through to the plain-query
             // fallback and hit the pattern-valued refusal with no haps at all.
             Node::Stack(children) => Some(
-                children
-                    .iter()
-                    .flat_map(|child| query_stack_child(|| child.resolve_for_join(state)))
-                    .collect(),
+                extend_budgeted(
+                    children
+                        .iter()
+                        .map(|child| query_stack_child(|| child.resolve_for_join(state))),
+                )
+                // A refused concatenation resolves to silence; the refusal
+                // itself travels on the query-wide channel.
+                .unwrap_or_default(),
             ),
             // `fastGap` on a pattern-of-patterns: the join must consume the
             // same compressed outer windows the query path produces, or
@@ -6131,7 +6408,14 @@ impl Pattern {
                         });
                         return Some(Vec::new());
                     };
+                    // The per-cycle results concatenate, so each extend is
+                    // charged: the branches are individually legal while the
+                    // running total is not.
+                    if !charge_haps(resolved_haps.len() + haps.len()) {
+                        return Some(Vec::new());
+                    }
                     resolved_haps.extend(haps);
+                    note_accumulated(resolved_haps.len());
                 }
                 Some(resolved_haps)
             }
@@ -6202,11 +6486,7 @@ impl Pattern {
             ui_visuals: hap.ui_visuals,
             live_controls: hap.live_controls,
             slider_binding: hap.slider_binding,
-            scale: hap.scale.clone(),
-            tags: hap.tags.clone(),
-            log_line: hap.log_line.clone(),
-            edo_size: hap.edo_size,
-            scale_definition: hap.scale_definition.clone(),
+            keys: hap.keys.clone(),
         })
     }
 
@@ -6214,7 +6494,7 @@ impl Pattern {
     /// `register()`'s fast path keys off this, and it is semantically
     /// observable because that path also merges source locations.
     fn as_pure_inner(&self) -> Option<Value> {
-        match &*self.node {
+        match self.node_kind() {
             Node::Pure(v) | Node::PurePickLookup(v, _) => Some(v.clone()),
             // `withContext` preserves the pure fast-path metadata;
             // AddContext is that operation's native representation.
@@ -6253,7 +6533,7 @@ impl Pattern {
     }
 
     pub fn as_pick_lookup(&self) -> Option<PickLookup> {
-        let lookup = match &*self.node {
+        let lookup = match self.node_kind() {
             Node::PurePickLookup(_, lookup) => Some(lookup.clone()),
             _ => None,
         }?;
@@ -6280,8 +6560,10 @@ impl Pattern {
     }
 
     pub fn with_ui_visual_slot(&self, slot: u8) -> Self {
-        let mut pattern =
-            self.map_haps_preserving_live(move |hap| Some(hap.clone().with_ui_visual_slot(slot)));
+        let mut pattern = self.map_haps_preserving_live(
+            move |hap| Some(hap.clone().with_ui_visual_slot(slot)),
+            SpanUse::Ignores,
+        );
         pattern.steps = self.steps;
         pattern.pure_loc = self.pure_loc;
         pattern
@@ -6454,13 +6736,16 @@ impl Pattern {
             Arc::new(move |outer| {
                 let outer = outer.clone();
                 let combine = combine.clone();
-                inputs.map_haps_preserving_live(move |inner| {
-                    Some(
-                        inner
-                            .with_value(|value| combine(&outer.value, value))
-                            .with_pitch_live_controls(&outer),
-                    )
-                })
+                inputs.map_haps_preserving_live(
+                    move |inner| {
+                        Some(
+                            inner
+                                .with_value(|value| combine(&outer.value, value))
+                                .with_pitch_live_controls(&outer),
+                        )
+                    },
+                    SpanUse::Ignores,
+                )
             }),
         ))
         .outer_join()
@@ -6624,6 +6909,26 @@ impl Pattern {
         state: &State,
         budget: u64,
     ) -> Result<QueryArcOutcome, QueryLimit> {
+        self.query_arc_outcome_in(state, budget, table::Order::Graph)
+    }
+
+    /// [`Self::query_arc_outcome_with_budget`] with the haps sorted as
+    /// [`sort_haps_for_query`] sorts them. A precomputed answer comes sorted
+    /// already, so this is cheaper than sorting the outcome afterwards.
+    pub fn query_arc_outcome_sorted_with_budget(
+        &self,
+        state: &State,
+        budget: u64,
+    ) -> Result<QueryArcOutcome, QueryLimit> {
+        self.query_arc_outcome_in(state, budget, table::Order::Sorted)
+    }
+
+    fn query_arc_outcome_in(
+        &self,
+        state: &State,
+        budget: u64,
+        order: table::Order,
+    ) -> Result<QueryArcOutcome, QueryLimit> {
         // A fresh top-level query reports only its own contained failures; a
         // stale publication from a construction probe or an earlier query
         // must not be attributed here.
@@ -6640,7 +6945,12 @@ impl Pattern {
         let query = || {
             with_hap_budget(budget, || {
                 let raw_query_attaches_metadata = QUERY_DEPTH.with(|depth| depth.get() == 0);
-                let mut haps = self.query(state);
+                let (mut haps, data_only) = self.answer_in(state, order);
+                // A table answers with data only: no script object to
+                // materialise and no runtime to attach.
+                if data_only {
+                    return haps;
+                }
                 // JS-owned arrays/objects preserve their identity throughout the
                 // graph, but the host that can resolve that identity exists only
                 // during the outer query. Convert returned values here so every
@@ -6650,7 +6960,7 @@ impl Pattern {
                     let materialized = hap.value.contains_js_value();
                     if materialized {
                         hap.value = materialize_js_value(&hap.value);
-                        hap.live_controls = [0; 3];
+                        hap.live_controls = [0; 4];
                         hap.slider_binding = 0;
                     }
                     if let Some(settings) = &metadata_owner
@@ -6809,7 +7119,16 @@ impl Pattern {
     /// query span and the hap spans.
     pub fn revv(&self) -> Self {
         fn negate(span: &TimeSpan) -> TimeSpan {
-            TimeSpan::new(span.end.neg(), span.begin.neg())
+            // A span at the far edge of the native range cannot be negated;
+            // the query refuses rather than unwinds. The returned span is
+            // never read once the refusal flag is set.
+            match (span.end.checked_neg(), span.begin.checked_neg()) {
+                (Some(end), Some(begin)) => TimeSpan::new(end, begin),
+                (None, _) | (_, None) => {
+                    refuse(QueryLimit::NativeFraction { operation: "revv" });
+                    *span
+                }
+            }
         }
         self.with_query_span(negate).with_hap_span(negate)
     }
@@ -6885,6 +7204,7 @@ impl Pattern {
                     "gain" => mapped.live_controls[0] = slider_binding,
                     "cutoff" => mapped.live_controls[1] = slider_binding,
                     "resonance" => mapped.live_controls[2] = slider_binding,
+                    "fmi" => mapped.live_controls[3] = slider_binding,
                     _ => {}
                 }
             }
@@ -6930,29 +7250,40 @@ impl Pattern {
     /// Per-hap rewrite where `None` drops the hap. Steps are preserved by the
     /// callers registered `preserveSteps`.
     pub fn map_haps_native(&self, f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static) -> Self {
-        self.map_haps_preserving_live(move |hap| f(hap).map(Hap::without_live_controls))
+        self.map_haps_preserving_live(
+            move |hap| f(hap).map(Hap::without_live_controls),
+            SpanUse::Reads,
+        )
     }
 
     fn map_haps_preserving_live(
         &self,
         f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+        spans: SpanUse,
     ) -> Self {
-        Pattern::of(Node::MapHapsNative(self.clone(), Arc::new(f)))
+        Pattern::of(Node::MapHapsNative(self.clone(), Arc::new(f), spans))
     }
 
     /// Maps each hap and gives the closure ownership of it. Use this when the
-    /// change can move the value or context instead of cloning them.
+    /// change can move the value or context instead of cloning them. `f`
+    /// keeps the spans and reads none of them.
     fn map_haps_owned(&self, f: impl Fn(Hap) -> Option<Hap> + Send + Sync + 'static) -> Self {
-        Pattern::of(Node::MapHapsOwned(self.clone(), Arc::new(f)))
+        Pattern::of(Node::MapHapsOwned(
+            self.clone(),
+            Arc::new(f),
+            SpanUse::Ignores,
+        ))
     }
 
+    /// A pitch rewrite. `f` keeps the spans and reads none of them.
     fn map_pitch_haps_native(
         &self,
         f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
     ) -> Self {
-        self.map_haps_preserving_live(move |hap| {
-            f(hap).map(|mapped| mapped.with_pitch_live_controls(hap))
-        })
+        self.map_haps_preserving_live(
+            move |hap| f(hap).map(|mapped| mapped.with_pitch_live_controls(hap)),
+            SpanUse::Ignores,
+        )
     }
 
     fn expand_pitch_haps_native(
@@ -7088,7 +7419,10 @@ impl Pattern {
     /// one branch of a `when`, then keep only those, which is how a score
     /// selects what an earlier transform touched.
     pub fn tag(&self, name: Arc<str>) -> Self {
-        self.map_haps_preserving_live(move |hap| Some(hap.clone().with_tag_context(name.clone())))
+        self.map_haps_preserving_live(
+            move |hap| Some(hap.clone().with_tag_context(name.clone())),
+            SpanUse::Ignores,
+        )
     }
 
     /// Add a native graph node whose semantics are owned by a statically
@@ -7204,14 +7538,12 @@ impl Pattern {
     /// steps. On overflow, record `NativeFraction` and use zero until the query
     /// boundary reports the refusal.
     fn shift_time(&self, t: Fraction, operation: &'static str) -> Self {
-        let steps = self.steps;
-        let refused = move || {
-            mark_stepwise_refusal(QueryLimit::NativeFraction { operation });
-            Fraction::ZERO
-        };
-        self.with_query_time(move |x| x.checked_sub(t).unwrap_or_else(refused))
-            .with_hap_time(move |x| x.checked_add(t).unwrap_or_else(refused))
-            .with_steps(steps)
+        Pattern::of(Node::Shift(self.clone(), t, operation)).with_steps(self.steps)
+    }
+
+    /// The [`Node::Fast`] behind [`combinators::checked_fast`].
+    pub(crate) fn fast_node(&self, factor: Fraction, operation: &'static str) -> Self {
+        Pattern::of(Node::Fast(self.clone(), factor, operation))
     }
 
     /// Speeds up like `fast`, but leaves a **gap** for the rest of the cycle
@@ -7412,6 +7744,8 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         Node::NonSendMutation(_) => {}
         Node::WithQueryTime(pattern, _)
         | Node::WithHapTime(pattern, _)
+        | Node::Fast(pattern, _, _)
+        | Node::Shift(pattern, _, _)
         | Node::WithQuerySpan(pattern, _)
         | Node::WithQuerySpanJs(pattern, _)
         | Node::WithHapSpan(pattern, _)
@@ -7428,8 +7762,8 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         | Node::FilterHapsJs(pattern, _)
         | Node::FilterWhenJs(pattern, _)
         | Node::SortHapsByPart(pattern)
-        | Node::MapHapsNative(pattern, _)
-        | Node::MapHapsOwned(pattern, _)
+        | Node::MapHapsNative(pattern, _, _)
+        | Node::MapHapsOwned(pattern, _, _)
         | Node::MapHapsWithState(pattern, _)
         | Node::ExpandHapsNative(pattern, _)
         | Node::Collect(pattern)
@@ -7520,8 +7854,8 @@ impl Drop for Node {
         while let Some(pattern) = pending.pop() {
             // Only the last owner has a graph to take apart; anyone else is
             // just releasing a reference.
-            if let Some(mut node) = Arc::into_inner(pattern.node) {
-                drain_pattern_children(&mut node, &mut pending);
+            if let Some(mut cell) = Arc::into_inner(pattern.node) {
+                drain_pattern_children(&mut cell.kind, &mut pending);
             }
         }
     }
@@ -7553,11 +7887,10 @@ fn step_slices_pattern(resolved: &[(Hap, Pattern)]) -> Pattern {
             if span.intersection(&hap.part).is_none() {
                 continue;
             }
-            let locations = hap.context.clone();
-            layers.push(if locations.is_empty() {
+            layers.push(if hap.context.is_empty() {
                 inner.clone()
             } else {
-                inner.with_added_context(locations)
+                inner.with_added_context(hap.context.to_vec())
             });
         }
         let stacked = stack(layers);
@@ -7648,6 +7981,8 @@ fn compute_purity(node: &Node) -> purity::Purity {
 
         Node::WithQueryTime(p, _)
         | Node::WithHapTime(p, _)
+        | Node::Fast(p, _, _)
+        | Node::Shift(p, _, _)
         | Node::WithQuerySpan(p, _)
         | Node::WithHapSpan(p, _)
         | Node::Rev(p)
@@ -7659,8 +7994,8 @@ fn compute_purity(node: &Node) -> purity::Purity {
         | Node::FilterValues(p, _)
         | Node::FilterHaps(p, _)
         | Node::SortHapsByPart(p)
-        | Node::MapHapsNative(p, _)
-        | Node::MapHapsOwned(p, _)
+        | Node::MapHapsNative(p, _, _)
+        | Node::MapHapsOwned(p, _, _)
         | Node::MapHapsWithState(p, _)
         | Node::ExpandHapsNative(p, _)
         | Node::Collect(p)
@@ -7966,8 +8301,8 @@ pub const UNREADABLE_MIDI_PORT: &str = "(unreadable port name)";
 /// complaint and calls the non-function later, so the host must build
 /// something rather than throw. See
 /// `crates/jsruntime/tests/bind_ownership.rs`.
-pub fn query_error_pattern(message: &'static str) -> Pattern {
-    Pattern::of(Node::QueryError(message))
+pub fn query_error_pattern(message: impl Into<Arc<str>>) -> Pattern {
+    Pattern::of(Node::QueryError(message.into()))
 }
 
 /// A pure pattern that refuses through the typed resource channel when it is
@@ -8039,7 +8374,7 @@ pub fn unjoin(pattern: Pattern, pieces: Pattern, function: Option<&value::Functi
     let transform = function.cloned();
     let mut dependencies = vec![pattern];
     if let Some(function) = &transform {
-        dependencies.push(pure(Value::Function(function.clone())));
+        dependencies.push(pure(Value::Function(Box::new(function.clone()))));
     }
     Pattern::of(Node::PatternOfHap(
         pieces,
@@ -9099,5 +9434,34 @@ mod set_lookup_tests {
             }
         }
         assert!(skipped > 1_000, "only {skipped} merges skipped the lookup");
+    }
+}
+
+#[cfg(test)]
+mod stable_sort_tests {
+    use super::*;
+
+    fn hap(begin: i128, end: i128, label: &str) -> Hap {
+        let span = TimeSpan::new(Fraction::new(begin, 4), Fraction::new(end, 4));
+        Hap::new(Some(span), span, Value::Str(label.into()))
+    }
+
+    fn labels(haps: &[Hap]) -> Vec<String> {
+        haps.iter().map(|hap| hap.value.show()).collect()
+    }
+
+    #[test]
+    fn equal_haps_keep_their_order_and_every_hap_moves_once() {
+        let haps = vec![
+            hap(2, 3, "c"),
+            hap(0, 1, "a1"),
+            hap(1, 2, "b"),
+            hap(0, 1, "a2"),
+            hap(0, 2, "long"),
+        ];
+        let sorted = sort_haps_for_query(haps);
+        assert_eq!(labels(&sorted), ["a1", "a2", "long", "b", "c"]);
+        let already = sort_haps_for_query(sorted);
+        assert_eq!(labels(&already), ["a1", "a2", "long", "b", "c"]);
     }
 }

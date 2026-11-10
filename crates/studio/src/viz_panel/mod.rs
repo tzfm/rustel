@@ -21,6 +21,8 @@ mod column;
 mod events;
 mod mixer;
 mod scopes;
+#[cfg(feature = "video")]
+mod video;
 
 pub use art::{ArtView, art_rows};
 pub use column::{VizAddView, VizDockView};
@@ -30,6 +32,8 @@ pub use mixer::{
     REDUCTION_FULL_DB,
 };
 pub use scopes::{Look, ScopeView, SpectrumView, VectorView};
+#[cfg(feature = "video")]
+pub use video::VideoView;
 
 /// Cells a docked column takes by default, its rule included, and the
 /// least and the most a resize allows.
@@ -215,6 +219,8 @@ pub enum WidgetKind {
     /// The stereo field, left against right, on a polar dial.
     #[serde(rename = "vectorscope")]
     Vector,
+    /// A video clip from the set, ←/→ picking which one feeds it.
+    Video,
     /// The events as they are queued to sound, newest last.
     Events,
     /// The input, the orbits and the master as meters with faders, and
@@ -231,17 +237,20 @@ impl WidgetKind {
     /// on the screen it is streamed from whether or not anything is
     /// sounding, and so does the space a spacer holds. Everything else is
     /// a picture of sound, and there is none to draw when nothing plays.
+    /// The video feeds are picked before anything plays, so the clip
+    /// picker is there too, whatever the set is doing.
     pub fn always_visible(self) -> bool {
         // The mixer is a control surface: its faders are there to be set
         // before anything plays, and its lights say what is plugged in.
-        matches!(self, Self::Art | Self::Spacer | Self::Mixer)
+        matches!(self, Self::Art | Self::Spacer | Self::Mixer | Self::Video)
     }
 
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Art,
         Self::Scope,
         Self::Spectrum,
         Self::Vector,
+        Self::Video,
         Self::Events,
         Self::Mixer,
         Self::Spacer,
@@ -258,6 +267,7 @@ impl WidgetKind {
             Self::Scope => "scope",
             Self::Spectrum => "spectrum",
             Self::Vector => "vectorscope",
+            Self::Video => "video",
             Self::Events => "events",
             Self::Mixer => "mixer",
             Self::Spacer => "spacer",
@@ -271,6 +281,7 @@ impl WidgetKind {
             Self::Scope => "the mix as a trace, six ways",
             Self::Spectrum => "the analyser, bars to waterfall",
             Self::Vector => "the stereo field on a polar dial",
+            Self::Video => "a video clip of the set, ←/→ its feed",
             Self::Events => "every event as it fires",
             Self::Mixer => "a row a strip: input, orbits, master - meters and faders",
             Self::Spacer => "an empty slot, to place the others",
@@ -285,6 +296,7 @@ impl WidgetKind {
             Self::Scope => 6,
             Self::Spectrum => 8,
             Self::Vector => 14,
+            Self::Video => 10,
             Self::Events => 10,
             Self::Mixer => 8,
             Self::Spacer => 2,
@@ -299,7 +311,7 @@ impl WidgetKind {
             Self::Scope => ScopeStyle::NAMES,
             Self::Spectrum => SpectrumStyle::NAMES,
             Self::Vector => VectorStyle::NAMES,
-            Self::Events | Self::Mixer | Self::Spacer => &[],
+            Self::Video | Self::Events | Self::Mixer | Self::Spacer => &[],
         }
     }
 }
@@ -555,6 +567,10 @@ pub struct WidgetSpec {
     /// The art's own text, when it is not the set's name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// The video widget's feed: the clip name it draws. A name the set no
+    /// longer sounds draws as the first feed again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed: Option<String>,
     #[serde(default, skip_serializing_if = "ArtAlignment::is_center")]
     pub alignment: ArtAlignment,
 }
@@ -566,6 +582,7 @@ impl WidgetSpec {
             style: None,
             colour: None,
             text: None,
+            feed: None,
             alignment: ArtAlignment::default(),
         }
     }
@@ -659,6 +676,25 @@ impl WidgetSpec {
         true
     }
 
+    /// The next feed along, either way, from `feeds`, wrapping; the video
+    /// widget's ←/→. A feed the set no longer sounds steps from the first
+    /// again. Returns whether the feed moved.
+    pub fn step_feed(&mut self, forwards: bool, feeds: &[String]) -> bool {
+        if feeds.len() < 2 {
+            self.feed = feeds.first().cloned();
+            return false;
+        }
+        let current = self
+            .feed
+            .as_deref()
+            .and_then(|feed| feeds.iter().position(|name| name == feed));
+        let index = current.unwrap_or(0);
+        let count = feeds.len() as isize;
+        let next = (index as isize + if forwards { 1 } else { -1 }).rem_euclid(count) as usize;
+        self.feed = Some(feeds[next].clone());
+        true
+    }
+
     pub fn step_colour(&mut self, forwards: bool) -> bool {
         if matches!(
             self.kind,
@@ -673,6 +709,11 @@ impl WidgetSpec {
     /// What the widget's header says: its kind, style and colour.
     pub fn title(&self) -> String {
         match self.kind {
+            // The video's feed is its style: which clip it draws.
+            WidgetKind::Video => self.feed.as_deref().map_or_else(
+                || self.kind.name().to_owned(),
+                |feed| format!("{} · {feed}", self.kind.name()),
+            ),
             WidgetKind::Events | WidgetKind::Mixer | WidgetKind::Spacer => {
                 self.kind.name().to_owned()
             }
@@ -708,6 +749,8 @@ impl WidgetSpec {
                 self.colour().animated() || self.vector_style() == VectorStyle::Sweep
             }
             WidgetKind::Scope | WidgetKind::Spectrum => self.colour().animated(),
+            // The clip's picture moves with its sound.
+            WidgetKind::Video => true,
             WidgetKind::Events | WidgetKind::Mixer | WidgetKind::Spacer => false,
         }
     }

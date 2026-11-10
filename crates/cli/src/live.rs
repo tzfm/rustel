@@ -30,6 +30,7 @@ pub(super) fn run_musician(
         link,
         audio_input,
         buffer_frames,
+        output: output_selector,
         // Read in `run`, which stores the one global switch `json_asked()`
         // reports; the field itself has no second reader here.
         json: _,
@@ -183,6 +184,7 @@ pub(super) fn run_musician(
         link,
         audio_input,
         buffer_frames,
+        output_selector.clone(),
         ui_events,
         first_install_from_zero,
         anchored,
@@ -681,7 +683,7 @@ mod live_panic_tests {
         assert!(
             event["live_error"]["message"]
                 .as_str()
-                .unwrap()
+                .expect("the field is a string")
                 .contains("injected CLI query panic")
         );
         assert_eq!(session.active_source(), Some(source));
@@ -1361,6 +1363,7 @@ pub(super) fn play_live(
     link: bool,
     audio_input: Option<String>,
     buffer_frames: Option<u32>,
+    output_selector: Option<String>,
     ui_events: bool,
     first_install_from_zero: bool,
     anchored: Option<std::sync::mpsc::Sender<()>>,
@@ -1473,7 +1476,7 @@ pub(super) fn play_live(
         );
     }
     let mut device = rustel_audio::LiveScalarDevice::start_output_with_options(
-        None,
+        output_selector.as_deref(),
         session.generation(),
         live_output_options(session, buffer_frames),
     )
@@ -2250,12 +2253,7 @@ pub(super) fn play_live(
             reverbs.observe_prepared(&device, &event);
             let pushed = device.push(event.clone());
             if pushed && ui_events_enabled {
-                pushed_ui_ids.push(rustel_runtime::ui_events::UiAcceptedOnset {
-                    generation: event.generation,
-                    onset_id: event.onset_id,
-                    frequency_hz: Some(event.freq_hz),
-                    gain: Some(event.gain),
-                });
+                pushed_ui_ids.push(rustel_runtime::ui_events::UiAcceptedOnset::scalar(&event));
             }
             pushed
         };
@@ -2806,12 +2804,12 @@ pub(super) fn play_live(
                     }
                 };
                 if sent && ui_events_enabled {
-                    accepted_external_ui_ids.push(rustel_runtime::ui_events::UiAcceptedOnset {
-                        generation: intent.generation,
-                        onset_id: intent.onset_id,
-                        frequency_hz: None,
-                        gain: None,
-                    });
+                    accepted_external_ui_ids.push(
+                        rustel_runtime::ui_events::UiAcceptedOnset::external(
+                            intent.generation,
+                            intent.onset_id,
+                        ),
+                    );
                 }
             }
             let midi_report = midi_outputs.report();
@@ -2904,12 +2902,12 @@ pub(super) fn play_live(
                         session.note_osc_handed_out(intent.generation, intent.target_time);
                     }
                     if sent && ui_events_enabled {
-                        accepted_external_ui_ids.push(rustel_runtime::ui_events::UiAcceptedOnset {
-                            generation: intent.generation,
-                            onset_id: intent.onset_id,
-                            frequency_hz: None,
-                            gain: None,
-                        });
+                        accepted_external_ui_ids.push(
+                            rustel_runtime::ui_events::UiAcceptedOnset::external(
+                                intent.generation,
+                                intent.onset_id,
+                            ),
+                        );
                     }
                 }
             }
@@ -2996,12 +2994,12 @@ pub(super) fn play_live(
                     session.note_serial_handed_out(intent.generation, intent.target_time);
                 }
                 if submitted.accepted && ui_events_enabled {
-                    accepted_external_ui_ids.push(rustel_runtime::ui_events::UiAcceptedOnset {
-                        generation: intent.generation,
-                        onset_id: intent.onset_id,
-                        frequency_hz: None,
-                        gain: None,
-                    });
+                    accepted_external_ui_ids.push(
+                        rustel_runtime::ui_events::UiAcceptedOnset::external(
+                            intent.generation,
+                            intent.onset_id,
+                        ),
+                    );
                 }
             }
         }
@@ -3283,6 +3281,7 @@ pub(super) fn play_live(
                 "plugin_jobs_inline": report.plugin_jobs_inline,
                 "plugin_join_wait_nanos": report.plugin_join_wait_nanos,
                 "plugin_late_jobs": report.plugin_late_jobs,
+                "plugin_restarts": report.plugin_restarts,
                 "plugin_worker_busy_nanos": report.realtime_load.worker_busy_nanos,
                 "midi": midi_report,
                 "realtime_metrics": "available"
@@ -3327,6 +3326,7 @@ fn live_device_report_value(report: rustel_audio::LiveDeviceReport) -> serde_jso
         "plugin_jobs_inline": report.plugin_jobs_inline,
         "plugin_join_wait_nanos": report.plugin_join_wait_nanos,
         "plugin_late_jobs": report.plugin_late_jobs,
+        "plugin_restarts": report.plugin_restarts,
     })
 }
 
@@ -3361,6 +3361,7 @@ pub(super) fn play_live(
     _link: bool,
     _audio_input: Option<String>,
     _buffer_frames: Option<u32>,
+    _output_selector: Option<String>,
     _ui_events: bool,
     _first_install_from_zero: bool,
     // Dropped unsent, so a replay's delivery thread exits.

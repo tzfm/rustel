@@ -21,8 +21,9 @@ use rustel_transpiler::TranspileOptions;
 
 /// The single `n` the expression yields, or the error it threw.
 fn n_of(expression: &str) -> Result<f64, String> {
-    let rt = JsRuntime::new().unwrap();
-    rt.install_semantic_bindings().unwrap();
+    let rt = JsRuntime::new().expect("the runtime builds");
+    rt.install_semantic_bindings()
+        .expect("the bindings install");
     rt.evaluate_score(&format!("n({expression})"), &TranspileOptions::default())
         .map_err(|e| e.to_string())?;
     let haps = rt

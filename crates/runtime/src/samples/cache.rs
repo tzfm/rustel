@@ -80,6 +80,9 @@ pub(super) fn clear_sample_cache_at(base: &Path) -> Result<(), String> {
     // The score namespace has a lock and a marker protocol of its own, so
     // it is cleared through its own door rather than deleted from under it.
     clear_score_sample_cache_at(base)?;
+    // The decoded-PCM sidecars answer to no manifest of their own: the
+    // folder as a whole is this cache's, so the folder as a whole goes.
+    let _ = std::fs::remove_dir_all(base.join(super::decode_cache::DECODED_DIR));
     let Ok(entries) = std::fs::read_dir(base) else {
         return Ok(());
     };
@@ -146,23 +149,6 @@ impl ScoreCacheKind {
     }
 }
 
-impl ScoreCacheTrust {
-    fn key_domain(self) -> &'static [u8] {
-        match self {
-            Self::Cors => b"cors",
-            Self::Grant => b"grant",
-        }
-    }
-
-    pub(super) fn from_cors_required(cors_required: bool) -> Self {
-        if cors_required {
-            Self::Cors
-        } else {
-            Self::Grant
-        }
-    }
-}
-
 impl ScoreCache {
     pub(super) fn new(base: PathBuf) -> Self {
         Self {
@@ -185,8 +171,8 @@ impl ScoreCache {
         self.base.join(SCORE_CACHE_NAMESPACE)
     }
 
-    pub(super) fn path(&self, url: &str, kind: ScoreCacheKind, trust: ScoreCacheTrust) -> PathBuf {
-        score_cache_path(&self.dir(), url, kind, trust)
+    pub(super) fn path(&self, url: &str, kind: ScoreCacheKind) -> PathBuf {
+        score_cache_path(&self.dir(), url, kind)
     }
 
     pub(super) fn open(&self, path: &Path) -> Result<Option<std::fs::File>, String> {
@@ -741,13 +727,11 @@ pub(super) fn cache_path(dir: &Path, url: &str) -> PathBuf {
     cache_path_in_domain(dir, url, None)
 }
 
-fn score_cache_path(
-    dir: &Path,
-    url: &str,
-    kind: ScoreCacheKind,
-    trust: ScoreCacheTrust,
-) -> PathBuf {
-    cache_path_in_domain(dir, url, Some(&[kind.key_domain(), trust.key_domain()]))
+fn score_cache_path(dir: &Path, url: &str, kind: ScoreCacheKind) -> PathBuf {
+    // `grant` named the entries stored when a server's CORS headers could
+    // also let a score load. Every entry comes from an allowed source now,
+    // and the old name keeps the entries already on disk.
+    cache_path_in_domain(dir, url, Some(&[kind.key_domain(), b"grant"]))
 }
 
 fn cache_path_in_domain(dir: &Path, url: &str, domains: Option<&[&[u8]]>) -> PathBuf {
@@ -755,8 +739,7 @@ fn cache_path_in_domain(dir: &Path, url: &str, domains: Option<&[&[u8]]>) -> Pat
     let mut hasher = Sha256::new();
     if let Some(domains) = domains {
         // Domain separation keeps a manifest and an audio response at the same
-        // URL from sharing validation or eviction state, and keeps CORS-
-        // consented bytes apart from grant-only ones. The legacy/trusted
+        // URL from sharing validation or eviction state. The legacy/trusted
         // layout deliberately retains its original URL-only identity above.
         hasher.update(SCORE_CACHE_KEY_DOMAIN_V1);
         for domain in domains {
@@ -862,7 +845,7 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn ensure_private_dir(path: &Path) -> Result<(), String> {
+pub(super) fn ensure_private_dir(path: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
             Ok(())
@@ -913,7 +896,8 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
 pub(crate) fn fetch_located(url: &str) -> Result<Vec<u8>, String> {
     if let Some(path) = url.strip_prefix("file://") {
         use std::io::Read;
-        let ceiling = rustel_audio::sample_pcm_ceiling();
+        let limit = FileLimit::of(url);
+        let ceiling = limit.bytes;
         let file = std::fs::File::open(path).map_err(|error| format!("read {path}: {error}"))?;
         // Ask the filesystem for the length first. One stat refuses a file
         // that is too big, and the error can state its size. Without the
@@ -922,11 +906,7 @@ pub(crate) fn fetch_located(url: &str) -> Result<Vec<u8>, String> {
         if let Some(length) = length
             && length > ceiling as u64
         {
-            return Err(format!(
-                "{path} is {}, past the {} one sound can hold",
-                rustel_audio::format_sample_bytes(length as usize),
-                rustel_audio::format_sample_bytes(ceiling)
-            ));
+            return Err(limit.refusal(Some(length)));
         }
         // The read stays bounded, because the reported length is not
         // reliable: a pipe or a device reports none (`/dev/zero` reports
@@ -945,10 +925,7 @@ pub(crate) fn fetch_located(url: &str) -> Result<Vec<u8>, String> {
         if bytes.len() > ceiling {
             // The reader stopped at the ceiling, so this one cannot say the
             // size: nothing measured it, which is the point.
-            return Err(format!(
-                "{path} is over {}, the most one sound can hold",
-                rustel_audio::format_sample_bytes(ceiling)
-            ));
+            return Err(limit.refusal(None));
         }
         return Ok(bytes);
     }
@@ -970,7 +947,7 @@ pub(super) fn fetch_cached_with_budget(
         return Ok(bytes);
     }
     let path = cache_path(dir, url);
-    if let Ok(bytes) = read_sample_cache(&path) {
+    if let Ok(bytes) = read_sample_cache(&path, FileLimit::of(url).bytes) {
         budget.check()?;
         return Ok(bytes);
     }
@@ -1139,14 +1116,12 @@ pub(super) fn fetch_manifest_cached_with_budget(
 /// with a grant for a different origin, must not read bytes that a granted
 /// score left in the cache.
 ///
-/// An approved remote URL may persist under the score cache. CORS-consented
-/// bytes and exact-grant bytes keep separate identities, so a grant-only
-/// admission cannot later satisfy the public-https/CORS policy for the same
-/// URL. A hit serves the bytes whether or not the server is reachable, so
-/// an offline render of a score that fetches its samples still works.
+/// An approved remote URL may persist under the score cache. A hit serves
+/// the bytes whether or not the server is reachable, so an offline render of
+/// a score that fetches its samples still works.
 ///
-/// Entries are keyed by the full URL, kind, and trust mode. Reads are
-/// size-bounded like a network body.
+/// Entries are keyed by the full URL and kind. Reads are size-bounded like a
+/// network body.
 #[cfg(test)]
 fn fetch_score_source_cached<T>(
     cache: &ScoreCache,
@@ -1194,7 +1169,8 @@ mod tests {
 
             let sample = cache_path(dir.path(), "https://samples.example/kick.wav");
             symlink(&victim, &sample).expect("plant sample symlink");
-            let error = read_sample_cache(&sample).expect_err("a sample symlink is refused");
+            let error = read_sample_cache(&sample, rustel_audio::sample_pcm_ceiling())
+                .expect_err("a sample symlink is refused");
             assert!(error.contains("not a regular file"), "{error}");
 
             let manifest = cache_path(dir.path(), "https://samples.example/kit.json");
@@ -1205,7 +1181,11 @@ mod tests {
 
             let honest = cache_path(dir.path(), "https://samples.example/snare.wav");
             std::fs::write(&honest, b"sample").expect("regular sample entry");
-            assert_eq!(read_sample_cache(&honest).expect("sample entry"), b"sample");
+            assert_eq!(
+                read_sample_cache(&honest, rustel_audio::sample_pcm_ceiling())
+                    .expect("sample entry"),
+                b"sample"
+            );
             std::fs::write(&honest, b"{}").expect("regular manifest entry");
             assert_eq!(read_manifest_cache(&honest).expect("manifest entry"), b"{}");
         }
@@ -1592,7 +1572,7 @@ mod tests {
             assert_eq!(library.adopt_set_folder(set.path()), Ok(1));
             let mut access = ScoreSampleAccess::denied();
             access
-                .permit_origin("https://samples.example")
+                .permit_source("https://samples.example")
                 .expect("origin");
             library
                 .register_score_custom(r#"{"bd":"https://samples.example/bd.wav"}"#, None, &access)
@@ -1669,7 +1649,7 @@ mod tests {
             let library = empty_library();
             let mut access = ScoreSampleAccess::denied();
             access
-                .permit_origin("https://samples.example")
+                .permit_source("https://samples.example")
                 .expect("origin");
             library
                 .register_score_custom(r#"{"bd":"https://samples.example/bd.wav"}"#, None, &access)
@@ -1728,7 +1708,7 @@ mod tests {
 
             let mut access = ScoreSampleAccess::denied();
             access
-                .permit_origin("https://samples.example")
+                .permit_source("https://samples.example")
                 .expect("origin");
             library
                 .register_score_custom(r#"{"bd":"https://samples.example/bd.wav"}"#, None, &access)
@@ -1825,7 +1805,7 @@ mod tests {
             }
             let mut access = ScoreSampleAccess::denied();
             access
-                .permit_origin("https://samples.example")
+                .permit_source("https://samples.example")
                 .expect("origin");
 
             let library = empty_library();
@@ -1865,7 +1845,7 @@ mod tests {
             let library = empty_library();
             let mut access = ScoreSampleAccess::denied();
             access
-                .permit_origin("https://samples.example")
+                .permit_source("https://samples.example")
                 .expect("origin");
             library
                 .register_score_custom(
@@ -1882,7 +1862,7 @@ mod tests {
             for (map, expected) in [
                 (
                     r#"{"blocked":"https://other.example/kick.wav"}"#,
-                    "outside the permitted sample origins",
+                    "is not an allowed sample source",
                 ),
                 (
                     r#"{"blocked":"file:///tmp/not-a-score-sample.wav"}"#,
@@ -1985,8 +1965,7 @@ mod tests {
             });
 
             let access = ScoreFetchAccess::Remote {
-                origin: origin.clone(),
-                cors_required: false,
+                sources: [SourceRule::parse(&origin.clone()).expect("a test source")].into(),
             };
             let as_json = |bytes: &[u8]| {
                 serde_json::from_slice::<serde_json::Value>(bytes)
@@ -2007,9 +1986,7 @@ mod tests {
                 "an unparseable body must not be accepted"
             );
             assert!(
-                !cache
-                    .path(&url, ScoreCacheKind::Manifest, ScoreCacheTrust::Grant)
-                    .exists(),
+                !cache.path(&url, ScoreCacheKind::Manifest).exists(),
                 "an unvalidated body must not be committed"
             );
 
@@ -2026,9 +2003,7 @@ mod tests {
             .expect("the valid body is accepted");
             assert_eq!(value["ok"], serde_json::json!(true));
             assert!(
-                cache
-                    .path(&url, ScoreCacheKind::Manifest, ScoreCacheTrust::Grant)
-                    .exists(),
+                cache.path(&url, ScoreCacheKind::Manifest).exists(),
                 "valid bytes are committed"
             );
             server.join().expect("server");
@@ -2036,11 +2011,8 @@ mod tests {
             // A stored entry that stops validating is evicted, not served. The
             // listener is closed now, so the retry has nowhere to go and errors -
             // which is exactly how eviction shows.
-            std::fs::write(
-                cache.path(&url, ScoreCacheKind::Manifest, ScoreCacheTrust::Grant),
-                b"corrupted",
-            )
-            .expect("corrupt the entry");
+            std::fs::write(cache.path(&url, ScoreCacheKind::Manifest), b"corrupted")
+                .expect("corrupt the entry");
             assert!(
                 fetch_score_source_cached(
                     &cache,
@@ -2054,9 +2026,7 @@ mod tests {
                 "a corrupt entry must not be served"
             );
             assert!(
-                !cache
-                    .path(&url, ScoreCacheKind::Manifest, ScoreCacheTrust::Grant)
-                    .exists(),
+                !cache.path(&url, ScoreCacheKind::Manifest).exists(),
                 "a corrupt entry must be evicted"
             );
 
@@ -2076,15 +2046,14 @@ mod tests {
             let origin = format!("http://{}", listener.local_addr().unwrap());
             let url = format!("{origin}/shared-resource");
             let access = ScoreFetchAccess::Remote {
-                origin: origin.clone(),
-                cors_required: false,
+                sources: [SourceRule::parse(&origin.clone()).expect("a test source")].into(),
             };
 
-            let manifest_path = cache.path(&url, ScoreCacheKind::Manifest, ScoreCacheTrust::Grant);
+            let manifest_path = cache.path(&url, ScoreCacheKind::Manifest);
             cache
                 .admit(&manifest_path, br#"{"bank":[]}"#)
                 .expect("seed manifest cache");
-            let audio_path = cache.path(&url, ScoreCacheKind::Audio, ScoreCacheTrust::Grant);
+            let audio_path = cache.path(&url, ScoreCacheKind::Audio);
             assert_ne!(manifest_path, audio_path, "content kinds shared one key");
 
             let server = std::thread::spawn(move || {
@@ -2145,21 +2114,9 @@ mod tests {
                 .join(format!("rustel-cache-global-quota-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let cache = ScoreCache::with_limits(dir.clone(), quota_limits(6, 2, 100, 10));
-            let first = cache.path(
-                "https://samples.example/first.wav",
-                ScoreCacheKind::Audio,
-                ScoreCacheTrust::Grant,
-            );
-            let second = cache.path(
-                "https://samples.example/second.wav",
-                ScoreCacheKind::Audio,
-                ScoreCacheTrust::Grant,
-            );
-            let third = cache.path(
-                "https://samples.example/third.wav",
-                ScoreCacheKind::Audio,
-                ScoreCacheTrust::Grant,
-            );
+            let first = cache.path("https://samples.example/first.wav", ScoreCacheKind::Audio);
+            let second = cache.path("https://samples.example/second.wav", ScoreCacheKind::Audio);
+            let third = cache.path("https://samples.example/third.wav", ScoreCacheKind::Audio);
 
             assert_eq!(
                 cache.admit(&first, b"1234").expect("first admission"),
@@ -2207,16 +2164,10 @@ mod tests {
             let limits = quota_limits(100, 10, 4, 1);
             let first_session = ScoreCache::with_limits(dir.clone(), limits);
             let second_session = ScoreCache::with_limits(dir.clone(), limits);
-            let first = first_session.path(
-                "https://samples.example/first.wav",
-                ScoreCacheKind::Audio,
-                ScoreCacheTrust::Grant,
-            );
-            let second = first_session.path(
-                "https://samples.example/second.wav",
-                ScoreCacheKind::Audio,
-                ScoreCacheTrust::Grant,
-            );
+            let first =
+                first_session.path("https://samples.example/first.wav", ScoreCacheKind::Audio);
+            let second =
+                first_session.path("https://samples.example/second.wav", ScoreCacheKind::Audio);
 
             assert_eq!(
                 first_session
@@ -2263,7 +2214,7 @@ mod tests {
             let spawn =
                 |cache: Arc<ScoreCache>, url: &'static str, barrier: Arc<std::sync::Barrier>| {
                     std::thread::spawn(move || {
-                        let path = cache.path(url, ScoreCacheKind::Audio, ScoreCacheTrust::Grant);
+                        let path = cache.path(url, ScoreCacheKind::Audio);
                         barrier.wait();
                         cache.admit(&path, b"1234").expect("admission")
                     })
@@ -2311,8 +2262,7 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("cache root");
             let url = "http://127.0.0.1:9/kick.wav";
             let access = ScoreFetchAccess::Remote {
-                origin: "http://127.0.0.1:9".to_owned(),
-                cors_required: false,
+                sources: [SourceRule::parse("http://127.0.0.1:9").expect("a test source")].into(),
             };
             let legacy = cache_path(&dir, url);
             std::fs::write(&legacy, b"legacy").expect("legacy entry");
@@ -2334,11 +2284,7 @@ mod tests {
                 legacy.exists(),
                 "refused migration destroyed the offline copy"
             );
-            assert!(
-                !refused
-                    .path(url, ScoreCacheKind::Audio, ScoreCacheTrust::Grant)
-                    .exists()
-            );
+            assert!(!refused.path(url, ScoreCacheKind::Audio).exists());
 
             let admitted = ScoreCache::with_limits(dir.clone(), quota_limits(64, 4, 64, 4));
             assert_eq!(
@@ -2354,9 +2300,7 @@ mod tests {
                 b"legacy"
             );
             assert!(
-                admitted
-                    .path(url, ScoreCacheKind::Audio, ScoreCacheTrust::Grant)
-                    .exists(),
+                admitted.path(url, ScoreCacheKind::Audio).exists(),
                 "legacy copy was not committed"
             );
             assert!(
@@ -2375,10 +2319,7 @@ mod tests {
             clear_score_sample_cache_at(&dir).expect("clear score cache");
             // This models the exact clear/migration race: a fetch read and
             // validated legacy bytes, then clear completed before its admission.
-            admitted.copy_legacy(
-                &admitted.path(url, ScoreCacheKind::Audio, ScoreCacheTrust::Grant),
-                &in_flight,
-            );
+            admitted.copy_legacy(&admitted.path(url, ScoreCacheKind::Audio), &in_flight);
             assert!(!admitted.dir().exists(), "score namespace survived clear");
             assert!(legacy.exists(), "clear removed a host-trusted cache entry");
             assert!(
@@ -2397,11 +2338,7 @@ mod tests {
                 .is_err(),
                 "clear silently reimported a legacy entry"
             );
-            assert!(
-                !admitted
-                    .path(url, ScoreCacheKind::Audio, ScoreCacheTrust::Grant)
-                    .exists()
-            );
+            assert!(!admitted.path(url, ScoreCacheKind::Audio).exists());
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -2422,11 +2359,7 @@ mod tests {
             let lock = score_cache_lock_path(&dir);
             symlink(&victim, &lock).expect("lock symlink");
             let cache = ScoreCache::with_limits(dir.clone(), quota_limits(64, 4, 64, 4));
-            let target = cache.path(
-                "https://samples.example/kick.wav",
-                ScoreCacheKind::Audio,
-                ScoreCacheTrust::Grant,
-            );
+            let target = cache.path("https://samples.example/kick.wav", ScoreCacheKind::Audio);
             let error = cache
                 .admit(&target, b"sample")
                 .expect_err("a symlink lock must be refused");
@@ -2463,11 +2396,7 @@ mod tests {
             let victim = dir.join("victim");
             std::fs::write(&victim, b"secret").expect("victim");
             let cache = ScoreCache::with_limits(dir.clone(), quota_limits(64, 4, 64, 4));
-            let path = cache.path(
-                "https://samples.example/kick.wav",
-                ScoreCacheKind::Audio,
-                ScoreCacheTrust::Grant,
-            );
+            let path = cache.path("https://samples.example/kick.wav", ScoreCacheKind::Audio);
             cache.admit(&path, b"sample").expect("admit");
             std::fs::remove_file(&path).expect("remove cache file");
             symlink(&victim, &path).expect("plant symlink");
@@ -2490,62 +2419,11 @@ mod tests {
                 Path::new("/cache"),
                 "https://samples.example/kick.wav",
                 ScoreCacheKind::Audio,
-                ScoreCacheTrust::Grant,
             );
             assert_eq!(
                 path.file_name().and_then(|name| name.to_str()),
                 Some("f51176c6893fc2b1d0ea1ea37a6b171b.wav")
             );
-            let cors = score_cache_path(
-                Path::new("/cache"),
-                "https://samples.example/kick.wav",
-                ScoreCacheKind::Audio,
-                ScoreCacheTrust::Cors,
-            );
-            assert_ne!(
-                path, cors,
-                "CORS-consented and grant-only bytes must not share a file"
-            );
-        }
-
-        #[test]
-        fn cors_required_fetches_do_not_reuse_grant_only_cache_bytes() {
-            let dir = std::env::temp_dir()
-                .join(format!("rustel-cache-cors-trust-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            let _ = std::fs::create_dir_all(&dir);
-            let cache = ScoreCache::new(dir.clone());
-            let url = "https://samples.example/kick.wav";
-            let grant_path = cache.path(url, ScoreCacheKind::Audio, ScoreCacheTrust::Grant);
-            std::fs::create_dir_all(grant_path.parent().expect("parent")).expect("mkdir");
-            std::fs::write(&grant_path, b"grant-only bytes").expect("seed grant entry");
-
-            let cors_access = ScoreFetchAccess::Remote {
-                origin: "https://samples.example".into(),
-                cors_required: true,
-            };
-            // No server: a cors_required hit must not return the grant-only file.
-            // The fetch fails on the wire instead of serving unconsented bytes.
-            let error = fetch_score_source_cached(
-                &cache,
-                url,
-                &cors_access,
-                ScoreCacheKind::Audio,
-                1024,
-                |bytes| Ok(bytes.to_vec()),
-            )
-            .expect_err("cors policy must not read grant-only cache");
-            assert!(
-                !error.is_empty(),
-                "refusal should name the failed fetch, got {error:?}"
-            );
-            assert!(
-                !cache
-                    .path(url, ScoreCacheKind::Audio, ScoreCacheTrust::Cors)
-                    .exists(),
-                "a failed cors fetch must not invent a cors entry"
-            );
-            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]
@@ -2610,17 +2488,13 @@ mod tests {
             let cache = ScoreCache::new(dir.clone());
             let url = "http://granted.example/kick.wav";
             std::fs::create_dir_all(cache.dir()).expect("score cache");
-            std::fs::write(
-                cache.path(url, ScoreCacheKind::Audio, ScoreCacheTrust::Grant),
-                b"seeded bytes",
-            )
-            .expect("seed the cache");
+            std::fs::write(cache.path(url, ScoreCacheKind::Audio), b"seeded bytes")
+                .expect("seed the cache");
 
             // A grant for a DIFFERENT origin must not reach this entry, and must
             // not fall through to the network either.
             let elsewhere = ScoreFetchAccess::Remote {
-                origin: "http://other.example".to_owned(),
-                cors_required: false,
+                sources: [SourceRule::parse("http://other.example").expect("a test source")].into(),
             };
             let error = fetch_score_source_cached(
                 &cache,
@@ -2631,13 +2505,13 @@ mod tests {
                 |b| Ok(b.to_vec()),
             )
             .expect_err("a grant elsewhere must not read this entry");
-            assert!(error.contains("outside its permitted origin"), "{error}");
+            assert!(error.contains("outside its allowed source"), "{error}");
 
             // The matching grant does read it, which is what proves the entry was
             // reachable all along and policy is what withheld it.
             let granted = ScoreFetchAccess::Remote {
-                origin: "http://granted.example".to_owned(),
-                cors_required: false,
+                sources: [SourceRule::parse("http://granted.example").expect("a test source")]
+                    .into(),
             };
             assert_eq!(
                 fetch_score_source_cached(
@@ -2666,14 +2540,9 @@ mod tests {
             // reached the network at all would fail rather than pass quietly.
             let url = "http://127.0.0.1:9/kick.wav";
             std::fs::create_dir_all(cache.dir()).expect("score cache");
-            std::fs::write(
-                cache.path(url, ScoreCacheKind::Audio, ScoreCacheTrust::Grant),
-                b"cached audio",
-            )
-            .expect("seed");
+            std::fs::write(cache.path(url, ScoreCacheKind::Audio), b"cached audio").expect("seed");
             let access = ScoreFetchAccess::Remote {
-                origin: "http://127.0.0.1:9".to_owned(),
-                cors_required: false,
+                sources: [SourceRule::parse("http://127.0.0.1:9").expect("a test source")].into(),
             };
             assert_eq!(
                 fetch_score_source_cached(&cache, url, &access, ScoreCacheKind::Audio, 1024, |b| {
@@ -2727,8 +2596,7 @@ mod tests {
             });
 
             let access = ScoreFetchAccess::Remote {
-                origin: origin.clone(),
-                cors_required: false,
+                sources: [SourceRule::parse(&origin.clone()).expect("a test source")].into(),
             };
             let first = fetch_score_source_cached(
                 &cache,
@@ -2770,8 +2638,9 @@ mod tests {
             ] {
                 let parsed = Url::parse(target).expect("test url");
                 let access = ScoreFetchAccess::Remote {
-                    origin: parsed.origin().ascii_serialization(),
-                    cors_required: false,
+                    sources: [SourceRule::parse(&parsed.origin().ascii_serialization())
+                        .expect("a test source")]
+                    .into(),
                 };
                 let error = fetch_score_source_cached(
                     &cache,
@@ -2812,17 +2681,14 @@ mod tests {
             });
 
             let mut access = ScoreSampleAccess::denied();
-            access.permit_origin(&origin).expect("map origin");
+            access.permit_source(&origin).expect("map origin");
             let library = empty_library();
             let source = serde_json::to_string(&map_url).expect("source string");
             let error = library
                 .register_score_custom(&source, None, &access)
                 .expect_err("a fetched map must not introduce another origin");
             server.join().expect("map server");
-            assert!(
-                error.contains("outside the permitted sample origins"),
-                "{error}"
-            );
+            assert!(error.contains("is not an allowed sample source"), "{error}");
             assert!(library.custom.read().expect("custom banks").is_empty());
         }
 
@@ -2849,20 +2715,62 @@ mod tests {
             });
             let parsed = Url::parse(&redirect_url).expect("redirect URL");
             let access = ScoreFetchAccess::Remote {
-                origin: parsed.origin().ascii_serialization(),
-                cors_required: false,
+                sources: [SourceRule::parse(&parsed.origin().ascii_serialization())
+                    .expect("a test source")]
+                .into(),
             };
             let error = fetch_score_source(&redirect_url, &access, 1024)
                 .expect_err("score fetch must stop at a cross-origin redirect");
             server.join().expect("redirect server");
-            assert!(
-                error.contains("outside the permitted sample origin"),
-                "{error}"
-            );
+            assert!(error.contains("is not an allowed sample source"), "{error}");
             assert!(
                 matches!(destination.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
                 "the redirect target received a request"
             );
+        }
+
+        /// A redirect to an address another allowed source allows is
+        /// followed, as GitHub's `/raw/` links redirect to another host. The
+        /// score could name that address itself.
+        #[test]
+        fn a_redirect_may_reach_another_allowed_source() {
+            use std::io::Write;
+            use std::net::TcpListener;
+
+            let destination = TcpListener::bind("127.0.0.1:0").expect("destination listener");
+            let destination_origin = format!("http://{}", destination.local_addr().unwrap());
+            let redirect = TcpListener::bind("127.0.0.1:0").expect("redirect listener");
+            let redirect_origin = format!("http://{}", redirect.local_addr().unwrap());
+            let location = format!("{destination_origin}/payload");
+            let server = std::thread::spawn(move || {
+                let (mut first, _) = redirect.accept().expect("redirect request");
+                drain_request_head(&first);
+                write!(
+                    first,
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .expect("redirect response");
+                let (mut second, _) = destination.accept().expect("payload request");
+                drain_request_head(&second);
+                write!(
+                    second,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nRIFF"
+                )
+                .expect("payload response");
+            });
+            let mut policy = ScoreSampleAccess::denied();
+            policy
+                .permit_source(&redirect_origin)
+                .expect("first source");
+            policy
+                .permit_source(&destination_origin)
+                .expect("second source");
+            let (url, access) = policy
+                .approve_remote(&format!("{redirect_origin}/map"))
+                .expect("an allowed address");
+            let bytes = fetch_score_source(&url, &access, 1024).expect("the second source");
+            server.join().expect("servers");
+            assert_eq!(bytes, b"RIFF");
         }
 
         #[test]
@@ -2890,8 +2798,9 @@ mod tests {
             });
             let parsed = Url::parse(&url).expect("sample URL");
             let access = ScoreFetchAccess::Remote {
-                origin: parsed.origin().ascii_serialization(),
-                cors_required: false,
+                sources: [SourceRule::parse(&parsed.origin().ascii_serialization())
+                    .expect("a test source")]
+                .into(),
             };
             let bytes = fetch_score_source(&url, &access, 1024).expect("same-origin redirect");
             server.join().expect("sample server");

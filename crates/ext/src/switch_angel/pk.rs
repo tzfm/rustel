@@ -26,7 +26,10 @@ pub(super) const REFERENCE: ReferenceEntry = simple_reference!(
 
 fn apply(args: &[Pattern], _receiver: Option<&Pattern>) -> Pattern {
     let (choices, selector) = if args.len() > 2 {
-        (&args[..args.len() - 1], args.last().cloned().unwrap())
+        (
+            &args[..args.len() - 1],
+            args.last().cloned().expect("the list has the entry"),
+        )
     } else {
         (args, rustel_core::pure(Value::F64(0.0)))
     };

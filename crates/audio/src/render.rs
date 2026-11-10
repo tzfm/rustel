@@ -2,36 +2,25 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::backend::{AudioBackend, OnsetEvent};
 
 /// Render `frames` of stereo interleaved `f32` PCM at `sample_rate` using
 /// `backend` and the supplied onset list.
+///
+/// The list is admitted as the output reaches it, in onset order, so a
+/// render longer than the backend's pending-event ceiling still sounds
+/// every event instead of silently dropping the ones past it.
 pub fn render_pcm(
     backend: &mut dyn AudioBackend,
     sample_rate: u32,
     frames: usize,
     events: &[OnsetEvent],
 ) -> Result<Vec<f32>, String> {
-    backend.init(sample_rate)?;
-    backend.reset();
-    for e in events {
-        backend.prepare_note(e)?;
-        backend.note(e.clone());
-    }
-    let mut pcm = vec![0.0f32; frames * 2];
-    // Process in 128-frame blocks (Dough's native block size) for realism.
-    const BLOCK: usize = 128;
-    let mut offset = 0;
-    while offset < frames {
-        let n = (frames - offset).min(BLOCK);
-        let start = offset * 2;
-        let end = start + n * 2;
-        backend.process_block(&mut pcm[start..end], n);
-        offset += n;
-    }
-    Ok(pcm)
+    let mut queued = events.to_vec();
+    queued.sort_by_key(|event| event.onset_frame);
+    render_pcm_events(backend, sample_rate, frames, queued)
 }
 
 /// Render events in onset order as the output reaches them. The iterator may
@@ -42,6 +31,18 @@ pub fn render_pcm_events(
     frames: usize,
     events: impl IntoIterator<Item = OnsetEvent>,
 ) -> Result<Vec<f32>, String> {
+    render_pcm_events_until(backend, sample_rate, frames, events, || false)
+}
+
+/// [`render_pcm_events`] that reads `stop` before each block. Once `stop`
+/// gives true, the render ends with [`RENDER_CANCELLED`].
+pub fn render_pcm_events_until(
+    backend: &mut dyn AudioBackend,
+    sample_rate: u32,
+    frames: usize,
+    events: impl IntoIterator<Item = OnsetEvent>,
+    stop: impl Fn() -> bool,
+) -> Result<Vec<f32>, String> {
     backend.init(sample_rate)?;
     backend.reset();
     let mut events = events.into_iter().peekable();
@@ -49,6 +50,9 @@ pub fn render_pcm_events(
     const BLOCK: usize = 128;
     let mut offset = 0usize;
     while offset < frames {
+        if stop() {
+            return Err(RENDER_CANCELLED.to_owned());
+        }
         let admit_before = offset
             .saturating_add((sample_rate as usize / 10).max(1))
             .saturating_add(2 * BLOCK) as u64;
@@ -82,6 +86,10 @@ pub fn write_pcm16_wav(
 /// The error a cancelled render returns, so a caller can tell "the artist
 /// stopped this" from "the render failed".
 pub const RENDER_CANCELLED: &str = "render cancelled";
+
+/// The error of an export that ends before its writer makes its file. No
+/// audio exists to keep, so the export writes no file.
+pub const RENDER_ENDED_BEFORE_AUDIO: &str = "the export ended before its first frame";
 
 /// Stop a bounce when the music has finished, rather than when the clock runs
 /// out.
@@ -291,6 +299,177 @@ pub fn write_wav_events_controlled(
     control: RenderControl<'_, '_>,
     format: WavSampleFormat,
 ) -> Result<usize, String> {
+    write_render_wav_events(
+        path.as_ref(),
+        backend,
+        sample_rate,
+        frames,
+        events,
+        control,
+        format,
+        None,
+    )
+}
+
+/// Stream a stems bounce beside `path`: [`stems_folder`] holds a `main.wav`
+/// with what [`write_wav_events_controlled`] would have written, plus one
+/// stereo WAV a sounding orbit, named `1.wav` upward. The stems tap every
+/// orbit after its delay, reverb, filter, duck and fader, before the
+/// limiter, so mastering stays in the DAW and the stems sum back to the
+/// unmastered main. Orbits that never sound leave no file. A backend
+/// without taps, or a folder that already exists, is refused before
+/// anything is rendered.
+pub fn write_stems_wav_events_controlled(
+    path: impl AsRef<Path>,
+    backend: &mut dyn AudioBackend,
+    sample_rate: u32,
+    frames: usize,
+    events: impl IntoIterator<Item = OnsetEvent>,
+    control: RenderControl<'_, '_>,
+    format: WavSampleFormat,
+) -> Result<usize, String> {
+    if backend.stems().is_none() {
+        return Err(format!(
+            "{} keeps no orbit taps, so it cannot render stems",
+            backend.name()
+        ));
+    }
+    // The loop runs this check for the main file; running it here keeps an
+    // absurd length from leaving a folder behind.
+    wav_data_bytes(frames, 2, format.bytes_per_sample())?;
+    let path = path.as_ref();
+    check_stems_folder(path)?;
+    let folder = stems_folder(path);
+    std::fs::create_dir(&folder)
+        .map_err(|error| format!("cannot create {}: {error}", folder.display()))?;
+    let mut tracks = match StemTracks::create(&folder, sample_rate, frames, format) {
+        Ok(tracks) => tracks,
+        Err(error) => {
+            let _ = std::fs::remove_dir(&folder);
+            return Err(error);
+        }
+    };
+    let rendered = write_render_wav_events(
+        &folder.join("main.wav"),
+        backend,
+        sample_rate,
+        frames,
+        events,
+        control,
+        format,
+        Some(&mut tracks),
+    );
+    if rendered.is_err() {
+        // Dropping the tracks removes what never sounded; an empty folder
+        // left behind would refuse the retry.
+        drop(tracks);
+        let _ = std::fs::remove_dir(&folder);
+    }
+    rendered
+}
+
+/// The folder a stems bounce beside `path` writes into: the file's stem plus
+/// ` stems`, a sibling of the file.
+pub fn stems_folder(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("render");
+    path.with_file_name(format!("{stem} stems"))
+}
+
+/// Refuse a stems bounce beside `path` when its [`stems_folder`] exists. A
+/// bounce writes into a new folder only, so it never mixes its stems with
+/// the stems of another bounce.
+pub fn check_stems_folder(path: &Path) -> Result<(), String> {
+    let folder = stems_folder(path);
+    if folder.exists() {
+        return Err(format!(
+            "cannot write stems into {}: it already exists",
+            folder.display()
+        ));
+    }
+    Ok(())
+}
+
+/// One orbit's WAV in a stems bounce. Every orbit gets a file up front, and
+/// the drop removes the ones that never sounded, whatever ended the bounce.
+struct StemTracks {
+    files: Vec<(PathBuf, File)>,
+    /// Copied from the backend's taps every block, so the cleanup at the
+    /// end knows what sounded even when the bounce was interrupted.
+    sounded: [bool; crate::scalar::MAX_ORBITS],
+    /// Each orbit's tap, interleaved stereo and oldest first, held back by
+    /// the main file's limiter lookahead so a stem keeps the main's frames.
+    delays: Vec<std::collections::VecDeque<f32>>,
+}
+
+impl StemTracks {
+    /// Open one WAV per orbit under `folder`, each with the bounce's header.
+    fn create(
+        folder: &Path,
+        sample_rate: u32,
+        frames: usize,
+        format: WavSampleFormat,
+    ) -> Result<Self, String> {
+        let mut files = Vec::with_capacity(crate::scalar::MAX_ORBITS);
+        for orbit in 0..crate::scalar::MAX_ORBITS {
+            let path = folder.join(format!("{}.wav", orbit + 1));
+            let mut file = File::create(&path).map_err(|error| error.to_string())?;
+            write_wav_header(&mut file, sample_rate, frames, 2, format)?;
+            files.push((path, file));
+        }
+        Ok(Self {
+            files,
+            sounded: [false; crate::scalar::MAX_ORBITS],
+            delays: Vec::new(),
+        })
+    }
+
+    /// Hold every stem back by `frames` of silence, the lookahead the
+    /// limiter adds to the main file before the render discards it.
+    fn hold_back(&mut self, frames: usize) {
+        self.delays = (0..self.files.len())
+            .map(|_| std::iter::repeat_n(0.0, frames * 2).collect())
+            .collect();
+    }
+
+    /// Patch every stem's header to the frames the main file kept.
+    fn finalise(&mut self, frames_written: usize, bytes_per_sample: u16) -> Result<(), String> {
+        for (_, file) in &mut self.files {
+            finalise_partial_wav(file, frames_written, 2, bytes_per_sample)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StemTracks {
+    fn drop(&mut self) {
+        for index in (0..self.files.len()).rev() {
+            if !self.sounded[index] {
+                // Close before removing: Windows refuses to unlink an open
+                // file.
+                let (path, file) = self.files.remove(index);
+                drop(file);
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// The render loop every writer above funnels into, with the orbit stems a
+/// bounce keeps beside the main file, when it has any.
+#[allow(clippy::too_many_arguments)]
+fn write_render_wav_events(
+    path: &Path,
+    backend: &mut dyn AudioBackend,
+    sample_rate: u32,
+    frames: usize,
+    events: impl IntoIterator<Item = OnsetEvent>,
+    control: RenderControl<'_, '_>,
+    format: WavSampleFormat,
+    mut stems: Option<&mut StemTracks>,
+) -> Result<usize, String> {
     const CHANNELS: u16 = 2;
     const BLOCK: usize = 128;
     let RenderControl {
@@ -317,82 +496,38 @@ pub fn write_wav_events_controlled(
         .as_ref()
         .map_or(0, |(processor, _)| processor.latency_frames());
     let mut skip = latency;
+    if let Some(tracks) = stems.as_deref_mut() {
+        tracks.hold_back(latency);
+    }
     // A tenth of a second: long enough not to click, short enough that a
     // stop is a stop.
     let fade_frames = (sample_rate as usize / 10).max(1);
     let mut fade_from: Option<usize> = None;
     let bytes_per_sample = format.bytes_per_sample();
 
-    let data_bytes = (frames as u64)
-        .checked_mul(u64::from(CHANNELS))
-        .and_then(|value| value.checked_mul(u64::from(bytes_per_sample)))
-        .ok_or_else(|| "PCM byte count overflowed".to_string())?;
-    if data_bytes + 36 > u64::from(u32::MAX) {
-        return Err(format!(
-            "{frames} frames need {data_bytes} PCM bytes, which a RIFF file cannot address"
-        ));
-    }
-    let data_bytes = data_bytes as u32;
-    let block_align = CHANNELS * bytes_per_sample;
-    let byte_rate = sample_rate
-        .checked_mul(u32::from(block_align))
-        .ok_or_else(|| "WAV byte rate overflowed".to_string())?;
+    let data_bytes = wav_data_bytes(frames, CHANNELS, bytes_per_sample)?;
 
     backend.init(sample_rate)?;
+    // The file starts at this backend frame. The backend renders up to
+    // frames + preroll.
+    let preroll = backend.preroll_frames();
+    let rendered_frames = frames
+        .checked_add(preroll)
+        .ok_or_else(|| "PCM byte count overflowed".to_string())?;
     // Feed events as the render reaches them, not all at once. The backend's
     // pending queue is bounded (MAX_PENDING_EVENTS) because a live producer
     // must not grow it without limit. An offline render that queues every
     // onset up front exceeds that bound, and the backend drops the rest
     // without an error.
     let mut queued = events.into_iter().peekable();
-
-    let mut file = File::create(path).map_err(|error| error.to_string())?;
-    file.write_all(b"RIFF").map_err(|error| error.to_string())?;
-    file.write_all(&(36 + data_bytes).to_le_bytes())
-        .map_err(|error| error.to_string())?;
-    file.write_all(b"WAVEfmt ")
-        .map_err(|error| error.to_string())?;
-    file.write_all(&16u32.to_le_bytes())
-        .map_err(|error| error.to_string())?;
-    file.write_all(&format.wave_format_tag().to_le_bytes())
-        .map_err(|error| error.to_string())?;
-    file.write_all(&CHANNELS.to_le_bytes())
-        .map_err(|error| error.to_string())?;
-    file.write_all(&sample_rate.to_le_bytes())
-        .map_err(|error| error.to_string())?;
-    file.write_all(&byte_rate.to_le_bytes())
-        .map_err(|error| error.to_string())?;
-    file.write_all(&block_align.to_le_bytes())
-        .map_err(|error| error.to_string())?;
-    file.write_all(&format.bits().to_le_bytes())
-        .map_err(|error| error.to_string())?;
-    file.write_all(b"data").map_err(|error| error.to_string())?;
-    file.write_all(&data_bytes.to_le_bytes())
-        .map_err(|error| error.to_string())?;
-
-    // Silence only ends a render once the music has actually started: a score
-    // that fades in, or opens on a rest, would otherwise stop before its first
-    // note.
-    let mut heard_sound = false;
-    let mut silent_frames = 0usize;
-    let mut pcm = [0.0f32; BLOCK * CHANNELS as usize];
-    let mut encoded = [0u8; BLOCK * CHANNELS as usize * 4];
-    let mut offset = 0usize;
-    let mut input_offset = 0usize;
-    while offset < frames {
-        // Checked per block, not per progress tick: a 2 s reporting interval
-        // would make Ctrl-C feel ignored for exactly as long.
-        if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
-            finalise_partial_wav(&mut file, offset, CHANNELS, bytes_per_sample)?;
-            return Err(RENDER_CANCELLED.to_owned());
-        }
-        // Admit one scheduler lead plus one block so nothing is handed to the
-        // backend late. Most sources remain pending until their onset. SBD
-        // intentionally becomes active during this window: its connected
-        // WaveShaper has a tiny zero-input output before the oscillator starts,
-        // and handing it over only one block early erases that onset prehistory
-        // from streamed WAVs.
-        let scheduler_lookahead = (sample_rate as usize / 10).max(1);
+    // Admit one scheduler lead plus one block so nothing is handed to the
+    // backend late. Most sources remain pending until their onset. SBD
+    // intentionally becomes active during this window: its connected
+    // WaveShaper has a tiny zero-input output before the oscillator starts,
+    // and handing it over only one block early erases that onset prehistory
+    // from streamed WAVs.
+    let scheduler_lookahead = (sample_rate as usize / 10).max(1);
+    let mut admit = |backend: &mut dyn AudioBackend, input_offset: usize| {
         let admit_before = input_offset
             .saturating_add(scheduler_lookahead)
             .saturating_add(2 * BLOCK) as u64;
@@ -404,8 +539,52 @@ pub fn write_wav_events_controlled(
             backend.prepare_note(&event)?;
             backend.note(event);
         }
+        Ok::<(), String>(())
+    };
+
+    let mut pcm = [0.0f32; BLOCK * CHANNELS as usize];
+    // The pre-roll renders before the file exists. Its output and its taps
+    // go nowhere: no limiter, observer, silence test, file or stem.
+    let mut input_offset = 0usize;
+    while input_offset < preroll {
+        admit(backend, input_offset)?;
+        let count = (preroll - input_offset).min(BLOCK);
+        backend.process_block(&mut pcm[..count * CHANNELS as usize], count);
+        input_offset += count;
+        // Read after each block, the last one too, so a cancel or a finish
+        // in the pre-roll makes no file.
+        if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(RENDER_CANCELLED.to_owned());
+        }
+        if finish.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(RENDER_ENDED_BEFORE_AUDIO.to_owned());
+        }
+    }
+
+    let mut file = File::create(path).map_err(|error| error.to_string())?;
+    write_wav_header(&mut file, sample_rate, frames, CHANNELS, format)?;
+
+    // Silence only ends a render once the music has actually started: a score
+    // that fades in, or opens on a rest, would otherwise stop before its first
+    // note.
+    let mut heard_sound = false;
+    let mut silent_frames = 0usize;
+    let mut stem_pcm = [0.0f32; BLOCK * CHANNELS as usize];
+    let mut encoded = [0u8; BLOCK * CHANNELS as usize * 4];
+    let mut offset = 0usize;
+    while offset < frames {
+        // Checked per block, not per progress tick: a 2 s reporting interval
+        // would make Ctrl-C feel ignored for exactly as long.
+        if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            finalise_partial_wav(&mut file, offset, CHANNELS, bytes_per_sample)?;
+            if let Some(stems) = stems.as_deref_mut() {
+                stems.finalise(offset, bytes_per_sample)?;
+            }
+            return Err(RENDER_CANCELLED.to_owned());
+        }
+        admit(backend, input_offset)?;
         let input_count = (frames - offset + skip).min(BLOCK);
-        let render_count = input_count.min(frames.saturating_sub(input_offset));
+        let render_count = input_count.min(rendered_frames.saturating_sub(input_offset));
         if render_count > 0 {
             backend.process_block(&mut pcm[..render_count * CHANNELS as usize], render_count);
         }
@@ -422,6 +601,29 @@ pub fn write_wav_events_controlled(
         let discarded = skip.min(input_count);
         skip -= discarded;
         let count = input_count - discarded;
+        // A bounce with stems writes every orbit beside the main file. Each
+        // stem takes the delay the limiter gives the main, then the same
+        // discard, so every file starts on the same frame. The taps span
+        // what the block rendered, and the flushed tail is silence.
+        if let Some(tracks) = stems.as_deref_mut() {
+            let taps = backend
+                .stems()
+                .expect("a stems render is refused on a backend with no taps");
+            tracks.sounded = *taps.sounded();
+            for (orbit, delay) in tracks.delays.iter_mut().enumerate() {
+                let tap = if render_count > 0 {
+                    taps.orbit(orbit, render_count)
+                } else {
+                    &[]
+                };
+                delay.extend(tap);
+                delay.extend(std::iter::repeat_n(
+                    0.0,
+                    input_count * CHANNELS as usize - tap.len(),
+                ));
+                delay.drain(..discarded * CHANNELS as usize);
+            }
+        }
         if count == 0 {
             continue;
         }
@@ -432,13 +634,22 @@ pub fn write_wav_events_controlled(
         if fade_from.is_none()
             && finish.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
         {
+            if offset == 0 {
+                // No frame is in the file yet: the export ends with none.
+                drop(file);
+                let _ = std::fs::remove_file(path);
+                if let Some(tracks) = stems.as_deref_mut() {
+                    tracks.sounded = [false; crate::scalar::MAX_ORBITS];
+                }
+                return Err(RENDER_ENDED_BEFORE_AUDIO.to_owned());
+            }
             fade_from = Some(offset);
         }
         let mut finished_at: Option<usize> = None;
         if let Some(from) = fade_from {
             for frame in 0..count {
                 let position = (offset + frame).saturating_sub(from);
-                let gain = 1.0 - (position as f32 / fade_frames as f32).min(1.0);
+                let gain = fade_gain(position, fade_frames);
                 pcm[frame * 2] *= gain;
                 pcm[frame * 2 + 1] *= gain;
                 if position + 1 >= fade_frames && finished_at.is_none() {
@@ -463,6 +674,9 @@ pub fn write_wav_events_controlled(
                     // interval used to confirm it.
                     let keep = (offset + count).saturating_sub(silent_frames);
                     finalise_partial_wav(&mut file, keep, CHANNELS, bytes_per_sample)?;
+                    if let Some(stems) = stems.as_deref_mut() {
+                        stems.finalise(keep, bytes_per_sample)?;
+                    }
                     return Ok(keep * CHANNELS as usize * bytes_per_sample as usize);
                 }
             }
@@ -477,30 +691,124 @@ pub fn write_wav_events_controlled(
             });
         }
         let width = usize::from(bytes_per_sample);
-        for (sample, bytes) in pcm[..count * CHANNELS as usize]
-            .iter()
-            .zip(encoded.chunks_exact_mut(width))
-        {
-            match format {
-                WavSampleFormat::Pcm16 => {
-                    let quantized = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
-                    bytes.copy_from_slice(&quantized.to_le_bytes());
-                }
-                // Deliberately NOT clamped: storing what the engine computed
-                // is the whole point of this format.
-                WavSampleFormat::Float32 => bytes.copy_from_slice(&sample.to_le_bytes()),
-            }
-        }
+        encode_samples(&pcm[..count * CHANNELS as usize], &mut encoded, format);
         file.write_all(&encoded[..count * CHANNELS as usize * width])
             .map_err(|error| error.to_string())?;
+        // The stems take the main file's finish fade, so all files land the
+        // same length.
+        if let Some(tracks) = stems.as_deref_mut() {
+            for ((_, stem), delay) in tracks.files.iter_mut().zip(&mut tracks.delays) {
+                for (slot, sample) in stem_pcm
+                    .iter_mut()
+                    .zip(delay.drain(..count * CHANNELS as usize))
+                {
+                    *slot = sample;
+                }
+                if let Some(from) = fade_from {
+                    for frame in 0..count {
+                        let position = (offset + frame).saturating_sub(from);
+                        let gain = fade_gain(position, fade_frames);
+                        stem_pcm[frame * 2] *= gain;
+                        stem_pcm[frame * 2 + 1] *= gain;
+                    }
+                }
+                encode_samples(&stem_pcm[..count * CHANNELS as usize], &mut encoded, format);
+                stem.write_all(&encoded[..count * CHANNELS as usize * width])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         offset += count;
         if let Some(keep) = finished_at {
             // The fade has run its course: the file ends here, a success.
             finalise_partial_wav(&mut file, keep, CHANNELS, bytes_per_sample)?;
+            if let Some(stems) = stems.as_deref_mut() {
+                stems.finalise(keep, bytes_per_sample)?;
+            }
             return Ok(keep * CHANNELS as usize * bytes_per_sample as usize);
         }
     }
     Ok(data_bytes as usize)
+}
+
+/// The data chunk length of `frames`, checked against the RIFF bound.
+fn wav_data_bytes(frames: usize, channels: u16, bytes_per_sample: u16) -> Result<u32, String> {
+    let data_bytes = (frames as u64)
+        .checked_mul(u64::from(channels))
+        .and_then(|value| value.checked_mul(u64::from(bytes_per_sample)))
+        .ok_or_else(|| "PCM byte count overflowed".to_string())?;
+    // Checked: the addition itself can leave the u64 range before the RIFF
+    // bound comparison runs, and the guard must refuse, not unwind.
+    if data_bytes
+        .checked_add(36)
+        .is_none_or(|with_header| with_header > u64::from(u32::MAX))
+    {
+        return Err(format!(
+            "{frames} frames need {data_bytes} PCM bytes, which a RIFF file cannot address"
+        ));
+    }
+    Ok(data_bytes as u32)
+}
+
+/// Write the 44 byte RIFF header of `frames` in `format`.
+fn write_wav_header(
+    file: &mut File,
+    sample_rate: u32,
+    frames: usize,
+    channels: u16,
+    format: WavSampleFormat,
+) -> Result<(), String> {
+    let bytes_per_sample = format.bytes_per_sample();
+    let data_bytes = wav_data_bytes(frames, channels, bytes_per_sample)?;
+    let block_align = channels * bytes_per_sample;
+    let byte_rate = sample_rate
+        .checked_mul(u32::from(block_align))
+        .ok_or_else(|| "WAV byte rate overflowed".to_string())?;
+    file.write_all(b"RIFF").map_err(|error| error.to_string())?;
+    file.write_all(&(36 + data_bytes).to_le_bytes())
+        .map_err(|error| error.to_string())?;
+    file.write_all(b"WAVEfmt ")
+        .map_err(|error| error.to_string())?;
+    file.write_all(&16u32.to_le_bytes())
+        .map_err(|error| error.to_string())?;
+    file.write_all(&format.wave_format_tag().to_le_bytes())
+        .map_err(|error| error.to_string())?;
+    file.write_all(&channels.to_le_bytes())
+        .map_err(|error| error.to_string())?;
+    file.write_all(&sample_rate.to_le_bytes())
+        .map_err(|error| error.to_string())?;
+    file.write_all(&byte_rate.to_le_bytes())
+        .map_err(|error| error.to_string())?;
+    file.write_all(&block_align.to_le_bytes())
+        .map_err(|error| error.to_string())?;
+    file.write_all(&format.bits().to_le_bytes())
+        .map_err(|error| error.to_string())?;
+    file.write_all(b"data").map_err(|error| error.to_string())?;
+    file.write_all(&data_bytes.to_le_bytes())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Encode interleaved stereo into `encoded`, whose chunk width matches the
+/// format.
+fn encode_samples(samples: &[f32], encoded: &mut [u8], format: WavSampleFormat) {
+    let width = usize::from(format.bytes_per_sample());
+    for (sample, bytes) in samples.iter().zip(encoded.chunks_exact_mut(width)) {
+        match format {
+            WavSampleFormat::Pcm16 => {
+                let quantized = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+                bytes.copy_from_slice(&quantized.to_le_bytes());
+            }
+            // Deliberately NOT clamped: storing what the engine computed
+            // is the whole point of this format.
+            WavSampleFormat::Float32 => bytes.copy_from_slice(&sample.to_le_bytes()),
+        }
+    }
+}
+
+/// The gain of `position` frames into a finish fade: unity at the start,
+/// silence after `fade_frames`.
+fn fade_gain(position: usize, fade_frames: usize) -> f32 {
+    1.0 - (position as f32 / fade_frames as f32).min(1.0)
 }
 
 /// Rewrite the two RIFF length fields to describe what was actually written.
@@ -537,6 +845,63 @@ fn finalise_partial_wav(
     file.set_len(u64::from(data_bytes) + 44)
         .map_err(|error| error.to_string())?;
     file.flush().map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod riff_limit_tests {
+    use super::*;
+
+    /// A frame count whose PCM byte count leaves the u64 range only when
+    /// the RIFF header is added must meet the size refusal, before any file
+    /// is created or the backend is asked to render.
+    #[test]
+    fn a_riff_size_that_overflows_only_with_its_header_is_refused() {
+        let path = std::env::temp_dir().join("rustel-riff-never-created.wav");
+        let _ = std::fs::remove_file(&path);
+        struct Never;
+        impl AudioBackend for Never {
+            fn name(&self) -> &'static str {
+                "never"
+            }
+            #[expect(
+                clippy::panic_in_result_fn,
+                reason = "this test double must panic when called"
+            )]
+            fn init(&mut self, _: u32) -> Result<(), String> {
+                panic!("the size refusal must come before the backend runs")
+            }
+            fn reset(&mut self) {}
+            fn note(&mut self, _: crate::OnsetEvent) {}
+            fn prepare_note(&mut self, _: &crate::OnsetEvent) -> Result<(), String> {
+                Ok(())
+            }
+            fn process_block(&mut self, _: &mut [f32], _: usize) {
+                panic!("the size refusal must come before any processing")
+            }
+        }
+        // PCM16: 2 bytes a sample, 2 channels - 4 bytes a frame. 2^62 - 1
+        // frames need 2^64 - 4 bytes, which only overflows once the 36
+        // header bytes are added.
+        let error = write_wav_controlled(
+            &path,
+            &mut Never,
+            48_000,
+            (1_u64 << 62) as usize - 1,
+            &[],
+            RenderControl::default(),
+            WavSampleFormat::Pcm16,
+        )
+        .expect_err("the overflowed RIFF size must be refused");
+        assert!(
+            error.contains("cannot address"),
+            "the refusal names the size: {error}"
+        );
+        assert!(
+            !path.exists(),
+            "the refusal comes before any file is created"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]
@@ -748,7 +1113,68 @@ mod finish_tests {
             u32::from_le_bytes(file[40..44].try_into().unwrap()) as usize,
             bytes
         );
+
+        // A flag raised in the last block of the pre-roll leaves no file, and
+        // so does a finish raised in the first block of the file.
+        std::fs::remove_file(&path).unwrap();
+        let raised = AtomicBool::new(false);
+        let error = write_pcm16_wav_controlled(
+            &path,
+            &mut Raising(&raised, 128),
+            48_000,
+            48_000,
+            &[],
+            RenderControl {
+                cancelled: Some(&raised),
+                ..RenderControl::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, RENDER_CANCELLED);
+        assert!(!path.exists());
+        for preroll in [128, 0] {
+            let raised = AtomicBool::new(false);
+            let error = write_wav_controlled(
+                &path,
+                &mut Raising(&raised, preroll),
+                48_000,
+                48_000,
+                &[],
+                RenderControl {
+                    finish: Some(&raised),
+                    ..RenderControl::default()
+                },
+                WavSampleFormat::Float32,
+            )
+            .unwrap_err();
+            assert_eq!(error, RENDER_ENDED_BEFORE_AUDIO, "pre-roll {preroll}");
+            assert!(!path.exists(), "pre-roll {preroll}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A backend with a pre-roll of one block that plays 0.5. Each block
+    /// raises the flag, so the flag rises in the last block of the
+    /// pre-roll.
+    /// Raises its flag in every block, after a pre-roll of this many frames.
+    struct Raising<'a>(&'a std::sync::atomic::AtomicBool, usize);
+
+    impl AudioBackend for Raising<'_> {
+        fn name(&self) -> &'static str {
+            "raising-test"
+        }
+        fn init(&mut self, _: u32) -> Result<(), String> {
+            Ok(())
+        }
+        fn reset(&mut self) {}
+        fn note(&mut self, _: OnsetEvent) {}
+        fn process_block(&mut self, out: &mut [f32], _: usize) {
+            out.fill(0.5);
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn preroll_frames(&self) -> usize {
+            self.1
+        }
     }
 }
 
@@ -759,6 +1185,7 @@ mod export_limiter_tests {
     struct Signal {
         pcm: Vec<f32>,
         frames: usize,
+        preroll: usize,
     }
 
     impl AudioBackend for Signal {
@@ -776,22 +1203,33 @@ mod export_limiter_tests {
             out.copy_from_slice(&self.pcm[self.frames * 2..(self.frames + frames) * 2]);
             self.frames += frames;
         }
+        fn preroll_frames(&self) -> usize {
+            self.preroll
+        }
     }
 
+    /// With a pre-roll of 256 frames the backend renders 256 frames more,
+    /// and the file and the observer hold the frames after them.
     #[test]
     fn limiting_preserves_the_first_and_last_frames_and_the_requested_length() {
         let dir =
             std::env::temp_dir().join(format!("rustel-export-latency-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bounce.wav");
-        for character in crate::LimiterCharacter::ALL {
+        for (character, preroll) in crate::LimiterCharacter::ALL
+            .into_iter()
+            .flat_map(|character| [(character, 0), (character, 256)])
+        {
             for frames in [0, 1, 17, 127, 128, 129, 1001] {
                 let expected: Vec<f32> = (0..frames * 2)
                     .map(|n| (n % 23 + 1) as f32 / 1000.0)
                     .collect();
+                let mut pcm = vec![-0.5; preroll * 2];
+                pcm.extend_from_slice(&expected);
                 let mut backend = Signal {
-                    pcm: expected.clone(),
+                    pcm,
                     frames: 0,
+                    preroll,
                 };
                 let mut observed = Vec::new();
                 let mut observe = |tick: RenderTick<'_>| observed.extend_from_slice(tick.block);
@@ -815,7 +1253,7 @@ mod export_limiter_tests {
                     WavSampleFormat::Float32,
                 )
                 .unwrap();
-                assert_eq!(backend.frames, frames, "no extra music rendered");
+                assert_eq!(backend.frames, frames + preroll, "no extra music rendered");
                 assert_eq!(bytes, frames * 8);
                 let wav = std::fs::read(&path).unwrap();
                 assert_eq!(wav.len(), 44 + bytes);
@@ -825,7 +1263,10 @@ mod export_limiter_tests {
                     .iter()
                     .map(|sample| f32::from_le_bytes(*sample))
                     .collect();
-                assert_eq!(actual, expected, "{character:?}, {frames} frames");
+                assert_eq!(
+                    actual, expected,
+                    "{character:?}, {frames} frames, pre-roll {preroll}"
+                );
                 assert_eq!(observed, actual, "the scope sees what is written");
             }
         }
@@ -841,6 +1282,7 @@ mod scheduler_lookahead_tests {
     struct AdmissionProbe {
         frame: usize,
         admissions: Vec<(u64, usize)>,
+        preroll: usize,
     }
 
     impl crate::AudioBackend for AdmissionProbe {
@@ -861,38 +1303,373 @@ mod scheduler_lookahead_tests {
             self.admissions.push((event.onset_frame, self.frame));
         }
 
+        /// Each block holds its first frame, so 2 renders with the same
+        /// blocks give the same samples.
         fn process_block(&mut self, out: &mut [f32], frames: usize) {
-            out.fill(0.0);
+            out.fill(self.frame as f32);
             self.frame += frames;
+        }
+
+        fn preroll_frames(&self) -> usize {
+            self.preroll
         }
     }
 
+    /// With a pre-roll of 256 frames, an event 256 frames later is admitted
+    /// one lead early too: the admission counts in the frames of the backend.
+    /// The pre-roll admits an event on its first frame before that frame.
     #[test]
     fn streamed_renders_admit_events_at_least_one_scheduler_lead_early() {
         const SAMPLE_RATE: u32 = 48_000;
-        let onset = u64::from(SAMPLE_RATE);
-        let event = OnsetEvent::new(onset, 440.0, 1.0, 0.1);
         let dir =
             std::env::temp_dir().join(format!("rustel-render-lookahead-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("probe.wav");
-        let mut backend = AdmissionProbe::default();
+        for preroll in [0, 256] {
+            let onset = u64::from(SAMPLE_RATE) + preroll as u64;
+            let first = OnsetEvent::new(0, 440.0, 1.0, 0.1);
+            let event = OnsetEvent::new(onset, 440.0, 1.0, 0.1);
+            let mut backend = AdmissionProbe {
+                preroll,
+                ..AdmissionProbe::default()
+            };
 
-        write_pcm16_wav(
-            &path,
-            &mut backend,
+            write_pcm16_wav(
+                &path,
+                &mut backend,
+                SAMPLE_RATE,
+                SAMPLE_RATE as usize + 128,
+                &[first, event],
+            )
+            .expect("render");
+
+            assert_eq!(backend.admissions.len(), 2);
+            assert_eq!(backend.admissions[0], (0, 0));
+            let (_, admitted_at) = backend.admissions[1];
+            assert!(
+                admitted_at + SAMPLE_RATE as usize / 10 <= onset as usize,
+                "event at {onset} was admitted at {admitted_at}, less than 100 ms early"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+
+        // The in-memory render reads its stop before each block. A stop
+        // that turns true at its third read ends the render after 2 blocks.
+        let events = || {
+            [
+                OnsetEvent::new(0, 440.0, 1.0, 0.1),
+                OnsetEvent::new(u64::from(SAMPLE_RATE), 440.0, 1.0, 0.1),
+            ]
+        };
+        let mut stopped = AdmissionProbe::default();
+        let reads = std::cell::Cell::new(0);
+        let rendered = render_pcm_events_until(
+            &mut stopped,
             SAMPLE_RATE,
-            SAMPLE_RATE as usize + 128,
-            &[event],
+            SAMPLE_RATE as usize,
+            events(),
+            || {
+                reads.set(reads.get() + 1);
+                reads.get() >= 3
+            },
+        );
+        assert_eq!(
+            rendered.err().as_deref(),
+            Some(RENDER_CANCELLED),
+            "a stop ends the render"
+        );
+        assert_eq!(stopped.frame, 256);
+        // A stop that never turns true renders the blocks of
+        // render_pcm_events.
+        let mut plain = AdmissionProbe::default();
+        let expected = render_pcm_events(&mut plain, SAMPLE_RATE, SAMPLE_RATE as usize, events())
+            .expect("render");
+        let mut until = AdmissionProbe::default();
+        let actual = render_pcm_events_until(
+            &mut until,
+            SAMPLE_RATE,
+            SAMPLE_RATE as usize,
+            events(),
+            || false,
         )
         .expect("render");
+        assert_eq!(actual, expected);
+        assert_eq!(until.frame, plain.frame);
+        assert_eq!(until.admissions, plain.admissions);
+    }
+}
 
-        assert_eq!(backend.admissions.len(), 1);
-        let (_, admitted_at) = backend.admissions[0];
-        assert!(
-            admitted_at + SAMPLE_RATE as usize / 10 <= onset as usize,
-            "event at {onset} was admitted at {admitted_at}, less than 100 ms early"
+#[cfg(test)]
+mod stems_tests {
+    use super::*;
+    use crate::backend::{OnsetEvent, OscillatorControls};
+    use crate::scalar::ScalarBackend;
+
+    fn note(onset_frame: u64, freq_hz: f32, orbit: u8) -> OnsetEvent {
+        OnsetEvent::new(onset_frame, freq_hz, 0.5, 0.3).with_controls(OscillatorControls {
+            orbit,
+            ..Default::default()
+        })
+    }
+
+    /// Read the float samples of a WAV this module wrote: a fixed 44 byte
+    /// header, then the data chunk.
+    fn float_wav(path: &std::path::Path) -> Vec<f32> {
+        let bytes = std::fs::read(path).expect("read wav");
+        let data = u32::from_le_bytes(bytes[40..44].try_into().expect("data size")) as usize;
+        assert_eq!(
+            data,
+            bytes.len() - 44,
+            "header must describe the file it is in"
         );
-        let _ = std::fs::remove_dir_all(dir);
+        bytes[44..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect()
+    }
+
+    fn bounce(path: &std::path::Path) -> Result<usize, String> {
+        bounce_with(path, RenderControl::default())
+    }
+
+    fn bounce_with(
+        path: &std::path::Path,
+        control: RenderControl<'_, '_>,
+    ) -> Result<usize, String> {
+        bounce_after(path, control, 0, None)
+    }
+
+    /// A bounce with `preroll` frames before its file, and each note that
+    /// much later. An `early` note plays in the pre-roll.
+    fn bounce_after(
+        path: &std::path::Path,
+        control: RenderControl<'_, '_>,
+        preroll: u64,
+        early: Option<OnsetEvent>,
+    ) -> Result<usize, String> {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        let mut backend = ScalarBackend::prepared(48_000, 16).expect("backend");
+        backend.capture_stems();
+        backend.set_preroll(preroll);
+        let notes = [note(preroll, 220.0, 0), note(preroll, 330.0, 1)];
+        write_stems_wav_events_controlled(
+            path,
+            &mut backend,
+            48_000,
+            48_000 / 2,
+            early.into_iter().chain(notes),
+            control,
+            WavSampleFormat::Float32,
+        )
+    }
+
+    /// The stems are tapped before the limiter, so a limiter on the main
+    /// file leaves them as they were: on the main's frames, from the first.
+    #[test]
+    fn a_limiter_on_the_main_moves_no_stem() {
+        let dir = std::env::temp_dir().join(format!("rustel-stems-limiter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plain = dir.join("plain").join("bounce.wav");
+        let limited = dir.join("limited").join("bounce.wav");
+
+        bounce(&plain).expect("plain bounce");
+        bounce_with(
+            &limited,
+            RenderControl {
+                limiter: Some(RenderLimiter {
+                    settings: crate::LimiterSettings {
+                        threshold_db: -12.0,
+                        character: crate::LimiterCharacter::Transparent,
+                    },
+                    makeup: false,
+                }),
+                ..RenderControl::default()
+            },
+        )
+        .expect("limited bounce");
+
+        for stem in ["1.wav", "2.wav"] {
+            let plain = float_wav(&stems_folder(&plain).join(stem));
+            assert!(plain.iter().any(|sample| *sample != 0.0), "{stem} sounds");
+            assert_eq!(
+                plain,
+                float_wav(&stems_folder(&limited).join(stem)),
+                "{stem} moved under the limiter"
+            );
+        }
+
+        // A pre-roll of 256 frames, with each note 256 frames later, gives
+        // the same files. A note on orbit 2 that ends in a pre-roll of 4 096
+        // frames leaves no stem, so the folder has no 3.wav.
+        let shifted = dir.join("shifted").join("bounce.wav");
+        bounce_after(&shifted, RenderControl::default(), 256, None).expect("shifted bounce");
+        let early = dir.join("early").join("bounce.wav");
+        let short = OnsetEvent::new(0, 440.0, 0.5, 0.01).with_controls(OscillatorControls {
+            orbit: 2,
+            ..Default::default()
+        });
+        bounce_after(&early, RenderControl::default(), 4_096, Some(short)).expect("early bounce");
+        for file in ["main.wav", "1.wav", "2.wav"] {
+            let plain = float_wav(&stems_folder(&plain).join(file));
+            for bounce in [&shifted, &early] {
+                let moved = float_wav(&stems_folder(bounce).join(file));
+                assert!(moved == plain, "{file} of {}", bounce.display());
+            }
+        }
+        assert!(!stems_folder(&early).join("3.wav").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The taps hold each orbit's exact contribution to the main mix, added
+    /// in orbit order, so the stems sum back to the unmastered main frame
+    /// for frame.
+    #[test]
+    fn the_stems_sum_to_the_unmastered_main_and_only_sounders_get_files() {
+        let dir = std::env::temp_dir().join(format!("rustel-stems-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("bounce.wav");
+
+        bounce(&path).expect("stems bounce");
+
+        let folder = stems_folder(&path);
+        let mut files: Vec<String> = std::fs::read_dir(&folder)
+            .expect("stems folder")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        files.sort();
+        assert_eq!(files, ["1.wav", "2.wav", "main.wav"]);
+        let main = float_wav(&folder.join("main.wav"));
+        let first = float_wav(&folder.join("1.wav"));
+        let second = float_wav(&folder.join("2.wav"));
+        assert_eq!(main.len(), 48_000);
+        assert_eq!(main.len(), first.len());
+        assert_eq!(main.len(), second.len());
+        for index in 0..main.len() {
+            assert_eq!(
+                main[index],
+                first[index] + second[index],
+                "frame {index} must be the sum of its stems"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An instrument that plays 0.125 times its plugin number.
+    struct Level(crate::InsertKey);
+
+    impl crate::OrbitInsert for Level {
+        fn key(&self) -> crate::InsertKey {
+            self.0
+        }
+
+        fn set_param(&mut self, _: crate::InsertParam, _: u32) {}
+
+        fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+            let level = 0.125 * self.0.plugin as f32;
+            left.fill(level);
+            right.fill(level);
+        }
+    }
+
+    /// An instrument swap splits a block. Each part of the block taps its
+    /// own frames, so the stems still sum to the main frame for frame.
+    #[test]
+    fn an_instrument_swap_inside_a_block_keeps_each_stem_on_its_frames() {
+        let dir = std::env::temp_dir().join(format!("rustel-stems-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("bounce.wav");
+        let mut backend = ScalarBackend::prepared(48_000, 16).expect("backend");
+        backend.render_offline();
+        backend.set_insert_provider(std::sync::Arc::new(|key, _, _| {
+            Some(Box::new(Level(key)) as Box<dyn crate::OrbitInsert>)
+        }));
+        backend.capture_stems();
+        let swap = |frame, plugin| {
+            OnsetEvent::new(frame, 440.0, 1.0, 0.02).with_controls(OscillatorControls {
+                orbit: 0,
+                instrument: Some(crate::InsertControls::new(crate::InsertKey {
+                    plugin,
+                    preset: 0,
+                })),
+                ..Default::default()
+            })
+        };
+        write_stems_wav_events_controlled(
+            &path,
+            &mut backend,
+            48_000,
+            1024,
+            vec![swap(0, 1), note(0, 330.0, 1), swap(50, 2)],
+            RenderControl::default(),
+            WavSampleFormat::Float32,
+        )
+        .expect("stems bounce");
+
+        let folder = stems_folder(&path);
+        let main = float_wav(&folder.join("main.wav"));
+        let first = float_wav(&folder.join("1.wav"));
+        let second = float_wav(&folder.join("2.wav"));
+        assert_eq!(main.len(), 1024 * 2);
+        for index in 0..main.len() {
+            assert_eq!(
+                main[index],
+                first[index] + second[index],
+                "frame {index} must be the sum of its stems"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_existing_stems_folder_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rustel-stems-taken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("bounce.wav");
+        std::fs::create_dir_all(stems_folder(&path)).expect("existing folder");
+
+        let error = bounce(&path).expect_err("the taken folder must be refused");
+        assert!(
+            error.contains("already exists"),
+            "the refusal names the folder: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_backend_without_taps_cannot_render_stems() {
+        let dir = std::env::temp_dir().join(format!("rustel-stems-no-taps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("bounce.wav");
+        let mut backend = ScalarBackend::prepared(48_000, 16).expect("backend");
+
+        let error = write_stems_wav_events_controlled(
+            &path,
+            &mut backend,
+            48_000,
+            1024,
+            std::iter::empty(),
+            RenderControl::default(),
+            WavSampleFormat::Pcm16,
+        )
+        .expect_err("a backend without taps must be refused");
+        assert!(
+            error.contains("keeps no orbit taps"),
+            "the refusal names the reason: {error}"
+        );
+        assert!(
+            !path.exists() && !stems_folder(&path).exists(),
+            "the refusal leaves nothing behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -105,6 +105,22 @@ pub(super) fn studio_runtime_snapshot(
 }
 
 impl App {
+    /// A terminal that answers its pictures, though each asks for no
+    /// answer, answers every frame. It draws in text cells for the rest of
+    /// the session, and says so once. The saved choice stays, for the next
+    /// terminal.
+    pub(super) fn stop_answered_pictures(&mut self) {
+        if !self.features.kitty_graphics {
+            return;
+        }
+        self.features.kitty_graphics = false;
+        super::super::graphics::set_tier(self.ui_settings.rendering.resolve(&self.features));
+        let message = "Kitty pixels are off: this terminal answers every picture, so pictures draw in text cells";
+        self.log
+            .push(LogLevel::Info, "terminal", message.to_owned());
+        self.set_notice(message.to_owned());
+    }
+
     /// One turn of the loop's housekeeping, between frames: every drain,
     /// the debounce timers, the timed decorations. This is the sequence the
     /// event loop runs each turn and the method the end-to-end harness
@@ -140,6 +156,10 @@ impl App {
         // The plugins: on macOS each one is created and released here.
         #[cfg(feature = "vst")]
         rustel_runtime::vst::pump_main();
+        // The detached video windows take their frames here. Off macOS
+        // their events arrive here too, on the studio's own thread.
+        #[cfg(feature = "video")]
+        self.pump_video_window();
         self.drive_mapped_faders(Instant::now());
         self.drain_lint();
         self.pump_theme_editor();
@@ -208,12 +228,13 @@ impl App {
             self.auto_evaluate_due = false;
             self.auto_evaluate();
         }
-        let catalogue_refresh = if self.library_loading {
-            CATALOGUE_LOADING_REFRESH
-        } else {
-            CATALOGUE_REFRESH
-        };
+        let catalogue_refresh = catalogue_refresh_interval(
+            self.library_loading,
+            self.downloads_active(),
+            now.duration_since(self.catalogue_progress_at),
+        );
         if self.worker.poll_catalogue() {
+            self.catalogue_progress_at = now;
             self.install_catalogue();
         }
         if now.duration_since(self.catalogue_refreshed_at) >= catalogue_refresh {
@@ -227,11 +248,17 @@ impl App {
         self.sync_live_material(now);
         self.send_sample_memory();
         self.send_import_origins();
+        self.send_sample_grants();
         self.send_csound();
+        self.note_refused_samples();
         // A permit that unblocked a refused update re-runs it here, once
         // the sends above have put the permission in the engine's hands -
         // a re-run ahead of them would be refused by the old state.
-        if self.refused_update_owed && !self.csound_owed && !self.import_origins_owed {
+        if self.refused_update_owed
+            && !self.csound_owed
+            && !self.import_origins_owed
+            && !self.sample_grants_owed
+        {
             self.refused_update_owed = false;
             self.retry_refused_update();
         }
@@ -258,6 +285,7 @@ impl App {
         self.watch_take();
         self.poll_export();
         self.poll_reveal();
+        self.poll_sample_details();
         self.poll_vim_config(now);
         self.poll_external_changes(now);
         if let Err(error) = super::vim::flush_timeout(self) {
@@ -337,6 +365,16 @@ impl App {
         &mut self,
         terminal: &mut TerminalSession,
     ) -> Result<(), RuntimeError> {
+        // This thread paints; the audio callback and the engine producer keep
+        // their deadlines. On a machine without spare cores the frame loop
+        // stands below them (see `background`). The host connection must be
+        // built BEFORE the demotion: this loop's probe threads are born
+        // demoted, the connection thread inherits its creator's priority,
+        // and the audio callback rides that thread - a host first built
+        // below would put the sound below the workers this demotion is
+        // meant to order below the sound.
+        rustel_audio::prime_playback_host();
+        crate::background::demote();
         let mut raw_paste_continuation = false;
         while !self.quit {
             // Art coloured by the clock or the mix is a moving picture:
@@ -385,6 +423,7 @@ impl App {
             // above the loop's own 60 is allowed to stand: it can cost
             // the terminal, never a note.
             let frame_interval = self.ui_settings.frame_rate.interval();
+            let paced_interval = frame_interval * u32::from(self.frame_pace);
             let animating = self.is_playing()
                 // The piano indicator fades at the configured frame rate,
                 // including before the first note, without starting transport.
@@ -438,13 +477,19 @@ impl App {
                 // Set before drawing, so the draw spends the interval rather
                 // than extending it.
                 self.next_frame =
-                    next_frame_deadline(self.next_frame, Instant::now(), frame_interval);
+                    next_frame_deadline(self.next_frame, Instant::now(), paced_interval);
                 // Sampling the meter immediately before painting is what
                 // makes the peak per frame rather than per loop turn: the
                 // engine folds every producer reading in with a maximum, and
                 // reading it resets that accumulator.
                 self.observe_master(now);
+                let draw_started = Instant::now();
                 self.draw(terminal)?;
+                (self.frame_pace, self.frame_overruns, self.frame_cheaps) = paced_after(
+                    (self.frame_pace, self.frame_overruns, self.frame_cheaps),
+                    draw_started.elapsed(),
+                    frame_interval,
+                );
                 self.dirty_frame = false;
                 self.input_dirty = false;
             }
@@ -466,7 +511,7 @@ impl App {
                     self.input_dirty,
                     wait_from,
                     self.next_frame,
-                    frame_interval,
+                    paced_interval,
                 ),
                 midi_wait_cap(
                     self.pads.open_count(),
@@ -490,6 +535,15 @@ impl App {
                 wait.min(crate::remote::POLL)
             } else {
                 wait
+            };
+            // A detached video window moves with its sound, so while one
+            // is open the idle sleep ends often enough to keep it moving
+            // even when the terminal itself has nothing to repaint.
+            #[cfg(feature = "video")]
+            let wait = if self.video_windows.is_empty() {
+                wait
+            } else {
+                wait.min(Duration::from_millis(33))
             };
             if terminal.poll_event(wait)? {
                 // What this batch of input marks stale is told apart from
@@ -541,6 +595,10 @@ impl App {
                 self.dirty_frame |= animated_dirty;
             } else {
                 raw_paste_continuation = false;
+            }
+            // A swallowed picture reply can be the turn's only input.
+            if terminal.pictures_answered() {
+                self.stop_answered_pictures();
             }
         }
         Ok(())
@@ -625,6 +683,7 @@ impl App {
         self.emit_performance_records(snapshot, ProcessStats::default());
     }
 
+    #[allow(clippy::print_stderr, reason = "performance records are opt-in output")]
     pub(super) fn emit_performance_records(
         &self,
         performance: StudioPerformanceSnapshot,
@@ -721,6 +780,53 @@ pub(super) fn pacing_wait(
     }
 }
 
+/// The most the animated cadence is stretched away from the configured frame
+/// rate: eight times the interval, the thriftiest rung of the frame-rate
+/// ladder.
+pub(super) const MAX_FRAME_PACE: u8 = 8;
+/// Consecutive over budget draws before the animated cadence steps slower.
+pub(super) const FRAME_OVERRUN_LIMIT: u8 = 6;
+/// Consecutive cheap draws before the animated cadence steps back faster.
+pub(super) const FRAME_QUICK_LIMIT: u8 = 24;
+
+/// The animated pace after one draw, from `(pace, overruns, cheap draws)` and
+/// how long the draw took against the configured `interval`.
+///
+/// A draw that costs more than the configured interval cannot run at the
+/// configured rate without spending a core on repaints; after a run of them
+/// the animated cadence doubles until it fits, which on a small machine hands
+/// the core back to the audio path. A draw a quarter of the paced budget has
+/// room for a faster rung, taken once it has held for a while so a cheap
+/// moment does not bounce the rate up and down. Only the animated repaint is
+/// paced: a keystroke still paints at once.
+pub(super) fn paced_after(
+    (pace, overruns, cheap): (u8, u8, u8),
+    draw: Duration,
+    interval: Duration,
+) -> (u8, u8, u8) {
+    let paced = interval * u32::from(pace);
+    if draw > interval {
+        // `overruns` resets at the limit, so it stays far below the
+        // addition's ceiling - at the last pace rung included, where the
+        // pace can no longer grow and a machine that overruns every frame
+        // would otherwise count past the ceiling.
+        if overruns + 1 >= FRAME_OVERRUN_LIMIT {
+            if pace < MAX_FRAME_PACE {
+                return ((pace * 2).min(MAX_FRAME_PACE), 0, 0);
+            }
+            return (pace, 0, 0);
+        }
+        return (pace, overruns + 1, 0);
+    }
+    if pace > 1 && draw * 4 <= paced {
+        if cheap + 1 >= FRAME_QUICK_LIMIT {
+            return (pace / 2, 0, 0);
+        }
+        return (pace, 0, cheap + 1);
+    }
+    (pace, 0, 0)
+}
+
 /// The longest the loop may wait while a MIDI press can act, `since_drain`
 /// after the turn that last drained the pads began: whatever remains of the
 /// arrival deadline, and never less than a millisecond.
@@ -770,6 +876,36 @@ mod tests {
 
         use crate::app::event_loop::*;
         use crate::app::tests::support::*;
+
+        #[test]
+        fn a_terminal_that_answers_its_pictures_draws_in_cells_and_says_so_once() {
+            use crate::graphics::{self, RenderingMode, Tier};
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let before = graphics::tier();
+            app.features.kitty_graphics = true;
+            app.features.fine_glyphs = false;
+            app.features.cell_pixels = Some((10, 20));
+            app.ui_settings.rendering = RenderingMode::Kitty;
+            graphics::set_tier(app.ui_settings.rendering.resolve(&app.features));
+            assert_eq!(graphics::tier(), Tier::Pixels);
+            app.stop_answered_pictures();
+            assert_eq!(graphics::tier(), Tier::Cells, "the pictures draw in cells");
+            assert!(
+                app.status.starts_with("Kitty pixels are off"),
+                "{}",
+                app.status
+            );
+            assert_eq!(
+                app.ui_settings.rendering,
+                RenderingMode::Kitty,
+                "the saved choice stays for the next terminal"
+            );
+            app.status.clear();
+            app.stop_answered_pictures();
+            assert!(app.status.is_empty(), "it says so once");
+            graphics::set_tier(before);
+        }
 
         const SIXTY: Duration = Duration::from_micros(16_667);
 
@@ -1149,6 +1285,41 @@ mod tests {
                 after.contains("bd*4"),
                 "what was typed is on disk: {after:?}"
             );
+        }
+
+        /// A run of draws that cost more than the configured interval halves
+        /// the animated rate, because running at the configured rate would
+        /// spend a core on repaints.
+        #[test]
+        fn overruns_slow_the_animated_cadence() {
+            let mut state = (1, 0, 0);
+            for _ in 0..FRAME_OVERRUN_LIMIT {
+                state = paced_after(state, SIXTY * 2, SIXTY);
+            }
+            assert_eq!(state.0, 2, "the pace doubled");
+            state = (8, 0, 0);
+            state = paced_after(state, SIXTY * 2, SIXTY);
+            assert_eq!(state.0, 8, "the pace is already at its floor");
+        }
+
+        /// Cheap draws hold for a while and then win a faster rung back, so
+        /// a cheap moment does not bounce the rate up and down.
+        #[test]
+        fn a_run_of_cheap_draws_wins_the_rate_back() {
+            let mut state = (4, 0, 0);
+            let cheap = SIXTY / 4;
+            for _ in 0..FRAME_QUICK_LIMIT - 1 {
+                state = paced_after(state, cheap, SIXTY);
+                assert_eq!(state.0, 4, "the pace holds while draws run cheap");
+            }
+            state = paced_after(state, cheap, SIXTY);
+            assert_eq!(state.0, 2, "the pace stepped back down");
+            // A draw that neither overruns nor is a quarter of the paced
+            // budget resets the run instead of letting it drift. At pace 2
+            // that window is a draw between a quarter and all of the
+            // configured interval.
+            let state = paced_after((2, 0, FRAME_QUICK_LIMIT - 2), SIXTY * 3 / 4, SIXTY);
+            assert_eq!(state, (2, 0, 0), "an ordinary draw resets the run");
         }
     }
 

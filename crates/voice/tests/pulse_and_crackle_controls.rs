@@ -7,8 +7,13 @@ fn render(sound: &str, controls: Value) -> Vec<f32> {
     let mut value = json!({"s": sound, "note": "c3", "gain": 0.5});
     value
         .as_object_mut()
-        .unwrap()
-        .extend(controls.as_object().unwrap().clone());
+        .expect("the value is an object")
+        .extend(
+            controls
+                .as_object()
+                .expect("the value is an object")
+                .clone(),
+        );
     let event = rustel_voice::resolve_voice(&value, 1, 0.5, 0.0, SAMPLE_RATE, 0.5)
         .expect("native voice resolves");
     let pcm = render_pcm(

@@ -6,7 +6,7 @@
 //! strings while
 //! wall-clock scheduling values are finite JSON numbers.
 
-use rustel_scheduler::ScheduleTraceEvent;
+use rustel_scheduler::{ScheduleTraceEvent, TraceSampleWalk};
 use rustel_transpiler::{
     ALL_VISUAL_WIDGET_PREFIX, TranspileOptions, VISUAL_WIDGET_METHODS, transpile,
 };
@@ -258,6 +258,7 @@ impl UiVisual {
                     | "tscope"
                     | "pitchwheel"
                     | "spectrum"
+                    | "video"
                     | "markcss"
             )
         {
@@ -1001,6 +1002,11 @@ pub struct UiScheduledEvent {
     pub frequency_hz: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gain: Option<f32>,
+    /// How the event's sample voice walks its buffer, for a picture that
+    /// follows it. The studio's own painters read it, so it stays out of
+    /// the protocol.
+    #[serde(skip)]
+    pub sample: Option<TraceSampleWalk>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub ui_visuals: u64,
     /// Absolute UTF-8 byte ranges in the evaluated source.
@@ -1034,6 +1040,7 @@ impl UiScheduledEvent {
             scale: trace.scale.as_ref().map(UiEdoScale::from),
             frequency_hz: trace.frequency_hz,
             gain: trace.gain,
+            sample: trace.sample,
             ui_visuals: trace.ui_visuals,
             context: trace
                 .context
@@ -1072,6 +1079,7 @@ impl UiScheduledEvent {
             scale: trace.scale.as_ref().map(UiEdoScale::from),
             frequency_hz: trace.frequency_hz,
             gain: trace.gain,
+            sample: trace.sample,
             ui_visuals: trace.ui_visuals,
             context,
         };
@@ -1345,6 +1353,43 @@ pub struct UiAcceptedOnset {
     pub onset_id: u64,
     pub frequency_hz: Option<f32>,
     pub gain: Option<f32>,
+    pub sample: Option<TraceSampleWalk>,
+}
+
+impl UiAcceptedOnset {
+    /// An onset the scalar audio took: the pitch and gain of its voice, and
+    /// how its sample walks the buffer.
+    pub fn scalar<K>(event: &rustel_audio::AudioEvent<K>) -> Self {
+        Self {
+            generation: event.generation,
+            onset_id: event.onset_id,
+            frequency_hz: Some(event.freq_hz),
+            gain: Some(event.gain),
+            sample: event.sample.as_ref().map(|sample| TraceSampleWalk {
+                rate: if sample.muted {
+                    0.0
+                } else {
+                    sample.playback_rate
+                },
+                begin: sample.begin,
+                end: (sample.hold == rustel_audio::SampleHold::Slice).then_some(sample.end),
+                reversed: sample.reversed,
+                loop_secs: sample.loop_secs,
+                nudge_secs: sample.nudge_secs,
+            }),
+        }
+    }
+
+    /// An onset an external route took, which carries no voice of its own.
+    pub fn external(generation: u64, onset_id: u64) -> Self {
+        Self {
+            generation,
+            onset_id,
+            frequency_hz: None,
+            gain: None,
+            sample: None,
+        }
+    }
 }
 
 /// Remove and return only traces whose matching onset reached an output.
@@ -1380,6 +1425,7 @@ pub fn correlate_submitted_traces(
                 .filter(|frequency| *frequency > 0.0)
                 .or(trace.frequency_hz);
             trace.gain = accepted.gain;
+            trace.sample = accepted.sample;
             correlation.ready.push(trace);
         } else {
             correlation.dropped = correlation.dropped.saturating_add(1);
@@ -2217,6 +2263,7 @@ mod tests {
             scale: None,
             frequency_hz: None,
             gain: None,
+            sample: None,
             ui_visuals: 0,
             context: vec![(4, 8), (11, 13)],
         }
@@ -2876,18 +2923,21 @@ unknown(slider(440, 20, 20000));"#;
                     onset_id: 1,
                     frequency_hz: Some(55.0),
                     gain: Some(0.8),
+                    sample: None,
                 },
                 UiAcceptedOnset {
                     generation: 8,
                     onset_id: 2,
                     frequency_hz: Some(110.0),
                     gain: Some(0.7),
+                    sample: None,
                 },
                 UiAcceptedOnset {
                     generation: 7,
                     onset_id: 99,
                     frequency_hz: Some(220.0),
                     gain: Some(0.6),
+                    sample: None,
                 },
             ],
         );
@@ -2921,18 +2971,21 @@ unknown(slider(440, 20, 20000));"#;
                     onset_id: 1,
                     frequency_hz: Some(f32::NAN),
                     gain: Some(1.0),
+                    sample: None,
                 },
                 UiAcceptedOnset {
                     generation: 7,
                     onset_id: 2,
                     frequency_hz: Some(440.0),
                     gain: Some(f32::INFINITY),
+                    sample: None,
                 },
                 UiAcceptedOnset {
                     generation: 7,
                     onset_id: 3,
                     frequency_hz: Some(-1.0),
                     gain: Some(1.0),
+                    sample: None,
                 },
             ],
         );
@@ -2952,6 +3005,7 @@ unknown(slider(440, 20, 20000));"#;
                 onset_id: 1,
                 frequency_hz: Some(0.0),
                 gain: Some(0.8),
+                sample: None,
             }],
         );
 
@@ -2984,12 +3038,14 @@ unknown(slider(440, 20, 20000));"#;
                     onset_id: 1,
                     frequency_hz: Some(0.0),
                     gain: Some(0.8),
+                    sample: None,
                 },
                 UiAcceptedOnset {
                     generation: 7,
                     onset_id: 2,
                     frequency_hz: Some(440.0),
                     gain: Some(0.8),
+                    sample: None,
                 },
             ],
         );
@@ -3007,6 +3063,7 @@ unknown(slider(440, 20, 20000));"#;
                 onset_id: 1,
                 frequency_hz: None,
                 gain: None,
+                sample: None,
             }],
         );
 
@@ -3632,5 +3689,78 @@ unknown(slider(440, 20, 20000));"#;
     fn zero_capacity_is_rejected() {
         let error = UiEventSink::with_writer(0, io::sink()).expect_err("zero capacity");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The walk a sample voice resolved reaches the UI event of the onset
+    /// the audio took: the rate it plays at, its slice, its loop and its
+    /// direction. A voice the hap gates has no slice end, and a muted one
+    /// walks nowhere.
+    #[test]
+    fn an_accepted_sample_voice_gives_its_walk_to_the_ui_event() {
+        let sample = rustel_audio::SampleControls {
+            sample: rustel_audio::SampleId(0),
+            playback_rate: 2.0,
+            begin: 0.5,
+            end: 0.75,
+            hold: rustel_audio::SampleHold::Slice,
+            muted: false,
+            loop_secs: None,
+            envelope_peak: 1.0,
+            reversed: true,
+            nudge_secs: 0.25,
+            cut: None,
+        };
+        let voice = |sample| rustel_audio::AudioEvent::<rustel_audio::KabelControls> {
+            onset_id: 9,
+            generation: 3,
+            ui_visuals: 0,
+            target_frame: 0,
+            onset_lead: 0.0,
+            freq_hz: 0.0,
+            gain: 0.5,
+            duration_secs: 1.0,
+            controls: rustel_audio::OscillatorControls::default(),
+            sample: Some(sample),
+            wavetable: None,
+            synth: None,
+            cut: None,
+        };
+        let walk = |sample| {
+            let mut pending = HashMap::from([(9, trace())]);
+            let ready =
+                correlate_submitted_traces(&mut pending, [UiAcceptedOnset::scalar(&voice(sample))])
+                    .ready;
+            UiScheduledEvent::from_owned_trace(ready.into_iter().next().expect("ready"), 0.5)
+                .expect("event")
+                .sample
+        };
+        let sliced = rustel_scheduler::TraceSampleWalk {
+            rate: 2.0,
+            begin: 0.5,
+            end: Some(0.75),
+            reversed: true,
+            loop_secs: None,
+            nudge_secs: 0.25,
+        };
+        assert_eq!(walk(sample), Some(sliced));
+        let looped = rustel_audio::SampleControls {
+            hold: rustel_audio::SampleHold::Hap,
+            loop_secs: Some((0.5, 1.5)),
+            ..sample
+        };
+        assert_eq!(
+            walk(looped),
+            Some(rustel_scheduler::TraceSampleWalk {
+                end: None,
+                loop_secs: Some((0.5, 1.5)),
+                ..sliced
+            }),
+            "the hap gates a looping voice"
+        );
+        let muted = rustel_audio::SampleControls {
+            muted: true,
+            ..sample
+        };
+        assert_eq!(walk(muted).map(|walk| walk.rate), Some(0.0), "speed(0)");
     }
 }

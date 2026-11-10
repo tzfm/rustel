@@ -40,7 +40,7 @@ fn assert_spans_point_into_the_scores_own_strings(source: &str) {
     let haps = haps(source, 2);
     assert!(!haps.is_empty(), "{source} produced nothing");
     for hap in &haps {
-        for &(from, to) in &hap.context {
+        for (from, to) in &hap.context {
             assert!(
                 ranges
                     .iter()

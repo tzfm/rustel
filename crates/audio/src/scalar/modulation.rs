@@ -238,6 +238,28 @@ impl ModAdds {
     }
 }
 
+/// Whether a modulator moves the post gain of a note. The post gain of a
+/// note then changes while it plays.
+pub(super) fn postgain_moves<K>(controls: &crate::backend::OscillatorControls<K>) -> bool {
+    let post =
+        |fxi: Option<u8>, target| fxi.is_none() && target == crate::backend::ModTarget::Postgain;
+    controls
+        .lfos
+        .iter()
+        .flatten()
+        .any(|lfo| post(lfo.fxi, lfo.target))
+        || controls
+            .envs
+            .iter()
+            .flatten()
+            .any(|env| post(env.fxi, env.target))
+        || controls
+            .bus_mods
+            .iter()
+            .flatten()
+            .any(|bus| post(bus.fxi, bus.target))
+}
+
 /// Clamp that tolerates an inverted range. `f32::clamp` PANICS when
 /// `min > max`, which a modulator reaches legitimately: `depth = depth ·
 /// currentValue` goes negative on a negative param base (`lfo({c:'pan'})`
@@ -379,6 +401,25 @@ pub(super) fn lfo_phase0(time_secs: f32, frequency_hz: f32, phase_offset: f32) -
     (f64::from(time_secs) * f64::from(frequency_hz) + f64::from(phase_offset)).rem_euclid(1.0)
 }
 
+/// Wrap an LFO or oscillator phase into `[0, 1)`. A rate above the sample
+/// rate advances by more than a whole cycle a sample, and a negative rate
+/// walks below zero, so the wrap removes every whole turn at once rather
+/// than one.
+pub(super) fn wrap_phase(phase: f64) -> f64 {
+    if (0.0..=1.0).contains(&phase) {
+        // An exact cycle end stays stored: the waveshapes read phase 1.0
+        // as the end of the cycle, and dyadic rates land on it exactly.
+        return phase;
+    }
+    if phase > 1.0 {
+        // Whole turns come off, but an exact boundary maps to 1.0, as the
+        // one-turn subtract the walks always did.
+        phase - (phase.ceil() - 1.0)
+    } else {
+        phase - phase.floor()
+    }
+}
+
 /// Unipolar LFO waveshapes on phase in [0, 1]; phase stays f64. The walks
 /// wrap on a strict `>`, so a phase of exactly 1.0 is stored and must read as
 /// the start of the next cycle.
@@ -484,8 +525,9 @@ pub(super) fn env_mod_value(env: &crate::backend::EnvMod, t: f32) -> f32 {
 /// No output or phase advance occurs until the first quantum strictly past
 /// the f32-rounded begin time. Comparing it with the f64 render clock retains
 /// AudioParam timing semantics: rounding can decide whether the onset's own
-/// quantum runs.
-pub(super) fn lfo_quantum_open(quantum_start: u64, sample_rate: f64, begin_secs: f32) -> bool {
+/// quantum runs. The quantum counts from the file, so a quantum of the
+/// pre-roll is below 0.
+pub(super) fn lfo_quantum_open(quantum_start: i64, sample_rate: f64, begin_secs: f32) -> bool {
     (quantum_start as f64) / sample_rate > f64::from(begin_secs)
 }
 
@@ -495,7 +537,7 @@ pub(super) fn lfo_quantum_open(quantum_start: u64, sample_rate: f64, begin_secs:
 /// sample. Same rule as `lfo_quantum_open`, so it lands on the same quantum.
 pub(super) fn first_open_quantum(begin_secs: f32, sample_rate: f64) -> u64 {
     let floor = (f64::from(begin_secs) * sample_rate / 128.0).max(0.0) as u64 * 128;
-    if lfo_quantum_open(floor, sample_rate, begin_secs) {
+    if lfo_quantum_open(floor as i64, sample_rate, begin_secs) {
         floor
     } else {
         floor + 128
@@ -503,7 +545,7 @@ pub(super) fn first_open_quantum(begin_secs: f32, sample_rate: f64) -> u64 {
 }
 
 /// Whether this quantum begins before the f32-rounded LFO end time.
-pub(super) fn lfo_quantum_alive(quantum_start: u64, sample_rate: f64, end_secs: f32) -> bool {
+pub(super) fn lfo_quantum_alive(quantum_start: i64, sample_rate: f64, end_secs: f32) -> bool {
     (quantum_start as f64) / sample_rate < f64::from(end_secs)
 }
 
@@ -537,6 +579,7 @@ pub(super) fn lfo_shape(shape: u8, phase: f32, skew: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use super::wrap_phase;
     use super::*;
     mod lfo_waveshape_tests {
         /// `tremolo` defaults to skew 1, and `tri` divides by `1 - skew` on its
@@ -593,7 +636,7 @@ mod tests {
         #[test]
         fn the_onset_quantum_runs_only_when_f32_rounds_the_begin_down() {
             let sr = 48_000.0;
-            let opens_on_its_own_onset = |k: u64| {
+            let opens_on_its_own_onset = |k: i64| {
                 let begin = (2.0 * k as f64 / 3.0) as f32;
                 super::lfo_quantum_open(k * 32_000, sr, begin)
             };
@@ -746,5 +789,20 @@ mod tests {
             assert!((env_mod_value(&e, 0.5) - 0.5).abs() < 1e-3);
             assert!(env_mod_value(&e, 0.9999) < 1e-3);
         }
+    }
+
+    /// The wrap matches the one-turn subtract the walks always did, and
+    /// holds for rates past the sample clock and negative rates.
+    #[test]
+    fn wrap_phase_keeps_a_stored_cycle_end() {
+        assert_eq!(wrap_phase(0.0), 0.0);
+        assert_eq!(wrap_phase(0.5), 0.5);
+        assert_eq!(wrap_phase(1.0), 1.0, "an exact cycle end stays stored");
+        assert_eq!(wrap_phase(1.5), 0.5);
+        assert_eq!(wrap_phase(2.0), 1.0, "a whole extra turn lands on 1.0");
+        assert_eq!(wrap_phase(250.75), 0.75);
+        assert_eq!(wrap_phase(250.0), 1.0);
+        assert_eq!(wrap_phase(-0.25), 0.75);
+        assert_eq!(wrap_phase(-250.5), 0.5);
     }
 }

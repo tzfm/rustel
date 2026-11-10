@@ -5,6 +5,10 @@
 //! `sample_cache` manages cached samples, and `live` runs live and watched playback.
 //! `replay_plan` selects recorded saves for playback and export; `style` handles
 //! terminal colours.
+#![allow(
+    clippy::print_stderr,
+    reason = "the CLI reports its warnings on stderr"
+)]
 
 #[cfg(feature = "device-audio")]
 use std::io;
@@ -575,6 +579,10 @@ struct MusicianArgs {
     /// Cycles per second the score starts at; setcps/setcpm in the score win.
     #[arg(long, default_value_t = 0.5, help_heading = "Playing")]
     cps: f64,
+    /// The audio output to open: a device name, or `silent` for none -
+    /// the clock, the meters and takes without audio hardware.
+    #[arg(long, value_name = "NAME")]
+    output: Option<String>,
     /// Output buffer in frames - the latency knob: the callback size on
     /// macOS and Linux; on Windows (WASAPI shared mode) the callback stays
     /// at the 10 ms device period and this is the buffer queued ahead of it.
@@ -1032,6 +1040,10 @@ enum Command {
         /// it at the end.
         #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,
+        /// The audio output to open: a device name, or `silent` for none -
+        /// a replay without audio hardware keeps its clock and its protocol.
+        #[arg(long, value_name = "NAME")]
+        output: Option<String>,
         /// Bounce the replayed set to WAV or MP3 instead of playing it: the
         /// recording becomes audio with no DAW and no loopback device.
         ///
@@ -1315,6 +1327,11 @@ enum Command {
         /// Meter for a MIDI file, N/D. [default: 4/4]
         #[arg(long, value_name = "N/D")]
         meter: Option<String>,
+        /// Beside the file, write a `<name> stems` folder: the same bounce
+        /// as main.wav plus one WAV per sounding orbit, tapped before the
+        /// export limiter so they sum back to the unmastered main. WAV only.
+        #[arg(long)]
+        stems: bool,
         /// The sample rate in Hz.
         #[arg(long, default_value_t = 48000, value_name = "HZ")]
         sample_rate: u32,
@@ -1397,19 +1414,21 @@ struct SourceInput {
 
 #[derive(Clone, Debug, Default, clap::Args)]
 struct SampleAccessArgs {
-    /// Permit score-level samples() requests to this exact HTTP(S) origin.
-    /// May be repeated. Redirects to other origins remain blocked.
+    /// Let scores load samples, images and videos from this source. A
+    /// domain, such as example.com, allows https from it and its
+    /// subdomains. An address, such as example.com/kits/, allows that
+    /// folder and below. Plain http needs the scheme, such as
+    /// http://localhost:8000/. Repeatable. A redirect must reach an address
+    /// that an allowed source allows.
     #[arg(
         long = "allow-sample-origin",
-        value_name = "ORIGIN",
+        value_name = "SOURCE",
         help_heading = "Sample access"
     )]
-    origins: Vec<String>,
-    /// Fetch score samples() only from origins granted above. By default a
-    /// public https origin whose server consents via CORS
-    /// (`Access-Control-Allow-Origin: *`) is fetched without a grant - the
-    /// same set strudel.cc can reach. Private and loopback addresses are
-    /// refused either way.
+    sources: Vec<String>,
+    /// Do not allow the built-in sources (raw.githubusercontent.com,
+    /// strudel.b-cdn.net, shabda.ndre.gr and cdn.freesound.org). Scores
+    /// then load only from the sources given above.
     #[arg(long = "strict-sample-origins", help_heading = "Sample access")]
     strict_origins: bool,
     /// Permit samples('local:...') beneath this directory.
@@ -1440,11 +1459,11 @@ fn with_sample_access(
 ) -> Result<SessionConfig, RuntimeError> {
     let mut access = ScoreSampleAccess::denied();
     if !args.strict_origins {
-        access.permit_public_cors_origins();
+        access.permit_builtin_sources();
     }
-    for origin in &args.origins {
+    for source in &args.sources {
         access
-            .permit_origin(origin)
+            .permit_source(source)
             .map_err(RuntimeError::Message)?;
     }
     if let Some(root) = &args.local_root {
@@ -1826,11 +1845,16 @@ fn exit_code_for(kind: &str) -> u8 {
     }
 }
 
-/// Serves the macOS main thread's pads and plugins while `runs` says the
-/// work is not done: the pads arrive through its run loop, and each plugin
-/// is created and released on the thread itself. Both are no-ops where the
-/// system asks nothing of the main thread.
-#[cfg(any(feature = "gamepad", feature = "vst"))]
+/// Serves the macOS main thread's pads, plugins and video windows while
+/// `runs` says the work is not done: the pads arrive through its run loop,
+/// each plugin is created and released on the thread itself, and a window
+/// exists only there. All are no-ops where the system asks nothing of the
+/// main thread.
+#[cfg(any(
+    feature = "gamepad",
+    feature = "vst",
+    all(feature = "studio", feature = "video")
+))]
 fn pump_the_main_thread(runs: impl Fn() -> bool) {
     #[cfg(feature = "gamepad")]
     let pads = rustel_runtime::gamepad::needs_the_main_thread();
@@ -1840,11 +1864,17 @@ fn pump_the_main_thread(runs: impl Fn() -> bool) {
     let plugins = rustel_runtime::vst::needs_the_main_thread();
     #[cfg(not(feature = "vst"))]
     let plugins = false;
-    while (pads || plugins) && runs() {
+    #[cfg(all(feature = "studio", feature = "video"))]
+    let windows = rustel_studio::app::video_window::needs_the_main_thread();
+    #[cfg(not(all(feature = "studio", feature = "video")))]
+    let windows = false;
+    while (pads || plugins || windows) && runs() {
         #[cfg(feature = "gamepad")]
         rustel_runtime::gamepad::pump();
         #[cfg(feature = "vst")]
         rustel_runtime::vst::pump_main();
+        #[cfg(all(feature = "studio", feature = "video"))]
+        rustel_studio::app::video_window::pump_main();
         std::thread::sleep(std::time::Duration::from_millis(4));
     }
 }
@@ -1870,9 +1900,9 @@ fn main() -> ExitCode {
     // (which the recursion bound admits) overflows the platform default
     // main-thread stack under debug-profile frame sizes. An explicit stack
     // gives every platform and build profile the same headroom.
-    // On macOS the pads arrive and the plugins are created and released
-    // only on the main thread, which would otherwise sit in the join of the
-    // worker. The service is registered before the worker starts, so no
+    // On macOS the pads arrive, the plugins are created and released, and
+    // the studio's video windows exist only on the main thread, which would
+    // otherwise sit in the join of the worker. The service is registered before the worker starts, so no
     // plugin step can run before the main thread serves it.
     #[cfg(feature = "vst")]
     rustel_runtime::vst::install_main_service();
@@ -1881,7 +1911,11 @@ fn main() -> ExitCode {
         .stack_size(rustel_runtime::QUERY_WORKER_STACK_BYTES)
         .spawn(run)
         .expect("spawn the rustel worker thread");
-    #[cfg(any(feature = "gamepad", feature = "vst"))]
+    #[cfg(any(
+        feature = "gamepad",
+        feature = "vst",
+        all(feature = "studio", feature = "video")
+    ))]
     pump_the_main_thread(|| !worker.is_finished());
     let outcome = worker
         .join()
@@ -2146,6 +2180,7 @@ fn run_command(
                     serde_json::json!({
                         "terminal": features.name,
                         "truecolor": features.truecolor,
+                        "keyboard": features.keyboard,
                         "kitty_graphics": features.kitty_graphics,
                         "sixel": features.sixel,
                         "fine_glyphs": features.fine_glyphs,
@@ -2295,6 +2330,7 @@ fn run_command(
             json: _,
             session,
             out,
+            output,
             speed,
             from,
             export,
@@ -2307,6 +2343,7 @@ fn run_command(
             &session,
             ReplayRun {
                 out,
+                output,
                 speed,
                 from,
                 export,
@@ -2580,6 +2617,7 @@ fn run_command(
                     false,
                     None,
                     None,
+                    None,
                     false,
                     false,
                     None,
@@ -2641,6 +2679,7 @@ fn run_command(
             format,
             ppq,
             meter,
+            stems,
             sample_rate,
             // Folded into the run's one JSON switch at parse time.
             json: _,
@@ -2660,6 +2699,16 @@ fn run_command(
                 return Err(RuntimeError::Message(
                     "--until-silence needs audio output; a MIDI file ends at the requested length"
                         .into(),
+                ));
+            }
+            if stems
+                && !matches!(
+                    format,
+                    RenderCliFormat::ScalarWav | RenderCliFormat::ScalarF32
+                )
+            {
+                return Err(RuntimeError::Message(
+                    "--stems writes WAV stems beside a WAV export, so it needs a WAV format".into(),
                 ));
             }
             let output = match output {
@@ -2740,6 +2789,7 @@ fn run_command(
                 session.stop_export_when_silent(floor, std::time::Duration::from_secs_f64(hold));
                 session.set_render_tail(RENDER_TAIL_CEILING_SECS);
             }
+            session.set_stems_export(stems);
             let report = session.render(duration, &output, format.into())?;
             if json_asked() {
                 outln!(
@@ -2979,6 +3029,7 @@ fn run_doc(name: &str, json: bool) -> Result<(), RuntimeError> {
 /// The `replay` command's options, for [`run_replay`].
 struct ReplayRun {
     out: Option<PathBuf>,
+    output: Option<String>,
     speed: f64,
     from: f64,
     export: Option<PathBuf>,
@@ -3772,11 +3823,11 @@ mod parse_fraction_tests {
         }
         // The bound itself is a cycle time like any other.
         assert_eq!(
-            parse_fraction("9223372036854775808/1").unwrap(),
+            parse_fraction("9223372036854775808/1").expect("the fraction parses"),
             Fraction::int(1 << 63)
         );
         assert_eq!(
-            parse_fraction("-9223372036854775808/1").unwrap(),
+            parse_fraction("-9223372036854775808/1").expect("the fraction parses"),
             Fraction::int(-(1 << 63))
         );
     }
@@ -3784,19 +3835,29 @@ mod parse_fraction_tests {
     /// The legal shapes around the edge keep their exact values and messages.
     #[test]
     fn representable_rationals_parse_unchanged() {
-        assert_eq!(parse_fraction("1/-6").unwrap(), Fraction::new(1, -6));
-        assert_eq!(parse_fraction("1/3").unwrap(), Fraction::new(1, 3));
-        assert_eq!(parse_fraction("0.25").unwrap(), Fraction::new(1, 4));
         assert_eq!(
-            parse_fraction("1e12").unwrap(),
+            parse_fraction("1/-6").expect("the fraction parses"),
+            Fraction::new(1, -6)
+        );
+        assert_eq!(
+            parse_fraction("1/3").expect("the fraction parses"),
+            Fraction::new(1, 3)
+        );
+        assert_eq!(
+            parse_fraction("0.25").expect("the fraction parses"),
+            Fraction::new(1, 4)
+        );
+        assert_eq!(
+            parse_fraction("1e12").expect("the fraction parses"),
             Fraction::int(1_000_000_000_000)
         );
         assert_eq!(
-            parse_fraction("0/-170141183460469231731687303715884105728").unwrap(),
+            parse_fraction("0/-170141183460469231731687303715884105728")
+                .expect("the fraction parses"),
             Fraction::ZERO
         );
         // The zero-denominator refusal keeps its own message.
-        let zero = parse_fraction("1/0").unwrap_err();
+        let zero = parse_fraction("1/0").expect_err("the fraction parses");
         assert!(
             format!("{zero:?}").contains("zero denominator"),
             "the zero-denominator message moved: {zero:?}"
@@ -4428,7 +4489,8 @@ mod live_output_contract_tests {
 
     #[test]
     fn update_checks_require_an_interactive_human_command() {
-        let human = Cli::try_parse_from(["rustel", "check", "-e", "silence"]).unwrap();
+        let human =
+            Cli::try_parse_from(["rustel", "check", "-e", "silence"]).expect("the arguments parse");
         assert!(human.checks_for_updates(true, false));
         assert!(!human.checks_for_updates(false, false));
         assert!(!human.checks_for_updates(true, true));
@@ -4465,10 +4527,11 @@ mod live_output_contract_tests {
         }
         #[cfg(feature = "studio")]
         {
-            let studio = Cli::try_parse_from(["rustel", "studio"]).unwrap();
+            let studio = Cli::try_parse_from(["rustel", "studio"]).expect("the arguments parse");
             assert!(studio.checks_for_updates(true, false));
             for flag in ["--list-themes", "--probe-terminal", "--performance-events"] {
-                let cli = Cli::try_parse_from(["rustel", "studio", flag]).unwrap();
+                let cli =
+                    Cli::try_parse_from(["rustel", "studio", flag]).expect("the arguments parse");
                 assert!(!cli.checks_for_updates(true, false), "{flag}");
             }
         }
@@ -5100,9 +5163,10 @@ mod live_output_contract_tests {
 
     #[test]
     fn verbose_json_shorthand_is_limited_to_live_commands() {
-        let cli = Cli::try_parse_from(["rustel", "devices", "-vvv"]).unwrap();
+        let cli = Cli::try_parse_from(["rustel", "devices", "-vvv"]).expect("the arguments parse");
         assert!(!cli.wants_json());
-        let cli = Cli::try_parse_from(["rustel", "devices", "-vvv", "--json"]).unwrap();
+        let cli = Cli::try_parse_from(["rustel", "devices", "-vvv", "--json"])
+            .expect("the arguments parse");
         assert!(cli.wants_json());
     }
 
@@ -5111,7 +5175,7 @@ mod live_output_contract_tests {
         let event = serde_json::json!({"replay": {"session": "set\u{1b}]52;c;payload\u{7}\u{202e}", "saves": 1}});
         let human = LiveOutput::new(0, false, false)
             .render(LiveDetail::Essential, &event)
-            .unwrap();
+            .expect("the render output builds");
         assert!(human.contains("set␛]52;c;payload␇�"), "{human}");
         assert!(!human.contains('\u{1b}'));
         assert!(!human.contains('\u{7}'));
@@ -5119,9 +5183,10 @@ mod live_output_contract_tests {
 
         let structured = LiveOutput::new(0, false, true)
             .render(LiveDetail::Essential, &event)
-            .unwrap();
+            .expect("the render output builds");
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&structured).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&structured)
+                .expect("the render output builds"),
             event
         );
     }
@@ -5537,7 +5602,7 @@ mod tests {
             Command::Studio {
                 remote_control: Some(address),
                 ..
-            } if address == "127.0.0.1:9247".parse().unwrap()
+            } if address == "127.0.0.1:9247".parse().expect("the address parses")
         ));
 
         let chosen = Cli::try_parse_from([
@@ -5555,7 +5620,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(file.as_deref(), Some(std::path::Path::new("song.strudel")));
-                assert_eq!(remote_control, Some("127.0.0.1:9000".parse().unwrap()));
+                assert_eq!(
+                    remote_control,
+                    Some("127.0.0.1:9000".parse().expect("the address parses"))
+                );
             }
             other => panic!("expected the studio command, got {other:?}"),
         }
@@ -5578,7 +5646,7 @@ mod tests {
                 Command::Studio {
                     remote_control: Some(bind),
                     ..
-                } if bind == address.parse().unwrap()
+                } if bind == address.parse().expect("the address parses")
             ));
         }
 
@@ -5753,9 +5821,15 @@ mod tests {
         assert_eq!(capture.update(&delivery, 8), None);
 
         let replacement = "note(\"g5\")._spectrum()";
-        assert!(!observe_ui_layout_if_audible(&mut delivery, replacement, 9, 8).unwrap());
+        assert!(
+            !observe_ui_layout_if_audible(&mut delivery, replacement, 9, 8)
+                .expect("the observation succeeds")
+        );
         assert_eq!(capture.update(&delivery, 8), None);
-        assert!(observe_ui_layout_if_audible(&mut delivery, replacement, 9, 9).unwrap());
+        assert!(
+            observe_ui_layout_if_audible(&mut delivery, replacement, 9, 9)
+                .expect("the observation succeeds")
+        );
         assert_eq!(
             capture.update(&delivery, 9),
             Some(UiVisualAudioUpdate::Set(0))
@@ -6690,35 +6764,35 @@ mod tests {
     #[test]
     fn render_lengths_read_seconds_minutes_and_bars() {
         assert_eq!(
-            parse_render_length("60").unwrap(),
+            parse_render_length("60").expect("the length parses"),
             RenderLength::Seconds(60.0)
         );
         assert_eq!(
-            parse_render_length("30s").unwrap(),
+            parse_render_length("30s").expect("the length parses"),
             RenderLength::Seconds(30.0)
         );
         assert_eq!(
-            parse_render_length("2m").unwrap(),
+            parse_render_length("2m").expect("the length parses"),
             RenderLength::Seconds(120.0)
         );
         assert_eq!(
-            parse_render_length("1:30").unwrap(),
+            parse_render_length("1:30").expect("the length parses"),
             RenderLength::Seconds(90.0)
         );
         assert_eq!(
-            parse_render_length("1h").unwrap(),
+            parse_render_length("1h").expect("the length parses"),
             RenderLength::Seconds(3600.0)
         );
         assert_eq!(
-            parse_render_length("16b").unwrap(),
+            parse_render_length("16b").expect("the length parses"),
             RenderLength::Cycles(16.0)
         );
         assert_eq!(
-            parse_render_length(" 4 bars ").unwrap(),
+            parse_render_length(" 4 bars ").expect("the length parses"),
             RenderLength::Cycles(4.0)
         );
         assert_eq!(
-            parse_render_length("0.5m").unwrap(),
+            parse_render_length("0.5m").expect("the length parses"),
             RenderLength::Seconds(30.0)
         );
         for (text, seconds) in [
@@ -6730,19 +6804,21 @@ mod tests {
             ("1e12", 1e12),
         ] {
             assert_eq!(
-                parse_render_length(text).unwrap(),
+                parse_render_length(text).expect("the length parses"),
                 RenderLength::Seconds(seconds),
                 "{text}"
             );
         }
         assert_eq!(
-            parse_render_length("1e-3b").unwrap(),
+            parse_render_length("1e-3b").expect("the length parses"),
             RenderLength::Cycles(0.001)
         );
         for bad in [
             "", "abc", "-3", "1:x", "5 weeks", "1e", "NaN", "inf", "1e309",
         ] {
-            let error = parse_render_length(bad).unwrap_err().to_string();
+            let error = parse_render_length(bad)
+                .expect_err("the length parses")
+                .to_string();
             assert!(error.contains("seconds (60, 30s)"), "{bad}: {error}");
         }
     }
@@ -6874,6 +6950,25 @@ mod tests {
             .is_err(),
             "a length is one thing or the other"
         );
+        let cli = Cli::try_parse_from([
+            product::COMMAND_NAME,
+            "render",
+            "song.strudel",
+            "--stems",
+            "--format",
+            "scalar-f32",
+        ])
+        .expect("a stems export");
+        match cli.command {
+            Command::Render { stems, format, .. } => {
+                assert!(stems, "--stems parses on");
+                assert!(
+                    matches!(format, Some(RenderCliFormat::ScalarF32)),
+                    "the float format parses: {format:?}"
+                );
+            }
+            other => panic!("not a render: {other:?}"),
+        }
         let wants = |line: &[&str]| {
             let mut args = vec![product::COMMAND_NAME];
             args.extend_from_slice(line);

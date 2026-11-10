@@ -68,6 +68,7 @@ impl StudioEngine {
             input: device.input + own_inputs,
             record: device.record,
             reverbs: device.reverbs,
+            send_lines: device.send_lines,
             backend: device.backend,
             other: device.analysis + backlog,
         })
@@ -318,6 +319,8 @@ impl StudioEngine {
         self.adopt_idle_ready_samples();
         let now = Instant::now();
         self.enforce_sample_memory(now);
+        #[cfg(feature = "vst")]
+        self.close_output_of_closed_tabs();
         self.free_memory_when_due(now);
     }
 
@@ -360,6 +363,18 @@ impl StudioEngine {
             &self.config.import_origins,
             self.config.csound_allowed,
         ));
+    }
+
+    /// Replace what the permissions page permits a score's `samples()`,
+    /// images and videos to read. The next evaluation and the next pack
+    /// import read it. A bank from a source turned off is dropped.
+    pub fn set_sample_grants(&mut self, grants: SampleGrants) {
+        let access = sample_access(&self.config.session, &grants);
+        self.config.sample_grants = grants;
+        if let Some(library) = self.session.sample_library() {
+            library.set_import_policy(access.clone());
+        }
+        self.session.set_score_sample_access(access);
     }
 
     /// Flip the permissions page's orchestra switch. The next evaluation
@@ -408,6 +423,18 @@ impl StudioEngine {
         }
         #[cfg(feature = "vst")]
         {
+            // The scene of a tab that left gives its plugin copies back.
+            let closed = &material.closed_documents;
+            if let Some(gone) = closed.get(self.live_documents_closed..)
+                && !gone.is_empty()
+            {
+                for document in gone {
+                    self.closed_plugin_copies |= self.session.forget_plugin_document(*document);
+                }
+                self.live_documents_closed = closed.len();
+                self.ask_idle_sweep();
+            }
+            self.close_output_of_closed_tabs();
             // A plugin the column shows no more goes with the next sweep.
             // A text edit asks for no sweep, as for the sounds.
             if material.plugins != self.live_plugins_shown {
@@ -850,7 +877,10 @@ impl StudioEngine {
     /// [`rustel_runtime::vst::whole_names`]. Each chain of the score keeps
     /// its plugins too, also after a Stop: see
     /// [`rustel_runtime::Session::plugin_names`]. So a plugin from a setup
-    /// text, an import or a name the score computes stays loaded.
+    /// text, an import or a name the score computes stays loaded. So does
+    /// the plugin of each copy an open scene keeps while it does not play.
+    /// The chains of a closed score end first: see
+    /// [`rustel_runtime::Session::end_closed_plugin_document`].
     /// The host keeps each plugin with a running copy, so an unload waits
     /// for the output of its score to close. A stop parks the output with
     /// the copies of its score. The sweep closes a parked output that holds
@@ -881,20 +911,45 @@ impl StudioEngine {
         }
         // Another string keeps a plugin by its whole name only.
         keep.extend(rustel_runtime::vst::whole_names(&strings));
+        // The chains of a closed score end while the output is stopped.
+        if self.live.is_none() {
+            self.closed_plugin_copies |= self.session.end_closed_plugin_document();
+        }
         keep.extend(self.session.plugin_names());
         // The close sends the copies to the plugin thread before the unload.
         // Piano mode, a key that rings out or a score tail keeps the output
         // open. Its copies keep their plugins loaded.
-        if self.live.is_none()
+        if self.parked_output_idle() && rustel_runtime::vst::engine_holds_unkept(&keep) {
+            self.close_piano_output();
+        }
+        rustel_runtime::vst::unload_unused(&keep);
+    }
+
+    /// True when the parked output closes with no sound lost: no score
+    /// plays, Piano mode is closed, and no key or score tail rings out.
+    #[cfg(feature = "vst")]
+    fn parked_output_idle(&self) -> bool {
+        self.live.is_none()
             && self.piano_output.is_some()
             && !self.piano_mode
             && self.piano.iter().all(Option::is_none)
             && !self.piano_has_score_tail
-            && rustel_runtime::vst::engine_holds_unkept(&keep)
-        {
+    }
+
+    /// Closes the parked output while it holds a plugin copy of a chain that
+    /// a closed tab ended, so the copy ends with no wait for the sweep:
+    /// see [`Self::closed_plugin_copies`]. Piano mode, a key that rings out
+    /// or a score tail keeps the output open, and a later turn closes it.
+    /// The plugins stay loaded for the next sweep to judge. With no output
+    /// open, it clears [`Self::closed_plugin_copies`]: each copy left with
+    /// the output that held it.
+    #[cfg(feature = "vst")]
+    pub(super) fn close_output_of_closed_tabs(&mut self) {
+        if self.audio_device().is_none() {
+            self.closed_plugin_copies = false;
+        } else if self.closed_plugin_copies && self.parked_output_idle() {
             self.close_piano_output();
         }
-        rustel_runtime::vst::unload_unused(&keep);
     }
 
     pub(super) fn enforce_sample_memory(&mut self, now: Instant) {
@@ -1096,6 +1151,88 @@ mod tests {
         }
     }
 
+    /// The page's grants reach the session and the pack imports alike, and
+    /// a change replaces the last one. The record of refused sources stays
+    /// the host's, so the studio reads it from the policy it gave.
+    #[test]
+    fn sample_grants_reach_the_session_and_the_pack_imports() {
+        let mut host = SessionConfig::default();
+        host.score_sample_access.permit_builtin_sources();
+        let refused = host.score_sample_access.clone();
+        let github = rustel_runtime::SourceRule::parse("raw.githubusercontent.com").unwrap();
+        let mut engine = StudioEngine::new(StudioConfig {
+            session: host,
+            ..StudioConfig::default()
+        })
+        .expect("engine");
+
+        engine.set_sample_grants(SampleGrants {
+            sources: vec!["http://kit.invalid".to_owned()],
+            ..SampleGrants::default()
+        });
+        let granted = engine.session.config().score_sample_access.clone();
+        assert!(granted.sources().contains(&github), "the built-ins stay");
+        assert_eq!(
+            granted.source_for("http://kit.invalid/kit.json"),
+            Ok(Some(
+                &rustel_runtime::SourceRule::parse("http://kit.invalid").unwrap()
+            ))
+        );
+        let library = engine.session.sample_library().expect("library");
+        assert_eq!(library.import_policy_for_test(), Some(granted));
+
+        // Plain http needs a source that spells it out. The score plays on
+        // without the bank, and the refusal is a diagnostic.
+        engine
+            .session
+            .evaluate("samples('http://other.invalid/kit.json')\n$: s(\"bd\")")
+            .expect("the score");
+        assert_eq!(refused.take_refused_sources(), ["http://other.invalid"]);
+    }
+
+    /// A source turned off on the page takes the banks it allowed, and the
+    /// pictures read under the new grants from the next turn, so Stop and
+    /// Play fetch nothing from it.
+    #[test]
+    fn a_source_turned_off_takes_its_banks_and_pictures() {
+        let mut engine = StudioEngine::new(StudioConfig::default()).expect("engine");
+        engine.set_sample_grants(SampleGrants {
+            sources: vec!["http://kit.invalid".to_owned()],
+            ..SampleGrants::default()
+        });
+        let library = Arc::clone(engine.session.sample_library().expect("library"));
+        library
+            .register_score_custom(
+                r#"{"kit":"a.wav"}"#,
+                Some("http://kit.invalid/"),
+                &engine.session.config().score_sample_access,
+            )
+            .expect("an allowed bank");
+        #[cfg(feature = "hydra")]
+        let mut hydra = rustel_runtime::hydra::HydraBridge::new();
+        #[cfg(feature = "hydra")]
+        let pictures = |hydra: &rustel_runtime::hydra::HydraBridge| {
+            hydra
+                .sample_access_for_test()
+                .source_for("http://kit.invalid/a.png")
+                .expect("an address")
+                .is_some()
+        };
+        #[cfg(feature = "hydra")]
+        {
+            engine.drive_hydra(&mut hydra, None);
+            assert!(pictures(&hydra));
+        }
+
+        engine.set_sample_grants(SampleGrants::default());
+        assert!(!library.knows("kit"), "the bank goes with its source");
+        #[cfg(feature = "hydra")]
+        {
+            engine.drive_hydra(&mut hydra, None);
+            assert!(!pictures(&hydra), "the pictures read under the new grants");
+        }
+    }
+
     mod sample_reclamation {
         use super::*;
 
@@ -1284,6 +1421,7 @@ mod tests {
                 &mut use_until,
                 48_000,
                 0,
+                0,
             );
             assert!(
                 use_until[&sample] > event.target_frame + 96_000,
@@ -1297,11 +1435,29 @@ mod tests {
                 &mut use_until,
                 48_000,
                 render_frontier,
+                0,
             );
             assert!(
                 use_until[&sample] > render_frontier + 96_000,
                 "a late onset still gets the full sample lifetime after adoption"
             );
+            // A note of a plugin chain with 480 frames of latency starts up
+            // to that latency after its frame, and a restart moves it up to
+            // its restart lead later.
+            let late = use_until[&sample];
+            let mut latent = event.clone();
+            let stage = rustel_audio::InsertControls::new(rustel_audio::InsertKey::default());
+            latent.controls.effects[0] = Some(stage.with_latency(480));
+            note_sample_use(
+                &latent,
+                &HashMap::new(),
+                Some(&library),
+                &mut use_until,
+                48_000,
+                render_frontier,
+                240,
+            );
+            assert_eq!(use_until[&sample], late + 720);
             assert_eq!(
                 library.take_ready().len(),
                 1,
@@ -1893,11 +2049,13 @@ mod tests {
             boundary_time: 8.0,
             rewind: false,
             unit_cycles: 1.0,
-            preview: false,
+            mark: InstallMark::default(),
             followed: Vec::new(),
             waited: false,
             #[cfg(feature = "vst")]
             prepared: true,
+            #[cfg(feature = "vst")]
+            lead: 0.0,
         });
         assert!(
             protected_afresh(&mut engine).contains(&SampleId(74)),
@@ -2085,8 +2243,9 @@ mod tests {
         );
 
         // An armed launch carries the mark to its line, and Stop keeps the
-        // set as it stood.
+        // set as it stood. The document mark stays for the next install.
         engine.mark_next_install_preview(true);
+        engine.mark_next_install_document(4);
         engine
             .arm_launch("s(\"piano\")", false, 1.0, false)
             .expect("arm");
@@ -2094,9 +2253,10 @@ mod tests {
             engine
                 .pending_launch
                 .as_ref()
-                .is_some_and(|pending| pending.preview)
+                .is_some_and(|pending| pending.mark.preview && pending.mark.document == 4)
         );
-        assert!(!engine.next_install_preview);
+        assert!(!engine.next_install.preview);
+        assert_eq!(engine.next_install.document, 4);
         assert!(engine.stop(Duration::from_millis(500)).is_some());
         assert!(engine.played_before_preview.is_none());
         assert_eq!(

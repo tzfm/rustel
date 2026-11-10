@@ -29,7 +29,7 @@ mod handover;
 #[cfg(all(feature = "vst", feature = "device-audio"))]
 mod plugin_wait;
 #[cfg(all(feature = "vst", feature = "device-audio"))]
-pub use plugin_wait::PLUGIN_WAIT;
+pub use plugin_wait::{PLUGIN_WAIT, SEAM_WAIT};
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -60,7 +60,8 @@ use crate::samples::ScoreSampleAccess;
 use crate::score_import::ScoreImportAccess;
 
 const DEFAULT_CPS: f64 = 0.5;
-const DEFAULT_HORIZON: f64 = 0.5;
+/// The scheduling horizon a fresh session keeps ahead of the clock, in seconds.
+pub const DEFAULT_HORIZON: f64 = 0.5;
 pub(crate) const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 const DEFAULT_CHANNELS: u16 = 2;
 const SCORE_CPU_BUDGET: Duration = Duration::from_secs(2);
@@ -132,6 +133,12 @@ pub(crate) const MIN_LIVE_QUERY_JS_BUDGET: Duration = Duration::from_millis(25);
 /// painters, never queued to the audio - so it can never collide with the
 /// scheduler's dense counter, which starts at zero.
 pub const PREVIEW_ONSET_ID_FLAG: u64 = 1 << 63;
+/// The document of a snippet preview with no set under it, and of the
+/// silence that opens the output while nothing plays. A document is the key
+/// a caller gives a score text, as the scene id in Studio. This document
+/// never goes to rest: a preview is no scene of the set, so the session
+/// keeps none of its lanes for a later play.
+pub const PREVIEW_DOCUMENT: u64 = u64::MAX;
 
 /// The JavaScript a preview query may run. It runs on the engine thread
 /// between producer steps, so a callback-bearing score gets the live
@@ -370,6 +377,26 @@ pub(crate) enum LiveQueryBudgetMode {
     ReplacementPrefill,
 }
 
+/// The kind of a live window, for the lead of its plugin notes: see
+/// [`Session::chain_live_events`].
+#[cfg(feature = "vst")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum LeadWindow {
+    /// A window of the score in play, or the first window of a score with
+    /// no takeover.
+    Steady,
+    /// The first window of a takeover with a cut: a rewind. Each note takes
+    /// its whole lead. The restart floor of the output sounds a note aimed
+    /// behind the flip whole.
+    Rewind,
+    /// The first window of a takeover with no cut, on this frame, with the
+    /// lead in seconds that the takeover added: an edit, a requery of the
+    /// score in play, or a launch with no rewind. Only the live producer has
+    /// such a window.
+    #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
+    Edit(u64, f64),
+}
+
 enum EvaluatedScore {
     JavaScript {
         pattern: Pattern,
@@ -433,6 +460,10 @@ struct AudibleSource {
     cycle_zero_time: f64,
     /// The cycle that `getTime()` returned while this source evaluated.
     evaluated_cycle: f64,
+    /// The document of the source: see [`Session::set_plugin_document`]. A
+    /// rollback and a panic replay read the source in it.
+    #[cfg(feature = "vst")]
+    document: u64,
 }
 
 /// Settings a Session is built with; [`Session::with_config`] validates them.
@@ -842,6 +873,10 @@ pub struct Session {
     export_limiter: Option<rustel_audio::RenderLimiter>,
     /// Tick resolution and meter for a MIDI file render.
     midi_export_options: rustel_smf::SmfOptions,
+    /// Whether a scalar WAV export also writes a `<name> stems` folder beside
+    /// the file: `main.wav` plus one WAV a sounding orbit. See
+    /// [`Self::set_stems_export`].
+    stems_export: bool,
     /// The input-channel warnings already said for this score and this
     /// input: a silent voice on `in:1` is news once, not once a window.
     input_warnings_reported: std::collections::BTreeSet<String>,
@@ -874,6 +909,28 @@ pub struct Session {
     /// takeover does not sound one of their onsets twice.
     #[cfg(feature = "device-audio")]
     compensated_onsets: handover::CompensatedOnsets,
+    /// The lead of the plugin chains of the score in play, in seconds, with
+    /// the stop count of the transport when it was set: see
+    /// [`Self::plugin_lead`].
+    #[cfg(feature = "vst")]
+    plugin_lead: (f64, u64),
+    /// The lead of the plugin copies of the lanes that do not play now and of
+    /// the cycles ahead, and of a held text, in seconds, with the stop count
+    /// as above. The cover of the producer keeps room for it.
+    #[cfg(feature = "vst")]
+    cover_lead: (f64, u64),
+    /// The lead of the plan of the candidate at the commit seam, in seconds,
+    /// from the seam to the commit: see `Session::plugin_seam`.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    plan_lead: Option<f64>,
+    /// The lead the takeover of the newest commit or requery added to its
+    /// margin, in seconds: see [`Self::takeover_lead`].
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    takeover_added: f64,
+    /// The lead of the plugin chains in frames at the rate of the output,
+    /// for the restart of a rewind: see [`Self::attach_instruments`].
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    restart_lead: Arc<std::sync::atomic::AtomicU32>,
     /// How far a live host has handed the OSC bundles out, so a takeover
     /// does not send an onset that is out again.
     #[cfg(all(feature = "device-audio", feature = "osc"))]
@@ -894,6 +951,11 @@ pub struct Session {
     /// Live-reload re-query margin (the device's consumption frontier).
     /// Falls back to `schedule_lead` when the host never measured one.
     continuity_margin: Option<f64>,
+    /// Floor a host puts under a live replacement's takeover headroom, from
+    /// how long its producer's turns actually take. Zero keeps the default
+    /// response-time pricing (see [`Self::set_replacement_headroom_floor`]).
+    #[cfg(any(feature = "device-audio", test))]
+    replacement_headroom_floor: Duration,
     /// The sample rate of the last live schedule, in Hz. The producer
     /// converts a takeover time to the takeover frame at this rate, and
     /// [`Self::takeover_frame_edge`] uses the same rate. `None` until a
@@ -998,10 +1060,14 @@ pub struct Session {
 ///
 /// A stopped transport is the artist pressing Ctrl-C, not a failure: it has to
 /// arrive as `Cancelled` so the CLI exits quietly with the partial file rather
-/// than printing an I/O error for something that worked as asked.
+/// than printing an I/O error for something that worked as asked. An export
+/// that ends before its first frame keeps its own words.
 fn render_error(error: std::io::Error) -> RuntimeError {
     if error.to_string().contains(rustel_audio::RENDER_CANCELLED) {
         return RuntimeError::Cancelled;
+    }
+    if error.to_string() == crate::render::RENDER_ENDED_BEFORE_AUDIO {
+        return RuntimeError::Message(error.to_string());
     }
     match error.kind() {
         std::io::ErrorKind::InvalidInput => RuntimeError::Message(format!("scalar audio: {error}")),
@@ -1160,6 +1226,7 @@ impl Session {
             stop_when_silent: None,
             export_limiter: None,
             midi_export_options: rustel_smf::SmfOptions::default(),
+            stems_export: false,
             input_warnings_reported: std::collections::BTreeSet::new(),
             refusals_reported: std::collections::BTreeSet::new(),
             plugin_lines_reported: std::collections::BTreeSet::new(),
@@ -1171,6 +1238,16 @@ impl Session {
             audio_confirmations: None,
             #[cfg(feature = "device-audio")]
             compensated_onsets: handover::CompensatedOnsets::default(),
+            #[cfg(feature = "vst")]
+            plugin_lead: (0.0, 0),
+            #[cfg(feature = "vst")]
+            cover_lead: (0.0, 0),
+            #[cfg(all(feature = "vst", feature = "device-audio"))]
+            plan_lead: None,
+            #[cfg(all(feature = "vst", feature = "device-audio"))]
+            takeover_added: 0.0,
+            #[cfg(all(feature = "vst", feature = "device-audio"))]
+            restart_lead: Arc::default(),
             #[cfg(all(feature = "device-audio", feature = "osc"))]
             osc_handed_out: handover::HandedOut::default(),
             #[cfg(all(feature = "device-audio", feature = "serial"))]
@@ -1180,6 +1257,8 @@ impl Session {
             audio_input_channels: None,
             schedule_lead: 0.0,
             continuity_margin: None,
+            #[cfg(any(feature = "device-audio", test))]
+            replacement_headroom_floor: Duration::ZERO,
             live_sample_rate: None,
             requery_takeover_time: None,
             requery_takeover_cut: TakeoverCut::None,
@@ -1218,6 +1297,13 @@ impl Session {
         if let Some(candidate) = self.staged_hydra.take() {
             self.pending_hydra = Some(candidate);
         }
+    }
+
+    /// A score recovered from a failed evaluation draws nothing of its
+    /// own: close the picture, unless the evaluation already recorded one.
+    #[cfg(feature = "hydra")]
+    pub(crate) fn stage_hydra_close_when_unstaged(&mut self) {
+        self.staged_hydra.get_or_insert_with(Box::default);
     }
 
     /// The visuals program a committed score installed, if there is a new one.
@@ -1259,6 +1345,16 @@ impl Session {
         self.config.score_import_access = access;
     }
 
+    /// Replace what a score's `samples()`, images and videos may read. The
+    /// next evaluation reads the new policy. A bank from a source the policy
+    /// no longer allows is dropped, and none of its files loads again.
+    pub fn set_score_sample_access(&mut self, access: ScoreSampleAccess) {
+        if let Some(library) = self.sample_library() {
+            library.withdraw_sources(&access);
+        }
+        self.config.score_sample_access = access;
+    }
+
     pub fn csound_snapshot(&self) -> crate::CsoundSnapshot {
         self.csound.snapshot()
     }
@@ -1291,15 +1387,17 @@ impl Session {
         self.attach_instruments(device);
     }
 
-    /// Connects this session's instruments to a live output.
+    /// Connects this session's instruments to a live output. The output
+    /// publishes the lead of the plugin chains with each cutover, so a rewind
+    /// restarts its first notes in time: see [`Self::plugin_lead`].
     #[cfg(feature = "device-audio")]
     pub fn attach_instruments(&self, device: &rustel_audio::LiveScalarDevice) {
         #[cfg(feature = "vst")]
         {
-            self.plugin_rate
-                .store(device.sample_rate(), std::sync::atomic::Ordering::Relaxed);
+            self.set_plugin_rate(device.sample_rate());
             self.plugins_live
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            device.set_restart_lead(Arc::clone(&self.restart_lead));
         }
         device.set_insert_provider(self.csound.provider(false));
         let csound = self.csound.clone();
@@ -1332,10 +1430,199 @@ impl Session {
 
     /// Gives the plugins the sample rate of the live output after a reopen
     /// of the output. A reopen is no new attach: see [`Self::attach_plugins`].
+    /// The restart lead of the output takes the new rate too.
     #[cfg(feature = "vst")]
     pub fn set_plugin_rate(&self, sample_rate: u32) {
         self.plugin_rate
             .store(sample_rate, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "device-audio")]
+        self.store_restart_lead();
+    }
+
+    /// The lead of the plugin chains of the score in play, in seconds: the
+    /// notes of a chain with latency start this long before their onset, 1 s
+    /// at most, so the chain plays in time with the other lanes. An edit, a
+    /// start, a slider, a key and a clock steer take effect this long later,
+    /// and a live producer schedules this long further ahead. The plan of a
+    /// commit sets the lead. A look at the plugin copies and a live window
+    /// raise it: see [`Self::plugins_pending`]. A Stop ends the lead, and so
+    /// does [`Self::end_plugin_leads`]. 0 with no plugin.
+    pub fn plugin_lead(&self) -> f64 {
+        #[cfg(feature = "vst")]
+        {
+            self.lead_since_stop(self.plugin_lead)
+        }
+        #[cfg(not(feature = "vst"))]
+        {
+            0.0
+        }
+    }
+
+    /// The lead of the plugin copies of the lanes that do not play now, of
+    /// the cycles ahead and of a held text, in seconds. The cover of a live
+    /// producer keeps room for it, so the first notes of such a lane find
+    /// room for their lead. A Stop ends the lead. 0 with no plugin.
+    fn cover_lead(&self) -> f64 {
+        #[cfg(feature = "vst")]
+        {
+            self.lead_since_stop(self.cover_lead)
+        }
+        #[cfg(not(feature = "vst"))]
+        {
+            0.0
+        }
+    }
+
+    /// `lead` in seconds, with the stop count of the transport when it was
+    /// set: 0 after a later Stop.
+    #[cfg(feature = "vst")]
+    fn lead_since_stop(&self, (lead, stops): (f64, u64)) -> f64 {
+        if stops == self.transport.stops() {
+            lead
+        } else {
+            0.0
+        }
+    }
+
+    /// Raises the lead of the plugin chains of the score in play to `lead`
+    /// seconds: see [`Self::plugin_lead`]. After a Stop the lead starts from
+    /// 0.
+    #[cfg(feature = "vst")]
+    fn raise_plugin_lead(&mut self, lead: f64) {
+        if lead > self.plugin_lead() {
+            self.plugin_lead = (lead, self.transport.stops());
+            self.plugin_lead_changed();
+        }
+    }
+
+    /// Raises the lead of the plugin copies that do not play now to `lead`
+    /// seconds: see [`Self::cover_lead`]. After a Stop the lead starts from
+    /// 0.
+    #[cfg(feature = "vst")]
+    fn raise_cover_lead(&mut self, lead: f64) {
+        if lead > self.cover_lead() {
+            self.cover_lead = (lead, self.transport.stops());
+            self.sync_live_schedule_horizon();
+        }
+    }
+
+    /// The commit of a text with a plan: the lead of the plan is the lead of
+    /// the plugin chains of the score in play now, and the cover keeps room
+    /// for it alone.
+    #[cfg(feature = "vst")]
+    fn set_plugin_leads(&mut self, lead: f64) {
+        let stops = self.transport.stops();
+        self.plugin_lead = (lead, stops);
+        self.cover_lead = (lead, stops);
+        self.plugin_lead_changed();
+    }
+
+    /// Ends the lead of the plugin chains and the lead the cover keeps room
+    /// for, as a Stop ends them. A text that replaces a held start calls it:
+    /// the held text never sounded, so its lead does not count. See
+    /// [`Self::plugin_lead`].
+    #[cfg(feature = "vst")]
+    pub fn end_plugin_leads(&mut self) {
+        self.set_plugin_leads(0.0);
+    }
+
+    /// The lead of the plugin chains changed, or a start set cycle zero:
+    /// the cover of a live producer and the restart lead of the output
+    /// follow the lead.
+    #[cfg(feature = "vst")]
+    fn plugin_lead_changed(&mut self) {
+        #[cfg(feature = "device-audio")]
+        self.store_restart_lead();
+        self.sync_live_schedule_horizon();
+    }
+
+    /// Writes the lead of the plugin chains in frames at the rate of the
+    /// output to the cell the output reads: see [`Self::attach_instruments`].
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    fn store_restart_lead(&self) {
+        let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+        let frames = (self.plugin_lead() * f64::from(rate)).round() as u32;
+        self.restart_lead
+            .store(frames, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Takes the lead of the plan the commit seam made for a candidate, for
+    /// its commit: see `Session::plugin_seam`. `None` for a commit with no
+    /// seam.
+    fn take_plan_lead(&mut self) -> Option<f64> {
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        {
+            self.plan_lead.take()
+        }
+        #[cfg(not(all(feature = "vst", feature = "device-audio")))]
+        {
+            None
+        }
+    }
+
+    /// How much earlier a launch fires for the plugin chains, in seconds: the
+    /// lead of the plugin chains of the score in play, or the lead of the
+    /// copies of the text the arm of the launch prepared when that is larger.
+    /// The call reads those copies again, so a copy that became ready during
+    /// the countdown counts. See [`Self::plugin_lead`] and
+    /// [`Self::prepare_reload`]. The notes of the launch then have room for
+    /// their lead before its line. 0 with no plugin.
+    pub fn takeover_headroom(&self) -> f64 {
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        {
+            let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+            let prepared = self.plugin_hold.as_ref();
+            let prepared = prepared.map_or(0.0, |hold| hold.lead(rate));
+            self.plugin_lead().max(prepared)
+        }
+        #[cfg(not(all(feature = "vst", feature = "device-audio")))]
+        {
+            self.plugin_lead()
+        }
+    }
+
+    /// The lead the takeover of the newest commit or requery added for the
+    /// plugin chains, in seconds: see [`Self::plugin_lead`]. A note of a
+    /// chain with latency starts that long before the takeover, so the first
+    /// window goes out that long before its takeover at the latest. Only the
+    /// publication of a commit checks its freshness with it.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    pub(crate) fn takeover_lead(&self) -> f64 {
+        self.takeover_added
+    }
+
+    /// The restart lead the live output publishes with its cutovers, in
+    /// frames: see [`Self::attach_instruments`]. A restart moves a note of
+    /// its first window up to this far after its target. 0 with no plugin.
+    #[cfg(feature = "device-audio")]
+    pub(crate) fn restart_lead_frames(&self) -> u64 {
+        #[cfg(feature = "vst")]
+        {
+            u64::from(self.restart_lead.load(std::sync::atomic::Ordering::Relaxed))
+        }
+        #[cfg(not(feature = "vst"))]
+        {
+            0
+        }
+    }
+
+    /// Sets the lead of the plugin chains of the score in play to `lead`
+    /// seconds, as a look at copies with that latency sets it: see
+    /// [`Self::plugin_lead`].
+    #[cfg(all(feature = "vst", any(test, feature = "test-support")))]
+    #[doc(hidden)]
+    pub fn set_plugin_lead_for_test(&mut self, lead: f64) {
+        self.plugin_lead = (lead, self.transport.stops());
+        self.plugin_lead_changed();
+    }
+
+    /// The generation of the score of the last look of
+    /// [`Self::plugins_pending`] at the plugin copies. `None` before the
+    /// first look.
+    #[cfg(all(feature = "vst", any(test, feature = "test-support")))]
+    #[doc(hidden)]
+    pub fn plugin_look_for_test(&self) -> Option<u64> {
+        self.plugin_look.map(|(_, generation, _)| generation)
     }
 
     /// True when the score of this session plays through the plugins of a
@@ -1343,6 +1630,21 @@ impl Session {
     #[cfg(feature = "vst")]
     pub fn plugins_live(&self) -> bool {
         self.plugins_live.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Gives each plugin copy of the score in play that did not start, or
+    /// that faulted, one new try in the background, with no evaluation: see
+    /// [`crate::vst::Host::retry`]. The update press of Studio on the text in
+    /// play calls this. Gives the count of the tries that start. A session
+    /// with no live output, and a score with no plugin chain in play, ask
+    /// the plugin host nothing.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    pub fn retry_plugins(&self) -> usize {
+        if !self.plugins_live() {
+            return 0;
+        }
+        let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+        crate::vst::retry(&self.chains, None, rate)
     }
 
     /// True when an evaluation of this session ran a plugin call. A plugin
@@ -1353,19 +1655,61 @@ impl Session {
     }
 
     /// The plugin names of the chains of the score in play and of the text
-    /// the session plans, as the notes write them, each one time. A chain in
-    /// its grace does not count: its lane left the text, or the lane lost
-    /// the instrument or each plugin of the chain. A Stop ends no chain, so
-    /// the names stay while the transport is stopped. A caller that unloads
-    /// the plugins no score uses keeps these plugins: also a plugin from a
-    /// setup text, an import or a name the score computes. Empty for a
-    /// session with no live output: see [`Self::attach_plugins`].
+    /// the session plans, and of the copies each document at rest keeps, as
+    /// the notes write them, each one time. A chain in its grace does not
+    /// count: its lane left the text, or the lane lost the instrument or each
+    /// plugin of the chain. A Stop ends only the chains of a closed document:
+    /// see [`Self::end_closed_plugin_document`]. The other names stay while
+    /// the transport is stopped. A caller that unloads the plugins no score
+    /// uses keeps these plugins: also a plugin from a setup text, an import
+    /// or a name the score computes. Empty for a session with no live
+    /// output: see [`Self::attach_plugins`].
     #[cfg(feature = "vst")]
     pub fn plugin_names(&self) -> Vec<String> {
         if !self.plugins_live() {
             return Vec::new();
         }
         crate::vst::plugin_names(&self.chains)
+    }
+
+    /// The next score texts of this session are of `document`: the key a
+    /// caller gives each score text, as the scene id in Studio. The CLI and an
+    /// embedder read in document 0. An open document that does not play is
+    /// at rest: the plugin copies of its chains wait for its next play, so a
+    /// document that plays again loads nothing. A document that plays for the
+    /// first time shares the lanes of the score in play, with their copies.
+    #[cfg(feature = "vst")]
+    pub fn set_plugin_document(&mut self, document: u64) {
+        self.lanes.set_reading(document);
+    }
+
+    /// The tab of `document` left. A document at rest gives its plugin
+    /// copies back at once. The score in play plays on, and its copies end
+    /// at the next Stop, or 5 s of play after another score plays: see
+    /// [`Self::end_closed_plugin_document`]. Gives true when an engine holds
+    /// a copy of a chain that ended while the transport is stopped: the
+    /// output gives it back at its close. With the transport running, the
+    /// output gives back the copy of each chain it does not name, and the
+    /// call gives false.
+    #[cfg(feature = "vst")]
+    pub fn forget_plugin_document(&mut self, document: u64) -> bool {
+        let live = self.plugins_live();
+        let held = crate::vst::forget_document(&self.chains, &mut self.lanes, document, live);
+        self.end_closed_plugin_document() || (held && self.transport.is_stopped())
+    }
+
+    /// Ends the plugin chains of each closed document while the transport
+    /// is stopped: the chains of the closed score in play, and of a closed
+    /// score in its 5 s. Gives true when an engine holds a copy of a chain
+    /// that ended: the output gives it back at its close. With the transport
+    /// running, nothing ends.
+    #[cfg(feature = "vst")]
+    pub fn end_closed_plugin_document(&self) -> bool {
+        if !self.transport.is_stopped() {
+            return false;
+        }
+        let live = self.plugins_live();
+        crate::vst::end_closed_documents(&self.chains, &self.lanes, live)
     }
 
     /// Keeps the plugin name of each plugin call an evaluation ran. `names`
@@ -1417,28 +1761,89 @@ impl Session {
     }
 
     /// Gives each event of a live window the plugin chain of its note, in
-    /// one assignment for the window: see [`crate::vst::assign`]. `values`
-    /// are the notes of `events`, in the same order. A note with no room
+    /// one assignment for the window: see [`crate::vst::assign`]. `onsets`
+    /// are the onsets of `events`, in the same order. A note with no room
     /// for its chain plays with no plugin. With plugins on a live output,
     /// a slider that is the value of a plugin key of a note links to the
     /// parameter of its copy: see [`crate::vst::link_sliders`].
+    ///
+    /// With plugins on a live output, each stage of a chain also gets the
+    /// latency of its copy at `sample_rate`: see [`crate::vst::latencies`].
+    /// A note of a chain with latency starts early by that latency, 1 s at
+    /// most, so the chain plays in time with the other lanes: the note
+    /// converts again at the earlier time, with the sounds of `samples`. See
+    /// [`crate::render::early_audio_event`]. The note takes its whole lead
+    /// when the earlier time is at `reach` or after it, the first time the
+    /// window reaches, in seconds, and in the first window of a rewind. Else
+    /// it keeps its frame and plays late by the latency of its chain, in
+    /// onset order. In the first window of an edit, a note before the
+    /// takeover is a note the edit adds there: with no room for its lead, it
+    /// does not play, and the edit sounds on its lane from the takeover on.
+    /// In the first window of an edit, a note on or after the takeover frame
+    /// also takes its whole lead when the earlier time is at or after the
+    /// edge of that frame less the lead the takeover added: the takeover
+    /// waited that lead for it. Each note of a chain with latency raises the
+    /// lead of the plugin chains to the lead of its chain: see
+    /// [`Self::plugin_lead`]. Gives the places of the events that do not
+    /// play, in ascending order.
     #[cfg(feature = "vst")]
     pub(crate) fn chain_live_events(
-        &self,
+        &mut self,
         events: &mut [rustel_audio::AudioEvent],
-        values: &[&ValueJson],
-    ) {
+        onsets: &[&OnsetEventJson],
+        samples: &dyn rustel_voice::SampleLookup,
+        sample_rate: u32,
+        reach: f64,
+        window: LeadWindow,
+    ) -> Vec<usize> {
         let live = self.plugins_live();
-        let notes = values.iter().copied();
+        let notes = onsets.iter().map(|onset| &onset.value);
         let chains = crate::vst::assign(&self.chains, &self.lanes, &self.csound, notes, live);
-        for ((event, chain), value) in events.iter_mut().zip(chains).zip(values) {
+        let (mut known, mut left_out) = (Vec::new(), Vec::new());
+        let events = events.iter_mut().zip(chains).zip(onsets);
+        for (place, ((event, chain), onset)) in events.enumerate() {
             chain.apply(&mut event.controls, &mut event.gain);
-            if live && let ValueJson::Raw(value) = value {
+            if !live {
+                continue;
+            }
+            if let ValueJson::Raw(value) = &onset.value {
                 let param_of =
                     |name: &str, key: &str| crate::vst::started()?.loaded(name)?.param(key);
                 crate::vst::link_sliders(&self.chains, value, &event.controls, param_of);
             }
+            let controls = &mut event.controls;
+            let lead = crate::vst::latencies(&self.chains, controls, sample_rate, &mut known);
+            if lead == 0 {
+                continue;
+            }
+            // The cover grows by the lead, so the next notes of the chain
+            // find room for it.
+            let lead_secs = f64::from(lead) / f64::from(sample_rate);
+            self.raise_plugin_lead(lead_secs);
+            let start = onset.target_time - lead_secs;
+            let onset_frame = crate::render::onset_frame_at(onset.target_time, sample_rate);
+            // The takeover of an edit waits the lead it added, so a note on
+            // or after its frame has that room before the frame.
+            let reach = match window {
+                LeadWindow::Edit(takeover, added) if onset_frame >= takeover => {
+                    reach.min(crate::render::onset_frame_edge(takeover, sample_rate) - added)
+                }
+                _ => reach,
+            };
+            if start < reach && window != LeadWindow::Rewind {
+                if matches!(window, LeadWindow::Edit(takeover, _) if onset_frame < takeover) {
+                    left_out.push(place);
+                }
+                continue;
+            }
+            let cps = self.config.cps;
+            let early =
+                crate::render::early_audio_event(onset, event, lead, sample_rate, cps, samples);
+            if let Some(early) = early {
+                *event = early;
+            }
         }
+        left_out
     }
 
     /// The plugin chains of this session, for the tests of the chains.
@@ -1512,14 +1917,14 @@ mod test_support {
         let mut config = SessionConfig::default();
         config
             .score_sample_access
-            .permit_origin(origin)
+            .permit_source(origin)
             .expect("test sample origin");
         Session::with_config(config).expect("session")
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// The first plugin note of the first cycle.
     #[cfg(feature = "vst")]
     pub(super) fn plugin_note(session: &Session) -> serde_json::Value {
@@ -1554,7 +1959,7 @@ mod tests {
     /// new folder is a new plugin for the plugin host, so its first copy is
     /// not ready at once. One test at a time has the folder.
     #[cfg(all(feature = "vst", feature = "device-audio"))]
-    pub(super) fn fixture_plugins() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+    pub(crate) fn fixture_plugins() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
         pub(super) static FOLDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let one = FOLDER.lock().unwrap_or_else(|poison| poison.into_inner());
         let folder = tempfile::tempdir().expect("plugin folder");
@@ -1681,7 +2086,7 @@ mod tests {
             whole_begin: "0".into(),
             duration_secs: 0.25,
             target_time: 0.0,
-            live_controls: [0; 3],
+            live_controls: [0; 4],
             ui_visuals: 0,
             value: ValueJson::Raw(value),
             value_show: String::new(),
@@ -2046,6 +2451,9 @@ mod tests {
         session.set_direct_diagnostic_logging(false);
         session.set_schedule_lead(0.0);
         session.set_continuity_margin(0.0);
+        // Each score is of a document of its own.
+        #[cfg(feature = "vst")]
+        session.set_plugin_document(1);
         if mini {
             session.evaluate_mini(source_a).expect("source A");
         } else {
@@ -2096,6 +2504,8 @@ mod tests {
             )
             .expect("A shield");
         let generation_a = session.generation();
+        #[cfg(feature = "vst")]
+        session.set_plugin_document(2);
         let generation_b = session
             .reload_with_clock_cancellable(source_b, mini, transport.stopped_flag(), || now)
             .expect("B evaluates");
@@ -2110,6 +2520,8 @@ mod tests {
 
         // The host is deliberately not invoked for B. C is valid native mini
         // syntax, but its bare string haps cannot become scalar voice objects.
+        #[cfg(feature = "vst")]
+        session.set_plugin_document(3);
         let generation_c = session
             .reload_with_clock_cancellable("c4*64", true, transport.stopped_flag(), || now)
             .expect("C installs before conversion");
@@ -2161,6 +2573,13 @@ mod tests {
             Some(if delayed_b { source_b } else { source_a }),
             "only a copied window may select its retained rollback source"
         );
+        // The rollback reads the score it puts back in the document of that
+        // score. A mini score reads no lane.
+        #[cfg(feature = "vst")]
+        if !mini {
+            let document = if delayed_b { 2 } else { 1 };
+            assert_eq!(session.lanes.document(), document);
+        }
     }
     #[test]
     fn max_polyphony_is_transactional_and_isolated_per_session() {

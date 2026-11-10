@@ -1,8 +1,8 @@
 use super::*;
 
-/// Takes a lock of the insert state. The insert provider is host code and
-/// runs with these locks. A panic in that code does not end the output: the
-/// next turn reads the value as the panic left it.
+/// Takes a lock of the producer state. The insert provider is host code and
+/// runs with the insert locks. A panic in that code does not end the output:
+/// the next turn reads the value as the panic left it.
 fn locked<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     lock.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -14,8 +14,10 @@ impl Default for LiveReverbBatch {
             requested: [None; crate::scalar::MAX_ORBITS],
             publication: None,
             // A turn with no plugin makes no allocation here.
+            rooms: Vec::new(),
             inserts: Vec::new(),
             refused: 0,
+            latency: 0,
         }
     }
 }
@@ -23,6 +25,27 @@ impl Default for LiveReverbBatch {
 impl LiveReverbBatch {
     pub(super) fn request_orbit(&mut self, orbit: usize, params: crate::reverb::ReverbParams) {
         self.requested[orbit.min(crate::scalar::MAX_ORBITS - 1)] = Some(params);
+    }
+
+    /// Asks for the room of `chain`: the last reverb a note of the turn
+    /// asks for, and a delay line when a note sends to a delay. A turn asks
+    /// for the rooms of as many chains as the output has buses.
+    fn request_room(
+        &mut self,
+        chain: u64,
+        reverb: Option<crate::reverb::ReverbParams>,
+        delay: bool,
+    ) {
+        if let Some(held) = self.rooms.iter_mut().find(|held| held.chain == chain) {
+            held.reverb = reverb.or(held.reverb);
+            held.delay |= delay;
+        } else if self.rooms.len() < crate::insert::MAX_INSERT_BUSES {
+            self.rooms.push(ChainRoomRequest {
+                chain,
+                reverb,
+                delay,
+            });
+        }
     }
 
     /// Observe one event without constructing an orbit impulse response.
@@ -44,17 +67,33 @@ impl LiveReverbBatch {
     /// scheduling window before generation publication.
     pub fn observe_prepared(&mut self, device: &LiveScalarDevice, event: &crate::AudioEvent) {
         self.observe_inserts(event);
-        if let Some(reverb) = event.controls.reverb {
-            self.request_orbit(
-                usize::from(event.controls.orbit),
-                crate::reverb::ReverbParams {
-                    ir: None,
-                    size_secs: reverb.size_secs,
-                    fade_secs: reverb.fade_secs,
-                    lp_start_hz: reverb.lp_start_hz,
-                    lp_end_hz: reverb.lp_end_hz,
-                },
-            );
+        let reverb = event
+            .controls
+            .reverb
+            .map(|reverb| crate::reverb::ReverbParams {
+                ir: None,
+                size_secs: reverb.size_secs,
+                fade_secs: reverb.fade_secs,
+                lp_start_hz: reverb.lp_start_hz,
+                lp_end_hz: reverb.lp_end_hz,
+            });
+        // The orbit keeps its reverb for a note through effects too: the
+        // note sends to its orbit while its chain has no room.
+        if let Some(params) = reverb {
+            self.request_orbit(usize::from(event.controls.orbit), params);
+        }
+        // A note through effects sends to the room of its chain, in front of
+        // the effects: see `ChainRoom`. A send of 0 asks for no room: the
+        // callback sends nothing for it.
+        let sent_reverb = event
+            .controls
+            .reverb
+            .filter(|reverb| reverb.wet > 0.0)
+            .and(reverb);
+        let delay = event.controls.delay.is_some_and(|delay| delay.wet != 0.0);
+        let effects = event.controls.effects.iter().any(Option::is_some);
+        if effects && !event.controls.piano && (sent_reverb.is_some() || delay) {
+            self.request_room(event.controls.insert_chain(), sent_reverb, delay);
         }
         for stage in event.controls.fx_stages.iter().flatten() {
             let Some(room) = stage.room else { continue };
@@ -79,6 +118,7 @@ impl LiveReverbBatch {
     }
 
     fn observe_inserts(&mut self, event: &crate::AudioEvent) {
+        self.latency = self.latency.max(event.controls.effect_latency());
         let chain = event.controls.insert_chain();
         for (place, effect) in event.controls.effects.iter().enumerate() {
             if let Some(effect) = effect {
@@ -101,12 +141,16 @@ impl LiveReverbBatch {
         batch.flush_inserts(device);
     }
 
-    /// Prepare and ship each requested reverb and logical insert slot.
+    /// Prepare and ship each requested reverb, room of a chain and logical
+    /// insert slot.
     pub fn flush(&mut self, device: &LiveScalarDevice) {
         for (orbit, request) in self.requested.iter_mut().enumerate() {
             if let Some(params) = request.take() {
                 device.ensure_reverb(orbit, params);
             }
+        }
+        for room in self.rooms.drain(..) {
+            device.ensure_chain_room(room.chain, room.reverb, room.delay);
         }
         self.flush_inserts(device);
     }
@@ -126,6 +170,8 @@ impl LiveReverbBatch {
             let chains = names(turn);
             device.set_named_insert_chains(&chains.named);
             device.release_inserts(&chains.gone);
+            device.restart_inserts(&chains.restart, &chains.gone);
+            device.replace_inserts(&chains.replace);
         }
         // The moved values fill the room of the ring. The rest waits in the
         // source for the next turn.
@@ -161,6 +207,78 @@ impl LiveReverbBatch {
             .fetch_add(self.refused, Ordering::Relaxed);
         self.refused = 0;
         device.ship_plugin_pool();
+        device.ship_send_lines(self.latency);
+    }
+}
+
+impl ChainRoomCache {
+    pub(super) fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            serial: 0,
+            budget: crate::scalar::MAX_CHAIN_ROOM_BYTES,
+        }
+    }
+
+    /// The bytes of the rooms shipped to the callback.
+    pub(super) fn bytes(&self) -> usize {
+        let entry =
+            |entry: &ChainRoomEntry| entry.reverb.map_or(0, |(_, bytes)| bytes) + entry.delay;
+        self.entries.iter().map(entry).sum()
+    }
+
+    /// The place of the entry of `chain`, made when the chain has none. A
+    /// full list drops an entry that holds no room for the new one, and a
+    /// list that holds a room in each entry gives none.
+    fn entry(&mut self, chain: u64) -> Option<usize> {
+        if let Some(at) = self.entries.iter().position(|entry| entry.chain == chain) {
+            return Some(at);
+        }
+        if self.entries.len() == 2 * crate::insert::MAX_INSERT_BUSES {
+            let empty = |entry: &ChainRoomEntry| entry.reverb.is_none() && entry.delay == 0;
+            let at = self.entries.iter().position(empty)?;
+            self.entries.swap_remove(at);
+        }
+        self.entries.push(ChainRoomEntry {
+            chain,
+            reverb: None,
+            delay: 0,
+            serial: 0,
+            refused: None,
+            no_bus: None,
+        });
+        Some(self.entries.len() - 1)
+    }
+
+    /// The callback gave `room` back. A room that left with its chain frees
+    /// its part of the budget. A refused room waits a second for its next
+    /// try. An older box than the last one shipped leaves the parts of the
+    /// room unknown: the last box may hold only the parts the room lacked,
+    /// so the next request ships each part again.
+    fn returned(&mut self, room: &crate::scalar::ChainRoom) {
+        let Some(at) = self
+            .entries
+            .iter()
+            .position(|entry| entry.chain == room.chain())
+        else {
+            return;
+        };
+        let entry = &mut self.entries[at];
+        match room.returned() {
+            crate::scalar::ChainRoomReturn::Merged => {}
+            _ if entry.serial != room.serial() => {
+                entry.reverb = None;
+                entry.delay = 0;
+            }
+            crate::scalar::ChainRoomReturn::Refused => {
+                entry.reverb = None;
+                entry.delay = 0;
+                entry.no_bus = Some(Instant::now());
+            }
+            crate::scalar::ChainRoomReturn::Released => {
+                self.entries.swap_remove(at);
+            }
+        }
     }
 }
 
@@ -233,11 +351,11 @@ impl LiveScalarDevice {
     /// it, and a repeat call with unchanged params is a cache hit.
     pub fn ensure_reverb(&self, orbit: usize, params: crate::reverb::ReverbParams) {
         let orbit = orbit.min(crate::scalar::MAX_ORBITS - 1);
+        self.reclaim_assets();
         let mut cache = self.reverb_cache.lock().expect("producer reverb cache");
         if cache[orbit].is_some_and(|(cached, _)| cached == params) {
             return;
         }
-        self.reclaim_assets();
         let reverb = Box::new(crate::reverb::OrbitReverb::generate_with_dispatch(
             self.sample_rate,
             params,
@@ -262,6 +380,108 @@ impl LiveScalarDevice {
                 // Ring full: free and retry on a later batch.
                 // SAFETY: never left this thread; unique owner.
                 drop(unsafe { Box::from_raw(install.reverb) });
+            }
+        }
+    }
+
+    /// Makes sure the room of `chain` holds a reverb with `reverb` and a
+    /// delay line when `delay`, and ships the parts the room lacks: see
+    /// `crate::scalar::ChainRoom`. Producer-side and potentially SLOW, as
+    /// [`Self::ensure_reverb`]. A request the room holds already is a cache
+    /// hit. The rooms keep within [`crate::scalar::MAX_CHAIN_ROOM_BYTES`]
+    /// together. A part past the budget is not made, and neither is a room
+    /// while the ring is full or within a second after the callback found
+    /// no bus for it. The notes of the chain then send that part to their
+    /// orbit.
+    pub fn ensure_chain_room(
+        &self,
+        chain: u64,
+        reverb: Option<crate::reverb::ReverbParams>,
+        delay: bool,
+    ) {
+        self.reclaim_assets();
+        let mut cache = locked(&self.chain_room_cache);
+        let Some(at) = cache.entry(chain) else {
+            return;
+        };
+        let entry = cache.entries[at];
+        if entry
+            .no_bus
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        let new_reverb =
+            reverb.filter(|wanted| entry.reverb.is_none_or(|(held, _)| held != *wanted));
+        let new_delay = delay && entry.delay == 0;
+        let installs = &self.shared.samples.chain_room_installs;
+        if (new_reverb.is_none() && !new_delay) || installs.len() == installs.capacity() {
+            return;
+        }
+        // A new reverb takes the place of the reverb of the room, which goes
+        // back to be freed.
+        let freed = new_reverb.and(entry.reverb).map_or(0, |(_, bytes)| bytes);
+        let resident = cache.bytes();
+        let budget = cache.budget;
+        let line = crate::scalar::ChainRoom::delay_bytes(self.sample_rate);
+        let new_delay = new_delay && crate::scalar::ChainRoom::fits(resident, freed, line, budget);
+        let lines = if new_delay { line } else { 0 };
+        let fits = |bytes: usize| {
+            crate::scalar::ChainRoom::fits(resident, freed, lines.saturating_add(bytes), budget)
+        };
+        let mut refused = entry.refused;
+        let made = new_reverb.and_then(|wanted| {
+            let known = refused.filter(|(held, _)| *held == wanted);
+            if known.is_some_and(|(_, bytes)| !fits(bytes)) {
+                return None;
+            }
+            let reverb = Box::new(crate::reverb::OrbitReverb::generate_with_dispatch(
+                self.sample_rate,
+                wanted,
+                self.dispatch(),
+            ));
+            let bytes = reverb.approx_bytes();
+            if !fits(bytes) {
+                // Keep the size, or each later turn makes the room again.
+                refused = Some((wanted, bytes));
+                return None;
+            }
+            refused = None;
+            Some((wanted, bytes, reverb))
+        });
+        cache.entries[at].refused = refused;
+        if made.is_none() && !new_delay {
+            return;
+        }
+        // The serial only grows, so a box that comes back names the box
+        // the entry knows, or an older one.
+        cache.serial += 1;
+        let serial = cache.serial;
+        let (held, reverb) = match made {
+            Some((wanted, bytes, reverb)) => (Some((wanted, bytes)), Some(reverb)),
+            None => (entry.reverb, None),
+        };
+        let room = crate::scalar::ChainRoom::new(
+            chain,
+            serial,
+            reverb,
+            new_delay.then_some(self.sample_rate),
+        );
+        let install = crate::assets::ChainRoomInstall {
+            room: Box::into_raw(Box::new(room)),
+            sample_rate: self.sample_rate,
+        };
+        match installs.push(install) {
+            Ok(()) => {
+                let entry = &mut cache.entries[at];
+                entry.reverb = held;
+                entry.delay += lines;
+                entry.serial = serial;
+            }
+            Err(install) => {
+                // Only this thread fills the ring, and a place was free.
+                // SAFETY: never left this thread. Unique owner.
+                drop(unsafe { Box::from_raw(install.room) });
             }
         }
     }
@@ -296,10 +516,14 @@ impl LiveScalarDevice {
         let mut cache = locked(&self.insert_cache);
         let mut waiting = locked(&self.insert_waiting);
         waiting.retain(|(held, _, _)| *held != slot);
-        if cache
-            .iter()
-            .any(|(held, cached, _)| *held == slot && *cached == key)
-        {
+        // A copy that faulted lets its new copy ship.
+        let shipped = {
+            let replaced = locked(&self.insert_replaced);
+            cache.iter().any(|(held, cached, address)| {
+                *held == slot && *cached == key && !replaced.contains(address)
+            })
+        };
+        if shipped {
             return;
         }
         let provider = locked(&self.insert_provider).clone();
@@ -396,6 +620,34 @@ impl LiveScalarDevice {
             Err(install) => {
                 // SAFETY: the count never left this thread.
                 drop(unsafe { Arc::from_raw(install.0) });
+            }
+        }
+    }
+
+    /// Ships send lines to the backend of the stream for the notes of chains
+    /// with `latency` frames of effect latency, 1 s at most, when the lines
+    /// it shipped do not reach that far: see [`crate::scalar::SendLines`].
+    /// The lines are made here, on the producer. With send lines still on
+    /// their way to the callback, the next turn tries again.
+    fn ship_send_lines(&self, latency: u32) {
+        let latency = latency.min(self.sample_rate);
+        let installs = &self.shared.samples.send_line_installs;
+        if latency <= self.send_lines_reach.load(Ordering::Relaxed)
+            || installs.len() == installs.capacity()
+        {
+            return;
+        }
+        let lines = Box::new(crate::scalar::SendLines::new(latency, self.sample_rate));
+        let (reach, bytes) = (lines.reach(), lines.bytes());
+        match installs.push(crate::assets::SendLineInstall(Box::into_raw(lines))) {
+            Ok(()) => {
+                self.send_lines_reach.store(reach, Ordering::Relaxed);
+                self.send_lines_bytes.store(bytes, Ordering::Relaxed);
+            }
+            Err(install) => {
+                // Only this thread fills the ring, and a place was free.
+                // SAFETY: never left this thread. Unique owner.
+                drop(unsafe { Box::from_raw(install.0) });
             }
         }
     }
@@ -647,30 +899,44 @@ impl LiveScalarDevice {
     }
 
     pub(super) fn reclaim_assets(&self) {
-        let mut cache = self
-            .fx_reverb_cache
-            .lock()
-            .expect("producer fx reverb cache");
-        let mut kabel = self.kabel_cache.lock().expect("producer KabelSalat cache");
-        let mut programs = self
-            .program_cache
-            .lock()
-            .expect("producer KabelSalat program cache");
-        let mut inserts = locked(&self.insert_cache);
-        self.shared.samples.reclaim_with_inserts(
-            |returned| {
-                cache.retain(|(_, _, installed)| *installed != returned as usize);
-            },
-            |returned| {
-                kabel.retain(|entry| entry.pointer != returned as usize);
-            },
-            |returned| {
-                programs.retain(|entry| entry.pointer != returned as usize);
-            },
-            |returned| {
-                inserts.retain(|(_, _, installed)| *installed != returned as *mut () as usize);
-            },
-        );
+        {
+            // A room the callback gave back changes what the producer knows
+            // of the room of its chain before the box is freed.
+            let mut rooms = locked(&self.chain_room_cache);
+            self.shared
+                .samples
+                .reclaim_chain_rooms(|room| rooms.returned(&room));
+        }
+        let mut boxes = Vec::new();
+        {
+            // The drop of the device reclaims too, so a lock that a panic
+            // poisoned does not panic here.
+            let mut cache = locked(&self.fx_reverb_cache);
+            let mut kabel = locked(&self.kabel_cache);
+            let mut programs = locked(&self.program_cache);
+            let mut inserts = locked(&self.insert_cache);
+            let mut replaced = locked(&self.insert_replaced);
+            self.shared.samples.reclaim_with_inserts(
+                |returned| {
+                    cache.retain(|(_, _, installed)| *installed != returned as usize);
+                },
+                |returned| {
+                    kabel.retain(|entry| entry.pointer != returned as usize);
+                },
+                |returned| {
+                    programs.retain(|entry| entry.pointer != returned as usize);
+                },
+                |insert| {
+                    let returned = &*insert as *const dyn crate::insert::OrbitInsert as *const ();
+                    inserts.retain(|(_, _, installed)| *installed != returned as usize);
+                    replaced.retain(|installed| *installed != returned as usize);
+                    boxes.push(insert);
+                },
+            );
+        }
+        // A returned insert drops after the locks: the drop of a Csound
+        // insert joins its worker.
+        drop(boxes);
     }
 
     /// Sets the source of the chain names: the output asks the source
@@ -745,7 +1011,11 @@ impl LiveScalarDevice {
             if last.is_some_and(|last| released[last].2.elapsed() < Duration::from_secs(1)) {
                 continue;
             }
-            let release = crate::assets::InsertRelease { slot, key };
+            let release = crate::assets::InsertRelease {
+                slot,
+                key,
+                forced: false,
+            };
             if self.shared.samples.insert_releases.push(release).is_err() {
                 break;
             }
@@ -755,9 +1025,154 @@ impl LiveScalarDevice {
             }
         }
     }
+
+    /// Asks the callback to give back each shipped copy of `restart` that
+    /// `gone` does not name, for a restart of its plugin. The first releases
+    /// wait for a quiet moment: the callback keeps a busy or heard copy, and
+    /// the release goes again each 100 ms. 2 s after the first ask a
+    /// forced release takes the copy, again each second while the copy is
+    /// out. A copy that came back waits in `insert_waiting`, so a later turn
+    /// ships it again once the provider gives it. A pair leaves the list
+    /// when its copy is out again, or after 30 s. With a full ring the rest
+    /// go at the next turn.
+    fn restart_inserts(
+        &self,
+        restart: &[(crate::insert::InsertSlot, crate::insert::InsertKey)],
+        gone: &[(crate::insert::InsertSlot, crate::insert::InsertKey)],
+    ) {
+        let mut restarting = locked(&self.insert_restarting);
+        if restart.is_empty() && restarting.is_empty() {
+            return;
+        }
+        let cache = locked(&self.insert_cache);
+        let mut waiting = locked(&self.insert_waiting);
+        let holds = |slot, key| {
+            cache
+                .iter()
+                .any(|(held, cached, _)| (*held, *cached) == (slot, key))
+        };
+        restarting.retain_mut(|entry| {
+            let pair = (entry.slot, entry.key);
+            let shipped = entry.returned && holds(entry.slot, entry.key);
+            if shipped || gone.contains(&pair) || entry.asked.elapsed() >= Duration::from_secs(30) {
+                return false;
+            }
+            if !entry.returned && !holds(entry.slot, entry.key) {
+                entry.returned = true;
+                let queued = waiting.iter().any(|(slot, key, _)| (*slot, *key) == pair);
+                if !queued && waiting.len() < crate::insert::INSERT_SLOTS {
+                    waiting.push((entry.slot, entry.key, Instant::now()));
+                }
+            }
+            true
+        });
+        for &(slot, key) in restart {
+            let known = restarting
+                .iter()
+                .any(|entry| (entry.slot, entry.key) == (slot, key));
+            if known || gone.contains(&(slot, key)) || !holds(slot, key) {
+                continue;
+            }
+            restarting.push(InsertRestart {
+                slot,
+                key,
+                asked: Instant::now(),
+                released: None,
+                returned: false,
+            });
+            self.plugin_restarts.fetch_add(1, Ordering::Relaxed);
+        }
+        for entry in restarting.iter_mut().filter(|entry| !entry.returned) {
+            let forced = entry.asked.elapsed() >= Duration::from_secs(2);
+            let due = entry.released.is_none_or(|(at, was_forced)| match forced {
+                true => !was_forced || at.elapsed() >= Duration::from_secs(1),
+                false => at.elapsed() >= Duration::from_millis(100),
+            });
+            if !due {
+                continue;
+            }
+            let release = crate::assets::InsertRelease {
+                slot: entry.slot,
+                key: entry.key,
+                forced,
+            };
+            if self.shared.samples.insert_releases.push(release).is_err() {
+                break;
+            }
+            entry.released = Some((Instant::now(), forced));
+        }
+    }
+
+    /// Ships the new copy of each pair of `replace`: a pair whose copy
+    /// faulted in the callback. The callback swaps the new copy in at the
+    /// next note of the slot. A restart asks such a pair back no more. A mark
+    /// on each shipped copy of the pair lets one more copy ship, and a pair
+    /// with a mark ships no third copy. A marked copy still counts for a
+    /// release, and its mark leaves with it.
+    fn replace_inserts(&self, replace: &[(crate::insert::InsertSlot, crate::insert::InsertKey)]) {
+        if replace.is_empty() {
+            return;
+        }
+        locked(&self.insert_restarting).retain(|entry| !replace.contains(&(entry.slot, entry.key)));
+        for &(slot, key) in replace {
+            {
+                let cache = locked(&self.insert_cache);
+                let mut replaced = locked(&self.insert_replaced);
+                let copies = cache
+                    .iter()
+                    .filter(|(held, cached, _)| (*held, *cached) == (slot, key))
+                    .map(|(.., address)| *address);
+                if copies.clone().any(|address| replaced.contains(&address)) {
+                    continue;
+                }
+                replaced.extend(copies);
+            }
+            self.ensure_insert(slot, key);
+        }
+    }
+
+    /// True while a copy that a restart asked back is not in the output
+    /// again.
+    pub fn restarts_in_flight(&self) -> bool {
+        !locked(&self.insert_restarting).is_empty()
+    }
 }
 
 impl LiveScalarDevice {
+    /// Drops each insert of a closed stream on the producer: each copy in the
+    /// line to the callback, each copy the backend holds, then each copy the
+    /// callback gave back. No box drops while a lock of the device is held.
+    /// A close asks the names source nothing. The send lines on their way to
+    /// the callback drop too, and the send lines of the backend go with the
+    /// backend. The next turn ships send lines again.
+    ///
+    /// Call it after the callback retired and its stream closed.
+    pub(super) fn hand_back_inserts(&mut self) {
+        for install in self.shared.samples.insert_installs.drain_available() {
+            // SAFETY: the old callback joined. This unconsumed box has one owner.
+            drop(unsafe { Box::from_raw(install.insert) });
+        }
+        for install in self.shared.samples.send_line_installs.drain_available() {
+            // SAFETY: the old callback joined. These lines have one owner.
+            drop(unsafe { Box::from_raw(install.0) });
+        }
+        // The rooms of the chains go with the backend. The next turn ships
+        // rooms to the new backend.
+        for install in self.shared.samples.chain_room_installs.drain_available() {
+            // SAFETY: the old callback joined. This unconsumed box has one owner.
+            drop(unsafe { Box::from_raw(install.room) });
+        }
+        *self.send_lines_reach.get_mut() = 0;
+        *self.send_lines_bytes.get_mut() = 0;
+        if let Some(cell) = self.backend.take() {
+            // SAFETY: the callback retired, so no render uses the backend
+            // again, and this thread holds no other reference to it.
+            let backend = unsafe { cell.get() };
+            backend.take_inserts().for_each(drop);
+        }
+        self.reclaim_assets();
+    }
+
     pub(super) fn clear_reverb_caches(&self) {
         // The old callback joined. Its replacement starts with an empty
         // backend, so the producer must prepare its assets again.
@@ -769,9 +1184,12 @@ impl LiveScalarDevice {
             .lock()
             .expect("producer fx reverb cache")
             .clear();
+        locked(&self.chain_room_cache).entries.clear();
         locked(&self.insert_cache).clear();
         locked(&self.insert_waiting).clear();
         locked(&self.insert_released).clear();
+        locked(&self.insert_restarting).clear();
+        locked(&self.insert_replaced).clear();
         self.kabel_cache
             .lock()
             .expect("producer KabelSalat cache")
@@ -845,11 +1263,13 @@ mod tests {
         );
         let generation = AtomicU64::new(7);
         let zero = AtomicU64::new(0);
+        let fired = AtomicU64::new(0);
         let flip = crate::LiveFlipAtomics {
             generation: &generation,
             takeover_frame: &zero,
             takeover_cut: &zero,
             line_arm: &zero,
+            line_fired: &fired,
         };
         let stopped = AtomicBool::new(false);
         let mut output = [0.0; 1024];
@@ -1056,6 +1476,138 @@ mod tests {
         let recycled = device.memory();
         assert_eq!(recycled.reverbs, 0, "a fresh backend has none yet");
         assert_eq!(recycled.backend, opened.backend, "the same backend again");
+    }
+
+    /// The producer ships what the room of a chain lacks. The same request
+    /// ships nothing, and a new reverb ships alone, so the room keeps its
+    /// delay line. The memory report counts each part once. A room past the
+    /// budget is not made. A box the callback gives back with no bus for it
+    /// frees its part of the budget, and its chain waits before its next try.
+    /// A recycled backend holds no room.
+    #[test]
+    fn the_room_of_a_chain_ships_what_it_lacks_within_the_budget() {
+        let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+        device.silent.take().expect("silent callback").stop();
+        let small = crate::reverb::ReverbParams {
+            size_secs: 0.025,
+            fade_secs: 0.01,
+            lp_start_hz: 15_000.0,
+            lp_end_hz: 1_000.0,
+            ir: None,
+        };
+        let large = crate::reverb::ReverbParams {
+            size_secs: 0.5,
+            ..small
+        };
+        // The boxes on their way to the callback.
+        let take = |device: &LiveScalarDevice| -> Vec<Box<crate::scalar::ChainRoom>> {
+            let installs = device.shared.samples.chain_room_installs.drain_available();
+            // SAFETY: the callback is stopped. This thread owns the popped box.
+            installs
+                .map(|install| unsafe { Box::from_raw(install.room) })
+                .collect()
+        };
+        let line = crate::scalar::ChainRoom::delay_bytes(48_000);
+        device.ensure_chain_room(3, Some(small), true);
+        let first = take(&device);
+        assert_eq!(first.len(), 1);
+        let one = first[0].bytes();
+        assert!(one > line, "a reverb and a line");
+        assert_eq!(device.memory().reverbs, one);
+        device.ensure_chain_room(3, Some(small), true);
+        device.ensure_chain_room(3, None, true);
+        assert!(take(&device).is_empty(), "the same room");
+
+        device.ensure_chain_room(3, Some(large), true);
+        let mut second = take(&device);
+        assert_eq!(second.len(), 1);
+        let larger = second[0].bytes();
+        assert!(larger > one - line, "the larger reverb alone");
+        assert_eq!(device.memory().reverbs, larger + line);
+
+        locked(&device.chain_room_cache).budget = larger + line;
+        device.ensure_chain_room(4, Some(small), false);
+        assert!(take(&device).is_empty(), "past the budget");
+        assert_eq!(device.memory().reverbs, larger + line);
+
+        let refused = crate::scalar::ChainRoom::refuse(second.remove(0));
+        let returned = crate::assets::ReturnedChainRoom(Box::into_raw(refused));
+        let returns = &device.shared.samples.chain_room_returns;
+        assert!(returns.push(returned).is_ok());
+        device.ensure_chain_room(3, Some(large), true);
+        assert!(take(&device).is_empty(), "the chain with no bus waits");
+        assert_eq!(device.memory().reverbs, 0);
+        device.ensure_chain_room(4, Some(small), false);
+        let third = take(&device);
+        assert_eq!(third.len(), 1);
+        assert_eq!(device.memory().reverbs, third[0].bytes());
+
+        device.recycle_output().expect("recycle silent output");
+        assert_eq!(device.memory().reverbs, 0, "a fresh backend has no room");
+    }
+
+    /// A note through effects with a send of 0 ships no room: the callback
+    /// sends nothing to it, so the megabytes of a reverb would wait for
+    /// nothing. A send above 0 ships the room.
+    #[test]
+    fn a_send_of_zero_ships_no_room() {
+        let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+        device.silent.take().expect("silent callback").stop();
+        let mut controls = crate::OscillatorControls {
+            orbit: 1,
+            insert_chain: Some(3),
+            reverb: Some(crate::ReverbControls {
+                wet: 0.0,
+                size_secs: 0.025,
+                fade_secs: 0.01,
+                lp_start_hz: 15_000.0,
+                lp_end_hz: 1_000.0,
+                ir: None,
+            }),
+            delay: Some(crate::DelayControls {
+                wet: 0.0,
+                time_secs: 0.25,
+                feedback: 0.5,
+            }),
+            ..Default::default()
+        };
+        controls.effects[0] = Some(crate::insert::InsertControls::new(
+            crate::insert::InsertKey {
+                plugin: 1,
+                preset: 0,
+            },
+        ));
+        let shipped = |controls: crate::OscillatorControls| {
+            let event = AudioEvent {
+                onset_id: 1,
+                generation: device.generation(),
+                target_frame: device.clock_frames() + 4_800,
+                onset_lead: 0.0,
+                freq_hz: 220.0,
+                gain: 0.5,
+                duration_secs: 0.05,
+                ui_visuals: 0,
+                controls,
+                sample: None,
+                synth: None,
+                wavetable: None,
+                cut: None,
+            };
+            let mut batch = LiveReverbBatch::default();
+            batch.observe_prepared(&device, &event);
+            batch.flush(&device);
+            let installs = device.shared.samples.chain_room_installs.drain_available();
+            // SAFETY: the callback is stopped. This thread owns the popped box.
+            let rooms: Vec<Box<crate::scalar::ChainRoom>> = installs
+                .map(|install| unsafe { Box::from_raw(install.room) })
+                .collect();
+            rooms.len()
+        };
+        assert_eq!(shipped(controls.clone()), 0, "no send, no room");
+        if let Some(reverb) = controls.reverb.as_mut() {
+            reverb.wet = 0.3;
+        }
+        assert_eq!(shipped(controls), 1, "a room for the reverb");
     }
 
     /// More than eight room settings remain usable across repeated cache cycles.
@@ -1267,7 +1819,8 @@ mod tests {
     /// The producer builds an insert one time for an orbit, the running
     /// callback keeps the instance when its output orbit changes,
     /// and a displaced insert comes back for the producer to free. A copy
-    /// the score no longer has comes back too.
+    /// the score no longer has comes back too. Each copy drops on the
+    /// producer, also the copies of a closed stream.
     #[test]
     fn the_callback_installs_and_returns_the_insert_of_an_orbit() {
         use std::sync::atomic::AtomicUsize;
@@ -1279,7 +1832,12 @@ mod tests {
             busy: AtomicBool,
             processed: [AtomicUsize; 2],
             parameters: [AtomicUsize; 2],
-            dropped: AtomicUsize,
+            /// The thread of each drop.
+            dropped: std::sync::Mutex<Vec<std::thread::ThreadId>>,
+            /// Each drop panics.
+            fault: AtomicBool,
+            /// Each copy writes silence after a fault.
+            faulted: AtomicBool,
         }
         struct Probe(crate::insert::InsertKey, Arc<Seen>, usize);
         impl crate::insert::OrbitInsert for Probe {
@@ -1296,19 +1854,33 @@ mod tests {
             fn busy(&self) -> bool {
                 self.1.busy.load(Ordering::Relaxed)
             }
+            fn faulted(&self) -> bool {
+                self.1.faulted.load(Ordering::Relaxed)
+            }
         }
         impl Drop for Probe {
             fn drop(&mut self) {
-                self.1.dropped.fetch_add(1, Ordering::Relaxed);
+                let thread = std::thread::current().id();
+                self.1.dropped.lock().unwrap().push(thread);
+                if self.1.fault.load(Ordering::Relaxed) {
+                    panic!("a drop fault");
+                }
             }
         }
 
         let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
         let seen = Arc::new(Seen::default());
+        // The count of drops. Each drop ran on this thread.
+        let producer = std::thread::current().id();
+        let dropped = || {
+            let threads = seen.dropped.lock().unwrap();
+            assert!(threads.iter().all(|thread| *thread == producer));
+            threads.len()
+        };
         let key = |plugin| crate::insert::InsertKey { plugin, preset: 0 };
         // A note with no provider plays dry, and a later request tries again.
         device.ensure_insert(crate::insert::effect_slot(1, 0), key(1));
-        device.set_insert_provider(Arc::new({
+        let provider: Arc<crate::insert::InsertProvider> = Arc::new({
             let seen = Arc::clone(&seen);
             move |wanted, sample_rate, orbit| {
                 assert_eq!(
@@ -1322,7 +1894,8 @@ mod tests {
                 seen.built.fetch_add(1, Ordering::Relaxed);
                 Some(Box::new(Probe(wanted, Arc::clone(&seen), 0)) as Box<_>)
             }
-        }));
+        });
+        device.set_insert_provider(Arc::clone(&provider));
         device.ensure_insert(crate::insert::effect_slot(1, 0), key(1));
         device.ensure_insert(crate::insert::effect_slot(1, 0), key(1));
         assert_eq!(seen.built.load(Ordering::Relaxed), 1);
@@ -1376,7 +1949,7 @@ mod tests {
         }
         assert!(device.holds_insert(crate::insert::effect_slot(1, 0), key(1)));
         assert!(!device.holds_insert(crate::insert::effect_slot(2, 0), key(1)));
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(dropped(), 0);
 
         device.ensure_insert(crate::insert::effect_slot(1, 0), key(2));
         assert_eq!(seen.built.load(Ordering::Relaxed), 2);
@@ -1402,10 +1975,10 @@ mod tests {
             seen.processed[1].load(Ordering::Relaxed) > 0
                 && device.shared.samples.insert_returns.len() == 1
         });
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(dropped(), 0);
         // A turn with no request frees the copy that came back.
         LiveReverbBatch::default().flush_inserts(&device);
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(dropped(), 1);
         assert!(device.holds_insert(crate::insert::effect_slot(1, 0), key(2)));
         assert!(!device.holds_insert(crate::insert::effect_slot(1, 0), key(1)));
 
@@ -1415,13 +1988,16 @@ mod tests {
         // and forgets its releases.
         let slot = crate::insert::effect_slot(1, 0);
         let gone = Arc::new(std::sync::Mutex::new(vec![(slot, key(2))]));
-        device.set_insert_names(Arc::new({
+        let names: Arc<crate::insert::InsertNames> = Arc::new({
             let gone = Arc::clone(&gone);
             move |_| crate::insert::InsertChains {
                 named: vec![1],
                 gone: gone.lock().unwrap().clone(),
+                restart: Vec::new(),
+                replace: Vec::new(),
             }
-        }));
+        });
+        device.set_insert_names(Arc::clone(&names));
         let releases = &device.shared.samples.insert_releases;
         assert_eq!(releases.capacity(), crate::insert::INSERT_SLOTS);
         let sent = || {
@@ -1454,7 +2030,7 @@ mod tests {
             device.shared.samples.insert_returns.len() == 1
         });
         LiveReverbBatch::default().flush_inserts(&device);
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(dropped(), 2);
         assert!(!device.holds_insert(slot, key(2)));
         assert_eq!(sent(), None);
 
@@ -1477,22 +2053,438 @@ mod tests {
             device.shared.samples.insert_returns.len() == 1
         });
         LiveReverbBatch::default().flush_inserts(&device);
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 3);
+        assert_eq!(dropped(), 3);
         assert!(!device.holds_insert(slot, key(2)));
         device.resume();
         seen.busy.store(false, Ordering::Relaxed);
+
+        // A restart pair of a busy copy in play, with a Seen, a provider and
+        // a names source of its own. The device asks for the copy at once and
+        // again each 100 ms, and the callback keeps it. 2 s after the first
+        // ask a forced release takes the copy, again each second while the
+        // device holds the pair. The pair then waits for the provider, and a
+        // later turn ships the copy again. A stopped output gives the copy
+        // back at the first release. A pair of gone gets no restart release.
+        let restarted = Arc::new(Seen::default());
+        device.set_insert_provider(Arc::new({
+            let restarted = Arc::clone(&restarted);
+            move |wanted, _, _| {
+                if restarted.reject.load(Ordering::Relaxed) {
+                    return None;
+                }
+                restarted.built.fetch_add(1, Ordering::Relaxed);
+                Some(Box::new(Probe(wanted, Arc::clone(&restarted), 0)) as Box<_>)
+            }
+        }));
+        // The pairs of gone and the pairs of restart.
+        let pairs = Arc::new(std::sync::Mutex::new((Vec::new(), Vec::new())));
+        device.set_insert_names(Arc::new({
+            let pairs = Arc::clone(&pairs);
+            move |_| {
+                let (gone, restart) = pairs.lock().unwrap().clone();
+                crate::insert::InsertChains {
+                    named: vec![1],
+                    gone,
+                    restart,
+                    replace: Vec::new(),
+                }
+            }
+        }));
+        let freed = || {
+            let threads = restarted.dropped.lock().unwrap();
+            assert!(threads.iter().all(|thread| *thread == producer));
+            threads.len()
+        };
+        let pair = (slot, key(1));
+        let entry = || device.insert_restarting.lock().unwrap().first().copied();
+        let released = || entry().and_then(|entry| entry.released);
+        let flush = || LiveReverbBatch::default().flush_inserts(&device);
+        let returns = &device.shared.samples.insert_returns;
+        device.ensure_insert(slot, key(1));
+        let mut controls = crate::OscillatorControls {
+            orbit: 1,
+            ..Default::default()
+        };
+        controls.effects[0] = Some(crate::insert::InsertControls::new(key(1)));
+        let note = AudioEvent {
+            onset_id: 100,
+            generation: device.generation(),
+            target_frame: device.clock_frames() + 4_800,
+            onset_lead: 0.0,
+            freq_hz: 220.0,
+            gain: 0.5,
+            duration_secs: 0.05,
+            ui_visuals: 0,
+            controls,
+            sample: None,
+            synth: None,
+            wavetable: None,
+            cut: None,
+        };
+        assert!(device.push(note));
+        until("the copy of the restart did not play", || {
+            restarted.processed[0].load(Ordering::Relaxed) > 0
+        });
+        restarted.busy.store(true, Ordering::Relaxed);
+        pairs.lock().unwrap().1 = vec![pair];
+        flush();
+        assert!(matches!(released(), Some((_, false))));
+        assert_eq!(device.report().plugin_restarts, 1);
+        assert!(device.report().restarts_waiting);
+        until("the callback did not take the release", || {
+            releases.len() == 0
+        });
+        let taken_by = device.clock_frames() + 512;
+        until("the callback did not run", || {
+            device.clock_frames() >= taken_by
+        });
+        assert_eq!(returns.len(), 0, "the callback keeps a busy copy");
+        // A busy machine stalls the waits above at times, so the time of the
+        // release moves to now.
+        let now = Instant::now();
+        device.insert_restarting.lock().unwrap()[0].released = Some((now, false));
+        flush();
+        assert_eq!(released(), Some((now, false)), "one release each 100 ms");
+        device.insert_restarting.lock().unwrap()[0].released =
+            Some((now - Duration::from_millis(100), false));
+        flush();
+        assert!(released().is_some_and(|(at, forced)| at > now && !forced));
+        until("the callback did not take the release", || {
+            releases.len() == 0
+        });
+        device.insert_restarting.lock().unwrap()[0].asked = now - Duration::from_secs(2);
+        #[cfg(feature = "test-support")]
+        assert!(device.hold_silent_clock_for_test(true));
+        flush();
+        assert!(released().is_some_and(|(_, forced)| forced));
+        // A held callback keeps the copy, so the device holds the pair and
+        // forces a release again 1 s later.
+        #[cfg(feature = "test-support")]
+        {
+            let now = Instant::now();
+            device.insert_restarting.lock().unwrap()[0].released = Some((now, true));
+            flush();
+            assert_eq!((releases.len(), released()), (1, Some((now, true))));
+            device.insert_restarting.lock().unwrap()[0].released =
+                Some((now - Duration::from_secs(1), true));
+            flush();
+            assert_eq!(releases.len(), 2);
+            assert!(released().is_some_and(|(at, forced)| at > now && forced));
+            assert!(device.hold_silent_clock_for_test(false));
+        }
+        // The copy fades out and comes back. The device frees it and asks no
+        // more. The pair waits for the provider.
+        restarted.reject.store(true, Ordering::Relaxed);
+        until("the forced release did not take the copy", || {
+            returns.len() == 1
+        });
+        assert_eq!(releases.len(), 0);
+        device.insert_restarting.lock().unwrap()[0].released =
+            Some((Instant::now() - Duration::from_secs(1), true));
+        flush();
+        assert_eq!((freed(), releases.len()), (1, 0));
+        assert!(entry().is_some_and(|entry| entry.returned));
+        assert_eq!(
+            device
+                .insert_waiting
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(slot, key, _)| (*slot, *key))
+                .collect::<Vec<_>>(),
+            [pair]
+        );
+        assert!(device.report().restarts_waiting);
+        // The park restarted the copy, so the pair is not a restart pair any
+        // more. A turn ships the copy, and the next turn ends the pair.
+        pairs.lock().unwrap().1 = Vec::new();
+        restarted.reject.store(false, Ordering::Relaxed);
+        flush();
+        assert_eq!(restarted.built.load(Ordering::Relaxed), 2);
+        until("the callback did not take the copy", || {
+            device.shared.samples.insert_installs.len() == 0
+        });
+        assert!(device.report().restarts_waiting);
+        flush();
+        assert!(entry().is_none());
+        assert!(!device.report().restarts_waiting);
+        assert_eq!(
+            device.report().plugin_restarts,
+            1,
+            "one count for each pair"
+        );
+
+        assert!(device.stop_and_wait(Duration::from_secs(5)));
+        pairs.lock().unwrap().1 = vec![pair];
+        flush();
+        assert!(matches!(released(), Some((_, false))));
+        until("the stopped output kept the copy", || returns.len() == 1);
+        flush();
+        assert_eq!(freed(), 2);
+        assert_eq!(restarted.built.load(Ordering::Relaxed), 3);
+        pairs.lock().unwrap().1 = Vec::new();
+        until("the callback did not take the copy", || {
+            device.shared.samples.insert_installs.len() == 0
+        });
+        flush();
+        assert!(entry().is_none());
+        assert_eq!(device.report().plugin_restarts, 2);
+        device.resume();
+        // The gone release takes the copy home.
+        *pairs.lock().unwrap() = (vec![pair], vec![pair]);
+        flush();
+        assert!(entry().is_none());
+        assert_eq!(device.report().plugin_restarts, 2);
+        until("the gone copy did not come back", || returns.len() == 1);
+        flush();
+        assert_eq!(freed(), 3);
+        assert!(!device.holds_insert(slot, key(1)));
+        assert_eq!(sent(), None);
+        assert!(device.insert_restarting.lock().unwrap().is_empty());
+        device.set_insert_provider(Arc::clone(&provider));
+        device.set_insert_names(Arc::clone(&names));
+
+        // A replace pair of a copy that faulted in play, with a Seen, a
+        // provider and a names source of their own. The pair leaves the
+        // restart pairs. The device marks the copy and ships one more copy
+        // of the pair, also when the provider has it only at a later turn.
+        // A turn that reads the pair again ships no third copy. The release
+        // of a pair the score no longer has takes the new copy back first,
+        // then the faulted copy 1 s later. Each mark leaves with its copy.
+        let renewed = Arc::new(Seen::default());
+        device.set_insert_provider(Arc::new({
+            let renewed = Arc::clone(&renewed);
+            move |wanted, _, _| {
+                if renewed.reject.load(Ordering::Relaxed) {
+                    return None;
+                }
+                renewed.built.fetch_add(1, Ordering::Relaxed);
+                Some(Box::new(Probe(wanted, Arc::clone(&renewed), 0)) as Box<_>)
+            }
+        }));
+        // The pairs of gone and the pairs of replace.
+        let renewal = Arc::new(std::sync::Mutex::new((Vec::new(), Vec::new())));
+        device.set_insert_names(Arc::new({
+            let renewal = Arc::clone(&renewal);
+            move |_| {
+                let (gone, replace) = renewal.lock().unwrap().clone();
+                crate::insert::InsertChains {
+                    named: vec![1],
+                    gone,
+                    restart: Vec::new(),
+                    replace,
+                }
+            }
+        }));
+        let freed = || {
+            let threads = renewed.dropped.lock().unwrap();
+            assert!(threads.iter().all(|thread| *thread == producer));
+            threads.len()
+        };
+        let built = || renewed.built.load(Ordering::Relaxed);
+        let marks = || device.insert_replaced.lock().unwrap().len();
+        let pair = (slot, key(2));
+        device.ensure_insert(slot, key(2));
+        let mut controls = crate::OscillatorControls {
+            orbit: 1,
+            ..Default::default()
+        };
+        controls.effects[0] = Some(crate::insert::InsertControls::new(key(2)));
+        let note = AudioEvent {
+            onset_id: 200,
+            generation: device.generation(),
+            target_frame: device.clock_frames() + 4_800,
+            onset_lead: 0.0,
+            freq_hz: 220.0,
+            gain: 0.5,
+            duration_secs: 0.05,
+            ui_visuals: 0,
+            controls,
+            sample: None,
+            synth: None,
+            wavetable: None,
+            cut: None,
+        };
+        let quiet_by = note.target_frame + 9_600;
+        assert!(device.push(note));
+        until("the copy of the replace did not play", || {
+            renewed.processed[1].load(Ordering::Relaxed) > 0
+        });
+        // The copy faults. The device took its pair for a restart before.
+        // The copy is busy, so a restart release of that turn takes nothing.
+        renewed.faulted.store(true, Ordering::Relaxed);
+        renewed.busy.store(true, Ordering::Relaxed);
+        device
+            .insert_restarting
+            .lock()
+            .unwrap()
+            .push(InsertRestart {
+                slot,
+                key: key(2),
+                asked: Instant::now(),
+                released: Some((Instant::now(), false)),
+                returned: false,
+            });
+        renewed.reject.store(true, Ordering::Relaxed);
+        renewal.lock().unwrap().1 = vec![pair];
+        flush();
+        assert!(device.insert_restarting.lock().unwrap().is_empty());
+        assert_eq!((built(), marks()), (1, 1));
+        assert_eq!(
+            device
+                .insert_waiting
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(slot, key, _)| (*slot, *key))
+                .collect::<Vec<_>>(),
+            [pair]
+        );
+        renewed.reject.store(false, Ordering::Relaxed);
+        flush();
+        assert_eq!(built(), 2);
+        assert!(device.insert_waiting.lock().unwrap().is_empty());
+        until("the callback did not take the new copy", || {
+            device.shared.samples.insert_installs.len() == 0
+        });
+        flush();
+        assert_eq!(built(), 2);
+        renewal.lock().unwrap().1 = Vec::new();
+        flush();
+        assert_eq!((built(), marks()), (2, 1));
+        until("the note did not end", || device.clock_frames() >= quiet_by);
+        renewed.busy.store(false, Ordering::Relaxed);
+        renewal.lock().unwrap().0 = vec![pair];
+        flush();
+        let first = sent().expect("a release");
+        until("the new copy did not come back", || returns.len() == 1);
+        flush();
+        assert_eq!((freed(), marks()), (1, 1));
+        assert!(device.holds_insert(slot, key(2)));
+        device.insert_released.lock().unwrap()[0].2 = first - Duration::from_secs(1);
+        flush();
+        until("the faulted copy did not come back", || returns.len() == 1);
+        flush();
+        assert_eq!((freed(), marks(), built()), (2, 0, 2));
+        assert!(!device.holds_insert(slot, key(2)));
+        assert_eq!(sent(), None);
+        assert!(device.insert_waiting.lock().unwrap().is_empty());
+        assert!(device.insert_restarting.lock().unwrap().is_empty());
+        device.set_insert_provider(Arc::clone(&provider));
+        device.set_insert_names(Arc::clone(&names));
+
         // The callback holds a waiting copy of key 2 for the steps below.
         device.ensure_insert(slot, key(2));
         until("the callback did not take the copy", || {
             device.shared.samples.insert_installs.len() == 0
         });
 
+        // A turn with a note of key 2 through a stage with 480 frames of
+        // latency ships send lines, and the callback takes them. A turn that
+        // needs no longer reach ships none. A stage with 960 frames ships
+        // longer lines. The callback takes them and gives the first lines
+        // back. While those wait to be freed, the callback takes no other
+        // lines. A reclaim frees them. A stage of 2 s ships lines for
+        // 1 s, one time. The turns build and drop no copy. The names source
+        // gives no copy the score no longer has, so the turns send no release.
+        *gone.lock().unwrap() = Vec::new();
+        let (built, drops) = (seen.built.load(Ordering::Relaxed), dropped());
+        let turn = |latency| {
+            let mut controls = crate::OscillatorControls {
+                orbit: 1,
+                ..Default::default()
+            };
+            let effect = crate::insert::InsertControls::new(key(2)).with_latency(latency);
+            controls.effects[0] = Some(effect);
+            let note = AudioEvent {
+                onset_id: 0,
+                generation: device.generation(),
+                target_frame: device.clock_frames() + 4_800,
+                onset_lead: 0.0,
+                freq_hz: 220.0,
+                gain: 0.5,
+                duration_secs: 0.05,
+                ui_visuals: 0,
+                controls,
+                sample: None,
+                synth: None,
+                wavetable: None,
+                cut: None,
+            };
+            LiveReverbBatch::install_inserts(&device, std::slice::from_ref(&note));
+        };
+        let lines = &device.shared.samples.send_line_installs;
+        let replaced = &device.shared.samples.send_line_returns;
+        let reach = || device.send_lines_reach.load(Ordering::Relaxed);
+        // The memory report counts the lines the turns ship: 4 lines for
+        // each of 16 orbits and 4 level lines, each a power of 2 of samples
+        // of 4 bytes.
+        let send_lines = || device.memory().send_lines;
+        turn(480);
+        assert_eq!(reach(), 896);
+        assert_eq!(send_lines(), (16 * 4 + 4) * 1024 * 4);
+        until("the callback did not take the send lines", || {
+            lines.len() == 0
+        });
+        turn(480);
+        assert_eq!((lines.len(), reach()), (0, 896));
+        turn(960);
+        assert_eq!(reach(), 1_920);
+        until("the callback did not give the first lines back", || {
+            lines.len() == 0 && replaced.len() == 1
+        });
+        let next = Box::new(crate::scalar::SendLines::new(4_800, 48_000));
+        let next = crate::assets::SendLineInstall(Box::into_raw(next));
+        assert!(lines.push(next).is_ok());
+        let taken_by = device.clock_frames() + 512;
+        until("the callback did not run", || {
+            device.clock_frames() >= taken_by
+        });
+        assert_eq!((lines.len(), replaced.len()), (1, 1));
+        // The reclaim frees the returned lines, so the callback has room to
+        // take the next. The reclaim drains until the ring is empty, so it
+        // can also free the lines that take gives back: either count is right.
+        device.reclaim_assets();
+        // The message says which part waits, and if the callback ran.
+        let (since, start) = (device.clock_frames(), std::time::Instant::now());
+        while lines.len() != 0 {
+            assert!(
+                start.elapsed().as_secs() < 10,
+                "the callback did not take the next lines: {} in the line, {} returned, {} frames since the reclaim, {} leaked",
+                lines.len(),
+                replaced.len(),
+                device.clock_frames() - since,
+                device.shared.samples.leaked.load(Ordering::Relaxed),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(device.shared.samples.leaked.load(Ordering::Relaxed), 0);
+        LiveReverbBatch::default().flush_inserts(&device);
+        assert_eq!(replaced.len(), 0);
+        turn(96_000);
+        assert_eq!(reach(), 65_408);
+        assert_eq!(send_lines(), (16 * 4 + 4) << 18);
+        until("the callback did not take the lines of 1 s", || {
+            lines.len() == 0
+        });
+        turn(96_000);
+        assert_eq!((lines.len(), reach()), (0, 65_408));
+        let long = crate::scalar::SendLines::new(96_000, 48_000);
+        assert_eq!(long.reach(), 65_408, "lines hold 1 s at most");
+        assert_eq!(
+            (seen.built.load(Ordering::Relaxed), dropped()),
+            (built, drops)
+        );
+        assert!(device.holds_insert(slot, key(2)));
+        *gone.lock().unwrap() = vec![(slot, key(2))];
+
         // Stop consumption so the next copy stays in the line during the
-        // recycle. A copy that is not ready waits for the next turn.
+        // recycle. A copy that is not ready waits for the next turn. The
+        // device keeps the backend of the stopped thread and its copy.
         device.silent.as_mut().unwrap().stop();
         seen.reject.store(true, Ordering::Relaxed);
         device.ensure_insert(crate::insert::effect_slot(1, 0), key(1));
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 4);
+        assert_eq!(dropped(), 3);
         assert_eq!(device.shared.samples.insert_installs.len(), 0);
         assert_eq!(
             device
@@ -1514,7 +2506,11 @@ mod tests {
         // to the next turn.
         *gone.lock().unwrap() = vec![(slot, key(2))];
         let releases = &device.shared.samples.insert_releases;
-        let stale = crate::assets::InsertRelease { slot, key: key(3) };
+        let stale = crate::assets::InsertRelease {
+            slot,
+            key: key(3),
+            forced: false,
+        };
         while releases.push(stale).is_ok() {}
         device.insert_waiting.lock().unwrap()[0].2 = Instant::now() - Duration::from_secs(31);
         let built = seen.built.load(Ordering::Relaxed);
@@ -1529,6 +2525,30 @@ mod tests {
         seen.reject.store(false, Ordering::Relaxed);
         device.ensure_insert(crate::insert::effect_slot(1, 0), key(1));
         assert_eq!(device.shared.samples.insert_installs.len(), 1);
+
+        // A copy that came back drops after the locks of the device, so a
+        // drop that panics poisons none of them. A turn that asks for a new
+        // orbit reverb frees the copy first.
+        let faulty = Arc::new(Seen::default());
+        faulty.fault.store(true, Ordering::Relaxed);
+        let copy = Box::new(Probe(key(1), faulty, 0)) as Box<dyn crate::insert::OrbitInsert>;
+        let returned = crate::assets::ReturnedInsert(Box::into_raw(copy));
+        assert!(device.shared.samples.insert_returns.push(returned).is_ok());
+        let room = crate::reverb::ReverbParams {
+            size_secs: 0.025,
+            fade_secs: 0.01,
+            lp_start_hz: 15_000.0,
+            lp_end_hz: 1_000.0,
+            ir: None,
+        };
+        let turn = std::panic::AssertUnwindSafe(|| {
+            let mut batch = LiveReverbBatch::default();
+            batch.request_orbit(0, room);
+            batch.flush(&device);
+        });
+        assert!(std::panic::catch_unwind(turn).is_err());
+        assert!(!device.reverb_cache.is_poisoned() && !device.insert_cache.is_poisoned());
+        assert!(!device.fx_reverb_cache.is_poisoned());
 
         // With a full line the provider keeps its copy, and the slot
         // waits for the next turn.
@@ -1570,6 +2590,32 @@ mod tests {
             crate::insert::INSERT_SLOTS * 3
         );
 
+        // A host that keeps the callback after its stream closed keeps the
+        // backend. The close takes each copy out of it all the same. The
+        // close forgets the restart pairs and the marks of the replace pairs
+        // too.
+        let held = device.backend.clone();
+        device
+            .insert_restarting
+            .lock()
+            .unwrap()
+            .push(InsertRestart {
+                slot,
+                key: key(2),
+                asked: Instant::now(),
+                released: None,
+                returned: false,
+            });
+        let marked = device
+            .insert_cache
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(held, cached, _)| (*held, *cached) == (slot, key(2)))
+            .map(|(.., address)| *address)
+            .expect("the copy of key 2");
+        device.insert_replaced.lock().unwrap().push(marked);
+        assert_eq!(device.memory().send_lines, (16 * 4 + 4) << 18);
         assert!(
             device
                 .recycle_output_to_with(
@@ -1581,13 +2627,20 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 5);
+        // The close drops the queued copy of key 1 and the copy of key 2
+        // the backend held.
+        assert_eq!(dropped(), 5);
+        drop(held);
         assert_eq!(device.shared.samples.insert_installs.len(), 0);
         assert!(!device.holds_insert(crate::insert::effect_slot(1, 0), key(1)));
         assert!(device.insert_waiting.lock().unwrap().is_empty());
         // The releases of the old callback go, and so does their record.
         assert_eq!(device.shared.samples.insert_releases.len(), 0);
         assert!(device.insert_released.lock().unwrap().is_empty());
+        assert!(!device.restarts_in_flight());
+        assert!(device.insert_replaced.lock().unwrap().is_empty());
+        // The send lines went with the backend.
+        assert_eq!(device.memory().send_lines, 0);
         *gone.lock().unwrap() = Vec::new();
 
         device
@@ -1613,6 +2666,13 @@ mod tests {
         }));
         LiveReverbBatch::default().flush_inserts(&device);
         assert!(device.holds_insert(slot, key(2)));
+        // The close reclaims also with a cache lock that a panic poisoned.
+        let fault = std::panic::AssertUnwindSafe(|| {
+            let _cache = device.fx_reverb_cache.lock();
+            panic!("a reverb fault");
+        });
+        assert!(std::panic::catch_unwind(fault).is_err());
+        drop(device);
     }
 
     /// A moved value reaches the copy of its key after one turn, and a note
@@ -1836,7 +2896,10 @@ mod tests {
         drop(backend);
 
         // A failed replacement keeps the workers. The next turn ships them,
-        // and the recycle after it drops what no backend took.
+        // and the recycle after it drops what no backend took. A turn with a
+        // note through a stage with latency also ships send lines. A recycle
+        // drops the send lines no backend took and forgets their reach, so
+        // the next such turn ships send lines again.
         let fail = |device: &mut LiveScalarDevice| {
             device.recycle_output_to_with(
                 Some(SILENT_OUTPUT_NAME),
@@ -1844,16 +2907,46 @@ mod tests {
                 |_, _| Err(DevicePlaybackError::Unavailable("no output".into())),
             )
         };
+        let latent = |device: &LiveScalarDevice| {
+            let mut controls = crate::OscillatorControls::default();
+            let effect = crate::insert::InsertControls::new(key(1)).with_latency(480);
+            controls.effects[0] = Some(effect);
+            let note = AudioEvent {
+                onset_id: 0,
+                generation: device.generation(),
+                target_frame: 4_800,
+                onset_lead: 0.0,
+                freq_hz: 220.0,
+                gain: 0.5,
+                duration_secs: 0.05,
+                ui_visuals: 0,
+                controls,
+                sample: None,
+                synth: None,
+                wavetable: None,
+                cut: None,
+            };
+            LiveReverbBatch::install_inserts(device, std::slice::from_ref(&note));
+        };
+        let lines = |device: &LiveScalarDevice| {
+            let reach = device.send_lines_reach.load(Ordering::Relaxed);
+            (device.shared.samples.send_line_installs.len(), reach)
+        };
+        latent(&device);
+        assert_eq!(lines(&device), (1, 896));
         assert!(fail(&mut device).is_err());
+        assert_eq!(lines(&device), (0, 0));
         let installs = &device.shared.samples.pool_installs;
-        LiveReverbBatch::default().flush_inserts(&device);
+        latent(&device);
         assert_eq!((installs.len(), Arc::strong_count(&shared)), (1, 5));
+        assert_eq!(lines(&device), (1, 896));
         assert!(fail(&mut device).is_err());
         let installs = &device.shared.samples.pool_installs;
         assert_eq!((installs.len(), Arc::strong_count(&shared)), (0, 4));
+        assert_eq!(lines(&device), (0, 0));
 
         // The replacement output takes the same workers, which follow its
-        // buffer.
+        // buffer, and the send lines of its first turn.
         device.set_buffer_preference(AudioBufferPreference::Frames(257));
         device
             .recycle_output_to_with(
@@ -1862,9 +2955,12 @@ mod tests {
                 |device, _| device.prepare_recycled_output(None),
             )
             .expect("replacement output");
-        LiveReverbBatch::default().flush_inserts(&device);
+        latent(&device);
         until("the next backend did not take the pool", || {
             device.shared.samples.pool_installs.len() == 0
+        });
+        until("the next backend did not take the send lines", || {
+            lines(&device) == (0, 896)
         });
         assert_eq!(Arc::strong_count(&shared), 5);
         assert_eq!(device.report().plugin_workers, 2);
@@ -1900,10 +2996,11 @@ mod tests {
         assert_eq!(batch.requested.iter().flatten().count(), 2);
     }
 
-    /// The names source hears the counts of the output at each turn.
+    /// The names source hears the counts of the output at each turn. A close
+    /// gives the source no turn.
     #[test]
     fn the_names_source_hears_the_counts_of_the_output() {
-        let device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+        let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
         let turns = Arc::new(std::sync::Mutex::new(Vec::new()));
         device.set_insert_names(Arc::new({
             let turns = Arc::clone(&turns);
@@ -1925,6 +3022,17 @@ mod tests {
             late_jobs: 2,
             inline_jobs: 3,
         };
+        assert_eq!(*turns.lock().unwrap(), [turn]);
+        assert!(
+            device
+                .recycle_output_to_with(
+                    Some(SILENT_OUTPUT_NAME),
+                    |_| unreachable!("silent output needs no discovery"),
+                    |_, _| Err(DevicePlaybackError::Unavailable("no output".into())),
+                )
+                .is_err()
+        );
+        drop(device);
         assert_eq!(*turns.lock().unwrap(), [turn]);
     }
 }

@@ -33,8 +33,10 @@ rustel vst --rescan
 one plugin. A second word keeps the parameters with the word in their group,
 name or key. In Studio, the vst tab of the reference panel lists the plugins,
 and Ctrl-F in a `vst()` or `vsti()` call completes plugin names, parameters
-and presets. Under an open plugin, Tab moves between its parameters and its
-presets, and a search lists the half the cursor is in.
+and presets. → on a plugin opens the two rows under it, its presets and its
+parameters, and → on one of the two makes that half the view of the tab, with
+its own search and a trail on the search line. ← and Esc go back, Tab flips
+the halves, and a search of the plugin list reads plugin names only.
 
 Rustel reads the standard VST3 folders:
 
@@ -71,8 +73,10 @@ Studio, the plugin row on the vst page of Settings shows the fault.
 The file `~/.rustel/vst/scan.json` keeps the result. `rustel vst`, or the
 scan row in Settings, tests only new or changed bundles, for example after you
 install a plugin. `rustel vst --rescan`, or the rescan row in Settings,
-empties the cache and scans each bundle again. `rustel play` and
-`rustel render` run no scan. They load the plugins the score names.
+empties the cache and scans each bundle again. A rescan that stops before
+its end leaves each bundle it did not test with no entry, so the next scan
+tests it. `rustel play` and `rustel render` run no scan. They load the
+plugins the score names.
 
 ## Names and values
 
@@ -105,8 +109,9 @@ s("hh*8").vst("valhalla supermassive", {
   value too. The output keeps the last moves of 64 values for such notes.
 - After an edit, a slider moves the parameter value at once again from the
   time rustel queues the first note of the chain after the edit. Before that
-  time, a note from before the edit keeps its value. Rustel queues a note up
-  to about half a second before it plays.
+  time, a note from before the edit keeps its value. Rustel queues each
+  note about half a second ahead, plus one or two audio buffers, and further
+  by the largest latency of the plugin chains of the score, 1 second at most.
 - A slider in an expression or with a time transform, as `slider(0.5).mul(2)`
   or `slider(0.5).fast(2)`, moves the value with the next note.
 - The next move of a slider overrides a value that code of the score wrote
@@ -119,7 +124,9 @@ s("hh*8").vst("valhalla supermassive", {
   plugin does not have. The note keeps its plugin.
 - Studio refuses an update with a wrong parameter name of a loaded plugin.
   The last score plays on, and Studio marks the name and gives the nearest
-  one.
+  one. A preset name no file of the loaded plugin has is refused and marked
+  the same way, read as the engine reads it, upper case, spaces and
+  punctuation aside.
 
 A plugin name with no plugin, a preset name with no file, or a dropped value
 gives one warning for each evaluation. The warning shows in the Studio log,
@@ -142,21 +149,26 @@ case, spaces and punctuation.
 Any folder of `.vstpreset` files works too, in any structure: Settings ▸
 VST ▸ `add preset folder` adds one. Each file names its plugin in its
 header, so rustel finds the presets of a plugin in every folder you added,
-and the plugin rows of the page say the count. Enter on a plugin row lists
-<<<<<<< HEAD
-its presets. The folders are watched while Studio runs: a preset saved or
+and the plugin rows of the page say the count. These folders count in
+Studio only. Enter on a plugin row lists its presets. A change of the
+folders reads them again at once, on the plugin thread: the
+background-jobs sheet lists the read while it runs, and no ask waits for
+it. Studio and `rustel play` watch the preset folders: a preset saved or
 copied in while a score plays is there with no rescan, once the read of
-the folders ends, and the count line of the vst tab says where that read
-is.
+the folders ends. In Studio, the count line of the vst tab says where that
+read is.
 
 In the vst tab, Enter on a preset writes the call with the preset. With the
 caret in a call of the same plugin, Enter on a preset changes only the
-preset, and Enter on the row of that plugin goes to its rows. The pick of a
-plugin name with Ctrl-F leaves the panel open on the presets of the plugin,
-so the next Enter picks one.
-=======
-its presets.
->>>>>>> origin/main
+preset, and Enter on the row of that plugin goes to the rows under it. The
+pick of a plugin name with Ctrl-F leaves the panel open in the presets of
+the plugin, so the next Enter picks one.
+
+The knobs column shows the presets of the plugin call under its rails, as
+a section closed until → opens it. Enter on a name, and a click on one,
+write the preset into the call, and the name the call holds carries the
+mark. ← closes the section, and the j k h l of Vim list keys work there
+as the arrows do.
 
 A plugin call with no `preset` plays `default.vstpreset` when the folder of
 the plugin has one. Save the start sound of a plugin there, and each call
@@ -171,6 +183,11 @@ class in the file and copies the file to the folder of that plugin. The
 status line says which plugin. A file with the name of a preset already in
 the folder is not copied. The scan cache of an earlier version has no plugin
 classes. After an upgrade, rescan once so a dropped file finds its plugin.
+
+When you save a preset file again, the next read of the folders ends each
+copy of the preset that waits in the plugin host. A new copy of the preset
+then loads the saved file. A copy that plays keeps the state it loaded until
+it leaves the output.
 
 ## Chains
 
@@ -187,8 +204,17 @@ classes. After an upgrade, rescan once so a dropped file finds its plugin.
   same orbit. One pattern used again in the same lane shares its copies.
 - `gain` sets the level before the effects. `postgain` sets the level after
   the chain.
-- `lpf`, `hpf`, `bpf`, `pan`, `room` and `delay` act on the instrument output,
-  before the effects. The last note sets them for the shared instrument.
+- `lpf`, `hpf`, `bpf` and `pan` act on the instrument output, before the
+  effects. The last note sets them for the shared instrument.
+- Everything before `.vst()` goes through the plugin, also `room` and
+  `delay`. Each chain has a reverb and a delay of its own, in front of its
+  effects, so the plugin processes the reverb and the echoes with the dry
+  sound: in `s("bd").room(.3).delay(.5).vst("bitcrush", { mix: 1 })` the
+  bitcrusher crushes the tail too. The last note of the chain sets
+  `roomsize`, `roomfade`, `roomlp`, `roomdim`, `delaytime`, `delayfeedback`
+  and `delaysync` for the chain, as the last note of an orbit does for the
+  orbit. An instrument with no `.vst()` effect sends `room` and `delay` to
+  its orbit, after `postgain`.
 - A note with a new level or a new pan moves the value in 5 ms while the
   notes before still sound.
 - The plugin output joins the orbit before the orbit fader, the DJ filter and
@@ -199,7 +225,7 @@ classes. After an upgrade, rescan once so a dropped file finds its plugin.
 Rustel runs 64 chains at most. A Csound instrument takes one of them for each
 orbit it plays on, and a plugin chain never takes its place. When the 64 are
 in use, a new chain takes the place of a chain in its last 5 seconds, such as
-the chain of a lane you removed: see
+the chain of a lane you removed, and then of a chain an edit left over: see
 [Plugin copies and edits](#plugin-copies-and-edits). With no such chain, the
 notes of the new chain play with no plugin. An effect note then plays dry,
 and an instrument note is silent. A Csound note with a `.vst()` effect is
@@ -246,13 +272,21 @@ before. A new preset of the instrument, or a new instrument in a chain that
 keeps an effect, fades the copy before out under its first note. Each fade
 takes 5 ms. A silent chain changes with no fade.
 
-The copy before ends after its fade, and so does the copy of an effect you
-remove. On a lane with a note in the next 16 cycles but no note in 5 seconds
-of play, such a copy ends 5 seconds of play after the edit, once the chain
-is silent. An instrument you remove ends 5 seconds of play after the edit on
-any lane, once it is silent. Time counts only while the score plays, so a
-Stop ends no chain. An undo before a copy ends loads nothing, and an undo
-after it loads the copy again.
+The copy before leaves the chain after its fade, and so does the copy of an
+effect you remove. On a lane with a note in the next 16 cycles but no note in
+5 seconds of play, such a copy ends 5 seconds of play after the edit, once
+the chain is silent. An instrument you remove ends 5 seconds of play after
+the edit on any lane, once it is silent. Time counts only while the score
+plays, so a Stop ends no chain of an open tab.
+
+A copy that leaves its chain waits in the plugin host until 5 seconds of
+play after the edit, then ends. An undo in that time takes the copy back and
+loads nothing, also after the first note of the edit, and also through a
+Stop or a new output. An undo after that time loads the copy again. In a run
+of preset changes on one call in 5 seconds of play, as from the knobs
+column, the call keeps the copy before and the copy of the preset the run
+started from. So a return to that preset loads nothing, and a preset between
+the two loads again.
 
 A lane with no note in the next 16 cycles keeps its copies until it has such
 a note, also the copy before a new preset. A plugin name the lane loses
@@ -285,6 +319,13 @@ time keeps the chain. So does a note that still plays the plugin, as with a
 name in a variable. A chain with a plugin the text of its lane does not name
 ends after 10 minutes of play with no note. Such a plugin has its name in a
 variable or a function, or comes with a pattern from a prebake or an import.
+The 10 minutes count the play of the scene of the chain.
+
+An edit that removes an arm of a `stack()`, an effect in `every()` or a
+preset of `"<a b>"` can leave a chain over: its lane has more chains of a
+plugin than calls of it. Such a chain with no note since the edit ends after
+10 minutes of play with no note. A chain with a note since the edit stays, so
+a lane that alternates presets keeps its chains.
 
 ## Load time and memory
 
@@ -304,7 +345,7 @@ the edit plays. If no copy becomes ready in 20 seconds, the wait ends. The
 edit then plays, and a note with no copy plays with no plugin until its copy
 is ready.
 
-Studio has two load modes under Settings ▸ Advanced ▸ Playback. In each mode,
+Studio has two load modes under Settings ▸ General ▸ Playback. In each mode,
 Studio evaluates the text of a launch on a cycle line during the countdown,
 reads its notes, and loads its plugin copies. If this work still runs a short
 time before the line, the launch takes the first line after the work. Until a
@@ -313,7 +354,8 @@ copies at its line. In the wait mode, a start waits for the plugin copies of
 its first 2 cycles, and an edit waits as above. If a copy of a launch is not
 ready at the line, the launch takes the first line after the copy is ready. In
 the async mode, the score starts at once, an edit plays at once, and a launch
-does not wait for its plugin copies.
+does not wait for its plugin copies. After a new output, the score waits for
+its copies 150 ms at most, as below.
 
 `rustel play` waits for the plugin copies of the first 4 cycles at its start.
 They load while the samples load. With `--watch`, a save with a plugin copy
@@ -333,21 +375,158 @@ a prebake, an import or a name the score computes stays loaded. A plugin
 call in a tab names its plugin, also with a part of the name. Another string
 names a plugin only with its whole name, as in `const fx = 'ott'`.
 
+The reverb and the delay of a chain sit in front of its effects, so the
+reverb and the echoes go through the latency of the effects with the dry
+sound. A chain with `room` holds a reverb of its own: 7 MiB at the default
+`roomsize` of 2, 25 MiB at a `roomsize` of 6. A chain with `delay` holds a
+delay line of 1 second: 375 KiB at 48 kHz. The memory viewer counts them
+with the reverbs, and they go with the chain. The reverbs and the delay lines
+of the chains hold 128 MiB at most together, in play and in an export. A
+chain past that, or a chain whose reverb is not ready yet, sends its notes
+to the reverb and the delay of the orbit, after `postgain`, and the plugin
+does not process them.
+
+Such `room` and `delay` sends of a note through effects with latency wait in
+send lines of the output, so they reach the orbit with the output of the
+chain. The level of a note whose post gain moves waits in them too. The
+lines take the size of the largest latency of the effects of a chain that
+played, 1 second at most: 8.5 MiB for 0.5 seconds at 48 kHz, 17 MiB for
+1 second at 48 kHz, and 68 MiB for 1 second at 192 kHz. They
+keep their size until the output closes, and the memory viewer shows them
+as `send lines`. An export with effects with latency holds send lines of
+that size while it renders.
+
 At Stop, Studio keeps its output open with the plugin copies of the score. A
-start that reuses that output loads no copy. On Linux, with no output chosen,
-the next start after a Stop opens a new output to follow the default device,
-and the copies of the score load again. If you open Piano mode or play a note
+start that reuses that output loads no copy. While the output is stopped,
+each plugin plays out its tail with no sound, until it is quiet for as long
+as the tail it reports, 0.25 seconds at least and 3 seconds at most. A start
+after that has no old tail under its first note.
+
+On Linux, with no output chosen, the next start after a Stop opens a new
+output to follow the default device. If you open Piano mode or play a note
 in it before that start, Piano mode opens the new output. When the stopped
 output holds a copy of a plugin the cleanup unloads, the cleanup closes the
 output first. In Piano mode, the cleanup keeps the output open with its
 copies. The first cleanup after you leave Piano mode closes the output when
 it holds a copy of a plugin the cleanup unloads.
 
+A new output keeps the plugin copies of the score. Studio opens one for
+another output device, for a new buffer size, after a device stops, and at
+the start on Linux above. The new output takes each copy back with no load,
+also at a new sample rate. A copy that still sounds restarts and runs a short
+silence before it is back. In the wait mode, the score waits until its copies
+are back. If no copy comes back in 20 seconds, the wait ends. In the async
+mode, the score waits 150 ms at most, and a note before its copy is back plays
+with no plugin. `rustel play` opens a new output after its device stops, and
+waits as the wait mode does.
+
+Each open scene keeps the plugin copies of its chains, as an open project of a
+DAW keeps its plugins. A lane of a scene you play for the first time takes the
+copies of a lane of the scene in play by the rules of
+[Plugin copies and edits](#plugin-copies-and-edits). So the 2 scenes share
+them, and a scene change loads no copy that the scene in play has. When
+another scene plays, the copies of the scene you left wait. For 5 seconds of
+play they stay in the output, then they wait in the plugin host. When you play
+that scene again, its notes take these copies, and nothing loads. The chains
+of a scene that waits do not end, also after 10 minutes. An edit of a lane
+that 2 scenes share keeps the copies the other scene needs.
+
+A scene you close gives its copies back at once. When you close the tab of the
+score in play while the set is stopped, its copies end, and the next cleanup
+unloads its plugins. While the set plays, the score of a tab you close plays
+on. Its copies end at the next Stop, or 5 seconds of play after another score
+plays. After a close, the next start opens the output again. A snippet preview
+under a set is a part of its scene. A snippet preview with no set under it
+keeps no copy after it stops.
+
+The plugin host keeps 320 copies ready at most. A new copy for the scene in
+play first ends a copy no scene uses, then the copies of the scene you left
+first. A copy of the scene in play does not end this way. An export ends no
+copy of a scene, and keeps up to 320 copies of its own. With no copy to end,
+the new copy does not start, and you get one warning, as
+`vsti skipped: Serum 2 did not start: the host keeps 320 copies ready at most`.
+Each open scene keeps its copies, so memory grows with the open scenes. When
+Studio holds more than half of the memory of the machine, the scene that
+waited longest gives its copies back at the next evaluation, with one warning:
+`a scene that waits gave back its plugin copies: the studio holds more than half of the memory`.
+Its next play loads them again.
+
+## Faults and new tries
+
+A plugin crash ends rustel, as in a DAW with no plugin bridge. Save your set
+before you play a plugin you do not trust.
+
+A bundle with a fault at the scan stays off until a rescan or new files. In a
+bundle with several plugins, a plugin that does not start at the scan stays
+off the same way. A bundle that does not load stays off with its reason on
+its row, and each call of its plugin gives the reason as a warning. The next
+scan gives it a new try. `rustel play` runs no scan, so such a bundle stays
+off to the end of the run.
+
+A missing preset is no fault. Studio refuses an update with a preset name no
+file of the plugin has: save the file in a preset folder, then update again.
+With `rustel play`, the next note finds the file.
+
+A copy that does not start gives one warning, as
+`vst skipped: OTT did not start: the preset is for a different plugin`,
+and the row of its plugin says so. Your next evaluation gives the copy one
+new try in the background. The score in play goes on, and nothing waits for
+the try. A copy of a scene that waits gets its try when the scene plays
+again. A copy whose try fails waits longer before each next try: the time of
+the try, then twice the wait before, 60 seconds at most. A save of its
+preset file ends the wait, and so does a scan. A preset file you move or
+rename after such a failure counts as a new file, with no wait. When a try
+loads its copy, the other copies of the same plugin and preset load right
+after it, and no edit waits for them.
+
+A copy whose output has no number for 1 second of play, with notes or sound
+going in, plays silence with one warning, as
+`vst OTT: no number in the output for 1 s, so the stage plays silence until a new copy takes over`,
+and the row of its plugin says so. A plugin that gives no number only in
+silence keeps its notes. Your next evaluation gives the stage a new copy,
+which takes over at the next note of the lane. A start in the wait mode
+waits for that new copy, as for each copy it needs. A new copy that faults
+again waits as a copy whose try fails does.
+
+In a render or an export, such a copy plays silence to the end. A Studio
+export then fails and names the plugin, with stems or not. `rustel render`
+prints the warning and writes the file, as for a plugin that does not start.
+A copy that holds 128 notes loses the next note. A sample that is not a
+number plays as silence, and too many parameter values at one time lose a
+value. Each gives one warning, also in a render, and a lost note in a render
+fails a Studio export too. A block the plugin refuses gives a warning only
+with such a sample.
+
+A warning names the plugin and goes out one time for each evaluation, as
+each plugin warning does. So a second copy of the plugin that faults gives
+no second warning before the next evaluation. A launch evaluates its text at
+its arm and again at its line, so its plugin warning goes out two times. Each
+warning shows in the Studio log and as a `warning:` line of `rustel play`. A
+fault that lasts also shows on the row of its plugin in the vst tab, on the
+vst page of Settings and in the memory viewer. The row says when a new try
+runs, when a new copy loads and when the new copy waits for the next note of
+its lane, as
+`a copy plays silence: no number in its output for 1 s · a new copy loads`.
+
+These give a new try: an update with a new text, an edit that auto evaluate
+applies, a save that `sync & eval` evaluates, a launch, a start after a
+Stop, an update of the text in play while a plugin row shows a fault, and a
+save of `rustel play --watch` that changes the text. Auto evaluate applies
+an edit from typing or from a rail of the knobs column. An update of the
+text in play while a plugin row shows a fault evaluates nothing. It asks for
+the new tries, and the status says
+`unchanged - already playing · new tries asked for the plugin faults`. A
+save with the same bytes, the landing of an edit that waited, a rollback
+and a replay give none. A copy that does not start or that faults never
+makes Studio refuse an update, so the update gives the new try. With
+`rustel play` and no `--watch`, a copy that does not start gets no new try,
+and a faulted copy plays silence to the end of the run.
+
 ## Where the audio runs
 
 The plugin audio runs in the rustel process, as in most DAWs. Each plugin
-gets 128 frames at most in one call. A plugin fault during a set ends rustel.
-Save your set before you play a plugin you do not trust.
+gets 128 frames at most in one call. For a plugin crash, see
+[Faults and new tries](#faults-and-new-tries).
 
 A light set runs each plugin on the audio thread, one after the other. A
 heavy set spreads its plugin chains over plugin workers, as live FX
@@ -390,8 +569,9 @@ For a plugin that breaks on another thread, turn on its switch
 row of the plugin and press Space. The row then ends in `audio thread only`,
 and the copies of the plugin stay on the audio thread. The other plugins keep
 the plugin workers. A copy that loads after the change follows the switch. A
-copy in play keeps its thread until it loads again, for example when you
-restart Studio.
+copy in play keeps its thread until it loads again or an output takes it back
+from the plugin host, for example when you restart Studio, set a new buffer
+size or undo an edit after its first note.
 
 Studio keeps the switches in `~/.rustel/rustel.json`, and `rustel play` reads
 them too. With no Studio, write the whole names of the plugins in the file.
@@ -430,12 +610,108 @@ yabridgectl sync
 The plugins then show in `~/.vst3/yabridge`. `wine` must be on `PATH` when
 rustel starts. yabridge 5.1.1 needs Wine Staging 9.21 or earlier.
 
+## Latency
+
+Rustel reads the latency of each plugin copy. The latency of a chain is the
+sum of the latencies of its plugins. Rustel starts the notes of a chain that
+much before their time, so the chain plays in time with the other lanes.
+Rustel compensates 1 second at most. A chain with more latency plays the
+rest late, with one warning for each evaluation:
+`a plugin chain has 1200 ms of latency: rustel compensates 1000 ms, and the lane plays the rest late`.
+
+When the score plays a chain with latency, these take effect later on each
+lane: an edit, a rail of the knobs column on a number with no `slider(...)`,
+a start, a key press that `midikeys` plays, a slider that asks the score
+again, and a tempo or phase change from Link or the MIDI clock in. They wait
+the largest latency of the chains that play, 1 second at most, as a DAW
+delays its output by the latency of its plugins. While the set plays, a
+start at cycle zero with no launch line cuts the score at once, and its
+first beat comes that much after the cut. A launch on a beat or cycle line
+still lands on its line. After a start, Link and a MIDI clock in that sent
+a Start steer the score back to their grid.
+
+A note that an edit adds before the edit takes effect still plays on a lane
+with no latency. A lane with latency leaves it out. `oneshot` still plays on
+its next grid line in a launch, and on a lane with no latency.
+
+A slider that is the value of a plugin key still moves the parameter value
+at once. A slider placed directly on `gain`, `lpf`, `lpq` or `fm` moves a
+voice with no latency at once, and a voice through a chain with latency
+later by the latency of the chain. A new preset counts the latency of the
+other presets of its plugin until its copy is ready.
+
 ## Limits
 
 - A plugin shows no window. Activate a plugin with a licence window in a
   different host first.
-- Rustel does not compensate plugin latency. A look-ahead effect plays late by
-  its look-ahead.
+- On a chain with latency, a `bus` send, the `djf` of its orbit, the voice
+  limit and a modulator on `postgain` act early by the latency of the chain.
+  So do the `delaytime` and the `delayfeedback` of its orbit when the chain
+  sends to its orbit for want of a delay of its own. The `scope` and
+  `spectrum` of its lane show its notes early by that latency.
+- When a chain that sounds changes a plugin with latency, in play and in a
+  render, the sound of the chain has a gap up to that latency.
+- In the async mode, rustel knows the latency of a plugin once its first copy
+  at the sample rate of the output is ready. The notes that rustel queued
+  before that play through the copy late by its latency, for up to about half
+  a second. Then, for as long as the latency, those late notes overlap the
+  first notes in time.
+- A note that rustel queues less than the latency of its chain before its
+  time plays late by that latency. Rustel queues each note about half a
+  second ahead, plus one or two audio buffers, and further by the largest
+  latency of the plugin chains of the score, 1 second at most.
+- A `oneshot` on a lane with latency does not play when its grid line is
+  nearer to the edit than the latency.
+- `rustel trace` plays a chain with latency late by its latency.
+- A render loads each plugin copy and reads its latency before its first
+  note, in the offline mode of VST3. A plugin that refuses the offline mode
+  gets the real-time mode, as in play. The render waits for each copy as long
+  as its load takes. In `rustel render`, Ctrl+C ends the wait and writes no
+  file. In Studio, the export shows `preparing` while its samples and its
+  copies load, and the export chord then ends the export with no file.
+- A render reads the latency of a copy one time, with the values of the
+  first note of the copy. When a later value changes the latency, the render
+  still compensates the latency of that first note.
+- At its start, a render takes the preset of each note. The copy of the
+  first preset of each plugin of a chain waits for its note in the plugin
+  host, and the copy of another preset loads again at its note. A copy plays
+  the state its preset file had at its load. So a preset file you save
+  during a render reaches the next render. In this render, it reaches only a
+  copy that loads after the save.
+- A plugin that does not load or start in a render fails a Studio export,
+  and so do a plugin name with no plugin, a preset name with no file,
+  `.vst()` with an instrument and `.vsti()` with an effect. The message
+  names the plugin. `rustel render` prints a warning and writes the file.
+- A latency change in play restarts the plugin copy. Rustel waits for a
+  quiet moment of the plugin, 2 seconds at most. A restart while the plugin
+  sounds silences its chain for a moment: the copy turns off and on, and
+  plays on. An instrument plugin plays again from the next note of its lane.
+  A plugin that reports a latency change at each value change restarts one
+  time in each second at most. A plugin that keeps its latency through 2
+  changes in a row gets no more restarts while it plays, with one warning:
+  `vst OTT: the plugin reports latency changes and keeps its latency, so its copy restarts only when it leaves the output`.
+- A plugin that does not turn on again after a restart leaves its chain
+  after half a second, and its notes play with no plugin, as for a plugin
+  that does not load.
+- On Windows and Linux, a latency change that a plugin reports from a timer
+  takes effect at the next new output, close of the output or edit that
+  replaces the copy. On macOS the main run loop runs the timer, and the
+  change restarts the copy as above, also while Studio is stopped.
+- While an export loads its plugin copies, a live edit waits for one of
+  those loads at most.
+- An edit or a start waits 20 seconds at most for a copy with no progress.
+  A render waits for each load of a copy until it ends, or until Ctrl+C or
+  the export chord ends the render.
+- Rustel loads the plugin copies of the next 16 cycles. When a copy takes
+  longer to load than 16 cycles of play, the first notes of its lane play
+  with no plugin.
+- Rustel loads one plugin at a time, in the order of the calls of the score,
+  with the calls of muted lanes among them.
+- Until a score runs a plugin call, a launch whose plugin comes only from a
+  setup helper loads its plugin copies at its line.
+- A note carries 16 parameter values at most for each plugin. A chain holds
+  4 effects at most. Rustel runs 64 chains at most, with the Csound orbits
+  among them.
 - A side-chain input of a plugin gets silence.
 - `cut` does not stop a note of an instrument plugin.
 - Native `distort`, `crush`, `coarse` and `compressor` do not process the
@@ -446,12 +722,31 @@ rustel starts. yabridge 5.1.1 needs Wine Staging 9.21 or earlier.
 - An edit that puts the effects of a chain in a new order changes their order
   at once, with no fade. In a chain with 4 effects, so does an edit that
   removes an effect and adds one at another place.
+- A new preset of a call is a new copy of the plugin on the same stage, with
+  a load of its own.
+- An effect on a part of the notes of an instrument, as in
+  `.sometimes(x => x.vst("ott"))`, gives those notes a second copy of the
+  instrument.
 - A chain runs its plugins one at a time. A chain that needs more than one
   core for a block crackles.
 - A plugin call longer than the rest of the audio buffer crackles the whole
   output. Rustel does not render a plugin ahead of the audio.
 - An export runs its plugins on one thread.
-- A plugin that hangs stops the audio.
+- A copy that plays keeps the state its preset file had at its load, also
+  after you save the file again.
+- A plugin that reports no tail counts as silent once it is quiet for 0.25
+  seconds, at a Stop and at a new output. An echo that comes later stays in
+  the plugin and sounds under the next note of its chain.
+- A plugin that hangs stops the audio, and each close of the output waits
+  for it.
+- A plugin that hangs when its copy ends holds each later load of a plugin
+  or a copy and each read of the preset folders.
+- A plugin crash ends rustel.
+- A plugin that faults in each new copy stays silent, and it waits longer
+  for each new copy, 60 seconds at most.
+- A plugin that gives no number in a part of its output plays those samples
+  as silence and gets no new copy. A copy faults only after 1 second of
+  blocks in a row with no number in half of their output or more.
 - On Windows with the multimedia class scheduler service off, each plugin
   runs on the audio thread.
 - A plugin with its multicore option on waits for its own threads. Rustel

@@ -44,7 +44,7 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     // -- constructors ------------------------------------------------------
     fn pat_pure(value: Value) -> Self;
     fn pat_silence() -> Self;
-    fn pat_query_error(message: &'static str) -> Self;
+    fn pat_query_error(message: std::sync::Arc<str>) -> Self;
     fn pat_query_limit(limit: crate::QueryLimit) -> Self;
     fn pat_stack(pats: Vec<Self>) -> Self;
     fn pat_slowcat(pats: Vec<Self>) -> Self;
@@ -61,6 +61,10 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
 
     // -- time --------------------------------------------------------------
     fn fast(&self, factor: Fraction) -> Self;
+    /// The speed change itself, with no zero check or step update. Only
+    /// [`crate::combinators::checked_fast`] calls it.
+    #[doc(hidden)]
+    fn fast_node(&self, factor: Fraction, operation: &'static str) -> Self;
     fn slow(&self, factor: Fraction) -> Self;
     fn early(&self, t: Fraction) -> Self;
     fn late(&self, t: Fraction) -> Self;
@@ -216,7 +220,7 @@ impl PatOps for Pattern {
     fn pat_silence() -> Self {
         crate::silence()
     }
-    fn pat_query_error(message: &'static str) -> Self {
+    fn pat_query_error(message: std::sync::Arc<str>) -> Self {
         crate::query_error_pattern(message)
     }
     fn pat_query_limit(limit: crate::QueryLimit) -> Self {
@@ -253,6 +257,9 @@ impl PatOps for Pattern {
 
     fn fast(&self, factor: Fraction) -> Self {
         Pattern::fast(self, factor)
+    }
+    fn fast_node(&self, factor: Fraction, operation: &'static str) -> Self {
+        Pattern::fast_node(self, factor, operation)
     }
     fn slow(&self, factor: Fraction) -> Self {
         Pattern::slow(self, factor)
@@ -486,7 +493,7 @@ impl PatOps for PurePattern {
     fn pat_silence() -> Self {
         PurePattern::assert_pure(crate::silence())
     }
-    fn pat_query_error(message: &'static str) -> Self {
+    fn pat_query_error(message: std::sync::Arc<str>) -> Self {
         PurePattern::assert_pure(crate::query_error_pattern(message))
     }
     fn pat_query_limit(limit: crate::QueryLimit) -> Self {
@@ -531,6 +538,9 @@ impl PatOps for PurePattern {
 
     fn fast(&self, factor: Fraction) -> Self {
         PurePattern::fast(self, factor)
+    }
+    fn fast_node(&self, factor: Fraction, operation: &'static str) -> Self {
+        PurePattern::assert_pure(self.pattern().fast_node(factor, operation))
     }
     fn slow(&self, factor: Fraction) -> Self {
         PurePattern::slow(self, factor)

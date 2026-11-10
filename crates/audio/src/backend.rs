@@ -118,10 +118,10 @@ impl Default for FilterControls {
 pub struct OscillatorControls<K = KabelControls> {
     /// KabelSalat runs at the beginning of the main effects chain.
     pub kabel: Option<K>,
-    /// Host-only direct slider bindings: gain, lowpass cutoff, then lowpass
-    /// resonance. Zero is unbound. Tokens never cross score evaluations or
-    /// arbitrary value maps.
-    pub live_controls: [u64; 3],
+    /// Host-only direct slider bindings: gain, lowpass cutoff, lowpass
+    /// resonance, then the direct FM route's index. Zero is unbound. Tokens
+    /// never cross score evaluations or arbitrary value maps.
+    pub live_controls: [u64; 4],
     /// Host preview identity. Zero belongs to the score; a newer nonzero
     /// identity replaces older preview voices without touching score voices.
     pub preview_epoch: u64,
@@ -189,6 +189,9 @@ pub struct OscillatorControls<K = KabelControls> {
     pub effects: [Option<crate::insert::InsertControls>; crate::insert::EFFECT_CHAIN],
     /// The insert that makes the sound of the note from the note itself.
     pub instrument: Option<crate::insert::InsertControls>,
+    /// The frames the note starts before its musical onset, so its chain
+    /// plays in time with the other lanes: see [`Self::musical`].
+    pub lead: u32,
     /// `lfo()` modulators: each rides an
     /// AudioParam additively. Fixed capacity keeps the ring event POD; the
     /// resolver skips-and-logs beyond it.
@@ -1037,13 +1040,40 @@ impl<K> OscillatorControls<K> {
             self.orbit.min(crate::scalar::MAX_ORBITS as u8 - 1),
         ))
     }
+
+    /// The latency of the effects of the note in frames: the sum of the
+    /// latencies of their stages.
+    pub fn effect_latency(&self) -> u32 {
+        self.effects
+            .iter()
+            .flatten()
+            .map(crate::insert::InsertControls::latency)
+            .fold(0, u32::saturating_add)
+    }
+
+    /// The latency of the chain of the note in frames: its effects and its
+    /// instrument. The output of the note comes this many frames after the
+    /// frame the note starts on.
+    pub fn chain_latency(&self) -> u32 {
+        let instrument = self
+            .instrument
+            .as_ref()
+            .map_or(0, crate::insert::InsertControls::latency);
+        self.effect_latency().saturating_add(instrument)
+    }
+
+    /// The musical onset of a note that starts on `target_frame`: that frame
+    /// plus the lead of the note.
+    pub fn musical(&self, target_frame: u64) -> u64 {
+        target_frame.saturating_add(u64::from(self.lead))
+    }
 }
 
 impl<K> Default for OscillatorControls<K> {
     fn default() -> Self {
         Self {
             kabel: None,
-            live_controls: [0; 3],
+            live_controls: [0; 4],
             preview_epoch: 0,
             choke_only: false,
             piano: false,
@@ -1075,6 +1105,7 @@ impl<K> Default for OscillatorControls<K> {
             insert_chain: None,
             effects: [None; crate::insert::EFFECT_CHAIN],
             instrument: None,
+            lead: 0,
             lfos: [None; MAX_VOICE_MODS],
             envs: [None; MAX_VOICE_MODS],
             phaser: None,
@@ -1233,6 +1264,20 @@ pub trait AudioBackend {
     /// Render the next `frames` stereo frames into `out` (length `frames * 2`).
     fn process_block(&mut self, out: &mut [f32], frames: usize);
 
+    /// This backend's orbit taps, when a stems render asked for them. The
+    /// taps hold the block the last [`process_block`](Self::process_block)
+    /// rendered. Backends without orbits keep none.
+    fn stems(&self) -> Option<&crate::scalar::Stems> {
+        None
+    }
+
+    /// The frames a render runs before the first frame of its file. The
+    /// file starts at this backend frame, and the writer drops each frame
+    /// before it. Most backends need none.
+    fn preroll_frames(&self) -> usize {
+        0
+    }
+
     /// Human-readable backend name.
     fn name(&self) -> &'static str;
 }
@@ -1367,6 +1412,7 @@ impl<K> OscillatorControls<K> {
             insert_chain: self.insert_chain,
             effects: self.effects,
             instrument: self.instrument,
+            lead: self.lead,
             lfos: self.lfos,
             bus_mods: self.bus_mods,
             bus: self.bus,

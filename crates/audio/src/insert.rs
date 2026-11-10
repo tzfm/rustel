@@ -13,11 +13,17 @@
 //! an insert that makes sound from notes. The instrument goes through the
 //! chain when its note asks for an effect too.
 //!
+//! The `room` and the `delay` of a note through effects go to the reverb
+//! and the delay of its chain, in front of the effects, so the effects
+//! process them too: see `crate::scalar::ChainRoom`. A chain with no room
+//! of its own sends them to the orbit after the postgain, as a note with no
+//! chain and an instrument with no effect do.
+//!
 //! ```text
-//!   voice/instrument -> gain --+-> dry -> [VST effects] -> postgain --+
-//!                             +-> postgain -> delay/reverb ---------+
-//!                                                                   |
-//!                      mix <- fader <- duck <- DJ filter <- orbit <-+
+//!   voice/instrument -> gain -+-> dry ------------+-> [VST effects] -> postgain -+
+//!                             +-> delay/reverb ---+                              |
+//!                                 of the chain                                   |
+//!                      mix <- fader <- duck <- DJ filter <- orbit <--------------+
 //! ```
 
 /// The parameter values one note carries for its insert.
@@ -31,6 +37,11 @@ pub const INSERT_SLOTS: usize = (EFFECT_CHAIN + 1) * MAX_INSERT_BUSES;
 /// No stage. An effect with no stage takes the stage of its place in the
 /// note, and a list of stages ends here.
 pub const NO_STAGE: u8 = u8::MAX;
+/// The shortest quiet time of an insert, in seconds. A stopped output
+/// drains an insert until it is quiet for its tail, and for this long at
+/// least: see [`OrbitInsert::drain`]. The plugin host takes the same time
+/// for its flush, so a copy the drain made quiet skips its flush.
+pub const INSERT_DRAIN_QUIET_SECONDS: f32 = 0.25;
 
 /// A logical chain and its effect or instrument position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -123,6 +134,9 @@ pub struct InsertControls {
     param_count: u8,
     /// The stage of the chain that serves this effect: see [`Self::stage`].
     stage: u8,
+    /// The latency of the copy of the stage in frames: see
+    /// [`Self::latency`].
+    latency: u32,
     /// The position of the note in quarter notes, and the quarter notes in
     /// one minute. A tempo of 0 means the note has no clock.
     beats: f64,
@@ -140,6 +154,7 @@ impl InsertControls {
             params: [InsertParam { id: 0, value: 0.0 }; MAX_INSERT_PARAMS],
             param_count: 0,
             stage: NO_STAGE,
+            latency: 0,
             beats: 0.0,
             tempo: 0.0,
             note: InsertNote {
@@ -219,6 +234,18 @@ impl InsertControls {
             _ => place,
         }
     }
+
+    /// Gives the stage the latency of its copy: see [`Self::latency`].
+    pub fn with_latency(mut self, frames: u32) -> Self {
+        self.latency = frames;
+        self
+    }
+
+    /// The latency of the copy that serves the stage, in frames. The output
+    /// of the stage comes this many frames after its input.
+    pub fn latency(&self) -> u32 {
+        self.latency
+    }
 }
 
 /// A stereo effect in one chain.
@@ -287,6 +314,11 @@ pub trait OrbitInsert: Send {
     /// Starts a prepared score event `frames` from now.
     fn score(&mut self, _score: u64, _frames: u32) {}
 
+    /// Retracts a prepared score event that has not started rendering.
+    /// Unknown or already-started IDs do nothing; cancellation never cuts
+    /// other notes.
+    fn cancel_score(&mut self, _score: u64) {}
+
     /// Ends each note `frames` from now: a note that sounds then, and a
     /// note that starts before then. A rewind cuts the engine voices at the
     /// same frame.
@@ -309,17 +341,40 @@ pub trait OrbitInsert: Send {
         false
     }
 
+    /// True when the insert writes silence after a fault, so the engine
+    /// swaps in a prepared copy of its own key. The default has no fault.
+    fn faulted(&self) -> bool {
+        false
+    }
+
     /// True when the blocks of this insert run on any thread. The engine
-    /// then makes the block calls (`submit`, `collect` and `busy`) on the
-    /// audio callback or on a plugin worker of the output, one thread at a
-    /// time. Between the start of a block and its join, the engine makes no
-    /// other call on the insert. Each other call stays on the callback.
+    /// then makes the block calls (`submit`, `collect`, `drain` and `busy`)
+    /// on the audio callback or on a plugin worker of the output, one thread
+    /// at a time. Between the start of a block and its join, the engine makes
+    /// no other call on the insert. Each other call stays on the callback.
     fn any_thread(&self) -> bool {
         false
     }
 
     /// Ends each note and drops the tail after a clock reset.
     fn reset(&mut self) {}
+
+    /// The frames the insert sounds after its input goes silent, as the
+    /// tail of a reverb or a delay: 3 s at most. The default has no tail.
+    fn tail_frames(&self) -> u32 {
+        0
+    }
+
+    /// Plays one block of silence while the output is stopped, after
+    /// `reset`. The output of the block goes nowhere. Both slices have the
+    /// same length, from 1 to 128 frames. A stopped output drains an insert
+    /// until it is quiet for its tail, or for 0.25 s when that is longer,
+    /// and for 3 s at most: see [`Self::tail_frames`]. So an insert that
+    /// keeps its tail through a reset has no tail left at its next note. The
+    /// default processes the block.
+    fn drain(&mut self, left: &mut [f32], right: &mut [f32]) {
+        self.process(left, right);
+    }
 }
 
 /// Builds the insert for a key, a sample rate and a slot, outside the
@@ -350,6 +405,14 @@ pub struct InsertChains {
     /// slot and key. The callback gives such a copy back when it is not busy
     /// and its stage is not heard.
     pub gone: Vec<(InsertSlot, InsertKey)>,
+    /// The copies whose plugin asks for a restart, by slot and key. The
+    /// output asks such a copy back at a quiet moment, and after 2 s by
+    /// force, then ships the copy again once the provider gives it.
+    pub restart: Vec<(InsertSlot, InsertKey)>,
+    /// The copies that faulted and have a new copy ready, by slot and key.
+    /// The output ships the new copy, though the callback holds the
+    /// faulted one, and the new copy takes over at the next note.
+    pub replace: Vec<(InsertSlot, InsertKey)>,
 }
 
 /// Gives the chains the playing score has now, and the copies it no longer
@@ -368,13 +431,14 @@ mod tests {
 
     #[test]
     fn a_note_carries_sixteen_parameter_values_and_refuses_one_more() {
-        // The stage fits in the room the fields leave, so the event keeps
-        // its size.
+        // The stage and the latency fit in the room the other fields leave,
+        // so the controls keep their size.
         assert_eq!(std::mem::size_of::<InsertControls>(), 184);
         let mut controls = InsertControls::new(InsertKey {
             plugin: 3,
             preset: 0,
         });
+        assert_eq!(controls.latency(), 0);
         // An effect with no stage takes the stage of its place.
         assert_eq!(controls.stage(2), 2);
         controls.set_stage(1);
@@ -387,5 +451,37 @@ mod tests {
         assert!(!controls.push(InsertParam { id: 99, value: 1.0 }));
         assert_eq!(controls.params().len(), MAX_INSERT_PARAMS);
         assert_eq!(controls.params()[15].id, 15);
+
+        // The other builders keep the latency of the stage.
+        let controls = controls.with_latency(480);
+        assert_eq!(controls.latency(), 480);
+        let note = InsertNote {
+            pitch: 60.0,
+            velocity: 1.0,
+            frames: 64,
+        };
+        assert_eq!(controls.with_note(note).latency(), 480);
+        assert_eq!(controls.with_score(7).latency(), 480);
+        assert_eq!(controls.with_clock(2.0, 120.0).latency(), 480);
+
+        // A chain sums the latencies of its stages, whatever the lead of the
+        // note.
+        let stage = |frames| InsertControls::new(InsertKey::default()).with_latency(frames);
+        let mut note_controls: crate::OscillatorControls = Default::default();
+        assert_eq!(note_controls.lead, 0);
+        assert_eq!(note_controls.chain_latency(), 0);
+        note_controls.effects[0] = Some(stage(100));
+        note_controls.effects[2] = Some(stage(200));
+        note_controls.instrument = Some(stage(64));
+        for lead in [0, 100, 364] {
+            note_controls.lead = lead;
+            assert_eq!(note_controls.effect_latency(), 300);
+            assert_eq!(note_controls.chain_latency(), 364);
+        }
+        // The musical onset is the frame the note starts on plus its lead.
+        note_controls.lead = 0;
+        assert_eq!(note_controls.musical(1000), 1000);
+        note_controls.lead = 480;
+        assert_eq!(note_controls.musical(1000), 1480);
     }
 }

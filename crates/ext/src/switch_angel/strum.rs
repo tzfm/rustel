@@ -85,11 +85,25 @@ impl ExtensionPatternNode for StrumNode {
             }
             let width = Fraction::int(last as i128);
             for (index, hap) in group.into_iter().enumerate() {
-                let position = Fraction::int(2 * index as i128)
-                    .div(width)
-                    .sub(Fraction::ONE);
-                let offset = self.amount.mul(position);
-                output.push(hap.with_span(|span| span.with_time(|time| time.add(offset))));
+                // Each shift is checked: a hap at the far edge of the
+                // native range refuses rather than unwinds.
+                let Some(offset) = Fraction::int(2 * index as i128)
+                    .checked_div(width)
+                    .and_then(|position| position.checked_sub(Fraction::ONE))
+                    .and_then(|position| self.amount.checked_mul(position))
+                else {
+                    rustel_core::refuse_native_fraction("strum");
+                    return Vec::new();
+                };
+                output.push(hap.with_span(|span| {
+                    span.with_time(|time| match time.checked_add(offset) {
+                        Some(moved) => moved,
+                        None => {
+                            rustel_core::refuse_native_fraction("strum");
+                            time
+                        }
+                    })
+                }));
             }
         }
         output

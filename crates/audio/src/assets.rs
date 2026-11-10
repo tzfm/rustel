@@ -195,6 +195,9 @@ unsafe impl Send for ReturnedInsert {}
 pub(crate) struct InsertRelease {
     pub slot: crate::insert::InsertSlot,
     pub key: crate::insert::InsertKey,
+    /// Takes a busy or heard copy too: see
+    /// [`crate::ScalarBackend::release_insert`].
+    pub forced: bool,
 }
 
 /// The plugin workers of an output on their way to the callback: one count
@@ -206,6 +209,44 @@ pub(crate) struct PoolInstall(pub *const crate::pool::PoolShared);
 // SAFETY: the count crosses the SPSC ring once, and one side owns it at a
 // time. The pool is `Send` and `Sync`.
 unsafe impl Send for PoolInstall {}
+
+/// Send lines on their way to the callback, with the same baton discipline
+/// as a reverb: see [`crate::scalar::SendLines`].
+#[derive(Clone, Copy)]
+pub(crate) struct SendLineInstall(pub *mut crate::scalar::SendLines);
+
+/// The send lines the callback replaced, on their way back to be freed.
+#[derive(Clone, Copy)]
+pub(crate) struct ReturnedSendLines(pub *mut crate::scalar::SendLines);
+
+// SAFETY: same SPSC baton pass: the producer boxes the lines, the callback
+// takes them and returns the lines they replace, and the producer frees
+// those. One side owns each box at a time. `SendLines` is `Send`.
+unsafe impl Send for SendLineInstall {}
+unsafe impl Send for ReturnedSendLines {}
+
+/// The room of a chain on its way to the callback, with the same baton
+/// discipline as a reverb: see [`crate::scalar::ChainRoom`]. The box names
+/// its chain.
+#[derive(Clone, Copy)]
+pub(crate) struct ChainRoomInstall {
+    pub room: *mut crate::scalar::ChainRoom,
+    /// The rate the room was made for. An output at another rate gives the
+    /// room back.
+    pub sample_rate: u32,
+}
+
+/// A room the callback gave back, on its way to be freed: the parts a room
+/// gave up, a room the callback refused, or the room of a chain that left
+/// its bus. The box says which.
+#[derive(Clone, Copy)]
+pub(crate) struct ReturnedChainRoom(pub *mut crate::scalar::ChainRoom);
+
+// SAFETY: same SPSC baton pass: the producer boxes the room, the callback
+// takes it and gives back each box it does not keep, and the producer frees
+// those. One side owns each box at a time. `ChainRoom` is `Send`.
+unsafe impl Send for ChainRoomInstall {}
+unsafe impl Send for ReturnedChainRoom {}
 
 const KABEL_RETIRING: usize = 1 << (usize::BITS - 1);
 
@@ -299,6 +340,14 @@ pub(crate) struct SampleChannel {
     pub insert_releases: AssetRing<InsertRelease>,
     /// One place: the device ships its plugin workers to each backend once.
     pub pool_installs: AssetRing<PoolInstall>,
+    /// One place each: the send lines on their way to the callback, and the
+    /// lines they replaced on their way back.
+    pub send_line_installs: AssetRing<SendLineInstall>,
+    pub send_line_returns: AssetRing<ReturnedSendLines>,
+    /// A place for each bus: the rooms of the chains on their way to the
+    /// callback, and the rooms it gives back.
+    pub chain_room_installs: AssetRing<ChainRoomInstall>,
+    pub chain_room_returns: AssetRing<ReturnedChainRoom>,
     /// Stage reverbs refused by the install queue or callback byte budget.
     pub fx_reverb_refusals: AtomicU64,
     pub insert_refusals: AtomicU64,
@@ -344,6 +393,10 @@ impl SampleChannel {
             insert_returns: AssetRing::with_capacity(crate::insert::INSERT_SLOTS),
             insert_releases: AssetRing::with_capacity(crate::insert::INSERT_SLOTS),
             pool_installs: AssetRing::with_capacity(1),
+            send_line_installs: AssetRing::with_capacity(1),
+            send_line_returns: AssetRing::with_capacity(1),
+            chain_room_installs: AssetRing::with_capacity(crate::insert::MAX_INSERT_BUSES),
+            chain_room_returns: AssetRing::with_capacity(crate::insert::MAX_INSERT_BUSES),
             fx_reverb_refusals: AtomicU64::new(0),
             insert_refusals: AtomicU64::new(0),
             kabel_installs: AssetRing::new(),
@@ -362,7 +415,9 @@ impl SampleChannel {
     /// Producer side: free every returned sample. Call only from the single
     /// producer thread (before pushing new installs). The return rings are
     /// SPSC - a second reclaiming thread races the consumer head and can
-    /// double-free.
+    /// double-free. It also frees the returned rooms of the chains, without
+    /// the count of their bytes, so a live producer reclaims with
+    /// [`Self::reclaim_with_inserts`] and [`Self::reclaim_chain_rooms`].
     pub fn reclaim(&self) {
         self.reclaim_with_fx(|_| {});
     }
@@ -388,17 +443,20 @@ impl SampleChannel {
         returned_kabel: impl FnMut(*mut rustel_kabel::Graph),
         returned_program: impl FnMut(*mut PreparedKabelProgram),
     ) {
-        self.reclaim_with_inserts(returned_fx, returned_kabel, returned_program, |_| {});
+        self.reclaim_with_inserts(returned_fx, returned_kabel, returned_program, drop);
+        self.reclaim_chain_rooms(drop);
     }
 
-    /// Like [`Self::reclaim_with_programs`], and `returned_insert` sees each
-    /// insert the callback gave back before the insert is freed.
+    /// Like [`Self::reclaim_with_programs`], and `returned_insert` takes each
+    /// insert the callback gave back. The caller frees it. The rooms of the
+    /// chains stay in their ring for [`Self::reclaim_chain_rooms`]: the
+    /// producer that ships them counts their bytes against the budget there.
     pub fn reclaim_with_inserts(
         &self,
         mut returned_fx: impl FnMut(*mut crate::reverb::OrbitReverb),
         mut returned_kabel: impl FnMut(*mut rustel_kabel::Graph),
         mut returned_program: impl FnMut(*mut PreparedKabelProgram),
-        mut returned_insert: impl FnMut(*mut dyn crate::insert::OrbitInsert),
+        mut returned_insert: impl FnMut(Box<dyn crate::insert::OrbitInsert>),
     ) {
         while let Some(returned) = self.program_returns.pop() {
             returned_program(returned.0);
@@ -426,9 +484,25 @@ impl SampleChannel {
             drop(unsafe { Box::from_raw(returned.0) });
         }
         while let Some(returned) = self.insert_returns.pop() {
-            returned_insert(returned.0);
             // SAFETY: same pass for inserts displaced by the callback.
+            returned_insert(unsafe { Box::from_raw(returned.0) });
+        }
+        while let Some(returned) = self.send_line_returns.pop() {
+            // SAFETY: same pass for send lines the callback replaced.
             drop(unsafe { Box::from_raw(returned.0) });
+        }
+    }
+
+    /// Producer side: `returned` takes each room the callback gave back and
+    /// frees it. Call it from the producer thread only, as
+    /// [`Self::reclaim`].
+    pub(crate) fn reclaim_chain_rooms(
+        &self,
+        mut returned: impl FnMut(Box<crate::scalar::ChainRoom>),
+    ) {
+        while let Some(room) = self.chain_room_returns.pop() {
+            // SAFETY: same pass for the rooms the callback did not keep.
+            returned(unsafe { Box::from_raw(room.0) });
         }
     }
 }
@@ -468,6 +542,14 @@ impl Drop for SampleChannel {
             // SAFETY: the count never reached the consumer, and this side
             // owns it.
             drop(unsafe { std::sync::Arc::from_raw(install.0) });
+        }
+        while let Some(install) = self.send_line_installs.pop() {
+            // SAFETY: never reached the consumer. Unique ownership here.
+            drop(unsafe { Box::from_raw(install.0) });
+        }
+        while let Some(install) = self.chain_room_installs.pop() {
+            // SAFETY: never reached the consumer. Unique ownership here.
+            drop(unsafe { Box::from_raw(install.room) });
         }
     }
 }
@@ -783,6 +865,12 @@ mod tests {
         let pool = std::sync::Arc::new(crate::pool::PoolShared::new(1, true).expect("a pool"));
         let install = PoolInstall(std::sync::Arc::into_raw(std::sync::Arc::clone(&pool)));
         channel.pool_installs.push(install).ok().expect("push");
+        // Send lines go through their 2 rings as a reverb does.
+        let lines = || Box::into_raw(Box::new(crate::scalar::SendLines::new(0, 8_000)));
+        let install = SendLineInstall(lines());
+        channel.send_line_installs.push(install).ok().expect("push");
+        let returned = ReturnedSendLines(lines());
+        channel.send_line_returns.push(returned).ok().expect("push");
         channel
             .kabel_installs
             .push(KabelInstall {

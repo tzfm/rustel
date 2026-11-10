@@ -21,8 +21,10 @@ use ratatui::widgets::Widget;
 use rustel_runtime::ui_analysis::{UI_SPECTRUM_BINS, UiAudioAnalysisFrame, UiAudioAnalysisSet};
 use rustel_runtime::ui_events::{
     UiAudioMetadata, UiEventBatch, UiEventValidationError, UiLayout, UiLayoutEnvelope,
-    UiScheduledEvent, UiTraceBatchRequest,
+    UiScheduledEvent, UiTraceBatchRequest, UiVisual,
 };
+#[cfg(feature = "video")]
+use rustel_runtime::video::VideoThumbnails;
 
 use super::engine::StudioSnapshot;
 use super::theme::{Theme, VisualOptions, hsv, luminance, mix, parse_color, true_rgb, wash};
@@ -50,6 +52,9 @@ impl ClockAnchor {
 #[derive(Debug, Default)]
 pub struct VisualState {
     layout: Option<UiLayout>,
+    /// The text of the score of `layout`, when the studio knows it: see
+    /// [`Self::install_layout_of`].
+    layout_source: Option<std::sync::Arc<str>>,
     running: bool,
     events: VecDeque<UiScheduledEvent>,
     onset_ids: HashSet<u64>,
@@ -74,6 +79,22 @@ pub struct VisualState {
     /// it lands whatever generation or state the score is in, so the
     /// preview scope works on a stopped set too.
     audition_audio: Option<UiAudioAnalysisFrame>,
+    /// The video clips the layout's painters name, keyed by the sound the
+    /// score spells. A clip is asked for until it lands here with a strip
+    /// or a reason it has none.
+    #[cfg(feature = "video")]
+    videos: BTreeMap<String, VideoEntry>,
+    /// The frame each video painter drew last, by its slot. It stays on
+    /// screen while the painter has nothing newer to draw: between an
+    /// edit and the new score's first events, while its clip is asked
+    /// for again, and when the set stops. Kept by the draw, which sees the
+    /// state only through a shared borrow.
+    #[cfg(feature = "video")]
+    held_videos: std::cell::RefCell<BTreeMap<Option<u8>, HeldFrame>>,
+    /// The place each named feed showed last, for the dock's widget and
+    /// the detached window to hold the same way.
+    #[cfg(feature = "video")]
+    held_feeds: std::cell::RefCell<BTreeMap<String, f64>>,
     /// The spectrogram's memory: one column per audio frame, per tap
     /// (`None` is the master), newest last. strudel.cc's spectrum scrolls
     /// the last frames across the canvas; a terminal keeps them here.
@@ -86,6 +107,185 @@ pub struct VisualState {
     audio_sample_rate: u32,
     audio_sequence: u64,
     dropped: u64,
+}
+
+/// How many times a video painter asks the library for a clip before it
+/// says the picture never arrived. A clip downloads and decodes behind
+/// its sound, so a first play can outlast a few polls.
+#[cfg(feature = "video")]
+const VIDEO_ASK_LIMIT: u8 = 100;
+
+/// One named clip's picture, as a painter finds it.
+#[cfg(feature = "video")]
+#[derive(Clone, Debug)]
+pub enum VideoEntry {
+    /// Asked this many times; the library has no strip and no refusal yet.
+    Asking(u8),
+    /// The decoded strip.
+    Ready(std::sync::Arc<VideoThumbnails>),
+    /// Why there is no strip.
+    Failed(String),
+    /// A sound with no picture, which no painter shows or lists.
+    NotVideo,
+    /// A bank the note picks from, with its keys as MIDI numbers. No
+    /// painter shows or lists it: each key is a clip of its own.
+    ByNote(Vec<f64>),
+}
+
+/// Which events the video painters show.
+#[cfg(feature = "video")]
+#[derive(Clone, Copy, Debug)]
+enum VideoLanes {
+    /// The lanes whose events carry these painter bits.
+    Tagged(u64),
+    /// Every event: a painter of the whole stack is there.
+    Every,
+}
+
+#[cfg(feature = "video")]
+impl VideoLanes {
+    fn holds(self, event: &UiScheduledEvent) -> bool {
+        match self {
+            Self::Tagged(bits) => event.ui_visuals & bits != 0,
+            Self::Every => true,
+        }
+    }
+}
+
+/// The frame a video painter drew last: its clip and the place in it.
+#[cfg(feature = "video")]
+#[derive(Clone, Debug)]
+struct HeldFrame {
+    name: String,
+    strip: std::sync::Arc<VideoThumbnails>,
+    position: f32,
+}
+
+#[cfg(feature = "video")]
+impl PartialEq for VideoEntry {
+    fn eq(&self, other: &Self) -> bool {
+        use std::sync::Arc;
+        match (self, other) {
+            (Self::Asking(asks), Self::Asking(other_asks)) => asks == other_asks,
+            (Self::Ready(strip), Self::Ready(other_strip)) => Arc::ptr_eq(strip, other_strip),
+            (Self::Failed(message), Self::Failed(other)) => message == other,
+            (Self::NotVideo, Self::NotVideo) => true,
+            (Self::ByNote(keys), Self::ByNote(other_keys)) => keys == other_keys,
+            _ => false,
+        }
+    }
+}
+
+/// The sound an event's chain carries, as the voice looks it up: the
+/// `s:name` token with the `bank:` prefix. A name with a space in it stops
+/// at the space, the way the chain text does. The painter then says no
+/// clip answered to it.
+#[cfg(feature = "video")]
+fn event_sound(event: &UiScheduledEvent) -> Option<String> {
+    let value = event.value.as_deref()?;
+    let token = |wanted: &str| {
+        value.split_whitespace().find_map(|token| {
+            let (key, spelled) = token.split_once(':')?;
+            (key == wanted).then_some(spelled)
+        })
+    };
+    let sound = token("s")?;
+    Some(match token("bank") {
+        Some(bank) if !sound.is_empty() => rustel_voice::banked_name(bank, sound),
+        _ => sound.to_owned(),
+    })
+}
+
+/// The clip an event's sound names: [`event_sound`] with the `n:` pick
+/// the same sound resolves with, spelled the way the library spells a
+/// numbered variant.
+#[cfg(feature = "video")]
+fn event_clip_name(event: &UiScheduledEvent) -> Option<String> {
+    let sound = event_sound(event)?;
+    // The pick the voice plays: `n(2)` in a bank of files is the third
+    // one, the same as spelling `name:2`.
+    if let Some(pick) = event_chain_number(event, "n")
+        && pick.fract() == 0.0
+    {
+        return Some(format!("{sound}:{}", pick as i64));
+    }
+    Some(sound)
+}
+
+/// The note a sample voice picks its file by: the pitch the score wrote,
+/// else the voice's default for the sound. The trace carries that pitch
+/// as an `f32` frequency. A thousandth of a semitone gives the note back
+/// as written, so a note halfway between two keys picks the key the voice
+/// picks.
+#[cfg(feature = "video")]
+fn event_sample_midi(event: &UiScheduledEvent) -> f64 {
+    match event.frequency_hz {
+        Some(hertz) => {
+            let midi = 69.0 + 12.0 * (f64::from(hertz) / 440.0).log2();
+            (midi * 1000.0).round() / 1000.0
+        }
+        None => rustel_voice::sample_default_midi(event_sound(event).as_deref().unwrap_or("")),
+    }
+}
+
+/// One `key:number` link of an event's chain, as the number the control
+/// holds.
+#[cfg(feature = "video")]
+fn event_chain_number(event: &UiScheduledEvent, key: &str) -> Option<f64> {
+    event
+        .value
+        .as_deref()?
+        .split_whitespace()
+        .find_map(|token| {
+            let (spelled_key, value) = token.split_once(':')?;
+            (spelled_key == key)
+                .then(|| value.parse::<f64>().ok())
+                .flatten()
+                .filter(|number| number.is_finite())
+        })
+}
+
+/// Where a clip's sound is inside it, in seconds, on a clip `duration`
+/// long: the walk the voice resolved for the event, from where it starts
+/// at the rate it plays, wrapped in its loop or held where its slice or
+/// the clip ends, and counted from the clip's end when reversed. The
+/// scalar render walks a sample voice the same way. An event no voice
+/// took, such as a preview, walks the clip from its start at one second
+/// a second.
+#[cfg(feature = "video")]
+fn clip_position(event: &UiScheduledEvent, now: f64, duration: f64) -> f64 {
+    let walk = event.sample.unwrap_or(rustel_scheduler::TraceSampleWalk {
+        rate: 1.0,
+        begin: 0.0,
+        end: None,
+        reversed: false,
+        loop_secs: None,
+        nudge_secs: 0.0,
+    });
+    let elapsed = if now.is_finite() {
+        (now - event.target_time - f64::from(walk.nudge_secs)).max(0.0)
+    } else {
+        0.0
+    };
+    let walked = f64::from(walk.begin) * duration + elapsed * f64::from(walk.rate);
+    let walked = match walk.loop_secs {
+        Some((start, end)) if end > start => {
+            let (start, end) = (f64::from(start), f64::from(end));
+            if walked >= end {
+                start + (walked - end).rem_euclid(end - start)
+            } else {
+                walked
+            }
+        }
+        Some(_) => walked,
+        None => walked.min(f64::from(walk.end.unwrap_or(1.0)) * duration),
+    }
+    .clamp(0.0, duration);
+    if walk.reversed {
+        duration - walked
+    } else {
+        walked
+    }
 }
 
 /// The bit the display sets on a preview's onset id, so a preview is told
@@ -211,14 +411,107 @@ fn spectrogram_column(frame: &UiAudioAnalysisFrame) -> [f32; SPECTROGRAM_BANDS] 
     std::array::from_fn(|band| spectrum_level(&frame.spectrum, band, SPECTROGRAM_BANDS))
 }
 
+/// The slot in the new score of each painter of the old score that the new
+/// score kept, by its slot in the old score. A slot counts the painters
+/// before it, so a painter added or deleted above moves the slots below. The
+/// text both scores share at their start and at their end did not change. A
+/// painter whose call ends in that text is the same painter, at the same
+/// place or moved by the length of the edit. A painter whose call ends inside
+/// the edit went, and one the edit wrote is new.
+fn kept_painters(old: (&str, &[UiVisual]), new: (&str, &[UiVisual])) -> BTreeMap<u8, u8> {
+    let (old_text, new_text) = (old.0.as_bytes(), new.0.as_bytes());
+    let front = old_text
+        .iter()
+        .zip(new_text)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let back = old_text[front..]
+        .iter()
+        .rev()
+        .zip(new_text[front..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    // Where a byte of the old text is in the new one, if the edit kept it.
+    let place = |at: usize| {
+        if at < front {
+            Some(at)
+        } else if at >= old_text.len() - back && at < old_text.len() {
+            Some(at + new_text.len() - old_text.len())
+        } else {
+            None
+        }
+    };
+    old.1
+        .iter()
+        .filter_map(|painter| {
+            let end = place(painter.to.checked_sub(1)?)? + 1;
+            let kept = new
+                .1
+                .iter()
+                .find(|now| now.kind == painter.kind && now.to == end)?;
+            Some((painter.slot?, kept.slot?))
+        })
+        .collect()
+}
+
+/// Moves each ring of a tap to the slot its painter has in the new score,
+/// and drops the rings of painters that went. The master's ring stays.
+fn follow_painters<T>(rings: &mut BTreeMap<Option<u8>, T>, kept: &BTreeMap<u8, u8>) {
+    *rings = std::mem::take(rings)
+        .into_iter()
+        .filter_map(|(tap, ring)| match tap {
+            None => Some((None, ring)),
+            Some(slot) => kept.get(&slot).map(|slot| (Some(*slot), ring)),
+        })
+        .collect();
+}
+
 impl VisualState {
+    /// Installs a layout whose score text the studio does not know. A new
+    /// score then keeps the history of the master only: see
+    /// [`Self::install_layout_of`].
     pub fn install_layout(&mut self, envelope: UiLayoutEnvelope) {
+        self.install(envelope, None);
+    }
+
+    /// Installs the layout of the score `source`. A painter the new score
+    /// kept takes its own history to its new slot.
+    pub fn install_layout_of(&mut self, envelope: UiLayoutEnvelope, source: std::sync::Arc<str>) {
+        self.install(envelope, Some(source));
+    }
+
+    fn install(&mut self, envelope: UiLayoutEnvelope, source: Option<std::sync::Arc<str>>) {
         let next = &envelope.ui_layout;
         let source_changed = self
             .layout
             .as_ref()
             .is_none_or(|current| current.source_revision != next.source_revision);
         let generation = next.generation;
+        // The painters the new score kept, by their slots before and now,
+        // when the studio knows both scores.
+        let kept = match (&self.layout, &self.layout_source, &source) {
+            (Some(layout), Some(old), Some(new)) => {
+                Some(kept_painters((old, &layout.visuals), (new, &next.visuals)))
+            }
+            _ => None,
+        };
+        self.layout_source = source;
+        // A painter the new score dropped lets go of its frame. One it
+        // kept holds the frame at its new slot until the new score's events
+        // reach it.
+        #[cfg(feature = "video")]
+        {
+            let held = self.held_videos.get_mut();
+            if let Some(kept) = &kept {
+                follow_painters(held, kept);
+            }
+            held.retain(|slot, _| {
+                next.visuals
+                    .iter()
+                    .any(|visual| visual.kind == "video" && visual.slot == *slot)
+            });
+        }
+        let kept = kept.unwrap_or_default();
         self.layout = Some(envelope.ui_layout);
         if source_changed {
             self.events.clear();
@@ -226,14 +519,22 @@ impl VisualState {
             self.previews.clear();
             self.real_keys.clear();
             self.clock = None;
-            // The analysers and their history belong to the score that was
-            // playing. A different score is a different picture, so they
-            // start again.
+            // The analyser and the spectrogram follow one stream of sound,
+            // and an eval does not stop the stream: their memory carries on
+            // and the new score's frames merge into it. A kept painter keeps
+            // its own ring at its new slot. A painter that went loses its
+            // ring, so nothing stays behind for another painter to show.
+            follow_painters(&mut self.spectrograms, &kept);
+            follow_painters(&mut self.analysers, &kept);
             self.audio = None;
             self.visual_audio.clear();
-            self.spectrograms.clear();
-            self.analysers.clear();
             self.audio_sequence = 0;
+            // The clips the new score names are asked for again; the ones
+            // the old score failed to send have their chance back, and a
+            // strip that is still wanted comes straight from the library's
+            // own table, decoded once.
+            #[cfg(feature = "video")]
+            self.videos.clear();
         } else {
             // The same score under a new generation - a slider moved, or the
             // output was recycled. The music did not change, so neither should
@@ -504,7 +805,7 @@ impl VisualState {
     }
 
     /// What the spectrograms' histories hold: the room each tap's ring
-    /// has taken, which a full history keeps until the score is reset.
+    /// has taken, which stays until the tap goes.
     pub fn history_bytes(&self) -> usize {
         self.spectrograms
             .values()
@@ -585,6 +886,202 @@ impl VisualState {
     /// samples browser is sounding, with none of the score in it.
     pub fn audition_audio(&self) -> Option<&UiAudioAnalysisFrame> {
         self.audition_audio.as_ref()
+    }
+
+    /// The strip a video painter's sound decoded, or why it has none.
+    #[cfg(feature = "video")]
+    pub fn video_for(&self, name: &str) -> Option<&VideoEntry> {
+        self.videos.get(name)
+    }
+
+    /// The clip an event shows: its sound, and in a bank the note picks
+    /// from, the key its note picks, spelled `name note:key` the way the
+    /// library asks for it. `None` for an event with no sound, or a bank
+    /// with no keys.
+    #[cfg(feature = "video")]
+    fn clip_name(&self, event: &UiScheduledEvent) -> Option<String> {
+        let name = event_clip_name(event)?;
+        let Some(VideoEntry::ByNote(keys)) = self.videos.get(&name) else {
+            return Some(name);
+        };
+        let key = keys[rustel_runtime::samples::closest_note_key(
+            keys.iter().copied(),
+            event_sample_midi(event),
+        )?];
+        Some(format!("{name} note:{key}"))
+    }
+
+    /// The set's video clips by name, sorted: what the dock's video
+    /// widget steps through with ←/→. Only the clips the video painters
+    /// asked for are listed, so the widget shows the sounds of a lane
+    /// with `_video()` or `video()` and no other. A sound of that lane
+    /// with no picture is no clip.
+    #[cfg(feature = "video")]
+    pub fn video_feeds(&self) -> Vec<String> {
+        let mut feeds: Vec<String> = self
+            .videos
+            .iter()
+            .filter(|(_, entry)| !matches!(entry, VideoEntry::NotVideo | VideoEntry::ByNote(_)))
+            .map(|(name, _)| name.clone())
+            .collect();
+        feeds.sort();
+        feeds
+    }
+
+    /// The strip a named feed is showing and the position inside it, in
+    /// seconds, for the dock's video widget and the detached window: the
+    /// event sounding now for that clip, else the last that sounded, else
+    /// the next to come, else the place it showed last.
+    #[cfg(feature = "video")]
+    pub fn video_feed_frame(&self, feed: &str) -> Option<(f64, std::sync::Arc<VideoThumbnails>)> {
+        let strip = match self.videos.get(feed) {
+            Some(VideoEntry::Ready(strip)) => std::sync::Arc::clone(strip),
+            _ => return None,
+        };
+        let (now, _, _) = self.current_clock().unwrap_or((f64::NAN, 0.0, 0.0));
+        let lanes = self.video_lanes();
+        let mut active = None;
+        let mut past = None;
+        let mut future = None;
+        for event in self.events() {
+            if !lanes.is_some_and(|lanes| lanes.holds(event))
+                || self.clip_name(event).as_deref() != Some(feed)
+            {
+                continue;
+            }
+            let end = event.target_time + event.duration_seconds.max(0.035);
+            if !now.is_finite() {
+                future.get_or_insert(event);
+            } else if event.target_time <= now && now <= end {
+                let newer = active
+                    .is_none_or(|held: &UiScheduledEvent| held.target_time < event.target_time);
+                if newer {
+                    active = Some(event);
+                }
+            } else if event.target_time <= now {
+                let later =
+                    past.is_none_or(|held: &UiScheduledEvent| held.target_time < event.target_time);
+                if later {
+                    past = Some(event);
+                }
+            } else {
+                let sooner = future
+                    .is_none_or(|held: &UiScheduledEvent| held.target_time > event.target_time);
+                if sooner {
+                    future = Some(event);
+                }
+            }
+        }
+        let mut held = self.held_feeds.borrow_mut();
+        let position = match active.or(past).or(future) {
+            Some(event) => {
+                let position = clip_position(event, now, f64::from(strip.duration()));
+                held.insert(feed.to_owned(), position);
+                position
+            }
+            // With no event of its own, the clip holds the place it showed
+            // last, or shows its poster: the first frame is what a docked
+            // widget or a window has before the score reaches it.
+            None => held.get(feed).copied().unwrap_or(0.0),
+        };
+        Some((position, strip))
+    }
+
+    /// Remember a clip's decoded strip, or why it has none. Returns
+    /// whether anything changed, so the caller knows to repaint.
+    #[cfg(feature = "video")]
+    pub fn install_video(&mut self, name: &str, entry: VideoEntry) -> bool {
+        if self.videos.get(name) == Some(&entry) {
+            return false;
+        }
+        self.videos.insert(name.to_owned(), entry);
+        true
+    }
+
+    /// Drop every clip's refusal, so the next poll asks for it again: a
+    /// setting that refused it has changed.
+    #[cfg(feature = "video")]
+    pub fn forget_failed_videos(&mut self) {
+        self.videos
+            .retain(|_, entry| !matches!(entry, VideoEntry::Failed(_)));
+    }
+
+    /// Count one ask for a clip the library has no answer for yet. A clip
+    /// whose bank is still on its way answers `None` a while longer. Past
+    /// [`VIDEO_ASK_LIMIT`] asks the painter says so and stops asking. An
+    /// ask the library answers `decoding` does not count: a decode always
+    /// ends in a strip or a refusal, and a long clip decodes for minutes.
+    /// Returns whether the asking ran out, so the caller repaints.
+    #[cfg(feature = "video")]
+    pub fn note_video_ask(&mut self, name: &str, decoding: bool) -> bool {
+        let next = match self.videos.get(name) {
+            Some(VideoEntry::Asking(_)) if decoding => None,
+            None if decoding => Some(VideoEntry::Asking(0)),
+            Some(VideoEntry::Asking(asks)) if *asks >= VIDEO_ASK_LIMIT => {
+                Some(VideoEntry::Failed("the picture did not arrive".to_owned()))
+            }
+            Some(VideoEntry::Asking(asks)) => Some(VideoEntry::Asking(asks + 1)),
+            Some(_) => None,
+            None => Some(VideoEntry::Asking(1)),
+        };
+        match next {
+            Some(next) => {
+                let ran_out = matches!(next, VideoEntry::Failed(_));
+                self.videos.insert(name.to_owned(), next);
+                ran_out
+            }
+            None => false,
+        }
+    }
+
+    /// The lanes the video painters show, or `None` with no video
+    /// painter. `_video()` and `video()` each tag their own lane's events.
+    #[cfg(feature = "video")]
+    fn video_lanes(&self) -> Option<VideoLanes> {
+        let mut lanes = None;
+        for visual in &self.layout.as_ref()?.visuals {
+            if visual.kind == "video" {
+                lanes = Some(match (lanes, visual.slot) {
+                    // A painter of the whole stack tags no event.
+                    (_, None) | (Some(VideoLanes::Every), _) => VideoLanes::Every,
+                    (Some(VideoLanes::Tagged(bits)), Some(slot)) => {
+                        VideoLanes::Tagged(bits | 1_u64 << slot)
+                    }
+                    (None, Some(slot)) => VideoLanes::Tagged(1_u64 << slot),
+                });
+            }
+        }
+        lanes
+    }
+
+    /// The sounds a video painter's lane names and no strip is held for:
+    /// what the next library ask is for. A stopped set keeps its strips,
+    /// so this names nothing once every clip has landed.
+    #[cfg(feature = "video")]
+    pub fn video_names_to_ask(&self) -> Vec<String> {
+        let Some(lanes) = self.video_lanes() else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = Vec::new();
+        let mut push = |event: &UiScheduledEvent| {
+            let Some(name) = self.clip_name(event) else {
+                return;
+            };
+            if !lanes.holds(event) {
+                return;
+            }
+            if matches!(
+                self.videos.get(name.as_str()),
+                None | Some(VideoEntry::Asking(..=VIDEO_ASK_LIMIT))
+            ) && !names.contains(&name)
+            {
+                names.push(name);
+            }
+        };
+        for event in self.events.iter().chain(self.previews.iter()) {
+            push(event);
+        }
+        names
     }
 
     pub fn dropped(&self) -> u64 {
@@ -794,7 +1291,11 @@ pub(super) fn braille_dot(level: f32, dx: usize, dy: usize) -> bool {
 /// A 2×4 patch of luminance as one Braille glyph, indexed `[dy][dx]`.
 /// Empty is `⠀` and full is `⣿`; everything between is a dot count, which
 /// is the only shading a glyph raster has.
-pub(super) fn braille_luma_glyph(patch: [[u8; 2]; 4]) -> char {
+///
+/// The camera painter moved with the theme engines and has its own. This
+/// one lets the test below check the studio's own dither the same way.
+#[cfg(test)]
+fn braille_luma_glyph(patch: [[u8; 2]; 4]) -> char {
     let mut bits = 0u8;
     for (dy, row) in patch.iter().enumerate() {
         for (dx, level) in row.iter().enumerate() {
@@ -1180,6 +1681,8 @@ pub fn render(request: VisualRequest<'_>, area: Rect, buffer: &mut Buffer) {
         "pitchwheel" => PitchWheel::new(&request).render(area, buffer),
         "scope" | "tscope" => Scope::new(&request).render(area, buffer),
         "spectrum" => Spectrum::new(&request).render(area, buffer),
+        #[cfg(feature = "video")]
+        "video" => Video::new(&request).render(area, buffer),
         kind => note(
             &request,
             buffer,
@@ -2894,6 +3397,181 @@ impl Widget for Spectrum<'_, '_> {
     }
 }
 
+/// The video painter: a clip's own picture where its sound is. The frame
+/// is the one the clock says is showing, so the picture plays with the
+/// sample and holds when the transport holds.
+#[cfg(feature = "video")]
+struct Video<'a, 'b> {
+    request: &'a VisualRequest<'b>,
+}
+
+#[cfg(feature = "video")]
+impl<'a, 'b> Video<'a, 'b> {
+    fn new(request: &'a VisualRequest<'b>) -> Self {
+        Self { request }
+    }
+
+    /// The clip to show: the event sounding now, else the last that
+    /// sounded, else the next to come. Among events of one tier, a clip
+    /// the library answered with a strip outranks a newer one it has not:
+    /// a stage painter sees every lane's events, and a plain sound must
+    /// not take the picture from the clip beside it.
+    fn clip(&self, now: f64) -> Option<(&UiScheduledEvent, String)> {
+        let state = self.request.state;
+        let slot = self.request.slot;
+        struct Candidate<'a> {
+            event: &'a UiScheduledEvent,
+            name: String,
+            ready: bool,
+        }
+        let ready = |name: &str| matches!(state.video_for(name), Some(VideoEntry::Ready(_)));
+        // `forward` says the tier wants the newest event; `false`, the
+        // soonest.
+        let beats = |held: &Candidate<'_>, next: &Candidate<'_>, forward: bool| {
+            if next.ready != held.ready {
+                return next.ready;
+            }
+            if forward {
+                held.event.target_time < next.event.target_time
+            } else {
+                held.event.target_time > next.event.target_time
+            }
+        };
+        let mut active: Option<Candidate<'_>> = None;
+        let mut past: Option<Candidate<'_>> = None;
+        let mut future: Option<Candidate<'_>> = None;
+        for event in state.events() {
+            if !slot.is_none_or(|slot| event.ui_visuals & (1_u64 << slot) != 0) {
+                continue;
+            }
+            let Some(name) = state.clip_name(event) else {
+                continue;
+            };
+            // A sound with no picture leaves the lane's clip showing.
+            if matches!(state.video_for(&name), Some(VideoEntry::NotVideo)) {
+                continue;
+            }
+            let next = Candidate {
+                event,
+                ready: ready(&name),
+                name,
+            };
+            let end = event.target_time + event.duration_seconds.max(0.035);
+            if !now.is_finite() {
+                // No clock yet: the first clip the score names will do.
+                future.get_or_insert(next);
+            } else if event.target_time <= now && now <= end {
+                if active.as_ref().is_none_or(|held| beats(held, &next, true)) {
+                    active = Some(next);
+                }
+            } else if event.target_time <= now {
+                if past.as_ref().is_none_or(|held| beats(held, &next, true)) {
+                    past = Some(next);
+                }
+            } else if future.as_ref().is_none_or(|held| beats(held, &next, false)) {
+                future = Some(next);
+            }
+        }
+        let chosen = active.or(past).or(future)?;
+        Some((chosen.event, chosen.name))
+    }
+}
+
+#[cfg(feature = "video")]
+impl Video<'_, '_> {
+    /// Draw `strip`'s frame at `position`, keeping its shape and centred.
+    fn paint(
+        &self,
+        name: &str,
+        strip: &VideoThumbnails,
+        position: f32,
+        area: Rect,
+        buffer: &mut Buffer,
+    ) {
+        let Some(frame) = strip.frame_at(position) else {
+            note(
+                self.request,
+                buffer,
+                area,
+                &format!("{name} decoded to no frames"),
+            );
+            return;
+        };
+        let mut canvas = Canvas::bars(area);
+        let (canvas_width, canvas_height) = (canvas.width(), canvas.height());
+        let (frame_width, frame_height) = (strip.width() as usize, strip.height() as usize);
+        // The frame keeps its shape inside the canvas points and sits
+        // centred, however much larger or smaller it is than the rows it
+        // was given; the points it leaves untouched show the pane behind.
+        let scale = (canvas_width as f64 / frame_width.max(1) as f64)
+            .min(canvas_height as f64 / frame_height.max(1) as f64);
+        let fit = |frame_side: usize, canvas_side: usize| {
+            (((frame_side as f64 * scale).round().max(1.0)) as usize).min(canvas_side)
+        };
+        let (draw_width, draw_height) = (
+            fit(frame_width, canvas_width),
+            fit(frame_height, canvas_height),
+        );
+        let (x0, y0) = (
+            (canvas_width - draw_width) / 2,
+            (canvas_height - draw_height) / 2,
+        );
+        for y in 0..draw_height {
+            let source_row = (y * frame_height / draw_height) * frame_width;
+            for x in 0..draw_width {
+                let at = (source_row + x * frame_width / draw_width) * 4;
+                if let [red, green, blue, ..] = frame.get(at..at + 3).unwrap_or_default() {
+                    canvas.set(x0 + x, y0 + y, Color::Rgb(*red, *green, *blue));
+                }
+            }
+        }
+        canvas.paint(buffer, self.request.background);
+    }
+}
+
+#[cfg(feature = "video")]
+impl Widget for Video<'_, '_> {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        let state = self.request.state;
+        let (now, _, _) = state.current_clock().unwrap_or((f64::NAN, 0.0, 0.0));
+        let gap = match self.clip(now) {
+            None => "no video event in this lane".to_owned(),
+            Some((event, name)) => match state.video_for(&name) {
+                Some(VideoEntry::Ready(strip)) => {
+                    // Where the sound is inside the clip, from the event's
+                    // own chain.
+                    let position = clip_position(event, now, f64::from(strip.duration())) as f32;
+                    self.paint(&name, strip, position, area, buffer);
+                    state.held_videos.borrow_mut().insert(
+                        self.request.slot,
+                        HeldFrame {
+                            name,
+                            strip: std::sync::Arc::clone(strip),
+                            position,
+                        },
+                    );
+                    return;
+                }
+                Some(VideoEntry::Failed(message)) => {
+                    note(self.request, buffer, area, &format!("{name}: {message}"));
+                    return;
+                }
+                Some(VideoEntry::NotVideo) => format!("{name} has no picture"),
+                Some(VideoEntry::Asking(_) | VideoEntry::ByNote(_)) | None => {
+                    format!("waiting for {name}")
+                }
+            },
+        };
+        // Nothing newer to draw: the last frame stays, the way a player
+        // holds its picture, rather than a blank between two takes.
+        let held = state.held_videos.borrow().get(&self.request.slot).cloned();
+        match held {
+            Some(held) => self.paint(&held.name, &held.strip, held.position, area, buffer),
+            None => note(self.request, buffer, area, &gap),
+        }
+    }
+}
+
 fn parse_fraction(value: &str) -> Option<f64> {
     let (numerator, denominator) = value.split_once('/')?;
     let numerator = numerator.trim().parse::<f64>().ok()?;
@@ -3145,6 +3823,12 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
             number("min", -80.0, -120.0, 0.0),
             number("max", 0.0, -120.0, 0.0),
         ],
+    },
+    PainterTerminal {
+        painter: "video",
+        entry: "Small by default: eight rows under its own line, a real picture on a kitty terminal and coloured cells on the glyph tiers, the clip's shape kept inside the rows. A plain video() paints the stage behind the score. The frame is the one the clock says is showing; between the clip's kept frames the earlier one shows, and past the last one the last one holds.",
+        options: &[],
+        numbers: &[],
     },
     PainterTerminal {
         painter: "markcss",
@@ -3619,6 +4303,18 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         origin: "rustel",
     },
     ReferenceEntry {
+        name: "video",
+        synonyms: &[],
+        summary: "Shows the picture of a video sample while its sound plays.",
+        description: "Shows the picture of a video sample while its sound plays. The frame follows the pattern's clock, so the picture plays with the sample and holds when the transport holds. The picture decodes once per clip and stays small. H.264, HEVC, AV1, VP9, VP8 and Motion JPEG decode in this build. A clip in another video codec says which codec it is.",
+        params: &[],
+        examples: &["$: s(\"bd\")._video()"],
+        tags: &["visualization"],
+        no_autocomplete: false,
+        deprecated: false,
+        origin: "rustel",
+    },
+    ReferenceEntry {
         name: "markcss",
         synonyms: &[],
         summary: "Overrides the css of highlighted events.",
@@ -3767,6 +4463,7 @@ mod tests {
             scale: None,
             frequency_hz: None,
             gain: Some(1.0),
+            sample: None,
             ui_visuals: 0,
             context: vec![(0, 4)],
         }
@@ -5298,6 +5995,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn fades_keep_their_colour_on_a_ground_the_terminal_owns() {
         let terminal = Theme::built_in("terminal").unwrap();
@@ -5328,6 +6026,7 @@ mod tests {
     /// The spectrogram paints its quiet level, so its lowest colour must
     /// be one the terminal can show. A reset ground would paint black or
     /// the default foreground, and the picture would open on a slab.
+    #[cfg(feature = "themes")]
     #[test]
     fn a_spectrum_ramp_on_a_terminal_ground_starts_visible() {
         let theme = Theme::built_in("terminal").expect("terminal ships");
@@ -5344,6 +6043,7 @@ mod tests {
     /// whole painter path runs under the terminal theme: no cell that
     /// carries a glyph may come back `Reset`, which the pixel raster
     /// paints as plain black, and the bars wear the palette's own slots.
+    #[cfg(feature = "themes")]
     #[test]
     fn a_roll_under_the_terminal_theme_paints_no_black_bars() {
         let state = playing(
@@ -5402,12 +6102,16 @@ mod tests {
         indexed.syntax.string = Color::Indexed(2);
         indexed.syntax.number = Color::Indexed(3);
         indexed.meter.peak = Color::Indexed(1);
-        for theme in [
+        #[cfg(feature = "themes")]
+        let themes = vec![
             theme(),
-            Theme::built_in("rustel-light").unwrap(),
-            Theme::built_in("mono").unwrap(),
+            Theme::built_in("rustel-light").expect("rustel-light"),
+            Theme::built_in("mono").expect("mono"),
             indexed,
-        ] {
+        ];
+        #[cfg(not(feature = "themes"))]
+        let themes = vec![theme(), indexed];
+        for theme in themes {
             for level in [-8.0, -32.0] {
                 let state = analyser_state(&[[level; UI_SPECTRUM_BINS]]);
                 let options = VisualOptions::parse("");
@@ -5956,6 +6660,7 @@ mod tests {
                     onset_id: trace.onset_id,
                     frequency_hz: Some(accepted_frequency),
                     gain: Some(1.0),
+                    sample: None,
                 };
                 let mut pending = std::collections::HashMap::from([(trace.onset_id, trace)]);
                 let real = correlate_submitted_traces(&mut pending, [accepted])
@@ -6066,14 +6771,138 @@ mod tests {
             "the picture is the same picture"
         );
 
-        // A different score is a different picture, and starts again.
+        // A different score is still the same stream of sound: the history
+        // carries on, and the new score's frames merge into it.
         visual.install_layout(
             rustel_runtime::ui_events::visual_layout("note(62)._scope()._spectrum()", 9).unwrap(),
         );
         assert!(
-            !visual.analysers_are_kept_across_a_generation(),
-            "a score that changed starts its analysers over"
+            visual.analysers_are_kept_across_a_generation(),
+            "the history of the sound outlives the score"
         );
+    }
+
+    /// An eval does not reset the spectrogram: the columns of the score
+    /// before stay in the scroll, the frames of the new score follow them,
+    /// and a tap the new score has not - a painter that went - loses its
+    /// ring.
+    #[test]
+    fn a_new_score_merges_into_the_spectrograms_history() {
+        let source = "note(60)._scope()._spectrum()";
+        let mut visual = VisualState::default();
+        visual.install_layout(rustel_runtime::ui_events::visual_layout(source, 7).unwrap());
+        visual.start();
+        let frame = |bins: f32| UiAudioAnalysisSet {
+            master: UiAudioAnalysisFrame {
+                scope: [0.5; UI_SCOPE_SAMPLES],
+                spectrum: [bins; UI_SPECTRUM_BINS],
+            },
+            visuals: vec![(
+                0,
+                UiAudioAnalysisFrame {
+                    scope: [0.5; UI_SCOPE_SAMPLES],
+                    spectrum: [bins; UI_SPECTRUM_BINS],
+                },
+            )],
+            sides: Vec::new(),
+        };
+        let feed = |visual: &mut VisualState, generation: u64, sequence: u64, bins: f32| {
+            visual.install_audio(
+                UiAudioMetadata {
+                    sequence,
+                    generation,
+                    device_time: 0.5,
+                    stream_id: 1,
+                    epoch: 1,
+                    end_frame: 24_000,
+                    sample_rate: 48_000,
+                },
+                frame(bins),
+            );
+        };
+        feed(&mut visual, 7, 1, -40.0);
+        feed(&mut visual, 7, 2, -20.0);
+        assert_eq!(visual.spectrogram(None).expect("the master").len(), 2);
+        assert_eq!(visual.spectrogram(Some(0)).expect("the tap").len(), 2);
+
+        // The new score: the columns of the old one stay at the front of
+        // the scroll and the new ones follow them.
+        visual.install_layout(rustel_runtime::ui_events::visual_layout(source, 8).unwrap());
+        feed(&mut visual, 8, 3, -30.0);
+        let columns = visual.spectrogram(None).expect("the master");
+        assert_eq!(columns.len(), 3);
+        assert_eq!(
+            columns.front(),
+            Some(&spectrogram_column(&UiAudioAnalysisFrame {
+                scope: [0.5; UI_SCOPE_SAMPLES],
+                spectrum: [-40.0; UI_SPECTRUM_BINS],
+            })),
+            "the oldest column of the score before leads the scroll"
+        );
+
+        // A score with no painter: the tap's ring goes, the master stays.
+        visual.install_layout(rustel_runtime::ui_events::visual_layout("note(62)", 9).unwrap());
+        assert!(visual.spectrogram(None).is_some());
+        assert!(visual.spectrogram(Some(0)).is_none());
+    }
+
+    /// A painter's slot counts the painters above it. An edit above moves
+    /// the slots, and each painter takes its own history to its new slot.
+    /// A painter that went leaves nothing behind for another to show.
+    #[test]
+    fn a_painter_keeps_its_own_history_when_the_painters_above_it_change() {
+        let tap = |bins: f32| UiAudioAnalysisFrame {
+            scope: [0.5; UI_SCOPE_SAMPLES],
+            spectrum: [bins; UI_SPECTRUM_BINS],
+        };
+        let mut visual = VisualState::default();
+        let install = |visual: &mut VisualState, source: &str, generation: u64| {
+            visual.install_layout_of(
+                rustel_runtime::ui_events::visual_layout(source, generation).unwrap(),
+                std::sync::Arc::from(source),
+            );
+        };
+        install(&mut visual, "note(60)._spectrum()\nnote(72)._spectrum()", 7);
+        visual.start();
+        visual.install_audio(
+            UiAudioMetadata {
+                sequence: 1,
+                generation: 7,
+                device_time: 0.5,
+                stream_id: 1,
+                epoch: 1,
+                end_frame: 24_000,
+                sample_rate: 48_000,
+            },
+            UiAudioAnalysisSet {
+                master: tap(-30.0),
+                visuals: vec![(0, tap(-40.0)), (1, tap(-20.0))],
+                sides: Vec::new(),
+            },
+        );
+        let history = |visual: &VisualState, slot: u8| {
+            visual
+                .spectrogram(Some(slot))
+                .and_then(|ring| ring.back().copied())
+        };
+        let (first, second) = (
+            Some(spectrogram_column(&tap(-40.0))),
+            Some(spectrogram_column(&tap(-20.0))),
+        );
+
+        // An edit in the first line moves both painters by one byte.
+        install(
+            &mut visual,
+            "note(600)._spectrum()\nnote(72)._spectrum()",
+            8,
+        );
+        assert_eq!(history(&visual, 0), first);
+        assert_eq!(history(&visual, 1), second);
+
+        // The first painter goes: the second takes its own history to slot 0.
+        install(&mut visual, "note(72)._spectrum()", 9);
+        assert_eq!(history(&visual, 0), second, "the painter's own history");
+        assert_eq!(history(&visual, 1), None);
     }
 
     #[test]
@@ -6246,5 +7075,573 @@ mod tests {
             }
         }
         assert!(checked >= 8, "every terminal number is drawn");
+    }
+
+    #[cfg(feature = "video")]
+    mod video {
+        //! The video painter: the clip a lane's sound names, its frame
+        //! following the clock, and the poll that asks for each strip once.
+
+        use super::super::*;
+        use super::{draw, event, playing, rows};
+
+        /// A two-frame strip: all red, then all blue.
+        fn strip() -> rustel_runtime::video::VideoThumbnails {
+            let red = [255, 0, 0, 255].repeat(4);
+            let blue = [0, 0, 255, 255].repeat(4);
+            rustel_runtime::video::VideoThumbnails::from_frames(2, 2, vec![(0.0, red), (0.5, blue)])
+                .expect("strip")
+        }
+
+        fn clip_event(target_time: f64) -> UiScheduledEvent {
+            let mut event = event(1, "0/1", "1/2", target_time);
+            event.value = Some("s:clip.webm note:60".to_owned());
+            event.label = None;
+            // The lane's one visual is slot 0, the transpiler's first.
+            event.ui_visuals = 1;
+            event
+        }
+
+        /// The walk a voice resolved: `rate` seconds of the clip a second,
+        /// from `begin` of it, to its end.
+        fn walk(rate: f32, begin: f32) -> rustel_scheduler::TraceSampleWalk {
+            rustel_scheduler::TraceSampleWalk {
+                rate,
+                begin,
+                end: None,
+                reversed: false,
+                loop_secs: None,
+                nudge_secs: 0.0,
+            }
+        }
+
+        #[test]
+        fn an_event_names_the_sound_its_chain_carries() {
+            let mut event = clip_event(10.0);
+            assert_eq!(event_clip_name(&event), Some("clip.webm".to_owned()));
+            event.value = Some("note:60 gain:1".to_owned());
+            assert_eq!(event_clip_name(&event), None, "no sound, no clip");
+            event.value = Some("speed:2 s:loop.mkv s:again.webm".to_owned());
+            assert_eq!(
+                event_clip_name(&event),
+                Some("loop.mkv".to_owned()),
+                "the first sound"
+            );
+            // The pick the voice plays names the file the picture shows.
+            event.value = Some("s:clips n:2 note:60".to_owned());
+            assert_eq!(
+                event_clip_name(&event),
+                Some("clips:2".to_owned()),
+                "n(2) is the third file, the name:2 spelling"
+            );
+            event.value = Some("s:clips n:2.5".to_owned());
+            assert_eq!(
+                event_clip_name(&event),
+                Some("clips".to_owned()),
+                "a fractional pick is no file index"
+            );
+            event.value = Some("s:take bank:reels n:1".to_owned());
+            assert_eq!(
+                event_clip_name(&event),
+                Some("reels_take:1".to_owned()),
+                "the voice plays `reels_take` of `.bank(\"reels\")`"
+            );
+        }
+
+        #[test]
+        fn a_bank_keyed_by_note_shows_the_clip_each_note_picks() {
+            let at = |note: f64, time: f64| {
+                let mut event = clip_event(time);
+                event.onset_id = note as u64;
+                event.value = Some(format!("s:keys note:{note}"));
+                event.frequency_hz = Some(rustel_core::util::midi_to_freq(note) as f32);
+                event
+            };
+            let mut state = playing(
+                "$: note(\"48 50 60\").s(\"keys\")._video()",
+                vec![at(48.0, 10.0), at(50.0, 10.2), at(60.0, 10.4)],
+                0.0,
+            );
+            assert_eq!(state.video_names_to_ask(), vec!["keys".to_owned()]);
+            // The library says the bank picks by note. Keys 52 and 48 are
+            // as near to 50, and the first listed wins, as in the voice.
+            assert!(state.install_video("keys", VideoEntry::ByNote(vec![52.0, 48.0, 60.0])));
+            assert_eq!(
+                state.video_names_to_ask(),
+                vec!["keys note:48", "keys note:52", "keys note:60"]
+            );
+            assert!(
+                state.video_feeds().is_empty(),
+                "the bank is no clip, and no key has answered yet"
+            );
+            for key in ["keys note:48", "keys note:52", "keys note:60"] {
+                assert!(state.install_video(key, VideoEntry::Ready(std::sync::Arc::new(strip()))));
+            }
+            assert_eq!(
+                state.video_feeds(),
+                vec!["keys note:48", "keys note:52", "keys note:60"]
+            );
+            assert!(state.video_feed_frame("keys note:52").is_some());
+
+            // With no note, a `gm_` name plays at the voice's MIDI 48.
+            let mut noteless = clip_event(10.0);
+            noteless.value = Some("s:gm_keys".to_owned());
+            let mut state = playing("$: s(\"gm_keys\")._video()", vec![noteless], 0.0);
+            assert!(state.install_video("gm_keys", VideoEntry::ByNote(vec![36.0, 52.0])));
+            assert_eq!(state.video_names_to_ask(), vec!["gm_keys note:52"]);
+        }
+
+        #[test]
+        fn a_picture_larger_than_its_rows_still_fills_them() {
+            // A real clip keeps up to 160 px on its long edge, while the
+            // band's rows hold a fraction of that in points. The frame
+            // must shrink into them, not collapse to a single cell.
+            let frame = [80, 40, 160, 255].repeat(160 * 90);
+            let wide =
+                rustel_runtime::video::VideoThumbnails::from_frames(160, 90, vec![(0.0, frame)])
+                    .expect("strip");
+            let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
+            assert!(state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(wide))));
+            let picture = draw("video", "", &state, Rect::new(0, 0, 80, 8));
+            let painted = picture
+                .content
+                .iter()
+                .filter(|cell| cell.fg == Color::Rgb(80, 40, 160))
+                .count();
+            assert!(
+                painted > 100,
+                "the shrunken frame filled the band: {painted} cells"
+            );
+        }
+
+        #[test]
+        fn the_picture_starts_where_the_sound_does_and_walks_its_speed() {
+            // `begin` skips into the clip the ratio names: the second half
+            // of a half-second clip is the blue frame, at once.
+            let mut begun = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
+            let mut chain = clip_event(10.0);
+            chain.sample = Some(walk(1.0, 1.0));
+            begun.events.pop_front();
+            begun.events.push_back(chain);
+            assert!(
+                begun.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
+            );
+            let picture = draw("video", "", &begun, Rect::new(0, 0, 20, 8));
+            assert!(
+                picture
+                    .content
+                    .iter()
+                    .any(|cell| cell.fg == Color::Rgb(0, 0, 255)),
+                "the clip starts at its second half"
+            );
+
+            // Twice the speed reaches the same place in half the time:
+            // 0.25 s in at 2x is the blue frame.
+            let mut sped = playing("$: s(\"clip.webm\")._video()", vec![clip_event(9.75)], 0.0);
+            let mut chain = clip_event(9.75);
+            chain.sample = Some(walk(2.0, 0.0));
+            sped.events.pop_front();
+            sped.events.push_back(chain);
+            assert!(
+                sped.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
+            );
+            let picture = draw("video", "", &sped, Rect::new(0, 0, 20, 8));
+            assert!(
+                picture
+                    .content
+                    .iter()
+                    .any(|cell| cell.fg == Color::Rgb(0, 0, 255)),
+                "0.2 s at twice the speed is the later frame"
+            );
+        }
+
+        /// The picture walks the way the voice resolved it, not the way
+        /// the chain's text reads: a note or `loopAt` that speeds the sound
+        /// speeds the picture, a reversed voice counts its `begin` from the
+        /// clip's end, a slice holds where it stops the sound, a loop wraps
+        /// where the voice's does, and a nudge waits.
+        #[test]
+        fn the_picture_follows_the_walk_the_voice_resolved() {
+            use rustel_scheduler::TraceSampleWalk;
+            let at = |walk: TraceSampleWalk, elapsed: f64| {
+                let mut event = clip_event(10.0);
+                event.sample = Some(walk);
+                clip_position(&event, 10.0 + elapsed, 2.0)
+            };
+            let near = |shown: f64, expected: f64, what: &str| {
+                assert!(
+                    (shown - expected).abs() < 1e-6,
+                    "{what}: {shown}, not {expected}"
+                );
+            };
+            // The chain's text says no speed, and the voice walks at twice
+            // the rate: half a second in is a second into the clip.
+            near(at(walk(2.0, 0.0), 0.5), 1.0, "a note an octave up");
+            let reversed = TraceSampleWalk {
+                reversed: true,
+                ..walk(1.0, 0.5)
+            };
+            near(
+                at(reversed, 0.0),
+                1.0,
+                "a reversed begin(0.5) starts mid-clip",
+            );
+            near(at(reversed, 0.5), 0.5, "and walks back");
+            let sliced = TraceSampleWalk {
+                end: Some(0.25),
+                ..walk(1.0, 0.0)
+            };
+            near(
+                at(sliced, 1.5),
+                0.5,
+                "end(0.25) holds where the sound stops",
+            );
+            let looped = TraceSampleWalk {
+                loop_secs: Some((0.5, 1.5)),
+                ..walk(1.0, 0.0)
+            };
+            near(at(looped, 1.75), 0.75, "the loop wraps at its own end");
+            let nudged = TraceSampleWalk {
+                nudge_secs: 0.25,
+                ..walk(1.0, 0.0)
+            };
+            near(at(nudged, 0.5), 0.25, "a nudge holds the start");
+            near(at(walk(0.0, 0.5), 3.0), 1.0, "speed(0) stays at its begin");
+        }
+
+        /// A sound of a video lane with no picture is no clip: the dock
+        /// does not list it, and while it plays the painter keeps the
+        /// lane's clip, not a note about the drum.
+        #[test]
+        fn a_sound_with_no_picture_is_no_feed() {
+            // The clip began 0.6 s ago, on its blue frame, and a drum of
+            // the same lane sounds now.
+            let mut drum = clip_event(10.0);
+            drum.onset_id = 2;
+            drum.value = Some("s:bd".to_owned());
+            let mut state = playing(
+                "$: s(\"clip.webm bd\")._video()",
+                vec![clip_event(9.4), drum],
+                0.0,
+            );
+            assert!(
+                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
+            );
+            assert!(state.install_video("bd", VideoEntry::NotVideo));
+            assert_eq!(state.video_feeds(), ["clip.webm"]);
+            assert!(
+                state.video_names_to_ask().is_empty(),
+                "no name is asked again"
+            );
+            let picture = draw("video", "", &state, Rect::new(0, 0, 20, 8));
+            let blue = picture
+                .content
+                .iter()
+                .filter(|cell| cell.fg == Color::Rgb(0, 0, 255))
+                .count();
+            assert!(blue > 100, "the clip shows while the drum plays: {blue}");
+        }
+
+        #[test]
+        fn the_painter_draws_the_frame_the_clock_is_showing() {
+            let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
+            assert!(
+                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip()))),
+                "the strip lands"
+            );
+            // The event sounds now, so the first frame shows: red.
+            let picture = draw("video", "", &state, Rect::new(0, 0, 20, 8));
+            let red = picture
+                .content
+                .iter()
+                .filter(|cell| cell.fg == Color::Rgb(255, 0, 0))
+                .count();
+            assert!(red > 100, "the first frame filled the pane: {red} cells");
+            assert!(
+                picture
+                    .content
+                    .iter()
+                    .all(|cell| cell.fg != Color::Rgb(0, 0, 255)),
+                "the second frame is not showing yet"
+            );
+        }
+
+        #[test]
+        fn the_frame_follows_the_position_into_the_clip() {
+            // The event began 0.6 s ago: past the second frame's time, the
+            // picture holds the blue one.
+            let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(9.4)], 0.0);
+            assert!(
+                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
+            );
+            let picture = draw("video", "", &state, Rect::new(0, 0, 20, 8));
+            let blue = picture
+                .content
+                .iter()
+                .filter(|cell| cell.fg == Color::Rgb(0, 0, 255))
+                .count();
+            assert!(blue > 100, "the later frame filled the pane: {blue} cells");
+        }
+
+        #[test]
+        fn the_last_frame_stays_while_the_painter_has_nothing_newer() {
+            // The blue frame shows 0.6 s into the clip.
+            let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(9.4)], 0.0);
+            assert!(
+                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
+            );
+            let blue = |state: &VisualState| {
+                draw("video", "", state, Rect::new(0, 0, 20, 8))
+                    .content
+                    .iter()
+                    .filter(|cell| cell.fg == Color::Rgb(0, 0, 255))
+                    .count()
+            };
+            assert!(blue(&state) > 100, "the frame the clock shows");
+            let place = |state: &VisualState| {
+                state
+                    .video_feed_frame("clip.webm")
+                    .map(|(position, _)| position)
+            };
+            // Past the clip's last frame, at its end.
+            let shown = place(&state);
+            assert_eq!(shown, Some(0.5), "the dock's widget is at the same frame");
+            // The events go, as they do between an edit and the new
+            // score's first events, and the clip is asked for again.
+            state.events.clear();
+            state.videos.clear();
+            assert!(blue(&state) > 100, "the frame stays, not a blank");
+            assert_eq!(
+                place(&state),
+                None,
+                "a feed with no strip has nothing to show"
+            );
+            assert!(
+                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
+            );
+            assert_eq!(
+                place(&state),
+                shown,
+                "the widget holds its place too, not the poster"
+            );
+        }
+
+        #[test]
+        fn a_clip_that_has_not_decoded_says_so_and_a_refusal_names_itself() {
+            let state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
+            let waiting = draw("video", "", &state, Rect::new(0, 0, 40, 8));
+            assert!(
+                rows(&waiting).contains("waiting for clip.webm"),
+                "says the clip is on its way"
+            );
+            let mut refused = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
+            assert!(refused.install_video(
+                "clip.webm",
+                VideoEntry::Failed("the picture is H.264".to_owned())
+            ));
+            let picture = draw("video", "", &refused, Rect::new(0, 0, 40, 8));
+            assert!(
+                rows(&picture).contains("H.264"),
+                "the refusal is the note: {}",
+                rows(&picture)
+            );
+        }
+
+        #[test]
+        fn the_poll_names_each_clip_once_and_stops_at_its_strip() {
+            let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
+            let asks = state.video_names_to_ask();
+            assert_eq!(asks, vec!["clip.webm".to_owned()]);
+            // Another lane's sound is not this painter's to ask for: the
+            // spiral's lane is slot 1.
+            let mut other = clip_event(10.2);
+            other.onset_id = 2;
+            other.ui_visuals = 1_u64 << 1;
+            other.value = Some("s:other.webm".to_owned());
+            let wider = playing(
+                "stack(s('clip.webm')._video(), s('other.webm')._spiral())",
+                vec![clip_event(10.0), other],
+                0.0,
+            );
+            assert_eq!(
+                wider.video_names_to_ask(),
+                vec!["clip.webm".to_owned()],
+                "the spiral's sound is not asked for"
+            );
+            // The dock's widget lists what the painters asked for: the
+            // spiral's lane is not a video lane, so its sound is no feed.
+            let mut wider = wider;
+            for name in wider.video_names_to_ask() {
+                wider.note_video_ask(&name, false);
+            }
+            assert_eq!(wider.video_feeds(), vec!["clip.webm".to_owned()]);
+            state.note_video_ask("clip.webm", false);
+            assert_eq!(
+                state.video_names_to_ask(),
+                vec!["clip.webm".to_owned()],
+                "an unanswered ask is asked again"
+            );
+            assert!(
+                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
+            );
+            assert!(
+                state.video_names_to_ask().is_empty(),
+                "a strip answers the ask"
+            );
+        }
+
+        #[test]
+        fn a_looping_clip_wraps_its_picture_back_to_the_start() {
+            // Three frames: red, green, blue, the last at half a second.
+            let strip = rustel_runtime::video::VideoThumbnails::from_frames(
+                2,
+                2,
+                vec![
+                    (0.0, [255, 0, 0, 255].repeat(4)),
+                    (0.25, [0, 255, 0, 255].repeat(4)),
+                    (0.5, [0, 0, 255, 255].repeat(4)),
+                ],
+            )
+            .expect("strip");
+            let mut looping = playing("$: s(\"clip.webm\")._video()", vec![clip_event(9.3)], 0.0);
+            let mut chain = clip_event(9.3);
+            // `loop(1)`: the voice loops the whole sound, half a second.
+            chain.sample = Some(rustel_scheduler::TraceSampleWalk {
+                loop_secs: Some((0.0, 0.5)),
+                ..walk(1.0, 0.0)
+            });
+            looping.events.pop_back();
+            looping.events.push_back(chain);
+            assert!(
+                looping.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip)))
+            );
+            // 0.7 s in: past the clip's end, so the loop wraps to 0.2 s -
+            // the red frame - where the unlooping clip holds the blue one.
+            let picture = draw("video", "", &looping, Rect::new(0, 0, 20, 8));
+            assert!(
+                picture
+                    .content
+                    .iter()
+                    .any(|cell| cell.fg == Color::Rgb(255, 0, 0)),
+                "the loop wrapped the picture to its start"
+            );
+            assert!(
+                picture
+                    .content
+                    .iter()
+                    .all(|cell| cell.fg != Color::Rgb(0, 0, 255)),
+                "the last frame is not held while the clip loops"
+            );
+        }
+
+        #[test]
+        fn a_whole_stack_painter_asks_for_every_lane_s_clip() {
+            // `all(video)` tags no event, so an untagged sound is its clip.
+            let mut plain = clip_event(10.0);
+            plain.ui_visuals = 0;
+            let mut state = playing("$: s(\"clip.webm\")\nall(video)", vec![plain], 0.0);
+            assert_eq!(state.video_names_to_ask(), vec!["clip.webm".to_owned()]);
+            state.note_video_ask("clip.webm", false);
+            assert_eq!(state.video_feeds(), vec!["clip.webm".to_owned()]);
+            assert!(
+                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
+            );
+            assert!(state.video_feed_frame("clip.webm").is_some());
+        }
+
+        #[test]
+        fn a_named_feed_shows_its_own_event_s_place_in_the_clip() {
+            // The dock's widget and the detached window ask by name: the
+            // position is the named clip's own event, not another's.
+            let mut a_event = clip_event(10.0);
+            a_event.value = Some("s:a.webm".to_owned());
+            let mut state = playing(
+                "stack(s('a.webm')._video(), s('b.webm')._video())",
+                vec![a_event],
+                0.0,
+            );
+            assert!(state.install_video("a.webm", VideoEntry::Ready(std::sync::Arc::new(strip()))));
+            assert!(state.install_video("b.webm", VideoEntry::Ready(std::sync::Arc::new(strip()))));
+            // `a.webm` has its event sounding now; `b.webm` has none, and
+            // shows its poster frame - the clip's first.
+            assert!(state.video_feed_frame("a.webm").is_some());
+            let (position, _) = state
+                .video_feed_frame("b.webm")
+                .expect("a landed strip always has a frame to show");
+            assert_eq!(position, 0.0, "the poster is the clip's first frame");
+            assert_eq!(state.video_feeds(), vec!["a.webm", "b.webm"]);
+        }
+
+        #[test]
+        fn a_clip_that_never_answers_is_said_so_and_left_alone() {
+            let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
+            // A clip that decodes is not given up on, however long it takes.
+            for _ in 0..=2 * u16::from(VIDEO_ASK_LIMIT) {
+                assert!(!state.note_video_ask("clip.webm", true));
+            }
+            assert!(matches!(
+                state.video_for("clip.webm"),
+                Some(VideoEntry::Asking(_))
+            ));
+            let mut ran_out = false;
+            for _ in 0..=VIDEO_ASK_LIMIT {
+                ran_out = state.note_video_ask("clip.webm", false);
+            }
+            assert!(ran_out, "the last ask says the asking ran out");
+            assert!(
+                matches!(state.video_for("clip.webm"), Some(VideoEntry::Failed(_))),
+                "the asking ran out"
+            );
+            assert!(
+                state.video_names_to_ask().is_empty(),
+                "a failed clip is not asked for again"
+            );
+            // A new score gives the clip its chance back: the failed note
+            // is gone, and the next events ask again. A strip that lands
+            // meanwhile comes straight from the library's own table.
+            state.install_layout(
+                rustel_runtime::ui_events::visual_layout("$: s(\"clip.webm\")._video().slow(2)", 2)
+                    .expect("layout"),
+            );
+            assert!(
+                state.video_for("clip.webm").is_none(),
+                "the new score holds no stale refusal"
+            );
+        }
+
+        /// A video painter holds its last frame across an edit at its new
+        /// slot. When a painter above it goes, it does not take that
+        /// painter's frame.
+        #[test]
+        fn a_held_frame_follows_its_painter_to_its_new_slot() {
+            let mut state = VisualState::default();
+            let install = |state: &mut VisualState, source: &str, generation: u64| {
+                state.install_layout_of(
+                    rustel_runtime::ui_events::visual_layout(source, generation).expect("layout"),
+                    std::sync::Arc::from(source),
+                );
+            };
+            install(
+                &mut state,
+                "$: s(\"a.webm\")._video()\n$: s(\"b.webm\")._video()",
+                1,
+            );
+            let strip = std::sync::Arc::new(strip());
+            for (slot, name) in [(0, "a.webm"), (1, "b.webm")] {
+                let frame = HeldFrame {
+                    name: name.to_owned(),
+                    strip: std::sync::Arc::clone(&strip),
+                    position: 0.0,
+                };
+                state.held_videos.get_mut().insert(Some(slot), frame);
+            }
+            install(&mut state, "$: s(\"b.webm\")._video()", 2);
+            let held = state.held_videos.get_mut();
+            let names: Vec<_> = held
+                .iter()
+                .map(|(slot, held)| (*slot, held.name.as_str()))
+                .collect();
+            assert_eq!(names, [(Some(0), "b.webm")]);
+        }
     }
 }

@@ -44,6 +44,12 @@ pub enum MenuAction {
     NewSession,
     OpenSet,
     OpenRecent,
+    /// Import the entries of a Strudel pattern export into the open set,
+    /// as score files of its folder.
+    ImportStrudel,
+    /// Export the open set's scores as one pattern export beside the
+    /// sets, in the shape strudel.cc's Patterns tab gives and takes.
+    ExportPatterns,
     RenameSet,
     /// Copy the samples this set's scores name into the set's own folder,
     /// so the folder plays on its own wherever it goes.
@@ -1398,6 +1404,18 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
                 hint(BindAction::OpenSet),
             ),
             MenuItem::action(MenuAction::OpenRecent, "Open recent\u{2026}", 'r', ""),
+            MenuItem::action(
+                MenuAction::ImportStrudel,
+                "Import patterns\u{2026}",
+                'i',
+                "",
+            ),
+            MenuItem::action(
+                MenuAction::ExportPatterns,
+                "Export patterns\u{2026}",
+                'x',
+                "",
+            ),
             MenuItem::action(MenuAction::RenameSet, "Rename set\u{2026}", 'a', "")
                 .enabled(!cx.recording),
             MenuItem::separator(),

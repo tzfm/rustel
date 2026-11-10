@@ -313,7 +313,9 @@ mod realtime {
     #[derive(Clone, Copy, Default)]
     struct Ordinal {
         state: OrdinalState,
-        target_frame: u64,
+        /// The musical onset of the event: its target frame plus the lead of
+        /// its note. A copy past it holds the start of its output.
+        musical: u64,
     }
 
     const ACTIVATED_WORD_BITS: usize = u64::BITS as usize;
@@ -444,7 +446,7 @@ mod realtime {
                         .enumerate()
                         .any(|(word, &bits)| {
                             activated_offsets(bits).any(|offset| {
-                                window.ordinals[word * ACTIVATED_WORD_BITS + offset].target_frame
+                                window.ordinals[word * ACTIVATED_WORD_BITS + offset].musical
                                     < previous_end
                             })
                         })
@@ -457,10 +459,12 @@ mod realtime {
             self.drain_offers();
         }
 
+        /// The device admitted or refused the event of `tag`, whose musical
+        /// onset is `musical`.
         pub(crate) fn admission(
             &mut self,
             tag: ConfirmationOnset,
-            target_frame: u64,
+            musical: u64,
             generation: u64,
             accepted: bool,
         ) {
@@ -479,13 +483,13 @@ mod realtime {
                 window.fail(WindowOutcome::DuplicateOrdinal);
                 return;
             }
-            ordinal.target_frame = target_frame;
+            ordinal.musical = musical;
             ordinal.state = if accepted {
                 OrdinalState::Admitted
             } else {
                 OrdinalState::Failed
             };
-            if target_frame >= offer.end_frame {
+            if musical >= offer.end_frame {
                 window.fail(WindowOutcome::InvalidOffer);
             } else if !accepted {
                 window.fail(WindowOutcome::AdmissionRefused);
@@ -556,7 +560,7 @@ mod realtime {
                         .any(|ordinal| match ordinal.state {
                             OrdinalState::Unseen => offer.end_frame > takeover_frame,
                             OrdinalState::Admitted | OrdinalState::Activated => {
-                                ordinal.target_frame >= takeover_frame
+                                ordinal.musical >= takeover_frame
                             }
                             OrdinalState::Copied | OrdinalState::Failed => false,
                         });
@@ -598,7 +602,7 @@ mod realtime {
                             for offset in activated_offsets(*bits) {
                                 let ordinal =
                                     &mut window.ordinals[word * ACTIVATED_WORD_BITS + offset];
-                                if ordinal.target_frame < end {
+                                if ordinal.musical < end {
                                     ordinal.state = OrdinalState::Copied;
                                     *bits &= !(1u64 << offset);
                                     window.copied += 1;

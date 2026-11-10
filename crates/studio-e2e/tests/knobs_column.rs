@@ -394,3 +394,128 @@ fn add_needs_a_list() {
         studio.status()
     );
 }
+
+/// The fixture plugin and a preset file of its own, as the only folders of
+/// the process. The plugin is loaded, for its presets read through the
+/// class its load gives it.
+fn fixture_with_presets() -> (tempfile::TempDir, tempfile::TempDir) {
+    let folder = tempfile::tempdir().expect("plugin folder");
+    let presets = tempfile::tempdir().expect("preset folder");
+    let of_fixture = presets.path().join(rustel_vst3_fixture::NAME);
+    std::fs::create_dir_all(&of_fixture).expect("preset folder");
+    std::fs::write(
+        of_fixture.join("Dark Bass.vstpreset"),
+        rustel_vst3_fixture::preset(0.5, 0.0),
+    )
+    .expect("preset file");
+    let plugins = folder.path().join("plugins");
+    rustel_vst3_fixture::install(&plugins);
+    let host = rustel_runtime::vst::host();
+    host.set_preset_folder(presets.path().to_path_buf());
+    rustel_runtime::vst::pin_standard_folders(vec![plugins]);
+    host.resolve(rustel_vst3_fixture::NAME, true);
+    host.wait_idle();
+    // The first ask of the presets arms the read of the root; the second
+    // sees its end.
+    host.presets(rustel_vst3_fixture::NAME);
+    host.wait_idle();
+    (folder, presets)
+}
+
+/// The presets of a plugin call sit under the rails of the column, closed
+/// until → opens them: End reaches the heading, the names walk under it,
+/// and Enter - and a click - write the preset into the call, so the score
+/// plays it. A pick of another name replaces the one held.
+#[test]
+fn the_presets_of_a_plugin_call_write_the_score() {
+    // The studio first: its own start pins no plugin folder, and a pin
+    // after it is the one the host keeps.
+    let mut studio = studio_over("$: s(\"bd\").vst(\"rustel fixture\", { gain: 1 })");
+    let (_folder, _presets) = fixture_with_presets();
+    open_knobs(&mut studio);
+    // The host reads the plugin folders and the preset folders on its own
+    // thread; the section shows once the names are here.
+    studio.pump_until(
+        std::time::Duration::from_secs(20),
+        "the presets section",
+        |studio| studio.rows().iter().any(|row| row.contains("▸ presets")),
+    );
+    let column = column_text(&studio.rows());
+    assert!(
+        column
+            .iter()
+            .any(|row| row.contains("gain") && row.contains("1")),
+        "the gain rail:\n{}",
+        column.join("\n")
+    );
+    row_containing(&column, "presets");
+    row_containing(&column, "1");
+
+    // ↓ walks to the heading under the rails - its hint says what → does -
+    // → opens it, and ↓ walks to the name. Enter writes the preset into
+    // the call.
+    for _ in 0..12 {
+        if studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("opens the presets"))
+        {
+            break;
+        }
+        studio.press(KeyCode::Down, KeyModifiers::NONE);
+        studio.settle();
+    }
+    row_containing(&studio.rows(), "opens the presets");
+    studio.press(KeyCode::Right, KeyModifiers::NONE);
+    studio.settle();
+    let column = column_text(&studio.rows());
+    row_containing(&column, "▾ presets");
+    row_containing(&column, "Dark Bass");
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    assert!(
+        studio.score().contains("preset: \"Dark Bass\""),
+        "Enter wrote the preset:\n{}",
+        studio.score()
+    );
+
+    // A click on a name writes it too, and a preset the call holds gives
+    // way to the one picked.
+    let rows = studio.rows();
+    let at = rows
+        .iter()
+        .position(|row| row.contains("Dark Bass"))
+        .unwrap_or_else(|| panic!("the preset row:\n{}", rows.join("\n")));
+    let x = rows[0].chars().count() as u16 - 10;
+    studio.mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        x,
+        at as u16,
+        KeyModifiers::NONE,
+    );
+    studio.mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        x,
+        at as u16,
+        KeyModifiers::NONE,
+    );
+    studio.settle();
+    assert_eq!(
+        studio.score().matches("preset:").count(),
+        1,
+        "the click kept one preset member:\n{}",
+        studio.score()
+    );
+
+    // ← closes the section, and the heading keeps its row under the rails.
+    studio.press(KeyCode::Left, KeyModifiers::NONE);
+    studio.settle();
+    let column = column_text(&studio.rows());
+    row_containing(&column, "▸ presets");
+    assert!(
+        !column.iter().any(|row| row.contains("Dark Bass")),
+        "the names went with the fold:\n{}",
+        column.join("\n")
+    );
+}

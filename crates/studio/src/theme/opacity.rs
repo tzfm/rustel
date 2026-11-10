@@ -353,10 +353,7 @@ mod tests {
     #[test]
     fn fixed_presets_load_their_authored_json_without_recalibration() {
         let mut names = BTreeSet::new();
-        for &(name, document) in super::super::BUILT_INS
-            .iter()
-            .chain(super::super::SHOWROOM_THEMES)
-        {
+        for (name, document) in super::super::fixed_themes() {
             assert!(names.insert(name), "duplicate fixed theme: {name}");
             let authored = Theme::from_json(document).unwrap().named(name);
             let loaded = Theme::built_in(name).unwrap();
@@ -368,6 +365,7 @@ mod tests {
         assert_eq!(names, fixed_names, "every fixed preset comes from JSON");
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn every_animated_preset_and_random_palette_has_a_visible_bounded_balance() {
         let names: BTreeSet<_> = Theme::built_in_names()
@@ -458,46 +456,51 @@ mod tests {
             "a bright crest cannot buy a background that obscures the quiet phase"
         );
 
-        let theme = Theme::built_in("lsd").unwrap();
-        for effect in [CharacterEffect::Aurora, CharacterEffect::Hologram] {
-            let mut theme = theme.clone();
-            theme.set_character_effect(Some(effect));
-            let character = CharacterWash::from_theme(&theme).unwrap();
-            let mut targets = vec![theme.accent, theme.syntax.number, theme.foreground];
-            if effect == CharacterEffect::Hologram {
-                targets.push(mix(theme.muted, theme.foreground, 0.58));
-            }
-            let endpoints = targets.clone();
-            for &first in &endpoints {
-                for &second in &endpoints {
-                    targets.push(mix(first, second, 0.37));
+        #[cfg(feature = "themes")]
+        {
+            let theme = Theme::built_in("lsd").expect("lsd");
+            for effect in [CharacterEffect::Aurora, CharacterEffect::Hologram] {
+                let mut theme = theme.clone();
+                theme.set_character_effect(Some(effect));
+                let character = CharacterWash::from_theme(&theme).unwrap();
+                let mut targets = vec![theme.accent, theme.syntax.number, theme.foreground];
+                if effect == CharacterEffect::Hologram {
+                    targets.push(mix(theme.muted, theme.foreground, 0.58));
                 }
-            }
-            for original in [theme.syntax.comment, theme.syntax.string, theme.foreground] {
-                for native_amount in [0.0, 0.18] {
-                    for opacity in [0, 37, 100] {
-                        let character = character.at_opacity(opacity);
-                        let bound =
-                            ColorBounds::native(original, native_amount).characters(character);
-                        let (lr, lg, lb) = true_rgb(bound.low).unwrap();
-                        let (hr, hg, hb) = true_rgb(bound.high).unwrap();
-                        for native_target in [
-                            Color::Rgb(0, 0, 0),
-                            Color::Rgb(255, 255, 255),
-                            Color::Rgb(255, 0, 128),
-                        ] {
-                            let native = mix(original, native_target, native_amount);
-                            for &target in &targets {
-                                for phase in [0.0, 0.5, 1.0] {
-                                    let shaded = mix(native, target, character.strength * phase);
-                                    let (r, g, b) =
-                                        true_rgb(mix(native, shaded, character.opacity)).unwrap();
-                                    assert!(
-                                        (lr..=hr).contains(&r)
-                                            && (lg..=hg).contains(&g)
-                                            && (lb..=hb).contains(&b),
-                                        "{effect:?}: ordered phase escaped its RGB bounds"
-                                    );
+                let endpoints = targets.clone();
+                for &first in &endpoints {
+                    for &second in &endpoints {
+                        targets.push(mix(first, second, 0.37));
+                    }
+                }
+                for original in [theme.syntax.comment, theme.syntax.string, theme.foreground] {
+                    for native_amount in [0.0, 0.18] {
+                        for opacity in [0, 37, 100] {
+                            let character = character.at_opacity(opacity);
+                            let bound =
+                                ColorBounds::native(original, native_amount).characters(character);
+                            let (lr, lg, lb) = true_rgb(bound.low).unwrap();
+                            let (hr, hg, hb) = true_rgb(bound.high).unwrap();
+                            for native_target in [
+                                Color::Rgb(0, 0, 0),
+                                Color::Rgb(255, 255, 255),
+                                Color::Rgb(255, 0, 128),
+                            ] {
+                                let native = mix(original, native_target, native_amount);
+                                for &target in &targets {
+                                    for phase in [0.0, 0.5, 1.0] {
+                                        let shaded =
+                                            mix(native, target, character.strength * phase);
+                                        let (r, g, b) =
+                                            true_rgb(mix(native, shaded, character.opacity))
+                                                .unwrap();
+                                        assert!(
+                                            (lr..=hr).contains(&r)
+                                                && (lg..=hg).contains(&g)
+                                                && (lb..=hb).contains(&b),
+                                            "{effect:?}: ordered phase escaped its RGB bounds"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -524,6 +527,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn palette_bound_character_effects_can_use_more_of_their_colours() {
         for name in ["lsd", "synthwave"] {
@@ -539,6 +543,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn arbitrary_picture_colours_cannot_cross_the_contrast_budget() {
         let theme = Theme::built_in("unicorn").unwrap();
@@ -566,6 +571,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "themes")]
     #[test]
     fn custom_opacities_and_static_themes_are_not_automatically_rewritten() {
         let mut theme = Theme::built_in("rustel-drift").unwrap();

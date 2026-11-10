@@ -75,7 +75,7 @@ pub use device::{
     AssetQueuePressureSnapshot, AudioDeviceInfo, AudioInput, CallbackTripwireArmError,
     DevicePlaybackError, LiveAnalysisSnapshot, LiveDeviceMemory, LiveDeviceReport, LiveReverbBatch,
     LiveScalarDevice, RecordCapture, RecordCaptureError, SILENT_OUTPUT_NAME, ScalarDevice,
-    audio_device_inventory, audio_devices, input_retry_delay,
+    audio_device_inventory, audio_devices, input_retry_delay, prime_playback_host,
 };
 pub use device_facts::{
     AudioHost, AudioInputFacts, AudioOutputFacts, AudioSampleFormat, AudioStreamFacts,
@@ -83,9 +83,10 @@ pub use device_facts::{
 pub use dispatch::DspDispatch;
 pub use distortion::{DISTORTION_ALGORITHMS, DistortControls};
 pub use insert::{
-    EFFECT_CHAIN, INSERT_SLOTS, InsertChains, InsertControls, InsertKey, InsertNames, InsertNote,
-    InsertParam, InsertProvider, InsertSlot, InsertTurn, InsertValue, InsertValues,
-    MAX_INSERT_BUSES, MAX_INSERT_PARAMS, NO_STAGE, OrbitInsert, effect_slot, instrument_slot,
+    EFFECT_CHAIN, INSERT_DRAIN_QUIET_SECONDS, INSERT_SLOTS, InsertChains, InsertControls,
+    InsertKey, InsertNames, InsertNote, InsertParam, InsertProvider, InsertSlot, InsertTurn,
+    InsertValue, InsertValues, MAX_INSERT_BUSES, MAX_INSERT_PARAMS, NO_STAGE, OrbitInsert,
+    effect_slot, instrument_slot,
 };
 pub use limiter::{Character as LimiterCharacter, DEFAULT_THRESHOLD_DB, Limiter};
 pub use live::{
@@ -103,10 +104,11 @@ pub use pressure::{RealtimePool, RealtimePressureSnapshot};
 #[cfg(feature = "device-audio")]
 pub use realtime::RealtimeLoadSnapshot;
 pub use render::{
-    RENDER_CANCELLED, RenderControl, RenderLimiter, RenderTick, SilenceStop, WavSampleFormat,
-    render_pcm, render_pcm_events, write_pcm16_wav, write_pcm16_wav_controlled,
-    write_pcm16_wav_reporting, write_wav_controlled, write_wav_events_controlled,
-    write_wav_reporting,
+    RENDER_CANCELLED, RENDER_ENDED_BEFORE_AUDIO, RenderControl, RenderLimiter, RenderTick,
+    SilenceStop, WavSampleFormat, check_stems_folder, render_pcm, render_pcm_events,
+    render_pcm_events_until, stems_folder, write_pcm16_wav, write_pcm16_wav_controlled,
+    write_pcm16_wav_reporting, write_stems_wav_events_controlled, write_wav_controlled,
+    write_wav_events_controlled, write_wav_reporting,
 };
 pub use ring::{AudioEvent, QueuedAudioEvent, Ring};
 pub use sample::{

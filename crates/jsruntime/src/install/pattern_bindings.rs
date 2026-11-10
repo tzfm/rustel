@@ -542,7 +542,10 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
             sidecars.extend(callback_sidecars);
             let callbacks = match callback_parts.len() {
                 0 => rustel_core::silence(),
-                1 => callback_parts.into_iter().next().unwrap(),
+                1 => callback_parts
+                    .into_iter()
+                    .next()
+                    .expect("the iterator yields the element"),
                 _ => rustel_core::fastcat(callback_parts),
             };
             derive_wrapper(
@@ -772,7 +775,7 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
                 for arg in &args.0 {
                     let (pattern, sidecar) = reify_bridged(&ctx, arg)?;
                     let function = pattern.as_pure().and_then(|v| match v {
-                        Value::Function(f) => Some(f),
+                        Value::Function(f) => Some(*f),
                         _ => None,
                     });
                     match function {

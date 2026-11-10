@@ -20,19 +20,20 @@ impl From<&rustel_core::reference::ReferenceEntry> for Entry {
                     name: param.name.to_owned(),
                     r#type: param.r#type.to_owned(),
                     description: param.description.to_owned(),
-                    choices: (!entry.tags.contains(&"kabelsalat"))
-                        .then(|| rustel_core::reference::reference_choices(entry.name, param.name))
-                        .flatten()
-                        .map(|set| {
-                            set.choices
-                                .iter()
-                                .map(|choice| Choice {
-                                    value: choice.value.to_owned(),
-                                    description: choice.description.to_owned(),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
+                    choices: (!entry.tags.contains(&"kabelsalat")
+                        && entry.tags.first() != Some(&"hydra"))
+                    .then(|| rustel_core::reference::reference_choices(entry.name, param.name))
+                    .flatten()
+                    .map(|set| {
+                        set.choices
+                            .iter()
+                            .map(|choice| Choice {
+                                value: choice.value.to_owned(),
+                                description: choice.description.to_owned(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 })
                 .collect(),
             examples: entry
@@ -58,7 +59,15 @@ impl Entry {
         self.snippet.is_none()
             && !self.tags.iter().any(|tag| tag == "sound" || tag == "value")
             && (self.tags.iter().any(|tag| tag == "kabelsalat")
+                || self.is_hydra()
                 || !rustel_runtime::lint::global_values().contains(self.name.as_str()))
+    }
+
+    /// Whether this entry documents a name of the Hydra namespace: it is filed
+    /// under the `hydra` heading. `initHydra` and `clearHydra` carry the tag
+    /// too, but they are pattern calls filed under `rustel`.
+    pub fn is_hydra(&self) -> bool {
+        self.heading() == "hydra"
     }
 
     /// The signature line: `lpf(frequency)` plus its other names.
@@ -201,7 +210,31 @@ impl Reference {
             }
             reference.entries.push(entry);
         }
+        #[cfg(feature = "hydra")]
+        reference.ingest_hydra();
         reference
+    }
+
+    /// The Hydra namespace. A global is written first in a statement or an
+    /// argument, a member after a dot. `a` is both: the audio analyser and
+    /// the alpha channel, with one entry for each.
+    #[cfg(feature = "hydra")]
+    fn ingest_hydra(&mut self) {
+        for documented in rustel_jsruntime::hydra_reference_entries() {
+            let mut entry = Entry::from(documented);
+            entry.origin.clear();
+            let index = self.entries.len();
+            let member = entry.tags.iter().any(|tag| tag == "method");
+            let names = if member {
+                &mut self.by_hydra_member
+            } else {
+                &mut self.by_hydra_name
+            };
+            for name in std::iter::once(&entry.name).chain(&entry.synonyms) {
+                names.insert(name.clone(), index);
+            }
+            self.entries.push(entry);
+        }
     }
 
     /// The lines worth pasting rather than remembering, in the same list
@@ -415,6 +448,26 @@ impl Reference {
             .count()
     }
 
+    /// How many entries a list in `scope` can hold: the Hydra entries in a
+    /// Hydra scope, and the others everywhere else.
+    pub fn len_in(&self, scope: ReferenceScope) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.is_hydra() == scope.is_hydra())
+            .count()
+    }
+
+    /// How many of the entries a list in `scope` can hold the settings hide
+    /// from it when unfiltered.
+    pub fn hidden_len_in(&self, scope: ReferenceScope) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry.is_hydra() == scope.is_hydra() && !self.offers(entry, &TagFilter::default())
+            })
+            .count()
+    }
+
     /// Whether a search lists `entry`. The entry is in no hidden category,
     /// or the query's `tag:` names the hidden category.
     fn offers(&self, entry: &Entry, filter: &TagFilter) -> bool {
@@ -467,7 +520,22 @@ impl Reference {
             ReferenceScope::Kabelsalat | ReferenceScope::KabelsalatMember => {
                 self.by_kabel_name.get(word).copied()
             }
+            ReferenceScope::Hydra | ReferenceScope::HydraAll => self
+                .by_hydra_name
+                .get(word)
+                .or_else(|| self.by_hydra_member.get(word))
+                .copied(),
+            ReferenceScope::HydraMember => self
+                .by_hydra_member
+                .get(word)
+                .or_else(|| self.by_hydra_name.get(word))
+                .copied(),
         }
+    }
+
+    /// Whether `name` is a Hydra global, which starts a Hydra statement.
+    pub fn is_hydra_global(&self, name: &str) -> bool {
+        self.by_hydra_name.contains_key(name)
     }
 
     fn lookup_spelling(&self, word: &str) -> Option<usize> {
@@ -501,7 +569,9 @@ impl Reference {
     /// the names that ARE the spelling - a chord symbol like `+`, `-` or
     /// `^7` - so the catalogues check against the exact word.
     pub fn documents(&self, name: &str) -> bool {
-        self.by_name.contains_key(name) || self.by_kabel_name.contains_key(name)
+        self.by_name.contains_key(name)
+            || self.by_kabel_name.contains_key(name)
+            || self.by_hydra_name.contains_key(name)
     }
 
     /// The entry a name resolves to, exact spelling first.
@@ -566,11 +636,22 @@ impl Reference {
                     || !entry.tags.iter().any(|tag| tag == "bypass")
             })
             .filter(|(index, entry)| {
-                if filter.name.is_some() || scope == ReferenceScope::All {
+                // Hydra names stay in Hydra code, even for an explicit tag:
+                // `osc` and `shape` mean something else in a pattern.
+                if entry.is_hydra() != scope.is_hydra() {
+                    return false;
+                }
+                if filter.name.is_some() || scope.is_browser() {
                     return true;
                 }
                 let graph = self.by_kabel_name.get(&entry.name) == Some(index);
                 match scope {
+                    ReferenceScope::Hydra => {
+                        !entry.no_autocomplete && !entry.tags.iter().any(|tag| tag == "method")
+                    }
+                    ReferenceScope::HydraMember => {
+                        !entry.no_autocomplete && !entry.tags.iter().any(|tag| tag == "global")
+                    }
                     ReferenceScope::Kabelsalat => {
                         graph
                             && !entry.no_autocomplete
@@ -582,7 +663,7 @@ impl Reference {
                             && !entry.tags.iter().any(|tag| tag == "global")
                     }
                     ReferenceScope::Pattern => !graph,
-                    ReferenceScope::All => true,
+                    ReferenceScope::All | ReferenceScope::HydraAll => true,
                 }
             })
             // An underscore asks for an inline/underscored callable, not a

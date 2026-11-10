@@ -162,6 +162,24 @@ impl SliderForm {
         self.selected = true;
     }
 
+    /// The field navigation every form of this kind shares: Tab, Shift+Tab,
+    /// ↑ and ↓ move between the fields, wrapping. Returns true when the key
+    /// was one of them.
+    pub(crate) fn navigate(&mut self, key: &KeyEvent) -> bool {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let forwards = match key.code {
+            KeyCode::Tab => !shift,
+            KeyCode::BackTab => false,
+            KeyCode::Down => true,
+            KeyCode::Up => false,
+            _ => return false,
+        };
+        let len = Field::ALL.len();
+        let next = (self.field + if forwards { 1 } else { len - 1 }) % len;
+        self.focus(next);
+        true
+    }
+
     /// The four numbers, if they are four numbers.
     pub(crate) fn parse(&self) -> Result<[f64; 4], String> {
         let mut out = [0.0; 4];

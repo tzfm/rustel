@@ -115,6 +115,10 @@ help a set when the run with the default gives fewer underruns. A late job
 now and then is normal. Many late jobs in a heavy set of one plugin point to
 a multicore option of that plugin: see [Limits](plugins.md#limits).
 
+`plugin_restarts` counts the restarts of the plugin copies whose latency
+changed in play: see [Limits](plugins.md#limits). It stays 0 while each
+plugin keeps its latency.
+
 A set that needs less than half of each buffer runs its plugins on the audio
 thread in both runs. In Studio, set the metric detail row under Settings ▸
 Look to `full`. The header then shows the DSP load: the time of the audio

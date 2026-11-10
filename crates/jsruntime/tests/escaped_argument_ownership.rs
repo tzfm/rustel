@@ -18,8 +18,9 @@ use rustel_jsruntime::{JsRuntime, Slot};
 use rustel_transpiler::TranspileOptions;
 
 fn runtime() -> JsRuntime {
-    let rt = JsRuntime::new().unwrap();
-    rt.install_semantic_bindings().unwrap();
+    let rt = JsRuntime::new().expect("the runtime builds");
+    rt.install_semantic_bindings()
+        .expect("the bindings install");
     rt
 }
 
@@ -81,7 +82,8 @@ fn install_base(rt: &JsRuntime) {
 /// only `escaped` refers to the callback. A collection with the original still
 /// bound would prove nothing.
 fn strand_the_escaped_argument(rt: &JsRuntime) {
-    rt.eval("globalThis.base = null;").unwrap();
+    rt.eval("globalThis.base = null;")
+        .expect("the script evaluates");
     rt.clear_active();
     rt.run_gc();
     eval(rt, "escaped");

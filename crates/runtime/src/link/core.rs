@@ -48,9 +48,17 @@ impl Session {
     pub fn initiate_tempo(&mut self, wanted_bpm: f64, ghost: i64) {
         let micros_per_beat = micros_per_beat(wanted_bpm);
         let beat_now = self.timeline.beat_at(ghost);
-        let beat_origin = beat_now.max(self.timeline.beat_origin + MICRO_BEATS_PER_BEAT);
-        let time_origin = self.timeline.time_at(beat_now)
-            + (beat_origin - beat_now) * micros_per_beat / MICRO_BEATS_PER_BEAT;
+        let beat_origin = beat_now.max(
+            self.timeline
+                .beat_origin
+                .saturating_add(MICRO_BEATS_PER_BEAT),
+        );
+        let time_origin = self.timeline.time_at(beat_now).saturating_add(
+            beat_origin
+                .saturating_sub(beat_now)
+                .saturating_mul(micros_per_beat)
+                / MICRO_BEATS_PER_BEAT,
+        );
         self.timeline = Timeline {
             micros_per_beat,
             beat_origin,
@@ -125,14 +133,31 @@ pub fn should_join(
     if current_id == other_id {
         return false;
     }
-    let ghost_diff = other_offset - current_offset;
+    let ghost_diff = other_offset.saturating_sub(current_offset);
+    // A difference past the range of i64 is not a tie: saturating_abs
+    // sends it to i64::MAX, far over the epsilon, where neither side
+    // joins. Plain abs would panic in a checked build and wrap negative
+    // in a wrapping one, where the epsilon test would then read true.
     ghost_diff > SESSION_EPSILON_MICROS
-        || (ghost_diff.abs() < SESSION_EPSILON_MICROS && other_id < current_id)
+        || (ghost_diff.saturating_abs() < SESSION_EPSILON_MICROS && other_id < current_id)
 }
 
 /// Where a grid is, in cycles of four beats, at a ghost time.
 pub fn cycle_of(timeline: &Timeline, ghost: i64) -> f64 {
     timeline.beat_at(ghost) as f64 / (4.0 * MICRO_BEATS_PER_BEAT as f64)
+}
+
+/// The mean of two clock samples, averaged by bits so a pair near
+/// `i64::MAX` or `i64::MIN` averages exactly as `(a + b) / 2` would,
+/// which rounds toward zero.
+pub(super) fn mean(a: i64, b: i64) -> i64 {
+    let floored = (a & b) + ((a ^ b) >> 1);
+    // A negative half rounds up toward zero, as the plain division does.
+    if (a ^ b) & 1 == 1 && floored < 0 {
+        floored + 1
+    } else {
+        floored
+    }
 }
 
 /// The median of the clock samples a measurement gathered. An empty set
@@ -146,7 +171,7 @@ pub fn median(samples: &mut [i64]) -> Option<i64> {
     Some(if samples.len() % 2 == 1 {
         samples[middle]
     } else {
-        (samples[middle - 1] + samples[middle]) / 2
+        mean(samples[middle - 1], samples[middle])
     })
 }
 
@@ -260,6 +285,9 @@ mod tests {
         assert!(!should_join(higher, 0, lower, SESSION_EPSILON_MICROS));
         // A session is never joined with itself.
         assert!(!should_join(higher, 0, higher, 9_000_000));
+        // A difference past the range of i64 is no tie, whatever the ids.
+        assert!(!should_join(higher, 0, lower, i64::MIN));
+        assert!(!should_join(lower, 0, higher, i64::MIN));
     }
 
     #[test]
@@ -283,5 +311,19 @@ mod tests {
         assert_eq!(median(&mut [1, 2, 8, 9]), Some(5));
         // Already sorted, reversed, whatever: the answer is the middle.
         assert_eq!(median(&mut [-40, -50, -30]), Some(-40));
+    }
+
+    #[test]
+    fn the_median_averages_a_middle_pair_that_would_overflow() {
+        let mut high = [i64::MAX - 2, i64::MAX - 2, i64::MAX, i64::MAX];
+        assert_eq!(median(&mut high), Some(i64::MAX - 1));
+        let mut low = [i64::MIN, i64::MIN, i64::MIN + 2, i64::MIN + 2];
+        assert_eq!(median(&mut low), Some(i64::MIN + 1));
+        // Mixed-sign pairs truncate toward zero, exactly as (a + b) / 2.
+        assert_eq!(mean(-1, 2), 0);
+        assert_eq!(mean(1, -2), 0);
+        assert_eq!(mean(-3, 0), -1);
+        assert_eq!(mean(-5, -6), -5);
+        assert_eq!(mean(5, 6), 5);
     }
 }

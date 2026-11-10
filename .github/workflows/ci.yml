@@ -27,11 +27,11 @@ jobs:
   # documents listed below. A push to main always runs the checks.
   changes:
     name: Changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       code: ${{ steps.diff.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -61,7 +61,7 @@ jobs:
       matrix:
         include:
           - name: Linux x64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             jobs: "4"
           - name: macOS Apple Silicon
             # macos-14 retired on 2026-11-02 with brownouts through October
@@ -86,7 +86,7 @@ jobs:
         shell: bash
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
@@ -145,14 +145,20 @@ jobs:
           }
           Remove-Item $probe, "$probe.exe" -ErrorAction SilentlyContinue
 
-      - uses: Swatinem/rust-cache@v2
+      # Pull requests restore only. A pull request's save is scoped to that
+      # pull request, so main can never reuse it, and each extra generation
+      # evicted the heavy sample caches from the 10 GB repository quota.
+      # Main pushes are the only writer, as in the heavy workflow.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Install Linux audio build dependencies
         if: runner.os == 'Linux'
         run: |
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
             sudo apt-get update
-            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev
+            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
           fi
 
       - name: Install Csound for native instrument tests
@@ -182,7 +188,7 @@ jobs:
       # re-checks every file against its pinned sha256 and re-fetches what
       # does not match.
       - name: Share the sample cache between runs
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/rustel-check-sample-cache
           key: rustel-check-samples-v1-${{ hashFiles('crates/runtime/assets/sample-banks.json', 'crates/runtime/assets/gm-fonts.json') }}
@@ -190,6 +196,17 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Test release and installer security
+        run: |
+          bash .github/scripts/tests/release-notes.sh
+          bash .github/scripts/tests/release-security.sh
+          bash .github/scripts/tests/installer-security.sh
+
+      - name: Test PowerShell installer security
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .github/scripts/tests/installer-security.ps1
 
       - name: Check release panic recovery
         if: runner.os == 'Linux'
@@ -292,7 +309,7 @@ jobs:
     name: Miri (Linux x64)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     concurrency:
       group: ${{ github.workflow }}-miri-${{ github.ref }}
       cancel-in-progress: true
@@ -303,11 +320,15 @@ jobs:
       # Miri does not optimize, and warns about a profile with an opt-level.
       CARGO_PROFILE_TEST_OPT_LEVEL: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
-      - uses: Swatinem/rust-cache@v2
+      # Pull requests restore only. The check job's cache step gives the
+      # reason.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
 
       # The runner image no longer carries the ALSA headers, and the audio
       # crates fail to build without them.
@@ -316,7 +337,7 @@ jobs:
         run: |
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
             sudo apt-get update
-            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev
+            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
           fi
 
       - name: Run Miri
@@ -349,7 +370,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
@@ -358,14 +379,18 @@ jobs:
           rustup show
           rustup target add ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      # Pull requests restore only. The check job's cache step gives the
+      # reason.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Install Linux audio and serial build dependencies
         if: runner.os == 'Linux'
         run: |
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
             sudo apt-get update
-            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev
+            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
           fi
 
       # Check the remaining release targets without optimized builds or publication.
@@ -376,14 +401,14 @@ jobs:
         run: target/${{ matrix.target }}/debug/rustel --version
 
 
-  # The one required check of the main ruleset. A skipped matrix job reports
+  # The check to require in the main ruleset. A skipped matrix job reports
   # no check with its own name, so the ruleset does not name those jobs.
   # Miri is not in this list. A Miri failure does not block a merge.
   result:
     name: CI result
     needs: [changes, check, build-release-platforms]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Fail when a required job failed
         env:

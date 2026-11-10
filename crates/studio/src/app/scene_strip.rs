@@ -267,7 +267,6 @@ impl App {
         let before = self.scenes.current().name();
         let scene_id = self.scenes.current().id;
         let dirty = self.scenes.current().dirty;
-        let revision = self.scenes.current().editor.revision();
         let source = Arc::<str>::from(self.scenes.current().editor.source());
         match self.scenes.rename_current(name) {
             Ok(()) => {
@@ -279,7 +278,7 @@ impl App {
                 // that receives the bytes; handle_save_result ignores a
                 // completion whose path no longer matches.
                 if dirty || before != after {
-                    self.write_scene(scene_id, revision, source);
+                    self.write_scene(scene_id, source);
                 }
                 self.persist_manifest();
                 self.status = if before == after {
@@ -302,6 +301,50 @@ impl App {
         self.dirty_frame = true;
     }
 
+    /// Bring the current score's file name in line with its `@title` field,
+    /// when the setting asks for it. Runs where an update saves the score,
+    /// before the save is queued, so the write lands on the renamed file and
+    /// no in-flight write can land beside it under the old name: a busy save
+    /// worker leaves the name to the next update. A score with no `@title`,
+    /// or one that already names its file, is left alone without a word.
+    pub(super) fn sync_name_from_title(&mut self) {
+        if !self.ui_settings.sync_name_from_title {
+            return;
+        }
+        let scene = self.scenes.current();
+        if !scene.is_score() {
+            return;
+        }
+        let meta = crate::metadata::ScoreMeta::parse(&scene.editor.source());
+        let (before, title) = (
+            scene.name().to_owned(),
+            meta.first("title").map(str::to_owned),
+        );
+        let Some(name) = title.as_deref().and_then(crate::scenes::sanitize_name) else {
+            return;
+        };
+        if name == before || !self.save_worker.idle() {
+            return;
+        }
+        match self.scenes.rename_current(&name) {
+            Ok(()) => {
+                let after = self.scenes.current().name();
+                self.refresh_set_panel(None);
+                self.persist_manifest();
+                self.status = format!("renamed {before:?} to {after:?} - its @title");
+            }
+            // A refusal is ribboned rather than said in the status line: the
+            // save that follows this update lands its own "saved" notice a
+            // moment later, and a line would be gone before it was read. The
+            // ribbon stays until something else is said.
+            Err(error) => self.set_error(
+                ErrorOwner::Interface,
+                format!("could not rename {before:?} to its @title: {error}"),
+            ),
+        }
+        self.dirty_frame = true;
+    }
+
     pub(super) fn close_scene(&mut self) {
         if let Some(scope) = self.current_prebake() {
             return self.close_prebake(scope);
@@ -313,13 +356,10 @@ impl App {
         // the folder. A scene that cannot be written stays open: its text is
         // nowhere else, and the save error says why.
         let scene = self.scenes.current();
+        let path = scene.path.clone();
         if scene.dirty {
-            let (id, revision, source) = (
-                scene.id,
-                scene.editor.revision(),
-                Arc::<str>::from(scene.editor.source()),
-            );
-            self.write_scene(id, revision, source);
+            let (id, source) = (scene.id, Arc::<str>::from(scene.editor.source()));
+            self.write_scene(id, source);
             self.wait_for_saves();
             if let Some(scene) = self.scenes.get(id).filter(|scene| scene.unsaved()) {
                 self.status = format!(
@@ -330,6 +370,8 @@ impl App {
                 return;
             }
         }
+        // The file stays as the tab leaves it, with the saves of its own.
+        self.note_own_write(&path);
         if self.scenes.score_count() == 1 {
             // Keep a score available while closing the old one normally.
             let current = self.scenes.current_index();
@@ -520,6 +562,92 @@ mod tests {
                 reopened.current().editor.source(),
                 "// saved after rename\n"
             );
+        }
+
+        /// With the setting on, an update brings the score's file name in
+        /// line with its `@title`: the rename lands before the save is
+        /// queued, so nothing is written under the old name. A title another
+        /// file holds is refused in a ribbon, and the score keeps its
+        /// own name.
+        #[test]
+        fn an_update_renames_the_score_to_its_title_when_the_setting_is_on() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.ui_settings.sync_name_from_title = true;
+            app.new_scene(false);
+            let old_path = directory.path().join("scene 1.strudel");
+            let titled = directory.path().join("night drive.strudel");
+
+            // No @title: the save lands and the name stays.
+            app.dispatch_editor(Command::InsertText("$: s(\"bd\")\n".into()))
+                .expect("edit");
+            app.dispatch_editor(Command::Evaluate).expect("update");
+            app.wait_for_saves();
+            assert_eq!(app.scenes.current().name(), "scene 1");
+            assert!(old_path.exists());
+
+            app.dispatch_editor(Command::Move {
+                motion: crate::editor::Motion::DocumentStart,
+                extend: false,
+            })
+            .expect("top");
+            app.dispatch_editor(Command::InsertText("/*\n@title night drive\n*/\n".into()))
+                .expect("edit");
+            app.dispatch_editor(Command::Evaluate).expect("update");
+            app.wait_for_saves();
+            assert_eq!(app.scenes.current().name(), "night drive");
+            assert!(titled.exists(), "the file was renamed");
+            assert!(!old_path.exists(), "the old name was left behind");
+            assert_eq!(
+                std::fs::read_to_string(&titled).unwrap(),
+                "/*\n@title night drive\n*/\n$: s(\"bd\")\n",
+                "the save landed on the renamed file"
+            );
+
+            // A title another file holds is ribboned, the way a refused
+            // rename from the strip is: nothing failed, the title just
+            // cannot have that name, and the score keeps its own.
+            std::fs::write(directory.path().join("taken.strudel"), "// another file")
+                .expect("occupied target");
+            app.dispatch_editor(Command::Move {
+                motion: crate::editor::Motion::DocumentStart,
+                extend: false,
+            })
+            .expect("top");
+            app.dispatch_editor(Command::InsertText("/*\n@title taken\n*/\n".into()))
+                .expect("edit");
+            app.dispatch_editor(Command::Evaluate).expect("update");
+            app.wait_for_saves();
+            assert_eq!(app.scenes.current().name(), "night drive", "the name stays");
+            let error = app.errors.visible().expect("the refusal is reported");
+            assert!(
+                error.contains(
+                    r#"could not rename "night drive" to its @title: "taken" is already in use"#
+                ),
+                "{error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&titled).unwrap(),
+                "/*\n@title taken\n*/\n/*\n@title night drive\n*/\n$: s(\"bd\")\n"
+            );
+        }
+
+        /// The setting can be turned off: with it off, a title names no
+        /// file.
+        #[test]
+        fn a_title_names_no_file_when_the_setting_is_off() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.ui_settings.sync_name_from_title = false;
+            app.new_scene(false);
+            app.dispatch_editor(Command::InsertText(
+                "/*\n@title night drive\n*/\n$: s(\"bd\")\n".into(),
+            ))
+            .expect("edit");
+            app.dispatch_editor(Command::Evaluate).expect("update");
+            app.wait_for_saves();
+            assert_eq!(app.scenes.current().name(), "scene 1");
+            assert!(directory.path().join("scene 1.strudel").exists());
         }
 
         /// A failed rename restores the actual name and keeps edits in rename mode.

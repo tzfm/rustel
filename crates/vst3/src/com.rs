@@ -140,9 +140,11 @@ impl IComponentHandlerTrait for Handler {
         // A plugin calls this from any thread, also from a plugin worker
         // inside a block. The call takes no lock and makes no allocation.
         // With the release store, the thread that reads the flag sees each
-        // write the plugin made before the call.
+        // write the plugin made before the call. The flag of the host comes
+        // after the bit: see `Host::restarts`.
         if flags & RestartFlags_::kLatencyChanged != 0 {
             self.state.latency_changed.store(true, Ordering::Release);
+            self.state.restart_asked.store(true, Ordering::Release);
         }
         kResultOk
     }
@@ -659,8 +661,8 @@ mod tests {
     use super::*;
 
     /// A restart request for a new latency sets the flag in the cell of the
-    /// copy, also with other requests in the same call. Each other request
-    /// leaves the flag as it is.
+    /// copy and the flag of the host, also with other requests in the same
+    /// call. Each other request leaves the flags as they are.
     #[test]
     fn a_restart_for_a_new_latency_sets_the_flag_of_the_copy() {
         let state = Arc::new(CopyState::default());
@@ -671,12 +673,14 @@ mod tests {
         // call reads no pointer.
         let restart = |flags| unsafe { handler.restartComponent(flags) };
         let changed = || state.latency_changed.load(Ordering::Acquire);
+        let asked = || state.restart_asked.load(Ordering::Acquire);
         assert_eq!(restart(!RestartFlags_::kLatencyChanged), kResultOk);
-        assert!(!changed());
+        assert!(!changed() && !asked());
         let flags = RestartFlags_::kParamValuesChanged | RestartFlags_::kLatencyChanged;
         assert_eq!(restart(flags), kResultOk);
-        assert!(changed());
+        assert!(changed() && asked());
+        state.restart_asked.store(false, Ordering::Release);
         assert_eq!(restart(!RestartFlags_::kLatencyChanged), kResultOk);
-        assert!(changed());
+        assert!(changed() && !asked());
     }
 }

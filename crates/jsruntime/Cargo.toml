@@ -45,3 +45,6 @@ rquickjs = { version = "=0.14.0", git = "https://github.com/tzfm/rquickjs", rev 
     # The rejecting module resolver needs the loader machinery.
     "loader",
 ] }
+
+[lints]
+workspace = true

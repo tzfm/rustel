@@ -1167,6 +1167,25 @@ mod tests {
             assert!(app.status.is_empty(), "the stop said: {}", app.status);
         }
 
+        /// A stop pressed before the first snapshot of a play still stops
+        /// it: the update is on its way, and the engine must cancel it.
+        #[test]
+        fn a_stop_while_a_play_is_on_its_way_asks_the_engine() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            app.snapshot = Some(sounding(false, false));
+            app.handle_editor_effect(EditorEffect::Evaluate {
+                revision: app.editor().revision(),
+                source: "$: note(60).s(\"sine\")".into(),
+            })
+            .expect("evaluate");
+            assert!(!app.inflight.is_empty(), "the play went out");
+
+            app.handle_editor_effect(EditorEffect::Stop).expect("stop");
+
+            assert!(app.stop_requested, "the stop was asked of the engine");
+        }
+
         /// The second stop word of the engine - a stray Stopped, or the
         /// snapshot after a settle - settles nothing: the advisories stay,
         /// the visual update the held frame is showing is not discarded,

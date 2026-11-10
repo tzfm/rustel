@@ -370,7 +370,12 @@ pub(super) fn render_samples_pulse(
             };
             cell.set_bg(ground);
             if column == knob {
-                cell.set_char(super::super::terminal::symbol("▮").chars().next().unwrap());
+                cell.set_char(
+                    super::super::terminal::symbol("▮")
+                        .chars()
+                        .next()
+                        .expect("the iterator yields the element"),
+                );
                 cell.set_fg(theme.accent);
             } else {
                 cell.set_char('─');

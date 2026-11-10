@@ -68,21 +68,14 @@ pub fn query_inner(outer: &Hap, pattern: &Pattern, state: &State) -> Vec<Hap> {
     let mut output = Vec::new();
     for inner in pattern.query(&state.set_span(outer.part)) {
         let mut context = outer.context.clone();
-        context.extend_from_slice(&inner.context);
+        context.append(&inner.context);
         if !crate::push_budgeted(
             &mut output,
             Hap {
                 whole: inner.whole,
                 part: inner.part,
                 pick_lookup: crate::joined_pick_lookup(outer, &inner),
-                scale: inner.scale.clone().or_else(|| outer.scale.clone()),
-                tags: inner.tags.clone().or_else(|| outer.tags.clone()),
-                log_line: inner.log_line.clone().or_else(|| outer.log_line.clone()),
-                edo_size: inner.edo_size.or(outer.edo_size),
-                scale_definition: inner
-                    .scale_definition
-                    .clone()
-                    .or_else(|| outer.scale_definition.clone()),
+                keys: crate::context_keys::ContextKeys::merge(&inner.keys, &outer.keys),
                 value: inner.value,
                 context,
                 ui_visuals: inner.ui_visuals | outer.ui_visuals,

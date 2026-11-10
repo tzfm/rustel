@@ -491,18 +491,38 @@ fn to_uint32(x: f64) -> u32 {
 
 /// JS's Abstract Relational Comparison `a < b`.
 ///
-/// String-string compares by UTF-16 code unit; anything else is coerced to a
-/// number, and `None` models the spec's `undefined` result when either side is
-/// NaN. All four relational operators treat `None` as `false`.
+/// String-string compares by UTF-16 code unit, so an astral code point
+/// orders by its surrogate pair, under the characters above the BMP that
+/// Rust's scalar ordering places above it; anything else is coerced to a
+/// number, and `None` models the spec's `undefined` result when either side
+/// is NaN. All four relational operators treat `None` as `false`.
 fn js_less_than(a: &Value, b: &Value) -> Option<bool> {
     if let (Value::Str(x), Value::Str(y)) = (a, b) {
-        return Some(x < y);
+        return Some(utf16_cmp(x, y) == std::cmp::Ordering::Less);
     }
     let (x, y) = (js_to_number(a), js_to_number(b));
     if x.is_nan() || y.is_nan() {
         return None;
     }
     Some(x < y)
+}
+
+/// Compare two strings by UTF-16 code unit, as JavaScript does.
+fn utf16_cmp(x: &str, y: &str) -> std::cmp::Ordering {
+    let mut x = x.encode_utf16();
+    let mut y = y.encode_utf16();
+    loop {
+        match (x.next(), y.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(unit_x), Some(unit_y)) => {
+                if unit_x != unit_y {
+                    return unit_x.cmp(&unit_y);
+                }
+            }
+        }
+    }
 }
 
 /// JS `==` restricted to the value shapes patterns actually carry.
@@ -604,6 +624,33 @@ mod tests {
         assert_eq!(
             ComposeOp::Add.apply_scalar(&Value::Str("3".into()), &Value::Str("4".into())),
             Value::F64(7.0)
+        );
+    }
+
+    #[test]
+    fn relational_string_comparison_uses_utf16_order() {
+        // An astral code point is the surrogate pair D800 DC00 in UTF-16,
+        // which sorts under U+E000; Rust's scalar ordering says otherwise.
+        let astral = Value::Str("\u{10000}".into());
+        let above_bmp = Value::Str("\u{E000}".into());
+        assert_eq!(
+            ComposeOp::Lt.apply_scalar(&astral, &above_bmp),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            ComposeOp::Gt.apply_scalar(&astral, &above_bmp),
+            Value::Bool(false)
+        );
+        // Two astral code points order by their surrogate pairs, and an
+        // ordinary pair keeps the order both systems agree on.
+        let next_astral = Value::Str("\u{10001}".into());
+        assert_eq!(
+            ComposeOp::Lt.apply_scalar(&astral, &next_astral),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            ComposeOp::Lte.apply_scalar(&Value::Str("a".into()), &Value::Str("b".into())),
+            Value::Bool(true)
         );
     }
 

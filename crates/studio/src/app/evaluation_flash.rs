@@ -165,7 +165,7 @@ impl EvaluationFlash {
         if self.success {
             u8::from(elapsed >= slot)
         } else {
-            (elapsed.as_millis() / slot.as_millis()).min(3) as u8
+            (elapsed.as_nanos() / slot.as_nanos()).min(3) as u8
         }
     }
 
@@ -196,8 +196,10 @@ impl EvaluationFlash {
         let slot = run.total();
         let mut elapsed = now.saturating_duration_since(self.started);
         if !self.success {
-            let slot_millis = slot.as_millis().max(1);
-            elapsed -= slot * u32::try_from(elapsed.as_millis() / slot_millis).unwrap_or(0);
+            // Whole nanoseconds, as `phase_at` counts the pulses: a pulse
+            // counted in milliseconds starts before its slot does.
+            let pulses = elapsed.as_nanos() / slot.as_nanos().max(1);
+            elapsed -= slot * u32::try_from(pulses).unwrap_or(0);
         }
         let progress = (elapsed.as_secs_f32() / slot.as_secs_f32()).clamp(0.0, 1.0);
         Some((
@@ -823,6 +825,7 @@ mod tests {
                 EvalAnimation::FadeFast,
                 EvalAnimation::FadeMedium,
                 EvalAnimation::FadeSlow,
+                EvalAnimation::Swipe,
                 EvalAnimation::Zap,
                 EvalAnimation::Steps,
                 EvalAnimation::Glitch,
@@ -839,6 +842,15 @@ mod tests {
                     flash.drawing_at(started).is_some(),
                     "{animation:?} flashes at once"
                 );
+                // A frame can land at any instant of the run.
+                for ms in 0..1500 {
+                    let now = started + Duration::from_millis(ms);
+                    assert_eq!(
+                        flash.drawing_at(now).is_some(),
+                        flash.is_lit(now),
+                        "{animation:?} at {ms}ms"
+                    );
+                }
                 // The dark gap between the two pulses is real, and the
                 // second pulse relights after it.
                 let gap_start = dark_again(&app, started);

@@ -43,7 +43,7 @@ impl JsRuntime {
             self.evaluate_prelude_with_effects_cancellable(source, options, budget, cancellation)
                 .map(|(_, effects)| effects)
         };
-        let effects = with_ctx(&self.ctx, |ctx| {
+        let effects = with_ctx(self, |ctx| {
             let globals = ctx.globals();
             let before = match scope {
                 ImportScope::Score => {
@@ -116,7 +116,7 @@ impl JsRuntime {
     /// Let every score see the names of an import a score loaded. A prebake
     /// names the import now.
     pub fn share_import(&self, specifier: &str) {
-        with_ctx(&self.ctx, |ctx| {
+        with_ctx(self, |ctx| {
             self.import_surface.borrow_mut().share(&ctx, specifier);
         });
     }
@@ -130,7 +130,7 @@ impl JsRuntime {
         if surface.shows(&listed) {
             return;
         }
-        with_ctx(&self.ctx, |ctx| {
+        with_ctx(self, |ctx| {
             // A name the last score registered goes back first. The swap
             // then replaces the value the engine or an import gave the name.
             if restore_registration_surface(&ctx).is_err() {

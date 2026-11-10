@@ -280,10 +280,12 @@ fn open_vst_tab(studio: &mut Hermetic) {
 }
 
 /// The vst tab of the reference column lists the bundle by its name. →
-/// loads the bundle with no wait: the parameters of the effect show
-/// under its row, and the instrument of the bundle gets a row of its own.
-/// Enter writes `.vst()` for the effect and `.vsti()` for the instrument at
-/// the caret. The memory breakdown of the log then has a row for each.
+/// loads the bundle with no wait: the plugin opens onto the two rows of
+/// its halves, and → on the parameters row makes them the view of the tab,
+/// with the trail of the view on the search line and its own search. Esc
+/// goes back, and Enter writes `.vst()` for the effect and `.vsti()` for
+/// the instrument at the caret. The memory breakdown of the log then has a
+/// row for each.
 #[test]
 fn the_reference_tab_loads_a_plugin_and_writes_its_call() {
     let mut studio = hermetic();
@@ -297,16 +299,53 @@ fn the_reference_tab_loads_a_plugin_and_writes_its_call() {
     wait_for_row(&mut studio, "1 of 1 plugins");
     row_containing(&studio.rows(), "▸ Rustel Fixture");
 
+    // → loads the bundle and opens the plugin onto the rows of its halves.
     studio.press(KeyCode::Right, KeyModifiers::NONE);
-    studio.pump_until(LOAD_BUDGET, "the plugin loaded", |studio| {
-        studio.rows().iter().any(|row| row.contains("beatgate"))
+    // The marker of the row turns the moment the plugin opens; the two rows
+    // under it come with the end of the load.
+    studio.pump_until(LOAD_BUDGET, "the plugin opened", |studio| {
+        studio.rows().iter().any(|row| row.contains("▸ presets"))
     });
     let rows = studio.rows();
     assert!(rows[row_containing(&rows, "▾ Rustel Fixture")].contains("effect"));
-    assert!(rows[row_containing(&rows, "gain  Gain")].contains("     gain"));
-    row_containing(&rows, "beatgate  Beat Gate");
+    row_containing(&rows, "▸ presets (0)");
+    row_containing(&rows, "▸ parameters (5)");
     assert!(rows[row_containing(&rows, "▸ Rustel Fixture Tone")].contains("instrument"));
 
+    // → on the parameters row makes them the view of the tab, with the
+    // trail on the search line.
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Right, KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    row_containing(&rows, "Rustel Fixture > parameters");
+    assert!(rows[row_containing(&rows, "gain  Gain")].contains("gain"));
+    row_containing(&rows, "beatgate  Beat Gate");
+
+    // The search of the view reads its rows: `beat` keeps the beat gate
+    // alone, and the letters go when Backspace takes them off.
+    for letter in ['b', 'e', 'a', 't'] {
+        studio.press(KeyCode::Char(letter), KeyModifiers::NONE);
+    }
+    studio.settle();
+    let rows = studio.rows();
+    row_containing(&rows, "beatgate  Beat Gate");
+    assert!(
+        !rows.iter().any(|row| row.contains("gain  Gain")),
+        "the search of the view keeps the gain out:\n{}",
+        rows.join("\n")
+    );
+    for _ in 0..4 {
+        studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    }
+
+    // Esc goes back to the plugin list, the cursor on the row of the half,
+    // and Enter on the plugin row writes the call.
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    studio.press(KeyCode::Up, KeyModifiers::NONE);
+    studio.press(KeyCode::Up, KeyModifiers::NONE);
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
     assert_eq!(studio.reference_tab(), None, "the column closed");
@@ -383,11 +422,11 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
         assert_eq!(studio.score(), format!("$: s(\"bd\").{call}({plugin:?})"));
     }
 
-    // The object of the call: `preset` at once, and the 4 keys of the
+    // The object of the call: `preset` at once, and the 5 keys of the
     // effect at the end of its load, each with its title.
     let text = "$: s(\"bd\").vst(\"rustel fixture\", { ga })";
     complete_after(&mut studio, text, "ga");
-    wait_for_row(&mut studio, "1 of 5 parameter choices");
+    wait_for_row(&mut studio, "1 of 6 parameter choices");
     assert!(studio.rows()[row_containing(&studio.rows(), " gain ")].contains("Gain · "));
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
@@ -419,7 +458,7 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
         ),
     ] {
         complete_after(&mut studio, text, before);
-        wait_for_row(&mut studio, "1 of 5 parameter choices");
+        wait_for_row(&mut studio, "1 of 6 parameter choices");
         studio.press(KeyCode::Enter, KeyModifiers::NONE);
         studio.settle();
         assert_eq!(studio.score(), expected);
@@ -462,9 +501,70 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
     vst::host().set_preset_folder(empty.path().to_path_buf());
 }
 
+/// The pick of a plugin name opens the presets of the plugin, one Enter
+/// from a choice. A plugin the read of the preset folders holds no preset
+/// for goes to its parameters instead, where Enter picks one of them: the
+/// panel never stands in a half that offers nothing. The pick into a call
+/// open at its bracket closes the call. The pick into a string still open
+/// closes the string and the call after the name, and leaves the line
+/// below as it was.
+#[test]
+fn a_pick_of_a_plugin_with_no_preset_opens_its_parameters() {
+    let mut studio = hermetic();
+    let folder = tempfile::tempdir().expect("plugin folder");
+    rustel_vst3_fixture::install(folder.path());
+    vst::pin_standard_folders(vec![folder.path().to_path_buf()]);
+    // The preset root holds no file of the plugin.
+    let presets = tempfile::tempdir().expect("empty preset root");
+    vst::host().set_preset_folder(presets.path().to_path_buf());
+
+    // The call open at its bracket: the pick writes the name and closes
+    // the call, so the reader does not have to type the bracket.
+    let text = "$: s(\"bd\").vst(";
+    complete_after(&mut studio, text, ".vst(");
+    wait_for_row(&mut studio, "1 of 1 plugins");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    assert_eq!(studio.score(), "$: s(\"bd\").vst(\"Rustel Fixture\")");
+
+    // The load gives the plugin its class, the read of the preset folders
+    // answers no preset, and the parameters take the place of the empty
+    // half.
+    wait_for_row(&mut studio, "5 parameters of Rustel Fixture");
+    assert_eq!(
+        studio.status(),
+        "plugin parameters - Enter adds the choice to this call"
+    );
+    let rows = studio.rows();
+    row_containing(&rows, "Rustel Fixture > parameters");
+    row_containing(&rows, "gain  Gain");
+
+    // The string open after its quote, with a line below that has quotes
+    // of its own. Enter on a parameter then adds it to the closed call.
+    let text = "$: s(\"bd\").vst(\"\n$: s(\"hh*4\")";
+    complete_after(&mut studio, text, ".vst(\"");
+    wait_for_row(&mut studio, "1 of 1 plugins");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    assert_eq!(
+        studio.score(),
+        "$: s(\"bd\").vst(\"Rustel Fixture\")\n$: s(\"hh*4\")"
+    );
+    wait_for_row(&mut studio, "gain  Gain");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    assert_eq!(
+        studio.score(),
+        "$: s(\"bd\").vst(\"Rustel Fixture\", { gain: 1 })\n$: s(\"hh*4\")"
+    );
+}
+
 /// Switching from plugin-name completion to the vst tab keeps the plugin
-/// of the call open. A parameter choice edits this call, regardless of the
-/// caret's position, and never replaces a value already written there.
+/// of the call open. Ctrl+F in a call opens the parameters of its plugin
+/// as the view of the tab, so Enter picks from them, regardless of the
+/// caret's position, and never replaces a value already written there. A
+/// call that names its plugin by a part of the name, as the host finds it,
+/// takes the choice too.
 #[test]
 fn a_plugins_parameters_are_available_throughout_its_call() {
     let mut studio = hermetic();
@@ -481,8 +581,17 @@ fn a_plugins_parameters_are_available_throughout_its_call() {
         studio.press(KeyCode::Tab, KeyModifiers::NONE);
     }
     assert_eq!(studio.reference_tab(), Some("vst"));
-    wait_for_row(&mut studio, "beatgate  Beat Gate");
+    // The plugin of the call is open in the list. → on the row of its
+    // parameters makes them the view of the tab.
+    studio.pump_until(LOAD_BUDGET, "the plugin opened", |studio| {
+        studio.rows().iter().any(|row| row.contains("▸ presets"))
+    });
     studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Right, KeyModifiers::NONE);
+    studio.settle();
+    row_containing(&studio.rows(), "Rustel Fixture > parameters");
+    row_containing(&studio.rows(), "beatgate  Beat Gate");
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
     assert_eq!(
@@ -506,26 +615,31 @@ fn a_plugins_parameters_are_available_throughout_its_call() {
             ".vs",
             "$: s(\"bd\").vst(\"Rustel Fixture\", { gain: 1 })",
         ),
+        // A part of the name finds the plugin, in a chain of plugins.
+        (
+            "$: s(\"bd\").vst(\"Crystalline\").vst(\"fixture\").vst(\"Ozone 12\")",
+            "Crystalline\").vs",
+            "$: s(\"bd\").vst(\"Crystalline\").vst(\"fixture\", { gain: 1 }).vst(\"Ozone 12\")",
+        ),
     ] {
         studio.set_score(text);
         studio.set_caret(text.find(before).unwrap() + before.len());
         studio.chord("ctrl+f");
         assert_eq!(studio.reference_tab(), Some("vst"), "{text}");
         wait_for_row(&mut studio, "beatgate  Beat Gate");
-        studio.press(KeyCode::Down, KeyModifiers::NONE);
         studio.press(KeyCode::Enter, KeyModifiers::NONE);
         studio.settle();
         assert_eq!(studio.score(), expected);
     }
 
     // The same context follows an instrument call. The fixture instrument
-    // has no parameters, but its own row opens instead of the effect's.
+    // has no parameters, so its view holds no row of the effect's.
     let text = "$: note(\"c\").vsti(\"Rustel Fixture Tone\", {})";
     studio.set_score(text);
     studio.set_caret(text.find(".vs").unwrap() + 3);
     studio.chord("ctrl+f");
     assert_eq!(studio.reference_tab(), Some("vst"));
-    wait_for_row(&mut studio, "▾ Rustel Fixture Tone");
+    wait_for_row(&mut studio, "Rustel Fixture Tone > parameters");
     assert!(studio.rows().iter().all(|row| !row.contains("beatgate")));
 }
 
@@ -551,13 +665,16 @@ fn a_preset_file_saved_while_the_studio_runs_reaches_the_open_plugin() {
     vst::pin_standard_folders(vec![plugins]);
 
     // The presets are the half of the plugin the saved file reaches. →
-    // opens the plugin on its parameters, Tab goes to the presets.
+    // opens the plugin, → on its presets row makes them the view.
     studio.press(KeyCode::End, KeyModifiers::NONE);
     open_vst_tab(&mut studio);
     wait_for_row(&mut studio, "1 of 1 plugins");
     studio.press(KeyCode::Right, KeyModifiers::NONE);
-    studio.settle();
-    studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    studio.pump_until(LOAD_BUDGET, "the plugin opened", |studio| {
+        studio.rows().iter().any(|row| row.contains("▸ presets"))
+    });
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Right, KeyModifiers::NONE);
     studio.settle();
     studio.pump_until(LOAD_BUDGET, "the presets of the read", |studio| {
         studio.rows().iter().any(|row| row.contains("Dark Bass"))
@@ -571,4 +688,174 @@ fn a_preset_file_saved_while_the_studio_runs_reaches_the_open_plugin() {
     studio.pump_until(LOAD_BUDGET, "the preset of the watch", |studio| {
         studio.rows().iter().any(|row| row.contains("Late Save"))
     });
+
+    // The host is the one of the process: leave its preset root over a
+    // folder with no files, so a later test counts no preset of this one.
+    // On Windows the loaded plugin holds this test's folder, so its preset
+    // files stay after the test ends.
+    let empty = tempfile::tempdir().expect("empty preset root");
+    vst::host().set_preset_folder(empty.path().to_path_buf());
+}
+
+/// The fixture in a folder of its own, loaded, with a preset root that holds
+/// no file. The studio comes first: its own start pins no plugin folder, and
+/// a pin after it is the one the host keeps.
+fn fixture_loaded() -> tempfile::TempDir {
+    let folder = tempfile::tempdir().expect("plugin folder");
+    let presets = folder.path().join("presets");
+    std::fs::create_dir_all(&presets).expect("preset folder");
+    let plugins = folder.path().join("plugins");
+    rustel_vst3_fixture::install(&plugins);
+    let host = vst::host();
+    host.set_preset_folder(presets);
+    vst::pin_standard_folders(vec![plugins]);
+    host.resolve(rustel_vst3_fixture::NAME, true);
+    host.wait_idle();
+    folder
+}
+
+/// A plugin copy with no number in its output for 1 s of play plays
+/// silence, and the row of its plugin in the vst tab and on the vst page of
+/// the settings says so. An update of the text in play evaluates nothing:
+/// it asks for the new tries, and the status says so. The plugin then makes
+/// one more copy.
+#[test]
+fn a_faulted_plugin_shows_on_its_row_and_an_update_tries_it() {
+    let mut studio = hermetic();
+    let folder = fixture_loaded();
+    // The host is the one of the process, so the marks go to a file of
+    // this test.
+    let marks = folder.path().join("marks");
+    // SAFETY: the global mutex of the suite is held, and the plugin thread
+    // finished its work in fixture_loaded. The studio plays nothing yet, so
+    // no plugin call runs. No other thread reads a variable now.
+    unsafe { std::env::set_var(rustel_vst3_fixture::THREAD_MARK_ENV, &marks) };
+    let makes = || {
+        let marked = std::fs::read_to_string(&marks).unwrap_or_default();
+        marked
+            .lines()
+            .filter(|line| line.starts_with("make "))
+            .count()
+    };
+
+    // With no fault, an update of the text in play asks for nothing.
+    let source = "$: note(\"c3\").s(\"sine\").vst(\"rustel fixture\", { fault: 0 }).fast(8)";
+    studio.set_score(source);
+    studio.chord("ctrl+s");
+    studio.pump_until(LOAD_BUDGET, "the score plays", |studio| studio.is_playing());
+    vst::host().wait_idle();
+    studio.chord("ctrl+s");
+    assert_eq!(
+        studio.status(),
+        "unchanged - already playing (stop first to restart it)"
+    );
+
+    studio.set_score(&source.replace("fault: 0", "fault: 1"));
+    studio.chord("ctrl+s");
+    studio.settle();
+    open_vst_tab(&mut studio);
+    // The tag of the row loses its end when the column has no room for it.
+    let silent = "a copy plays silence";
+    studio.pump_until(LOAD_BUDGET, "the row of the fault", |studio| {
+        studio.rows().iter().any(|row| row.contains(silent))
+    });
+    let rows = studio.rows();
+    assert!(
+        rows[row_containing(&rows, silent)].contains("Rustel Fixture"),
+        "{}",
+        rows.join("\n")
+    );
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    // The vst page of the settings says it too.
+    studio.chord("ctrl+o");
+    for _ in 0..5 {
+        studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    }
+    wait_for_row(&mut studio, &format!("Rustel Fixture · ready · {silent}"));
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+
+    let before = makes();
+    studio.chord("ctrl+s");
+    assert_eq!(
+        studio.status(),
+        "unchanged - already playing · new tries asked for the plugin faults"
+    );
+    assert!(!studio.is_evaluating(), "the update evaluates nothing");
+    studio.pump_until(LOAD_BUDGET, "the new copy", |_| makes() > before);
+
+    // The studio closes and gives its copies back. The global mutex of the
+    // suite stays held.
+    drop(studio.studio);
+    vst::host().wait_idle();
+    // SAFETY: the global mutex of the suite is held, the studio closed, and
+    // the plugin thread finished its work. No plugin call runs. No other
+    // thread reads a variable now.
+    unsafe { std::env::remove_var(rustel_vst3_fixture::THREAD_MARK_ENV) };
+    // The host is the one of the process: leave its preset root over a
+    // folder with no files, as the tests above do.
+    let empty = tempfile::tempdir().expect("empty preset root");
+    vst::host().set_preset_folder(empty.path().to_path_buf());
+}
+
+/// A scene that closes gives back the plugin copies its lanes kept, and the
+/// scene in play keeps its own: the running count of the plugin row of the
+/// memory breakdown says so.
+#[test]
+fn a_closed_scene_gives_its_plugin_copies_back() {
+    let mut studio = hermetic();
+    let _folder = fixture_loaded();
+    // The column of the breakdown cuts the label of the row after the
+    // first letter of `running`.
+    let wait_for_running = |studio: &mut Hermetic, count: usize| {
+        let row = format!("Rustel Fixture · effect · {count} r");
+        studio.pump_until(LOAD_BUDGET, &row, |studio| {
+            studio.rows().iter().any(|line| line.contains(&row))
+        });
+    };
+
+    // Scene 1 plays one lane through the plugin, and the docked log shows
+    // the memory breakdown.
+    let lane = "$: note(\"c3\").s(\"sine\").vst(\"rustel fixture\")";
+    studio.set_score(lane);
+    studio.chord("ctrl+s");
+    studio.pump_until(LOAD_BUDGET, "scene 1 plays", |studio| studio.is_playing());
+    studio.chord("f9");
+    studio.chord("shift+f9");
+    wait_for_running(&mut studio, 1);
+
+    // Scene 2 plays the same lane and one lane more.
+    studio.chord("ctrl+n");
+    studio.settle();
+    studio.set_score(&format!(
+        "{lane}\n$: note(\"e3\").s(\"sine\").vst(\"rustel fixture\")"
+    ));
+    studio.chord("ctrl+s");
+    studio.settle();
+    wait_for_running(&mut studio, 2);
+
+    // Scene 1 plays again, and scene 2 keeps the copy of its other lane
+    // while it is open. Then scene 2 closes while scene 1 plays.
+    studio.press(KeyCode::F(6), KeyModifiers::NONE);
+    studio.chord("ctrl+s");
+    studio.settle();
+    assert!(studio.is_playing(), "{}", studio.status());
+    vst::host().wait_idle();
+    let fixture = vst::host().plugins();
+    let fixture = fixture
+        .iter()
+        .find(|plugin| plugin.name == rustel_vst3_fixture::NAME);
+    assert_eq!(fixture.map(|plugin| plugin.running), Some(2));
+    studio.press(KeyCode::F(7), KeyModifiers::NONE);
+    studio.chord("ctrl+w");
+    studio.settle();
+    assert_eq!(studio.scene_names(), ["first"]);
+    wait_for_running(&mut studio, 1);
+    assert!(studio.is_playing(), "{}", studio.status());
+    assert_eq!(studio.score(), lane);
+
+    // The host is the one of the process: leave its preset root over a
+    // folder with no files, as the tests above do.
+    let empty = tempfile::tempdir().expect("empty preset root");
+    vst::host().set_preset_folder(empty.path().to_path_buf());
 }

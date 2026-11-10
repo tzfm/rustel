@@ -23,3 +23,6 @@ midir = { version = "0.11", optional = true }
 libc = "0.2"
 
 [dev-dependencies]
+
+[lints]
+workspace = true

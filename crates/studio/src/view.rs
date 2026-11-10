@@ -346,6 +346,14 @@ pub enum SceneStripMode {
     Learning,
 }
 
+/// The export sheet the chrome draws: its settings face, or the same
+/// sheet over a running bounce, with the render's glance.
+pub struct ExportView<'a> {
+    pub sheet: &'a ExportSheet,
+    /// The running bounce, when one is under the sheet.
+    pub glance: Option<&'a ExportGlance>,
+}
+
 pub struct StudioChrome<'a> {
     pub caret_visible: bool,
     pub keybinds: &'a super::keybinds::Keybinds,
@@ -695,7 +703,7 @@ pub struct StudioView<'a> {
     pub mappings: [super::settings::SlotView; super::settings::MAPPING_SLOTS],
     /// The shortcut rows, for the Keybinds page.
     pub keybind_rows: Vec<super::settings::KeybindRow>,
-    /// The origins of the permissions page.
+    /// The rows of the permissions page.
     pub permission_rows: Vec<super::settings::PermissionRow>,
     /// The plugin folders, for the vst page. Empty while another page shows.
     #[cfg(feature = "vst")]
@@ -764,8 +772,9 @@ pub struct StudioView<'a> {
     /// What the docked memory breakdown shows and the room it asks the
     /// layout for, while it is open.
     pub memory: Option<(super::memory::MemoryFigures, super::viz_panel::Dock)>,
-    /// The export sheet, when it is open.
-    pub export: Option<&'a ExportSheet>,
+    /// The export sheet, when it is open: its settings face, or over a
+    /// running bounce the render's progress.
+    pub export: Option<ExportView<'a>>,
     /// The theme picker, when it is open.
     pub theme_picker: Option<&'a ThemePicker>,
     /// The set panel, when it is open.
@@ -795,6 +804,11 @@ pub struct StudioView<'a> {
     /// Live Hydra camera state for the Settings row.
     #[cfg(feature = "hydra")]
     pub hydra_webcam: Option<rustel_runtime::hydra::HydraWebcamStatus>,
+    /// The clips the detached video windows are playing, when any are
+    /// open: a video widget folds to a note while its clip plays
+    /// elsewhere.
+    #[cfg(feature = "video")]
+    pub video_windows: Vec<String>,
     /// The settings sheet, when it is open, with what it shows.
     pub settings: Option<(SettingsSheet, &'a UiSettings, &'a TerminalFeatures)>,
 }
@@ -1261,6 +1275,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 on_right: layout.sidebar_side == Side::Right,
                 focused: view.focused_panel == Some(PanelKind::Set),
                 keybinds: chrome.keybinds,
+                caret_lit: chrome.caret_visible,
             },
             area,
         );
@@ -1285,6 +1300,8 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 area: layout.viz[index],
                 focused: view.focused_panel == Some(PanelKind::Viz) && view.viz_focus == index,
                 mixer: view.mixer.as_ref(),
+                #[cfg(feature = "video")]
+                windows: &view.video_windows,
             },
             area,
         );
@@ -1299,6 +1316,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 name: knobs.name,
                 listed: knobs.listed,
                 knobs: knobs.knobs,
+                presets: knobs.presets,
                 panel: knobs.panel,
                 theme,
                 focused: view.focused_panel == Some(PanelKind::Knobs),
@@ -1344,12 +1362,17 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
             area,
         );
     }
-    if let Some(sheet) = view.export {
+    if let Some(export) = view.export {
+        // The render face names the chord that ends a bounce early, in the
+        // spelling the keybind table holds.
+        let export_hint = chrome.keybinds.hint(super::keybinds::BindAction::Export);
         frame.render_widget(
             ExportSheetView {
-                sheet,
+                sheet: export.sheet,
                 theme,
                 vim: chrome.vim_text_modes,
+                exporting: export.glance,
+                export_hint: &export_hint,
             },
             area,
         );
@@ -3160,6 +3183,8 @@ mod tests {
                 render(
                     frame,
                     StudioView {
+                        #[cfg(feature = "video")]
+                        video_windows: Vec::new(),
                         show_scrollbars: true,
                         midi_rows: Vec::new(),
                         clock_in: None,
@@ -3285,6 +3310,8 @@ mod tests {
                 render(
                     frame,
                     StudioView {
+                        #[cfg(feature = "video")]
+                        video_windows: Vec::new(),
                         show_scrollbars: true,
                         midi_rows: Vec::new(),
                         clock_in: None,
@@ -3398,6 +3425,8 @@ mod tests {
                 render(
                     frame,
                     StudioView {
+                        #[cfg(feature = "video")]
+                        video_windows: Vec::new(),
                         show_scrollbars: true,
                         midi_rows: Vec::new(),
                         clock_in: None,
@@ -3514,6 +3543,8 @@ mod tests {
                 render(
                     frame,
                     StudioView {
+                        #[cfg(feature = "video")]
+                        video_windows: Vec::new(),
                         show_scrollbars: true,
                         midi_rows: Vec::new(),
                         clock_in: None,

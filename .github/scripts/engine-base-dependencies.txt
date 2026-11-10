@@ -25,6 +25,7 @@ rustel-fraction
 rustel-kabel
 rustel-mini
 rustel-scheduler
+rustel-talkit
 rustel-voice
 rustfft
 serde

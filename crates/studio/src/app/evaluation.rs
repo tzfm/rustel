@@ -313,6 +313,33 @@ impl App {
         if !scene.is_score() {
             return;
         }
+        // While another score plays, the typing pause applies nothing: an
+        // edit of a score the set is not playing stays in its file until
+        // the player asks for it with the evaluate key. The score that key
+        // sent last, held for its sounds or armed for its line, is the one
+        // the set is about to play.
+        let latest = self.pending_evaluation.as_ref().or_else(|| {
+            self.inflight
+                .values()
+                .max_by_key(|pending| pending.request_id)
+        });
+        let on_its_way = match latest {
+            Some(pending) => pending.scene == scene.id,
+            None => self.armed_scene == Some(scene.id),
+        };
+        if !external
+            && !on_its_way
+            && self
+                .audible_scene
+                .is_some_and(|playing| playing != scene.id)
+        {
+            self.status = format!(
+                "another score is playing - {} runs this one",
+                self.keybinds.hint(BindAction::Evaluate)
+            );
+            self.dirty_frame = true;
+            return;
+        }
         let (id, revision) = (scene.id, scene.editor.revision());
         let source: Arc<str> = Arc::from(scene.editor.source());
         // What is playing is already this text, byte for byte. An auto
@@ -351,7 +378,7 @@ impl App {
                 "transport",
                 "auto update skipped - the edit adds no instruction".to_owned(),
             );
-            self.write_scene(id, revision, Arc::clone(&source));
+            self.write_scene(id, Arc::clone(&source));
             self.bind_live_sliders(id, revision, &source);
             return;
         }
@@ -391,7 +418,7 @@ impl App {
         // watched file already holds this text: writing it again could
         // overwrite a newer save that landed while it was read.
         if !external {
-            self.write_scene(id, revision, Arc::clone(&source));
+            self.write_scene(id, Arc::clone(&source));
         }
         self.queue_evaluation(revision, source);
     }
@@ -451,7 +478,7 @@ impl App {
         self.silence_preview();
         self.playing_pane = Some(self.focused);
         // The file is what you hear, whoever asked for the update.
-        self.write_scene(scene, revision, Arc::clone(&source));
+        self.write_scene(scene, Arc::clone(&source));
         self.queue_evaluation_for(scene, revision, source, true);
     }
 
@@ -656,19 +683,11 @@ impl App {
         let Some(pending) = self.pending_evaluation.take() else {
             return;
         };
-        // A snippet previewed under the set is removed when the score is
-        // restored. Its install must be marked as a preview in the engine.
-        #[cfg(feature = "hydra")]
-        let preview = self
-            .snippet_preview
-            .as_ref()
-            .is_some_and(|preview| preview.source == pending.source);
-        #[cfg(not(feature = "hydra"))]
-        let preview = false;
+        let (preview, document) = self.install_mark(&pending);
         let send = if preview {
             StudioWorker::try_evaluate_snippet_preview
         } else {
-            StudioWorker::try_evaluate
+            StudioWorker::try_evaluate_document
         };
         match send(
             &self.worker,
@@ -678,6 +697,7 @@ impl App {
             self.options.mini,
             pending.launch,
             pending.rewind,
+            document,
         ) {
             Ok(()) => {
                 self.inflight.insert(pending.request_id, pending);
@@ -689,6 +709,34 @@ impl App {
                 self.mark_engine_disconnected();
             }
         }
+    }
+
+    /// Whether `pending` is a snippet preview, and the document of its text:
+    /// see [`StudioWorker::try_evaluate_document`].
+    pub(super) fn install_mark(&self, pending: &PendingEvaluation) -> (bool, u64) {
+        // A snippet previewed under the set is removed when the score is
+        // restored. Its install must be marked as a preview in the engine.
+        #[cfg(feature = "hydra")]
+        let snippet = self
+            .snippet_preview
+            .as_ref()
+            .filter(|preview| preview.source == pending.source);
+        #[cfg(feature = "hydra")]
+        let (preview, alone) = (
+            snippet.is_some(),
+            snippet.is_some_and(|preview| preview.restore.is_none()),
+        );
+        #[cfg(not(feature = "hydra"))]
+        let (preview, alone) = (false, false);
+        // The text is of the scene it went out for. A snippet previewed
+        // under the set is a part of that scene, and a snippet heard alone
+        // is of no scene.
+        let document = if alone {
+            rustel_runtime::PREVIEW_DOCUMENT
+        } else {
+            pending.scene.0
+        };
+        (preview, document)
     }
 
     pub(super) fn drain_engine(&mut self) {
@@ -737,7 +785,12 @@ impl App {
                 // evaluation time.
                 self.installed_revision = Some(hash.clone());
                 let evaluated = self.evaluation_revisions.get(&hash);
-                self.visual.install_layout(layout);
+                match &evaluated {
+                    Some(entry) => self
+                        .visual
+                        .install_layout_of(layout, Arc::clone(&entry.source)),
+                    None => self.visual.install_layout(layout),
+                }
                 match evaluated {
                     Some(entry) => {
                         // Widgets leave a scene that stopped being the
@@ -850,7 +903,17 @@ impl App {
                         if diagnostic.kind == "gamepad" {
                             self.toast(diagnostic.message.clone());
                         }
-                        self.status = diagnostic.message;
+                        if diagnostic.kind == "preview" {
+                            self.end_failed_preview(&diagnostic.message);
+                        }
+                        self.status = if diagnostic.kind == "sample-failed" {
+                            status_sample_failure(
+                                &diagnostic.message,
+                                self.ui_settings.show_full_paths,
+                            )
+                        } else {
+                            diagnostic.message
+                        };
                     }
                     (StudioDiagnosticLevel::Info, _) => {
                         self.log.push_with(
@@ -940,6 +1003,12 @@ impl App {
                     if let Some(device) = snapshot.device.as_ref() {
                         self.resting_output = Some(device.name().to_owned());
                     }
+                    let last = self.snapshot.take();
+                    self.follow_preview_loading(
+                        last.as_ref()
+                            .and_then(|last| last.audition_loading.as_deref()),
+                        snapshot.audition_loading.as_deref(),
+                    );
                     self.snapshot = Some(*snapshot);
                     self.dirty_frame = true;
                 }
@@ -1303,6 +1372,9 @@ pub(super) fn virtual_rows_for(
                 "scope" | "tscope" | "spectrum" => 6,
                 "spiral" => 12,
                 "pitchwheel" => 10,
+                // A small window on the clip: enough rows for its shape,
+                // not so many that a lane of videos eats the score.
+                "video" => 8,
                 other => return Some(Err(format!("unknown inline visual kind {other:?}"))),
             };
             if !alive(visual) {
@@ -1394,7 +1466,8 @@ mod tests {
 
         /// The apply itself: queued while the set plays, and no flash, because
         /// a flash confirms a press and nobody pressed anything. The launch
-        /// row is off by default, so the edit lands at once.
+        /// row is off by default, so the edit lands at once. The edit is of
+        /// its scene.
         #[test]
         fn a_paused_edit_applies_itself_without_a_flash() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -1404,6 +1477,11 @@ mod tests {
             assert_eq!(queued.len(), 1, "the paused edit was queued");
             assert_eq!(&*queued[0].source, "$: s(\"bd\")\n");
             assert_eq!(queued[0].launch, Launch::Now);
+            assert_eq!(
+                app.install_mark(&queued[0]),
+                (false, scene.0),
+                "the edit is of its scene"
+            );
             assert!(
                 app.evaluation_feedback.is_none(),
                 "an auto apply begins no flash"
@@ -1520,6 +1598,85 @@ mod tests {
             assert!(
                 !app.auto_evaluate_due,
                 "the elapsed pause is spent stopped, not saved up"
+            );
+        }
+
+        /// While one score plays, the typing pause applies an edit of that
+        /// score alone: an edit of another score stays in its file, the pause
+        /// says why, and the evaluate key is the one that runs it.
+        #[test]
+        fn the_pause_stays_on_the_playing_score() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            playing_this(&mut app, scene, "$: s(\"bd\")\n");
+
+            // An edit of the playing score still applies by itself.
+            app.dispatch_editor(Command::PasteText("$: s(\"bd\")\n$: s(\"hh\")\n".into()))
+                .expect("edit the playing score");
+            app.auto_evaluate();
+            assert!(
+                !queued_by(&app, scene).is_empty(),
+                "the playing score keeps its auto apply"
+            );
+            clear_queued(&mut app);
+
+            // A second scene: an edit of it sends nothing, and the pause says
+            // why. The playing score is left alone.
+            app.new_scene(false);
+            let other = app.scenes.current().id;
+            app.dispatch_editor(Command::PasteText("$: s(\"cp\")\n".into()))
+                .expect("edit the other score");
+            app.auto_evaluate();
+            assert!(
+                queued_by(&app, other).is_empty(),
+                "the pause sent nothing for the other score"
+            );
+            assert!(
+                queued_by(&app, scene).is_empty(),
+                "the pause sent nothing for the playing score either"
+            );
+            assert!(
+                app.status.contains("another score is playing"),
+                "the pause says why: {}",
+                app.status
+            );
+
+            // The press runs the edited score.
+            app.dispatch_editor(Command::Evaluate).expect("the press");
+            assert!(
+                !queued_by(&app, other).is_empty(),
+                "the evaluate key runs the edited score"
+            );
+
+            // Until it lands, the pressed score is the one the set is about
+            // to play, and an edit of it applies by itself.
+            app.dispatch_editor(Command::PasteText("$: s(\"hh\")\n".into()))
+                .expect("edit the score on its way");
+            app.auto_evaluate();
+            assert!(
+                queued_by(&app, other)
+                    .iter()
+                    .any(|pending| pending.source.contains("hh")),
+                "the score on its way takes the pause"
+            );
+
+            // A newer press of a third score is the one that lands, so an
+            // edit of the earlier one waits for a press of its own.
+            app.new_scene(false);
+            app.dispatch_editor(Command::PasteText("$: s(\"cp*2\")\n".into()))
+                .expect("a third score");
+            app.dispatch_editor(Command::Evaluate)
+                .expect("the newer press");
+            let earlier = app.scenes.index_of(other).expect("the earlier score");
+            app.select_scene(earlier);
+            app.dispatch_editor(Command::PasteText("$: s(\"bd*2\")\n".into()))
+                .expect("edit the earlier score");
+            app.auto_evaluate();
+            assert!(
+                !queued_by(&app, other)
+                    .iter()
+                    .any(|pending| pending.source.contains("bd*2")),
+                "the earlier score waits for its press"
             );
         }
 
@@ -1945,7 +2102,18 @@ mod tests {
 
             // Enter on a refused row of the same origin adds nothing.
             app.blocked_imports.push(origin.to_owned());
-            app.permit_row(1);
+            let refused = app
+                .permission_rows()
+                .iter()
+                .position(|row| {
+                    matches!(
+                        row,
+                        crate::settings::PermissionRow::Origin { origin: named, allowed: false }
+                            if named == origin
+                    )
+                })
+                .expect("the refused row");
+            app.permit_row(refused);
             assert_eq!(app.prefs.import_origins, [origin]);
             assert!(app.blocked_imports.is_empty());
         }
@@ -2100,6 +2268,42 @@ mod tests {
                     .all(|line| line.level == LogLevel::Info && line.text.contains("[hap] "))
             );
             assert_eq!(app.status, "ready", "the status line keeps its own words");
+        }
+
+        /// A local sound that failed to load is named by its file on the
+        /// status line, so the reason is not pushed off it. The Log and the
+        /// full paths setting keep the whole URL.
+        #[test]
+        fn a_failed_local_sample_is_named_by_its_file_on_the_status_line() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let reason = "1335 MB is over the 128 MB video limit - raise biggest video in Settings";
+            let message = format!("file:///Users/player/Downloads/long take [1].webm: {reason}");
+            let failed = || {
+                StudioControlEvent::Diagnostic(crate::engine::StudioDiagnostic::message(
+                    "sample-failed",
+                    message.clone(),
+                ))
+            };
+
+            app.handle_control(failed());
+            assert_eq!(app.status, format!("long take [1].webm: {reason}"));
+            assert_eq!(
+                app.log.lines().back().map(|line| line.text.as_str()),
+                Some(message.as_str()),
+                "the Log keeps the whole URL"
+            );
+
+            app.ui_settings.show_full_paths = true;
+            app.handle_control(failed());
+            assert_eq!(app.status, message);
+
+            let remote = "https://host/kits/kick.wav: connection refused";
+            app.ui_settings.show_full_paths = false;
+            app.handle_control(StudioControlEvent::Diagnostic(
+                crate::engine::StudioDiagnostic::message("sample-failed", remote),
+            ));
+            assert_eq!(app.status, remote, "a remote address stays whole");
         }
 
         #[test]

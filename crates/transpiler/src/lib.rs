@@ -333,8 +333,8 @@ impl<'a> Visit<'a> for RegexLiteralCollector {
 
 /// Double-quoted arguments that are JavaScript data rather than mini
 /// notation. Keep this list deliberately tiny and structural: globally
-/// exempting URLs (or every argument to a method named `initImage`) would
-/// silently change ordinary score semantics.
+/// exempting URLs (or every argument to a method named `initImage` or
+/// `initVideo`) would silently change ordinary score semantics.
 #[derive(Default)]
 struct OrdinaryStringLiteralRanges(Vec<(usize, usize)>);
 
@@ -347,7 +347,7 @@ impl OrdinaryStringLiteralRanges {
             .iter()
             .chain(ERROR_MESSAGE_CALLS.iter())
             .map(|(name, _)| *name)
-            .chain(["initImage", "import"])
+            .chain(["initImage", "initVideo", "import", "talkit"])
             .any(|name| source.contains(name))
         {
             return Self::default();
@@ -467,16 +467,34 @@ impl HydraImageStringCollector {
                 }
             }
         }
+        // Speech option keys name settings. A value stays mini-notation: a
+        // plain word such as `"sung"` is one event, so the call still reads
+        // it, and `"<natural sung>"` gives one quality to each event.
+        if name == "talkit"
+            && let Some(Argument::ObjectExpression(options)) = arguments.get(1)
+        {
+            for property in &options.properties {
+                if let ObjectPropertyKind::ObjectProperty(property) = property
+                    && !property.computed
+                    && let PropertyKey::StringLiteral(literal) = &property.key
+                {
+                    let span = literal.span();
+                    self.ranges.push((span.start as usize, span.end as usize));
+                }
+            }
+        }
     }
 }
 
 impl<'a> Visit<'a> for HydraImageStringCollector {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         let direct_hydra_source = call.callee.as_member_expression().is_some_and(|member| {
-            member.static_property_name() == Some("initImage")
-                && ["s0", "s1", "s2", "s3"]
-                    .iter()
-                    .any(|source| member.object().is_specific_id(source))
+            matches!(
+                member.static_property_name(),
+                Some("initImage" | "initVideo")
+            ) && ["s0", "s1", "s2", "s3"]
+                .iter()
+                .any(|source| member.object().is_specific_id(source))
         });
         if direct_hydra_source
             && let Some(Argument::StringLiteral(literal)) = call.arguments.first()
@@ -1127,6 +1145,8 @@ pub const VISUAL_WIDGET_METHODS: &[&str] = &[
     "_pitchwheel",
     "spectrum",
     "_spectrum",
+    "video",
+    "_video",
     "markcss",
 ];
 
@@ -1914,6 +1934,52 @@ impl RegistrationCollector<'_> {
             _ => self.has_dynamic_names = true,
         }
     }
+
+    /// Hydra's `setFunction({ name, ... })` names a transform or a source
+    /// that later calls reach, as `register` does.
+    fn is_set_function(&self, expression: &Expression<'_>) -> bool {
+        matches!(expression.get_inner_expression(), Expression::Identifier(identifier)
+            if identifier.name == "setFunction"
+                && identifier.reference_id.get().is_some_and(|reference|
+                    self.scoping.get_reference(reference).symbol_id().is_none()))
+    }
+
+    fn collect_set_function(&mut self, argument: Option<&Argument<'_>>) {
+        let definition = match argument {
+            // Refused when it runs, and it names nothing.
+            None => return,
+            Some(Argument::ObjectExpression(definition)) => definition,
+            Some(_) => {
+                self.has_dynamic_names = true;
+                return;
+            }
+        };
+        for property in &definition.properties {
+            match property {
+                ObjectPropertyKind::ObjectProperty(property)
+                    if !property.computed
+                        && property.key.static_name().as_deref() == Some("name") =>
+                {
+                    match &property.value {
+                        Expression::StringLiteral(literal) => self.push(literal.value.as_str()),
+                        Expression::TemplateLiteral(template) => {
+                            match static_template_value(template) {
+                                Some(name) => self.push(name),
+                                None => self.has_dynamic_names = true,
+                            }
+                        }
+                        _ => self.has_dynamic_names = true,
+                    }
+                    return;
+                }
+                ObjectPropertyKind::SpreadProperty(_) => {
+                    self.has_dynamic_names = true;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 impl<'a> Visit<'a> for RegistrationCollector<'_> {
@@ -1934,6 +2000,8 @@ impl<'a> Visit<'a> for RegistrationCollector<'_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if self.is_registration(&call.callee) {
             self.collect_argument(call.arguments.first());
+        } else if self.is_set_function(&call.callee) {
+            self.collect_set_function(call.arguments.first());
         }
         walk::walk_call_expression(self, call);
     }
@@ -2828,7 +2896,10 @@ fn rewrite_mini_literals(
             index = end;
             continue;
         }
-        let ch = source[index..].chars().next().unwrap();
+        let ch = source[index..]
+            .chars()
+            .next()
+            .expect("the iterator yields the element");
         output.push(ch);
         index += ch.len_utf8();
     }
@@ -3732,9 +3803,9 @@ fn scan_quoted_with_status(bytes: &[u8], start: usize, quote: u8) -> (usize, boo
 }
 
 /// Index just past the `}` closing the template substitution whose code starts
-/// at `start`, or `bytes.len()` when it never closes. Braces, strings, comments
-/// and nested templates in the code are skipped whole; regex literals are not
-/// recognized.
+/// at `start`, or `bytes.len()` when it never closes. Braces, strings,
+/// comments, regex literals and nested templates in the code are skipped
+/// whole.
 fn skip_interpolation(bytes: &[u8], start: usize) -> usize {
     let mut depth = 1usize;
     let mut index = start;
@@ -3745,6 +3816,15 @@ fn skip_interpolation(bytes: &[u8], start: usize) -> usize {
         }
         if let Some(after) = comment_end_at(bytes, index) {
             index = after;
+            continue;
+        }
+        // A `}` inside a regex literal is code, not a brace, so the literal
+        // is skipped whole before the depth is touched.
+        if bytes[index] == b'/'
+            && !matches!(bytes.get(index + 1), Some(b'/') | Some(b'*'))
+            && regex_can_start_here(bytes, index)
+        {
+            index = regex_literal_end(bytes, index);
             continue;
         }
         if bytes[index] == b'{' {
@@ -3758,6 +3838,31 @@ fn skip_interpolation(bytes: &[u8], start: usize) -> usize {
         index += 1;
     }
     bytes.len()
+}
+
+/// Index just past a regex literal that starts at its opening `/`. The body
+/// holds no line break, so one that never closes ends at the break or the
+/// end of the bytes, where the parser reports the damage.
+fn regex_literal_end(bytes: &[u8], start: usize) -> usize {
+    let mut index = start + 1;
+    let mut in_class = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index = (index + 2).min(bytes.len()),
+            b'[' => in_class = true,
+            b']' => in_class = false,
+            b'/' if !in_class => {
+                index += 1;
+                while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
+                    index += 1;
+                }
+                return index;
+            }
+            b'\n' | b'\r' => return index,
+            _ => index += 1,
+        }
+    }
+    index
 }
 
 /// Read `count` hex digits, or nothing if any of them is not hex.
@@ -3937,11 +4042,16 @@ fn quote_single(value: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// Start offsets of the calls upstream awaits: each call whose callee is the
-/// identifier `samples`, unless it is already the operand of an `await`.
+/// Start offsets of the calls upstream awaits: each call whose callee is a
+/// read of the GLOBAL identifier `samples`, unless it is already the
+/// operand of an `await`.
 #[derive(Default)]
 struct SamplesFetchCalls {
     starts: Vec<usize>,
+    /// Spans where an unresolved, global `samples` is read. A lexical
+    /// binding of the same name shadows the loader, and its calls are the
+    /// score's own.
+    global: std::collections::HashSet<u32>,
 }
 
 impl<'a> Visit<'a> for SamplesFetchCalls {
@@ -3955,7 +4065,8 @@ impl<'a> Visit<'a> for SamplesFetchCalls {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if call.callee.is_specific_id("samples") {
+        if call.callee.is_specific_id("samples") && self.global.contains(&call.callee.span().start)
+        {
             self.starts.push(call.span.start as usize);
         }
         walk::walk_call_expression(self, call);
@@ -3963,15 +4074,40 @@ impl<'a> Visit<'a> for SamplesFetchCalls {
 }
 
 /// `source` with `await ` spliced before each [`SamplesFetchCalls`] call.
-/// A member call, a constructor, or a declaration named `samples` is not a
-/// fetch call and is left as written.
+/// A member call, a constructor, a declaration, or a lexically bound name
+/// named `samples` is not a fetch call and is left as written.
 fn rewrite_bare_samples(source: &str) -> String {
     if !source.contains("samples") {
         return source.to_owned();
     }
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
-    let mut calls = SamplesFetchCalls::default();
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
+        return source.to_owned();
+    }
+    let built = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .build(&parsed.program);
+    let semantic = built.semantic;
+    let scoping = semantic.scoping();
+    let mut calls = SamplesFetchCalls {
+        global: scoping
+            .root_unresolved_references()
+            .get("samples")
+            .map(|references| {
+                references
+                    .iter()
+                    .filter_map(|&id| {
+                        let reference = scoping.get_reference(id);
+                        reference
+                            .is_read()
+                            .then(|| semantic.reference_span(reference).start)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        starts: Vec::new(),
+    };
     calls.visit_program(&parsed.program);
     calls.starts.sort_unstable();
     let mut output = String::with_capacity(source.len() + calls.starts.len() * "await ".len());
@@ -4756,6 +4892,25 @@ mod tests {
         );
         assert!(output.output.contains("m('0.2 0.8'"), "{}", output.output);
         assert!(!output.output.contains("m('A B'"), "{}", output.output);
+        // Speech text in double quotes is mini-notation, one word per
+        // event, and so is a speech option, one setting per event.
+        let output = transpile(
+            r#"$: talkit("my name is", { q: "sung monotone" })"#,
+            &TranspileOptions {
+                add_return: false,
+                ..TranspileOptions::default()
+            },
+        );
+        assert!(
+            output.output.contains("m('sung monotone'"),
+            "{}",
+            output.output
+        );
+        assert!(
+            output.output.contains("m('my name is'"),
+            "{}",
+            output.output
+        );
     }
 
     #[test]
@@ -5525,6 +5680,21 @@ mod tests {
                 output.output
             );
         }
+        // A lexical binding of the name shadows the loader: its calls are
+        // the score's own and gain nothing, while an unresolved global
+        // call in the same file still awaits.
+        for (source, expected) in [
+            (
+                "const samples = () => 1; const f = () => samples(); f()",
+                "const samples = () => 1;\nconst f = () => samples();\nf();",
+            ),
+            (
+                "const samples = () => 1; samples('bank')",
+                "const samples = () => 1;\nsamples('bank');",
+            ),
+        ] {
+            assert_eq!(transpile(source, &options).output, expected, "{source}");
+        }
         for (source, expected) in [
             (
                 "stack(...samples('xxx'))",
@@ -5570,6 +5740,10 @@ mod tests {
         assert_eq!(
             transpile("s4.initImage(\"bd\")", &options).output,
             "s4.initImage(m('bd', 13));"
+        );
+        assert_eq!(
+            transpile("s1.initVideo(\"clips/loop.webm\")", &options).output,
+            "s1.initVideo('clips/loop.webm');"
         );
     }
 
@@ -7432,5 +7606,55 @@ p._scope({ text: "/* not a comment */" });"#;
         let unwound = std::panic::catch_unwind(|| on_caller_stack(|| panic!("work unwinds")));
         assert!(unwound.is_err());
         assert!(spawns(), "a parse after an unwind spawns its thread again");
+    }
+
+    /// A regex literal inside a template substitution is skipped whole: its
+    /// `}` does not end the substitution early, so the template ends at its
+    /// own backtick and the code after it keeps its ordinary rewrites.
+    #[test]
+    fn a_regex_literal_in_a_substitution_does_not_end_the_template() {
+        let options = TranspileOptions {
+            add_return: false,
+            ..TranspileOptions::default()
+        };
+        let output = transpile("const re = `${/}`/}`;\ns(\"bd\")", &options);
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert!(
+            output.output.contains("m('bd'"),
+            "the mini call after the template still rewrites: {}",
+            output.output
+        );
+        assert!(
+            output.output.contains("${/}`/}"),
+            "the template and its regex stay as written: {}",
+            output.output
+        );
+    }
+
+    /// Hydra's `setFunction` names what later calls reach. A name the checker
+    /// cannot read makes the names dynamic, and a local `setFunction` is
+    /// not Hydra's.
+    #[test]
+    fn set_function_names_are_registrations() {
+        let hints = registration_hints(
+            "setFunction({ type: 'color', name: 'chroma', glsl: '' })\n\
+             setFunction({ name: `stars`, type: 'src' })\n\
+             setFunction()",
+        );
+        assert_eq!(hints.names, ["chroma", "stars"]);
+        assert!(!hints.has_dynamic_names);
+
+        for source in [
+            "setFunction(definition)",
+            "setFunction({ name: prefix + 'x' })",
+            "setFunction({ ...definition })",
+        ] {
+            assert!(registration_hints(source).has_dynamic_names, "{source}");
+        }
+
+        let local =
+            registration_hints("const setFunction = () => {}\nsetFunction({ name: 'mine' })");
+        assert!(local.names.is_empty());
+        assert!(!local.has_dynamic_names);
     }
 }

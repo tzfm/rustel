@@ -53,9 +53,27 @@ use rustel_runtime::ui_events::{
     source_revision,
 };
 use rustel_runtime::{
-    EnginePressureMonitor, EnginePressureSnapshot, LiveFileProducer, LiveProducerStep,
-    RuntimeError, Session, SessionConfig,
+    DEFAULT_HORIZON, EnginePressureMonitor, EnginePressureSnapshot, LIVE_REPLACEMENT_MIN_HEADROOM,
+    LiveFileProducer, LiveProducerStep, RuntimeError, Session, SessionConfig,
 };
+
+/// The most the studio lets the scheduling horizon grow. An evaluation
+/// slower than this still drains the ring, and the replacement it arms
+/// rolls back rather than taking over into a gap.
+const MAX_LIVE_HORIZON: f64 = 2.0;
+
+/// The horizon that keeps a replacement's takeover inside scheduled audio
+/// after an evaluation of the playing score took `evaluation`.
+///
+/// The engine thread is also the live producer, so while it compiles nothing
+/// refills the ring, and a replacement armed after a compile longer than the
+/// ring holds takes over past its last scheduled onset: the refusal that
+/// follows keeps the old score and drops the edit. Twice the compile plus a
+/// tenth keeps a full ring through the next one; a fast machine's compile
+/// never reaches the default horizon, so it schedules as before.
+pub(super) fn horizon_for_evaluation(evaluation: Duration) -> f64 {
+    (evaluation.as_secs_f64() * 2.0 + 0.1).clamp(DEFAULT_HORIZON, MAX_LIVE_HORIZON)
+}
 
 /// Scheduling cadence used by the native studio worker.
 pub const DEFAULT_STUDIO_POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -74,8 +92,14 @@ pub const DEFAULT_STUDIO_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long the mix has to stay below the silence floor before a graceful
 /// stop concludes that nothing is left to hear.
 const GRACEFUL_STOP_SILENCE_HOLD: Duration = Duration::from_millis(250);
-/// How long a preview waits for its sample to load before giving up.
-const AUDITION_LOAD_TIMEOUT: Duration = Duration::from_secs(4);
+/// How long a preview waits for its sample to load before giving up. A
+/// long recording or a video decodes for seconds, and the list says
+/// `loading` while it does: the wait is the studio's stop window, so a
+/// preview that comes late is one Space can still stop.
+const AUDITION_LOAD_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a chord preview waits for the bank it plays on. A chord heard
+/// long after its key is no preview of it.
+const CHORD_AUDITION_LOAD_TIMEOUT: Duration = Duration::from_secs(4);
 /// Default ceiling on decoded PCM the sounding score does not name.
 pub const DEFAULT_PREVIEW_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// Default pause after the last preview before unused samples are dropped.
@@ -128,6 +152,12 @@ pub struct LiveMaterial {
     /// them, so a move here owes one more. A count rather than an event:
     /// a send the full queue refused is sent again with the latest.
     pub tabs_closed: u64,
+    /// The scene id of each tab that has left the studio, in order: closed,
+    /// deleted, or put down with its set. A scene id is the document of the
+    /// text of its tab, and the engine closes the document of each new id:
+    /// see [`rustel_runtime::Session::forget_plugin_document`]. A list
+    /// rather than an event, for the reason of the count above.
+    pub closed_documents: Vec<u64>,
     /// Whether a setup picks sample variants: a setup open in a tab, or
     /// either setup as the studio stores it. See
     /// [`rustel_runtime::sounds::variant_selection`].
@@ -176,9 +206,12 @@ struct ProtectionKey {
 /// How far ahead of the device clock a preview is placed.
 const AUDITION_LEAD_SECS: f64 = 0.06;
 /// How far ahead of its own moment a run's note is handed to the device.
-/// Wider than the lead itself, so a note is always placed at the moment
-/// it belongs to rather than at the earliest the device would take it.
-const AUDITION_RUN_LEAD_SECS: f64 = AUDITION_LEAD_SECS * 2.0;
+/// Wide enough that a slow engine turn - a busy small machine renders its
+/// turns hundreds of milliseconds apart - still hands each note over
+/// before its moment, so the device places it at the time it belongs to
+/// and the run keeps its tempo. A note already handed over cannot be
+/// taken back; `stop_audition` cuts each of those at its own start.
+const AUDITION_RUN_LEAD_SECS: f64 = 0.15;
 /// Gate length of a preview; a one-shot sample plays to its end anyway.
 const AUDITION_GATE_SECS: f64 = 2.0;
 /// A chord is held a little longer than a one-shot: the ear needs the
@@ -272,6 +305,9 @@ pub struct StudioConfig {
     /// The origins of the permissions page, which scores import scripts from.
     /// They add to the origins that `session` already trusts.
     pub import_origins: Vec<String>,
+    /// What the permissions page permits a score's `samples()`, images and
+    /// videos to read, over what `session` permits.
+    pub sample_grants: SampleGrants,
     /// Whether native orchestras run. The studio turns them on at start -
     /// an installed library is the opt-in - and the permissions page can
     /// flip the switch during a run. The default is the studio's rule, so
@@ -296,9 +332,44 @@ impl Default for StudioConfig {
             watch_pads: true,
             open_default_input: true,
             import_origins: Vec::new(),
+            sample_grants: SampleGrants::default(),
             csound_allowed: true,
         }
     }
+}
+
+/// The permissions page's answers for what a score's `samples()`, images
+/// and videos read. Each one does what its command line flag does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SampleGrants {
+    /// The sources allowed as `--allow-sample-origin` allows one.
+    pub sources: Vec<String>,
+    /// The folder `samples('local:')` reads, as `--allow-local-samples`
+    /// names one.
+    pub local_root: Option<std::path::PathBuf>,
+}
+
+/// What `session` permits a score to read, with the page's `grants` added.
+/// A folder from the command line wins over the page's own.
+pub(super) fn sample_access(
+    session: &SessionConfig,
+    grants: &SampleGrants,
+) -> rustel_runtime::ScoreSampleAccess {
+    // A clone shares the policy's record of refused sources, which the
+    // page reads.
+    let mut access = session.score_sample_access.clone();
+    for source in &grants.sources {
+        // The page keeps only sources that the runtime read.
+        let _ = access.permit_source(source);
+    }
+    if let Some(root) = &grants.local_root
+        && !access.has_local_root()
+    {
+        // A folder that is gone since the page chose it permits nothing,
+        // and `samples('local:')` says how to grant one.
+        let _ = access.permit_local_root(root);
+    }
+    access
 }
 
 /// The origins that `session` trusts for script imports, `origins` of the
@@ -654,6 +725,10 @@ pub struct AudioMemory {
     pub record: usize,
     /// The orbit and `.FX()` reverbs the output holds.
     pub reverbs: usize,
+    /// The send lines of the plugin chains with latency: the reverb and
+    /// delay sends of their notes wait there. Sized by the largest latency
+    /// of the chains that played, 1 s at most.
+    pub send_lines: usize,
     /// What the output's DSP wrote when it was prepared.
     pub backend: usize,
     /// The analysis taps and the producer's backlog, a ring whose ends
@@ -666,7 +741,13 @@ pub struct AudioMemory {
 impl AudioMemory {
     /// Every part together: what the audio side holds beside its sounds.
     pub fn total(&self) -> usize {
-        self.event_ring + self.input + self.record + self.reverbs + self.backend + self.other
+        self.event_ring
+            + self.input
+            + self.record
+            + self.reverbs
+            + self.send_lines
+            + self.backend
+            + self.other
     }
 }
 
@@ -948,9 +1029,9 @@ struct PendingLaunch {
     /// The quantise unit the line was chosen on, in cycles. A fired
     /// rewind's grace is sized from it.
     unit_cycles: f64,
-    /// A snippet previewed under the set: see
-    /// [`StudioEngine::played_before_preview`].
-    preview: bool,
+    /// Whether it is a snippet previewed under the set, and the document of
+    /// its text: see [`InstallMark`].
+    mark: InstallMark,
     /// What its text needs; in wait mode it lands on the first line after
     /// all of it has loaded.
     followed: Vec<Followed>,
@@ -960,6 +1041,33 @@ struct PendingLaunch {
     /// prepare: see [`StudioEngine::prepare_launch`].
     #[cfg(feature = "vst")]
     prepared: bool,
+    /// The lead of the plugin chains its line was chosen with: see
+    /// [`rustel_runtime::Session::takeover_headroom`]. Only a lead that grew
+    /// past it can leave the fire too little room before the line.
+    #[cfg(feature = "vst")]
+    lead: f64,
+}
+
+/// What the worker says of the score it hands over next, for its install.
+#[derive(Clone, Copy, Debug, Default)]
+struct InstallMark {
+    /// A snippet previewed under the set: see
+    /// [`StudioEngine::played_before_preview`]. One install takes it.
+    preview: bool,
+    /// The document of the text: the scene id of its tab, as the session
+    /// reads it. See [`StudioEngine::mark_next_install_document`]. It stays
+    /// for each install until the next mark.
+    document: u64,
+}
+
+impl InstallMark {
+    /// The mark of one install. The preview goes with the install, and the
+    /// document stays for the next.
+    fn take(&mut self) -> Self {
+        let mark = *self;
+        self.preview = false;
+        mark
+    }
 }
 
 /// A launch that has fired: its evaluation is done, the new generation is
@@ -1123,12 +1231,23 @@ const BATON_SETTLE_CALLBACKS: u64 = 2;
 pub struct StudioEngine {
     config: StudioConfig,
     session: Session,
+    /// The horizon the session keeps filled, raised when an evaluation of the
+    /// playing score runs longer than the audio scheduled ahead of the clock
+    /// (see [`Self::follow_horizon_to_evaluation`]).
+    live_horizon: f64,
+    /// The last evaluation that installed a score, wall-clock. The first
+    /// replacement of a score sizes its takeover from this until the
+    /// producer has measured a cutover of its own (see
+    /// [`Self::match_replacement_headroom_to_producer`]).
+    last_live_evaluation: Duration,
     recovery_epoch: u64,
     launch_pads: Vec<(u8, u8)>,
     live: Option<StudioPlayback>,
     /// Output parked between transports: no score producer, transport or
     /// cycle ownership. A stop parks the stream here rather than closing
-    /// it, and the next start adopts it where it stands.
+    /// it, and the next start adopts it where it stands. Outside Piano mode,
+    /// a stop closes a stream that holds a plugin copy of a chain that a
+    /// closed tab ended: see [`Self::closed_plugin_copies`].
     piano_output: Option<LiveScalarDevice>,
     piano_close_when_idle: bool,
     /// Piano mode is open in the app: from [`Self::prepare_piano`] to
@@ -1305,13 +1424,24 @@ pub struct StudioEngine {
     /// earlier one, pushed after the score was put back over a preview,
     /// are the preview playing on to its cutover.
     played_from_generation: u64,
-    /// Whether the score handed over next - evaluated at once, or armed
-    /// for a line and carried there by [`PendingLaunch::preview`] - is a
-    /// snippet previewed under the set. Set by the worker with each
-    /// evaluation, and taken by the install.
-    next_install_preview: bool,
+    /// The install mark of the score handed over next: a snippet previewed
+    /// under the set or not, and the document of its text. The worker sets
+    /// it with each evaluation. A score armed for a line carries it there in
+    /// [`PendingLaunch::mark`]. The install takes the preview, and the
+    /// document stays until the next mark.
+    next_install: InstallMark,
     /// [`LiveMaterial::tabs_closed`] as last sent.
     live_tabs_closed: u64,
+    /// How many ids of [`LiveMaterial::closed_documents`] the engine took.
+    #[cfg(feature = "vst")]
+    live_documents_closed: usize,
+    /// An engine holds a plugin copy of a chain that a closed tab ended: see
+    /// [`rustel_runtime::Session::end_closed_plugin_document`]. The parked
+    /// output then closes, so the copy ends: see
+    /// [`Self::close_output_of_closed_tabs`]. Stays until the parked output
+    /// closes, a start adopts it, or no output is open.
+    #[cfg(feature = "vst")]
+    closed_plugin_copies: bool,
     /// The plugins the texts of the tabs name, as last sent.
     #[cfg(feature = "vst")]
     live_plugins_named: Vec<String>,
@@ -1667,6 +1797,7 @@ impl StudioEngine {
             &config.import_origins,
             config.csound_allowed,
         ));
+        session.set_score_sample_access(sample_access(&config.session, &config.sample_grants));
         session.set_query_hap_budget(STUDIO_QUERY_HAP_BUDGET)?;
         let master = Arc::new(StudioMasterBus::default());
         master.set_max_polyphony(config.session.max_polyphony);
@@ -1697,12 +1828,14 @@ impl StudioEngine {
         // is: the policy the host chose for scores, with each pack's own
         // origin permitted on top of it. The library must exist first.
         if let Some(library) = session.sample_library() {
-            library.set_import_policy(config.session.score_sample_access.clone());
+            library.set_import_policy(session.config().score_sample_access.clone());
         }
 
         Ok(Self {
             config,
             session,
+            live_horizon: DEFAULT_HORIZON,
+            last_live_evaluation: Duration::ZERO,
             recovery_epoch: 0,
             launch_pads: Vec::new(),
             live: None,
@@ -1771,8 +1904,12 @@ impl StudioEngine {
             awaiting_score: false,
             played_before_preview: None,
             played_from_generation: 0,
-            next_install_preview: false,
+            next_install: InstallMark::default(),
             live_tabs_closed: 0,
+            #[cfg(feature = "vst")]
+            live_documents_closed: 0,
+            #[cfg(feature = "vst")]
+            closed_plugin_copies: false,
             #[cfg(feature = "vst")]
             live_plugins_named: Vec::new(),
             #[cfg(feature = "vst")]
@@ -1892,6 +2029,15 @@ impl StudioEngine {
         if let Some(device) = self.audio_device() {
             device.cut_sounding();
         }
+    }
+
+    /// Gives each plugin copy of the score in play that did not start, or
+    /// that faulted, one new try in the background, with no evaluation: see
+    /// [`rustel_runtime::Session::retry_plugins`]. The update press on the
+    /// text in play asks for it while a plugin row shows a fault.
+    #[cfg(feature = "vst")]
+    pub fn retry_plugins(&self) {
+        self.session.retry_plugins();
     }
 
     pub fn stop_handle(&self) -> StudioStopHandle {
@@ -2150,6 +2296,7 @@ impl StudioEngine {
                 self.advance_clock_out();
                 self.follow_clock_in();
             }
+            flush_waiting_restarts(&self.live.as_ref().expect("checked playback").device);
             return Ok(self.advance_graceful_stop(observed_at));
         }
 
@@ -2212,6 +2359,7 @@ impl StudioEngine {
             // A held start keeps its output open: previews sound through it
             // as they would through a playing score.
             self.advance_previews();
+            flush_waiting_restarts(&self.live.as_ref().expect("checked playback").device);
             emit_pending_diagnostics(&mut self.pending_diagnostics, &mut emit);
             return Ok(StudioTick::Running {
                 step: None,
@@ -2242,12 +2390,18 @@ impl StudioEngine {
         }
         if self.session.transport().is_stopped() {
             self.advance_clock_out();
+            flush_waiting_restarts(&self.live.as_ref().expect("checked playback").device);
             return Ok(self.advance_graceful_stop(observed_at));
         }
         self.advance_previews();
         self.retire_finished_audition_transport();
         if self.session.transport().is_stopped() {
             self.advance_clock_out();
+            // A finished audition hands its output to a held key: the parked
+            // output gets its flush in service_idle_piano.
+            if let Some(live) = self.live.as_ref() {
+                flush_waiting_restarts(&live.device);
+            }
             return Ok(self.advance_graceful_stop(observed_at));
         }
         {
@@ -2309,13 +2463,9 @@ impl StudioEngine {
                         reverbs.observe_prepared(device, &event);
                         let pushed = device.push(event.clone());
                         if pushed {
-                            played.note(&event, device.render_frontier_frames());
-                            accepted_audio.push(UiAcceptedOnset {
-                                generation: event.generation,
-                                onset_id: event.onset_id,
-                                frequency_hz: Some(event.freq_hz),
-                                gain: Some(event.gain),
-                            });
+                            let frontier = device.render_frontier_frames();
+                            played.note(&event, frontier, device.restart_lead());
+                            accepted_audio.push(UiAcceptedOnset::scalar(&event));
                         }
                         pushed
                     },
@@ -2464,6 +2614,9 @@ impl StudioEngine {
     /// Stop is idempotent at the Session level and ends the current playback.
     /// A healthy device stays open after an acknowledged Stop or a zero timeout.
     /// A later [`Self::evaluate`] adopts that stream rather than opening a new one.
+    /// Outside Piano mode, the device closes at the Stop while it holds a
+    /// plugin copy of a chain that a closed tab ended: see
+    /// [`Self::closed_plugin_copies`].
     /// An idle Linux default output is reopened to resolve its current route.
     ///
     /// This is the immediate form: the device declicks over ten milliseconds
@@ -2490,6 +2643,11 @@ impl StudioEngine {
         self.piano_has_score_tail = false;
         self.piano_tail_silent_since = None;
         self.session.transport().stop();
+        // The score of a tab that closed while it played ends its chains.
+        #[cfg(feature = "vst")]
+        {
+            self.closed_plugin_copies |= self.session.end_closed_plugin_document();
+        }
         self.session.consume_audio_confirmations();
         self.supersede_launch();
         if let Some(out) = self.clock_out.as_mut() {
@@ -2518,6 +2676,12 @@ impl StudioEngine {
         self.external_outputs().forget();
         let acknowledged = device.stop_and_wait(timeout);
         let report = device.report();
+        // A copy of a chain that a closed tab ended goes with its output.
+        // The output drained above, so it closes here with no second drain.
+        // Piano mode keeps it open.
+        #[cfg(feature = "vst")]
+        let keep_output =
+            keep_output && !(acknowledged && self.closed_plugin_copies && !self.piano_mode);
         // Reuse avoids host clicks from closing and reopening a stream.
         // A zero timeout leaves the stop ramp pending on a healthy callback;
         // an expired positive timeout means the callback cannot be reused.
@@ -2527,6 +2691,11 @@ impl StudioEngine {
         } else {
             drop(device);
         }
+        // A zero timeout parks the output before the end of its stop ramp.
+        // Its close waits for the ramp. An output that closed here sent its
+        // copies home.
+        #[cfg(feature = "vst")]
+        self.close_output_of_closed_tabs();
         // The parked output keeps its rings and pools until the next start
         // adopts them or a device change releases the stream. What the
         // session let go is still owed back.
@@ -2553,20 +2722,31 @@ fn output_recovery_cancelled(requested: Option<&DevicePlaybackError>) -> Runtime
     }
 }
 
+/// Arms the refill of the replacement output at `now`, at its rate. `waits`
+/// is the load mode: in the wait mode the first window of the new output
+/// waits for the plugin copies the close sent home, and in the async mode a
+/// short time at most.
 fn arm_output_recovery_after_recycle(
     session: &mut Session,
     producer: &mut LiveFileProducer,
     now: f64,
     sample_rate: u32,
+    waits: bool,
 ) -> Result<(), RuntimeError> {
     // The replacement output is already open. New decodes must follow its
     // rate even if requery fails; retained PCM keeps its own rate.
     if let Some(library) = session.sample_library() {
         library.set_render_rate(sample_rate);
     }
-    // A held start counts its plugin copies at this rate too.
+    // A held start counts its plugin copies at this rate too, and the first
+    // window holds by the load mode of now.
     #[cfg(feature = "vst")]
-    session.set_plugin_rate(sample_rate);
+    {
+        session.set_plugin_rate(sample_rate);
+        session.set_plugin_wait(waits);
+    }
+    #[cfg(not(feature = "vst"))]
+    let _ = waits;
     session.consume_audio_confirmations();
     let requery = session.requery_after_output_recycle_at(now);
     session.consume_audio_confirmations();
@@ -2654,8 +2834,9 @@ struct PlayedSink<'a> {
 }
 
 impl PlayedSink<'_> {
-    /// Note a score event's sample, if it plays one.
-    fn note(&mut self, event: &AudioEvent, render_frontier: u64) {
+    /// Note a score event's sample, if it plays one. `render_frontier` and
+    /// `restart_lead` are the device's, read after the push.
+    fn note(&mut self, event: &AudioEvent, render_frontier: u64, restart_lead: u32) {
         note_sample_use(
             event,
             self.samples,
@@ -2663,6 +2844,7 @@ impl PlayedSink<'_> {
             self.use_until,
             self.sample_rate,
             render_frontier,
+            restart_lead,
         );
         if event.synth.is_some() || event.generation < self.from {
             return;
@@ -2689,6 +2871,7 @@ fn note_sample_use(
     use_until: &mut HashMap<SampleId, u64>,
     sample_rate: u32,
     render_frontier: u64,
+    restart_lead: u32,
 ) {
     if event.synth.is_some() {
         return;
@@ -2700,11 +2883,17 @@ fn note_sample_use(
     else {
         return;
     };
-    // A restart can move a late onset to its callback adoption frame. The
-    // frontier read after the successful push bounds that frame: generation
-    // publication precedes the push, and each render chunk rechecks it.
+    // A restart moves a late onset to its callback adoption frame, and up
+    // to its restart lead after it. The frontier read after the
+    // successful push bounds that frame: generation publication precedes
+    // the push, and each render chunk rechecks it. The source of a note of a
+    // plugin chain starts up to the latency of the chain after its frame.
+    let later = u64::from(event.controls.chain_latency()) + u64::from(restart_lead);
     let event = AudioEvent {
-        target_frame: event.target_frame.max(render_frontier),
+        target_frame: event
+            .target_frame
+            .max(render_frontier)
+            .saturating_add(later),
         ..event.clone()
     };
     // A decode can become ready during the query, after this turn's bank
@@ -2803,6 +2992,11 @@ struct RunningAudition {
     /// handed over. A run is heard as a tempo, so what matters is where
     /// each note sounds, and the device places a note by its own clock.
     due: f64,
+    /// The clock second each handed-over note was QUEUED to sound at,
+    /// slides included: a slide moves a note off the ideal step grid, so
+    /// the queue times cannot be rebuilt from `due` afterwards. A stop
+    /// reads these to cut exactly the notes the device already holds.
+    handed: Vec<f64>,
 }
 
 impl RunningAudition {
@@ -2821,6 +3015,7 @@ impl RunningAudition {
 
     /// That note is the device's now; the one after it is a step later.
     fn sounded(&mut self) {
+        self.handed.push(self.due);
         self.next += 1;
         self.due += self.request.step_secs.max(0.01);
     }
@@ -2913,6 +3108,21 @@ fn hush(device: &LiveScalarDevice) -> (u64, u64) {
     (hushed, frame)
 }
 
+/// One flush of the inserts of `device` with no events, while a plugin copy
+/// waits for a restart and no score plays: a Stop that plays out its tail,
+/// a held start or the parked output. The flush asks the copy back, and a
+/// later flush ships it again after the restart of its park. So the copy is
+/// in its slot before the next start. With no request since the last list
+/// of the restarts, the check takes no lock of the plugin host.
+fn flush_waiting_restarts(device: &LiveScalarDevice) {
+    #[cfg(feature = "vst")]
+    if rustel_runtime::vst::restarts_pending() || device.restarts_in_flight() {
+        LiveReverbBatch::default().flush(device);
+    }
+    #[cfg(not(feature = "vst"))]
+    let _ = device;
+}
+
 /// How long an externally-scheduled onset waits, from the device clock's
 /// now. `Duration::from_secs_f64` panics on a value that is not finite or
 /// is beyond `u64::MAX` seconds, and a score's target time reaches here
@@ -2970,10 +3180,12 @@ impl ExternalOutputs<'_> {
     }
 }
 
-/// Whether the render frontier has passed `line_frame`, so a cut armed
-/// there has fired.
+/// Whether a cut armed at `line_frame` has fired: the render frontier has
+/// passed the line, or the device fired the cut before it. A note of a
+/// plugin chain with latency starts its lead before its output, so the
+/// device fires a cut that lead before its line.
 fn line_passed(device: &LiveScalarDevice, line_frame: u64) -> bool {
-    device.render_frontier_frames() > line_frame
+    device.render_frontier_frames() > line_frame || device.fired_line_frame() == Some(line_frame)
 }
 
 /// Where a flip at `takeover_frame` retires the outgoing score's external
@@ -3244,7 +3456,7 @@ pub(super) mod tests {
     #[test]
     fn constructor_passes_the_score_sample_policy_to_imported_sources() {
         let mut granted = rustel_runtime::samples::ScoreSampleAccess::denied();
-        granted.permit_origin("https://samples.example").unwrap();
+        granted.permit_source("https://samples.example").unwrap();
         for access in [
             rustel_runtime::samples::ScoreSampleAccess::denied(),
             granted,
@@ -3679,6 +3891,10 @@ pub(super) mod tests {
     /// tick and stays frozen after the one that fires, so the caller sees
     /// the landing exactly as that tick left it; release it with
     /// [`hold_clock`] before driving time forward.
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "the deadline is the test failure"
+    )]
     pub(in crate::engine) fn tick_until_fired(
         engine: &mut StudioEngine,
     ) -> Result<StudioInstall, RuntimeError> {
@@ -3779,11 +3995,13 @@ pub(super) mod tests {
             boundary_time,
             rewind: true,
             unit_cycles: 0.25,
-            preview: false,
+            mark: InstallMark::default(),
             followed: Vec::new(),
             waited: false,
             #[cfg(feature = "vst")]
             prepared: true,
+            #[cfg(feature = "vst")]
+            lead: 0.0,
         });
     }
 

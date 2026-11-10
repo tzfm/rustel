@@ -21,11 +21,10 @@ fn all_transform_does_not_repeat_within_an_evaluation() {
     studio.settle();
 
     // A repeated transform call in this evaluation must refuse the update.
-    // The save ack and the install status race for the status line, so
-    // accept either. A refused update never leaves a saved score sounding.
+    // A refused update never leaves a saved score sounding.
     let status = studio.status().to_owned();
     assert!(
-        status == "playing from the top" || status.starts_with("saved "),
+        status == "playing from the top",
         "the update was refused or never installed: {status}"
     );
     assert!(studio.is_playing(), "the score is sounding");

@@ -46,7 +46,10 @@ fn cleanup(at: &Path) {
 /// The folder name as the Sources page reads it - the label is the last
 /// component, not the whole path, and the row says `(local)`.
 fn source_row_holds(rows: &[String], folder: &Path) -> bool {
-    let name = folder.file_name().unwrap().to_string_lossy();
+    let name = folder
+        .file_name()
+        .expect("the path has a name")
+        .to_string_lossy();
     rows.iter()
         .any(|row| row.contains(name.as_ref()) && row.contains("(local)"))
 }

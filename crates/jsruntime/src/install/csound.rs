@@ -64,7 +64,7 @@ fn source_text<'js>(ctx: &Ctx<'js>, args: &[rquickjs::Value<'js>]) -> rquickjs::
     if let Some(parts) = first.as_array()
         && parts.as_object().contains_key("raw")?
     {
-        if parts.len() != args.len() {
+        if js_array_len(parts)? != args.len() {
             return Err(throw_type_error(
                 ctx,
                 "loadCSound template substitutions do not match",

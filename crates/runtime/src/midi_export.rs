@@ -409,7 +409,7 @@ mod tests {
         value: serde_json::Value,
     ) -> OnsetEventJson {
         OnsetEventJson {
-            live_controls: [0; 3],
+            live_controls: [0; 4],
             onset_id: id,
             generation: 0,
             whole_begin: "0/1".into(),

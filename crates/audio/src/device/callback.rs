@@ -23,7 +23,7 @@ impl CallbackGate {
     pub(super) fn new() -> Self {
         Self {
             state: AtomicU8::new(CALLBACK_PENDING),
-            errors_in_flight: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -33,16 +33,18 @@ impl CallbackGate {
 
     pub(super) fn retire(&self) {
         // Retire before shared status is reused. Error writers never wait.
+        // A render in flight ends first, so the backend is the producer's
+        // when this returns.
         self.state.store(CALLBACK_RETIRED, Ordering::SeqCst);
-        while self.errors_in_flight.load(Ordering::SeqCst) != 0 {
+        while self.in_flight.load(Ordering::SeqCst) != 0 {
             std::thread::yield_now();
         }
     }
 
     pub(super) fn begin_error(&self) -> CallbackErrorGuard<'_> {
         // Retirement sees this writer, or its state check sees retirement.
-        self.errors_in_flight.fetch_add(1, Ordering::SeqCst);
-        CallbackErrorGuard(&self.errors_in_flight)
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        CallbackErrorGuard(&self.in_flight)
     }
 
     pub(super) fn activate(&self) -> Result<(), DevicePlaybackError> {
@@ -66,7 +68,11 @@ impl CallbackGate {
         T: Sample + FromSample<f32>,
     {
         tripwire::audio_scope(|| {
-            if self.is_active() {
+            // Retirement sees this render, or this check sees retirement.
+            // The guard drops also in a panic, so a render that panics holds
+            // no retirement.
+            let _in_flight = self.begin_error();
+            if self.state.load(Ordering::SeqCst) == CALLBACK_ACTIVE {
                 render(output);
             } else {
                 output.fill(T::from_sample(0.0));
@@ -150,6 +156,7 @@ impl ManualLiveOutput {
             gate: Arc::clone(&gate),
             tripwire_baseline: tripwire::Violations::capture(),
             backend_bytes: backend.prepared_bytes(),
+            backend: None,
         };
         let device = LiveScalarDevice::start_prepared(shared, options, prepared)?;
         Ok(Self {
@@ -258,6 +265,8 @@ impl LiveScalarDevice {
         let mut report = self.shared.report(self.stream_id);
         report.playhead_nanos = self.clock_nanos();
         report.plugin_workers = self.ready_plugin_workers();
+        report.plugin_restarts = self.plugin_restarts.load(Ordering::Relaxed);
+        report.restarts_waiting = self.restarts_in_flight();
         let violations = tripwire::Violations::capture()
             .since(self.tripwire_baseline)
             .since(self.tripwire_canaries);
@@ -303,6 +312,11 @@ impl LiveScalarDevice {
                 .fx_reverb_resident_bytes
                 .load(Ordering::Acquire),
         );
+        let chain_rooms = self
+            .chain_room_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bytes();
         let master = &self.shared.analysis;
         let visual_taps = self
             .shared
@@ -314,7 +328,8 @@ impl LiveScalarDevice {
             event_rings: ring(&self.shared.ring) + ring(&self.shared.immediate),
             input: self.shared.input.touched_bytes(),
             record: self.shared.record.touched_bytes(),
-            reverbs: orbit_reverbs + stage_reverbs,
+            reverbs: orbit_reverbs + stage_reverbs + chain_rooms,
+            send_lines: self.send_lines_bytes.load(Ordering::Relaxed),
             backend: self.backend_bytes
                 + self
                     .kabel_cache
@@ -421,44 +436,13 @@ impl CallbackProAudio {
     }
 }
 
-#[cfg(target_os = "linux")]
-impl CallbackRealTime {
-    /// The class for a stream of `frames` at `rate`.
-    pub(super) fn new(frames: u32, rate: u32) -> Self {
-        Self {
-            frames,
-            rate,
-            asked: false,
-            promoted: None,
-        }
-    }
-
-    /// Promotes the calling thread at the first call that finds
-    /// `workers_ready` set. A worker with the class proves that the system
-    /// gives the class to the process, so the call meets no refusal, whose
-    /// error the crate allocates. Until then the thread keeps its priority.
-    pub(super) fn promote_once(&mut self, workers_ready: &AtomicBool) {
-        if !self.asked && workers_ready.load(Ordering::Acquire) {
-            self.asked = true;
-            self.promoted =
-                audio_thread_priority::promote_current_thread_to_real_time(self.frames, self.rate)
-                    .ok()
-                    .map(|handle| (handle, std::thread::current().id()));
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for CallbackRealTime {
-    fn drop(&mut self) {
-        if let Some((handle, thread)) = self.promoted.take()
-            && thread == std::thread::current().id()
-        {
-            let _ = audio_thread_priority::demote_current_thread_from_real_time(handle);
-        }
-    }
-}
-
+/// The output callback holds no real-time handle, by design. The class
+/// is per thread and the callback could only ask for itself, and a
+/// callback whose render runs near the whole of every period sits near a
+/// total real-time duty cycle - the kernel's real-time watchdog kills
+/// such a thread (SIGXCPU, then death) within a fraction of a second of
+/// the grant. The plugin workers keep the class instead; their turns are
+/// short, and `pool.rs` asks for them.
 #[cfg(any(windows, feature = "test-support"))]
 impl PlaybackUnderruns {
     /// The count of a stream of `buffer_frames` at `sample_rate`.
@@ -778,6 +762,24 @@ fn write_live_output_inner<T>(
             let left = scratch[frame * 2];
             let right = scratch[frame * 2 + 1];
             if channels == 1 {
+                // A mono device has no second pair to place a routed orbit
+                // on, so every orbit falls back to the main pair and stays
+                // audible in the mixdown, as the routing contract says.
+                let mut left = left;
+                let mut right = right;
+                if routed {
+                    for (orbit, pair) in pairs.iter().enumerate() {
+                        if *pair == 0 {
+                            continue;
+                        }
+                        let mix = backend.orbit_mix(orbit, count);
+                        if mix.len() < (frame + 1) * 2 {
+                            continue;
+                        }
+                        left += mix[frame * 2] * frame_gains[frame];
+                        right += mix[frame * 2 + 1] * frame_gains[frame];
+                    }
+                }
                 output_frame[0] = T::from_sample((left + right) * 0.5);
             } else if routed {
                 // Orbits go to their pairs; a pair nobody is routed to is
@@ -911,6 +913,7 @@ pub(super) fn write_output<T>(
     channels: usize,
     total_frames: u64,
     written: &AtomicU64,
+    admission: &mut super::stream::FiniteAdmission,
 ) where
     T: Sample + FromSample<f32>,
 {
@@ -928,6 +931,8 @@ pub(super) fn write_output<T>(
     let mut rendered = 0usize;
     while rendered < frames {
         let count = (frames - rendered).min(BLOCK);
+        let due = start + (rendered + count) as u64;
+        admission.admit_until(backend, admission.horizon(due));
         backend.notify_pending_inserts_early(count);
         backend.process_block(&mut scratch[..count * 2], count);
         for frame in 0..count {
@@ -1754,6 +1759,50 @@ mod tests {
     mod callback_output {
         use super::*;
 
+        /// The only sounding orbit is routed to pair 1, which a mono device
+        /// does not have: the routing contract sends it back to the main
+        /// pair, so it stays audible in the mixdown instead of vanishing.
+        #[test]
+        fn a_routed_orbit_stays_audible_on_a_mono_output() {
+            let _tripwire_guard = tripwire_assertion_guard();
+            let shared = LiveShared::new(1);
+            shared.orbit_pairs[2].store(1, Ordering::Relaxed);
+            assert!(shared.ring.push(AudioEvent {
+                onset_id: 1,
+                generation: 1,
+                target_frame: 0,
+                onset_lead: 0.0,
+                freq_hz: 440.0,
+                gain: 0.8,
+                duration_secs: 0.5,
+                ui_visuals: 0,
+                controls: crate::OscillatorControls {
+                    orbit: 2,
+                    envelope: crate::Envelope {
+                        attack_secs: 0.001,
+                        decay_secs: 0.0,
+                        sustain: 1.0,
+                        release_secs: 0.01,
+                    },
+                    ..Default::default()
+                },
+                sample: None,
+                synth: Some(crate::SynthSource::One),
+                wavetable: None,
+                cut: None,
+            }));
+            let mut backend = LiveScalarBackend::new(48_000, 4).expect("live scalar");
+            let mut meters = LiveCallbackMeters::new(48_000, &shared.realtime_load);
+            let mut output = [0.0f32; 256];
+            tripwire::audio_scope(|| {
+                write_live_output(&mut backend, &mut meters, &mut output, 1, &shared)
+            });
+            assert!(
+                output.iter().any(|sample| *sample > 0.01),
+                "the orbit routed to an absent pair must fall back to the mono main pair"
+            );
+        }
+
         #[test]
         fn callback_load_publication_is_calibrated_and_allocation_free() {
             let _tripwire_guard = tripwire_assertion_guard();
@@ -2164,14 +2213,16 @@ mod tests {
             let mut backend = ScalarBackend::new();
             backend.init(48_000).unwrap();
             backend.note(OnsetEvent::new(0, 440.0, 0.8, 0.1));
+            let mut admission =
+                super::stream::queue_finite_events(&mut backend, &[], 48_000).unwrap();
             let written = AtomicU64::new(0);
             let mut first = [0.0f32; 128 * 2];
-            write_output(&mut backend, &mut first, 2, 130, &written);
+            write_output(&mut backend, &mut first, 2, 130, &written, &mut admission);
             assert_eq!(written.load(Ordering::Acquire), 128);
             assert!(first.iter().any(|sample| sample.abs() > 1e-6));
 
             let mut last = [1.0f32; 128 * 2];
-            write_output(&mut backend, &mut last, 2, 130, &written);
+            write_output(&mut backend, &mut last, 2, 130, &written, &mut admission);
             assert_eq!(written.load(Ordering::Acquire), 130);
             assert!(last[4..].iter().all(|sample| *sample == 0.0));
         }

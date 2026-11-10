@@ -16,6 +16,11 @@
 //! `--parallel=3` runs 3 copies of the chain at the same time on 3 threads.
 //! With either option, a chain on this thread gets the same input, and each
 //! callback compares the output of the threads with its output.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "the example prints its measurements"
+)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -252,7 +257,7 @@ impl Poller {
         self.stop.store(true, Ordering::Relaxed);
         self.thread
             .take()
-            .unwrap()
+            .expect("finish runs once")
             .join()
             .map_err(|_| "readiness polling thread panicked".into())
     }
@@ -469,7 +474,7 @@ fn run() -> Result<(), String> {
                     .params()
                     .iter()
                     .find(|param| param.id == id)
-                    .unwrap()
+                    .expect("the parameter list has the id")
                     .default;
                 Ok::<_, String>(InsertParam {
                     id,
@@ -487,8 +492,14 @@ fn run() -> Result<(), String> {
         } else {
             InsertSlot::effect(slot as u64, 0)
         };
-        let insert = host
-            .insert(key, rate, insert_slot, true)
+        // A copy for live play, as an output takes it: the first call starts
+        // the build, and the call after the build takes the copy.
+        let take = || host.insert(key, rate, insert_slot, false);
+        let insert = take()
+            .or_else(|| {
+                host.wait_idle();
+                take()
+            })
             .ok_or_else(|| format!("{name}: instance build failed: {:?}", host.take_errors()))?;
         startup.push(json!({
             "plugin": plugin.name(),

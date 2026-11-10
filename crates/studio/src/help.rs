@@ -157,7 +157,8 @@ impl HelpContext {
             Self::Knobs => {
                 "The numbers of the call under the caret, as sliders. The arrows write \
                  the score as they move, and the far left takes an optional entry out. \
-                 Press Enter to type an exact value. A plugin keeps the knobs you add to it."
+                 Press Enter to type an exact value. A plugin keeps the knobs you add to \
+                 it, and its presets sit under the rails: → opens them, Enter takes one."
             }
         }
     }
@@ -243,10 +244,13 @@ impl HelpContext {
             ],
             Self::Set => [
                 (
-                    "Up/Down · Enter",
-                    "choose a score or a tape / open it (a double click too)",
+                    "Up/Down · Enter · 1-9",
+                    "choose a score / open it / open the strip's score",
                 ),
-                ("Space · n", "fold sessions / start a new session tape"),
+                (
+                    "Space · n · /",
+                    "fold sessions / start a new tape / filter by name and @fields",
+                ),
                 (
                     "Delete · Esc · ^B",
                     "delete (Enter confirms) / back to the score / hide the panel",
@@ -328,7 +332,7 @@ impl HelpContext {
             ],
             Self::SettingsPermissions => [
                 (
-                    "Enter · Space",
+                    "Enter · ←/→ · Space",
                     "permit a refused origin · turn a row on or off",
                 ),
                 (
@@ -569,6 +573,10 @@ fn shortcut_rows_with_keybinds(
             "start a new session tape; keep scores and playback",
         ),
         HelpRow::new(
+            "/ in set panel",
+            "filter the scores by name or @field; Enter keeps, Esc restores",
+        ),
+        HelpRow::new(
             shortcut_with_alias(keybinds, BindAction::Log),
             "open the studio log",
         ),
@@ -586,6 +594,11 @@ fn shortcut_rows_with_keybinds(
         HelpRow::new(
             scene_switch(true),
             "split: cycle the focused pane, skipping the other pane's scene",
+        ),
+        HelpRow::new("Alt+1-9", "open the strip's numbered score"),
+        HelpRow::new(
+            "Ctrl+Shift+1-9",
+            "the same, where Option types the digit's character",
         ),
         HelpRow::new(hint(BindAction::NewScene), "new scene"),
         HelpRow::new(

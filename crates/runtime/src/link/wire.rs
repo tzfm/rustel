@@ -40,17 +40,25 @@ pub struct Timeline {
 }
 
 impl Timeline {
-    /// The beat the grid is at, in micro-beats.
+    /// The beat the grid is at, in micro-beats. Every step saturates, so
+    /// a grid a peer carried past the range of `i64` reads as a bound,
+    /// not a panic.
     pub fn beat_at(&self, ghost: i64) -> i64 {
-        let micros = ghost - self.time_origin;
-        self.beat_origin + micros * MICRO_BEATS_PER_BEAT / self.micros_per_beat.max(1)
+        let micros = ghost.saturating_sub(self.time_origin);
+        self.beat_origin.saturating_add(
+            micros.saturating_mul(MICRO_BEATS_PER_BEAT) / self.micros_per_beat.max(1),
+        )
     }
 
     /// The ghost time a beat is at. Rounding keeps the inverse of
-    /// `beat_at` exact on whole beats.
+    /// `beat_at` exact on whole beats, and every step saturates as in
+    /// `beat_at`.
     pub fn time_at(&self, beat: i64) -> i64 {
-        let micros = (beat - self.beat_origin) * self.micros_per_beat / MICRO_BEATS_PER_BEAT;
-        self.time_origin + micros
+        let micros = beat
+            .saturating_sub(self.beat_origin)
+            .saturating_mul(self.micros_per_beat.max(1))
+            / MICRO_BEATS_PER_BEAT;
+        self.time_origin.saturating_add(micros)
     }
 }
 
@@ -472,5 +480,23 @@ mod tests {
         let near = timeline.time_at(beat) + timeline.micros_per_beat / 2;
         let beat_near = timeline.beat_at(near);
         assert!((beat_near - beat).abs() <= MICRO_BEATS_PER_BEAT);
+    }
+
+    #[test]
+    fn a_peer_grid_past_the_range_of_i64_reads_as_a_bound() {
+        // Origins a malformed peer can carry: both conversions would
+        // overflow a plain subtraction or multiplication.
+        let far_past = Timeline {
+            micros_per_beat: 1,
+            beat_origin: 0,
+            time_origin: i64::MIN,
+        };
+        assert_eq!(far_past.beat_at(0), i64::MAX);
+        let far_future = Timeline {
+            micros_per_beat: 1_000_000,
+            beat_origin: i64::MIN,
+            time_origin: i64::MAX,
+        };
+        assert_eq!(far_future.time_at(0), i64::MAX);
     }
 }

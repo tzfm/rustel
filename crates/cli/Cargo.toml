@@ -10,10 +10,10 @@ description = "The rustel command: play, render, query and check scores, and ope
 [features]
 # The ordinary build is the complete product. `--no-default-features` builds
 # the lean command line, and each feature below adds one capability back.
-# `studio` adds the rustel-studio crate, and `remote-control` forwards to the
-# studio only. Every other feature forwards to the runtime feature of the same
-# name, and to the studio's when it has one.
-default = ["mp3-export", "extensions", "opus", "osc", "serial", "hydra", "studio", "gamepad", "remote-control", "vst"]
+# `studio` adds the rustel-studio crate, and `remote-control` and `themes`
+# forward to the studio only. Every other feature forwards to the runtime
+# feature of the same name, and to the studio's when it has one.
+default = ["mp3-export", "extensions", "opus", "osc", "serial", "hydra", "video", "studio", "gamepad", "remote-control", "vst", "themes"]
 mp3-export = ["rustel-runtime/mp3-export"]
 extensions = ["rustel-runtime/extensions", "rustel-studio?/extensions"]
 opus = ["rustel-runtime/opus"]
@@ -23,6 +23,8 @@ midi = ["dep:rustel-midi", "rustel-runtime/midi"]
 gamepad = ["rustel-runtime/gamepad", "rustel-studio?/gamepad"]
 osc = ["dep:rustel-osc", "rustel-runtime/osc", "rustel-studio?/osc"]
 hydra = ["dep:rustel-hydra", "rustel-runtime/hydra", "rustel-studio?/hydra"]
+themes = ["rustel-studio?/themes"]
+video = ["rustel-runtime/video", "rustel-studio?/video"]
 vst = ["rustel-runtime/vst", "rustel-studio?/vst"]
 remote-control = ["rustel-studio?/remote-control"]
 # The studio plays live and lists MIDI ports, so the command's own device and
@@ -43,7 +45,7 @@ rustel-scheduler = { path = "../scheduler" }
 rustel-voice = { path = "../voice" }
 rustel-midi = { path = "../midi", optional = true }
 rustel-smf = { path = "../smf" }
-rustel-hydra = { path = "../hydra", optional = true }
+rustel-hydra = { git = "https://github.com/tzfm/rustel-hydra.git", tag = "v0.2.3", optional = true }
 rustel-osc = { path = "../osc", optional = true }
 rustel-serial = { path = "../serial", optional = true }
 clap = { version = "4", features = ["derive", "color", "wrap_help"] }
@@ -71,3 +73,6 @@ rustel-runtime = { path = "../runtime", default-features = false, features = [
 rustel-vst3-fixture = { path = "../vst3-fixture" }
 tempfile = "3"
 libc = "0.2"
+
+[lints]
+workspace = true

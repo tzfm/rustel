@@ -298,10 +298,18 @@ fn compact_rendering_preserves_unicode_and_opaque_root_delimiters() {
     }
 
     impl rustel_core::CallbackHost for MaterializeHost {
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "this test double must panic when called"
+        )]
         fn call_value(&self, id: rustel_core::CallbackId, _: &Value) -> Result<Value, String> {
             panic!("unexpected value callback {id}")
         }
 
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "this test double must panic when called"
+        )]
         fn call_query(
             &self,
             id: rustel_core::CallbackId,
@@ -310,6 +318,7 @@ fn compact_rendering_preserves_unicode_and_opaque_root_delimiters() {
             panic!("unexpected query callback {id}")
         }
 
+        #[expect(clippy::panic_in_result_fn, reason = "the assertion is the test")]
         fn call_materialize_value(&self, id: rustel_core::CallbackId) -> Result<Value, String> {
             assert_eq!(id, 1);
             self.calls.set(self.calls.get() + 1);

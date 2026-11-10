@@ -80,6 +80,10 @@ pub struct StudioPrefs {
     /// or `sync-eval`. Absent is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_changes: Option<String>,
+    /// Whether an update renames the score's file to its `@title` field.
+    /// Absent is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_name_from_title: Option<bool>,
     /// `wait` or `async`. `strudel-like` still reads as async.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_mode: Option<String>,
@@ -362,6 +366,19 @@ pub struct StudioPrefs {
     /// score, such as `https://glossing.dev`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub import_origins: Vec<String>,
+    /// The sources the player allows for a score's `samples()`, images and
+    /// videos, as `--allow-sample-origin` allows one: a domain, or an
+    /// address. The trusted origins of an older studio read as addresses.
+    #[serde(
+        default,
+        alias = "sample_origins",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub allowed_sources: Vec<String>,
+    /// The folder `samples('local:')` and relative Hydra paths read, as
+    /// `--allow-local-samples` does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_sample_root: Option<String>,
     /// What an imported bank was renamed to, by the name it arrived under.
     /// An overlay: the files are untouched, and removing the entry brings
     /// the old name back.
@@ -377,6 +394,9 @@ pub struct StudioPrefs {
     /// The most one sound may hold, by rung key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_ceiling: Option<String>,
+    /// The most one video file may hold, by rung key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_ceiling: Option<String>,
     /// After this long without a sample preview, unused decoded PCM is dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unused_sample_idle: Option<String>,
@@ -390,6 +410,95 @@ pub struct StudioPrefs {
         skip_serializing_if = "super::keybinds::KeybindPrefs::is_empty"
     )]
     pub keybinds: super::keybinds::KeybindPrefs,
+    /// The keys this build does not know, as the file has them: the keys
+    /// of a newer build. A save writes them back, so the newer build finds
+    /// its settings again.
+    #[serde(flatten)]
+    pub(crate) other_keys: OtherKeys,
+    /// The values of known keys that did not read: see [`Unread`].
+    #[serde(skip)]
+    pub(crate) unread: Unread,
+}
+
+/// The values of known keys that did not read: a value in a form of an
+/// older or a newer build. Each setting of these keys has its default.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Unread {
+    /// The values as the file has them.
+    written: serde_json::Map<String, serde_json::Value>,
+    /// What this build writes for each of these keys while the setting
+    /// stays as the read left it. An absent key writes nothing.
+    untouched: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The keys that builds before this one wrote and that no build reads now.
+/// A key of this list leaves the file at the next save. Each other key
+/// that this build does not know stays in the file.
+const RETIRED_KEYS: &[&str] = &[
+    "graphics",
+    "slider_cc",
+    "slider_cc_push",
+    "slider_stick",
+    "syntax_check",
+    "webcam_preview_braille",
+];
+
+/// The old names of keys that a field reads under its new name. Only an
+/// older build writes an old name, so an old name that does not read is
+/// not written back: the field writes its new name.
+const RENAMED_KEYS: &[&str] = &["generator_stack", "sample_origins"];
+
+/// The keys of a preferences file that no field of [`StudioPrefs`] reads,
+/// with no retired key among them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct OtherKeys(serde_json::Map<String, serde_json::Value>);
+
+impl<'de> Deserialize<'de> for OtherKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut keys = serde_json::Map::deserialize(deserializer)?;
+        keys.retain(|key, _| !RETIRED_KEYS.contains(&key.as_str()));
+        Ok(Self(keys))
+    }
+}
+
+/// Read a preferences file key by key. A key whose value does not read
+/// keeps its default, and the other keys keep their values: one setting
+/// that another build wrote in another form does not take all the others
+/// with it. `None` when the text is not a JSON object.
+fn read_prefs(text: &str) -> Option<StudioPrefs> {
+    let serde_json::Value::Object(file) = serde_json::from_str(text).ok()? else {
+        return None;
+    };
+    if let Ok(prefs) = serde_json::from_value(serde_json::Value::Object(file.clone())) {
+        return Some(prefs);
+    }
+    let mut read = serde_json::Map::new();
+    let mut unread = serde_json::Map::new();
+    for (key, value) in file {
+        let mut tried = read.clone();
+        tried.insert(key.clone(), value.clone());
+        if serde_json::from_value::<StudioPrefs>(serde_json::Value::Object(tried.clone())).is_ok() {
+            read = tried;
+        } else {
+            unread.insert(key, value);
+        }
+    }
+    let mut prefs: StudioPrefs = serde_json::from_value(serde_json::Value::Object(read)).ok()?;
+    // The studio writes its settings into the preferences before each
+    // save, so what it writes for an untouched setting is the setting
+    // after that round.
+    let mut untouched = prefs.clone();
+    untouched.set_ui_settings(&untouched.ui_settings());
+    let untouched = serde_json::to_value(untouched).unwrap_or_default();
+    prefs.unread = Unread {
+        untouched: unread
+            .keys()
+            .filter_map(|key| Some((key.clone(), untouched.get(key)?.clone())))
+            .collect(),
+        written: unread,
+    };
+    Some(prefs)
 }
 
 /// One imported sample source, as `studio.json` keeps it.
@@ -649,6 +758,15 @@ impl StudioPrefs {
             .collect()
     }
 
+    /// The permissions page's grants for samples and media, as the engine
+    /// takes them.
+    pub fn sample_grants(&self) -> super::engine::SampleGrants {
+        super::engine::SampleGrants {
+            sources: self.allowed_sources.clone(),
+            local_root: self.local_sample_root.as_ref().map(PathBuf::from),
+        }
+    }
+
     /// The imported sources as the library takes them.
     pub fn global_sources(&self) -> Vec<rustel_runtime::samples::GlobalSource> {
         self.sample_sources
@@ -704,6 +822,9 @@ impl StudioPrefs {
                 .as_deref()
                 .map(super::settings::ExternalChanges::parse)
                 .unwrap_or(defaults.external_changes),
+            sync_name_from_title: self
+                .sync_name_from_title
+                .unwrap_or(defaults.sync_name_from_title),
             load_mode: self
                 .load_mode
                 .as_deref()
@@ -871,6 +992,11 @@ impl StudioPrefs {
                 .as_deref()
                 .map(super::settings::SampleCeiling::parse)
                 .unwrap_or(defaults.sample_ceiling),
+            video_ceiling: self
+                .video_ceiling
+                .as_deref()
+                .map(super::settings::VideoCeiling::parse)
+                .unwrap_or(defaults.video_ceiling),
             preview_budget: self
                 .preview_budget
                 .as_deref()
@@ -902,6 +1028,7 @@ impl StudioPrefs {
         self.auto_evaluate = Some(settings.auto_evaluate);
         self.typing_pause = Some(settings.typing_pause.key().to_owned());
         self.external_changes = Some(settings.external_changes.key().to_owned());
+        self.sync_name_from_title = Some(settings.sync_name_from_title);
         self.load_mode = Some(settings.load_mode.key().to_owned());
         self.animation = Some(settings.animation);
         self.highlights = Some(settings.highlights);
@@ -993,6 +1120,7 @@ impl StudioPrefs {
         }
         self.preview_budget = Some(settings.preview_budget.key().to_owned());
         self.sample_ceiling = Some(settings.sample_ceiling.key().to_owned());
+        self.video_ceiling = Some(settings.video_ceiling.key().to_owned());
         self.unused_sample_idle = Some(settings.unused_sample_idle.key().to_owned());
         self.precache_sources = Some(settings.precache_sources);
         self.reference_hidden = settings
@@ -1002,6 +1130,7 @@ impl StudioPrefs {
         self.show_menu = Some(settings.show_menu);
         self.show_header = Some(settings.show_header);
         self.show_footer = Some(settings.show_footer);
+        self.beat_line = Some(settings.beat_line.key().to_owned());
         // `sample_sources` is NOT written here. The sheet edits the rows in
         // place, through `set_sample_sources`, because a source is a thing
         // you added rather than a switch you flipped: rebuilding the list
@@ -1020,7 +1149,6 @@ impl StudioPrefs {
         self.backdrop_opacity = Some(settings.backdrop_opacity);
         self.interface_opacity = Some(settings.interface_opacity);
         self.editor_opacity = Some(settings.editor_opacity);
-        self.beat_line = Some(settings.beat_line.key().to_owned());
     }
 
     /// The learnt shortcuts, restored from the file. The overrides live
@@ -1056,7 +1184,7 @@ pub fn take_kept_aside() -> Option<PathBuf> {
 /// player's settings. Returns the new path when the file was moved.
 fn keep_unreadable_aside(path: &std::path::Path) -> Option<PathBuf> {
     match bounded_file::read_to_string(path, MAX_DOCUMENT_BYTES) {
-        Ok(text) if serde_json::from_str::<StudioPrefs>(&text).is_ok() => return None,
+        Ok(text) if read_prefs(&text).is_some() => return None,
         Err(bounded_file::ReadError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return None;
         }
@@ -1081,9 +1209,10 @@ impl StudioPrefs {
         super::config::directory().map(|directory| directory.join(prefs_file_name().as_ref()))
     }
 
-    /// Read the file; a missing or unreadable one is the defaults. An
-    /// unreadable file is first moved aside, because the next save replaces
-    /// it. See [`take_kept_aside`].
+    /// Read the file; a missing one, or one that is not a JSON object, is
+    /// the defaults. Such an unreadable file is first moved aside, because
+    /// the next save replaces it. See [`take_kept_aside`]. A key that does
+    /// not read keeps only its own default: see [`read_prefs`].
     pub fn load() -> Self {
         let path = super::config::read_path(prefs_file_name().as_ref());
         if let Some(kept) = path.as_deref().and_then(keep_unreadable_aside) {
@@ -1095,7 +1224,7 @@ impl StudioPrefs {
     pub fn load_from(path: Option<&std::path::Path>) -> Self {
         let mut prefs: Self = path
             .and_then(|path| bounded_file::read_to_string(path, MAX_DOCUMENT_BYTES).ok())
-            .and_then(|text| serde_json::from_str(&text).ok())
+            .and_then(|text| read_prefs(&text))
             .unwrap_or_default();
         prefs.carry_over_first_dock();
         prefs
@@ -1118,6 +1247,23 @@ impl StudioPrefs {
         }
     }
 
+    /// Put each value that did not read back in `file`, as the file had
+    /// it, while its setting stays as the read left it: the build that
+    /// wrote the value reads it again. A setting changed since then writes
+    /// its new value.
+    fn with_unread(&self, file: &mut serde_json::Value) {
+        let serde_json::Value::Object(file) = file else {
+            return;
+        };
+        for (key, value) in &self.unread.written {
+            if !RENAMED_KEYS.contains(&key.as_str())
+                && file.get(key) == self.unread.untouched.get(key)
+            {
+                file.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
     /// Write the file, creating its folder. Says why when it cannot.
     pub fn save(&self) -> Result<PathBuf, String> {
         let path = Self::path().ok_or_else(|| "no config folder on this system".to_owned())?;
@@ -1130,7 +1276,9 @@ impl StudioPrefs {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
         }
-        let text = serde_json::to_string_pretty(self).map_err(|error| error.to_string())?;
+        let mut file = serde_json::to_value(self).map_err(|error| error.to_string())?;
+        self.with_unread(&mut file);
+        let text = serde_json::to_string_pretty(&file).map_err(|error| error.to_string())?;
         // Written through a temporary and renamed, never truncated in place.
         // `fs::write` opens with truncate, so a kill or a power loss between
         // that and the last byte left a short file - and a short file does not
@@ -1181,6 +1329,68 @@ mod tests {
                 "an old knob does not become a slot: it named the focused \
          slider, which no longer exists"
             );
+        }
+
+        /// A file of another build: a value in a form this build does not
+        /// take, as the `auto_evaluate` of an older build or a dock widget
+        /// of a newer one, and a key this build does not know. Each other
+        /// setting reads and nothing is moved aside. A save, which writes
+        /// the settings of the studio first, gives the other build its
+        /// values back. A setting changed here writes its new value.
+        #[test]
+        fn a_file_of_another_build_keeps_every_setting() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let path = directory.path().join(PREFS_FILE_NAME);
+            let visuals = serde_json::json!([
+                {"edge": "right", "open": true, "widgets": [{"kind": "hologram"}]},
+                {"edge": "left", "open": false, "widgets": []}
+            ]);
+            let file = serde_json::json!({
+                "theme": "mono",
+                "auto_evaluate": "immediate",
+                "visuals": visuals,
+                "wrap": true,
+                "a_newer_setting": {"on": true},
+                "sample_origins": [5]
+            });
+            std::fs::write(&path, file.to_string()).expect("write");
+            let saved = || -> serde_json::Value {
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
+                    .expect("the saved file")
+            };
+
+            assert_eq!(super::super::keep_unreadable_aside(&path), None);
+            let mut prefs = StudioPrefs::load_from(Some(&path));
+            assert_eq!(prefs.theme.as_deref(), Some("mono"));
+            assert_eq!(prefs.wrap, Some(true));
+            let settings = prefs.ui_settings();
+            let default = UiSettings::default().auto_evaluate;
+            assert_eq!(
+                settings.auto_evaluate, default,
+                "the setting has its default"
+            );
+            prefs.set_ui_settings(&settings);
+            prefs.save_to(&path).expect("save");
+            for key in [
+                "theme",
+                "auto_evaluate",
+                "visuals",
+                "wrap",
+                "a_newer_setting",
+            ] {
+                assert_eq!(saved()[key], file[key], "{key} as the other build wrote it");
+            }
+            assert_eq!(saved().get("sample_origins"), None, "an old name goes");
+
+            let mut prefs = StudioPrefs::load_from(Some(&path));
+            let settings = UiSettings {
+                auto_evaluate: !default,
+                ..prefs.ui_settings()
+            };
+            prefs.set_ui_settings(&settings);
+            prefs.save_to(&path).expect("save");
+            assert_eq!(saved()["auto_evaluate"], serde_json::json!(!default));
+            assert_eq!(saved()["visuals"], visuals);
         }
 
         #[test]
@@ -1935,6 +2145,24 @@ mod tests {
     }
 
     #[test]
+    fn sync_name_from_title_defaults_on_and_remembers_off() {
+        for json in ["{}", r#"{"sync_name_from_title":null}"#] {
+            let prefs: StudioPrefs = serde_json::from_str(json).unwrap();
+            assert!(prefs.ui_settings().sync_name_from_title);
+        }
+        let settings = super::super::settings::UiSettings {
+            sync_name_from_title: false,
+            ..Default::default()
+        };
+        let mut prefs = StudioPrefs::default();
+        prefs.set_ui_settings(&settings);
+        let encoded = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(encoded["sync_name_from_title"], false);
+        let restored: StudioPrefs = serde_json::from_value(encoded).unwrap();
+        assert!(!restored.ui_settings().sync_name_from_title);
+    }
+
+    #[test]
     fn evaluation_flash_defaults_full_and_remembers_each_mode() {
         use super::super::settings::EvaluationFlashMode;
 
@@ -2021,7 +2249,7 @@ mod tests {
                 ..Default::default()
             };
             let mut prefs = StudioPrefs::default();
-            prefs.claim_opacities(&settings);
+            prefs.set_ui_settings(&settings);
             let encoded = serde_json::to_value(&prefs).unwrap();
             assert_eq!(encoded["beat_line"], key);
             let restored: StudioPrefs = serde_json::from_value(encoded).unwrap();

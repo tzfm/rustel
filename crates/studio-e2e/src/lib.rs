@@ -5,6 +5,7 @@
 //! otherwise drift between machines: theme, keyboard capabilities, graphics
 //! tier, terminal identity, directory layout, and the set folder's content.
 //! What a test then asserts is what the studio itself did, not where it ran.
+#![allow(clippy::print_stderr, reason = "golden updates report on stderr")]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -363,7 +364,8 @@ pub fn loud_wav_bytes() -> Vec<u8> {
     pcm16_mono_wav(&square)
 }
 
-fn pcm16_mono_wav(samples: &[i16]) -> Vec<u8> {
+/// A WAV of these samples at 8 kHz, 16-bit mono.
+pub fn pcm16_mono_wav(samples: &[i16]) -> Vec<u8> {
     let sample_rate: u32 = 8000;
     let data_len = samples.len() as u32 * 2;
     let mut bytes = Vec::with_capacity(44 + data_len as usize);

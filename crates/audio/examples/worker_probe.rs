@@ -16,6 +16,11 @@
 //! the worker on Windows, and the park of the standard library elsewhere.
 //! On Windows the probe also reads the efficiency class of the core under
 //! each thread at each period.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "the probe prints its measurements"
+)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Barrier, OnceLock};

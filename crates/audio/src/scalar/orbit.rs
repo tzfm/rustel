@@ -3,8 +3,18 @@ use super::*;
 /// Stereo pan, STEREO input branch (the mono branch is
 /// `channel_gains`): x ≤ 0 folds right into left, x > 0 folds left into
 /// right, equal-power.
+///
+/// A centred panner (x = 0) still evaluates `cos` and `sin` of the same
+/// quarter-turn constant on every frame of every stereo voice. The cached
+/// values below hold exactly that pair, so the centred path - the ordinary
+/// case for a voice with no pan control - costs two multiplies instead of a
+/// library call. Every other `x` keeps the library call.
 pub(super) fn stereo_pan(l: f32, r: f32, x: f32) -> (f32, f32) {
     use std::f32::consts::FRAC_PI_2;
+    if x == 0.0 {
+        let (cos, sin) = *CENTRED_PAN.get_or_init(centred_pan);
+        return (l + r * cos, r * sin);
+    }
     if x <= 0.0 {
         let a = (x + 1.0) * FRAC_PI_2;
         (l + r * a.cos(), r * a.sin())
@@ -12,6 +22,17 @@ pub(super) fn stereo_pan(l: f32, r: f32, x: f32) -> (f32, f32) {
         let a = x * FRAC_PI_2;
         (l * a.cos(), r + l * a.sin())
     }
+}
+
+/// `cos` and `sin` of the exact angle a centred panner computes: `1.0 *
+/// FRAC_PI_2`. The pair is the library's own answer for that exact input.
+static CENTRED_PAN: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+
+/// Populate [`CENTRED_PAN`] with the library values for the centred angle.
+fn centred_pan() -> (f32, f32) {
+    use std::f32::consts::FRAC_PI_2;
+    let a = 1.0 * FRAC_PI_2;
+    (a.cos(), a.sin())
 }
 
 impl DuckSegments {
@@ -104,6 +125,18 @@ impl ScalarBackend {
         self.orbit_pairs = pairs;
     }
 
+    /// Keep the orbit taps of a stems render: every block after this
+    /// carries each orbit's finished stereo out beside the main mix. An
+    /// offline render's own ask; the live callback never makes it.
+    pub fn capture_stems(&mut self) {
+        self.stems = Some(Stems::new());
+    }
+
+    /// The orbit taps of a stems render, if one asked for them.
+    pub fn stems(&self) -> Option<&Stems> {
+        self.stems.as_ref()
+    }
+
     pub fn orbit_pairs(&self) -> [u8; MAX_ORBITS] {
         self.orbit_pairs
     }
@@ -188,9 +221,11 @@ impl ScalarBackend {
     /// the live path delivers through the device's SPSC sample channel and
     /// installs between blocks.
     /// Sidechain scheduling, shared by both intake paths: queue the trigger
-    /// for its ARM time (10 ms before the onset), never arm immediately.
+    /// for its ARM time (10 ms before the musical onset), never arm
+    /// immediately.
     pub(super) fn arm_duck<K>(&mut self, event: &OnsetEvent<K>) {
-        self.arm_duck_at(event.onset_frame, event.controls.duck);
+        let musical = event.controls.musical(event.onset_frame);
+        self.arm_duck_at(musical, event.controls.duck);
     }
 
     /// Arm a sidechain dip the moment its event is first seen - at SCHEDULE
@@ -209,7 +244,8 @@ impl ScalarBackend {
             }
             let hold = (0.01 * f64::from(self.sample_rate.max(1))) as u64;
             self.pending_ducks.push(PendingDuck {
-                arm_frame: onset_frame.saturating_sub(hold),
+                // The arm stops at the first frame of the file.
+                arm_frame: onset_frame.saturating_sub(hold).max(self.preroll),
                 onset_frame,
                 controls: duck,
             });
@@ -260,6 +296,24 @@ impl ScalarBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_centred_panner_matches_the_library_bit_for_bit() {
+        let (cos, sin) = centred_pan();
+        assert_eq!(cos.to_bits(), (std::f32::consts::FRAC_PI_2).cos().to_bits());
+        assert_eq!(sin.to_bits(), (std::f32::consts::FRAC_PI_2).sin().to_bits());
+        for pair in [(0.0f32, 0.0), (0.5, -0.5), (-1.0, 1.0), (3.2e-9, -7.7e8)] {
+            let (l, r) = pair;
+            let expected = {
+                let a = 1.0 * std::f32::consts::FRAC_PI_2;
+                (l + r * a.cos(), r * a.sin())
+            };
+            let actual = stereo_pan(l, r, 0.0);
+            assert_eq!(actual.0.to_bits(), expected.0.to_bits());
+            assert_eq!(actual.1.to_bits(), expected.1.to_bits());
+        }
+    }
+
     mod ui_visual_mix_tests {
         use super::*;
         use crate::backend::{AudioBackend, OnsetEvent};

@@ -105,6 +105,7 @@ impl LiveScalarDevice {
             input: None,
             reverb_cache: std::sync::Mutex::new(vec![None; crate::scalar::MAX_ORBITS]),
             fx_reverb_cache: std::sync::Mutex::new(Vec::with_capacity(8)),
+            chain_room_cache: std::sync::Mutex::new(ChainRoomCache::new()),
             kabel_cache: std::sync::Mutex::new(Vec::with_capacity(crate::MAX_KABEL_GRAPHS)),
             program_cache: std::sync::Mutex::new(Vec::new()),
             insert_cache: std::sync::Mutex::new(Vec::with_capacity(
@@ -114,11 +115,17 @@ impl LiveScalarDevice {
             insert_released: std::sync::Mutex::new(Vec::with_capacity(
                 crate::insert::INSERT_SLOTS * 3,
             )),
+            insert_restarting: std::sync::Mutex::new(Vec::new()),
+            insert_replaced: std::sync::Mutex::new(Vec::new()),
+            plugin_restarts: AtomicU64::new(0),
             insert_provider: std::sync::Mutex::new(None),
             insert_names: std::sync::Mutex::new(None),
             insert_values: std::sync::Mutex::new(None),
             plugin_pool: std::sync::Mutex::new(None),
             plugin_pool_shipped: AtomicBool::new(false),
+            send_lines_reach: std::sync::atomic::AtomicU32::new(0),
+            send_lines_bytes: std::sync::atomic::AtomicUsize::new(0),
+            restart_lead_cell: std::sync::Mutex::new(None),
             shared,
             sample_rate: facts.sample_rate_hz(),
             channels: facts.channels(),
@@ -133,6 +140,7 @@ impl LiveScalarDevice {
             tripwire_baseline: prepared.tripwire_baseline,
             tripwire_canaries: tripwire::Violations::default(),
             backend_bytes: 0,
+            backend: None,
         };
         device.activate_prepared(prepared)?;
         Ok(device)
@@ -140,15 +148,17 @@ impl LiveScalarDevice {
 
     fn activate_prepared(
         &mut self,
-        prepared: PreparedLiveOutput,
+        mut prepared: PreparedLiveOutput,
     ) -> Result<(), DevicePlaybackError> {
         let backend_bytes = prepared.backend_bytes;
         let callback_gate = Arc::clone(&prepared.gate);
+        let backend = prepared.backend.take();
         match prepared.activate()? {
             OutputHandle::Native(stream) => self.stream = Some(stream),
             OutputHandle::Silent(silent) => self.silent = Some(silent),
         }
         self.callback_gate = Some(callback_gate);
+        self.backend = backend;
         self.backend_bytes = backend_bytes;
         Ok(())
     }
@@ -289,8 +299,9 @@ impl Drop for LiveScalarDevice {
         // Finish the output owner before publishing retirement to any
         // producer endpoint retained beyond this device's lifetime.
         self.stream = None;
-        // No callback runs now, so no job is out. The plugin workers end
-        // here, on the producer.
+        // No callback runs now, so no job is out. Each insert goes back
+        // here, then the plugin workers end, both on the producer.
+        self.hand_back_inserts();
         drop(
             self.plugin_pool
                 .get_mut()
@@ -348,6 +359,7 @@ impl PreparedLiveOutput {
             select_live_buffer_frames(opened.config.buffer_size(), options.buffer_preference())?;
         let backend = Self::backend(&shared, sample_rate, options, samples)?;
         let backend_bytes = backend.prepared_bytes();
+        let backend = Arc::new(BackendCell::new(backend));
         let gate = Arc::new(CallbackGate::new());
         // Include callbacks invoked synchronously while CPAL builds a stream.
         let tripwire_baseline = tripwire::Violations::capture();
@@ -355,7 +367,7 @@ impl PreparedLiveOutput {
             &opened.device,
             &opened.config,
             requested,
-            backend,
+            Arc::clone(&backend),
             shared,
             Arc::clone(&gate),
         )?;
@@ -377,6 +389,7 @@ impl PreparedLiveOutput {
             gate,
             tripwire_baseline,
             backend_bytes,
+            backend: Some(backend),
         })
     }
 
@@ -392,11 +405,12 @@ impl PreparedLiveOutput {
             .map_err(buffer_preference_error)?;
         let backend = Self::backend(&shared, sample_rate, options, samples)?;
         let backend_bytes = backend.prepared_bytes();
+        let backend = Arc::new(BackendCell::new(backend));
         let gate = Arc::new(CallbackGate::new());
         let tripwire_baseline = tripwire::Violations::capture();
         let silent = spawn_silent_output(
             shared,
-            backend,
+            Arc::clone(&backend),
             sample_rate,
             buffer_frames,
             Arc::clone(&gate),
@@ -416,6 +430,7 @@ impl PreparedLiveOutput {
             gate,
             tripwire_baseline,
             backend_bytes,
+            backend: Some(backend),
         })
     }
 
@@ -508,7 +523,7 @@ fn silent_elapsed(
 
 fn spawn_silent_output(
     shared: LiveShared,
-    mut backend: LiveScalarBackend,
+    backend: Arc<BackendCell>,
     sample_rate: u32,
     buffer_frames: u32,
     gate: Arc<CallbackGate>,
@@ -572,7 +587,10 @@ fn spawn_silent_output(
                             Ordering::Release,
                         );
                         shared.playback_latency_nanos.store(0, Ordering::Release);
-                        write_live_output(&mut backend, &mut meters, output, 2, &shared);
+                        // SAFETY: the callback uses the backend in its render
+                        // alone, and retire waits for the render.
+                        let backend = unsafe { backend.get() };
+                        write_live_output(backend, &mut meters, output, 2, &shared);
                     });
                     delivered += u64::from(buffer_frames);
                 }
@@ -774,10 +792,7 @@ impl LiveScalarDevice {
         // single-consumer check able to tell this legitimate handoff from a
         // second consumer running concurrently.
         self.stream = None;
-        for install in self.shared.samples.insert_installs.drain_available() {
-            // SAFETY: the old callback joined. This unconsumed box has one owner.
-            drop(unsafe { Box::from_raw(install.insert) });
-        }
+        self.hand_back_inserts();
         // A release names a copy of the old backend. It holds no box.
         while self.shared.samples.insert_releases.pop().is_some() {}
         // The plugin workers stay. The next turn ships them to the new
@@ -788,7 +803,6 @@ impl LiveScalarDevice {
             drop(unsafe { Arc::from_raw(install.0) });
         }
         *self.plugin_pool_shipped.get_mut() = false;
-        self.reclaim_assets();
         self.clear_reverb_caches();
         // No output remains if replacement preparation or startup fails.
         self.shared.failed.store(true, Ordering::Release);
@@ -1463,18 +1477,75 @@ fn prepare_finite_inserts(
     Ok(())
 }
 
-fn queue_finite_events(
+/// The events a finite playback still has to admit, in onset order. The
+/// callback admits them as the output reaches them, the way the live ring
+/// does, so native score queues stay bounded however long the list is.
+pub(super) struct FiniteAdmission {
+    events: Vec<OnsetEvent>,
+    next: usize,
+    sample_rate: u32,
+}
+
+impl FiniteAdmission {
+    /// One scheduler lookahead: an onset is admitted before the block that
+    /// reaches it, never after.
+    pub(super) fn horizon(&self, frame: u64) -> u64 {
+        frame.saturating_add((self.sample_rate as u64 / 10).max(1) + 256)
+    }
+
+    /// Admit every event due before `horizon`. An event the backend cannot
+    /// take yet stays for the next block, exactly as a full live ring does.
+    pub(super) fn admit_until(&mut self, backend: &mut ScalarBackend, horizon: u64) {
+        while self
+            .events
+            .get(self.next)
+            .is_some_and(|event| event.onset_frame < horizon)
+        {
+            let compact = self.events[self.next]
+                .clone()
+                .map_kabel(crate::CompactKabelControls::from);
+            if !backend.try_note_prepared(compact) {
+                // Admission is refused for now and retried on the next
+                // block: arming before this point would queue the same
+                // sidechain once per retry and flood the duck queue.
+                return;
+            }
+            // Sidechains arm here, once per admitted event, as the live
+            // path arms at ring intake: the queue drains as ducks fire,
+            // and arming at the prepare pass would spend its whole
+            // capacity on far-future onsets. The dip lands on the musical
+            // onset, as in the live path.
+            let event = &self.events[self.next];
+            backend.arm_duck_at(
+                event.controls.musical(event.onset_frame),
+                event.controls.duck,
+            );
+            self.next += 1;
+        }
+    }
+}
+
+pub(super) fn queue_finite_events(
     backend: &mut ScalarBackend,
     events: &[OnsetEvent],
-) -> Result<(), DevicePlaybackError> {
-    for event in events {
-        backend
-            .prepare_kabel_event(event)
-            .map_err(DevicePlaybackError::ResourceLimit)?;
-        backend.note(event.clone());
-    }
+    sample_rate: u32,
+) -> Result<FiniteAdmission, DevicePlaybackError> {
+    let mut queued = events.to_vec();
+    queued.sort_by_key(|event| event.onset_frame);
+    backend
+        .prepare_finite_playback(&queued)
+        .map_err(DevicePlaybackError::ResourceLimit)?;
+    // Admit the first scheduler window before priming: ahead-rendering
+    // inserts are primed over the notes near frame zero, so those notes
+    // must already be pending, exactly as a full pre-queue left them.
+    let mut admission = FiniteAdmission {
+        events: queued,
+        next: 0,
+        sample_rate,
+    };
+    admission.admit_until(backend, admission.horizon(0));
     backend.prime_finite_inserts();
-    Ok(())
+    Ok(admission)
 }
 
 impl ScalarDevice {
@@ -1707,7 +1778,7 @@ impl ScalarDevice {
             }
         }
         backend.forbid_inline_reverb();
-        queue_finite_events(&mut backend, events)?;
+        let admission = queue_finite_events(&mut backend, events, self.sample_rate())?;
 
         let written = Arc::new(AtomicU64::new(0));
         let failed = Arc::new(AtomicBool::new(false));
@@ -1718,6 +1789,7 @@ impl ScalarDevice {
             total_frames,
             written.clone(),
             failed.clone(),
+            admission,
         )?;
         stream.play().map_err(|error| {
             DevicePlaybackError::Unavailable(format!(
@@ -1807,7 +1879,7 @@ fn with_preferred_host<T>(
         let mut pulse = PULSE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pulse.is_none() {
+        if pulse.is_none() && host_builder_at_normal_priority() {
             *pulse = cpal::host_from_id(cpal::HostId::PulseAudio).ok();
         }
         if let Some(host) = pulse.as_ref() {
@@ -1816,6 +1888,23 @@ fn with_preferred_host<T>(
         }
     }
     use_host(&cpal::default_host())
+}
+
+/// True when the calling thread still stands at or above its normal
+/// scheduling priority.
+///
+/// The host's connection hands its work to a fresh thread that carries no
+/// name, and a thread with no name inherits its creator's scheduling
+/// priority and name; the audio callback later rides that thread. Only a
+/// caller at a normal priority may build the connection: one demoted below
+/// it - a device probe - would put the sound below the workers around it
+/// for the life of the process. A demoted caller lists through the default
+/// host instead, and the next caller at a normal priority - a priming at
+/// startup, or a stream opening - builds the cache.
+#[cfg(target_os = "linux")]
+fn host_builder_at_normal_priority() -> bool {
+    // SAFETY: getpriority only reads a scheduling value.
+    unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) <= 0 }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1837,6 +1926,38 @@ fn with_preferred_host<T>(
     use_host(&cpal::default_host())
 }
 
+/// Build the cached playback host now, at the calling thread's priority,
+/// and wait for it.
+///
+/// The host's connection hands its work to a fresh thread that carries no
+/// name, and a thread with no name inherits its creator's scheduling
+/// priority and name. The audio callback later rides that thread, so a
+/// host first built by a demoted worker - a device probe spawned by a
+/// demoted frame loop - puts the sound itself below the workers around it
+/// for the life of the process. Call this while the calling thread still
+/// stands at its normal priority; the helper here carries that priority
+/// and the name `audio-host` over to the connection. The wait is bounded
+/// by the host's own handshake timeout, so a server that never answers
+/// costs seconds at worst - and without the wait a demoted probe spawned
+/// right after could reach the cache first.
+pub fn prime_playback_host() {
+    let primed = std::thread::Builder::new()
+        .name("audio-host".into())
+        .spawn(|| {
+            let _ = with_preferred_host(|_| Ok::<(), DevicePlaybackError>(()));
+        });
+    match primed {
+        Ok(handle) => {
+            let _ = handle.join();
+        }
+        // A thread that cannot be spawned leaves the host to be built
+        // inline, at this thread's priority.
+        Err(_) => {
+            let _ = with_preferred_host(|_| Ok::<(), DevicePlaybackError>(()));
+        }
+    }
+}
+
 fn build_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
@@ -1844,6 +1965,7 @@ fn build_stream(
     total_frames: u64,
     written: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
+    admission: FiniteAdmission,
 ) -> Result<cpal::Stream, DevicePlaybackError> {
     macro_rules! build {
         ($sample:ty) => {
@@ -1854,6 +1976,7 @@ fn build_stream(
                 total_frames,
                 written,
                 failed,
+                admission,
             )
         };
     }
@@ -1883,6 +2006,7 @@ fn build_typed_stream<T>(
     total_frames: u64,
     written: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
+    mut admission: FiniteAdmission,
 ) -> Result<cpal::Stream, DevicePlaybackError>
 where
     T: SizedSample + FromSample<f32>,
@@ -1892,7 +2016,14 @@ where
         .build_output_stream(
             config,
             move |output: &mut [T], _| {
-                write_output(&mut backend, output, channels, total_frames, &written);
+                write_output(
+                    &mut backend,
+                    output,
+                    channels,
+                    total_frames,
+                    &written,
+                    &mut admission,
+                );
             },
             flag_stream_failure(failed),
             Some(Duration::from_secs(3)),
@@ -1906,7 +2037,7 @@ fn build_live_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
     buffer_frames: u32,
-    backend: LiveScalarBackend,
+    backend: Arc<BackendCell>,
     shared: LiveShared,
     gate: Arc<CallbackGate>,
 ) -> Result<cpal::Stream, DevicePlaybackError> {
@@ -1945,7 +2076,7 @@ fn build_live_typed_stream<T>(
     device: &cpal::Device,
     mut config: cpal::StreamConfig,
     buffer_frames: u32,
-    mut backend: LiveScalarBackend,
+    backend: Arc<BackendCell>,
     shared: LiveShared,
     gate: Arc<CallbackGate>,
 ) -> Result<cpal::Stream, DevicePlaybackError>
@@ -1974,11 +2105,20 @@ where
     // the closure drops with the stream.
     #[cfg(windows)]
     let mut pro_audio = CallbackProAudio(None);
-    // On Linux the callback takes the class of the plugin workers at its
-    // first call after a worker got it, and gives it back when the closure
-    // drops with the stream.
-    #[cfg(target_os = "linux")]
-    let mut real_time = CallbackRealTime::new(buffer_frames, sample_rate);
+    // On Linux the callback deliberately holds no real-time handle. The
+    // class is per thread and the callback could only ask for itself, and
+    // asking is not safe for a callback whose render runs near the whole
+    // of every period: the kernel's watchdog kills such a thread within a
+    // fraction of a second of the grant. The plugin workers keep the
+    // class; their turns are short.
+    // Deliberately no probe here. The class is per thread and the callback
+    // can only ask for itself, but asking is not safe unconditionally: a
+    // callback whose render runs near the whole of every period sits near a
+    // total real-time duty cycle, and the kernel's watchdog kills such a
+    // thread (SIGXCPU) within a fraction of a second of the grant. Until
+    // the callback measures its own duty cycle and asks only with
+    // headroom, the class stays with the plugin workers, whose turns are
+    // short - which is the behaviour this stream has always shipped.
     // cpal reports no underruns for a WASAPI output, so the callback counts
     // them from the playback clock.
     #[cfg(windows)]
@@ -1989,8 +2129,6 @@ where
             move |output: &mut [T], info| {
                 #[cfg(windows)]
                 pro_audio.attach_once();
-                #[cfg(target_os = "linux")]
-                real_time.promote_once(&shared.plugin_real_time);
                 gate.render_or_silence(output, |output| {
                     let playback = info.timestamp().playback;
                     let origin = *playback_origin.get_or_insert(playback);
@@ -2022,7 +2160,10 @@ where
                     shared
                         .max_playback_latency_nanos
                         .fetch_max(latency_nanos, Ordering::Relaxed);
-                    write_live_output(&mut backend, &mut meters, output, channels, &shared);
+                    // SAFETY: the callback uses the backend in its render
+                    // alone, and retire waits for the render.
+                    let backend = unsafe { backend.get() };
+                    write_live_output(backend, &mut meters, output, channels, &shared);
                 });
             },
             on_error,
@@ -2131,12 +2272,19 @@ mod tests {
                     )
                     .is_none()
             );
-            queue_finite_events(&mut backend, &events).unwrap();
+            let mut admission = queue_finite_events(&mut backend, &events, 48_000).unwrap();
             let written = AtomicU64::new(0);
             let mut output = vec![0.0f32; total as usize * 2];
             let before = crate::tripwire::Violations::capture();
             crate::tripwire::audio_scope(|| {
-                super::super::callback::write_output(&mut backend, &mut output, 2, total, &written);
+                super::super::callback::write_output(
+                    &mut backend,
+                    &mut output,
+                    2,
+                    total,
+                    &written,
+                    &mut admission,
+                );
             });
             assert!(crate::tripwire::Violations::capture().since(before).clean());
             assert_eq!(written.load(Ordering::Acquire), total);
@@ -2152,6 +2300,166 @@ mod tests {
                     .any(|v| v.abs() > 0.01)
             );
         }
+    }
+
+    /// A finite playback longer than the pending-event ceiling still sounds
+    /// every event: the callback admits from the timeline as the output
+    /// reaches it, so the short events drain and the final tone is
+    /// retained. The backend is built the way production builds it, from
+    /// `with_dispatch`, whose pools start empty: the producer reserves what
+    /// the in-callback admission needs.
+    #[test]
+    fn finite_playback_admits_events_past_the_pending_ceiling() {
+        let _guard = tripwire_assertion_guard();
+        let spacing = 64u64;
+        let mut events: Vec<_> = (0..crate::scalar::MAX_PENDING_EVENTS as u64)
+            .map(|index| OnsetEvent::new(index * spacing, 440.0, 0.05, 0.001))
+            .collect();
+        let tone_at = crate::scalar::MAX_PENDING_EVENTS as u64 * spacing + 128;
+        events.push(OnsetEvent::new(tone_at, 220.0, 0.8, 0.25));
+        let total = tone_at + 24_000;
+
+        let mut backend = ScalarBackend::with_dispatch(DspDispatch::portable());
+        backend.init(48_000).unwrap();
+        let mut admission = queue_finite_events(&mut backend, &events, 48_000).unwrap();
+        let written = AtomicU64::new(0);
+        let mut output = Vec::new();
+        while written.load(Ordering::Acquire) < total {
+            let mut block = [0.0f32; 128 * 2];
+            let before = crate::tripwire::Violations::capture();
+            crate::tripwire::audio_scope(|| {
+                super::super::callback::write_output(
+                    &mut backend,
+                    &mut block,
+                    2,
+                    total,
+                    &written,
+                    &mut admission,
+                );
+            });
+            assert!(
+                crate::tripwire::Violations::capture().since(before).clean(),
+                "in-callback admission allocated"
+            );
+            output.extend_from_slice(&block);
+        }
+        let tone = &output[tone_at as usize * 2..];
+        assert!(
+            tone.iter().any(|sample| sample.abs() > 0.01),
+            "the tone after a full pending queue of short events must still sound"
+        );
+    }
+
+    /// Sidechains arm at admission, as the live path arms at ring intake:
+    /// with a list longer than the duck queue's capacity, a trigger past
+    /// the old full-queue drop still dips its target orbit. A trigger through
+    /// a plugin chain with latency starts that latency early, and dips on its
+    /// musical onset.
+    #[test]
+    fn finite_playback_arms_ducks_past_the_queue_capacity() {
+        let _guard = tripwire_assertion_guard();
+        let duck = crate::DuckControls {
+            targets: [
+                Some(crate::DuckTarget {
+                    orbit: 2,
+                    onset_secs: 0.0,
+                    attack_secs: 0.05,
+                    depth: 1.0,
+                }),
+                None,
+                None,
+                None,
+            ],
+        };
+        let controls = |orbit: u8, duck: Option<crate::DuckControls>| crate::OscillatorControls {
+            orbit,
+            duck,
+            envelope: crate::Envelope {
+                attack_secs: 0.001,
+                decay_secs: 0.0,
+                sustain: 1.0,
+                release_secs: 0.01,
+            },
+            ..Default::default()
+        };
+        // A sustained tone on orbit 2, and more silent duck triggers than
+        // the 4096-entry sidechain queue holds, spaced far enough apart
+        // that the gain recovers to unity between dips.
+        let tone_duration = (4500u64 * 4800 + 12_000) as f32 / 48_000.0;
+        let tone = OnsetEvent::new(0, 220.0, 1.0, tone_duration).with_controls(controls(2, None));
+        let count = 4500u64;
+        let spacing = 4800u64;
+        let last_onset = count * spacing;
+        let triggers = (0..count).map(|index| {
+            OnsetEvent::new(index * spacing + 2400, 220.0, 0.0, 0.01)
+                .with_controls(controls(1, Some(duck)))
+        });
+        let mut events = vec![tone.clone()];
+        events.extend(triggers);
+        let total = last_onset + 12_000;
+
+        // The first `total` frames of `events` through the finite path.
+        let render = |events: &[OnsetEvent], total: u64| {
+            let mut backend = ScalarBackend::with_dispatch(DspDispatch::portable());
+            backend.init(48_000).unwrap();
+            let mut admission = queue_finite_events(&mut backend, events, 48_000).unwrap();
+            let written = AtomicU64::new(0);
+            let mut output = vec![0.0f32; 0];
+            while written.load(Ordering::Acquire) < total {
+                let mut block = [0.0f32; 128 * 2];
+                crate::tripwire::audio_scope(|| {
+                    super::super::callback::write_output(
+                        &mut backend,
+                        &mut block,
+                        2,
+                        total,
+                        &written,
+                        &mut admission,
+                    );
+                });
+                output.extend_from_slice(&block);
+            }
+            output
+        };
+        let output = render(&events, total);
+        let rms = |from: usize, to: usize| {
+            let slice = &output[from * 2..to * 2];
+            (slice
+                .iter()
+                .map(|s| f64::from(*s) * f64::from(*s))
+                .sum::<f64>()
+                / slice.len() as f64)
+                .sqrt()
+        };
+        let last_trigger = (count - 1) * spacing + 2400;
+        let before = rms(
+            (last_trigger - 2_000) as usize,
+            (last_trigger - 100) as usize,
+        );
+        let dipped = rms((last_trigger + 50) as usize, (last_trigger + 600) as usize);
+        assert!(
+            dipped < before * 0.5,
+            "the trigger past the queue capacity must still dip the orbit:              before {before:.5}, at the last trigger {dipped:.5}"
+        );
+
+        // A trigger with its musical onset on frame 9_600, through a plugin
+        // chain with `lead` frames of latency.
+        let trigger = |lead: u32| {
+            let key = crate::InsertKey {
+                plugin: 1,
+                preset: 0,
+            };
+            let mut trigger = OnsetEvent::new(9_600 - u64::from(lead), 220.0, 0.0, 0.01)
+                .with_controls(controls(1, Some(duck)));
+            trigger.controls.lead = lead;
+            trigger.controls.effects[0] = Some(crate::InsertControls::new(key).with_latency(lead));
+            trigger
+        };
+        let early = render(&[tone.clone(), trigger(480)], 19_200);
+        assert!(
+            early == render(&[tone, trigger(0)], 19_200),
+            "a trigger 480 frames early dips on the frame of its musical onset"
+        );
     }
 
     #[test]
@@ -2391,10 +2699,18 @@ mod tests {
                 self.output
             }
 
+            #[expect(
+                clippy::panic_in_result_fn,
+                reason = "the stub host does not implement this"
+            )]
             fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, cpal::Error> {
                 panic!("listing must not request input formats from the fake host")
             }
 
+            #[expect(
+                clippy::panic_in_result_fn,
+                reason = "the stub host does not implement this"
+            )]
             fn supported_output_configs(
                 &self,
             ) -> Result<Self::SupportedOutputConfigs, cpal::Error> {
@@ -2409,6 +2725,10 @@ mod tests {
                 self.default_config(false)
             }
 
+            #[expect(
+                clippy::panic_in_result_fn,
+                reason = "the stub host does not implement this"
+            )]
             fn build_input_stream_raw<D, E>(
                 &self,
                 _config: cpal::StreamConfig,
@@ -2424,6 +2744,10 @@ mod tests {
                 panic!("listing must not open an input stream")
             }
 
+            #[expect(
+                clippy::panic_in_result_fn,
+                reason = "the stub host does not implement this"
+            )]
             fn build_output_stream_raw<D, E>(
                 &self,
                 _config: cpal::StreamConfig,
@@ -2948,6 +3272,279 @@ mod tests {
             crate::set_plugin_pool_for_test(None);
         }
 
+        /// A stopped output drains each insert with silence and no sound out,
+        /// until the insert is quiet for its tail, 0.25 s at least, and for
+        /// 3 s at most. The next note then finds no tail and has its level at
+        /// once. A plugin that reports no tail gets 0.25 s of quiet, so its
+        /// echo after a longer gap sounds under the next note. An insert that
+        /// renders ahead gets no drain. The chains drain on the callback, and
+        /// on plugin workers. A copy that does not run on any thread drains
+        /// on the callback.
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn a_stopped_output_drains_the_tail_of_each_insert() {
+            /// The frames the copies of a chain drained, the frames of their
+            /// tails they played, and their calls on a plugin worker while
+            /// they do not run on any thread.
+            #[derive(Default)]
+            struct Counts {
+                drained: AtomicU64,
+                sounded: AtomicU64,
+                strays: AtomicU64,
+            }
+            /// Passes its input on, or plays 0.5 while its note holds. When
+            /// its input ends, its tail starts: after `delay` frames, `length`
+            /// frames that fall from 0.25 to 0. A new input does not end the
+            /// tail. It answers `tail` for its tail.
+            struct Tail {
+                key: crate::insert::InsertKey,
+                /// The `delay`, the `length` and the `tail`.
+                shape: (u32, u32, u32),
+                ahead: bool,
+                any_thread: bool,
+                note: u32,
+                fed: bool,
+                /// The frames since the input ended, while the tail plays.
+                since: Option<u32>,
+                counts: Arc<Counts>,
+            }
+            impl crate::insert::OrbitInsert for Tail {
+                fn key(&self) -> crate::insert::InsertKey {
+                    self.key
+                }
+                fn set_param(&mut self, _: crate::insert::InsertParam, _: u32) {}
+                fn note(&mut self, note: crate::insert::InsertNote, _: u32) {
+                    self.note = note.frames;
+                }
+                fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+                    if !self.any_thread && crate::pool::on_plugin_worker() {
+                        self.counts.strays.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let input = left.iter().chain(&*right).any(|sample| *sample != 0.0);
+                    let fed = self.note > 0 || input;
+                    if self.fed && !fed {
+                        self.since = Some(0);
+                    }
+                    self.fed = fed;
+                    let (delay, length, _) = self.shape;
+                    for (left, right) in left.iter_mut().zip(right) {
+                        let mut sound = if self.note > 0 { 0.5 } else { 0.0 };
+                        self.note = self.note.saturating_sub(1);
+                        if let Some(since) = self.since {
+                            if let Some(at) = since.checked_sub(delay) {
+                                sound += 0.25 * (1.0 - at as f32 / length as f32);
+                                self.counts.sounded.fetch_add(1, Ordering::SeqCst);
+                            }
+                            let end = delay.saturating_add(length);
+                            self.since = Some(since + 1).filter(|since| *since < end);
+                        }
+                        *left += sound;
+                        *right += sound;
+                    }
+                }
+                fn renders_ahead(&self) -> bool {
+                    self.ahead
+                }
+                fn any_thread(&self) -> bool {
+                    self.any_thread
+                }
+                fn reset(&mut self) {
+                    self.note = 0;
+                }
+                fn tail_frames(&self) -> u32 {
+                    self.shape.2
+                }
+                fn drain(&mut self, left: &mut [f32], right: &mut [f32]) {
+                    let frames = left.len() as u64;
+                    self.counts.drained.fetch_add(frames, Ordering::SeqCst);
+                    self.process(left, right);
+                }
+            }
+            /// What a stop did to the copies of a chain.
+            struct Stopped {
+                /// The first frames of the note before the stop, and of the
+                /// note after it.
+                before: Vec<f32>,
+                after: Vec<f32>,
+                /// Each stopped block was silent.
+                silent: bool,
+                /// The frames the copies drained in the stop, and the frames
+                /// of their tails they played.
+                drained: u64,
+                sounded: u64,
+                /// The frames the copies drained while the note after the
+                /// stop played, and in a second stop.
+                in_play: u64,
+                again: u64,
+                /// The calls of a copy on a worker while it does not run on
+                /// any thread.
+                strays: u64,
+            }
+            const RATE: u32 = 48_000;
+            // The frames of each note the test compares: 0.2 s.
+            const HEARD: usize = 9_600;
+            let _tripwire_guard = tripwire_assertion_guard();
+            crate::set_plugin_pool_for_test(Some(2));
+            let effect = crate::insert::InsertKey {
+                plugin: 1,
+                preset: 0,
+            };
+            let instrument_key = crate::insert::InsertKey {
+                plugin: 2,
+                preset: 0,
+            };
+            // A note through new copies with the tail of `shape`, a stop of
+            // `seconds`, and the same note again. The copy of the instrument
+            // runs on any thread, and the copy of the effect when `any_thread`
+            // says so.
+            let through_stop = |shape, ahead, any_thread, instrument, seconds: f64| {
+                let counts = Arc::new(Counts::default());
+                let mut manual = ManualLiveOutput::new(RATE, 7).expect("manual output");
+                let seen = Arc::clone(&counts);
+                manual
+                    .device()
+                    .set_insert_provider(Arc::new(move |key, _, _| {
+                        Some(Box::new(Tail {
+                            key,
+                            shape,
+                            ahead,
+                            any_thread: any_thread || key == instrument_key,
+                            note: 0,
+                            fed: false,
+                            since: None,
+                            counts: Arc::clone(&seen),
+                        }) as Box<_>)
+                    }));
+                let note = |frame| {
+                    let mut event = resume_tone(frame);
+                    event.controls.effects[0] = Some(crate::insert::InsertControls::new(effect));
+                    if instrument {
+                        let note = crate::insert::InsertNote {
+                            pitch: 69.0,
+                            velocity: 1.0,
+                            frames: RATE,
+                        };
+                        event.controls.instrument = Some(
+                            crate::insert::InsertControls::new(instrument_key).with_note(note),
+                        );
+                    }
+                    event
+                };
+                // The left channel of `renders` renders of 256 frames.
+                let render = |manual: &mut ManualLiveOutput, renders: usize| {
+                    let mut output = [0.0f32; 256 * 2];
+                    let mut left = Vec::with_capacity(renders * 256);
+                    for _ in 0..renders {
+                        manual.render(&mut output);
+                        left.extend(output.iter().step_by(2));
+                    }
+                    left
+                };
+                LiveReverbBatch::install_inserts(manual.device(), &[note(0)]);
+                // Only a worker runs an effect job. So a copy that does not run
+                // on any thread and still goes into a job shows on a worker.
+                if let Some(pool) = manual.device().plugin_pool.lock().unwrap().as_ref() {
+                    for bus in 0..crate::insert::MAX_INSERT_BUSES {
+                        pool.shared()
+                            .claim_before_join(crate::pool::JobKind::Effect, bus);
+                    }
+                }
+                // Each note is at the first frame of its render. So no block
+                // of play comes between the stop and the note after it.
+                assert!(manual.device().push(note(0)));
+                let before = render(&mut manual, 40)[..HEARD].to_vec();
+                manual.device().stop();
+                // The ramp of 480 frames ends in the last block of the second
+                // render. That block ran each copy, so no copy drained yet.
+                render(&mut manual, 2);
+                assert_eq!(
+                    counts.drained.load(Ordering::SeqCst),
+                    0,
+                    "the block that ends the ramp drained"
+                );
+                render(&mut manual, 1);
+                assert!(manual.device().report().stop_acknowledged);
+                let renders = (seconds * f64::from(RATE) / 256.0) as usize;
+                let silent = render(&mut manual, renders)
+                    .iter()
+                    .all(|sample| *sample == 0.0);
+                let drained = counts.drained.load(Ordering::SeqCst);
+                let sounded = counts.sounded.load(Ordering::SeqCst);
+                manual.device().resume();
+                assert!(manual.device().push(note(manual.device().clock_frames())));
+                let after = render(&mut manual, 40)[..HEARD].to_vec();
+                let in_play = counts.drained.load(Ordering::SeqCst) - drained;
+                // The next stop drains again, while the note sounds.
+                manual.device().stop();
+                render(&mut manual, 8);
+                Stopped {
+                    before,
+                    after,
+                    silent,
+                    drained,
+                    sounded,
+                    in_play,
+                    again: counts.drained.load(Ordering::SeqCst) - drained - in_play,
+                    strays: counts.strays.load(Ordering::SeqCst),
+                }
+            };
+            // The largest distance between the frames of the 2 notes.
+            let apart = |stopped: &Stopped| {
+                let pairs = stopped.before.iter().zip(&stopped.after);
+                pairs.fold(0.0f32, |most, (before, after)| {
+                    most.max((before - after).abs())
+                })
+            };
+            // The first block with 0.25 s of quiet ends a drain.
+            let quarter = u64::from(RATE / 4).div_ceil(128) * 128;
+            for any_thread in [false, true] {
+                for instrument in [false, true] {
+                    let case = format!("any thread {any_thread}, instrument {instrument}");
+                    let copies = 1 + u64::from(instrument);
+                    let stop = |shape, ahead, seconds| {
+                        let stopped = through_stop(shape, ahead, any_thread, instrument, seconds);
+                        assert!(stopped.silent, "{case}: a drain sounded");
+                        assert_eq!(stopped.in_play, 0, "{case}: a copy drained in play");
+                        assert_eq!(stopped.strays, 0, "{case}: a copy ran on a worker");
+                        stopped
+                    };
+                    // A tail that falls to 0 in 0.1 s drains in the stop.
+                    let decays = (0, RATE / 10, 0);
+                    let stopped = stop(decays, false, 0.4);
+                    assert!(stopped.sounded > 0, "{case}: no tail");
+                    assert!(
+                        apart(&stopped) < 1e-6,
+                        "{case}: a tail or a step under the note: {}",
+                        apart(&stopped)
+                    );
+                    assert!(stopped.again > 0, "{case}: the next stop drained nothing");
+                    // A tail with no end drains for 3 s.
+                    let stopped = stop((0, u32::MAX, 0), false, 3.5);
+                    assert_eq!(stopped.drained, u64::from(3 * RATE) * copies, "{case}");
+                    assert!(stopped.again > 0, "{case}: the next stop drained nothing");
+                    // A tail of 0.5 s drains through the silent gap before an
+                    // echo 0.4 s after the input.
+                    let echo = |tail| (2 * RATE / 5, RATE / 100, tail);
+                    let stopped = stop(echo(RATE / 2), false, 1.0);
+                    assert_eq!(stopped.sounded, u64::from(RATE / 100) * copies, "{case}");
+                    assert!(
+                        apart(&stopped) < 1e-6,
+                        "{case}: the echo sounded under the note: {}",
+                        apart(&stopped)
+                    );
+                    // With no tail, the drain ends at 0.25 s of quiet, and
+                    // the echo sounds under the note.
+                    let stopped = stop(echo(0), false, 1.0);
+                    assert_eq!(stopped.drained, quarter * copies, "{case}");
+                    assert_eq!(stopped.sounded, 0, "{case}");
+                    assert!(apart(&stopped) > 0.1, "{case}: no echo under the note");
+                    // An insert that renders ahead gets no drain.
+                    assert_eq!(stop(decays, true, 0.4).drained, 0, "{case}");
+                }
+            }
+            crate::set_plugin_pool_for_test(None);
+        }
+
         /// Passes its input on after the work `spin` asks for its next
         /// block, the work `steady` asks for each block and the time off the
         /// CPU `pause` asks for, in microseconds. It runs on any thread, and
@@ -3133,9 +3730,10 @@ mod tests {
             assert!(!end_buffer(0));
         }
 
-        /// A stopped output posts no job, and its plugin workers park. A
-        /// resumed output posts jobs again. The report counts the jobs the
-        /// callback ran and the late ones.
+        /// A stopped output drains its chains in jobs until they are quiet
+        /// for their quiet time. Then it posts no job, and its plugin workers
+        /// park. A resumed output posts jobs again. The report counts the
+        /// jobs the callback ran and the late ones.
         #[cfg(feature = "test-support")]
         #[test]
         fn a_stopped_output_parks_its_plugin_workers() {
@@ -3184,6 +3782,18 @@ mod tests {
                 manual.render(&mut output);
             }
             assert!(manual.device().report().stop_acknowledged);
+            // The chain sounded at the stop, so the next stopped blocks drain
+            // it on a worker. It is quiet on silence, so its drain ends after
+            // 0.25 s.
+            let drains = away.load(Ordering::SeqCst);
+            manual.render(&mut output);
+            assert!(
+                away.load(Ordering::SeqCst) > drains,
+                "a stopped block posted no drain job"
+            );
+            for _ in 0..50 {
+                manual.render(&mut output);
+            }
             let stopped = away.load(Ordering::SeqCst);
             for _ in 0..20 {
                 manual.render(&mut output);
@@ -3191,7 +3801,7 @@ mod tests {
             assert_eq!(
                 away.load(Ordering::SeqCst),
                 stopped,
-                "a stopped block posted a job"
+                "a stopped block posted a job after the drain"
             );
             let deadline = Instant::now() + Duration::from_secs(10);
             while shared.parked_workers() < 2 {
@@ -5262,6 +5872,75 @@ mod tests {
             live_errors(&pending, &shared)(xrun());
             assert!(!shared.failed.load(Ordering::Acquire));
             assert_eq!(shared.report(1).callback_xruns, 2);
+
+            // A render holds retirement until it returns, so the backend is
+            // the producer's after retire. A render that panics holds nothing.
+            // The panic allocates in the audio scope, so the test holds the
+            // tripwire lock.
+            let _tripwire_guard = tripwire_assertion_guard();
+            let retire = |gate: &Arc<CallbackGate>| {
+                let (retired_tx, retired_rx) = std::sync::mpsc::sync_channel(1);
+                let retiring = Arc::clone(gate);
+                let retirement = std::thread::spawn(move || {
+                    retiring.retire();
+                    retired_tx.send(()).expect("retirement receiver");
+                });
+                (retired_rx, retirement)
+            };
+            let rendering = Arc::new(CallbackGate::new());
+            rendering.activate().expect("active output");
+            let entered = Arc::new(AtomicBool::new(false));
+            let leave = Arc::new(AtomicBool::new(false));
+            let callback = std::thread::spawn({
+                let (gate, entered, leave) = (
+                    Arc::clone(&rendering),
+                    Arc::clone(&entered),
+                    Arc::clone(&leave),
+                );
+                move || {
+                    let mut output = [0.0f32; 4];
+                    gate.render_or_silence(&mut output, |output| {
+                        entered.store(true, Ordering::Release);
+                        while !leave.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                        output.fill(1.0);
+                    });
+                    output
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !entered.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "the render did not start");
+                std::thread::yield_now();
+            }
+            let (retired_rx, retirement) = retire(&rendering);
+            assert!(matches!(
+                retired_rx.recv_timeout(Duration::from_millis(20)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            leave.store(true, Ordering::Release);
+            retired_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("retirement waits for the render");
+            retirement.join().expect("retirement thread");
+            assert_eq!(callback.join().expect("callback thread"), [1.0; 4]);
+            let mut output = [1.0f32; 4];
+            rendering.render_or_silence(&mut output, |_| panic!("a retired gate rendered"));
+            assert_eq!(output, [0.0; 4]);
+
+            let faulting = Arc::new(CallbackGate::new());
+            faulting.activate().expect("active output");
+            let render = std::panic::AssertUnwindSafe(|| {
+                let mut output = [0.0f32; 4];
+                faulting.render_or_silence(&mut output, |_| panic!("a render fault"));
+            });
+            assert!(std::panic::catch_unwind(render).is_err());
+            let (retired_rx, retirement) = retire(&faulting);
+            retired_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a panic in the render leaves retirement free");
+            retirement.join().expect("retirement thread");
         }
 
         #[test]

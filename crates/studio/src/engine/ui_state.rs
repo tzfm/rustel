@@ -303,7 +303,21 @@ impl StudioUiState {
         };
 
         if self.audio_enabled && observed_at >= self.next_audio {
-            self.next_audio = observed_at.saturating_add(self.audio_interval);
+            // The analysis is real FFT work per visual slot on the
+            // producer, and its memory traffic is what a callback near its
+            // period budget feels first. When the audio thread reports
+            // spending most of its periods rendering, the analysis thins
+            // to a quarter rate until the load clears; nothing audible
+            // changes, the meters redraw a little less often. The slow
+            // average follows the load of the last moments, not of the
+            // whole stream.
+            let load = device.report().realtime_load;
+            let analysis_interval = if load.slow_load_basis_points > 7_500 {
+                self.audio_interval * 4
+            } else {
+                self.audio_interval
+            };
+            self.next_audio = observed_at.saturating_add(analysis_interval);
             // The frame is tagged with the generation of the layout on
             // screen, not the audible one: its slots are numbered by that
             // layout, and the display drops audio for a generation its

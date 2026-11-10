@@ -215,6 +215,28 @@ mod tests {
             assert!(paths[0].exists());
         }
 
+        /// In Vim the Esc that leaves Insert calls an armed deletion off, as
+        /// Esc in Command does. The next Enter deletes nothing.
+        #[test]
+        fn the_esc_that_leaves_vim_insert_cancels_deletion() {
+            let directory = tempfile::tempdir().unwrap();
+            let imported = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            let paths = import_bank(&mut app, imported.path(), &["solo.wav"]);
+
+            precision_key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert!(app.reference_panel.as_ref().unwrap().vim_insert());
+            arm(&mut app);
+            precision_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            let panel = app.reference_panel.as_ref().expect("the browser stays");
+            assert!(!panel.vim_insert(), "Esc left Insert");
+            assert_eq!(panel.confirm_delete, None, "Esc cancelled the deletion");
+            precision_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(paths[0].exists(), "Enter after the Esc deleted nothing");
+        }
+
         #[test]
         fn moving_pasting_clicking_and_modified_enter_cancel_deletion() {
             let directory = tempfile::tempdir().unwrap();

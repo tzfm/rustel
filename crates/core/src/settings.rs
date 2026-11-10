@@ -656,6 +656,28 @@ pub fn current_state_id() -> SettingsStateId {
         })
 }
 
+/// Whether `id` names the settings snapshot in force now. Unlike
+/// [`current_state_id`], this clones nothing.
+pub(crate) fn is_current_state(id: &SettingsStateId) -> bool {
+    CURRENT.with(|current| match current.borrow().last() {
+        Some(bound) => {
+            Arc::ptr_eq(&bound.requested, &id.requested)
+                && Arc::ptr_eq(&bound.selected, &id.selected)
+        }
+        None => {
+            Arc::ptr_eq(&FALLBACK.inner, &id.requested)
+                && Arc::ptr_eq(
+                    &FALLBACK
+                        .inner
+                        .state
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    &id.selected,
+                )
+        }
+    })
+}
+
 fn with_current<R>(f: impl FnOnce(&SettingsState) -> R) -> R {
     CURRENT.with(|current| {
         let current = current.borrow();

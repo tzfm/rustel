@@ -34,8 +34,8 @@ pub fn samples_pulse_rows(area: Rect) -> (u16, u16) {
 }
 
 pub(crate) fn sample_pulse_rows(area: Rect) -> (u16, u16) {
-    // Source, then the two shortcut rows, live below the sample's fader.
-    let meter = area.bottom().saturating_sub(4);
+    // The two shortcut rows live below the sample's fader.
+    let meter = area.bottom().saturating_sub(3);
     (meter.saturating_sub(1), meter)
 }
 
@@ -47,6 +47,27 @@ pub fn samples_wave_area(area: Rect) -> Rect {
     Rect::new(area.x, meter.saturating_sub(rows), area.width, rows)
 }
 
+/// The rows of the selected sound's details above its waveform: a rule and
+/// two lines while the list keeps its floor, else the one line that names
+/// the sound's source.
+pub fn samples_detail_rows(area: Rect) -> u16 {
+    const FULL: u16 = 3;
+    const LIST_FLOOR: u16 = 6;
+    if default_list(area).height >= 2 + samples_wave_rows(area) + FULL + LIST_FLOOR {
+        FULL
+    } else {
+        1
+    }
+}
+
+/// Where the samples tab writes the selected sound's details: the rows
+/// immediately above its waveform.
+pub fn samples_details_area(area: Rect) -> Rect {
+    let wave = samples_wave_area(area);
+    let rows = samples_detail_rows(area).min(wave.y.saturating_sub(area.y));
+    Rect::new(area.x, wave.y.saturating_sub(rows), area.width, rows)
+}
+
 /// A list on a tab with a live audition at its foot.
 ///
 /// Samples need the scope and meter rows. Chords and scales also keep one
@@ -56,7 +77,7 @@ pub fn samples_wave_area(area: Rect) -> Rect {
 fn audition_list(area: Rect, tab: Tab) -> Rect {
     let list = default_list(area);
     let reserved = match tab {
-        Tab::Samples => 3 + samples_wave_rows(area),
+        Tab::Samples => 2 + samples_wave_rows(area) + samples_detail_rows(area),
         Tab::Chords | Tab::Scales => 2 + keyboard_rows(area),
         Tab::Reference => 0,
         #[cfg(feature = "vst")]

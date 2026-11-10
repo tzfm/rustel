@@ -26,7 +26,7 @@ permissions:
 jobs:
   validate:
     name: Validate heavy target
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       ref: ${{ steps.target.outputs.ref }}
       sha: ${{ steps.target.outputs.sha }}

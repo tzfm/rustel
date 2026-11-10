@@ -140,6 +140,29 @@ mod classification_tests {
             &Lookup::Unknown,
         )
         .expect("a banked oscillator name falls back to the oscillator");
+
+        // A dedicated synth name under a bank follows the sample path both
+        // ways: the bank's asset plays when it has one, and the normal
+        // unknown-sound refusal names the bank when it does not.
+        let event = detailed(
+            &json!({ "s": "supersaw", "bank": "my_bank" }),
+            &Lookup::Found,
+        )
+        .expect("the banked asset resolves");
+        assert!(event.sample.is_some(), "the found asset is the sound");
+        assert!(
+            event.synth.is_none(),
+            "the synth the plain name names does not take over"
+        );
+        assert_eq!(
+            refusal(
+                &json!({ "s": "supersaw", "bank": "my_bank" }),
+                &Lookup::Unknown
+            ),
+            VoiceError::UnknownSound(
+                "my_bank_supersaw is not loaded - that layer stays silent, the rest plays".into(),
+            )
+        );
     }
 
     #[test]
@@ -365,6 +388,152 @@ mod tests {
         assert!(banked.contains("still loading"), "{banked}");
     }
 
+    /// A `talkit` hap asks the host for speech and plays the sample it gets
+    /// back, with the settings the score asked for, shortcut keys included.
+    /// A host with no speech refuses the hap.
+    #[test]
+    fn a_talkit_hap_speaks_through_the_sample_path() {
+        use rustel_talkit::params::{Effort, Params, Quality};
+        use std::cell::RefCell;
+        struct Speaks(RefCell<Vec<(String, Params)>>);
+        impl super::SampleLookup for Speaks {
+            fn resolve(&self, _s: &str, _n: f64, _midi: f64) -> super::SampleResolution {
+                super::SampleResolution::Unknown
+            }
+            fn insert_speech(
+                &self,
+                request: &super::SpeechRequest<'_>,
+            ) -> Result<super::SampleResolution, String> {
+                self.0
+                    .borrow_mut()
+                    .push((request.text.to_owned(), request.params));
+                Ok(super::SampleResolution::Found {
+                    id: rustel_audio::SampleId(7),
+                    transpose: 0.0,
+                    duration_secs: 0.75,
+                    loop_secs: None,
+                    envelope_peak: 1.0,
+                    soundfont: false,
+                })
+            }
+        }
+        let speaks = Speaks(RefCell::new(Vec::new()));
+        let resolve = |value: serde_json::Value| {
+            super::resolve_voice_with_samples(&value, 1, 0.25, 0.0, 48_000, 0.5, &speaks)
+        };
+        let asked = || speaks.0.borrow().last().cloned().expect("an ask");
+        let spoken = resolve(serde_json::json!({
+            "talkit": { "text": "hello there, nice to meet you", "p": 250, "v": "little-robot",
+                        "q": "sung", "l": "es", "s": 160 },
+            "s": "sine"
+        }))
+        .expect("speech resolves");
+        let sample = spoken.sample.expect("the word is a sample");
+        assert_eq!(sample.sample, rustel_audio::SampleId(7));
+        assert_eq!(sample.playback_rate, 1.0);
+        assert!(!sample.muted);
+        assert!(spoken.synth.is_none(), "the words outrank a synth `s`");
+        // The personality applies first though the object lists it after
+        // the pitch, so the pitch overrides the preset's 90 Hz.
+        assert_eq!(
+            asked(),
+            (
+                "hello there, nice to meet you".to_owned(),
+                Params {
+                    pitch: 250.0,
+                    speed: 160,
+                    quality: Quality::Sung,
+                    effort: Effort::Normal,
+                    language: rustel_talkit::lang::Language::Spanish,
+                    timbre: rustel_talkit::personality::Personality::LittleRobot.timbre(),
+                }
+            )
+        );
+        // `freq` or `note` name the pitch the voice starts on, to the cent,
+        // and `octave` moves it. An explicit `pitch` setting outranks them,
+        // and zero and "" are no pitch at all.
+        let pitch_of = |controls: serde_json::Value| {
+            let mut value = serde_json::json!({ "talkit": { "text": "hey" } });
+            value
+                .as_object_mut()
+                .expect("object")
+                .extend(controls.as_object().expect("controls").clone());
+            resolve(value).expect("a pitched speech resolves");
+            asked().1.pitch
+        };
+        for (controls, hz) in [
+            (serde_json::json!({ "note": "c3" }), 130.8128),
+            (serde_json::json!({ "note": 48.004 }), 130.8128),
+            (serde_json::json!({ "note": "c3", "octave": 1 }), 261.6256),
+            (serde_json::json!({ "freq": 220, "note": "c3" }), 220.0),
+            (serde_json::json!({ "note": 0 }), 100.0),
+            (serde_json::json!({ "note": "" }), 100.0),
+        ] {
+            let pitch = pitch_of(controls.clone());
+            assert!((pitch - hz).abs() < 0.01, "{controls}: {pitch} Hz");
+        }
+        resolve(serde_json::json!({ "talkit": { "text": "hey", "pitch": 200 }, "note": "c3" }))
+            .expect("an explicit pitch resolves");
+        assert_eq!(asked().1.pitch, 200.0);
+        let refused = resolve(serde_json::json!({ "talkit": { "text": "hey" }, "note": "c0" }))
+            .expect_err("a note below C1 is refused");
+        assert!(refused.contains("C1 to C7"), "{refused}");
+        // The word plays to its end; a release hands the gate to the hap.
+        assert!(matches!(sample.hold, rustel_audio::SampleHold::Slice));
+        let gated = resolve(serde_json::json!({
+            "talkit": { "text": "hey" }, "release": 0.2
+        }))
+        .expect("gated speech resolves");
+        assert!(matches!(
+            gated.sample.expect("a sample").hold,
+            rustel_audio::SampleHold::Hap
+        ));
+        // `speed` is the playback rate, 0 the same per-hap no-op as a sample.
+        let fast = resolve(serde_json::json!({ "talkit": { "text": "hey" }, "speed": 2 }))
+            .expect("fast speech resolves");
+        assert_eq!(fast.sample.expect("a sample").playback_rate, 2.0);
+        let silent = resolve(serde_json::json!({ "talkit": { "text": "hey" }, "speed": 0 }))
+            .expect("speed 0 mutes rather than refusing");
+        assert!(silent.sample.expect("a sample").muted);
+        // The refusals name the setting, not the host.
+        let refused = resolve(serde_json::json!({ "talkit": "hey" }))
+            .expect_err("a bare string names no speech object");
+        assert!(refused.contains("talkit must be an object"), "{refused}");
+        let refused = resolve(serde_json::json!({ "talkit": { "text": ["hey"] } }))
+            .expect_err("non-text talkit is refused");
+        assert!(refused.contains("talkit text must be text"), "{refused}");
+        for (fields, says) in [
+            (
+                serde_json::json!({ "text": "hey", "timbre": "warm" }),
+                "`timbre` is not a setting",
+            ),
+            (
+                serde_json::json!({ "text": "hey", "pitch": "high" }),
+                "pitch takes 50 to 500",
+            ),
+            (
+                serde_json::json!({ "text": "hey", "v": "little" }),
+                "little-robot",
+            ),
+        ] {
+            let refused = resolve(serde_json::json!({ "talkit": fields }))
+                .expect_err("a bad setting is refused");
+            assert!(refused.contains(says), "{refused}");
+        }
+        // A host that cannot speak says so rather than playing a synth.
+        let refused = super::resolve_voice_with_samples(
+            &serde_json::json!({ "talkit": { "text": "hello" } }),
+            1,
+            0.25,
+            0.0,
+            48_000,
+            0.5,
+            &super::BundledOnly,
+        )
+        .expect_err("an unspeaking host refuses");
+        assert!(refused.contains("talkit needs a sample bank"), "{refused}");
+    }
+
     #[test]
     fn native_synth_names_match_the_generator_surface() {
         for name in [
@@ -496,11 +665,7 @@ mod tests {
     /// `gm_*` voice an octave low.
     #[test]
     fn a_noteless_soundfont_defaults_an_octave_above_a_noteless_sample() {
-        let midi_for = |name: &str| {
-            let value = serde_json::json!({ "s": name });
-            let object = value.as_object().expect("object");
-            super::sample_default_midi(object, name)
-        };
+        let midi_for = super::sample_default_midi;
         assert_eq!(
             midi_for("gm_flute"),
             48.0,
@@ -1027,6 +1192,46 @@ mod tests {
                 lfos[0].is_none(),
                 "{control} modulator must be inert with no {control} node"
             );
+        }
+    }
+
+    // A banked wavetable and its direct spelling must classify the same:
+    // the gates test the bank-prefixed name, as selection does.
+    #[test]
+    fn a_banked_wavetable_gates_like_its_direct_spelling() {
+        let mods = |json: &str| {
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+        };
+        // An oscillator name under a bank that lacks it falls back to the
+        // oscillator, and its pitch still rides the frequency.
+        let (banked, _, _) = mods(
+            r#"{"s": "sine", "bank": "no_such_bank", "lfo": {"a": {"control": "note", "rate": 2}}}"#,
+        );
+        let slot = banked[0].expect("the fallback oscillator resolves the pitch target");
+        assert_eq!(
+            slot.param_base, 220.0,
+            "a banked-but-missing oscillator rides its frequency, not detune"
+        );
+
+        for control in ["note", "s", "freq", "frequency", "wt", "detune", "warp"] {
+            let lfo = format!(r#""lfo": {{"a": {{"control": "{control}", "rate": 2}}}}"#);
+            let direct = format!(r#"{{"s": "wt_digital_basique", {lfo}}}"#);
+            let banked = format!(r#"{{"s": "basique", "bank": "wt_digital", {lfo}}}"#);
+            let (direct, _, _) = mods(&direct);
+            let (banked, _, _) = mods(&banked);
+            let direct = &direct[0];
+            let banked = &banked[0];
+            match (direct, banked) {
+                (Some(direct), Some(banked)) => {
+                    assert_eq!(
+                        (direct.param_base, direct.min, direct.max),
+                        (banked.param_base, banked.min, banked.max),
+                        "{control} modulates both spellings the same way"
+                    );
+                }
+                (None, None) => {}
+                pair => panic!("{control}: the gate differs between spellings: {pair:?}"),
+            }
         }
     }
 
@@ -1909,6 +2114,35 @@ pub fn native_synth_yields_to_sample(name: &str) -> bool {
     name == "one"
 }
 
+/// The sound names [`synth_source`] claims as a source of its own, distinct
+/// from the basic oscillator names. Keep the two lists in step.
+const DEDICATED_SYNTH_SOUNDS: &[&str] = &[
+    "one",
+    "white",
+    "pink",
+    "brown",
+    "crackle",
+    "zzfx",
+    "z_sine",
+    "z_sawtooth",
+    "z_triangle",
+    "z_square",
+    "z_tan",
+    "z_noise",
+    "bytebeat",
+    "in",
+    "bus",
+    "supersaw",
+    "pulse",
+    "sbd",
+];
+
+/// True when a sound name names a dedicated synth source, so an explicit
+/// bank that lacks it refuses rather than falling back to an oscillator.
+fn is_dedicated_synth_sound(name: &str) -> bool {
+    DEDICATED_SYNTH_SOUNDS.contains(&name)
+}
+
 /// True when a sound name is generated entirely by the native voice engine.
 ///
 /// These names need no preload when no sample bank claims them. Oscillator
@@ -1939,7 +2173,18 @@ fn source_pitch_rides_detune(object: &serde_json::Map<String, serde_json::Value>
     match object.get("s").and_then(serde_json::Value::as_str) {
         // No sound named at all is the default oscillator.
         None => false,
-        Some(name) => !is_native_synth_sound(name) && !name.starts_with("wt_"),
+        Some(name) => {
+            // A banked table counts as the `wt_` name it resolves to, as
+            // selection does. A native synth name keeps its oscillator
+            // under a bank that lacks it, and an oscillator rides its
+            // frequency: only a sample rides detune.
+            let banked = bank_prefixed(object, name).ok().flatten();
+            let wavetable = name.starts_with("wt_")
+                || banked
+                    .as_deref()
+                    .is_some_and(|banked| banked.starts_with("wt_"));
+            !wavetable && !is_native_synth_sound(name)
+        }
     }
 }
 
@@ -1959,6 +2204,10 @@ pub fn direct_diagnostic_logging() -> bool {
 /// Print the notice's `record`, or keep the notice for the enclosing
 /// [`with_diagnostic_policy`] scope. Outside every scope, with direct logging
 /// off, it is dropped.
+#[allow(
+    clippy::print_stderr,
+    reason = "notices print when direct logging is on"
+)]
 fn report_notice(message: impl Into<String>, record: serde_json::Value) {
     if direct_diagnostic_logging() {
         eprintln!("{record}");
@@ -2041,6 +2290,16 @@ pub trait SampleLookup {
         Err("this host has no plugins".into())
     }
 
+    /// The sample for a `talkit(...)` speech request, rendered by the host.
+    ///
+    /// `Err` names text that can never sound and refuses the hap like any
+    /// other invalid control. `Ok(Failed)` is an asset failure, such as a full
+    /// sample bank, that refuses only this onset. `Ok(Unknown)` is a host with
+    /// no speech: the hap is refused with a note that this host cannot speak.
+    fn insert_speech(&self, _request: &SpeechRequest<'_>) -> Result<SampleResolution, String> {
+        Ok(SampleResolution::Unknown)
+    }
+
     /// Prepares a Csound score event outside the audio callback.
     fn csound(&self, _request: &CsoundRequest<'_>) -> Result<rustel_audio::InsertControls, String> {
         Err("this host has no Csound support".into())
@@ -2056,6 +2315,14 @@ pub struct PluginRequest<'a> {
     pub preset: Option<&'a str>,
     /// Parameter values by name, each from 0 to 1.
     pub params: &'a [(&'a str, f64)],
+}
+
+/// What a `talkit("text", { ... })` hap asks of the host: the words, and the
+/// settings its options, `freq`, `note` and `octave` resolve to.
+pub struct SpeechRequest<'a> {
+    /// The words to speak, spaces and punctuation included.
+    pub text: &'a str,
+    pub params: rustel_talkit::params::Params,
 }
 
 /// Why one onset could not be converted, independently of its diagnostic text.
@@ -2187,6 +2454,8 @@ pub fn resolve_voice_with_samples(
         sample_rate,
         cps,
         samples,
+        0,
+        0.0,
     )
     .map_err(VoiceError::into_message)
 }
@@ -2221,6 +2490,8 @@ pub fn resolve_hap_value(
         sample_rate,
         cps,
         samples,
+        0,
+        0.0,
     )
 }
 
@@ -2257,6 +2528,41 @@ pub fn resolve_voice_with_samples_detailed(
     cps: f64,
     samples: &dyn SampleLookup,
 ) -> Result<rustel_audio::OnsetEvent, VoiceError> {
+    resolve_voice_with_origin(
+        value,
+        onset_id,
+        duration_secs,
+        target_time,
+        cycle,
+        sample_rate,
+        cps,
+        samples,
+        0,
+        0.0,
+    )
+}
+
+/// [`resolve_voice_with_samples_detailed`] for a render whose file starts
+/// `origin` frames into the clock of its backend. The onset frame of the
+/// event is the frame of `target_time` plus `origin`, so a `target_time`
+/// below 0 converts while that frame is not below 0. Each time of the event
+/// stays in the time of the file. `floor` is the earliest time, in seconds,
+/// the `.stretch()` compensation moves an onset to: 0 for the first
+/// conversion of a note. With `origin` 0 and `floor` 0 this is
+/// [`resolve_voice_with_samples_detailed`].
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_voice_with_origin(
+    value: &serde_json::Value,
+    onset_id: u64,
+    duration_secs: f64,
+    target_time: f64,
+    cycle: f64,
+    sample_rate: u32,
+    cps: f64,
+    samples: &dyn SampleLookup,
+    origin: u64,
+    floor: f64,
+) -> Result<rustel_audio::OnsetEvent, VoiceError> {
     resolve_voice_at(
         value,
         onset_id,
@@ -2266,11 +2572,13 @@ pub fn resolve_voice_with_samples_detailed(
         sample_rate,
         cps,
         samples,
+        origin,
+        floor,
     )
 }
 
-/// [`resolve_voice_with_samples_detailed`] with the musical time, in seconds,
-/// in place of the cycle.
+/// [`resolve_voice_with_origin`] with the musical time, in seconds, in place
+/// of the cycle.
 #[allow(clippy::too_many_arguments)]
 fn resolve_voice_at(
     value: &serde_json::Value,
@@ -2281,6 +2589,8 @@ fn resolve_voice_at(
     sample_rate: u32,
     cps: f64,
     samples: &dyn SampleLookup,
+    origin: u64,
+    floor: f64,
 ) -> Result<rustel_audio::OnsetEvent, VoiceError> {
     // A hap value that is not an object is refused by design. A bare signal
     // head reaches this: `run(3).scale("c:major")` and `irand(7).scale(...)`
@@ -2337,12 +2647,24 @@ fn resolve_voice_at(
                 .transpose()?;
             // An external instrument needs no native sound source.
             plays_plugin = plays_csound || object.contains_key("vsti");
-            let wavetable = if plays_plugin {
+            // A `talkit` hap speaks its own sound the same way: the host
+            // renders the text and the sampler plays the result.
+            let speech = if plays_plugin {
+                None
+            } else {
+                speech_controls(object, samples)?
+            };
+            let speaks = speech.is_some();
+            let wavetable = if plays_plugin || speaks {
                 None
             } else {
                 wavetable_controls(object, samples, cps)?
             };
-            let sample = if plays_plugin || wavetable.is_some() {
+            let sample = if speech.is_some() {
+                // The spoken word is the source: a `talkit` hap never
+                // resolves an `s` it happens to carry as well.
+                speech
+            } else if plays_plugin || wavetable.is_some() {
                 None
             } else {
                 sample_controls(object, samples)?
@@ -2437,12 +2759,16 @@ fn resolve_voice_at(
                 cps,
                 frequency,
             )?;
-            let synth = if plays_plugin {
+            // A spoken word is the whole sound: an `s` naming a synth on the
+            // same hap does not take its place.
+            let synth = if plays_plugin || speaks {
                 None
             } else {
-                // A sample named `one` is the sound, not the constant signal.
-                synth_source(object, duration_secs, target_time)?
-                    .filter(|synth| !(sample.is_some() && *synth == rustel_audio::SynthSource::One))
+                // A resolved sample is the sound, not a starting point for
+                // the synth its unbanked name names: `s("supersaw").bank("my_bank")`
+                // plays the bank's supersaw when the bank has one. A sample
+                // named `one` already followed this rule.
+                synth_source(object, duration_secs, target_time)?.filter(|_| sample.is_none())
             };
             // One cycle is one bar of 4 quarter notes.
             let clocked = |plugin: rustel_audio::InsertControls| {
@@ -2470,7 +2796,7 @@ fn resolve_voice_at(
                 preview_epoch: 0,
                 choke_only: false,
                 piano: false,
-                live_controls: [0; 3],
+                live_controls: [0; 4],
                 // `if (noise) { getNoiseMix(...) }` - absent or zero skips the
                 // mix entirely rather than crossfading at zero.
                 noise: checked_f32(
@@ -2553,6 +2879,7 @@ fn resolve_voice_at(
                         .and_then(|plugin| plugin_controls(plugin, "vsti", samples))
                         .map(clocked)
                 },
+                lead: 0,
                 lfos,
                 envs,
                 phaser: phaser_controls(object, target_time)?,
@@ -2660,12 +2987,12 @@ fn resolve_voice_at(
     // onset to frames: the reference's 40 ms, plus the frames this vocoder
     // trails a render-quantum one by, so the shifted voice lands where the
     // reference's does. Separate `.FX()` stretch stages keep their delay.
-    // A compensated onset before the render begins starts at time zero.
+    // A compensated onset before the render begins starts at `floor`.
     let source_time = target_time;
     let target_time = if value.get("stretch").is_some_and(|value| !value.is_null()) {
         let lag_secs =
             f64::from(rustel_audio::stretch::QUANTUM_LAG_FRAMES) / f64::from(sample_rate);
-        (target_time - STRETCH_LATENCY_SECS - lag_secs).max(0.0)
+        (target_time - STRETCH_LATENCY_SECS - lag_secs).max(floor)
     } else {
         target_time
     };
@@ -2680,7 +3007,9 @@ fn resolve_voice_at(
         exact_frame
     };
     let onset_frame = exact_frame.ceil();
-    if !onset_frame.is_finite() || onset_frame < 0.0 || onset_frame > u64::MAX as f64 {
+    // The origin adds whole frames after the lead, so the lead keeps its bits.
+    let framed = onset_frame + origin as f64;
+    if !framed.is_finite() || framed < 0.0 || framed > u64::MAX as f64 {
         return Err(
             format!("onset {onset_id} has an unrepresentable target time {target_time}").into(),
         );
@@ -2699,7 +3028,7 @@ fn resolve_voice_at(
         );
     }
     let event = rustel_audio::OnsetEvent::new(
-        onset_frame as u64,
+        framed as u64,
         frequency as f32,
         gain as f32,
         duration_secs as f32,
@@ -3185,6 +3514,11 @@ fn fm_controls(
     Ok(Some(rustel_audio::FmControls { operators, routes }))
 }
 
+/// The spelling the voice looks a sound up by in a bank: `{bank}_{s}`.
+pub fn banked_name(bank: &str, name: &str) -> String {
+    format!("{bank}_{name}")
+}
+
 /// The whole bank rule: `s` becomes `{bank}_{s}`.
 ///
 /// Returns `None` when there is no bank to apply, so the caller keeps the name
@@ -3198,15 +3532,28 @@ pub fn bank_prefixed(
         return Ok(None);
     }
     match object.get("bank") {
-        Some(serde_json::Value::String(bank)) => Ok(Some(format!("{bank}_{name}"))),
+        Some(serde_json::Value::String(bank)) => Ok(Some(banked_name(bank, name))),
         Some(serde_json::Value::Null) | None => Ok(None),
         Some(other) => match other.as_f64() {
             // `.bank('9000')` numerifies under miniAllStrings; the prefix
             // rule stringifies it right back.
-            Some(bank) => Ok(Some(format!("{bank}_{name}"))),
+            Some(bank) => Ok(Some(banked_name(&bank.to_string(), name))),
             _ => Err("bank must be a scalar bank name".to_owned()),
         },
     }
+}
+
+/// The name a wavetable gate tests: the raw `s` with the bank prefix
+/// applied, so `s("basique").bank("wt_digital")` counts as the `wt_` name it
+/// resolves to. Mirrors [`wavetable_controls`]'s own prefixing.
+fn banked_source_name(object: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let name = object.get("s").and_then(serde_json::Value::as_str)?;
+    Some(
+        bank_prefixed(object, name)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| name.to_owned()),
+    )
 }
 
 /// `wt_`-named sounds route to the wavetable oscillator.
@@ -3491,6 +3838,218 @@ fn slice_refusal(begin: f64, end: f64) -> String {
     )
 }
 
+/// The longest text one `talkit` hap speaks, in characters.
+const MAX_SPEECH_CHARS: usize = 300;
+
+/// The `talkit` hap: the host renders the text to a sample and the sampler
+/// plays it. The spoken word is the source, so `speed` is its playback rate
+/// and `cut`, `release` and `clip` keep their sample meanings. `freq`, `note`
+/// and `octave` set the pitch the voice speaks at, so they never transpose
+/// the playback.
+fn speech_controls(
+    object: &serde_json::Map<String, serde_json::Value>,
+    samples: &dyn SampleLookup,
+) -> Result<Option<rustel_audio::SampleControls>, VoiceError> {
+    let Some(fields) = object.get("talkit") else {
+        return Ok(None);
+    };
+    // The talkit call writes one object: `talkit("hi", { quality: "sung" })`
+    // carries `{ talkit: { text: "hi", quality: "sung" } }`.
+    let Some(fields) = fields.as_object() else {
+        return Err(VoiceError::InvalidControl(
+            "talkit must be an object with a text field".into(),
+        ));
+    };
+    let text = fields
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| VoiceError::InvalidControl("talkit text must be text".into()))?;
+    let length = text.chars().count();
+    if length > MAX_SPEECH_CHARS {
+        return Err(VoiceError::InvalidControl(format!(
+            "talkit text is {length} characters; maximum is {MAX_SPEECH_CHARS}"
+        )));
+    }
+    let request = SpeechRequest {
+        text,
+        params: speech_params(object, fields)?,
+    };
+    let (id, natural_duration_secs, envelope_peak) = match samples.insert_speech(&request)? {
+        SampleResolution::Found {
+            id,
+            duration_secs,
+            envelope_peak,
+            ..
+        } => (id, duration_secs, envelope_peak),
+        SampleResolution::Loading => {
+            return Err(VoiceError::SampleLoading(
+                "talkit speech is still rendering".into(),
+            ));
+        }
+        SampleResolution::Failed => {
+            return Err(VoiceError::SampleFailed(
+                "talkit speech failed to render".into(),
+            ));
+        }
+        SampleResolution::Unknown => {
+            return Err(VoiceError::UnknownSound(
+                "talkit needs a sample bank, and this host has none".into(),
+            ));
+        }
+    };
+    let speed = optional_f64(object.get("speed"), "speed")?.unwrap_or(1.0);
+    // The same per-hap no-op as a silent sample event.
+    if speed == 0.0 {
+        return Ok(Some(rustel_audio::SampleControls {
+            sample: id,
+            playback_rate: 1.0,
+            begin: 0.0,
+            end: 1.0,
+            hold: rustel_audio::SampleHold::Slice,
+            muted: true,
+            loop_secs: None,
+            envelope_peak: 1.0,
+            reversed: false,
+            nudge_secs: 0.0,
+            cut: None,
+        }));
+    }
+    let rate = speed.abs();
+    if !rate.is_finite() || rate <= 0.0 {
+        return Err(format!("talkit playback rate {rate} is not finite and positive").into());
+    }
+    let slice_duration = natural_duration_secs / rate;
+    if !slice_duration.is_finite() || slice_duration > 24.0 * 60.0 * 60.0 {
+        return Err(
+            format!("talkit speech lasts {slice_duration} seconds; maximum is 86400").into(),
+        );
+    }
+    let playback_rate = checked_f32(rate, "talkit playback rate")?;
+    if playback_rate == 0.0 {
+        return Err(VoiceError::InvalidControl(
+            "talkit speed is too small for native f32 playback".into(),
+        ));
+    }
+    Ok(Some(rustel_audio::SampleControls {
+        sample: id,
+        playback_rate,
+        // The word plays whole: slicing a spoken word at `begin`/`end` has no
+        // useful meaning, so the slice stays the entire buffer.
+        begin: 0.0,
+        end: 1.0,
+        // Like a sample: the word plays to its end unless the hap gates it
+        // (`release`, `clip`).
+        hold: if object.get("clip").is_some_and(|value| !value.is_null())
+            || object.get("release").is_some_and(|value| !value.is_null())
+        {
+            rustel_audio::SampleHold::Hap
+        } else {
+            rustel_audio::SampleHold::Slice
+        },
+        muted: false,
+        loop_secs: None,
+        envelope_peak: checked_f32(envelope_peak, "talkit envelope peak")?,
+        reversed: speed < 0.0,
+        nudge_secs: 0.0,
+        cut: optional_f64(object.get("cut"), "cut")?
+            .map(|cut| checked_f32(cut, "cut"))
+            .transpose()?,
+    }))
+}
+
+/// The settings a `talkit` hap speaks with. The keys and values are the ones
+/// the talkit command line takes, read by the same parser. A personality
+/// applies its whole preset first, so the single settings override it in
+/// whatever order the object lists them. `freq` or `note` set the pitch when
+/// no `pitch` setting does.
+fn speech_params(
+    object: &serde_json::Map<String, serde_json::Value>,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> Result<rustel_talkit::params::Params, VoiceError> {
+    use rustel_talkit::params::{ParamError, Params, Setting};
+    let refused = |error: ParamError| VoiceError::InvalidControl(format!("talkit: {error}"));
+    let mut settings = Vec::with_capacity(fields.len());
+    for (key, value) in fields {
+        if key == "text" || value.is_null() {
+            continue;
+        }
+        let setting =
+            Setting::parse(key).ok_or_else(|| refused(ParamError::UnknownKey(key.clone())))?;
+        settings.push((setting, value));
+    }
+    settings.sort_by_key(|(setting, _)| *setting != Setting::Personality);
+    let mut params = Params::default();
+    for &(setting, value) in &settings {
+        let written = match value {
+            serde_json::Value::String(text) => std::borrow::Cow::Borrowed(text.as_str()),
+            // A whole number reads as one, wherever the JSON form put it.
+            serde_json::Value::Number(number) => match number.as_f64() {
+                Some(whole) if whole.fract() == 0.0 && whole.abs() < 1e15 => {
+                    std::borrow::Cow::Owned((whole as i64).to_string())
+                }
+                _ => std::borrow::Cow::Owned(number.to_string()),
+            },
+            other => std::borrow::Cow::Owned(other.to_string()),
+        };
+        params.set(setting, &written).map_err(refused)?;
+    }
+    if !settings
+        .iter()
+        .any(|(setting, _)| *setting == Setting::Pitch)
+        && let Some(hz) = speech_note_pitch(object)?
+    {
+        params.pitch = hz;
+    }
+    Ok(params)
+}
+
+/// The pitch a hap's `freq`, or else its `note`, asks the voice to start on,
+/// moved by `octave`, the way the synth path reads them: a zero `freq`, a
+/// zero note and an empty note are no pitch at all. The pitch rounds to the
+/// nearest cent, so float noise in a computed note does not render the same
+/// words twice.
+fn speech_note_pitch(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<f32>, VoiceError> {
+    let midi = match optional_f64(object.get("freq"), "freq")? {
+        Some(hz) if hz != 0.0 => {
+            if !(hz.is_finite() && hz > 0.0) {
+                return Err(VoiceError::InvalidControl(format!(
+                    "talkit: freq {hz} is not a positive frequency"
+                )));
+            }
+            69.0 + 12.0 * (hz / 440.0).log2()
+        }
+        _ => match object.get("note") {
+            None | Some(serde_json::Value::Null) => return Ok(None),
+            Some(serde_json::Value::Number(midi)) => match midi.as_f64() {
+                Some(0.0) => return Ok(None),
+                Some(midi) => midi,
+                None => return Err(non_scalar_speech_note()),
+            },
+            Some(serde_json::Value::String(text)) if text.is_empty() => return Ok(None),
+            Some(serde_json::Value::String(text)) => rustel_core::util::note_to_midi(text, 3)?,
+            Some(_) => return Err(non_scalar_speech_note()),
+        },
+    };
+    let octave = optional_f64(object.get("octave"), "octave")?.unwrap_or(0.0);
+    let midi = ((midi + 12.0 * octave) * 100.0).round() / 100.0;
+    let hz = midi_to_hz(midi)? as f32;
+    let range = rustel_talkit::params::NOTE_PITCH;
+    if !range.contains(&hz) {
+        return Err(VoiceError::InvalidControl(format!(
+            "talkit: a voice speaks from C1 to C7 ({} to {} Hz), and this note asks for {hz:.1} Hz",
+            range.start(),
+            range.end()
+        )));
+    }
+    Ok(Some(hz))
+}
+
+fn non_scalar_speech_note() -> VoiceError {
+    VoiceError::InvalidControl("talkit: note must be a note name or a MIDI number".into())
+}
+
 fn sample_controls(
     object: &serde_json::Map<String, serde_json::Value>,
     samples: &dyn SampleLookup,
@@ -3508,7 +4067,7 @@ fn sample_controls(
     let plain = name;
     let name = match object.get("bank") {
         Some(serde_json::Value::String(bank)) if !name.is_empty() => {
-            banked = format!("{bank}_{name}");
+            banked = banked_name(bank, name);
             banked.as_str()
         }
         Some(serde_json::Value::Null) | None => name,
@@ -3516,7 +4075,7 @@ fn sample_controls(
             // `.bank('9000')` numerifies under miniAllStrings; the prefix
             // rule stringifies it right back.
             Some(bank) if !name.is_empty() => {
-                banked = format!("{bank}_{name}");
+                banked = banked_name(&bank.to_string(), name);
                 banked.as_str()
             }
             _ => {
@@ -3541,7 +4100,7 @@ fn sample_controls(
     // kind of sound. An ordinary sample bank falls back to midi 36; a gm_*
     // soundfont falls back to c3, which is midi 48 - the soundfont loader
     // carries its own default and it is an octave up from the sampler's.
-    let default_midi = sample_default_midi(object, name);
+    let default_midi = sample_default_midi(name);
     let midi = match object.get("freq") {
         Some(serde_json::Value::Number(freq)) => {
             let freq = freq
@@ -3591,7 +4150,19 @@ fn sample_controls(
             }
             // Not a sample: the oscillator path decides whether the name
             // means anything (and refuses loudly when it does not).
-            SampleResolution::Unknown => return Ok(None),
+            SampleResolution::Unknown => {
+                // An explicitly banked name a dedicated synth would claim
+                // has no oscillator fallback: the score asked the bank for
+                // that sound, and the bank does not have it. A basic
+                // oscillator name keeps its oscillator, as
+                // `s('sine').bank(...)` always had.
+                if banked_name && is_dedicated_synth_sound(plain) {
+                    return Err(VoiceError::UnknownSound(format!(
+                        "{name} is not loaded - that layer stays silent, the rest plays"
+                    )));
+                }
+                return Ok(None);
+            }
         };
     // A soundfont zone plays at its note's pitch, from its start: `speed`,
     // `begin`/`end`, `unit`, `cut` and `nudge` do not reach it.
@@ -4310,8 +4881,8 @@ fn modulator_controls(
             // Only the wavetable and supersaw oscillators have `detune` and
             // `spread` params. No other source has such a param to ride.
             "detune" | "spread" => {
-                let source = object.get("s").and_then(serde_json::Value::as_str)?;
-                if !source.starts_with("wt_") && source != "supersaw" {
+                let source = banked_source_name(object)?;
+                if !source.starts_with("wt_") && source.as_str() != "supersaw" {
                     return None;
                 }
                 if control == "detune" {
@@ -4329,7 +4900,11 @@ fn modulator_controls(
                         object
                             .get("spread")
                             .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(if source == "supersaw" { 0.6 } else { 0.7 }),
+                            .unwrap_or(if source.as_str() == "supersaw" {
+                                0.6
+                            } else {
+                                0.7
+                            }),
                         false,
                     ))
                 }
@@ -4338,7 +4913,7 @@ fn modulator_controls(
             // same rules as the position pair below - `warpdc` is absent for
             // the same reason `wtdc` is.
             "warp" | "warprate" | "warpsync" | "warpdepth" | "warpskew" => {
-                let source = object.get("s").and_then(serde_json::Value::as_str)?;
+                let source = banked_source_name(object)?;
                 if !source.starts_with("wt_") {
                     return None;
                 }
@@ -4383,7 +4958,7 @@ fn modulator_controls(
             // (a `dc`/`dcoffset` param-name mismatch throws), so neither can
             // a score here.
             "wt" | "wtrate" | "wtsync" | "wtdepth" | "wtskew" => {
-                let source = object.get("s").and_then(serde_json::Value::as_str)?;
+                let source = banked_source_name(object)?;
                 if !source.starts_with("wt_") {
                     return None;
                 }
@@ -5575,19 +6150,13 @@ fn plugin_controls(
             return None;
         }
     };
-    let mut params = Vec::new();
-    if let Some(serde_json::Value::Object(values)) = plugin.get("params") {
-        for (key, value) in values {
-            match optional_f64(Some(value), key) {
-                Ok(Some(value)) => params.push((key.as_str(), value)),
-                Ok(None) => {}
-                Err(reason) => {
-                    skip(&reason);
-                    return None;
-                }
-            }
+    let params = match plugin_params(plugin) {
+        Ok(params) => params,
+        Err(reason) => {
+            skip(&reason);
+            return None;
         }
-    }
+    };
     let request = PluginRequest {
         instrument: call == "vsti",
         name,
@@ -5601,6 +6170,24 @@ fn plugin_controls(
             None
         }
     }
+}
+
+/// The parameter values of one plugin object of a hap, as its `params`
+/// map writes them: each key with its number. A null value is left out.
+/// `Err` gives the reason of a value that is not a finite number: the note
+/// then plays with no plugin.
+pub fn plugin_params(
+    plugin: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<(&str, f64)>, String> {
+    let mut params = Vec::new();
+    if let Some(serde_json::Value::Object(values)) = plugin.get("params") {
+        for (key, value) in values {
+            if let Some(value) = optional_f64(Some(value), key)? {
+                params.push((key.as_str(), value));
+            }
+        }
+    }
+    Ok(params)
 }
 
 /// The vowel formant table, including the unicode aliases.
@@ -6599,6 +7186,7 @@ pub static SOUND_REFERENCE: &[ReferenceEntry] = &[
         description: concat!(
             "Choose an input in the device picker's audio in section; the `none` row at the top of that list turns the input off again. `s(\"in\")` plays channel 0; `s(\"in:1\")` plays channel 1. `n` selects an input channel, not a pitch. With no input open, the source is silent.\n\n",
             "Effects: gain, pan, filters, distortion, delay and reverb process the incoming audio.\n\n",
+            "Modulation: the FM controls bend the playback rate of the incoming signal. The route amounts set the bend; `note` does not retune it. A deep or slow bend can skip or repeat parts of the stream.\n\n",
             "Rhythm: `seg` / `segment` divides the pattern into listening windows. Adjacent windows can sound continuous; add `clip(.5)` to leave gaps. Envelopes shape each window.\n\n",
             "Requires recorded audio: `speed`, sample `begin` / `end`, and reverse playback with `speed(-1)` need a recorded sample. `note` does not retune the live input. `chop` can change event timing, but its sample slices do not select different parts of the stream; `rev` reverses event order, not the incoming waveform."
         ),
@@ -6606,6 +7194,7 @@ pub static SOUND_REFERENCE: &[ReferenceEntry] = &[
         examples: &[
             "$: s(\"in\").lpf(2000).room(.5).delay(.3)",
             "$: s(\"in\").seg(8).clip(.5).attack(.005).release(.01).lpf(1200)",
+            "$: s(\"in\").fm(\"<0 2 8>\").fmh(2)",
             "$: stack(s(\"in\").pan(0), s(\"in:1\").pan(1))",
         ],
         tags: &["sound", "external_io"],
@@ -6645,12 +7234,13 @@ mod unplayable_tests {
     }
 }
 
-/// The pitch a sample voice takes when the score names no note.
+/// The pitch a sample voice takes when the score names no note, by the
+/// name it looks the sound up with.
 ///
 /// An ordinary sample bank uses midi 36; a `gm_*` soundfont uses c3, midi 48,
 /// because the soundfont loader carries its own default an octave above the
 /// sampler's.
-fn sample_default_midi(_object: &serde_json::Map<String, serde_json::Value>, name: &str) -> f64 {
+pub fn sample_default_midi(name: &str) -> f64 {
     if name.starts_with("gm_") { 48.0 } else { 36.0 }
 }
 

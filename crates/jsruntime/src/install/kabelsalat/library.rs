@@ -430,7 +430,7 @@ mod tests {
 
     fn compile(source: &str) -> String {
         let runtime = JsRuntime::new().expect("runtime");
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(&runtime, |ctx| {
             super::super::install(&ctx).expect("bindings");
             super::super::compile_graph(&ctx, source, &[], 220.0)
                 .unwrap_or_else(|error| panic!("{source}: {error:?}; {:?}", ctx.catch()))
@@ -604,7 +604,7 @@ mod tests {
     #[test]
     fn unbounded_forks_and_custom_processors_are_rejected() {
         let runtime = JsRuntime::new().expect("runtime");
-        with_ctx(&runtime.ctx, |ctx| {
+        with_ctx(&runtime, |ctx| {
             super::super::install(&ctx).expect("bindings");
             for source in [
                 "n(1).fork(Infinity).out()",

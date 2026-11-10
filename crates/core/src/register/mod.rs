@@ -868,7 +868,7 @@ mod numeric_string_tests {
             }),
             true,
         );
-        let callback = pure(Value::Function(transformer));
+        let callback = pure(Value::Function(Box::new(transformer)));
         let count = pure(Value::F64((MAX_ITER_PARTS + 1) as f64));
         let receiver = pure(Value::Str("a".into()));
         let cases = [
@@ -973,7 +973,7 @@ mod numeric_string_tests {
             }),
             true,
         );
-        let callback = pure(Value::Function(transformer));
+        let callback = pure(Value::Function(Box::new(transformer)));
         let receiver = pure(Value::Str("a".into()));
         let echo_with = registry.get("echoWith").expect("registered echoWith");
 
@@ -1025,7 +1025,7 @@ mod numeric_string_tests {
             &[
                 pure(Value::F64(MAX_ECHO_COPIES as f64)),
                 pure(Value::F64(0.0)),
-                pure(Value::Function(transformer)),
+                pure(Value::Function(Box::new(transformer))),
             ],
             pure(Value::Str("a".into())),
         );

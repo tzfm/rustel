@@ -44,10 +44,44 @@ pub(super) enum Landing {
 }
 
 impl App {
+    /// The caret as a name lookup reads it. A bar caret stands between two
+    /// characters. Vim's block caret in Normal covers one, so on a name it
+    /// reads as just past the letter it covers, inside that name. On the
+    /// quote that opens a string, it reads as just inside that string.
+    pub(super) fn name_caret(&self) -> ByteOffset {
+        let editor = self.editor();
+        let selection = editor.primary_selection();
+        let head = selection.head;
+        if !editor.vim_is_normal() || !selection.is_empty() {
+            return head;
+        }
+        let document = editor.document();
+        let Some(next) = document
+            .next_grapheme_boundary(head)
+            .ok()
+            .filter(|next| *next > head)
+        else {
+            return head;
+        };
+        let Ok(covered) = document.slice(head..next) else {
+            return head;
+        };
+        let letter = covered
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '_');
+        let opens_string = matches!(covered.as_str(), "\"" | "'")
+            && document
+                .line_of(head)
+                .ok()
+                .and_then(|line| document.slice(document.line_start(line)..head).ok())
+                .is_some_and(|before| open_quote(before.as_bytes()).is_none());
+        if letter || opens_string { next } else { head }
+    }
+
     /// The word under the caret and where it sits, when there is one.
     pub(super) fn word_range_at_caret(&self) -> Option<(String, Range<ByteOffset>)> {
         let editor = self.editor();
-        let (word, range) = word_before(editor.document(), editor.primary_selection().head)?;
+        let (word, range) = word_before(editor.document(), self.name_caret())?;
         let source = editor.source();
         let qualified = reference_name_range(&source, range.start.0..range.end.0);
         if qualified.start == range.start.0 {
@@ -61,9 +95,17 @@ impl App {
     }
 
     /// A callee uses the namespace before its name. Its arguments can
-    /// switch namespace themselves, as `K` and `S` do.
+    /// switch namespace themselves, as `K`, `S` and `H` do. A Hydra
+    /// statement is Hydra code; see `hydra_scope.rs`.
     pub(super) fn reference_scope_at(&self, at: ByteOffset) -> ReferenceScope {
-        reference_scope(&self.editor().source(), at.0)
+        let source = self.editor().source();
+        #[cfg(feature = "hydra")]
+        if super::hydra_scope::in_hydra_code(&source, at.0, |name| {
+            self.reference.is_hydra_global(name)
+        }) {
+            return ReferenceScope::Hydra;
+        }
+        reference_scope(&source, at.0)
     }
 
     pub(super) fn reference_scope_at_caret(&self) -> ReferenceScope {
@@ -74,8 +116,8 @@ impl App {
     /// only members belong in the list behind that documentation.
     pub(super) fn reference_name_scope_at(&self, at: ByteOffset) -> ReferenceScope {
         let scope = self.reference_scope_at(at);
-        if scope.is_kabelsalat() && self.editor().source()[..at.0].trim_end().ends_with('.') {
-            ReferenceScope::KabelsalatMember
+        if self.editor().source()[..at.0].trim_end().ends_with('.') {
+            member_scope(scope)
         } else {
             scope
         }
@@ -83,8 +125,8 @@ impl App {
 
     fn chain_reference_scope(&self, range: &Range<ByteOffset>) -> ReferenceScope {
         let scope = self.reference_name_scope_at(range.start);
-        if scope.is_kabelsalat() && range.is_empty() {
-            ReferenceScope::KabelsalatMember
+        if range.is_empty() {
+            member_scope(scope)
         } else {
             scope
         }
@@ -94,7 +136,7 @@ impl App {
         if let Some(range) = self.chain_position_at_caret() {
             return self.chain_reference_scope(&range);
         }
-        let caret = self.editor().primary_selection().head;
+        let caret = self.name_caret();
         let scope = self.reference_scope_at(caret);
         let name = self
             .word_range_at_caret()
@@ -134,7 +176,7 @@ impl App {
     /// unrelated strings such as `lfo({ control: "gain" })`.
     pub(super) fn object_key_before_string_at_caret(&self) -> Option<String> {
         let editor = self.editor();
-        let caret = editor.primary_selection().head;
+        let caret = self.name_caret();
         let document = editor.document();
         let line = document.line_of(caret).ok()?;
         let start = document.line_start(line);
@@ -170,7 +212,7 @@ impl App {
     /// or chords - never functions.
     pub(super) fn string_completion_at_caret(&self) -> Option<(String, String, Range<ByteOffset>)> {
         let editor = self.editor();
-        let caret = editor.primary_selection().head;
+        let caret = self.name_caret();
         let document = editor.document();
         let line = document.line_of(caret).ok()?;
         let start = document.line_start(line);
@@ -200,6 +242,12 @@ impl App {
         // and `G^9` becomes `G^Db-7`.
         let role = self.string_role(&callee);
         let chord = role == Some(StringRole::Chord);
+        // A documented choice can be hyphenated - `little-man` - and the
+        // hyphen is part of it, or the chosen name lands inside the old one
+        // and `little-man` becomes `little-big-robot`.
+        let hyphenated = self
+            .string_choice_set(&callee)
+            .is_some_and(|set| set.choices.iter().any(|choice| choice.value.contains('-')));
         let word_byte = move |byte: u8| {
             // An apostrophe belongs to a name - `s("bell'")` - but never
             // when it is the string's own delimiter, or the scan walks
@@ -209,7 +257,8 @@ impl App {
             byte != quote
                 && (byte.is_ascii_alphanumeric()
                     || matches!(byte, b'_' | b'#' | b'\'')
-                    || (chord && matches!(byte, b'^' | b'-' | b'+')))
+                    || (chord && matches!(byte, b'^' | b'-' | b'+'))
+                    || (hyphenated && byte == b'-'))
         };
         // A sound and a scale are each written as one word with a colon
         // in it - `bd:3`, `C:major` - and the whole of it is replaced. A
@@ -618,7 +667,7 @@ impl App {
             return None;
         }
         let editor = self.editor();
-        let caret = editor.primary_selection().head;
+        let caret = self.name_caret();
         let document = editor.document();
         let line = document.line_of(caret).ok()?;
         let start = document.line_start(line);
@@ -805,8 +854,9 @@ impl App {
                     })
                     .is_some_and(|asked| asked != index),
                 ReferenceMode::Browse => {
-                    panel.scope != ReferenceScope::All
-                        && panel.scope != self.completion_scope_at_caret()
+                    let caret = self.completion_scope_at_caret();
+                    (!panel.scope.is_browser() && panel.scope != caret)
+                        || panel.scope.is_hydra() != caret.is_hydra()
                 }
             });
         let retarget = self.reference_panel.is_some()
@@ -877,6 +927,9 @@ impl App {
                         (None, None) if enclosing.is_some() => {
                             ReferencePanel::browse_in(&self.reference, "", scope)
                         }
+                        (None, None) if scope.is_hydra() => {
+                            ReferencePanel::browse_in(&self.reference, "", scope.browser())
+                        }
                         (None, None) => ReferencePanel::browse(&self.reference),
                     };
                     self.reference_anchor = None;
@@ -916,9 +969,9 @@ impl App {
                     anchor.word
                 )
             }
-            (Some(_), None) => format!(
+            (Some(panel), None) => format!(
                 "reference - {} entries; type to search",
-                self.reference.len() - self.reference.hidden_len()
+                self.reference.len_in(panel.scope) - self.reference.hidden_len_in(panel.scope)
             ),
             (None, _) => "reference closed".into(),
         };
@@ -948,6 +1001,16 @@ impl App {
             .find('\n')
             .map_or(source.len(), |at| caret + at);
         source[start..end].trim().is_empty()
+    }
+}
+
+/// The namespace of a name written after a dot. Pattern methods share
+/// their namespace with pattern globals.
+fn member_scope(scope: ReferenceScope) -> ReferenceScope {
+    match scope {
+        ReferenceScope::Kabelsalat => ReferenceScope::KabelsalatMember,
+        ReferenceScope::Hydra => ReferenceScope::HydraMember,
+        other => other,
     }
 }
 
@@ -1198,6 +1261,59 @@ mod scoped_completion_tests {
         app.set_reference_panel(None);
         app.reference_anchor = None;
         app.focus = Focus::Editor;
+    }
+
+    /// Vim's block caret covers a letter, so `gd` on the first letter of
+    /// a name opens that name's docs, as it does on its bracket.
+    #[test]
+    fn gd_on_the_first_letter_of_a_name_opens_its_docs() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = crate::app::tests::support::app_over(directory.path());
+        app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+        app.vim_config.set_mappings_for_test(
+            crate::vim_config::VimMappings::parse_with_defaults("").expect("mappings"),
+        );
+        for (marked, name) in [
+            ("$: s(\"bd\").|gain(0.5)\n", "gain"),
+            ("$: |s(\"bd\").gain(0.5)\n", "s"),
+            ("$: s(\"bd\").gain|(0.5)\n", "gain"),
+            ("$: stack(s(\"bd\").|gain(0.5))\n", "gain"),
+        ] {
+            seed(&mut app, marked);
+            app.sync_editor_keybindings();
+            for key in ['g', 'd'] {
+                crate::app::tests::support::press(&mut app, KeyCode::Char(key), KeyModifiers::NONE);
+            }
+            assert_eq!(app.status, format!("reference - {name}"), "{marked}");
+        }
+    }
+
+    /// Vim's block caret on the quote that opens a string stands in that
+    /// string, so a pick from Normal writes what a pick just past the quote
+    /// writes, with no second pair of quotes.
+    #[test]
+    fn a_pick_on_the_quote_that_opens_a_string_writes_inside_it() {
+        let pick = |marked: &str, vim: bool| {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            if vim {
+                app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+                app.vim_config.set_mappings_for_test(
+                    crate::vim_config::VimMappings::parse_with_defaults("").expect("mappings"),
+                );
+            }
+            seed(&mut app, marked);
+            app.sync_editor_keybindings();
+            crate::app::tests::support::press(&mut app, KeyCode::Char(' '), KeyModifiers::CONTROL);
+            crate::app::tests::support::press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            app.editor().source().to_string()
+        };
+        let typed = pick("$: s(\"bd\").warpmode(\"|\n", false);
+        assert_ne!(
+            typed, "$: s(\"bd\").warpmode(\"\n",
+            "the pick writes a choice"
+        );
+        assert_eq!(pick("$: s(\"bd\").warpmode(|\"\n", true), typed);
     }
 
     #[test]
@@ -1676,12 +1792,23 @@ mod tests {
                 .iter()
                 .filter(|set| set.completes_string)
             {
-                let current = set.choices[set.choices.len() / 2].value;
+                // A hyphenated name, where the list has one, is the case a
+                // word scan most easily cuts short.
+                let current = set
+                    .choices
+                    .iter()
+                    .find(|choice| choice.value.contains('-'))
+                    .unwrap_or(&set.choices[set.choices.len() / 2])
+                    .value;
                 let score = match set.entry {
                     "setDefaultJoin" | "useRNG" => {
                         format!(r#"{}("{current}")\n"#, set.entry)
                     }
                     "lfo" => format!(r#"$: s("sine").lfo({{ shape: "{current}" }})\n"#),
+                    "talkit" => format!(
+                        r#"$: talkit("hello", {{ {}: "{current}" }})\n"#,
+                        set.parameter.trim_start_matches("config.")
+                    ),
                     _ => format!(r#"$: s("sine").{}("{current}")\n"#, set.entry),
                 };
                 let mut app = app_over(directory.path());

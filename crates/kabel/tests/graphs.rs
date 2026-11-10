@@ -2,10 +2,10 @@ use rustel_kabel::{Graph, MAX_INPUTS, MAX_NODES, Program};
 use serde_json::{Value, json};
 
 fn program(nodes: Value) -> Program {
-    Program::from_json(&json!({"nodes": nodes}).to_string()).unwrap()
+    Program::from_json(&json!({"nodes": nodes}).to_string()).expect("the program is valid")
 }
 fn graph(nodes: Value) -> Graph {
-    Graph::new(&program(nodes), 48000.0).unwrap()
+    Graph::new(&program(nodes), 48000.0).expect("the graph builds")
 }
 fn sample(nodes: Value) -> [f64; 2] {
     graph(nodes).process([0.0; 2], 1.0, 0.0)

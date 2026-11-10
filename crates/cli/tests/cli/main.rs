@@ -16,6 +16,7 @@ later version.
 //! Each test spawns `CARGO_BIN_EXE_rustel`. A panic is never an acceptable
 //! outcome: a mistyped expression in a live-coding session must produce a
 //! diagnostic and a non-zero exit, not a crash.
+#![allow(clippy::print_stderr, reason = "the test prints its diagnostics")]
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Output};
@@ -245,18 +246,18 @@ fn scratch(name: &str) -> PathBuf {
 #[cfg(feature = "vst")]
 #[test]
 fn a_render_goes_through_the_plugin_a_score_names() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().expect("tempdir created");
     let plugins = directory.path().join("plugins");
     let config = directory.path().join("config");
     let presets = config.join("vst").join(rustel_vst3_fixture::NAME);
-    std::fs::create_dir_all(&plugins).unwrap();
-    std::fs::create_dir_all(&presets).unwrap();
+    std::fs::create_dir_all(&plugins).expect("the directory is created");
+    std::fs::create_dir_all(&presets).expect("the directory is created");
     rustel_vst3_fixture::install(&plugins);
     std::fs::write(
         presets.join("Half Level.vstpreset"),
         rustel_vst3_fixture::preset(0.5, 0.0),
     )
-    .unwrap();
+    .expect("the file operation succeeds");
     let invoke = |args: &[&str]| {
         let child = rustel()
             .args(args)
@@ -265,7 +266,7 @@ fn a_render_goes_through_the_plugin_a_score_names() {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .unwrap();
+            .expect("the child starts");
         let output = wait_for_output(child, args);
         assert!(output.status.success(), "{output:?}");
         output
@@ -277,7 +278,7 @@ fn a_render_goes_through_the_plugin_a_score_names() {
             "-e",
             score,
             "-o",
-            path.to_str().unwrap(),
+            path.to_str().expect("utf-8 path"),
             "--cycles",
             "1",
         ]);
@@ -287,7 +288,10 @@ fn a_render_goes_through_the_plugin_a_score_names() {
             .iter()
             .map(|sample| i16::from_le_bytes(*sample))
             .collect();
-        (samples, String::from_utf8(output.stderr).unwrap())
+        (
+            samples,
+            String::from_utf8(output.stderr).expect("utf-8 output"),
+        )
     };
     let render = |effect: &str| render_score(&format!(r#"note("c3").s("sine"){effect}"#));
     let (dry, _) = render("");
@@ -301,6 +305,42 @@ fn a_render_goes_through_the_plugin_a_score_names() {
     assert!(scaled(&quarter, 0.25));
     let (half, _) = render(r#".vst("rustel fixture", { preset: "Half Level" })"#);
     assert!(scaled(&half, 0.5));
+    // A delay of the plugin is its latency, and the render starts the note
+    // early by that latency: the note sounds on its frame.
+    std::fs::write(
+        presets.join("Late.vstpreset"),
+        rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.25),
+    )
+    .expect("the file operation succeeds");
+    for effect in [
+        r#".vst("rustel fixture", { delay: 0.25 })"#,
+        r#".vst("rustel fixture", { preset: "Late" })"#,
+    ] {
+        let (late, notice) = render(effect);
+        assert!(scaled(&late, 1.0), "{effect}");
+        assert!(notice.is_empty(), "{notice}");
+    }
+    // A copy with the preset of a different plugin does not start. The
+    // render gives its line one time and plays the note with no plugin.
+    let mut other = rustel_vst3_fixture::preset(0.5, 0.0);
+    other[8] = b'0';
+    std::fs::write(presets.join("Other.vstpreset"), other).expect("the file operation succeeds");
+    let (unstarted, notice) = render(r#".vst("rustel fixture", { preset: "Other" })"#);
+    assert!(scaled(&unstarted, 1.0));
+    let line = format!("{} did not start", rustel_vst3_fixture::NAME);
+    assert_eq!(notice.matches(&line).count(), 1, "{notice}");
+    // A copy with no number in its output for 1 s of the note plays silence
+    // to the end. The render succeeds and gives its line one time.
+    let (faulted, notice) = render(r#".vst("rustel fixture", { fault: 1 })"#);
+    assert!(faulted.iter().all(|sample| *sample == 0));
+    let line = format!(
+        "{}: no number in the output for 1 s, so the stage plays silence to the end",
+        rustel_vst3_fixture::NAME
+    );
+    assert_eq!(notice.matches(&line).count(), 1, "{notice}");
+    // A preset with no file gives one line.
+    let (_, notice) = render(r#".vst("rustel fixture", { preset: "Nowhere" })"#);
+    assert_eq!(notice.lines().count(), 1, "{notice}");
     // A key that is no parameter drops its value alone. The plugin runs
     // with the other value. The warning counts the onset at the end of the
     // render too.
@@ -314,7 +354,8 @@ fn a_render_goes_through_the_plugin_a_score_names() {
     );
     // A settings file with a fault gives a warning, and the plugin plays.
     let settings = config.join("rustel.json");
-    std::fs::write(&settings, r#"{"plugin_audio_thread": "OTT"}"#).unwrap();
+    std::fs::write(&settings, r#"{"plugin_audio_thread": "OTT"}"#)
+        .expect("the file operation succeeds");
     let (faulty, notice) = render(r#".vst("rustel fixture", { gain: 0.25 })"#);
     assert!(scaled(&faulty, 0.25));
     assert!(
@@ -323,7 +364,7 @@ fn a_render_goes_through_the_plugin_a_score_names() {
         ),
         "{notice}"
     );
-    std::fs::remove_file(&settings).unwrap();
+    std::fs::remove_file(&settings).expect("the cleanup succeeds");
 
     // The second plugin of the bundle is an instrument. With `.vsti()` the
     // plugin makes the sound of the note: a 440 Hz sine with a peak of
@@ -341,8 +382,13 @@ fn a_render_goes_through_the_plugin_a_score_names() {
     let (note, rest) = alone.split_at(48_000);
     let rises = note.windows(2).filter(|pair| pair[0] <= 0 && pair[1] > 0);
     assert_eq!(rises.count(), 440);
+    // Through the delay, the tone rises on the frame it rises on with no
+    // plugin.
+    let first_rise = |samples: &[i16]| samples.iter().position(|sample| *sample > 0);
+    let (late, _) = tone(r#".vst("rustel fixture", { delay: 0.25 })"#);
+    assert_eq!(first_rise(&late), first_rise(&alone));
     let peak = |samples: &[i16]| samples.iter().map(|sample| sample.unsigned_abs()).max();
-    let level = f32::from(peak(note).unwrap());
+    let level = f32::from(peak(note).expect("the peak is measured"));
     let wanted = 0.8 * rustel_vst3_fixture::TONE_LEVEL * 32_767.0;
     assert!((level - wanted).abs() < 20.0, "peak {level}");
     assert!(rest.iter().all(|sample| *sample == 0));
@@ -360,7 +406,7 @@ fn a_render_goes_through_the_plugin_a_score_names() {
     ] {
         let (scaled, _) = tone(effect);
         assert!(
-            (f32::from(peak(&scaled).unwrap()) - wanted * scale).abs() < 20.0,
+            (f32::from(peak(&scaled).expect("the peak is measured")) - wanted * scale).abs() < 20.0,
             "{effect}"
         );
         if scale == 0.0 {
@@ -384,7 +430,7 @@ fn a_render_goes_through_the_plugin_a_score_names() {
     let listed = invoke(&["vst"]);
     assert!(String::from_utf8_lossy(&listed.stdout).contains(rustel_vst3_fixture::NAME));
     let one = invoke(&["vst", "fixture", "--json"]);
-    let one: serde_json::Value = serde_json::from_slice(&one.stdout).unwrap();
+    let one: serde_json::Value = serde_json::from_slice(&one.stdout).expect("valid JSON");
     assert_eq!(one["params"][0]["key"], "gain");
     assert_eq!(one["params"][1]["key"], "beatgate");
     assert_eq!(one["presets"][0], "Half Level");
@@ -400,13 +446,13 @@ fn a_render_goes_through_the_plugin_a_score_names() {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .unwrap();
+            .expect("the child starts");
         let output = wait_for_output(child, args);
         assert!(output.status.success(), "{output:?}");
         output.stdout
     };
     let one: serde_json::Value =
-        serde_json::from_slice(&printing(&["vst", "fixture", "--json"])).unwrap();
+        serde_json::from_slice(&printing(&["vst", "fixture", "--json"])).expect("valid JSON");
     assert_eq!(one["params"][0]["key"], "gain");
     let path = directory.path().join("printed.wav");
     let score = r#"note("c3").s("sine").vst("rustel fixture")"#;
@@ -415,7 +461,7 @@ fn a_render_goes_through_the_plugin_a_score_names() {
         "-e",
         score,
         "-o",
-        path.to_str().unwrap(),
+        path.to_str().expect("utf-8 path"),
         "--cycles",
         "1",
     ]);
@@ -434,11 +480,12 @@ fn a_render_goes_through_the_plugin_a_score_names() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .unwrap();
+        .expect("the child starts");
     let scanned = wait_for_output(child, &["vst"]);
     let list = String::from_utf8_lossy(&scanned.stdout);
     assert!(list.contains(rustel_vst3_fixture::TONE_NAME), "{scanned:?}");
-    let cache = std::fs::read_to_string(fresh.join("vst").join("scan.json")).unwrap();
+    let cache = std::fs::read_to_string(fresh.join("vst").join("scan.json"))
+        .expect("the file operation succeeds");
     assert!(cache.contains(rustel_vst3_fixture::TONE_NAME), "{cache}");
 
     // A plugin with a fault at its load ends the scan process and not the
@@ -453,7 +500,7 @@ fn a_render_goes_through_the_plugin_a_score_names() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .unwrap();
+        .expect("the child starts");
     let at_load = wait_for_output(child, &args);
     assert_eq!(at_load.status.code(), Some(1), "{at_load:?}");
     let said = String::from_utf8_lossy(&at_load.stderr);
@@ -462,7 +509,7 @@ fn a_render_goes_through_the_plugin_a_score_names() {
 
 #[test]
 fn config_get_and_set_use_the_user_directory() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().expect("tempdir created");
     let config = directory.path().join("config");
     let invoke = |args: &[&str]| {
         let child = rustel()
@@ -472,7 +519,7 @@ fn config_get_and_set_use_the_user_directory() {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .unwrap();
+            .expect("the child starts");
         wait_for_output(child, args)
     };
     let output = invoke(&["config", "get", "check_updates"]);
@@ -489,15 +536,17 @@ fn config_get_and_set_use_the_user_directory() {
         let output = invoke(&["config", "get", "check_updates"]);
         assert!(output.status.success());
         assert_eq!(
-            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stdout).expect("utf-8 output"),
             format!("{value}\n")
         );
-        let settings: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(config.join("rustel.json")).unwrap()).unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(config.join("rustel.json")).expect("the settings file is read"),
+        )
+        .expect("valid JSON");
         assert_eq!(settings["check_updates"], value == "true");
     }
     assert!(!directory.path().join(".rustel").exists());
-    let before = std::fs::read(config.join("rustel.json")).unwrap();
+    let before = std::fs::read(config.join("rustel.json")).expect("the file operation succeeds");
     for args in [
         vec!["config", "set", "check_updates", "yes"],
         vec!["config", "set", "unknown", "false"],
@@ -505,7 +554,10 @@ fn config_get_and_set_use_the_user_directory() {
     ] {
         let output = invoke(&args);
         assert_eq!(output.status.code(), Some(2), "{output:?}");
-        assert_eq!(std::fs::read(config.join("rustel.json")).unwrap(), before);
+        assert_eq!(
+            std::fs::read(config.join("rustel.json")).expect("the file operation succeeds"),
+            before
+        );
     }
 }
 
@@ -1107,14 +1159,13 @@ fn query_score_text_has_no_implicit_module_or_sample_io_access() {
         let denied = run(&["query", "--json", "-e", source]);
         assert!(!denied.status.success(), "denied query exited 0");
         assert!(
-            String::from_utf8_lossy(&denied.stderr)
-                .contains("outside the permitted sample origins"),
+            String::from_utf8_lossy(&denied.stderr).contains("is not an allowed sample source"),
             "the denied capability was not reported for {source:?}: {}",
             String::from_utf8_lossy(&denied.stderr)
         );
     }
 
-    // --strict-sample-origins removes the parity default entirely: with no
+    // --strict-sample-origins removes the built-in sources: with no
     // grants at all, registration is refused before any URL is considered.
     let strict = run(&[
         "query",
@@ -1164,7 +1215,7 @@ fn query_score_text_has_no_implicit_module_or_sample_io_access() {
             "--allow-sample-origin",
             "file:///tmp",
         ],
-        "must be an http or https origin",
+        "not an http or https address",
     );
 }
 
@@ -4841,10 +4892,22 @@ fn indexed_echo_aliases_match_exact_callback_and_timing_contracts() {
                     let index = value.strip_prefix(&prefix)?;
                     Some((
                         index.to_owned(),
-                        hap["whole"]["begin"].as_str().unwrap().to_owned(),
-                        hap["whole"]["end"].as_str().unwrap().to_owned(),
-                        hap["part"]["begin"].as_str().unwrap().to_owned(),
-                        hap["part"]["end"].as_str().unwrap().to_owned(),
+                        hap["whole"]["begin"]
+                            .as_str()
+                            .expect("the field is a string")
+                            .to_owned(),
+                        hap["whole"]["end"]
+                            .as_str()
+                            .expect("the field is a string")
+                            .to_owned(),
+                        hap["part"]["begin"]
+                            .as_str()
+                            .expect("the field is a string")
+                            .to_owned(),
+                        hap["part"]["end"]
+                            .as_str()
+                            .expect("the field is a string")
+                            .to_owned(),
                     ))
                 })
                 .collect::<Vec<_>>();
@@ -4874,10 +4937,22 @@ fn indexed_echo_aliases_match_exact_callback_and_timing_contracts() {
             let index = hap["value"].as_str()?.strip_prefix("curried:echoWith:")?;
             Some((
                 index.to_owned(),
-                hap["whole"]["begin"].as_str().unwrap().to_owned(),
-                hap["whole"]["end"].as_str().unwrap().to_owned(),
-                hap["part"]["begin"].as_str().unwrap().to_owned(),
-                hap["part"]["end"].as_str().unwrap().to_owned(),
+                hap["whole"]["begin"]
+                    .as_str()
+                    .expect("the field is a string")
+                    .to_owned(),
+                hap["whole"]["end"]
+                    .as_str()
+                    .expect("the field is a string")
+                    .to_owned(),
+                hap["part"]["begin"]
+                    .as_str()
+                    .expect("the field is a string")
+                    .to_owned(),
+                hap["part"]["end"]
+                    .as_str()
+                    .expect("the field is a string")
+                    .to_owned(),
             ))
         })
         .collect::<Vec<_>>();
@@ -8866,7 +8941,7 @@ fn a_refused_samples_import_is_reported_where_it_is_written() {
         .find(|line| {
             line["check"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("outside the permitted sample origins"))
+                .is_some_and(|message| message.contains("is not an allowed sample source"))
         })
         .unwrap_or_else(|| panic!("no refusal finding: {stdout}"));
     assert_eq!(refusal["check"]["line"], 2, "{refusal}");
@@ -9129,23 +9204,24 @@ fn cache_clear_requires_consent_and_dry_run_changes_nothing() {
         } else {
             "sample-consent"
         });
-        std::fs::create_dir_all(base.join("score")).unwrap();
+        std::fs::create_dir_all(base.join("score")).expect("the directory is created");
         let entry = base.join("score").join("response.wav");
-        std::fs::write(&entry, b"keep until confirmed").unwrap();
+        std::fs::write(&entry, b"keep until confirmed").expect("the file operation succeeds");
         for flags in [vec![], vec!["--no-input"], vec!["--quiet"]] {
             let output = rustel()
                 .args(&command)
                 .args(flags)
                 .env("RUSTEL_SAMPLE_CACHE", &base)
                 .output()
-                .unwrap();
+                .expect("the command runs");
             assert_eq!(output.status.code(), Some(1));
             assert!(output.stdout.is_empty());
-            let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            let error: serde_json::Value =
+                serde_json::from_slice(&output.stderr).expect("valid JSON");
             assert!(
                 error["error"]["message"]
                     .as_str()
-                    .unwrap()
+                    .expect("the field is a string")
                     .contains("--force")
             );
             assert!(entry.exists());
@@ -9155,25 +9231,37 @@ fn cache_clear_requires_consent_and_dry_run_changes_nothing() {
             .args(["--dry-run", "--no-input", "--force"])
             .env("RUSTEL_SAMPLE_CACHE", &base)
             .output()
-            .unwrap();
+            .expect("the command runs");
         assert!(output.status.success(), "{output:?}");
-        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        let report = report.as_object().unwrap().values().next().unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+        let report = report
+            .as_object()
+            .expect("the value is an object")
+            .values()
+            .next()
+            .expect("the report has an entry");
         assert_eq!(report["status"], "dry_run");
-        assert!(report["scope"].as_str().unwrap().contains("kept"));
+        assert!(
+            report["scope"]
+                .as_str()
+                .expect("the field is a string")
+                .contains("kept")
+        );
         assert!(entry.exists());
         assert_eq!(
-            std::fs::read_dir(&base).unwrap().count(),
+            std::fs::read_dir(&base)
+                .expect("the folder is listed")
+                .count(),
             1,
             "dry run wrote a lock or marker"
         );
-        std::fs::remove_dir_all(&base).unwrap();
+        std::fs::remove_dir_all(&base).expect("the cleanup succeeds");
         let output = rustel()
             .args(&command)
             .arg("-n")
             .env("RUSTEL_SAMPLE_CACHE", &base)
             .output()
-            .unwrap();
+            .expect("the command runs");
         assert!(output.status.success());
         assert!(!base.exists(), "dry run created a cache directory");
     }
@@ -9189,7 +9277,7 @@ fn bare_invocation_and_display_flags_offer_help() {
     ] {
         let output = run(&args);
         assert!(output.status.success(), "{output:?}");
-        let help = String::from_utf8(output.stdout).unwrap();
+        let help = String::from_utf8(output.stdout).expect("utf-8 output");
         assert!(help.contains("Usage:"));
         assert!(help.contains("https://github.com/tzfm/rustel/issues"));
         assert!(!help.contains('\x1b'));
@@ -9199,7 +9287,7 @@ fn bare_invocation_and_display_flags_offer_help() {
         let mut args = command.into_iter().collect::<Vec<_>>();
         args.push("-h");
         let short = ok_stdout(&args);
-        *args.last_mut().unwrap() = "--help";
+        *args.last_mut().expect("the list has the entry") = "--help";
         assert_eq!(short, ok_stdout(&args));
     }
 }
@@ -9215,14 +9303,17 @@ fn check_json_findings_end_with_a_json_failure_envelope() {
     ]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(!output.stdout.is_empty());
-    for line in String::from_utf8(output.stdout).unwrap().lines() {
-        serde_json::from_str::<serde_json::Value>(line).unwrap();
+    for line in String::from_utf8(output.stdout)
+        .expect("utf-8 output")
+        .lines()
+    {
+        serde_json::from_str::<serde_json::Value>(line).expect("valid JSON");
     }
-    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).expect("valid JSON");
     assert!(
         error["error"]["message"]
             .as_str()
-            .unwrap()
+            .expect("valid JSON")
             .contains("check found issues")
     );
 }
@@ -9236,16 +9327,17 @@ fn watch_code_piped_output_has_no_terminal_controls() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .unwrap();
+        .expect("the child starts");
     let source = "note('c3')\n\u{1b}]52;c;payload\u{7}";
     let event = serde_json::json!({"score_active": {
         "source": rustel_runtime::session_log::encode_base64(source.as_bytes()),
         "index": 1
     }});
-    writeln!(child.stdin.take().unwrap(), "{event}").unwrap();
+    writeln!(child.stdin.take().expect("stdin is piped"), "{event}")
+        .expect("writing to a string cannot fail");
     let output = wait_for_output(child, &["watch-code"]);
     assert!(output.status.success());
-    let output = String::from_utf8(output.stdout).unwrap();
+    let output = String::from_utf8(output.stdout).expect("utf-8 output");
     assert!(output.contains("note('c3')"));
     assert!(output.contains("␛]52;c;payload␇"), "{output}");
     assert!(!output.contains('\x1b'));
@@ -9268,7 +9360,7 @@ fn score_text_in_errors_findings_and_values_cannot_drive_the_terminal() {
         (query_error.stderr, 1),
         (query_value.stdout, 2),
     ] {
-        let shown = String::from_utf8(shown).unwrap();
+        let shown = String::from_utf8(shown).expect("utf-8 output");
         assert_eq!(
             shown.matches("␛]52;c;cGF5bG9hZA==␇").count(),
             count,
@@ -9282,7 +9374,7 @@ fn score_text_in_errors_findings_and_values_cannot_drive_the_terminal() {
 
     // A syntax finding quotes the character the parser stopped at.
     let stray = run(&["check", "-e", "note('c3')\u{1b}"]);
-    let stray = String::from_utf8(stray.stdout).unwrap();
+    let stray = String::from_utf8(stray.stdout).expect("utf-8 output");
     assert!(
         stray
             .lines()
@@ -9315,3 +9407,83 @@ fn misspelled_commands_with_arguments_offer_a_hint() {
 }
 
 mod diagnostics;
+
+/// A later cue whose atomic write fails is reported as a failed save. The
+/// protocol must not announce that cue as active while the watched file
+/// still holds the older save.
+#[test]
+fn a_replay_save_that_never_reached_the_score_is_reported_not_announced() {
+    let quiet = r#"note("c4").gain(0.2)"#;
+    let tape = installed_tape(
+        "replay-io-fail.rustel-session",
+        &[(0.0, quiet), (1.0, quiet)],
+    );
+    let out = scratch("replay-io-fail.strudel");
+    // The later cue's atomic-write staging path, occupied by a directory so
+    // the write cannot land.
+    let staging = out.with_extension("rustel.replay-tmp");
+    let _ = std::fs::remove_file(&staging);
+    std::fs::create_dir_all(&staging).expect("stage the failure");
+
+    let mut child = rustel()
+        .args([
+            "replay",
+            tape.to_str().expect("UTF-8 tape"),
+            "--out",
+            out.to_str().expect("UTF-8 target"),
+            "--output",
+            "silent",
+            "--json",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn replay");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (lines, done) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if lines.send(line).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut saw_failure = false;
+    let mut saw_any_active = false;
+    while std::time::Instant::now() < deadline {
+        match done.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(line) => {
+                if line.contains("replay_save_failed") {
+                    saw_failure = true;
+                }
+                if line.contains("\"score_active\"") {
+                    saw_any_active = true;
+                }
+                if saw_failure {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        saw_failure,
+        "the failed delivery must be reported on stderr"
+    );
+    assert!(
+        !saw_any_active,
+        "a cue whose save never reached the score must not be announced active"
+    );
+    let _ = std::fs::remove_dir_all(&staging);
+    for path in [tape, out] {
+        let _ = std::fs::remove_file(path);
+    }
+}

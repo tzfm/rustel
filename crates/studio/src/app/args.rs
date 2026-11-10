@@ -172,7 +172,23 @@ pub(super) fn parameter_edit(
             };
             return Some((range, String::new()));
         }
-        return Some((entry.clone(), source[entry.clone()].to_owned()));
+        // The member's own text, without the spaces, line breaks and
+        // comments around it: a caller that writes a new value over it,
+        // such as a preset pick, keeps them.
+        let member = &source[entry.clone()];
+        let own = |at: usize| {
+            !member.as_bytes()[at].is_ascii_whitespace()
+                && rustel_runtime::lint::blanked_at(member, at)
+                    != Some(rustel_runtime::lint::Blanked::Comment)
+        };
+        let start = (0..member.len())
+            .find(|at| own(*at))
+            .map_or(entry.start, |at| entry.start + at);
+        let end = (0..member.len())
+            .rev()
+            .find(|at| own(*at))
+            .map_or(start, |at| entry.start + at + 1);
+        return Some((start..end, source[start..end].to_owned()));
     }
     if let Some(typed) = typed {
         let entry = entries
@@ -266,6 +282,38 @@ mod tests {
                 parameter_edit(source, source.find('(').unwrap(), "gain: 0.5", None).is_none(),
                 "{source}"
             );
+        }
+    }
+
+    /// A pick that writes a new value over the existing member, as a preset
+    /// pick does, changes the member alone: the comments, line breaks and
+    /// spaces around it stay.
+    #[test]
+    fn a_value_written_over_an_existing_member_keeps_what_is_around_it() {
+        for (source, expected) in [
+            (
+                "vsti('FX', {\n  // warm pad\n  preset: \"A\",\n  cutoff: 0.4,\n})",
+                "vsti('FX', {\n  // warm pad\n  preset: \"B\",\n  cutoff: 0.4,\n})",
+            ),
+            (
+                "vsti('FX', { preset: \"A\", cutoff: 0.4 })",
+                "vsti('FX', { preset: \"B\", cutoff: 0.4 })",
+            ),
+            (
+                "vsti('FX', {\n  cutoff: 0.4,\n  preset: \"A\" // warm\n})",
+                "vsti('FX', {\n  cutoff: 0.4,\n  preset: \"B\" // warm\n})",
+            ),
+        ] {
+            let open = source.find('(').unwrap();
+            let (range, kept) = parameter_edit(source, open, "preset: \"B\"", None).unwrap();
+            assert_eq!(
+                kept,
+                source[range.clone()],
+                "the member, unchanged: {source}"
+            );
+            let mut result = source.to_owned();
+            result.replace_range(range, "preset: \"B\"");
+            assert_eq!(result, expected, "{source}");
         }
     }
 

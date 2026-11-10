@@ -9,7 +9,7 @@ use super::*;
 
 /// The voice a chord is previewed on, and what stands in for it before
 /// its bank has downloaded.
-const CHORD_PREVIEW_SOUND: &str = "piano";
+pub(super) const CHORD_PREVIEW_SOUND: &str = "piano";
 const CHORD_PREVIEW_FALLBACK: &str = "triangle";
 
 /// The octave a previewed chord is played in, matching the panel's own.
@@ -232,6 +232,20 @@ impl App {
     /// A preview can keep sounding while another scene or shelf row is
     /// selected. Follow its own source until it is replaced or stopped,
     /// including failures that recover after a later loader retry.
+    /// Whether the preview sound's bank is still on its way in. A preview
+    /// pressed while this is true waits for the bank before it sounds, so
+    /// the status says the load instead of claiming a preview that has
+    /// not happened yet.
+    fn preview_sound_loading(&self) -> bool {
+        use rustel_voice::{SampleLookup, SampleResolution};
+        self.worker.library().is_some_and(|library| {
+            matches!(
+                library.resolve(CHORD_PREVIEW_SOUND, 0.0, 60.0),
+                SampleResolution::Loading
+            )
+        })
+    }
+
     #[cfg(feature = "hydra")]
     pub(super) fn refresh_preview_readiness(&mut self) {
         let Some(preview) = self.snippet_preview.as_mut() else {
@@ -271,9 +285,13 @@ impl App {
             .worker
             .try_audition_notes(&notes, sound, self.preview_gain)
         {
-            self.preview_armed = Some((chord.to_owned(), Instant::now()));
+            self.arm_preview(chord);
             self.preview_lit_until = Some(Instant::now() + CHORD_PREVIEW_GLOW);
-            self.status = format!("preview {chord}");
+            self.status = if self.preview_sound_loading() {
+                "loading the piano for previews...".to_owned()
+            } else {
+                format!("preview {chord}")
+            };
         } else {
             self.status = format!("the engine is busy; {chord} was not previewed");
         }
@@ -342,14 +360,18 @@ impl App {
             .worker
             .try_audition_run(&run, sound, self.preview_gain, SCALE_PREVIEW_STEP_SECS)
         {
-            self.preview_armed = Some((scale.to_owned(), Instant::now()));
+            self.arm_preview(scale);
             self.preview_lit_until = Some(
                 Instant::now()
                     + Duration::from_secs_f64(
                         SCALE_PREVIEW_STEP_SECS * run.len().min(MAX_PREVIEW_RUN_NOTES) as f64,
                     ),
             );
-            self.status = format!("preview {scale}");
+            self.status = if self.preview_sound_loading() {
+                "loading the piano for previews...".to_owned()
+            } else {
+                format!("preview {scale}")
+            };
         } else {
             self.status = format!("the engine is busy; {scale} was not previewed");
         }
@@ -379,7 +401,7 @@ impl App {
             .worker
             .try_audition_run(&run, sound, self.preview_gain, SCALE_PREVIEW_STEP_SECS)
         {
-            self.preview_armed = Some((tuning.to_owned(), Instant::now()));
+            self.arm_preview(tuning);
             self.status = format!("preview {tuning}");
         } else {
             self.status = format!("the engine is busy; {tuning} was not previewed");
@@ -387,10 +409,18 @@ impl App {
         self.dirty_frame = true;
     }
 
+    /// A preview of `name` starts now. A waveform belongs to the one
+    /// sample it was drawn from: a chord, a scale or another sound lets it
+    /// go, so the picture and the stop window read only what plays.
+    fn arm_preview(&mut self, name: &str) {
+        self.preview_armed = Some((name.to_owned(), Instant::now()));
+        self.preview_shape = None;
+    }
+
     /// Hear one sound once, outside the score.
     pub(super) fn preview_sound(&mut self, sound: &str) {
         if self.worker.try_audition(sound, self.preview_gain) {
-            self.preview_armed = Some((sound.to_owned(), Instant::now()));
+            self.arm_preview(sound);
             self.preview_shape = self
                 .worker
                 .library()
@@ -423,7 +453,7 @@ impl App {
     pub(super) fn poll_preview_shape(&mut self) {
         if self.preview_shape.is_none()
             && let Some((sound, started)) = self.preview_armed.clone()
-            && started.elapsed() <= PREVIEW_STOP_WINDOW
+            && started.elapsed() <= self.preview_window()
             && let Some(library) = self.worker.library()
             && let Some(shape) = library.sound_shape(&sound)
         {
@@ -882,6 +912,61 @@ impl App {
         self.preview_shape = None;
     }
 
+    /// How long after its start a preview may still sound: the stop
+    /// window, or all of a longer sample, so Space and Esc stop a long
+    /// recording deep into it too.
+    pub(super) fn preview_window(&self) -> Duration {
+        let length = self
+            .preview_shape
+            .as_ref()
+            .map_or(0.0, |(_, seconds)| *seconds);
+        PREVIEW_STOP_WINDOW.max(Duration::try_from_secs_f64(length).unwrap_or_default())
+    }
+
+    /// The engine holds a preview while its sample loads, and each
+    /// snapshot names the sound it holds: `held` at the last snapshot and
+    /// `loading` at the new one. The status line says the wait, and says
+    /// the preview once the sound goes out. A status line that says
+    /// something else since is left as it is. The preview's clock starts
+    /// when the sound goes out, so its position and its stop window do not
+    /// count the load.
+    pub(super) fn follow_preview_loading(&mut self, held: Option<&str>, loading: Option<&str>) {
+        let Some((sound, started)) = self.preview_armed.as_mut() else {
+            return;
+        };
+        if loading == Some(sound.as_str()) || held == Some(sound.as_str()) {
+            *started = Instant::now();
+        }
+        let playing = format!("preview {sound}");
+        let waiting = format!("loading {sound} to preview...");
+        let (from, to) = if loading == Some(sound.as_str()) {
+            (playing, waiting)
+        } else {
+            (waiting, playing)
+        };
+        if self.status == from {
+            self.status = to;
+            self.dirty_frame = true;
+        }
+    }
+
+    /// The engine gives up on a preview whose sample did not load in time
+    /// or did not decode, and the status line says why. The preview it
+    /// names is let go: nothing sounds, so Space on its row plays it again
+    /// instead of stopping it.
+    pub(super) fn end_failed_preview(&mut self, message: &str) {
+        let names_it = self.preview_armed.as_ref().is_some_and(|(sound, _)| {
+            message
+                .split_whitespace()
+                .any(|word| word.trim_end_matches(':') == sound.as_str())
+        });
+        if names_it {
+            self.preview_armed = None;
+            self.preview_lit_until = None;
+            self.preview_shape = None;
+        }
+    }
+
     /// Silence the preview if one may still be sounding. Returns whether
     /// there was one to stop.
     pub(super) fn stop_preview(&mut self) -> bool {
@@ -889,6 +974,9 @@ impl App {
         let snippet = self.stop_snippet_preview();
         #[cfg(not(feature = "hydra"))]
         let snippet = false;
+        // The window reads the length of the sound, so it comes before
+        // the shape goes.
+        let window = self.preview_window();
         let Some((_, started)) = self.preview_armed.take() else {
             return snippet;
         };
@@ -896,7 +984,7 @@ impl App {
         self.preview_shape = None;
         // A preview that started long ago has ended on its own; nothing to
         // stop, and the key that asked keeps its ordinary meaning.
-        if started.elapsed() > PREVIEW_STOP_WINDOW {
+        if started.elapsed() > window {
             return snippet;
         }
         if self.worker.try_stop_audition() {
@@ -1495,21 +1583,29 @@ mod tests {
                             code[source..].lines().next()
                         );
                     }
-                    let mut session = rustel_runtime::Session::new().unwrap();
-                    session.evaluate(&block).unwrap();
-                    let events = session
-                        .query(
-                            rustel_fraction::Fraction::from(0),
-                            rustel_fraction::Fraction::from(2),
-                        )
+                    // On the stack the engine worker evaluates with.
+                    std::thread::Builder::new()
+                        .stack_size(rustel_runtime::QUERY_WORKER_STACK_BYTES)
+                        .spawn(move || {
+                            let mut session = rustel_runtime::Session::new().unwrap();
+                            session.evaluate(&block).unwrap();
+                            let events = session
+                                .query(
+                                    rustel_fraction::Fraction::from(0),
+                                    rustel_fraction::Fraction::from(2),
+                                )
+                                .unwrap();
+                            assert!(!events.is_empty());
+                            for event in events {
+                                assert_eq!(
+                                    event.value.get("__rustelPreview").cloned(),
+                                    Some(rustel_core::Value::F64(42.0))
+                                );
+                            }
+                        })
+                        .unwrap()
+                        .join()
                         .unwrap();
-                    assert!(!events.is_empty());
-                    for event in events {
-                        assert_eq!(
-                            event.value.get("__rustelPreview").cloned(),
-                            Some(rustel_core::Value::F64(42.0))
-                        );
-                    }
                 }
             }
         }
@@ -2741,7 +2837,13 @@ mod tests {
             assert_eq!(app.prefs.auto_preview, Some(true));
             assert!(app.status.contains("auto-play on"), "{}", app.status);
             press(&mut app, KeyCode::Down, KeyModifiers::NONE);
-            assert!(app.status.contains("C7"), "{}", app.status);
+            // The preview bank can still be loading in a test host, and
+            // then the honest status says the load rather than the chord.
+            assert!(
+                app.status.contains("C7") || app.status.contains("loading"),
+                "{}",
+                app.status
+            );
             // Alt+A again: the choice turns off, and is kept turned off.
             press(&mut app, KeyCode::Char('a'), KeyModifiers::ALT);
             assert!(!app.ui_settings.auto_preview);
@@ -3305,7 +3407,7 @@ mod tests {
 
         /// A preview alone plays the snippet from its beginning. The install
         /// itself carries the from-zero flag, and the flag does not stay set
-        /// for the next evaluation.
+        /// for the next evaluation. It is of no scene.
         #[cfg(feature = "hydra")]
         #[test]
         fn a_preview_alone_begins_at_its_beginning_on_the_install_itself() {
@@ -3325,6 +3427,11 @@ mod tests {
                 sent.rewind,
                 "alone, the snippet installs from its own cycle zero"
             );
+            assert_eq!(
+                app.install_mark(sent),
+                (true, rustel_runtime::PREVIEW_DOCUMENT),
+                "alone, the snippet is of no scene"
+            );
             app.pending_evaluation = None;
             app.inflight.clear();
 
@@ -3334,7 +3441,8 @@ mod tests {
         }
 
         /// Under a playing score, a previewed snippet joins the cycle where it
-        /// stands. The install carries no from-zero flag.
+        /// stands. The install carries no from-zero flag. It is a part of the
+        /// scene of the set.
         #[cfg(feature = "hydra")]
         #[test]
         fn a_preview_under_a_score_keeps_the_set_s_place_in_the_cycle() {
@@ -3356,6 +3464,11 @@ mod tests {
             assert!(
                 !sent.rewind,
                 "under a score, the snippet keeps the set's place in the cycle"
+            );
+            assert_eq!(
+                app.install_mark(sent),
+                (true, scene.0),
+                "under a score, the snippet is a part of its scene"
             );
             assert!(!app.next_rewind, "and no flag lingers after it either");
         }
@@ -3577,6 +3690,94 @@ mod tests {
                 Instant::now() - PREVIEW_STOP_WINDOW - Duration::from_secs(1),
             ));
             assert!(!app.stop_preview(), "a long-gone preview is not");
+            // A recording of ten minutes still sounds long after the window.
+            app.preview_armed = Some((
+                "take:0".into(),
+                Instant::now() - PREVIEW_STOP_WINDOW - Duration::from_secs(1),
+            ));
+            app.preview_shape = Some((std::sync::Arc::from(&[200u8, 40][..]), 600.0));
+            assert!(app.stop_preview(), "a long sample is stopped deep into it");
+        }
+
+        /// The engine holds a preview while its sample loads: the status
+        /// line says the wait, then the preview once the sound goes out. A
+        /// status line that says something else in between is left alone.
+        #[test]
+        fn the_status_says_a_preview_waits_for_its_sample() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            app.preview_armed = Some(("clip:0".into(), Instant::now()));
+            app.status = "preview clip:0".into();
+
+            app.follow_preview_loading(None, Some("clip:0"));
+            assert_eq!(app.status, "loading clip:0 to preview...");
+            app.follow_preview_loading(Some("clip:0"), Some("clip:0"));
+            assert_eq!(app.status, "loading clip:0 to preview...");
+            app.follow_preview_loading(Some("clip:0"), None);
+            assert_eq!(app.status, "preview clip:0");
+
+            app.follow_preview_loading(None, Some("clip:0"));
+            app.status = "saved".into();
+            app.follow_preview_loading(Some("clip:0"), None);
+            assert_eq!(app.status, "saved");
+        }
+
+        /// A preview's clock runs from when its sound goes out: a long load
+        /// does not use up the window in which Space stops it.
+        #[test]
+        fn a_preview_counts_from_when_its_sound_goes_out() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let long_ago = Instant::now() - PREVIEW_STOP_WINDOW - Duration::from_secs(1);
+            app.preview_armed = Some(("clip:0".into(), long_ago));
+            app.follow_preview_loading(None, Some("clip:0"));
+            assert!(app.stop_preview(), "a preview that still loads is stopped");
+
+            app.preview_armed = Some(("clip:0".into(), long_ago));
+            app.follow_preview_loading(Some("clip:0"), None);
+            assert!(app.stop_preview(), "a sound that just went out is stopped");
+        }
+
+        /// A preview whose sample does not load says why, and Space on its
+        /// row plays it again instead of stopping it. The failure of
+        /// another sound leaves a sounding preview alone.
+        #[test]
+        fn a_preview_that_does_not_load_is_let_go() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let failed = |message: &str| {
+                crate::worker::StudioControlEvent::Diagnostic(
+                    crate::engine::StudioDiagnostic::message("preview", message),
+                )
+            };
+            app.preview_armed = Some(("hh:0".into(), Instant::now()));
+            app.status = "preview hh:0".into();
+            app.handle_control(failed("clip:0 did not load in time to preview"));
+            assert!(app.stop_preview(), "hh:0 still sounds");
+
+            app.preview_armed = Some(("clip:0".into(), Instant::now()));
+            app.status = "loading clip:0 to preview...".into();
+            app.handle_control(failed("clip:0 did not load in time to preview"));
+            assert_eq!(app.status, "clip:0 did not load in time to preview");
+            assert!(!app.stop_preview(), "nothing is left to stop");
+        }
+
+        /// A chord heard after a long sample stops as a chord does: the
+        /// length of the sample leaves with the sample.
+        #[test]
+        fn a_chord_after_a_long_sample_keeps_the_window_of_a_chord() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            app.preview_armed = Some(("take:0".into(), Instant::now()));
+            app.preview_shape = Some((std::sync::Arc::from(&[200u8, 40][..]), 600.0));
+            app.preview_chord("C^");
+            let (chord, started) = app.preview_armed.as_mut().expect("the chord sounds");
+            assert_eq!(chord, "C^", "{}", app.status);
+            *started = Instant::now() - PREVIEW_STOP_WINDOW - Duration::from_secs(1);
+            assert!(
+                !app.stop_preview(),
+                "a chord that ended long ago has nothing to stop"
+            );
         }
 
         #[test]

@@ -15,6 +15,22 @@ plays it. Any other new path, such as `rustel studio set1`, creates a set folder
 with a starter scene. File > Open set does the same with a path you type. The
 parent folder must exist.
 
+A path given to File > Open set can be a Strudel pattern export: a `.json`
+object that holds one pattern of code per entry. Such a file is not a set on
+disk, so Studio makes a set of it. The new set folder sits beside the others and
+takes its name from the export file. One score is written per entry. A score
+that carries a `@title` field takes it as its file name, an entry keyed by a
+name takes the key, and the rest are numbered `pattern 1`, `pattern 2` and so on
+in the order the patterns were made. The open-set prompt offers these exports
+beside the sets, and File > Import patterns does the same import into
+the set already open: one score file an entry lands in the set's folder. An
+entry the set already holds under its name is skipped and counted, a name that
+holds other code goes on to `name 2`, and nothing is overwritten. File >
+Export patterns writes the set's scores the other way: one pattern export at
+the sets root, keyed by name, the score on screen as it stands with its
+unsaved edits, and the export loads in strudel.cc and in the open-set prompt
+alike.
+
 Type or paste a score, then press **Ctrl+S** or **F5**. Press **Ctrl+G** or **F8**
 to stop. Editing does not change the playing score until you update it. If an
 update fails, the last good score keeps playing. An update that changes nothing
@@ -127,6 +143,14 @@ Selecting a scene changes the editor; it does not start playback. Update the
 selected scene to play it. The scene strip marks the playing scene with `▶`
 and unsaved edits with `●`.
 
+Alt with 1 to 9 selects the score that holds that number on the strip. It
+works while the editor has the keyboard, so you can switch scores without the
+set panel. The panel's rows show the numbers, and a number the strip does not
+hold says so in the footer. Apple Terminal, and iTerm2 without the keyboard
+protocol, send Option with a digit as a typed character, such as `¡`. That is
+also what the `§` key of an ISO Mac keyboard sends, so there the character
+types. Press the digit in the set panel instead.
+
 Use Ctrl+N for a new scene or F3 to duplicate the current scene. These actions
 create files. Scene > Rename scene renames the scene and its file. Rename has
 no default shortcut. You can assign one in Settings > Keybinds. Ctrl+W closes
@@ -164,8 +188,28 @@ uses the terminal's own selection.
 ### The set panel
 
 Press Ctrl+B. Use the arrows to select a score or session, then Enter to open
-it. Space folds a section. Esc returns to the editor. Use `+` and `-` to change
-the panel size.
+it. Press 1 to 9 to open the score that holds that number on the strip. Space
+folds a section. Esc returns to the editor. Use `+` and `-` to change the
+panel size.
+
+The panel's foot shows the selected row's details under its own rule: the
+name, its strip number and open state, the `@` fields its leading comments
+carry, and when it was last saved. The block follows the selection with no
+key of its own. A tape's row shows its recording time, and the sessions fold
+its count. The hint rows at the panel's bottom name the open, strip and
+filter keys.
+
+Press `/` to filter the scores: type, and the panel hides the scores the query
+does not answer. A query matches a name or any `@` field value. Enter leaves
+the filter standing and moves to the first match. Esc restores the full list.
+The sessions fold is never filtered. The box shows its caret while it types.
+When the query matches nothing, the row says no match and blinks, so an empty
+list cannot read as an empty folder. While a filter stands, Backspace takes the
+box back up and deletes from the query. It never starts a delete of a file. In
+vim mode `/` opens the box typing, as Vim's own search does. Every letter types
+at once, `j` and `k` included: the insert mappings of the score do not reach
+the box. Esc leaves typing, and `j k h l` walk the list again. Press `i` or
+`a` to type.
 
 Delete asks for confirmation before it removes a file. Confirming also discards
 its unsaved edits. Studio does not delete the last score or the active session
@@ -178,6 +222,8 @@ Options > Global prebake or Options > Local prebake, or from Settings. Learn a
 key for either on Settings > Keybinds. The global file is
 `<rustel-config>/prebake.strudel`. The local prebake
 is stored in the set. Studio runs the global code first, then the local code.
+Opening another set runs its local prebake. Helpers from the last set's local
+prebake do not pass the check there.
 
 Update checks and saves the prebake, then applies it to the playing score. It
 does not start playback when Studio is stopped. Use `globalThis` or `register`
@@ -234,6 +280,47 @@ run through `K` or `worklet`; graph node names are local to the graph. Studio do
 check a score with an import for unknown function names: the script defines
 names Studio does not read before the script runs. See
 [Script imports](../SECURITY.md#script-imports) for the security rules.
+
+### Samples and media
+
+A score's `samples()`, Hydra images and Hydra videos load only from a source
+that you allow. `raw.githubusercontent.com`, `strudel.b-cdn.net`,
+`shabda.ndre.gr` and `cdn.freesound.org` are always allowed. They serve the
+`github:`, `bubo:` and `shabda:` shorthands, the default banks, and the
+freesound sounds that shared scores name. They have no row on the page. With
+`--strict-sample-origins`, they are off for the run.
+
+When a score loads a file that no source allows, the score plays without the
+file. The folder of the file comes onto the Permissions page as `samples off`.
+Press Enter to allow the folder and all addresses below it. Space turns a
+source off or on, and `d` removes it. A source turned off or removed takes
+the banks it allowed, and their files no longer load. Packs you imported in
+Settings stay.
+
+Press `e` to edit a source. The text sets what the source allows:
+
+- A domain, such as `github.com`. It allows HTTPS from that domain and its
+  subdomains.
+- An address, such as `github.com/me/kits/`. It allows HTTPS from that
+  address and below.
+- A full address, such as `http://localhost:8000/`. Plain HTTP and a server
+  on this computer need the full address.
+
+The edit must still allow what the row allowed, so a typing error cannot
+allow a different site. To allow all of `github.com/me/kits/808/`, cut it
+down to `github.com`. A script origin stays exact, and `e` does not edit it.
+
+The `local:` row is the folder that `samples('local:...')` reads. Hydra also
+reads a file from it when the set folder does not have the file. The row
+comes onto the page when a score asks for a `local:` file, or when a folder
+is set. Press Enter to choose the folder, and `d` to forget it. With
+`--allow-local-samples`, the folder of the flag is used for the run.
+
+Studio keeps the sources and the folder in `studio.json`. If an update
+stopped on a refusal, it runs again when you give the permission. Otherwise
+the next update reads with the new permission. A redirect must reach an
+address that an allowed source allows. See
+[Sample access](../SECURITY.md#sample-access) for the rules.
 
 ## Checking and playback
 
@@ -297,7 +384,9 @@ or cycle holds it for the line the row names, and the header shows the
 `» scene` countdown while it waits.
 
 Auto evaluate works while the set plays. A stopped set stays stopped, so
-Ctrl+S remains how playback starts.
+Ctrl+S remains how playback starts. While one score plays, the pause applies
+an edit of that score alone: an edit of another score of the set stays in
+its file, and the evaluate key is the one that runs it.
 
 ### External changes
 
@@ -318,6 +407,24 @@ itself is ignored.
 
 A save from another program that changes the text replaces the open editor's
 text, including edits that are not saved yet. Studio does not merge the two.
+
+### Sync with score metadata
+
+A score can name its own file. Sync with score metadata, under Settings ▸ Set,
+is on by default. An update renames the score's file to its @title field:
+
+```javascript
+/*
+  @title night drive
+  @by you
+*/
+$: s("bd sd")
+```
+
+The characters a name may not hold turn into dashes, and both ends are
+trimmed. A name another score or file already holds is not taken. The ribbon
+says so, and the file keeps its name. A score with no @title is left
+alone.
 
 ### Stopping
 
@@ -410,6 +517,22 @@ Two shortcuts open the reference panel for the caret position:
 keeps Ctrl+Space for input sources by default. The menus and Settings show
 Ctrl+Space only where Studio expects it to arrive.
 
+Hydra code has its own names. `osc`, `noise`, `shape` and `src` are shader
+sources in a Hydra statement and pattern functions in pattern code, so the
+panel follows the statement at the caret:
+
+- In a Hydra statement, Ctrl+F and the suggestions list only Hydra names,
+  under the `hydra` heading. Ctrl+F outside a call browses all of them.
+- In pattern code, they never list a Hydra name, not even for `tag:hydra`.
+- Ctrl+D opens the entry in the language of the statement: `osc` in
+  `osc(10).out()` is the Hydra source.
+
+A statement is Hydra code when the score calls `initHydra()` and the
+statement starts with a Hydra name, such as `osc`, `src`, `o0`, `s0` or
+`render`. The argument of `H()` is pattern code. On an empty line, or while
+you type the first name, the statement above decides: below
+`await initHydra()` or a Hydra statement, the list is Hydra.
+
 Use arrows to select an item. Enter uses the selected item as shown in the
 footer. Depending on the view, it inserts text or copies an example. Esc goes
 back or closes the panel. Search filters such as `tag:vis` and `tag:snippet`
@@ -422,9 +545,9 @@ search `lpf` and Enter writes `lpf`. When two names differ only in case, the
 row shows the camelCase name. A capital in your search text selects the names
 with this capital first: `cycleS` puts `cycleStruct` before `cyclesPer`.
 
-Settings ▸ Reference has one switch for each of six kinds of entry. All six
-are on by default. Turn one off to hide the kind from the reference and the
-suggestions:
+Settings ▸ Reference has one switch for each of seven kinds of entry. All
+seven are on by default. Turn one off to hide the kind from the reference and
+the suggestions:
 
 - **OSC / SuperDirt**: controls only SuperDirt or another OSC receiver reads,
   plus `osc()`, `oschost` and `oscport`.
@@ -436,10 +559,13 @@ suggestions:
 - **pattern internals**: `withHap`, `splitQueries` and other hap plumbing.
 - **KabelSalat**: `K()`, `S()`, graph nodes and inputs such as `sFreq` and
   `sGate`. This setting does not change score playback.
+- **Hydra**: the Hydra names, plus `initHydra()` and `clearHydra()`. This
+  setting does not change the visuals.
 
 A hidden kind stays in reach. `tag:osc`, `tag:serial`, `tag:fm_matrix`,
-`tag:bind`, `tag:internals` and `tag:kabelsalat` list the kind anyway, and
-Ctrl+D still opens the documentation.
+`tag:bind`, `tag:internals`, `tag:kabelsalat` and `tag:hydra` list the kind
+anyway, and Ctrl+D still opens the documentation. `tag:hydra` lists Hydra
+names only in Hydra code.
 
 In the panel, Tab goes to the next tab. The examples tab has parts, tracks,
 sound design, and Hydra visuals. The generator tab makes new music from a
@@ -448,10 +574,13 @@ copies the code. A copy does not change the score. Paste the code into the
 score, then update the score.
 
 The vst tab lists the VST3 plugins in the plugin folders. Right arrow loads a
-plugin and opens its row: the parameters at the top level, then one row for
-each parameter group with its parameter count, then the presets. Right arrow
-on a group shows its parameters. Left arrow closes the group or the plugin.
-A parameter row shows the name a score writes, the title and the default.
+plugin and opens its row onto two rows under it: its presets and its
+parameters. Right arrow on one of the two makes that half the view of the
+tab, with a trail on the search line - `Serum > presets` - and its own
+search. Left arrow and Esc go back to the plugin list. In the parameters
+view, right arrow on a group shows its parameters, and left arrow closes the
+group first. A parameter row shows the name a score writes, the title and
+the default.
 
 In a `.vst()` or `.vsti()` call, Ctrl+F completes from the plugin host. The
 first string lists the plugin names: a part of a name finds the plugin, and a
@@ -459,8 +588,9 @@ plugin of a known kind shows only for its own call. The object lists the
 parameter keys of the plugin, each with its title and default, when the plugin
 has loaded.
 The string of `preset` lists the preset files of the plugin.
-Type to search the plugins by name. With a plugin open, the search finds its
-parameters too, by name, title or group. Enter on a plugin writes
+Type to search the plugins by name. In the view of a half, the search finds
+its rows: parameters by name, title or group, presets by name. Enter on a
+plugin writes
 `.vst("name")` for an effect and `.vsti("name")` for an instrument at the
 caret. Enter on a parameter writes the parameter with its default, and Enter
 on a preset writes `preset: "name"`.
@@ -494,10 +624,11 @@ confirmation before deleting a file. An alias must not replace an existing
 bank name. See [local samples](local-samples.md) for folder names, bank aliases,
 and stable sample order.
 
-The disk cache stores downloaded files. It is separate from decoded samples
-held in memory. Use the Samples settings to fetch imports, cache samples, or
-clear the disk cache. Clearing the cache requires confirmation. A later use
-can download the files again.
+The disk cache stores downloaded files and their decoded sound. The decoded
+sound takes 2 GiB at most, and the oldest goes first. The cache is separate
+from decoded samples held in memory. Use the Samples settings to fetch
+imports, cache samples, or clear the disk cache. Clearing the cache requires
+confirmation. A later use can download the files again.
 
 ## Sliders
 
@@ -657,6 +788,13 @@ The View menu opens the two visuals docks. Use `e` to change a dock's edge and
 `+` or `-` to resize it. Use its controls to choose a scope, spectrum, events,
 mixer, or another visual. Follow the footer for actions in the selected view.
 
+A video widget plays a video sample's picture in its slot. Use the arrows to
+pick which clip feeds it, from every video the set sounds. Press Enter and the
+clip opens a window of its own on the desktop, in sync with the sound, and the
+widget folds to a note. Press Enter again, or close the window, and the clip
+comes back to the dock. Windows are placed and sized by hand, one per clip,
+and none of it outlives the studio.
+
 Scores can also contain inline visualizers. Use the visualizers switch in
 Settings, or View > Inline visualizers, to show or hide them. Bind a key for
 Inline visualizers on the Settings > Keybinds page. Visual settings control
@@ -669,13 +807,17 @@ Press Ctrl+T to choose a theme. Type to search, use arrows to select, and press
 Enter to keep the selection. Ctrl+N creates a user theme. Ctrl+E edits one; an
 edit to a built-in theme creates a user copy. Ctrl+D asks to delete a user theme.
 
+The theme documents, except rustel-dark, and the Rust that draws them, live in
+[rustel-studio-themes](https://github.com/tzfm/rustel-studio-themes).
+The default build includes the extra documents. A build without the `themes` feature keeps `rustel-dark`.
+
 User themes are JSON files in `<rustel-config>/themes/`. `--theme` accepts a
 theme name or a path to a theme file, such as `--theme ./midnight.json`. You
 can list themes or select one at startup:
 
 ```sh
 rustel studio --list-themes
-rustel studio --theme strudel song.strudel
+rustel studio --theme rustel-dark song.strudel
 ```
 
 ### Minimal user theme
@@ -882,9 +1024,9 @@ The theme picker and the export sheet use the same modes. `j` and `k` move
 the list or the form, `i` or `a` type, and Esc returns to Command. On the
 export sheet, `h` and `l` change a choice or a number, and Space toggles a
 choice. In Command mode, `p` pastes the clipboard into the search or form
-and enters Insert. Insert mappings from your vimrc and the shipped defaults
-apply in these fields too. The shipped `jk` mapping leaves Insert in the
-search.
+and enters Insert. Insert types every letter at once, `j` and `k` included,
+as Vim's own command line does. The insert mappings of the score, such as the
+shipped `jk`, do not reach these fields. Esc leaves Insert.
 
 ### Custom Vim mappings
 
@@ -1068,8 +1210,9 @@ folder, and your bank renames. Live playback continues.
 If the export cannot find or load a sound, or the engine refuses a note, the
 export fails and names the refusal. The file is still written. The check covers
 every note the export schedules, also notes after an early end.
-Use Tab and arrows to choose the length, WAV, MP3, or MIDI format, and output
-path. Space moves to the next format. Left selects WAV and Right selects MIDI.
+Use Tab and arrows to choose the length, WAV, MP3, or MIDI format, stems, and
+output path. Space moves to the next format. Left selects WAV and Right selects
+MIDI.
 
 A MIDI export writes a Type 1 file with 480 ticks per quarter note and a 4/4
 meter. It needs a fixed cycle length. Until-silence and the limiter apply to
@@ -1090,9 +1233,18 @@ the export dialog affects that export only. CLI exports do not inherit the set
 limiter. Match limiter, duration, sample rate, and voice limit when comparing
 an export with another render.
 
+Turn stems on to write a `<name> stems` folder beside the take instead of the
+one file. It holds `main.wav` with the same bounce, plus one stereo WAV for
+each orbit that sounds, named `1.wav` upward. Each stem is tapped after its
+orbit's delay, reverb, filter, duck and fader, before the master limiter, so
+the stems sum back to an unmastered main and mastering stays in the DAW. Stems
+need the WAV format: turning them on takes the format back to WAV, and MP3
+turns them off. The status names the folder, because the take lands inside it.
+
 For an audio export, press Ctrl+Shift+X again to end early. Studio adds a fade
 and keeps the audio already rendered. Use Transport ▸ Reveal last export or take to
-locate it.
+locate it. Before the first frame of audio, while Studio prepares the export,
+the same keys end it with no file.
 See [CLI export](cli.md#export) for command-line options.
 
 ## Log

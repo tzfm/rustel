@@ -23,6 +23,8 @@ use crate::session::{
     LiveAudioScheduleError, LiveQueryBudgetMode, MIN_LIVE_QUERY_JS_BUDGET, RollbackAttempt,
 };
 use crate::{FileWatch, RuntimeError, Session, WatchLanguage, WatchPoll, WatchTarget};
+#[cfg(feature = "vst")]
+use crate::{PLUGIN_WAIT, SEAM_WAIT};
 
 /// A transient GC, page fault, or heavy score install must influence the next
 /// setup attempt, but not disable setup for the lifetime of the process. One
@@ -56,6 +58,21 @@ impl ContinuationWindow {
 
     fn high_water(&self) -> Option<Duration> {
         self.samples[..self.len].iter().copied().max()
+    }
+}
+
+impl LiveFileProducer {
+    /// The slowest full scheduling, conversion and ring turn of the recent
+    /// window, and of the recent windows that carried a cutover: how long a
+    /// producer step has actually taken on this machine. `None` before the
+    /// first turn.
+    pub fn observed_turn_high_water(&self) -> Option<Duration> {
+        let steady = self.continuation_window.high_water();
+        let cutover = self.replacement_window.high_water();
+        match (steady, cutover) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            pair => pair.0.or(pair.1),
+        }
     }
 }
 
@@ -164,6 +181,41 @@ impl ParkedHold {
     }
 }
 
+/// The cycles from the clock whose plugin copies a first install waits for:
+/// see [`LiveFileProducer::hold_for_plugins`].
+#[cfg(feature = "vst")]
+const FIRST_INSTALL_CYCLES: f64 = 2.0;
+
+/// The hold of the first window of a new output, or of the first install of
+/// a producer that never published, for its plugin copies: see
+/// [`LiveFileProducer::hold_for_plugins`].
+#[cfg(feature = "vst")]
+struct PluginTurns {
+    /// True for a first install, which counts the copies its notes need. A
+    /// new output counts the copies its close sent home.
+    first: bool,
+    /// The copies not ready at the last look.
+    pending: usize,
+    /// The last time the count went down, or the arm.
+    progress: Instant,
+    /// The time of the arm.
+    armed: Instant,
+}
+
+#[cfg(feature = "vst")]
+impl PluginTurns {
+    /// A hold armed now, `first` for a first install.
+    fn new(first: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            first,
+            pending: 0,
+            progress: now,
+            armed: now,
+        }
+    }
+}
+
 /// Events the producer may hold undelivered. Generous for ordinary dense
 /// scores (the ring drains as audio plays) and small enough that a runaway
 /// span cannot lock out later edits for minutes.
@@ -180,6 +232,11 @@ pub struct LiveFileProducer {
     /// score work. Query deadlines use the separate post-query tail below so a
     /// slow successful query cannot recursively price out every later query.
     continuation_window: ContinuationWindow,
+    /// Full turns that carried an unpublished cutover: the expensive ones a
+    /// replacement's takeover headroom must cover. Kept apart from
+    /// [`Self::continuation_window`], whose half-second of 2 ms turns would
+    /// age a slow replacement out before the next save arrives.
+    replacement_window: ContinuationWindow,
     /// Whether the backlog-overflow message has already been printed for the
     /// current overflow episode.
     backlog_dropped_reported: bool,
@@ -195,9 +252,10 @@ pub struct LiveFileProducer {
     /// A future onset can hold the ring before a later, earlier onset.
     queued_through: f64,
     pending_publication: Option<rustel_audio::KabelPublication>,
-    /// One past the latest target any scheduled event has carried. Monotone;
-    /// the engine freezes it when the library forgets a sample, since
-    /// nothing scheduled afterwards can name that sample.
+    /// One past the latest frame the source of a scheduled event starts
+    /// on. It never goes backwards. The engine freezes it when the library
+    /// forgets a sample, since nothing scheduled afterwards names that
+    /// sample.
     scheduled_through_frame: u64,
     generation_needs_prefill: bool,
     /// Device generation handoff is deliberately later than Session install:
@@ -270,6 +328,14 @@ pub struct LiveFileProducer {
     load_meter: ProducerLoadMeter,
     completed_turn: Option<ProducerTurnRecord>,
     turn_rollbacks: u64,
+    /// The hold of the first window for its plugin copies, from its arm to
+    /// its end: see [`Self::hold_for_plugins`].
+    #[cfg(feature = "vst")]
+    plugin_turns: Option<PluginTurns>,
+    /// The first window of this producer went out. A producer that never
+    /// published holds its first install for its plugin copies.
+    #[cfg(feature = "vst")]
+    audible: bool,
 }
 
 impl LiveFileProducer {
@@ -332,6 +398,7 @@ impl LiveFileProducer {
             next_watch_poll: Duration::ZERO,
             evaluation_continuation_floor,
             continuation_window: ContinuationWindow::default(),
+            replacement_window: ContinuationWindow::default(),
             starving_since: None,
             backlog_dropped_reported: false,
             query_tail_window: ContinuationWindow::default(),
@@ -361,6 +428,10 @@ impl LiveFileProducer {
             load_meter: ProducerLoadMeter::default(),
             completed_turn: None,
             turn_rollbacks: 0,
+            #[cfg(feature = "vst")]
+            plugin_turns: None,
+            #[cfg(feature = "vst")]
+            audible: false,
         })
     }
 
@@ -419,6 +490,7 @@ impl LiveFileProducer {
             next_watch_poll: Duration::ZERO,
             evaluation_continuation_floor,
             continuation_window: ContinuationWindow::default(),
+            replacement_window: ContinuationWindow::default(),
             starving_since: None,
             backlog_dropped_reported: false,
             query_tail_window: ContinuationWindow::default(),
@@ -448,6 +520,10 @@ impl LiveFileProducer {
             load_meter: ProducerLoadMeter::default(),
             completed_turn: None,
             turn_rollbacks: 0,
+            #[cfg(feature = "vst")]
+            plugin_turns: None,
+            #[cfg(feature = "vst")]
+            audible: false,
         })
     }
 
@@ -663,6 +739,7 @@ impl LiveFileProducer {
     ) -> Result<LiveProducerStep, RuntimeError> {
         self.sync_panic_recovery(session);
         let started = self.begin_turn();
+        let cutover_turn = self.pending_generation.is_some();
         let result = self.step_with_clock_inner(
             session,
             observed_at,
@@ -673,6 +750,9 @@ impl LiveFileProducer {
             set_generation,
             push,
         );
+        if cutover_turn {
+            self.replacement_window.record(started.elapsed());
+        }
         self.stage_turn(session, started, &result);
         result
     }
@@ -916,7 +996,7 @@ impl LiveFileProducer {
             && !matches!(watches.score, WatchPoll::Stopped)
             && !matches!(watches.prebake, WatchPoll::Stopped))
         .then(Instant::now);
-        let step = self.finish_step_with_preparation(
+        let result = self.finish_step_with_preparation(
             session,
             watches,
             &mut schedule_now,
@@ -925,7 +1005,9 @@ impl LiveFileProducer {
             install,
             set_generation,
             push,
-        )?;
+        );
+        // A refused turn is the one a slow machine most needs priced into the
+        // continuation reserve: record it before the error leaves the step.
         if let Some(started) = continuation_started {
             let elapsed = started.elapsed();
             // A look at the plugin copies ahead caps itself by the cover, so
@@ -934,7 +1016,7 @@ impl LiveFileProducer {
             let elapsed = elapsed.saturating_sub(session.take_look_ahead_time());
             self.continuation_window.record(elapsed);
         }
-        Ok(step)
+        result
     }
 
     /// Arm a Session-installed replacement so the next unwatched step completes
@@ -973,6 +1055,12 @@ impl LiveFileProducer {
         self.control_requery_pending = false;
         self.check_takeover_freshness = true;
         self.cut_takeover_deferred_for_loading = false;
+        // The first install of a producer that never published holds its
+        // first window for its plugin copies.
+        #[cfg(feature = "vst")]
+        if !self.audible {
+            self.plugin_turns = Some(PluginTurns::new(true));
+        }
     }
 
     /// Arm a same-graph re-query after a query-time control mutation.
@@ -1114,6 +1202,12 @@ impl LiveFileProducer {
         // snapshot instead of leaving the replacement stream silent forever.
         self.control_requery_pending = false;
         self.check_takeover_freshness = false;
+        // The first window of the new output holds for the plugin copies the
+        // close sent home.
+        #[cfg(feature = "vst")]
+        {
+            self.plugin_turns = Some(PluginTurns::new(false));
+        }
     }
 
     /// Put the last audible score back after a replacement refused every
@@ -1312,6 +1406,75 @@ impl LiveFileProducer {
         }
     }
 
+    /// The hold of the first window of a new output, or of the first install
+    /// of a producer that never published, for its plugin copies, with `now`
+    /// the clock of this turn. A new output counts the copies its close sent
+    /// home: see [`Session::plugins_returning`]. A first install holds only
+    /// with the wait of the session on, and with a plugin call in an
+    /// evaluation or `vst` in the text, as the prepare of Studio. It counts
+    /// the copies the notes of its first cycles need: see
+    /// [`Session::plugins_pending`]. A lower count is progress. True while
+    /// the window holds: with the wait on, until no copy became ready in
+    /// [`PLUGIN_WAIT`], and with the wait off, [`SEAM_WAIT`] after the arm at
+    /// most. A note of a copy that is not ready then plays with no plugin. A
+    /// window that held queries again from `now`, so its takeover is not
+    /// behind the clock: see [`Session::requery_after_output_recycle_at`]. A
+    /// rewind armed in the hold queries from its own cycle zero, which the
+    /// slide of the turn keeps on the clock.
+    #[cfg(feature = "vst")]
+    fn hold_for_plugins(&mut self, session: &mut Session, now: f64) -> Result<bool, RuntimeError> {
+        let Some(mut turns) = self.plugin_turns.take() else {
+            return Ok(false);
+        };
+        let held = turns.pending > 0;
+        let named = session
+            .active_source()
+            .is_some_and(|source| source.contains("vst"));
+        let arms = session.plugin_wait() && (session.ran_plugin_calls() || named);
+        let count = if !turns.first {
+            session.plugins_returning()
+        } else if held || arms {
+            let generation = session.generation();
+            let (cycle, reserve) = (session.cycle_at_time(now), self.live_query_reserve());
+            let looked = session.with_panic_recovery(now, |session| {
+                Ok(session.plugins_pending(cycle, FIRST_INSTALL_CYCLES, reserve))
+            });
+            match looked {
+                Ok(count) => count,
+                Err(error) => {
+                    self.recover_after_panic(session, generation, &error.to_string());
+                    return Err(error);
+                }
+            }
+        } else {
+            0
+        };
+        if count < turns.pending {
+            turns.progress = Instant::now();
+        }
+        turns.pending = count;
+        let waits = if session.plugin_wait() {
+            turns.progress.elapsed() < PLUGIN_WAIT
+        } else {
+            turns.armed.elapsed() < SEAM_WAIT
+        };
+        if count > 0 && waits {
+            self.plugin_turns = Some(turns);
+            return Ok(true);
+        }
+        // A rewind armed in the hold keeps its cycle zero and its cut. The
+        // slide of this turn put them on the clock, and a requery from `now`
+        // skips the notes of its first schedule lead.
+        if held
+            && !session.rewind_pending()
+            && let Some((before, after)) = session.requery_after_output_recycle_at(now)?
+        {
+            self.arm_output_recovery_requery(before, after);
+            self.plugin_turns = None;
+        }
+        Ok(false)
+    }
+
     /// Extend the currently audible generation by one bounded query before
     /// synchronous replacement work occupies the producer thread.
     pub fn shield_reload_with_clock(
@@ -1449,7 +1612,9 @@ impl LiveFileProducer {
             ProducerPhase::AssetPreparation,
             preparation_started.elapsed(),
         );
-        self.note_scheduled_through(batch.events.iter().map(|event| event.target_frame));
+        let restart_lead = session.restart_lead_frames();
+        let starts = batch.events.iter();
+        self.note_scheduled_through(starts.map(|event| latest_start(event, restart_lead)));
         self.pending.extend(
             batch
                 .events
@@ -1613,6 +1778,7 @@ impl LiveFileProducer {
     ) -> Result<LiveProducerStep, RuntimeError> {
         self.sync_panic_recovery(session);
         let started = self.begin_turn();
+        let cutover_turn = self.pending_generation.is_some();
         let result = self.step_unwatched_with_clock_and_cutover_inner(
             session,
             schedule_now,
@@ -1622,6 +1788,9 @@ impl LiveFileProducer {
             set_generation,
             push,
         );
+        if cutover_turn {
+            self.replacement_window.record(started.elapsed());
+        }
         self.stage_turn(session, started, &result);
         result
     }
@@ -1662,7 +1831,7 @@ impl LiveFileProducer {
         };
         let measure_continuation = watch != WatchPoll::Stopped;
         let continuation_started = measure_continuation.then(Instant::now);
-        let step = self.finish_step_with_preparation(
+        let result = self.finish_step_with_preparation(
             session,
             WatchResults {
                 score: watch.clone(),
@@ -1674,11 +1843,13 @@ impl LiveFileProducer {
             install,
             set_generation,
             push,
-        )?;
+        );
+        // A refused turn is the one a slow machine most needs priced into the
+        // continuation reserve: record it before the error leaves the step.
         if let Some(started) = continuation_started {
             self.continuation_window.record(started.elapsed());
         }
-        Ok(step)
+        result
     }
 
     #[cfg(test)]
@@ -1841,9 +2012,12 @@ impl LiveFileProducer {
             // the exact retained backlog has crossed.
             let now = schedule_now();
             cover_age_started = Some(Instant::now());
-            // A rewind that reaches this turn with its cycle zero already
-            // behind the clock restarts from the top where it can sound:
-            // cycle zero slides to now (see `slide_pending_rewind_anchor`).
+            // A rewind that reaches this turn with its cycle zero behind the
+            // clock, or nearer to it than the lead of the plugin chains,
+            // restarts from the top where it can sound: cycle zero slides to
+            // now plus that lead (see `slide_pending_rewind_anchor`). A line
+            // still ahead keeps its takeover and its cut, so the countdown
+            // plays to the line.
             // Left in the rendered past, its downbeat started partway into
             // its sample; held past the cover, the gap skip began it bars
             // in.
@@ -1871,6 +2045,22 @@ impl LiveFileProducer {
                 && parked.turns < HELD_REWIND_RETRY_TURNS
             {
                 parked.turns += 1;
+                return Ok(self.held_step(
+                    session,
+                    watch,
+                    prebake_watch,
+                    HeldTurn {
+                        pushed,
+                        backpressured,
+                        cover_age_started: None,
+                        loading: true,
+                    },
+                ));
+            }
+            // The first window of a new output, or of a first install, waits
+            // for its plugin copies.
+            #[cfg(feature = "vst")]
+            if self.hold_for_plugins(session, now)? {
                 return Ok(self.held_step(
                     session,
                     watch,
@@ -2292,7 +2482,12 @@ impl LiveFileProducer {
                 // already have fired, leaving that room silent. An ordinary
                 // edit still refuses to publish into the past: its takeover
                 // is where the outgoing score's retained events stop, and a
-                // late publication would ask rendered frames to change.
+                // late publication would ask rendered frames to change. The
+                // notes of a plugin chain with latency start the lead the
+                // takeover added before it, so the edit refuses that much
+                // earlier.
+                #[cfg(feature = "vst")]
+                let publication_now = publication_now + session.takeover_lead();
                 if session.transport().is_stopped()
                     || (publication_now > takeover_time && takeover_cut == TakeoverCut::None)
                 {
@@ -2354,7 +2549,11 @@ impl LiveFileProducer {
                     // until the takeover, and this generation's copy arrives
                     // too late to matter). They keep playing without a
                     // receipt: the offer counts only the certifiable onsets,
-                    // and ordinals are numbered over those alone.
+                    // and ordinals are numbered over those alone. The device
+                    // judges an event by its musical onset: its target plus
+                    // the lead of its note. A note of a plugin chain with
+                    // latency is aimed that lead before it. So the offer
+                    // counts and tags by the musical onset too.
                     let start_frame = ((now * f64::from(sample_rate)).floor().max(0.0) as u64)
                         .max(takeover_frame);
                     // Count event by event, not with a binary search. The
@@ -2365,12 +2564,12 @@ impl LiveFileProducer {
                     let uncertifiable = batch
                         .events
                         .iter()
-                        .filter(|event| event.target_frame < start_frame)
+                        .filter(|event| event.controls.musical(event.target_frame) < start_frame)
                         .count();
                     let last_frame = batch
                         .events
                         .iter()
-                        .map(|event| event.target_frame)
+                        .map(|event| event.controls.musical(event.target_frame))
                         .max()
                         .unwrap_or(start_frame)
                         .max(start_frame);
@@ -2495,6 +2694,10 @@ impl LiveFileProducer {
                 self.check_takeover_freshness = false;
             }
             self.generation_needs_prefill = false;
+            #[cfg(feature = "vst")]
+            {
+                self.audible = true;
+            }
             let tail_started = batch.tail_started;
             let events = batch.events;
             scheduled = events.len();
@@ -2506,7 +2709,9 @@ impl LiveFileProducer {
             // about to sound; the excess is dropped and reported once.
             let room = MAX_PENDING_BACKLOG.saturating_sub(self.pending.len());
             let dropped = events.len().saturating_sub(room);
-            self.note_scheduled_through(events.iter().map(|event| event.target_frame));
+            let restart_lead = session.restart_lead_frames();
+            let starts = events.iter();
+            self.note_scheduled_through(starts.map(|event| latest_start(event, restart_lead)));
             let mut next_ordinal = 0u32;
             self.pending.extend(
                 events
@@ -2519,7 +2724,9 @@ impl LiveFileProducer {
                         // one that counts `uncertifiable`, so the ordinals
                         // match the offer.
                         confirmation: confirmation
-                            .filter(|_| event.target_frame >= certified_from)
+                            .filter(|_| {
+                                event.controls.musical(event.target_frame) >= certified_from
+                            })
                             .map(|key| {
                                 let ordinal = next_ordinal;
                                 next_ordinal += 1;
@@ -2601,10 +2808,21 @@ impl LiveFileProducer {
     }
 }
 
+/// The latest frame the source of `event` starts on: its target plus the
+/// latency of its plugin chain plus the restart lead of the output. See
+/// [`Session::restart_lead_frames`].
+fn latest_start(event: &rustel_audio::AudioEvent, restart_lead: u64) -> u64 {
+    event
+        .target_frame
+        .saturating_add(u64::from(event.controls.chain_latency()))
+        .saturating_add(restart_lead)
+}
+
 impl LiveFileProducer {
-    /// Remember how far ahead the backlog now reaches.
-    fn note_scheduled_through(&mut self, targets: impl Iterator<Item = u64>) {
-        let last = targets.max().map_or(0, |last| last.saturating_add(1));
+    /// Remember how far ahead the backlog now reaches: one past the latest
+    /// frame a source of the events starts on, from `starts`.
+    fn note_scheduled_through(&mut self, starts: impl Iterator<Item = u64>) {
+        let last = starts.max().map_or(0, |last| last.saturating_add(1));
         self.scheduled_through_frame = self.scheduled_through_frame.max(last);
     }
 
@@ -2616,7 +2834,9 @@ impl LiveFileProducer {
         }
     }
 
-    /// One past the latest target any scheduled event has carried.
+    /// One past the latest frame the source of a scheduled event starts
+    /// on: its target plus the latency of its plugin chain plus the
+    /// restart lead of the output.
     pub fn scheduled_through_frame(&self) -> u64 {
         self.scheduled_through_frame
     }
@@ -3667,6 +3887,13 @@ mod tests {
             .expect("initial prefill");
 
         let generation = session.generation();
+        // A plugin chain with latency plays: a restart moves a note up to 480
+        // frames after its target.
+        #[cfg(feature = "vst")]
+        {
+            session.set_plugin_rate(48_000);
+            session.set_plugin_lead_for_test(0.01);
+        }
         let mut shielded = Vec::new();
         assert!(
             producer
@@ -3686,15 +3913,19 @@ mod tests {
             shielded.iter().all(|event| event.generation == generation),
             "reload shield crossed generations"
         );
+        let latest = shielded
+            .iter()
+            .map(|event| event.target_frame)
+            .max()
+            .unwrap_or_default();
         assert!(
-            shielded
-                .iter()
-                .map(|event| event.target_frame)
-                .max()
-                .unwrap_or_default()
-                >= 96_000,
+            latest >= 96_000,
             "reload shield did not extend the audible ring by one 120 BPM cycle"
         );
+        // The producer keeps the samples of each note up to its latest
+        // start, the restart lead after its target.
+        #[cfg(feature = "vst")]
+        assert_eq!(producer.scheduled_through_frame(), latest + 480 + 1);
     }
 
     #[test]
@@ -4326,6 +4557,8 @@ mod tests {
                 r#"
                 setCpm(900/4)
                 note('d4').fmap(value => {
+                    const step = Date.now()
+                    while (Date.now() === step) {}
                     const until = Date.now() + 70
                     while (Date.now() < until) {}
                     return value
@@ -4339,7 +4572,8 @@ mod tests {
         producer.arm_replacement(generation_before, generation_after);
 
         // Model a ~160 ms first scheduling turn. The 70 ms callback above
-        // crosses the adaptive threshold. The synthetic device clock below
+        // crosses the adaptive threshold. On some systems `Date.now()` moves
+        // in steps of about 16 ms, so the callback starts its 70 ms on a step. The synthetic device clock below
         // keeps the takeover assertion independent of test-runner scheduling.
         // The tempo-aware contract keeps one bounded 900-BPM query cycle
         // ahead of the producer clock.
@@ -4428,10 +4662,11 @@ mod tests {
     }
 
     /// The frontier of everything ever scheduled: one past the latest
-    /// target, and never backwards - a later, earlier batch does not
-    /// shorten what an evicted sample has to outlive.
+    /// start. It never goes backwards: a later, earlier batch does not
+    /// shorten what an evicted sample has to outlive. A note of a plugin
+    /// chain counts the frames its source starts after its target at most.
     #[test]
-    fn scheduled_through_frame_is_one_past_the_latest_target_seen() {
+    fn scheduled_through_frame_is_one_past_the_latest_start_seen() {
         let mut producer = LiveFileProducer::new(
             "unused.strudel",
             WatchLanguage::JavaScript,
@@ -4454,6 +4689,14 @@ mod tests {
             96_001,
             "an empty batch is nothing"
         );
+        // The source of a note of a plugin chain with 480 frames of latency
+        // starts up to that latency after its target, and a restart moves
+        // the target up to its restart lead later, 240 frames here.
+        let mut latent = queued_at(96_000).event;
+        let stage = rustel_audio::InsertControls::new(rustel_audio::InsertKey::default());
+        latent.controls.effects[0] = Some(stage.with_latency(480));
+        producer.note_scheduled_through([latest_start(&latent, 240)].into_iter());
+        assert_eq!(producer.scheduled_through_frame(), 96_721);
         producer.note_scheduled_through([u64::MAX].into_iter());
         assert_eq!(producer.scheduled_through_frame(), u64::MAX, "saturates");
     }
@@ -5113,8 +5356,8 @@ mod tests {
     struct Sent {
         /// Each published generation with its takeover frame.
         takeovers: Vec<(u64, u64)>,
-        /// Each event's generation, target frame and receipt ordinal.
-        events: Vec<(u64, u64, Option<u32>)>,
+        /// Each event's generation, target frame, lead and receipt ordinal.
+        events: Vec<(u64, u64, u32, Option<u32>)>,
     }
 
     impl Sent {
@@ -5122,8 +5365,8 @@ mod tests {
         fn window(&self, generation: u64) -> Vec<(u64, Option<u32>)> {
             self.events
                 .iter()
-                .filter(|(event_generation, _, _)| *event_generation == generation)
-                .map(|&(_, target_frame, receipt)| (target_frame, receipt))
+                .filter(|(event_generation, ..)| *event_generation == generation)
+                .map(|&(_, target_frame, _, receipt)| (target_frame, receipt))
                 .collect()
         }
     }
@@ -5152,6 +5395,7 @@ mod tests {
                         sent.events.push((
                             event.generation,
                             event.target_frame,
+                            event.controls.lead,
                             event.confirmation.map(|receipt| receipt.ordinal),
                         ));
                     }
@@ -5300,6 +5544,342 @@ mod tests {
         assert!(
             certified_within(512, edit, &mut session, &mut producer, &mut output),
             "the device did not certify the edit's first window: {:?}",
+            output.device().report()
+        );
+    }
+
+    /// `rustel play --watch` from a file with no score: the producer never
+    /// published, and the first save plays a plugin. With the wait of the
+    /// session on, no event goes out before the copy of the plugin is ready,
+    /// and each note of the first window plays through the plugin. The load
+    /// of the plugin takes 600 ms here. A producer that published holds no
+    /// edit: the commit seam is the wait of an edit. A save over a score in
+    /// play that the producer never published holds too, and its window
+    /// reads from the clock at the end of the hold, past the takeover of the
+    /// save. With the wait off after the arm, the hold ends at SEAM_WAIT,
+    /// before the copy is ready. With the wait on, a hold ends when no copy
+    /// became ready in PLUGIN_WAIT, and a lower count is progress. A new
+    /// output holds its first window for the copy its close sent home:
+    /// SEAM_WAIT at most with the wait off, and until the copy is back with
+    /// the wait on. A rewind armed in the hold of a new output plays from its
+    /// cycle zero when the hold ends. With the wait off at the save, as in
+    /// the replay of a tape, nothing holds. A first score with no plugin call
+    /// holds nothing, also when a setup text gives its notes a plugin.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_first_window_waits_for_its_plugin_copies() {
+        use rustel_audio::device::ManualLiveOutput;
+        use rustel_vst3::Prepared;
+        let (_one, folder) = crate::session::tests::fixture_plugins();
+        let host = crate::vst::host();
+        let time = Instant::now();
+        let clock = move || time.elapsed().as_secs_f64();
+        // One turn of a producer, with `saved` as the watch gives it. Gives
+        // the events that went out.
+        let turn = |session: &mut Session,
+                    producer: &mut LiveFileProducer,
+                    saved: Option<crate::ReloadEvent>| {
+            let watches = WatchResults {
+                score: saved.map_or(WatchPoll::Unchanged, WatchPoll::Event),
+                prebake: WatchPoll::Unchanged,
+            };
+            let mut events = Vec::new();
+            let push = |event: QueuedAudioEvent| {
+                events.push(event.event);
+                true
+            };
+            let step = producer.finish_step(session, watches, clock, 48_000, |_, _, _| {}, push);
+            step.expect("a turn");
+            events
+        };
+        // The turns of a producer until a window goes out, the first with
+        // `saved`. Gives the events of the window.
+        let first_window = |session: &mut Session,
+                            producer: &mut LiveFileProducer,
+                            saved: Option<crate::ReloadEvent>| {
+            let started = Instant::now();
+            let mut events = turn(session, producer, saved);
+            while events.is_empty() {
+                assert!(started.elapsed() < Duration::from_secs(20), "no window");
+                std::thread::sleep(Duration::from_millis(2));
+                events = turn(session, producer, None);
+            }
+            events
+        };
+        // A session as `rustel play --watch` makes it from a file with no
+        // score, and its producer after a turn.
+        let empty = || {
+            let mut session = Session::new().expect("session");
+            session.set_direct_diagnostic_logging(false);
+            let library = crate::samples::SampleLibrary::empty();
+            session.set_sample_library_for_test(std::sync::Arc::new(library));
+            session.set_schedule_lead(0.0);
+            session.set_continuity_margin(0.0);
+            let output = ManualLiveOutput::new(48_000, 0).expect("output");
+            session.attach_plugins(output.device());
+            session.restart_transport_at(0.0);
+            let mut producer =
+                LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+            assert!(turn(&mut session, &mut producer, None).is_empty());
+            (session, producer)
+        };
+        // A save of `score`, as the watch makes it.
+        let save = |session: &mut Session, score: &str| {
+            let before = session.generation();
+            let stopped = std::sync::atomic::AtomicBool::new(false);
+            let saved = session.reload_live(score, false, &stopped, clock);
+            assert!(matches!(saved, Ok(crate::LiveReload::Installed(_))));
+            score_event(crate::ReloadStatus::Installed, before, session.generation())
+        };
+        // The slot of the plugin of the first note of `events`, and how far
+        // its copy is.
+        let slot = |events: &[rustel_audio::AudioEvent]| {
+            let chain = events[0].controls.insert_chain.expect("a chain");
+            rustel_audio::effect_slot(chain, 0)
+        };
+        let prepared = |events: &[rustel_audio::AudioEvent]| {
+            let (name, rate) = (rustel_vst3_fixture::NAME, 48_000);
+            host.prepared(name, None, false, rate, slot(events))
+        };
+        let score = r#"$: note("c3*16").s("sine").vst("rustel fixture", { gain: 0 })"#;
+        host.wait_idle();
+        // SAFETY: one fixture test runs at a time, and the plugin thread has
+        // no work. So no other thread reads the variable now.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ENV, "600") };
+        let (mut session, mut producer) = empty();
+        let saved = save(&mut session, score);
+        let events = first_window(&mut session, &mut producer, Some(saved));
+        let through = |event: &rustel_audio::AudioEvent| event.controls.effects[0].is_some();
+        assert!(events.iter().all(through), "a note with no plugin");
+        assert!(matches!(prepared(&events), Prepared::Ready(_)));
+        let plugins = host.plugins().into_iter();
+        let plugins = plugins.filter(|plugin| plugin.bundle.starts_with(folder.path()));
+        assert_eq!(plugins.map(|plugin| plugin.running).sum::<usize>(), 1);
+        // A producer that published holds no edit: the commit seam is the
+        // wait of an edit. This edit takes a door that never waits, so the
+        // copy of its new lane is not ready, and its first window goes out
+        // at once.
+        session.set_continuity_margin(0.25);
+        let before = session.generation();
+        let edit = format!("{score}\n$: note(\"e3*16\").s(\"sine\").vst(\"rustel fixture\")");
+        session.reload_at(&edit, false, clock()).expect("an edit");
+        let saved = score_event(crate::ReloadStatus::Installed, before, session.generation());
+        turn(&mut session, &mut producer, Some(saved));
+        assert!(!producer.generation_needs_prefill, "an edit held");
+        drop((session, producer));
+        host.wait_idle();
+        // SAFETY: as above. Each copy from here turns its plugin on and off
+        // slowly.
+        unsafe {
+            std::env::remove_var(rustel_vst3_fixture::SLOW_ENV);
+            std::env::set_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV, "400");
+        }
+
+        // A save over a score in play that the producer never published, as
+        // an edit before the first window of a Studio start, through a door
+        // that never waits.
+        let (mut session, mut producer) = empty();
+        session
+            .reload_at("silence", false, clock())
+            .expect("a score");
+        let before = session.generation();
+        session.reload_at(score, false, clock()).expect("a save");
+        let saved = score_event(crate::ReloadStatus::Installed, before, session.generation());
+        let armed = Instant::now();
+        assert!(turn(&mut session, &mut producer, Some(saved)).is_empty());
+        session.set_plugin_wait(false);
+        let events = first_window(&mut session, &mut producer, None);
+        assert!(armed.elapsed() >= SEAM_WAIT, "{:?}", armed.elapsed());
+        assert_eq!(prepared(&events), Prepared::Pending, "the copy is ready");
+        drop((session, producer));
+
+        // With the wait on, a hold ends when no copy became ready in
+        // PLUGIN_WAIT. A lower count is progress.
+        let (mut session, mut producer) = empty();
+        let saved = save(&mut session, score);
+        assert!(turn(&mut session, &mut producer, Some(saved)).is_empty());
+        let turns = producer.plugin_turns.as_mut().expect("the hold");
+        turns.progress = turns.progress.checked_sub(PLUGIN_WAIT).expect("uptime");
+        turns.pending = 2;
+        assert!(
+            turn(&mut session, &mut producer, None).is_empty(),
+            "progress"
+        );
+        let turns = producer.plugin_turns.as_mut().expect("the hold");
+        turns.progress = turns.progress.checked_sub(PLUGIN_WAIT).expect("uptime");
+        let events = first_window(&mut session, &mut producer, None);
+        assert_eq!(prepared(&events), Prepared::Pending, "the copy is ready");
+        // The copy plays a loud block in an engine, and the close of the
+        // output sends it home: the park turns it off and on, 800 ms.
+        host.wait_idle();
+        let key = events[0].controls.effects[0]
+            .as_ref()
+            .expect("a plugin")
+            .key;
+        let mut copy = (host.provider(false))(key, 48_000, slot(&events)).expect("a copy");
+        copy.process(&mut [1.0; 128], &mut [1.0; 128]);
+        drop(copy);
+        for wait in [false, true] {
+            session.set_plugin_wait(wait);
+            let arm = clock();
+            let requery = session.requery_after_output_recycle_at(arm);
+            let (before, after) = requery.expect("a requery").expect("a score");
+            producer.arm_output_recovery_requery(before, after);
+            let events = first_window(&mut session, &mut producer, None);
+            assert!(producer.plugin_turns.is_none(), "a hold after its window");
+            let home = matches!(prepared(&events), Prepared::Ready(_));
+            assert_eq!(home, wait, "the copy is home: wait {wait}");
+            // Each hold lasts SEAM_WAIT at least: the park of the copy takes
+            // 800 ms. The notes are 125 ms apart. So a window from the arm
+            // has a note in that time.
+            let held = (arm + SEAM_WAIT.as_secs_f64() - 0.02) * 48_000.0;
+            let late = |event: &rustel_audio::AudioEvent| (event.target_frame as f64) < held;
+            assert!(!events.iter().any(late), "a window behind the clock");
+        }
+        // A rewind from the top while the copy is on its way home again.
+        session.set_schedule_lead(0.1);
+        let mut copy = (host.provider(false))(key, 48_000, slot(&events)).expect("a copy");
+        copy.process(&mut [1.0; 128], &mut [1.0; 128]);
+        drop(copy);
+        session.set_plugin_wait(true);
+        let requery = session.requery_after_output_recycle_at(clock());
+        let (before, after) = requery.expect("a requery").expect("a score");
+        producer.arm_output_recovery_requery(before, after);
+        assert!(
+            turn(&mut session, &mut producer, None).is_empty(),
+            "the hold"
+        );
+        session.start_next_from_zero();
+        let before = session.generation();
+        session.reload_at(score, false, clock()).expect("a rewind");
+        let saved = score_event(crate::ReloadStatus::Installed, before, session.generation());
+        let events = first_window(&mut session, &mut producer, Some(saved));
+        let downbeat = session.cycle_at_time(events[0].target_frame as f64 / 48_000.0);
+        assert!(
+            downbeat.abs() < 1.0 / 32.0,
+            "the downbeat of the rewind: {downbeat}"
+        );
+        assert!(matches!(prepared(&events), Prepared::Ready(_)));
+        drop((session, producer));
+
+        // Nothing holds with the wait off at the save, or with no plugin call.
+        let setup = r#"globalThis.fixture = note("c3*16").s("sine").vst("rustel fixture")"#;
+        for (wait, setup, score) in [(false, None, score), (true, Some(setup), "$: fixture")] {
+            let (mut session, mut producer) = empty();
+            session.set_plugin_wait(wait);
+            if let Some(setup) = setup {
+                session.evaluate_prebake(setup).expect("setup");
+            }
+            let saved = save(&mut session, score);
+            turn(&mut session, &mut producer, Some(saved));
+            assert!(!producer.generation_needs_prefill, "a hold: {score}");
+        }
+        host.wait_idle();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV) };
+    }
+
+    /// An edit of a lane through a plugin with 480 frames of latency. Each
+    /// note of the lane starts 480 frames before its musical onset, so a
+    /// note with its musical onset in the first 480 frames after the takeover
+    /// is aimed before the takeover. The device judges a note by its musical
+    /// onset: such a note has a receipt, and the device certifies the window
+    /// in the block that copies the musical onset of its last note.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn an_edit_gives_a_receipt_to_a_latent_note_aimed_before_its_takeover() {
+        use rustel_audio::device::ManualLiveOutput;
+
+        /// Blocks of 128 frames rendered before the edit.
+        const EDIT_BLOCK: usize = 317;
+
+        let (_one, folder) = crate::session::tests::fixture_plugins();
+        let presets = folder.path().join("presets");
+        let presets = presets.join(rustel_vst3_fixture::NAME);
+        std::fs::create_dir_all(&presets).expect("preset folder");
+        // The fixture delays its output by 480 frames, and gives that delay
+        // as its latency.
+        let delay = rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.1171875);
+        std::fs::write(presets.join("Delay.vstpreset"), delay).expect("preset file");
+        // A lane of 256 notes a cycle through the plugin: at the default
+        // half cycle a second and 48 kHz, one each 375 frames.
+        let lane = |note: &str| {
+            format!(
+                "$: note(\"{note}*256\").s(\"sine\").vst(\"rustel fixture\", {{ preset: \"delay\" }})"
+            )
+        };
+
+        let mut session = Session::new().expect("session");
+        session.set_direct_diagnostic_logging(false);
+        let library = crate::samples::SampleLibrary::empty();
+        session.set_sample_library_for_test(std::sync::Arc::new(library));
+        session.set_schedule_lead(0.0);
+        session.set_continuity_margin(0.125);
+        session.evaluate(&lane("c3")).expect("score");
+        let original = session.generation();
+        let mut output = ManualLiveOutput::new(48_000, original).expect("output");
+        session.attach_plugins(output.device());
+        session
+            .bind_audio_confirmations(output.device().confirmations())
+            .expect("bind output");
+        // The copy of the plugin is ready, so the host knows its latency.
+        let started = Instant::now();
+        while session.plugins_pending(0.0, 1.0, Duration::from_secs(1)) > 0 {
+            assert!(started.elapsed() < Duration::from_secs(20), "no copy");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        session.restart_transport_at(0.0);
+        let mut producer = LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+        for _ in 0..EDIT_BLOCK {
+            turn(&mut session, &mut producer, &mut output);
+        }
+
+        let now = output.device().render_frontier_seconds();
+        let edit = session
+            .reload_at(&lane("e3"), false, now)
+            .expect("the edit");
+        producer.arm_replacement(original, edit);
+        let sent = turn(&mut session, &mut producer, &mut output);
+        assert_eq!(sent.takeovers.len(), 1, "test premise: the edit publishes");
+        let (generation, takeover) = sent.takeovers[0];
+        assert_eq!(generation, edit);
+        // The target, the musical onset and the receipt of each note.
+        let notes: Vec<(u64, u64, Option<u32>)> = sent
+            .events
+            .iter()
+            .filter(|(generation, ..)| *generation == edit)
+            .map(|&(_, target, lead, receipt)| (target, target + u64::from(lead), receipt))
+            .collect();
+        let aimed_before = |&(target, musical, _): &(u64, u64, Option<u32>)| {
+            target < takeover && musical >= takeover
+        };
+        let early = notes.iter().find(|note| aimed_before(note));
+        let early = early.expect("test premise: a note aimed before the takeover");
+        assert!(early.2.is_some(), "no receipt: {notes:?}");
+        let window: Vec<_> = notes
+            .iter()
+            .map(|&(_, musical, receipt)| (musical, receipt))
+            .collect();
+        let receipts: Vec<_> = window.iter().map(|&(_, receipt)| receipt).collect();
+        assert_eq!(receipts, receipts_from(takeover, &window), "{notes:?}");
+
+        // The device certifies the window once it copied the musical onset
+        // of the last note with a receipt, not its target.
+        let last = window.iter().filter(|(_, receipt)| receipt.is_some());
+        let last = last.map(|&(musical, _)| musical).max().expect("a receipt");
+        while output.device().clock_frames() <= last {
+            let clock = output.device().clock_frames();
+            assert_ne!(
+                session.confirmed_audio_generation(),
+                Some(edit),
+                "certified at frame {clock}, before frame {last}"
+            );
+            turn(&mut session, &mut producer, &mut output);
+        }
+        assert_eq!(
+            session.confirmed_audio_generation(),
+            Some(edit),
+            "the device did not certify the window of the edit: {:?}",
             output.device().report()
         );
     }

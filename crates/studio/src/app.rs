@@ -10,7 +10,7 @@
 //! |---|---|
 //! | the mixer desk, master level and limiter | `mixer.rs` |
 //! | the reference column (Ctrl+D) | `reference_panel.rs` |
-//! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs` |
+//! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs`, `hydra_scope.rs` |
 //! | hearing a chord, scale, sound or snippet | `previews.rs` |
 //! | the Settings sheet | `settings_sheet.rs` |
 //! | its Permissions page: origins and orchestras | `permissions.rs` |
@@ -89,6 +89,7 @@ use super::editor::{
     EditorEffect, EditorInput, HistoryMoment, KeyboardCapabilities, MemoryClipboard,
     PlatformClipboard, Revision, TerminalEventBatch, Transaction, VirtualRowSpec,
     composed_text_event, event_to_input_with_binds, is_plain_text_key_event, key_to_command,
+    sole_composed_character,
 };
 use super::engine::{DiagnosticAlert, Launch, LiveMaterial, StudioDiagnostic};
 use super::engine::{StudioConfig, StudioDeviceInfo, StudioDiagnosticLevel, StudioSnapshot};
@@ -165,6 +166,8 @@ mod external_changes;
 mod find;
 mod focus;
 mod hydra_backdrop;
+#[cfg(feature = "hydra")]
+mod hydra_scope;
 mod jobs_panel;
 mod key_bindings;
 mod keyboard;
@@ -199,6 +202,7 @@ mod replay_edit;
 mod replay_pointer;
 mod replay_tabs;
 mod sample_delete;
+mod sample_details;
 mod sample_import;
 mod sample_sources;
 mod scene_strip;
@@ -212,6 +216,8 @@ mod stage_pixels;
 mod string_roles;
 mod theme_sheets;
 mod transport;
+#[cfg(feature = "video")]
+pub mod video_window;
 mod vim;
 mod viz_panel;
 #[cfg(feature = "vst")]
@@ -239,7 +245,7 @@ use pointer_shape::{SHAPE_DEFAULT, SHAPE_GRABBING, SHAPE_POINTER, SHAPE_TEXT};
 use prebakes::PrebakeRequest;
 #[cfg(feature = "hydra")]
 use previews::SnippetPreview;
-use previews::{PREVIEW_STOP_WINDOW, nudge_preview_gain};
+use previews::nudge_preview_gain;
 use prompt_paste::{
     MAX_RAW_PASTE_KEY_EVENTS_PER_TURN, MAX_RAW_PASTE_TERMINAL_EVENTS_PER_TURN, poll_after_input,
     read_raw_paste_chunk,
@@ -251,14 +257,12 @@ use readiness::{
 use recording::{
     SampleTake, TAKE_NOTICE_DURATION, TrimJob, TrimTarget, format_take_length, trim_candidate,
 };
-use reference_panel::{
-    CATALOGUE_LOADING_REFRESH, CATALOGUE_REFRESH, browser_imports, with_input_channels,
-};
+use reference_panel::{browser_imports, catalogue_refresh_interval, with_input_channels};
 use replay_tabs::SetStash;
 use sample_import::dropped_paths;
 use sample_sources::{
     ShippedSource, SourceMeasurement, SourceRefresh, UserSource, sample_source_folder,
-    status_sample_source, status_sample_source_error,
+    status_sample_failure, status_sample_source, status_sample_source_error,
 };
 use sessions::TAPE_GESTURE_SETTLE;
 use sets::{SetPrompt, SetSwitch};
@@ -540,7 +544,14 @@ fn status_file_path(path: &std::path::Path, full: bool) -> String {
 /// Enter the alternate screen and run until the user quits. Playback begins
 /// only after the first evaluate command, mirroring the REPL's explicit Play
 /// gesture while still allowing the score to be edited silently first.
-fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
+#[allow(
+    clippy::print_stderr,
+    reason = "the theme fallback is reported before the screen opens"
+)]
+fn run_once(mut options: StudioOptions) -> Result<Session, RuntimeError> {
+    // The terminal pointer, for `mousex` in patterns and `mouse` in Hydra.
+    // The engine's session reads it, and the app writes it.
+    options.session.pointer.get_or_insert_with(Default::default);
     let starter = if options.mini {
         DEFAULT_MINI_SCORE
     } else {
@@ -617,6 +628,7 @@ fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
     // against, and a set that opens with a long sample in it must not have
     // it declined on the way in.
     rustel_audio::set_sample_pcm_ceiling(sample_settings.sample_ceiling.bytes());
+    rustel_runtime::set_video_file_ceiling(sample_settings.video_ceiling.bytes());
     let worker = StudioWorker::spawn(
         StudioConfig {
             session: options
@@ -639,6 +651,7 @@ fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
             preview_budget_bytes: sample_settings.preview_budget.bytes(),
             unused_sample_idle: sample_settings.unused_sample_idle.duration(),
             import_origins: prefs.import_origins.clone(),
+            sample_grants: prefs.sample_grants(),
             // `csound_allowed` stays at its default: on, because an
             // installed Csound library is the studio's opt-in. The
             // permissions page takes it back for a run, and the one-shot
@@ -833,6 +846,11 @@ struct App {
     worker: StudioWorker,
     save_worker: SaveWorker,
     visual: VisualState,
+    /// The detached video windows, one per clip the video widgets have
+    /// sent to the desktop. Attached is the default: a window exists
+    /// only while the player keeps it, and nothing of it persists.
+    #[cfg(feature = "video")]
+    video_windows: Vec<video_window::VideoWindow>,
     /// One or two panes, left to right. The focused one holds the caret and
     /// is always the set's current scene.
     panes: Vec<Pane>,
@@ -848,6 +866,15 @@ struct App {
     #[cfg(feature = "hydra")]
     generator_session: super::ideas::Generator,
     catalogue_refreshed_at: Instant,
+    /// When the catalogue last changed while loading, so the fast loading
+    /// cadence holds only while something keeps arriving.
+    catalogue_progress_at: Instant,
+    /// How far the animated cadence is stretched from the configured frame
+    /// rate, and the draws that say whether to stretch or relax it. See
+    /// `event_loop::paced_after`.
+    frame_pace: u8,
+    frame_overruns: u8,
+    frame_cheaps: u8,
     /// When the vst tab of the reference column last read the plugin list.
     #[cfg(feature = "vst")]
     plugins_polled_at: Instant,
@@ -865,6 +892,10 @@ struct App {
     /// presets of that read.
     #[cfg(feature = "vst")]
     plugin_presets_version: u64,
+    /// The host read the preset folders at the last turn. The read runs on
+    /// the plugin thread, and the jobs sheet lists it while it runs.
+    #[cfg(feature = "vst")]
+    plugin_presets_reading: bool,
     /// The text of the settings vst page's plugin filter. The sheet holds
     /// only its state, for its rows and its keys.
     #[cfg(feature = "vst")]
@@ -1041,6 +1072,11 @@ struct App {
     /// Whether the log has already said the picture was made smaller, so
     /// it is said once and not on every step down.
     pixel_budget_said: bool,
+    /// How long pixel frames have been taking, a sixteenth of each new one,
+    /// and since when that has been quick: the picture budget moves on
+    /// these, never on one frame.
+    pixel_pace: Duration,
+    pixel_quick_since: Option<Instant>,
     /// The mapping slot the settings sheet is waiting to learn.
     mapping_learn: Option<usize>,
     /// The keybind learn the settings sheet is holding. While one is
@@ -1053,8 +1089,6 @@ struct App {
     /// re-learnt from there, so every surface asks the same table.
     keybinds: super::keybinds::Keybinds,
     vim_config: crate::vim_config::VimConfig,
-    /// Plain keys waiting for an insert mapping in a Vim text surface.
-    vim_insert_pending: String,
     /// This key came from remote control. A machine sends normal keys, not
     /// Vim modes, so the score reads it with its usual editing.
     remote_key_event: bool,
@@ -1158,6 +1192,12 @@ struct App {
     /// Only a setup that ran counts: what a refused one managed before it
     /// threw is on the heap, but which names those are cannot be known.
     applied_setup: [Arc<rustel_transpiler::SetupDefinitions>; 2],
+    /// The first request of the set open now. A local setup sent before it
+    /// is the last set's.
+    set_first_request: u64,
+    /// The local setup that opening the set queued, which runs without
+    /// taking the status line from the set being opened.
+    opening_prebake: Option<u64>,
     /// The rename prompt still shows the old name: the first key replaces it.
     rename_untouched: bool,
     /// What this terminal can do, found out when it was entered.
@@ -1254,6 +1294,16 @@ struct App {
     csound_owed: bool,
     /// The permissions page changed and the engine does not have the list yet.
     import_origins_owed: bool,
+    /// Folders the engine refused a score's samples or media from in this
+    /// studio, oldest first.
+    blocked_samples: Vec<String>,
+    /// A score asked for `local:` files with no folder chosen, so the
+    /// permissions page shows the folder row.
+    local_files_asked: bool,
+    /// The source the permissions page's edit prompt is cutting down.
+    editing_source: Option<String>,
+    /// The page's sample grants changed and the engine does not have them yet.
+    sample_grants_owed: bool,
     /// A permit unblocked a refused update and the studio owes its re-run.
     /// It waits for the engine to hold the permission, so the re-run cannot
     /// be refused by the state it is running to use.
@@ -1377,8 +1427,13 @@ struct App {
     /// Tabs by most recent visit, and material last accepted by the engine.
     scene_visits: Vec<SceneId>,
     tabs_closed: u64,
+    /// The id of each tab that left, in order: see
+    /// [`LiveMaterial::closed_documents`].
+    closed_documents: Vec<u64>,
     live_material_sent: Option<Vec<(SceneId, LiveTextMark, bool)>>,
     tabs_closed_sent: u64,
+    /// How many of [`Self::closed_documents`] the engine accepted.
+    closed_documents_sent: usize,
     plugins_shown_sent: Vec<String>,
     setups_select_variants_sent: bool,
     sent_setup_selected_variants: bool,
@@ -1414,6 +1469,8 @@ struct App {
     pin_frame_inputs: bool,
     /// Geometry of the last painted frame, used to route pointer input.
     frame: Rect,
+    /// Where the pointer is over the frame, shared with the engine's session.
+    score_pointer: rustel_core::host_value::Pointer,
     regions: StudioRegions,
     pointer: Option<Pointer>,
     /// How far into its cell the pointer was at the last report, 0..1. A
@@ -1482,6 +1539,9 @@ struct App {
     /// while it is still `None`: a sound heard for the first time is being
     /// decoded at the moment it is asked for.
     preview_shape: Option<(std::sync::Arc<[u8]>, f64)>,
+    /// The read of the samples tab's selected file for its details, while
+    /// one is out.
+    details_read: Option<sample_details::DetailsRead>,
     /// How long the studio has had sound, in seconds, and when that was
     /// last counted.
     ///
@@ -1609,6 +1669,7 @@ impl App {
         // The switch starts on, as the engine's does: an installed library
         // is the opt-in, and the permissions page owns the switch from here.
         let csound_at_start = true;
+        let score_pointer = options.session.pointer.clone().unwrap_or_default();
         let mut app = Self {
             output_latency_pending: true,
             cli_output_latency: options.output_buffer_frames.map(OutputLatency::from_frames),
@@ -1619,6 +1680,8 @@ impl App {
             prebake_applied: [None, None],
             prebake_rejected: [None, None],
             applied_setup: [Arc::default(), Arc::default()],
+            set_first_request: 0,
+            opening_prebake: None,
             registry: rustel_runtime::capability_registry_for_dispatch(
                 options.session.dsp_dispatch,
             ),
@@ -1640,6 +1703,8 @@ impl App {
             worker,
             save_worker,
             visual,
+            #[cfg(feature = "video")]
+            video_windows: Vec::new(),
             panes: vec![Pane {
                 scene: first_scene,
                 last_map: None,
@@ -1652,6 +1717,10 @@ impl App {
             #[cfg(feature = "hydra")]
             generator_session: super::ideas::Generator::default(),
             catalogue_refreshed_at: now,
+            catalogue_progress_at: now,
+            frame_pace: 1,
+            frame_overruns: 0,
+            frame_cheaps: 0,
             #[cfg(feature = "vst")]
             plugins_polled_at: now,
             #[cfg(feature = "vst")]
@@ -1664,6 +1733,8 @@ impl App {
             plugin_scan: None,
             #[cfg(feature = "vst")]
             plugin_presets_version: 0,
+            #[cfg(feature = "vst")]
+            plugin_presets_reading: false,
             #[cfg(feature = "vst")]
             vst_filter: settings::VstFilter::default(),
             #[cfg(feature = "vst")]
@@ -1749,11 +1820,12 @@ impl App {
             mixer_selection: None,
             pixel_budget: super::graphics::PIXEL_CEILING,
             pixel_budget_said: false,
+            pixel_pace: Self::FRESH_PACE,
+            pixel_quick_since: None,
             mapping_learn: None,
             keybind_learn: None,
             keybinds: prefs.keybinds(),
             vim_config: crate::vim_config::VimConfig::default(),
-            vim_insert_pending: String::new(),
             remote_key_event: false,
             midi_cc_last: HashMap::new(),
             note_pressed_at: HashMap::new(),
@@ -1820,6 +1892,10 @@ impl App {
             csound_refused: false,
             csound_owed: false,
             import_origins_owed: false,
+            blocked_samples: Vec::new(),
+            local_files_asked: false,
+            editing_source: None,
+            sample_grants_owed: false,
             refused_update_owed: false,
             evaluation_alerts: HashMap::new(),
             lint_status: None,
@@ -1884,8 +1960,10 @@ impl App {
             launch_pads_sent: None,
             scene_visits: Vec::new(),
             tabs_closed: 0,
+            closed_documents: Vec::new(),
             live_material_sent: None,
             tabs_closed_sent: 0,
+            closed_documents_sent: 0,
             plugins_shown_sent: Vec::new(),
             setups_select_variants_sent: false,
             sent_setup_selected_variants: false,
@@ -1898,6 +1976,7 @@ impl App {
             #[cfg(feature = "harness")]
             pin_frame_inputs: false,
             frame: Rect::default(),
+            score_pointer,
             regions: StudioRegions::default(),
             pointer: None,
             pointer_subcell: 0.0,
@@ -1919,6 +1998,7 @@ impl App {
             preview_armed: None,
             preview_lit_until: None,
             preview_shape: None,
+            details_read: None,
             sound_seconds: std::cell::Cell::new(0.0),
             sound_counted_at: std::cell::Cell::new(Instant::now()),
             #[cfg(feature = "hydra")]
@@ -2272,6 +2352,7 @@ impl App {
         self.live_sliders.remove(&id);
         self.readiness.remove(&id);
         self.tabs_closed += 1;
+        self.closed_documents.push(id.0);
     }
 
     fn live_tabs(&self) -> Vec<(SceneId, bool)> {
@@ -2322,6 +2403,7 @@ impl App {
         let plugins = Vec::new();
         if (self.live_material_sent.as_ref() == Some(&key)
             && self.tabs_closed_sent == self.tabs_closed
+            && self.closed_documents_sent == self.closed_documents.len()
             && self.plugins_shown_sent == plugins)
             || now.duration_since(self.last_edit_at) < LINT_DEBOUNCE
         {
@@ -2353,6 +2435,7 @@ impl App {
                 .filter_map(|(id, _, _)| text(*id))
                 .collect(),
             tabs_closed: self.tabs_closed,
+            closed_documents: self.closed_documents.clone(),
             setups_select_variants,
             plugins: plugins.clone(),
         };
@@ -2381,6 +2464,7 @@ impl App {
         load_variants_ahead(&ahead, setups_select_variants, &library);
         self.live_material_sent = Some(key);
         self.tabs_closed_sent = self.tabs_closed;
+        self.closed_documents_sent = material.closed_documents.len();
         self.plugins_shown_sent = plugins;
         self.setups_select_variants_sent = setups_select_variants;
     }
@@ -2409,31 +2493,21 @@ mod tests {
         use super::super::*;
 
         #[test]
-        fn successful_save_hides_parent_folders_unless_enabled() {
+        fn a_save_that_lands_says_nothing() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = super::support::app_over(directory.path());
             let path = app.scenes.current().path.clone();
-            assert!(!app.ui_settings.show_full_paths);
+            app.status = "playing from the top".into();
             for full in [false, true] {
                 app.ui_settings.show_full_paths = full;
                 app.handle_save_result(SaveResult {
                     request_id: 42,
                     path: path.clone(),
-                    editor_revision: app.editor().revision(),
                     source_revision: source_revision(&app.editor().source()),
                     result: Ok(true),
                 });
-                let expected = if full {
-                    format!("saved {}", path.display())
-                } else {
-                    "saved first.strudel".to_owned()
-                };
-                assert_eq!(app.status, expected);
-                let deadline = app.status_notice.as_ref().expect("save notice").1;
-                app.expire_notice(deadline - Duration::from_millis(1));
-                assert_eq!(app.status, expected);
-                app.expire_notice(deadline);
-                assert!(app.status.is_empty());
+                assert_eq!(app.status, "playing from the top", "the line is left alone");
+                assert!(app.status_notice.is_none(), "and no notice is raised");
             }
         }
 
@@ -3255,7 +3329,8 @@ mod tests {
 
         /// A closed tab holds nothing: its lint, its sliders, its readiness
         /// and its place among the visits go with it, and the count of tabs
-        /// let go moves, which is what has the engine sweep its sounds.
+        /// let go moves, which is what has the engine sweep its sounds. Its
+        /// id joins the closed documents, so the engine closes its scene.
         #[test]
         fn closing_a_scene_forgets_it() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -3270,6 +3345,7 @@ mod tests {
             assert!(app.scenes.get(closed).is_none(), "closed: {}", app.status);
             assert!(!holds_anything_of(&app, closed));
             assert_eq!(app.tabs_closed, before + 1);
+            assert_eq!(app.closed_documents, [closed.0]);
             assert!(!app.status.contains("pad"), "{}", app.status);
         }
 
@@ -3403,10 +3479,13 @@ mod tests {
             assert!(!path.exists(), "deleted: {}", app.status);
             assert!(!holds_anything_of(&app, deleted));
             assert_eq!(app.tabs_closed, before + 1);
+            assert_eq!(app.closed_documents, [deleted.0]);
         }
 
         /// A set put down takes every tab with it, and what was kept for each
-        /// goes whole - as one move of the count, not one per tab.
+        /// goes whole, as one move of the count, not one per tab. The id of
+        /// each score tab joins the closed documents. A setup tab has no
+        /// document.
         #[test]
         fn switching_sets_forgets_every_tab_of_the_old_one() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -3417,6 +3496,8 @@ mod tests {
             for id in [first, second] {
                 remember_something_of(&mut app, id);
             }
+            app.open_prebake(PrebakeScope::Local);
+            assert!(app.scenes.current().prebake().is_some(), "{}", app.status);
             let before = app.tabs_closed;
 
             let elsewhere = tempfile::tempdir().expect("second set");
@@ -3429,6 +3510,7 @@ mod tests {
                 assert!(!holds_anything_of(&app, id), "{id:?}");
             }
             assert_eq!(app.tabs_closed, before + 1);
+            assert_eq!(app.closed_documents, [first.0, second.0]);
             assert_eq!(
                 app.scene_visits,
                 [app.scenes.current().id],
@@ -3473,7 +3555,8 @@ mod tests {
         /// A tape's tab is not live material, so closing one leaves the tabs
         /// the engine was sent as they were. The count of tabs let go is sent
         /// on its own, or what only the tape played would wait out a sweep
-        /// that had already run.
+        /// that had already run. The id of the tape goes with the count, so
+        /// the engine closes its scene.
         #[test]
         fn closing_a_tape_is_news_to_the_engine() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -3484,6 +3567,7 @@ mod tests {
             let tape = write_tape(&tapes, "2026-09-05T12-09-48", &[(0.0, "$: s(\"bd\")")]);
             app.open_replay_tab(&tape);
             assert!(app.scenes.current().is_replay(), "{}", app.status);
+            let replay = app.scenes.current().id;
             let later = Instant::now() + LINT_DEBOUNCE;
             app.sync_live_material(later);
             let sent = app.live_material_sent.clone().expect("the tabs were sent");
@@ -3496,6 +3580,11 @@ mod tests {
             assert_eq!(
                 app.tabs_closed_sent, app.tabs_closed,
                 "and the tape leaving went with them"
+            );
+            assert_eq!(app.closed_documents, [replay.0]);
+            assert_eq!(
+                app.closed_documents_sent, 1,
+                "the id of the tape went with them"
             );
         }
 

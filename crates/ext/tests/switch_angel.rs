@@ -20,8 +20,9 @@ use rustel_jsruntime::{JsRuntime, Slot};
 use rustel_transpiler::TranspileOptions;
 
 fn runtime() -> JsRuntime {
-    let rt = JsRuntime::new().unwrap();
-    rt.install_semantic_bindings().unwrap();
+    let rt = JsRuntime::new().expect("the runtime builds");
+    rt.install_semantic_bindings()
+        .expect("the bindings install");
     rt
 }
 
@@ -596,5 +597,43 @@ mod sealing {
             &AtomicBool::new(false),
         )
         .expect("a name declared in one update answers in the next");
+    }
+}
+
+// -- the hap budget ----------------------------------------------------------
+
+/// Each shape concatenates one-hap branches across its selector haps: every
+/// branch is individually within a budget of one while the total of two is
+/// not. The refusal must arrive while the output vector grows, not after it
+/// exists.
+#[test]
+fn concatenating_extensions_charge_the_hap_budget_as_they_grow() {
+    let shapes = [
+        r#"track([note("c")], 1, "a", 1, "a")"#,
+        r#"blockArrange([[note("c"), "<1 1>"]])"#,
+        r#"note("c").glitch("<0.2 0.2>")"#,
+        r#"note("c").humanize("<0.5 0.5>")"#,
+    ];
+    for source in shapes {
+        let rt = runtime();
+        rt.evaluate_score(source, &TranspileOptions::default())
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        let haps = rt
+            .query_with_budget(Slot::Active, 0, Fraction::ZERO, Fraction::int(2), 2)
+            .unwrap_or_else(|e| panic!("{source}: the at-budget query was refused: {e}"));
+        assert_eq!(haps.len(), 2, "{source}: unexpected at-budget hap count");
+
+        rustel_core::reset_haps_materialised();
+        let refused = rt.query_with_budget(Slot::Active, 0, Fraction::ZERO, Fraction::int(2), 1);
+        match refused {
+            Err(rustel_jsruntime::QueryError::Limit(rustel_core::QueryLimit::HapBudget {
+                budget: 1,
+            })) => {}
+            other => panic!("{source}: expected a hap budget refusal, got {other:?}"),
+        }
+        assert!(
+            rustel_core::peak_hap_vector() <= 1,
+            "{source}: the over-budget output vector existed before the refusal"
+        );
     }
 }

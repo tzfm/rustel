@@ -16,6 +16,7 @@ struct Host {
     takeover_frame: AtomicU64,
     takeover_cut: AtomicU64,
     line_arm: AtomicU64,
+    line_fired: AtomicU64,
     stopped: AtomicBool,
     sample_rate: u32,
     block_frames: usize,
@@ -32,6 +33,7 @@ impl Host {
             takeover_frame: AtomicU64::new(0),
             takeover_cut: AtomicU64::new(0),
             line_arm: AtomicU64::new(0),
+            line_fired: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             sample_rate,
             block_frames,
@@ -86,6 +88,7 @@ impl Host {
                 takeover_frame: &self.takeover_frame,
                 takeover_cut: &self.takeover_cut,
                 line_arm: &self.line_arm,
+                line_fired: &self.line_fired,
             },
             &self.stopped,
         );

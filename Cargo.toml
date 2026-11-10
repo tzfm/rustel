@@ -18,7 +18,6 @@ members = [
     "crates/serial",
     "crates/midi",
     "crates/osc",
-    "crates/hydra",
     "crates/vst3",
     "crates/csound",
     "crates/vst3-fixture",
@@ -28,9 +27,10 @@ members = [
 ]
 
 # `cargo build` at the root builds the complete product, the `rustel` binary
-# of `crates/cli`. Its default features include Studio and Hydra, so the path
-# dependency is pulled in even though `rustel-hydra` is not itself a top-level
-# default member. A lean build is `-p rustel --no-default-features`, with
+# of `crates/cli`. Its default features include Studio, Hydra and the theme
+# pack, so the `rustel-hydra` and `rustel-studio-themes` packages are pulled
+# in. A lean build is
+# `-p rustel --no-default-features`, with
 # `--features mp3-export` to keep MP3 export.
 default-members = [
     "crates/engine",
@@ -53,13 +53,53 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 # The toolchain rust-toolchain.toml pins, the only one tested.
 rust-version = "1.98.1"
 # The public repository. Members inherit this for their published metadata.
 repository = "https://github.com/tzfm/rustel"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+# Backlog, flip to warn once clean: 315 types without a Debug impl.
+missing_debug_implementations = "allow"
+# Backlog, flip to warn once clean: 338 items pub in private modules.
+unreachable_pub = "allow"
+rust_2018_idioms = { level = "warn", priority = -1 }
+# The one `rust_2018_idioms` lint that is pure `'_` churn at this size.
+elided_lifetimes_in_paths = "allow"
+# `core` verifies the `Node` thread-safety assertion with a deliberately
+# non-Send payload; `studio-e2e` gates its pty-only test paths.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(non_send_node_mutation)', 'cfg(pty_available)'] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Panic hygiene. A panic on the audio thread is a dropout.
+unwrap_used = "warn"
+# `expect` with a message is the preferred form; `unwrap` is not.
+expect_used = "allow"
+panic_in_result_fn = "warn"
+
+# Backlog, flip to warn once clean: 527 blocks without a safety comment.
+undocumented_unsafe_blocks = "allow"
+# Backlog, flip to warn once clean: 147 blocks with more than one operation.
+multiple_unsafe_ops_per_block = "allow"
+
+# API shape. Backlog, flip to warn once clean: 5 functions with four or
+# more bool parameters, plus 74 structs with four or more bool fields.
+fn_params_excessive_bools = "allow"
+struct_excessive_bools = "allow"
+# Backlog, flip to warn once clean: 405 reference-counted clones to mark.
+clone_on_ref_ptr = "allow"
+
+# A stray print corrupts the studio's screen.
+dbg_macro = "warn"
+todo = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
 
 [profile.release]
 # Score panic recovery needs unwinding; see .github/scripts/check-panic-unwind.sh.
@@ -81,3 +121,7 @@ incremental = true
 # after a resize and kitty associated text; return to crates.io after a
 # release includes crossterm-rs/crossterm PRs #1125, #1127 and #1128.
 crossterm = { git = "https://github.com/tzfm/crossterm", rev = "f772fd3f90be8a85d0a94866bc9daeb0e082255d" }
+# The connection reactor zeroed a megabyte on every wakeup. The fork reads
+# into a scratch it keeps instead. Return to crates.io after a release
+# includes colinmarc/pulseaudio-rs PR #22 (0.3.2 still zeroes).
+pulseaudio = { git = "https://github.com/undy-aeon/pulseaudio-rs", rev = "49f1f69a6b500bb513164edc2c19c69446f53a8c" }

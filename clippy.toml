@@ -7,3 +7,7 @@ disallowed-methods = [
     { path = "f32::mul_add", reason = "A fused multiply-add can change the last bits of audio. Use separate multiplication and addition." },
     { path = "f64::mul_add", reason = "A fused multiply-add can change the last bits of audio. Use separate multiplication and addition." },
 ]
+
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true

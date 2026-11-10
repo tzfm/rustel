@@ -12,6 +12,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::canonical;
+
 pub(crate) struct Preset<'a> {
     /// The class id of the plugin the preset is for, as 32 hex characters.
     pub class: &'a str,
@@ -34,7 +36,12 @@ pub(crate) fn parse(file: &[u8]) -> Result<Preset<'_>, String> {
     if bytes(list, 4) != Some(b"List") {
         return Err(bad());
     }
-    let count = i32::from_le_bytes(bytes(list + 4, 4).ok_or_else(bad)?.try_into().unwrap());
+    let count = i32::from_le_bytes(
+        bytes(list + 4, 4)
+            .ok_or_else(bad)?
+            .try_into()
+            .expect("the slice has the right length"),
+    );
     let mut component = None;
     let mut controller = None;
     for index in 0..usize::try_from(count).map_err(|_| bad())? {
@@ -56,6 +63,16 @@ pub(crate) fn parse(file: &[u8]) -> Result<Preset<'_>, String> {
     })
 }
 
+/// [`parse`] for the plugin with the class id `class`: a preset of another
+/// plugin is an error.
+pub(crate) fn parse_for<'a>(file: &'a [u8], class: &str) -> Result<Preset<'a>, String> {
+    let preset = parse(file)?;
+    if !preset.class.eq_ignore_ascii_case(class) {
+        return Err("the preset is for a different plugin".into());
+    }
+    Ok(preset)
+}
+
 /// The class id of the plugin the preset is for, from the header alone:
 /// 32 hex characters. `None` when the bytes are no VST3 preset header. The
 /// header is 40 bytes, so a scan of a folder reads no whole preset file.
@@ -68,11 +85,15 @@ pub(crate) fn class_of(file: &[u8]) -> Option<&str> {
 /// The `.vstpreset` files under `folders`, by the lower case class id each
 /// file names. Any folder structure counts: the header says the plugin, not
 /// the folder. A file a folder before holds wins over a file of a later
-/// folder with the same preset name. Each list is sorted by name.
+/// folder with the same preset name, and in one folder the first path wins.
+/// Names compare in the form of [`canonical`], as a lookup does. Each list
+/// is sorted by name.
 pub(crate) fn scan_folders(folders: &[PathBuf]) -> HashMap<String, Vec<(String, PathBuf)>> {
     let mut files = Vec::new();
     for folder in folders {
+        let start = files.len();
         walk(folder, &mut files);
+        files[start..].sort();
     }
     let mut index: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
     for path in files {
@@ -84,7 +105,8 @@ pub(crate) fn scan_folders(folders: &[PathBuf]) -> HashMap<String, Vec<(String, 
         };
         let name = path.file_stem().unwrap_or_default().to_string_lossy();
         let files = index.entry(class.to_ascii_lowercase()).or_default();
-        let known = files.iter().any(|(known, _)| *known == name);
+        let key = canonical(&name);
+        let known = files.iter().any(|(known, _)| canonical(known) == key);
         if !known {
             files.push((name.into_owned(), path));
         }
@@ -179,6 +201,8 @@ mod tests {
         std::fs::write(bank.join("notes.txt"), "no preset").unwrap();
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join("lead.vstpreset"), &file).unwrap();
+        // A name in another case is the same name.
+        std::fs::write(other.join("PAD.vstpreset"), &file).unwrap();
 
         let folders = vec![root.clone(), other.clone()];
         let index = scan_folders(&folders);

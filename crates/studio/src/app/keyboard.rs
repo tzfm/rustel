@@ -226,12 +226,17 @@ impl App {
     }
 
     /// Whether the panel has a text field that owns held typing keys.
-    fn panel_is_typing(&self, kind: PanelKind) -> bool {
+    pub(super) fn panel_is_typing(&self, kind: PanelKind) -> bool {
+        // The set prompt types whether the vim surface below it answers
+        // or not.
+        if kind == PanelKind::Set && self.set_prompt.is_some() {
+            return true;
+        }
         if let Some(typing) = super::vim::surface_typing(self) {
             return typing;
         }
         match kind {
-            PanelKind::Set => self.set_prompt.is_some(),
+            PanelKind::Set => self.set_search_typing(),
             PanelKind::Viz => self.viz_docks[self.viz_focus]
                 .as_ref()
                 .is_some_and(|panel| panel.prompt.is_some()),
@@ -245,6 +250,18 @@ impl App {
                 .reference_panel
                 .as_ref()
                 .is_some_and(|panel| panel.wants_text()),
+            // The column's own sheets: the add list searches, and the form
+            // types its numbers.
+            PanelKind::Knobs => self
+                .knobs_panel
+                .as_ref()
+                .is_some_and(|panel| panel.adding.is_some() || panel.editing.is_some()),
+            // The vst page's filter, while its letters build it.
+            #[cfg(feature = "vst")]
+            PanelKind::Settings => self
+                .settings_sheet
+                .as_ref()
+                .is_some_and(|sheet| sheet.shows_vst() && sheet.vst_filter.is_typing()),
             _ => false,
         }
     }
@@ -305,12 +322,18 @@ impl App {
             PanelKind::Set if alt && !primary && self.set_prompt.is_none() => {
                 self.handle_set_file_key(code)
             }
+            // A chord is not text: while the search box types, ^B, ^O and
+            // the rest go on to the studio's chords. Ctrl with Alt is how
+            // a legacy terminal sends AltGr, and AltGr still types.
+            PanelKind::Set if primary && !alt && self.set_search_typing() => false,
             PanelKind::Set
                 if code == KeyCode::Char('n')
                     && !primary
                     && !shift
                     && !alt
-                    && self.set_prompt.is_none() =>
+                    && self.set_prompt.is_none()
+                    // `n` is a letter the search box may be typing.
+                    && !self.set_search_typing() =>
             {
                 self.new_session();
                 true
@@ -422,17 +445,34 @@ impl App {
         result
     }
 
+    /// Whether the text a terminal composed for an Option key spells the
+    /// Alt chord over typing. Only an exotic one-character composition
+    /// does: the US Option+2, ™, is no character anyone types. A plain
+    /// ASCII one steps aside, because on a Swedish layout Option+2 is the
+    /// one way to type @, and a longer composition pastes.
+    fn composition_spells_the_chord(text: &str) -> bool {
+        sole_composed_character(text).is_some_and(|character| !character.is_ascii())
+    }
+
     /// Recover an Option panel chord from the composed character a terminal
     /// sends. Only where the focused surface answers to that Option letter,
-    /// so the same character types normally everywhere else.
+    /// so the same character types normally everywhere else. Alt+., the
+    /// browser spelling of stop, answers on every surface.
+    ///
+    /// A terminal that carries the keyboard protocol reports Alt itself, in
+    /// the key the composition rides, so no terminal table is needed for
+    /// that spelling: the protocol is the fact. A legacy terminal sends the
+    /// composed character alone, and the table below reads it.
     fn option_panel_spelling(&self, event: Event) -> Event {
         match &event {
-            Event::KeyWithText { key, .. }
+            Event::KeyWithText { key, text }
                 if key.modifiers == KeyModifiers::ALT
                     && let KeyCode::Char(letter) = key.code =>
             {
                 let letter = letter.to_ascii_lowercase();
-                if self.alt_panel_action_applies(letter) && self.keybinds.composes_option(letter) {
+                let chord = self.alt_panel_action_applies(letter)
+                    || self.keybinds.browser_spelling(key).is_some();
+                if chord && Self::composition_spells_the_chord(text) {
                     return Event::Key(KeyEvent::new_with_kind_and_state(
                         KeyCode::Char(letter),
                         KeyModifiers::ALT,
@@ -461,7 +501,11 @@ impl App {
 
     /// Whether the focused surface has a use for an Option letter. A chord
     /// learnt over the action retires the letter, so it is not recovered.
+    /// An Option digit is the strip's own: it names a score on the strip.
     fn alt_panel_action_applies(&self, letter: char) -> bool {
+        if letter.is_ascii_digit() {
+            return self.strip_digit_applies(letter);
+        }
         if let Some(action) = self.panel_action_at(letter) {
             return !self.keybinds.overridden(action);
         }
@@ -471,6 +515,17 @@ impl App {
                 .reference_panel
                 .as_ref()
                 .is_some_and(|panel| crate::reference::tab_previews(panel.tab))
+    }
+
+    /// Whether an Alt digit picks a strip's score right now: the score has
+    /// the keyboard, and nothing over it is reading the digit. Alt is not a
+    /// chord the keybind table can hold, so no learnt key can retire it.
+    fn strip_digit_applies(&self, digit: char) -> bool {
+        matches!(digit, '1'..='9')
+            && self.focus == Focus::Editor
+            && !self.editor().find_open()
+            && self.smart_action.is_none()
+            && matches!(self.strip_mode, SceneStripMode::Idle)
     }
 
     pub(super) fn route_terminal_event(
@@ -498,6 +553,7 @@ impl App {
             self.caret_visible = true;
         }
         self.note_pointer_shape_event(&terminal_event);
+        self.follow_score_pointer(&terminal_event);
         // A find prompt owns the keys before Vim mappings and every editor
         // command: a typed pattern is never a motion or an edit.
         if allow_modal_keys && self.route_find_event(&terminal_event)? {
@@ -509,8 +565,12 @@ impl App {
             if self.editor_accepts_raw_paste()
                 && self.editor().find_open()
                 && self.find_global_chord(key));
+        // A clicked slider keeps the keys its status promises until it is
+        // let go, in Vim as outside it. They go on to `armed_slider_key`.
+        let slider_key = matches!(&terminal_event, Event::Key(key) if self.armed_slider_takes(key));
         let quit_was_armed = self.quit_armed;
         if !find_global
+            && !slider_key
             && allow_modal_keys
             && self.editor_accepts_raw_paste()
             && let Event::Key(key) = &terminal_event
@@ -525,12 +585,33 @@ impl App {
             }
             return Ok(());
         }
-        let non_key_interrupt = matches!(&terminal_event, Event::Paste(_) | Event::FocusLost)
-            || matches!(&terminal_event, Event::Mouse(mouse) if mouse.kind != MouseEventKind::Moved);
-        if non_key_interrupt {
+        // A pointer press interrupts. A release or a drag carries on a
+        // gesture its press began, and the press already interrupted.
+        // Counted again, the release of a click on Edit > Find closed the
+        // find bar that same click had opened. The wheel only moves the
+        // view, and focus leaving the window is no input, so neither ends
+        // a mode or closes a prompt. Focus loss still sends a held mapping
+        // prefix on.
+        let pointer_press = matches!(&terminal_event, Event::Mouse(mouse)
+            if matches!(mouse.kind, MouseEventKind::Down(_)));
+        let paste = matches!(&terminal_event, Event::Paste(_));
+        if pointer_press || paste || matches!(&terminal_event, Event::FocusLost) {
             super::vim::flush_pending(self)?;
         }
-        let interrupts_key_mode = non_key_interrupt
+        // Vim's `:` line takes a paste as typed text, as the find bar does.
+        if let Event::Paste(text) = &terminal_event
+            && allow_modal_keys
+            && self.editor_accepts_raw_paste()
+            && self.editor_mut().vim_command_paste(text)
+        {
+            self.dirty_frame = true;
+            return Ok(());
+        }
+        // A paste is text. Where typed text lands it joins the insert and
+        // its undo step. Elsewhere it ends a pending command, and Visual,
+        // whose selection it replaces.
+        let interrupts_key_mode = pointer_press
+            || (paste && !self.editor().accepts_typed_text())
             || matches!(&terminal_event, Event::Key(key)
                 if key.kind != KeyEventKind::Release
                     && (key.modifiers.intersects(
@@ -1010,7 +1091,7 @@ impl App {
             // keys on they are list keys, not typing. An arrow with no
             // target still belongs to the panel: letting it through would
             // move a caret the reader cannot see.
-            if super::vim::panel_takes_list_navigation(kind)
+            if super::vim::panel_takes_list_navigation(self, kind)
                 && let Some(alias) = self.list_navigation_alias(key)
             {
                 let _ = self.dispatch_panel_key(kind, alias.code, false, false, false)?;
@@ -1047,6 +1128,34 @@ impl App {
         alt: bool,
         letter: Option<char>,
     ) -> bool {
+        // An Alt digit selects that strip's score, the way the digit on
+        // its row in the set panel does, from wherever the score has the
+        // keyboard. The strip runs to nine; past that, the arrows.
+        if alt
+            && !primary
+            && !shift
+            && let KeyCode::Char(digit) = key.code
+            && self.strip_digit_applies(digit)
+        {
+            self.select_strip_by_number((digit as u8 - b'0') as usize);
+            return true;
+        }
+        // Ctrl with Shift spells the same selection where Option types
+        // real characters, as the Swedish layout's Option row does for
+        // five of the nine digits: Ctrl composes nothing on any layout,
+        // so this spelling holds on every one of them. Unlike the Alt
+        // digit, a chord the keybind table learns over the key retires
+        // it, the way every other primary chord retires.
+        if primary
+            && shift
+            && !alt
+            && let KeyCode::Char(digit) = key.code
+            && self.strip_digit_applies(digit)
+            && !self.key_is_a_learnt_chord(key)
+        {
+            self.select_strip_by_number((digit as u8 - b'0') as usize);
+            return true;
+        }
         if primary && !shift && letter == Some('d') && !self.key_is_a_learnt_chord(key) {
             self.toggle_reference_at_caret();
             return true;
@@ -1454,7 +1563,7 @@ impl App {
                 || (text_key(key.code) && self.panel_is_typing(kind))
             {
                 self.dispatch_panel_key(kind, key.code, primary, shift, alt)?;
-            } else if super::vim::panel_takes_list_navigation(kind)
+            } else if super::vim::panel_takes_list_navigation(self, kind)
                 && !self.panel_is_typing(kind)
                 && let Some(alias) = self.list_navigation_alias(key)
                 && (panel_repeat_is_safe(kind, alias.code)
@@ -1999,6 +2108,48 @@ mod tests {
             let source = app.editor().source();
             assert!(source.contains("generated"), "{source:?}");
             assert_eq!(source.matches("generated").count(), 1, "{source:?}");
+        }
+
+        /// A newer copy from another surface is put by Vim's rules: after
+        /// the caret, a copied line below the current one, and over a
+        /// Visual selection, which ends Visual. V keeps the line break.
+        #[test]
+        fn vim_p_puts_a_newer_copy_by_vim_rules() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.scenes.current_mut().editor =
+                crate::editor::Editor::new("one two\nthree\n").expect("editor");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+            let copy = |app: &mut App, text: &str| {
+                app.clipboard.set_text(text.into()).expect("newer copy");
+            };
+
+            copy(&mut app, "X");
+            precision_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            assert_eq!(
+                app.editor().source(),
+                "oXne two\nthree\n",
+                "after the caret"
+            );
+            copy(&mut app, "new\n");
+            precision_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            assert_eq!(
+                app.editor().source(),
+                "oXne two\nnew\nthree\n",
+                "a copied line goes below"
+            );
+
+            copy(&mut app, "last");
+            precision_key(&mut app, KeyCode::Char('V'), KeyModifiers::SHIFT);
+            precision_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            assert_eq!(
+                app.editor().source(),
+                "oXne two\nlast\nthree\n",
+                "the line it replaced keeps its line break"
+            );
+            assert!(app.editor().vim_is_normal(), "the put ends Visual");
         }
 
         #[test]
@@ -2625,6 +2776,44 @@ mod tests {
             assert_eq!(legacy(KeyCode::Char('.')), None);
         }
 
+        /// A held letter keeps typing the vst page's filter. In Vim a held
+        /// `j` does not turn into ↓, which would end the filter and move.
+        #[cfg(feature = "vst")]
+        #[test]
+        fn a_held_letter_keeps_typing_the_vst_filter() {
+            use crossterm::event::{KeyEvent, KeyEventKind};
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.toggle_settings_sheet();
+            app.settings_sheet
+                .as_mut()
+                .expect("sheet open")
+                .show_page(crate::settings::SettingsPage::Vst);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            let selected = app.settings_sheet.as_ref().expect("sheet open").selected;
+            app.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('j'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )))
+            .expect("repeat");
+            assert_eq!(
+                app.vst_filter,
+                crate::settings::VstFilter::Typing("jj".into()),
+                "the repeat typed"
+            );
+            assert_eq!(
+                app.settings_sheet.as_ref().expect("sheet open").selected,
+                selected,
+                "the cursor stayed"
+            );
+        }
+
         /// A held key belongs to the prompt that took its press: repeats of
         /// Backspace erase in the field and never reach the score, and a
         /// held letter keeps typing there.
@@ -2783,6 +2972,23 @@ mod tests {
             assert!(app.editor().source().contains("ab"));
         }
 
+        /// Option+. stops on a terminal that reports the composed `≥` too:
+        /// the browser spelling of stop is a chord, not text.
+        #[test]
+        fn a_composed_option_period_stops_instead_of_typing() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ax\n");
+            app.snapshot = Some(sounding(true, false));
+            let source = app.editor().source();
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT),
+                text: "≥".into(),
+            })
+            .expect("composed stop");
+            assert_eq!(app.editor().source(), source, "nothing typed");
+            assert!(app.stop_requested, "the stop reached the engine");
+        }
+
         #[test]
         fn composed_text_on_a_lock_key_does_not_type() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -2811,6 +3017,268 @@ mod tests {
             })
             .expect("composed release");
             assert_eq!(app.editor().source(), source);
+        }
+
+        /// The line of the caret, counted from zero.
+        fn caret_line(app: &App) -> usize {
+            let head = app.editor().primary_selection().head.0;
+            app.editor().source()[..head].matches('\n').count()
+        }
+
+        /// The wheel changes no Vim mode. A `:` line waiting for its number
+        /// and a V-LINE selection both carry on after a wheel step. The
+        /// wheel once closed the one and turned the other character-wise.
+        #[test]
+        fn a_wheel_step_keeps_the_vim_command_line_and_visual_line() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let source = (1..=50).map(|n| format!("// {n}\n")).collect::<String>();
+            let (mut app, _scene) = plain_app(directory.path(), &source);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            let editor = app.regions.panes[0].editor;
+            let wheel = |app: &mut App| {
+                mouse(app, MouseEventKind::ScrollDown, editor.x + 2, editor.y + 1);
+            };
+
+            type_text(&mut app, ":42");
+            wheel(&mut app);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(caret_line(&app), 41, ":42 went to line 42");
+
+            type_text(&mut app, "V");
+            wheel(&mut app);
+            type_text(&mut app, "yp");
+            assert!(
+                app.editor().source().contains("// 42\n// 42\n// 43\n"),
+                "the put stays linewise"
+            );
+        }
+
+        /// A paste while Vim's `:` line is open types into it, as typing
+        /// does. It once closed the line and went into the score.
+        #[test]
+        fn a_paste_types_into_the_vim_command_line() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let source = (1..=50).map(|n| format!("// {n}\n")).collect::<String>();
+            let (mut app, _scene) = plain_app(directory.path(), &source);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            let score = app.editor().source();
+            type_text(&mut app, ":");
+            app.handle_terminal_event(Event::Paste("42".into()))
+                .expect("paste handled");
+            assert_eq!(app.editor().vim_label().as_deref(), Some(":42"));
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.editor().source(), score);
+            assert_eq!(caret_line(&app), 41, ":42 went to line 42");
+        }
+
+        /// A paste in Vim's Insert is part of that insert, so Esc and one
+        /// `u` take all of it back. The paste once split the insert into
+        /// three undo steps.
+        #[test]
+        fn a_paste_in_insert_undoes_with_the_rest_of_the_insert() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// score\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            let score = app.editor().source();
+            type_text(&mut app, "iab");
+            app.handle_terminal_event(Event::Paste("XY".into()))
+                .expect("paste handled");
+            type_text(&mut app, "cd");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(app.editor().source(), format!("abXYcd{score}"));
+            type_text(&mut app, "u");
+            assert_eq!(app.editor().source(), score);
+        }
+    }
+
+    mod strip_digits {
+        //! Alt with a digit selects that strip's score, the way the digit
+        //! on its row in the set panel does - and nothing that shares the
+        //! editor's keyboard loses its keys to it.
+
+        use crate::app::keyboard::*;
+        use crate::app::tests::support::*;
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        /// A studio with two scores on the strip, the second current, and
+        /// the editor holding the keyboard.
+        fn app_with_two_scores(directory: &std::path::Path) -> App {
+            let mut app = app_over(directory);
+            std::fs::write(directory.join("second.strudel"), "$: s(\"hh\")\n")
+                .expect("a second score");
+            app.scenes
+                .open_file(&directory.join("second.strudel"))
+                .expect("open the second score");
+            app.land_on_current_scene();
+            app.focus = Focus::Editor;
+            app
+        }
+
+        #[test]
+        fn an_alt_digit_selects_that_strips_score() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_two_scores(directory.path());
+            assert_eq!(app.scenes.current().name(), "second");
+            press(&mut app, KeyCode::Char('1'), KeyModifiers::ALT);
+            assert_eq!(
+                app.scenes.current().name(),
+                "first",
+                "Alt+1 selects the strip's first score"
+            );
+            assert_eq!(app.status, "scene 1 - first");
+            press(&mut app, KeyCode::Char('2'), KeyModifiers::ALT);
+            assert_eq!(app.scenes.current().name(), "second");
+            // A number the strip does not hold says so and moves nothing.
+            press(&mut app, KeyCode::Char('9'), KeyModifiers::ALT);
+            assert_eq!(app.scenes.current().name(), "second");
+            assert_eq!(app.status, "no scene 9 on the strip");
+        }
+
+        /// The chord answers in vim mode too, from Insert as from Normal.
+        #[test]
+        fn an_alt_digit_selects_in_vim_mode() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_two_scores(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            assert!(!app.editor().vim_is_insert(), "the score opens in Normal");
+            press(&mut app, KeyCode::Char('1'), KeyModifiers::ALT);
+            assert_eq!(app.scenes.current().name(), "first");
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert!(app.editor().vim_is_insert());
+            press(&mut app, KeyCode::Char('2'), KeyModifiers::ALT);
+            assert_eq!(
+                app.scenes.current().name(),
+                "second",
+                "Alt+2 selects from Insert"
+            );
+        }
+
+        /// Ctrl with Shift spells the same selection where Option types
+        /// real characters, as the Swedish layout's Option row does, and a
+        /// chord learnt over the key retires it.
+        #[test]
+        fn a_ctrl_shift_digit_selects_the_strip_score_and_retires() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_two_scores(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            press(
+                &mut app,
+                KeyCode::Char('1'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert_eq!(
+                app.scenes.current().name(),
+                "first",
+                "Ctrl+Shift+1 selected from vim Normal"
+            );
+            press(
+                &mut app,
+                KeyCode::Char('2'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert_eq!(
+                app.scenes.current().name(),
+                "second",
+                "Ctrl+Shift+2 selected too"
+            );
+            // A chord learnt over the key takes it back: the press now
+            // comments the line instead of selecting a score.
+            let chord =
+                crate::keybinds::KeyCombo::parse("ctrl+shift+1").expect("a parseable chord");
+            app.keybinds.learn(BindAction::ToggleComment, Some(chord));
+            press(
+                &mut app,
+                KeyCode::Char('1'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert_eq!(
+                app.scenes.current().name(),
+                "second",
+                "the learnt chord retired the strip digit"
+            );
+        }
+
+        /// The find bar keeps its digits: the chord waits until it is shut.
+        #[test]
+        fn the_find_bar_keeps_its_keys() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_two_scores(directory.path());
+            press(
+                &mut app,
+                KeyCode::Char('y'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert!(app.editor().find_open());
+            press(&mut app, KeyCode::Char('1'), KeyModifiers::ALT);
+            assert_eq!(
+                app.scenes.current().name(),
+                "second",
+                "the find bar had the keyboard"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('1'), KeyModifiers::ALT);
+            assert_eq!(app.scenes.current().name(), "first");
+        }
+
+        /// iTerm2 without the keyboard protocol sends a composed Option
+        /// digit as its character alone, the way a layout's own key sends
+        /// it, so the character types and the strip stays.
+        #[test]
+        fn iterm2s_composed_digit_types() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_two_scores(directory.path());
+            app.keybinds.set_reach(crate::keybinds::Reach {
+                enhanced: false,
+                terminal: "iTerm2".into(),
+            });
+            press(&mut app, KeyCode::Char('§'), KeyModifiers::NONE);
+            assert_eq!(app.scenes.current().name(), "second", "the strip moved");
+            assert!(
+                app.editor().source().contains('§'),
+                "the character typed: {:?}",
+                app.editor().source()
+            );
+        }
+
+        /// A terminal that carries the keyboard protocol reports the Alt
+        /// key itself, with the composition riding beside it. The exotic
+        /// composition gives up the chord, with no terminal table at all.
+        /// A plain ASCII one keeps typing, because on a Swedish layout
+        /// Option+2 is the one way to type @.
+        #[test]
+        fn a_protocols_composed_digit_recovers_the_chord() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_two_scores(directory.path());
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
+                text: "¡".into(),
+            })
+            .expect("composed digit");
+            assert_eq!(
+                app.scenes.current().name(),
+                "first",
+                "the protocol's Alt+1 reached the strip"
+            );
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+                text: "@".into(),
+            })
+            .expect("composed digit");
+            assert_eq!(
+                app.scenes.current().name(),
+                "first",
+                "the plain composition did not reach the strip"
+            );
+            assert!(
+                app.editor().source().contains('@'),
+                "the plain composition typed: {:?}",
+                app.editor().source()
+            );
         }
     }
 
@@ -3864,6 +4332,71 @@ mod tests {
                 assert_eq!(app.ui_settings.terminal_profile.as_deref(), Some("kitty"));
                 assert!(app.keybinds.prefs().is_empty());
             }
+        }
+
+        /// iTerm2 with Option as Normal composes Alt+O into `ø` and sends
+        /// no Alt bit. The composed character still reveals the set panel's
+        /// selected file, because the terminal profile recovers the letter.
+        /// A chord learnt over the action retires the letter again, and the
+        /// character then reaches no panel.
+        #[test]
+        fn an_iterm2_composed_option_o_still_reveals_the_set_panels_selection() {
+            // SAFETY: process-global environment, held only by this test
+            // while the studio suite runs one test at a time. The reveal
+            // must answer headless, or the press opens the runner's desktop.
+            unsafe { std::env::set_var(crate::reveal::HEADLESS_ENV, "1") };
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_for(directory.path(), "iTerm2", false);
+            action(&mut app, BindAction::SetPanel);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            assert!(app.set_prompt.is_none(), "{}", app.status);
+            app.status.clear();
+            app.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('ø'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert!(app.reveal_pending.is_some(), "{}", app.status);
+            assert!(app.status.starts_with("opening"), "{}", app.status);
+            // The letter retires with a learnt chord, so `ø` types again.
+            app.reveal_pending = None;
+            app.status.clear();
+            app.keybinds
+                .learn(BindAction::ShowFile, KeyCombo::parse("ctrl+f9"));
+            app.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('ø'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert!(app.reveal_pending.is_none(), "{}", app.status);
+            // SAFETY: give the environment back before other tests run.
+            unsafe { std::env::remove_var(crate::reveal::HEADLESS_ENV) };
+        }
+
+        /// A terminal that carries the keyboard protocol composes Alt+O
+        /// into `ø` as well, but reports the Alt bit beside it. The chord
+        /// still reveals the set panel's selected file, with no terminal
+        /// table behind it.
+        #[test]
+        fn a_protocols_composed_option_o_still_reveals_the_set_panels_selection() {
+            // SAFETY: process-global environment, held only by this test
+            // while the studio suite runs one test at a time.
+            unsafe { std::env::set_var(crate::reveal::HEADLESS_ENV, "1") };
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_for(directory.path(), "Ghostty", true);
+            action(&mut app, BindAction::SetPanel);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            assert!(app.set_prompt.is_none(), "{}", app.status);
+            app.status.clear();
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT),
+                text: "ø".into(),
+            })
+            .unwrap();
+            assert!(app.reveal_pending.is_some(), "{}", app.status);
+            assert!(app.status.starts_with("opening"), "{}", app.status);
+            // SAFETY: give the environment back before other tests run.
+            unsafe { std::env::remove_var(crate::reveal::HEADLESS_ENV) };
         }
     }
 }

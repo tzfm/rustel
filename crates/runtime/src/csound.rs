@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use rustel_audio::{InsertControls, InsertKey, InsertProvider};
 use rustel_csound::{Event, Instrument, Program};
 use rustel_jsruntime::CsoundSource;
-use rustel_voice::{CsoundRequest, SampleLookup, SampleResolution};
+use rustel_voice::{CsoundRequest, SampleLookup, SampleResolution, SpeechRequest};
 use serde_json::{Map, Value};
 
 use crate::score_import::{ImportRefusal, ScoreImportAccess};
@@ -447,27 +447,50 @@ impl State {
         self.program()
     }
 
+    /// The copy of the Csound program of `key` at `rate`. A copy that does
+    /// not start gives its error to [`Self::take_errors`].
+    fn instance(&self, key: InsertKey, rate: u32) -> Option<Box<dyn rustel_audio::OrbitInsert>> {
+        let program = self
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .revisions
+            .get(&key)
+            .cloned()?;
+        match program.instance(rate) {
+            Ok(instance) => Some(instance),
+            Err(message) => {
+                let mut store = self.0.lock().unwrap_or_else(|error| error.into_inner());
+                if store.errors.len() < 64 && !store.errors.contains(&message) {
+                    store.errors.push(message);
+                }
+                None
+            }
+        }
+    }
+
+    /// [`Self::provider`] for a render to a file: each plugin key goes to the
+    /// render provider of the plugin host, which waits for each build while
+    /// `stop` gives false. See [`crate::vst::render_provider`].
+    #[cfg(feature = "vst")]
+    pub(crate) fn render_provider(
+        &self,
+        stop: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Arc<InsertProvider> {
+        let (state, plugins) = (self.clone(), crate::vst::render_provider(stop));
+        Arc::new(move |key, rate, slot| {
+            if key.plugin == rustel_csound::PLUGIN_ID {
+                return state.instance(key, rate);
+            }
+            plugins.as_ref()?(key, rate, slot)
+        })
+    }
+
     pub(crate) fn provider(&self, wait: bool) -> Arc<InsertProvider> {
         let state = self.clone();
         Arc::new(move |key, rate, slot| {
             if key.plugin == rustel_csound::PLUGIN_ID {
-                let program = state
-                    .0
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .revisions
-                    .get(&key)
-                    .cloned()?;
-                return match program.instance(rate) {
-                    Ok(instance) => Some(instance),
-                    Err(message) => {
-                        let mut store = state.0.lock().unwrap_or_else(|error| error.into_inner());
-                        if store.errors.len() < 64 && !store.errors.contains(&message) {
-                            store.errors.push(message);
-                        }
-                        None
-                    }
-                };
+                return state.instance(key, rate);
             }
             #[cfg(feature = "vst")]
             {
@@ -501,6 +524,10 @@ impl SampleLookup for Lookup<'_> {
         request: &rustel_voice::PluginRequest<'_>,
     ) -> Result<Option<InsertControls>, String> {
         self.samples.insert(request)
+    }
+
+    fn insert_speech(&self, request: &SpeechRequest<'_>) -> Result<SampleResolution, String> {
+        self.samples.insert_speech(request)
     }
 
     fn csound(&self, request: &CsoundRequest<'_>) -> Result<InsertControls, String> {
@@ -537,6 +564,10 @@ impl SampleLookup for ValidationLookup<'_> {
         request: &rustel_voice::PluginRequest<'_>,
     ) -> Result<Option<InsertControls>, String> {
         self.0.insert(request)
+    }
+
+    fn insert_speech(&self, request: &SpeechRequest<'_>) -> Result<SampleResolution, String> {
+        self.0.insert_speech(request)
     }
 
     fn csound(&self, request: &CsoundRequest<'_>) -> Result<InsertControls, String> {
@@ -828,5 +859,50 @@ mod tests {
         assert!((event.p5 - 50.8).abs() < 0.0001);
         assert!(event.p6.contains("frequency/440.4"));
         assert!(!event.p6.contains("csoundm/"));
+    }
+
+    /// A lookup that only answers speech, to prove the wrappers hand a
+    /// speech request to the bank they wrap instead of answering it
+    /// themselves with the no-speech default.
+    struct SpeechSpy {
+        seen: std::cell::Cell<bool>,
+    }
+
+    impl SampleLookup for SpeechSpy {
+        fn resolve(&self, _s: &str, _n: f64, _midi: f64) -> SampleResolution {
+            SampleResolution::Unknown
+        }
+
+        fn insert_speech(&self, _request: &SpeechRequest<'_>) -> Result<SampleResolution, String> {
+            self.seen.set(true);
+            Ok(SampleResolution::Loading)
+        }
+    }
+
+    #[test]
+    fn wrapped_lookups_forward_speech_to_the_bank_they_wrap() {
+        let request = SpeechRequest {
+            text: "hello",
+            params: rustel_talkit::params::Params::default(),
+        };
+        let spy = SpeechSpy {
+            seen: std::cell::Cell::new(false),
+        };
+        assert!(matches!(
+            ValidationLookup(&spy).insert_speech(&request),
+            Ok(SampleResolution::Loading)
+        ));
+        assert!(spy.seen.get());
+        spy.seen.set(false);
+        let state = State::new(false);
+        let lookup = Lookup {
+            samples: &spy,
+            state: &state,
+        };
+        assert!(matches!(
+            lookup.insert_speech(&request),
+            Ok(SampleResolution::Loading)
+        ));
+        assert!(spy.seen.get());
     }
 }

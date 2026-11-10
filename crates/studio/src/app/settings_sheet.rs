@@ -245,6 +245,14 @@ impl App {
         // worker: the decoders and the fetcher that enforce it run on
         // loader threads with no engine in reach.
         rustel_audio::set_sample_pcm_ceiling(self.ui_settings.sample_ceiling.bytes());
+        let video_ceiling = rustel_runtime::video_file_ceiling();
+        if rustel_runtime::set_video_file_ceiling(self.ui_settings.video_ceiling.bytes())
+            != video_ceiling
+        {
+            // A clip the old ceiling refused is asked for again.
+            #[cfg(feature = "video")]
+            self.visual.forget_failed_videos();
+        }
         self.worker
             .master()
             .set_max_polyphony(self.ui_settings.max_polyphony);
@@ -610,6 +618,12 @@ impl App {
                 self.settings_sheet = Some(sheet);
                 self.status = "shortcut reset cancelled".into();
                 self.dirty_frame = true;
+            }
+            // With Vim list keys on, Ctrl+D and Ctrl+U page every list
+            // panel, the sheet too. The sheet pages itself rather than
+            // handing the chord back, so no spelling of it falls through.
+            if let Some(page) = self.list_navigation_alias(&event) {
+                return self.handle_settings_key(page.code, false, false);
             }
             // Settings is a modal sheet. A chord it does not implement is
             // still the sheet's: letting Ctrl+V, Ctrl+X or Ctrl+Z fall
@@ -1009,39 +1023,48 @@ impl App {
                 return true;
             }
             SettingsAction::RefreshSource(at) => self.refresh_sample_source(at),
-            SettingsAction::PermitRow(at) => {
-                let refused_origin = matches!(
-                    self.permission_rows().get(at),
-                    Some(PermissionRow::Origin { allowed: false, .. })
-                );
-                self.permit_row(at);
-                if refused_origin {
-                    // The origin moved up, to the end of the trusted ones.
-                    sheet.selected = self.prefs.import_origins.len().saturating_sub(1);
+            action @ (SettingsAction::PermitRow(at) | SettingsAction::ToggleRow(at)) => {
+                let row = self.permission_rows().into_iter().nth(at);
+                // The folder prompt opens over the page, as the import
+                // prompt does.
+                if let Some(PermissionRow::LocalFolder { fixed: false, .. }) = row {
+                    self.settings_sheet = Some(sheet);
+                    self.open_set_prompt(SetPrompt::LocalSampleFolder);
+                    #[cfg(feature = "hydra")]
+                    self.sync_settings_webcam_preview();
+                    return true;
                 }
-            }
-            SettingsAction::ToggleRow(at) => {
-                // The orchestra switch stays where it stands. Either way an
-                // origin moved: a permission taken back lands at the end of
-                // the refused ones, one given at the end of the trusted.
-                let (origin, refused) = match self.permission_rows().get(at) {
-                    Some(PermissionRow::Origin { allowed, .. }) => (true, !*allowed),
-                    _ => (false, false),
-                };
-                self.toggle_row(at);
-                if origin {
-                    sheet.selected = if refused {
-                        self.prefs.import_origins.len().saturating_sub(1)
-                    } else {
-                        (self.prefs.import_origins.len() + self.blocked_imports.len())
-                            .saturating_sub(1)
-                    };
+                if matches!(action, SettingsAction::PermitRow(_)) {
+                    self.permit_row(at);
+                } else {
+                    self.toggle_row(at);
+                }
+                // A switch stays where it stands. An origin moves: one given
+                // lands at the end of the trusted ones of its kind, one taken
+                // back at the end of the refused, and the selection follows.
+                if let Some(row) = row
+                    && let Some(now) = self
+                        .permission_rows()
+                        .iter()
+                        .position(|moved| moved.is_same_row(&row))
+                {
+                    sheet.selected = now;
                 }
             }
             SettingsAction::ForgetRow(at) => {
                 self.forget_row(at);
                 let rows = self.permission_row_count();
                 sheet.selected = at.min(rows.saturating_sub(1));
+            }
+            // The edit prompt opens over the page, as the folder prompt does.
+            SettingsAction::EditRow(at) => {
+                if self.edit_row(at).is_some() {
+                    self.settings_sheet = Some(sheet);
+                    self.open_set_prompt(SetPrompt::EditSource);
+                    #[cfg(feature = "hydra")]
+                    self.sync_settings_webcam_preview();
+                    return true;
+                }
             }
             // The prompt opens over the page, as the import prompt does.
             #[cfg(feature = "vst")]
@@ -1465,6 +1488,38 @@ mod tests {
         use crate::app::tests::support::*;
         use crate::app::*;
 
+        /// With Vim list keys on, Ctrl+D and Ctrl+U page the sheet as
+        /// PageDown and PageUp do.
+        #[test]
+        fn ctrl_d_and_ctrl_u_page_the_sheet_in_vim() {
+            use crate::settings::SettingsPage;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 30);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.toggle_settings_sheet();
+            app.settings_sheet
+                .as_mut()
+                .expect("sheet open")
+                .show_page(SettingsPage::Keybinds);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            let selected = |app: &App| app.settings_sheet.as_ref().expect("sheet open").selected;
+            let start = selected(&app);
+
+            press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+            let page = selected(&app);
+            assert!(page > start, "PageDown pages");
+            press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+            assert_eq!(selected(&app), start);
+
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert_eq!(selected(&app), page, "Ctrl+D paged as PageDown does");
+            press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+            assert_eq!(selected(&app), start, "Ctrl+U paged back up");
+            assert!(app.settings_sheet.is_some(), "the sheet stays open");
+        }
+
         #[test]
         fn the_visualizers_chord_toggles_the_inline_visualizers() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -1646,7 +1701,7 @@ mod tests {
         /// its Hydra siblings do: the switch is the consent, the theme has to
         /// be kept or on the picker, a draft being typed never acquires, and a
         /// score's own picture drawn over the theme's suppresses it.
-        #[cfg(feature = "hydra")]
+        #[cfg(all(feature = "hydra", feature = "themes"))]
         #[test]
         fn the_native_camera_theme_requests_capture_only_while_its_picture_is_visible() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -2068,7 +2123,7 @@ mod tests {
             // Down to the machine rows at the page's end, onto max
             // polyphony: past the set rows, the load mode and the output
             // buffer.
-            for _ in 0..14 {
+            for _ in 0..15 {
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE);
             }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
@@ -2090,8 +2145,8 @@ mod tests {
             let sheet = SettingsSheet::default();
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
-            // Down onto the load mode, the first machine row at the end.
-            for _ in 0..12 {
+            // Down onto the load mode, past the set rows.
+            for _ in 0..13 {
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE);
             }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
@@ -2100,6 +2155,43 @@ mod tests {
             assert_eq!(app.prefs.load_mode.as_deref(), Some("async"));
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
             assert_eq!(app.worker.master().load_mode(), LoadMode::Wait);
+        }
+
+        /// A chosen beat line is kept on its own, and claims none of the
+        /// opacities: the next theme still suggests those.
+        #[test]
+        fn choosing_a_beat_line_leaves_the_opacities_to_the_theme() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.prefs.follow_theme_opacity();
+            let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Appearance);
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            // Down onto the beat line, past the menu, header and footer rows.
+            for _ in 0..3 {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
+            let before = app.ui_settings.beat_line;
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            assert_ne!(
+                app.ui_settings.beat_line, before,
+                "the row is the beat line"
+            );
+            assert_eq!(
+                app.prefs.beat_line.as_deref(),
+                Some(app.ui_settings.beat_line.key())
+            );
+            assert_eq!(
+                (
+                    app.prefs.backdrop_opacity,
+                    app.prefs.interface_opacity,
+                    app.prefs.editor_opacity
+                ),
+                (None, None, None),
+                "the theme's suggested opacities were claimed"
+            );
         }
     }
 }

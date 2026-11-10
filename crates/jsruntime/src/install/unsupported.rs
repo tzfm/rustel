@@ -2,24 +2,31 @@ use super::*;
 use rquickjs::function::Rest;
 use rustel_core::reference::{ReferenceEntry, ReferenceParam};
 
+/// `H` in a build with no visuals, where it is a stub. A build with visuals
+/// documents `H` with the Hydra names, because it is written in Hydra code.
+#[cfg(not(feature = "hydra"))]
+pub(crate) const ABSENT_VISUALS_ENTRIES: &[ReferenceEntry] = &[ReferenceEntry {
+    name: "H",
+    synonyms: &[],
+    summary: "use a pattern as a Hydra parameter",
+    description: "This build has no visuals. H(pattern) is accepted and reads 0, so a score written for a build with visuals still plays.",
+    params: &[ReferenceParam {
+        name: "pattern",
+        r#type: "string | Pattern",
+        description: "the pattern that a build with visuals reads.",
+    }],
+    examples: &["await initHydra()\nshape(H(\"3 4 5 [6 7]*2\")).out(o0)"],
+    tags: &["rustel", "visuals", "hydra"],
+    no_autocomplete: false,
+    deprecated: false,
+    origin: "rustel",
+}];
+
+#[cfg(feature = "hydra")]
+pub(crate) const ABSENT_VISUALS_ENTRIES: &[ReferenceEntry] = &[];
+
 /// Reference entries for visual helpers and unsupported score calls.
 pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
-    ReferenceEntry {
-        name: "H",
-        synonyms: &[],
-        summary: "use a pattern as a Hydra parameter",
-        description: "Uses a pattern to supply a Hydra parameter at the current transport position. The pattern must be queryable without JavaScript: mini-notation, arithmetic and signals are supported; JavaScript callbacks are not.",
-        params: &[ReferenceParam {
-            name: "pattern",
-            r#type: "string | Pattern",
-            description: "the pattern to read, in mini-notation or already built.",
-        }],
-        examples: &["await initHydra()\nshape(H(\"3 4 5 [6 7]*2\")).out(o0)"],
-        tags: &["rustel", "visuals", "hydra"],
-        no_autocomplete: false,
-        deprecated: false,
-        origin: "rustel",
-    },
     ReferenceEntry {
         name: "clearHydra",
         synonyms: &[],

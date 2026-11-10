@@ -19,7 +19,7 @@ use crate::scenes::SCENE_EXTENSION;
 
 /// How often a watched file is stat-ed. Ten checks a second costs
 /// microseconds of work, and a read happens only when the stamp moves.
-const POLL: Duration = Duration::from_millis(100);
+pub(super) const POLL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileStamp {
@@ -41,10 +41,24 @@ pub(super) struct ExternalWatch {
     /// The mode these files were gathered for. A switch starts over, so
     /// entering eval mode baselines the whole set instead of playing it.
     mode: ExternalChanges,
+    /// The set folder these files were gathered from. Another set starts
+    /// over the same way: its scores are a baseline, not saves.
+    directory: PathBuf,
     files: HashMap<PathBuf, WatchedFile>,
     /// The first poll after the mode turns on only records what is there.
     /// Otherwise every score in the set would open and play at once.
     started: bool,
+}
+
+/// Why one open scene's file did or did not reload.
+enum ReloadOutcome {
+    /// The file's text was adopted into the editor.
+    Adopted,
+    /// The file holds what the editor already saved, or could not be read.
+    Refused,
+    /// A save of the studio's own is still in flight; try again once it
+    /// lands.
+    SavePending,
 }
 
 impl App {
@@ -66,9 +80,11 @@ impl App {
         self.external_watch_checked_at = now;
 
         let paths = self.watched_paths(mode);
+        let directory = self.scenes.directory();
         let watch = self.external_watch.get_or_insert_default();
-        if watch.mode != mode {
+        if watch.mode != mode || watch.directory != directory {
             watch.mode = mode;
+            watch.directory = directory.to_path_buf();
             watch.files.clear();
             watch.started = false;
         }
@@ -110,6 +126,29 @@ impl App {
         settled.sort_by_key(|(_, modified)| *modified);
         for (path, _) in settled {
             self.apply_watched_change(&path, now);
+        }
+    }
+
+    /// Take a file as the watch's baseline, so a write of the studio's own
+    /// is not read back as another program's save. A file with a tab has
+    /// its saved text to tell. An import, and the file of a tab that
+    /// closes after its saves, have no tab to tell it.
+    pub(super) fn note_own_write(&mut self, path: &Path) {
+        let Some(watch) = self.external_watch.as_mut() else {
+            return;
+        };
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let stamp = FileStamp {
+                modified: metadata.modified().ok(),
+                len: metadata.len(),
+            };
+            watch.files.insert(
+                path.to_path_buf(),
+                WatchedFile {
+                    stamp,
+                    settling: false,
+                },
+            );
         }
     }
 
@@ -164,9 +203,27 @@ impl App {
             // Read and adopt before selecting, so a save of our own never
             // steals a tab back from the one the reader is on.
             Some(id) => {
-                if !self.reload_open_scene(id, path) {
-                    self.dirty_frame = true;
-                    return;
+                match self.reload_open_scene(id, path) {
+                    ReloadOutcome::Adopted => {}
+                    ReloadOutcome::SavePending => {
+                        // The stamp was already advanced, so nothing would
+                        // trigger a re-read once the save lands. Keep the
+                        // file settling: the next polls retry, and an
+                        // external edit that landed under the pending save
+                        // is still adopted instead of being overwritten by
+                        // the next studio save.
+                        if let Some(watch) = self.external_watch.as_mut()
+                            && let Some(file) = watch.files.get_mut(path)
+                        {
+                            file.settling = true;
+                        }
+                        self.dirty_frame = true;
+                        return;
+                    }
+                    ReloadOutcome::Refused => {
+                        self.dirty_frame = true;
+                        return;
+                    }
                 }
                 if mode == ExternalChanges::SyncAndEvaluate
                     && let Some(index) = self.scenes.index_of(id)
@@ -199,28 +256,35 @@ impl App {
         };
         let name = self.scenes.current().name();
         self.note_external_change(scene_id, now);
+        // The file changed on disk, so its row's fields and saved time did
+        // too. Keep the selection the reader has, not the file that moved.
+        let keep = self.set_panel_selection();
+        self.refresh_set_panel(keep);
         self.set_notice(format!("reloaded {name} from disk"));
         if mode == ExternalChanges::SyncAndEvaluate {
             self.apply_external_change();
         }
     }
 
-    /// Read one open scene's file into its editor. Answers whether the
-    /// text changed.
-    fn reload_open_scene(&mut self, scene_id: SceneId, path: &Path) -> bool {
+    /// Read one open scene's file into the editor.
+    fn reload_open_scene(&mut self, scene_id: SceneId, path: &Path) -> ReloadOutcome {
         let Ok(source) = bounded_file::read_to_string(path, MAX_DOCUMENT_BYTES) else {
-            return false;
+            return ReloadOutcome::Refused;
         };
         let Some(scene) = self.scenes.get_mut(scene_id) else {
-            return false;
+            return ReloadOutcome::Refused;
         };
         // A save of our own is not an external change. The file may hold
         // text older than the caret, and adopting it would drop what was
         // typed after the save was queued.
-        if scene.latest_save.is_some() || source_revision(&source) == scene.saved_source_revision {
-            return false;
+        if scene.latest_save.is_some() {
+            return ReloadOutcome::SavePending;
         }
-        scene.adopt_source(&source)
+        if source_revision(&source) == scene.saved_source_revision {
+            return ReloadOutcome::Refused;
+        }
+        scene.adopt_source(&source);
+        ReloadOutcome::Adopted
     }
 
     /// What an edit made outside the studio owes the studio.

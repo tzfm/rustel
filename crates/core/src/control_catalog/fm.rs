@@ -7,7 +7,7 @@ pub(super) const FMH: ControlRow = ControlRow {
         name: "fmh",
         synonyms: &[],
         summary: "FM operator 1 harmonicity ratio.",
-        description: "Defaults to 1. For an oscillator operator, 2 doubles its frequency, while non-integer ratios create inharmonic sidebands. For a noise operator, harmonicity scales the outgoing modulation depth without changing the noise playback pitch. fmh2 through fmh8 address the other operators. Requires a nonzero FM route involving operator 1 and a connected path to the carrier; fmi (alias fm) supplies the direct route. The FM matrix affects basic oscillators, supersaw, pulse, and bytebeat. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, live input, and buses ignore it.",
+        description: "Defaults to 1. For an oscillator operator, 2 doubles its frequency, while non-integer ratios create inharmonic sidebands. For a noise operator, harmonicity scales the outgoing modulation depth without changing the noise playback pitch. fmh2 through fmh8 address the other operators. Requires a nonzero FM route involving operator 1 and a connected path to the carrier; fmi (alias fm) supplies the direct route. The FM matrix affects basic oscillators, supersaw, pulse, bytebeat, and the live input, where it bends the playback rate of the incoming signal. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, and buses ignore it.",
         params: &[
             ReferenceParam {
                 name: "harmonicity",
@@ -207,7 +207,7 @@ pub(super) const FMI: ControlRow = ControlRow {
         name: "fmi",
         synonyms: &["fm", "fm1", "fmi1", "fmh1"],
         summary: "Modulation index from FM operator 1 into the carrier.",
-        description: "The unitless index sets brightness: the frequency deviation scales with carrier frequency and operator harmonicity. Absent or 0 makes no connection. fmi2/fm2 sends operator 2 into operator 1, continuing up to operator 8; a missing link breaks the chain. Matrix routes such as fmi20 send an operator directly to another target (0 is the carrier). At most 16 nonzero routes are accepted. The FM matrix affects basic oscillators, supersaw, pulse, and bytebeat. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, live input, and buses ignore it.",
+        description: "The unitless index sets brightness: the frequency deviation scales with carrier frequency and operator harmonicity. Absent or 0 makes no connection. fmi2/fm2 sends operator 2 into operator 1, continuing up to operator 8; a missing link breaks the chain. Matrix routes such as fmi20 send an operator directly to another target (0 is the carrier). At most 16 nonzero routes are accepted. The FM matrix affects basic oscillators, supersaw, pulse, bytebeat, and the live input, where it bends the playback rate of the incoming signal. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, and buses ignore it.",
         params: &[
             ReferenceParam {
                 name: "brightness",
@@ -408,7 +408,7 @@ pub(super) const FMENV: ControlRow = ControlRow {
         name: "fmenv",
         synonyms: &["fme", "fme1", "fmenv1"],
         summary: "Curve of FM operator 1’s depth envelope.",
-        description: "Defaults to exponential. lin or linear selects a linear curve; other strings keep exponential. The curve only matters after fmattack, fmdecay, fmsustain, or fmrelease creates a depth envelope; fmenv alone leaves the depth flat. Numbered forms select operators 2 through 8. Requires a nonzero FM route involving operator 1 and a connected path to the carrier; fmi (alias fm) supplies the direct route. The FM matrix affects basic oscillators, supersaw, pulse, and bytebeat. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, live input, and buses ignore it.",
+        description: "Defaults to exponential. lin or linear selects a linear curve; other strings keep exponential. The curve only matters after fmattack, fmdecay, fmsustain, or fmrelease creates a depth envelope; fmenv alone leaves the depth flat. Numbered forms select operators 2 through 8. Requires a nonzero FM route involving operator 1 and a connected path to the carrier; fmi (alias fm) supplies the direct route. The FM matrix affects basic oscillators, supersaw, pulse, bytebeat, and the live input, where it bends the playback rate of the incoming signal. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, and buses ignore it.",
         params: &[
             ReferenceParam {
                 name: "type",
@@ -608,7 +608,7 @@ pub(super) const FMATTACK: ControlRow = ControlRow {
         name: "fmattack",
         synonyms: &["fmatt", "fmatt1", "fmattack1"],
         summary: "FM operator 1 depth attack, in seconds.",
-        description: "Time for modulation depth to rise to its peak. Naming any fmattack, fmdecay, fmsustain, or fmrelease creates operator 1’s depth envelope; with none present the depth stays flat. Omitted attack/decay default to 0.001 s and release to 0.01 s. Omitted sustain is 0.001 when decay is set, otherwise 1. Attack/decay floor at 0.001 s, release at 0.01 s, and sustain caps at 1. Numbered forms select operators 2 through 8. Requires a nonzero FM route involving operator 1 and a connected path to the carrier; fmi (alias fm) supplies the direct route. The FM matrix affects basic oscillators, supersaw, pulse, and bytebeat. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, live input, and buses ignore it.",
+        description: "Time for modulation depth to rise to its peak. Naming any fmattack, fmdecay, fmsustain, or fmrelease creates operator 1’s depth envelope; with none present the depth stays flat. Omitted attack/decay default to 0.001 s and release to 0.01 s. Omitted sustain is 0.001 when decay is set, otherwise 1. Attack/decay floor at 0.001 s, release at 0.01 s, and sustain caps at 1. Numbered forms select operators 2 through 8. Requires a nonzero FM route involving operator 1 and a connected path to the carrier; fmi (alias fm) supplies the direct route. The FM matrix affects basic oscillators, supersaw, pulse, bytebeat, and the live input, where it bends the playback rate of the incoming signal. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, and buses ignore it.",
         params: &[
             ReferenceParam {
                 name: "time",
@@ -808,7 +808,7 @@ pub(super) const FMWAVE: ControlRow = ControlRow {
         name: "fmwave",
         synonyms: &["fmwave1"],
         summary: "Waveform of FM operator 1.",
-        description: "Defaults to sine. Accepts sine, triangle/tri, square, sawtooth/saw, white, pink, brown, or crackle; unknown names reject an active operator. A noise operator uses a looping buffer with no pitched oscillator, and incoming FM routes do not modulate it. Numbered forms select operators 2 through 8. Requires a nonzero FM route involving operator 1 and a connected path to the carrier; fmi (alias fm) supplies the direct route. The FM matrix affects basic oscillators, supersaw, pulse, and bytebeat. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, live input, and buses ignore it.",
+        description: "Defaults to sine. Accepts sine, triangle/tri, square, sawtooth/saw, white, pink, brown, or crackle; unknown names reject an active operator. A noise operator uses a looping buffer with no pitched oscillator, and incoming FM routes do not modulate it. Numbered forms select operators 2 through 8. Requires a nonzero FM route involving operator 1 and a connected path to the carrier; fmi (alias fm) supplies the direct route. The FM matrix affects basic oscillators, supersaw, pulse, bytebeat, and the live input, where it bends the playback rate of the incoming signal. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, and buses ignore it.",
         params: &[
             ReferenceParam {
                 name: "wave",
@@ -1009,7 +1009,7 @@ pub(super) const FMDECAY: ControlRow = ControlRow {
         name: "fmdecay",
         synonyms: &["fmdec", "fmdec1", "fmdecay1"],
         summary: "FM operator 1 depth decay, in seconds.",
-        description: "Time for modulation depth to fall from its peak to sustain. Naming any fmattack, fmdecay, fmsustain, or fmrelease creates operator 1’s depth envelope; with none present the depth stays flat. Omitted attack/decay default to 0.001 s and release to 0.01 s. Omitted sustain is 0.001 when decay is set, otherwise 1. Attack/decay floor at 0.001 s, release at 0.01 s, and sustain caps at 1. Numbered forms select operators 2 through 8. Requires a nonzero FM route involving operator 1 and a connected path to the carrier; fmi (alias fm) supplies the direct route. The FM matrix affects basic oscillators, supersaw, pulse, and bytebeat. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, live input, and buses ignore it.",
+        description: "Time for modulation depth to fall from its peak to sustain. Naming any fmattack, fmdecay, fmsustain, or fmrelease creates operator 1’s depth envelope; with none present the depth stays flat. Omitted attack/decay default to 0.001 s and release to 0.01 s. Omitted sustain is 0.001 when decay is set, otherwise 1. Attack/decay floor at 0.001 s, release at 0.01 s, and sustain caps at 1. Numbered forms select operators 2 through 8. Requires a nonzero FM route involving operator 1 and a connected path to the carrier; fmi (alias fm) supplies the direct route. The FM matrix affects basic oscillators, supersaw, pulse, bytebeat, and the live input, where it bends the playback rate of the incoming signal. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, and buses ignore it.",
         params: &[
             ReferenceParam {
                 name: "time",
@@ -1209,7 +1209,7 @@ pub(super) const FMSUSTAIN: ControlRow = ControlRow {
         name: "fmsustain",
         synonyms: &["fmsus", "fmsus1", "fmsustain1"],
         summary: "FM operator 1 sustain depth as a fraction of its peak.",
-        description: "A unitless sustain multiplier, normally 0..1. Naming any fmattack, fmdecay, fmsustain, or fmrelease creates operator 1’s depth envelope; with none present the depth stays flat. Omitted attack/decay default to 0.001 s and release to 0.01 s. Omitted sustain is 0.001 when decay is set, otherwise 1. Attack/decay floor at 0.001 s, release at 0.01 s, and sustain caps at 1. Numbered forms select operators 2 through 8. Requires a nonzero FM route involving operator 1 and a connected path to the carrier; fmi (alias fm) supplies the direct route. The FM matrix affects basic oscillators, supersaw, pulse, and bytebeat. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, live input, and buses ignore it.",
+        description: "A unitless sustain multiplier, normally 0..1. Naming any fmattack, fmdecay, fmsustain, or fmrelease creates operator 1’s depth envelope; with none present the depth stays flat. Omitted attack/decay default to 0.001 s and release to 0.01 s. Omitted sustain is 0.001 when decay is set, otherwise 1. Attack/decay floor at 0.001 s, release at 0.01 s, and sustain caps at 1. Numbered forms select operators 2 through 8. Requires a nonzero FM route involving operator 1 and a connected path to the carrier; fmi (alias fm) supplies the direct route. The FM matrix affects basic oscillators, supersaw, pulse, bytebeat, and the live input, where it bends the playback rate of the incoming signal. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, and buses ignore it.",
         params: &[
             ReferenceParam {
                 name: "level",
@@ -1409,7 +1409,7 @@ pub(super) const FMRELEASE: ControlRow = ControlRow {
         name: "fmrelease",
         synonyms: &["fmrel", "fmrel1", "fmrelease1"],
         summary: "FM operator 1 depth release, in seconds.",
-        description: "Time for modulation depth to fall after the note ends. Naming any fmattack, fmdecay, fmsustain, or fmrelease creates operator 1’s depth envelope; with none present the depth stays flat. Omitted attack/decay default to 0.001 s and release to 0.01 s. Omitted sustain is 0.001 when decay is set, otherwise 1. Attack/decay floor at 0.001 s, release at 0.01 s, and sustain caps at 1. Numbered forms select operators 2 through 8. Requires a nonzero FM route involving operator 1 and a connected path to the carrier; fmi (alias fm) supplies the direct route. The FM matrix affects basic oscillators, supersaw, pulse, and bytebeat. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, live input, and buses ignore it.",
+        description: "Time for modulation depth to fall after the note ends. Naming any fmattack, fmdecay, fmsustain, or fmrelease creates operator 1’s depth envelope; with none present the depth stays flat. Omitted attack/decay default to 0.001 s and release to 0.01 s. Omitted sustain is 0.001 when decay is set, otherwise 1. Attack/decay floor at 0.001 s, release at 0.01 s, and sustain caps at 1. Numbered forms select operators 2 through 8. Requires a nonzero FM route involving operator 1 and a connected path to the carrier; fmi (alias fm) supplies the direct route. The FM matrix affects basic oscillators, supersaw, pulse, bytebeat, and the live input, where it bends the playback rate of the incoming signal. Recorded samples, `gm_*` soundfonts, `wt_*` wavetables, ZZFX, sbd, standalone noise, and buses ignore it.",
         params: &[
             ReferenceParam {
                 name: "time",

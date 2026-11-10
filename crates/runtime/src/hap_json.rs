@@ -76,7 +76,7 @@ impl HapJson {
             whole: hap.whole.map(SpanJson::from_span),
             part: SpanJson::from_span(hap.part),
             value: ValueJson::from_value(&hap.value),
-            context: hap.context.clone(),
+            context: hap.context.to_vec(),
             has_onset: hap.has_onset(),
             show: hap.show(),
         }
@@ -102,7 +102,7 @@ pub struct QueryReport {
 pub struct OnsetEventJson {
     /// Private direct-control provenance; never part of query/report JSON.
     #[serde(skip)]
-    pub live_controls: [u64; 3],
+    pub live_controls: [u64; 4],
     pub onset_id: u64,
     pub generation: u64,
     /// The begin of the onset's whole as `n/d`. The audio path reads the
@@ -188,13 +188,24 @@ pub struct RenderReport {
     pub failed_save: Option<String>,
     pub onset_count: usize,
     /// Each distinct refusal of a note the render dropped: a sound it could
-    /// not find or load, or a control the engine refuses. The file is
-    /// silent where those notes are. The diagnostic policy still reports
-    /// each one as a `voice-refused` diagnostic. [`Self::failure`] leaves
-    /// them out: a Studio export fails on them, and `rustel export` lists
-    /// them and succeeds.
+    /// not find or load, a control the engine refuses, a plugin that did
+    /// not load or start, a plugin copy with no number in its output for
+    /// 1 s of play, or a note a plugin copy lost. The file is silent where
+    /// those notes are. A note of a plugin that did not start plays with no
+    /// plugin, and a copy with no number plays silence to the end of the
+    /// render. The diagnostic policy still reports each one as a
+    /// `voice-refused` diagnostic.
+    /// [`Self::failure`] leaves them out: a Studio export fails on them, and
+    /// `rustel export` lists them and succeeds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub voices_refused: Vec<String>,
+    /// The plugin lines of the render that refuse no note: a plugin chain
+    /// with more latency than the render compensates, whose lane plays the
+    /// rest late, and the counts of a plugin copy: a sample of its output
+    /// that was no number and played as silence, a block the plugin refused
+    /// with such a sample, and a value lost to too many values at one time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugin_lines: Vec<String>,
 }
 
 impl RenderReport {

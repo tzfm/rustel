@@ -76,40 +76,27 @@ impl VimMappings {
     }
 
     fn parse_text(text: &str, defaults: bool) -> Result<Self, String> {
-        let mut maps = ModeMaps::default();
+        let mut mappings = Self::default();
         if defaults {
             // gd is Vim's go-to-definition. Docs answers here while Vim
             // owns Ctrl+D. The shipped defaults may replace it, and a vimrc
             // line replaces both.
-            maps.normal.push(("gd".into(), "<Action:docs>".into()));
+            parse_map_line("nnoremap gd <Action:docs>", &mut mappings)?;
             for (number, line) in DEFAULT_VIMRC.lines().enumerate() {
-                parse_map_line(line, &mut maps)
+                parse_map_line(line, &mut mappings)
                     .map_err(|error| format!("default vimrc line {}: {error}", number + 1))?;
             }
         }
+        // An editor can save the file with a byte order mark.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         for (number, line) in text.lines().enumerate() {
-            parse_map_line(line, &mut maps)
+            parse_map_line(line, &mut mappings)
                 .map_err(|error| format!("line {}: {error}", number + 1))?;
         }
-        Ok(Self {
-            normal: parse_mode("normal", maps.normal)?,
-            insert: parse_mode("insert", maps.insert)?,
-            visual: parse_mode("visual", maps.visual)?,
-            operator_pending: parse_mode("operator_pending", maps.operator_pending)?,
-        })
+        Ok(mappings)
     }
-}
 
-#[derive(Default)]
-struct ModeMaps {
-    normal: Vec<(String, String)>,
-    insert: Vec<(String, String)>,
-    visual: Vec<(String, String)>,
-    operator_pending: Vec<(String, String)>,
-}
-
-impl ModeMaps {
-    fn for_mode(&mut self, mode: VimMappingMode) -> &mut Vec<(String, String)> {
+    fn for_mode_mut(&mut self, mode: VimMappingMode) -> &mut Vec<VimMapping> {
         match mode {
             VimMappingMode::Normal => &mut self.normal,
             VimMappingMode::Insert => &mut self.insert,
@@ -122,7 +109,7 @@ impl ModeMaps {
 /// One Vimscript map line. Everything else in the file - settings, plugins,
 /// functions, comments - is skipped, so a real `.vimrc` or `init.vim` can be
 /// used as the mapping file.
-fn parse_map_line(line: &str, maps: &mut ModeMaps) -> Result<(), String> {
+fn parse_map_line(line: &str, mappings: &mut VimMappings) -> Result<(), String> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('"') {
         return Ok(());
@@ -143,16 +130,8 @@ fn parse_map_line(line: &str, maps: &mut ModeMaps) -> Result<(), String> {
         ],
         _ => return Ok(()),
     };
-    let mut rest = after;
-    let (lhs, after) = loop {
-        let Some((word, after)) = first_word(rest) else {
-            return Ok(());
-        };
-        if is_map_option(word) {
-            rest = after;
-            continue;
-        }
-        break (word, after);
+    let Some((lhs, after)) = first_word(without_map_options(after)) else {
+        return Ok(());
     };
     // Keep runs of spaces inside the replacement. The first run after the
     // left side only separates the two.
@@ -161,13 +140,11 @@ fn parse_map_line(line: &str, maps: &mut ModeMaps) -> Result<(), String> {
         return Ok(());
     }
     let lower = rhs.to_ascii_lowercase();
-    let plugin_command = ["<cmd>", "<plug>", "<sid>"]
+    // Studio does not run plugin calls.
+    if ["<cmd>", "<plug>", "<sid>"]
         .iter()
-        .any(|notation| lower.contains(notation));
-    let insert = modes.contains(&VimMappingMode::Insert);
-    // Studio does not run Ex commands or plugin calls. A Normal-mode RHS
-    // that starts with `:` is a command, not typed text.
-    if plugin_command || (rhs.starts_with(':') && !insert) {
+        .any(|notation| lower.contains(notation))
+    {
         return Ok(());
     }
     let Ok(keys) = parse_keys(lhs) else {
@@ -176,28 +153,107 @@ fn parse_map_line(line: &str, maps: &mut ModeMaps) -> Result<(), String> {
     if keys.is_empty() {
         return Ok(());
     }
-    if parse_replacement(rhs).is_err() {
+    let Ok(replacement) = parse_replacement(rhs) else {
+        return Ok(());
+    };
+    if reaches_the_command_line(modes.contains(&VimMappingMode::Insert), &replacement) {
         return Ok(());
     }
     for mode in modes {
-        let map = maps.for_mode(*mode);
-        if let Some(existing) = map.iter_mut().find(|(key, _)| key == lhs) {
-            existing.1 = rhs.to_owned();
+        let list = mappings.for_mode_mut(*mode);
+        // The last definition of the same keys wins, as in Vim, however
+        // they are spelt.
+        if let Some(existing) = list.iter_mut().find(|mapping| mapping.keys == keys) {
+            existing.replacement = replacement.clone();
         } else {
-            if map.len() >= 256 {
+            if list.len() >= 256 {
                 return Err(format!("{mode:?} has more than 256 mappings"));
             }
-            map.push((lhs.to_owned(), rhs.to_owned()));
+            list.push(VimMapping {
+                keys: keys.clone(),
+                replacement: replacement.clone(),
+            });
         }
     }
     Ok(())
 }
 
-fn is_map_option(word: &str) -> bool {
-    matches!(
-        word.to_ascii_lowercase().as_str(),
-        "<silent>" | "<nowait>" | "<buffer>" | "<unique>" | "<special>" | "<script>"
-    )
+const MAP_OPTIONS: [&str; 6] = [
+    "<silent>",
+    "<nowait>",
+    "<buffer>",
+    "<unique>",
+    "<special>",
+    "<script>",
+];
+
+/// The text after the map flags. Vim reads the flags with or without
+/// spaces between them, as in `<silent><Space>V`.
+fn without_map_options(mut text: &str) -> &str {
+    loop {
+        text = text.trim_start();
+        let Some(option) = MAP_OPTIONS.iter().find(|option| {
+            text.get(..option.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(option))
+        }) else {
+            return text;
+        };
+        text = &text[option.len()..];
+    }
+}
+
+/// Whether a replacement reaches Vim's command line, as an Ex command
+/// does, or asks for register entry with Ctrl+R. Studio runs neither, so
+/// the keys would land somewhere else.
+///
+/// A `:` opens the command line in Normal, Visual or a pending operator.
+/// A map starts there unless it is an Insert map, and Esc, Ctrl+[, Ctrl+C
+/// and Ctrl+O return there. The keys that start Insert or a search make
+/// the keys after them text, and `r`, `f` and `t` read the next key as a
+/// character.
+fn reaches_the_command_line(insert: bool, replacement: &[VimMappedKey]) -> bool {
+    #[derive(Clone, Copy)]
+    enum Typing {
+        Command,
+        Character,
+        Insert,
+        Search,
+    }
+    let mut typing = if insert {
+        Typing::Insert
+    } else {
+        Typing::Command
+    };
+    for step in replacement {
+        let VimMappedKey::Key(key) = step else {
+            continue;
+        };
+        let control = key.modifiers == KeyModifiers::CONTROL;
+        if key.code == KeyCode::Esc || control && matches!(key.code, KeyCode::Char('[' | 'c' | 'o'))
+        {
+            typing = Typing::Command;
+            continue;
+        }
+        if control && key.code == KeyCode::Char('r') {
+            if matches!(typing, Typing::Insert | Typing::Search) {
+                return true;
+            }
+            continue;
+        }
+        typing = match (typing, key.code) {
+            (Typing::Character, _) | (Typing::Search, KeyCode::Enter) => Typing::Command,
+            (typing, _) if !key.modifiers.is_empty() => typing,
+            (Typing::Command, KeyCode::Char(':')) => return true,
+            (Typing::Command, KeyCode::Char('/' | '?')) => Typing::Search,
+            (
+                Typing::Command,
+                KeyCode::Char('i' | 'a' | 'I' | 'A' | 'o' | 'O' | 's' | 'S' | 'c' | 'C' | 'R'),
+            ) => Typing::Insert,
+            (Typing::Command, KeyCode::Char('r' | 'f' | 't' | 'F' | 'T')) => Typing::Character,
+            (typing, _) => typing,
+        };
+    }
+    false
 }
 
 /// The first word, and the rest of the line after it.
@@ -258,28 +314,6 @@ fn action_token(text: &str) -> Result<Option<(usize, usize)>, String> {
         return Err("unclosed action notation, use <Action:name>".into());
     };
     Ok(Some((start, start + offset)))
-}
-
-fn parse_mode(mode: &str, entries: Vec<(String, String)>) -> Result<Vec<VimMapping>, String> {
-    if entries.len() > 256 {
-        return Err(format!("{mode} has more than 256 mappings"));
-    }
-    let mut mappings: Vec<VimMapping> = Vec::with_capacity(entries.len());
-    for (keys, replacement) in entries {
-        let keys = parse_keys(&keys).map_err(|error| format!("{mode}: {error}"))?;
-        if keys.is_empty() {
-            return Err(format!("{mode}: a mapping needs an input key"));
-        }
-        let replacement =
-            parse_replacement(&replacement).map_err(|error| format!("{mode}: {error}"))?;
-        if let Some(existing) = mappings.iter_mut().find(|mapping| mapping.keys == keys) {
-            // The last definition of a key wins, as in Vim.
-            existing.replacement = replacement;
-        } else {
-            mappings.push(VimMapping { keys, replacement });
-        }
-    }
-    Ok(mappings)
 }
 
 fn parse_keys(text: &str) -> Result<Vec<KeyEvent>, String> {
@@ -550,8 +584,11 @@ impl VimConfig {
         };
         // Stat first. The text is read only when the file actually changed,
         // so an idle studio does not read the mapping file twice a second.
+        // A file that failed to read is read again: a permission fix does
+        // not change its stamp.
         let stamp = file_stamp(path);
-        if self.stamp == Some(stamp) {
+        let failed = matches!(self.observed, Some(Snapshot::Error(_)));
+        if self.stamp == Some(stamp) && !failed {
             // The file is unchanged. A read taken on the last change may
             // have settled by now.
             if let Some((pending, since)) = &self.pending
@@ -605,6 +642,14 @@ impl VimConfig {
                 changed
             }
             Err(error) => {
+                let mut changed = false;
+                if !self.has_valid {
+                    // A file Studio cannot use still leaves the shipped
+                    // mappings, as a missing file does.
+                    let shipped = VimMappings::parse_with_defaults("").unwrap_or_default();
+                    changed = *self.mappings != shipped;
+                    self.mappings = Arc::new(shipped);
+                }
                 let fallback = if self.has_valid {
                     "previous bindings kept"
                 } else {
@@ -613,7 +658,7 @@ impl VimConfig {
                 let message = format!("Vim mappings: {error} · {fallback}");
                 self.error = Some(message.clone());
                 self.notice = Some(message);
-                false
+                changed
             }
         }
     }
@@ -846,6 +891,171 @@ mod tests {
                 KeyCode::Char('['),
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT
             )
+        );
+    }
+
+    fn replacement_of(
+        mappings: &VimMappings,
+        mode: VimMappingMode,
+        keys: &str,
+    ) -> Option<Vec<VimMappedKey>> {
+        let wanted = parse_keys(keys).expect("keys");
+        mappings
+            .for_mode(mode)
+            .iter()
+            .find(|mapping| mapping.keys == wanted)
+            .map(|mapping| mapping.replacement.clone())
+    }
+
+    /// A replacement that reaches the command line or asks for register
+    /// entry runs nothing Studio supports, so the line is skipped. A
+    /// search and a typed colon still map.
+    #[test]
+    fn a_command_or_register_entry_inside_a_replacement_skips_the_line() {
+        let mappings = VimMappings::parse(
+            "inoremap <C-s> <Esc>:w<CR>\n\
+             inoremap <C-q> <C-o>:w<CR>\n\
+             inoremap <C-x> <C-[>:w<CR>\n\
+             inoremap <C-y> <C-c>:w<CR>\n\
+             inoremap <F2> <C-r>=strftime('%c')<CR>\n\
+             nnoremap <F3> A;<Esc>:w<CR>\n\
+             vnoremap <F4> y:echo<CR>\n\
+             inoremap ,, a:b\n\
+             nnoremap J /\\$<CR>\n\
+             nnoremap ,c a:<Esc>\n\
+             nnoremap ,r r:\n\
+             nnoremap ,u <C-r>\n",
+        )
+        .expect("mappings");
+        for (mode, keys) in [
+            (VimMappingMode::Insert, "<C-s>"),
+            (VimMappingMode::Insert, "<C-q>"),
+            (VimMappingMode::Insert, "<C-x>"),
+            (VimMappingMode::Insert, "<C-y>"),
+            (VimMappingMode::Insert, "<F2>"),
+            (VimMappingMode::Normal, "<F3>"),
+            (VimMappingMode::Visual, "<F4>"),
+        ] {
+            assert_eq!(
+                replacement_of(&mappings, mode, keys),
+                None,
+                "{keys} is skipped"
+            );
+        }
+        for (mode, keys) in [
+            (VimMappingMode::Insert, ",,"),
+            (VimMappingMode::Normal, "J"),
+            (VimMappingMode::Normal, ",c"),
+            (VimMappingMode::Normal, ",r"),
+            (VimMappingMode::Normal, ",u"),
+        ] {
+            assert!(
+                replacement_of(&mappings, mode, keys).is_some(),
+                "{keys} maps"
+            );
+        }
+    }
+
+    /// Two spellings of the same keys are one mapping, and the last
+    /// definition wins, as in Vim.
+    #[test]
+    fn the_last_definition_of_the_same_keys_wins_across_spellings() {
+        let mappings = VimMappings::parse_with_defaults(
+            "nnoremap <space>V <Action:mixer>\nnnoremap <Space>V <Action:log>\n",
+        )
+        .expect("mappings");
+        assert_eq!(
+            replacement_of(&mappings, VimMappingMode::Normal, "<Space>V"),
+            Some(vec![VimMappedKey::Action(BindAction::Log)])
+        );
+        let mappings =
+            VimMappings::parse("nnoremap X a\nnnoremap <S-x> b\nnnoremap X c\n").expect("mappings");
+        assert_eq!(
+            replacement_of(&mappings, VimMappingMode::Normal, "X"),
+            Some(vec![VimMappedKey::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::NONE
+            ))])
+        );
+    }
+
+    /// Vim reads map flags written together, with no space before the keys.
+    #[test]
+    fn flags_written_together_are_read_before_the_keys() {
+        let mappings = VimMappings::parse(
+            "nnoremap <silent><Space>V <Action:mixer>\n\
+             nnoremap <silent><nowait> Q <Action:stop>\n",
+        )
+        .expect("mappings");
+        assert_eq!(
+            replacement_of(&mappings, VimMappingMode::Normal, "<Space>V"),
+            Some(vec![VimMappedKey::Action(BindAction::Mixer)])
+        );
+        assert_eq!(
+            replacement_of(&mappings, VimMappingMode::Normal, "Q"),
+            Some(vec![VimMappedKey::Action(BindAction::Stop)])
+        );
+    }
+
+    /// A file saved with a UTF-8 byte order mark keeps its first line.
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_first_map() {
+        let mappings = VimMappings::parse("\u{feff}nnoremap Q <Action:stop>\n").expect("mappings");
+        assert_eq!(
+            replacement_of(&mappings, VimMappingMode::Normal, "Q"),
+            Some(vec![VimMappedKey::Action(BindAction::Stop)])
+        );
+    }
+
+    /// A vimrc Studio cannot read reports why, and the shipped mappings
+    /// stay, as they do for a missing file.
+    #[test]
+    fn an_unreadable_vimrc_keeps_the_shipped_mappings() {
+        let directory = tempfile::tempdir().expect("temporary folder");
+        let shipped = VimMappings::parse_with_defaults("").expect("defaults");
+        for (name, bytes) in [
+            ("latin1", b"\" caf\xe9\nnnoremap Q dd\n".to_vec()),
+            ("large", vec![b'"'; MAX_CONFIG_BYTES as usize + 1]),
+        ] {
+            let path = directory.path().join(name);
+            fs::write(&path, bytes).expect("vimrc");
+            let mut config = VimConfig::default();
+            config.configure(true, path.to_str(), Instant::now());
+            assert!(config.error().is_some(), "{name}: the error is reported");
+            assert_eq!(
+                *config.mappings(),
+                shipped,
+                "{name}: the shipped layer stays"
+            );
+        }
+    }
+
+    /// A file that failed to read is read again, so fixing its permissions
+    /// loads it without an edit.
+    #[cfg(unix)]
+    #[test]
+    fn a_vimrc_made_readable_again_loads_without_an_edit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary folder");
+        let path = directory.path().join("vimrc");
+        fs::write(&path, "nnoremap Q dd\n").expect("vimrc");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("lock the file");
+        if fs::read(&path).is_ok() {
+            // A superuser reads the file anyway, so there is nothing to fix.
+            return;
+        }
+        let mut config = VimConfig::default();
+        let now = Instant::now();
+        config.configure(true, path.to_str(), now);
+        assert!(config.error().is_some(), "the locked file is an error");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("unlock the file");
+        config.poll(now + POLL_INTERVAL);
+        config.poll(now + POLL_INTERVAL * 2);
+        assert_eq!(config.error(), None, "the file is read again");
+        assert_eq!(
+            *config.mappings(),
+            VimMappings::parse_with_defaults("nnoremap Q dd\n").expect("mappings")
         );
     }
 

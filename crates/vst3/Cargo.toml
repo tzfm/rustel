@@ -34,3 +34,6 @@ libc = "0.2"
 name = "main_thread"
 path = "tests/main_thread.rs"
 harness = false
+
+[lints]
+workspace = true

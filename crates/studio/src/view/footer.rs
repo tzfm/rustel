@@ -316,7 +316,7 @@ impl Widget for Footer<'_, '_> {
         );
         let warning = self.chrome.audio_warning.map(|message| {
             if UnicodeWidthStr::width(message) > usize::from(area.width.saturating_sub(2)) {
-                "Try raising latency: Settings → Advanced"
+                "Try raising latency: Settings → General"
             } else {
                 message
             }
@@ -993,7 +993,7 @@ mod tests {
         let mut chrome = chrome(&theme, &master, Path::new("live.strudel"));
         chrome.status = "ready";
         chrome.audio_warning =
-            Some("Audio struggling · try raising audio out latency in Settings → Advanced");
+            Some("Audio struggling · try raising audio out latency in Settings → General");
         chrome.device = Some("Speakers");
         for width in [80, 100] {
             let area = Rect::new(0, 0, width, 3);
@@ -1018,7 +1018,7 @@ mod tests {
         let area = Rect::new(0, 0, 50, 3);
         let mut buffer = Buffer::empty(area);
         Footer { chrome: &chrome }.render(area, &mut buffer);
-        assert!(text_of(&buffer).contains("Try raising latency: Settings → Advanced"));
+        assert!(text_of(&buffer).contains("Try raising latency: Settings → General"));
     }
 
     #[test]
@@ -1030,7 +1030,7 @@ mod tests {
         chrome.error = Some("the query exceeded its 249 ms deadline and was refused");
         chrome.status = "the producer fell behind the audio clock; resumed at the present";
         chrome.audio_warning =
-            Some("Audio struggling · try raising audio out latency in Settings → Advanced");
+            Some("Audio struggling · try raising audio out latency in Settings → General");
         chrome.device = Some("Speakers");
         for width in [50, 100] {
             let regions = regions_with_footer(
@@ -1063,7 +1063,7 @@ mod tests {
             assert_eq!(buffer.cell((1, 0)).unwrap().fg, theme.error);
             assert!(row(1).contains("raising"), "warning row: {}", row(1));
             assert!(
-                row(1).contains("Settings → Advanced"),
+                row(1).contains("Settings → General"),
                 "warning row: {}",
                 row(1)
             );
@@ -1088,7 +1088,7 @@ mod tests {
         chrome.piano_notes = Some("Notes  C4 + E4 + G4");
         chrome.device = Some("Speakers");
         chrome.audio_warning =
-            Some("Audio struggling · try raising audio out latency in Settings → Advanced");
+            Some("Audio struggling · try raising audio out latency in Settings → General");
         let row = |buffer: &Buffer, y| {
             (0..100)
                 .map(|x| buffer.cell((x, y)).unwrap().symbol())
@@ -1162,7 +1162,7 @@ mod tests {
         let mut chrome = chrome(&theme, &master, Path::new("live.strudel"));
         chrome.status = "ready";
         chrome.audio_warning =
-            Some("Audio struggling · try raising audio out latency in Settings → Advanced");
+            Some("Audio struggling · try raising audio out latency in Settings → General");
         for (width, hint) in [(100, "Audio struggling"), (50, "Try raising latency")] {
             for height in [1, 2] {
                 let area = Rect::new(0, 0, width, height);
