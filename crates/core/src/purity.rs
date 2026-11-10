@@ -41,6 +41,11 @@ pub struct Purity {
     /// function, so nothing reached through a volatile graph is ever cached.
     /// Monotonic like `impure`: wrapping never removes it.
     pub volatile: bool,
+    /// True when the graph reads the default voicing dictionary. While the
+    /// selected default is a JavaScript object, the host refreshes that
+    /// dictionary in place, so the graph is volatile exactly then. See
+    /// [`crate::Pattern::is_cacheable`]. Monotonic like `volatile`.
+    pub host_voicings: bool,
 }
 
 impl Purity {
@@ -50,6 +55,7 @@ impl Purity {
             reachable: Vec::new(),
             opaque: false,
             volatile: false,
+            host_voicings: false,
         }
     }
 
@@ -61,6 +67,7 @@ impl Purity {
             reachable: vec![id],
             opaque: false,
             volatile: true,
+            host_voicings: false,
         }
     }
 
@@ -73,6 +80,7 @@ impl Purity {
             reachable: Vec::new(),
             opaque: false,
             volatile: true,
+            host_voicings: false,
         }
     }
 
@@ -88,6 +96,7 @@ impl Purity {
             reachable: Vec::new(),
             opaque: true,
             volatile: true,
+            host_voicings: false,
         }
     }
 
@@ -98,6 +107,7 @@ impl Purity {
             out.impure |= p.impure;
             out.opaque |= p.opaque;
             out.volatile |= p.volatile;
+            out.host_voicings |= p.host_voicings;
             out.reachable.extend(p.reachable);
         }
         out.reachable.sort_unstable();
@@ -111,6 +121,7 @@ impl Purity {
             out.impure |= p.impure;
             out.opaque |= p.opaque;
             out.volatile |= p.volatile;
+            out.host_voicings |= p.host_voicings;
             out.reachable.extend_from_slice(&p.reachable);
         }
         out.reachable.sort_unstable();
@@ -146,6 +157,20 @@ impl PurePattern {
              was broken inside rustel-core"
         );
         PurePattern(p)
+    }
+
+    /// What a callback host built for a compiled callback in a pure graph
+    /// after the program stopped standing for it.
+    ///
+    /// The graph was pure when it was built and stays classified pure. The
+    /// runtime that issued the program queries every graph that can reach a
+    /// stale program through its host while the program is alive, so the
+    /// script graph is queried with a host installed. The handle keeps the
+    /// callbacks it reaches and is volatile, so no memo or table keeps it.
+    pub(crate) fn host_built(pattern: crate::Pattern) -> Self {
+        let mut pattern = pattern.mark_volatile();
+        pattern.purity.impure = false;
+        PurePattern(pattern)
     }
 }
 

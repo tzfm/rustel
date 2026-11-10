@@ -60,55 +60,102 @@ pub(super) fn bridge_callable<'js>(
     Ok((id, Sidecar::one(id, cell)))
 }
 
-/// Bridge a `Pattern -> Pattern` callable and attach a proven native candidate
+/// Bridge a `Pattern -> Pattern` callable and attach a proven native program
 /// when its captured source is one of the closed callback-IR shapes.
 ///
 /// The JavaScript function is bridged first and remains owned by the returned
 /// sidecar in every case. Source inspection is an optional optimisation: any
-/// extraction, parse, or IR-construction failure takes the complete QuickJS
-/// path with the exact same callback id.
+/// extraction, parse, proof or IR-construction failure takes the complete
+/// QuickJS path with the exact same callback id.
 pub(super) fn bridge_pattern_callable<'js>(
     ctx: &Ctx<'js>,
     function: Function<'js>,
 ) -> rquickjs::Result<(rustel_core::value::FunctionRef, Sidecar<'js>)> {
     let (id, sidecar) = bridge_callable(ctx, function.clone())?;
-    let fallback = || rustel_core::value::FunctionRef::js(id);
+    let function = compiled_pattern_callable(ctx, id, function)
+        .unwrap_or_else(|| rustel_core::value::FunctionRef::js(id));
+    Ok((function, sidecar))
+}
 
-    let source = host_stack(ctx).and_then(|stack| {
-        let source: Function = stack.as_object().get(CALLBACK_SOURCE)?;
-        let mut args = rquickjs::function::Args::new_unsized(ctx.clone());
-        args.this(function.into_value())?;
-        args.apply::<String>(&source)
-    });
-    let Ok(source) = source else {
-        return Ok((fallback(), sidecar));
-    };
-    let cache = host_pattern_transform_ir_cache(ctx).ok();
-    let cached = cache.as_ref().and_then(|cache| cache.borrow().get(&source));
-    let candidate = if let Some(candidate) = cached {
-        candidate
-    } else {
-        let Ok(candidate) = rustel_transpiler::lower_pattern_transform_callback(&source) else {
-            return Ok((fallback(), sidecar));
-        };
-        if let Some(cache) = &cache {
-            cache.borrow_mut().insert(&source, candidate);
-        }
-        candidate
-    };
+/// The representation of a bridged callback with a native program, or `None`
+/// for an ordinary QuickJS callback.
+///
+/// | candidate | Auto | Compatibility | DualRun |
+/// |---|---|---|---|
+/// | identity | lowered | checked | checked |
+/// | chain the gate admits | lowered | ordinary | checked |
+/// | any other | ordinary | ordinary | ordinary |
+///
+/// A lowered callback has a pure view that runs its program. A checked one
+/// stays impure, and the host runs its program, its callback or both.
+fn compiled_pattern_callable<'js>(
+    ctx: &Ctx<'js>,
+    id: CallbackId,
+    function: Function<'js>,
+) -> Option<rustel_core::value::FunctionRef> {
+    use rustel_core::callback_ir::PatternTransformProgram;
+    use rustel_core::value::FunctionRef;
 
-    let program = match candidate {
+    let state = host_callback_ir(ctx).ok()?;
+    let source = host_stack(ctx)
+        .and_then(|stack| {
+            let source: Function = stack.as_object().get(CALLBACK_SOURCE)?;
+            let mut args = rquickjs::function::Args::new_unsized(ctx.clone());
+            args.this(function.into_value())?;
+            args.apply::<String>(&source)
+        })
+        .ok()?;
+    let candidate = recognise_pattern_callable(&state, &source).ok()?;
+    let mode = state.mode.get();
+    let function = match &*candidate {
         rustel_transpiler::PatternTransformCandidate::Identity => {
-            rustel_core::callback_ir::PatternTransformProgram::new([])
+            let program = PatternTransformProgram::new([]).ok()?;
+            if mode == PatternTransformIrMode::Auto {
+                FunctionRef::lowered_js(id, program)
+            } else {
+                FunctionRef::js_pattern_ir(id, program)
+            }
+        }
+        rustel_transpiler::PatternTransformCandidate::MethodChain(calls) => {
+            // A closed gate admits no chain, so nothing is compiled for it.
+            if mode == PatternTransformIrMode::Compatibility
+                || !state.gate.borrow().admits(&LoweringDependencies::default())
+            {
+                return None;
+            }
+            let lowered = lower_method_chain(ctx, calls).ok()?;
+            let program = {
+                let mut gate = state.gate.borrow_mut();
+                if !gate.admits(&lowered.dependencies) {
+                    return None;
+                }
+                let standings =
+                    gate.issue(&lowered.dependencies, mode == PatternTransformIrMode::Auto);
+                lowered.program.with_standings(standings)
+            };
+            if mode == PatternTransformIrMode::Auto {
+                FunctionRef::lowered_js(id, program)
+            } else {
+                FunctionRef::js_pattern_ir(id, program)
+            }
         }
     };
-    let Ok(program) = program else {
-        return Ok((fallback(), sidecar));
-    };
-    Ok((
-        rustel_core::value::FunctionRef::js_pattern_ir(id, program),
-        sidecar,
-    ))
+    state.count(|stats| stats.lowered = stats.lowered.saturating_add(1));
+    Some(function)
+}
+
+/// Recognise one callback source, through the realm's cache.
+fn recognise_pattern_callable(state: &CallbackIr, source: &str) -> PatternTransformOutcome {
+    if let Some(outcome) = state.cache.borrow().get(source) {
+        return outcome;
+    }
+    let outcome = rustel_transpiler::lower_pattern_transform_callback(source).map(Rc::new);
+    // A source past the recogniser's bound is refused before parsing, so
+    // keeping it would only evict others.
+    if source.len() <= rustel_transpiler::MAX_CALLBACK_IR_SOURCE_BYTES {
+        state.cache.borrow_mut().insert(source, outcome.clone());
+    }
+    outcome
 }
 
 pub(super) fn bridge_js_value<'js>(
@@ -610,11 +657,13 @@ pub(super) fn callback_argument<'js>(
     )
 }
 
+mod lowering;
 mod polymeter;
 mod reify;
 mod stepalt;
 mod stepwise;
 
+pub(crate) use lowering::*;
 pub(crate) use polymeter::*;
 pub(crate) use reify::*;
 pub(crate) use stepalt::*;

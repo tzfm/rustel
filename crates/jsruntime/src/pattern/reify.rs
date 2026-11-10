@@ -503,16 +503,24 @@ fn combinator_reference_within(
         .iter()
         .map(|value| reify_native_reference_arg(value, remaining))
         .collect::<Option<Vec<Pattern>>>()?;
-    // Provably pure only when the body is native AND the bound arguments are
-    // pure; otherwise the transformer is applied through the conservative path.
-    let provable_pure = matches!(
-        registration.func,
-        rustel_core::register::CombinatorFn::Native(_)
-    ) && args.iter().all(Pattern::is_pure);
-    let bound_args = args;
-    Some(rustel_core::value::FunctionRef::registered(
-        &name,
-        std::sync::Arc::new(move |pattern| registration.call(&bound_args, pattern)),
+    Some(bound_registered_transformer(&name, registration, args))
+}
+
+/// A registered combinator with its leading arguments bound, as `fast(2)` or
+/// a compiled `x => x.fast(2)` applies it.
+///
+/// The transformer is provably pure exactly when the registration keeps a
+/// pure operand pure with these arguments. Otherwise it is applied through
+/// the conservative path.
+pub(crate) fn bound_registered_transformer(
+    name: &str,
+    registration: rustel_core::register::Registration,
+    args: Vec<Pattern>,
+) -> rustel_core::value::FunctionRef {
+    let provable_pure = registration.preserves_purity_with(&args);
+    rustel_core::value::FunctionRef::registered(
+        name,
+        std::sync::Arc::new(move |pattern| registration.call(&args, pattern)),
         provable_pure,
-    ))
+    )
 }

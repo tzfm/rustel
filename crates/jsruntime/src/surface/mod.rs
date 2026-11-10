@@ -103,9 +103,6 @@ pub(super) fn sequence_args_bridged<'js>(
     ctx: &Ctx<'js>,
     args: &[rquickjs::Value<'js>],
 ) -> rquickjs::Result<(Pattern, Vec<Sidecar<'js>>)> {
-    if args.is_empty() {
-        return Ok((rustel_core::silence(), Vec::new()));
-    }
     let mut patterns = Vec::with_capacity(args.len());
     let mut sidecars = Vec::new();
     for arg in args {
@@ -113,12 +110,84 @@ pub(super) fn sequence_args_bridged<'js>(
         patterns.push(pattern);
         sidecars.extend(nested);
     }
-    let pattern = if patterns.len() == 1 {
-        patterns.pop().expect("one sequence argument")
+    Ok((sequence_patterns(patterns), sidecars))
+}
+
+/// `sequence(...patterns)` of already reified patterns: silence for none,
+/// the one pattern itself, or one cycle of all of them.
+pub(crate) fn sequence_patterns(mut patterns: Vec<Pattern>) -> Pattern {
+    match patterns.len() {
+        0 => rustel_core::silence(),
+        1 => patterns.pop().expect("one sequence argument"),
+        _ => rustel_core::fastcat(patterns),
+    }
+}
+
+/// Registered methods whose method body takes a route of its own: device
+/// and orchestra routes, scale arrays, and indexed transformers. A callback
+/// is never compiled against them.
+pub(crate) const SPECIAL_REGISTERED_METHODS: &[&str] = &[
+    "midi", "serial", "osc", "csound", "xen", "echoWith", "echowith", "stutWith", "stutwith",
+];
+
+/// Whether a registered method with `expected` inputs takes its `given`
+/// arguments as one sequence: `.fast(2, 4)` is `.fast(sequence(2, 4))`.
+pub(crate) fn sequences_registered_arguments(expected: usize, given: usize) -> bool {
+    expected == 1 && given != 1
+}
+
+/// The leading patterns a registered method hands its registration, or
+/// `None` where the method throws for the number of arguments.
+pub(crate) fn registered_method_arguments(
+    registration: &rustel_core::register::Registration,
+    given: Vec<Pattern>,
+) -> Option<Vec<Pattern>> {
+    let expected = registration.arity.saturating_sub(1);
+    if sequences_registered_arguments(expected, given.len()) {
+        // A sequence of nothing is silence, so the method refuses it.
+        (!given.is_empty()).then(|| vec![sequence_patterns(given)])
     } else {
-        rustel_core::fastcat(patterns)
-    };
-    Ok((pattern, sidecars))
+        (given.len() == expected).then_some(given)
+    }
+}
+
+/// How a control method reads its arguments.
+#[derive(Clone)]
+pub(crate) enum ControlArguments<T> {
+    /// A compound control's names, one argument each: `limit(-6, "hard")`.
+    Positional(Vec<T>),
+    /// One value for the control, or none to name the receiver's values.
+    Single(Option<T>),
+}
+
+/// Split a control method's arguments as the method reads them. Reading
+/// stops at the first undefined argument, and a leading undefined argument
+/// is no value.
+pub(crate) fn control_arguments<T>(
+    spec: &rustel_core::controls::ControlSpec,
+    given: Vec<T>,
+    is_undefined: impl Fn(&T) -> bool,
+) -> ControlArguments<T> {
+    let mut given = given.into_iter();
+    let first = given.next().filter(|value| !is_undefined(value));
+    let rest: Vec<T> = given.take_while(|value| !is_undefined(value)).collect();
+    if !rest.is_empty() && spec.names.len() > 1 {
+        ControlArguments::Positional(first.into_iter().chain(rest).collect())
+    } else {
+        ControlArguments::Single(first)
+    }
+}
+
+/// What a control method builds from its reified arguments.
+pub(crate) fn apply_control_method(
+    spec: &rustel_core::controls::ControlSpec,
+    receiver: &Pattern,
+    arguments: ControlArguments<Pattern>,
+) -> Pattern {
+    match arguments {
+        ControlArguments::Positional(parts) => spec.apply_positional(receiver, &parts),
+        ControlArguments::Single(value) => spec.apply(receiver, value),
+    }
 }
 
 /// Refuse JavaScript callbacks at a registered combinator boundary unless the
@@ -391,9 +460,15 @@ pub(super) fn install_composer<'js>(
         )
         .map_err(|e| e.to_string())?;
     define
-        .call::<_, ()>((proto.clone(), op.name(), getter))
+        .call::<_, ()>((proto.clone(), op.name(), getter.clone()))
         .map_err(|e: rquickjs::Error| e.to_string())?;
-    Ok(())
+    record_builtin_method(
+        ctx,
+        op.name(),
+        getter.into_value(),
+        BuiltinMethod::Composer(op),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Install one registered combinator as both a prototype method and a free
@@ -409,6 +484,12 @@ pub(super) fn install_combinator<'js>(
     let indexed_transformer = matches!(name, "echoWith" | "echowith" | "stutWith" | "stutwith");
     let method_name: std::sync::Arc<str> = std::sync::Arc::from(name);
     let method_registration = registration.clone();
+    let compilable = !SPECIAL_REGISTERED_METHODS.contains(&name)
+        && matches!(
+            registration.func,
+            rustel_core::register::CombinatorFn::Native(_)
+        );
+    let builtin = compilable.then(|| BuiltinMethod::Registered(Box::new(registration.clone())));
     let method_indexed_transformer = indexed_transformer;
     let method = Function::new(
         ctx.clone(),
@@ -482,7 +563,7 @@ pub(super) fn install_combinator<'js>(
             reject_unexpected_registered_functions(
                 &ctx,
                 method_name.as_ref(),
-                method_registration.takes_function,
+                method_registration.takes_function(),
                 &args.0,
             )?;
             if method_name.as_ref() == "xen"
@@ -499,7 +580,7 @@ pub(super) fn install_combinator<'js>(
                 // selects its default. Sequencing zero arguments creates silence,
                 // then silently filter it out.
                 reify_registered_args(&ctx, &args.0, method_indexed_transformer)?
-            } else if expected == 1 && args.0.len() != 1 {
+            } else if sequences_registered_arguments(expected, args.0.len()) {
                 // Several arguments to a one-input method are a sequence:
                 // `.fast(2, 4)` is `.fast("2 4")`. No arguments is not: a
                 // sequence of nothing is silence, and silence through the
@@ -537,7 +618,11 @@ pub(super) fn install_combinator<'js>(
         }),
     )
     .map_err(|e| e.to_string())?;
-    proto.set(name, method).map_err(|e| e.to_string())?;
+    proto.set(name, method.clone()).map_err(|e| e.to_string())?;
+    if let Some(builtin) = builtin {
+        record_builtin_method(ctx, name, method.into_value(), builtin)
+            .map_err(|error| error.to_string())?;
+    }
 
     // MIDI output is a custom prototype method, not a registered
     // free export. Exposing a generated `midi(...)` bypassed the raw-port
@@ -607,11 +692,13 @@ pub(super) fn install_combinator<'js>(
 }
 
 mod array_guard;
+mod builtin_methods;
 pub(crate) mod effects;
 mod patterns;
 mod setup;
 
 pub(crate) use array_guard::*;
+pub(crate) use builtin_methods::*;
 pub(crate) use effects::*;
 pub(crate) use patterns::*;
 pub(crate) use setup::*;

@@ -349,6 +349,12 @@ impl<'js> JsClass<'js> for NativeSetStringParser<'js> {
         let parser = params
             .arg(0)
             .unwrap_or_else(|| common::undefined(params.ctx()));
+        // A compiled callback must not stand for a string argument that the
+        // parser now reads. Teardown severs the parser after the host roots
+        // are gone, and nothing is compiled then.
+        if let Ok(state) = host_callback_ir(params.ctx()) {
+            state.gate.borrow_mut().close_raw_strings();
+        }
         state.borrow_mut().string_parser = parser.clone();
         Ok(parser)
     }
@@ -971,6 +977,10 @@ fn register_one<'js>(
         return Ok(result.into_value());
     }
     let name = common::property_name(ctx, name)?;
+    // A compiled callback must not stand for a method this call replaces.
+    if let Ok(state) = host_callback_ir(ctx) {
+        state.gate.borrow_mut().close_method(&name);
+    }
     let publish = mode == RegistrationMode::Public;
     let install_method = mode != RegistrationMode::RawOnly;
     let publish_raw = publish || mode != RegistrationMode::Public;

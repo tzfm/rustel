@@ -250,40 +250,48 @@ impl CallbackHost for JsRuntime {
         program: &rustel_core::callback_ir::PatternTransformProgram,
         pattern: Pattern,
     ) -> Result<Pattern, String> {
-        let mode = self.pattern_transform_ir_mode.get();
-        let mut stats = self.pattern_transform_ir_stats.get();
-        stats.calls = stats.calls.saturating_add(1);
-        match mode {
-            PatternTransformIrMode::Auto => {
-                stats.native_executions = stats.native_executions.saturating_add(1);
-            }
-            PatternTransformIrMode::Compatibility => {
-                stats.compatibility_executions = stats.compatibility_executions.saturating_add(1);
-            }
-            PatternTransformIrMode::DualRun => {
-                stats.native_executions = stats.native_executions.saturating_add(1);
-                stats.compatibility_executions = stats.compatibility_executions.saturating_add(1);
-                stats.dual_runs = stats.dual_runs.saturating_add(1);
-            }
-        }
+        let state = &self.callback_ir;
+        let mode = state.mode.get();
+        // A stale program no longer stands for its callback. The graph that
+        // reached this host still owns the callback, which runs.
+        let current = program.is_current();
         // Publish before a compatibility call can re-enter this runtime and
         // update the same counters. Holding a stale snapshot across QuickJS
         // would overwrite nested callback evidence on return.
-        self.pattern_transform_ir_stats.set(stats);
+        state.count(|stats| {
+            stats.calls = stats.calls.saturating_add(1);
+            match mode {
+                PatternTransformIrMode::Auto if current => {
+                    stats.native_executions = stats.native_executions.saturating_add(1);
+                }
+                PatternTransformIrMode::DualRun if current => {
+                    stats.native_executions = stats.native_executions.saturating_add(1);
+                    stats.compatibility_executions =
+                        stats.compatibility_executions.saturating_add(1);
+                    stats.dual_runs = stats.dual_runs.saturating_add(1);
+                }
+                PatternTransformIrMode::Auto
+                | PatternTransformIrMode::Compatibility
+                | PatternTransformIrMode::DualRun => {
+                    stats.compatibility_executions =
+                        stats.compatibility_executions.saturating_add(1);
+                    if !current {
+                        stats.stale = stats.stale.saturating_add(1);
+                    }
+                }
+            }
+        });
 
         match mode {
-            PatternTransformIrMode::Auto => Ok(program.apply(pattern)),
-            PatternTransformIrMode::Compatibility => self.call_pattern_compatibility(id, pattern),
-            PatternTransformIrMode::DualRun => {
+            PatternTransformIrMode::Auto if current => Ok(program.apply(pattern)),
+            PatternTransformIrMode::DualRun if current => {
                 let candidate = program.apply(pattern.clone());
                 match self.call_pattern_compatibility(id, pattern) {
-                    Ok(compatibility) if candidate.same_graph_handle(&compatibility) => {
+                    Ok(compatibility) if candidate.same_construction(&compatibility) => {
                         Ok(compatibility)
                     }
                     Ok(_) => {
-                        let mut stats = self.pattern_transform_ir_stats.get();
-                        stats.mismatches = stats.mismatches.saturating_add(1);
-                        self.pattern_transform_ir_stats.set(stats);
+                        state.count(|stats| stats.mismatches = stats.mismatches.saturating_add(1));
                         Err(format!(
                             "pattern callback IR {id} disagreed with its JavaScript fallback"
                         ))
@@ -291,6 +299,9 @@ impl CallbackHost for JsRuntime {
                     Err(error) => Err(error),
                 }
             }
+            PatternTransformIrMode::Auto
+            | PatternTransformIrMode::Compatibility
+            | PatternTransformIrMode::DualRun => self.call_pattern_compatibility(id, pattern),
         }
     }
 

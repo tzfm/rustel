@@ -31,6 +31,7 @@ impl JsRuntime {
         let hydra_chains = Rc::new(RefCell::new(crate::install::HydraChains::default()));
         let effect_policy_refusal = Rc::new(RefCell::new(None));
         let effect_policy_owner_depth = Rc::new(Cell::new(0));
+        let callback_ir = Rc::new(CallbackIr::new());
         ctx.with(|ctx| -> rquickjs::Result<()> {
             let held = rquickjs::Array::new(ctx.clone())?;
             held.as_object().set_prototype(None)?;
@@ -74,9 +75,8 @@ impl JsRuntime {
                 slider_sets,
                 voicing_sets,
                 protected_globals: Rc::new(RefCell::new(BTreeSet::new())),
-                pattern_transform_ir_cache: Rc::new(RefCell::new(
-                    PatternTransformIrCache::default(),
-                )),
+                callback_ir: callback_ir.clone(),
+                builtin_methods: Rc::new(RefCell::new(BuiltinMethods::default())),
                 effects: EffectBoundaryState {
                     policy: effect_policy.clone(),
                     refusal: effect_policy_refusal.clone(),
@@ -145,8 +145,7 @@ impl JsRuntime {
             effect_policy,
             hap_budget: Cell::new(rustel_core::DEFAULT_HAP_BUDGET),
             query_threw: RefCell::new(None),
-            pattern_transform_ir_mode: Cell::new(PatternTransformIrMode::Auto),
-            pattern_transform_ir_stats: Cell::new(PatternTransformIrStats::default()),
+            callback_ir,
             heap: budget,
             deadline,
             interrupted,
@@ -178,25 +177,28 @@ impl JsRuntime {
     }
 
     /// Select callback-IR execution policy for tests and same-machine A/B.
+    /// Callbacks bridged before the change keep the representation they were
+    /// bridged with. See [`PatternTransformIrMode`].
     #[doc(hidden)]
     pub fn set_pattern_transform_ir_mode(&self, mode: PatternTransformIrMode) {
-        self.pattern_transform_ir_mode.set(mode);
+        self.callback_ir.mode.set(mode);
     }
 
     #[doc(hidden)]
     pub fn pattern_transform_ir_mode(&self) -> PatternTransformIrMode {
-        self.pattern_transform_ir_mode.get()
+        self.callback_ir.mode.get()
     }
 
     /// Snapshot bounded producer-side callback-IR counters.
     #[doc(hidden)]
     pub fn pattern_transform_ir_stats(&self) -> PatternTransformIrStats {
-        self.pattern_transform_ir_stats.get()
+        self.callback_ir.stats.get()
     }
 
     #[doc(hidden)]
     pub fn reset_pattern_transform_ir_stats(&self) {
-        self.pattern_transform_ir_stats
+        self.callback_ir
+            .stats
             .set(PatternTransformIrStats::default());
     }
 
@@ -468,11 +470,13 @@ impl JsRuntime {
         let effect_policy_owner = EffectPolicyOwner::enter(self);
         let _effect_transaction =
             EffectTransactionOwner::enter(self, EffectPolicy::NONE).map_err(|e| e.to_string())?;
+        self.record_surface_writes(&rustel_transpiler::surface_writes(src));
         let result = with_ctx(self, |ctx| {
             ctx.eval::<rquickjs::Value, _>(src)
                 .map(|_| ())
                 .map_err(|error| describe_js_error(&ctx, error))
         });
+        self.check_lowered_surface();
         let policy = effect_policy_owner.policy();
         match (result, policy) {
             (_, Some(policy)) => Err(policy),
@@ -1075,13 +1079,16 @@ impl JsRuntime {
     }
 
     /// Whether the active graph needs [`JsRuntime::with_active_scope`] to be
-    /// queried - i.e. it is not classified pure.
+    /// queried: it is not classified pure, or a pure graph can reach a
+    /// compiled callback that no longer stands for its JavaScript. See
+    /// [`JsRuntime::compiled_callbacks_need_host`].
     pub fn active_needs_host(&self) -> bool {
         let _settings = self.core_settings.bind();
         rustel_core::voicings::selected_default_voicings_is_host_owned()
             || self
                 .active_pattern_unwrapped()
                 .is_some_and(|pattern| !pattern.is_pure())
+            || self.compiled_callbacks_need_host()
     }
 
     pub(super) fn sync_host_voicing_default(&self) -> Result<(), QueryError> {
@@ -1449,8 +1456,9 @@ impl JsRuntime {
                 // reject `s("bd").every("<2 3>", rev)`, which is native
                 // throughout. Query classified-pure graphs on the fast path,
                 // and give the rest a host so a callback that did appear would
-                // resolve rather than panic.
-                if pattern.is_pure() {
+                // resolve rather than panic. A pure graph that can reach a
+                // stale compiled callback is one of the rest.
+                if pattern.is_pure() && !self.compiled_callbacks_need_host() {
                     // Typed: a refused query must not reach the caller as an
                     // empty result. See `Pattern::try_query_arc_sorted`.
                     // Pure graphs can still report contained semantic errors

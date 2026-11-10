@@ -179,6 +179,7 @@ impl JsRuntime {
                     .join("\n"),
             ));
         }
+        self.record_surface_writes(&output.surface_writes);
 
         let wrapped = format!(
             "(async function () {{\n\"use strict\";\n{}\n}}).call(globalThis);",
@@ -362,6 +363,7 @@ impl JsRuntime {
                 })
             })
         });
+        self.check_lowered_surface();
         let policy = effect_policy_owner.policy();
         match evaluation {
             // Resource ownership stays dominant when more than one refusal
@@ -1247,6 +1249,7 @@ impl JsRuntime {
         let output = self
             .transpile_score(source, options)
             .map_err(QueryError::Message)?;
+        self.record_surface_writes(&output.surface_writes);
 
         struct CancellationGuard<'a> {
             slot: std::rc::Rc<Cell<Option<*const std::sync::atomic::AtomicBool>>>,
@@ -1311,6 +1314,7 @@ impl JsRuntime {
                 }
             })
         });
+        self.check_lowered_surface();
         if let Err(error) = evaluation {
             self.discard_slider_candidate();
             self.discard_voicing_candidate();
@@ -1343,6 +1347,7 @@ impl JsRuntime {
         let _effect_transaction =
             EffectTransactionOwner::enter(self, EffectPolicy::NONE).map_err(|e| e.to_string())?;
         let output = self.transpile_score(source, options)?;
+        self.record_surface_writes(&output.surface_writes);
         self.begin_slider_candidate()?;
         if let Err(error) = self.begin_voicing_candidate() {
             self.discard_slider_candidate();
@@ -1353,6 +1358,7 @@ impl JsRuntime {
             let _published_owner = self.core_settings.bind();
             self.execute_score(&output.output, &output.line_map, false)
         });
+        self.check_lowered_surface();
         let evaluated = evaluated.map_err(|error| error.to_string());
         let policy = effect_policy_owner.policy();
         match (evaluated, policy) {

@@ -141,6 +141,9 @@ impl JsRuntime {
             install_midimap_surface(&ctx)?;
             registration_seal.finish(&surface.proto)?;
             repl::install_clear_scope(&ctx)?;
+            // Last: every layer that can replace a built-in method has run.
+            seal_builtin_methods(&ctx, &surface.proto, &surface.globals)
+                .map_err(|error| error.to_string())?;
             Ok(())
         })
     }

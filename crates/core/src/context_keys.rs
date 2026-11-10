@@ -17,10 +17,10 @@ later version.
 use crate::Value;
 use std::sync::Arc;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ContextKeys(Option<Arc<Keys>>);
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Keys {
     /// `hap.context.scale`: set by `.scale()`, read by `.scaleTranspose()`.
     pub(crate) scale: Option<Arc<str>>,

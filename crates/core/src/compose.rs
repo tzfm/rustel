@@ -337,27 +337,46 @@ fn as_object(v: &Value) -> OrderedMap {
 /// addition is **dropped** rather than creating a stray `value` key; the
 /// example snapshots depend on it.
 fn union_with_obj(op: ComposeOp, a: &OrderedMap, b: &OrderedMap) -> Value {
-    if b.len() == 1
-        && b.get("value")
-            .is_some_and(|v| !matches!(v, Value::Undefined))
-    {
+    if union_drops(b) {
         return Value::Object(a.clone());
     }
-    // a's key order, then b's new keys; common keys replaced in place by
-    // the combined value.
     let mut out = a.clone();
-    for (key, b_value) in b {
-        match a.get(key) {
-            Some(a_value) => {
-                let combined = op.apply_scalar(a_value, b_value);
-                out.insert(key.clone(), combined);
-            }
-            None => {
-                out.insert(key.clone(), b_value.clone());
-            }
-        }
-    }
+    union_into(op, &mut out, b);
     Value::Object(out)
+}
+
+/// Whether a union with `b` keeps the other side unchanged: `b` is only
+/// `{value: …}`. See [`union_with_obj`].
+pub(crate) fn union_drops(b: &OrderedMap) -> bool {
+    b.len() == 1
+        && b.get("value")
+            .is_some_and(|v| !matches!(v, Value::Undefined))
+}
+
+/// `b`'s keys added to `out`: common keys replaced where they are by the
+/// combined value, then `b`'s new keys in `b`'s order.
+fn union_into(op: ComposeOp, out: &mut OrderedMap, b: &OrderedMap) {
+    out.reserve(b.len());
+    for (key, b_value) in b {
+        out.upsert(key, |a_value| match a_value {
+            Some(a_value) => op.apply_scalar(a_value, b_value),
+            None => b_value.clone(),
+        });
+    }
+}
+
+/// [`compose_op`] of two data values, which hold no script object, made
+/// where `a` is. A union of two maps adds `b`'s keys to `a`'s map, which it
+/// copies only when it is shared.
+pub(crate) fn compose_data_in_place(op: ComposeOp, a: &mut Value, b: &Value) {
+    debug_assert!(a.is_data(0) && b.is_data(0));
+    if let (Value::Object(map), Value::Object(other)) = (&mut *a, b)
+        && !union_drops(other)
+    {
+        union_into(op, map, other);
+        return;
+    }
+    *a = compose_op(op, a, b);
 }
 
 /// One cell of the generated matrix: `pat.<op>.<how>(other)`.
@@ -393,13 +412,20 @@ fn compose_inner<P: PatOps>(pat: &P, other: &P, op: ComposeOp, how: Alignment) -
         )
         .remove_undefineds()
     } else {
-        apply_alignment(
-            pat,
-            other,
-            how,
-            move |a, b| compose_op(op, a, b),
-            lookup_flow,
-        )
+        // A direct alignment names its op, so that a precomputed table can
+        // run it on the structure hap's value where that value is.
+        match how {
+            Alignment::In => pat.app_left_composed(other.clone(), op, lookup_flow),
+            Alignment::Out => pat.app_right_composed(other.clone(), op, lookup_flow),
+            Alignment::Mix => pat.app_both_composed(other.clone(), op, lookup_flow),
+            _ => apply_alignment(
+                pat,
+                other,
+                how,
+                move |a, b| compose_op(op, a, b),
+                lookup_flow,
+            ),
+        }
     }
 }
 

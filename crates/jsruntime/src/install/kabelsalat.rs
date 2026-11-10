@@ -72,6 +72,11 @@ pub(crate) fn compile_graph<'js>(
         })?
         .function_constructor
         .clone();
+    // The source can reach this compiler as an event value, under a key no
+    // text has to spell, and then runs as code that no text announced.
+    if let Ok(state) = host_callback_ir(ctx) {
+        state.gate.borrow_mut().close_all();
+    }
     let state = Rc::new(graph::State::new(ctx)?);
     {
         let compiler = ctx

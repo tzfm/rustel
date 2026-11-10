@@ -112,6 +112,17 @@ pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
     },
 ];
 
+/// Controls whose value is CODE, not a pattern.
+///
+/// `bbexpr('t*(t>>15^t>>66)')` is a bytebeat expression. Each of those
+/// operators means something else to the mini parser, so reifying the string
+/// either fails or changes the expression. The string stays whole: the
+/// compatibility snapshot records `byteBeatExpression:t*(t>>15^t>>66)` as a
+/// single value, so a literal string reaches the hap unparsed. A
+/// double-quoted string is already a pattern when it arrives (the transpiler
+/// rewrote it), so this sees only the single-quoted form the docs use.
+const LITERAL_STRING_CONTROLS: &[&str] = &["byteBeatExpression", "bbexpr", "bb"];
+
 pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Result<(), String> {
     let globals = surface.globals.clone();
     let proto = surface.proto.clone();
@@ -194,18 +205,6 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
         .map_err(|error| describe_js_error(&ctx, error))?;
 
     // -- controls ---------------------------------------------------
-    // Controls whose value is CODE, not a pattern.
-    //
-    // `bbexpr('t*(t>>15^t>>66)')` is a bytebeat expression. Each of those
-    // operators means something else to the mini parser, so reifying the
-    // string either fails or changes the expression. The string stays
-    // whole: the compatibility snapshot records
-    // `byteBeatExpression:t*(t>>15^t>>66)` as a single value, so a literal
-    // string reaches the hap unparsed. A double-quoted string is already a
-    // pattern when it arrives (the transpiler rewrote it), so this sees only
-    // the single-quoted form the docs use.
-    const LITERAL_STRING_CONTROLS: &[&str] = &["byteBeatExpression", "bbexpr", "bb"];
-
     for name in control_registry().names() {
         let spec = control_registry()
             .get(name)
@@ -226,21 +225,25 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
                 // Spelling them separately is what lets a pattern go on one
                 // of them - `limit(slider(-6, -24, 0), "hard")` - which a
                 // string glued together cannot do.
-                let mut given = args.0.into_iter();
-                let first = given.next().filter(|v| !v.is_undefined());
-                let rest: Vec<_> = given.take_while(|v| !v.is_undefined()).collect();
-                if !rest.is_empty() && method_spec.names.len() > 1 {
-                    let mut parts = Vec::with_capacity(rest.len() + 1);
-                    for value in first.into_iter().chain(rest) {
-                        let (pattern, sidecar) = reify_bridged(&ctx, &value)?;
-                        sidecars.push(sidecar);
-                        parts.push(pattern);
-                    }
-                    let pattern = method_spec.apply_positional(&receiver, &parts);
-                    return derive_wrapper(ctx, pattern, &sidecars);
-                }
+                let argument =
+                    match control_arguments(&method_spec, args.0, rquickjs::Value::is_undefined) {
+                        ControlArguments::Positional(values) => {
+                            let mut parts = Vec::with_capacity(values.len());
+                            for value in values {
+                                let (pattern, sidecar) = reify_bridged(&ctx, &value)?;
+                                sidecars.push(sidecar);
+                                parts.push(pattern);
+                            }
+                            let pattern = apply_control_method(
+                                &method_spec,
+                                &receiver,
+                                ControlArguments::Positional(parts),
+                            );
+                            return derive_wrapper(ctx, pattern, &sidecars);
+                        }
+                        ControlArguments::Single(argument) => argument,
+                    };
                 // `if (typeof value === 'undefined') return pat.fmap(withVal);`
-                let argument = first;
                 let value = if let Some(value) = argument {
                     match value.as_string().filter(|_| literal) {
                         // A code expression: keep it whole.
@@ -256,7 +259,8 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
                 } else {
                     None
                 };
-                let pattern = method_spec.apply(&receiver, value);
+                let pattern =
+                    apply_control_method(&method_spec, &receiver, ControlArguments::Single(value));
                 derive_wrapper(ctx, pattern, &sidecars)
             }),
         )
@@ -266,7 +270,14 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
         // method; the free form is still installed below and the REPL later
         // replaces it with the session-tempo setter.
         if name != "cps" {
-            proto.set(name, method).map_err(|e| e.to_string())?;
+            proto.set(name, method.clone()).map_err(|e| e.to_string())?;
+            record_builtin_method(
+                &ctx,
+                name,
+                method.into_value(),
+                BuiltinMethod::Control(spec.clone()),
+            )
+            .map_err(|error| error.to_string())?;
         }
 
         // `if (!pat) return reify(value).withValue(withVal);`
@@ -334,7 +345,10 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
         ("s_tour", "tour"),
     ] {
         let value: rquickjs::Value = proto.get(canonical).map_err(|error| error.to_string())?;
-        proto.set(alias, value).map_err(|error| error.to_string())?;
+        proto
+            .set(alias, value.clone())
+            .map_err(|error| error.to_string())?;
+        record_builtin_alias(&ctx, alias, canonical, value).map_err(|error| error.to_string())?;
     }
     // `s_zip` is produced by the alias-copy loop even though
     // `zip` is a free function only. Reading the absent canonical
@@ -345,8 +359,9 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
         .map_err(|error| error.to_string())?;
     let pace: rquickjs::Value = proto.get("pace").map_err(|error| error.to_string())?;
     proto
-        .set("steps", pace)
+        .set("steps", pace.clone())
         .map_err(|error| error.to_string())?;
+    record_builtin_alias(&ctx, "steps", "pace", pace).map_err(|error| error.to_string())?;
 
     // -- the COMPOSERS x ALIGNMENTS matrix --------------------------
     //
@@ -464,7 +479,14 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
             }),
         )
         .map_err(|e| e.to_string())?;
-        proto.set(name, f).map_err(|e| e.to_string())?;
+        proto.set(name, f.clone()).map_err(|e| e.to_string())?;
+        record_builtin_method(
+            &ctx,
+            name,
+            f.into_value(),
+            BuiltinMethod::Shortcut { op, how },
+        )
+        .map_err(|error| error.to_string())?;
     }
 
     // -- prototype methods that are not `register()`ed --------------

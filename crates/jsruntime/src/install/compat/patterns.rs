@@ -6,7 +6,7 @@ use rquickjs::{
 };
 use rustel_core::{
     ops::PatOps,
-    register::{CombinatorFn, DeclaredIn, JoinKind, Registration},
+    register::{CombinatorFn, DeclaredIn, FunctionArgument, JoinKind, Registration},
     value::FunctionRef,
 };
 use std::sync::Arc;
@@ -128,14 +128,14 @@ fn registration(
     names: &[&str],
     reference: rustel_core::reference::ReferenceEntry,
     arity: usize,
-    takes_function: bool,
+    function_argument: FunctionArgument,
     func: CombinatorFn,
 ) -> Registration {
     Registration {
         names: names.iter().map(|name| Arc::from(*name)).collect(),
         reference,
         declared_in: DeclaredIn::PatternModule,
-        takes_function,
+        function_argument,
         arity,
         patternify: true,
         preserve_steps: false,
@@ -372,7 +372,7 @@ pub(super) fn install<'js>(
         &["plyWith", "plywith"],
         PLY_WITH,
         3,
-        true,
+        FunctionArgument::Transformer,
         rustel_core::native_combinator!(|args, pat| rustel_core::combinators::ply_with(
             &pat,
             fraction(args, 0),
@@ -394,7 +394,7 @@ pub(super) fn install<'js>(
         &["plyForEach", "plyforeach"],
         PLY_FOR_EACH,
         3,
-        true,
+        FunctionArgument::Transformer,
         rustel_core::native_combinator!(|args, pat| rustel_core::combinators::ply_for_each(
             &pat,
             fraction(args, 0),
@@ -440,7 +440,7 @@ pub(super) fn install<'js>(
         &["loopAt", "loopat"],
         LOOP_AT,
         2,
-        false,
+        FunctionArgument::None,
         rustel_core::native_combinator!(|args, pat| pat.loop_at(fraction(args, 0))),
     );
     for name in ["loopAt", "loopat"] {
@@ -458,7 +458,7 @@ pub(super) fn install<'js>(
         &["fit"],
         FIT,
         1,
-        false,
+        FunctionArgument::None,
         rustel_core::native_combinator!(|_args, pat| pat.fit()),
     );
     install_registration(
@@ -522,7 +522,7 @@ pub(super) fn install<'js>(
         &["chunkInto", "chunkinto"],
         CHUNK_INTO,
         3,
-        true,
+        FunctionArgument::Transformer,
         CombinatorFn::Dynamic(Arc::new(|args, pat| {
             rustel_core::chunk_into(pat, number(args, 0), function(args, 1))
         })),

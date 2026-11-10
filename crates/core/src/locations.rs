@@ -122,9 +122,29 @@ impl Locations {
                 }
             }
         }
-        let mut all = self.to_vec();
-        all.extend_from_slice(more);
-        self.0 = Repr::Shared(Arc::from(all));
+        let mut inline = [(0, 0); INLINE];
+        let all: Arc<[(usize, usize)]> = self
+            .as_slice(&mut inline)
+            .iter()
+            .chain(more)
+            .copied()
+            .collect();
+        self.0 = Repr::Shared(all);
+    }
+
+    /// These ranges as one slice, widened into `inline` when they are kept
+    /// in place.
+    fn as_slice<'a>(&'a self, inline: &'a mut [(usize, usize); INLINE]) -> &'a [(usize, usize)] {
+        match &self.0 {
+            Repr::Inline { len, ranges } => {
+                let len = usize::from(*len);
+                for (slot, &(begin, end)) in inline.iter_mut().zip(&ranges[..len]) {
+                    *slot = (begin as usize, end as usize);
+                }
+                &inline[..len]
+            }
+            Repr::Shared(ranges) => ranges,
+        }
     }
 
     /// Append every range of `other`, after this list's own.
@@ -148,7 +168,8 @@ impl Locations {
                         return;
                     }
                 }
-                self.extend_from_slice(&other.to_vec());
+                let mut inline = [(0, 0); INLINE];
+                self.extend_from_slice(other.as_slice(&mut inline));
             }
         }
     }
