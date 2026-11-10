@@ -22,9 +22,10 @@ later version.
 //! takes a table's own arithmetic outside the native range, goes back to the
 //! graph, so every refusal stays the graph's. See [`Work`].
 
+use crate::compose::ComposeOp;
 use crate::settings::SettingsStateId;
 use crate::{
-    CombineFn, Hap, HapExpandFn, HapMapFn, JoinMode, LookupFlow, Meeting, Node, OwnedHapMapFn,
+    Combine, Hap, HapExpandFn, HapMapFn, JoinMode, LookupFlow, Meeting, Node, OwnedHapMapFn,
     Pattern, PickIndexMode, PickLookup, SignalFn, SpanUse, State, TimeSpan, ValueFn,
     ValuePredicate, applied_hap, joined_hap, picked_hap,
 };
@@ -222,13 +223,21 @@ enum Stage {
         signal: Signal,
         /// The side of the meeting the signal is on.
         side: Side,
-        apply: CombineFn,
+        apply: Combine,
         flow: LookupFlow,
     },
     Step(Step),
     /// The outer hap of a pick or a join, met by each hap after the inner
     /// pattern's own meetings, as the graph meets it.
     Outer(Arc<Outer>),
+    /// Meetings in a row, each with a constant whose keys it sets on the
+    /// structure's value: `signal` is the constant that they make together.
+    /// Haps that can meet it in place, each in one of its cycles, meet it
+    /// as one. Others meet `each` in turn.
+    Fused {
+        signal: Signal,
+        each: Vec<Stage>,
+    },
 }
 
 /// The outer hap of a pick or a join, which a [`Stage::Outer`] merges into
@@ -271,14 +280,6 @@ struct Sampled {
 }
 
 impl Sampled {
-    /// `sampler` for every one of `entries` entries.
-    fn one(sampler: Sampler, entries: usize) -> Self {
-        Self {
-            samplers: vec![Arc::new(sampler)],
-            of: vec![0; entries],
-        }
-    }
-
     /// Whether every entry runs the same sampler.
     fn is_uniform(&self) -> bool {
         self.samplers.len() == 1
@@ -382,6 +383,36 @@ struct Fixed {
     samplers: Vec<Option<Arc<Sampler>>>,
 }
 
+/// What the per-cycle nodes of a [`Signal`] chose on the way in, innermost
+/// last, kept in place: a signal under more of them answers through the
+/// graph.
+struct Chosen {
+    taken: [Fraction; 8],
+    len: usize,
+}
+
+impl Default for Chosen {
+    fn default() -> Self {
+        Self {
+            taken: [Fraction::ZERO; 8],
+            len: 0,
+        }
+    }
+}
+
+impl Chosen {
+    fn push(&mut self, choice: Fraction) -> Option<()> {
+        *self.taken.get_mut(self.len)? = choice;
+        self.len += 1;
+        Some(())
+    }
+
+    fn pop(&mut self) -> Option<Fraction> {
+        self.len = self.len.checked_sub(1)?;
+        self.taken.get(self.len).copied()
+    }
+}
+
 /// One node between a signal and its meeting.
 #[derive(Clone)]
 enum SignalOp {
@@ -405,7 +436,7 @@ enum SignalOp {
     Constant {
         hap: Box<Hap>,
         side: Side,
-        apply: CombineFn,
+        apply: Combine,
         flow: LookupFlow,
         /// The levels of the constant's own walk.
         levels: u32,
@@ -488,6 +519,43 @@ impl CycleMap {
 }
 
 impl Signal {
+    /// The constant's hap, when it meets all of `part`: the source is a
+    /// constant under speed changes and shifts only, and `part` lies in one
+    /// cycle of the constant's own time.
+    fn constant_over(&self, part: TimeSpan) -> Option<&Hap> {
+        let Source::Constant(constant) = &self.source else {
+            return None;
+        };
+        // Shifts by whole cycles keep a span in one cycle or across two.
+        if self.ops.iter().all(|op| match op {
+            SignalOp::Shift(by) | SignalOp::Restart { begin: by, .. } => by.denom() == 1,
+            _ => false,
+        }) {
+            return in_one_cycle(part).then_some(&**constant);
+        }
+        let moved = |span: TimeSpan, by: Fraction| {
+            Some(TimeSpan::new(
+                span.begin.checked_sub(by)?,
+                span.end.checked_sub(by)?,
+            ))
+        };
+        let mut inside = part;
+        for op in self.ops.iter().rev() {
+            inside = match *op {
+                SignalOp::Fast(factor) if factor > Fraction::ZERO => TimeSpan::new(
+                    inside.begin.checked_mul(factor)?,
+                    inside.end.checked_mul(factor)?,
+                ),
+                SignalOp::Shift(by) => moved(inside, by)?,
+                SignalOp::Restart { begin, period } => {
+                    moved(inside, restart_offset(inside.begin, begin, period)?)?
+                }
+                _ => return None,
+            };
+        }
+        in_one_cycle(inside).then_some(&**constant)
+    }
+
     /// The signal alone, whose hap only its value changes.
     fn bare(&self) -> Option<&SignalFn> {
         match &self.source {
@@ -522,7 +590,7 @@ impl Signal {
         // in, and what each per-cycle node chose there.
         let mut asked = span;
         let mut cut = part;
-        let mut chosen: Vec<Fraction> = Vec::new();
+        let mut chosen = Chosen::default();
         for op in self.ops.iter().rev() {
             match op {
                 SignalOp::Fast(factor) => {
@@ -537,14 +605,13 @@ impl Signal {
                     let c = cut.begin.floor().numer();
                     asked = map.inward(asked, c)?;
                     cut = map.inward(cut, c)?;
-                    chosen.push(Fraction::int(c));
+                    chosen.push(Fraction::int(c))?;
                 }
                 SignalOp::Restart { begin, period } => {
-                    let copy = periods_below(cut.begin, *begin, *period)?;
-                    let by = begin.checked_add(Fraction::int(copy.checked_mul(*period)?))?;
+                    let by = restart_offset(cut.begin, *begin, *period)?;
                     asked = moved(asked, by)?;
                     cut = moved(cut, by)?;
-                    chosen.push(by);
+                    chosen.push(by)?;
                 }
                 SignalOp::Step(_) | SignalOp::Constant { .. } => {}
             }
@@ -587,12 +654,12 @@ impl Signal {
                 SignalOp::Step(step) => out.retain_mut(|hap| step.run_in_place(hap)),
                 SignalOp::Fast(factor) => {
                     for hap in out.iter_mut() {
-                        *hap = retimed(hap, |t| t.checked_div(*factor))?;
+                        retime(hap, |t| t.checked_div(*factor))?;
                     }
                 }
                 SignalOp::Shift(by) => {
                     for hap in out.iter_mut() {
-                        *hap = retimed(hap, |t| t.checked_add(*by))?;
+                        retime(hap, |t| t.checked_add(*by))?;
                     }
                 }
                 SignalOp::Cycle(map) => {
@@ -604,7 +671,7 @@ impl Signal {
                 SignalOp::Restart { .. } => {
                     let by = chosen.pop()?;
                     for hap in out.iter_mut() {
-                        *hap = retimed(hap, |t| t.checked_add(by))?;
+                        retime(hap, |t| t.checked_add(by))?;
                     }
                 }
                 SignalOp::Constant {
@@ -614,6 +681,26 @@ impl Signal {
                     flow,
                     ..
                 } => {
+                    // A hap in one cycle meets all of the constant's hap
+                    // there, which is the same in every cycle.
+                    if out.iter().all(|hap| in_one_cycle(hap.part)) {
+                        for hap in out.iter_mut() {
+                            let part = hap.part;
+                            if !(matches!(side, Side::Value)
+                                && Meeting::in_place(hap, constant, part, apply, *flow))
+                            {
+                                *hap = match side {
+                                    Side::Value => {
+                                        applied_hap(hap, constant, hap.whole, part, apply, *flow)
+                                    }
+                                    Side::Function => {
+                                        applied_hap(constant, hap, hap.whole, part, apply, *flow)
+                                    }
+                                };
+                            }
+                        }
+                        continue;
+                    }
                     let mut met = Vec::with_capacity(out.len());
                     for hap in out.iter() {
                         // The constant asked over this hap's part: one hap
@@ -661,83 +748,16 @@ impl Sampler {
         out: &mut Vec<Hap>,
     ) -> Option<()> {
         let start = out.len();
-        // Until a meeting or a step, the entry at `whole` and `part` stands
-        // for the hap; it is pushed only when something needs it there.
-        let structure = |out: &mut Vec<Hap>| {
-            let mut hap = entry.clone();
-            hap.whole = Some(whole);
-            hap.part = part;
-            out.push(hap);
-        };
-        let mut pushed = false;
-        for stage in &self.stages {
-            match stage {
-                Stage::Meet {
-                    signal: source,
-                    side,
-                    apply,
-                    flow,
-                } => {
-                    source.answer(whole, part, probe, signal)?;
-                    let meet = |structure: &Hap, cut: TimeSpan, met: &Hap| match side {
-                        Side::Function => {
-                            applied_hap(met, structure, Some(whole), cut, apply, *flow)
-                        }
-                        Side::Value => applied_hap(structure, met, Some(whole), cut, apply, *flow),
-                    };
-                    let mut next = Vec::with_capacity(signal.len());
-                    if pushed {
-                        for structure in &out[start..] {
-                            for met in signal.iter() {
-                                if let Some(cut) = structure.part.intersection(&met.part) {
-                                    next.push(meet(structure, cut, met));
-                                }
-                            }
-                        }
-                        out.truncate(start);
-                    } else {
-                        // The entry itself, at its whole and part, is the
-                        // structure of the first meeting.
-                        for met in signal.iter() {
-                            if let Some(cut) = part.intersection(&met.part) {
-                                next.push(meet(entry, cut, met));
-                            }
-                        }
-                    }
-                    out.append(&mut next);
-                    pushed = true;
-                }
-                Stage::Step(step) => {
-                    if !pushed {
-                        structure(out);
-                        pushed = true;
-                    }
-                    let mut kept = start;
-                    for index in start..out.len() {
-                        if step.run_in_place(&mut out[index]) {
-                            if kept != index {
-                                out.swap(kept, index);
-                            }
-                            kept += 1;
-                        }
-                    }
-                    out.truncate(kept);
-                }
-                Stage::Outer(outer) => {
-                    if !pushed {
-                        structure(out);
-                        pushed = true;
-                    }
-                    for hap in &mut out[start..] {
-                        let inner =
-                            std::mem::replace(hap, Hap::new(None, part, crate::Value::Undefined));
-                        *hap = outer.merge(inner);
-                    }
-                }
-            }
+        let mut hap = entry.clone();
+        hap.whole = Some(whole);
+        hap.part = part;
+        out.push(hap);
+        if self.stages.is_empty() {
+            // An entry's own value is data.
+            return Some(());
         }
-        if !pushed {
-            structure(out);
+        for stage in &self.stages {
+            stage.run(whole, part, probe, signal, out, start)?;
         }
         out[start..]
             .iter()
@@ -745,10 +765,22 @@ impl Sampler {
             .then_some(())
     }
 
+    /// `stage` run after the others. A meeting that sets a constant's keys
+    /// joins one that does so just before it. See [`Stage::Fused`].
+    fn push(&mut self, stage: Stage) {
+        if let Some(last) = self.stages.last_mut()
+            && let Some(fused) = last.fused_with(&stage)
+        {
+            *last = fused;
+            return;
+        }
+        self.stages.push(stage);
+    }
+
     /// The bare signal of the first meeting, its side and combination, when
     /// every stage after it is a value step: such a layer meets its signal
     /// where each hap is. See [`Layer::emit_sampled_in_place`].
-    fn in_place(&self) -> Option<(&SignalFn, Side, &CombineFn, LookupFlow, &[Stage])> {
+    fn in_place(&self) -> Option<(&SignalFn, Side, &Combine, LookupFlow, &[Stage])> {
         let (
             Stage::Meet {
                 signal,
@@ -768,6 +800,204 @@ impl Sampler {
     }
 }
 
+impl Stage {
+    /// Run this stage on the haps that one entry makes, `out[start..]`, at
+    /// the entry's `whole` and `part`. See [`Sampler::run`].
+    fn run(
+        &self,
+        whole: TimeSpan,
+        part: TimeSpan,
+        probe: &mut State,
+        signal: &mut Vec<Hap>,
+        out: &mut Vec<Hap>,
+        start: usize,
+    ) -> Option<()> {
+        match self {
+            Stage::Meet {
+                signal: source,
+                side,
+                apply,
+                flow,
+            } => {
+                let meet = |structure: &Hap, cut: TimeSpan, met: &Hap| match side {
+                    Side::Function => applied_hap(met, structure, Some(whole), cut, apply, *flow),
+                    Side::Value => applied_hap(structure, met, Some(whole), cut, apply, *flow),
+                };
+                // A constant meets all of a part that lies in one of its
+                // cycles, with the same hap in every cycle.
+                let answered = !matches!(source.source, Source::Constant(_));
+                if answered {
+                    source.answer(whole, part, probe, signal)?;
+                }
+                let only = |structure: &Hap| {
+                    if answered {
+                        only_meeting(structure.part, signal)
+                    } else {
+                        let constant = source.constant_over(structure.part)?;
+                        Some((structure.part, constant))
+                    }
+                };
+                if out[start..]
+                    .iter()
+                    .all(|structure| only(structure).is_some())
+                {
+                    // Each hap meets one hap, so it becomes the met hap
+                    // where it is.
+                    for hap in &mut out[start..] {
+                        let (cut, met) = only(hap)?;
+                        if !(matches!(side, Side::Value)
+                            && Meeting::in_place(hap, met, cut, apply, *flow))
+                        {
+                            *hap = meet(hap, cut, met);
+                        }
+                    }
+                    return Some(());
+                }
+                if !answered {
+                    source.answer(whole, part, probe, signal)?;
+                }
+                let mut next = Vec::with_capacity(signal.len());
+                for structure in &out[start..] {
+                    for met in signal.iter() {
+                        if let Some(cut) = structure.part.intersection(&met.part) {
+                            next.push(meet(structure, cut, met));
+                        }
+                    }
+                }
+                out.truncate(start);
+                out.append(&mut next);
+            }
+            Stage::Fused {
+                signal: source,
+                each,
+            } => {
+                let apply = Combine::Composed(ComposeOp::Set);
+                let Source::Constant(constant) = &source.source else {
+                    return None;
+                };
+                if out[start..].iter().all(|hap| {
+                    source.constant_over(hap.part).is_some()
+                        && Meeting::meets_in_place(hap, constant, &apply, LookupFlow::Set)
+                }) {
+                    for hap in &mut out[start..] {
+                        let part = hap.part;
+                        if !Meeting::in_place(hap, constant, part, &apply, LookupFlow::Set) {
+                            return None;
+                        }
+                    }
+                    return Some(());
+                }
+                for stage in each {
+                    stage.run(whole, part, probe, signal, out, start)?;
+                }
+            }
+            Stage::Step(step) => {
+                let mut kept = start;
+                for index in start..out.len() {
+                    if step.run_in_place(&mut out[index]) {
+                        if kept != index {
+                            out.swap(kept, index);
+                        }
+                        kept += 1;
+                    }
+                }
+                out.truncate(kept);
+            }
+            Stage::Outer(outer) => {
+                for hap in &mut out[start..] {
+                    let inner =
+                        std::mem::replace(hap, Hap::new(None, part, crate::Value::Undefined));
+                    *hap = outer.merge(inner);
+                }
+            }
+        }
+        Some(())
+    }
+
+    /// The constant hap this stage meets, when it is a meeting that sets
+    /// that hap's keys on the structure's value as they are, in the
+    /// constant's own time: one that may join others. See [`Stage::Fused`].
+    fn setting(&self) -> Option<&Hap> {
+        let Stage::Meet {
+            signal,
+            side: Side::Value,
+            apply: Combine::Composed(ComposeOp::Set),
+            flow: LookupFlow::Set,
+        } = self
+        else {
+            return None;
+        };
+        let Source::Constant(constant) = &signal.source else {
+            return None;
+        };
+        let keys = constant.value.as_object()?;
+        (signal.ops.is_empty()
+            && constant.pick_lookup.is_none()
+            && !crate::compose::union_drops(keys)
+            && constant.value.is_data(0))
+        .then_some(constant)
+    }
+
+    /// This stage and `next` as one, when both set constants' keys.
+    ///
+    /// Meeting the constant they make together sets what meeting both in
+    /// turn sets: the union keeps the first's keys in order and then adds
+    /// the second's, the second's locations come first, and the second's
+    /// live controls win for its own keys.
+    fn fused_with(&self, next: &Stage) -> Option<Stage> {
+        let constant = next.setting()?;
+        let (before, mut each) = match self {
+            Stage::Fused { signal, each } if signal.ops.is_empty() => match &signal.source {
+                Source::Constant(before) => (&**before, each.clone()),
+                _ => return None,
+            },
+            stage => (stage.setting()?, vec![stage.clone()]),
+        };
+        let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
+        let together = applied_hap(
+            before,
+            constant,
+            Some(cycle),
+            cycle,
+            &Combine::Composed(ComposeOp::Set),
+            LookupFlow::Set,
+        );
+        if together.pick_lookup.is_some() {
+            return None;
+        }
+        // Each hap reads the constant's map. A kept map is known to be data.
+        let mut together = together;
+        let crate::Value::Object(map) = &together.value else {
+            return None;
+        };
+        if let Some(kept) = map.interned() {
+            together.value = crate::Value::Object(kept);
+        }
+        each.push(next.clone());
+        Some(Stage::Fused {
+            signal: Signal {
+                source: Source::Constant(Box::new(together)),
+                ops: Vec::new(),
+            },
+            each,
+        })
+    }
+
+    /// `ops` added outside each signal this stage meets.
+    fn extend_ops(&mut self, ops: &[SignalOp]) {
+        match self {
+            Stage::Meet { signal, .. } => signal.ops.extend_from_slice(ops),
+            Stage::Fused { signal, each } => {
+                signal.ops.extend_from_slice(ops);
+                for stage in each {
+                    stage.extend_ops(ops);
+                }
+            }
+            Stage::Step(_) | Stage::Outer(_) => {}
+        }
+    }
+}
+
 /// A per-hap change that does not look at time: run once per entry, or per
 /// hap on a sampled layer, whose values the query makes.
 #[derive(Clone)]
@@ -780,11 +1010,6 @@ enum Step {
 }
 
 impl Step {
-    /// The hap after this step, or `None` when the step drops it.
-    fn run(&self, mut hap: Hap) -> Option<Hap> {
-        self.run_in_place(&mut hap).then_some(hap)
-    }
-
     /// Run this step on `hap` where it is. `false` when the step drops it.
     #[inline]
     fn run_in_place(&self, hap: &mut Hap) -> bool {
@@ -1153,6 +1378,14 @@ fn periods_below(a: Fraction, b: Fraction, period: i128) -> Option<i128> {
     floor_div(floor_div(numerator, denominator)?, period)
 }
 
+/// How far `pickRestart` moves the copy of its pattern that time `at` is
+/// in: to the start of the selector hap that starts at `begin` in period
+/// zero, in the period of `period` cycles that `at` is in.
+fn restart_offset(at: Fraction, begin: Fraction, period: i128) -> Option<Fraction> {
+    let copy = periods_below(at, begin, period)?;
+    begin.checked_add(Fraction::int(copy.checked_mul(period)?))
+}
+
 /// `floor(n / d)` for a positive `d`, in 64 bits when both fit.
 fn floor_div(n: i128, d: i128) -> Option<i128> {
     match (i64::try_from(n), i64::try_from(d)) {
@@ -1263,6 +1496,56 @@ impl Layer {
         }
         self.sampled = sampled.map(Arc::new);
         self
+    }
+
+    /// This layer with `stage` run after what each entry runs already.
+    /// `most` is the most haps the stage makes of one hap. An entry whose
+    /// value is its own runs a `fixed` stage here, once: what such a stage
+    /// reads repeats every cycle, so what it makes repeats with the entry.
+    /// Every other entry runs `stage` in each query, last of its sampler.
+    fn staged(&self, stage: &Stage, most: u64, fixed: bool) -> Option<Layer> {
+        let sampled = self.sampled.as_deref();
+        // Each sampler changes once, however many entries run it. The one
+        // with no stage is that of the entries whose value is their own.
+        let changed: Vec<Option<Arc<Sampler>>> = sampled.map_or_else(Vec::new, |sampled| {
+            sampled
+                .samplers
+                .iter()
+                .map(|sampler| {
+                    (!sampler.stages.is_empty()).then(|| {
+                        let mut sampler = Sampler::clone(sampler);
+                        sampler.push(stage.clone());
+                        sampler.most = sampler.most.saturating_mul(most);
+                        Arc::new(sampler)
+                    })
+                })
+                .collect()
+        });
+        let alone = Sampler {
+            stages: vec![stage.clone()],
+            most,
+        };
+        let own = (!fixed).then(|| Arc::new(alone.clone()));
+        let mut out = Structure::default();
+        for (index, entry) in self.entries.iter().enumerate() {
+            let sampler = match sampled {
+                Some(sampled) => changed
+                    .get(usize::try_from(*sampled.of.get(index)?).ok()?)?
+                    .clone(),
+                None => None,
+            };
+            match sampler.or_else(|| own.clone()) {
+                Some(sampler) => {
+                    out.haps.push(entry.clone());
+                    out.samplers.push(Some(sampler));
+                }
+                None => run_fixed(&alone, entry, &mut out)?,
+            }
+            if out.haps.len() > MAX_ENTRIES {
+                return None;
+            }
+        }
+        out.into_layer(self.period)
     }
 
     /// The entries to answer from: in graph order, or sorted. `None` when
@@ -1395,7 +1678,7 @@ impl Layer {
             met.settle(hap);
             if then.iter().all(|stage| match stage {
                 Stage::Step(step) => step.run_in_place(hap),
-                Stage::Meet { .. } | Stage::Outer(_) => false,
+                Stage::Meet { .. } | Stage::Outer(_) | Stage::Fused { .. } => false,
             }) {
                 if !hap.value.is_data(0) {
                     return None;
@@ -1673,9 +1956,7 @@ impl Structure {
                 }
                 let mut changed = Sampler::clone(&sampler);
                 for stage in &mut changed.stages {
-                    if let Stage::Meet { signal, .. } = stage {
-                        signal.ops.extend_from_slice(ops);
-                    }
+                    stage.extend_ops(ops);
                 }
                 let changed = Arc::new(changed);
                 moved.push((key, Arc::clone(&changed)));
@@ -2377,29 +2658,48 @@ fn pure(value: &crate::Value) -> Option<Tables> {
     ))
 }
 
-/// A span-blind per-hap step: run once per entry, or added to a sampled
-/// layer's steps, since its values exist only in a query.
+/// A span-blind per-hap step: run once per entry whose value is its own,
+/// and added to the samplers of the others, whose values exist only in a
+/// query.
 fn stepped(tables: &Tables, step: Step) -> Option<Tables> {
-    tables.map_layers(tables.work.above(), |layer| {
-        if let Some(sampled) = &layer.sampled {
-            let stepped = sampled.map(|sampler| {
-                let mut stepped = Sampler::clone(sampler);
-                stepped.stages.push(Stage::Step(step.clone()));
-                Some(stepped)
-            });
-            return Some(layer.clone().with_sampled(stepped));
+    let stage = Stage::Step(step);
+    tables.map_layers(tables.work.above(), |layer| layer.staged(&stage, 1, true))
+}
+
+/// Run `sampler`, whose stages read only what repeats every cycle, on
+/// `entry` where it is, while a table is built. What it makes joins `out`
+/// with values of its own. `None` when a step moves the hap, which a
+/// span-blind step must not do.
+fn run_fixed(sampler: &Sampler, entry: &Hap, out: &mut Structure) -> Option<()> {
+    let whole = entry.whole?;
+    let from = out.haps.len();
+    sampler.run(
+        entry,
+        whole,
+        entry.part,
+        &mut State::new(whole),
+        &mut Vec::new(),
+        &mut out.haps,
+    )?;
+    let stepped = sampler
+        .stages
+        .iter()
+        .all(|stage| matches!(stage, Stage::Step(_)));
+    let inside = |part: TimeSpan| {
+        if stepped {
+            part == entry.part
+        } else {
+            part.begin >= entry.part.begin && part.end <= entry.part.end
         }
-        let mut entries = Vec::with_capacity(layer.entries.len());
-        for entry in &layer.entries {
-            if let Some(mapped) = step.run(entry.clone()) {
-                if mapped.whole != entry.whole || mapped.part != entry.part {
-                    return None;
-                }
-                entries.push(mapped);
-            }
-        }
-        Layer::new(layer.period, entries)
-    })
+    };
+    if !out.haps[from..]
+        .iter()
+        .all(|hap| hap.whole == Some(whole) && inside(hap.part))
+    {
+        return None;
+    }
+    out.samplers.resize(out.haps.len(), None);
+    Some(())
 }
 
 /// A span-blind map of each hap to several, all at its whole and part, in
@@ -2573,7 +2873,7 @@ fn sampled(
     structure: &Tables,
     signal: Signal,
     side: Side,
-    apply: &CombineFn,
+    apply: &Combine,
     flow: LookupFlow,
 ) -> Option<Tables> {
     let (walk, most) = signal_work(
@@ -2588,30 +2888,16 @@ fn sampled(
         levels: structure.work.levels.max(walk.levels).saturating_add(1),
         times: structure.work.times.max(walk.times),
     };
+    // A constant repeats every cycle. A signal has a value of its own at
+    // every time.
+    let fixed = matches!(signal.source, Source::Constant(_)) && signal.ops.is_empty();
     let stage = Stage::Meet {
         signal,
         side,
         apply: apply.clone(),
         flow,
     };
-    structure.map_layers(work, |layer| {
-        let sampled = match &layer.sampled {
-            Some(sampled) => sampled.map(|sampler| {
-                let mut sampler = Sampler::clone(sampler);
-                sampler.stages.push(stage.clone());
-                sampler.most = sampler.most.saturating_mul(most);
-                Some(sampler)
-            })?,
-            None => Sampled::one(
-                Sampler {
-                    stages: vec![stage.clone()],
-                    most,
-                },
-                layer.entries.len(),
-            ),
-        };
-        Some(layer.clone().with_sampled(Some(sampled)))
-    })
+    structure.map_layers(work, |layer| layer.staged(&stage, most, fixed))
 }
 
 /// Whether the tables of `pattern` hold a layer whose values a query makes.
@@ -2629,7 +2915,7 @@ fn met(
     structure: &Pattern,
     other: &Pattern,
     side: Side,
-    apply: &CombineFn,
+    apply: &Combine,
     flow: LookupFlow,
 ) -> Option<Tables> {
     if sampling(structure) && constant_of(other).is_some() {
@@ -2689,6 +2975,12 @@ fn met(
                 .map(|sampler| sampler.as_ref().map_or(1, |sampler| sampler.most))
                 .fold(0u64, u64::saturating_add)
                 .max(1);
+            // An entry whose value is its own meets haps whose values are
+            // their own here, once.
+            let here = sampler
+                .as_ref()
+                .is_none_or(|sampler| sampler.stages.is_empty())
+                && fixed.samplers.iter().all(Option::is_none);
             let mut sampler = match sampler {
                 Some(sampler) => Sampler::clone(&sampler),
                 None => Sampler {
@@ -2696,7 +2988,7 @@ fn met(
                     most: 1,
                 },
             };
-            sampler.stages.push(Stage::Meet {
+            sampler.push(Stage::Meet {
                 signal: Signal {
                     source: Source::Fixed(Arc::new(Fixed {
                         whole,
@@ -2710,8 +3002,15 @@ fn met(
                 flow,
             });
             sampler.most = sampler.most.saturating_mul(most);
-            out.haps.push(entry);
-            out.samplers.push(Some(Arc::new(sampler)));
+            if here {
+                run_fixed(&sampler, &entry, &mut out)?;
+            } else {
+                out.haps.push(entry);
+                out.samplers.push(Some(Arc::new(sampler)));
+            }
+            if out.haps.len() > MAX_ENTRIES {
+                return None;
+            }
         }
         out.into_layer(period)
     })
@@ -2724,7 +3023,7 @@ fn met_constant(
     structure: &Pattern,
     constant: &Pattern,
     side: Side,
-    apply: &CombineFn,
+    apply: &Combine,
     flow: LookupFlow,
 ) -> Option<Tables> {
     let (hap, levels) = constant_of(constant)?;
@@ -3097,9 +3396,7 @@ fn moved(sampled: &Sampled, op: SignalOp) -> Option<Sampled> {
     sampled.map(|sampler| {
         let mut sampler = Sampler::clone(sampler);
         for stage in &mut sampler.stages {
-            if let Stage::Meet { signal, .. } = stage {
-                signal.ops.push(op.clone());
-            }
+            stage.extend_ops(std::slice::from_ref(&op));
         }
         Some(sampler)
     })
@@ -3297,6 +3594,29 @@ fn reflected(span: TimeSpan, c: i128) -> Option<TimeSpan> {
     ))
 }
 
+/// Whether `span` lies in one cycle.
+fn in_one_cycle(span: TimeSpan) -> bool {
+    span.begin
+        .floor()
+        .checked_add_int(1)
+        .is_some_and(|next| span.end <= next)
+}
+
+/// The one hap of `haps` that meets `part`, with the part they share, when
+/// exactly one does.
+fn only_meeting(part: TimeSpan, haps: &[Hap]) -> Option<(TimeSpan, &Hap)> {
+    let mut found = None;
+    for hap in haps {
+        if let Some(cut) = part.intersection(&hap.part) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some((cut, hap));
+        }
+    }
+    found
+}
+
 /// The span of cycle `c`.
 fn cycle_span(c: i128) -> Option<TimeSpan> {
     Some(TimeSpan::new(
@@ -3325,14 +3645,21 @@ fn shifted_span(span: TimeSpan, cycles: i128) -> Option<TimeSpan> {
 
 /// A copy of `hap` with every time mapped by an order-preserving `map`.
 fn retimed(hap: &Hap, map: impl Fn(Fraction) -> Option<Fraction>) -> Option<Hap> {
-    let span = |span: TimeSpan| Some(TimeSpan::new(map(span.begin)?, map(span.end)?));
     let mut hap = hap.clone();
+    retime(&mut hap, map)?;
+    Some(hap)
+}
+
+/// [`retimed`] where `hap` is. `None`, with `hap` changed in part, when a
+/// time leaves the native range.
+fn retime(hap: &mut Hap, map: impl Fn(Fraction) -> Option<Fraction>) -> Option<()> {
+    let span = |span: TimeSpan| Some(TimeSpan::new(map(span.begin)?, map(span.end)?));
     hap.part = span(hap.part)?;
     hap.whole = match hap.whole {
         Some(whole) => Some(span(whole)?),
         None => None,
     };
-    Some(hap)
+    Some(())
 }
 
 fn lcm(a: i128, b: i128) -> Option<i128> {
@@ -3401,9 +3728,22 @@ mod tests {
         )
     }
 
+    /// Each hap with all it carries: value, locations, live bindings,
+    /// visuals, lookup and context keys.
     fn describe(haps: &[Hap]) -> Vec<String> {
         haps.iter()
-            .map(|hap| format!("{} {:?}", hap.show(), hap.context))
+            .map(|hap| {
+                format!(
+                    "{} {:?} live={:?}/{} visuals={} lookup={} keys={:?}",
+                    hap.show(),
+                    hap.context,
+                    hap.live_controls,
+                    hap.slider_binding,
+                    hap.ui_visuals,
+                    hap.pick_lookup.is_some(),
+                    hap.keys
+                )
+            })
             .collect()
     }
 
@@ -5221,5 +5561,192 @@ mod tests {
                 ),
             );
         }
+    }
+
+    /// A constant at `location`, which every meeting with it carries.
+    fn located_constant(value: f64, location: usize) -> Twin {
+        let located = || pure(Value::F64(value)).with_added_context(vec![(location, location + 1)]);
+        Twin {
+            tabled: located(),
+            graph: located(),
+        }
+    }
+
+    /// Controls set from located constants after a signal, one key twice.
+    fn set_in_a_row(structure: Twin) -> Twin {
+        let set =
+            |twin, value, location, name| controlled(twin, located_constant(value, location), name);
+        set(
+            set(set(structure, 10.0, 30, "lpq"), 0.2, 32, "decay"),
+            0.5,
+            34,
+            "lpq",
+        )
+    }
+
+    #[test]
+    fn constants_set_in_a_row_after_a_signal_match_the_graph() {
+        let row = || set_in_a_row(sampled_notes(&[0.0, 1.0, 2.0]));
+        assert_twins("in a row", &row());
+        assert_twins("then late", &one(row(), |p| p.late(frac(1, 3))));
+        assert_twins("then fast", &one(row(), |p| p.fast(frac(3, 2))));
+        assert_twins("then rev", &one(row(), |p| p.rev()));
+        assert_twins(
+            "then a signal and a constant",
+            &controlled(
+                controlled(row(), signal_twin(crate::signal::saw), "gain"),
+                constant_twin(0.3),
+                "room",
+            ),
+        );
+        let long = controlled(
+            named(one(leaf(1.0, 1), |p| p.slow(frac(5, 2))), "n"),
+            signal_twin(crate::signal::sine),
+            "lpf",
+        );
+        assert_twins("a whole across cycles", &set_in_a_row(long));
+        let cycles = || map(vec![leaf(0.0, 80), leaf(1.0, 84)], slowcat);
+        for mode in [JoinMode::Restart, JoinMode::Reset, JoinMode::Inner] {
+            assert_twins(
+                &format!("{mode:?} pick of constants in a row"),
+                &picked_from(
+                    cycles(),
+                    vec![row(), seq(&[3.0])],
+                    PickIndexMode::Clamp,
+                    mode,
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn constants_that_make_lookups_or_keep_the_value_match_the_graph() {
+        // A string meets a control with a lookup of its characters, which
+        // each later meeting carries on.
+        let word = |text: &str, location: usize| {
+            let word =
+                || pure(Value::Str(text.into())).with_added_context(vec![(location, location + 1)]);
+            Twin {
+                tabled: word(),
+                graph: word().mark_volatile(),
+            }
+        };
+        let words = map(vec![word("bd", 1), word("sd", 3)], fastcat);
+        assert_twins(
+            "a string structure",
+            &set_in_a_row(controlled(words, signal_twin(crate::signal::sine), "lpf")),
+        );
+        // A control of only `value` leaves the structure's value as it is.
+        let only_value = Twin {
+            tabled: pure(Value::object([("value".into(), Value::F64(3.0))])),
+            graph: pure(Value::object([("value".into(), Value::F64(3.0))])),
+        };
+        let kept = composed(
+            set_in_a_row(sampled_notes(&[0.0, 1.0])),
+            only_value,
+            ComposeOp::Set,
+            Alignment::In,
+        );
+        assert_twins("a value-only control", &set_in_a_row(kept));
+        assert_twins(
+            "a constant on the structure side",
+            &composed(
+                named(located_constant(0.5, 40), "room"),
+                sampled_notes(&[0.0, 1.0, 2.0]),
+                ComposeOp::Set,
+                Alignment::Out,
+            ),
+        );
+        assert_twins(
+            "a sum after a signal",
+            &composed(
+                sampled_notes(&[0.0, 1.0]),
+                named(located_constant(2.0, 44), "n"),
+                ComposeOp::Add,
+                Alignment::In,
+            ),
+        );
+    }
+
+    #[test]
+    fn plain_entries_of_a_sampled_layer_match_the_graph() {
+        let mixed = || {
+            map(
+                vec![
+                    sampled_notes(&[0.0, 1.0]),
+                    named(seq(&[5.0, 6.0, 7.0]), "s"),
+                ],
+                stack,
+            )
+        };
+        assert_twins(
+            "a constant",
+            &controlled(mixed(), located_constant(0.5, 50), "room"),
+        );
+        assert_twins("a step", &one(mixed(), |p| p.fmap(Value::clone)));
+        assert_twins(
+            "a patterned side",
+            &composed(
+                mixed(),
+                named(seq(&[0.1, 0.2, 0.3]), "gain"),
+                ComposeOp::Set,
+                Alignment::In,
+            ),
+        );
+        let long = map(
+            vec![
+                sampled_notes(&[0.0]),
+                named(one(leaf(4.0, 9), |p| p.slow(frac(3, 2))), "s"),
+            ],
+            stack,
+        );
+        assert_twins(
+            "a long plain whole cut by a constant",
+            &controlled(long, located_constant(0.5, 50), "room"),
+        );
+    }
+
+    /// The stages of every sampler in `twin`'s tables.
+    fn stages(twin: &Twin) -> Vec<Vec<&'static str>> {
+        let tables = twin.tabled.tables().expect("tables");
+        let mut out = Vec::new();
+        for layer in &tables.layers {
+            let Some(sampled) = &layer.sampled else {
+                continue;
+            };
+            for sampler in &sampled.samplers {
+                out.push(
+                    sampler
+                        .stages
+                        .iter()
+                        .map(|stage| match stage {
+                            Stage::Meet { .. } => "meet",
+                            Stage::Fused { .. } => "fused",
+                            Stage::Step(_) => "step",
+                            Stage::Outer(_) => "outer",
+                        })
+                        .collect(),
+                );
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn constants_set_in_a_row_meet_once_and_plain_entries_meet_nothing() {
+        let row = set_in_a_row(sampled_notes(&[0.0, 1.0, 2.0]));
+        assert_eq!(stages(&row), vec![vec!["meet", "fused"]]);
+        let mixed = map(
+            vec![sampled_notes(&[0.0, 1.0]), named(seq(&[5.0, 6.0]), "s")],
+            stack,
+        );
+        let stepped = controlled(
+            one(mixed, |p| p.fmap(Value::clone)),
+            constant_twin(0.5),
+            "room",
+        );
+        // The plain layer has no sampler at all, and the sampled one meets
+        // its signal, then the constant, with the step between.
+        assert_eq!(stages(&stepped), vec![vec!["meet", "step", "meet"]]);
     }
 }

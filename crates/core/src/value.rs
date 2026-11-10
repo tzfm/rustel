@@ -34,14 +34,18 @@ pub struct OrderedMap {
 #[derive(Clone)]
 enum Entries {
     /// A clone is a reference count step.
-    Shared(Arc<Vec<(String, Value)>>),
+    Shared(Arc<Vec<(Key, Value)>>),
     /// Kept for the life of the process, so a clone copies a pointer. See
     /// [`OrderedMap::interned`].
-    Interned(&'static Vec<(String, Value)>),
+    Interned(&'static Vec<(Key, Value)>),
 }
 
+/// The entries a copy of shared entries has room for beyond its own, at
+/// least.
+const COPY_ROOM: usize = 4;
+
 /// The entries of every empty map, so a fresh map allocates nothing.
-static EMPTY: Vec<(String, Value)> = Vec::new();
+static EMPTY: Vec<(Key, Value)> = Vec::new();
 
 impl Default for OrderedMap {
     fn default() -> Self {
@@ -71,12 +75,12 @@ const INTERN_BUDGET: usize = 16 << 20;
 
 /// The bytes one kept map costs besides its entries: the boxed list and
 /// its slot in a shard.
-const KEPT_MAP_BYTES: usize = std::mem::size_of::<Vec<(String, Value)>>()
+const KEPT_MAP_BYTES: usize = std::mem::size_of::<Vec<(Key, Value)>>()
     + std::mem::size_of::<(u64, Vec<Kept>)>()
     + std::mem::size_of::<Kept>();
 
 /// The entries of one interned map.
-type Kept = &'static Vec<(String, Value)>;
+type Kept = &'static Vec<(Key, Value)>;
 
 /// Interned maps by content hash, in one of 16 shards so that builders on
 /// several threads rarely wait for one another.
@@ -110,20 +114,41 @@ impl Hasher for Fnv {
 }
 
 impl OrderedMap {
-    fn entries(&self) -> &Vec<(String, Value)> {
+    fn entries(&self) -> &Vec<(Key, Value)> {
         match &self.entries {
             Entries::Shared(entries) => entries,
             Entries::Interned(entries) => entries,
         }
     }
 
-    fn entries_mut(&mut self) -> &mut Vec<(String, Value)> {
-        if let Entries::Interned(entries) = self.entries {
-            self.entries = Entries::Shared(Arc::new(entries.clone()));
+    /// The entries to write, with room for `additional` more. Entries
+    /// another map shares are copied first, once, with that room and a
+    /// little more, since a map that is written once is often written again.
+    fn entries_mut(&mut self, additional: usize) -> &mut Vec<(Key, Value)> {
+        let unique = match &mut self.entries {
+            Entries::Shared(entries) => Arc::get_mut(entries).is_some(),
+            Entries::Interned(_) => false,
+        };
+        if !unique {
+            let mut copy = Vec::with_capacity(self.len() + additional.max(COPY_ROOM));
+            copy.extend_from_slice(self.entries());
+            self.entries = Entries::Shared(Arc::new(copy));
         }
         match &mut self.entries {
-            Entries::Shared(entries) => Arc::make_mut(entries),
+            Entries::Shared(entries) => {
+                let entries = Arc::make_mut(entries);
+                entries.reserve(additional);
+                entries
+            }
             Entries::Interned(_) => unreachable!("an interned map was just copied"),
+        }
+    }
+
+    /// Room for `additional` more entries, so that adding them grows the
+    /// map at most once.
+    pub fn reserve(&mut self, additional: usize) {
+        if additional > 0 {
+            self.entries_mut(additional);
         }
     }
 
@@ -138,7 +163,9 @@ impl OrderedMap {
             return Some(self.clone());
         }
         let entries = self.entries();
-        if !entries.iter().all(|(_, value)| value.is_data(0)) {
+        // As deep as the map's own data check reads them, so that a kept map
+        // is data. See `Value::is_data`.
+        if !entries.iter().all(|(_, value)| value.is_data(1)) {
             return None;
         }
         let mut hasher = Fnv::default();
@@ -166,7 +193,7 @@ impl OrderedMap {
             .iter()
             .map(|(key, value)| key.len() + data_bytes(value))
             .sum::<usize>()
-            + std::mem::size_of::<(String, Value)>() * entries.len()
+            + std::mem::size_of::<(Key, Value)>() * entries.len()
             + KEPT_MAP_BYTES;
         if INTERNED_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes > INTERN_BUDGET {
             INTERNED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
@@ -197,12 +224,34 @@ impl OrderedMap {
     }
 
     pub fn insert(&mut self, key: String, value: Value) -> Option<Value> {
-        let entries = self.entries_mut();
-        if let Some((_, current)) = entries.iter_mut().find(|(name, _)| name == &key) {
+        self.insert_key(Key::from(key), value)
+    }
+
+    /// [`Self::insert`] of a key that another map or a control already
+    /// holds, which the map then shares.
+    pub fn insert_key(&mut self, key: Key, value: Value) -> Option<Value> {
+        let entries = self.entries_mut(0);
+        if let Some((_, current)) = entries.iter_mut().find(|(name, _)| *name == key) {
             return Some(std::mem::replace(current, value));
         }
         entries.push((key, value));
         None
+    }
+
+    /// `key`'s value replaced by what `make` makes of it where it is, or
+    /// `make(None)` added last when the map has no such key.
+    pub(crate) fn upsert(&mut self, key: &Key, make: impl FnOnce(Option<&Value>) -> Value) {
+        let entries = self.entries_mut(0);
+        match entries.iter().position(|(name, _)| name == key) {
+            Some(index) => {
+                let value = make(Some(&entries[index].1));
+                entries[index].1 = value;
+            }
+            None => {
+                let value = make(None);
+                entries.push((key.clone(), value));
+            }
+        }
     }
 
     /// Vec-compatible spelling retained for state-control call sites.
@@ -220,7 +269,7 @@ impl OrderedMap {
         if !self.contains_key(key) {
             return None;
         }
-        self.entries_mut()
+        self.entries_mut(0)
             .iter_mut()
             .find_map(|(name, value)| (name == key).then_some(value))
     }
@@ -229,7 +278,7 @@ impl OrderedMap {
         if !self.contains_key(key) {
             return None;
         }
-        let entries = self.entries_mut();
+        let entries = self.entries_mut(0);
         let index = entries.iter().position(|(name, _)| name == key)?;
         Some(entries.remove(index).1)
     }
@@ -273,17 +322,82 @@ impl OrderedMap {
 }
 
 impl<'a> IntoIterator for &'a OrderedMap {
-    type Item = (&'a String, &'a Value);
-    type IntoIter = std::iter::Map<
-        std::slice::Iter<'a, (String, Value)>,
-        fn(&(String, Value)) -> (&String, &Value),
-    >;
+    type Item = (&'a Key, &'a Value);
+    type IntoIter =
+        std::iter::Map<std::slice::Iter<'a, (Key, Value)>, fn(&(Key, Value)) -> (&Key, &Value)>;
 
     fn into_iter(self) -> Self::IntoIter {
-        fn pair(entry: &(String, Value)) -> (&String, &Value) {
+        fn pair(entry: &(Key, Value)) -> (&Key, &Value) {
             (&entry.0, &entry.1)
         }
         self.entries().iter().map(pair)
+    }
+}
+
+/// A key of an [`OrderedMap`]. Every copy of a map, and every map that a
+/// control makes, shares its key's one allocation.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Key(Arc<str>);
+
+impl Key {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Key {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for Key {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for Key {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for Key {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl From<String> for Key {
+    fn from(key: String) -> Self {
+        Self(Arc::from(key))
+    }
+}
+
+impl From<&str> for Key {
+    fn from(key: &str) -> Self {
+        Self(Arc::from(key))
+    }
+}
+
+impl From<Arc<str>> for Key {
+    fn from(key: Arc<str>) -> Self {
+        Self(key)
+    }
+}
+
+impl fmt::Debug for Key {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
+impl fmt::Display for Key {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&*self.0, f)
     }
 }
 
@@ -927,7 +1041,7 @@ fn same_data(a: &Value, b: &Value) -> bool {
 }
 
 /// [`same_data`] for the entries of two maps, in order.
-fn same_entries(a: &[(String, Value)], b: &[(String, Value)]) -> bool {
+fn same_entries(a: &[(Key, Value)], b: &[(Key, Value)]) -> bool {
     a.len() == b.len()
         && a.iter()
             .zip(b)
@@ -943,9 +1057,7 @@ fn data_bytes(value: &Value) -> usize {
         }
         Value::Object(object) => object
             .iter()
-            .map(|(key, value)| {
-                key.len() + data_bytes(value) + std::mem::size_of::<(String, Value)>()
-            })
+            .map(|(key, value)| key.len() + data_bytes(value) + std::mem::size_of::<(Key, Value)>())
             .sum(),
         _ => 0,
     }
@@ -961,6 +1073,8 @@ impl Value {
         match self {
             Value::Undefined | Value::Null | Value::Bool(_) | Value::F64(_) | Value::Str(_) => true,
             Value::List(items) => items.iter().all(|item| item.is_data(depth + 1)),
+            // A kept map was checked as data when it was kept.
+            Value::Object(object) if depth == 0 && object.is_interned() => true,
             Value::Object(object) => object.iter().all(|(_, item)| item.is_data(depth + 1)),
             Value::Pattern(_) | Value::JsValue(_) | Value::Function(_) | Value::Haps(_) => false,
         }
@@ -1126,7 +1240,7 @@ impl Value {
                 {
                     return true;
                 }
-                for (_, value) in values.entries_mut() {
+                for (_, value) in values.entries_mut(0) {
                     if !value.attach_runtime_settings(settings, depth + 1) {
                         return false;
                     }

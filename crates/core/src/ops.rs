@@ -171,6 +171,25 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
         combine: impl Fn(&Value, &Value) -> Value + Send + Sync + 'static,
         lookup_flow: crate::LookupFlow,
     ) -> Self;
+    /// `app_*_with_lookup` of [`crate::compose::compose_op`] for `op`.
+    fn app_left_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self;
+    fn app_right_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self;
+    fn app_both_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self;
 
     // -- joins -------------------------------------------------------------
     fn inner_bind(&self, f: impl Fn(&Value) -> Self + Send + Sync + 'static) -> Self;
@@ -442,6 +461,30 @@ impl PatOps for Pattern {
         lookup_flow: crate::LookupFlow,
     ) -> Self {
         Pattern::app_both_with_lookup(self, other, combine, lookup_flow)
+    }
+    fn app_left_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        Pattern::app_left_composed(self, other, op, lookup_flow)
+    }
+    fn app_right_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        Pattern::app_right_composed(self, other, op, lookup_flow)
+    }
+    fn app_both_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        Pattern::app_both_composed(self, other, op, lookup_flow)
     }
 
     fn inner_bind(&self, f: impl Fn(&Value) -> Self + Send + Sync + 'static) -> Self {
@@ -743,6 +786,42 @@ impl PatOps for PurePattern {
         PurePattern::assert_pure(self.pattern().app_both_with_lookup(
             other.pattern().clone(),
             combine,
+            lookup_flow,
+        ))
+    }
+    fn app_left_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        PurePattern::assert_pure(self.pattern().app_left_composed(
+            other.pattern().clone(),
+            op,
+            lookup_flow,
+        ))
+    }
+    fn app_right_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        PurePattern::assert_pure(self.pattern().app_right_composed(
+            other.pattern().clone(),
+            op,
+            lookup_flow,
+        ))
+    }
+    fn app_both_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        PurePattern::assert_pure(self.pattern().app_both_composed(
+            other.pattern().clone(),
+            op,
             lookup_flow,
         ))
     }

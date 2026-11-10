@@ -47,7 +47,7 @@ use rustel_fraction::Fraction;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-pub use value::{OrderedMap, Value};
+pub use value::{Key, OrderedMap, Value};
 
 // ---------------------------------------------------------------------------
 // TimeSpan
@@ -800,7 +800,7 @@ impl State {
     pub fn set_controls(&self, controls: &OrderedMap) -> Self {
         let mut merged = self.controls.clone();
         for (key, value) in controls {
-            merged.insert(key.clone(), value.clone());
+            merged.insert_key(key.clone(), value.clone());
         }
         Self {
             span: self.span,
@@ -1782,9 +1782,29 @@ fn host_call_query(id: CallbackId, state: &State) -> Vec<Hap> {
     })
 }
 
-/// Combines an accumulator value with the next positional argument during
-/// `register()`'s appLeft fold.
+/// How an `app*` node makes one value of a function value and an argument
+/// value.
+#[derive(Clone)]
+pub(crate) enum Combine {
+    /// [`compose::compose_op`] of this op, which a meeting can run on the
+    /// structure hap's value where it is. See [`Meeting::in_place`].
+    Composed(compose::ComposeOp),
+    /// Any other function.
+    With(CombineFn),
+}
+
+/// A function that makes one value of a function value and an argument
+/// value.
 type CombineFn = Arc<dyn Fn(&Value, &Value) -> Value + Send + Sync>;
+
+impl Combine {
+    fn apply(&self, function: &Value, value: &Value) -> Value {
+        match self {
+            Combine::Composed(op) => compose::compose_op(*op, function, value),
+            Combine::With(apply) => apply(function, value),
+        }
+    }
+}
 
 /// Whether a per-hap map looks at the spans of the hap it is given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3820,10 +3840,15 @@ fn applied_live_controls(flow: LookupFlow, left: &Hap, right: &Hap) -> ([u64; 4]
             }
             let mut bindings = left.live_controls;
             if let Value::Object(values) = &right.value {
-                for (slot, key) in ["gain", "cutoff", "resonance", "fmi"].iter().enumerate() {
-                    if values.contains_key(key) {
-                        bindings[slot] = right.live_controls[slot];
-                    }
+                for (key, _) in values {
+                    let slot = match key.as_str() {
+                        "gain" => 0,
+                        "cutoff" => 1,
+                        "resonance" => 2,
+                        "fmi" => 3,
+                        _ => continue,
+                    };
+                    bindings[slot] = right.live_controls[slot];
                 }
             }
             (bindings, 0)
@@ -3840,7 +3865,7 @@ fn applied_hap(
     hv: &Hap,
     whole: Option<TimeSpan>,
     part: TimeSpan,
-    apply: &CombineFn,
+    apply: &Combine,
     flow: LookupFlow,
 ) -> Hap {
     let mut context = hv.context.clone();
@@ -3870,8 +3895,8 @@ pub(crate) struct Meeting {
 }
 
 impl Meeting {
-    pub(crate) fn of(hf: &Hap, hv: &Hap, apply: &CombineFn, flow: LookupFlow) -> Self {
-        let value = apply(&hf.value, &hv.value);
+    pub(crate) fn of(hf: &Hap, hv: &Hap, apply: &Combine, flow: LookupFlow) -> Self {
+        let value = apply.apply(&hf.value, &hv.value);
         let pick_lookup = applied_pick_lookup(flow, &value, hf, hv);
         let (live_controls, slider_binding) = applied_live_controls(flow, hf, hv);
         Self {
@@ -3880,6 +3905,61 @@ impl Meeting {
             live_controls,
             slider_binding,
         }
+    }
+
+    /// [`applied_hap`] of `hf` and `hv` at `hf`'s whole and at `part`, made
+    /// where `hf` is, so that the meeting copies none of `hf`. Only for a
+    /// known compose op of two data values, where neither hap carries a
+    /// pick lookup and the meeting makes none. `false`, with `hf`
+    /// unchanged, otherwise.
+    pub(crate) fn in_place(
+        hf: &mut Hap,
+        hv: &Hap,
+        part: TimeSpan,
+        apply: &Combine,
+        flow: LookupFlow,
+    ) -> bool {
+        let Combine::Composed(op) = apply else {
+            return false;
+        };
+        if !Self::meets_in_place(hf, hv, apply, flow) {
+            return false;
+        }
+        let (live_controls, slider_binding) = applied_live_controls(flow, hf, hv);
+        compose::compose_data_in_place(*op, &mut hf.value, &hv.value);
+        hf.part = part;
+        // The value side's locations come first.
+        if !hv.context.is_empty() {
+            let mut context = hv.context.clone();
+            context.append(&hf.context);
+            hf.context = context;
+        }
+        hf.keys = ContextKeys::merge(&hf.keys, &hv.keys);
+        hf.ui_visuals |= hv.ui_visuals;
+        hf.live_controls = live_controls;
+        hf.slider_binding = slider_binding;
+        true
+    }
+
+    /// Whether [`Self::in_place`] makes the meeting of `hf` and `hv`.
+    pub(crate) fn meets_in_place(hf: &Hap, hv: &Hap, apply: &Combine, flow: LookupFlow) -> bool {
+        let Combine::Composed(op) = apply else {
+            return false;
+        };
+        if hf.pick_lookup.is_some()
+            || hv.pick_lookup.is_some()
+            || !hf.value.is_data(0)
+            || !hv.value.is_data(0)
+        {
+            return false;
+        }
+        // A set meeting makes a lookup of a string side, or of a union that
+        // keeps `hv`'s keys out. See `set_lookup_follows_value`.
+        flow != LookupFlow::Set
+            || (*op == compose::ComposeOp::Set
+                && !matches!(hf.value, Value::Str(_))
+                && !matches!(hv.value, Value::Str(_))
+                && !hv.value.as_object().is_some_and(compose::union_drops))
     }
 
     /// Turn `hap`, one side of the meeting, into the met hap. Only valid when
@@ -4545,12 +4625,12 @@ enum Node {
     /// `appLeft`: a pattern of functions applied to a pattern of values,
     /// keeping the FUNCTION side's whole. This is the fold `register()` uses
     /// when a leading argument is itself a pattern.
-    AppLeft(Pattern, Pattern, CombineFn, LookupFlow),
+    AppLeft(Pattern, Pattern, Combine, LookupFlow),
     /// `appRight`: keeps the VALUE side's whole and structure.
-    AppRight(Pattern, Pattern, CombineFn, LookupFlow),
+    AppRight(Pattern, Pattern, Combine, LookupFlow),
     /// `appBoth`: both sides are queried over the SAME span and the wholes
     /// intersect. Tidal's `<*>`.
-    AppBoth(Pattern, Pattern, CombineFn, LookupFlow),
+    AppBoth(Pattern, Pattern, Combine, LookupFlow),
     /// Appends source locations to every hap's context.
     AddContext(Pattern, Arc<Vec<(usize, usize)>>),
     /// A pattern whose values become patterns via a closure that is
@@ -6702,14 +6782,14 @@ impl Pattern {
         Pattern::of(Node::AppLeft(
             self.clone(),
             other,
-            Arc::new(|acc: &Value, v: &Value| match acc {
+            Combine::With(Arc::new(|acc: &Value, v: &Value| match acc {
                 Value::List(xs) => {
                     let mut xs = xs.clone();
                     xs.push(v.clone());
                     Value::List(xs)
                 }
                 other => Value::List(vec![other.clone(), v.clone()]),
-            }),
+            })),
             LookupFlow::Infer,
         ))
     }
@@ -6731,14 +6811,22 @@ impl Pattern {
         combine: impl Fn(&Value, &Value) -> Value + Send + Sync + 'static,
         lookup_flow: LookupFlow,
     ) -> Self {
+        self.app_left_by(other, Combine::With(Arc::new(combine)), lookup_flow)
+    }
+
+    /// [`Self::app_left_with_lookup`] of [`compose::compose_op`] for `op`.
+    pub fn app_left_composed(
+        &self,
+        other: Pattern,
+        op: compose::ComposeOp,
+        lookup_flow: LookupFlow,
+    ) -> Self {
+        self.app_left_by(other, Combine::Composed(op), lookup_flow)
+    }
+
+    fn app_left_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
         let steps = self.steps;
-        Pattern::of(Node::AppLeft(
-            self.clone(),
-            other,
-            Arc::new(combine),
-            lookup_flow,
-        ))
-        .with_steps(steps)
+        Pattern::of(Node::AppLeft(self.clone(), other, combine, lookup_flow)).with_steps(steps)
     }
 
     /// Apply a native curried-value equivalent with `appRight` alignment.
@@ -6758,14 +6846,22 @@ impl Pattern {
         combine: impl Fn(&Value, &Value) -> Value + Send + Sync + 'static,
         lookup_flow: LookupFlow,
     ) -> Self {
+        self.app_right_by(other, Combine::With(Arc::new(combine)), lookup_flow)
+    }
+
+    /// [`Self::app_right_with_lookup`] of [`compose::compose_op`] for `op`.
+    pub fn app_right_composed(
+        &self,
+        other: Pattern,
+        op: compose::ComposeOp,
+        lookup_flow: LookupFlow,
+    ) -> Self {
+        self.app_right_by(other, Combine::Composed(op), lookup_flow)
+    }
+
+    fn app_right_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
         let steps = other.steps;
-        Pattern::of(Node::AppRight(
-            self.clone(),
-            other,
-            Arc::new(combine),
-            lookup_flow,
-        ))
-        .with_steps(steps)
+        Pattern::of(Node::AppRight(self.clone(), other, combine, lookup_flow)).with_steps(steps)
     }
 
     /// `appBoth` - both sides queried over the same span, wholes intersected.
@@ -6785,6 +6881,20 @@ impl Pattern {
         combine: impl Fn(&Value, &Value) -> Value + Send + Sync + 'static,
         lookup_flow: LookupFlow,
     ) -> Self {
+        self.app_both_by(other, Combine::With(Arc::new(combine)), lookup_flow)
+    }
+
+    /// [`Self::app_both_with_lookup`] of [`compose::compose_op`] for `op`.
+    pub fn app_both_composed(
+        &self,
+        other: Pattern,
+        op: compose::ComposeOp,
+        lookup_flow: LookupFlow,
+    ) -> Self {
+        self.app_both_by(other, Combine::Composed(op), lookup_flow)
+    }
+
+    fn app_both_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
         let steps = match (other.steps, self.steps) {
             (Some(a), Some(b)) => match a.checked_lcm(b) {
                 Some(steps) => Some(steps),
@@ -6799,13 +6909,7 @@ impl Pattern {
             (Some(a), None) => Some(a),
             (None, b) => b,
         };
-        Pattern::of(Node::AppBoth(
-            self.clone(),
-            other,
-            Arc::new(combine),
-            lookup_flow,
-        ))
-        .with_steps(steps)
+        Pattern::of(Node::AppBoth(self.clone(), other, combine, lookup_flow)).with_steps(steps)
     }
 
     /// Map each value to a **provably pure** pattern.
@@ -7497,7 +7601,7 @@ impl Pattern {
                 ("unit".into(), Value::Str("c".into())),
             ]);
             for (name, value) in &value {
-                next.insert(name.clone(), value.clone());
+                next.insert_key(name.clone(), value.clone());
             }
             Some(hap.with_value(|_| Value::Object(next.clone())))
         })
