@@ -19,35 +19,37 @@ fn text(bytes: &[u8]) -> String {
 
 fn score(directory: &Path, name: &str) -> PathBuf {
     let path = directory.join(name);
-    std::fs::write(&path, "$: note(\"c4 e4 g4 b4\").s(\"gm_piano\")").unwrap();
+    std::fs::write(&path, "$: note(\"c4 e4 g4 b4\").s(\"gm_piano\")").expect("write the score");
     path
 }
 
 fn export(score: &Path, output: &Path) {
     let result = run(&[
         "export",
-        score.to_str().unwrap(),
+        score.to_str().expect("the path is UTF-8"),
         "--cycles",
         "2",
         "--format",
         "midi",
         "-o",
-        output.to_str().unwrap(),
+        output.to_str().expect("the path is UTF-8"),
     ]);
     assert!(result.status.success(), "{}", text(&result.stderr));
 }
 
 fn imported(bytes: &[u8]) -> rustel_smf::ImportReport {
-    import_smf(bytes, &ImportOptions::default()).unwrap().report
+    import_smf(bytes, &ImportOptions::default())
+        .expect("a valid MIDI file")
+        .report
 }
 
 #[test]
 fn export_writes_a_type_1_file_and_infers_the_extension() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().expect("temp directory");
     let score = score(directory.path(), "take.strudel");
     let midi = directory.path().join("take.mid");
     export(&score, &midi);
-    let report = imported(&std::fs::read(&midi).unwrap());
+    let report = imported(&std::fs::read(&midi).expect("read the exported MIDI"));
     assert_eq!(report.format, 1);
     assert_eq!(report.lanes.len(), 1);
     assert_eq!(report.lanes[0].notes, 8);
@@ -55,24 +57,28 @@ fn export_writes_a_type_1_file_and_infers_the_extension() {
     let inferred = directory.path().join("inferred.mid");
     let result = run(&[
         "export",
-        score.to_str().unwrap(),
+        score.to_str().expect("the path is UTF-8"),
         "--cycles",
         "2",
         "-o",
-        inferred.to_str().unwrap(),
+        inferred.to_str().expect("the path is UTF-8"),
     ]);
     assert!(result.status.success(), "{}", text(&result.stderr));
-    assert!(std::fs::read(&inferred).unwrap().starts_with(b"MThd"));
+    assert!(
+        std::fs::read(&inferred)
+            .expect("read the exported MIDI")
+            .starts_with(b"MThd")
+    );
 }
 
 #[test]
 fn export_honors_the_ppq_and_meter() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().expect("temp directory");
     let score = score(directory.path(), "take.strudel");
     let midi = directory.path().join("take.mid");
     let result = run(&[
         "export",
-        score.to_str().unwrap(),
+        score.to_str().expect("the path is UTF-8"),
         "--cycles",
         "1",
         "--format",
@@ -82,28 +88,28 @@ fn export_honors_the_ppq_and_meter() {
         "--meter",
         "3/4",
         "-o",
-        midi.to_str().unwrap(),
+        midi.to_str().expect("the path is UTF-8"),
     ]);
     assert!(result.status.success(), "{}", text(&result.stderr));
-    let report = imported(&std::fs::read(&midi).unwrap());
+    let report = imported(&std::fs::read(&midi).expect("read the exported MIDI"));
     assert_eq!(report.ppq, 96);
-    assert_eq!(report.meter, Meter::new(3, 4).unwrap());
+    assert_eq!(report.meter, Meter::new(3, 4).expect("a valid meter"));
 }
 
 #[test]
 fn midi_flags_are_only_for_midi_output() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().expect("temp directory");
     let score = score(directory.path(), "take.strudel");
     let wav = directory.path().join("take.wav");
     let result = run(&[
         "export",
-        score.to_str().unwrap(),
+        score.to_str().expect("the path is UTF-8"),
         "--format",
         "wav",
         "--ppq",
         "480",
         "-o",
-        wav.to_str().unwrap(),
+        wav.to_str().expect("the path is UTF-8"),
     ]);
     assert!(!result.status.success());
     assert!(text(&result.stderr).contains("only for MIDI"));
@@ -111,12 +117,12 @@ fn midi_flags_are_only_for_midi_output() {
     let midi = directory.path().join("take.mid");
     let result = run(&[
         "export",
-        score.to_str().unwrap(),
+        score.to_str().expect("the path is UTF-8"),
         "--format",
         "midi",
         "--until-silence",
         "-o",
-        midi.to_str().unwrap(),
+        midi.to_str().expect("the path is UTF-8"),
     ]);
     assert!(!result.status.success());
     assert!(text(&result.stderr).contains("--until-silence"));
@@ -124,30 +130,30 @@ fn midi_flags_are_only_for_midi_output() {
 
 #[test]
 fn import_midi_writes_a_score_and_respects_force() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().expect("temp directory");
     let score = score(directory.path(), "score.strudel");
     let midi = directory.path().join("song.mid");
     export(&score, &midi);
 
     let default_output = directory.path().join("song.strudel");
-    let result = run(&["import-midi", midi.to_str().unwrap()]);
+    let result = run(&["import-midi", midi.to_str().expect("the path is UTF-8")]);
     assert!(result.status.success(), "{}", text(&result.stderr));
-    let source = std::fs::read_to_string(&default_output).unwrap();
+    let source = std::fs::read_to_string(&default_output).expect("read the imported score");
     assert!(source.contains("setcpm("));
     assert!(source.contains("note("));
 
-    let result = run(&["import-midi", midi.to_str().unwrap()]);
+    let result = run(&["import-midi", midi.to_str().expect("the path is UTF-8")]);
     assert!(!result.status.success());
     assert!(text(&result.stderr).contains("exists"));
 
-    let result = run(&["import-midi", midi.to_str().unwrap(), "--force"]);
+    let result = run(&["import-midi", midi.to_str().expect("the path is UTF-8"), "--force"]);
     assert!(result.status.success(), "{}", text(&result.stderr));
 
     let result = run(&[
         "import-midi",
-        midi.to_str().unwrap(),
+        midi.to_str().expect("the path is UTF-8"),
         "-o",
-        midi.to_str().unwrap(),
+        midi.to_str().expect("the path is UTF-8"),
     ]);
     assert!(!result.status.success());
     assert!(text(&result.stderr).contains("replace the input"));
@@ -155,20 +161,20 @@ fn import_midi_writes_a_score_and_respects_force() {
 
 #[test]
 fn import_midi_json_is_one_object() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().expect("temp directory");
     let score = score(directory.path(), "score.strudel");
     let midi = directory.path().join("song.mid");
     export(&score, &midi);
     let output = directory.path().join("song.strudel");
     let result = run(&[
         "import-midi",
-        midi.to_str().unwrap(),
+        midi.to_str().expect("the path is UTF-8"),
         "-o",
-        output.to_str().unwrap(),
+        output.to_str().expect("the path is UTF-8"),
         "--json",
     ]);
     assert!(result.status.success(), "{}", text(&result.stderr));
-    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&result.stdout).expect("a JSON report");
     assert!(
         value["lanes"]
             .as_array()
@@ -179,15 +185,15 @@ fn import_midi_json_is_one_object() {
 
 #[test]
 fn import_midi_rejects_a_malformed_file() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().expect("temp directory");
     let bad = directory.path().join("bad.mid");
-    std::fs::write(&bad, b"not a midi file").unwrap();
+    std::fs::write(&bad, b"not a midi file").expect("write the refused file");
     let output = directory.path().join("bad.strudel");
     let result = run(&[
         "import-midi",
-        bad.to_str().unwrap(),
+        bad.to_str().expect("the path is UTF-8"),
         "-o",
-        output.to_str().unwrap(),
+        output.to_str().expect("the path is UTF-8"),
     ]);
     assert!(!result.status.success());
     assert!(text(&result.stderr).contains("invalid MIDI file"));
@@ -196,34 +202,34 @@ fn import_midi_rejects_a_malformed_file() {
 
 #[test]
 fn export_import_export_keeps_the_notes() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().expect("temp directory");
     let score = score(directory.path(), "score.strudel");
     let first = directory.path().join("first.mid");
     export(&score, &first);
     let midi = directory.path().join("song.mid");
-    std::fs::copy(&first, &midi).unwrap();
+    std::fs::copy(&first, &midi).expect("copy the exported MIDI");
     let source = directory.path().join("song.strudel");
     let result = run(&[
         "import-midi",
-        midi.to_str().unwrap(),
+        midi.to_str().expect("the path is UTF-8"),
         "-o",
-        source.to_str().unwrap(),
+        source.to_str().expect("the path is UTF-8"),
     ]);
     assert!(result.status.success(), "{}", text(&result.stderr));
     let second = directory.path().join("second.mid");
     let result = run(&[
         "export",
-        source.to_str().unwrap(),
+        source.to_str().expect("the path is UTF-8"),
         "--cycles",
         "2",
         "--format",
         "midi",
         "-o",
-        second.to_str().unwrap(),
+        second.to_str().expect("the path is UTF-8"),
     ]);
     assert!(result.status.success(), "{}", text(&result.stderr));
-    let first = imported(&std::fs::read(&first).unwrap());
-    let second = imported(&std::fs::read(&second).unwrap());
+    let first = imported(&std::fs::read(&first).expect("read the exported MIDI"));
+    let second = imported(&std::fs::read(&second).expect("read the exported MIDI"));
     assert_eq!(first.lanes.len(), second.lanes.len());
     assert_eq!(first.lanes[0].notes, second.lanes[0].notes);
 }

@@ -83,7 +83,11 @@ fn wait_for_import(studio: &mut Hermetic) {
 /// Wait for the source row, the durable result of an import. The receipt is
 /// a transient status that the source's scan line can replace.
 fn wait_for_source(studio: &mut Hermetic, folder: &Path) {
-    let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+    let name = folder
+        .file_name()
+        .expect("the path has a name")
+        .to_string_lossy()
+        .into_owned();
     studio.pump_until(SOURCE_BUDGET, "the source reached the list", |studio| {
         studio
             .rows()
@@ -95,7 +99,11 @@ fn wait_for_source(studio: &mut Hermetic, folder: &Path) {
 /// Wait for the source's scan to settle. The row's sound count is durable,
 /// unlike the transient import receipt.
 fn wait_for_source_scan(studio: &mut Hermetic, folder: &Path) {
-    let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+    let name = folder
+        .file_name()
+        .expect("the path has a name")
+        .to_string_lossy()
+        .into_owned();
     studio.pump_until(SOURCE_BUDGET, "the source scan settled", |studio| {
         studio
             .rows()
@@ -180,7 +188,11 @@ fn a_source_added_from_the_sheet_lists_and_can_be_removed() {
 fn a_source_whose_folder_is_gone_at_start_reads_missing_without_a_warning() {
     let mut studio = hermetic();
     let folder = audio_folder("gone-at-start");
-    let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+    let name = folder
+        .file_name()
+        .expect("the path has a name")
+        .to_string_lossy()
+        .into_owned();
     import_folder(&mut studio, &folder);
     // The source is a preference, written on a debounce.
     std::thread::sleep(std::time::Duration::from_millis(700));
@@ -228,7 +240,11 @@ fn a_source_whose_folder_is_gone_at_start_reads_missing_without_a_warning() {
 fn space_turns_a_source_off_and_enter_refuses_to_fetch_it() {
     let mut studio = hermetic();
     let folder = audio_folder("toggle");
-    let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+    let name = folder
+        .file_name()
+        .expect("the path has a name")
+        .to_string_lossy()
+        .into_owned();
 
     import_folder(&mut studio, &folder);
 
@@ -366,7 +382,11 @@ fn alt_r_in_the_samples_browser_aliases_an_imported_bank() {
 fn e_opens_the_source_for_editing_and_esc_keeps_it() {
     let mut studio = hermetic();
     let folder = audio_folder("edit");
-    let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+    let name = folder
+        .file_name()
+        .expect("the path has a name")
+        .to_string_lossy()
+        .into_owned();
 
     import_folder(&mut studio, &folder);
     wait_for_source_scan(&mut studio, &folder);

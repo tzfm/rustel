@@ -1903,13 +1903,17 @@ mod tests {
         if MP3_EXPORT {
             sheet.field = Field::Format;
             sheet.key(KeyCode::Right, false);
-            assert!(sheet.settings.mp3);
+            assert_eq!(sheet.settings.format, ExportFormat::Mp3);
             assert!(!sheet.settings.stems, "mp3 turns stems off");
             assert!(sheet.target.to_string_lossy().ends_with(".mp3"));
             sheet.field = Field::Stems;
             sheet.key(KeyCode::Right, false);
             assert!(sheet.settings.stems);
-            assert!(!sheet.settings.mp3, "stems take the format back to wav");
+            assert_eq!(
+                sheet.settings.format,
+                ExportFormat::Wav,
+                "stems take the format back to wav"
+            );
             assert!(sheet.target.to_string_lossy().ends_with(".wav"));
         }
     }
@@ -2329,7 +2333,7 @@ mod tests {
             &plain_score(r#"s("sine nosuchsound")"#),
             ExportSettings {
                 length: Length::Cycles(0.5),
-                mp3: false,
+                format: ExportFormat::Wav,
                 ..ExportSettings::default()
             },
             SessionConfig::default(),
@@ -2498,7 +2502,7 @@ mod tests {
             plain_score(r#"note("c3").s("sine").vst("rustel fixture", { preset: "Other" })"#),
             ExportSettings {
                 length: Length::Cycles(0.5),
-                mp3: false,
+                format: ExportFormat::Wav,
                 ..ExportSettings::default()
             },
             SessionConfig::default(),
@@ -2519,7 +2523,7 @@ mod tests {
             let target = dir.path().join(format!("{name}.wav"));
             let settings = ExportSettings {
                 length: Length::Cycles(1.0),
-                mp3: false,
+                format: ExportFormat::Wav,
                 stems,
                 ..ExportSettings::default()
             };
