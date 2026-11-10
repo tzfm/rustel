@@ -130,6 +130,23 @@ fn h_refuses_a_pattern_the_window_could_not_query_on_its_own() {
     );
 }
 
+/// A compiled method chain is native while it stands, but a later edit of the
+/// score can replace what it stands for. The window samples signals long
+/// after that, with no host to route through, so it must not keep one.
+#[test]
+fn h_refuses_a_compiled_callback_that_a_later_edit_can_change() {
+    let message = evaluate_error(
+        r#"
+        await initHydra()
+        osc(20, 0.1, H(n("0 1").sometimes((x) => x.add(12)))).out()
+        "#,
+    );
+    assert!(
+        message.contains("H(...) needs a pattern the engine can query on its own"),
+        "{message}"
+    );
+}
+
 #[test]
 fn a_function_argument_crosses_as_its_own_source() {
     let update = program(

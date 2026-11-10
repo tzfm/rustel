@@ -1528,6 +1528,20 @@ pub(super) fn install<'js>(
                      instead",
                 ));
             }
+            // A compiled method chain is native while it stands, but a later
+            // edit of the score can replace what it stands for, and from then
+            // on only the runtime's host can answer for it. The signal sampler
+            // never installs a host, so a pattern that keeps one must not
+            // become a signal.
+            if !pattern.reachable_callbacks().is_empty() {
+                return Err(throw_type_error(
+                    &ctx,
+                    "H(...) needs a pattern the engine can query on its own, because its values are \
+                     read while the window is drawing, long after the score has finished. This one \
+                     keeps a compiled callback that a later edit can change; build it from \
+                     mini-notation, signals and numbers instead",
+                ));
+            }
             let slot = Cell::new(0_u32);
             stage_effect(
                 &ctx,
