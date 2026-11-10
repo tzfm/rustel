@@ -18,3 +18,11 @@ crates/studio-e2e/goldens/** text eol=lf
 # check-engine.sh compares the base engine profile's dependency snapshot with
 # cargo's output line for line, so the snapshot is LF wherever it lands.
 .github/scripts/engine-base-dependencies.txt text eol=lf
+
+# Release scripts execute in Bash and deployed installers must match byte for byte.
+.github/scripts/**/*.sh text eol=lf
+.github/scripts/*.sh text eol=lf
+rustelup/install text eol=lf
+rustelup/install.ps1 text eol=lf
+rustelup/rustelup text eol=lf
+rustelup/rustelup.ps1 text eol=lf

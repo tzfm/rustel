@@ -65,7 +65,7 @@ jobs:
     # build of the runtime is a fraction of the debug test binaries, and the
     # corpus renders audio only.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
@@ -116,7 +116,7 @@ jobs:
           }
           Remove-Item $probe, "$probe.exe" -ErrorAction SilentlyContinue
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ inputs.save_cache }}
 
@@ -134,7 +134,7 @@ jobs:
       # is safe because the loader re-checks every file's sha256.
       - name: Restore the corpus sample cache
         id: corpus-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/rustel-corpus-sample-cache
           key: rustel-corpus-samples-v1-${{ hashFiles('crates/runtime/tests/e2e/**') }}
@@ -162,7 +162,7 @@ jobs:
 
       - name: Save the corpus sample cache
         if: inputs.save_cache && steps.corpus-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/rustel-corpus-sample-cache
           key: ${{ steps.corpus-cache.outputs.cache-primary-key }}
@@ -170,7 +170,7 @@ jobs:
       # The goldens must be captured on the platform that gates them.
       - name: Keep the actual goldens when the corpus disagrees
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: corpus-actual-${{ runner.os }}
           path: crates/runtime/tests/e2e/golden/*.actual
@@ -202,7 +202,7 @@ jobs:
         shell: bash
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
@@ -235,7 +235,7 @@ jobs:
 
       - *msvc-probe
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ inputs.save_cache }}
 
@@ -264,7 +264,7 @@ jobs:
       # loader re-checks every file against its pinned sha256.
       - name: Restore the studio sample cache
         id: studio-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/rustel-studio-sample-cache
           key: rustel-studio-samples-v1-${{ hashFiles('crates/runtime/assets/sample-banks.json', 'crates/runtime/assets/gm-fonts.json') }}
@@ -296,7 +296,7 @@ jobs:
 
       - name: Save the studio sample cache
         if: inputs.save_cache && steps.studio-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/rustel-studio-sample-cache
           key: ${{ steps.studio-cache.outputs.cache-primary-key }}
@@ -306,7 +306,7 @@ jobs:
       # local rerun.
       - name: Upload golden failures
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: studio-e2e-golden-failures-${{ matrix.name }}
           path: crates/studio-e2e/goldens/**/*.actual
