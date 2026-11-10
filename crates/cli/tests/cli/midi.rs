@@ -146,7 +146,11 @@ fn import_midi_writes_a_score_and_respects_force() {
     assert!(!result.status.success());
     assert!(text(&result.stderr).contains("exists"));
 
-    let result = run(&["import-midi", midi.to_str().expect("the path is UTF-8"), "--force"]);
+    let result = run(&[
+        "import-midi",
+        midi.to_str().expect("the path is UTF-8"),
+        "--force",
+    ]);
     assert!(result.status.success(), "{}", text(&result.stderr));
 
     let result = run(&[
