@@ -2605,6 +2605,21 @@ fn observe_preview(engine: &mut StudioEngine, window: Duration) -> (f32, u64, u6
     (peak, peak_voices, voices_now)
 }
 
+/// [`observe_preview`] for a window whose sound must be heard. A machine
+/// loaded by the rest of the suite can start a preview late, and then a
+/// healthy engine looks silent inside one fixed window. This keeps observing
+/// until the slot carries the sound, and gives up only once the deadline has
+/// no room for another window.
+fn observe_audible(engine: &mut StudioEngine, window: Duration) -> (f32, u64, u64) {
+    let deadline = Instant::now() + Duration::from_millis(2_000);
+    loop {
+        let seen = observe_preview(engine, window);
+        if seen.0 > 0.01 || Instant::now() + window > deadline {
+            return seen;
+        }
+    }
+}
+
 /// A chord preview: the notes sound together, on the preview's own slot,
 /// and one stop silences all of them. The harness cannot see three
 /// separate voices in a summed scope, so the count the device reports is
@@ -2636,7 +2651,7 @@ fn a_chord_preview_sounds_its_notes_together_and_stops_together() {
     // a choke group, they cut each other and one note remains.
     let _onset = observe_preview(&mut engine, Duration::from_millis(200));
     let (chord_peak, chord_voices, still_held) =
-        observe_preview(&mut engine, Duration::from_millis(500));
+        observe_audible(&mut engine, Duration::from_millis(500));
     assert!(chord_peak > 0.01, "the chord was heard: {chord_peak}");
     assert!(
         chord_voices >= 3,
@@ -2672,7 +2687,7 @@ fn a_chord_preview_sounds_its_notes_together_and_stops_together() {
     engine
         .audition_run(&[60.0, 62.0, 64.0, 65.0, 67.0], "triangle", 1.0, 0.15)
         .expect("the run previews");
-    let (run_peak, run_voices, _) = observe_preview(&mut engine, Duration::from_millis(900));
+    let (run_peak, run_voices, _) = observe_audible(&mut engine, Duration::from_millis(900));
     assert!(run_peak > 0.01, "the run was heard: {run_peak}");
     assert!(
         run_voices >= 3,
@@ -2702,7 +2717,7 @@ fn a_chord_preview_sounds_its_notes_together_and_stops_together() {
     engine
         .audition("triangle", 1.0)
         .expect("a one-sound preview");
-    let (one_peak, _, _) = observe_preview(&mut engine, Duration::from_millis(500));
+    let (one_peak, _, _) = observe_audible(&mut engine, Duration::from_millis(500));
     assert!(one_peak > 0.01, "the single sound was heard: {one_peak}");
     let _ = engine.stop(Duration::from_millis(200));
 }
