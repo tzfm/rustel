@@ -438,11 +438,16 @@ impl ExportSheet {
                 };
             }
             Field::Format => {
-                self.choose_format(if direction > 0 {
-                    ExportFormat::Midi
-                } else {
-                    ExportFormat::Wav
-                });
+                // The radios read wav, mp3, midi, so an arrow steps onto
+                // the neighbour that way and holds at the end of the row.
+                let next = match (self.settings.format, direction > 0) {
+                    (ExportFormat::Wav, true) if MP3_EXPORT => ExportFormat::Mp3,
+                    (ExportFormat::Wav, true) | (ExportFormat::Mp3, true) => ExportFormat::Midi,
+                    (ExportFormat::Midi, false) if MP3_EXPORT => ExportFormat::Mp3,
+                    (ExportFormat::Midi, false) | (ExportFormat::Mp3, false) => ExportFormat::Wav,
+                    (current, _) => current,
+                };
+                self.choose_format(next);
             }
             Field::Limiter => {
                 if self.settings.format.is_audio() {
@@ -1494,10 +1499,18 @@ mod tests {
         assert_eq!(sheet.settings.length, Length::Cycles(32.0));
         assert_eq!(sheet.field, Field::Format, "no hold line for cycles");
         sheet.key(KeyCode::Right, false);
-        assert_eq!(sheet.settings.format, ExportFormat::Midi);
+        let format = if MP3_EXPORT {
+            ExportFormat::Mp3
+        } else {
+            ExportFormat::Midi
+        };
+        assert_eq!(sheet.settings.format, format);
         assert_eq!(
             sheet.target,
-            PathBuf::from("/sets/exports/drums-1970-01-01T00-00-00.mid")
+            PathBuf::from(format!(
+                "/sets/exports/drums-1970-01-01T00-00-00.{}",
+                format.extension()
+            ))
         );
         sheet.key(KeyCode::Left, false);
         assert_eq!(sheet.settings.format, ExportFormat::Wav);
@@ -1946,7 +1959,11 @@ mod tests {
             sheet.key(KeyCode::Tab, true);
         }
         sheet.key(KeyCode::Right, false);
-        assert_eq!(sheet.target, PathBuf::from("/tmp/bounces/take one.mid"));
+        let extension = if MP3_EXPORT { "mp3" } else { "mid" };
+        assert_eq!(
+            sheet.target,
+            PathBuf::from(format!("/tmp/bounces/take one.{extension}"))
+        );
         sheet.target = PathBuf::from("/tmp/bounces/take.final");
         sheet.key(KeyCode::Left, false);
         assert_eq!(sheet.target, PathBuf::from("/tmp/bounces/take.final"));
