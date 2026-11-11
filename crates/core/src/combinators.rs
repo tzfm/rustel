@@ -1910,34 +1910,55 @@ pub fn undegrade_by<P: PatOps>(pat: &P, x: f64) -> P {
 /// Applies `f` to roughly `x` of the events. The halves are complementary:
 /// the transformed copy takes exactly the events the plain copy dropped.
 /// The scalar carrier and `inner_bind` are required: they split crossing
-/// wholes at cycle boundaries and invoke `f` lazily, per queried carrier hap.
+/// wholes at cycle boundaries, and the closure ignores its carrier.
+///
+/// A transform whose one application stands for every later one has its
+/// halves built once, here, as [`first_of`]/[`last_of`] build their
+/// transformed part: the carrier hap carries nothing the transform reads,
+/// and building the halves per carrier hap re-ran the transform for every
+/// hap of every query. Any other transform keeps its application per
+/// carrier hap, where a query runs it: a JavaScript transform runs at query
+/// time, exactly once per carrier hap, and a lowered transform whose
+/// program can go stale must reach its callback again once it does. What
+/// that application is wrapped in — both halves, the coin signals — is
+/// pure, so it is still built once, and only the application itself is
+/// rebuilt per carrier hap.
 pub fn sometimes_by<P: PatOps>(pat: &P, x: f64, f: Option<&FunctionRef>) -> P {
-    let pat = pat.clone();
-    let f = f.cloned();
-    P::pat_pure(Value::F64(x)).inner_bind(move |_| {
-        let plain = degrade_by(&pat, x);
-        let transformed = call(&undegrade_by(&pat, 1.0 - x), f.as_ref());
-        P::pat_stack(vec![plain, transformed])
-    })
+    let plain = degrade_by(pat, x);
+    let transformed_base = undegrade_by(pat, 1.0 - x);
+    if f.is_some_and(|f| !f.stands_for_every_application()) {
+        let f = f.cloned();
+        return P::pat_pure(Value::F64(x)).inner_bind(move |_| {
+            let transformed = call(&transformed_base, f.as_ref());
+            P::pat_stack(vec![plain.clone(), transformed])
+        });
+    }
+    let transformed = call(&transformed_base, f);
+    let whole = P::pat_stack(vec![plain, transformed]);
+    P::pat_pure(Value::F64(x)).inner_bind(move |_| whole.clone())
 }
 
 /// [`sometimes_by`], but `segment(1)` on the rand signal makes the coin
 /// flip once per CYCLE rather than per hap.
 pub fn some_cycles_by<P: PatOps>(pat: &P, x: f64, f: Option<&FunctionRef>) -> P {
-    let pat = pat.clone();
-    let f = f.cloned();
-    P::pat_pure(Value::F64(x)).inner_bind(move |_| {
-        let per_cycle = segment(&pure_signal::<P>(crate::signal::rand()), Fraction::ONE);
-        let inverted = segment(
-            &pure_signal::<P>(crate::signal::rand())
-                .fmap(|v| Value::F64(1.0 - util::parse_numeral(v).unwrap_or(f64::NAN))),
-            Fraction::ONE,
-        );
-        P::pat_stack(vec![
-            degrade_by_with(&pat, &per_cycle, x),
-            call(&degrade_by_with(&pat, &inverted, 1.0 - x), f.as_ref()),
-        ])
-    })
+    let per_cycle = segment(&pure_signal::<P>(crate::signal::rand()), Fraction::ONE);
+    let inverted = segment(
+        &pure_signal::<P>(crate::signal::rand())
+            .fmap(|v| Value::F64(1.0 - util::parse_numeral(v).unwrap_or(f64::NAN))),
+        Fraction::ONE,
+    );
+    let plain = degrade_by_with(pat, &per_cycle, x);
+    let transformed_base = degrade_by_with(pat, &inverted, 1.0 - x);
+    if f.is_some_and(|f| !f.stands_for_every_application()) {
+        let f = f.cloned();
+        return P::pat_pure(Value::F64(x)).inner_bind(move |_| {
+            let transformed = call(&transformed_base, f.as_ref());
+            P::pat_stack(vec![plain.clone(), transformed])
+        });
+    }
+    let transformed = call(&transformed_base, f);
+    let whole = P::pat_stack(vec![plain, transformed]);
+    P::pat_pure(Value::F64(x)).inner_bind(move |_| whole.clone())
 }
 
 // -- envelope shorthands ----------------------------------------------------

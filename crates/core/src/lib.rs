@@ -2348,6 +2348,18 @@ fn query_stack_child<T>(query: impl FnOnce() -> Vec<T>) -> Vec<T> {
     }
 }
 
+// Materialise only what holds a JavaScript-owned identity. On a value that
+// holds none, the walk rebuilds every container to hand back the same data,
+// so the hap keeps its value as it is. The outer query boundary applies the
+// same rule to the haps it returns.
+fn materialize_if_js(value: &Value) -> Value {
+    if value.contains_js_value() {
+        materialize_js_value(value)
+    } else {
+        value.clone()
+    }
+}
+
 // Keep callback temporaries out of the recursive query dispatcher. The child
 // query finishes before entering this helper, so its frame is not multiplied
 // by every node in a pattern graph.
@@ -2372,9 +2384,9 @@ fn map_js_haps(
             if let Some(predicate) = predicate {
                 // Final event inspection consumes JS containers once, after
                 // all user callbacks have run.
-                let value = materialize_js_value(v);
+                let value = materialize_if_js(v);
                 return if predicate(&value) {
-                    materialize_js_value(&host_call_value(id, &value))
+                    materialize_if_js(&host_call_value(id, &value))
                 } else {
                     value
                 };
@@ -2384,7 +2396,7 @@ fn map_js_haps(
                 // Trusted control rewrites consume their result here, so
                 // compare native values before retaining bindings. User fmap
                 // keeps opaque JS identity.
-                materialize_js_value(&value)
+                materialize_if_js(&value)
             } else {
                 value
             }

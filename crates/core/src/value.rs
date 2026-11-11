@@ -630,6 +630,25 @@ impl FunctionRef {
         }
     }
 
+    /// Whether a later application may have to differ from this one: a
+    /// lowered callback whose program can go stale must reach its script
+    /// callback again once it does, so applying it once does not stand for
+    /// applying it at every query.
+    pub(crate) fn can_go_stale(&self) -> bool {
+        self.callback_kept_by_pure_view().is_some()
+    }
+
+    /// Whether applying this once stands for applying it at every query: a
+    /// function with a native view that cannot go stale always applies the
+    /// same way, so a combinator may apply it once while it builds its
+    /// graph. A JavaScript callback, a host-bound transformer, or a lowered
+    /// callback that can go stale does not: those applications run at query
+    /// time, once per carrier hap, and a program that stops standing for its
+    /// callback must reach the callback again.
+    pub(crate) fn stands_for_every_application(&self) -> bool {
+        self.is_native() && !self.can_go_stale()
+    }
+
     /// The callback id, for a JS function.
     pub fn callback_id(&self) -> Option<crate::CallbackId> {
         match self.kind {
