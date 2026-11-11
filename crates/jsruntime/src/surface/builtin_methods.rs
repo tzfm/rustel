@@ -339,7 +339,7 @@ mod tests {
         with_ctx(&runtime, |ctx| {
             for name in [
                 "rev", "fast", "gain", "add", "struct", "s", "vib", "fm", "fmh", "detune", "crush",
-                "speed", "mask", "squeeze", "set",
+                "speed", "mask", "squeeze", "set", "when", "clip", "ply",
             ] {
                 assert!(
                     prove_builtin_method(&ctx, name).is_some(),

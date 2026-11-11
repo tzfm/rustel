@@ -21,7 +21,7 @@ use crate::purity::PurePattern;
 use crate::value::FunctionRef;
 
 /// Invalidates cached programs if the instruction contract changes.
-pub const PATTERN_TRANSFORM_IR_VERSION: u16 = 12;
+pub const PATTERN_TRANSFORM_IR_VERSION: u16 = 13;
 
 /// Maximum work one callback-IR invocation may perform.
 ///
@@ -30,10 +30,104 @@ pub const PATTERN_TRANSFORM_IR_VERSION: u16 = 12;
 pub const MAX_PATTERN_TRANSFORM_IR_INSTRUCTIONS: usize = 64;
 
 /// One type-checked operation in a [`PatternTransformProgram`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 pub enum PatternTransformInstruction {
     /// Apply an existing native pattern transformer to the current value.
     Apply(FunctionRef),
+    /// Apply a registered combinator to the current value with literal
+    /// leading arguments, as the JavaScript method call passes them. One
+    /// argument may hold the one lowered callback in the registration's
+    /// function slot.
+    ///
+    /// Executing delegates to
+    /// [`Registration::call`](crate::register::Registration::call), so the
+    /// program builds exactly the graph the method call builds, including the
+    /// patternified general path a patterned argument takes. That path is
+    /// impure by construction - the same call in JavaScript is impure the
+    /// same way - so this instruction runs through its ordinary view only;
+    /// its pure view wraps that result as host-built.
+    ApplyRegistered {
+        registration: Box<crate::register::Registration>,
+        arguments: Vec<Pattern>,
+    },
+}
+
+impl fmt::Debug for PatternTransformInstruction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Apply(function) => formatter.debug_tuple("Apply").field(function).finish(),
+            Self::ApplyRegistered {
+                registration,
+                arguments,
+            } => formatter
+                .debug_struct("ApplyRegistered")
+                .field("registration", &registration.names)
+                .field("arguments", &arguments.len())
+                .finish(),
+        }
+    }
+}
+
+impl PartialEq for PatternTransformInstruction {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Apply(left), Self::Apply(right)) => left == right,
+            (
+                Self::ApplyRegistered {
+                    registration: left,
+                    arguments: left_arguments,
+                },
+                Self::ApplyRegistered {
+                    registration: right,
+                    arguments: right_arguments,
+                },
+            ) => {
+                left.same_definition(right)
+                    && left_arguments.len() == right_arguments.len()
+                    && left_arguments
+                        .iter()
+                        .zip(right_arguments)
+                        .all(|(left, right)| left.same_construction(right))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Whether an [`PatternTransformInstruction::ApplyRegistered`] instruction is
+/// one the interpreter can run: a native-body registration called with the
+/// number of leading arguments its method call passes, every argument a
+/// pure literal pattern, and at most the one lowered callback, in the
+/// registration's function slot.
+fn compilable_registered_arguments(
+    registration: &crate::register::Registration,
+    arguments: &[Pattern],
+) -> bool {
+    use crate::register::CombinatorFn;
+    if !matches!(registration.func, CombinatorFn::Native(_)) {
+        return false;
+    }
+    if arguments.len() != registration.arity.saturating_sub(1) {
+        return false;
+    }
+    let mut functions = 0usize;
+    for argument in arguments {
+        match argument.as_pure() {
+            // A literal scalar or string carries nothing the host owns.
+            Some(value) if !value.has_js_function() => {}
+            // The function slot may hold exactly one callback with its
+            // compiled program, whose host owns the choice between the
+            // program and the callback.
+            Some(crate::Value::Function(function)) if function.carries_pattern_program() => {
+                functions += 1;
+            }
+            // A patterned literal such as mini-notation holds scalar values
+            // across many wholes, so it reaches no callback.
+            None if argument.is_pure() && argument.reachable_callbacks().is_empty() => {}
+            _ => return false,
+        }
+    }
+    functions <= usize::from(registration.takes_function())
 }
 
 /// Why a proposed native callback program was rejected.
@@ -217,6 +311,10 @@ impl PatternTransformProgram {
             }
             let native = match &instruction {
                 PatternTransformInstruction::Apply(function) => function.is_native(),
+                PatternTransformInstruction::ApplyRegistered {
+                    registration,
+                    arguments,
+                } => compilable_registered_arguments(registration, arguments),
             };
             if !native {
                 return Err(PatternTransformBuildError::NonNativeInstruction {
@@ -253,6 +351,24 @@ impl PatternTransformProgram {
         &self.standings
     }
 
+    /// Every script callback a function holding this program must keep alive:
+    /// the callbacks of the function values its registered calls take as
+    /// arguments, which apply per query and can go stale while this program
+    /// stands. See [`crate::value::FunctionRef::retained_callbacks`].
+    pub(crate) fn retained_callback_ids(&self) -> Vec<crate::CallbackId> {
+        let mut ids = Vec::new();
+        for instruction in &self.instructions[..] {
+            if let PatternTransformInstruction::ApplyRegistered { arguments, .. } = instruction {
+                for argument in arguments.iter() {
+                    if let Some(crate::Value::Function(function)) = argument.as_pure() {
+                        ids.extend(function.retained_callbacks());
+                    }
+                }
+            }
+        }
+        ids
+    }
+
     /// Whether the program reads any fact, so that it can stop standing for
     /// its callback.
     pub fn can_go_stale(&self) -> bool {
@@ -286,6 +402,10 @@ impl PatternTransformProgram {
         for instruction in &self.instructions {
             pattern = match instruction {
                 PatternTransformInstruction::Apply(function) => function.apply_unbound(pattern),
+                PatternTransformInstruction::ApplyRegistered {
+                    registration,
+                    arguments,
+                } => registration.call(arguments, pattern),
             };
         }
         pattern
@@ -298,6 +418,16 @@ impl PatternTransformProgram {
                 PatternTransformInstruction::Apply(function) => function
                     .apply_pure_unbound(pattern)
                     .expect("validated callback IR instruction lost its native purity proof"),
+                // The registered call is impure by construction, as its
+                // JavaScript method call is. Its pure view runs the same
+                // ordinary view and wraps the result as host-built, the way
+                // the host arm of a stale lowered callback does.
+                PatternTransformInstruction::ApplyRegistered {
+                    registration,
+                    arguments,
+                } => {
+                    PurePattern::host_built(registration.call(arguments, pattern.pattern().clone()))
+                }
             };
         }
         pattern
@@ -462,6 +592,114 @@ mod tests {
     #[test]
     fn javascript_instruction_is_rejected_before_execution() {
         let error = PatternTransformProgram::new([apply(FunctionRef::js(41))]).unwrap_err();
+        assert_eq!(
+            error,
+            PatternTransformBuildError::NonNativeInstruction { index: 0 }
+        );
+    }
+
+    /// The `when` registration, as a lowered callback's compiled method call
+    /// holds it.
+    fn when_registration() -> crate::register::Registration {
+        crate::register::default_registry()
+            .get("when")
+            .expect("when is registered")
+            .clone()
+    }
+
+    fn apply_registered(
+        registration: crate::register::Registration,
+        arguments: Vec<Pattern>,
+    ) -> PatternTransformInstruction {
+        PatternTransformInstruction::ApplyRegistered {
+            registration: Box::new(registration),
+            arguments,
+        }
+    }
+
+    /// A two-whole condition, as a mini-notation literal lowers to.
+    fn two_whole_condition() -> Pattern {
+        crate::fastcat(vec![
+            crate::pure(Value::Bool(true)),
+            crate::pure(Value::Bool(false)),
+        ])
+    }
+
+    #[test]
+    fn a_registered_call_with_a_lowered_callback_is_compilable_and_impure() {
+        let inner = FunctionRef::lowered_js(
+            9,
+            PatternTransformProgram::new([apply(increment())]).expect("a native program"),
+        );
+        let instruction = apply_registered(
+            when_registration(),
+            vec![
+                two_whole_condition(),
+                crate::pure(Value::Function(Box::new(inner))),
+            ],
+        );
+        let program = PatternTransformProgram::new([instruction]).expect("compilable");
+        // The patternified general path joins the two wholes, so one cycle
+        // holds two haps of the operand the condition chose.
+        let output = program.apply(crate::pure(Value::F64(1.0)));
+        let haps = output.query_arc(Fraction::ZERO, Fraction::ONE);
+        assert_eq!(haps.len(), 2, "both wholes answer");
+        // The pure view runs the same ordinary view, host-built.
+        let pure = program.apply_pure(PurePattern::assert_pure(crate::pure(Value::F64(1.0))));
+        assert_eq!(
+            pure.query_arc(Fraction::ZERO, Fraction::ONE).len(),
+            2,
+            "the pure view answers the same"
+        );
+    }
+
+    #[test]
+    fn a_registered_call_refuses_every_uncompilable_shape() {
+        let lowered = FunctionRef::lowered_js(4, PatternTransformProgram::new([]).unwrap());
+        let function = crate::pure(Value::Function(Box::new(lowered)));
+        let condition = two_whole_condition();
+        // The wrong number of leading arguments.
+        for arguments in [
+            vec![],
+            vec![condition.clone()],
+            vec![condition.clone(), function.clone(), condition.clone()],
+        ] {
+            let error =
+                PatternTransformProgram::new([apply_registered(when_registration(), arguments)])
+                    .unwrap_err();
+            assert_eq!(
+                error,
+                PatternTransformBuildError::NonNativeInstruction { index: 0 },
+                "the argument count must be the method call's"
+            );
+        }
+        // A JavaScript callback in the function slot, and a JS-owned value in
+        // any slot.
+        for arguments in [
+            vec![
+                condition.clone(),
+                crate::pure(Value::Function(Box::new(FunctionRef::js(7)))),
+            ],
+            vec![
+                crate::pure(Value::JsValue(crate::value::JsValueRef::new(7, false))),
+                function.clone(),
+            ],
+        ] {
+            let error =
+                PatternTransformProgram::new([apply_registered(when_registration(), arguments)])
+                    .unwrap_err();
+            assert_eq!(
+                error,
+                PatternTransformBuildError::NonNativeInstruction { index: 0 },
+                "only the lowered callback may cross into the program"
+            );
+        }
+        // A non-pure argument.
+        let error = PatternTransformProgram::new([apply_registered(
+            when_registration(),
+            vec![crate::pure(Value::F64(1.0)).fmap_js(7), function],
+        )])
+        .unwrap_err();
         assert_eq!(
             error,
             PatternTransformBuildError::NonNativeInstruction { index: 0 }

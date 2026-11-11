@@ -36,8 +36,9 @@ mod callback_ir;
 mod frequency_sliders;
 mod surface_writes;
 pub use callback_ir::{
-    CallbackArgument, CallbackMethodCall, MAX_CALLBACK_IR_SOURCE_BYTES, PatternTransformCandidate,
-    PatternTransformFallbackReason, lower_pattern_transform_callback,
+    CallbackArgument, CallbackMethodCall, MAX_CALLBACK_IR_SOURCE_BYTES,
+    MAX_CALLBACK_TRANSFORM_DEPTH, PatternTransformCandidate, PatternTransformFallbackReason,
+    lower_pattern_transform_callback,
 };
 pub use frequency_sliders::is_frequency_control;
 pub use surface_writes::{SurfaceWrites, surface_writes};

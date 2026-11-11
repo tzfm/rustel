@@ -17,10 +17,14 @@ impl Pattern {
     ///
     /// Two graphs agree when their nodes have the same kinds in the same
     /// shape, equal scalar payloads and agreeing children, and every handle
-    /// has the same step count, source location, purity and runtime owner. A
-    /// node shared by both sides agrees with itself without a walk. Closures,
-    /// construction memos and precomputed tables are not compared. A
-    /// comparison past [`MAX_COMPARED_NODES`] node pairs does not agree.
+    /// has the same step count, source location, purity and runtime owner.
+    /// The reachable-callback set is the one part of purity left out: a
+    /// callback's id is its per-bridge allocation ordinal, so two builds of
+    /// one score reach the same callbacks under different ids, and the nodes
+    /// that carry an id are compared as nodes already. A node shared by both
+    /// sides agrees with itself without a walk. Closures, construction memos
+    /// and precomputed tables are not compared. A comparison past
+    /// [`MAX_COMPARED_NODES`] node pairs does not agree.
     #[doc(hidden)]
     pub fn same_construction(&self, other: &Pattern) -> bool {
         let mut pending = vec![(self, other)];
@@ -28,7 +32,10 @@ impl Pattern {
         while let Some((left, right)) = pending.pop() {
             if left.steps != right.steps
                 || left.pure_loc != right.pure_loc
-                || left.purity != right.purity
+                || left.purity.impure != right.purity.impure
+                || left.purity.opaque != right.purity.opaque
+                || left.purity.volatile != right.purity.volatile
+                || left.purity.host_voicings != right.purity.host_voicings
                 || !left.same_runtime_owner(right)
             {
                 return false;

@@ -618,6 +618,17 @@ impl FunctionRef {
         }
     }
 
+    /// Whether this is a JavaScript callback with its compiled program: the
+    /// one function value a callback program may hold, in its registration's
+    /// function slot. The host owns the choice between the program and the
+    /// callback, in either kind.
+    pub(crate) fn carries_pattern_program(&self) -> bool {
+        matches!(
+            self.kind,
+            FunctionKind::LoweredJs { .. } | FunctionKind::JsPatternIr { .. }
+        )
+    }
+
     /// The script callback a pure view of this function may still need: a
     /// lowered callback whose program can go stale. See
     /// [`crate::Pattern::retaining_callbacks`].
@@ -628,6 +639,34 @@ impl FunctionRef {
             }
             _ => None,
         }
+    }
+
+    /// Every script callback a wrapper owning this function must keep alive:
+    /// the fallback a lowered callback needs once its program can go stale,
+    /// the fallback a pattern-IR callback needs at every application, and -
+    /// for either kind - the same set for every function-valued argument the
+    /// program holds, which can go stale on its own while the program stands.
+    ///
+    /// A closure that captures a function value cannot show it to purity, so
+    /// [`crate::Pattern::retaining_callbacks`] is the only channel these ids
+    /// reach a wrapper's harvest through.
+    pub(crate) fn retained_callbacks(&self) -> Vec<crate::CallbackId> {
+        let mut ids = Vec::new();
+        match &self.kind {
+            FunctionKind::Js(id) => ids.push(*id),
+            FunctionKind::JsPatternIr { fallback, program } => {
+                ids.push(*fallback);
+                ids.extend(program.retained_callback_ids());
+            }
+            FunctionKind::LoweredJs { fallback, program } => {
+                if program.can_go_stale() {
+                    ids.push(*fallback);
+                }
+                ids.extend(program.retained_callback_ids());
+            }
+            FunctionKind::Native { .. } | FunctionKind::Registered { .. } => {}
+        }
+        ids
     }
 
     /// Whether a later application may have to differ from this one: a
@@ -1867,7 +1906,7 @@ mod tests {
         assert!(value.has_js_function());
         assert!(!crate::pure(value).is_pure());
         assert!(super::is_rendered_function(&format!("{lowered:?}")));
-        assert!(format!("{lowered:?}").ends_with("(cb 9, native ir v12:0 ops)"));
+        assert!(format!("{lowered:?}").ends_with("(cb 9, native ir v13:0 ops)"));
 
         let pattern = crate::pure(Value::F64(4.0));
         let pure = crate::purity::PurePattern::assert_pure(pattern.clone());
