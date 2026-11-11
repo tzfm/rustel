@@ -35,6 +35,9 @@ pub struct OrderedMap {
 enum Entries {
     /// A clone is a reference count step.
     Shared(Arc<Vec<(Key, Value)>>),
+    /// Shared entries a compose made of data values only, so the map holds
+    /// data until it is written again. See [`compose::compose_data_in_place`].
+    Made(Arc<Vec<(Key, Value)>>),
     /// Kept for the life of the process, so a clone copies a pointer. See
     /// [`OrderedMap::interned`].
     Interned(&'static Vec<(Key, Value)>),
@@ -114,9 +117,10 @@ impl Hasher for Fnv {
 }
 
 impl OrderedMap {
-    fn entries(&self) -> &Vec<(Key, Value)> {
+    pub(crate) fn entries(&self) -> &Vec<(Key, Value)> {
         match &self.entries {
             Entries::Shared(entries) => entries,
+            Entries::Made(entries) => entries,
             Entries::Interned(entries) => entries,
         }
     }
@@ -124,9 +128,16 @@ impl OrderedMap {
     /// The entries to write, with room for `additional` more. Entries
     /// another map shares are copied first, once, with that room and a
     /// little more, since a map that is written once is often written again.
-    fn entries_mut(&mut self, additional: usize) -> &mut Vec<(Key, Value)> {
+    pub(crate) fn entries_mut(&mut self, additional: usize) -> &mut Vec<(Key, Value)> {
+        // A map a compose made of data holds that guarantee only until it is
+        // written again; the compose re-marks its own writes.
+        if let Entries::Made(entries) = &self.entries {
+            let entries = Arc::clone(entries);
+            self.entries = Entries::Shared(entries);
+        }
         let unique = match &mut self.entries {
             Entries::Shared(entries) => Arc::get_mut(entries).is_some(),
+            Entries::Made(_) => unreachable!("a made map was just downgraded"),
             Entries::Interned(_) => false,
         };
         if !unique {
@@ -140,6 +151,7 @@ impl OrderedMap {
                 entries.reserve(additional);
                 entries
             }
+            Entries::Made(_) => unreachable!("a made map was just downgraded"),
             Entries::Interned(_) => unreachable!("an interned map was just copied"),
         }
     }
@@ -211,6 +223,25 @@ impl OrderedMap {
     pub(crate) fn is_interned(&self) -> bool {
         matches!(self.entries, Entries::Interned(_))
     }
+
+    /// Whether the map's own storage answers for its data-ness: an interned
+    /// map was checked when it was kept, and a made map was made of data
+    /// values only.
+    pub(crate) fn holds_only_data(&self) -> bool {
+        matches!(self.entries, Entries::Interned(_) | Entries::Made(_))
+    }
+
+    /// Mark this map, whose writes a compose of data values just finished,
+    /// as holding data only. A map another writer shares, or one already
+    /// kept, is left alone: the guarantee belongs to this compose's own
+    /// unique copy.
+    pub(crate) fn mark_made_of_data(&mut self) {
+        let current = std::mem::replace(&mut self.entries, Entries::Interned(&EMPTY));
+        self.entries = match current {
+            Entries::Shared(entries) if Arc::strong_count(&entries) == 1 => Entries::Made(entries),
+            other => other,
+        };
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -236,22 +267,6 @@ impl OrderedMap {
         }
         entries.push((key, value));
         None
-    }
-
-    /// `key`'s value replaced by what `make` makes of it where it is, or
-    /// `make(None)` added last when the map has no such key.
-    pub(crate) fn upsert(&mut self, key: &Key, make: impl FnOnce(Option<&Value>) -> Value) {
-        let entries = self.entries_mut(0);
-        match entries.iter().position(|(name, _)| name == key) {
-            Some(index) => {
-                let value = make(Some(&entries[index].1));
-                entries[index].1 = value;
-            }
-            None => {
-                let value = make(None);
-                entries.push((key.clone(), value));
-            }
-        }
     }
 
     /// Vec-compatible spelling retained for state-control call sites.
@@ -336,8 +351,24 @@ impl<'a> IntoIterator for &'a OrderedMap {
 
 /// A key of an [`OrderedMap`]. Every copy of a map, and every map that a
 /// control makes, shares its key's one allocation.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Eq)]
 pub struct Key(Arc<str>);
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Self) -> bool {
+        // Maps that share a key's allocation answer by pointer; only keys
+        // from different allocations compare their text.
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+impl Hash for Key {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // By text, so equal keys hash equal whether or not they share an
+        // allocation.
+        self.0.hash(state)
+    }
+}
 
 impl Key {
     pub fn as_str(&self) -> &str {
@@ -1218,8 +1249,9 @@ impl Value {
         match self {
             Value::Undefined | Value::Null | Value::Bool(_) | Value::F64(_) | Value::Str(_) => true,
             Value::List(items) => items.iter().all(|item| item.is_data(depth + 1)),
-            // A kept map was checked as data when it was kept.
-            Value::Object(object) if depth == 0 && object.is_interned() => true,
+            // A kept map was checked as data when it was kept, and a made
+            // map was made of data values only.
+            Value::Object(object) if object.holds_only_data() => true,
             Value::Object(object) => object.iter().all(|(_, item)| item.is_data(depth + 1)),
             Value::Pattern(_) | Value::JsValue(_) | Value::Function(_) | Value::Haps(_) => false,
         }
@@ -1320,6 +1352,9 @@ impl Value {
             Self::Haps(haps) => haps.0.iter().any(|hap| hap.value.has_js_function()),
             Self::JsValue(_) => true,
             Self::List(items) => items.iter().any(Value::has_js_function),
+            // A kept map was checked as data when it was kept, and a made
+            // map was made of data values only; data holds no function.
+            Self::Object(map) if map.holds_only_data() => false,
             Self::Object(map) => map.iter().any(|(_, v)| v.has_js_function()),
             _ => false,
         }
@@ -1335,6 +1370,10 @@ impl Value {
             Self::JsValue(_) => true,
             Self::Haps(haps) => haps.0.iter().any(|hap| hap.value.contains_js_value()),
             Self::List(items) => items.iter().any(Value::contains_js_value),
+            // A kept map was checked as data when it was kept, and a made
+            // map was made of data values only; data holds nothing a host
+            // owns.
+            Self::Object(map) if map.holds_only_data() => false,
             Self::Object(map) => map.iter().any(|(_, value)| value.contains_js_value()),
             _ => false,
         }

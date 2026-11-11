@@ -30,7 +30,8 @@ use crate::{
     ValuePredicate, applied_hap, joined_hap, picked_hap,
 };
 use rustel_fraction::Fraction;
-use std::sync::{Arc, OnceLock};
+use std::fmt;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The most haps one table may hold, and the most cycles a build answers
 /// one at a time. Above it the graph answers.
@@ -38,6 +39,47 @@ const MAX_ENTRIES: usize = 8192;
 
 /// The most haps one query reserves room for ahead of making them.
 const MAX_RESERVED: usize = 1 << 16;
+
+// Buffers of haps that one query hands out and takes back, so that a
+// nested answer does not allocate its own. Per thread, without locks; a
+// buffer returns on drop, empty but with its room.
+thread_local! {
+    static HAP_BUFFERS: std::cell::RefCell<Vec<Vec<Hap>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One buffer from [`HAP_BUFFERS`], returned when it drops.
+struct HapBuffer(Vec<Hap>);
+
+impl HapBuffer {
+    fn take() -> Self {
+        let pooled = HAP_BUFFERS.with(|pool| pool.borrow_mut().pop());
+        Self(pooled.unwrap_or_default())
+    }
+}
+
+impl Drop for HapBuffer {
+    fn drop(&mut self) {
+        if self.0.capacity() <= MAX_RESERVED {
+            self.0.clear();
+            HAP_BUFFERS.with(|pool| pool.borrow_mut().push(std::mem::take(&mut self.0)));
+        }
+    }
+}
+
+impl std::ops::Deref for HapBuffer {
+    type Target = Vec<Hap>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for HapBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// The most graph levels one table build walks. Each level is a few native
 /// frames, so this stays well below [`crate::MAX_PATTERN_DEPTH`].
@@ -625,7 +667,7 @@ impl Signal {
             }
             Source::Fixed(fixed) => {
                 let by = asked.begin.checked_sub(fixed.whole.begin)?;
-                let mut scratch = Vec::new();
+                let mut scratch = HapBuffer::take();
                 for (hap, sampler) in fixed.haps.iter().zip(&fixed.samplers) {
                     let hap = retimed(hap, |t| t.checked_add(by))?;
                     match sampler {
@@ -856,7 +898,8 @@ impl Stage {
                 if !answered {
                     source.answer(whole, part, probe, signal)?;
                 }
-                let mut next = Vec::with_capacity(signal.len());
+                let mut next = HapBuffer::take();
+                next.reserve(signal.len());
                 for structure in &out[start..] {
                     for met in signal.iter() {
                         if let Some(cut) = structure.part.intersection(&met.part) {
@@ -1074,6 +1117,9 @@ pub(crate) struct Tables {
     /// answers only while they all hold. See
     /// [`crate::callback_ir::recording_reads`].
     read: Box<[Arc<crate::callback_ir::Standing>]>,
+    /// The answers this table gave, for a query that asks the same span
+    /// again. Shared by every clone of these tables, which answer alike.
+    answers: Arc<Answers>,
 }
 
 /// What the graph's walk does for a query, as bounds a table checks before
@@ -1761,7 +1807,7 @@ impl Layer {
         }
         out.reserve(self.most(entries, span, periods)?.min(MAX_RESERVED));
         let mut probe = state.clone();
-        let mut signal = Vec::new();
+        let mut signal = HapBuffer::take();
         for k in periods.first..=periods.last {
             let shift = k.checked_mul(self.period)?;
             let inside = periods.is_inside(k);
@@ -2306,6 +2352,73 @@ impl Stop {
     }
 }
 
+/// The answers a table gave, kept for a query that asks the same span
+/// again: playback asks one cycle many times over. Direct-mapped, a span's
+/// first cycle its slot. A hit hands out a copy of the kept haps, taken
+/// without the lock.
+#[derive(Default)]
+struct Answers(Mutex<Vec<Option<KeptAnswer>>>);
+
+/// One kept answer.
+struct KeptAnswer {
+    span: TimeSpan,
+    order: Order,
+    haps: Arc<Vec<Hap>>,
+}
+
+impl Answers {
+    /// The most answers one table keeps.
+    const SLOTS: usize = 16;
+
+    /// The most haps one kept answer holds. A larger answer costs more to
+    /// copy than it costs again, and sixteen of them cost more memory than
+    /// a table's own haps.
+    const MOST_HAPS: usize = 2048;
+
+    fn slot(span: TimeSpan) -> usize {
+        span.begin.numer() as usize & (Self::SLOTS - 1)
+    }
+
+    fn get(&self, span: TimeSpan, order: Order) -> Option<Vec<Hap>> {
+        let kept = {
+            let slots = self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slots
+                .get(Self::slot(span))?
+                .as_ref()
+                .filter(|kept| kept.span == span && kept.order == order)
+                .map(|kept| Arc::clone(&kept.haps))?
+        };
+        Some(kept.as_ref().clone())
+    }
+
+    fn put(&self, span: TimeSpan, order: Order, haps: Vec<Hap>) {
+        if haps.is_empty() || haps.len() > Self::MOST_HAPS {
+            return;
+        }
+        let mut slots = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slots.is_empty() {
+            slots.resize_with(Self::SLOTS, || None);
+        }
+        slots[Self::slot(span)] = Some(KeptAnswer {
+            span,
+            order,
+            haps: Arc::new(haps),
+        });
+    }
+}
+
+impl fmt::Debug for Answers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Answers(..)")
+    }
+}
+
 impl Tables {
     fn new(layers: Vec<Layer>, work: Work) -> Self {
         let mut extent = 0.0f64;
@@ -2337,6 +2450,7 @@ impl Tables {
             sorted,
             state: None,
             read: Box::new([]),
+            answers: Arc::new(Answers::default()),
         }
     }
 
@@ -2484,6 +2598,13 @@ impl Tables {
         if !stop.begin() {
             return Some(out);
         }
+        // A query that carries no controls asks the same question every
+        // time it asks the same span, so its answer is kept and handed out
+        // again.
+        let plain = state.controls.is_empty();
+        if plain && let Some(kept) = self.answers.get(state.span, order) {
+            return Some(kept);
+        }
         let meeting = self
             .layer_index()
             .and_then(|index| index.meeting(state.span));
@@ -2496,6 +2617,9 @@ impl Tables {
             if stop.stopped() {
                 break;
             }
+        }
+        if plain && !stop.stopped() {
+            self.answers.put(state.span, order, out.clone());
         }
         Some(out)
     }
@@ -2838,7 +2962,15 @@ fn signal_work(signal: &Signal, width: Fraction, extent: f64, bits: u32) -> Opti
     // outermost in. A constant walks the cycles of its span, and each cycle
     // bound in it can cut the signal's haps once more.
     let mut cycles = Cycles::NONE;
-    let mut most = 1u64;
+    // A signal answers one hap over the span it is asked over. A constant
+    // answers its hap once a cycle of the span, counted below: a whole hap
+    // a cycle, not one more than that, or every meeting of one multiplies
+    // the haps the next is charged for.
+    let mut most = if matches!(signal.source, Source::Constant(_)) {
+        0u64
+    } else {
+        1u64
+    };
     let mut wide = width;
     // The signal, and one level for each node above it. A constant's own
     // pattern is a child of its meeting.

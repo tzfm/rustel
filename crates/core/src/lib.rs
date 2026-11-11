@@ -2365,7 +2365,7 @@ fn map_js_haps(
         // A pending query error is deliberately NOT a stop: the turn
         // boundary turns a throwing callback into silence after every hap
         // had its turn, which the `and`/`or` lazy-truthy contracts pin.
-        if budget_exhausted() || cancellation_requested() || query_deadline_expired() {
+        if query_stop_requested() {
             return Vec::new();
         }
         let mapped = hap.with_value(|v| {
@@ -2638,6 +2638,11 @@ thread_local! {
     /// plausible silence, and typed so the caller learns which limit fired.
     static REFUSAL: std::cell::RefCell<Option<QueryLimit>> =
         const { std::cell::RefCell::new(None) };
+    /// The stop signals as one word — a refusal recorded, a deadline armed
+    /// or past, a cancellation flag installed — so the checks a query makes
+    /// per hap read one thread-local instead of walking each slot. The
+    /// separate slots stay the source of truth; the word only mirrors them.
+    static QUERY_STOP: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     /// Remaining stepwise construction entries in this top-level query.
     /// `None` outside a query means the scalar body receives the same limit per
     /// invocation; nested queries share the enclosing remaining balance.
@@ -2647,6 +2652,21 @@ thread_local! {
     /// not race.
     static STEPWISE_ENTRIES_MATERIALISED: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+}
+
+/// [`QUERY_STOP`] bits: the refusal slot holds a limit, a deadline is
+/// installed, that deadline has passed, a cancellation flag is installed.
+const STOP_REFUSED: u8 = 1;
+const STOP_DEADLINE_ARMED: u8 = 2;
+const STOP_DEADLINE_PASSED: u8 = 4;
+const STOP_CANCEL_ARMED: u8 = 8;
+
+/// Mirror one stop signal into [`QUERY_STOP`].
+fn set_stop_bit(bit: u8, on: bool) {
+    QUERY_STOP.with(|slot| {
+        let word = slot.get();
+        slot.set(if on { word | bit } else { word & !bit });
+    });
 }
 
 /// Charge a complete planned stepwise expansion before any Pattern nodes are
@@ -2706,8 +2726,10 @@ fn without_query_signals<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
     }
     impl RefusalScope {
         fn enter() -> Self {
+            let outer = REFUSAL.with(|slot| slot.borrow_mut().take());
+            set_stop_bit(STOP_REFUSED, outer.is_some());
             Self {
-                outer: REFUSAL.with(|slot| slot.borrow_mut().take()),
+                outer,
                 finished: false,
             }
         }
@@ -2715,15 +2737,17 @@ fn without_query_signals<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
         fn finish(mut self) -> bool {
             self.finished = true;
             let outer = self.outer.take();
-            REFUSAL
-                .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), outer))
-                .is_some()
+            let outer_refused = outer.is_some();
+            let inner = REFUSAL.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), outer));
+            set_stop_bit(STOP_REFUSED, outer_refused);
+            inner.is_some()
         }
     }
     impl Drop for RefusalScope {
         fn drop(&mut self) {
             if !self.finished {
                 let outer = self.outer.take();
+                set_stop_bit(STOP_REFUSED, outer.is_some());
                 REFUSAL.with(|slot| *slot.borrow_mut() = outer);
             }
         }
@@ -2931,7 +2955,23 @@ pub fn charge_hap_at(len_after_push: usize) -> bool {
 /// keeps making re-entries after its deadline. Each one is cheap, but tens
 /// of thousands of them cost seconds on the producer thread.
 pub(crate) fn budget_exhausted() -> bool {
-    REFUSAL.with(|slot| slot.borrow().is_some()) || DEADLINE_EXPIRED.with(|slot| slot.get())
+    QUERY_STOP.with(|slot| slot.get()) & (STOP_REFUSED | STOP_DEADLINE_PASSED) != 0
+}
+
+/// All three stop signals in one thread-local read: a recorded refusal, a
+/// past deadline, an installed cancellation flag. The word cannot answer
+/// alone for the armed cases — a deadline must still sample the clock, and
+/// a cancellation flag belongs to another thread — so those fall back to
+/// their full checks.
+pub(crate) fn query_stop_requested() -> bool {
+    let word = QUERY_STOP.with(|slot| slot.get());
+    if word & (STOP_REFUSED | STOP_DEADLINE_PASSED) != 0 {
+        return true;
+    }
+    if word & STOP_CANCEL_ARMED != 0 && cancellation_requested() {
+        return true;
+    }
+    word & STOP_DEADLINE_ARMED != 0 && query_deadline_after(1)
 }
 
 /// Record a resource refusal. The first one wins, as with query errors.
@@ -2940,6 +2980,7 @@ pub(crate) fn refuse(limit: QueryLimit) {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
             *slot = Some(limit);
+            set_stop_bit(STOP_REFUSED, true);
         }
     });
 }
@@ -2988,10 +3029,12 @@ pub fn with_cancellation<R>(flag: &std::sync::atomic::AtomicBool, f: impl FnOnce
     struct Guard(Option<*const std::sync::atomic::AtomicBool>);
     impl Drop for Guard {
         fn drop(&mut self) {
+            set_stop_bit(STOP_CANCEL_ARMED, self.0.is_some());
             CANCEL_FLAG.with(|slot| slot.set(self.0));
         }
     }
     let previous = CANCEL_FLAG.with(|slot| slot.replace(Some(flag as *const _)));
+    set_stop_bit(STOP_CANCEL_ARMED, true);
     let _guard = Guard(previous);
     // A fresh scope starts with nothing observed; the enclosing scope's
     // observation is restored when it ends.
@@ -3038,6 +3081,7 @@ pub fn with_query_deadline<T>(deadline: std::time::Instant, f: impl FnOnce() -> 
     struct Guard(Option<std::time::Instant>, u64);
     impl Drop for Guard {
         fn drop(&mut self) {
+            set_stop_bit(STOP_DEADLINE_ARMED, self.0.is_some());
             QUERY_DEADLINE.with(|slot| slot.set(self.0));
             QUERY_DEADLINE_MILLIS.with(|slot| slot.set(self.1));
         }
@@ -3060,10 +3104,12 @@ pub fn with_query_deadline<T>(deadline: std::time::Instant, f: impl FnOnce() -> 
         let previous_millis = QUERY_DEADLINE_MILLIS.with(|slot| slot.replace(allowed));
         (previous, previous_millis)
     });
+    set_stop_bit(STOP_DEADLINE_ARMED, true);
     let _guard = Guard(previous, previous_millis);
     // A nested scope starts un-expired and re-detects within its own sampling
     // interval; the enclosing scope's verdict is restored when it ends.
     let previously_expired = DEADLINE_EXPIRED.with(|slot| slot.replace(false));
+    set_stop_bit(STOP_DEADLINE_PASSED, false);
     let _expiry_guard = ExpiryGuard(previously_expired);
     DEADLINE_TICK.with(|tick| tick.set(0));
     f()
@@ -3072,6 +3118,7 @@ pub fn with_query_deadline<T>(deadline: std::time::Instant, f: impl FnOnce() -> 
 struct ExpiryGuard(bool);
 impl Drop for ExpiryGuard {
     fn drop(&mut self) {
+        set_stop_bit(STOP_DEADLINE_PASSED, self.0);
         DEADLINE_EXPIRED.with(|slot| slot.set(self.0));
     }
 }
@@ -3116,6 +3163,7 @@ pub(crate) fn query_deadline_after(checks: u32) -> bool {
             return false;
         }
         DEADLINE_EXPIRED.with(|expired| expired.set(true));
+        set_stop_bit(STOP_DEADLINE_PASSED, true);
         refuse(QueryLimit::QueryDeadline {
             millis: QUERY_DEADLINE_MILLIS.with(|slot| slot.get()),
         });
@@ -3133,6 +3181,11 @@ pub fn installed_query_deadline_millis() -> Option<u64> {
 
 /// Whether the current query has been asked to stop.
 pub(crate) fn cancellation_requested() -> bool {
+    // The word answers the common case: no flag installed means no other
+    // thread can be asking this one to stop.
+    if QUERY_STOP.with(|slot| slot.get()) & STOP_CANCEL_ARMED == 0 {
+        return false;
+    }
     let requested = CANCEL_FLAG.with(|slot| match slot.get() {
         None => false,
         // SAFETY: set only by `with_cancellation`, which outlives this read.
@@ -3192,7 +3245,11 @@ fn with_hap_budget<R>(budget: u64, f: impl FnOnce() -> R) -> (R, Option<QueryLim
         }
         (previous, previous.is_some())
     });
-    let previous_refusal = (!nested).then(|| REFUSAL.with(|f| f.borrow_mut().take()));
+    let previous_refusal = (!nested).then(|| {
+        let previous = REFUSAL.with(|f| f.borrow_mut().take());
+        set_stop_bit(STOP_REFUSED, false);
+        previous
+    });
     let previous_stepwise = STEPWISE_ENTRIES_REMAINING.with(|slot| {
         let previous = slot.get();
         if !nested {
@@ -3212,6 +3269,7 @@ fn with_hap_budget<R>(budget: u64, f: impl FnOnce() -> R) -> (R, Option<QueryLim
             if !self.nested {
                 STEPWISE_ENTRIES_REMAINING.with(|slot| slot.set(self.previous_stepwise));
                 let previous = self.previous_refusal.take().flatten();
+                set_stop_bit(STOP_REFUSED, previous.is_some());
                 REFUSAL.with(|slot| *slot.borrow_mut() = previous);
             }
         }
@@ -4122,11 +4180,7 @@ fn restarted_from_tables(
     state: &State,
     part: TimeSpan,
 ) -> Option<Vec<Hap>> {
-    if query_error_pending()
-        || budget_exhausted()
-        || cancellation_requested()
-        || query_deadline_expired()
-    {
+    if query_error_pending() || query_stop_requested() {
         return None;
     }
     // The moved pattern, then `pattern` below it.
@@ -4334,7 +4388,7 @@ fn query_patternified_pick(
             })
             .or_else(|| PickLookup::from_value(&hap.value).and_then(scoped_pick_lookup));
         let Some(lookup) = lookup else {
-            if budget_exhausted() || cancellation_requested() || query_deadline_expired() {
+            if query_stop_requested() {
                 return Vec::new();
             }
             signal_query_error(|| "Cannot convert undefined or null to object".into());
@@ -5141,7 +5195,7 @@ impl Pattern {
         // the finished timeline runs after the allocation it exists to prevent.
         // Combined with `MAX_QUERY_SPAN_CYCLES`, which bounds what a single leaf
         // can produce in one pass, no unbounded `Vec<Hap>` can form.
-        if budget_exhausted() || cancellation_requested() || query_deadline_expired() {
+        if query_stop_requested() {
             return (Vec::new(), true);
         }
         // A table holds data only, which carries no runtime to attach.
@@ -5735,20 +5789,45 @@ impl Pattern {
             // hap's wholeOrPart, and the function side's whole wins.
             Node::AppLeft(pat_func, pat_val, apply, lookup_flow) => {
                 let mut out = Vec::new();
-                for hf in pat_func.query(state) {
+                for mut hf in pat_func.query(state) {
                     let inner = pat_val.query(&state.set_span(hf.whole_or_part()));
-                    for hv in inner {
-                        if let Some(part) = hf.part.intersection(&hv.part) {
-                            let hap = applied_hap(&hf, &hv, hf.whole, part, apply, *lookup_flow);
-                            if budget_exhausted()
-                                || cancellation_requested()
-                                || query_deadline_expired()
-                            {
+                    // One value hap meets this function hap, and that one
+                    // meeting is the hap's own: the hap is consumed where it
+                    // is, as a sampled meeting is. Several meetings share the
+                    // function hap as their base, so each keeps a copy of it.
+                    if inner.len() == 1
+                        && let [hv] = inner.as_slice()
+                        && let Some(part) = hf.part.intersection(&hv.part)
+                    {
+                        // A refused in-place meeting leaves the hap unchanged.
+                        if Meeting::in_place(&mut hf, hv, part, apply, *lookup_flow) {
+                            if query_stop_requested() {
+                                return Vec::new();
+                            }
+                            if !push_budgeted(&mut out, hf) {
+                                return Vec::new();
+                            }
+                        } else {
+                            let hap = applied_hap(&hf, hv, hf.whole, part, apply, *lookup_flow);
+                            if query_stop_requested() {
                                 return Vec::new();
                             }
                             if !push_budgeted(&mut out, hap) {
                                 return Vec::new();
                             }
+                        }
+                        continue;
+                    }
+                    for hv in &inner {
+                        let Some(part) = hf.part.intersection(&hv.part) else {
+                            continue;
+                        };
+                        let hap = applied_hap(&hf, hv, hf.whole, part, apply, *lookup_flow);
+                        if query_stop_requested() {
+                            return Vec::new();
+                        }
+                        if !push_budgeted(&mut out, hap) {
+                            return Vec::new();
                         }
                     }
                 }
@@ -5756,7 +5835,10 @@ impl Pattern {
             }
 
             // appRight: loop value haps first, query function haps in each
-            // value whole, and preserve the value side's whole.
+            // value whole, and preserve the value side's whole. The value
+            // side's hap is the meeting's base, but a meeting composes with
+            // the function side first, so it cannot be made in place as
+            // `appLeft`'s lone meeting is.
             Node::AppRight(pat_func, pat_val, apply, lookup_flow) => {
                 let mut out = Vec::new();
                 for hv in pat_val.query(state) {
@@ -5764,10 +5846,7 @@ impl Pattern {
                     for hf in funcs {
                         if let Some(part) = hf.part.intersection(&hv.part) {
                             let hap = applied_hap(&hf, &hv, hv.whole, part, apply, *lookup_flow);
-                            if budget_exhausted()
-                                || cancellation_requested()
-                                || query_deadline_expired()
-                            {
+                            if query_stop_requested() {
                                 return Vec::new();
                             }
                             if !push_budgeted(&mut out, hap) {
@@ -5803,10 +5882,7 @@ impl Pattern {
                             _ => None,
                         };
                         let hap = applied_hap(hf, hv, whole, part, apply, *lookup_flow);
-                        if budget_exhausted()
-                            || cancellation_requested()
-                            || query_deadline_expired()
-                        {
+                        if query_stop_requested() {
                             return Vec::new();
                         }
                         if !push_budgeted(&mut out, hap) {
@@ -8225,9 +8301,10 @@ fn compute_purity(node: &Node) -> purity::Purity {
         Node::PurePickLookup(_, lookup) => {
             Purity::merge(lookup.patterns().map(|pattern| pattern.purity.clone()))
         }
-        Node::Silence | Node::Signal(_) | Node::QueryError(_) | Node::QueryLimit(_) => {
-            Purity::pure()
-        }
+        Node::Silence
+        | Node::Signal(_)
+        | Node::QueryError(_)
+        | Node::QueryLimit(_) => Purity::pure(),
 
         // Any node holding a callback id is impure and contributes it.
         Node::FmapJs(p, id)
@@ -8795,7 +8872,7 @@ pub fn pick_f_compat(
                     })
                     .or_else(|| PickLookup::from_value(&hap.value).and_then(scoped_pick_lookup))
                 else {
-                    if budget_exhausted() || cancellation_requested() || query_deadline_expired() {
+                    if query_stop_requested() {
                         return silence();
                     }
                     return query_error_pattern("Cannot convert undefined or null to object");

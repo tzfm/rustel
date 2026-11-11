@@ -356,24 +356,33 @@ pub(crate) fn union_drops(b: &OrderedMap) -> bool {
 /// `b`'s keys added to `out`: common keys replaced where they are by the
 /// combined value, then `b`'s new keys in `b`'s order.
 fn union_into(op: ComposeOp, out: &mut OrderedMap, b: &OrderedMap) {
-    out.reserve(b.len());
-    for (key, b_value) in b {
-        out.upsert(key, |a_value| match a_value {
-            Some(a_value) => op.apply_scalar(a_value, b_value),
-            None => b_value.clone(),
-        });
+    let entries = b.entries();
+    if entries.is_empty() {
+        return;
+    }
+    // One hold of the entries for every key of `b`, not one per key: each
+    // hold pays for the map's copy and its shared-count bookkeeping.
+    let out = out.entries_mut(entries.len());
+    for (key, b_value) in entries {
+        match out.iter_mut().find(|(name, _)| name == key) {
+            Some((_, current)) => *current = op.apply_scalar(current, b_value),
+            None => out.push((key.clone(), b_value.clone())),
+        }
     }
 }
 
 /// [`compose_op`] of two data values, which hold no script object, made
 /// where `a` is. A union of two maps adds `b`'s keys to `a`'s map, which it
-/// copies only when it is shared.
+/// copies only when it is shared. Data made of data is data, so the union's
+/// map is marked as holding data only, and the next compose of it does not
+/// walk its entries to learn that again.
 pub(crate) fn compose_data_in_place(op: ComposeOp, a: &mut Value, b: &Value) {
     debug_assert!(a.is_data(0) && b.is_data(0));
     if let (Value::Object(map), Value::Object(other)) = (&mut *a, b)
         && !union_drops(other)
     {
         union_into(op, map, other);
+        map.mark_made_of_data();
         return;
     }
     *a = compose_op(op, a, b);
