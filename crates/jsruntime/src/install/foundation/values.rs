@@ -1601,12 +1601,11 @@ pub(super) fn install<'js>(ctx: &Ctx<'js>) -> Result<rquickjs::Object<'js>, Stri
             Function::new(ctx.clone(), native_silence).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
+    let mini_callee = Function::new(ctx.clone(), native_mini).map_err(|error| error.to_string())?;
     globals
-        .set(
-            "m",
-            Function::new(ctx.clone(), native_mini).map_err(|error| error.to_string())?,
-        )
+        .set("m", mini_callee.clone())
         .map_err(|error| error.to_string())?;
+    record_mini_callee(ctx, &mini_callee).map_err(|error| error.to_string())?;
     let mini =
         Function::new(ctx.clone(), native_mini_sequence).map_err(|error| error.to_string())?;
     mini.set_name("mini").map_err(|error| error.to_string())?;

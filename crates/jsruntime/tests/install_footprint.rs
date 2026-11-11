@@ -1,6 +1,8 @@
 use rustel_jsruntime::JsRuntime;
 
-const CORE_SEMANTIC_OBJECT_BUDGET: usize = 3_535;
+// The core surface, plus the two private roots the builtin-method lowering
+// gate keeps: the recorded prototype slots and the intrinsics snapshot.
+const CORE_SEMANTIC_OBJECT_BUDGET: usize = 3_537;
 
 fn semantic_object_budget() -> usize {
     let mut budget = CORE_SEMANTIC_OBJECT_BUDGET;

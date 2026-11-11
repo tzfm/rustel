@@ -129,6 +129,9 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     /// queries - see [`crate::purity::Purity::volatile`]. What a body that
     /// reads mutable host state at query time calls on its result.
     fn mark_volatile(&self) -> Self;
+    /// Declare that this pattern reads the default voicing dictionary - see
+    /// [`crate::purity::Purity::host_voicings`].
+    fn mark_host_voicings(&self) -> Self;
     fn discrete_only(&self) -> Self;
     fn onsets_only(&self) -> Self;
     fn remove_undefineds(&self) -> Self;
@@ -168,6 +171,25 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
         combine: impl Fn(&Value, &Value) -> Value + Send + Sync + 'static,
         lookup_flow: crate::LookupFlow,
     ) -> Self;
+    /// `app_*_with_lookup` of [`crate::compose::compose_op`] for `op`.
+    fn app_left_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self;
+    fn app_right_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self;
+    fn app_both_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self;
 
     // -- joins -------------------------------------------------------------
     fn inner_bind(&self, f: impl Fn(&Value) -> Self + Send + Sync + 'static) -> Self;
@@ -183,7 +205,7 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     /// Under the `PurePattern` instantiation this REQUIRES a native function.
     /// A JS function reaching it is a classification bug, not a user error, and
     /// panics rather than silently producing a false-pure pattern; see
-    /// `Registration::takes_function`, which keeps it unreachable.
+    /// `Registration::function_argument`, which keeps it unreachable.
     fn apply_fn(&self, f: &crate::value::FunctionRef) -> Self;
 
     /// Apply one indexed transformer to a complete `echoWith` batch.
@@ -379,6 +401,9 @@ impl PatOps for Pattern {
     fn mark_volatile(&self) -> Self {
         Pattern::mark_volatile(self)
     }
+    fn mark_host_voicings(&self) -> Self {
+        Pattern::mark_host_voicings(self)
+    }
     fn discrete_only(&self) -> Self {
         Pattern::discrete_only(self)
     }
@@ -436,6 +461,30 @@ impl PatOps for Pattern {
         lookup_flow: crate::LookupFlow,
     ) -> Self {
         Pattern::app_both_with_lookup(self, other, combine, lookup_flow)
+    }
+    fn app_left_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        Pattern::app_left_composed(self, other, op, lookup_flow)
+    }
+    fn app_right_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        Pattern::app_right_composed(self, other, op, lookup_flow)
+    }
+    fn app_both_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        Pattern::app_both_composed(self, other, op, lookup_flow)
     }
 
     fn inner_bind(&self, f: impl Fn(&Value) -> Self + Send + Sync + 'static) -> Self {
@@ -658,6 +707,9 @@ impl PatOps for PurePattern {
     fn mark_volatile(&self) -> Self {
         PurePattern::assert_pure(self.pattern().mark_volatile())
     }
+    fn mark_host_voicings(&self) -> Self {
+        PurePattern::assert_pure(self.pattern().mark_host_voicings())
+    }
     fn discrete_only(&self) -> Self {
         PurePattern::assert_pure(self.pattern().discrete_only())
     }
@@ -737,6 +789,42 @@ impl PatOps for PurePattern {
             lookup_flow,
         ))
     }
+    fn app_left_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        PurePattern::assert_pure(self.pattern().app_left_composed(
+            other.pattern().clone(),
+            op,
+            lookup_flow,
+        ))
+    }
+    fn app_right_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        PurePattern::assert_pure(self.pattern().app_right_composed(
+            other.pattern().clone(),
+            op,
+            lookup_flow,
+        ))
+    }
+    fn app_both_composed(
+        &self,
+        other: Self,
+        op: crate::compose::ComposeOp,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        PurePattern::assert_pure(self.pattern().app_both_composed(
+            other.pattern().clone(),
+            op,
+            lookup_flow,
+        ))
+    }
 
     fn inner_bind(&self, f: impl Fn(&Value) -> Self + Send + Sync + 'static) -> Self {
         PurePattern::assert_pure(self.pattern().fmap_to_pure_pattern(f).inner_join())
@@ -769,7 +857,7 @@ impl PatOps for PurePattern {
     fn apply_fn(&self, f: &crate::value::FunctionRef) -> Self {
         f.apply_pure(self.clone()).unwrap_or_else(|| {
             // Unreachable: a registration that consumes a function argument
-            // declares `takes_function`, which keeps the general path on the
+            // declares `function_argument`, which keeps the general path on the
             // dynamic constructor, and the fast path checks the argument
             // values. Kept as the self-check that keeps that claim honest.
             PurePattern::assert_pure(f.apply(self.pattern().clone()))

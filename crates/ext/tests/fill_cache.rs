@@ -260,3 +260,41 @@ fn a_volatile_child_reached_only_at_query_time_is_asked_every_time() {
         "the answer reached something volatile, so it was not kept"
     );
 }
+
+#[test]
+fn a_kept_answer_goes_with_the_compiled_callback_it_applied() {
+    use rustel_core::callback_ir::{PatternTransformProgram, Standing};
+    use rustel_core::value::FunctionRef;
+
+    let standing = Standing::new();
+    let program = PatternTransformProgram::new([])
+        .expect("the identity program")
+        .with_standings([standing.clone()]);
+    let callback = pure(Value::Function(Box::new(FunctionRef::lowered_js(
+        1, program,
+    ))));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let child = rustel_ext::default_registry()
+        .get("sometimesBy")
+        .expect("sometimesBy registration")
+        .call(
+            &[pure(Value::F64(1.0)), callback],
+            counting_child(Arc::clone(&asked)),
+        );
+    assert!(
+        child.is_cacheable(),
+        "a current program leaves a pure child"
+    );
+    let filled = fill(child);
+    let first = filled.query_arc(Fraction::ZERO, Fraction::ONE);
+    assert!(!first.is_empty());
+    let once = asked.load(Ordering::Relaxed);
+    let _ = filled.query_arc(Fraction::ZERO, Fraction::ONE);
+    assert_eq!(asked.load(Ordering::Relaxed), once, "kept while it stands");
+    standing.mark_stale();
+    // With no host to run the callback, the stale program plays nothing.
+    assert!(
+        filled.query_arc(Fraction::ZERO, Fraction::ONE).is_empty(),
+        "a program that no longer stands for its callback leaves no kept answer"
+    );
+}

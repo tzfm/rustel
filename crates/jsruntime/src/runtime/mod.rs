@@ -154,15 +154,20 @@ pub(super) struct MidiInputCandidate {
 
 /// Runtime policy for a callback-IR candidate whose original JavaScript
 /// callable is still retained as the compatibility fallback.
+///
+/// The mode applies when a callback is bridged, so it must be set before the
+/// score that creates the callback is evaluated. Each call still reads it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PatternTransformIrMode {
-    /// Execute a proven native candidate.
+    /// Compile a proven candidate to a native program that stands for the
+    /// callback, including inside pure graphs.
     #[default]
     Auto,
-    /// Force the original QuickJS callback for same-machine comparisons.
+    /// Bridge every callback as the original QuickJS callback, for
+    /// same-machine comparisons.
     Compatibility,
-    /// Execute both paths, require the exact same graph handle, and return the
-    /// compatibility result.
+    /// Keep every callback impure, execute both paths on each call, require
+    /// the same construction, and return the compatibility result.
     DualRun,
 }
 
@@ -174,6 +179,40 @@ pub struct PatternTransformIrStats {
     pub compatibility_executions: u64,
     pub dual_runs: u64,
     pub mismatches: u64,
+    /// Callbacks bridged with a native program.
+    pub lowered: u64,
+    /// Calls that ran the JavaScript callback because the program no longer
+    /// stood for it.
+    pub stale: u64,
+}
+
+/// Callback-IR policy, evidence and soundness state, shared by the runtime
+/// and the host roots of its realm.
+pub(crate) struct CallbackIr {
+    pub(crate) mode: Cell<PatternTransformIrMode>,
+    pub(crate) stats: Cell<PatternTransformIrStats>,
+    /// What texts and host writers have closed. See [`LoweringGate`].
+    pub(crate) gate: RefCell<LoweringGate>,
+    /// Recognition outcomes by callback source text.
+    pub(crate) cache: RefCell<PatternTransformIrCache>,
+}
+
+impl CallbackIr {
+    pub(super) fn new() -> Self {
+        Self {
+            mode: Cell::new(PatternTransformIrMode::Auto),
+            stats: Cell::new(PatternTransformIrStats::default()),
+            gate: RefCell::new(LoweringGate::default()),
+            cache: RefCell::new(PatternTransformIrCache::default()),
+        }
+    }
+
+    /// Count one event in the stats.
+    pub(crate) fn count(&self, update: impl FnOnce(&mut PatternTransformIrStats)) {
+        let mut stats = self.stats.get();
+        update(&mut stats);
+        self.stats.set(stats);
+    }
 }
 
 impl Default for MidiInputCandidate {
@@ -282,10 +321,9 @@ pub struct JsRuntime {
     /// window; reports consume this message through `take_query_throw`.
     pub(super) query_threw: RefCell<Option<String>>,
     /// Callback-IR selection is resolved at the owning runtime rather than in
-    /// a pattern hot loop. `Compatibility` and `DualRun` are test/benchmark
-    /// controls; ordinary playback uses `Auto`.
-    pub(super) pattern_transform_ir_mode: Cell<PatternTransformIrMode>,
-    pub(super) pattern_transform_ir_stats: Cell<PatternTransformIrStats>,
+    /// a pattern hot loop. `Compatibility` and `DualRun` are test and
+    /// benchmark controls. Ordinary playback uses `Auto`.
+    pub(super) callback_ir: Rc<CallbackIr>,
     /// Live bytes and the ceiling, shared with the allocator enforcing them.
     pub(super) heap: std::rc::Rc<alloc::HeapBudget>,
     /// Shared with the interrupt handler. `Some(deadline)` while an evaluation
@@ -756,7 +794,10 @@ mod evaluation;
 mod import_surface;
 mod imports;
 mod inspection;
+mod lowering_gate;
 mod teardown;
+
+pub(crate) use lowering_gate::{LoweringDependencies, LoweringGate};
 
 pub use import_surface::ImportScope;
 use import_surface::ImportSurface;

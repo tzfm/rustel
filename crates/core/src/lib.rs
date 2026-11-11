@@ -7,6 +7,7 @@
 pub mod callback_ir;
 pub mod combinators;
 pub mod compose;
+mod construction;
 mod context_keys;
 pub mod controls;
 pub mod gamepad;
@@ -47,7 +48,7 @@ use rustel_fraction::Fraction;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-pub use value::{OrderedMap, Value};
+pub use value::{Key, OrderedMap, Value};
 
 // ---------------------------------------------------------------------------
 // TimeSpan
@@ -733,6 +734,25 @@ impl fmt::Debug for Hap {
 /// A value-preserving bind may rebuild `pure(value)` to retime the hap. Carry
 /// the exact lookup only when the inner result kept the SAME identity-bearing
 /// value; a merely equal user value must not inherit hidden Pattern entries.
+/// The hap an inner, outer or mix join makes of an outer hap `outer` and one
+/// hap `inner` of the pattern it names, at `whole`. See `Node::Join`.
+fn joined_hap(outer: &Hap, inner: Hap, whole: Option<TimeSpan>) -> Hap {
+    let pick_lookup = joined_pick_lookup(outer, &inner);
+    let mut context = outer.context.clone();
+    context.append(&inner.context);
+    Hap {
+        whole,
+        part: inner.part,
+        pick_lookup,
+        keys: ContextKeys::merge(&inner.keys, &outer.keys),
+        value: inner.value,
+        context,
+        ui_visuals: outer.ui_visuals | inner.ui_visuals,
+        live_controls: inner.live_controls,
+        slider_binding: inner.slider_binding,
+    }
+}
+
 fn joined_pick_lookup(outer: &Hap, inner: &Hap) -> Option<Arc<PickLookup>> {
     inner.pick_lookup.clone().or_else(|| {
         (outer.pick_lookup.is_some() && inner.value == outer.value)
@@ -781,7 +801,7 @@ impl State {
     pub fn set_controls(&self, controls: &OrderedMap) -> Self {
         let mut merged = self.controls.clone();
         for (key, value) in controls {
-            merged.insert(key.clone(), value.clone());
+            merged.insert_key(key.clone(), value.clone());
         }
         Self {
             span: self.span,
@@ -1420,6 +1440,11 @@ pub fn with_callback_host<R>(host: &dyn CallbackHost, f: impl FnOnce() -> R) -> 
     f()
 }
 
+/// Whether a callback host is installed on this thread.
+pub(crate) fn host_installed() -> bool {
+    CURRENT_HOST.with(|host| host.get().is_some())
+}
+
 fn host_call_value(id: CallbackId, v: &Value) -> Value {
     CURRENT_HOST.with(|h| match h.get() {
         // SAFETY: set only by `with_callback_host`, which outlives this call.
@@ -1559,6 +1584,10 @@ pub(crate) fn host_call_pattern(id: CallbackId, pattern: Pattern) -> Pattern {
 /// The host retains the original JavaScript function and owns selection and
 /// differential policy. A missing host remains a false-pure classification,
 /// exactly like the compatibility-only pattern callback path.
+///
+/// Only the identity callback was a candidate before method chains, and its
+/// failures keep their wording. A chain stands for an ordinary callback, so a
+/// failure of its JavaScript fallback reads as that callback's would.
 pub(crate) fn host_call_pattern_ir(
     id: CallbackId,
     program: &callback_ir::PatternTransformProgram,
@@ -1570,8 +1599,12 @@ pub(crate) fn host_call_pattern_ir(
             unsafe { &*pointer }.call_pattern_ir(id, program, pattern)
         }) {
             Ok(result) => result,
-            Err(error) => {
+            Err(error) if program.is_empty() => {
                 signal_query_error(move || format!("pattern callback IR {id} failed: {error}"));
+                silence()
+            }
+            Err(error) => {
+                signal_query_error(move || format!("pattern callback {id} failed: {error}"));
                 silence()
             }
         },
@@ -1763,9 +1796,29 @@ fn host_call_query(id: CallbackId, state: &State) -> Vec<Hap> {
     })
 }
 
-/// Combines an accumulator value with the next positional argument during
-/// `register()`'s appLeft fold.
+/// How an `app*` node makes one value of a function value and an argument
+/// value.
+#[derive(Clone)]
+pub(crate) enum Combine {
+    /// [`compose::compose_op`] of this op, which a meeting can run on the
+    /// structure hap's value where it is. See [`Meeting::in_place`].
+    Composed(compose::ComposeOp),
+    /// Any other function.
+    With(CombineFn),
+}
+
+/// A function that makes one value of a function value and an argument
+/// value.
 type CombineFn = Arc<dyn Fn(&Value, &Value) -> Value + Send + Sync>;
+
+impl Combine {
+    fn apply(&self, function: &Value, value: &Value) -> Value {
+        match self {
+            Combine::Composed(op) => compose::compose_op(*op, function, value),
+            Combine::With(apply) => apply(function, value),
+        }
+    }
+}
 
 /// Whether a per-hap map looks at the spans of the hap it is given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1804,15 +1857,29 @@ const CONSTRUCTION_MEMO_ENTRIES: usize = 32;
 /// onto the destruction worklist like any other child.
 #[derive(Default)]
 struct ConstructionMemo {
-    entries: Mutex<Vec<ConstructionEntry>>,
+    entries: Mutex<Constructions>,
     /// Round-robin victim once full. The key set is a handful of argument
     /// values, so plain replacement is enough and never thrashes on it.
     victim: std::sync::atomic::AtomicUsize,
 }
 
+/// What a [`ConstructionMemo`] holds.
+#[derive(Default)]
+struct Constructions {
+    kept: Vec<ConstructionEntry>,
+    /// A construction a table build made and could not keep. The next
+    /// construction of the same value takes it instead of building, so a
+    /// build adds no construction to those the graph makes, and the
+    /// construction still answers one query only.
+    handed: Option<ConstructionEntry>,
+}
+
 struct ConstructionEntry {
     value: Value,
     settings: settings::SettingsStateId,
+    /// The standings of the compiled programs the construction applied. See
+    /// [`callback_ir::recording_reads`].
+    read: Box<[Arc<callback_ir::Standing>]>,
     pattern: purity::PurePattern,
 }
 
@@ -1854,7 +1921,7 @@ fn plain_key(value: &Value) -> bool {
 }
 
 impl ConstructionMemo {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<ConstructionEntry>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Constructions> {
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1868,47 +1935,99 @@ impl ConstructionMemo {
         settings: &settings::SettingsStateId,
         construct: impl FnOnce(&Value) -> purity::PurePattern,
     ) -> purity::PurePattern {
-        if let Some(kept) = self
-            .lock()
-            .iter()
-            .find(|entry| entry.settings == *settings && same_key(&entry.value, value))
+        self.construct_handing(value, settings, construct, false).0
+    }
+
+    /// The kept construction for `value`, building it when none is kept, for
+    /// a table build. A table shares one construction among all its queries,
+    /// so it may use only one the memo keeps and shares too. `None` for any
+    /// other: a key that is never kept is not built at all, and a built
+    /// construction the memo cannot keep goes to the next construction of the
+    /// same value, so a build adds no construction to those the graph makes.
+    fn kept_for_table(
+        &self,
+        value: &Value,
+        settings: &settings::SettingsStateId,
+        construct: impl FnOnce(&Value) -> purity::PurePattern,
+    ) -> Option<purity::PurePattern> {
+        if !plain_key(value) {
+            return None;
+        }
+        let (pattern, kept) = self.construct_handing(value, settings, construct, true);
+        kept.then_some(pattern)
+    }
+
+    /// The construction for `value`, and whether the memo keeps it.
+    fn construct_handing(
+        &self,
+        value: &Value,
+        settings: &settings::SettingsStateId,
+        construct: impl FnOnce(&Value) -> purity::PurePattern,
+        hand: bool,
+    ) -> (purity::PurePattern, bool) {
         {
-            return kept.pattern.clone();
+            let mut constructions = self.lock();
+            let names = |entry: &ConstructionEntry| {
+                entry.settings == *settings
+                    && same_key(&entry.value, value)
+                    && callback_ir::reads_hold(&entry.read)
+            };
+            if let Some(kept) = constructions.kept.iter().find(|entry| names(entry)) {
+                callback_ir::note_read(&kept.read);
+                return (kept.pattern.clone(), true);
+            }
+            if constructions.handed.as_ref().is_some_and(names)
+                && let Some(handed) = constructions.handed.take()
+            {
+                callback_ir::note_read(&handed.read);
+                return (handed.pattern, false);
+            }
         }
         // Built outside the lock: construction is arbitrary native code.
-        let built = construct(value);
+        let (built, read) = callback_ir::recording_reads(|| construct(value));
         // A construction that raised a query error or a refusal is what the
         // boundary is about to discard, and NaN would never be found again.
         // A key that holds a pattern handle is not kept either: a callback
         // can hand a graph its own ancestor as a value, and keeping that
         // would tie the cycle no worklist can take apart.
         let keep = plain_key(value)
-            && !built.pattern().purity().volatile
+            && !built.pattern().is_volatile()
             && !query_error_pending()
             && !budget_exhausted();
+        let entry = ConstructionEntry {
+            value: value.clone(),
+            settings: settings.clone(),
+            read,
+            pattern: built.clone(),
+        };
+        let mut constructions = self.lock();
         if keep {
-            let mut entries = self.lock();
-            let entry = ConstructionEntry {
-                value: value.clone(),
-                settings: settings.clone(),
-                pattern: built.clone(),
-            };
-            if entries.len() < CONSTRUCTION_MEMO_ENTRIES {
-                entries.push(entry);
+            if constructions.kept.len() < CONSTRUCTION_MEMO_ENTRIES {
+                constructions.kept.push(entry);
             } else {
                 let victim = self
                     .victim
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     % CONSTRUCTION_MEMO_ENTRIES;
-                entries[victim] = entry;
+                constructions.kept[victim] = entry;
             }
+        } else if hand && plain_key(value) {
+            constructions.handed = Some(entry);
         }
-        built
+        (built, keep)
     }
 
     /// Hand every kept pattern to the destruction worklist.
     fn drain_into(&self, out: &mut Vec<Pattern>) {
-        out.extend(self.lock().drain(..).map(|entry| entry.pattern.0));
+        let mut constructions = self.lock();
+        let handed = constructions.handed.take();
+        out.extend(
+            constructions
+                .kept
+                .drain(..)
+                .chain(handed)
+                .map(|entry| entry.pattern.0),
+        );
     }
 }
 /// A native value transform.
@@ -3743,10 +3862,15 @@ fn applied_live_controls(flow: LookupFlow, left: &Hap, right: &Hap) -> ([u64; 4]
             }
             let mut bindings = left.live_controls;
             if let Value::Object(values) = &right.value {
-                for (slot, key) in ["gain", "cutoff", "resonance", "fmi"].iter().enumerate() {
-                    if values.contains_key(key) {
-                        bindings[slot] = right.live_controls[slot];
-                    }
+                for (key, _) in values {
+                    let slot = match key.as_str() {
+                        "gain" => 0,
+                        "cutoff" => 1,
+                        "resonance" => 2,
+                        "fmi" => 3,
+                        _ => continue,
+                    };
+                    bindings[slot] = right.live_controls[slot];
                 }
             }
             (bindings, 0)
@@ -3763,7 +3887,7 @@ fn applied_hap(
     hv: &Hap,
     whole: Option<TimeSpan>,
     part: TimeSpan,
-    apply: &CombineFn,
+    apply: &Combine,
     flow: LookupFlow,
 ) -> Hap {
     let mut context = hv.context.clone();
@@ -3793,8 +3917,8 @@ pub(crate) struct Meeting {
 }
 
 impl Meeting {
-    pub(crate) fn of(hf: &Hap, hv: &Hap, apply: &CombineFn, flow: LookupFlow) -> Self {
-        let value = apply(&hf.value, &hv.value);
+    pub(crate) fn of(hf: &Hap, hv: &Hap, apply: &Combine, flow: LookupFlow) -> Self {
+        let value = apply.apply(&hf.value, &hv.value);
         let pick_lookup = applied_pick_lookup(flow, &value, hf, hv);
         let (live_controls, slider_binding) = applied_live_controls(flow, hf, hv);
         Self {
@@ -3803,6 +3927,61 @@ impl Meeting {
             live_controls,
             slider_binding,
         }
+    }
+
+    /// [`applied_hap`] of `hf` and `hv` at `hf`'s whole and at `part`, made
+    /// where `hf` is, so that the meeting copies none of `hf`. Only for a
+    /// known compose op of two data values, where neither hap carries a
+    /// pick lookup and the meeting makes none. `false`, with `hf`
+    /// unchanged, otherwise.
+    pub(crate) fn in_place(
+        hf: &mut Hap,
+        hv: &Hap,
+        part: TimeSpan,
+        apply: &Combine,
+        flow: LookupFlow,
+    ) -> bool {
+        let Combine::Composed(op) = apply else {
+            return false;
+        };
+        if !Self::meets_in_place(hf, hv, apply, flow) {
+            return false;
+        }
+        let (live_controls, slider_binding) = applied_live_controls(flow, hf, hv);
+        compose::compose_data_in_place(*op, &mut hf.value, &hv.value);
+        hf.part = part;
+        // The value side's locations come first.
+        if !hv.context.is_empty() {
+            let mut context = hv.context.clone();
+            context.append(&hf.context);
+            hf.context = context;
+        }
+        hf.keys = ContextKeys::merge(&hf.keys, &hv.keys);
+        hf.ui_visuals |= hv.ui_visuals;
+        hf.live_controls = live_controls;
+        hf.slider_binding = slider_binding;
+        true
+    }
+
+    /// Whether [`Self::in_place`] makes the meeting of `hf` and `hv`.
+    pub(crate) fn meets_in_place(hf: &Hap, hv: &Hap, apply: &Combine, flow: LookupFlow) -> bool {
+        let Combine::Composed(op) = apply else {
+            return false;
+        };
+        if hf.pick_lookup.is_some()
+            || hv.pick_lookup.is_some()
+            || !hf.value.is_data(0)
+            || !hv.value.is_data(0)
+        {
+            return false;
+        }
+        // A set meeting makes a lookup of a string side, or of a union that
+        // keeps `hv`'s keys out. See `set_lookup_follows_value`.
+        flow != LookupFlow::Set
+            || (*op == compose::ComposeOp::Set
+                && !matches!(hf.value, Value::Str(_))
+                && !matches!(hv.value, Value::Str(_))
+                && !hv.value.as_object().is_some_and(compose::union_drops))
     }
 
     /// Turn `hap`, one side of the meeting, into the met hap. Only valid when
@@ -3929,6 +4108,77 @@ fn pick_property_key(value: &Value) -> String {
     }
 }
 
+/// The haps of `pattern.late(by)` inside `part`, from the tables of
+/// `pattern`, or `None` to leave them to the graph.
+///
+/// The graph asks the moved pattern over the whole query span and keeps what
+/// meets `part`. Tables answer a span as the clip of a wider one, so asking
+/// them over `part` alone gives the same haps in the same order. They answer
+/// only when the walk of the whole span stays within every limit, two levels
+/// down, so a refusal stays the graph's.
+fn restarted_from_tables(
+    pattern: &Pattern,
+    by: Fraction,
+    state: &State,
+    part: TimeSpan,
+) -> Option<Vec<Hap>> {
+    if query_error_pending()
+        || budget_exhausted()
+        || cancellation_requested()
+        || query_deadline_expired()
+    {
+        return None;
+    }
+    // The moved pattern, then `pattern` below it.
+    let depth = QUERY_DEPTH.with(std::cell::Cell::get).checked_add(2)?;
+    let tables = pattern.tables_for_query()?;
+    let moved = |span: TimeSpan| {
+        Some(TimeSpan::new(
+            span.begin.checked_sub(by)?,
+            span.end.checked_sub(by)?,
+        ))
+    };
+    let mut stop = table::Stop::query(depth);
+    if !tables.answerable(moved(state.span)?, &stop)? {
+        return None;
+    }
+    let answer = tables.query(&state.set_span(moved(part)?), &mut stop);
+    stop.finish();
+    if take_query_error().is_some() {
+        return None;
+    }
+    let mut haps = answer?;
+    note_materialised(haps.len());
+    for hap in &mut haps {
+        hap.part = TimeSpan::new(
+            hap.part.begin.checked_add(by)?,
+            hap.part.end.checked_add(by)?,
+        );
+        if let Some(whole) = &mut hap.whole {
+            *whole = TimeSpan::new(whole.begin.checked_add(by)?, whole.end.checked_add(by)?);
+        }
+    }
+    Some(haps)
+}
+
+/// The hap a pick join makes of an `outer` hap and one `inner` hap of the
+/// pattern it picked, at `whole` and `part`, for every join but `squeeze`.
+fn picked_hap(outer: &Hap, inner: Hap, whole: Option<TimeSpan>, part: TimeSpan) -> Hap {
+    let mut context = outer.context.clone();
+    context.append(&inner.context);
+    Hap {
+        whole,
+        part,
+        keys: ContextKeys::merge(&inner.keys, &outer.keys),
+        pick_lookup: inner.pick_lookup,
+        value: inner.value,
+        context,
+        ui_visuals: inner.ui_visuals | outer.ui_visuals,
+        live_controls: inner.live_controls,
+        slider_binding: inner.slider_binding,
+    }
+}
+
 /// `_pick(...).{inner,outer,squeeze,reset,restart}Join()` out of line, so the
 /// join's nested locals do not enlarge every recursive `query_node` frame.
 #[inline(never)]
@@ -3986,22 +4236,8 @@ fn query_pick(
                         },
                         _ => unreachable!(),
                     };
-                    let mut context = outer.context.clone();
-                    context.append(&inner.context);
-                    if !push_budgeted(
-                        &mut out,
-                        Hap {
-                            whole,
-                            part: inner.part,
-                            pick_lookup: inner.pick_lookup.clone(),
-                            keys: ContextKeys::merge(&inner.keys, &outer.keys),
-                            value: inner.value,
-                            context,
-                            ui_visuals: inner.ui_visuals | outer.ui_visuals,
-                            live_controls: inner.live_controls,
-                            slider_binding: inner.slider_binding,
-                        },
-                    ) {
+                    let part = inner.part;
+                    if !push_budgeted(&mut out, picked_hap(&outer, inner, whole, part)) {
                         return Vec::new();
                     }
                 }
@@ -4051,29 +4287,16 @@ fn query_pick(
                 } else {
                     outer_whole.begin.cycle_pos()
                 };
-                for inner in inner_pattern.late(shift).query(state) {
+                let inner_haps = restarted_from_tables(inner_pattern, shift, state, outer.part)
+                    .unwrap_or_else(|| inner_pattern.late(shift).query(state));
+                for inner in inner_haps {
                     let Some(part) = inner.part.intersection(&outer.part) else {
                         continue;
                     };
                     let whole = inner
                         .whole
                         .and_then(|inner_whole| inner_whole.intersection(&outer_whole));
-                    let mut context = outer.context.clone();
-                    context.append(&inner.context);
-                    if !push_budgeted(
-                        &mut out,
-                        Hap {
-                            whole,
-                            part,
-                            pick_lookup: inner.pick_lookup.clone(),
-                            keys: ContextKeys::merge(&inner.keys, &outer.keys),
-                            value: inner.value,
-                            context,
-                            ui_visuals: inner.ui_visuals | outer.ui_visuals,
-                            live_controls: inner.live_controls,
-                            slider_binding: inner.slider_binding,
-                        },
-                    ) {
+                    if !push_budgeted(&mut out, picked_hap(&outer, inner, whole, part)) {
                         return Vec::new();
                     }
                 }
@@ -4364,7 +4587,7 @@ enum Node {
     /// One hap expands to N haps sharing its span - `voicing()`'s
     /// `stack(...notes).note().set(rest)` + outerJoin collapses to exactly
     /// this shape natively (each note covers the source hap's whole/part).
-    ExpandHapsNative(Pattern, HapExpandFn),
+    ExpandHapsNative(Pattern, HapExpandFn, SpanUse),
     Collect(Pattern),
     /// `isobite`: the onsets in the cycle of the query, each valued by its
     /// position among them. An onset is a hap with a value not loosely 0.
@@ -4424,12 +4647,12 @@ enum Node {
     /// `appLeft`: a pattern of functions applied to a pattern of values,
     /// keeping the FUNCTION side's whole. This is the fold `register()` uses
     /// when a leading argument is itself a pattern.
-    AppLeft(Pattern, Pattern, CombineFn, LookupFlow),
+    AppLeft(Pattern, Pattern, Combine, LookupFlow),
     /// `appRight`: keeps the VALUE side's whole and structure.
-    AppRight(Pattern, Pattern, CombineFn, LookupFlow),
+    AppRight(Pattern, Pattern, Combine, LookupFlow),
     /// `appBoth`: both sides are queried over the SAME span and the wholes
     /// intersect. Tidal's `<*>`.
-    AppBoth(Pattern, Pattern, CombineFn, LookupFlow),
+    AppBoth(Pattern, Pattern, Combine, LookupFlow),
     /// Appends source locations to every hap's context.
     AddContext(Pattern, Arc<Vec<(usize, usize)>>),
     /// A pattern whose values become patterns via a closure that is
@@ -4503,7 +4726,7 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
         | Node::MapHapsNative(pattern, _, _)
         | Node::MapHapsOwned(pattern, _, _)
         | Node::MapHapsWithState(pattern, _)
-        | Node::ExpandHapsNative(pattern, _)
+        | Node::ExpandHapsNative(pattern, _, _)
         | Node::Collect(pattern)
         | Node::CycleOnsetIndex(pattern)
         | Node::CycleOnsetCount(pattern)
@@ -4624,13 +4847,20 @@ impl Pattern {
                 self.node
                     .tables
                     .get_or_init(|| {
-                        without_query_signals(|| table::build(self.node_kind()))
-                            .map(|tables| Box::new(tables.built_under(state)))
+                        let (built, read) = callback_ir::recording_reads(|| {
+                            without_query_signals(|| table::build(self.node_kind()))
+                        });
+                        built.map(|tables| Box::new(tables.built_under(state, read)))
                     })
                     .as_deref()?
             }
         };
-        tables.current().then_some(tables)
+        if !tables.current() {
+            return None;
+        }
+        // A build that uses these tables reads what they read.
+        callback_ir::note_read(tables.read());
+        Some(tables)
     }
 
     /// Whether this handle may answer from tables at all: a cacheable graph
@@ -4734,7 +4964,15 @@ impl Pattern {
     /// JavaScript, and nothing reachable that answers differently to the
     /// same query. See [`purity::Purity::volatile`].
     pub fn is_cacheable(&self) -> bool {
-        !self.purity.impure && !self.purity.volatile
+        !self.purity.impure && !self.is_volatile()
+    }
+
+    /// Whether two identical queries may answer differently under the
+    /// settings in force. See [`purity::Purity::volatile`] and
+    /// [`purity::Purity::host_voicings`].
+    fn is_volatile(&self) -> bool {
+        self.purity.volatile
+            || (self.purity.host_voicings && settings::default_voicings_is_host_owned())
     }
 
     /// This handle, declared volatile - see [`purity::Purity::volatile`].
@@ -4745,6 +4983,31 @@ impl Pattern {
     pub fn mark_volatile(&self) -> Self {
         let mut pattern = self.clone();
         pattern.purity.volatile = true;
+        pattern
+    }
+
+    /// This handle, also reaching the callbacks `ids`, with its purity kept.
+    ///
+    /// A pure view that captured a lowered callback can still need its
+    /// script callback once the program goes stale, so every wrapper that
+    /// owns the graph has to keep the callback alive. On the handle, so the
+    /// ids propagate upward as the rest of the classification does.
+    pub(crate) fn retaining_callbacks(self, ids: impl IntoIterator<Item = CallbackId>) -> Self {
+        let mut pattern = self;
+        let before = pattern.purity.reachable.len();
+        pattern.purity.reachable.extend(ids);
+        if pattern.purity.reachable.len() != before {
+            pattern.purity.reachable.sort_unstable();
+            pattern.purity.reachable.dedup();
+        }
+        pattern
+    }
+
+    /// This handle, marked as reading the default voicing dictionary. See
+    /// [`purity::Purity::host_voicings`].
+    pub(crate) fn mark_host_voicings(&self) -> Self {
+        let mut pattern = self.clone();
+        pattern.purity.host_voicings = true;
         pattern
     }
 
@@ -4761,19 +5024,6 @@ impl Pattern {
         } else {
             None
         }
-    }
-
-    /// Exact graph-handle comparison for callback-IR differential checks.
-    ///
-    /// This is intentionally stronger than output equivalence: the initial
-    /// identity IR is valid only when its JavaScript fallback returns the
-    /// callback argument unchanged, including metadata and runtime ownership.
-    #[doc(hidden)]
-    pub fn same_graph_handle(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.node, &other.node)
-            && self.steps == other.steps
-            && self.pure_loc == other.pure_loc
-            && self.same_runtime_owner(other)
     }
 
     fn same_runtime_owner(&self, other: &Self) -> bool {
@@ -4825,7 +5075,7 @@ impl Pattern {
     /// holds data only.
     fn answer_in(&self, state: &State, order: table::Order) -> (Vec<Hap>, bool) {
         let outermost = QUERY_DEPTH.with(|depth| depth.get() == 0);
-        if self.purity.volatile {
+        if self.is_volatile() {
             note_uncacheable();
         }
         match &self.runtime_settings {
@@ -5138,7 +5388,7 @@ impl Pattern {
                 .filter_map(|hap| f(state, &hap))
                 .collect(),
 
-            Node::ExpandHapsNative(pat, f) => {
+            Node::ExpandHapsNative(pat, f, _) => {
                 // One hap expands into N, so the output can outgrow the
                 // input's own charge; each push is charged as it lands.
                 let mut out = Vec::new();
@@ -5693,22 +5943,7 @@ impl Pattern {
                                     },
                                     _ => unreachable!("handled by the outer match"),
                                 };
-                                let mut ctx = a.context.clone();
-                                ctx.append(&b.context);
-                                if !push_budgeted(
-                                    &mut out,
-                                    Hap {
-                                        whole,
-                                        part: b.part,
-                                        pick_lookup: joined_pick_lookup(&a, &b),
-                                        keys: ContextKeys::merge(&b.keys, &a.keys),
-                                        value: b.value.clone(),
-                                        context: ctx,
-                                        ui_visuals: a.ui_visuals | b.ui_visuals,
-                                        live_controls: b.live_controls,
-                                        slider_binding: b.slider_binding,
-                                    },
-                                ) {
+                                if !push_budgeted(&mut out, joined_hap(&a, b, whole)) {
                                     return Vec::new();
                                 }
                             }
@@ -6580,14 +6815,14 @@ impl Pattern {
         Pattern::of(Node::AppLeft(
             self.clone(),
             other,
-            Arc::new(|acc: &Value, v: &Value| match acc {
+            Combine::With(Arc::new(|acc: &Value, v: &Value| match acc {
                 Value::List(xs) => {
                     let mut xs = xs.clone();
                     xs.push(v.clone());
                     Value::List(xs)
                 }
                 other => Value::List(vec![other.clone(), v.clone()]),
-            }),
+            })),
             LookupFlow::Infer,
         ))
     }
@@ -6609,14 +6844,22 @@ impl Pattern {
         combine: impl Fn(&Value, &Value) -> Value + Send + Sync + 'static,
         lookup_flow: LookupFlow,
     ) -> Self {
+        self.app_left_by(other, Combine::With(Arc::new(combine)), lookup_flow)
+    }
+
+    /// [`Self::app_left_with_lookup`] of [`compose::compose_op`] for `op`.
+    pub fn app_left_composed(
+        &self,
+        other: Pattern,
+        op: compose::ComposeOp,
+        lookup_flow: LookupFlow,
+    ) -> Self {
+        self.app_left_by(other, Combine::Composed(op), lookup_flow)
+    }
+
+    fn app_left_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
         let steps = self.steps;
-        Pattern::of(Node::AppLeft(
-            self.clone(),
-            other,
-            Arc::new(combine),
-            lookup_flow,
-        ))
-        .with_steps(steps)
+        Pattern::of(Node::AppLeft(self.clone(), other, combine, lookup_flow)).with_steps(steps)
     }
 
     /// Apply a native curried-value equivalent with `appRight` alignment.
@@ -6636,14 +6879,22 @@ impl Pattern {
         combine: impl Fn(&Value, &Value) -> Value + Send + Sync + 'static,
         lookup_flow: LookupFlow,
     ) -> Self {
+        self.app_right_by(other, Combine::With(Arc::new(combine)), lookup_flow)
+    }
+
+    /// [`Self::app_right_with_lookup`] of [`compose::compose_op`] for `op`.
+    pub fn app_right_composed(
+        &self,
+        other: Pattern,
+        op: compose::ComposeOp,
+        lookup_flow: LookupFlow,
+    ) -> Self {
+        self.app_right_by(other, Combine::Composed(op), lookup_flow)
+    }
+
+    fn app_right_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
         let steps = other.steps;
-        Pattern::of(Node::AppRight(
-            self.clone(),
-            other,
-            Arc::new(combine),
-            lookup_flow,
-        ))
-        .with_steps(steps)
+        Pattern::of(Node::AppRight(self.clone(), other, combine, lookup_flow)).with_steps(steps)
     }
 
     /// `appBoth` - both sides queried over the same span, wholes intersected.
@@ -6663,6 +6914,20 @@ impl Pattern {
         combine: impl Fn(&Value, &Value) -> Value + Send + Sync + 'static,
         lookup_flow: LookupFlow,
     ) -> Self {
+        self.app_both_by(other, Combine::With(Arc::new(combine)), lookup_flow)
+    }
+
+    /// [`Self::app_both_with_lookup`] of [`compose::compose_op`] for `op`.
+    pub fn app_both_composed(
+        &self,
+        other: Pattern,
+        op: compose::ComposeOp,
+        lookup_flow: LookupFlow,
+    ) -> Self {
+        self.app_both_by(other, Combine::Composed(op), lookup_flow)
+    }
+
+    fn app_both_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
         let steps = match (other.steps, self.steps) {
             (Some(a), Some(b)) => match a.checked_lcm(b) {
                 Some(steps) => Some(steps),
@@ -6677,13 +6942,7 @@ impl Pattern {
             (Some(a), None) => Some(a),
             (None, b) => b,
         };
-        Pattern::of(Node::AppBoth(
-            self.clone(),
-            other,
-            Arc::new(combine),
-            lookup_flow,
-        ))
-        .with_steps(steps)
+        Pattern::of(Node::AppBoth(self.clone(), other, combine, lookup_flow)).with_steps(steps)
     }
 
     /// Map each value to a **provably pure** pattern.
@@ -7298,6 +7557,7 @@ impl Pattern {
                     .map(|mapped| mapped.with_pitch_live_controls(hap))
                     .collect()
             }),
+            SpanUse::Ignores,
         ))
     }
 
@@ -7316,6 +7576,7 @@ impl Pattern {
         Pattern::of(Node::ExpandHapsNative(
             self.clone(),
             Arc::new(move |hap| f(hap).into_iter().map(Hap::without_live_controls).collect()),
+            SpanUse::Reads,
         ))
     }
 
@@ -7373,7 +7634,7 @@ impl Pattern {
                 ("unit".into(), Value::Str("c".into())),
             ]);
             for (name, value) in &value {
-                next.insert(name.clone(), value.clone());
+                next.insert_key(name.clone(), value.clone());
             }
             Some(hap.with_value(|_| Value::Object(next.clone())))
         })
@@ -7765,7 +8026,7 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         | Node::MapHapsNative(pattern, _, _)
         | Node::MapHapsOwned(pattern, _, _)
         | Node::MapHapsWithState(pattern, _)
-        | Node::ExpandHapsNative(pattern, _)
+        | Node::ExpandHapsNative(pattern, _, _)
         | Node::Collect(pattern)
         | Node::CycleOnsetIndex(pattern)
         | Node::CycleOnsetCount(pattern)
@@ -7997,7 +8258,7 @@ fn compute_purity(node: &Node) -> purity::Purity {
         | Node::MapHapsNative(p, _, _)
         | Node::MapHapsOwned(p, _, _)
         | Node::MapHapsWithState(p, _)
-        | Node::ExpandHapsNative(p, _)
+        | Node::ExpandHapsNative(p, _, _)
         | Node::Collect(p)
         | Node::CycleOnsetIndex(p)
         | Node::CycleOnsetCount(p)

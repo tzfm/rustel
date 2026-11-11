@@ -60,21 +60,30 @@ pub(crate) fn native_gap<'js>(
     )
 }
 
+/// The transpiler-facing `m(source, offset)`.
 pub(crate) fn native_mini<'js>(
     ctx: Ctx<'js>,
     source: String,
     offset: i64,
 ) -> rquickjs::Result<rquickjs::Class<'js, NativePatternWrapper<'js>>> {
-    let mut pattern =
-        rustel_mini::mini_at(&source, usize::try_from(offset).unwrap_or(0)).map_err(|error| {
-            rquickjs::Error::new_from_js_message("string", "Pattern", error.to_string())
-        })?;
-    if offset < 0 {
-        pattern = pattern
-            .map_haps_native(|hap| Some(hap.clone().with_context(Vec::new())))
-            .with_steps(pattern.steps);
-    }
+    let pattern = transpiled_mini(&source, offset)
+        .map_err(|error| rquickjs::Error::new_from_js_message("string", "Pattern", error))?;
     new_wrapper(&ctx, NativePatternWrapper::plain(pattern))
+}
+
+/// The pattern a transpiled mini-notation literal builds. `offset` is the
+/// byte offset of its opening quote in the score. A negative offset parses
+/// without source locations, for code outside the score.
+pub(crate) fn transpiled_mini(source: &str, offset: i64) -> Result<Pattern, String> {
+    let pattern = rustel_mini::mini_at(source, usize::try_from(offset).unwrap_or(0))
+        .map_err(|error| error.to_string())?;
+    Ok(if offset < 0 {
+        pattern
+            .map_haps_native(|hap| Some(hap.clone().with_context(Vec::new())))
+            .with_steps(pattern.steps)
+    } else {
+        pattern
+    })
 }
 
 /// Public `mini(...strings)`, distinct from transpiler-facing `m(str, offset)`.

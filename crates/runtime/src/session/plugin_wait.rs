@@ -848,7 +848,7 @@ impl Session {
                         pattern.query_arc_outcome_with_budget(&state, budget)
                     })
                 };
-                let queried = if pattern.is_pure() {
+                let queried = if pattern.is_pure() && !self.js.compiled_callbacks_need_host() {
                     settings.with(query).ok()
                 } else {
                     let left = deadline.saturating_duration_since(Instant::now());

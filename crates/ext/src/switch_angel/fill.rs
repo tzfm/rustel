@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 
+use rustel_core::callback_ir::AnswerReads;
 use rustel_core::extension_node::{ExtensionPatternNode, push_hap};
 use rustel_core::reference::ReferenceEntry;
 use rustel_core::register::{DeclaredIn, Registry, add_in};
@@ -37,12 +38,14 @@ const FILL_CACHE_ENTRIES: usize = 256;
 /// the bound above into megabytes.
 const FILL_CACHE_HAPS: usize = 16_384;
 
-/// One answered query: the state it was asked with, and what it answered.
+/// One answered query: the state it was asked with, what it answered, and
+/// what the answer read of compiled callbacks.
 struct FillEntry {
     span: TimeSpan,
     controls: OrderedMap,
     settings: SettingsStateId,
     haps: Vec<Hap>,
+    reads: AnswerReads,
 }
 
 #[derive(Default)]
@@ -57,23 +60,38 @@ struct FillCache {
 }
 
 impl FillCache {
+    /// The kept answer to this query. An answer that applied a compiled
+    /// callback which no longer stands for its JavaScript is not one.
     fn find(&self, state: &State, settings: &SettingsStateId) -> Option<&FillEntry> {
         self.entries.iter().find(|entry| {
             entry.span == state.span
                 && entry.settings == *settings
                 && entry.controls == state.controls
+                && entry.reads.hold()
         })
     }
 
-    fn insert(&mut self, state: &State, settings: SettingsStateId, haps: Vec<Hap>) {
+    fn insert(
+        &mut self,
+        state: &State,
+        settings: SettingsStateId,
+        haps: Vec<Hap>,
+        reads: AnswerReads,
+    ) {
         if haps.len() > FILL_CACHE_HAPS {
             return;
+        }
+        // An answer whose reads no longer hold is never found again.
+        if self.entries.iter().any(|entry| !entry.reads.hold()) {
+            self.entries.retain(|entry| entry.reads.hold());
+            self.haps = self.entries.iter().map(|entry| entry.haps.len()).sum();
         }
         let entry = FillEntry {
             span: state.span,
             controls: state.controls.clone(),
             settings,
             haps,
+            reads,
         };
         while !self.entries.is_empty()
             && (self.entries.len() >= FILL_CACHE_ENTRIES
@@ -174,10 +192,11 @@ impl ExtensionPatternNode for FillNode {
             return Self::evaluate(pattern, state);
         }
         let settings = rustel_core::settings::current_state_id();
-        let kept = self
-            .cache()
-            .find(state, &settings)
-            .map(|entry| entry.haps.clone());
+        let kept = self.cache().find(state, &settings).map(|entry| {
+            // Whatever keeps this answer in turn reads what it read.
+            entry.reads.reuse();
+            entry.haps.clone()
+        });
         if let Some(kept) = kept {
             // Replayed through the live budget, charged for what it hands
             // back. A cold evaluation also charged the two-cycle window it
@@ -191,7 +210,7 @@ impl ExtensionPatternNode for FillNode {
             return output;
         }
         let touches = rustel_core::uncacheable_touches();
-        let output = Self::evaluate(pattern, state);
+        let (output, reads) = AnswerReads::record(|| Self::evaluate(pattern, state));
         // An interrupted query - an error, a refusal, a deadline, a
         // cancellation - answered less than it should have, and the boundary
         // is about to discard it. Only a complete answer is worth keeping.
@@ -202,13 +221,14 @@ impl ExtensionPatternNode for FillNode {
             && !rustel_core::query_interrupted()
             && rustel_core::uncacheable_touches() == touches
         {
-            self.cache().insert(state, settings, output.clone());
+            self.cache().insert(state, settings, output.clone(), reads);
         }
         output
     }
 
     /// Nothing of its own between queries: the cache only remembers what the
-    /// child answered, and is keyed by everything that answer depends on.
+    /// child answered, and is keyed by everything that answer depends on,
+    /// the compiled callbacks it applied included.
     fn volatile(&self) -> bool {
         false
     }

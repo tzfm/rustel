@@ -130,7 +130,9 @@ fn pure_bigint_argument_reads_as_number() {
 /// `Vec<Arc<str>>` and not `&'static [&'static str]`.
 #[test]
 fn runtime_register_from_user_code() {
-    use rustel_core::register::{CombinatorFn, DeclaredIn, JoinKind, Registration, Registry};
+    use rustel_core::register::{
+        CombinatorFn, DeclaredIn, FunctionArgument, JoinKind, Registration, Registry,
+    };
     use std::sync::Arc;
 
     let rt = JsRuntime::new().unwrap();
@@ -141,7 +143,7 @@ fn runtime_register_from_user_code() {
     let mut reg = Registry::new();
     reg.register(Registration {
         declared_in: DeclaredIn::PatternModule,
-        takes_function: false,
+        function_argument: FunctionArgument::None,
         names: vec![Arc::from("userfn")],
         reference: rustel_core::reference::ReferenceEntry::blank("userfn"),
         arity: 1,
@@ -172,7 +174,9 @@ fn runtime_register_from_user_code() {
 /// pattern, so the combinator body runs at query time and enters JS.
 #[test]
 fn js_callback_under_register_general_path() {
-    use rustel_core::register::{CombinatorFn, DeclaredIn, JoinKind, Registration, Registry};
+    use rustel_core::register::{
+        CombinatorFn, DeclaredIn, FunctionArgument, JoinKind, Registration, Registry,
+    };
     use std::sync::Arc;
 
     let rt = JsRuntime::new().unwrap();
@@ -182,7 +186,7 @@ fn js_callback_under_register_general_path() {
     let mut reg = Registry::new();
     reg.register(Registration {
         declared_in: DeclaredIn::PatternModule,
-        takes_function: false,
+        function_argument: FunctionArgument::None,
         names: vec![Arc::from("tagged")],
         reference: rustel_core::reference::ReferenceEntry::blank("tagged"),
         arity: 2,

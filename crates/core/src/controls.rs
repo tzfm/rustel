@@ -13,7 +13,7 @@ later version.
 */
 
 use crate::ops::PatOps;
-use crate::{OrderedMap, Pattern, Value};
+use crate::{Key, OrderedMap, Pattern, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -61,19 +61,24 @@ impl ControlSpec {
         {
             let result = bag.get_or_insert_with(OrderedMap::new);
             for (name, value) in self.names.iter().zip(values) {
-                result.insert(name.to_string(), value);
+                result.insert_key(Key::from(Arc::clone(name)), value);
             }
             return Value::Object(result.clone());
         }
 
-        if let Some(mut bag) = bag {
-            bag.insert(self.name().into(), value);
-            Value::Object(bag)
-        } else {
-            // An object is a value like any other here: `.dict({…})` hands
-            // a chord dictionary that `voicing()` reads back under `dict`.
-            Value::object([(self.name().into(), value)])
-        }
+        // An object is a value like any other here: `.dict({…})` hands a
+        // chord dictionary that `voicing()` reads back under `dict`.
+        let mut named = bag.unwrap_or_default();
+        named.insert_key(self.key(), value);
+        Value::Object(named)
+    }
+
+    /// The canonical name as a map key, which every map this control makes
+    /// shares.
+    fn key(&self) -> Key {
+        self.names
+            .first()
+            .map_or_else(|| Key::from(""), |name| Key::from(Arc::clone(name)))
     }
 
     fn pattern_for<P: PatOps>(&self, values: &P) -> P {
@@ -169,7 +174,7 @@ pub fn set_value(left: &Value, right: &Value) -> Value {
         match right {
             Value::Object(object) => {
                 for (key, value) in object {
-                    out.insert(key.clone(), value.clone());
+                    out.insert_key(key.clone(), value.clone());
                 }
             }
             value => {

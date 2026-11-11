@@ -484,6 +484,9 @@ impl Fraction {
     /// Exact addition, returning `None` if the reduced result cannot fit in
     /// `i128` components.
     pub fn checked_add(self, o: Self) -> Option<Self> {
+        if let Some(sum) = self.whole_sum(o, false) {
+            return Some(sum);
+        }
         if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
             return Some(reduced_small(n * od + on * d, d * od));
         }
@@ -510,6 +513,9 @@ impl Fraction {
     /// Checked exact subtraction; unlike `self.add(o.neg())`, this can inspect
     /// `i128::MIN` without first negating it.
     pub fn checked_sub(self, o: Self) -> Option<Self> {
+        if let Some(difference) = self.whole_sum(o, true) {
+            return Some(difference);
+        }
         if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
             return Some(reduced_small(n * od - on * d, d * od));
         }
@@ -531,6 +537,28 @@ impl Fraction {
                 BigInt::from(self.d.get()) * BigInt::from(o.d.get()),
             )
         })
+    }
+
+    /// `self + o`, or `self - o` when `subtract`, when one side is a whole
+    /// number: `n/d ± k` is `(n ± k·d)/d`, which is already reduced, so it
+    /// needs no gcd. `None` when neither side is whole, or when the
+    /// numerator does not fit, which the general path then decides.
+    #[inline]
+    fn whole_sum(self, o: Self, subtract: bool) -> Option<Self> {
+        let (fraction, whole, whole_first) = if o.d.get() == 1 {
+            (self, o.n, false)
+        } else if self.d.get() == 1 {
+            (o, self.n, true)
+        } else {
+            return None;
+        };
+        let scaled = whole.checked_mul(fraction.d.get())?;
+        let n = match (subtract, whole_first) {
+            (false, _) => fraction.n.checked_add(scaled)?,
+            (true, false) => fraction.n.checked_sub(scaled)?,
+            (true, true) => scaled.checked_sub(fraction.n)?,
+        };
+        Some(Fraction { n, d: fraction.d })
     }
 
     /// Checked multiplication. The `i128` path cancels across the operands
@@ -1588,6 +1616,41 @@ mod native_fast_path_tests {
                 fraction.checked_add(Fraction::int(cycles)),
                 "{fraction:?} + {cycles}"
             );
+        }
+    }
+
+    #[test]
+    fn a_whole_side_adds_and_subtracts_as_big_integers_do() {
+        let fractions = [
+            Fraction::new(3, 7),
+            Fraction::new(-5, 3),
+            Fraction::new(1, i128::MAX),
+            Fraction::new(i128::MAX, 2),
+            Fraction::new(i128::MIN + 1, 2),
+            Fraction::int(0),
+            Fraction::int(5),
+            Fraction::int(i128::MAX),
+            Fraction::int(i128::MIN),
+        ];
+        let wholes = [0i128, 1, -1, 7, i128::MAX / 7 + 1, i128::MAX, i128::MIN];
+        let big = |f: Fraction| (BigInt::from(f.numer()), BigInt::from(f.denom()));
+        for fraction in fractions {
+            for whole in wholes.map(Fraction::int) {
+                let (n, d) = big(fraction);
+                let (k, _) = big(whole);
+                for (left, right, got) in [
+                    (&n + &k * &d, d.clone(), fraction.checked_add(whole)),
+                    (&k * &d + &n, d.clone(), whole.checked_add(fraction)),
+                    (&n - &k * &d, d.clone(), fraction.checked_sub(whole)),
+                    (&k * &d - &n, d.clone(), whole.checked_sub(fraction)),
+                ] {
+                    assert_eq!(
+                        got,
+                        fraction_from_bigints(left, right),
+                        "{fraction:?} and {whole:?}"
+                    );
+                }
+            }
         }
     }
 

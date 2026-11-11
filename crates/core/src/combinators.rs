@@ -226,7 +226,7 @@ fn sliced_value(slices: &Value, index: &Value, value: &Value) -> Value {
     match crate::materialize_js_value(value) {
         Value::Object(object) => {
             for (name, value) in &object {
-                controls.insert(name.clone(), value.clone());
+                controls.insert_key(name.clone(), value.clone());
             }
         }
         Value::List(values) => {

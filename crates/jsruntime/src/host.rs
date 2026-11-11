@@ -88,7 +88,10 @@ pub(super) struct HostRoots<'js> {
     pub(super) slider_sets: rquickjs::Array<'js>,
     pub(super) voicing_sets: rquickjs::Array<'js>,
     pub(super) protected_globals: Rc<RefCell<BTreeSet<String>>>,
-    pub(super) pattern_transform_ir_cache: Rc<RefCell<PatternTransformIrCache>>,
+    /// Shared with the runtime. See [`CallbackIr`].
+    pub(super) callback_ir: Rc<CallbackIr>,
+    /// The built-in methods a callback can be compiled against.
+    pub(super) builtin_methods: Rc<RefCell<BuiltinMethods>>,
     pub(super) effects: EffectBoundaryState,
     /// The budget the allocator enforces, shared so host-side mirrors of JS
     /// values can bound their eager reservations by the LIVE ceiling rather
@@ -99,17 +102,26 @@ pub(super) struct HostRoots<'js> {
 const MAX_PATTERN_TRANSFORM_IR_CACHE_ENTRIES: usize = 256;
 const MAX_PATTERN_TRANSFORM_IR_CACHE_SOURCE_BYTES: usize = 64 * 1024;
 
+/// What recognising one callback source gave: its candidate, or why it stays
+/// a QuickJS callback.
+pub(super) type PatternTransformOutcome = Result<
+    Rc<rustel_transpiler::PatternTransformCandidate>,
+    rustel_transpiler::PatternTransformFallbackReason,
+>;
+
 #[derive(Clone)]
 struct CachedPatternTransform {
     source: Box<str>,
-    candidate: rustel_transpiler::PatternTransformCandidate,
+    outcome: PatternTransformOutcome,
 }
 
-/// Runtime-local, success-only callback compilation cache.
+/// Runtime-local callback recognition cache.
 ///
-/// The cache dies with the QuickJS realm, so a new binary/IR version cannot
-/// observe an entry built by an older implementation. FIFO eviction keeps
-/// both entry count and retained source bytes bounded during edit churn.
+/// Refusals are kept too, so bridging the same unsupported callback again
+/// does not parse it again. The cache dies with the QuickJS realm, so a new
+/// binary/IR version cannot observe an entry built by an older
+/// implementation. FIFO eviction keeps both entry count and retained source
+/// bytes bounded during edit churn.
 #[derive(Default)]
 pub(super) struct PatternTransformIrCache {
     entries: std::collections::VecDeque<CachedPatternTransform>,
@@ -117,18 +129,14 @@ pub(super) struct PatternTransformIrCache {
 }
 
 impl PatternTransformIrCache {
-    pub(super) fn get(&self, source: &str) -> Option<rustel_transpiler::PatternTransformCandidate> {
+    pub(super) fn get(&self, source: &str) -> Option<PatternTransformOutcome> {
         self.entries
             .iter()
             .find(|entry| entry.source.as_ref() == source)
-            .map(|entry| entry.candidate)
+            .map(|entry| entry.outcome.clone())
     }
 
-    pub(super) fn insert(
-        &mut self,
-        source: &str,
-        candidate: rustel_transpiler::PatternTransformCandidate,
-    ) {
+    pub(super) fn insert(&mut self, source: &str, outcome: PatternTransformOutcome) {
         if source.len() > MAX_PATTERN_TRANSFORM_IR_CACHE_SOURCE_BYTES || self.get(source).is_some()
         {
             return;
@@ -150,7 +158,7 @@ impl PatternTransformIrCache {
         self.source_bytes = self.source_bytes.saturating_add(owned.len());
         self.entries.push_back(CachedPatternTransform {
             source: owned.into_boxed_str(),
-            candidate,
+            outcome,
         });
     }
 }
@@ -249,18 +257,82 @@ pub(super) fn release_host_global(ctx: &Ctx<'_>, name: &str) -> rquickjs::Result
     Ok(())
 }
 
-pub(super) fn host_pattern_transform_ir_cache(
-    ctx: &Ctx<'_>,
-) -> rquickjs::Result<Rc<RefCell<PatternTransformIrCache>>> {
+pub(super) fn host_callback_ir(ctx: &Ctx<'_>) -> rquickjs::Result<Rc<CallbackIr>> {
     ctx.userdata::<HostRoots>()
-        .map(|roots| roots.pattern_transform_ir_cache.clone())
+        .map(|roots| roots.callback_ir.clone())
         .ok_or_else(|| {
             rquickjs::Error::new_from_js_message(
                 "runtime userdata",
-                "callback IR cache",
+                "callback IR state",
                 "private host roots are not installed",
             )
         })
+}
+
+pub(super) fn host_builtin_methods(ctx: &Ctx<'_>) -> rquickjs::Result<Rc<RefCell<BuiltinMethods>>> {
+    ctx.userdata::<HostRoots>()
+        .map(|roots| roots.builtin_methods.clone())
+        .ok_or_else(|| {
+            rquickjs::Error::new_from_js_message(
+                "runtime userdata",
+                "built-in methods",
+                "private host roots are not installed",
+            )
+        })
+}
+
+/// One own property, read without running a getter or a proxy trap of the
+/// object's prototype chain.
+pub(super) struct OwnProperty<'js> {
+    flags: i32,
+    pub(super) value: rquickjs::Value<'js>,
+    pub(super) getter: rquickjs::Value<'js>,
+    pub(super) setter: rquickjs::Value<'js>,
+}
+
+impl OwnProperty<'_> {
+    pub(super) fn is_accessor(&self) -> bool {
+        self.flags & rquickjs::qjs::JS_PROP_GETSET as i32 != 0
+    }
+
+    pub(super) fn is_writable(&self) -> bool {
+        self.flags & rquickjs::qjs::JS_PROP_WRITABLE as i32 != 0
+    }
+}
+
+/// The own property `name` of `object`, if it has one.
+pub(super) fn own_property<'js>(
+    ctx: &Ctx<'js>,
+    object: &rquickjs::Object<'js>,
+    name: &str,
+) -> rquickjs::Result<Option<OwnProperty<'js>>> {
+    let raw = ctx.as_raw().as_ptr();
+    let atom = unsafe { rquickjs::qjs::JS_NewAtomLen(raw, name.as_ptr().cast(), name.len() as _) };
+    if atom == rquickjs::qjs::JS_ATOM_NULL {
+        return Err(rquickjs::Error::Allocation);
+    }
+    let mut descriptor = std::mem::MaybeUninit::<rquickjs::qjs::JSPropertyDescriptor>::uninit();
+    let status = unsafe {
+        rquickjs::qjs::JS_GetOwnProperty(raw, descriptor.as_mut_ptr(), object.as_raw(), atom)
+    };
+    unsafe { rquickjs::qjs::JS_FreeAtom(raw, atom) };
+    match status {
+        0 => Ok(None),
+        status if status < 0 => Err(rquickjs::Error::Exception),
+        _ => {
+            // SAFETY: a found property fills the whole descriptor, and its
+            // three values are owned by the caller from here on.
+            let descriptor = unsafe { descriptor.assume_init() };
+            Ok(Some(unsafe {
+                OwnProperty {
+                    flags: descriptor.flags,
+                    value: rquickjs::Value::from_raw(ctx.clone(), descriptor.value),
+                    getter: rquickjs::Value::from_raw(ctx.clone(), descriptor.getter),
+                    setter: rquickjs::Value::from_raw(ctx.clone(), descriptor.setter),
+                }
+            }))
+        }
+    }
 }
 
 pub(super) fn has_own_property(
@@ -321,61 +393,42 @@ pub(super) fn slider_cell_is_plain_number<'js>(
     values: &rquickjs::Object<'js>,
     id: &str,
 ) -> Result<bool, String> {
-    let raw = ctx.as_raw().as_ptr();
-    let atom = unsafe { rquickjs::qjs::JS_NewAtomLen(raw, id.as_ptr().cast(), id.len() as _) };
-    if atom == rquickjs::qjs::JS_ATOM_NULL {
-        return Err("could not allocate slider property key".into());
-    }
-    let mut descriptor = std::mem::MaybeUninit::<rquickjs::qjs::JSPropertyDescriptor>::uninit();
-    let status = unsafe {
-        rquickjs::qjs::JS_GetOwnProperty(raw, descriptor.as_mut_ptr(), values.as_raw(), atom)
-    };
-    unsafe { rquickjs::qjs::JS_FreeAtom(raw, atom) };
-    if status < 0 {
-        return Err(describe_js_error(ctx, rquickjs::Error::Exception));
-    }
-    if status == 0 {
-        return Ok(false);
-    }
-
-    let descriptor = unsafe { descriptor.assume_init() };
-    let plain = descriptor.flags & rquickjs::qjs::JS_PROP_WRITABLE as i32 != 0
-        && unsafe { rquickjs::qjs::JS_IsUndefined(descriptor.getter) }
-        && unsafe { rquickjs::qjs::JS_IsUndefined(descriptor.setter) }
-        && unsafe { rquickjs::qjs::JS_IsNumber(descriptor.value) };
-    let mut number = 0.0;
-    let converted = if plain {
-        unsafe { rquickjs::qjs::JS_ToFloat64(raw, &mut number, descriptor.value) }
-    } else {
-        0
-    };
-    unsafe {
-        rquickjs::qjs::JS_FreeValue(raw, descriptor.value);
-        rquickjs::qjs::JS_FreeValue(raw, descriptor.getter);
-        rquickjs::qjs::JS_FreeValue(raw, descriptor.setter);
-    }
-    if converted < 0 {
-        return Err(describe_js_error(ctx, rquickjs::Error::Exception));
-    }
-    Ok(plain && number.is_finite())
+    let property = own_property(ctx, values, id).map_err(|error| match error {
+        rquickjs::Error::Allocation => "could not allocate slider property key".to_owned(),
+        error => describe_js_error(ctx, error),
+    })?;
+    Ok(property.is_some_and(|property| {
+        property.is_writable()
+            && property.getter.is_undefined()
+            && property.setter.is_undefined()
+            && property.value.as_number().is_some_and(f64::is_finite)
+    }))
 }
 
 #[cfg(test)]
 mod callback_ir_cache_tests {
     use super::*;
 
-    const IDENTITY: rustel_transpiler::PatternTransformCandidate =
-        rustel_transpiler::PatternTransformCandidate::Identity;
+    fn identity() -> PatternTransformOutcome {
+        Ok(Rc::new(
+            rustel_transpiler::PatternTransformCandidate::Identity,
+        ))
+    }
 
     #[test]
-    fn cache_retains_only_successes_inserted_by_the_caller() {
+    fn cache_keeps_candidates_and_refusals_once_each() {
         let mut cache = PatternTransformIrCache::default();
         assert_eq!(cache.get("x => x"), None);
-        cache.insert("x => x", IDENTITY);
-        assert_eq!(cache.get("x => x"), Some(IDENTITY));
-        cache.insert("x => x", IDENTITY);
+        cache.insert("x => x", identity());
+        assert_eq!(cache.get("x => x"), Some(identity()));
+        cache.insert("x => x", identity());
         assert_eq!(cache.entries.len(), 1);
         assert_eq!(cache.source_bytes, "x => x".len());
+
+        let refused = Err(rustel_transpiler::PatternTransformFallbackReason::ArgumentShape);
+        cache.insert("x => x.fast(k)", refused.clone());
+        assert_eq!(cache.get("x => x.fast(k)"), Some(refused));
+        assert_eq!(cache.entries.len(), 2);
     }
 
     #[test]
@@ -384,25 +437,25 @@ mod callback_ir_cache_tests {
         for multiplier in [1, 2] {
             let mut cache = PatternTransformIrCache::default();
             for index in 0..=(MAX_PATTERN_TRANSFORM_IR_CACHE_ENTRIES * multiplier) {
-                cache.insert(&format!("p{index} => p{index}"), IDENTITY);
+                cache.insert(&format!("p{index} => p{index}"), identity());
                 assert!(cache.entries.len() <= MAX_PATTERN_TRANSFORM_IR_CACHE_ENTRIES);
                 assert!(cache.source_bytes <= MAX_PATTERN_TRANSFORM_IR_CACHE_SOURCE_BYTES);
             }
             assert_eq!(cache.get(first), None);
             let last = MAX_PATTERN_TRANSFORM_IR_CACHE_ENTRIES * multiplier;
-            assert_eq!(cache.get(&format!("p{last} => p{last}")), Some(IDENTITY));
+            assert_eq!(cache.get(&format!("p{last} => p{last}")), Some(identity()));
         }
 
         let mut byte_bounded = PatternTransformIrCache::default();
         for index in 0..32 {
             let source = format!("{index:04}{}", "x".repeat(4_092));
-            byte_bounded.insert(&source, IDENTITY);
+            byte_bounded.insert(&source, identity());
             assert!(byte_bounded.source_bytes <= MAX_PATTERN_TRANSFORM_IR_CACHE_SOURCE_BYTES);
         }
         assert!(byte_bounded.entries.len() < MAX_PATTERN_TRANSFORM_IR_CACHE_ENTRIES);
         assert_eq!(
             byte_bounded.get(&format!("{:04}{}", 31, "x".repeat(4_092))),
-            Some(IDENTITY)
+            Some(identity())
         );
     }
 }
