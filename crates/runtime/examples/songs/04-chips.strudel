@@ -1,0 +1,15 @@
+// Chip lines: dense short haps, note chords and per-step control patterns.
+setcpm(90);
+
+function lead(notes) {
+  return note(notes).s("square").release(0.15).gain(0.6)
+}
+
+stack(
+  lead("<[c5 e5] [d5 f5] [e5 g5] [f5 a5]>*2"),
+  lead("<g4 b4 d5 g5 b5 d5 b4 g4>"),
+  note("<[c2 c3] [g2 g3] [a2 a3] [f2 f3]>").s("triangle").release(0.3),
+  s("bd*4").gain(0.9),
+  s("hh*16").gain("<0.15 0.3 0.2 0.25>"),
+  s("[~ sd]*2").gain(0.55)
+)
