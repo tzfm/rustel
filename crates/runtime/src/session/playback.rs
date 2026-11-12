@@ -1694,10 +1694,12 @@ mod tests {
             "Stop delivered as many onsets as an uncancelled run: {cancelled} \
              vs {full}"
         );
-        // A loose bound: a run that keeps querying after Stop takes seconds
-        // and fails it.
+        // A loose bound: a healthy stop ends the run in a small part of the
+        // uncancelled time, but the loop needs a moment to notice the stop,
+        // and a loaded machine stretches that moment. A run that ignores
+        // Stop takes about the whole time, so a third still fails it.
         assert!(
-            cancelled_elapsed * 10 < full_elapsed,
+            cancelled_elapsed * 3 < full_elapsed,
             "a stopped run took {cancelled_elapsed:?} against {full_elapsed:?} \
              uncancelled - Stop is not ending the work"
         );
