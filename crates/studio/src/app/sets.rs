@@ -1396,8 +1396,20 @@ impl App {
             return;
         }
         let plural = if count == 1 { "pattern" } else { "patterns" };
-        self.status = format!("exported {count} {plural} to {name}");
-        self.log.push(LogLevel::Info, "set", self.status.clone());
+        // The status names where the file went - every segment of the path,
+        // the middle let go when the row cannot hold it - and a click on it
+        // shows the file in the desktop's file manager, as an audio export's
+        // does.
+        self.status = format!(
+            "exported {count} {plural} to {} - click the path to show it",
+            elided_path(&beside)
+        );
+        self.log.push(
+            LogLevel::Info,
+            "set",
+            format!("exported {count} {plural} to {}", beside.display()),
+        );
+        self.remember_status_file(beside);
         self.dirty_frame = true;
     }
 
@@ -1801,6 +1813,37 @@ pub(super) fn shorten_home(path: &std::path::Path) -> String {
     }
 }
 
+/// The columns of path a status row holds before the middle gives way.
+const STATUS_PATH_COLUMNS: usize = 60;
+
+/// A path the status line names when where the file went matters more than
+/// the file's name alone: every segment while it fits, the home folder as
+/// `~` - and past that, the first and last segments with the middle let go,
+/// so the sets root that holds the file and the file's own name are what
+/// survive a long row. A name too long for even that goes out whole; the
+/// footer's own cut shortens the row after it.
+fn elided_path(path: &std::path::Path) -> String {
+    let text = shorten_home(path);
+    if text.chars().count() <= STATUS_PATH_COLUMNS {
+        return text;
+    }
+    let is_separator = |c: char| c == '/' || c == '\\';
+    let head = text
+        .split(is_separator)
+        .find(|segment| !segment.is_empty())
+        .unwrap_or_default();
+    let tail = text
+        .rsplit(is_separator)
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or_default();
+    let ends = format!("{head}…{tail}");
+    if ends.chars().count() <= STATUS_PATH_COLUMNS {
+        return ends;
+    }
+    format!("…{tail}")
+}
+
 /// One pattern of a Strudel pattern export: its code, when Strudel says
 /// it was made, and whether its key is a name. The documented form keys
 /// each entry by its name, while strudel.cc's own export keys it by an
@@ -2088,6 +2131,37 @@ mod tests {
                     std::path::MAIN_SEPARATOR,
                     std::path::MAIN_SEPARATOR
                 )
+            );
+        }
+
+        /// The export status names the whole path, and a path too long for
+        /// the row keeps its ends - the root that holds the file, and the
+        /// file's own name - while the middle gives way. A name too long for
+        /// even the ends is not cut into here; the footer shortens the row.
+        #[test]
+        fn a_long_export_path_keeps_its_ends() {
+            let separator = std::path::MAIN_SEPARATOR;
+            let short = PathBuf::from(format!("{separator}sets{separator}my patterns.json"));
+            assert_eq!(elided_path(&short), shorten_home(&short));
+            let long = format!(
+                "{separator}a music folder{separator}that keeps going{separator}deeper{separator}\
+                 every year{separator}my patterns.json"
+            );
+            assert!(
+                long.chars().count() > STATUS_PATH_COLUMNS,
+                "the fixture is long"
+            );
+            let elided = elided_path(&PathBuf::from(&long));
+            assert_eq!(elided, "a music folder…my patterns.json");
+            assert!(elided.chars().count() <= STATUS_PATH_COLUMNS);
+            // A name that alone outruns the row keeps the name.
+            let huge = format!(
+                "{separator}sets{separator}{}.json",
+                "a very long name".repeat(8)
+            );
+            assert_eq!(
+                elided_path(&PathBuf::from(&huge)),
+                format!("…{}.json", "a very long name".repeat(8))
             );
         }
 
@@ -3051,10 +3125,22 @@ mod tests {
             assert_eq!(
                 app.status,
                 format!(
-                    "exported 2 patterns to {}",
-                    file.file_name().unwrap().to_string_lossy()
+                    "exported 2 patterns to {} - click the path to show it",
+                    elided_path(&file)
                 )
             );
+            assert!(
+                app.status
+                    .contains(file.file_name().unwrap().to_string_lossy().as_ref()),
+                "the shortened path still names the file: {}",
+                app.status
+            );
+            assert_eq!(
+                app.last_file.as_deref(),
+                Some(file.as_path()),
+                "a click on the status shows the export"
+            );
+            assert!(app.status_names_last_file());
 
             // The export's own names come back through the importer, so
             // the round trip keeps them.

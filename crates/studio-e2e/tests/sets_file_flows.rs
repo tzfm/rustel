@@ -604,12 +604,24 @@ fn export_patterns_writes_the_sets_scores_beside_the_sets() {
 
     drop_file_menu(&mut studio);
     studio.press(KeyCode::Char('x'), KeyModifiers::NONE); // Export patterns…
+    // The status names the whole path to the export - shortened in the
+    // middle when the row cannot hold it, so the file's own name survives -
+    // and a click on it shows the file in the desktop's file manager.
+    let status = studio.status();
     assert!(
-        studio
-            .status()
-            .starts_with(&format!("exported 2 patterns to {name} patterns ")),
+        status.starts_with("exported 2 patterns to "),
         "{}",
-        studio.status()
+        status
+    );
+    assert!(
+        status.contains(&format!("{name} patterns ")),
+        "the path names the export: {}",
+        status
+    );
+    assert!(
+        status.ends_with(" - click the path to show it"),
+        "{}",
+        status
     );
     let root = sets_root(&studio);
     let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(&root)

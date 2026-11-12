@@ -31,6 +31,7 @@
 - Fixed: in Vim mode, a key in a search box cancels a pending delete, `p` handles a Unicode line separator, and a pick on an opening quote writes inside the string.
 - Fixed: a Hydra callback with a round number such as `mouse.x / 3000` compiles.
 - Fixed: an edit of a playing Csound pattern no longer plays the old notes it replaces, unless Csound already started them.
+- Fixed: File ▸ Export patterns names the export's whole path in the status line, shortened in the middle when the row cannot hold it, and a click on it shows the file in the desktop's file manager.
 ### Sound changes
 
 - The room and the delay of a note through `.vst()` go through the plugin, as its dry sound does.
