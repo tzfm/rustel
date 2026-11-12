@@ -1464,13 +1464,27 @@ pub(super) mod tests {
             assert!(!engine.hold_update("s(\"<sine sine kick>\").gain(0.5)", false, false));
         }
 
+        /// The lock of every test that uses the fixture plugins of the one
+        /// host of the process: one test at a time installs, pins or
+        /// resolves them. A test that resolves the fixture while another
+        /// holds it warms the module the other waits 600 ms to load.
+        #[cfg(feature = "vst")]
+        pub(crate) fn fixture_test_lock() -> std::sync::MutexGuard<'static, ()> {
+            static FOLDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            FOLDER.lock().unwrap_or_else(|poison| poison.into_inner())
+        }
+
         /// The fixture plugins, with the preset `Soft` of the effect, in a new
         /// folder that is the only plugin folder of the process. One test at a
         /// time has the folder.
         #[cfg(feature = "vst")]
         pub(crate) fn fixture_plugins() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
-            static FOLDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let one = FOLDER.lock().unwrap_or_else(|poison| poison.into_inner());
+            let one = fixture_test_lock();
+            // The module a test before this one loaded stays warm in the host,
+            // and a warm module builds a copy in no time. Put it away, so the
+            // slow load this test asks for takes the time it asks for.
+            rustel_runtime::vst::unload_unused(&[]);
+            rustel_runtime::vst::host().wait_idle();
             let folder = tempfile::tempdir().expect("plugins");
             rustel_vst3_fixture::install(folder.path());
             let presets = folder.path().join("presets");
