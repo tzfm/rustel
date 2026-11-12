@@ -602,7 +602,10 @@ impl Hap {
     }
 
     /// The owned hap with a new value and the same live control bindings.
-    fn into_value_keeping_live(self, value: Value) -> Hap {
+    /// Public because a caller that interns an [`OwnedHapMapFn`] for
+    /// [`Pattern::fmap_keeping_live_with`] must keep exactly these
+    /// semantics.
+    pub fn into_value_keeping_live(self, value: Value) -> Hap {
         Hap {
             whole: self.whole,
             part: self.part,
@@ -1823,7 +1826,7 @@ pub(crate) enum Combine {
 
 /// A function that makes one value of a function value and an argument
 /// value.
-type CombineFn = Arc<dyn Fn(&Value, &Value) -> Value + Send + Sync>;
+pub(crate) type CombineFn = Arc<dyn Fn(&Value, &Value) -> Value + Send + Sync>;
 
 impl Combine {
     fn apply(&self, function: &Value, value: &Value) -> Value {
@@ -1849,6 +1852,43 @@ type ToPatternFn = Arc<dyn Fn(&Value) -> Pattern + Send + Sync>;
 type HapToPatternFn = Arc<dyn Fn(&Hap) -> Pattern + Send + Sync>;
 /// A closure whose RETURN TYPE proves it cannot materialise JavaScript.
 type ToPurePatternFn = Arc<dyn Fn(&Value) -> purity::PurePattern + Send + Sync>;
+
+/// The payload of a [`Node::PatternOfPureOperand`]: a registered body and
+/// the chain width it unpacks values to.
+///
+/// Both come from the process-wide registry table and the source text, so
+/// two evaluations of the same call make equal payloads. The pattern the
+/// body reads is NOT part of the payload: it rides in the node as a child
+/// the adopt walk compares structurally, which is what lets an unchanged
+/// operand carry its answers across evaluations and edits. A host that
+/// rebuilt its combinator registry per evaluation would mint fresh body
+/// objects and lose that carry, never wrong answers; every current host
+/// installs the registry once per runtime.
+pub struct PatternedPureMap {
+    body: register::PureBody,
+    chain: usize,
+}
+
+impl PatternedPureMap {
+    /// Two payloads agree when they hold the same registered body and
+    /// unpack to the same width. Pointer equality is enough for the body:
+    /// the registry mints one object per combinator for the process.
+    fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.body, &other.body) && self.chain == other.chain
+    }
+
+    fn apply(&self, value: &Value, operand: &Pattern) -> purity::PurePattern {
+        let values = match value {
+            Value::List(values) => values.clone(),
+            single => vec![single.clone()],
+        };
+        debug_assert_eq!(values.len(), self.chain);
+        let pure = operand
+            .as_pure_pattern()
+            .expect("a PatternOfPureOperand is built from a pure operand");
+        (self.body)(&values, pure)
+    }
+}
 
 /// The most constructions one `PatternOfPure` node keeps.
 ///
@@ -2046,13 +2086,17 @@ impl ConstructionMemo {
 }
 /// A native value transform.
 type ValueFn = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
-/// A native value predicate.
-type ValuePredicate = Arc<dyn Fn(&Value) -> bool + Send + Sync>;
+/// A native value predicate. Public because a combinator that interns its
+/// predicate hands the built object to [`crate::ops::PatOps::filter_values_with`].
+pub type ValuePredicate = Arc<dyn Fn(&Value) -> bool + Send + Sync>;
 /// A native hap predicate - `filterHaps`, which sees whole/part, not just the
 /// value. `discreteOnly`/`onsetsOnly` are the two uses the joins need.
 type HapPredicate = Arc<dyn Fn(&Hap) -> bool + Send + Sync>;
 type HapMapFn = Arc<dyn Fn(&Hap) -> Option<Hap> + Send + Sync>;
-type OwnedHapMapFn = Arc<dyn Fn(Hap) -> Option<Hap> + Send + Sync>;
+/// A native hap rewrite that owns the hap. Public because the REPL's lane
+/// tag interns its map and hands the built object to
+/// [`crate::Pattern::fmap_keeping_live_with`].
+pub type OwnedHapMapFn = Arc<dyn Fn(Hap) -> Option<Hap> + Send + Sync>;
 type StateHapMapFn = Arc<dyn Fn(&State, &Hap) -> Option<Hap> + Send + Sync>;
 type HapExpandFn = Arc<dyn Fn(&Hap) -> Vec<Hap> + Send + Sync>;
 /// A native continuous signal sampled once per query.
@@ -2063,6 +2107,44 @@ type TimeFn = Arc<dyn Fn(Fraction) -> Fraction + Send + Sync>;
 /// `TimeFn` because `zoom` and `revv` map begin and end **jointly**, and
 /// `withCycle` needs the span's own `sam()`.
 type SpanFn = Arc<dyn Fn(&TimeSpan) -> TimeSpan + Send + Sync>;
+
+/// The most closures one intern pool keeps.
+const MAX_INTERNED_CLOSURES: usize = 4096;
+
+/// One closure object per key, for the whole process.
+///
+/// A node holds a transform as an opaque closure object, and two builds of
+/// one construction agree on it only while it is the same object. A closure
+/// whose behaviour is a pure function of a small deterministic key - a
+/// capture-free body, or plain data it captured - is interned here: the
+/// same key built again hands out the same object, so the unchanged
+/// subtree carries its answer tables across evaluations and edits instead
+/// of rebuilding them.
+///
+/// Past [`MAX_INTERNED_CLOSURES`] keys a pool stops taking entries: a
+/// score that mints one key a call must not grow it without end, and a
+/// fresh closure only loses the carry.
+pub fn interned_closure<K, F: ?Sized>(
+    pool: &std::sync::Mutex<std::collections::HashMap<K, Arc<F>>>,
+    key: K,
+    make: impl FnOnce() -> Arc<F>,
+) -> Arc<F>
+where
+    K: std::hash::Hash + PartialEq + Eq,
+{
+    if let Ok(entries) = pool.lock()
+        && let Some(found) = entries.get(&key)
+    {
+        return Arc::clone(found);
+    }
+    let made = make();
+    if let Ok(mut entries) = pool.lock()
+        && entries.len() < MAX_INTERNED_CLOSURES
+    {
+        entries.insert(key, Arc::clone(&made));
+    }
+    made
+}
 
 /// Live `Node` allocations. This cheap always-on counter observes Rust graph
 /// lifetime independently of the JavaScript heap; aggregate RSS cannot make
@@ -4740,6 +4822,13 @@ enum Node {
     /// The constructions this node has answered so far ride beside the
     /// closure; see [`ConstructionMemo`].
     PatternOfPure(Pattern, ToPurePatternFn, ConstructionMemo),
+    /// [`PatternOfPure`] for a registered combinator body that also reads a
+    /// pattern operand. The operand rides in the node as a compared child,
+    /// not inside the closure as a hidden capture, so a rebuild whose
+    /// operand is unchanged agrees with its counterpart and carries its
+    /// answers. The payload - the registered body plus the chain width it
+    /// unpacks values to - is the same in every evaluation of one call.
+    PatternOfPureOperand(Pattern, Pattern, Arc<PatternedPureMap>, ConstructionMemo),
     /// A pattern whose values become patterns via an **opaque** closure. The
     /// closure may materialise anything, including JavaScript, so this is
     /// always classified impure with an incomplete reachable set.
@@ -4781,6 +4870,10 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
         | Node::QueryLimit(_)
         | Node::Signal(_)
         | Node::JsQuery(_) => None,
+        Node::PatternOfPureOperand(carrier, operand, _, _) => carrier
+            .runtime_settings
+            .clone()
+            .or_else(|| operand.runtime_settings.clone()),
         #[cfg(non_send_node_mutation)]
         Node::NonSendMutation(_) => None,
         Node::WithQueryTime(pattern, _)
@@ -6048,7 +6141,10 @@ impl Pattern {
             // user-authored source (`pure(pure("bd")).polyJoin()` after
             // transpilation), and a live-coded mistake must not abort the
             // process.
-            Node::PatternOfPure(..) | Node::PatternOfDynamic(..) | Node::PatternOfHap(..) => {
+            Node::PatternOfPure(..)
+            | Node::PatternOfPureOperand(..)
+            | Node::PatternOfDynamic(..)
+            | Node::PatternOfHap(..) => {
                 signal_query_error(pattern_valued_hap_error);
                 Vec::new()
             }
@@ -6550,6 +6646,21 @@ impl Pattern {
                 }
                 Some(resolved)
             }
+            Node::PatternOfPureOperand(outer, operand, map, memo) => {
+                let mut resolved = Vec::new();
+                let settings = settings::current_state_id();
+                for hap in outer.query(state) {
+                    let inner = memo
+                        .construct(&hap.value, &settings, |value| map.apply(value, operand))
+                        .pattern()
+                        .clone();
+                    if query_error_pending() || budget_exhausted() {
+                        return Some(Vec::new());
+                    }
+                    resolved.push(ResolvedHap::of(hap, inner));
+                }
+                Some(resolved)
+            }
             Node::PatternOfDynamic(outer, f) => {
                 let mut resolved = Vec::new();
                 for hap in outer.query(state) {
@@ -6954,10 +7065,19 @@ impl Pattern {
     }
 
     pub fn with_ui_visual_slot(&self, slot: u8) -> Self {
-        let mut pattern = self.map_haps_preserving_live(
-            move |hap| Some(hap.clone().with_ui_visual_slot(slot)),
-            SpanUse::Ignores,
-        );
+        // One closure object per slot: the same visual built again is the
+        // same payload, so its subtree carries its answers across
+        // evaluations. See [`interned_closure`].
+        static POOL: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<u8, HapMapFn>>,
+        > = std::sync::OnceLock::new();
+        let interned = interned_closure(POOL.get_or_init(Default::default), slot, || {
+            let mapped: HapMapFn =
+                Arc::new(move |hap: &Hap| Some(hap.clone().with_ui_visual_slot(slot)));
+            mapped
+        });
+        let mut pattern =
+            Pattern::of(Node::MapHapsNative(self.clone(), interned, SpanUse::Ignores));
         pattern.steps = self.steps;
         pattern.pure_loc = self.pure_loc;
         pattern
@@ -7016,7 +7136,7 @@ impl Pattern {
         self.app_left_by(other, Combine::Composed(op), lookup_flow)
     }
 
-    fn app_left_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
+    pub(crate) fn app_left_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
         let steps = self.steps;
         Pattern::of(Node::AppLeft(self.clone(), other, combine, lookup_flow)).with_steps(steps)
     }
@@ -7051,7 +7171,7 @@ impl Pattern {
         self.app_right_by(other, Combine::Composed(op), lookup_flow)
     }
 
-    fn app_right_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
+    pub(crate) fn app_right_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
         let steps = other.steps;
         Pattern::of(Node::AppRight(self.clone(), other, combine, lookup_flow)).with_steps(steps)
     }
@@ -7086,7 +7206,7 @@ impl Pattern {
         self.app_both_by(other, Combine::Composed(op), lookup_flow)
     }
 
-    fn app_both_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
+    pub(crate) fn app_both_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
         let steps = match (other.steps, self.steps) {
             (Some(a), Some(b)) => match a.checked_lcm(b) {
                 Some(steps) => Some(steps),
@@ -7120,6 +7240,50 @@ impl Pattern {
         Pattern::of(Node::PatternOfPure(
             self.clone(),
             Arc::new(f),
+            ConstructionMemo::default(),
+        ))
+        .with_steps(steps)
+    }
+
+    /// [`fmap_to_pure_pattern`] for a body that captures nothing: one
+    /// closure object per body, so the same map built by a later
+    /// evaluation is the same payload. See [`interned_closure`].
+    pub fn fmap_to_pure_pattern_static(
+        &self,
+        body: fn(&Value) -> purity::PurePattern,
+    ) -> Self {
+        static POOL: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<usize, ToPurePatternFn>>,
+        > = std::sync::OnceLock::new();
+        let steps = self.steps;
+        let interned = interned_closure(POOL.get_or_init(Default::default), body as usize, || {
+            let mapped: ToPurePatternFn = Arc::new(body);
+            mapped
+        });
+        Pattern::of(Node::PatternOfPure(
+            self.clone(),
+            interned,
+            ConstructionMemo::default(),
+        ))
+        .with_steps(steps)
+    }
+
+    /// [`Self::fmap_to_pure_pattern`] for a registered combinator's pure
+    /// body, with the receiver pattern the body reads carried openly in the
+    /// node: the adopt walk compares that operand structurally, so an
+    /// unchanged operand agrees across evaluations and its answers carry,
+    /// where a hidden capture would refuse on every rebuild.
+    pub fn fmap_to_pure_pattern_with_operand(
+        &self,
+        operand: &purity::PurePattern,
+        body: register::PureBody,
+        chain: usize,
+    ) -> Self {
+        let steps = self.steps;
+        Pattern::of(Node::PatternOfPureOperand(
+            self.clone(),
+            operand.pattern().clone(),
+            Arc::new(PatternedPureMap { body, chain }),
             ConstructionMemo::default(),
         ))
         .with_steps(steps)
@@ -7589,6 +7753,13 @@ impl Pattern {
         .with_steps(steps)
     }
 
+    /// [`Self::fmap_keeping_live`] with an already-built map, for a caller
+    /// that interned one by what it reads. See [`interned_closure`].
+    pub fn fmap_keeping_live_with(&self, map: OwnedHapMapFn) -> Self {
+        let steps = self.steps;
+        Pattern::of(Node::MapHapsOwned(self.clone(), map, SpanUse::Ignores)).with_steps(steps)
+    }
+
     /// Host-only provenance for a native query-time slider. Arbitrary value
     /// maps discard this tag before it can become an audio parameter binding.
     pub fn with_slider_binding(&self, binding: u64) -> Self {
@@ -7601,33 +7772,14 @@ impl Pattern {
     }
 
     fn map_control(&self, spec: controls::ControlSpec, unnamed_only: bool) -> Self {
-        self.map_haps_owned(move |hap| {
-            let already_controls = unnamed_only
-                && match &hap.value {
-                    Value::Object(object) => !object.contains_key("value"),
-                    Value::JsValue(reference) if !reference.is_array() => matches!(
-                        materialize_js_value(&hap.value),
-                        Value::Object(object) if !object.contains_key("value")
-                    ),
-                    _ => false,
-                };
-            if already_controls {
-                return Some(hap);
-            }
-            let slider_binding = hap.slider_binding;
-            let scalar = matches!(hap.value, Value::F64(_));
-            let mut mapped = hap.map_value(|value| spec.with_value(value.clone()));
-            if slider_binding != 0 && scalar {
-                match spec.name() {
-                    "gain" => mapped.live_controls[0] = slider_binding,
-                    "cutoff" => mapped.live_controls[1] = slider_binding,
-                    "resonance" => mapped.live_controls[2] = slider_binding,
-                    "fmi" => mapped.live_controls[3] = slider_binding,
-                    _ => {}
-                }
-            }
-            Some(mapped)
-        })
+        // One closure object per distinct spec: the same control built again
+        // is the same payload, so its subtree carries its answers.
+        let map = controls::interned_control_map(&spec, unnamed_only);
+        Pattern::of(Node::MapHapsOwned(
+            self.clone(),
+            map,
+            SpanUse::Ignores,
+        ))
         .with_steps(self.steps)
     }
 
@@ -7636,6 +7788,12 @@ impl Pattern {
         predicate: impl Fn(&Value) -> bool + Send + Sync + 'static,
     ) -> Self {
         Pattern::of(Node::FilterValues(self.clone(), Arc::new(predicate))).with_steps(self.steps)
+    }
+
+    /// [`filter_values`] with an already-built predicate, for a combinator
+    /// that interned one by what it reads. See [`interned_closure`].
+    pub fn filter_values_with(&self, predicate: ValuePredicate) -> Self {
+        Pattern::of(Node::FilterValues(self.clone(), predicate)).with_steps(self.steps)
     }
 
     pub fn filter_values_js(&self, id: CallbackId) -> Self {
@@ -7674,6 +7832,22 @@ impl Pattern {
         )
     }
 
+    /// [`map_haps_native`] for a body that captures nothing: one closure
+    /// object per body, so the same rewrite built by a later evaluation is
+    /// the same payload. See [`interned_closure`].
+    pub fn map_haps_native_static(&self, body: fn(&Hap) -> Option<Hap>) -> Self {
+        static POOL: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<usize, HapMapFn>>,
+        > = std::sync::OnceLock::new();
+        let steps = self.steps;
+        let interned = interned_closure(POOL.get_or_init(Default::default), body as usize, || {
+            let mapped: HapMapFn =
+                Arc::new(move |hap: &Hap| body(hap).map(Hap::without_live_controls));
+            mapped
+        });
+        Pattern::of(Node::MapHapsNative(self.clone(), interned, SpanUse::Reads)).with_steps(steps)
+    }
+
     fn map_haps_preserving_live(
         &self,
         f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
@@ -7704,6 +7878,33 @@ impl Pattern {
         )
     }
 
+    /// [`Self::map_pitch_haps_native`] for a body that is a pure function of
+    /// the name it reads: one closure object per name, so the same rewrite
+    /// built by a later evaluation is the same payload and its subtree
+    /// carries its answers. See [`interned_closure`].
+    fn map_pitch_haps_native_interned(
+        &self,
+        key: &str,
+        f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+    ) -> Self {
+        static POOL: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, HapMapFn>>,
+        > = std::sync::OnceLock::new();
+        let steps = self.steps;
+        let interned = interned_closure(
+            POOL.get_or_init(Default::default),
+            key.to_string(),
+            || {
+                let mapped: HapMapFn = Arc::new(move |hap: &Hap| {
+                    f(hap).map(|mapped| mapped.with_pitch_live_controls(hap))
+                });
+                mapped
+            },
+        );
+        Pattern::of(Node::MapHapsNative(self.clone(), interned, SpanUse::Ignores))
+            .with_steps(steps)
+    }
+
     fn expand_pitch_haps_native(
         &self,
         f: impl Fn(&Hap) -> Vec<Hap> + Send + Sync + 'static,
@@ -7718,6 +7919,27 @@ impl Pattern {
             }),
             SpanUse::Ignores,
         ))
+    }
+
+    /// [`Self::expand_pitch_haps_native`] for a body that captures nothing:
+    /// one closure object per body, so the same expansion built by a later
+    /// evaluation is the same payload. See [`interned_closure`].
+    fn expand_pitch_haps_native_static(&self, body: fn(&Hap) -> Vec<Hap>) -> Self {
+        static POOL: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<usize, HapExpandFn>>,
+        > = std::sync::OnceLock::new();
+        let steps = self.steps;
+        let interned = interned_closure(POOL.get_or_init(Default::default), body as usize, || {
+            let expand: HapExpandFn = Arc::new(move |hap: &Hap| {
+                body(hap)
+                    .into_iter()
+                    .map(|mapped| mapped.with_pitch_live_controls(hap))
+                    .collect()
+            });
+            expand
+        });
+        Pattern::of(Node::ExpandHapsNative(self.clone(), interned, SpanUse::Ignores))
+            .with_steps(steps)
     }
 
     pub fn map_haps_with_state(
@@ -7862,7 +8084,18 @@ impl Pattern {
     }
 
     pub fn remove_undefineds(&self) -> Self {
-        self.filter_values(|value| !matches!(value, Value::Undefined | Value::Null))
+        // One predicate object for every call: the strip a `keepif` makes is
+        // the same payload wherever it is built again, so that subtree
+        // carries its answers. See [`interned_closure`].
+        static KEEP_DEFINED: std::sync::OnceLock<ValuePredicate> = std::sync::OnceLock::new();
+        let predicate = KEEP_DEFINED
+            .get_or_init(|| {
+                let predicate: ValuePredicate =
+                    Arc::new(|value: &Value| !matches!(value, Value::Undefined | Value::Null));
+                predicate
+            })
+            .clone();
+        self.filter_values_with(predicate)
     }
 
     pub fn degrade_by_seeded(&self, amount: f64, seed: u32) -> Self {
@@ -8233,6 +8466,10 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
             take_child(pattern, out);
             out.extend(std::mem::take(patterns));
         }
+        Node::PatternOfPureOperand(carrier, operand, _, _) => {
+            take_child(carrier, out);
+            take_child(operand, out);
+        }
         Node::WChoose {
             chooser,
             total,
@@ -8434,6 +8671,11 @@ fn compute_purity(node: &Node) -> purity::Purity {
         | Node::PatternOfPure(p, _, _)
         | Node::Join(p, _)
         | Node::InnerJoin(p, _) => p.purity.clone(),
+        // Sound for the same reason; the operand was proven pure when the
+        // node was built, and is re-proven by its own branch when rebuilt.
+        Node::PatternOfPureOperand(carrier, operand, _, _) => {
+            Purity::merge(vec![carrier.purity.clone(), operand.purity.clone()])
+        }
 
         // A live port answers with whatever was played since the last query.
         Node::MidiKeys(p, _) => Purity::merge(vec![p.purity.clone(), Purity::volatile()]),
@@ -8780,6 +9022,21 @@ pub fn signal(f: impl Fn(Fraction, &OrderedMap) -> Value + Send + Sync + 'static
     Pattern::of(Node::Signal(Arc::new(move |state| {
         f(state.span.begin, &state.controls)
     })))
+}
+
+/// [`signal`] for a body that captures nothing: one closure object per
+/// body, so the same signal built by a later evaluation is the same
+/// payload. See [`interned_closure`].
+pub fn signal_static(body: fn(Fraction, &OrderedMap) -> Value) -> Pattern {
+    static POOL: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, SignalFn>>,
+    > = std::sync::OnceLock::new();
+    let interned = interned_closure(POOL.get_or_init(Default::default), body as usize, || {
+        let mapped: SignalFn =
+            Arc::new(move |state: &State| body(state.span.begin, &state.controls));
+        mapped
+    });
+    Pattern::of(Node::Signal(interned))
 }
 
 pub fn state_signal(f: impl Fn(&State) -> Value + Send + Sync + 'static) -> Pattern {

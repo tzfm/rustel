@@ -2758,6 +2758,16 @@ pub(crate) fn build(node: &Node) -> Option<Tables> {
         } => picked(&*selector.tables()?, lookup, *index_mode, *mode),
         Node::Join(inner, mode) => match inner.node_kind() {
             Node::PatternOfPure(carrier, f, memo) => joined(&*carrier.tables()?, f, memo, *mode),
+            Node::PatternOfPureOperand(carrier, operand, map, memo) => {
+                // The registered body fixed to this node's operand: one
+                // closure per build, never per evaluation.
+                let construct: crate::ToPurePatternFn = {
+                    let map = Arc::clone(map);
+                    let operand = operand.clone();
+                    Arc::new(move |value| map.apply(value, &operand))
+                };
+                joined(&*carrier.tables()?, &construct, memo, *mode)
+            }
             _ => None,
         },
         Node::FmapNative(pattern, f) => stepped(&*pattern.tables()?, Step::Map(f.clone())),

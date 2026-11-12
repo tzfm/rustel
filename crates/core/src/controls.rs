@@ -13,11 +13,11 @@ later version.
 */
 
 use crate::ops::PatOps;
-use crate::{Key, OrderedMap, Pattern, Value};
+use crate::{Hap, Key, OrderedMap, Pattern, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, std::hash::Hash)]
 pub struct ControlSpec {
     /// Compound controls use each name positionally. The first name is the
     /// canonical control name and method name.
@@ -274,6 +274,59 @@ pub fn default_control_registry() -> &'static ControlRegistry {
         registry
     });
     &REGISTRY
+}
+
+/// The per-hap map of one control application, interned by what it reads.
+///
+/// The map is a pure function of its spec and its unnamed-only flag, so the
+/// same control built by a later evaluation is the same closure object. The
+/// node that holds it then agrees with its counterpart by pointer, and the
+/// answers of the unchanged subtree carry across evaluations and edits
+/// instead of rebuilding. See [`crate::interned_closure`].
+static INTERNED_CONTROL_MAPS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(ControlSpec, bool), crate::OwnedHapMapFn>>,
+> = std::sync::OnceLock::new();
+
+pub(crate) fn interned_control_map(spec: &ControlSpec, unnamed_only: bool) -> crate::OwnedHapMapFn {
+    crate::interned_closure(
+        INTERNED_CONTROL_MAPS.get_or_init(Default::default),
+        (spec.clone(), unnamed_only),
+        || {
+            let map: crate::OwnedHapMapFn = Arc::new(control_map(spec.clone(), unnamed_only));
+            map
+        },
+    )
+}
+
+/// The body of one interned control map. See [`interned_control_map`].
+fn control_map(spec: ControlSpec, unnamed_only: bool) -> impl Fn(Hap) -> Option<Hap> + Send + Sync {
+    move |hap| {
+        let already_controls = unnamed_only
+            && match &hap.value {
+                Value::Object(object) => !object.contains_key("value"),
+                Value::JsValue(reference) if !reference.is_array() => matches!(
+                    crate::materialize_js_value(&hap.value),
+                    Value::Object(object) if !object.contains_key("value")
+                ),
+                _ => false,
+            };
+        if already_controls {
+            return Some(hap);
+        }
+        let slider_binding = hap.slider_binding;
+        let scalar = matches!(hap.value, Value::F64(_));
+        let mut mapped = hap.map_value(|value| spec.with_value(value.clone()));
+        if slider_binding != 0 && scalar {
+            match spec.name() {
+                "gain" => mapped.live_controls[0] = slider_binding,
+                "cutoff" => mapped.live_controls[1] = slider_binding,
+                "resonance" => mapped.live_controls[2] = slider_binding,
+                "fmi" => mapped.live_controls[3] = slider_binding,
+                _ => {}
+            }
+        }
+        Some(mapped)
+    }
 }
 
 #[cfg(test)]

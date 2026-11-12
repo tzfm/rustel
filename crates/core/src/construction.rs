@@ -186,6 +186,9 @@ fn same_opaque_payloads(left: &Node, right: &Node) -> bool {
         InnerJoin(_, f) => matches!(right, InnerJoin(_, g) if Arc::ptr_eq(f, g)),
         PatternOfDynamic(_, f) => matches!(right, PatternOfDynamic(_, g) if Arc::ptr_eq(f, g)),
         PatternOfPure(_, f, _) => matches!(right, PatternOfPure(_, g, _) if Arc::ptr_eq(f, g)),
+        PatternOfPureOperand(_, _, f, _) => {
+            matches!(right, PatternOfPureOperand(_, _, g, _) if f.same(g))
+        }
         PatternOfHap(_, _, f) => matches!(right, PatternOfHap(_, _, g) if Arc::ptr_eq(f, g)),
         AppLeft(_, _, f, _) => matches!(right, AppLeft(_, _, g, _) if same_combine(f, g)),
         AppRight(_, _, f, _) => matches!(right, AppRight(_, _, g, _) if same_combine(f, g)),
@@ -645,6 +648,12 @@ fn same_node<'g>(
         },
         Node::PatternOfPure(a, _, _) => match right {
             Node::PatternOfPure(b, _, _) => child!(a, b),
+            _ => false,
+        },
+        Node::PatternOfPureOperand(a, operand, _, _) => match right {
+            Node::PatternOfPureOperand(b, other_operand, _, _) => {
+                child!(a, b) && child!(operand, other_operand)
+            }
             _ => false,
         },
         Node::PatternOfDynamic(a, _) => match right {

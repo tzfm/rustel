@@ -18,7 +18,7 @@
 - A Studio export names a plugin that does not load, and Ctrl+C stops `rustel export` to MP3.
 - Samples, images and videos load only from allowed sources. `--allow-sample-origin` adds a source, and Settings ▸ Permissions allows a refused folder.
 - Scores render faster on small machines and 64-bit ARM, queries of repeating patterns run up to 180 times faster, a query for a span a table answered before gets the kept answer, a `sometimesBy` with a native transform builds its halves once instead of once per event of every query, and decoded samples load faster the next time.
-- A score evaluated again keeps the answers of what it did not change: a setting written with the value in force no longer invalidates every answer, a repeated `mini` literal parses once, and an edit hands its unchanged parts their answers, so the first query after an edit runs faster.
+- A score evaluated again keeps the answers of what it did not change: a setting written with the value in force no longer invalidates every answer, a repeated `mini` literal parses once, an edit hands its unchanged parts their answers, and a closure or pure operand a later evaluation rebuilds the same keeps its answers too, so the first query after an edit of a large score runs up to 170 times faster.
 - An arrow that a method takes inside another arrow compiles too, as `when`'s inside `every`'s, so a query of such a score runs about 2.6 times faster, without JavaScript.
 - On a slow machine, an edit of a playing score arrives late instead of being refused. A dense synth score no longer refuses its edits.
 - On Linux, the audio keeps its priority over the studio, and rustelup offers to install rtkit when needed.

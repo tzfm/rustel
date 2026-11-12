@@ -27,6 +27,7 @@ later version.
 use crate::ops::PatOps;
 use crate::util;
 use crate::value::{OrderedMap, Value};
+use std::sync::Arc;
 
 /// The eight alignments an operator can compose under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,7 +101,7 @@ impl Alignment {
 }
 
 /// One entry of the COMPOSERS table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, std::hash::Hash)]
 pub enum ComposeOp {
     /// The right operand wins.
     Set,
@@ -412,14 +413,8 @@ fn compose_inner<P: PatOps>(pat: &P, other: &P, op: ComposeOp, how: Alignment) -
     // `keepif` bypasses `_composeOp` so that `b`'s value is discarded rather
     // than unioned, then strips the undefineds the falsy branch produced.
     if op == ComposeOp::KeepIf {
-        apply_alignment(
-            pat,
-            other,
-            how,
-            move |a, b| op.apply_scalar(a, b),
-            lookup_flow,
-        )
-        .remove_undefineds()
+        apply_alignment(pat, other, how, interned_combine(op, true), lookup_flow)
+            .remove_undefineds()
     } else {
         // A direct alignment names its op, so that a precomputed table can
         // run it on the structure hap's value where that value is.
@@ -427,15 +422,35 @@ fn compose_inner<P: PatOps>(pat: &P, other: &P, op: ComposeOp, how: Alignment) -
             Alignment::In => pat.app_left_composed(other.clone(), op, lookup_flow),
             Alignment::Out => pat.app_right_composed(other.clone(), op, lookup_flow),
             Alignment::Mix => pat.app_both_composed(other.clone(), op, lookup_flow),
-            _ => apply_alignment(
-                pat,
-                other,
-                how,
-                move |a, b| compose_op(op, a, b),
-                lookup_flow,
-            ),
+            _ => apply_alignment(pat, other, how, interned_combine(op, false), lookup_flow),
         }
     }
+}
+
+/// The combine closure one compose op builds, interned: the same op built
+/// by a later evaluation is the same closure object, so that node agrees
+/// with its counterpart by pointer and the answers of the unchanged
+/// subtree carry across evaluations and edits. `scalar_only` is the
+/// `keepif` body, which discards `b`'s value rather than unioning it.
+/// See [`crate::interned_closure`].
+fn interned_combine(op: ComposeOp, scalar_only: bool) -> crate::CombineFn {
+    static POOL: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(ComposeOp, bool), crate::CombineFn>>,
+    > = std::sync::OnceLock::new();
+    crate::interned_closure(
+        POOL.get_or_init(Default::default),
+        (op, scalar_only),
+        || {
+            let combine: crate::CombineFn = Arc::new(move |a: &Value, b: &Value| {
+                if scalar_only {
+                    op.apply_scalar(a, b)
+                } else {
+                    compose_op(op, a, b)
+                }
+            });
+            combine
+        },
+    )
 }
 
 /// The `_op*` family. `combine(a, b)` receives the LEFT pattern's value first,
@@ -449,13 +464,13 @@ fn apply_alignment<P: PatOps>(
     pat: &P,
     other: &P,
     how: Alignment,
-    combine: impl Fn(&Value, &Value) -> Value + Send + Sync + Clone + 'static,
+    combine: crate::CombineFn,
     lookup_flow: crate::LookupFlow,
 ) -> P {
     match how {
-        Alignment::In => pat.app_left_with_lookup(other.clone(), combine, lookup_flow),
-        Alignment::Out => pat.app_right_with_lookup(other.clone(), combine, lookup_flow),
-        Alignment::Mix => pat.app_both_with_lookup(other.clone(), combine, lookup_flow),
+        Alignment::In => pat.app_left_interned(other.clone(), combine, lookup_flow),
+        Alignment::Out => pat.app_right_interned(other.clone(), combine, lookup_flow),
+        Alignment::Mix => pat.app_both_interned(other.clone(), combine, lookup_flow),
 
         Alignment::Squeeze => {
             let other = other.clone();
