@@ -4875,6 +4875,18 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
     }
 }
 
+/// What one read of a node's slot can hold for the state in force.
+enum Held {
+    /// The slot never held tables: no build has taken it yet.
+    Empty,
+    /// The graph answers, and building again cannot change that.
+    Answers,
+    Tables(Arc<table::Tables>),
+    /// Stale or refused under a state that moved on: a build under the
+    /// state in force decides.
+    Build,
+}
+
 impl Pattern {
     /// Every constructor routes through here, so purity is computed exactly
     /// once per node and can never be forgotten by a new combinator.
@@ -4910,17 +4922,21 @@ impl Pattern {
     /// Tables the state moved past are replaced by a build under the state
     /// in force: a filled slot never dead-ends a node.
     fn tables(&self) -> Option<Arc<table::Tables>> {
+        match self.held_tables() {
+            Held::Tables(tables) => Self::served(tables),
+            Held::Empty | Held::Build => self.build_tables(),
+            Held::Answers => None,
+        }
+    }
+
+    /// What one read of the slot finds for the state in force.
+    fn held_tables(&self) -> Held {
         if !self.tables_may_answer() {
-            return None;
+            return Held::Answers;
         }
-        enum Held {
-            /// The graph answers, and building again cannot change that.
-            Answers,
-            Tables(Arc<table::Tables>),
-            Build,
-        }
-        let held = match self.node.tables.read() {
+        match self.node.tables.read() {
             Ok(slot) => match &*slot {
+                table::TableSlot::Empty => Held::Empty,
                 table::TableSlot::Ready(tables) if tables.current() => {
                     Held::Tables(Arc::clone(tables))
                 }
@@ -4928,22 +4944,20 @@ impl Pattern {
                 table::TableSlot::GraphAnswers(state) if settings::is_current_state(state) => {
                     Held::Answers
                 }
-                // Empty, stale, or a refusal under a state that moved on: a
-                // build under the state in force decides.
+                // Stale, or a refusal under a state that moved on: a build
+                // under the state in force decides.
                 _ => Held::Build,
             },
             // A poisoned lock is a query the graph answers.
             Err(_) => Held::Answers,
-        };
-        match held {
-            Held::Answers => None,
-            Held::Tables(tables) => {
-                // A build that uses these tables reads what they read.
-                callback_ir::note_read(tables.read());
-                Some(tables)
-            }
-            Held::Build => self.build_tables(),
         }
+    }
+
+    /// A table this query answers from: a build that uses it reads what it
+    /// read.
+    fn served(tables: Arc<table::Tables>) -> Option<Arc<table::Tables>> {
+        callback_ir::note_read(tables.read());
+        Some(tables)
     }
 
     /// Build this node's tables under the state in force and take the slot.
@@ -5006,25 +5020,28 @@ impl Pattern {
     }
 
     /// [`Self::tables`] for a query of this node, built only when
-    /// `NodeCell::build_next` allows it.
+    /// `NodeCell::build_next` allows it. One read of the slot settles both
+    /// what it holds and whether this query may build.
     fn tables_for_query(&self) -> Option<Arc<table::Tables>> {
-        let never_built = self
-            .node
-            .tables
-            .read()
-            .is_ok_and(|slot| matches!(&*slot, table::TableSlot::Empty));
-        if never_built {
-            // A node made while a query runs is often made for that query
-            // alone, so its first query answers from the graph and only a
-            // second one pays for a build. `build_next` holds that turn.
-            let relaxed = std::sync::atomic::Ordering::Relaxed;
-            if !self.node.build_next.swap(true, relaxed) {
-                return None;
+        match self.held_tables() {
+            Held::Tables(tables) => Self::served(tables),
+            Held::Build => self.build_tables(),
+            Held::Answers => None,
+            Held::Empty => {
+                // A node made while a query runs is often made for that
+                // query alone, so its first query answers from the graph and
+                // only a second one pays for a build. `build_next` holds
+                // that turn.
+                let relaxed = std::sync::atomic::Ordering::Relaxed;
+                if !self.node.build_next.swap(true, relaxed) {
+                    return None;
+                }
+                // The election won. Read afresh, as a query of a node that
+                // built once does: a slot another thread filled meanwhile
+                // answers from what it now holds.
+                self.tables()
             }
         }
-        // A build under way elects its one builder, and the queries that
-        // lose answer from the graph.
-        self.tables()
     }
 
     /// Whether a query of `span` is answered from precomputed tables, in
