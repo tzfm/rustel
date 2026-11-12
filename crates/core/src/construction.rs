@@ -61,9 +61,9 @@ impl Pattern {
     ///
     /// A table answers only while what it was built with still stands, so a
     /// table whose settings snapshot or compiled programs moved on is left
-    /// behind and its node builds afresh. The check runs here, at handover:
-    /// a filled table that later stops answering disables its node's fast
-    /// path for good, exactly as a table built by a query always has.
+    /// behind. The check runs here, at handover, and again at every query:
+    /// a filled table that later stops answering is replaced by the build
+    /// of the state in force, never left to dead-end its node.
     #[doc(hidden)]
     pub fn adopt_tables_from(&self, previous: &Pattern) {
         /// A pair entered, waiting for the verdicts of its children.
@@ -156,52 +156,97 @@ impl Pattern {
 }
 
 /// Whether the payloads [`same_node`] leaves out cannot tell this pair
-/// apart.
+/// apart. Only a pair `same_node` accepted reaches here, so `right` is the
+/// same kind as `left`.
 ///
 /// The differential mode may leave them out: two builds of one score make
 /// equal payloads, so the node shape already settles agreement there. An
 /// edit makes different payloads under a shape it did not change, and the
 /// answers of the old payloads are not this node's. Such a pair refuses,
 /// and a kind whose payloads `same_node` leaves out must be named here or
-/// its edits never carry.
+/// its edits never carry: the match names every kind, so a new one refuses
+/// to compile until it is placed.
 fn same_opaque_payloads(left: &Node, right: &Node) -> bool {
     use Node::*;
-    match (left, right) {
-        (WithQueryTime(_, f), WithQueryTime(_, g)) | (WithHapTime(_, f), WithHapTime(_, g)) => {
-            Arc::ptr_eq(f, g)
+    match left {
+        WithQueryTime(_, f) => matches!(right, WithQueryTime(_, g) if Arc::ptr_eq(f, g)),
+        WithHapTime(_, f) => matches!(right, WithHapTime(_, g) if Arc::ptr_eq(f, g)),
+        WithQuerySpan(_, f) => matches!(right, WithQuerySpan(_, g) if Arc::ptr_eq(f, g)),
+        WithHapSpan(_, f) => matches!(right, WithHapSpan(_, g) if Arc::ptr_eq(f, g)),
+        FmapNative(_, f) => matches!(right, FmapNative(_, g) if Arc::ptr_eq(f, g)),
+        FilterValues(_, f) => matches!(right, FilterValues(_, g) if Arc::ptr_eq(f, g)),
+        FilterHaps(_, f) => matches!(right, FilterHaps(_, g) if Arc::ptr_eq(f, g)),
+        MapHapsNative(_, f, _) => matches!(right, MapHapsNative(_, g, _) if Arc::ptr_eq(f, g)),
+        MapHapsOwned(_, f, _) => matches!(right, MapHapsOwned(_, g, _) if Arc::ptr_eq(f, g)),
+        MapHapsWithState(_, f) => matches!(right, MapHapsWithState(_, g) if Arc::ptr_eq(f, g)),
+        ExpandHapsNative(_, f, _) => {
+            matches!(right, ExpandHapsNative(_, g, _) if Arc::ptr_eq(f, g))
         }
-        (WithQuerySpan(_, f), WithQuerySpan(_, g)) | (WithHapSpan(_, f), WithHapSpan(_, g)) => {
-            Arc::ptr_eq(f, g)
-        }
-        (FmapNative(_, f), FmapNative(_, g)) => Arc::ptr_eq(f, g),
-        (FilterValues(_, f), FilterValues(_, g)) => Arc::ptr_eq(f, g),
-        (FilterHaps(_, f), FilterHaps(_, g)) => Arc::ptr_eq(f, g),
-        (MapHapsNative(_, f, _), MapHapsNative(_, g, _)) => Arc::ptr_eq(f, g),
-        (MapHapsOwned(_, f, _), MapHapsOwned(_, g, _)) => Arc::ptr_eq(f, g),
-        (MapHapsWithState(_, f), MapHapsWithState(_, g)) => Arc::ptr_eq(f, g),
-        (ExpandHapsNative(_, f, _), ExpandHapsNative(_, g, _)) => Arc::ptr_eq(f, g),
-        (Signal(f), Signal(g)) => Arc::ptr_eq(f, g),
-        (InnerJoin(_, f), InnerJoin(_, g)) | (PatternOfDynamic(_, f), PatternOfDynamic(_, g)) => {
-            Arc::ptr_eq(f, g)
-        }
-        (PatternOfPure(_, f, _), PatternOfPure(_, g, _)) => Arc::ptr_eq(f, g),
-        (PatternOfHap(_, _, f), PatternOfHap(_, _, g)) => Arc::ptr_eq(f, g),
-        (AppLeft(_, _, f, _), AppLeft(_, _, g, _))
-        | (AppRight(_, _, f, _), AppRight(_, _, g, _))
-        | (AppBoth(_, _, f, _), AppBoth(_, _, g, _)) => same_combine(f, g),
-        (FmapJsPreservingControls(_, _, f), FmapJsPreservingControls(_, _, g)) => {
-            match (f, g) {
+        Signal(f) => matches!(right, Signal(g) if Arc::ptr_eq(f, g)),
+        InnerJoin(_, f) => matches!(right, InnerJoin(_, g) if Arc::ptr_eq(f, g)),
+        PatternOfDynamic(_, f) => matches!(right, PatternOfDynamic(_, g) if Arc::ptr_eq(f, g)),
+        PatternOfPure(_, f, _) => matches!(right, PatternOfPure(_, g, _) if Arc::ptr_eq(f, g)),
+        PatternOfHap(_, _, f) => matches!(right, PatternOfHap(_, _, g) if Arc::ptr_eq(f, g)),
+        AppLeft(_, _, f, _) => matches!(right, AppLeft(_, _, g, _) if same_combine(f, g)),
+        AppRight(_, _, f, _) => matches!(right, AppRight(_, _, g, _) if same_combine(f, g)),
+        AppBoth(_, _, f, _) => matches!(right, AppBoth(_, _, g, _) if same_combine(f, g)),
+        FmapJsPreservingControls(_, _, f) => match right {
+            FmapJsPreservingControls(_, _, g) => match (f, g) {
                 (Some(f), Some(g)) => std::ptr::fn_addr_eq(*f, *g),
                 (None, None) => true,
                 _ => false,
-            }
-        }
-        (Extension(f), Extension(g)) => std::ptr::eq(&**f, &**g),
-        // Every other kind carries its whole payload in the fields
-        // `same_node` compares. A pair of different kinds never reaches
-        // here: `same_node` refused it first, and an unnamed kind refuses
-        // rather than carry answers it may not own.
-        _ => false,
+            },
+            _ => false,
+        },
+        Extension(f) => matches!(right, Extension(g) if std::ptr::eq(&**f, &**g)),
+        #[cfg(non_send_node_mutation)]
+        NonSendMutation(_) => false,
+        // Every kind left carries its whole payload in the fields
+        // `same_node` compares: the shape settles it, and the pair carries.
+        Silence
+        | Pure(_)
+        | QueryError(_)
+        | QueryLimit(_)
+        | Fast(..)
+        | Shift(..)
+        | WithQuerySpanJs(..)
+        | Rev(_)
+        | StepJoin(_)
+        | PolyJoin(_)
+        | Arp(..)
+        | ArpWith(..)
+        | ArpWithPattern(..)
+        | PurePattern(_)
+        | PurePickLookup(..)
+        | PatternOfJs(..)
+        | FilterValuesJs(..)
+        | FilterHapsJs(..)
+        | FilterWhenJs(..)
+        | SortHapsByPart(_)
+        | Collect(_)
+        | CycleOnsetIndex(_)
+        | CycleOnsetCount(_)
+        | WithRandSeed(..)
+        | ChooseCycles(..)
+        | WChoose { .. }
+        | Pick { .. }
+        | PickPatternified { .. }
+        | Degrade(..)
+        | Stack(_)
+        | SlowCat(_)
+        | SlowCatPrime(_)
+        | SplitQueries(_)
+        | FastGap(..)
+        | RepeatCycles(..)
+        | LoopAt(..)
+        | Cpm(..)
+        | MidiKeys(..)
+        | AddContext(..)
+        | XenPatterns(..)
+        | Join(..)
+        | FmapJs(..)
+        | JsQuery(_)
+        | Timeline(..) => true,
     }
 }
 
