@@ -1090,6 +1090,21 @@ impl Step {
     }
 }
 
+/// The answer tables one node holds, in the state a query finds them.
+#[derive(Debug, Default)]
+pub(crate) enum TableSlot {
+    /// No build has put tables here yet.
+    #[default]
+    Empty,
+    /// A build under this settings state made none, so the graph answers.
+    /// A later state may build again: the compiled programs a build applies
+    /// can change with the state.
+    GraphAnswers(SettingsStateId),
+    /// Built tables, answering while [`Tables::current`] upholds them and
+    /// replaced by a fresh build the first query after they stop.
+    Ready(Arc<Tables>),
+}
+
 /// Layers answered one after the other, as a stack answers its children.
 #[derive(Clone, Debug)]
 pub(crate) struct Tables {
@@ -2729,10 +2744,10 @@ pub(crate) fn build(node: &Node) -> Option<Tables> {
         Node::Silence => Some(Tables::new(Vec::new(), Work::leaf(Cycles::NONE))),
         Node::Pure(value) if value.is_data(0) => pure(value),
         Node::AddContext(pattern, locations) => {
-            stepped(pattern.tables()?, Step::Locations(locations.clone()))
+            stepped(&*pattern.tables()?, Step::Locations(locations.clone()))
         }
-        Node::Fast(pattern, factor, _) => fast(pattern.tables()?, *factor),
-        Node::Shift(pattern, by, _) => shift(pattern.tables()?, *by),
+        Node::Fast(pattern, factor, _) => fast(&*pattern.tables()?, *factor),
+        Node::Shift(pattern, by, _) => shift(&*pattern.tables()?, *by),
         Node::Stack(patterns) => stack(patterns),
         Node::SplitQueries(inner) => split_queries(inner),
         Node::Pick {
@@ -2740,53 +2755,61 @@ pub(crate) fn build(node: &Node) -> Option<Tables> {
             lookup,
             index_mode,
             mode,
-        } => picked(selector.tables()?, lookup, *index_mode, *mode),
+        } => picked(&*selector.tables()?, lookup, *index_mode, *mode),
         Node::Join(inner, mode) => match inner.node_kind() {
-            Node::PatternOfPure(carrier, f, memo) => joined(carrier.tables()?, f, memo, *mode),
+            Node::PatternOfPure(carrier, f, memo) => joined(&*carrier.tables()?, f, memo, *mode),
             _ => None,
         },
-        Node::FmapNative(pattern, f) => stepped(pattern.tables()?, Step::Map(f.clone())),
-        Node::FilterValues(pattern, keep) => stepped(pattern.tables()?, Step::Keep(keep.clone())),
+        Node::FmapNative(pattern, f) => stepped(&*pattern.tables()?, Step::Map(f.clone())),
+        Node::FilterValues(pattern, keep) => stepped(&*pattern.tables()?, Step::Keep(keep.clone())),
         Node::MapHapsNative(pattern, f, SpanUse::Ignores) => {
-            stepped(pattern.tables()?, Step::MapHap(f.clone()))
+            stepped(&*pattern.tables()?, Step::MapHap(f.clone()))
         }
         Node::MapHapsOwned(pattern, f, SpanUse::Ignores) => {
-            stepped(pattern.tables()?, Step::MapOwned(f.clone()))
+            stepped(&*pattern.tables()?, Step::MapOwned(f.clone()))
         }
-        Node::ExpandHapsNative(pattern, f, SpanUse::Ignores) => expanded(pattern.tables()?, f),
+        Node::ExpandHapsNative(pattern, f, SpanUse::Ignores) => expanded(&*pattern.tables()?, f),
         Node::AppLeft(functions, values, apply, flow) => match signal_of(values) {
-            Some(signal) => sampled(functions.tables()?, signal, Side::Value, apply, *flow),
+            Some(signal) => sampled(&*functions.tables()?, signal, Side::Value, apply, *flow),
             None if sampling(functions) || sampling(values) => {
                 met(functions, values, Side::Value, apply, *flow)
             }
-            None => applied(functions.tables()?, values.tables()?, |function, value| {
-                let part = function.part.intersection(&value.part)?;
-                Some(applied_hap(
-                    function,
-                    value,
-                    function.whole,
-                    part,
-                    apply,
-                    *flow,
-                ))
-            }),
+            None => applied(
+                &*functions.tables()?,
+                &*values.tables()?,
+                |function, value| {
+                    let part = function.part.intersection(&value.part)?;
+                    Some(applied_hap(
+                        function,
+                        value,
+                        function.whole,
+                        part,
+                        apply,
+                        *flow,
+                    ))
+                },
+            ),
         },
         Node::AppRight(functions, values, apply, flow) => match signal_of(functions) {
-            Some(signal) => sampled(values.tables()?, signal, Side::Function, apply, *flow),
+            Some(signal) => sampled(&*values.tables()?, signal, Side::Function, apply, *flow),
             None if sampling(values) || sampling(functions) => {
                 met(values, functions, Side::Function, apply, *flow)
             }
-            None => applied(values.tables()?, functions.tables()?, |value, function| {
-                let part = function.part.intersection(&value.part)?;
-                Some(applied_hap(
-                    function,
-                    value,
-                    value.whole,
-                    part,
-                    apply,
-                    *flow,
-                ))
-            }),
+            None => applied(
+                &*values.tables()?,
+                &*functions.tables()?,
+                |value, function| {
+                    let part = function.part.intersection(&value.part)?;
+                    Some(applied_hap(
+                        function,
+                        value,
+                        value.whole,
+                        part,
+                        apply,
+                        *flow,
+                    ))
+                },
+            ),
         },
         _ => None,
     }
@@ -3183,7 +3206,7 @@ fn met_constant(
         source: Source::Constant(hap),
         ops: Vec::new(),
     };
-    let tables = sampled(structure.tables()?, signal, side, apply, flow)?;
+    let tables = sampled(&*structure.tables()?, signal, side, apply, flow)?;
     // The constant's own walk sits below the meeting.
     Some(Tables::new(
         tables.layers,
@@ -3595,9 +3618,9 @@ fn split_queries(inner: &Pattern) -> Option<Tables> {
     match inner.node_kind() {
         Node::SlowCat(patterns) => return slowcat(patterns),
         Node::SlowCatPrime(patterns) => return slowcat_prime(patterns),
-        Node::Rev(pattern) => return rev(pattern.tables()?),
-        Node::FastGap(pattern, factor) => return fast_gap(pattern.tables()?, *factor),
-        Node::RepeatCycles(pattern, count) => return repeat_cycles(pattern.tables()?, *count),
+        Node::Rev(pattern) => return rev(&*pattern.tables()?),
+        Node::FastGap(pattern, factor) => return fast_gap(&*pattern.tables()?, *factor),
+        Node::RepeatCycles(pattern, count) => return repeat_cycles(&*pattern.tables()?, *count),
         _ => {}
     }
     let tables = inner.tables()?;
@@ -3655,7 +3678,7 @@ fn slowcat_prime(patterns: &[Pattern]) -> Option<Tables> {
 }
 
 /// The walk of every constituent of an alternation, together.
-fn constituents(children: &[&Tables]) -> Work {
+fn constituents(children: &[Arc<Tables>]) -> Work {
     children
         .iter()
         .map(|child| child.work)

@@ -847,18 +847,32 @@ struct NodeCell {
     /// Whether a thread builds `tables` now. A query that finds a build under
     /// way answers from the graph instead of waiting for it.
     building: std::sync::atomic::AtomicBool,
-    /// Built by the query that `build_next` allows, or by a parent's build.
-    /// `None` inside means the graph answers. See the `table` module.
-    tables: std::sync::OnceLock<Option<Box<table::Tables>>>,
+    /// The answer tables this node holds, built by the query that
+    /// `build_next` allows or by a parent's build, or rebuilt when the
+    /// settings state they were built under moves past them. See the `table`
+    /// module.
+    ///
+    /// Readers take the read lock only to clone the `Arc`, so a query never
+    /// waits on another query, and a writer holds the lock only to swap the
+    /// slot, so a build never waits on a query.
+    tables: std::sync::RwLock<table::TableSlot>,
 }
 
 /// A table build under way on a node, marked until dropped, also on unwind.
 struct Building<'a>(&'a std::sync::atomic::AtomicBool);
 
 impl<'a> Building<'a> {
-    fn start(flag: &'a std::sync::atomic::AtomicBool) -> Self {
-        flag.store(true, std::sync::atomic::Ordering::Release);
-        Self(flag)
+    /// Elects the one builder among racing threads. The queries that lose
+    /// the election answer from the graph, as they do while any build runs.
+    fn try_start(flag: &'a std::sync::atomic::AtomicBool) -> Option<Self> {
+        flag.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .ok()
+        .map(|_| Self(flag))
     }
 }
 
@@ -4875,7 +4889,7 @@ impl Pattern {
                     QUERY_DEPTH.with(|depth| depth.get() == 0),
                 ),
                 building: std::sync::atomic::AtomicBool::new(false),
-                tables: std::sync::OnceLock::new(),
+                tables: std::sync::RwLock::new(table::TableSlot::Empty),
             }),
             steps: None,
             pure_loc: None,
@@ -4893,40 +4907,80 @@ impl Pattern {
     /// to the same query. A table answers only under the settings snapshot
     /// it was built under, the key of every result cache, and never for a
     /// handle that binds another runtime, whose snapshot moves on its own.
-    fn tables(&self) -> Option<&table::Tables> {
+    /// Tables the state moved past are replaced by a build under the state
+    /// in force: a filled slot never dead-ends a node.
+    fn tables(&self) -> Option<Arc<table::Tables>> {
         if !self.tables_may_answer() {
             return None;
         }
-        let tables = match self.node.tables.get() {
-            Some(tables) => tables.as_deref()?,
-            None => {
-                // A build asks each child for its tables in turn, one native
-                // frame per level. A graph deeper than the bound gets none
-                // and is answered by the graph, which refuses it past
-                // `MAX_PATTERN_DEPTH`. A stack overflow would abort the
-                // process instead.
-                let _depth = table::BuildDepth::enter()?;
-                let _building = Building::start(&self.node.building);
-                // The snapshot in force when the build begins is the one its
-                // closures read.
-                let state = settings::current_state_id();
-                self.node
-                    .tables
-                    .get_or_init(|| {
-                        let (built, read) = callback_ir::recording_reads(|| {
-                            without_query_signals(|| table::build(self.node_kind()))
-                        });
-                        built.map(|tables| Box::new(tables.built_under(state, read)))
-                    })
-                    .as_deref()?
-            }
-        };
-        if !tables.current() {
-            return None;
+        enum Held {
+            /// The graph answers, and building again cannot change that.
+            Answers,
+            Tables(Arc<table::Tables>),
+            Build,
         }
-        // A build that uses these tables reads what they read.
-        callback_ir::note_read(tables.read());
-        Some(tables)
+        let held = match self.node.tables.read() {
+            Ok(slot) => match &*slot {
+                table::TableSlot::Ready(tables) if tables.current() => {
+                    Held::Tables(Arc::clone(tables))
+                }
+                // A build under this state made none: the graph answers.
+                table::TableSlot::GraphAnswers(state) if settings::is_current_state(state) => {
+                    Held::Answers
+                }
+                // Empty, stale, or a refusal under a state that moved on: a
+                // build under the state in force decides.
+                _ => Held::Build,
+            },
+            // A poisoned lock is a query the graph answers.
+            Err(_) => Held::Answers,
+        };
+        match held {
+            Held::Answers => None,
+            Held::Tables(tables) => {
+                // A build that uses these tables reads what they read.
+                callback_ir::note_read(tables.read());
+                Some(tables)
+            }
+            Held::Build => self.build_tables(),
+        }
+    }
+
+    /// Build this node's tables under the state in force and take the slot.
+    /// One elected thread builds; the queries that lose the election answer
+    /// from the graph, as they do while any build runs.
+    fn build_tables(&self) -> Option<Arc<table::Tables>> {
+        // A build asks each child for its tables in turn, one native frame
+        // per level. A graph deeper than the bound gets none and is
+        // answered by the graph, which refuses it past
+        // `MAX_PATTERN_DEPTH`. A stack overflow would abort the process
+        // instead.
+        let _depth = table::BuildDepth::enter()?;
+        let _building = Building::try_start(&self.node.building)?;
+        // The snapshot in force when the build begins is the one its
+        // closures read.
+        let state = settings::current_state_id();
+        let (built, read) = callback_ir::recording_reads(|| {
+            without_query_signals(|| table::build(self.node_kind()))
+        });
+        match built {
+            Some(tables) => {
+                let tables = Arc::new(tables.built_under(state, read));
+                let stored = table::TableSlot::Ready(Arc::clone(&tables));
+                if let Ok(mut slot) = self.node.tables.write() {
+                    // A fresh build outranks a stale table, an empty slot
+                    // and a refusal under a state that moved on alike.
+                    *slot = stored;
+                }
+                Some(tables)
+            }
+            None => {
+                if let Ok(mut slot) = self.node.tables.write() {
+                    *slot = table::TableSlot::GraphAnswers(state);
+                }
+                None
+            }
+        }
     }
 
     /// Whether this handle may answer from tables at all: a cacheable graph
@@ -4941,35 +4995,35 @@ impl Pattern {
 
     /// The tables built so far that may answer now, building none.
     #[cfg(test)]
-    fn built_tables(&self) -> Option<&table::Tables> {
+    fn built_tables(&self) -> Option<Arc<table::Tables>> {
         if !self.tables_may_answer() {
             return None;
         }
-        self.node
-            .tables
-            .get()?
-            .as_deref()
-            .filter(|tables| tables.current())
+        self.node.tables.read().ok().and_then(|slot| match &*slot {
+            table::TableSlot::Ready(tables) if tables.current() => Some(Arc::clone(tables)),
+            _ => None,
+        })
     }
 
     /// [`Self::tables`] for a query of this node, built only when
     /// `NodeCell::build_next` allows it.
-    fn tables_for_query(&self) -> Option<&table::Tables> {
-        if self.node.tables.get().is_none() {
+    fn tables_for_query(&self) -> Option<Arc<table::Tables>> {
+        let never_built = self
+            .node
+            .tables
+            .read()
+            .is_ok_and(|slot| matches!(&*slot, table::TableSlot::Empty));
+        if never_built {
+            // A node made while a query runs is often made for that query
+            // alone, so its first query answers from the graph and only a
+            // second one pays for a build. `build_next` holds that turn.
             let relaxed = std::sync::atomic::Ordering::Relaxed;
-            if !self.node.build_next.load(relaxed) {
-                self.node.build_next.store(true, relaxed);
-                return None;
-            }
-            // Another thread builds it. The graph answers now.
-            if self
-                .node
-                .building
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if !self.node.build_next.swap(true, relaxed) {
                 return None;
             }
         }
+        // A build under way elects its one builder, and the queries that
+        // lose answer from the graph.
         self.tables()
     }
 
