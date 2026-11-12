@@ -178,6 +178,7 @@ mod loading_line;
 mod log_panel;
 mod memory_panel;
 mod menu_bar;
+mod midi_import;
 mod mixer;
 mod mouse;
 mod panes;
@@ -1506,6 +1507,11 @@ struct App {
     /// whenever that sheet is up, and would take the keyboard off the menu
     /// on the very next key.
     menu: Option<super::menu::MenuState>,
+    /// The File menu's Strudel patterns group is open: its Import and
+    /// Export rows are in the list rather than folded under the header.
+    /// Lives with the menu that opened it - the bar closing folds the
+    /// group again.
+    patterns_menu_open: bool,
     /// Double- and triple-click detection for the reference column's text.
     clicks: super::textblock::ClickCounter,
     /// A slider the arrows adjust: set by any gesture on a control, let go
@@ -1986,6 +1992,7 @@ impl App {
             quit_armed: false,
             pending_switch: None,
             menu: None,
+            patterns_menu_open: false,
             clicks: super::textblock::ClickCounter::default(),
             armed_slider: None,
             slider_precision: None,

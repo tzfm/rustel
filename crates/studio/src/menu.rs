@@ -44,12 +44,18 @@ pub enum MenuAction {
     NewSession,
     OpenSet,
     OpenRecent,
+    /// The header of the File menu's Strudel patterns group. Choosing it
+    /// opens and closes the group in place, so the menu stays up rather
+    /// than running a command.
+    StrudelPatterns,
     /// Import the entries of a Strudel pattern export into the open set,
     /// as score files of its folder.
     ImportStrudel,
     /// Export the open set's scores as one pattern export beside the
     /// sets, in the shape strudel.cc's Patterns tab gives and takes.
     ExportPatterns,
+    /// Import a Standard MIDI File as a new scene of the open set.
+    ImportMidi,
     RenameSet,
     /// Copy the samples this set's scores name into the set's own folder,
     /// so the folder plays on its own wherever it goes.
@@ -173,6 +179,15 @@ pub enum MenuItemKind {
         /// [`MenuEvent::PreviewBegin`] and [`MenuEvent::PreviewEnd`].
         previews: bool,
     },
+    /// The header of a collapsible run of rows in this same list. Choosing
+    /// it does not close the menu: the application is asked to turn the
+    /// group on or off, and the rows under the header arrive or leave with
+    /// the next build of the list. `open` is what the application last
+    /// said, so the arrow beside the label can say which way it goes.
+    Group {
+        id: MenuAction,
+        open: bool,
+    },
     Separator,
 }
 
@@ -192,6 +207,9 @@ pub struct MenuItem {
     /// The chord, already spelled by `KeyboardCapabilities`. Never a ⌘ form.
     pub accel: String,
     pub enabled: bool,
+    /// The row belongs to the [`MenuItemKind::Group`] above it, and draws
+    /// two columns in under the header's label.
+    pub indented: bool,
 }
 
 impl MenuItem {
@@ -209,6 +227,7 @@ impl MenuItem {
             label: label.to_owned(),
             accel: accel.into(),
             enabled: true,
+            indented: false,
         }
     }
 
@@ -219,7 +238,15 @@ impl MenuItem {
             mnemonic_at: None,
             accel: String::new(),
             enabled: false,
+            indented: false,
         }
+    }
+
+    /// Draw the row under its group header.
+    #[must_use]
+    pub fn indented(mut self) -> Self {
+        self.indented = true;
+        self
     }
 
     /// Grey the row out. A disabled row still draws - a menu that hides what
@@ -236,7 +263,8 @@ impl MenuItem {
             | MenuItemKind::Toggle { id, .. }
             | MenuItemKind::Radio { id, .. }
             | MenuItemKind::Stepper { id, .. }
-            | MenuItemKind::Submenu { id, .. } => Some(*id),
+            | MenuItemKind::Submenu { id, .. }
+            | MenuItemKind::Group { id, .. } => Some(*id),
             MenuItemKind::Separator => None,
         }
     }
@@ -265,11 +293,14 @@ impl MenuItem {
     }
 
     /// What is drawn to the right of the label: the accelerator, or a
-    /// stepper's value, or the arrow that says a submenu opens here.
+    /// stepper's value, or the arrow that says a submenu or a group opens
+    /// here.
     fn trailer(&self) -> &str {
         match &self.kind {
             MenuItemKind::Stepper { value, .. } => value,
             MenuItemKind::Submenu { .. } => "\u{25b8}",
+            MenuItemKind::Group { open: false, .. } => "\u{25b8}",
+            MenuItemKind::Group { open: true, .. } => "\u{25be}",
             _ => &self.accel,
         }
     }
@@ -607,6 +638,10 @@ impl MenuState {
                 self.close(menus, CloseReason::Committed, events);
             }
             MenuItemKind::Stepper { .. } => events.push(MenuEvent::Adjust(id, 1)),
+            // The list below the header is what changes, so the list stays
+            // up: the application answers by building the menu again with
+            // the group's rows in or out.
+            MenuItemKind::Group { .. } => events.push(MenuEvent::Activate(id)),
             _ => {
                 events.push(MenuEvent::Activate(id));
                 self.close(menus, CloseReason::Committed, events);
@@ -769,12 +804,18 @@ impl MenuState {
                 } else if delta < 0 && self.path.len() > 1 {
                     self.path.pop();
                     self.moved(menus, before, &mut events);
-                } else if delta > 0
-                    && self
-                        .highlighted(menus)
-                        .and_then(MenuItem::submenu)
-                        .is_some()
-                {
+                } else if self.highlighted(menus).is_some_and(|item| {
+                    // A submenu opens with Right. A group's rows are in
+                    // this list, so its arrow works both ways: Right turns
+                    // a closed one on, Left turns an open one off, and the
+                    // bar is reached only past that.
+                    match item.kind {
+                        MenuItemKind::Submenu { .. } => delta > 0,
+                        MenuItemKind::Group { open: false, .. } => delta > 0,
+                        MenuItemKind::Group { open: true, .. } => delta < 0,
+                        _ => false,
+                    }
+                }) {
                     self.choose(menus, &mut events);
                 } else {
                     // Along the bar. A dropped menu stays dropped, which is
@@ -864,8 +905,11 @@ fn list_width(items: &[MenuItem]) -> u16 {
         .map(|item| {
             let label = UnicodeWidthStr::width(item.label.as_str()) as u16;
             let trailer = UnicodeWidthStr::width(item.trailer()) as u16;
-            // highlight arrow, mark, label, space, gap, trailer
-            3 + label + if trailer > 0 { ACCEL_GAP + trailer } else { 0 }
+            // highlight arrow, mark, label, space, gap, trailer, and a
+            // group's rows sit two columns in
+            3 + u16::from(item.indented) * 2
+                + label
+                + if trailer > 0 { ACCEL_GAP + trailer } else { 0 }
         })
         .max()
         .unwrap_or(0)
@@ -1160,11 +1204,13 @@ pub fn render_dropdowns(
             let cursor = if highlighted { "\u{25b8}" } else { " " };
             buffer.set_stringn(rect.x + 1, y, cursor, 1, style);
             buffer.set_stringn(rect.x + 2, y, item.mark(), 1, style);
+            // A group's rows sit two columns in under the header's label.
+            let indent = u16::from(item.indented) * 2;
             buffer.set_stringn(
-                rect.x + 3,
+                rect.x + 3 + indent,
                 y,
                 &item.label,
-                usize::from(inner.saturating_sub(2)),
+                usize::from(inner.saturating_sub(2 + indent)),
                 style,
             );
             if let Some(at) = item.mnemonic_at
@@ -1173,7 +1219,7 @@ pub fn render_dropdowns(
             {
                 let before = UnicodeWidthStr::width(&item.label[..at]) as u16;
                 buffer.set_stringn(
-                    rect.x + 3 + before,
+                    rect.x + 3 + indent + before,
                     y,
                     letter.to_string(),
                     1,
@@ -1261,6 +1307,9 @@ pub struct MenuContext<'a> {
     pub can_learn_pad: bool,
     pub has_pad: bool,
     pub has_last_file: bool,
+    /// The Strudel patterns group of the File menu is open, so its Import
+    /// and Export rows are in the list rather than folded under it.
+    pub patterns_menu_open: bool,
     /// A take is being recorded: the Transport row reads "Finish".
     pub recording: bool,
     /// A sample is being recorded from the input: its row reads "Finish".
@@ -1390,50 +1439,57 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
     // beside Next.
     // The set is the file: a folder of scores, made, opened and renamed
     // here. Scores have a menu of their own.
-    let file = Menu::new(
-        "File",
-        'F',
-        vec![
-            MenuItem::action(MenuAction::NewSet, "New set", 'n', ""),
-            MenuItem::action(MenuAction::NewSession, "New session", 'e', "n in set panel")
-                .enabled(cx.can_record_session),
-            MenuItem::action(
-                MenuAction::OpenSet,
-                "Open set\u{2026}",
-                'o',
-                hint(BindAction::OpenSet),
-            ),
-            MenuItem::action(MenuAction::OpenRecent, "Open recent\u{2026}", 'r', ""),
-            MenuItem::action(
-                MenuAction::ImportStrudel,
-                "Import patterns\u{2026}",
-                'i',
-                "",
-            ),
-            MenuItem::action(
-                MenuAction::ExportPatterns,
-                "Export patterns\u{2026}",
-                'x',
-                "",
-            ),
-            MenuItem::action(MenuAction::RenameSet, "Rename set\u{2026}", 'a', "")
-                .enabled(!cx.recording),
-            MenuItem::separator(),
-            // A set that carries its own samples is a set you can hand
-            // over: nothing of yours travels until you ask for this.
-            MenuItem::action(
-                MenuAction::ConsolidateSamples,
-                "Copy samples into the set",
-                'y',
-                "",
-            ),
-            MenuItem::separator(),
-            // The set is a folder, and the desktop can show it.
-            MenuItem::action(MenuAction::ShowSet, show_set_label(), 's', ""),
-            MenuItem::separator(),
-            MenuItem::action(MenuAction::Quit, "Quit", 'q', hint(BindAction::Quit)),
-        ],
-    );
+    // The pattern round trip with strudel.cc is one subject with two
+    // directions, so it is one collapsible group rather than two rows that
+    // name their subject again: choosing the header opens the group right
+    // in this list, and choosing it again folds it away.
+    let mut file_items = vec![
+        MenuItem::action(MenuAction::NewSet, "New set", 'n', ""),
+        MenuItem::action(MenuAction::NewSession, "New session", 'e', "n in set panel")
+            .enabled(cx.can_record_session),
+        MenuItem::action(
+            MenuAction::OpenSet,
+            "Open set\u{2026}",
+            'o',
+            hint(BindAction::OpenSet),
+        ),
+        MenuItem::action(MenuAction::OpenRecent, "Open recent\u{2026}", 'r', ""),
+        MenuItem::new(
+            MenuItemKind::Group {
+                id: MenuAction::StrudelPatterns,
+                open: cx.patterns_menu_open,
+            },
+            "Strudel patterns",
+            'p',
+            "",
+        ),
+    ];
+    if cx.patterns_menu_open {
+        file_items.extend([
+            MenuItem::action(MenuAction::ImportStrudel, "Import\u{2026}", 'i', "").indented(),
+            MenuItem::action(MenuAction::ExportPatterns, "Export\u{2026}", 'x', "").indented(),
+        ]);
+    }
+    file_items.extend([
+        MenuItem::action(MenuAction::ImportMidi, "Import MIDI\u{2026}", 'm', ""),
+        MenuItem::action(MenuAction::RenameSet, "Rename set\u{2026}", 'a', "")
+            .enabled(!cx.recording),
+        MenuItem::separator(),
+        // A set that carries its own samples is a set you can hand
+        // over: nothing of yours travels until you ask for this.
+        MenuItem::action(
+            MenuAction::ConsolidateSamples,
+            "Copy samples into the set",
+            'y',
+            "",
+        ),
+        MenuItem::separator(),
+        // The set is a folder, and the desktop can show it.
+        MenuItem::action(MenuAction::ShowSet, show_set_label(), 's', ""),
+        MenuItem::separator(),
+        MenuItem::action(MenuAction::Quit, "Quit", 'q', hint(BindAction::Quit)),
+    ]);
+    let file = Menu::new("File", 'F', file_items);
     let scene = Menu::new(
         "Scene",
         'S',
@@ -1928,6 +1984,7 @@ mod tests {
             can_learn_pad: true,
             has_pad: true,
             has_last_file: true,
+            patterns_menu_open: false,
             recording: false,
             recording_sample: false,
             recording_tape: false,
@@ -1994,38 +2051,116 @@ mod tests {
     /// sharing a mnemonic makes the second unreachable. The real command list
     /// collides on the obvious choice three ways in Edit (Cut, Copy, Comment)
     /// and twice in Scene (New, Next), which is why several mnemonics are
-    /// deliberately not the first letter.
+    /// deliberately not the first letter. A group's rows share the list with
+    /// their header, so both shapes of it are checked.
     #[test]
     fn every_mnemonic_is_unique_within_its_menu() {
-        let menus = menus(&context());
-        let mut titles = Vec::new();
-        for menu in &menus {
-            let letter = menu.mnemonic().unwrap_or_else(|| {
-                panic!("menu {:?} has no mnemonic in its own title", menu.title)
-            });
-            assert!(
-                !titles.contains(&letter),
-                "two menus answer to {letter}: {:?}",
-                menu.title
-            );
-            titles.push(letter);
-
-            let mut seen = Vec::new();
-            for item in &menu.items {
-                if matches!(item.kind, MenuItemKind::Separator) {
-                    continue;
-                }
-                let letter = item.mnemonic().unwrap_or_else(|| {
-                    panic!("{:?} in {:?} has no mnemonic", item.label, menu.title)
+        for menus in [
+            menus(&context()),
+            menus(&MenuContext {
+                patterns_menu_open: true,
+                ..context()
+            }),
+        ] {
+            let mut titles = Vec::new();
+            for menu in &menus {
+                let letter = menu.mnemonic().unwrap_or_else(|| {
+                    panic!("menu {:?} has no mnemonic in its own title", menu.title)
                 });
                 assert!(
-                    !seen.contains(&letter),
-                    "{:?} and an earlier row of {:?} both answer to {letter}",
-                    item.label,
+                    !titles.contains(&letter),
+                    "two menus answer to {letter}: {:?}",
                     menu.title
                 );
-                seen.push(letter);
+                titles.push(letter);
+
+                let mut seen = Vec::new();
+                for item in &menu.items {
+                    if matches!(item.kind, MenuItemKind::Separator) {
+                        continue;
+                    }
+                    let letter = item.mnemonic().unwrap_or_else(|| {
+                        panic!("{:?} in {:?} has no mnemonic", item.label, menu.title)
+                    });
+                    assert!(
+                        !seen.contains(&letter),
+                        "{:?} and an earlier row of {:?} both answer to {letter}",
+                        item.label,
+                        menu.title
+                    );
+                    seen.push(letter);
+                }
             }
+        }
+    }
+
+    /// File ▸ Strudel patterns is one collapsible group: closed it is a
+    /// single header, and choosing the header puts its Import and Export
+    /// rows in the same list, drawn under it. A MIDI import is a row of
+    /// its own beside the group, so what a reader looks for under File is
+    /// on the bar, not only on a drop.
+    #[test]
+    fn the_pattern_group_opens_in_place_in_the_file_menu() {
+        let file = |open| {
+            menus(&MenuContext {
+                patterns_menu_open: open,
+                ..context()
+            })
+            .into_iter()
+            .find(|menu| menu.title == "File")
+            .expect("the File menu")
+            .items
+        };
+        let closed = file(false);
+        let at = closed
+            .iter()
+            .position(|item| item.id() == Some(MenuAction::StrudelPatterns))
+            .expect("the pattern group header");
+        assert_eq!(
+            closed[at].kind,
+            MenuItemKind::Group {
+                id: MenuAction::StrudelPatterns,
+                open: false
+            }
+        );
+        assert!(
+            closed
+                .iter()
+                .all(|item| item.id() != Some(MenuAction::ImportStrudel)),
+            "closed, the group holds its rows back"
+        );
+        let open = file(true);
+        assert_eq!(
+            open[at].kind,
+            MenuItemKind::Group {
+                id: MenuAction::StrudelPatterns,
+                open: true
+            }
+        );
+        assert_eq!(
+            open[at + 1..=at + 2]
+                .iter()
+                .map(|item| (item.label.as_str(), item.id(), item.indented))
+                .collect::<Vec<_>>(),
+            [
+                ("Import\u{2026}", Some(MenuAction::ImportStrudel), true),
+                ("Export\u{2026}", Some(MenuAction::ExportPatterns), true),
+            ],
+            "open, the group's rows sit directly under the header"
+        );
+        for items in [&closed, &open] {
+            assert!(
+                items.iter().any(|item| {
+                    item.label == "Import MIDI\u{2026}"
+                        && item.id() == Some(MenuAction::ImportMidi)
+                        && !item.indented
+                }),
+                "a MIDI import sits on File itself: {:?}",
+                items
+                    .iter()
+                    .map(|item| item.label.clone())
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
@@ -2543,6 +2678,88 @@ mod tests {
             vec![
                 MenuEvent::Activate(MenuAction::Log),
                 MenuEvent::PreviewEnd { restore: false },
+                MenuEvent::Close(CloseReason::Committed),
+            ]
+        );
+    }
+
+    /// A group header opens and closes its rows in the same list: choosing
+    /// it fires its action without closing the menu, and the arrows turn it
+    /// the way they point. The application answers the action by building
+    /// the list again with the rows in or out.
+    #[test]
+    fn a_group_header_toggles_in_place_without_closing_the_menu() {
+        let menus = |open| {
+            let mut items = vec![MenuItem::new(
+                MenuItemKind::Group {
+                    id: MenuAction::StrudelPatterns,
+                    open,
+                },
+                "Strudel patterns",
+                'p',
+                "",
+            )];
+            if open {
+                items.push(
+                    MenuItem::action(MenuAction::ImportStrudel, "Import", 'i', "").indented(),
+                );
+            }
+            items.push(MenuItem::action(MenuAction::Quit, "Quit", 'q', ""));
+            vec![Menu::new("File", 'F', items)]
+        };
+        // Enter on the closed header asks the application to open the
+        // group, and the menu stays up for the rows that brings in.
+        let mut state = MenuState::dropped_on(&menus(false), 0);
+        let MenuKey::Events(events) = state.key(&press(KeyCode::Enter), &menus(false)) else {
+            panic!("Enter did nothing");
+        };
+        assert_eq!(
+            events,
+            vec![MenuEvent::Activate(MenuAction::StrudelPatterns)]
+        );
+        assert!(
+            state.is_dropped(),
+            "the menu stays open to show the group's rows"
+        );
+
+        // The application answers with the open list; Left on an open
+        // header asks for it to close.
+        let MenuKey::Events(events) = state.key(&press(KeyCode::Left), &menus(true)) else {
+            panic!("Left did nothing");
+        };
+        assert_eq!(
+            events,
+            vec![MenuEvent::Activate(MenuAction::StrudelPatterns)]
+        );
+
+        // Right on a closed header asks for it to open.
+        let mut state = MenuState::dropped_on(&menus(false), 0);
+        let MenuKey::Events(events) = state.key(&press(KeyCode::Right), &menus(false)) else {
+            panic!("Right did nothing");
+        };
+        assert_eq!(
+            events,
+            vec![MenuEvent::Activate(MenuAction::StrudelPatterns)]
+        );
+
+        // Left on a closed header is the bar's Left, not a toggle: it asks
+        // the application for nothing.
+        let mut state = MenuState::dropped_on(&menus(false), 0);
+        if let MenuKey::Events(events) = state.key(&press(KeyCode::Left), &menus(false)) {
+            panic!("Left fired {events:?} on a closed group");
+        }
+
+        // A row of the open group is a command like any other: choosing it
+        // fires and closes.
+        let mut state = MenuState::dropped_on(&menus(true), 0);
+        state.key(&press(KeyCode::Down), &menus(true));
+        let MenuKey::Events(events) = state.key(&press(KeyCode::Enter), &menus(true)) else {
+            panic!("Enter did nothing");
+        };
+        assert_eq!(
+            events,
+            vec![
+                MenuEvent::Activate(MenuAction::ImportStrudel),
                 MenuEvent::Close(CloseReason::Committed),
             ]
         );

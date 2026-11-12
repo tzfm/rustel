@@ -22,11 +22,12 @@ takes its name from the export file. One score is written per entry. A score
 that carries a `@title` field takes it as its file name, an entry keyed by a
 name takes the key, and the rest are numbered `pattern 1`, `pattern 2` and so on
 in the order the patterns were made. The open-set prompt offers these exports
-beside the sets, and File > Import patterns does the same import into
-the set already open: one score file an entry lands in the set's folder. An
-entry the set already holds under its name is skipped and counted, a name that
-holds other code goes on to `name 2`, and nothing is overwritten. File >
-Export patterns writes the set's scores the other way: one pattern export at
+beside the sets, and File > Strudel patterns > Import does the same import
+into the set already open: one score file an entry lands in the set's folder.
+An entry the set already holds under its name is skipped and counted, a name
+that holds other code goes on to `name 2`, and nothing is overwritten. File >
+Strudel patterns > Export writes the set's scores the other way: one pattern
+export at
 the sets root, keyed by name, the score on screen as it stands with its
 unsaved edits, and the export loads in strudel.cc and in the open-set prompt
 alike.
@@ -615,7 +616,10 @@ to import samples. You can also add folders and packs in Settings ▸ Samples.
 Samples in the set folder are discovered automatically. Use File ▸ Copy
 samples into the set when you need a portable set. A dropped `.vstpreset`
 file goes to the preset folder of its plugin. See
-[Plugins](plugins.md#presets).
+[Plugins](plugins.md#presets). A dropped `.mid` or `.midi` file becomes a new
+score scene, and File ▸ Import MIDI does the same from a path you choose.
+The MIDI file is not changed. The import writes JavaScript, so it
+needs JavaScript mode.
 
 The sample view supports alias changes and file deletion. Check the
 confirmation before deleting a file. An alias must not replace an existing
@@ -1208,8 +1212,13 @@ folder, and your bank renames. Live playback continues.
 If the export cannot find or load a sound, or the engine refuses a note, the
 export fails and names the refusal. The file is still written. The check covers
 every note the export schedules, also notes after an early end.
-Use Tab and arrows to choose the length, WAV or MP3 format, stems, and output
-path.
+Use Tab and arrows to choose the length, WAV, MP3, or MIDI format, stems, and
+output path. Space moves to the next format. Left selects WAV and Right selects
+MIDI.
+
+A MIDI export writes a Type 1 file with 480 ticks per quarter note and a 4/4
+meter. It needs a fixed cycle length. Until-silence and the limiter apply to
+audio only.
 
 Choose a fixed number of cycles or **until silence**. Until-silence export stops
 when audio stays below the threshold for the hold time. The defaults are
@@ -1234,8 +1243,8 @@ the stems sum back to an unmastered main and mastering stays in the DAW. Stems
 need the WAV format: turning them on takes the format back to WAV, and MP3
 turns them off. The status names the folder, because the take lands inside it.
 
-Press Ctrl+Shift+X again to end an export early. Studio adds a fade and keeps
-the audio already rendered. Use Transport ▸ Reveal last export or take to
+For an audio export, press Ctrl+Shift+X again to end early. Studio adds a fade
+and keeps the audio already rendered. Use Transport ▸ Reveal last export or take to
 locate it. Before the first frame of audio, while Studio prepares the export,
 the same keys end it with no file.
 See [CLI export](cli.md#export) for command-line options.

@@ -53,10 +53,31 @@ pub enum Length {
     UntilSilence { floor_db: f64, hold_secs: f64 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportFormat {
+    Wav,
+    Mp3,
+    Midi,
+}
+
+impl ExportFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Wav => "wav",
+            Self::Mp3 => "mp3",
+            Self::Midi => "mid",
+        }
+    }
+
+    pub fn is_audio(self) -> bool {
+        !matches!(self, Self::Midi)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExportSettings {
     pub length: Length,
-    pub mp3: bool,
+    pub format: ExportFormat,
     /// Writes a `<name> stems` folder beside the bounce instead of the one
     /// file, so it needs the wav format; the sheet keeps the two in step.
     pub stems: bool,
@@ -69,7 +90,7 @@ impl Default for ExportSettings {
     fn default() -> Self {
         Self {
             length: Length::Cycles(16.0),
-            mp3: false,
+            format: ExportFormat::Wav,
             stems: false,
             limiter_enabled: false,
             limiter: rustel_audio::RenderLimiter {
@@ -85,7 +106,7 @@ impl Default for ExportSettings {
 
 impl ExportSettings {
     pub fn extension(&self) -> &'static str {
-        if self.mp3 { "mp3" } else { "wav" }
+        self.format.extension()
     }
 
     pub fn describe_length(&self) -> String {
@@ -164,6 +185,7 @@ pub struct SheetLayout {
     pub second: Rect,
     pub wav: Rect,
     pub mp3: Rect,
+    pub midi: Rect,
     pub limiter_off: Rect,
     pub limiter_on: Rect,
     pub stems_off: Rect,
@@ -176,7 +198,7 @@ pub struct SheetLayout {
 pub enum Hit {
     Length { silence: bool },
     Number(Field),
-    Format { mp3: bool },
+    Format(ExportFormat),
     Limiter { enabled: bool },
     Stems { on: bool },
     Target,
@@ -293,17 +315,38 @@ impl ExportSheet {
             .extension()
             .and_then(|extension| extension.to_str())
             .map(str::to_ascii_lowercase);
-        if matches!(extension.as_deref(), None | Some("wav" | "mp3")) {
+        if matches!(
+            extension.as_deref(),
+            None | Some("wav" | "mp3" | "mid" | "midi")
+        ) {
             self.target.set_extension(self.settings.extension());
         }
     }
 
     /// Stems need the wav format, so the pair moves together: stems on
-    /// takes the format back to wav, and mp3 turns stems off.
+    /// takes the format back to wav, and another format turns stems off.
     fn set_stems(&mut self, stems: bool) {
         self.settings.stems = stems;
-        if stems && self.settings.mp3 {
-            self.settings.mp3 = false;
+        if stems && self.settings.format != ExportFormat::Wav {
+            self.settings.format = ExportFormat::Wav;
+            self.retarget();
+        }
+    }
+
+    fn choose_format(&mut self, format: ExportFormat) {
+        if format == ExportFormat::Mp3 && !MP3_EXPORT {
+            return;
+        }
+        if format == ExportFormat::Midi
+            && matches!(self.settings.length, Length::UntilSilence { .. })
+        {
+            self.settings.length = Length::Cycles(16.0);
+        }
+        if self.settings.format != format {
+            self.settings.format = format;
+            if format != ExportFormat::Wav {
+                self.settings.stems = false;
+            }
             self.retarget();
         }
     }
@@ -335,26 +378,21 @@ impl ExportSheet {
         match hit {
             Hit::Length { silence } => {
                 self.field = Field::Length;
-                if silence != self.silence() {
+                if silence != self.silence() && (!silence || self.settings.format.is_audio()) {
                     self.toggle_choice();
                 }
             }
             Hit::Number(field) => self.field = field,
-            Hit::Format { mp3 } => {
+            Hit::Format(format) => {
                 self.field = Field::Format;
-                let mp3 = mp3 && MP3_EXPORT;
-                if self.settings.mp3 != mp3 {
-                    self.settings.mp3 = mp3;
-                    if mp3 {
-                        self.settings.stems = false;
-                    }
-                    self.retarget();
-                }
+                self.choose_format(format);
             }
             Hit::Target => self.field = Field::Target,
             Hit::Limiter { enabled } => {
                 self.field = Field::Limiter;
-                self.settings.limiter_enabled = enabled;
+                if self.settings.format.is_audio() {
+                    self.settings.limiter_enabled = enabled;
+                }
             }
             Hit::Stems { on } => {
                 self.field = Field::Stems;
@@ -384,11 +422,13 @@ impl ExportSheet {
             Field::Length => {
                 self.settings.length = if direction > 0 {
                     match self.settings.length {
-                        Length::Cycles(_) => Length::UntilSilence {
-                            floor_db: -60.0,
-                            hold_secs: 2.0,
-                        },
-                        current @ Length::UntilSilence { .. } => current,
+                        Length::Cycles(_) if self.settings.format.is_audio() => {
+                            Length::UntilSilence {
+                                floor_db: -60.0,
+                                hold_secs: 2.0,
+                            }
+                        }
+                        current => current,
                     }
                 } else {
                     match self.settings.length {
@@ -398,16 +438,22 @@ impl ExportSheet {
                 };
             }
             Field::Format => {
-                let mp3 = direction > 0 && MP3_EXPORT;
-                if self.settings.mp3 != mp3 {
-                    self.settings.mp3 = mp3;
-                    if mp3 {
-                        self.settings.stems = false;
-                    }
-                    self.retarget();
+                // The radios read wav, mp3, midi, so an arrow steps onto
+                // the neighbour that way and holds at the end of the row.
+                let next = match (self.settings.format, direction > 0) {
+                    (ExportFormat::Wav, true) if MP3_EXPORT => ExportFormat::Mp3,
+                    (ExportFormat::Wav, true) | (ExportFormat::Mp3, true) => ExportFormat::Midi,
+                    (ExportFormat::Midi, false) if MP3_EXPORT => ExportFormat::Mp3,
+                    (ExportFormat::Midi, false) | (ExportFormat::Mp3, false) => ExportFormat::Wav,
+                    (current, _) => current,
+                };
+                self.choose_format(next);
+            }
+            Field::Limiter => {
+                if self.settings.format.is_audio() {
+                    self.settings.limiter_enabled = direction > 0;
                 }
             }
-            Field::Limiter => self.settings.limiter_enabled = direction > 0,
             Field::Stems => self.set_stems(direction > 0),
             Field::First => match &mut self.settings.length {
                 Length::Cycles(cycles) => {
@@ -433,22 +479,30 @@ impl ExportSheet {
         self.commit_typed();
         match self.field {
             Field::Length => {
-                self.settings.length = match self.settings.length {
-                    Length::Cycles(_) => Length::UntilSilence {
-                        floor_db: -60.0,
-                        hold_secs: 2.0,
-                    },
-                    Length::UntilSilence { .. } => Length::Cycles(16.0),
-                };
+                if self.settings.format.is_audio() {
+                    self.settings.length = match self.settings.length {
+                        Length::Cycles(_) => Length::UntilSilence {
+                            floor_db: -60.0,
+                            hold_secs: 2.0,
+                        },
+                        Length::UntilSilence { .. } => Length::Cycles(16.0),
+                    };
+                }
             }
             Field::Format => {
-                self.settings.mp3 = !self.settings.mp3 && MP3_EXPORT;
-                if self.settings.mp3 {
-                    self.settings.stems = false;
-                }
-                self.retarget();
+                let next = match self.settings.format {
+                    ExportFormat::Wav if MP3_EXPORT => ExportFormat::Mp3,
+                    ExportFormat::Wav => ExportFormat::Midi,
+                    ExportFormat::Mp3 => ExportFormat::Midi,
+                    ExportFormat::Midi => ExportFormat::Wav,
+                };
+                self.choose_format(next);
             }
-            Field::Limiter => self.settings.limiter_enabled = !self.settings.limiter_enabled,
+            Field::Limiter => {
+                if self.settings.format.is_audio() {
+                    self.settings.limiter_enabled = !self.settings.limiter_enabled;
+                }
+            }
             Field::Stems => {
                 let stems = !self.settings.stems;
                 self.set_stems(stems);
@@ -673,6 +727,8 @@ pub struct ExportJob {
     pub scene_name: String,
     pub target: PathBuf,
     pub started: Instant,
+    /// What the job writes. An audio job can fade out early.
+    format: ExportFormat,
     /// Ends by silence, so a percentage would be of a ceiling nobody chose.
     open_ended: bool,
     /// Writes a stems folder beside the target instead of the one file.
@@ -697,6 +753,14 @@ impl ExportJob {
         config: SessionConfig,
         target: PathBuf,
     ) -> std::io::Result<Self> {
+        if settings.format == ExportFormat::Midi
+            && matches!(settings.length, Length::UntilSilence { .. })
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a MIDI export needs a cycle length",
+            ));
+        }
         if let Length::UntilSilence { hold_secs, .. } = settings.length {
             silence_hold_duration(hold_secs)?;
         }
@@ -733,8 +797,10 @@ impl ExportJob {
             scene_name,
             target,
             started: Instant::now(),
-            open_ended: matches!(settings.length, Length::UntilSilence { .. }),
+            format: settings.format,
             stems: settings.stems,
+            open_ended: settings.format.is_audio()
+                && matches!(settings.length, Length::UntilSilence { .. }),
             receiver,
             progress,
             finish,
@@ -775,6 +841,10 @@ impl ExportJob {
         self.finished_early
     }
 
+    pub fn is_audio(&self) -> bool {
+        self.format.is_audio()
+    }
+
     /// The plugin lines of the render that refuse no note: see
     /// `RenderReport::plugin_lines`. The render keeps them for its outcome.
     pub fn take_plugin_lines(&self) -> Vec<String> {
@@ -798,6 +868,7 @@ impl ExportJob {
             scene_name: scene_name.into(),
             target: PathBuf::new(),
             started: Instant::now(),
+            format: ExportFormat::Wav,
             open_ended: false,
             stems: false,
             receiver,
@@ -848,18 +919,21 @@ fn render(
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
     let mut session = Session::with_config(config).map_err(|error| error.to_string())?;
+    let audio = settings.format.is_audio();
     // Seed cached files before setups can request them again.
     session.restore_csound_snapshot(&score.csound);
-    session.set_export_limiter(settings.limiter_enabled.then_some(settings.limiter));
-    session.set_stems_export(settings.stems);
-    // The render does not care what the CLI would print. A library that
-    // cannot be reached leaves the synths sounding, and the export fails on
-    // each sample it lacks.
-    let _ = session.enable_default_samples();
-    if let Some(library) = session.sample_library() {
-        score
-            .samples
-            .adopt(library, &session.config().score_sample_access);
+    if audio {
+        session.set_export_limiter(settings.limiter_enabled.then_some(settings.limiter));
+        session.set_stems_export(settings.stems);
+        // The render does not care what the CLI would print. A library that
+        // cannot be reached leaves the synths sounding, and the export fails
+        // on each sample it lacks.
+        let _ = session.enable_default_samples();
+        if let Some(library) = session.sample_library() {
+            score
+                .samples
+                .adopt(library, &session.config().score_sample_access);
+        }
     }
     // What play runs, the bounce runs: the two setups first, so a score can
     // call by name what its set taught the heap. A setup the engine refuses
@@ -885,71 +959,82 @@ fn render(
         session.evaluate(&score.source)
     }
     .map_err(|error| error.to_string())?;
-    let sounds = rustel_runtime::sounds::in_score(&score.source);
-    session.prefetch_sounds(&sounds);
-    // The export chord ends this wait. No frame exists yet, so the export
-    // ends with no file.
-    let _ = session.wait_for_sample_loads_until(SAMPLE_WAIT, || finish.load(Ordering::Relaxed));
-    if finish.load(Ordering::Relaxed) {
-        return Err(rustel_runtime::RENDER_ENDED_BEFORE_AUDIO.to_owned());
+    if audio {
+        let sounds = rustel_runtime::sounds::in_score(&score.source);
+        session.prefetch_sounds(&sounds);
+        // The export chord ends this wait. No frame exists yet, so the
+        // export ends with no file.
+        let _ = session.wait_for_sample_loads_until(SAMPLE_WAIT, || finish.load(Ordering::Relaxed));
+        if finish.load(Ordering::Relaxed) {
+            return Err(rustel_runtime::RENDER_ENDED_BEFORE_AUDIO.to_owned());
+        }
     }
     let duration = match settings.length {
         Length::Cycles(cycles) => cycles / session.config().cps,
         Length::UntilSilence {
             floor_db,
             hold_secs,
-        } => {
+        } if audio => {
             let floor = 10f64.powf(floor_db / 20.0) as f32;
             let hold = silence_hold_duration(hold_secs).map_err(|error| error.to_string())?;
             session.stop_export_when_silent(floor, hold);
             UNTIL_SILENCE_CEILING_SECS
         }
-    };
-    let format = if settings.mp3 {
-        RenderFormat::ScalarMp3
-    } else {
-        RenderFormat::ScalarWav
-    };
-    let rate = session.config().sample_rate;
-    progress.sample_rate.store(rate as usize, Ordering::Relaxed);
-    // A slice of the scope is a sixteenth of a second: the header redraws
-    // no faster, and a peak per slice is all it shows.
-    let slice_frames = (rate as usize / 16).max(1);
-    let mut slice_peak = 0.0f32;
-    let mut slice_seen = 0usize;
-    let mut observer = |tick: rustel_audio::RenderTick<'_>| {
-        progress
-            .frames_written
-            .store(tick.frames_written, Ordering::Relaxed);
-        progress
-            .frames_total
-            .store(tick.frames_total, Ordering::Relaxed);
-        slice_peak = tick
-            .block
-            .iter()
-            .fold(slice_peak, |peak, sample| peak.max(sample.abs()));
-        slice_seen += tick.block.len() / 2;
-        if slice_seen >= slice_frames {
-            if let Ok(mut peaks) = progress.peaks.try_lock() {
-                if peaks.len() >= SCOPE_COLUMNS {
-                    peaks.pop_front();
-                }
-                peaks.push_back(slice_peak);
-            }
-            slice_peak = 0.0;
-            slice_seen = 0;
+        Length::UntilSilence { .. } => {
+            return Err("a MIDI export needs a cycle length".into());
         }
     };
-    let report = session
-        .render_controlled(
-            duration,
-            target,
-            format,
-            false,
-            Some(&mut observer),
-            Some(Arc::clone(finish)),
-        )
-        .map_err(|error| error.to_string())?;
+    let format = match settings.format {
+        ExportFormat::Wav => RenderFormat::ScalarWav,
+        ExportFormat::Mp3 => RenderFormat::ScalarMp3,
+        ExportFormat::Midi => RenderFormat::Midi,
+    };
+    let report = if audio {
+        let rate = session.config().sample_rate;
+        progress.sample_rate.store(rate as usize, Ordering::Relaxed);
+        // A slice of the scope is a sixteenth of a second: the header redraws
+        // no faster, and a peak per slice is all it shows.
+        let slice_frames = (rate as usize / 16).max(1);
+        let mut slice_peak = 0.0f32;
+        let mut slice_seen = 0usize;
+        let mut observer = |tick: rustel_audio::RenderTick<'_>| {
+            progress
+                .frames_written
+                .store(tick.frames_written, Ordering::Relaxed);
+            progress
+                .frames_total
+                .store(tick.frames_total, Ordering::Relaxed);
+            slice_peak = tick
+                .block
+                .iter()
+                .fold(slice_peak, |peak, sample| peak.max(sample.abs()));
+            slice_seen += tick.block.len() / 2;
+            if slice_seen >= slice_frames {
+                if let Ok(mut peaks) = progress.peaks.try_lock() {
+                    if peaks.len() >= SCOPE_COLUMNS {
+                        peaks.pop_front();
+                    }
+                    peaks.push_back(slice_peak);
+                }
+                slice_peak = 0.0;
+                slice_seen = 0;
+            }
+        };
+        session
+            .render_controlled(
+                duration,
+                target,
+                format,
+                false,
+                Some(&mut observer),
+                Some(Arc::clone(finish)),
+            )
+            .map_err(|error| error.to_string())?
+    } else {
+        session
+            .render_controlled(duration, target, format, false, None, None)
+            .map_err(|error| error.to_string())?
+    };
     if let Ok(mut lines) = progress.plugin_lines.lock() {
         lines.clone_from(&report.plugin_lines);
     }
@@ -1015,12 +1100,30 @@ impl ExportSheetView<'_> {
             (span(x + 9, y, &texts.first), Rect::default())
         };
         let y = panel.y + 3;
-        let wav = span(x + 9, y, &radio(!sheet.settings.mp3, "wav"));
+        let wav = span(
+            x + 9,
+            y,
+            &radio(sheet.settings.format == ExportFormat::Wav, "wav"),
+        );
         let mp3 = if MP3_EXPORT {
-            span(wav.right() + 3, y, &radio(sheet.settings.mp3, "mp3"))
+            span(
+                wav.right() + 3,
+                y,
+                &radio(sheet.settings.format == ExportFormat::Mp3, "mp3"),
+            )
         } else {
             Rect::default()
         };
+        let midi_x = if mp3.width > 0 {
+            mp3.right() + 3
+        } else {
+            wav.right() + 3
+        };
+        let midi = span(
+            midi_x,
+            y,
+            &radio(sheet.settings.format == ExportFormat::Midi, "midi"),
+        );
         let y = panel.y + 4;
         let limiter_off = span(x + 9, y, &radio(!sheet.settings.limiter_enabled, "off"));
         let limiter_on = span(
@@ -1040,6 +1143,7 @@ impl ExportSheetView<'_> {
             second,
             wav,
             mp3,
+            midi,
             limiter_off,
             limiter_on,
             stems_off,
@@ -1061,9 +1165,11 @@ impl ExportSheetView<'_> {
         } else if on(layout.second) {
             Some(Hit::Number(Field::Second))
         } else if on(layout.wav) {
-            Some(Hit::Format { mp3: false })
+            Some(Hit::Format(ExportFormat::Wav))
         } else if on(layout.mp3) {
-            Some(Hit::Format { mp3: true })
+            Some(Hit::Format(ExportFormat::Mp3))
+        } else if on(layout.midi) {
+            Some(Hit::Format(ExportFormat::Midi))
         } else if on(layout.limiter_off) {
             Some(Hit::Limiter { enabled: false })
         } else if on(layout.limiter_on) {
@@ -1195,7 +1301,7 @@ impl Widget for ExportSheetView<'_> {
             layout.until_silence,
             &texts.silence,
             silence,
-            active,
+            active && sheet.settings.format.is_audio(),
         );
         // number line(s)
         if silence {
@@ -1234,13 +1340,32 @@ impl Widget for ExportSheetView<'_> {
         // format
         label(buffer, panel.y + 3, "format ");
         let active = sheet.field == Field::Format;
-        paint_radio(buffer, layout.wav, "wav", !sheet.settings.mp3, active);
+        paint_radio(
+            buffer,
+            layout.wav,
+            "wav",
+            sheet.settings.format == ExportFormat::Wav,
+            active,
+        );
         if MP3_EXPORT {
-            paint_radio(buffer, layout.mp3, "mp3", sheet.settings.mp3, active);
+            paint_radio(
+                buffer,
+                layout.mp3,
+                "mp3",
+                sheet.settings.format == ExportFormat::Mp3,
+                active,
+            );
         }
+        paint_radio(
+            buffer,
+            layout.midi,
+            "midi",
+            sheet.settings.format == ExportFormat::Midi,
+            active,
+        );
         // master limiter, with the ceiling and character inherited from the mixer
         label(buffer, panel.y + 4, "limiter");
-        let active = sheet.field == Field::Limiter;
+        let active = sheet.field == Field::Limiter && sheet.settings.format.is_audio();
         paint_radio(
             buffer,
             layout.limiter_off,
@@ -1374,14 +1499,21 @@ mod tests {
         assert_eq!(sheet.settings.length, Length::Cycles(32.0));
         assert_eq!(sheet.field, Field::Format, "no hold line for cycles");
         sheet.key(KeyCode::Right, false);
-        assert_eq!(sheet.settings.mp3, MP3_EXPORT);
-        let extension = if MP3_EXPORT { "mp3" } else { "wav" };
+        let format = if MP3_EXPORT {
+            ExportFormat::Mp3
+        } else {
+            ExportFormat::Midi
+        };
+        assert_eq!(sheet.settings.format, format);
         assert_eq!(
             sheet.target,
             PathBuf::from(format!(
-                "/sets/exports/drums-1970-01-01T00-00-00.{extension}"
+                "/sets/exports/drums-1970-01-01T00-00-00.{}",
+                format.extension()
             ))
         );
+        sheet.key(KeyCode::Left, false);
+        assert_eq!(sheet.settings.format, ExportFormat::Wav);
         sheet.key(KeyCode::Tab, false);
         assert_eq!(sheet.field, Field::Limiter);
         sheet.key(KeyCode::Tab, false);
@@ -1410,7 +1542,7 @@ mod tests {
                     floor_db: -66.0,
                     hold_secs: 2.5
                 },
-                mp3: MP3_EXPORT,
+                format: ExportFormat::Wav,
                 ..ExportSettings::default()
             }
         );
@@ -1482,6 +1614,7 @@ mod tests {
             scene_name: "drums".into(),
             target: PathBuf::new(),
             started: Instant::now(),
+            format: ExportFormat::Wav,
             open_ended: false,
             stems: false,
             receiver,
@@ -1529,16 +1662,30 @@ mod tests {
         sheet.key(KeyCode::Right, false);
         sheet.key(KeyCode::Right, false);
         assert_eq!(
-            sheet.settings.mp3, MP3_EXPORT,
-            "right consistently selects mp3 where the build encodes it"
+            sheet.settings.format,
+            ExportFormat::Midi,
+            "right consistently selects MIDI"
         );
         sheet.key(KeyCode::Left, false);
         sheet.key(KeyCode::Left, false);
-        assert!(!sheet.settings.mp3, "left consistently selects wav");
+        assert_eq!(
+            sheet.settings.format,
+            ExportFormat::Wav,
+            "left consistently selects wav"
+        );
 
         sheet.key(KeyCode::Char(' '), false);
-        assert_eq!(sheet.settings.mp3, MP3_EXPORT, "Space remains a toggle");
+        assert_eq!(
+            sheet.settings.format,
+            if MP3_EXPORT {
+                ExportFormat::Mp3
+            } else {
+                ExportFormat::Midi
+            },
+            "Space moves to the next format"
+        );
 
+        sheet.settings.format = ExportFormat::Wav;
         sheet.field = Field::Limiter;
         sheet.key(KeyCode::Right, false);
         sheet.key(KeyCode::Right, false);
@@ -1586,6 +1733,7 @@ mod tests {
         assert!(text.contains("○ until silence"), "{text}");
         assert!(text.contains("● wav"), "{text}");
         assert_eq!(text.contains("mp3"), MP3_EXPORT, "{text}");
+        assert!(text.contains("○ midi"), "{text}");
         assert!(text.contains("limiter  ● off   ○ on"), "{text}");
         assert!(text.contains("stems    ● off   ○ on"), "{text}");
         assert!(text.contains("drums-1970-01-01T00-00-00.wav"), "{text}");
@@ -1711,9 +1859,9 @@ mod tests {
         assert_eq!(hit, Some(Hit::Number(Field::Second)));
         if MP3_EXPORT {
             let hit = ExportSheetView::hit(&sheet, area, layout.mp3.x + 1, layout.mp3.y);
-            assert_eq!(hit, Some(Hit::Format { mp3: true }));
-            sheet.click(Hit::Format { mp3: true });
-            assert!(sheet.settings.mp3);
+            assert_eq!(hit, Some(Hit::Format(ExportFormat::Mp3)));
+            sheet.click(Hit::Format(ExportFormat::Mp3));
+            assert_eq!(sheet.settings.format, ExportFormat::Mp3);
             assert!(sheet.target.to_string_lossy().ends_with(".mp3"));
         } else {
             assert_eq!(
@@ -1726,12 +1874,22 @@ mod tests {
         assert_eq!(hit, Some(Hit::Stems { on: true }));
         sheet.click(hit.expect("hit"));
         assert!(sheet.settings.stems);
-        assert!(!sheet.settings.mp3, "stems need the wav format");
+        assert_eq!(
+            sheet.settings.format,
+            ExportFormat::Wav,
+            "stems need the wav format"
+        );
         assert!(
             sheet.target.to_string_lossy().ends_with(".wav"),
             "{}",
             sheet.target.display()
         );
+        let hit = ExportSheetView::hit(&sheet, area, layout.midi.x + 1, layout.midi.y);
+        assert_eq!(hit, Some(Hit::Format(ExportFormat::Midi)));
+        sheet.click(Hit::Format(ExportFormat::Midi));
+        assert_eq!(sheet.settings.format, ExportFormat::Midi);
+        assert!(sheet.target.to_string_lossy().ends_with(".mid"));
+        assert!(!sheet.silence(), "a MIDI export keeps a cycle length");
         assert_eq!(
             ExportSheetView::hit(&sheet, area, layout.panel.x + 3, layout.target.y),
             Some(Hit::Target),
@@ -1758,13 +1916,17 @@ mod tests {
         if MP3_EXPORT {
             sheet.field = Field::Format;
             sheet.key(KeyCode::Right, false);
-            assert!(sheet.settings.mp3);
+            assert_eq!(sheet.settings.format, ExportFormat::Mp3);
             assert!(!sheet.settings.stems, "mp3 turns stems off");
             assert!(sheet.target.to_string_lossy().ends_with(".mp3"));
             sheet.field = Field::Stems;
             sheet.key(KeyCode::Right, false);
             assert!(sheet.settings.stems);
-            assert!(!sheet.settings.mp3, "stems take the format back to wav");
+            assert_eq!(
+                sheet.settings.format,
+                ExportFormat::Wav,
+                "stems take the format back to wav"
+            );
             assert!(sheet.target.to_string_lossy().ends_with(".wav"));
         }
     }
@@ -1797,7 +1959,7 @@ mod tests {
             sheet.key(KeyCode::Tab, true);
         }
         sheet.key(KeyCode::Right, false);
-        let extension = if MP3_EXPORT { "mp3" } else { "wav" };
+        let extension = if MP3_EXPORT { "mp3" } else { "mid" };
         assert_eq!(
             sheet.target,
             PathBuf::from(format!("/tmp/bounces/take one.{extension}"))
@@ -1863,7 +2025,7 @@ mod tests {
         );
 
         if MP3_EXPORT {
-            settings.mp3 = true;
+            settings.format = ExportFormat::Mp3;
             let mp3 = bounce(settings, "limited.mp3");
             let expected = dir.path().join("expected.mp3");
             rustel_runtime::test_support::encode_mp3(&expected, 48_000, &pcm)
@@ -1873,7 +2035,7 @@ mod tests {
                 std::fs::read(expected).unwrap(),
                 "MP3 must encode the limited audio"
             );
-            settings.mp3 = false;
+            settings.format = ExportFormat::Wav;
         }
         settings.limiter.makeup = true;
         let makeup = bounce(settings, "makeup.wav");
@@ -1927,7 +2089,7 @@ mod tests {
                 },
                 ExportSettings {
                     length: Length::Cycles(0.5),
-                    mp3: false,
+                    format: ExportFormat::Wav,
                     ..ExportSettings::default()
                 },
                 SessionConfig::default(),
@@ -1987,7 +2149,7 @@ mod tests {
                 score,
                 ExportSettings {
                     length: Length::Cycles(0.25),
-                    mp3: false,
+                    format: ExportFormat::Wav,
                     ..ExportSettings::default()
                 },
                 session_config(
@@ -2063,7 +2225,7 @@ mod tests {
             plain_score("note(\"c3 e3 g3\").s(\"sine\")"),
             ExportSettings {
                 length: Length::Cycles(2.0),
-                mp3: false,
+                format: ExportFormat::Wav,
                 ..ExportSettings::default()
             },
             SessionConfig::default(),
@@ -2088,6 +2250,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_midi_job_writes_a_parseable_file() {
+        let dir = tempfile::tempdir().expect("export dir");
+        let target = dir.path().join("bounce.mid");
+        let job = ExportJob::start(
+            "melody".into(),
+            plain_score("note(\"c4 e4\").s(\"gm_piano\")"),
+            ExportSettings {
+                length: Length::Cycles(2.0),
+                format: ExportFormat::Midi,
+                ..ExportSettings::default()
+            },
+            SessionConfig::default(),
+            target.clone(),
+        )
+        .unwrap();
+        let seconds = await_outcome(&job, std::time::Duration::from_secs(120)).expect("rendered");
+        assert!(
+            (seconds - 4.0).abs() < 0.05,
+            "two cycles at 0.5 cps: {seconds}"
+        );
+        assert_eq!(
+            job.glance().percent,
+            None,
+            "a MIDI file has no audio progress"
+        );
+        let bytes = std::fs::read(&target).unwrap();
+        let imported =
+            rustel_smf::import_smf(&bytes, &rustel_smf::ImportOptions::default()).unwrap();
+        assert!(!imported.report.lanes.is_empty());
+        assert!(imported.report.lanes[0].notes > 0);
+    }
+
     /// A pattern that threw bounces silent where the score is not. The file
     /// is written, but the job reports the CLI's failure - the sheet shows
     /// "export of … failed: …" - rather than a finished export.
@@ -2100,7 +2295,7 @@ mod tests {
             plain_score(r#"note("c4 e4").fmap(x => { throw new Error("boom-in-query") })"#),
             ExportSettings {
                 length: Length::Cycles(0.5),
-                mp3: false,
+                format: ExportFormat::Wav,
                 ..ExportSettings::default()
             },
             SessionConfig::default(),
@@ -2129,7 +2324,7 @@ mod tests {
             plain_score(r#"s("sine nosuchsound")"#),
             ExportSettings {
                 length: Length::Cycles(0.5),
-                mp3: false,
+                format: ExportFormat::Wav,
                 ..ExportSettings::default()
             },
             SessionConfig::default(),
@@ -2155,7 +2350,7 @@ mod tests {
             &plain_score(r#"s("sine nosuchsound")"#),
             ExportSettings {
                 length: Length::Cycles(0.5),
-                mp3: false,
+                format: ExportFormat::Wav,
                 ..ExportSettings::default()
             },
             SessionConfig::default(),
@@ -2183,7 +2378,7 @@ mod tests {
             let job = ExportJob::start(
                 "polyphony".into(),
                 plain_score(&format!("{setter} stack(note('c3'), note('e3'), note('g3'), note('c4')).s('sine').gain(0.05).attack(0).decay(0).sustain(1)")),
-                ExportSettings { length: Length::Cycles(0.025), mp3: false, ..ExportSettings::default() },
+                ExportSettings { length: Length::Cycles(0.025), format: ExportFormat::Wav, ..ExportSettings::default() },
                 session_config(&SessionConfig::default(), voices, inherited, &[], &Default::default(), false),
                 target.clone(),
             ).expect("start export job");
@@ -2266,7 +2461,7 @@ mod tests {
             plain_score("note(\"c3 e3 g3\").s(\"sine\")"),
             ExportSettings {
                 length: Length::Cycles(60.0),
-                mp3: false,
+                format: ExportFormat::Wav,
                 ..ExportSettings::default()
             },
             SessionConfig::default(),
@@ -2324,7 +2519,7 @@ mod tests {
             plain_score(r#"note("c3").s("sine").vst("rustel fixture", { preset: "Other" })"#),
             ExportSettings {
                 length: Length::Cycles(0.5),
-                mp3: false,
+                format: ExportFormat::Wav,
                 ..ExportSettings::default()
             },
             SessionConfig::default(),
@@ -2345,7 +2540,7 @@ mod tests {
             let target = dir.path().join(format!("{name}.wav"));
             let settings = ExportSettings {
                 length: Length::Cycles(1.0),
-                mp3: false,
+                format: ExportFormat::Wav,
                 stems,
                 ..ExportSettings::default()
             };

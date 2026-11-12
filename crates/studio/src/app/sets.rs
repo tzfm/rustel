@@ -908,6 +908,12 @@ impl App {
                 export_candidates(&root),
                 &root,
             ),
+            SetPrompt::ImportMidi => FilePicker::new(
+                "import a MIDI file",
+                "opens it as a new scene",
+                midi_candidates(&root),
+                &root,
+            ),
             SetPrompt::RenameSet => {
                 let mut picker = FilePicker::naming("rename the set", "renames its folder");
                 picker.offer(&self.scenes.name());
@@ -1018,6 +1024,10 @@ impl App {
                 "import Strudel patterns - Enter adds every entry to this set · Tab browses · type a path · Esc back"
                     .into()
             }
+            SetPrompt::ImportMidi => {
+                "import MIDI - Enter opens the file as a new scene · Tab browses · type a path · Esc back"
+                    .into()
+            }
             SetPrompt::RenameSet => {
                 "rename the set - type the new name and press Enter · Esc back".into()
             }
@@ -1093,7 +1103,8 @@ impl App {
                     SetPrompt::PickBankToRename | SetPrompt::RenameBank => "alias cancelled",
                     SetPrompt::AddSampleSource
                     | SetPrompt::EditSampleSource(_)
-                    | SetPrompt::ImportStrudel => "import cancelled",
+                    | SetPrompt::ImportStrudel
+                    | SetPrompt::ImportMidi => "import cancelled",
                     _ => "set prompt closed",
                 }
                 .into();
@@ -1101,6 +1112,17 @@ impl App {
             PickerKey::Chose(path) => match prompt {
                 SetPrompt::OpenSet | SetPrompt::OpenRecent => self.open_set_at(&path),
                 SetPrompt::ImportStrudel => self.import_strudel_into_current(&path),
+                // The drop's own import, so a menu choice and a dropped
+                // file land the same way. A refusal keeps the prompt: the
+                // status it set becomes the inline error, and a typed
+                // path can be fixed in place.
+                SetPrompt::ImportMidi => {
+                    if self.import_dropped_midi(&path) {
+                        self.close_set_prompt();
+                    } else if let Some((_, picker)) = self.set_prompt.as_mut() {
+                        picker.error = Some(self.status.clone());
+                    }
+                }
                 SetPrompt::RenameSet => {
                     let name = path.to_string_lossy().trim().to_owned();
                     self.rename_set(&name);
@@ -1345,7 +1367,7 @@ impl App {
         self.dirty_frame = true;
     }
 
-    /// File > Export patterns: the open set's scores, written as one
+    /// File > Strudel patterns > Export: the open set's scores, written as one
     /// pattern export beside the sets, in the shape strudel.cc's
     /// Patterns tab gives and takes and this studio's prompts read back.
     /// Keyed by name, so the names come back on an import, and an open
@@ -1396,8 +1418,20 @@ impl App {
             return;
         }
         let plural = if count == 1 { "pattern" } else { "patterns" };
-        self.status = format!("exported {count} {plural} to {name}");
-        self.log.push(LogLevel::Info, "set", self.status.clone());
+        // The status names where the file went - every segment of the path,
+        // the middle let go when the row cannot hold it - and a click on it
+        // shows the file in the desktop's file manager, as an audio export's
+        // does.
+        self.status = format!(
+            "exported {count} {plural} to {} - click the path to show it",
+            elided_path(&beside)
+        );
+        self.log.push(
+            LogLevel::Info,
+            "set",
+            format!("exported {count} {plural} to {}", beside.display()),
+        );
+        self.remember_status_file(beside);
         self.dirty_frame = true;
     }
 
@@ -1801,6 +1835,37 @@ pub(super) fn shorten_home(path: &std::path::Path) -> String {
     }
 }
 
+/// The columns of path a status row holds before the middle gives way.
+const STATUS_PATH_COLUMNS: usize = 60;
+
+/// A path the status line names when where the file went matters more than
+/// the file's name alone: every segment while it fits, the home folder as
+/// `~` - and past that, the first and last segments with the middle let go,
+/// so the sets root that holds the file and the file's own name are what
+/// survive a long row. A name too long for even that goes out whole; the
+/// footer's own cut shortens the row after it.
+fn elided_path(path: &std::path::Path) -> String {
+    let text = shorten_home(path);
+    if text.chars().count() <= STATUS_PATH_COLUMNS {
+        return text;
+    }
+    let is_separator = |c: char| c == '/' || c == '\\';
+    let head = text
+        .split(is_separator)
+        .find(|segment| !segment.is_empty())
+        .unwrap_or_default();
+    let tail = text
+        .rsplit(is_separator)
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or_default();
+    let ends = format!("{head}…{tail}");
+    if ends.chars().count() <= STATUS_PATH_COLUMNS {
+        return ends;
+    }
+    format!("…{tail}")
+}
+
 /// One pattern of a Strudel pattern export: its code, when Strudel says
 /// it was made, and whether its key is a name. The documented form keys
 /// each entry by its name, while strudel.cc's own export keys it by an
@@ -1957,6 +2022,46 @@ fn export_candidates(root: &std::path::Path) -> Vec<Candidate> {
         .collect()
 }
 
+/// The MIDI files at the sets root, newest first: what a drop onto the
+/// window imports, offered beside the sets so the common case needs no
+/// typed path and no folder walk.
+fn midi_candidates(root: &std::path::Path) -> Vec<Candidate> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<(std::time::SystemTime, Candidate)> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && super::sample_import::is_midi_path(path))
+        .filter_map(|path| {
+            let changed = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()?;
+            let label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            Some((
+                changed,
+                Candidate {
+                    label,
+                    detail: "MIDI file".to_owned(),
+                    path,
+                },
+            ))
+        })
+        .collect();
+    candidates.sort_by(|(a_time, a), (b_time, b)| {
+        b_time
+            .cmp(a_time)
+            .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+    });
+    candidates
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
 /// When a set last changed: the newest of its folder and the files in it.
 fn set_changed(path: &std::path::Path) -> std::time::SystemTime {
     let changed = |path: &std::path::Path| {
@@ -2039,6 +2144,9 @@ pub(super) enum SetPrompt {
     /// A Strudel pattern export file, whose entries become score files of
     /// the set already open.
     ImportStrudel,
+    /// A Standard MIDI File, which becomes a new scene of the set already
+    /// open: the same landing a dropped `.mid` file gets.
+    ImportMidi,
     RenameSet,
     SetsFolder,
     RecordingsFolder,
@@ -2088,6 +2196,37 @@ mod tests {
                     std::path::MAIN_SEPARATOR,
                     std::path::MAIN_SEPARATOR
                 )
+            );
+        }
+
+        /// The export status names the whole path, and a path too long for
+        /// the row keeps its ends - the root that holds the file, and the
+        /// file's own name - while the middle gives way. A name too long for
+        /// even the ends is not cut into here; the footer shortens the row.
+        #[test]
+        fn a_long_export_path_keeps_its_ends() {
+            let separator = std::path::MAIN_SEPARATOR;
+            let short = PathBuf::from(format!("{separator}sets{separator}my patterns.json"));
+            assert_eq!(elided_path(&short), shorten_home(&short));
+            let long = format!(
+                "{separator}a music folder{separator}that keeps going{separator}deeper{separator}\
+                 every year{separator}my patterns.json"
+            );
+            assert!(
+                long.chars().count() > STATUS_PATH_COLUMNS,
+                "the fixture is long"
+            );
+            let elided = elided_path(&PathBuf::from(&long));
+            assert_eq!(elided, "a music folder…my patterns.json");
+            assert!(elided.chars().count() <= STATUS_PATH_COLUMNS);
+            // A name that alone outruns the row keeps the name.
+            let huge = format!(
+                "{separator}sets{separator}{}.json",
+                "a very long name".repeat(8)
+            );
+            assert_eq!(
+                elided_path(&PathBuf::from(&huge)),
+                format!("…{}.json", "a very long name".repeat(8))
             );
         }
 
@@ -2879,7 +3018,7 @@ mod tests {
             assert_eq!(app.scenes.directory(), sets.join("gig"));
         }
 
-        /// File > Import patterns… reads an export into the set
+        /// File > Strudel patterns > Import… reads an export into the set
         /// already open: one named score file an entry, in the set's own
         /// folder with no tab taken up, and a name the set already holds
         /// never overwritten. The same file twice says there is nothing
@@ -2951,6 +3090,111 @@ mod tests {
             assert_eq!(app.status, "no new patterns - all 3 are already in home");
         }
 
+        /// A two-bar Standard MIDI File, the way a dragged-in song looks.
+        fn midi_file(at: &std::path::Path) -> std::path::PathBuf {
+            let path = at.join("song.mid");
+            let bytes = rustel_smf::Timeline {
+                ppq: 480,
+                tempo_micros_per_quarter: 500_000,
+                meter: rustel_smf::Meter::FOUR_FOUR,
+                tracks: vec![rustel_smf::Track {
+                    name: "lead".into(),
+                    channel: 1,
+                    messages: vec![
+                        rustel_smf::Message {
+                            tick: 0,
+                            kind: rustel_smf::MessageKind::NoteOn {
+                                note: 60,
+                                velocity: 100,
+                            },
+                        },
+                        rustel_smf::Message {
+                            tick: 3_840,
+                            kind: rustel_smf::MessageKind::NoteOff { note: 60 },
+                        },
+                    ],
+                }],
+            }
+            .to_bytes()
+            .expect("MIDI bytes");
+            std::fs::write(&path, bytes).expect("fixture");
+            path
+        }
+
+        /// File > Import MIDI… offers the MIDI files at the sets root and
+        /// lands the chosen one as a new scene: the same scene a drop of
+        /// the file gets, with the file itself left as it was.
+        #[test]
+        fn importing_midi_from_the_prompt_lands_like_a_drop() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let sets = directory.path().join("sets");
+            std::fs::create_dir_all(&sets).expect("sets");
+            let home = directory.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let mut app = app_over(&home);
+            app.prefs.sets_directory = Some(sets.display().to_string());
+            let midi = midi_file(&sets);
+            let bytes = std::fs::read(&midi).expect("fixture");
+
+            app.open_set_prompt(SetPrompt::ImportMidi);
+            let (_, picker) = app.set_prompt.as_ref().expect("the prompt is up");
+            assert_eq!(
+                picker
+                    .candidates
+                    .iter()
+                    .map(|candidate| (candidate.label.as_str(), candidate.detail.as_str()))
+                    .collect::<Vec<_>>(),
+                [("song.mid", "MIDI file")]
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+            assert!(app.set_prompt.is_none(), "the prompt closed");
+            assert_eq!(app.status, "imported song.mid - scene 2 (2 bars, 1 note)");
+            assert_eq!(app.scenes.score_count(), 2, "the import took up a scene");
+            let scene = app.scenes.current();
+            assert!(
+                scene.editor.source().contains("note("),
+                "the score came from the file"
+            );
+            assert!(scene.rewind, "a two-bar import starts at its own zero");
+            assert!(
+                scene.path.starts_with(&home) && scene.path.exists(),
+                "the score is a new file of the set"
+            );
+            assert_eq!(
+                std::fs::read(&midi).expect("fixture"),
+                bytes,
+                "the import was not written to"
+            );
+        }
+
+        /// A file the import cannot read keeps the prompt up with the
+        /// reason inline, so a typed path can be fixed in place, and
+        /// nothing is created.
+        #[test]
+        fn a_midi_import_that_cannot_be_read_keeps_the_prompt_with_the_reason() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let sets = directory.path().join("sets");
+            std::fs::create_dir_all(&sets).expect("sets");
+            let home = directory.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let mut app = app_over(&home);
+            app.prefs.sets_directory = Some(sets.display().to_string());
+            std::fs::write(sets.join("bad.mid"), b"nope").expect("fixture");
+
+            app.open_set_prompt(SetPrompt::ImportMidi);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+            assert_eq!(app.scenes.score_count(), 1, "nothing was created");
+            let (_, picker) = app.set_prompt.as_ref().expect("the prompt stands");
+            assert_eq!(
+                picker.error.as_deref(),
+                Some("bad.mid - could not import; see Log"),
+                "the refusal is said at the prompt: {:?}",
+                picker.error
+            );
+        }
+
         /// An import keeps every entry whose name the set holds with other
         /// code: two strudel.cc exports both number their patterns from
         /// one, and one export can hold two versions of a title. Each
@@ -3010,7 +3254,7 @@ mod tests {
             );
         }
 
-        /// File > Export patterns… writes the set's scores as one pattern
+        /// File > Strudel patterns > Export… writes the set's scores as one pattern
         /// export beside the sets, in the shape strudel.cc gives and
         /// takes: keyed by name, an open score as it stands - unsaved
         /// edits included - a closed one as its file reads, and the file
@@ -3051,10 +3295,22 @@ mod tests {
             assert_eq!(
                 app.status,
                 format!(
-                    "exported 2 patterns to {}",
-                    file.file_name().unwrap().to_string_lossy()
+                    "exported 2 patterns to {} - click the path to show it",
+                    elided_path(&file)
                 )
             );
+            assert!(
+                app.status
+                    .contains(file.file_name().unwrap().to_string_lossy().as_ref()),
+                "the shortened path still names the file: {}",
+                app.status
+            );
+            assert_eq!(
+                app.last_file.as_deref(),
+                Some(file.as_path()),
+                "a click on the status shows the export"
+            );
+            assert!(app.status_names_last_file());
 
             // The export's own names come back through the importer, so
             // the round trip keeps them.

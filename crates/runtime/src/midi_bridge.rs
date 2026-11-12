@@ -19,211 +19,15 @@ later version.
 //! `.midi()` in the browser layers on top of whatever the pattern already did.
 
 use std::{
-    borrow::Cow,
     collections::{BTreeSet, HashMap, VecDeque},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
-use rustel_midi::{MidiControls, MidiSender};
+use rustel_midi::MidiSender;
 
-use crate::hap_json::{OnsetEventJson, ValueJson};
-
-/// The port a hap names, plus the controls it carries.
-pub struct MidiOnset {
-    pub onset_id: u64,
-    pub generation: u64,
-    pub port: String,
-    pub controls: MidiControls,
-    /// Session-clock seconds, the same scale as `OnsetEventJson::target_time`.
-    pub target_time: f64,
-    pub duration_secs: f64,
-}
-
-fn object(value: &ValueJson) -> Option<&serde_json::Map<String, serde_json::Value>> {
-    match value {
-        ValueJson::Raw(serde_json::Value::Object(map)) => Some(map),
-        _ => None,
-    }
-}
-
-fn number(map: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<f64> {
-    map.get(key)?.as_f64()
-}
-
-/// A pitch control. The score can write it as a number or as a note name.
-///
-/// `note("c3")` arrives here as the string `"c3"`. `rustel-voice` resolves
-/// names where the audio path needs a frequency, so the scheduler leaves the
-/// value as the score wrote it. This function resolves the name for MIDI. A
-/// hap with no usable note plans no messages.
-///
-/// A bare name uses octave 3, the default of `note_to_hz`, so a name gives
-/// the same pitch on both paths.
-fn pitch(map: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<f64> {
-    match map.get(key)? {
-        serde_json::Value::Number(number) => number.as_f64(),
-        serde_json::Value::String(text) => {
-            let text = text.trim();
-            match text.parse::<f64>() {
-                Ok(number) => Some(number),
-                // A name that does not parse is not a note; `plan` refuses the
-                // NaN `note_to_midi` returns for a half-written one.
-                Err(_) => rustel_core::util::note_to_midi(text, 3).ok(),
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Retain only transport commands the wire planner understands.
-///
-/// Returning fresh fixed strings is deliberate: an unknown `midicmd` may be
-/// arbitrarily large score input and must not be cloned into the live queue
-/// merely to be discarded later by `rustel_midi::plan`.
-fn midi_command(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
-    match map.get("midicmd")?.as_str()? {
-        "clock" => Some("clock".into()),
-        "midiClock" => Some("midiClock".into()),
-        "start" => Some("start".into()),
-        "stop" => Some("stop".into()),
-        "continue" => Some("continue".into()),
-        _ => None,
-    }
-}
-
-/// Borrow the route named by one onset without cloning an attacker-controlled
-/// score string. Numeric selectors are formatted into a small owned value.
-pub fn midi_route(onset: &OnsetEventJson) -> Option<Cow<'_, str>> {
-    let map = object(&onset.value)?;
-    match map.get("midiport")? {
-        serde_json::Value::String(port) => Some(Cow::Borrowed(port)),
-        serde_json::Value::Number(port) => Some(Cow::Owned(port.to_string())),
-        _ => None,
-    }
-}
-
-/// Extract the MIDI intent of one onset after its route has been bounded and
-/// copied by the caller.
-pub fn midi_onset_with_port(onset: &OnsetEventJson, port: String) -> Option<MidiOnset> {
-    let map = object(&onset.value)?;
-    let options = map.get("midiopts").and_then(serde_json::Value::as_object);
-    let option_number = |key: &str| {
-        options
-            .and_then(|options| options.get(key))
-            .and_then(serde_json::Value::as_f64)
-            .filter(|value| value.is_finite())
-    };
-    Some(MidiOnset {
-        onset_id: onset.onset_id,
-        generation: onset.generation,
-        port,
-        target_time: onset.target_time,
-        duration_secs: onset.duration_secs,
-        controls: MidiControls {
-            // Read `note` only. `n` is the sample-index control, and the
-            // audio path does not read it as a pitch either. For example,
-            // `s("bd:3 sd:7").midi(port)` must not send note-ons at the
-            // sample index.
-            note: pitch(map, "note"),
-            gain: number(map, "gain").or_else(|| option_number("gain")),
-            velocity: number(map, "velocity").or_else(|| option_number("velocity")),
-            midichan: number(map, "midichan").or_else(|| option_number("midichannel")),
-            ccn: number(map, "ccn").or_else(|| number(map, "ctlNum")),
-            ccv: number(map, "ccv"),
-            prog_num: number(map, "progNum"),
-            midibend: number(map, "midibend"),
-            miditouch: number(map, "miditouch"),
-            midicmd: midi_command(map),
-            is_controller: options
-                .and_then(|options| options.get("isController"))
-                .is_some_and(|value| match value {
-                    serde_json::Value::Bool(flag) => *flag,
-                    serde_json::Value::Number(number) => {
-                        number.as_f64().is_some_and(|value| value != 0.0)
-                    }
-                    _ => false,
-                }),
-            note_offset_ms: option_number("noteOffsetMs"),
-            // A midimap turns named controls into CC messages: for every entry
-            // of the selected map whose control the hap carries, one CC with
-            // the value normalised into the entry's range. The hap's `midimap`
-            // control names the map; absent, the map registered as "default"
-            // applies, and a hap naming a map nobody registered sends no
-            // mapped CCs. This reads the bound settings. The caller
-            // (session.rs) binds the runtime's settings around the collection
-            // pass, because an unbound read falls back to the process-global
-            // state and sees nothing a Session registered.
-            mapped_ccs: {
-                let name = match map.get("midimap") {
-                    None => match options.and_then(|options| options.get("midimap")) {
-                        None => Some("default"),
-                        Some(serde_json::Value::String(name)) => Some(name.as_str()),
-                        Some(_) => None,
-                    },
-                    Some(serde_json::Value::String(name)) => Some(name.as_str()),
-                    // Map lookup is strict: null and numeric values do not
-                    // select the string-named default/map.
-                    Some(_) => None,
-                };
-                match name.and_then(rustel_core::midimap::midi_map) {
-                    // Never scan the score-controlled hap object: an object
-                    // pattern may carry arbitrarily many unrelated keys, and
-                    // this conversion runs after the bounded query turn. Walk
-                    // the pinned alias table plus the registered map instead;
-                    // both have hard native ceilings (currently 499 aliases
-                    // and at most 256 map entries), then perform O(1) hap
-                    // lookups. Alias canonicalisation survives without giving
-                    // one onset unbounded post-query work.
-                    Some(entries) => {
-                        let controls = rustel_core::controls::default_control_registry();
-                        let mut mapped = Vec::new();
-                        for (alias, canonical) in controls.alias_entries() {
-                            let Some(entry) = entries.get(canonical) else {
-                                continue;
-                            };
-                            let Some(value) = map.get(alias).and_then(serde_json::Value::as_f64)
-                            else {
-                                continue;
-                            };
-                            if value.is_finite() {
-                                mapped.push((entry.ccn, entry.normalise(value)));
-                            }
-                        }
-                        // User-defined controls have no pinned aliases. The
-                        // retained map is a HashMap, so sort its bounded (at
-                        // most 256) custom subset before emitting wire work;
-                        // otherwise two identical runs can reorder their CCs.
-                        let mut custom_entries = entries
-                            .iter()
-                            .filter(|(control, _)| controls.canonical_name(control).is_none())
-                            .collect::<Vec<_>>();
-                        custom_entries.sort_unstable_by_key(|(name, _)| *name);
-                        for (control, entry) in custom_entries {
-                            let Some(value) = map
-                                .get(control)
-                                .and_then(serde_json::Value::as_f64)
-                                .filter(|value| value.is_finite())
-                            else {
-                                continue;
-                            };
-                            mapped.push((entry.ccn, entry.normalise(value)));
-                        }
-                        mapped
-                    }
-                    None => Vec::new(),
-                }
-            },
-        },
-    })
-}
-
-/// Extract the MIDI intent of one onset, or `None` if it names no port.
-pub fn midi_onset(onset: &OnsetEventJson) -> Option<MidiOnset> {
-    let port = midi_route(onset)?.into_owned();
-    midi_onset_with_port(onset, port)
-}
+pub use crate::midi_onset::{MidiOnset, midi_onset, midi_onset_with_port, midi_route};
 
 /// A gap this large between the two clocks is not drift, it is a different
 /// timeline - a recycled device, a restarted transport. Only that is worth
@@ -1970,6 +1774,8 @@ mod offset_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{OnsetEventJson, ValueJson};
+    use rustel_midi::MidiControls;
 
     fn wire_batch(
         due: Instant,

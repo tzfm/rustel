@@ -2429,6 +2429,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "midly"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "207d755f4cb882d20c4da58d707ca9130a0c9bc5061f657a4f299b8e36362b7a"
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4391,6 +4397,7 @@ dependencies = [
  "rustel-runtime",
  "rustel-scheduler",
  "rustel-serial",
+ "rustel-smf",
  "rustel-studio",
  "rustel-voice",
  "rustel-vst3-fixture",
@@ -4511,6 +4518,7 @@ version = "0.1.6"
 dependencies = [
  "libc",
  "midir",
+ "rustel-core",
 ]
 
 [[package]]
@@ -4564,6 +4572,7 @@ dependencies = [
  "rustel-osc",
  "rustel-scheduler",
  "rustel-serial",
+ "rustel-smf",
  "rustel-talkit",
  "rustel-transpiler",
  "rustel-voice",
@@ -4599,6 +4608,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustel-smf"
+version = "0.1.6"
+dependencies = [
+ "midly",
+ "rustel-core",
+]
+
+[[package]]
 name = "rustel-studio"
 version = "0.1.6"
 dependencies = [
@@ -4623,6 +4640,7 @@ dependencies = [
  "rustel-runtime",
  "rustel-scheduler",
  "rustel-serial",
+ "rustel-smf",
  "rustel-studio-themes",
  "rustel-transpiler",
  "rustel-voice",
@@ -4649,6 +4667,7 @@ dependencies = [
  "portable-pty",
  "rustel-audio",
  "rustel-runtime",
+ "rustel-smf",
  "rustel-studio",
  "rustel-vst3-fixture",
  "serde",

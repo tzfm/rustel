@@ -36,7 +36,12 @@ impl App {
             // keep everything rendered so far. Before the first frame the
             // render ends with no file. Over the open sheet this is the
             // render window's own abort.
-            if !job.finished_early() {
+            if !job.is_audio() {
+                self.status = format!(
+                    "exporting {} - a MIDI file finishes on its own",
+                    job.scene_name
+                );
+            } else if !job.finished_early() {
                 let preparing = job.glance().preparing;
                 job.finish();
                 self.status = if preparing {
@@ -207,12 +212,19 @@ impl App {
             target,
         ) {
             Ok(job) => {
+                let early = if settings.format.is_audio() {
+                    format!(
+                        " - {} ends it early and keeps the file",
+                        self.keybinds.hint(BindAction::Export)
+                    )
+                } else {
+                    String::new()
+                };
                 self.status = format!(
-                    "exporting {} ({}) → {} - {} ends it early and keeps the file",
+                    "exporting {} ({}) → {}{early}",
                     job.scene_name,
                     settings.describe_length(),
-                    status_file_path(&job.output(), self.ui_settings.show_full_paths),
-                    self.keybinds.hint(BindAction::Export)
+                    status_file_path(&job.output(), self.ui_settings.show_full_paths)
                 );
                 self.log.push(
                     LogLevel::Info,
@@ -322,6 +334,7 @@ mod tests {
 
         use crate::app::tests::support::*;
         use crate::app::*;
+        use crate::export::ExportFormat;
 
         #[test]
         fn a_click_on_the_export_sheet_chooses_what_it_lands_on() {
@@ -357,7 +370,7 @@ mod tests {
             if rustel_runtime::MP3_EXPORT {
                 click(&mut app, layout.mp3.x, layout.mp3.y);
                 let sheet = app.export_sheet.as_ref().expect("still open");
-                assert!(sheet.settings.mp3);
+                assert_eq!(sheet.settings.format, ExportFormat::Mp3);
             }
             click(&mut app, layout.limiter_on.x, layout.limiter_on.y);
             let sheet = app.export_sheet.as_ref().expect("still open");
