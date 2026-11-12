@@ -608,11 +608,7 @@ fn export_patterns_writes_the_sets_scores_beside_the_sets() {
     // middle when the row cannot hold it, so the file's own name survives -
     // and a click on it shows the file in the desktop's file manager.
     let status = studio.status();
-    assert!(
-        status.starts_with("exported 2 patterns to "),
-        "{}",
-        status
-    );
+    assert!(status.starts_with("exported 2 patterns to "), "{}", status);
     assert!(
         status.contains(&format!("{name} patterns ")),
         "the path names the export: {}",
