@@ -959,6 +959,10 @@ pub fn on_caller_stack<T>(work: impl FnOnce() -> T) -> T {
 /// `MAX_CALLBACK_IR_SOURCE_BYTES`. The lexical nesting limit stops deep
 /// ordinary expressions; the raw size limit also bounds recursion when the
 /// lexical scan is defeated. This stack covers the bounded depth.
+///
+/// The thread runs `work` inside [`on_caller_stack`]: a parse that `work`
+/// starts from its own top level, as `transpile` does, is already on this
+/// stack and runs in place instead of starting another thread.
 fn on_parse_stack<T: Send>(work: impl FnOnce() -> T + Send) -> Option<T> {
     if ON_CALLER_STACK.get() {
         return Some(work());
@@ -966,7 +970,7 @@ fn on_parse_stack<T: Send>(work: impl FnOnce() -> T + Send) -> Option<T> {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .stack_size(PARSE_STACK_BYTES)
-            .spawn_scoped(scope, work)
+            .spawn_scoped(scope, || on_caller_stack(work))
             .ok()
             .map(|handle| {
                 handle
