@@ -159,7 +159,7 @@ pub(super) fn morph<'js>(
         .app_right_with(patterns.remove(0), append_pattern_value)
         .app_right_with(patterns.remove(0), append_pattern_value);
     let pattern = combined
-        .fmap_to_pure_pattern(|value| {
+        .fmap_to_pure_pattern_static(|value| {
             rustel_core::purity::PurePattern::assert_pure(morph_value(value))
         })
         .inner_join();
