@@ -128,6 +128,7 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
     let proto = surface.proto.clone();
     let set_canonical_polymeter_pace = surface.set_canonical_polymeter_pace.clone();
     let set_canonical_zoom = surface.set_canonical_zoom.clone();
+    let helpers = InstallHelpers::compile(&ctx)?;
     // -- prototype installation order -------------------------------
     //
     // Assignments onto `Pattern.prototype` land in a fixed order, and
@@ -148,7 +149,7 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
         if !registration.declared_in.is_extension() {
             continue;
         }
-        install_combinator(&ctx, &proto, &globals, name, registration.clone())?;
+        install_combinator(&ctx, &helpers, &proto, &globals, name, registration.clone())?;
     }
 
     for name in registry().names() {
@@ -156,7 +157,7 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
         if registration.declared_in != rustel_core::register::DeclaredIn::PatternModule {
             continue;
         }
-        install_combinator(&ctx, &proto, &globals, name, registration.clone())?;
+        install_combinator(&ctx, &helpers, &proto, &globals, name, registration.clone())?;
         // Raw swing, range/range2, apply/when/never/always, the stepwise
         // pairs, and canonical shrink/grow are installed later through
         // private JavaScript register() calls. Reserve their
@@ -299,7 +300,7 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
         if registration.declared_in != rustel_core::register::DeclaredIn::ControlsModule {
             continue;
         }
-        install_combinator(&ctx, &proto, &globals, name, registration.clone())?;
+        install_combinator(&ctx, &helpers, &proto, &globals, name, registration.clone())?;
     }
 
     // These are exact object aliases, not fresh
@@ -422,7 +423,7 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
             }),
         )
         .map_err(|error| error.to_string())?;
-        install_composer(&ctx, &proto, op, wrapper, default_apply)?;
+        install_composer(&ctx, &helpers, &proto, op, wrapper, default_apply)?;
     }
 
     // The named shortcuts defined on top of the matrix:
