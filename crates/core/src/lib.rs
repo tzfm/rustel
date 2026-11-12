@@ -2727,30 +2727,100 @@ pub const DEFAULT_HAP_BUDGET: u64 = 5_000_000;
 /// overlap while remaining individually bounded by their checked plans.
 pub const MAX_STEPWISE_ENTRIES: u64 = 16_384;
 
+/// The counters a query reads on every node and every hap, in one
+/// thread-local.
+///
+/// Where reaching a thread-local is a function call, as on macOS, every
+/// separate slot is one more call per node. Repeated reads of one slot in a
+/// function share one call. Each slot below is a view of one field and
+/// keeps the `with` of the thread-local it replaced.
+struct QueryThread {
+    hap_budget: std::cell::Cell<Option<u64>>,
+    depth: std::cell::Cell<u32>,
+    stop: std::cell::Cell<u8>,
+    peak: std::cell::Cell<u64>,
+    deadline: std::cell::Cell<Option<std::time::Instant>>,
+    deadline_millis: std::cell::Cell<u64>,
+    deadline_tick: std::cell::Cell<u32>,
+    deadline_expired: std::cell::Cell<bool>,
+}
+
+thread_local! {
+    static QUERY_THREAD: QueryThread = const {
+        QueryThread {
+            hap_budget: std::cell::Cell::new(None),
+            depth: std::cell::Cell::new(0),
+            stop: std::cell::Cell::new(0),
+            peak: std::cell::Cell::new(0),
+            deadline: std::cell::Cell::new(None),
+            deadline_millis: std::cell::Cell::new(0),
+            deadline_tick: std::cell::Cell::new(0),
+            deadline_expired: std::cell::Cell::new(false),
+        }
+    };
+}
+
+/// A view of one field of this thread's [`QueryThread`].
+struct QueryCell<T: 'static>(fn(&QueryThread) -> &T);
+
+impl<T: 'static> QueryCell<T> {
+    #[inline]
+    fn with<R>(&'static self, f: impl FnOnce(&T) -> R) -> R {
+        QUERY_THREAD.with(|thread| f((self.0)(thread)))
+    }
+}
+
+/// Haps still allowed in the current top-level query. `None` outside one.
+static HAP_BUDGET: QueryCell<std::cell::Cell<Option<u64>>> = QueryCell(|q| &q.hap_budget);
+/// How many `Pattern::query` frames are live on this thread.
+///
+/// Counted at the boundary rather than derived from the graph because
+/// `Pattern::of` cannot see a node's children without a per-variant match,
+/// and a match that must be extended for every future combinator is a
+/// limit that will eventually be forgotten. One counter on the one
+/// recursive entry point cannot be.
+static QUERY_DEPTH: QueryCell<std::cell::Cell<u32>> = QueryCell(|q| &q.depth);
+/// The stop signals as one word — a refusal recorded, a deadline armed
+/// or past, a cancellation flag installed — so the checks a query makes
+/// per hap read one thread-local instead of walking each slot. The
+/// separate slots stay the source of truth; the word only mirrors them.
+static QUERY_STOP: QueryCell<std::cell::Cell<u8>> = QueryCell(|q| &q.stop);
+static PEAK_CHARGE: QueryCell<std::cell::Cell<u64>> = QueryCell(|q| &q.peak);
+/// Wall-clock deadline for native query work, mirroring the JS CPU
+/// deadline. QuickJS's interrupt handler only fires while JavaScript
+/// runs; a pattern like `chop(32).slow(0.001)` spends its time in native
+/// query recursion (millions of cheap spans, each below every hap
+/// budget). Without this deadline a single save could occupy the producer
+/// for minutes: the live set goes silent while the process stays alive.
+static QUERY_DEADLINE: QueryCell<std::cell::Cell<Option<std::time::Instant>>> =
+    QueryCell(|q| &q.deadline);
+/// How long the installed deadline allowed, in milliseconds from its
+/// installation, so a refusal can say what it was measured against
+/// rather than reporting a zero it never had.
+static QUERY_DEADLINE_MILLIS: QueryCell<std::cell::Cell<u64>> = QueryCell(|q| &q.deadline_millis);
+/// Polling counter: `Instant::now()` is far too expensive per node, but
+/// the sample has to be frequent enough that a deep recursion notices
+/// the deadline in tens of milliseconds, not seconds.
+static DEADLINE_TICK: QueryCell<std::cell::Cell<u32>> = QueryCell(|q| &q.deadline_tick);
+/// Sticky for the lifetime of the installed deadline.
+///
+/// If the first expiry cleared the deadline, the rest of the query would
+/// have no bound: every later `Pattern::query` would read an empty slot
+/// and run at full speed. The refusal flag is the only other check, and
+/// `with_hap_budget` swaps it out at every non-nested boundary. A JS
+/// `queryArc` callback re-entry is such a boundary. Keeping expiry sticky
+/// ensures nested queries cannot escape the deadline.
+static DEADLINE_EXPIRED: QueryCell<std::cell::Cell<bool>> = QueryCell(|q| &q.deadline_expired);
+
 /// Alias kept for the shrink/grow boundary.
 pub const MAX_STEPWISE_SEGMENTS: u64 = MAX_STEPWISE_ENTRIES;
 
 thread_local! {
-    /// Haps still allowed in the current top-level query. `None` outside one.
-    static HAP_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-    /// How many `Pattern::query` frames are live on this thread.
-    ///
-    /// Counted at the boundary rather than derived from the graph because
-    /// `Pattern::of` cannot see a node's children without a per-variant match,
-    /// and a match that must be extended for every future combinator is a
-    /// limit that will eventually be forgotten. One counter on the one
-    /// recursive entry point cannot be.
-    static QUERY_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Set when a RESOURCE limit refuses the query. Separate from
     /// `QUERY_ERROR` so the `queryArc` boundary cannot turn a refusal into a
     /// plausible silence, and typed so the caller learns which limit fired.
     static REFUSAL: std::cell::RefCell<Option<QueryLimit>> =
         const { std::cell::RefCell::new(None) };
-    /// The stop signals as one word — a refusal recorded, a deadline armed
-    /// or past, a cancellation flag installed — so the checks a query makes
-    /// per hap read one thread-local instead of walking each slot. The
-    /// separate slots stay the source of truth; the word only mirrors them.
-    static QUERY_STOP: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     /// Remaining stepwise construction entries in this top-level query.
     /// `None` outside a query means the scalar body receives the same limit per
     /// invocation; nested queries share the enclosing remaining balance.
@@ -3116,7 +3186,6 @@ fn note_accumulated(len: usize) {
 }
 
 thread_local! {
-    static PEAK_CHARGE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Set while a cancellable query runs. Erased to a pointer because the flag
     /// is owned by the caller and shared with whatever thread will set it.
     static CANCEL_FLAG: std::cell::Cell<Option<*const std::sync::atomic::AtomicBool>> =
@@ -3154,34 +3223,6 @@ pub fn with_cancellation<R>(flag: &std::sync::atomic::AtomicBool, f: impl FnOnce
     }
     let _observed = ObservedGuard(CANCELLATION_OBSERVED.with(|observed| observed.replace(false)));
     f()
-}
-
-thread_local! {
-    /// Wall-clock deadline for native query work, mirroring the JS CPU
-    /// deadline. QuickJS's interrupt handler only fires while JavaScript
-    /// runs; a pattern like `chop(32).slow(0.001)` spends its time in native
-    /// query recursion (millions of cheap spans, each below every hap
-    /// budget). Without this deadline a single save could occupy the producer
-    /// for minutes: the live set goes silent while the process stays alive.
-    static QUERY_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
-        const { std::cell::Cell::new(None) };
-    /// How long the installed deadline allowed, in milliseconds from its
-    /// installation, so a refusal can say what it was measured against
-    /// rather than reporting a zero it never had.
-    static QUERY_DEADLINE_MILLIS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// Polling counter: `Instant::now()` is far too expensive per node, but
-    /// the sample has to be frequent enough that a deep recursion notices
-    /// the deadline in tens of milliseconds, not seconds.
-    static DEADLINE_TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// Sticky for the lifetime of the installed deadline.
-    ///
-    /// If the first expiry cleared the deadline, the rest of the query would
-    /// have no bound: every later `Pattern::query` would read an empty slot
-    /// and run at full speed. The refusal flag is the only other check, and
-    /// `with_hap_budget` swaps it out at every non-nested boundary. A JS
-    /// `queryArc` callback re-entry is such a boundary. Keeping expiry sticky
-    /// ensures nested queries cannot escape the deadline.
-    static DEADLINE_EXPIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Run `f` with a native query deadline installed (restored afterwards).
