@@ -11,9 +11,10 @@ later version.
 //! Building a MIDI file from the onsets a score schedules.
 //!
 //! The wire planner in `rustel_midi` decides the messages for one hap. This
-//! module places them on a tick grid and groups them by port and channel.
-//! Note-offs are exact: the live note-off margin exists for device clocks, not
-//! for a file.
+//! module places them on a tick grid and groups them by port, lane and
+//! channel: one track a lane, the lane the mixer strips and the voice
+//! routing already know as the note's orbit. Note-offs are exact: the live
+//! note-off margin exists for device clocks, not for a file.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -33,6 +34,10 @@ const MAX_SKIPPED_NAMES: usize = 8;
 /// The note a GM sound plays when the score gives none.
 const DEFAULT_GM_NOTE: f64 = 48.0;
 
+/// The lane a note carries when the score names none, as the voice
+/// routing reads it.
+const DEFAULT_ORBIT: u8 = 1;
+
 /// Most bytes in one track name.
 const MAX_TRACK_NAME_BYTES: usize = 128;
 
@@ -42,6 +47,7 @@ struct Intent {
     notes: Vec<u8>,
     drum_mapped: bool,
     sound: Option<String>,
+    orbit: u8,
     skipped_label: Option<String>,
 }
 
@@ -81,7 +87,7 @@ pub(crate) fn timeline(
             .then_with(|| left.onset_id.cmp(&right.onset_id))
     });
 
-    let mut tracks: BTreeMap<(Option<String>, u8), TrackState> = BTreeMap::new();
+    let mut tracks: BTreeMap<(Option<String>, u8, u8), TrackState> = BTreeMap::new();
     let mut notes = 0usize;
     let mut skipped_unsupported = 0usize;
     let mut skipped_names: Vec<String> = Vec::new();
@@ -93,7 +99,7 @@ pub(crate) fn timeline(
         let channel = channel_of(&intent);
         let onset_tick = tick_for(onset, 0.0, ticks_per_second);
         let state = tracks
-            .entry((intent.port.clone(), channel))
+            .entry((intent.port.clone(), intent.orbit, channel))
             .or_insert_with(|| TrackState {
                 messages: Vec::new(),
                 program: None,
@@ -158,8 +164,8 @@ pub(crate) fn timeline(
     let tracks: Vec<Track> = tracks
         .into_iter()
         .filter(|(_, state)| !state.messages.is_empty())
-        .map(|((port, channel), state)| Track {
-            name: track_name(port.as_deref(), channel),
+        .map(|((port, orbit, channel), state)| Track {
+            name: track_name(port.as_deref(), orbit, channel),
             channel,
             messages: state.messages,
         })
@@ -208,6 +214,7 @@ fn intent(onset: &OnsetEventJson) -> Option<Intent> {
                 notes,
                 drum_mapped: false,
                 sound: None,
+                orbit: DEFAULT_ORBIT,
                 skipped_label,
             })
         }
@@ -224,6 +231,7 @@ fn intent(onset: &OnsetEventJson) -> Option<Intent> {
                 notes,
                 drum_mapped: false,
                 sound: None,
+                orbit: DEFAULT_ORBIT,
                 skipped_label,
             })
         }
@@ -274,6 +282,7 @@ fn intent(onset: &OnsetEventJson) -> Option<Intent> {
                 notes,
                 drum_mapped,
                 sound,
+                orbit: orbit(map),
                 skipped_label,
             })
         }
@@ -293,11 +302,23 @@ fn intent(onset: &OnsetEventJson) -> Option<Intent> {
                 notes,
                 drum_mapped: false,
                 sound: None,
+                orbit: DEFAULT_ORBIT,
                 skipped_label: None,
             })
         }
         _ => None,
     }
+}
+
+/// The lane a note's orbit names, the way the voice routing reads it: 1
+/// with no `orbit`, the score's value clamped to the buses that exist.
+/// One lane, one exported track.
+fn orbit(map: &serde_json::Map<String, serde_json::Value>) -> u8 {
+    let last = (rustel_audio::MAX_ORBITS - 1) as f64;
+    map.get("orbit")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::from(DEFAULT_ORBIT))
+        .clamp(0.0, last) as u8
 }
 
 fn channel_of(intent: &Intent) -> u8 {
@@ -371,10 +392,10 @@ fn tick_for(onset: &OnsetEventJson, offset_secs: f64, ticks_per_second: f64) -> 
     }
 }
 
-fn track_name(port: Option<&str>, channel: u8) -> String {
+fn track_name(port: Option<&str>, orbit: u8, channel: u8) -> String {
     let mut name = match port {
-        Some(port) => format!("{port} ch {channel}"),
-        None => format!("channel {channel}"),
+        Some(port) => format!("{port} orbit {orbit} ch {channel}"),
+        None => format!("orbit {orbit} ch {channel}"),
     };
     if name.len() > MAX_TRACK_NAME_BYTES {
         let mut end = MAX_TRACK_NAME_BYTES;
@@ -569,12 +590,50 @@ mod tests {
             onset(2, 0.0, 0.5, serde_json::json!({ "note": 64 })),
         ]);
         assert_eq!(report.tracks, 2);
-        assert!(timeline.tracks.iter().any(|track| track.name == "IAC ch 1"));
         assert!(
             timeline
                 .tracks
                 .iter()
-                .any(|track| track.name == "channel 1")
+                .any(|track| track.name == "IAC orbit 1 ch 1")
+        );
+        assert!(
+            timeline
+                .tracks
+                .iter()
+                .any(|track| track.name == "orbit 1 ch 1")
+        );
+    }
+
+    /// One lane one track: the orbits the mixer strips show are the tracks
+    /// a DAW reads, in lane order, whether the score named them or not.
+    #[test]
+    fn each_lane_is_its_own_track() {
+        let (timeline, report) = exported(&[
+            onset(1, 0.0, 0.5, serde_json::json!({ "note": 60, "orbit": 0 })),
+            onset(2, 0.0, 0.5, serde_json::json!({ "note": 62 })),
+            onset(3, 0.0, 0.5, serde_json::json!({ "note": 64, "orbit": 2 })),
+            onset(4, 0.0, 0.5, serde_json::json!({ "note": 65, "orbit": 2 })),
+            onset(
+                5,
+                0.0,
+                0.5,
+                serde_json::json!({ "note": 67, "orbit": 2, "midichan": 3 }),
+            ),
+        ]);
+        assert_eq!(report.tracks, 4);
+        let names: Vec<&str> = timeline
+            .tracks
+            .iter()
+            .map(|track| track.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "orbit 0 ch 1",
+                "orbit 1 ch 1",
+                "orbit 2 ch 1",
+                "orbit 2 ch 3"
+            ]
         );
     }
 
@@ -666,6 +725,32 @@ mod tests {
         let imported =
             rustel_smf::import_smf(&bytes, &rustel_smf::ImportOptions::default()).unwrap();
         assert!(!imported.report.lanes.is_empty());
+    }
+
+    /// A score's lanes are the file's tracks, and they come back as lanes:
+    /// one render, one import, the same two lanes.
+    #[test]
+    fn each_lane_of_a_rendered_score_is_a_track_that_imports_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lanes.mid");
+        let mut session = crate::Session::new().unwrap();
+        session
+            .evaluate("$: note(\"c4 e4\").orbit(2)\n$h: note(\"g4\")")
+            .unwrap();
+        let report = session
+            .render(1.0, &path, crate::RenderFormat::Midi)
+            .unwrap();
+        let midi = report.midi.expect("MIDI report");
+        assert_eq!(midi.tracks, 2, "{midi:?}");
+        let bytes = std::fs::read(&path).unwrap();
+        let imported =
+            rustel_smf::import_smf(&bytes, &rustel_smf::ImportOptions::default()).unwrap();
+        assert_eq!(
+            imported.report.lanes.len(),
+            2,
+            "{:?}",
+            imported.report.lanes
+        );
     }
 
     #[test]

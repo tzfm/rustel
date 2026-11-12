@@ -22,7 +22,7 @@
 - On Linux, the audio keeps its priority over the studio, and rustelup offers to install rtkit when needed.
 - Vim mode follows Vim more closely in motions, operators, text objects, Visual mode, search, paste, undo and vimrc files.
 - The studio themes, except rustel-dark, live in [rustel-studio-themes](https://github.com/tzfm/rustel-studio-themes). A build without the `themes` feature keeps rustel-dark.
-- Add MIDI file export. `rustel export --format midi` writes a Type 1 file. Studio adds a MIDI format to the export sheet.
+- Add MIDI file export. `rustel export --format midi` writes a Type 1 file, one track a lane. Studio adds a MIDI format to the export sheet.
 - Add MIDI file import. `rustel import-midi` writes a score. A dropped `.mid` file opens as a new Studio scene.
 - Fixed: a studio.json that another rustel version wrote keeps its settings.
 - Fixed: the first chord or scale preview sounds, a scale preview keeps its tempo on a slow machine, and a sample preview says when it waits for its sample.
