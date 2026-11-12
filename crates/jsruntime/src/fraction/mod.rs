@@ -466,7 +466,7 @@ mod methods;
 mod parse;
 
 pub(crate) use install::ecma_to_i32;
-pub(super) use install::{install, seed_factory};
+pub(super) use install::{fraction_value, install, seed_factory};
 pub(crate) use math::*;
 pub(crate) use methods::*;
 pub(crate) use parse::*;

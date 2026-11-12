@@ -402,9 +402,14 @@ pub(super) fn new_wrapper_with_query_surface<'js>(
     let steps_value = match steps {
         Some(steps) => {
             let stack = host_stack(ctx)?;
-            match stack.as_object().get::<_, Function>(FRACTION_FACTORY) {
-                Ok(factory) => factory.call((fraction_seed(ctx, steps)?,))?,
-                Err(_) => rquickjs::Value::new_undefined(ctx.clone()),
+            if stack
+                .as_object()
+                .get::<_, Function>(FRACTION_FACTORY)
+                .is_ok()
+            {
+                crate::fraction::fraction_value(ctx, steps)?
+            } else {
+                rquickjs::Value::new_undefined(ctx.clone())
             }
         }
         None => rquickjs::Value::new_undefined(ctx.clone()),
