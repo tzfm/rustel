@@ -848,9 +848,9 @@ struct NodeCell {
     /// way answers from the graph instead of waiting for it.
     building: std::sync::atomic::AtomicBool,
     /// The answer tables this node holds, built by the query that
-    /// `build_next` allows or by a parent's build, or rebuilt when the
-    /// settings state they were built under moves past them. See the `table`
-    /// module.
+    /// `build_next` allows or by a parent's build, handed over from the
+    /// graph an edit replaced, or rebuilt when the settings state they were
+    /// built under moves past them. See the `table` module.
     ///
     /// Readers take the read lock only to clone the `Arc`, so a query never
     /// waits on another query, and a writer holds the lock only to swap the

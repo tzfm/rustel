@@ -979,8 +979,14 @@ impl JsRuntime {
                         .set(0, wrapper)
                         .map_err(|error| QueryError::Message(error.to_string()))
                 } else {
-                    host_active(&ctx)
-                        .map_err(|error| QueryError::Message(error.to_string()))?
+                    let active = host_active(&ctx)
+                        .map_err(|error| QueryError::Message(error.to_string()))?;
+                    // The graph an edit replaces hands its answer tables to
+                    // the one taking over, before the slot is written.
+                    if let Ok(previous) = active.get::<rquickjs::Value>(0) {
+                        Self::adopt_replaced_tables(&previous, &wrapper.borrow().pattern);
+                    }
+                    active
                         .set(0, wrapper)
                         .map_err(|error| QueryError::Message(error.to_string()))
                 }
@@ -995,6 +1001,23 @@ impl JsRuntime {
                 let _ = candidate.as_object().set("length", 0);
             }
         });
+    }
+
+    /// Hand the answer tables of the outgoing active graph to the graph that
+    /// replaces it. Only the new graph's nodes take over tables that still
+    /// answer for them; both wrappers are left exactly as they were.
+    ///
+    /// The handover runs where the score's own settings scope is still in
+    /// force, so a table built under a snapshot the next score already moved
+    /// past refuses itself instead of landing stale.
+    fn adopt_replaced_tables(previous: &rquickjs::Value<'_>, next: &rustel_core::Pattern) {
+        let Some(object) = previous.as_object() else {
+            return;
+        };
+        let Some(wrapper) = rquickjs::Class::<NativePatternWrapper>::from_object(object) else {
+            return;
+        };
+        next.adopt_tables_from(&wrapper.borrow().pattern);
     }
 
     /// Publish the exact staged JS wrapper, restoring the exact prior wrapper
@@ -1028,6 +1051,15 @@ impl JsRuntime {
             let previous: rquickjs::Value = active
                 .get(0)
                 .map_err(|error| QueryError::Message(error.to_string()))?;
+
+            // The graph an edit replaces hands its answer tables to the one
+            // taking over, before the slot is written. A publication that
+            // later refuses keeps its tables with the wrapper that owns them.
+            if let Some(object) = candidate.as_object()
+                && let Some(next) = rquickjs::Class::<NativePatternWrapper>::from_object(object)
+            {
+                Self::adopt_replaced_tables(&previous, &next.borrow().pattern);
+            }
 
             let _ = alloc::take_heap_exhausted();
             let publication = active.set(0, candidate);
