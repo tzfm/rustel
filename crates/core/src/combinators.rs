@@ -1892,23 +1892,19 @@ pub fn degrade_by_with<P: PatOps>(pat: &P, with_pat: &P, x: f64) -> P {
     static POOL: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<u64, crate::ValuePredicate>>,
     > = std::sync::OnceLock::new();
-    let gate_predicate = crate::interned_closure(
-        POOL.get_or_init(Default::default),
-        x.to_bits(),
-        || {
+    let gate_predicate =
+        crate::interned_closure(POOL.get_or_init(Default::default), x.to_bits(), || {
             let predicate: crate::ValuePredicate =
                 std::sync::Arc::new(move |v| util::parse_numeral(v).is_ok_and(|n| n > x));
             predicate
-        },
-    );
+        });
     let gate = with_pat.filter_values_with(gate_predicate);
     // The combine keeps the left value whatever the gate says: one closure
     // object for every degrade, so that node agrees by pointer.
     static KEEP_LEFT: std::sync::OnceLock<crate::CombineFn> = std::sync::OnceLock::new();
     let keep_left = KEEP_LEFT
         .get_or_init(|| {
-            let combine: crate::CombineFn =
-                std::sync::Arc::new(|a: &Value, _: &Value| a.clone());
+            let combine: crate::CombineFn = std::sync::Arc::new(|a: &Value, _: &Value| a.clone());
             combine
         })
         .clone();
@@ -1949,9 +1945,10 @@ fn coin_body() -> crate::register::PureBody {
 /// carries its answers across evaluations. Falls back to the opaque bind
 /// when `whole` is not pure.
 fn coin_bind<P: PatOps>(x: f64, whole: &P) -> P {
-    if let (Some(carrier), Some(operand)) =
-        (P::pat_pure(Value::F64(x)).as_pure_view(), whole.as_pure_view())
-    {
+    if let (Some(carrier), Some(operand)) = (
+        P::pat_pure(Value::F64(x)).as_pure_view(),
+        whole.as_pure_view(),
+    ) {
         let joined = carrier
             .0
             .fmap_to_pure_pattern_with_operand(&operand, coin_body(), 1)
@@ -2386,15 +2383,17 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
     };
     let scale_tag: std::sync::Arc<str> = std::sync::Arc::from(scale_name.as_str());
     let key = scale_name.clone();
-    pat.map_pitch_haps_native_interned(&key, move |hap| {
-        scale_hap(hap, &scale_name, &scale_tag)
-    })
+    pat.map_pitch_haps_native_interned(&key, move |hap| scale_hap(hap, &scale_name, &scale_tag))
 }
 
 /// The body of one `scale` rewrite: a pure function of the hap and the
 /// scale name. Kept as a named function so [`scale`] can intern its map by
 /// the name alone - see [`crate::interned_closure`].
-fn scale_hap(hap: &crate::Hap, scale_name: &str, scale_tag: &std::sync::Arc<str>) -> Option<crate::Hap> {
+fn scale_hap(
+    hap: &crate::Hap,
+    scale_name: &str,
+    scale_tag: &std::sync::Arc<str>,
+) -> Option<crate::Hap> {
     {
         let hap = &*materialized_hap(hap);
         // A plain value behaves as `{ n: value }`; note / n / value is
@@ -2486,9 +2485,7 @@ fn scale_hap(hap: &crate::Hap, scale_name: &str, scale_tag: &std::sync::Arc<str>
                     // anything else is NaN.
                     let anchor_midi = match anchor {
                         Value::F64(n) => *n,
-                        Value::Str(s) => {
-                            crate::util::note_to_midi(s, 3).unwrap_or(f64::NAN)
-                        }
+                        Value::Str(s) => crate::util::note_to_midi(s, 3).unwrap_or(f64::NAN),
                         _ => f64::NAN,
                     };
                     crate::tonaljs::step_in_named_scale(number, scale_name, Some(anchor_midi))

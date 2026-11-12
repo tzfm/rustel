@@ -7076,8 +7076,11 @@ impl Pattern {
                 Arc::new(move |hap: &Hap| Some(hap.clone().with_ui_visual_slot(slot)));
             mapped
         });
-        let mut pattern =
-            Pattern::of(Node::MapHapsNative(self.clone(), interned, SpanUse::Ignores));
+        let mut pattern = Pattern::of(Node::MapHapsNative(
+            self.clone(),
+            interned,
+            SpanUse::Ignores,
+        ));
         pattern.steps = self.steps;
         pattern.pure_loc = self.pure_loc;
         pattern
@@ -7136,7 +7139,12 @@ impl Pattern {
         self.app_left_by(other, Combine::Composed(op), lookup_flow)
     }
 
-    pub(crate) fn app_left_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
+    pub(crate) fn app_left_by(
+        &self,
+        other: Pattern,
+        combine: Combine,
+        lookup_flow: LookupFlow,
+    ) -> Self {
         let steps = self.steps;
         Pattern::of(Node::AppLeft(self.clone(), other, combine, lookup_flow)).with_steps(steps)
     }
@@ -7171,7 +7179,12 @@ impl Pattern {
         self.app_right_by(other, Combine::Composed(op), lookup_flow)
     }
 
-    pub(crate) fn app_right_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
+    pub(crate) fn app_right_by(
+        &self,
+        other: Pattern,
+        combine: Combine,
+        lookup_flow: LookupFlow,
+    ) -> Self {
         let steps = other.steps;
         Pattern::of(Node::AppRight(self.clone(), other, combine, lookup_flow)).with_steps(steps)
     }
@@ -7206,7 +7219,12 @@ impl Pattern {
         self.app_both_by(other, Combine::Composed(op), lookup_flow)
     }
 
-    pub(crate) fn app_both_by(&self, other: Pattern, combine: Combine, lookup_flow: LookupFlow) -> Self {
+    pub(crate) fn app_both_by(
+        &self,
+        other: Pattern,
+        combine: Combine,
+        lookup_flow: LookupFlow,
+    ) -> Self {
         let steps = match (other.steps, self.steps) {
             (Some(a), Some(b)) => match a.checked_lcm(b) {
                 Some(steps) => Some(steps),
@@ -7248,10 +7266,7 @@ impl Pattern {
     /// [`fmap_to_pure_pattern`] for a body that captures nothing: one
     /// closure object per body, so the same map built by a later
     /// evaluation is the same payload. See [`interned_closure`].
-    pub fn fmap_to_pure_pattern_static(
-        &self,
-        body: fn(&Value) -> purity::PurePattern,
-    ) -> Self {
+    pub fn fmap_to_pure_pattern_static(&self, body: fn(&Value) -> purity::PurePattern) -> Self {
         static POOL: std::sync::OnceLock<
             std::sync::Mutex<std::collections::HashMap<usize, ToPurePatternFn>>,
         > = std::sync::OnceLock::new();
@@ -7775,12 +7790,7 @@ impl Pattern {
         // One closure object per distinct spec: the same control built again
         // is the same payload, so its subtree carries its answers.
         let map = controls::interned_control_map(&spec, unnamed_only);
-        Pattern::of(Node::MapHapsOwned(
-            self.clone(),
-            map,
-            SpanUse::Ignores,
-        ))
-        .with_steps(self.steps)
+        Pattern::of(Node::MapHapsOwned(self.clone(), map, SpanUse::Ignores)).with_steps(self.steps)
     }
 
     pub fn filter_values(
@@ -7891,18 +7901,19 @@ impl Pattern {
             std::sync::Mutex<std::collections::HashMap<String, HapMapFn>>,
         > = std::sync::OnceLock::new();
         let steps = self.steps;
-        let interned = interned_closure(
-            POOL.get_or_init(Default::default),
-            key.to_string(),
-            || {
+        let interned =
+            interned_closure(POOL.get_or_init(Default::default), key.to_string(), || {
                 let mapped: HapMapFn = Arc::new(move |hap: &Hap| {
                     f(hap).map(|mapped| mapped.with_pitch_live_controls(hap))
                 });
                 mapped
-            },
-        );
-        Pattern::of(Node::MapHapsNative(self.clone(), interned, SpanUse::Ignores))
-            .with_steps(steps)
+            });
+        Pattern::of(Node::MapHapsNative(
+            self.clone(),
+            interned,
+            SpanUse::Ignores,
+        ))
+        .with_steps(steps)
     }
 
     fn expand_pitch_haps_native(
@@ -7938,8 +7949,12 @@ impl Pattern {
             });
             expand
         });
-        Pattern::of(Node::ExpandHapsNative(self.clone(), interned, SpanUse::Ignores))
-            .with_steps(steps)
+        Pattern::of(Node::ExpandHapsNative(
+            self.clone(),
+            interned,
+            SpanUse::Ignores,
+        ))
+        .with_steps(steps)
     }
 
     pub fn map_haps_with_state(
@@ -9028,9 +9043,8 @@ pub fn signal(f: impl Fn(Fraction, &OrderedMap) -> Value + Send + Sync + 'static
 /// body, so the same signal built by a later evaluation is the same
 /// payload. See [`interned_closure`].
 pub fn signal_static(body: fn(Fraction, &OrderedMap) -> Value) -> Pattern {
-    static POOL: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<usize, SignalFn>>,
-    > = std::sync::OnceLock::new();
+    static POOL: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, SignalFn>>> =
+        std::sync::OnceLock::new();
     let interned = interned_closure(POOL.get_or_init(Default::default), body as usize, || {
         let mapped: SignalFn =
             Arc::new(move |state: &State| body(state.span.begin, &state.controls));

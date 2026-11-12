@@ -494,11 +494,7 @@ impl Registration {
                 // The operand rides in the node as a compared child, so an
                 // unchanged operand carries its answers across evaluations.
                 (CombinatorFn::Native(n), Some(pure_operand)) => {
-                    acc.fmap_to_pure_pattern_with_operand(
-                        &pure_operand,
-                        n.pure.clone(),
-                        n_chain,
-                    )
+                    acc.fmap_to_pure_pattern_with_operand(&pure_operand, n.pure.clone(), n_chain)
                 }
                 // Anything else is an opaque closure -> always impure.
                 _ => acc.fmap_to_pattern(apply),

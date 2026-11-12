@@ -152,21 +152,17 @@ fn tagged<'js>(
     static POOL: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, rustel_core::OwnedHapMapFn>>,
     > = std::sync::OnceLock::new();
-    let map = rustel_core::interned_closure(
-        POOL.get_or_init(Default::default),
-        tag.clone(),
-        || {
-            let map: rustel_core::OwnedHapMapFn = std::sync::Arc::new(
-                move |hap: rustel_core::Hap| {
+    let map =
+        rustel_core::interned_closure(POOL.get_or_init(Default::default), tag.clone(), || {
+            let map: rustel_core::OwnedHapMapFn =
+                std::sync::Arc::new(move |hap: rustel_core::Hap| {
                     Some(match tagged_value(&hap.value, &tag) {
                         Some(value) => hap.into_value_keeping_live(value),
                         None => hap,
                     })
-                },
-            );
+                });
             map
-        },
-    );
+        });
     let pattern = pattern.fmap_keeping_live_with(map);
     Ok(derive_wrapper(ctx.clone(), pattern, &[sidecar])?.into_value())
 }

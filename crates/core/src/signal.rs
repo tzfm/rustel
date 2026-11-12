@@ -69,7 +69,9 @@ pub fn isquare() -> Pattern {
 }
 
 pub fn isquare2() -> Pattern {
-    signal_static(|time, _| Value::F64((1.0 - (time.to_f64() * 2.0).rem_euclid(2.0).floor()) * 2.0 - 1.0))
+    signal_static(|time, _| {
+        Value::F64((1.0 - (time.to_f64() * 2.0).rem_euclid(2.0).floor()) * 2.0 - 1.0)
+    })
 }
 
 pub fn time() -> Pattern {
