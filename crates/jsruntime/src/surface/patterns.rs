@@ -71,19 +71,47 @@ pub(crate) fn native_mini<'js>(
     new_wrapper(&ctx, NativePatternWrapper::plain(pattern))
 }
 
+/// The most mini literals one thread remembers. A literal past the bound
+/// forgets them all: every forgotten graph rebuilds at its next parse, so
+/// the bound stays simple and the memory flat.
+const MINI_MEMO_ENTRIES: usize = 1024;
+
+thread_local! {
+    /// The graphs this thread parsed from mini literals, by source bytes and
+    /// score offset. The same literal parses to the same graph every
+    /// evaluate, so a repeat evaluate shares the remembered graph instead of
+    /// parsing and allocating it again. The offset stays in the key because
+    /// a literal's haps carry the source locations of its offset.
+    static MINI_MEMO: std::cell::RefCell<
+        std::collections::HashMap<(std::sync::Arc<str>, i64), Pattern>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// The pattern a transpiled mini-notation literal builds. `offset` is the
 /// byte offset of its opening quote in the score. A negative offset parses
 /// without source locations, for code outside the score.
 pub(crate) fn transpiled_mini(source: &str, offset: i64) -> Result<Pattern, String> {
+    let key = (std::sync::Arc::from(source), offset);
+    if let Some(pattern) = MINI_MEMO.with(|memo| memo.borrow().get(&key).cloned()) {
+        return Ok(pattern);
+    }
     let pattern = rustel_mini::mini_at(source, usize::try_from(offset).unwrap_or(0))
         .map_err(|error| error.to_string())?;
-    Ok(if offset < 0 {
+    let pattern = if offset < 0 {
         pattern
             .map_haps_native(|hap| Some(hap.clone().with_context(Vec::new())))
             .with_steps(pattern.steps)
     } else {
         pattern
-    })
+    };
+    MINI_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= MINI_MEMO_ENTRIES {
+            memo.clear();
+        }
+        memo.insert(key, pattern.clone());
+    });
+    Ok(pattern)
 }
 
 /// Public `mini(...strings)`, distinct from transpiler-facing `m(str, offset)`.
