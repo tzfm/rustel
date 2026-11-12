@@ -631,6 +631,10 @@ mod tests {
         let (inside, rows, selected) = vst(&app);
         assert_eq!(inside, None);
         assert_eq!(rows[selected], PluginRow::Section(VstSection::Params));
+        // Every fixture test leaves the host with no folder, as it found
+        // it: a later test that reads the folders of the process sees no
+        // plugin this one pinned.
+        rustel_runtime::vst::pin_standard_folders(Vec::new());
     }
 
     /// j k h l drive the knobs column the way the arrows do: the rows
