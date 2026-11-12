@@ -2381,19 +2381,64 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
             });
         }
     };
-    let scale_tag: std::sync::Arc<str> = std::sync::Arc::from(scale_name.as_str());
     let key = scale_name.clone();
-    pat.map_pitch_haps_native_interned(&key, move |hap| scale_hap(hap, &scale_name, &scale_tag))
+    let steps = ScaleSteps::new(scale_name);
+    pat.map_pitch_haps_native_interned(&key, move |hap| scale_hap(hap, &steps))
+}
+
+/// The lowest degree [`ScaleSteps`] keeps.
+const LOWEST_KEPT_DEGREE: i64 = -64;
+
+/// How many degrees [`ScaleSteps`] keeps, from [`LOWEST_KEPT_DEGREE`] up.
+const KEPT_DEGREES: usize = 128;
+
+/// One scale as a `scale` call site reads it: the name, the tag its haps
+/// carry, and the note of each degree asked so far.
+///
+/// [`crate::tonaljs::scale_step`] resolves the scale name, its tonic and the
+/// octave transposition on every call. A degree's note depends on nothing
+/// else, so each degree in the kept range is resolved once, on first use,
+/// and later haps read it. A degree outside the range resolves every time,
+/// as before.
+struct ScaleSteps {
+    name: String,
+    tag: std::sync::Arc<str>,
+    degrees: Box<[std::sync::OnceLock<Result<String, String>>]>,
+}
+
+impl ScaleSteps {
+    fn new(name: String) -> Self {
+        Self {
+            tag: std::sync::Arc::from(name.as_str()),
+            name,
+            degrees: (0..KEPT_DEGREES)
+                .map(|_| std::sync::OnceLock::new())
+                .collect(),
+        }
+    }
+
+    /// [`crate::tonaljs::scale_step`] of `step` in this scale.
+    fn step(&self, step: f64) -> Result<String, String> {
+        // `scale_step` rounds up first, so a step and its ceiling have one
+        // note. Only a finite ceiling inside the range is kept.
+        let degree = step.ceil();
+        let slot = (LOWEST_KEPT_DEGREE as f64..(LOWEST_KEPT_DEGREE + KEPT_DEGREES as i64) as f64)
+            .contains(&degree)
+            .then(|| (degree as i64 - LOWEST_KEPT_DEGREE) as usize);
+        match slot {
+            Some(slot) => self.degrees[slot]
+                .get_or_init(|| crate::tonaljs::scale_step(degree, &self.name))
+                .clone(),
+            None => crate::tonaljs::scale_step(step, &self.name),
+        }
+    }
 }
 
 /// The body of one `scale` rewrite: a pure function of the hap and the
 /// scale name. Kept as a named function so [`scale`] can intern its map by
 /// the name alone - see [`crate::interned_closure`].
-fn scale_hap(
-    hap: &crate::Hap,
-    scale_name: &str,
-    scale_tag: &std::sync::Arc<str>,
-) -> Option<crate::Hap> {
+fn scale_hap(hap: &crate::Hap, steps: &ScaleSteps) -> Option<crate::Hap> {
+    let scale_name = steps.name.as_str();
     {
         let hap = &*materialized_hap(hap);
         // A plain value behaves as `{ n: value }`; note / n / value is
@@ -2491,7 +2536,7 @@ fn scale_hap(
                     crate::tonaljs::step_in_named_scale(number, scale_name, Some(anchor_midi))
                         .map(Value::F64)
                 }
-                None => crate::tonaljs::scale_step(number, scale_name).map(Value::Str),
+                None => steps.step(number).map(Value::Str),
             };
             let stepped = match stepped {
                 Ok(value) => value,
@@ -2522,8 +2567,47 @@ fn scale_hap(
         };
         Some(
             hap.with_value(|_| value.clone())
-                .with_scale_context(scale_tag.clone()),
+                .with_scale_context(steps.tag.clone()),
         )
+    }
+}
+
+#[cfg(test)]
+mod scale_steps_tests {
+    use super::{KEPT_DEGREES, LOWEST_KEPT_DEGREE, ScaleSteps};
+
+    #[test]
+    fn a_kept_degree_is_the_note_scale_step_resolves() {
+        let mut steps: Vec<f64> = (LOWEST_KEPT_DEGREE - 3
+            ..LOWEST_KEPT_DEGREE + KEPT_DEGREES as i64 + 3)
+            .map(|degree| degree as f64)
+            .collect();
+        steps.extend([
+            -0.5,
+            0.25,
+            2.5,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            -1e300,
+            1e300,
+        ]);
+        let tonics = ["C", "C#", "Eb4", "B2", "Fb", ""];
+        for (type_name, _, _) in crate::tonaljs_scales::SCALE_DICTIONARY {
+            for tonic in tonics {
+                let name = format!("{tonic}:{type_name}");
+                let kept = ScaleSteps::new(name.clone());
+                for &step in &steps {
+                    let expected = crate::tonaljs::scale_step(step, &name);
+                    assert_eq!(kept.step(step).is_ok(), expected.is_ok(), "{name} {step}");
+                    if let Ok(note) = expected {
+                        assert_eq!(kept.step(step), Ok(note), "{name} {step}");
+                    }
+                }
+            }
+        }
+        let unknown = ScaleSteps::new("C:no such scale".to_string());
+        assert!(unknown.step(1.0).is_err());
     }
 }
 
