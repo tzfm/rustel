@@ -10,6 +10,7 @@
 //! middle round is the number. Compare runs from the same day and the same
 //! machine only: day-to-day drift hides small changes. The hap total must not
 //! change between two versions being compared; only the time may.
+#![allow(clippy::print_stdout, reason = "the example prints its measurements")]
 
 use rustel_runtime::Session;
 use std::time::Instant;
@@ -21,7 +22,7 @@ fn main() {
     let end: i128 = args[3].parse().expect("end cycle");
     let iters: usize = args[4].parse().expect("iterations");
     let songs = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/songs"))
-        .and_then(|entries| {
+        .map(|entries| {
             let mut songs: Vec<std::path::PathBuf> = entries
                 .filter_map(|entry| {
                     let path = entry.ok()?.path();
@@ -29,7 +30,7 @@ fn main() {
                 })
                 .collect();
             songs.sort();
-            Ok(songs)
+            songs
         })
         .expect("read songs folder");
     let selected: Vec<std::path::PathBuf> = if target == "all" {
@@ -43,10 +44,10 @@ fn main() {
     for path in &selected {
         let name = path.file_stem().expect("song name");
         let mut source = std::fs::read_to_string(path).expect("read score");
-        if let Some(rest) = source.strip_prefix("---") {
-            if let Some(stop) = rest.find("\n---") {
-                source = rest[stop + 4..].to_string();
-            }
+        if let Some(rest) = source.strip_prefix("---")
+            && let Some(stop) = rest.find("\n---")
+        {
+            source = rest[stop + 4..].to_string();
         }
         let config = rustel_runtime::SessionConfig::default()
             .with_dsp_dispatch(rustel_audio::DspDispatch::portable());
