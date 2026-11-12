@@ -1034,7 +1034,7 @@ pub fn chop<P: PatOps>(pat: &P, n: i64) -> P {
         }
         P::pat_fastcat(slices)
     })
-    .map_haps_native(|hap| {
+    .map_haps_native_static(|hap| {
         let mut hap = hap.clone();
         hap.context.clear();
         Some(hap)
@@ -1886,8 +1886,33 @@ fn pure_signal<P: PatOps>(pattern: crate::Pattern) -> P {
 /// Structure comes from `pat` (app-left); the chooser is sampled over each
 /// hap's whole.
 pub fn degrade_by_with<P: PatOps>(pat: &P, with_pat: &P, x: f64) -> P {
-    let gate = with_pat.filter_values(move |v| util::parse_numeral(v).is_ok_and(|n| n > x));
-    pat.app_left_with_lookup(gate, |a, _| a.clone(), crate::LookupFlow::Left)
+    // The gate is a pure function of `x`: one predicate object per
+    // threshold, so the same degrade built by a later evaluation is the
+    // same payload.
+    static POOL: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u64, crate::ValuePredicate>>,
+    > = std::sync::OnceLock::new();
+    let gate_predicate = crate::interned_closure(
+        POOL.get_or_init(Default::default),
+        x.to_bits(),
+        || {
+            let predicate: crate::ValuePredicate =
+                std::sync::Arc::new(move |v| util::parse_numeral(v).is_ok_and(|n| n > x));
+            predicate
+        },
+    );
+    let gate = with_pat.filter_values_with(gate_predicate);
+    // The combine keeps the left value whatever the gate says: one closure
+    // object for every degrade, so that node agrees by pointer.
+    static KEEP_LEFT: std::sync::OnceLock<crate::CombineFn> = std::sync::OnceLock::new();
+    let keep_left = KEEP_LEFT
+        .get_or_init(|| {
+            let combine: crate::CombineFn =
+                std::sync::Arc::new(|a: &Value, _: &Value| a.clone());
+            combine
+        })
+        .clone();
+    pat.app_left_interned(gate, keep_left, crate::LookupFlow::Left)
         .set_steps(pat.pat_steps())
 }
 
@@ -1905,6 +1930,36 @@ pub fn undegrade_by<P: PatOps>(pat: &P, x: f64) -> P {
     let inverted = pure_signal::<P>(crate::signal::rand())
         .fmap(|v| Value::F64(1.0 - util::parse_numeral(v).unwrap_or(f64::NAN)));
     degrade_by_with(pat, &inverted, x)
+}
+
+/// The identity body of `sometimes`'s coin bind: whatever the coin says,
+/// the operand is the answer. One object for the process.
+fn coin_body() -> crate::register::PureBody {
+    static IDENTITY: std::sync::OnceLock<crate::register::PureBody> = std::sync::OnceLock::new();
+    IDENTITY
+        .get_or_init(|| {
+            let body: crate::register::PureBody = std::sync::Arc::new(|_, pat| pat);
+            body
+        })
+        .clone()
+}
+
+/// The coin bind of `sometimes`: `pure(x)` inner-joined to `whole`, with
+/// `whole` riding in the node as a compared child so an unchanged operand
+/// carries its answers across evaluations. Falls back to the opaque bind
+/// when `whole` is not pure.
+fn coin_bind<P: PatOps>(x: f64, whole: &P) -> P {
+    if let (Some(carrier), Some(operand)) =
+        (P::pat_pure(Value::F64(x)).as_pure_view(), whole.as_pure_view())
+    {
+        let joined = carrier
+            .0
+            .fmap_to_pure_pattern_with_operand(&operand, coin_body(), 1)
+            .inner_join();
+        return P::from_pure_view(crate::purity::PurePattern(joined));
+    }
+    let whole = whole.clone();
+    P::pat_pure(Value::F64(x)).inner_bind(move |_| whole.clone())
 }
 
 /// Applies `f` to roughly `x` of the events. The halves are complementary:
@@ -1927,6 +1982,8 @@ pub fn sometimes_by<P: PatOps>(pat: &P, x: f64, f: Option<&FunctionRef>) -> P {
     let plain = degrade_by(pat, x);
     let transformed_base = undegrade_by(pat, 1.0 - x);
     if f.is_some_and(|f| !f.stands_for_every_application()) {
+        // The function re-applies inside the bind per coin query, so this
+        // branch keeps the opaque form.
         let f = f.cloned();
         return P::pat_pure(Value::F64(x)).inner_bind(move |_| {
             let transformed = call(&transformed_base, f.as_ref());
@@ -1935,7 +1992,7 @@ pub fn sometimes_by<P: PatOps>(pat: &P, x: f64, f: Option<&FunctionRef>) -> P {
     }
     let transformed = call(&transformed_base, f);
     let whole = P::pat_stack(vec![plain, transformed]);
-    P::pat_pure(Value::F64(x)).inner_bind(move |_| whole.clone())
+    coin_bind(x, &whole)
 }
 
 /// [`sometimes_by`], but `segment(1)` on the rand signal makes the coin
@@ -1958,7 +2015,7 @@ pub fn some_cycles_by<P: PatOps>(pat: &P, x: f64, f: Option<&FunctionRef>) -> P 
     }
     let transformed = call(&transformed_base, f);
     let whole = P::pat_stack(vec![plain, transformed]);
-    P::pat_pure(Value::F64(x)).inner_bind(move |_| whole.clone())
+    coin_bind(x, &whole)
 }
 
 // -- envelope shorthands ----------------------------------------------------
@@ -2328,7 +2385,17 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
         }
     };
     let scale_tag: std::sync::Arc<str> = std::sync::Arc::from(scale_name.as_str());
-    pat.map_pitch_haps_native(move |hap| {
+    let key = scale_name.clone();
+    pat.map_pitch_haps_native_interned(&key, move |hap| {
+        scale_hap(hap, &scale_name, &scale_tag)
+    })
+}
+
+/// The body of one `scale` rewrite: a pure function of the hap and the
+/// scale name. Kept as a named function so [`scale`] can intern its map by
+/// the name alone - see [`crate::interned_closure`].
+fn scale_hap(hap: &crate::Hap, scale_name: &str, scale_tag: &std::sync::Arc<str>) -> Option<crate::Hap> {
+    {
         let hap = &*materialized_hap(hap);
         // A plain value behaves as `{ n: value }`; note / n / value is
         // picked out and the rest carried along.
@@ -2381,7 +2448,7 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
                     return None;
                 }
             };
-            match crate::tonaljs::nearest_scale_note(&scale_name, midi) {
+            match crate::tonaljs::nearest_scale_note(scale_name, midi) {
                 Ok(quantized) => Value::Str(quantized),
                 Err(error) => {
                     crate::signal_query_error(move || error.clone());
@@ -2424,10 +2491,10 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
                         }
                         _ => f64::NAN,
                     };
-                    crate::tonaljs::step_in_named_scale(number, &scale_name, Some(anchor_midi))
+                    crate::tonaljs::step_in_named_scale(number, scale_name, Some(anchor_midi))
                         .map(Value::F64)
                 }
-                None => crate::tonaljs::scale_step(number, &scale_name).map(Value::Str),
+                None => crate::tonaljs::scale_step(number, scale_name).map(Value::Str),
             };
             let stepped = match stepped {
                 Ok(value) => value,
@@ -2460,7 +2527,7 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
             hap.with_value(|_| value.clone())
                 .with_scale_context(scale_tag.clone()),
         )
-    })
+    }
 }
 
 #[cfg(test)]
