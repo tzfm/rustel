@@ -494,7 +494,7 @@ fn open_set_lists_the_others_and_opens_one() {
     );
 }
 
-/// File ▸ Import patterns…: an export in strudel.cc's own shape -
+/// File ▸ Strudel patterns… ▸ Import…: an export in strudel.cc's own shape -
 /// entries keyed by push ids, each an object with `code` and
 /// `created_at` - becomes named score files of the set already open.
 /// The prompt offers the export by name, the set panel lists what
@@ -532,7 +532,8 @@ fn import_strudel_patterns_adds_them_to_the_open_set() {
     .expect("export");
 
     drop_file_menu(&mut studio);
-    studio.press(KeyCode::Char('i'), KeyModifiers::NONE); // Import patterns…
+    studio.press(KeyCode::Char('p'), KeyModifiers::NONE); // Strudel patterns
+    studio.press(KeyCode::Char('i'), KeyModifiers::NONE); // Import…
     assert_eq!(
         studio.status(),
         "import Strudel patterns - Enter adds every entry to this set · Tab browses · type a path · Esc back"
@@ -574,7 +575,8 @@ fn import_strudel_patterns_adds_them_to_the_open_set() {
 
     // The same export again: everything already there, said plainly.
     drop_file_menu(&mut studio);
-    studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('p'), KeyModifiers::NONE); // Strudel patterns
+    studio.press(KeyCode::Char('i'), KeyModifiers::NONE); // Import…
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(
         studio.status(),
@@ -585,7 +587,7 @@ fn import_strudel_patterns_adds_them_to_the_open_set() {
     );
 }
 
-/// File ▸ Export patterns…: the set's scores as one pattern export at
+/// File ▸ Strudel patterns… ▸ Export…: the set's scores as one pattern export at
 /// the sets root, keyed by name, the open score as it stands on screen,
 /// and the file offered again by the open-set prompt.
 #[test]
@@ -603,7 +605,8 @@ fn export_patterns_writes_the_sets_scores_beside_the_sets() {
     let score = studio.score();
 
     drop_file_menu(&mut studio);
-    studio.press(KeyCode::Char('x'), KeyModifiers::NONE); // Export patterns…
+    studio.press(KeyCode::Char('p'), KeyModifiers::NONE); // Strudel patterns
+    studio.press(KeyCode::Char('x'), KeyModifiers::NONE); // Export…
     // The status names the whole path to the export - shortened in the
     // middle when the row cannot hold it, so the file's own name survives -
     // and a click on it shows the file in the desktop's file manager.
@@ -649,6 +652,84 @@ fn export_patterns_writes_the_sets_scores_beside_the_sets() {
     studio.settle();
     let rows = studio.rows();
     row_containing(&rows, "Strudel export - 2 patterns");
+}
+
+/// A two-bar Standard MIDI File, one note held through it: the way a
+/// dragged-in song looks.
+fn midi_bytes() -> Vec<u8> {
+    rustel_smf::Timeline {
+        ppq: 480,
+        tempo_micros_per_quarter: 500_000,
+        meter: rustel_smf::Meter::FOUR_FOUR,
+        tracks: vec![rustel_smf::Track {
+            name: "lead".into(),
+            channel: 1,
+            messages: vec![
+                rustel_smf::Message {
+                    tick: 0,
+                    kind: rustel_smf::MessageKind::NoteOn {
+                        note: 60,
+                        velocity: 100,
+                    },
+                },
+                rustel_smf::Message {
+                    tick: 3_840,
+                    kind: rustel_smf::MessageKind::NoteOff { note: 60 },
+                },
+            ],
+        }],
+    }
+    .to_bytes()
+    .expect("MIDI bytes")
+}
+
+/// File ▸ Import MIDI…: a `.mid` file at the sets root is offered by the
+/// prompt, and Enter opens it as a new scene of the set already open - the
+/// same landing a dropped file gets, with the file left as it was.
+#[test]
+fn import_midi_from_the_file_menu_opens_it_as_a_scene() {
+    let mut studio = hermetic();
+    let set = studio.set_directory().to_path_buf();
+    let root = sets_root(&studio);
+    std::fs::create_dir_all(&root).expect("sets root made");
+    let midi = root.join("song.mid");
+    std::fs::write(&midi, midi_bytes()).expect("fixture");
+    let bytes = std::fs::read(&midi).expect("fixture");
+
+    drop_file_menu(&mut studio);
+    studio.press(KeyCode::Char('m'), KeyModifiers::NONE); // Import MIDI…
+    assert_eq!(
+        studio.status(),
+        "import MIDI - Enter opens the file as a new scene · Tab browses · type a path · Esc back"
+    );
+    let rows = studio.rows();
+    let row = row_containing(&rows, "song.mid");
+    assert!(
+        rows[row].contains("MIDI file"),
+        "the file is offered for what it is: {}",
+        rows[row]
+    );
+
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    let status = studio.status();
+    assert!(
+        status.starts_with("imported song.mid - scene 2 (2 bars, 1 note)"),
+        "the status counts what landed: {status}"
+    );
+    assert_eq!(
+        studio.scene_names().as_slice(),
+        ["first", "scene 1"],
+        "the import took up a scene beside the open score"
+    );
+    assert!(
+        set.join("scene 1.strudel").is_file(),
+        "the scene is a score file of the set"
+    );
+    assert_eq!(
+        std::fs::read(&midi).expect("fixture"),
+        bytes,
+        "the import was not written to"
+    );
 }
 
 /// File ▸ Open recent…: the set just left is offered, and Enter goes back

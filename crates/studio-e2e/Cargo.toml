@@ -51,6 +51,8 @@ crossterm = "0.29"
 # of the machine. Its plugin is the fixture of the plugin host tests.
 rustel-runtime = { path = "../runtime", features = ["test-support"] }
 rustel-vst3-fixture = { path = "../vst3-fixture" }
+# The set-file flows write a real Standard MIDI File for the import path.
+rustel-smf = { path = "../smf" }
 
 [features]
 default = []

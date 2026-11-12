@@ -54,6 +54,8 @@ pub enum MenuAction {
     /// Export the open set's scores as one pattern export beside the
     /// sets, in the shape strudel.cc's Patterns tab gives and takes.
     ExportPatterns,
+    /// Import a Standard MIDI File as a new scene of the open set.
+    ImportMidi,
     RenameSet,
     /// Copy the samples this set's scores name into the set's own folder,
     /// so the folder plays on its own wherever it goes.
@@ -1469,6 +1471,7 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
         ]);
     }
     file_items.extend([
+        MenuItem::action(MenuAction::ImportMidi, "Import MIDI\u{2026}", 'm', ""),
         MenuItem::action(MenuAction::RenameSet, "Rename set\u{2026}", 'a', "")
             .enabled(!cx.recording),
         MenuItem::separator(),
@@ -2093,7 +2096,9 @@ mod tests {
 
     /// File ▸ Strudel patterns is one collapsible group: closed it is a
     /// single header, and choosing the header puts its Import and Export
-    /// rows in the same list, drawn under it.
+    /// rows in the same list, drawn under it. A MIDI import is a row of
+    /// its own beside the group, so what a reader looks for under File is
+    /// on the bar, not only on a drop.
     #[test]
     fn the_pattern_group_opens_in_place_in_the_file_menu() {
         let file = |open| {
@@ -2143,6 +2148,20 @@ mod tests {
             ],
             "open, the group's rows sit directly under the header"
         );
+        for items in [&closed, &open] {
+            assert!(
+                items.iter().any(|item| {
+                    item.label == "Import MIDI\u{2026}"
+                        && item.id() == Some(MenuAction::ImportMidi)
+                        && !item.indented
+                }),
+                "a MIDI import sits on File itself: {:?}",
+                items
+                    .iter()
+                    .map(|item| item.label.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     /// Menu accelerators must not advertise Command under any keyboard capability.

@@ -475,6 +475,7 @@ impl App {
             Do::StrudelPatterns => self.patterns_menu_open = !self.patterns_menu_open,
             Do::ImportStrudel => self.open_set_prompt(SetPrompt::ImportStrudel),
             Do::ExportPatterns => self.export_patterns(),
+            Do::ImportMidi => self.open_set_prompt(SetPrompt::ImportMidi),
             Do::RenameSet => self.open_set_prompt(SetPrompt::RenameSet),
             Do::ConsolidateSamples => self.consolidate_samples(),
             Do::DeleteScene => self.arm_delete_scene(),

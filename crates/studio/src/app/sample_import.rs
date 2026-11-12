@@ -116,8 +116,9 @@ fn is_score_path(path: &std::path::Path) -> bool {
         })
 }
 
-/// Whether a dropped file is a Standard MIDI File.
-fn is_midi_path(path: &std::path::Path) -> bool {
+/// Whether a path names a Standard MIDI File: the one rule for the drop
+/// dispatch and the import prompt alike.
+pub(super) fn is_midi_path(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {

@@ -23,7 +23,8 @@
 - Vim mode follows Vim more closely in motions, operators, text objects, Visual mode, search, paste, undo and vimrc files.
 - The studio themes, except rustel-dark, live in [rustel-studio-themes](https://github.com/tzfm/rustel-studio-themes). A build without the `themes` feature keeps rustel-dark.
 - Add MIDI file export. `rustel export --format midi` writes a Type 1 file, one track a lane. Studio adds a MIDI format to the export sheet.
-- Add MIDI file import. `rustel import-midi` writes a score. A dropped `.mid` file opens as a new Studio scene.
+- Add MIDI file import. `rustel import-midi` writes a score. A dropped `.mid` file or File ▸ Import MIDI opens it as a new Studio scene.
+- File ▸ Strudel patterns folds the pattern import and export into one row that opens in place.
 - Fixed: a studio.json that another rustel version wrote keeps its settings.
 - Fixed: the first chord or scale preview sounds, a scale preview keeps its tempo on a slow machine, and a sample preview says when it waits for its sample.
 - Fixed: the first notes of a plugin with a named preset go through it, and a parameter pick works with a partial plugin name.

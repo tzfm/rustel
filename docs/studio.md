@@ -617,7 +617,8 @@ Samples in the set folder are discovered automatically. Use File ▸ Copy
 samples into the set when you need a portable set. A dropped `.vstpreset`
 file goes to the preset folder of its plugin. See
 [Plugins](plugins.md#presets). A dropped `.mid` or `.midi` file becomes a new
-score scene. The MIDI file is not changed. The import writes JavaScript, so it
+score scene, and File ▸ Import MIDI does the same from a path you choose.
+The MIDI file is not changed. The import writes JavaScript, so it
 needs JavaScript mode.
 
 The sample view supports alias changes and file deletion. Check the
