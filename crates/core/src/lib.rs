@@ -9311,11 +9311,13 @@ fn compute_purity(node: &Node) -> purity::Purity {
         // Query-time errors and limits hold no callback or JavaScript, so they
         // stay queryable with no host installed.
         Node::Pure(value) => value_purity(value),
+        // Data holds no callback, and the values of a score are data.
         Node::Sequence(layers) => Purity::merge(
             layers
                 .iter()
-                .flat_map(|layer| layer.steps.iter())
-                .map(|step| value_purity(step.value())),
+                .flat_map(|layer| layer.values())
+                .filter(|value| !value.is_data(0))
+                .map(value_purity),
         ),
         Node::PurePickLookup(_, lookup) => {
             Purity::merge(lookup.patterns().map(|pattern| pattern.purity.clone()))

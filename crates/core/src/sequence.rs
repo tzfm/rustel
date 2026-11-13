@@ -7,20 +7,22 @@
 //! `s("bd*2 hh").bank("tr909").gain(0.8)` is then one node of three haps,
 //! where it was a node for each call, each argument and each location.
 //!
+//! A layer holds the places of its steps apart from their values, and each
+//! value once. A fold that changes values makes each value once and keeps
+//! the places, which the layers of a chain of folds share.
+//!
 //! Each fold reads the graph and runs no query, so it answers under every
 //! settings state as the nodes it stands for do. A fold that would raise a
 //! query error leaves its node in place, which raises the error at each
 //! query.
 
 use crate::compose::ComposeOp;
-use crate::context_keys::ContextKeys;
 use crate::{
-    Combine, Hap, Locations, LookupFlow, Meeting, Node, OwnedHapMapFn, Pattern, PickLookup,
-    QueryLimit, State, TimeSpan, Value, push_budgeted, query_stop_requested, refuse, silence,
-    without_query_signals,
+    Combine, Hap, Locations, LookupFlow, Meeting, Node, OwnedHapMapFn, Pattern, QueryLimit, State,
+    TimeSpan, Value, push_budgeted, query_stop_requested, refuse, silence, without_query_signals,
 };
 use rustel_fraction::Fraction;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// The most steps one layer holds after a fold. A fold that makes more
 /// keeps its own node.
@@ -31,39 +33,13 @@ const MAX_FOLDED_STEPS: usize = 256;
 /// native range.
 const MAX_PERIOD_TERM: i128 = 1 << 20;
 
-/// One step of a [`sequence`]: a hap of each period of its layer.
-#[derive(Clone)]
+/// One step of a [`sequence`], as a caller gives it: a value over a window
+/// of its layer's period, with the source locations its hap carries.
+#[derive(Clone, Debug)]
 pub struct SequenceStep {
-    /// The whole of the hap, as shares of the period.
-    whole: TimeSpan,
-    /// The part of a hap that a meeting cut, inside the whole. `None` for a
-    /// part that is the whole.
-    part: Option<Box<TimeSpan>>,
+    window: TimeSpan,
     value: Value,
     locations: Locations,
-    /// What few haps carry. `None` for a hap of a value and its locations.
-    rest: Option<Box<Rest>>,
-}
-
-/// The fields of a hap that a plain value leaves empty.
-#[derive(Clone)]
-struct Rest {
-    live_controls: [u64; 4],
-    slider_binding: u64,
-    ui_visuals: u64,
-    pick_lookup: Option<Arc<PickLookup>>,
-    keys: ContextKeys,
-}
-
-impl std::fmt::Debug for SequenceStep {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SequenceStep")
-            .field("whole", &self.whole)
-            .field("part", &self.part())
-            .field("value", &self.value)
-            .field("locations", &self.locations)
-            .finish_non_exhaustive()
-    }
 }
 
 impl SequenceStep {
@@ -71,22 +47,20 @@ impl SequenceStep {
     /// period, at `locations`.
     pub fn new(begin: Fraction, end: Fraction, value: Value, locations: Locations) -> Self {
         Self {
-            whole: TimeSpan::new(begin, end),
-            part: None,
+            window: TimeSpan::new(begin, end),
             value,
             locations,
-            rest: None,
         }
     }
 
-    /// Where the part of the step begins, as a share of the period.
+    /// Where the step begins, as a share of the period.
     pub fn begin(&self) -> Fraction {
-        self.part().begin
+        self.window.begin
     }
 
-    /// Where the part of the step ends, as a share of the period.
+    /// Where the step ends, as a share of the period.
     pub fn end(&self) -> Fraction {
-        self.part().end
+        self.window.end
     }
 
     pub fn value(&self) -> &Value {
@@ -97,11 +71,10 @@ impl SequenceStep {
         &self.locations
     }
 
-    /// This step, whole and part, from `begin` to `end`.
+    /// This step from `begin` to `end`.
     pub fn at(&self, begin: Fraction, end: Fraction) -> Self {
         Self {
-            whole: TimeSpan::new(begin, end),
-            part: None,
+            window: TimeSpan::new(begin, end),
             ..self.clone()
         }
     }
@@ -109,66 +82,6 @@ impl SequenceStep {
     /// More locations, after the step's own.
     pub fn locate(&mut self, locations: &[(usize, usize)]) {
         self.locations.extend_from_slice(locations);
-    }
-
-    fn part(&self) -> TimeSpan {
-        self.part.as_deref().copied().unwrap_or(self.whole)
-    }
-
-    /// The hap of this step at `whole` and `part`.
-    fn hap_at(&self, whole: TimeSpan, part: TimeSpan) -> Hap {
-        let mut hap = Hap::new(Some(whole), part, self.value.clone());
-        hap.context = self.locations.clone();
-        if let Some(rest) = &self.rest {
-            hap.live_controls = rest.live_controls;
-            hap.slider_binding = rest.slider_binding;
-            hap.ui_visuals = rest.ui_visuals;
-            hap.pick_lookup = rest.pick_lookup.clone();
-            hap.keys = rest.keys.clone();
-        }
-        hap
-    }
-
-    /// The hap of the period that begins at time zero, with its whole and
-    /// its part as shares of the period.
-    fn hap(&self) -> Hap {
-        self.hap_at(self.whole, self.part())
-    }
-
-    /// The step of `hap`, a hap with a whole.
-    fn of(hap: Hap) -> Option<Self> {
-        let whole = hap.whole?;
-        let plain = hap.live_controls == [0; 4]
-            && hap.slider_binding == 0
-            && hap.ui_visuals == 0
-            && hap.pick_lookup.is_none()
-            && hap.keys.is_empty();
-        Some(Self {
-            whole,
-            part: (hap.part != whole).then(|| Box::new(hap.part)),
-            value: hap.value,
-            locations: hap.context,
-            rest: (!plain).then(|| {
-                Box::new(Rest {
-                    live_controls: hap.live_controls,
-                    slider_binding: hap.slider_binding,
-                    ui_visuals: hap.ui_visuals,
-                    pick_lookup: hap.pick_lookup,
-                    keys: hap.keys,
-                })
-            }),
-        })
-    }
-
-    /// Whether this step and `other` are the same hap, with values that
-    /// `same_value` holds to be the same. Steps that carry more than a
-    /// value and its locations are not compared and are not the same.
-    pub(crate) fn same(&self, other: &Self, same_value: impl Fn(&Value, &Value) -> bool) -> bool {
-        self.rest.is_none()
-            && other.rest.is_none()
-            && (self.whole, self.part()) == (other.whole, other.part())
-            && self.locations == other.locations
-            && same_value(&self.value, &other.value)
     }
 }
 
@@ -180,20 +93,85 @@ pub struct SequenceLayer {
     pub steps: Vec<SequenceStep>,
 }
 
-/// The steps of one layer of a sequence node. Layers that a stack or a
-/// change of speed makes of the same steps share them.
+/// Where one step of a layer is, and which value it holds.
+#[derive(Clone)]
+struct Place {
+    /// The whole of the hap, as shares of the period.
+    whole: TimeSpan,
+    /// The part of a hap that a meeting cut, inside the whole. `None` for a
+    /// part that is the whole.
+    part: Option<Box<TimeSpan>>,
+    /// The place of the step's value among the layer's values.
+    value: u32,
+    /// The locations of the step's own value.
+    locations: Locations,
+}
+
+impl Place {
+    fn part(&self) -> TimeSpan {
+        self.part.as_deref().copied().unwrap_or(self.whole)
+    }
+}
+
+/// One layer of a sequence node: the places of its steps, and each value
+/// of them once. Each hap holds a plain value and its locations: a fold
+/// that would give a hap more keeps its own node.
 #[derive(Clone)]
 pub(crate) struct Layer {
     pub(crate) period: Fraction,
-    pub(crate) steps: Arc<[SequenceStep]>,
+    /// Shared by each layer that a fold makes of the same places.
+    places: Arc<[Place]>,
+    values: Arc<[Value]>,
+    /// The locations of each hap before its step's own: those of the
+    /// constants that the steps met, the last first.
+    before: Locations,
+    /// The locations of each hap after its step's own.
+    after: Locations,
+    /// Whether the part of each step lies in one cycle, in every period: a
+    /// constant, which is another hap in each cycle, then cuts no step.
+    in_cycles: bool,
+    /// The locations of each step's hap, as one list, made at the first
+    /// query of a layer that has locations of its own.
+    contexts: OnceLock<Box<[Locations]>>,
 }
 
 impl From<SequenceLayer> for Layer {
+    /// Equal data values share one place among the values.
     fn from(layer: SequenceLayer) -> Self {
-        Self {
-            period: layer.period,
-            steps: layer.steps.into(),
-        }
+        let mut values: Vec<Value> = Vec::new();
+        let mut known: std::collections::HashMap<u64, Vec<u32>> = std::collections::HashMap::new();
+        let places: Vec<Place> = layer
+            .steps
+            .into_iter()
+            .map(|step| {
+                let same = step.value.is_data(0).then(|| {
+                    let same = known.entry(step.value.data_hash()).or_default();
+                    let found = same
+                        .iter()
+                        .copied()
+                        .find(|index| values[*index as usize].same_data(&step.value));
+                    (same, found)
+                });
+                let value = match same {
+                    Some((_, Some(found))) => found,
+                    other => {
+                        let index = u32::try_from(values.len()).unwrap_or(u32::MAX);
+                        if let Some((same, _)) = other {
+                            same.push(index);
+                        }
+                        values.push(step.value);
+                        index
+                    }
+                };
+                Place {
+                    whole: step.window,
+                    part: None,
+                    value,
+                    locations: step.locations,
+                }
+            })
+            .collect();
+        Self::new(layer.period, places.into(), values.into())
     }
 }
 
@@ -206,30 +184,109 @@ enum SequenceStop {
 }
 
 impl Layer {
-    /// Whether the period is more than zero and the steps are in the order
-    /// of their haps: the part of each lies inside its whole and inside the
-    /// period, begins at or after the part before it and ends at or after
-    /// it, and no part is empty.
+    fn new(period: Fraction, places: Arc<[Place]>, values: Arc<[Value]>) -> Self {
+        Self {
+            in_cycles: lie_in_cycles(period, &places),
+            period,
+            places,
+            values,
+            before: Locations::new(),
+            after: Locations::new(),
+            contexts: OnceLock::new(),
+        }
+    }
+
+    /// This layer with other places, values or locations: the lists of
+    /// locations it made are not those of the new layer.
+    fn with(&self, change: impl FnOnce(&mut Self)) -> Self {
+        let mut layer = Self {
+            contexts: OnceLock::new(),
+            ..self.clone()
+        };
+        change(&mut layer);
+        layer
+    }
+
+    /// Whether the period is more than zero, each step holds one of the
+    /// values, and the steps are in the order of their haps: the part of
+    /// each lies inside its whole and inside the period, begins at or after
+    /// the part before it and ends at or after it, and no part is empty.
     fn is_sound(&self) -> bool {
-        let inside = |step: &SequenceStep| {
-            let (whole, part) = (step.whole, step.part());
-            Fraction::ZERO <= whole.begin
+        let inside = |place: &Place| {
+            let (whole, part) = (place.whole, place.part());
+            (place.value as usize) < self.values.len()
+                && Fraction::ZERO <= whole.begin
                 && whole.begin <= part.begin
                 && part.begin < part.end
                 && part.end <= whole.end
                 && whole.end <= Fraction::ONE
         };
-        let ordered = self
-            .steps
-            .windows(2)
-            .all(|pair| pair[0].begin() <= pair[1].begin() && pair[0].end() <= pair[1].end());
-        self.period > Fraction::ZERO && self.steps.iter().all(inside) && ordered
+        let ordered = self.places.windows(2).all(|pair| {
+            let (a, b) = (pair[0].part(), pair[1].part());
+            a.begin <= b.begin && a.end <= b.end
+        });
+        self.period > Fraction::ZERO && self.places.iter().all(inside) && ordered
+    }
+
+    /// The locations of the hap of step `index`: those before, the step's
+    /// own, then those after.
+    fn context(&self, index: usize) -> Locations {
+        if self.before.is_empty() && self.after.is_empty() {
+            return self.places[index].locations.clone();
+        }
+        let contexts = self.contexts.get_or_init(|| {
+            self.places
+                .iter()
+                .map(|place| {
+                    let mut context = self.before.clone();
+                    context.append(&place.locations);
+                    context.append(&self.after);
+                    context
+                })
+                .collect()
+        });
+        contexts[index].clone()
+    }
+
+    /// The hap of step `index` at `whole` and `part`.
+    fn hap_at(&self, index: usize, whole: TimeSpan, part: TimeSpan) -> Hap {
+        let place = &self.places[index];
+        let mut hap = Hap::new(Some(whole), part, self.values[place.value as usize].clone());
+        hap.context = self.context(index);
+        hap
     }
 
     /// The haps of one period, as a layer with a period of one cycle
     /// answers them for cycle zero.
     pub(crate) fn period_haps(&self) -> Vec<Hap> {
-        self.steps.iter().map(SequenceStep::hap).collect()
+        self.places
+            .iter()
+            .enumerate()
+            .map(|(index, place)| self.hap_at(index, place.whole, place.part()))
+            .collect()
+    }
+
+    /// The values of the steps, each once.
+    pub(crate) fn values(&self) -> &[Value] {
+        &self.values
+    }
+
+    /// Whether this layer and `other` answer the same haps, with values
+    /// that `same_value` holds to be the same.
+    pub(crate) fn same(&self, other: &Self, same_value: impl Fn(&Value, &Value) -> bool) -> bool {
+        let value = |layer: &Self, place: &Place| layer.values.get(place.value as usize).cloned();
+        self.period == other.period
+            && self.before == other.before
+            && self.after == other.after
+            && self.places.len() == other.places.len()
+            && self.places.iter().zip(other.places.iter()).all(|(a, b)| {
+                (a.whole, a.part()) == (b.whole, b.part())
+                    && a.locations == b.locations
+                    && match (value(self, a), value(other, b)) {
+                        (Some(a), Some(b)) => same_value(&a, &b),
+                        _ => false,
+                    }
+            })
     }
 
     /// Push the haps of this layer in `span`.
@@ -268,20 +325,28 @@ impl Layer {
             // The steps that meet the piece. A span of no width asks for the
             // step that holds its one time.
             let instant = begin == end;
-            let first = self.steps.partition_point(|step| step.end() <= begin);
-            let met = self.steps[first..]
-                .partition_point(|step| step.begin() <= begin || (!instant && step.begin() < end));
+            let first = self
+                .places
+                .partition_point(|place| place.part().end <= begin);
+            let met = self.places[first..].partition_point(|place| {
+                let from = place.part().begin;
+                from <= begin || (!instant && from < end)
+            });
             out.reserve(met);
-            for step in &self.steps[first..first + met] {
+            for (index, place) in self.places.iter().enumerate().skip(first).take(met) {
                 let whole = TimeSpan::new(
-                    in_range(cycles_at(at(step.whole.begin)?))?,
-                    in_range(cycles_at(at(step.whole.end)?))?,
+                    in_range(cycles_at(at(place.whole.begin)?))?,
+                    in_range(cycles_at(at(place.whole.end)?))?,
                 );
-                let part = TimeSpan::new(
-                    in_range(cycles_at(at(step.begin())?.max(piece.begin)))?,
-                    in_range(cycles_at(at(step.end())?.min(piece.end)))?,
-                );
-                if !push_budgeted(out, step.hap_at(whole, part)) {
+                // A step that is not cut and lies in the piece is its whole.
+                let part = match &place.part {
+                    None if place.whole.begin >= begin && place.whole.end <= end => whole,
+                    _ => TimeSpan::new(
+                        in_range(cycles_at(at(place.part().begin)?.max(piece.begin)))?,
+                        in_range(cycles_at(at(place.part().end)?.min(piece.end)))?,
+                    ),
+                };
+                if !push_budgeted(out, self.hap_at(index, whole, part)) {
                     return Err(SequenceStop::Query);
                 }
             }
@@ -289,56 +354,79 @@ impl Layer {
         Ok(())
     }
 
-    /// The steps of this layer with a period of a whole count of cycles, or
-    /// of one cycle in a whole count of periods: the bounds of the cycles
-    /// are then at the same places of each period. `None` for more steps
-    /// than a fold makes.
-    fn in_whole_cycles(&self) -> Option<(Fraction, std::borrow::Cow<'_, [SequenceStep]>)> {
+    /// The places of this layer cut at the bounds of the cycles, with their
+    /// period: each part then lies in one cycle. `None` for more steps than
+    /// a fold makes.
+    fn cut_at_cycles(&self) -> Option<(Fraction, Vec<Place>)> {
+        // A period of a whole count of cycles has the bounds of the cycles
+        // at the same places of each period. Any other period has them
+        // there in a count of its turns.
         let (cycles, turns) = (self.period.numer(), self.period.denom());
-        if cycles == 1 || turns == 1 {
-            return Some((self.period, std::borrow::Cow::Borrowed(&self.steps)));
-        }
         let count = usize::try_from(turns).ok()?;
-        if self.steps.len().checked_mul(count)? > MAX_FOLDED_STEPS {
+        if self.places.len().checked_mul(count)? > MAX_FOLDED_STEPS {
             return None;
         }
+        let period = Fraction::int(cycles);
         let turns = Fraction::int(turns);
-        let mut steps = Vec::with_capacity(self.steps.len() * count);
+        let mut places = Vec::with_capacity(self.places.len() * count);
         for turn in 0..count {
             let turn = Fraction::int(i128::try_from(turn).ok()?);
             let at = |share: Fraction| share.checked_add(turn)?.checked_div(turns);
-            let span = |span: TimeSpan| Some(TimeSpan::new(at(span.begin)?, at(span.end)?));
-            for step in self.steps.iter() {
-                steps.push(SequenceStep {
-                    whole: span(step.whole)?,
-                    part: match &step.part {
-                        Some(part) => Some(Box::new(span(**part)?)),
-                        None => None,
-                    },
-                    ..step.clone()
-                });
+            for place in self.places.iter() {
+                let whole = TimeSpan::new(at(place.whole.begin)?, at(place.whole.end)?);
+                let part = place.part();
+                let part = TimeSpan::new(at(part.begin)?, at(part.end)?);
+                // The bounds of the cycles inside the part, in order.
+                let end = part.end.checked_mul(period)?;
+                let mut from = part.begin;
+                let mut bound = from
+                    .checked_mul(period)?
+                    .floor()
+                    .checked_add(Fraction::ONE)?;
+                let mut push = |piece: TimeSpan| {
+                    places.push(Place {
+                        whole,
+                        part: (piece != whole).then(|| Box::new(piece)),
+                        value: place.value,
+                        locations: place.locations.clone(),
+                    });
+                    places.len() <= MAX_FOLDED_STEPS
+                };
+                while bound < end {
+                    let to = bound.checked_div(period)?;
+                    if !push(TimeSpan::new(from, to)) {
+                        return None;
+                    }
+                    from = to;
+                    bound = bound.checked_add(Fraction::ONE)?;
+                }
+                if !push(TimeSpan::new(from, part.end)) {
+                    return None;
+                }
             }
         }
-        Some((Fraction::int(cycles), std::borrow::Cow::Owned(steps)))
+        Some((period, places))
     }
 }
 
-/// The pieces of `part`, a part of a period of `period` cycles, between the
-/// bounds of the cycles. The period is one of [`Layer::in_whole_cycles`].
-fn cycle_pieces(part: TimeSpan, period: Fraction) -> Option<Vec<TimeSpan>> {
-    let begin = part.begin.checked_mul(period)?;
-    let end = part.end.checked_mul(period)?;
-    let mut pieces = Vec::with_capacity(1);
-    let mut from = part.begin;
-    let mut bound = begin.floor().checked_add(Fraction::ONE)?;
-    while bound < end {
-        let to = bound.checked_div(period)?;
-        pieces.push(TimeSpan::new(from, to));
-        from = to;
-        bound = bound.checked_add(Fraction::ONE)?;
+/// Whether the part of each of `places` lies in one cycle, in every turn of
+/// a period of `period` cycles. Read from the period where that is enough:
+/// `false` for a period that only a cut settles.
+fn lie_in_cycles(period: Fraction, places: &[Place]) -> bool {
+    // One cycle holds a whole count of such periods.
+    if period.numer() == 1 {
+        return true;
     }
-    pieces.push(TimeSpan::new(from, part.end));
-    Some(pieces)
+    // A period of a whole count of cycles has their bounds at the same
+    // places of each turn.
+    period.denom() == 1
+        && places.iter().all(|place| {
+            let part = place.part();
+            match (part.begin.checked_mul(period), part.end.checked_mul(period)) {
+                (Some(begin), Some(end)) => end <= begin.floor() + Fraction::ONE,
+                _ => false,
+            }
+        })
 }
 
 /// Values at places that are known when the pattern is built. The steps of
@@ -360,18 +448,24 @@ pub fn sequence(layers: Vec<SequenceLayer>) -> Option<Pattern> {
 
 /// The sequence node of `layers`, when each is sound.
 fn node(layers: Vec<Layer>) -> Option<Pattern> {
-    if !layers.iter().all(Layer::is_sound) {
-        return None;
-    }
+    layers
+        .iter()
+        .all(Layer::is_sound)
+        .then(|| node_of_sound(layers))
+}
+
+/// The sequence node of `layers`, which are sound: a fold of sound layers
+/// that moves no step.
+fn node_of_sound(layers: Vec<Layer>) -> Pattern {
     let layers: Arc<[Layer]> = layers
         .into_iter()
-        .filter(|layer| !layer.steps.is_empty())
+        .filter(|layer| !layer.places.is_empty())
         .collect();
-    Some(if layers.is_empty() {
+    if layers.is_empty() {
         silence()
     } else {
         Pattern::of(Node::Sequence(layers))
-    })
+    }
 }
 
 /// The haps of `layers` in `state`'s span. See [`sequence`].
@@ -397,10 +491,11 @@ pub(crate) fn query_sequence(layers: &[Layer], state: &State) -> Vec<Hap> {
 pub(crate) fn constant_value(layers: &[Layer]) -> Option<&Value> {
     let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
     match layers {
-        [layer] if layer.period == Fraction::ONE => match &*layer.steps {
-            [step] if step.whole == cycle && step.part.is_none() && step.value.is_data(0) => {
-                Some(&step.value)
-            }
+        [layer] if layer.period == Fraction::ONE => match &*layer.places {
+            [place] if place.whole == cycle && place.part.is_none() => layer
+                .values
+                .get(place.value as usize)
+                .filter(|value| value.is_data(0)),
             _ => None,
         },
         _ => None,
@@ -446,6 +541,22 @@ fn folded(pattern: &Pattern) -> Option<&[Layer]> {
     }
 }
 
+/// A hap of a plain value that fills cycle zero, with no location.
+fn cycle_hap(value: Value) -> Hap {
+    let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
+    Hap::new(Some(cycle), cycle, value)
+}
+
+/// Whether `hap` holds a value and its locations and nothing more: what a
+/// step of a sequence holds.
+fn is_plain(hap: &Hap) -> bool {
+    hap.live_controls == [0; 4]
+        && hap.slider_binding == 0
+        && hap.ui_visuals == 0
+        && hap.pick_lookup.is_none()
+        && hap.keys.is_empty()
+}
+
 /// The hap that `values` answers in each cycle, as of cycle zero, when the
 /// graph says it with no query: a `pure` value, at its locations, or a
 /// sequence of one value that fills each cycle.
@@ -454,18 +565,16 @@ fn constant(values: &Pattern) -> Option<Hap> {
         return None;
     }
     match values.node_kind() {
-        Node::Pure(value) if value.is_data(0) => {
-            let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
-            Some(Hap::new(Some(cycle), cycle, value.clone()))
-        }
+        Node::Pure(value) if value.is_data(0) => Some(cycle_hap(value.clone())),
         Node::AddContext(inner, locations) => {
             let mut hap = constant(inner)?;
             hap.context.extend_from_slice(locations);
             Some(hap)
         }
         Node::Sequence(layers) => {
-            constant_value(layers)?;
-            Some(layers[0].steps[0].hap())
+            let mut hap = cycle_hap(constant_value(layers)?.clone());
+            hap.context = layers[0].context(0);
+            Some(hap)
         }
         _ => None,
     }
@@ -477,33 +586,37 @@ fn layers(pattern: &Pattern) -> Option<std::borrow::Cow<'_, [Layer]>> {
     if let Some(layers) = folded(pattern) {
         return Some(std::borrow::Cow::Borrowed(layers));
     }
-    let step = SequenceStep::of(constant(pattern)?)?;
-    Some(std::borrow::Cow::Owned(vec![Layer {
-        period: Fraction::ONE,
-        steps: Arc::new([step]),
-    }]))
+    let hap = constant(pattern)?;
+    let place = Place {
+        whole: hap.whole?,
+        part: None,
+        value: 0,
+        locations: hap.context,
+    };
+    Some(std::borrow::Cow::Owned(vec![Layer::new(
+        Fraction::ONE,
+        Arc::new([place]),
+        Arc::new([hap.value]),
+    )]))
 }
 
-/// Each of `layers` with the steps that `change` gives for each step, as
-/// one sequence. Steps with equal control maps share one map. `None` when
-/// `change` gives none, or raises a query error: the error belongs to each
-/// query of the node that the fold stands for.
-fn refolded(
-    layers: &[Layer],
-    mut change: impl FnMut(&Layer, &mut Vec<SequenceStep>) -> Option<Fraction>,
+/// `layers` with each value that `change` makes of a value of them, as one
+/// sequence. `None` when `change` gives none, or raises a query error: the
+/// error belongs to each query of the node that the fold stands for.
+fn revalued(
+    layers: Vec<Layer>,
+    mut change: impl FnMut(&Value) -> Option<Value>,
 ) -> Option<Pattern> {
     without_query_signals(|| {
-        let mut changed = Vec::with_capacity(layers.len());
-        for layer in layers {
-            let mut steps = Vec::with_capacity(layer.steps.len());
-            let period = change(layer, &mut steps)?;
-            crate::value::share_equal_maps(steps.iter_mut().map(|step| &mut step.value));
-            changed.push(Layer {
-                period,
-                steps: steps.into(),
-            });
-        }
-        node(changed)
+        let layers = layers
+            .into_iter()
+            .map(|mut layer| {
+                let values: Option<Vec<Value>> = layer.values.iter().map(&mut change).collect();
+                layer.values = values?.into();
+                Some(layer)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(node_of_sound(layers))
     })
 }
 
@@ -511,44 +624,36 @@ fn refolded(
 /// [`Pattern::with_added_context`] gives, when `pattern` is a sequence. A
 /// `pure` keeps its own node, which says that it is one.
 pub(crate) fn located(pattern: &Pattern, locations: &[(usize, usize)]) -> Option<Pattern> {
-    refolded(folded(pattern)?, |layer, steps| {
-        steps.extend(layer.steps.iter().map(|step| {
-            let mut step = step.clone();
-            step.locate(locations);
-            step
-        }));
-        Some(layer.period)
-    })
+    let layers = folded(pattern)?
+        .iter()
+        .map(|layer| layer.with(|layer| layer.after.extend_from_slice(locations)))
+        .collect();
+    Some(node_of_sound(layers))
 }
 
 /// `pattern` with each hap changed by `map`, a map that reads no span and
-/// no state, when `pattern` is a sequence or a constant of data values.
+/// no state, when `pattern` is a sequence or a constant of data values and
+/// the map gives a plain value for each.
 pub(crate) fn mapped(pattern: &Pattern, map: &OwnedHapMapFn) -> Option<Pattern> {
-    refolded(&layers(pattern)?, |layer, steps| {
-        for step in layer.steps.iter() {
-            // A value of the script is read through its host, at each query.
-            if !step.value.is_data(0) {
-                return None;
-            }
-            let hap = step.hap();
-            let (whole, part) = (hap.whole, hap.part);
-            if let Some(hap) = map(hap) {
-                // A map that reads no span moves no hap.
-                if (hap.whole, hap.part) != (whole, part) {
-                    return None;
-                }
-                steps.push(SequenceStep::of(hap)?);
-            }
+    let layers = layers(pattern)?.into_owned();
+    revalued(layers, |value| {
+        // A value of the script is read through its host, at each query.
+        if !value.is_data(0) {
+            return None;
         }
-        Some(layer.period)
+        let hap = map(cycle_hap(value.clone()))?;
+        // A map that reads no span moves no hap.
+        let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
+        ((hap.whole, hap.part) == (Some(cycle), cycle) && is_plain(&hap) && hap.context.is_empty())
+            .then_some(hap.value)
     })
 }
 
 /// The `appLeft` of `functions` and `values` by `op`, when `functions` is a
-/// sequence or a constant and `values` is a constant: each step meets the
-/// constant where the step is. The constant is another hap in each cycle,
-/// so a step that crosses a bound of a cycle is cut there, as the meeting
-/// cuts its hap.
+/// sequence or a constant and `values` is a constant of a plain value: each
+/// step meets the constant where the step is. The constant is another hap
+/// in each cycle, so a step that crosses a bound of a cycle is cut there,
+/// as the meeting cuts its hap.
 ///
 /// `None` also for a meeting that [`Meeting::in_place`] does not make, and
 /// for cut steps that are not in the order of time.
@@ -560,20 +665,42 @@ pub(crate) fn applied(
 ) -> Option<Pattern> {
     let layers = layers(functions)?;
     let constant = constant(values)?;
-    let apply = Combine::Composed(op);
-    refolded(&layers, |layer, steps| {
-        let (period, whole_cycles) = layer.in_whole_cycles()?;
-        for step in whole_cycles.iter() {
-            for piece in cycle_pieces(step.part(), period)? {
-                let mut hap = step.hap();
-                let made = Meeting::in_place(&mut hap, &constant, piece, &apply, flow);
-                if !made || steps.len() == MAX_FOLDED_STEPS {
-                    return None;
+    if !is_plain(&constant) {
+        return None;
+    }
+    let cut = layers
+        .iter()
+        .map(|layer| {
+            Some(layer.with(|layer| {
+                // The value side's locations come first.
+                let mut before = constant.context.clone();
+                before.append(&layer.before);
+                layer.before = before;
+            }))
+            .and_then(|layer| {
+                if layer.in_cycles {
+                    return Some(layer);
                 }
-                steps.push(SequenceStep::of(hap)?);
-            }
-        }
-        Some(period)
+                let (period, places) = layer.cut_at_cycles()?;
+                let cut = Layer {
+                    period,
+                    places: places.into(),
+                    in_cycles: true,
+                    ..layer
+                };
+                cut.is_sound().then_some(cut)
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let apply = Combine::Composed(op);
+    // The meeting of a value with the constant's, with no location: the
+    // locations of the constant go before those of each step.
+    let meets = cycle_hap(constant.value.clone());
+    revalued(cut, |value| {
+        let mut hap = cycle_hap(value.clone());
+        let part = hap.part;
+        (Meeting::in_place(&mut hap, &meets, part, &apply, flow) && is_plain(&hap))
+            .then_some(hap.value)
     })
 }
 
@@ -587,7 +714,7 @@ pub(crate) fn stacked(patterns: &[Pattern]) -> Option<Pattern> {
         }
         stacked.extend(layers(pattern)?.iter().cloned());
     }
-    node(stacked)
+    Some(node_of_sound(stacked))
 }
 
 /// `pattern`, `factor` times as fast, when it is a sequence or a constant
@@ -602,13 +729,15 @@ pub(crate) fn faster(pattern: &Pattern, factor: Fraction) -> Option<Pattern> {
     let layers = layers
         .iter()
         .map(|layer| {
+            let period = layer.period.checked_div(factor).filter(small)?;
             Some(Layer {
-                period: layer.period.checked_div(factor).filter(small)?,
-                steps: Arc::clone(&layer.steps),
+                period,
+                in_cycles: lie_in_cycles(period, &layer.places),
+                ..layer.clone()
             })
         })
         .collect::<Option<Vec<_>>>()?;
-    node(layers)
+    Some(node_of_sound(layers))
 }
 
 #[cfg(test)]

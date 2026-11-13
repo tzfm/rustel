@@ -1267,6 +1267,20 @@ impl Value {
         }
     }
 
+    /// A hash of this data value, numbers by their bits. Values that are
+    /// [the same data](Self::same_data) hash the same.
+    pub(crate) fn data_hash(&self) -> u64 {
+        let mut hasher = WordHasher::default();
+        hash_data(self, &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    }
+
+    /// Whether this data value and `other` are the same down to the bits of
+    /// every number.
+    pub(crate) fn same_data(&self, other: &Value) -> bool {
+        same_data(self, other)
+    }
+
     pub fn object(entries: impl IntoIterator<Item = (String, Value)>) -> Self {
         Self::Object(OrderedMap::from_entries(entries))
     }

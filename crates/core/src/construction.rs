@@ -362,15 +362,7 @@ fn same_node<'g>(
         Node::Pure(a) => matches!(right, Node::Pure(b) if same_value(a, b)),
         Node::Sequence(a) => match right {
             Node::Sequence(b) => {
-                a.len() == b.len()
-                    && a.iter().zip(b.iter()).all(|(a, b)| {
-                        a.period == b.period
-                            && a.steps.len() == b.steps.len()
-                            && a.steps
-                                .iter()
-                                .zip(b.steps.iter())
-                                .all(|(a, b)| a.same(b, same_value))
-                    })
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| a.same(b, same_value))
             }
             _ => false,
         },
