@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! rustel-bench run [--quick] [--out report.json] [score or folder]...
-//! rustel-bench compare base.json new.json
+//! rustel-bench compare [--memory-only] base.json new.json
 //! ```
 //!
 //! `run` evaluates and queries each score through a fresh session and
@@ -31,13 +31,21 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("run") => run(&args[1..]),
-        Some("compare") if args.len() == 3 => compare(Path::new(&args[1]), Path::new(&args[2])),
-        _ => {
-            println!("usage: rustel-bench run [--quick] [--out FILE] [SCORE|FOLDER]...");
-            println!("       rustel-bench compare BASE.json NEW.json");
-            ExitCode::from(2)
-        }
+        Some("compare") => match &args[1..] {
+            [base, new] => compare(Path::new(base), Path::new(new), report::Gate::All),
+            [flag, base, new] if flag == "--memory-only" => {
+                compare(Path::new(base), Path::new(new), report::Gate::MemoryOnly)
+            }
+            _ => usage(),
+        },
+        _ => usage(),
     }
+}
+
+fn usage() -> ExitCode {
+    println!("usage: rustel-bench run [--quick] [--out FILE] [SCORE|FOLDER]...");
+    println!("       rustel-bench compare [--memory-only] BASE.json NEW.json");
+    ExitCode::from(2)
 }
 
 fn run(args: &[String]) -> ExitCode {
@@ -79,7 +87,7 @@ fn run(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn compare(base: &Path, new: &Path) -> ExitCode {
+fn compare(base: &Path, new: &Path, gate: report::Gate) -> ExitCode {
     let read = |path: &Path| {
         std::fs::read_to_string(path)
             .map_err(|error| error.to_string())
@@ -87,7 +95,7 @@ fn compare(base: &Path, new: &Path) -> ExitCode {
     };
     match (read(base), read(new)) {
         (Ok(base), Ok(new)) => {
-            let regressions = report::regressions(&base, &new);
+            let regressions = report::regressions(&base, &new, gate);
             for line in &regressions {
                 println!("{line}");
             }

@@ -143,9 +143,18 @@ impl Tolerance {
     }
 }
 
+/// Which measures a comparison gates on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    All,
+    /// Counts and bytes only, for runs made on shared machines whose time
+    /// moves with their neighbours' load.
+    MemoryOnly,
+}
+
 /// Every seam that got worse from `base` to `new` past its tolerance, and
 /// every score that evaluated in `base` and fails in `new`.
-pub fn regressions(base: &Report, new: &Report) -> Vec<String> {
+pub fn regressions(base: &Report, new: &Report, gate: Gate) -> Vec<String> {
     let mut out = Vec::new();
     for (score, base_seams) in &base.scores {
         let Ok(base_seams) = base_seams else {
@@ -188,7 +197,8 @@ pub fn regressions(base: &Report, new: &Report) -> Vec<String> {
                 ("peak", &PEAK, base_cost.peak as f64, new_cost.peak as f64),
             ];
             for (measure, tolerance, before, after) in checks {
-                if tolerance.exceeded(before, after) {
+                let timed = matches!(measure, "cpu" | "wall");
+                if (gate == Gate::All || !timed) && tolerance.exceeded(before, after) {
                     out.push(format!(
                         "{} {seam} {measure}: {before:.0} -> {after:.0}",
                         short(score)
@@ -207,7 +217,7 @@ fn short(score: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{Report, regressions};
+    use super::{Gate, Report, regressions};
     use crate::measure::Cost;
 
     fn report(allocations: u64, held: i64) -> Report {
@@ -228,13 +238,13 @@ mod tests {
     #[test]
     fn growth_past_a_tolerance_is_a_regression_and_a_round_trip_keeps_it() {
         let base = Report::from_json(&report(1000, 1 << 20).to_json()).expect("a report");
-        assert!(regressions(&base, &report(1010, 1 << 20)).is_empty());
-        let worse = regressions(&base, &report(1100, 2 << 20));
+        assert!(regressions(&base, &report(1010, 1 << 20), Gate::All).is_empty());
+        let worse = regressions(&base, &report(1100, 2 << 20), Gate::MemoryOnly);
         assert_eq!(worse.len(), 2, "{worse:?}");
         let mut failed = report(1000, 1 << 20);
         failed.scores[1].1 = Err("refused".into());
         assert_eq!(
-            regressions(&base, &failed),
+            regressions(&base, &failed, Gate::All),
             ["b.strudel: now fails: refused"]
         );
     }
