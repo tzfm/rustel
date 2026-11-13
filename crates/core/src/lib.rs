@@ -68,7 +68,6 @@ impl TimeSpan {
 
     /// Splits the span at cycle boundaries.
     pub fn span_cycles(&self) -> Vec<TimeSpan> {
-        let mut spans = Vec::new();
         let mut begin = self.begin;
         let end = self.end;
         let end_sam = end.sam();
@@ -85,13 +84,18 @@ impl TimeSpan {
         //
         // The failure travels on the typed resource-refusal channel so a
         // caller cannot mistake an uncomputed oversized query for silence.
-        if self.cycle_count_exceeds(MAX_QUERY_SPAN_CYCLES) {
+        let Some(count) = self
+            .cycle_count()
+            .filter(|count| *count <= MAX_QUERY_SPAN_CYCLES)
+        else {
             refuse(QueryLimit::QuerySpan {
                 cycles: MAX_QUERY_SPAN_CYCLES,
             });
             return Vec::new();
-        }
+        };
 
+        // The count is at most the limit above, so it is a size.
+        let mut spans = Vec::with_capacity(usize::try_from(count).unwrap_or_default());
         while end > begin {
             if begin.sam() == end_sam {
                 spans.push(TimeSpan::new(begin, self.end));
@@ -104,13 +108,14 @@ impl TimeSpan {
         spans
     }
 
-    /// Would `span_cycles` produce more than `limit` entries?
+    /// How many entries `span_cycles` produces for a span with a width, or
+    /// `None` for a count outside the native range.
     ///
     /// Computed from the endpoints, never by iterating - iteration is the
     /// thing being guarded against.
-    fn cycle_count_exceeds(&self, limit: i128) -> bool {
+    fn cycle_count(&self) -> Option<i128> {
         if self.end <= self.begin {
-            return false;
+            return Some(0);
         }
         // `span_cycles` emits one entry for every integer cycle bucket the
         // half-open span touches. `ceil(end) - floor(begin)` is that count
@@ -118,9 +123,7 @@ impl TimeSpan {
         // either edge was fractional.
         let first_cycle = self.begin.floor().numer();
         let after_last_cycle = self.end.ceil().numer();
-        after_last_cycle
-            .checked_sub(first_cycle)
-            .is_none_or(|count| count > limit)
+        after_last_cycle.checked_sub(first_cycle)
     }
 
     pub fn duration(&self) -> Fraction {
@@ -3073,7 +3076,13 @@ pub(crate) fn push_budgeted(out: &mut Vec<Hap>, hap: Hap) -> bool {
 /// Returns `None` once the budget is spent, so callers propagate rather than
 /// truncate.
 pub(crate) fn extend_budgeted<T>(branches: impl IntoIterator<Item = Vec<T>>) -> Option<Vec<T>> {
-    let mut out: Vec<T> = Vec::new();
+    let mut branches = branches.into_iter();
+    // The first branch is the answer so far, where it is.
+    let mut out: Vec<T> = branches.next().unwrap_or_default();
+    if !charge_haps(out.len()) {
+        return None;
+    }
+    note_accumulated(out.len());
     for branch in branches {
         if !charge_haps(out.len() + branch.len()) {
             return None;
@@ -5267,7 +5276,7 @@ impl<'a> ApplicationRun<'a> {
         let haps = self.base.query(state);
         // The unions are made for the query, which a few haps do not repay.
         let unions = (haps.len() >= UNIONS_REPAY_FROM).then(|| self.meetings());
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(haps.len());
         for mut hf in haps {
             let met = hf.whole_or_part();
             let mut taken = 0;
@@ -6484,8 +6493,9 @@ impl Pattern {
                     return run.query(state);
                 }
                 let mut meetings = Meetings::default();
-                let mut out = Vec::new();
-                for hf in side.functions.query(state) {
+                let functions = side.functions.query(state);
+                let mut out = Vec::with_capacity(functions.len());
+                for hf in functions {
                     if !side.meet(hf, &mut meetings, state, &mut out) {
                         return Vec::new();
                     }
@@ -9639,13 +9649,14 @@ impl SequenceLayer {
             let turn = piece.begin.sam();
             let begin = in_range(piece.begin.checked_sub(turn))?;
             let end = in_range(piece.end.checked_sub(turn))?;
-            // A span of no width asks for the step that holds its one time.
+            // The steps that meet the piece. A span of no width asks for the
+            // step that holds its one time.
             let instant = begin == end;
             let first = self.steps.partition_point(|step| step.end <= begin);
-            for step in &self.steps[first..] {
-                if step.begin > begin && (instant || step.begin >= end) {
-                    break;
-                }
+            let met = self.steps[first..]
+                .partition_point(|step| step.begin <= begin || (!instant && step.begin < end));
+            out.reserve(met);
+            for step in &self.steps[first..first + met] {
                 let from = in_range(turn.checked_add(step.begin))?;
                 let to = in_range(turn.checked_add(step.end))?;
                 let whole = TimeSpan::new(in_range(cycles_at(from))?, in_range(cycles_at(to))?);
