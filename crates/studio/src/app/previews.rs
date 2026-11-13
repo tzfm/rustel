@@ -69,30 +69,37 @@ pub(super) struct SnippetPreview {
     /// when the studio was silent and the snippet is playing alone.
     pub(super) restore: Option<(Arc<str>, Revision)>,
     pub(super) scene: SceneId,
-    /// That the count has seen this preview's own clock: the first
-    /// snapshot whose `source_revision` is the preview's. The count and
-    /// the strip ride the snapshot's clock, and a snapshot sampled before
-    /// the install's cutover still carries the outgoing one - counting on
-    /// it counts the wrong bar, and the install's rebased zero arriving
-    /// afterwards reads as the clock jumping backward. Only from the first
-    /// snapshot that names this revision is the cycle the preview's.
-    pub(super) clock_owned: std::cell::Cell<bool>,
-    /// Where the count-in's watch-keeping stands: the cycle line it is
-    /// counting to, once it has one. A count read straight off the
-    /// running clock re-arms at the very line it just counted to, so
-    /// whenever the preview's first mark goes unmapped it would tally the
-    /// next bar and the one after - the countdown the ear misses and
-    /// hears start again. Capturing the line on the first look, and
-    /// landing when the clock reaches it, ends the wait once and for all.
-    pub(super) count_in_target: std::cell::Cell<Option<f64>>,
-    /// That the wait is over for good: the line was crossed (or is here),
-    /// so no count again for this preview. Dies with it, so the next one
-    /// counts afresh.
-    pub(super) count_in_landed: std::cell::Cell<bool>,
+    /// Where the count-in stands. It dies with the preview, so the next
+    /// one counts afresh.
+    pub(super) count_in: std::cell::Cell<CountIn>,
+}
+
+/// Where a preview's count-in stands. It only moves forward.
+#[cfg(feature = "hydra")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum CountIn {
+    /// No line is captured yet. A snapshot sampled before the install's
+    /// cutover still carries the outgoing score's revision and clock, and
+    /// a count on it counts the wrong bar.
+    Waiting,
+    /// Counting down to this cycle line, captured on the first counting
+    /// look. A count read straight off the running clock moves on to the
+    /// next line at the line it just counted to, and the ear hears the
+    /// count start again.
+    Counting { target: f64 },
+    /// The line was reached or passed, or a mark of this preview's own
+    /// layout was drawn. No count again for this preview.
+    Landed,
 }
 
 #[cfg(feature = "hydra")]
 impl SnippetPreview {
+    /// A mark of this preview's own layout was drawn. The sound is
+    /// audible, so the count is over.
+    pub(super) fn heard(&self) {
+        self.count_in.set(CountIn::Landed);
+    }
+
     fn is_generator(&self) -> bool {
         matches!(
             self.row,
@@ -491,6 +498,27 @@ impl App {
             return;
         }
         let playing = self.is_playing() && !self.is_stopping() && !self.stop_requested;
+        // A preview never sets the tempo. Under a set it plays along, on
+        // the set's clock and its cycle line, so what you hear is how the
+        // snippet will sit in the music. In silence it plays at whatever
+        // the studio is at - 120 until something says otherwise - so two
+        // snippets heard one after the other can be compared rather than
+        // each arriving at a tempo of its own. The `setcps` stays in the
+        // text on the shelf, so taking the snippet still brings the tempo
+        // it was written at.
+        let (block, lines) = if generator {
+            self.generator_preview_epoch += 1;
+            self.generator_feedback_since = Some(Instant::now());
+            generator_preview_block(code, self.generator_preview_epoch)
+        } else {
+            preview_block(code)
+        };
+        // Checked before the sounding preview is taken: a block with
+        // nothing to play leaves that preview and its restore alone.
+        if block.trim().is_empty() {
+            self.toast("nothing to preview");
+            return;
+        }
         // One preview at a time. With one already sounding, the score this
         // is measured against is the one under that - what is installed
         // now is the score with the last snippet on the end of it, and
@@ -514,25 +542,6 @@ impl App {
                     (score, revision)
                 }),
         };
-        // A preview never sets the tempo. Under a set it plays along, on
-        // the set's clock and its cycle line, so what you hear is how the
-        // snippet will sit in the music. In silence it plays at whatever
-        // the studio is at - 120 until something says otherwise - so two
-        // snippets heard one after the other can be compared rather than
-        // each arriving at a tempo of its own. The `setcps` stays in the
-        // text on the shelf, so taking the snippet still brings the tempo
-        // it was written at.
-        let (block, lines) = if generator {
-            self.generator_preview_epoch += 1;
-            self.generator_feedback_since = Some(Instant::now());
-            generator_preview_block(code, self.generator_preview_epoch)
-        } else {
-            preview_block(code)
-        };
-        if block.trim().is_empty() {
-            self.toast("nothing to preview");
-            return;
-        }
         let scene = under
             .as_ref()
             .and(self.audible_scene)
@@ -582,12 +591,11 @@ impl App {
         // join a playing set at the next cycle; auditioning alone has no
         // external cycle to wait for.
         let alone = under.is_none();
-        self.next_launch = if generator && !alone {
+        let launch = if generator && !alone {
             Launch::Quantised { unit_cycles: 1.0 }
         } else {
             Launch::Now
         };
-        self.snippet_heard = false;
         let row = self.reference_panel.as_ref().and_then(|panel| {
             if panel.tab == Tab::Generator {
                 Some(super::super::reference::SnippetLine::Generator(
@@ -608,9 +616,7 @@ impl App {
             offset,
             restore: under,
             scene,
-            clock_owned: std::cell::Cell::new(false),
-            count_in_target: std::cell::Cell::new(None),
-            count_in_landed: std::cell::Cell::new(false),
+            count_in: std::cell::Cell::new(CountIn::Waiting),
         });
         self.refresh_preview_readiness();
         // Installing the next one does not silence the last: a reload
@@ -626,6 +632,7 @@ impl App {
         // same breath and cutting them would tear a hole in the
         // performance. Generated voices carry an ownership token, so they
         // are replaced at the new preview's onset without cutting the set.
+        let mut rewind = false;
         if alone {
             if replacing && !generator && !self.worker.try_cut_sounding() {
                 self.log.push(
@@ -652,8 +659,9 @@ impl App {
             // the same step the pattern takes, so the whole snippet is
             // queried whatever the engine is doing. Under a set the clock
             // is the set's and is not touched.
-            self.next_rewind = !generator || !replacing || !playing;
+            rewind = !generator || !replacing || !playing;
         }
+        self.next_evaluation = LaunchRequest { launch, rewind };
         self.queue_evaluation_for(scene, revision, source, false);
         self.status = if alone {
             "previewing the snippet".into()
@@ -769,8 +777,8 @@ impl App {
     /// The count is latched on the preview:
     ///
     /// ```text
-    ///  other clock --(1)--> counting --(2)--> landed
-    ///  returns None         "4" .. "1"        returns None
+    ///  waiting --(1)--> counting --(2)--> landed
+    ///  returns None     "4" .. "1"        returns None
     /// ```
     ///
     /// (1) The first snapshot whose `source_revision` names this preview
@@ -793,9 +801,11 @@ impl App {
         if preview.is_generator() && preview.restore.is_none() {
             return None;
         }
-        if self.snippet_heard || preview.count_in_landed.get() {
-            return None;
-        }
+        let captured = match preview.count_in.get() {
+            CountIn::Landed => return None,
+            CountIn::Counting { target } => Some(target),
+            CountIn::Waiting => None,
+        };
         let snapshot = self.snapshot.as_ref()?;
         if !snapshot.playing || snapshot.stopping || !snapshot.cycle.is_finite() {
             return None;
@@ -806,32 +816,28 @@ impl App {
             // outgoing score's bar would be counting to the wrong line.
             return None;
         }
-        preview.clock_owned.set(true);
         // Already standing on the line (or a hair past it): a fresh
         // install's zero can land between two polls, and a count that
         // started at 4 for a downbeat already here reads as broken. The
         // epsilon is in cycles, the same order the beat math below uses.
         const ON_LINE: f64 = 0.0125;
         if snapshot.cycle >= -ON_LINE && snapshot.cycle.fract() <= ON_LINE {
-            preview.count_in_landed.set(true);
+            preview.count_in.set(CountIn::Landed);
             return None;
         }
         // The line this count is counting to: the next whole cycle. A
         // clock not yet at its anchor (a fresh start's preroll) sits
         // below zero, and `ceil` takes it to zero - the downbeat itself.
-        let target = preview
-            .count_in_target
-            .get()
-            .unwrap_or_else(|| snapshot.cycle.ceil());
+        let target = captured.unwrap_or_else(|| snapshot.cycle.ceil());
         if snapshot.cycle >= target {
             // The line is here - possibly it passed between two polls.
             // What was counted stays counted: past it the preview is in
             // the music, and however the pattern falls from here is the
             // pattern's, not a wait.
-            preview.count_in_landed.set(true);
+            preview.count_in.set(CountIn::Landed);
             return None;
         }
-        preview.count_in_target.set(Some(target));
+        preview.count_in.set(CountIn::Counting { target });
         // Beats to the line is what remains of the cycle, times four. The
         // count is said as its bare number.
         let beats_left = (target - snapshot.cycle) * 4.0;
@@ -883,11 +889,15 @@ impl App {
         let Some(preview) = self.snippet_preview.take() else {
             return false;
         };
+        let playing = self.is_playing() && !self.is_stopping() && !self.stop_requested;
         match preview.restore {
-            Some((score, revision)) => {
+            Some((score, revision)) if playing => {
                 self.queue_evaluation_for(preview.scene, revision, score, false);
                 self.status = "preview stopped; the score plays on".into();
             }
+            // The set it was playing under has stopped since. Putting the
+            // score back would start music nobody asked to hear again.
+            Some(_) => self.status = "preview stopped".into(),
             None => {
                 self.stop_requested = true;
                 self.worker.request_stop();
@@ -896,6 +906,14 @@ impl App {
         }
         self.dirty_frame = true;
         true
+    }
+
+    /// End the snippet audition. The preview is no longer what sounds, and
+    /// a generator edit still owed does not open it again.
+    #[cfg(feature = "hydra")]
+    pub(super) fn end_snippet_audition(&mut self) {
+        self.snippet_preview = None;
+        self.generator_preview_pending = false;
     }
 
     /// Silence whatever the browser was auditioning, without a word about
@@ -1206,7 +1224,7 @@ mod tests {
     mod generator {
         //! Tests for generator.
 
-        use crate::app::previews::{SNIPPET_PREVIEW_BANNER, generator_preview_block};
+        use crate::app::previews::{CountIn, SNIPPET_PREVIEW_BANNER, generator_preview_block};
         use crate::app::*;
         use crate::ideas::{Direction, Generator, Row};
 
@@ -1316,7 +1334,10 @@ mod tests {
                 assert!(app.snippet_preview.as_ref().unwrap().restore.is_none());
                 install_generator_preview(&mut app, cycle);
                 // A sparse pattern or disabled highlights need not report a mark.
-                assert!(!app.snippet_heard);
+                assert_ne!(
+                    app.snippet_preview.as_ref().unwrap().count_in.get(),
+                    CountIn::Landed
+                );
                 assert!(app.preview_count_in().is_none());
                 let settled = app.generator_feedback_since.unwrap() + Duration::from_millis(250);
                 assert!(app.snippet_preview_note_at(settled).is_none());
@@ -3137,7 +3158,7 @@ mod tests {
             // being waited for has arrived.
             snapshot.cycle = 0.4;
             app.snapshot = Some(snapshot);
-            app.snippet_heard = true;
+            app.snippet_preview.as_ref().expect("preview").heard();
             assert!(app.snippet_preview_note().is_none());
         }
 
@@ -3251,7 +3272,6 @@ mod tests {
                 .snippet_preview
                 .as_ref()
                 .map(|preview| preview.revision.clone());
-            app.snippet_heard = false;
             app.snippet_preview.as_mut().expect("preview").readiness = Some(Readiness::default());
             snapshot.source_revision = app
                 .snippet_preview
@@ -3337,7 +3357,6 @@ mod tests {
                 .snippet_preview
                 .as_ref()
                 .map(|preview| preview.revision.clone());
-            app.snippet_heard = false;
             app.snippet_preview.as_mut().expect("preview").readiness = Some(Readiness::default());
             let mut snapshot = sounding(true, false);
             snapshot.source_revision = app
@@ -3405,6 +3424,94 @@ mod tests {
             );
         }
 
+        /// A preview that replaces another counts in on its own clock. The
+        /// marks of the outgoing composite fall past the same offset, but
+        /// they are the other snippet's. They do not light the new row, and
+        /// they do not end its count.
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn a_replacing_preview_counts_in_despite_the_outgoing_marks() {
+            use rustel_runtime::ui_events::{UiEventBatch, UiScheduledEvent};
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let scene = app.scenes.current().id;
+            let score = Arc::<str>::from("$: s(\"bd\")");
+            app.snapshot = Some(sounding(true, false));
+            app.installed_revision = Some(source_revision(&score));
+            app.audible_scene = Some(scene);
+            app.visual_revision = Some(app.editor().revision());
+            app.evaluated_source = Some(Arc::clone(&score));
+
+            // The first preview plays under the score, and its marks light
+            // its row.
+            app.preview_snippet_score("$: s(\"hh*8\")");
+            let first = app.snippet_preview.clone().expect("the first preview");
+            app.pending_evaluation = None;
+            app.inflight.clear();
+            let layout =
+                rustel_runtime::ui_events::visual_layout(&first.source, 1).expect("layout");
+            app.handle_control(StudioControlEvent::Layout(layout.clone()));
+            app.visual.start();
+            let event = UiScheduledEvent {
+                onset_id: 1,
+                generation: 1,
+                whole_begin: "0/1".into(),
+                whole_end: "100/1".into(),
+                part_begin: "0/1".into(),
+                part_end: "100/1".into(),
+                target_time: 10.0,
+                duration_seconds: 100.0,
+                value: Some("hh".into()),
+                color: None,
+                label: Some("hh".into()),
+                active_label: None,
+                scale: None,
+                frequency_hz: None,
+                gain: Some(1.0),
+                sample: None,
+                ui_visuals: 0,
+                context: vec![(first.offset + 3, first.offset + 5)],
+            };
+            assert!(
+                app.visual.install_batch(
+                    UiEventBatch::new(
+                        10.0,
+                        0.0,
+                        1.0,
+                        1,
+                        layout.ui_layout.source_revision.clone(),
+                        vec![event],
+                        0,
+                    )
+                    .expect("batch")
+                )
+            );
+            app.refresh_decorations();
+            assert!(!app.snippet_marks.is_empty(), "the first preview lights");
+
+            // The second replaces it. Its composite is on its way, and the
+            // layout is still the first one's.
+            app.preview_snippet_score("$: s(\"cp*4\")");
+            app.refresh_decorations();
+            assert!(
+                app.snippet_marks.is_empty(),
+                "the outgoing marks lit the new row"
+            );
+
+            // The second cuts over mid-bar, and counts in to its line.
+            app.pending_evaluation = None;
+            app.inflight.clear();
+            let second = app.snippet_preview.clone().expect("the second preview");
+            app.snippet_preview.as_mut().expect("preview").readiness = Some(Readiness::default());
+            app.installed_revision = Some(second.revision.clone());
+            let mut snapshot = sounding(true, false);
+            snapshot.cycle = 0.25;
+            snapshot.source_revision = Some(second.revision.clone());
+            app.snapshot = Some(snapshot);
+            let (note, _) = app.snippet_preview_note().expect("a count");
+            assert_eq!(note, "3");
+        }
+
         /// A preview alone plays the snippet from its beginning. The install
         /// itself carries the from-zero flag, and the flag does not stay set
         /// for the next evaluation. It is of no scene.
@@ -3437,7 +3544,10 @@ mod tests {
 
             // The flag is spent on the install it rode in on: it must not sit
             // waiting to rewind whatever is evaluated next.
-            assert!(!app.next_rewind, "the flag went with the preview");
+            assert!(
+                !app.next_evaluation.rewind,
+                "the flag went with the preview"
+            );
         }
 
         /// Under a playing score, a previewed snippet joins the cycle where it
@@ -3470,7 +3580,10 @@ mod tests {
                 (true, scene.0),
                 "under a score, the snippet is a part of its scene"
             );
-            assert!(!app.next_rewind, "and no flag lingers after it either");
+            assert!(
+                !app.next_evaluation.rewind,
+                "and no flag lingers after it either"
+            );
         }
 
         /// Stopping the set forgets what a preview was playing under, so
@@ -3658,9 +3771,7 @@ mod tests {
                 offset: 100,
                 restore: None,
                 scene: SceneId(0),
-                clock_owned: std::cell::Cell::new(false),
-                count_in_target: std::cell::Cell::new(None),
-                count_in_landed: std::cell::Cell::new(false),
+                count_in: std::cell::Cell::new(CountIn::Waiting),
             };
             // The second played line, four bytes in: `s("hh*8")`.
             let at = block.find("s(\"hh*8\")").expect("the line");

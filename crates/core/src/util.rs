@@ -103,6 +103,18 @@ pub fn note_to_midi(note: &str, default_octave: i32) -> Result<f64, String> {
     )
 }
 
+/// A MIDI note number as a name, for a display a musician can read.
+///
+/// Octave numbering matches [`note_to_midi`]'s: middle C (60) is c4 there, so
+/// note 0 is c-1.
+pub fn note_name(note: u8) -> String {
+    const NAMES: [&str; 12] = [
+        "c", "c#", "d", "d#", "e", "f", "f#", "g", "g#", "a", "a#", "b",
+    ];
+    let octave = i32::from(note) / 12 - 1;
+    format!("{}{}", NAMES[usize::from(note % 12)], octave)
+}
+
 pub fn midi_to_freq(n: f64) -> f64 {
     2f64.powf((n - 69.0) / 12.0) * 440.0
 }
@@ -338,6 +350,14 @@ mod tests {
         assert!(note_to_midi("c+4", 3).is_err());
         assert_eq!(midi_to_freq(57.0), 220.0);
         assert_eq!(freq_to_midi(220.0), 57.0);
+    }
+
+    #[test]
+    fn note_names_line_up_with_note_to_midi() {
+        assert_eq!(note_name(60), "c4");
+        assert_eq!(note_name(48), "c3");
+        assert_eq!(note_name(69), "a4");
+        assert_eq!(note_name(0), "c-1");
     }
 
     #[test]

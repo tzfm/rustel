@@ -99,9 +99,7 @@ impl LiveScalarDevice {
         prepared.start_gated()?;
         let facts = &prepared.facts;
         let mut device = Self {
-            stream: None,
-            callback_gate: None,
-            silent: None,
+            output: None,
             input: None,
             reverb_cache: std::sync::Mutex::new(vec![None; crate::scalar::MAX_ORBITS]),
             fx_reverb_cache: std::sync::Mutex::new(Vec::with_capacity(8)),
@@ -140,7 +138,6 @@ impl LiveScalarDevice {
             tripwire_baseline: prepared.tripwire_baseline,
             tripwire_canaries: tripwire::Violations::default(),
             backend_bytes: 0,
-            backend: None,
         };
         device.activate_prepared(prepared)?;
         Ok(device)
@@ -151,26 +148,47 @@ impl LiveScalarDevice {
         mut prepared: PreparedLiveOutput,
     ) -> Result<(), DevicePlaybackError> {
         let backend_bytes = prepared.backend_bytes;
-        let callback_gate = Arc::clone(&prepared.gate);
+        let gate = Arc::clone(&prepared.gate);
         let backend = prepared.backend.take();
-        match prepared.activate()? {
-            OutputHandle::Native(stream) => self.stream = Some(stream),
-            OutputHandle::Silent(silent) => self.silent = Some(silent),
-        }
-        self.callback_gate = Some(callback_gate);
-        self.backend = backend;
+        let handle = prepared.activate()?;
+        self.output = Some(OpenOutput {
+            handle,
+            gate,
+            backend,
+        });
         self.backend_bytes = backend_bytes;
         Ok(())
     }
 
+    /// Asks the music to stop and closes the output, then gives each insert
+    /// of its backend back on the producer. After the close no callback
+    /// thread of the output runs, so a replacement stream never runs beside
+    /// it and only one thread touches `LiveShared`.
+    fn close_output(&mut self) {
+        self.shared.request_stop();
+        let backend = self.output.take().and_then(OpenOutput::close);
+        self.hand_back_inserts(backend);
+    }
+
+    /// The thread of the output, when the output is silent.
+    fn silent_handle(&self) -> Option<&SilentHandle> {
+        match &self.output {
+            Some(OpenOutput {
+                handle: OutputHandle::Silent(silent),
+                ..
+            }) => Some(silent),
+            _ => None,
+        }
+    }
+
     pub fn is_silent(&self) -> bool {
-        self.silent.is_some()
+        self.silent_handle().is_some()
     }
 
     /// Whether an output handle is still owned. Unlike health, this separates
     /// an untouched but unhealthy stream from failed replacement after teardown.
     pub fn has_output(&self) -> bool {
-        self.stream.is_some() || self.silent.is_some()
+        self.output.is_some()
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -180,10 +198,23 @@ impl LiveScalarDevice {
     /// Open the audio input - the host default, or a named device - so
     /// `s("in")` voices have something to read. The input runs on its own
     /// stream beside the output (or beside the silent output); its frames
-    /// go into a ring the backend reads a little behind.
+    /// go into a ring the backend reads a little behind. The open input
+    /// closes first, and a failed open leaves the input closed.
     pub fn open_input(&mut self, selector: Option<&str>) -> Result<String, DevicePlaybackError> {
-        self.input = None;
-        let input = AudioInput::open(
+        self.open_input_with(selector, AudioInput::open)
+    }
+
+    fn open_input_with(
+        &mut self,
+        selector: Option<&str>,
+        open: impl FnOnce(
+            Option<&str>,
+            Arc<crate::input::InputRing>,
+            Option<u32>,
+        ) -> Result<AudioInput, DevicePlaybackError>,
+    ) -> Result<String, DevicePlaybackError> {
+        self.close_input();
+        let input = open(
             selector,
             Arc::clone(&self.shared.input),
             Some(self.sample_rate),
@@ -289,19 +320,12 @@ impl LiveScalarDevice {
 
 impl Drop for LiveScalarDevice {
     fn drop(&mut self) {
-        self.shared.request_stop();
-        if let Some(gate) = self.callback_gate.take() {
-            gate.retire();
-        }
-        if let Some(mut silent) = self.silent.take() {
-            silent.stop();
-        }
         // Finish the output owner before publishing retirement to any
-        // producer endpoint retained beyond this device's lifetime.
-        self.stream = None;
-        // No callback runs now, so no job is out. Each insert goes back
-        // here, then the plugin workers end, both on the producer.
-        self.hand_back_inserts();
+        // producer endpoint retained beyond this device's lifetime. No
+        // callback runs after the close, so no job is out. Each insert goes
+        // back in the close, then the plugin workers end, both on the
+        // producer.
+        self.close_output();
         drop(
             self.plugin_pool
                 .get_mut()
@@ -452,6 +476,20 @@ impl PreparedLiveOutput {
     }
 }
 
+impl OpenOutput {
+    /// Retires the callback, then stops the silent thread or drops the
+    /// stream, which joins the callback thread. Gives back the backend,
+    /// which only the producer uses from here.
+    fn close(self) -> Option<Arc<BackendCell>> {
+        self.gate.retire();
+        match self.handle {
+            OutputHandle::Silent(mut silent) => silent.stop(),
+            OutputHandle::Native(stream) => drop(stream),
+        }
+        self.backend
+    }
+}
+
 impl SilentHandle {
     /// Stop the thread and wait for it to leave `LiveShared`, so a
     /// replacement stream never runs concurrently with it.
@@ -474,7 +512,7 @@ impl LiveScalarDevice {
     /// false, doing nothing, when this device is not a running silent output.
     #[doc(hidden)]
     pub fn hold_silent_clock_for_test(&self, hold: bool) -> bool {
-        let Some(silent) = self.silent.as_ref().filter(|silent| silent.join.is_some()) else {
+        let Some(silent) = self.silent_handle().filter(|silent| silent.join.is_some()) else {
             return false;
         };
         if !hold {
@@ -498,6 +536,21 @@ impl LiveScalarDevice {
             std::thread::sleep(Duration::from_micros(200));
         }
         true
+    }
+}
+
+#[cfg(test)]
+impl LiveScalarDevice {
+    /// The thread of the output, when the output is silent, for a test that
+    /// stops the thread and takes the place of its callback.
+    pub(super) fn silent_handle_mut(&mut self) -> Option<&mut SilentHandle> {
+        match &mut self.output {
+            Some(OpenOutput {
+                handle: OutputHandle::Silent(silent),
+                ..
+            }) => Some(silent),
+            _ => None,
+        }
     }
 }
 
@@ -780,19 +833,11 @@ impl LiveScalarDevice {
             return Err(DevicePlaybackError::Cancelled);
         }
         let old_sample_rate = self.sample_rate;
-        self.shared.request_stop();
-        if let Some(gate) = self.callback_gate.take() {
-            gate.retire();
-        }
-        if let Some(mut silent) = self.silent.take() {
-            silent.stop();
-        }
-        // Dropping the stream joins the CPAL callback thread, so the consumer
+        // Closing the output joins its callback thread, so the consumer
         // role is free from here. Saying so explicitly keeps the ring's
         // single-consumer check able to tell this legitimate handoff from a
         // second consumer running concurrently.
-        self.stream = None;
-        self.hand_back_inserts();
+        self.close_output();
         // A release names a copy of the old backend. It holds no box.
         while self.shared.samples.insert_releases.pop().is_some() {}
         // The plugin workers stay. The next turn ships them to the new
@@ -895,9 +940,9 @@ impl LiveScalarDevice {
         // The old callback has joined and only this producer owns the channel.
         // Its queued commands predate the authoritative replacement snapshot.
         for install in self.shared.samples.installs.drain_available() {
-            if !install.sample.is_null() {
+            if let crate::assets::SampleInstall::Install { sample, .. } = install {
                 // SAFETY: this unconsumed producer-owned baton has no other owner.
-                drop(unsafe { Box::from_raw(install.sample) });
+                drop(unsafe { Box::from_raw(sample.as_ptr()) });
             }
         }
         self.reclaim_assets();
@@ -1122,14 +1167,22 @@ impl AudioInput {
                 "audio input sample format {native_sample_format} is not supported"
             ))
         })?;
-        ring.set_channels(usize::from(config.channels()));
-        ring.set_sample_rate(config.sample_rate());
-        ring.forget_deliveries();
         let failed = Arc::new(AtomicBool::new(false));
-        let stream = build_input_stream(&device, &config, Arc::clone(&ring), Arc::clone(&failed))?;
-        stream.play().map_err(|error| {
-            DevicePlaybackError::Unavailable(format!("cannot start audio input {name}: {error}"))
-        })?;
+        let stream = start_on_ring(
+            &ring,
+            usize::from(config.channels()),
+            config.sample_rate(),
+            || {
+                let stream =
+                    build_input_stream(&device, &config, Arc::clone(&ring), Arc::clone(&failed))?;
+                stream.play().map_err(|error| {
+                    DevicePlaybackError::Unavailable(format!(
+                        "cannot start audio input {name}: {error}"
+                    ))
+                })?;
+                Ok(stream)
+            },
+        )?;
         Ok(Self {
             _stream: stream,
             facts: AudioInputFacts::new(
@@ -1177,6 +1230,25 @@ impl AudioInput {
     pub fn failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
     }
+}
+
+/// Starts an input stream onto `ring` with `start`, then gives the ring the
+/// channels of the stream. The output reads `s("in")` frames only while the
+/// ring has channels. A stream that does not start leaves them as they were,
+/// so the caller starts from a ring with none. The ring takes the rate and
+/// forgets the deliveries of the old stream before the start, because the
+/// new stream can deliver frames before `start` returns.
+fn start_on_ring<S>(
+    ring: &crate::input::InputRing,
+    channels: usize,
+    sample_rate: u32,
+    start: impl FnOnce() -> Result<S, DevicePlaybackError>,
+) -> Result<S, DevicePlaybackError> {
+    ring.set_sample_rate(sample_rate);
+    ring.forget_deliveries();
+    let started = start()?;
+    ring.set_channels(channels);
+    Ok(started)
 }
 
 /// An input stream feeding the ring, in whatever sample format the device
@@ -4136,7 +4208,7 @@ mod tests {
                 LiveOutputOptions::default().with_dispatch(dispatch),
             )
             .expect("silent output");
-            device.silent.take().expect("callback").stop();
+            device.silent_handle_mut().expect("callback").stop();
             // SAFETY: the prior callback is joined before this thread becomes the
             // consumer, so asset inspection below never races a silent callback.
             unsafe { device.shared.ring.release_consumer() };
@@ -4469,7 +4541,7 @@ mod tests {
             }
 
             let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
-            device.silent.take().expect("silent callback").stop();
+            device.silent_handle_mut().expect("silent callback").stop();
             let params = crate::reverb::ReverbParams {
                 size_secs: 0.025,
                 fade_secs: 0.01,
@@ -4492,7 +4564,10 @@ mod tests {
             assert_eq!(device.shared.samples.fx_reverb_installs.len(), 0);
 
             device.recycle_output().expect("recycle silent output");
-            device.silent.take().expect("replacement callback").stop();
+            device
+                .silent_handle_mut()
+                .expect("replacement callback")
+                .stop();
             device.ensure_reverb(0, params);
             device.ensure_fx_reverb(params);
             let (orbit, stage) = take_prepared_reverbs(&device);
@@ -4682,10 +4757,10 @@ mod tests {
             let mut device = LiveScalarDevice::start_silent(44_100, 7).expect("silent output");
             // Quiesce the callback without dropping its owner so queue and telemetry
             // comparisons cannot race normal playback progress.
-            device.silent.as_mut().expect("silent callback").stop();
+            device.silent_handle_mut().expect("silent callback").stop();
             // SAFETY: `stop` joined the silent callback, the ring's only consumer.
             unsafe { device.shared.ring.release_consumer() };
-            let close = Arc::clone(&device.silent.as_ref().unwrap().close);
+            let close = Arc::clone(&device.silent_handle().unwrap().close);
             device.shared.frames.store(44_100, Ordering::Release);
             device.set_generation(7, 88_200, TakeoverCut::None);
             device.set_master_gain(0.5);
@@ -4730,7 +4805,7 @@ mod tests {
             assert_eq!(discoveries, 1);
             assert!(!device.shared.stop.is_stopped());
             assert!(Arc::ptr_eq(
-                &device.silent.as_ref().expect("retained output").close,
+                &device.silent_handle().expect("retained output").close,
                 &close
             ));
             assert_eq!(device.audio_facts(), facts);
@@ -4749,8 +4824,7 @@ mod tests {
         fn rejected_output_discovery_keeps_the_live_clock_running() {
             let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
             let callback = device
-                .silent
-                .as_ref()
+                .silent_handle()
                 .unwrap()
                 .join
                 .as_ref()
@@ -4771,8 +4845,7 @@ mod tests {
             assert!(!device.shared.stop.is_stopped());
             assert_eq!(
                 device
-                    .silent
-                    .as_ref()
+                    .silent_handle()
                     .expect("retained output")
                     .join
                     .as_ref()
@@ -4862,8 +4935,8 @@ mod tests {
                 let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
                 // Keep the old handle but join its callback so both batons are
                 // deterministically still pending when the real recycle begins.
-                device.silent.as_mut().expect("old callback").stop();
-                let old_close = Arc::clone(&device.silent.as_ref().unwrap().close);
+                device.silent_handle_mut().expect("old callback").stop();
+                let old_close = Arc::clone(&device.silent_handle().unwrap().close);
                 let id = crate::SampleId(9);
                 let old = crate::DecodedSample::from_parts(48_000, 1, vec![0.125; 4096])
                     .expect("old sample");
@@ -4902,8 +4975,8 @@ mod tests {
                 vec![(crate::SampleId(9), sample.clone()); crate::sample::SAMPLE_BANK_CAPACITY + 1],
             ] {
                 let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
-                device.silent.as_mut().expect("old callback").stop();
-                let close = Arc::clone(&device.silent.as_ref().unwrap().close);
+                device.silent_handle_mut().expect("old callback").stop();
+                let close = Arc::clone(&device.silent_handle().unwrap().close);
                 device
                     .install_sample(crate::SampleId(9), sample.clone())
                     .expect("install baton");
@@ -4920,7 +4993,7 @@ mod tests {
                 assert!(matches!(error, DevicePlaybackError::ResourceLimit(_)));
                 assert!(Arc::ptr_eq(
                     &close,
-                    &device.silent.as_ref().expect("old output").close
+                    &device.silent_handle().expect("old output").close
                 ));
                 assert!(!device.shared.stop.is_stopped());
                 assert_eq!(device.audio_facts(), facts);
@@ -4933,9 +5006,12 @@ mod tests {
                     .installs
                     .pop()
                     .expect("preserved install");
-                assert_eq!(install.id, crate::SampleId(9));
+                let crate::assets::SampleInstall::Install { id, sample: queued } = install else {
+                    panic!("the first preserved message is not the install");
+                };
+                assert_eq!(id, crate::SampleId(9));
                 // SAFETY: the callback is joined; this pop transfers unique ownership.
-                let queued = unsafe { Box::from_raw(install.sample) };
+                let queued = unsafe { Box::from_raw(queued.as_ptr()) };
                 assert_eq!(queued.identity(), sample.identity());
                 let uninstall = device
                     .shared
@@ -4943,8 +5019,12 @@ mod tests {
                     .installs
                     .pop()
                     .expect("preserved uninstall");
-                assert_eq!(uninstall.id, crate::SampleId(10));
-                assert!(uninstall.sample.is_null());
+                assert!(matches!(
+                    uninstall,
+                    crate::assets::SampleInstall::Clear {
+                        id: crate::SampleId(10)
+                    }
+                ));
                 assert_eq!(device.shared.samples.installs.len(), 0);
             }
         }
@@ -4953,7 +5033,7 @@ mod tests {
         fn recycle_preparation_failure_marks_output_unhealthy_and_can_recover() {
             let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
             device.check_health().expect("initial output is healthy");
-            let old_close = Arc::clone(&device.silent.as_ref().unwrap().close);
+            let old_close = Arc::clone(&device.silent_handle().unwrap().close);
             let samples = [(
                 crate::SampleId(9),
                 crate::DecodedSample::from_parts(48_000, 1, vec![0.75; 4096]).expect("seed"),
@@ -4970,7 +5050,7 @@ mod tests {
                         |device, opened| {
                             preparations += 1;
                             assert!(opened.is_none());
-                            assert!(device.stream.is_none() && device.silent.is_none());
+                            assert!(device.output.is_none());
                             assert!(device.shared.stop.is_stopped());
                             assert!(old_close.load(Ordering::Acquire));
                             assert_eq!(Arc::strong_count(&old_close), 1, "old thread was joined");
@@ -4990,7 +5070,7 @@ mod tests {
                     )
                     .expect_err("preparation must fail");
                 assert_eq!(error.to_string(), "preparation rejected");
-                assert!(device.stream.is_none() && device.silent.is_none());
+                assert!(device.output.is_none());
                 assert!(device.shared.stop.is_stopped());
                 assert_eq!(samples[0].1.identity(), identity);
                 assert_eq!(samples[0].1.pcm().as_ptr(), pcm);
@@ -5003,7 +5083,7 @@ mod tests {
             device
                 .recycle_output_to_with_samples(None, &samples, || false)
                 .expect("successful seeded silent retry");
-            assert!(device.stream.is_none() && device.silent.is_some());
+            assert!(device.is_silent());
             assert!(!device.shared.stop.is_stopped());
             device
                 .check_health()
@@ -5030,7 +5110,7 @@ mod tests {
         fn recycle_activation_failure_marks_output_unhealthy() {
             let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
             device.check_health().expect("initial output is healthy");
-            let old_close = Arc::clone(&device.silent.as_ref().unwrap().close);
+            let old_close = Arc::clone(&device.silent_handle().unwrap().close);
             let mut candidate_close = None;
             let mut preparations = 0;
             let error = device
@@ -5040,7 +5120,7 @@ mod tests {
                     |device, opened| {
                         preparations += 1;
                         assert!(opened.is_none());
-                        assert!(device.stream.is_none() && device.silent.is_none());
+                        assert!(device.output.is_none());
                         assert!(old_close.load(Ordering::Acquire));
                         assert_eq!(Arc::strong_count(&old_close), 1, "old thread was joined");
                         let prepared = device.prepare_recycled_output(opened)?;
@@ -5065,7 +5145,7 @@ mod tests {
                 error.to_string(),
                 "live output failed before activation or was already activated"
             );
-            assert!(device.stream.is_none() && device.silent.is_none());
+            assert!(device.output.is_none());
             assert!(device.shared.stop.is_stopped());
             let candidate_close = candidate_close.expect("candidate was prepared");
             assert!(candidate_close.load(Ordering::Acquire));
@@ -5109,7 +5189,7 @@ mod tests {
             let pcm = samples[0].1.pcm().as_ptr();
             for cancel_at in 1..=5 {
                 let mut device = LiveScalarDevice::start_silent(44_100, 7).expect("silent output");
-                let old_close = Arc::clone(&device.silent.as_ref().unwrap().close);
+                let old_close = Arc::clone(&device.silent_handle().unwrap().close);
                 let facts = device.audio_facts();
                 let checks = Cell::new(0);
                 let mut candidate_close = None;
@@ -5177,7 +5257,7 @@ mod tests {
 
             // Joining the sole callback leaves the test as the only asset-ring
             // consumer, so it can inspect the prepared installs without a race.
-            device.silent.take().expect("silent callback").stop();
+            device.silent_handle_mut().expect("silent callback").stop();
             let params = crate::reverb::ReverbParams {
                 size_secs: 0.025,
                 fade_secs: 0.01,
@@ -5303,7 +5383,7 @@ mod tests {
         fn recycled_stream_discards_pending_kabel_at_every_sample_rate() {
             for new_rate in [48_000, 44_100] {
                 let mut device = LiveScalarDevice::start_silent(48_000, 7).unwrap();
-                device.silent.take().unwrap().stop();
+                device.silent_handle_mut().unwrap().stop();
                 let event = kabel_event(kabel_program(), 1);
                 let publication = device
                     .prepare_kabel_events(std::slice::from_ref(&event))
@@ -5385,9 +5465,9 @@ mod tests {
                 let sample = enqueue(decoded.clone(), |sample| {
                     channel
                         .installs
-                        .push(SampleInstall {
+                        .push(SampleInstall::Install {
                             id: SampleId(8),
-                            sample,
+                            sample: std::ptr::NonNull::new(sample).expect("a boxed sample"),
                         })
                         .is_ok()
                 });
@@ -5414,11 +5494,17 @@ mod tests {
                 assert_eq!(channel.returns.len(), 1);
                 assert_eq!(channel.reverb_returns.len(), 1);
                 assert_eq!(channel.fx_reverb_returns.len(), 1);
-                let installed = channel.installs.pop().unwrap();
+                let SampleInstall::Install {
+                    id,
+                    sample: installed,
+                } = channel.installs.pop().unwrap()
+                else {
+                    panic!("the queued message is not the install");
+                };
                 // SAFETY: the pop transfers the queue's unique allocation here.
-                let installed_pcm = unsafe { Box::from_raw(installed.sample) };
-                assert_eq!(installed.id, SampleId(8));
-                assert_eq!(installed.sample, sample);
+                let installed_pcm = unsafe { Box::from_raw(installed.as_ptr()) };
+                assert_eq!(id, SampleId(8));
+                assert_eq!(installed.as_ptr(), sample);
                 assert_eq!(*installed_pcm, decoded);
                 let returned = channel.returns.pop().unwrap();
                 // SAFETY: this returned allocation has been popped exactly once.
@@ -5961,6 +6047,79 @@ mod tests {
                 assert_eq!(shared.callback_errors.load(Ordering::Acquire), 1);
                 assert_eq!(shared.report(1).callback_xruns, 0);
             }
+        }
+
+        /// An input that failed is opened again, and the new stream does not
+        /// start. The ring still holds the last frames of the dead input, and
+        /// an `s("in")` voice must play silence, not a loop of those frames.
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn an_input_reopen_that_cannot_start_leaves_input_voices_silent() {
+            let _tripwire_guard = tripwire_assertion_guard();
+            let mut manual = ManualLiveOutput::new(48_000, 7).expect("manual output");
+            let ring = Arc::clone(&manual.device.shared.input);
+            ring.set_channels(1);
+            ring.write(&[0.5; 4096], 1);
+            let error = manual
+                .device
+                .open_input_with(Some("mic"), |_, ring, _| {
+                    start_on_ring(&ring, 2, 48_000, || {
+                        Err::<AudioInput, _>(DevicePlaybackError::Unavailable(
+                            "the input is busy".into(),
+                        ))
+                    })
+                })
+                .expect_err("the stream does not start");
+            assert_eq!(error.to_string(), "the input is busy");
+            assert_eq!(manual.device().input_name(), None);
+            assert_eq!(manual.device().input_channels(), 0);
+            assert!(manual.device().push(AudioEvent {
+                onset_id: 1,
+                generation: 7,
+                target_frame: 0,
+                onset_lead: 0.0,
+                freq_hz: 220.0,
+                gain: 0.5,
+                duration_secs: 1.0,
+                ui_visuals: 0,
+                controls: Default::default(),
+                sample: None,
+                synth: Some(crate::SynthSource::Input { channel: 0 }),
+                wavetable: None,
+                cut: None,
+            }));
+            let mut output = [0.0f32; 256 * 2];
+            for block in 0..16 {
+                manual.render(&mut output);
+                assert!(
+                    output.iter().all(|sample| *sample == 0.0),
+                    "block {block}: s(\"in\") played the frames of the dead input"
+                );
+            }
+            assert_eq!(manual.device().report().accepted_events, 1);
+        }
+
+        /// A stream that starts gets the ring's channels only after the
+        /// start. The rate is set and the old deliveries are forgotten before
+        /// it, so a delivery during the start counts.
+        #[test]
+        fn an_input_that_starts_gets_its_channels_after_the_start() {
+            let ring = crate::input::InputRing::new();
+            ring.note_delivery(4096);
+            let started = start_on_ring(&ring, 2, 44_100, || {
+                assert_eq!(ring.channels(), 0, "the channels wait for the start");
+                assert_eq!(ring.sample_rate(), 44_100);
+                // The new stream delivers before its start returns.
+                ring.note_delivery(1024);
+                Ok(())
+            });
+            assert!(started.is_ok());
+            assert_eq!(ring.channels(), 2);
+            assert_eq!(
+                ring.read_lag(),
+                2 * 1024,
+                "the old delivery is forgotten, the new one kept"
+            );
         }
     }
 }

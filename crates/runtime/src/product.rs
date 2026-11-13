@@ -55,13 +55,18 @@ macro_rules! define_product {
             $command_name,
             " export song.strudel --cycles 32      # a musical length\n    ",
             $command_name,
-            " export song.strudel --until-silence  # and then wait for the tail to fade\n\n",
+            " export song.strudel --until-silence  # and then wait for the tail to fade\n    ",
+            $command_name,
+            " export song.strudel --format midi -o take.mid  # a Type 1 MIDI file\n\n",
             "The file is 16-bit stereo WAV at 48 kHz unless --format or --sample-rate say ",
-            "otherwise; an output ending in .mp3 is an mp3, in .json the onset dump. A ",
+            "otherwise. An output ending in .mp3 is an mp3, in .json the onset dump, in ",
+            ".mid or .midi a Type 1 MIDI file. --ppq and --meter set a MIDI file's tick ",
+            "resolution and meter. MIDI carries notes, controllers, programs and bends. ",
+            "It has no audio, so --until-silence does not apply. A ",
             "--duration in seconds (60, 30s), minutes (2m, 1:30) or bars (16b) ends on the ",
             "nearest whole cycle, so a bounce never stops mid-bar. --until-silence keeps ",
             "rendering after the length until the music has stayed under --silence-floor for ",
-            "--silence-hold, so reverbs and delays ring out; a score that never goes quiet ",
+            "--silence-hold, so reverbs and delays ring out. A score that never goes quiet ",
             "stops a minute past its length. `render` is the same command."
         );
         pub const FOLLOW_LONG_HELP: &str = concat!(

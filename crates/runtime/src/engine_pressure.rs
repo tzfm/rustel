@@ -562,6 +562,26 @@ impl EnginePressureSnapshot {
     }
 }
 
+/// The last incident. A healthy sample before `until` shows it.
+#[derive(Clone, Copy, Debug)]
+struct RecentFailure {
+    cause: EnginePressureCause,
+    level: EnginePressureLevel,
+    until: Instant,
+}
+
+/// Incidents that each come closer than [`HICCUP_SPAN`] to the one before.
+#[derive(Clone, Copy, Debug)]
+struct Hiccup {
+    /// The first incident of the hiccup.
+    start: Instant,
+    /// The latest incident of the hiccup.
+    last: Instant,
+    /// The hiccup starts within [`REPEAT_WINDOW`] after the last incident
+    /// of the one before.
+    repeated: bool,
+}
+
 /// Converts cumulative callback/producer counters into recent deltas.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EnginePressureMonitor {
@@ -572,14 +592,9 @@ pub struct EnginePressureMonitor {
     callback_errors: u64,
     ring_refusals: u64,
     max_callback_gap_nanos: u64,
-    recent_cause: EnginePressureCause,
-    recent_level: EnginePressureLevel,
-    recent_until: Option<Instant>,
-    /// When the current hiccup began, and when it last showed an incident.
-    hiccup_start: Option<Instant>,
-    last_incident: Option<Instant>,
-    /// The current hiccup followed another within [`REPEAT_WINDOW`].
-    hiccup_repeated: bool,
+    recent: Option<RecentFailure>,
+    /// The latest hiccup on this stream, ended or not.
+    hiccup: Option<Hiccup>,
 }
 
 impl EnginePressureMonitor {
@@ -606,12 +621,8 @@ impl EnginePressureMonitor {
             self.callback_xruns = 0;
             self.ring_refusals = 0;
             self.max_callback_gap_nanos = 0;
-            self.recent_cause = EnginePressureCause::Healthy;
-            self.recent_level = EnginePressureLevel::Normal;
-            self.recent_until = None;
-            self.hiccup_start = None;
-            self.last_incident = None;
-            self.hiccup_repeated = false;
+            self.recent = None;
+            self.hiccup = None;
         }
         let callback_deadline_misses = device
             .realtime_load
@@ -717,21 +728,7 @@ impl EnginePressureMonitor {
             | EnginePressureCause::HostStarvation
             | EnginePressureCause::Refusal => self.incident_level(now, load > 10_000),
         };
-        if immediate != EnginePressureCause::Healthy {
-            self.recent_cause = immediate;
-            self.recent_level = immediate_level;
-            self.recent_until = now.checked_add(RECENT_FAILURE_HOLD);
-        }
-        let (cause, cause_level) = if immediate != EnginePressureCause::Healthy {
-            (immediate, immediate_level)
-        } else if self.recent_until.is_some_and(|until| now < until) {
-            (self.recent_cause, self.recent_level)
-        } else {
-            self.recent_cause = EnginePressureCause::Healthy;
-            self.recent_level = EnginePressureLevel::Normal;
-            self.recent_until = None;
-            (EnginePressureCause::Healthy, EnginePressureLevel::Normal)
-        };
+        let (cause, cause_level) = self.shown_cause(immediate, immediate_level, now);
 
         let level = match load {
             0..7_000 => EnginePressureLevel::Normal,
@@ -759,23 +756,50 @@ impl EnginePressureMonitor {
     /// [`HICCUP_SPAN`], or it follows another within [`REPEAT_WINDOW`].
     /// Warning otherwise.
     fn incident_level(&mut self, now: Instant, sustained: bool) -> EnginePressureLevel {
-        let continuing = self
-            .last_incident
-            .is_some_and(|last| now.saturating_duration_since(last) < HICCUP_SPAN);
-        if !continuing {
-            self.hiccup_repeated = self
-                .last_incident
-                .is_some_and(|last| now.saturating_duration_since(last) < REPEAT_WINDOW);
-            self.hiccup_start = Some(now);
-        }
-        self.last_incident = Some(now);
-        let lasting = self
-            .hiccup_start
-            .is_some_and(|start| now.saturating_duration_since(start) >= HICCUP_SPAN);
-        if sustained || lasting || self.hiccup_repeated {
+        let since = |at: Instant| now.saturating_duration_since(at);
+        let hiccup = match self.hiccup {
+            Some(hiccup) if since(hiccup.last) < HICCUP_SPAN => Hiccup {
+                last: now,
+                ..hiccup
+            },
+            ended => Hiccup {
+                start: now,
+                last: now,
+                repeated: ended.is_some_and(|ended| since(ended.last) < REPEAT_WINDOW),
+            },
+        };
+        self.hiccup = Some(hiccup);
+        let lasting = since(hiccup.start) >= HICCUP_SPAN;
+        if sustained || lasting || hiccup.repeated {
             EnginePressureLevel::Error
         } else {
             EnginePressureLevel::Warning
+        }
+    }
+
+    /// The cause and level a sample shows. A sample with an incident shows
+    /// it and holds it for [`RECENT_FAILURE_HOLD`]. A healthy sample shows
+    /// the held incident until the hold ends.
+    fn shown_cause(
+        &mut self,
+        immediate: EnginePressureCause,
+        immediate_level: EnginePressureLevel,
+        now: Instant,
+    ) -> (EnginePressureCause, EnginePressureLevel) {
+        if immediate != EnginePressureCause::Healthy {
+            self.recent = now
+                .checked_add(RECENT_FAILURE_HOLD)
+                .map(|until| RecentFailure {
+                    cause: immediate,
+                    level: immediate_level,
+                    until,
+                });
+            return (immediate, immediate_level);
+        }
+        self.recent = self.recent.filter(|recent| now < recent.until);
+        match self.recent {
+            Some(recent) => (recent.cause, recent.level),
+            None => (EnginePressureCause::Healthy, EnginePressureLevel::Normal),
         }
     }
 }
@@ -1060,6 +1084,26 @@ mod tests {
             monitor.sample_at(new_device, same_producer, 128, now + Duration::from_secs(6));
         assert_eq!(new_underrun.callback_xruns, 1);
         assert_eq!(new_underrun.cause, EnginePressureCause::DeviceUnderrun);
+    }
+
+    #[test]
+    fn a_new_stream_drops_the_held_incident_and_the_hiccup() {
+        let now = Instant::now();
+        let mut monitor = EnginePressureMonitor::default();
+        let mut first = report(1_000);
+        first.stream_id = 1;
+        first.callback_xruns = 1;
+        assert_eq!(
+            monitor.sample_at(first, producer(0), 128, now).cause,
+            EnginePressureCause::DeviceUnderrun
+        );
+        let mut second = report(1_000);
+        second.stream_id = 2;
+        let fresh = monitor.sample_at(second, producer(0), 128, now + Duration::from_secs(1));
+        assert_eq!(fresh.cause, EnginePressureCause::Healthy);
+        second.callback_xruns = 1;
+        let underrun = monitor.sample_at(second, producer(0), 128, now + Duration::from_secs(2));
+        assert_eq!(underrun.level, EnginePressureLevel::Warning);
     }
 
     /// The level read after one late callback at each offset in `at`.

@@ -160,11 +160,31 @@ pub fn classify_from<'a>(lexer: Lexer, clusters: impl IntoIterator<Item = &'a st
 /// how a row starts in the state its line had actually reached.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Lexer {
-    quote: Option<char>,
-    slash: bool,
-    comment: bool,
-    block_comment: bool,
-    block_star: bool,
+    state: LexState,
+}
+
+/// Where the lexer is in its line.
+#[derive(Clone, Copy, Debug)]
+enum LexState {
+    /// Code. `slash` holds when the last character was a `/` that opened
+    /// no comment.
+    Code { slash: bool },
+    /// A string that `quote` closes. `escaped` holds after a backslash
+    /// that escapes the next character.
+    Str { quote: char, escaped: bool },
+    /// A `//` comment, which runs to the end of the line.
+    LineComment,
+    /// The `/` of a `/*` was read, and its `*` comes next.
+    BlockOpening,
+    /// Inside `/* */`. `star` holds when the last character was a `*`
+    /// after the opening marker.
+    BlockComment { star: bool },
+}
+
+impl Default for LexState {
+    fn default() -> Self {
+        Self::Code { slash: false }
+    }
 }
 
 impl Lexer {
@@ -198,39 +218,56 @@ impl Lexer {
     /// The same step, for a caller that already has characters and would
     /// otherwise spell each one back into a string to ask.
     pub fn advance(&mut self, character: char, lookahead: Option<char>) -> Token {
-        if self.comment {
-            return Token::Comment;
-        }
-        if self.block_comment {
-            let token = Token::Comment;
-            if self.block_star && character == '/' {
-                self.block_comment = false;
+        let slash = match self.state {
+            LexState::LineComment => return Token::Comment,
+            // The opening marker's `*` is part of the marker, so it cannot
+            // close the comment.
+            LexState::BlockOpening => {
+                self.state = LexState::BlockComment { star: false };
+                return Token::Comment;
             }
-            self.block_star = character == '*';
-            return token;
-        }
-        if let Some(quote) = self.quote {
-            if character == quote && !self.slash {
-                self.quote = None;
+            LexState::BlockComment { star } => {
+                self.state = if star && character == '/' {
+                    LexState::Code { slash: false }
+                } else {
+                    LexState::BlockComment {
+                        star: character == '*',
+                    }
+                };
+                return Token::Comment;
             }
-            self.slash = character == '\\' && !self.slash;
-            return Token::String;
-        }
-        if self.slash && character == '/' {
-            self.comment = true;
+            LexState::Str { quote, escaped } => {
+                self.state = if character == quote && !escaped {
+                    LexState::Code { slash: false }
+                } else {
+                    LexState::Str {
+                        quote,
+                        escaped: character == '\\' && !escaped,
+                    }
+                };
+                return Token::String;
+            }
+            LexState::Code { slash } => slash,
+        };
+        if slash && character == '/' {
+            self.state = LexState::LineComment;
             return Token::Comment;
         }
         if character == '/' && lookahead == Some('*') {
-            self.block_comment = true;
-            self.block_star = false;
+            self.state = LexState::BlockOpening;
             return Token::Comment;
         }
-        self.slash = character == '/';
-        if self.slash && lookahead == Some('/') {
+        self.state = LexState::Code {
+            slash: character == '/',
+        };
+        if character == '/' && lookahead == Some('/') {
             return Token::Comment;
         }
         if matches!(character, '\'' | '"' | '`') {
-            self.quote = Some(character);
+            self.state = LexState::Str {
+                quote: character,
+                escaped: false,
+            };
             return Token::String;
         }
         if character.is_ascii_digit() {
@@ -359,6 +396,18 @@ mod tests {
         let tokens = classify("x /* muted */ y");
         assert!(tokens[2..13].iter().all(|token| *token == Token::Comment));
         assert_eq!(tokens[14], Token::Text, "text after the closing marker");
+    }
+
+    /// The `*` of the opening marker cannot close the comment, so `/*/`
+    /// opens a comment that runs to the next `*/`, as in JavaScript.
+    #[test]
+    fn the_opening_star_of_a_block_comment_does_not_close_it() {
+        let tokens = classify("x /*/ y */ z");
+        assert!(
+            tokens[2..=9].iter().all(|token| *token == Token::Comment),
+            "{tokens:?}"
+        );
+        assert_eq!(tokens[11], Token::Text, "text after the closing marker");
     }
 
     #[test]

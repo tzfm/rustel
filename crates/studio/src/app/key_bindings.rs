@@ -116,8 +116,10 @@ impl App {
                 Ok(true)
             }
             Do::RewindEvaluate => {
-                self.next_rewind = true;
-                self.dispatch_editor(Command::Evaluate)?;
+                self.evaluate_with(LaunchRequest {
+                    rewind: true,
+                    ..LaunchRequest::default()
+                })?;
                 Ok(true)
             }
             Do::Evaluate => {
@@ -733,7 +735,10 @@ mod tests {
                 "the learnt chord evaluates, from anywhere the loop reaches: {}",
                 app.status
             );
-            assert!(!app.next_rewind, "the rewind flag rode along and was spent");
+            assert!(
+                !app.next_evaluation.rewind,
+                "the rewind flag rode along and was spent"
+            );
 
             // The freed ^⇧S re-means nothing: not the moved rewind, and not the
             // legacy reading of ^S either, which would make the freed key a
@@ -750,7 +755,10 @@ mod tests {
                 KeyCode::Char('s'),
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             );
-            assert!(!app.next_rewind, "the freed chord does not rewind");
+            assert!(
+                !app.next_evaluation.rewind,
+                "the freed chord does not rewind"
+            );
             assert!(
                 !evaluation_underway(&app),
                 "and does not quietly evaluate either"

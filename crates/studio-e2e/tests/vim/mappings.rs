@@ -222,6 +222,31 @@ fn an_action_mapping_arms_quit_and_a_second_press_quits() {
     assert!(studio.wants_quit(), "the second press quits");
 }
 
+/// One press of a mapping is one answer to an armed quit. A chord the
+/// mapping presses before its quit action does not call the quit off.
+#[test]
+fn a_mapping_that_presses_a_chord_then_quits_confirms_an_armed_quit() {
+    let mut studio = hermetic();
+    std::fs::write(
+        studio.config_home().join("vimrc"),
+        "nnoremap Z <C-s><Action:quit>\n",
+    )
+    .expect("quit mapping");
+    enable_vim(&mut studio);
+    studio.set_score("// one\n");
+    studio.set_caret(0);
+
+    studio.type_text("Z");
+    assert!(!studio.wants_quit(), "the first press only arms quit");
+    assert!(
+        studio.status().contains("again to quit"),
+        "the first press arms quit: {}",
+        studio.status()
+    );
+    studio.type_text("Z");
+    assert!(studio.wants_quit(), "the second press quits");
+}
+
 #[test]
 fn mapping_prefixes_preserve_insert_text_and_native_shortcuts() {
     let mut studio = hermetic();

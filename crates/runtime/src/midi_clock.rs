@@ -25,14 +25,50 @@ const SCHEDULE_AHEAD: Duration = Duration::from_millis(120);
 /// The follower stops trusting a clock that has gone quiet this long.
 const CLOCK_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// The transport the port has been told, by the Start, Continue and Stop
+/// messages this clock sent it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum OutTransport {
+    /// No transport message yet. The first play is a Start, wherever the
+    /// pattern is.
+    #[default]
+    Idle,
+    /// A Start or a Continue went out last, and no Stop ended it.
+    Playing,
+    /// A Stop went out after a Start. Playing again resumes the hardware's
+    /// own count: Continue from inside the pattern, Start from its top.
+    Stopped,
+}
+
+impl OutTransport {
+    /// The message for the scheduler moving to `playing` at `cycle_now`,
+    /// and the state after it. `None` when the transport is already there.
+    fn play(&mut self, playing: bool, cycle_now: f64) -> Option<MidiMessage> {
+        let message = match (*self, playing) {
+            (Self::Playing, true) | (Self::Idle, false) | (Self::Stopped, false) => {
+                return None;
+            }
+            (Self::Playing, false) => MidiMessage::stop(),
+            // Picking up from inside the pattern is Continue, so the
+            // hardware resumes its own tick count rather than going back
+            // to the top. A first start, or one from cycle zero, is Start.
+            (Self::Stopped, true) if cycle_now.fract().abs() > 0.0 => MidiMessage::cont(),
+            _ => MidiMessage::start(),
+        };
+        *self = if playing {
+            Self::Playing
+        } else {
+            Self::Stopped
+        };
+        Some(message)
+    }
+}
+
 /// Clock out: ticks to one port, Start and Stop with the transport.
 pub struct ClockOut {
     sender: MidiSender,
     port: String,
-    running: bool,
-    /// Whether a Start has gone out on this port, which is what makes a later
-    /// resume a Continue rather than another Start.
-    ever_started: bool,
+    transport: OutTransport,
     /// The next tick index to schedule, in ticks since cycle zero.
     next_tick: i64,
     scheduled_until: Instant,
@@ -44,8 +80,7 @@ impl ClockOut {
         Ok(Self {
             port: sender.port_name().to_owned(),
             sender,
-            running: false,
-            ever_started: false,
+            transport: OutTransport::Idle,
             next_tick: 0,
             scheduled_until: Instant::now(),
         })
@@ -60,12 +95,9 @@ impl ClockOut {
     /// on a Start goes out and the tick count restarts from cycle zero's
     /// grid, when it turns off a Stop goes out.
     pub fn advance(&mut self, playing: bool, cycle_now: f64, cps: f64, now: Instant) {
-        if playing != self.running {
-            self.running = playing;
-            let message = transport_message(playing, self.ever_started, cycle_now);
+        if let Some(message) = self.transport.play(playing, cycle_now) {
             let _ = self.sender.send_at(now, message);
             if playing {
-                self.ever_started = true;
                 self.next_tick = (cycle_now * TICKS_PER_CYCLE).ceil() as i64;
                 self.scheduled_until = now;
             }
@@ -109,24 +141,9 @@ impl ClockOut {
     }
 }
 
-/// The transport message a change of `playing` sends. Picking up from inside
-/// the pattern is Continue, so the hardware resumes its own tick count rather
-/// than going back to the top; a first start, or one from cycle zero, is
-/// Start.
-fn transport_message(playing: bool, ever_started: bool, cycle_now: f64) -> MidiMessage {
-    if !playing {
-        return MidiMessage::stop();
-    }
-    if ever_started && cycle_now.fract().abs() > 0.0 {
-        MidiMessage::cont()
-    } else {
-        MidiMessage::start()
-    }
-}
-
 impl Drop for ClockOut {
     fn drop(&mut self) {
-        if self.running {
+        if matches!(self.transport, OutTransport::Playing) {
             let _ = self.sender.send_at(Instant::now(), MidiMessage::stop());
         }
     }
@@ -137,20 +154,40 @@ const ESTIMATE_TICKS: usize = 192;
 /// Fewer ticks than this and there is no tempo to speak of.
 const ESTIMATE_MIN_TICKS: usize = 24;
 
+/// The clock's transport, as its Start, Continue and Stop messages set it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Transport {
+    /// No transport message yet. Ticks give a tempo but no position, and a
+    /// clock that is already going is followed.
+    #[default]
+    Free,
+    /// A Start or a Continue came last.
+    Running {
+        /// Ticks heard while running since the last Start, from a position
+        /// that the clock itself declared. `None` when no Start was heard.
+        since_start: Option<u64>,
+    },
+    /// A Stop came last. A clock that was told to stop is not followed.
+    Stopped {
+        /// The count at the Stop. A later Continue counts on from it.
+        since_start: Option<u64>,
+    },
+}
+
+impl Transport {
+    /// Ticks since the last Start, once a Start was heard.
+    fn since_start(self) -> Option<u64> {
+        match self {
+            Self::Free => None,
+            Self::Running { since_start } | Self::Stopped { since_start } => since_start,
+        }
+    }
+}
+
 /// What the follower has heard.
 #[derive(Clone, Debug, Default)]
 struct Heard {
-    running: bool,
-    /// A Stop has been heard, and no Start or Continue since. Distinct from
-    /// `!running`, which is also the state before anything arrives: joining a
-    /// clock that is already going must follow it, while one that was told to
-    /// stop must not.
-    stopped: bool,
-    /// A Start has been heard, so `ticks` counts from a position the clock
-    /// itself declared rather than from whenever we began listening.
-    positioned: bool,
-    /// Ticks since the last Start (or Continue).
-    ticks: u64,
+    transport: Transport,
     /// When the last ticks arrived. The tempo is the span of this window
     /// over its count - ticks that a sender bunches up cancel out, where
     /// timing each gap would not.
@@ -161,18 +198,19 @@ impl Heard {
     fn observe(&mut self, event: MidiEvent, now: Instant) {
         match event {
             MidiEvent::Start => {
-                self.running = true;
-                self.stopped = false;
-                self.positioned = true;
-                self.ticks = 0;
+                self.transport = Transport::Running {
+                    since_start: Some(0),
+                };
             }
             MidiEvent::Continue => {
-                self.running = true;
-                self.stopped = false;
+                self.transport = Transport::Running {
+                    since_start: self.transport.since_start(),
+                };
             }
             MidiEvent::Stop => {
-                self.running = false;
-                self.stopped = true;
+                self.transport = Transport::Stopped {
+                    since_start: self.transport.since_start(),
+                };
             }
             MidiEvent::Clock => {
                 // A long silence is a restart, not a slow tempo.
@@ -185,8 +223,11 @@ impl Heard {
                     self.stamps.pop_front();
                 }
                 self.stamps.push_back(now);
-                if self.running {
-                    self.ticks += 1;
+                if let Transport::Running {
+                    since_start: Some(ticks),
+                } = &mut self.transport
+                {
+                    *ticks += 1;
                 }
             }
             _ => {}
@@ -266,13 +307,14 @@ impl ClockIn {
             return None;
         }
         let since = now.duration_since(last).as_secs_f64() / interval;
+        let since_start = heard.transport.since_start();
         Some(ClockEstimate {
             cps: 1.0 / (interval * TICKS_PER_CYCLE),
-            cycle: (heard.ticks as f64 + since.min(1.0)) / TICKS_PER_CYCLE,
+            cycle: (since_start.unwrap_or(0) as f64 + since.min(1.0)) / TICKS_PER_CYCLE,
             // Ticks with no Start behind them are still a clock to follow;
             // only an explicit Stop rules one out.
-            running: !heard.stopped,
-            positioned: heard.positioned,
+            running: !matches!(heard.transport, Transport::Stopped { .. }),
+            positioned: since_start.is_some(),
         })
     }
 }
@@ -389,8 +431,7 @@ mod tests {
         let mut out = ClockOut {
             port: sender.port_name().to_owned(),
             sender,
-            running: false,
-            ever_started: false,
+            transport: OutTransport::Idle,
             next_tick: 0,
             scheduled_until: Instant::now(),
         };
@@ -453,43 +494,75 @@ mod tests {
         for index in 1..=96 {
             heard.observe(MidiEvent::Clock, start + tick * index);
         }
-        assert!(heard.running);
-        assert_eq!(heard.ticks, 96);
+        assert_eq!(
+            heard.transport,
+            Transport::Running {
+                since_start: Some(96)
+            }
+        );
         let interval = heard.interval().unwrap();
         assert!((interval - 0.020833).abs() < 0.0005, "{interval}");
         let cps = 1.0 / (interval * TICKS_PER_CYCLE);
         assert!((bpm(cps) - 120.0).abs() < 1.5, "{}", bpm(cps));
         heard.observe(MidiEvent::Stop, start + tick * 97);
-        assert!(!heard.running);
+        assert_eq!(
+            heard.transport,
+            Transport::Stopped {
+                since_start: Some(96)
+            }
+        );
+        // Ticks while stopped do not count, and a Continue counts on from the Stop.
+        heard.observe(MidiEvent::Clock, start + tick * 98);
+        heard.observe(MidiEvent::Continue, start + tick * 99);
+        heard.observe(MidiEvent::Clock, start + tick * 100);
+        assert_eq!(
+            heard.transport,
+            Transport::Running {
+                since_start: Some(97)
+            }
+        );
         // A restart counts from zero again.
         heard.observe(MidiEvent::Start, start + tick * 200);
-        assert_eq!(heard.ticks, 0);
+        assert_eq!(
+            heard.transport,
+            Transport::Running {
+                since_start: Some(0)
+            }
+        );
     }
 
     #[test]
     fn a_resume_inside_the_pattern_continues_rather_than_restarts() {
         // The first start on a port is a Start, wherever the pattern is.
+        let mut transport = OutTransport::default();
         assert_eq!(
-            transport_message(true, false, 0.0).as_slice(),
+            transport.play(true, 0.0).unwrap().as_slice(),
             MidiMessage::start().as_slice()
         );
+        assert_eq!(transport, OutTransport::Playing);
+        assert_eq!(transport.play(true, 2.5), None, "still going");
         assert_eq!(
-            transport_message(true, false, 2.5).as_slice(),
-            MidiMessage::start().as_slice()
-        );
-        assert_eq!(
-            transport_message(false, true, 2.5).as_slice(),
+            transport.play(false, 2.5).unwrap().as_slice(),
             MidiMessage::stop().as_slice()
         );
-        // Afterwards, coming back at cycle zero starts over, and coming back
+        assert_eq!(transport, OutTransport::Stopped);
+        assert_eq!(transport.play(false, 2.5), None, "still stopped");
+        // Coming back at cycle zero starts over, and coming back
         // mid-pattern continues.
         assert_eq!(
-            transport_message(true, true, 3.0).as_slice(),
+            transport.play(true, 3.0).unwrap().as_slice(),
             MidiMessage::start().as_slice()
         );
+        transport.play(false, 2.5).unwrap();
         assert_eq!(
-            transport_message(true, true, 2.5).as_slice(),
+            transport.play(true, 2.5).unwrap().as_slice(),
             MidiMessage::cont().as_slice()
+        );
+        // A port that never started also says Start from mid-pattern, not
+        // Continue.
+        assert_eq!(
+            OutTransport::Idle.play(true, 2.5).unwrap().as_slice(),
+            MidiMessage::start().as_slice()
         );
         // The three are distinct bytes, or the assertions above prove nothing.
         assert_ne!(
@@ -512,8 +585,7 @@ mod tests {
             ClockOut {
                 port: name.to_owned(),
                 sender,
-                running: false,
-                ever_started: false,
+                transport: OutTransport::Idle,
                 next_tick: 0,
                 scheduled_until: Instant::now(),
             },
@@ -643,7 +715,7 @@ mod tests {
         for index in 1..=48 {
             heard.observe(MidiEvent::Clock, start + tick * index);
         }
-        assert!(!heard.positioned, "no Start was heard");
+        assert_eq!(heard.transport, Transport::Free, "no Start was heard");
         assert!(heard.interval().is_some(), "the tempo is still measurable");
 
         let estimate = ClockEstimate {
@@ -677,10 +749,13 @@ mod tests {
         // An explicit Stop rules the clock out. Silence before any Start does
         // not, which is what makes joining a running clock work at all.
         heard.observe(MidiEvent::Stop, start + tick * 49);
-        assert!(heard.stopped);
+        assert_eq!(heard.transport, Transport::Stopped { since_start: None });
         heard.observe(MidiEvent::Start, start + tick * 50);
-        assert!(!heard.stopped);
-        assert!(heard.positioned);
-        assert_eq!(heard.ticks, 0);
+        assert_eq!(
+            heard.transport,
+            Transport::Running {
+                since_start: Some(0)
+            }
+        );
     }
 }

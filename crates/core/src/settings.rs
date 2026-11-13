@@ -30,7 +30,7 @@ struct SettingsState {
     max_polyphony: Option<usize>,
     rng_mode: u8,
     default_join: u8,
-    default_voicings: Option<VoicingSetting>,
+    default_voicings: Option<VoicingDefault>,
     /// MIDI control maps a score registered with `midimaps`/`defaultmidimap`.
     /// The map under the name "default" is what `defaultmidimap` sets and what
     /// a hap with no `midimap` control reads.
@@ -50,13 +50,62 @@ struct SettingsState {
     legacy_voicing_top_note: Arc<Mutex<Option<i64>>>,
 }
 
+/// The selected default voicing dictionary. A query that names no dictionary
+/// uses it.
 #[derive(Clone, Debug)]
-struct VoicingSetting {
-    name: String,
-    _lease: Option<VoicingDictionaryLease>,
-    /// A non-string default remains owned by QuickJS so later user mutation is
-    /// observable. Query entry refreshes this parsed, bounded native view.
-    live_dictionary: Option<Arc<RwLock<Option<VoicingDict>>>>,
+enum VoicingDefault {
+    /// A pinned or registered dictionary, selected by name.
+    Registry(String),
+    /// An object-valued default. QuickJS owns the object, so later user
+    /// mutation is observable. The lease keeps the object alive while a
+    /// snapshot selects it. Query entry refreshes the parsed, bounded view.
+    Host {
+        token: String,
+        lease: VoicingDictionaryLease,
+        view: Arc<RwLock<Option<VoicingDict>>>,
+    },
+    /// The last parsed view of a host default, copied into a fresh realm after
+    /// a producer panic. No host object backs it, so query entry does not
+    /// refresh it.
+    Recovered {
+        token: String,
+        view: Arc<RwLock<Option<VoicingDict>>>,
+    },
+}
+
+impl VoicingDefault {
+    /// The registry name, or the host-private token of a host or recovered
+    /// default.
+    fn name(&self) -> &str {
+        match self {
+            Self::Registry(name) => name,
+            Self::Host { token, .. } | Self::Recovered { token, .. } => token,
+        }
+    }
+
+    /// The shared parsed view of a host or recovered default.
+    fn view(&self) -> Option<&Arc<RwLock<Option<VoicingDict>>>> {
+        match self {
+            Self::Registry(_) => None,
+            Self::Host { view, .. } | Self::Recovered { view, .. } => Some(view),
+        }
+    }
+
+    /// The selection for a fresh realm. A host or recovered default becomes
+    /// recovered, with its own copy of the last parsed view.
+    fn recovered(&self) -> Self {
+        match self {
+            Self::Registry(name) => Self::Registry(name.clone()),
+            Self::Host { token, view, .. } | Self::Recovered { token, view } => Self::Recovered {
+                token: token.clone(),
+                view: Arc::new(RwLock::new(
+                    view.read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
+                )),
+            },
+        }
+    }
 }
 
 /// A parsed voicing dictionary: chord symbol to its voicings, each a list of
@@ -180,16 +229,20 @@ impl RuntimeSettings {
         charge.arc::<()>()?;
         charge.arc::<SettingsState>()?;
 
-        if let Some(selection) = &state.default_voicings {
-            charge.string(&selection.name)?;
-            if selection._lease.is_some() {
+        match &state.default_voicings {
+            Some(VoicingDefault::Registry(name)) => charge.string(name)?,
+            Some(VoicingDefault::Host { token, .. }) => {
+                charge.string(token)?;
                 charge.arc::<VoicingDictionaryLeaseInner>()?;
                 charge.arc::<std::sync::atomic::AtomicBool>()?;
                 charge.arc::<std::sync::atomic::AtomicBool>()?;
-            }
-            if selection.live_dictionary.is_some() {
                 charge.arc::<RwLock<Option<VoicingDict>>>()?;
             }
+            Some(VoicingDefault::Recovered { token, .. }) => {
+                charge.string(token)?;
+                charge.arc::<RwLock<Option<VoicingDict>>>()?;
+            }
+            None => {}
         }
 
         charge.map(&state.midi_maps)?;
@@ -355,7 +408,9 @@ impl RuntimeSettings {
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let lease = state.default_voicings.as_ref()?._lease.as_ref()?;
+        let Some(VoicingDefault::Host { lease, .. }) = &state.default_voicings else {
+            return None;
+        };
         Some(VoicingDictionaryIdentity(Arc::downgrade(&lease._inner)))
     }
 
@@ -386,18 +441,7 @@ impl RuntimeSettings {
         let default_voicings = source
             .default_voicings
             .as_ref()
-            .map(|selection| VoicingSetting {
-                name: selection.name.clone(),
-                _lease: None,
-                live_dictionary: selection.live_dictionary.as_ref().map(|dictionary| {
-                    Arc::new(RwLock::new(
-                        dictionary
-                            .read()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .clone(),
-                    ))
-                }),
-            });
+            .map(VoicingDefault::recovered);
         let top_note = *source
             .legacy_voicing_top_note
             .lock()
@@ -785,20 +829,16 @@ pub(crate) fn default_join() -> u8 {
 
 pub(crate) fn set_default_voicings(name: Option<String>) {
     update_current(|settings| {
-        settings.default_voicings = name.map(|name| VoicingSetting {
-            name,
-            _lease: None,
-            live_dictionary: None,
-        });
+        settings.default_voicings = name.map(VoicingDefault::Registry);
     });
 }
 
-pub(crate) fn set_default_voicings_with_lease(name: String, lease: VoicingDictionaryLease) {
+pub(crate) fn set_default_voicings_with_lease(token: String, lease: VoicingDictionaryLease) {
     update_current(|settings| {
-        settings.default_voicings = Some(VoicingSetting {
-            name,
-            _lease: Some(lease),
-            live_dictionary: Some(Arc::new(RwLock::new(None))),
+        settings.default_voicings = Some(VoicingDefault::Host {
+            token,
+            lease,
+            view: Arc::new(RwLock::new(None)),
         });
     });
 }
@@ -881,17 +921,12 @@ pub(crate) fn default_voicings() -> Option<String> {
         settings
             .default_voicings
             .as_ref()
-            .map(|selection| selection.name.clone())
+            .map(|selection| selection.name().to_owned())
     })
 }
 
 pub(crate) fn default_voicings_is_host_owned() -> bool {
-    with_current(|settings| {
-        settings
-            .default_voicings
-            .as_ref()
-            .is_some_and(|selection| selection._lease.is_some())
-    })
+    with_current(|settings| matches!(settings.default_voicings, Some(VoicingDefault::Host { .. })))
 }
 
 pub(crate) fn default_host_voicing_dict() -> Option<Arc<RwLock<Option<VoicingDict>>>> {
@@ -899,17 +934,19 @@ pub(crate) fn default_host_voicing_dict() -> Option<Arc<RwLock<Option<VoicingDic
         settings
             .default_voicings
             .as_ref()
-            .and_then(|selection| selection.live_dictionary.as_ref().map(Arc::clone))
+            .and_then(VoicingDefault::view)
+            .map(Arc::clone)
     })
 }
 
 pub(crate) fn sync_host_voicing_dict(name: &str, dict: Option<VoicingDict>) -> bool {
     let cell = with_current(|settings| {
-        settings.default_voicings.as_ref().and_then(|selection| {
-            (selection.name == name)
-                .then(|| selection.live_dictionary.as_ref().map(Arc::clone))
-                .flatten()
-        })
+        settings
+            .default_voicings
+            .as_ref()
+            .filter(|selection| selection.name() == name)
+            .and_then(VoicingDefault::view)
+            .map(Arc::clone)
     });
     let Some(cell) = cell else {
         return false;
@@ -1060,6 +1097,39 @@ mod recovery_tests {
             );
             with_legacy_voicing_top_note(|note| assert_eq!(*note, Some(60)));
         });
+    }
+
+    #[test]
+    fn a_second_recovery_keeps_its_own_copy_of_the_recovered_view() {
+        let settings = RuntimeSettings::default();
+        settings.with(|| {
+            set_default_voicings_with_lease(
+                "host-view".into(),
+                VoicingDictionaryLease::new(
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                ),
+            );
+            assert!(sync_host_voicing_dict(
+                "host-view",
+                Some(HashMap::from([("M".into(), vec![vec![0.0, 4.0, 7.0]])])),
+            ));
+        });
+        let first = settings.recovery_snapshot();
+        let second = first.recovery_snapshot();
+        let first_view = first.with(default_host_voicing_dict).unwrap();
+        let second_view = second.with(default_host_voicing_dict).unwrap();
+        assert!(!Arc::ptr_eq(&first_view, &second_view));
+        assert!(second.host_voicing_identity().is_none());
+        *first_view.write().unwrap() = None;
+        second.with(|| {
+            assert_eq!(default_voicings().as_deref(), Some("host-view"));
+            assert!(!default_voicings_is_host_owned());
+        });
+        assert_eq!(
+            second_view.read().unwrap().as_ref().unwrap()["M"],
+            vec![vec![0.0, 4.0, 7.0]]
+        );
     }
 }
 
@@ -1259,9 +1329,7 @@ mod tests {
             let cell = state
                 .default_voicings
                 .as_ref()
-                .unwrap()
-                .live_dictionary
-                .as_ref()
+                .and_then(VoicingDefault::view)
                 .unwrap();
             let _view = cell.write().unwrap();
             let _history = state.legacy_voicing_top_note.lock().unwrap();

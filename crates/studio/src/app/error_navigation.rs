@@ -176,7 +176,7 @@ impl App {
         self.armed_slider = None;
         self.stop_precision_drag();
         self.stop_replay_drag();
-        self.pointer = None;
+        self.end_pointer_gesture();
         self.drop_pane_selection();
         self.focus = Focus::Editor;
         self.marks_muted = None;
@@ -846,6 +846,78 @@ mod tests {
             press(&mut app, KeyCode::F(3), KeyModifiers::CONTROL);
             assert_eq!(app.editor().primary_selection().head, ByteOffset(3));
             assert_eq!(app.focus, Focus::Editor);
+        }
+
+        /// An error jump that lands mid-drag ends the drag. The release of a
+        /// drag in the docked log then goes to the score, and the wheel over
+        /// the log only scrolls it.
+        #[test]
+        fn an_error_jump_mid_drag_ends_a_drag_in_the_docked_log() {
+            use crate::app::tests::support::mouse;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let source = "// note\n$: s(\"missing\")\n";
+            let at = source.find("missing").expect("the problem is in the score");
+            let mut app = app_at(directory.path(), source);
+            for index in 0..40 {
+                app.log
+                    .push(LogLevel::Info, "engine", format!("line {index}"));
+            }
+            app.toggle_log_sticky();
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+                .expect("test terminal");
+            let mut draw = |app: &mut App| {
+                terminal
+                    .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                    .expect("draw");
+            };
+            draw(&mut app);
+            assert!(app.log_is_docked(), "the log is docked");
+            let list = crate::log::LogPanelView::list_area(app.log_sheet_frame(), app.log_extent())
+                .expect("the log has a list");
+
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                list.x,
+                list.y,
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Drag(MouseButton::Left),
+                list.x + 5,
+                list.y,
+            );
+            let selected = app
+                .log_panel
+                .as_ref()
+                .expect("log")
+                .editor
+                .primary_selection();
+            assert!(!selected.is_empty(), "a log drag is live");
+
+            cache(&mut app, vec![problem(LintLevel::Value, at)]);
+            jump(&mut app);
+            assert_eq!(app.focus, Focus::Editor, "the jump landed on the score");
+            assert_eq!(app.editor().primary_selection().head, ByteOffset(at));
+            mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                list.x + 5,
+                list.y,
+            );
+            draw(&mut app);
+            for _ in 0..3 {
+                mouse(&mut app, MouseEventKind::ScrollUp, list.x + 2, list.y + 1);
+            }
+            assert_eq!(
+                app.log_panel
+                    .as_ref()
+                    .expect("log")
+                    .editor
+                    .primary_selection(),
+                selected,
+                "the wheel scrolled the log without moving its selection"
+            );
         }
     }
 }

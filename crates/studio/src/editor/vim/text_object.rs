@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
@@ -17,11 +18,12 @@ impl Editor {
         character: char,
         moment: HistoryMoment,
     ) -> Result<(), EditorError> {
+        let before = self.vim.pending.operator.and_then(|(_, count)| count);
         let count = self
             .vim_take_count()
-            .saturating_mul(self.vim.operator.map_or(1, |(_, count)| count));
+            .saturating_mul(before.map_or(1, NonZeroUsize::get));
         let range = self.vim_text_object_range(kind, character, count)?;
-        let operator = self.vim.operator.map(|(operator, _)| operator);
+        let operator = self.vim.pending.operator.map(|(operator, _)| operator);
         self.vim_cancel_pending();
         let Some(range) = range else {
             self.vim.message = Some("Text object not found");

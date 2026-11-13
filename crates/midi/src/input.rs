@@ -463,15 +463,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn note_names_line_up_with_note_to_midi() {
-        // 60 is middle C, which `note_to_midi("c4", _)` also gives.
-        assert_eq!(note_name(60), "c4");
-        assert_eq!(note_name(48), "c3");
-        assert_eq!(note_name(69), "a4");
-        assert_eq!(note_name(0), "c-1");
-    }
-
     /// The summary is the mapping aid: turning one knob must show up as one
     /// controller with the range it covered.
     #[test]

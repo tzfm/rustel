@@ -8,25 +8,50 @@ impl LoadQueue {
         })
     }
 
-    /// Queue a job. Returns `false` when the line is closed - the caller
-    /// must not leave a claim that will never be worked.
-    pub(super) fn push(&self, job: LoadJob, priority: LoadPriority) -> bool {
+    /// Queue a job, unless the line is closed.
+    pub(super) fn push(&self, job: LoadJob, priority: LoadPriority) {
         let mut state = self.state.lock().expect("sample load queue");
         if state.closed {
-            return false;
+            return;
         }
         match priority {
             LoadPriority::Now => state.now.push_back(job),
             LoadPriority::Bet => state.bets.push_back(job),
         }
         self.wake.notify_one();
+    }
+
+    /// Claim `url` for a disk fetch and queue the fetch as a bet, in one
+    /// step. Returns false when the line is closed or a disk fetch claims
+    /// the url already.
+    fn claim_disk(&self, url: &Arc<str>) -> bool {
+        let mut guard = self.state.lock().expect("sample load queue");
+        let state = &mut *guard;
+        if state.closed {
+            return false;
+        }
+        let work = state.work.entry(Arc::clone(url)).or_default();
+        if work.disk.is_some() {
+            return false;
+        }
+        work.disk = Some(DiskFetch::Queued);
+        state.disk_claims += 1;
+        state.bets.push_back(LoadJob {
+            url: Arc::clone(url),
+            kind: LoadKind::Cache,
+        });
+        self.wake.notify_one();
         true
     }
 
-    /// A bet that turned out to be needed now moves up the line.
+    /// A bet that turned out to be needed now moves up the line. Only a
+    /// note's load moves: a disk fetch of the same url stays a bet.
     pub(super) fn promote(&self, url: &str) {
         let mut state = self.state.lock().expect("sample load queue");
-        if let Some(at) = state.bets.iter().position(|job| &*job.url == url)
+        if let Some(at) = state
+            .bets
+            .iter()
+            .position(|job| matches!(job.kind, LoadKind::Install { .. }) && &*job.url == url)
             && let Some(job) = state.bets.remove(at)
         {
             state.now.push_back(job);
@@ -34,8 +59,80 @@ impl LoadQueue {
         }
     }
 
+    /// The next job, now in the taker's hand.
     fn take(state: &mut LoadQueueState) -> Option<LoadJob> {
-        state.now.pop_front().or_else(|| state.bets.pop_back())
+        let job = state.now.pop_front().or_else(|| state.bets.pop_back())?;
+        let work = state.work.entry(Arc::clone(&job.url)).or_default();
+        match job.kind {
+            LoadKind::Cache => {
+                if work.disk.replace(DiskFetch::InHand).is_none() {
+                    state.disk_claims += 1;
+                }
+            }
+            LoadKind::Install { .. } => work.installs += 1,
+        }
+        Some(job)
+    }
+
+    /// A worker has recorded the outcome of the disk fetch of `url`. The
+    /// fetch gives up its claim.
+    fn finish_cache(&self, url: &str) {
+        self.finish(url, |work| work.disk = None);
+    }
+
+    /// A worker has recorded the outcome of a note's load of `url`.
+    fn finish_install(&self, url: &str) {
+        self.finish(url, |work| work.installs = work.installs.saturating_sub(1));
+    }
+
+    fn finish(&self, url: &str, done: impl FnOnce(&mut UrlWork)) {
+        let mut guard = self.state.lock().expect("sample load queue");
+        let state = &mut *guard;
+        if let Some(work) = state.work.get_mut(url) {
+            let claimed = work.disk.is_some();
+            done(work);
+            if claimed && work.disk.is_none() {
+                state.disk_claims -= 1;
+            }
+            if work.disk.is_none() && work.installs == 0 {
+                state.work.remove(url);
+            }
+        }
+    }
+
+    /// How many urls `among` accepts that a disk fetch claims, queued or
+    /// in hand.
+    pub(super) fn disk_claims(&self, among: impl Fn(&str) -> bool) -> usize {
+        let state = self.state.lock().expect("sample load queue");
+        state
+            .work
+            .iter()
+            .filter(|(url, work)| work.disk.is_some() && among(url))
+            .count()
+    }
+
+    /// A url `among` accepts that a worker has in hand.
+    pub(super) fn in_hand(&self, among: impl Fn(&str) -> bool) -> Option<Arc<str>> {
+        let state = self.state.lock().expect("sample load queue");
+        state
+            .work
+            .iter()
+            .find(|(url, work)| work.in_hand() && among(url))
+            .map(|(url, _)| Arc::clone(url))
+    }
+
+    /// The jobs waiting in the line, and the urls a disk fetch claims.
+    fn backlog(&self) -> (usize, usize) {
+        let state = self.state.lock().expect("sample load queue");
+        (
+            state.now.len().saturating_add(state.bets.len()),
+            state.disk_claims,
+        )
+    }
+
+    /// Whether a disk fetch claims any url.
+    fn has_disk_claims(&self) -> bool {
+        self.state.lock().expect("sample load queue").disk_claims != 0
     }
 
     /// The next job, waiting for one; `None` once the line is closed and
@@ -264,22 +361,12 @@ fn run_sample_loader(shared: Weak<Shared>, jobs: Arc<LoadQueue>, dir: PathBuf) {
         let Some(shared) = shared.upgrade() else {
             return;
         };
-        shared
-            .loading
-            .lock()
-            .expect("loading sample")
-            .insert(Arc::clone(&url));
         let budget = sample_fetch::FetchBudget::for_transfer(
             FileLimit::of(&url).bytes,
             shared.publication.cancellation(),
         );
         let LoadKind::Install { id, decode_rate } = kind else {
             let outcome = fetch_cached_with_budget(&dir, &url, &budget, &shared.publication);
-            shared
-                .caching
-                .lock()
-                .expect("disk-cache claims")
-                .remove(&url);
             if let Err(error) = outcome {
                 shared
                     .failures
@@ -287,7 +374,9 @@ fn run_sample_loader(shared: Weak<Shared>, jobs: Arc<LoadQueue>, dir: PathBuf) {
                     .expect("sample failures")
                     .push(format!("{url}: {error}").into());
             }
-            shared.loading.lock().expect("loading sample").remove(&url);
+            // After the failure, so a wait that sees the claim go also sees
+            // why the file is not on disk.
+            jobs.finish_cache(&url);
             continue;
         };
         let score_access = shared
@@ -366,7 +455,7 @@ fn run_sample_loader(shared: Weak<Shared>, jobs: Arc<LoadQueue>, dir: PathBuf) {
                     .push(format!("{url}: {error}").into());
             }
         }
-        shared.loading.lock().expect("loading sample").remove(&url);
+        jobs.finish_install(&url);
     }
 }
 
@@ -389,30 +478,9 @@ pub(super) fn ensure_cached_shared(shared: &Shared, url: &Arc<str>) -> bool {
             return false;
         }
     }
-    {
-        let mut caching = shared.caching.lock().expect("disk-cache claims");
-        if !caching.insert(Arc::clone(url)) {
-            return false;
-        }
-    }
-    // Claim first, then push. If the queue is closed because the library is
-    // shutting down, drop the claim, so a pack's row does not count a fetch
-    // that never runs.
-    if !shared.jobs.push(
-        LoadJob {
-            url: Arc::clone(url),
-            kind: LoadKind::Cache,
-        },
-        LoadPriority::Bet,
-    ) {
-        shared
-            .caching
-            .lock()
-            .expect("disk-cache claims")
-            .remove(url);
-        return false;
-    }
-    true
+    // The claim and its queued fetch are one step: no reader sees one
+    // without the other, and a closed line takes neither.
+    shared.jobs.claim_disk(url)
 }
 
 /// Cache a soundfont file the way [`ensure_cached_shared`] caches a bank
@@ -562,8 +630,7 @@ impl SampleLibrary {
             ready: Mutex::new(ReadySamples::default()),
             shapes: Mutex::new(SampleShapes::default()),
             source_tables: Mutex::new(SourceTables::default()),
-            bank_imports: RwLock::new(HashMap::new()),
-            set_banks: RwLock::new(BTreeMap::new()),
+            bank_owners: RwLock::new(HashMap::new()),
             set_folder: RwLock::new(None),
             custom_file_names: RwLock::new(HashMap::new()),
             global_file_names: RwLock::new(HashMap::new()),
@@ -571,16 +638,13 @@ impl SampleLibrary {
             next_id: AtomicU32::new(1),
             free_ids: Mutex::new(VecDeque::new()),
             jobs: Arc::clone(&jobs),
-            loading: Mutex::new(HashSet::new()),
-            caching: Mutex::new(HashSet::new()),
             host_cache: dir.clone(),
             font_base: font_base.clone(),
             fonts: RwLock::new(HashMap::new()),
             renames: RwLock::new(HashMap::new()),
             source_renames: RwLock::new(HashMap::new()),
             auto_aliases: RwLock::new(HashMap::new()),
-            global_slots: Mutex::new(Vec::new()),
-            global_generation: std::sync::atomic::AtomicU64::new(0),
+            global_rows: Mutex::new(GlobalRows::default()),
             global_source_of: RwLock::new(HashMap::new()),
             import_policy: Mutex::new(None),
             score_policy: Mutex::new(None),
@@ -591,8 +655,6 @@ impl SampleLibrary {
             ),
             #[cfg(feature = "video")]
             videos: Mutex::new(HashMap::new()),
-            #[cfg(feature = "video")]
-            video_ceiling_seen: AtomicU64::new(file_limit::video_ceiling_moves()),
             score_cache: ScoreCache::new(dir.clone()),
             manifest_pending: AtomicUsize::new(0),
             publication,
@@ -848,20 +910,18 @@ impl SampleLibrary {
     /// out to be until the manifests are in, and a bar that jumps backwards
     /// as it learns is worse than one that simply counts down.
     pub fn pending_loads(&self) -> usize {
-        let queued = {
-            let state = self.shared.jobs.state.lock().expect("sample load queue");
-            state.now.len().saturating_add(state.bets.len())
-        };
-        let caching = self.shared.caching.lock().expect("disk-cache claims").len();
-        queued.max(caching)
+        let (queued, claims) = self.shared.jobs.backlog();
+        queued.max(claims)
     }
 
     /// One of the files a loader has in hand right now - fetching or
     /// decoding - named as a person would: the last segment of its url,
     /// with the percent-escapes undone. `None` when every worker is idle.
     pub fn loading_now(&self) -> Option<String> {
-        let loading = self.shared.loading.lock().expect("loading sample");
-        loading.iter().next().map(|url| file_name_of_url(url))
+        self.shared
+            .jobs
+            .in_hand(|_| true)
+            .map(|url| file_name_of_url(&url))
     }
 
     /// Manifests still being fetched. While this is above zero a name that
@@ -1159,14 +1219,7 @@ impl SampleLibrary {
                         .values()
                         .any(|state| matches!(state, FontState::Loading))
                 }
-                || {
-                    !self
-                        .shared
-                        .caching
-                        .lock()
-                        .expect("disk-cache claims")
-                        .is_empty()
-                };
+                || self.shared.jobs.has_disk_claims();
             if !pending || started.elapsed() >= deadline {
                 return;
             }
@@ -2230,13 +2283,10 @@ pub(super) mod tests {
                 next_id: AtomicU32::new(next_id),
                 free_ids: Mutex::new(VecDeque::new()),
                 jobs: LoadQueue::new(),
-                loading: Mutex::new(HashSet::new()),
-                caching: Mutex::new(HashSet::new()),
                 host_cache: cache_dir(),
                 font_base: String::new(),
                 source_tables: Mutex::new(SourceTables::default()),
-                bank_imports: RwLock::new(HashMap::new()),
-                set_banks: RwLock::new(BTreeMap::new()),
+                bank_owners: RwLock::new(HashMap::new()),
                 set_folder: RwLock::new(None),
                 custom_file_names: RwLock::new(HashMap::new()),
                 global_file_names: RwLock::new(HashMap::new()),
@@ -2244,8 +2294,7 @@ pub(super) mod tests {
                 renames: RwLock::new(HashMap::new()),
                 source_renames: RwLock::new(HashMap::new()),
                 auto_aliases: RwLock::new(HashMap::new()),
-                global_slots: Mutex::new(Vec::new()),
-                global_generation: std::sync::atomic::AtomicU64::new(0),
+                global_rows: Mutex::new(GlobalRows::default()),
                 global_source_of: RwLock::new(HashMap::new()),
                 import_policy: Mutex::new(None),
                 score_policy: Mutex::new(None),
@@ -2254,8 +2303,6 @@ pub(super) mod tests {
                 direct_diagnostic_logging: AtomicBool::new(true),
                 #[cfg(feature = "video")]
                 videos: Mutex::new(HashMap::new()),
-                #[cfg(feature = "video")]
-                video_ceiling_seen: AtomicU64::new(0),
                 score_cache: ScoreCache::new(cache_dir()),
                 manifest_pending: AtomicUsize::new(0),
                 publication: Arc::new(PublicationGate::new()),
@@ -2314,13 +2361,9 @@ pub(super) mod tests {
                 matches!(job.kind, LoadKind::Cache),
                 "cache job must not ask the decoder to seat PCM"
             );
-            assert!(
-                library
-                    .shared
-                    .caching
-                    .lock()
-                    .expect("disk-cache claims")
-                    .contains(&url)
+            assert_eq!(
+                library.shared.jobs.disk_claims(|claimed| claimed == &*url),
+                1
             );
             assert_eq!(library.cache_to_disk("tone"), 1);
             assert!(
@@ -2619,8 +2662,8 @@ pub(super) mod tests {
             let kick: Arc<str> = Arc::from("https://github.test/kit/kick.wav");
             let snare: Arc<str> = Arc::from("https://github.test/kit/snare.wav");
             {
-                let mut slots = library.shared.global_slots.lock().expect("slots");
-                slots.push(GlobalSlot {
+                let mut rows = library.shared.global_rows.lock().expect("rows");
+                rows.slots.push(GlobalSlot {
                     row: 0,
                     spec: "github:me/kit".to_owned(),
                     kind: GlobalKind::Pack,
@@ -2628,8 +2671,7 @@ pub(super) mod tests {
                         "kick".to_owned(),
                         Bank::Array(vec![kick.clone(), snare.clone()]),
                     )]),
-                    state: GlobalSourceState::Ready { banks: 1 },
-                    rewalk: false,
+                    stage: RowStage::Ready,
                 });
             }
             library.global.write().expect("global").insert(
@@ -2664,6 +2706,128 @@ pub(super) mod tests {
             assert!(source_is_local(local));
             let local_asked = library.cache_import_source(local);
             assert_eq!(local_asked.queued, 0, "a folder on disk is not downloaded");
+        }
+
+        /// A file a loader has taken from the line is still on its way: the
+        /// pack's row counts it, and a second pass does not queue it again.
+        #[test]
+        fn a_file_a_loader_took_is_still_counted_and_not_queued_twice() {
+            let library = SampleLibrary::empty_without_loading();
+            let url: Arc<str> = Arc::from("https://example.test/in-hand/kick.wav");
+            let files = HashSet::from([Arc::clone(&url)]);
+            assert!(ensure_cached_shared(&library.shared, &url));
+            let job = library.shared.jobs.try_pop().expect("the disk fetch");
+            assert!(matches!(job.kind, LoadKind::Cache));
+
+            assert_eq!(
+                library.pending_cache_of(&files),
+                1,
+                "the file in a loader's hand is still on its way"
+            );
+            assert!(
+                !ensure_cached_shared(&library.shared, &url),
+                "a second pass does not queue the file again"
+            );
+        }
+
+        /// The count a progress bar reads holds a disk fetch from its
+        /// queueing until its worker lets go of it.
+        #[test]
+        fn a_disk_fetch_counts_as_pending_until_its_worker_lets_go() {
+            let library = SampleLibrary::empty_without_loading();
+            let url: Arc<str> = Arc::from("https://example.test/pending/kick.wav");
+            assert!(ensure_cached_shared(&library.shared, &url));
+            assert_eq!(library.pending_loads(), 1);
+            let job = library.shared.jobs.try_pop().expect("the disk fetch");
+            assert_eq!(
+                library.pending_loads(),
+                1,
+                "the fetch in a loader's hand is still on its way"
+            );
+            library.shared.jobs.finish_cache(&job.url);
+            assert_eq!(library.pending_loads(), 0);
+        }
+
+        /// A note that needs a file now moves its own load up the line, not
+        /// a disk fetch of the same file that was queued before it.
+        #[test]
+        fn a_note_moves_up_its_own_load_and_not_a_disk_fetch_of_the_file() {
+            let library = SampleLibrary::empty_without_loading();
+            let url: Arc<str> = Arc::from("https://example.test/promote/kick.wav");
+            assert!(ensure_cached_shared(&library.shared, &url));
+            let bet = LoadPriority::Bet;
+            ensure_loading_shared(&library.shared, &url, DecodeRate::Context, bet);
+            let now = LoadPriority::Now;
+            ensure_loading_shared(&library.shared, &url, DecodeRate::Context, now);
+
+            let first = library.shared.jobs.try_pop().expect("a job in the line");
+            assert!(
+                matches!(first.kind, LoadKind::Install { .. }),
+                "the note's load goes first"
+            );
+        }
+
+        /// A file that a disk fetch and a note's load hold at once stays in
+        /// hand until both let go of it.
+        #[test]
+        fn a_file_two_loaders_hold_stays_in_hand_until_both_let_go() {
+            use crate::samples::manifest_worker_tests::drain_request;
+            use std::io::Write;
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind server");
+            let url: Arc<str> = Arc::from(format!(
+                "http://{}/held-{}.wav",
+                listener.local_addr().expect("address"),
+                std::process::id()
+            ));
+            let (asked, both_asked) = mpsc::sync_channel(1);
+            let (release, released) = mpsc::sync_channel(2);
+            let server = std::thread::spawn(move || {
+                let held: Vec<_> = (0..2)
+                    .map(|_| drain_request(listener.accept().expect("accept").0))
+                    .collect();
+                asked.send(()).expect("both loaders asked");
+                for mut stream in held {
+                    released.recv().expect("release one answer");
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                }
+            });
+            let cache = tempfile::tempdir().expect("host cache");
+            let library = SampleLibrary::with_background_loaders_at(
+                HashMap::new(),
+                Vec::new(),
+                HashMap::new(),
+                String::new(),
+                cache.path().to_owned(),
+                Loading::InBackground,
+            )
+            .expect("library");
+            let files = HashSet::from([Arc::clone(&url)]);
+            assert!(ensure_cached_shared(&library.shared, &url));
+            let now = LoadPriority::Now;
+            ensure_loading_shared(&library.shared, &url, DecodeRate::Context, now);
+            both_asked
+                .recv_timeout(Duration::from_secs(10))
+                .expect("both loaders hold the file");
+
+            release.send(()).expect("answer one loader");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while library.take_failures().is_empty() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // The loader that was answered lets go of the file.
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                library.loading_among(&files),
+                Some(file_name_of_url(&url)),
+                "the other loader still has the file"
+            );
+
+            release.send(()).expect("answer the other loader");
+            server.join().expect("server");
         }
 
         /// The soundfonts are one pack: the files are the `.js` under the
@@ -2702,15 +2866,11 @@ pub(super) mod tests {
             );
             assert_eq!(library.pending_cache_under(&fonts.base), 2);
             assert!(library.loading_under(&fonts.base).is_none());
-            library
-                .shared
-                .loading
-                .lock()
-                .expect("loading")
-                .insert(Arc::from("https://example.test/sound/font1.js"));
+            // A worker takes one of the two files.
+            let taken = library.shared.jobs.try_pop().expect("a font fetch");
             assert_eq!(
-                library.loading_under(&fonts.base).as_deref(),
-                Some("font1.js")
+                library.loading_under(&fonts.base),
+                Some(file_name_of_url(&taken.url))
             );
             assert!(
                 library
@@ -2720,12 +2880,6 @@ pub(super) mod tests {
             // Several workers can hold claimed files at once; each still keeps
             // its claim live after the queue is drained.
             while library.shared.jobs.try_pop().is_some() {}
-            {
-                let mut loading = library.shared.loading.lock().expect("loading");
-                loading.clear();
-                loading.insert(Arc::from("https://example.test/sound/font0.js"));
-                loading.insert(Arc::from("https://example.test/sound/font1.js"));
-            }
             assert_eq!(library.pending_cache_under(&fonts.base), 2);
             assert!(library.loading_now().is_some());
         }

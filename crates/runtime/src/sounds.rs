@@ -1083,6 +1083,21 @@ pub fn string_end(body: &str, quote: char) -> usize {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_smf_program_table_follows_the_gm_font_asset() {
+        let asset: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/gm-fonts.json")).expect("asset");
+        let fonts: Vec<&str> = asset["fonts"]
+            .as_object()
+            .expect("fonts")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(fonts.first().copied(), Some("gm_piano"));
+        assert_eq!(&rustel_smf::GM_PROGRAMS[..4], &["gm_piano"; 4]);
+        assert_eq!(&rustel_smf::GM_PROGRAMS[4..], &fonts[1..]);
+    }
+
     /// An inline map's keys are the banks it brings, however the map is
     /// laid out; a map that cannot be read - a variable, an open brace -
     /// brings nothing this text can name.

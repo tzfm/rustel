@@ -871,6 +871,8 @@ pub struct Session {
     stop_when_silent: Option<rustel_audio::SilenceStop>,
     /// Optional master limiter for WAV/MP3 file exports.
     export_limiter: Option<rustel_audio::RenderLimiter>,
+    /// Tick resolution and meter for a MIDI file render.
+    midi_export_options: rustel_smf::SmfOptions,
     /// Whether a scalar WAV export also writes a `<name> stems` folder beside
     /// the file: `main.wav` plus one WAV a sounding orbit. See
     /// [`Self::set_stems_export`].
@@ -1221,6 +1223,7 @@ impl Session {
             prebake_selects_variants: false,
             stop_when_silent: None,
             export_limiter: None,
+            midi_export_options: rustel_smf::SmfOptions::default(),
             stems_export: false,
             input_warnings_reported: std::collections::BTreeSet::new(),
             refusals_reported: std::collections::BTreeSet::new(),

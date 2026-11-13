@@ -52,7 +52,7 @@ fn the_sheet_opens_on_the_focused_scene() {
     );
 }
 
-/// Right on the format flips WAV to MP3, and the target's extension
+/// Space on the format flips WAV to MP3, and the target's extension
 /// follows - the file is named for what it will be, before it is.
 #[test]
 fn the_format_flip_retargets_the_file() {
@@ -62,7 +62,7 @@ fn the_format_flip_retargets_the_file() {
     // Down Down: Length → First → Format (no silence fields on Cycles).
     studio.press(KeyCode::Down, KeyModifiers::NONE);
     studio.press(KeyCode::Down, KeyModifiers::NONE);
-    studio.press(KeyCode::Right, KeyModifiers::NONE);
+    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
     let row = row_containing(&studio.rows(), "mp3");
     assert!(
         studio.rows()[row].contains("mp3"),

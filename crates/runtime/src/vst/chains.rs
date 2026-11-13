@@ -1144,6 +1144,20 @@ struct SliderLink {
     param: u32,
 }
 
+/// A score text the session planned before the text goes in play: see
+/// [`Chains::plan`].
+struct Plan {
+    /// The text, which is not in play.
+    text: String,
+    /// The registry as the commit of the text leaves it. The registry has
+    /// the document of the read of the text.
+    registry: ChainRegistry,
+    /// The room of the assignment of the plan: see [`Batch::room`]. The
+    /// commit makes it [`Chains::room`], so a plan cuts no chain of the
+    /// score in play.
+    room: usize,
+}
+
 /// The chains of the scores of one session.
 ///
 /// The session plans the chains of a score text before the text goes in
@@ -1163,10 +1177,8 @@ struct SliderLink {
 pub(crate) struct Chains {
     /// The chains of the score in play.
     playing: ChainRegistry,
-    /// The last text the session planned that is not in play, with the
-    /// registry as the commit of that text leaves it. The registry has the
-    /// document of the read of the text.
-    plan: Option<(String, ChainRegistry)>,
+    /// The last text the session planned that is not in play.
+    plan: Option<Plan>,
     /// The snapshot of each document at rest: the copies its chains wanted
     /// when it went to rest. See [`ChainRegistry::snapshot`]. A document
     /// whose chains wanted no copy has no snapshot. The snapshot goes when
@@ -1199,9 +1211,6 @@ pub(crate) struct Chains {
     /// The room of the last assignment of the score in play: see
     /// [`Batch::room`]. The list of the chains of the output takes it.
     room: usize,
-    /// The room of the last plan. The room takes it at the commit of the
-    /// plan, so a plan cuts no chain of the score in play.
-    plan_room: usize,
     /// The counts of the live output at its last turn: see
     /// [`named_chains`].
     turn: InsertTurn,
@@ -1242,7 +1251,6 @@ impl Chains {
             kept: (Vec::new(), Vec::new(), 0),
             gone: Vec::new(),
             room: rustel_audio::MAX_INSERT_BUSES,
-            plan_room: rustel_audio::MAX_INSERT_BUSES,
             turn: InsertTurn::default(),
             told: InsertTurn::default(),
             links: Vec::new(),
@@ -1284,12 +1292,13 @@ impl Chains {
 
     /// The registry of the score in play, then the plan.
     fn registries(&self) -> impl Iterator<Item = &ChainRegistry> {
-        let plan = self.plan.iter().map(|(_, planned)| planned);
+        let plan = self.plan.iter().map(|plan| &plan.registry);
         std::iter::once(&self.playing).chain(plan)
     }
 
     /// Plans the chains of a score text that is not in play. `lanes` has
     /// the lanes of the text and its document: see [`LaneTable::read_of`].
+    /// `room` is the room of the assignment of the plan: see [`Plan::room`].
     /// Gives the registry of the plan: a copy of the registry of the score
     /// in play, with the score change of the text. Each note of the text
     /// takes the number of its chain there. A session with a plan of the
@@ -1304,12 +1313,13 @@ impl Chains {
         &mut self,
         source: &str,
         lanes: &LaneTable,
+        room: usize,
         now: Duration,
     ) -> (&mut ChainRegistry, Vec<u64>) {
         let (document, read) = lanes.read_of(source);
-        let same = self.plan.take_if(|(_, last)| last.document == document);
-        let (mut planned, ended) = match same {
-            Some((_, mut last)) => {
+        let same = self.plan.take_if(|plan| plan.registry.document == document);
+        let (mut planned, ended) = match same.map(|plan| plan.registry) {
+            Some(mut last) => {
                 let ended = last.catch_up(&self.playing);
                 (last, ended)
             }
@@ -1322,8 +1332,12 @@ impl Chains {
             planned.come_back(document, copies, now);
         }
         planned.score_changed(read, now);
-        let (_, planned) = self.plan.insert((source.to_owned(), planned));
-        (planned, ended)
+        let plan = Plan {
+            text: source.to_owned(),
+            registry: planned,
+            room,
+        };
+        (&mut self.plan.insert(plan).registry, ended)
     }
 
     /// A new score plays: see [`score_changed`]. `lanes` has the lanes of
@@ -1357,8 +1371,8 @@ impl Chains {
         }
         let before = self.playing.rest.clone();
         let snapshot = self.snapshots.remove(&document);
-        let same = self.plan.take_if(|(text, planned)| {
-            Some(text.as_str()) == source && planned.document == document
+        let same = self.plan.take_if(|plan| {
+            Some(plan.text.as_str()) == source && plan.registry.document == document
         });
         let ended = match same {
             // The plan made the score change of this text. A chain the
@@ -1369,7 +1383,11 @@ impl Chains {
             // that left, a lost plugin and a dropped key. A mark the score
             // in play has keeps its time. A chain keeps its last use in
             // play too.
-            Some((_, mut planned)) => {
+            Some(Plan {
+                registry: mut planned,
+                room,
+                ..
+            }) => {
                 let ended = planned.catch_up(&self.playing);
                 planned.bodies = std::mem::take(&mut self.playing.bodies);
                 planned.set_documents(document, lanes.rest_orders(), &before, now);
@@ -1396,7 +1414,7 @@ impl Chains {
                     }
                 }
                 self.playing = planned;
-                self.room = self.plan_room;
+                self.room = room;
                 ended
             }
             None => {
@@ -1443,8 +1461,8 @@ impl Chains {
             (self.rest, self.rest_changes) = (rest, self.rest_changes + 1);
         }
         self.playing.hold(&self.snapshots);
-        if let Some((_, planned)) = &mut self.plan {
-            planned.hold(&self.snapshots);
+        if let Some(plan) = &mut self.plan {
+            plan.registry.hold(&self.snapshots);
         }
     }
 
@@ -1458,8 +1476,8 @@ impl Chains {
         if self.playing.rest.remove(&document).is_none() {
             return Vec::new();
         }
-        if let Some((_, planned)) = &mut self.plan {
-            planned.rest.remove(&document);
+        if let Some(plan) = &mut self.plan {
+            plan.registry.rest.remove(&document);
         }
         self.give_back(document, lanes)
     }
@@ -1474,11 +1492,11 @@ impl Chains {
         self.set_rest();
         let now = self.clock;
         let mut ended = self.playing.close(document, lanes.playing(), now);
-        if let Some((source, planned)) = &mut self.plan
-            && planned.document != document
+        if let Some(plan) = &mut self.plan
+            && plan.registry.document != document
         {
-            let (_, read) = lanes.read_of(source);
-            ended.extend(planned.close(document, read, now));
+            let (_, read) = lanes.read_of(&plan.text);
+            ended.extend(plan.registry.close(document, read, now));
         }
         ended.sort_unstable();
         ended.dedup();
@@ -1492,8 +1510,8 @@ impl Chains {
     fn end_closed(&mut self, lanes: &LaneTable) -> Vec<u64> {
         let (closed, now) = (|document| lanes.is_closed(document), self.clock);
         let mut ended = self.playing.end_closed(closed, now);
-        if let Some((_, planned)) = &mut self.plan {
-            ended.extend(planned.end_closed(closed, now));
+        if let Some(plan) = &mut self.plan {
+            ended.extend(plan.registry.end_closed(closed, now));
         }
         ended.sort_unstable();
         ended.dedup();
@@ -1502,7 +1520,7 @@ impl Chains {
 
     /// Drops the plan. Gives the chains only the plan made.
     fn forget(&mut self) -> Vec<u64> {
-        let planned = self.plan.take().map(|(_, planned)| planned);
+        let planned = self.plan.take().map(|plan| plan.registry);
         let chains = planned.iter().flat_map(|planned| planned.owners.values());
         let made = chains.filter(|chain| !self.playing.has(chain.id));
         made.map(|chain| chain.id).collect()
@@ -1523,12 +1541,13 @@ impl Chains {
         rest: impl IntoIterator<Item = (u64, u64)>,
         now: Duration,
     ) {
-        let Some((text, planned)) = &mut self.plan else {
+        let Some(plan) = &mut self.plan else {
             return;
         };
-        if text != source || planned.document == document {
+        if plan.text != source || plan.registry.document == document {
             return;
         }
+        let planned = &mut plan.registry;
         let before = planned.document;
         let chains = planned.owners.values_mut();
         for chain in chains.filter(|chain| chain.document == before) {
@@ -1551,9 +1570,10 @@ impl Chains {
     /// snapshot holds goes to the document of the snapshot in both: see
     /// [`ChainRegistry::end`].
     fn settle(&mut self, now: Duration) -> Vec<u64> {
-        let Some((_, planned)) = &mut self.plan else {
+        let Some(plan) = &mut self.plan else {
             return self.playing.settle(now);
         };
+        let planned = &mut plan.registry;
         let ends = planned.due(now);
         let played = self.playing.due(now).into_iter();
         let mut gone: Vec<u64> = played
@@ -1968,8 +1988,8 @@ pub(crate) struct RenderPlan {
 }
 
 /// Ends the chains of a render at its drop: see [`Host::keep`]. The copies
-/// of the chains end in the end jobs of the plugin thread, and the counts
-/// of their copies that no take read go.
+/// of the chains end in jobs of the plugin thread, and the counts of their
+/// copies that no take read go.
 struct RenderGuard {
     host: &'static Host,
     caller: u64,
@@ -2508,8 +2528,7 @@ pub(crate) fn plan(
     let room = batch.room(csound.orbit_chains());
     let mut chains = locked(chains);
     let now = chains.clock;
-    chains.plan_room = room;
-    let (planned, mut ended) = chains.plan(source, lanes, now);
+    let (planned, mut ended) = chains.plan(source, lanes, room, now);
     let assignment = planned.assign(&batch.owners, room, now, ChainRegistry::in_grace);
     ended.extend(assignment.ended);
     keep_now(&mut chains, ended);
@@ -2658,7 +2677,7 @@ pub(crate) fn retry(chains: &Mutex<Chains>, source: Option<&str>, sample_rate: u
     let copies = {
         let chains = locked(chains);
         let registry = match &chains.plan {
-            Some((text, planned)) if Some(text.as_str()) == source => planned,
+            Some(plan) if Some(plan.text.as_str()) == source => &plan.registry,
             _ => &chains.playing,
         };
         registry.snapshot(registry.document)
@@ -3739,7 +3758,7 @@ mod tests {
             plan(&chains, &lanes, &no_csound, &edit, &haps, &[]);
             let held = |chains: &Mutex<Chains>| {
                 let chains = locked(chains);
-                let (_, planned) = chains.plan.as_ref().expect("the plan");
+                let planned = &chains.plan.as_ref().expect("the plan").registry;
                 (chains.playing.has(full[0]), planned.has(full[0]))
             };
             assert_eq!(held(&chains), (true, false));
@@ -3771,7 +3790,7 @@ mod tests {
             assign(&chains, &lanes, &no_csound, &window, true);
             assert_eq!(HOST_CALLS.get(), calls, "a chain of the plan");
             let chains = locked(&chains);
-            let (_, planned) = chains.plan.as_ref().expect("the plan");
+            let planned = &chains.plan.as_ref().expect("the plan").registry;
             assert!(!chains.playing.has(full[0]) && planned.has(full[0]));
         }
 
@@ -4293,12 +4312,12 @@ mod tests {
         let before = chains.playing.clone();
         let kept = named(1, 1)[0].clone();
         let harp = |lane: u32, call: u32| owner(&format!("${lane}"), &[], Some((call, "harp")));
-        let (planned, _) = chains.plan("a lane more", &table, start);
+        let (planned, _) = chains.plan("a lane more", &table, room, start);
         let tried = chains_of(planned, &[kept.clone(), harp(9, 11)], start);
         assert_eq!(tried[0], lead[0]);
         assert!(!before.has(tried[1]));
         let moved = harp(10, 12);
-        let (planned, ended) = chains.plan("a call more", &table, start);
+        let (planned, ended) = chains.plan("a call more", &table, room, start);
         assert_eq!(
             chains_of(planned, &[kept.clone(), moved.clone()], start),
             tried
@@ -4309,7 +4328,7 @@ mod tests {
         // session has the plan. An engine holds the copies of that chain:
         // the plan takes it, and the chain the plan made ends.
         let sounding = chain_of(&mut chains.playing, moved.clone(), start);
-        let (planned, ended) = chains.plan("a call more", &table, start);
+        let (planned, ended) = chains.plan("a call more", &table, room, start);
         assert_eq!(chain_of(planned, moved.clone(), start), sounding);
         assert_eq!(ended, [tried[1]]);
 
@@ -4368,7 +4387,7 @@ mod tests {
         chains.clock = start + CHAIN_GRACE;
         lanes.set_reading(1);
         assert_eq!(lanes.read(&first), [0]);
-        chains.plan(&first, &lanes, chains.clock);
+        chains.plan(&first, &lanes, room, chains.clock);
         chains.clock += CHAIN_GRACE;
         chains.settle(chains.clock);
         lanes.install(&first);
@@ -4498,6 +4517,7 @@ mod tests {
         let mut registry = ChainRegistry::new();
         let start = Duration::ZERO;
         let later = start + CHAIN_GRACE;
+        let room = rustel_audio::MAX_INSERT_BUSES;
         let preset = |name: &str| {
             let lead = format!("lead: note(\"c\").vsti(\"serum\", {{ preset: \"{name}\" }})");
             let owner = owner("#0", &[], Some((0, "serum")));
@@ -4636,7 +4656,7 @@ mod tests {
         chains.score_changed(Some(kick), &lanes, start);
         let first = "bass: note(\"c1\").vsti(\"zyklop\")\npad: note(\"e\").vsti(\"tone\")";
         assert_eq!(lanes.read(first), [1, 3]);
-        let (planned, _) = chains.plan(first, &lanes, start);
+        let (planned, _) = chains.plan(first, &lanes, room, start);
         let owners = [bass.clone(), owner("#3", &[], Some((2, "tone")))];
         let made = chains_of(planned, &owners, start);
         assert_eq!(made[0], played[1]);
@@ -4646,7 +4666,7 @@ mod tests {
         assert_eq!(chains.plugin_names(), ["tone", "zyklop"]);
         let second = "bass: note(\"c1\").vsti(\"zyklop\")";
         assert_eq!(lanes.read(second), [1]);
-        let (planned, _) = chains.plan(second, &lanes, start);
+        let (planned, _) = chains.plan(second, &lanes, room, start);
         assert_eq!(chain_of(planned, bass, start), played[1]);
         let late = chain_of(&mut chains.playing, owner("#2", &[(3, "ott")], None), start);
         let hat = "hat: note(\"c e g\").gain(0.5)";
@@ -4655,7 +4675,7 @@ mod tests {
         let mut gone = chains.settle(later);
         gone.sort_unstable();
         assert_eq!(gone, [played[0], made[1], late]);
-        let (_, planned) = chains.plan.as_ref().expect("the plan");
+        let planned = &chains.plan.as_ref().expect("the plan").registry;
         assert!(planned.has(played[1]) && planned.owners.len() == 1);
         assert!(chains.forget().is_empty());
         assert_eq!(chains.settle(later), [played[1]]);
@@ -4673,7 +4693,7 @@ mod tests {
         let lead = chain_of(&mut chains.playing, dark_owner, start);
         let text = format!("{soft}\npad: note(\"e\").vsti(\"tone\")");
         assert_eq!(lanes.read(&text), [0, 1]);
-        let (planned, _) = chains.plan(&text, &lanes, start);
+        let (planned, _) = chains.plan(&text, &lanes, room, start);
         let owners = [soft_owner, owner("#1", &[], Some((1, "tone")))];
         let made = chains_of(planned, &owners, start);
         assert_eq!(made[0], lead);
@@ -4697,7 +4717,7 @@ mod tests {
         chains.clock += CHAIN_GRACE / 2;
         let next = format!("{text}\nhat: s(\"hh\")");
         assert_eq!(lanes.read(&next), [0, 1, 2]);
-        chains.plan(&next, &lanes, chains.clock);
+        chains.plan(&next, &lanes, room, chains.clock);
         lanes.install(&next);
         chains.score_changed(Some(next.as_str()), &lanes, chains.clock);
         assert_eq!(presets(&chains).0, both_presets);
@@ -4907,7 +4927,7 @@ mod tests {
         let unnamed = chain_of(&mut chains.playing, loose.clone(), start);
         let text = "kick: s(\"bd\")\nkeys: note(\"e\").vsti(\"vital\")";
         assert_eq!(lanes.read(text), [0, 2]);
-        chains.plan(text, &lanes, start);
+        chains.plan(text, &lanes, room, start);
         let owners = [
             owner("#1", &[], Some((0, "tone"))),
             owner("#2", &[], Some((1, "tone"))),
@@ -4955,7 +4975,7 @@ mod tests {
         let back = chains.clock;
         lanes.set_reading(1);
         assert_eq!(lanes.read(pad), [0]);
-        chains.plan(pad, &lanes, back);
+        chains.plan(pad, &lanes, room, back);
         lanes.install(pad);
         chains.score_changed(Some(pad), &lanes, back);
         assert!(chains.rest.is_empty() && chains.plan.is_none());
@@ -4979,7 +4999,7 @@ mod tests {
         let back = chains.clock;
         lanes.set_reading(1);
         assert_eq!(lanes.read(pad), [0]);
-        chains.plan(pad, &lanes, back);
+        chains.plan(pad, &lanes, room, back);
         lanes.forget(1);
         assert_eq!(chains.close(1, &lanes), [chorus]);
         assert!(chains.settle(back).is_empty(), "the plan keeps the chain");
@@ -5107,7 +5127,7 @@ mod tests {
         // play and in a plan, a chain of a note with no lane too, and no
         // chain of 3.
         let loose = chain_of(&mut chains.playing, owner("", &[(0, "ott")], None), start);
-        chains.plan(bass, &lanes, start);
+        chains.plan(bass, &lanes, room, start);
         assert!(chains.end_closed(&lanes).is_empty(), "2 is open");
         lanes.forget(2);
         assert!(chains.close(2, &lanes).is_empty());
@@ -5115,7 +5135,7 @@ mod tests {
         stopped.sort_unstable();
         assert_eq!(chains.end_closed(&lanes), stopped);
         assert!(chains.playing.has(shared));
-        let (_, planned) = chains.plan.as_ref().expect("the plan");
+        let planned = &chains.plan.as_ref().expect("the plan").registry;
         assert!(!planned.has(loose) && planned.has(shared));
 
         // A lane of 1 leaves its text, and 1 rests while the chain of the
@@ -5165,7 +5185,7 @@ mod tests {
         );
         lanes.set_reading(1);
         assert_eq!(lanes.read(bass), [2]);
-        let (planned, _) = chains.plan(bass, &lanes, start);
+        let (planned, _) = chains.plan(bass, &lanes, room, start);
         let bassed = chain_of(planned, owner("#2", &[], Some((0, "zyklop"))), start);
         let mut named = vec![led, bassed];
         named.sort_unstable();
@@ -5199,7 +5219,7 @@ mod tests {
         // no snapshot holds a chain of the plan.
         lanes.set_reading(1);
         lanes.read(lead);
-        let (planned, _) = chains.plan(lead, &lanes, start);
+        let (planned, _) = chains.plan(lead, &lanes, room, start);
         assert_eq!(chain_with(planned, led).document, 1);
         assert!(!planned.holders.contains_key(&led));
         assert_eq!(chains.playing.holders[&led], 1);
@@ -5231,11 +5251,11 @@ mod tests {
         let edit = format!("{lead}\n{bass}");
         lanes.set_reading(1);
         assert_eq!(lanes.read(&edit), [0, 1]);
-        let (planned, _) = chains.plan(&edit, &lanes, start);
+        let (planned, _) = chains.plan(&edit, &lanes, room, start);
         let held = chain_of(planned, owner("#1", &[], Some((1, "zyklop"))), start);
         lanes.set_reading(2);
         lanes.read(hat);
-        let (planned, ended) = chains.plan(hat, &lanes, start);
+        let (planned, ended) = chains.plan(hat, &lanes, room, start);
         assert!(!planned.has(held));
         assert_eq!(ended, [held]);
         lanes.set_reading(3);
@@ -5250,7 +5270,7 @@ mod tests {
         );
         lanes.set_reading(4);
         assert!(lanes.read(&deep).is_empty());
-        chains.plan(&deep, &lanes, start);
+        chains.plan(&deep, &lanes, room, start);
         lanes.install(&deep);
         chains.score_changed(Some(deep.as_str()), &lanes, start);
         assert!(chains.plan.is_none() && lanes.document() == 3);
@@ -5264,20 +5284,20 @@ mod tests {
         play_in(&mut lanes, &mut chains, 1, lead, start);
         lanes.set_reading(2);
         assert_eq!(lanes.read(&edit), [0, 1]);
-        let (planned, _) = chains.plan(&edit, &lanes, start);
+        let (planned, _) = chains.plan(&edit, &lanes, room, start);
         let zyklop = owner("#1", &[], Some((1, "zyklop")));
         let held = chain_of(planned, zyklop.clone(), start);
         lanes.set_reading(3);
         assert!(!lanes.adopt_read(hat), "a read of another text");
         chains.adopt_plan(hat, 3, lanes.rest_orders_for(3), start);
-        let (_, planned) = chains.plan.as_ref().expect("the plan");
+        let planned = &chains.plan.as_ref().expect("the plan").registry;
         assert!(planned.document == 2 && lanes.read_of(&edit).0 == 2);
         assert!(lanes.adopt_read(&edit));
         assert!(!lanes.adopt_read(&edit), "a read of 3");
         chains.adopt_plan(&edit, 3, lanes.rest_orders_for(3), start);
         assert_eq!(chains.wanted().1, [held]);
         assert_eq!(lanes.read(&edit), [0, 1]);
-        let (planned, ended) = chains.plan(&edit, &lanes, start);
+        let (planned, ended) = chains.plan(&edit, &lanes, room, start);
         assert!(ended.is_empty());
         assert_eq!(chain_of(planned, zyklop, start), held);
 
@@ -5290,10 +5310,10 @@ mod tests {
             play_in(&mut lanes, &mut chains, 2, hat, start);
             lanes.set_reading(if same { 1 } else { 3 });
             lanes.read(lead);
-            chains.plan(lead, &lanes, start);
+            chains.plan(lead, &lanes, room, start);
             lanes.forget(1);
             assert_eq!(chains.close(1, &lanes), [led]);
-            let (_, planned) = chains.plan.as_ref().expect("the plan");
+            let planned = &chains.plan.as_ref().expect("the plan").registry;
             assert_eq!(planned.has(led), same);
         }
 
@@ -5539,7 +5559,12 @@ mod tests {
         let mut planned = registry.clone();
         chain_of(&mut planned, lane(3, 3), start);
         let mut chains = Chains::new();
-        (chains.playing, chains.plan) = (registry, Some((four.clone(), planned)));
+        let plan = Plan {
+            text: four.clone(),
+            registry: planned,
+            room: rustel_audio::MAX_INSERT_BUSES,
+        };
+        (chains.playing, chains.plan) = (registry, Some(plan));
         let chains = Mutex::new(chains);
         for in_plan in [true, false] {
             assert_eq!(play(&mut lanes, lead), [0]);

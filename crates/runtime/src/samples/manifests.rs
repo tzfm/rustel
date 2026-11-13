@@ -229,7 +229,14 @@ impl ManifestContext {
             // kind it is and however long its list took to arrive. None of
             // the score-layer bookkeeping below applies: an imported name
             // is never the set folder's and never a score import's.
-            if fill_global_slot(&self.shared, import, generation, staged) {
+            let filled = import.is_some_and(|spec| {
+                self.shared
+                    .global_rows
+                    .lock()
+                    .expect("global source rows")
+                    .fill_pack(generation, spec, staged)
+            });
+            if filled {
                 rebuild_global(&self.shared, &self.global);
             }
             self.shared
@@ -261,28 +268,21 @@ impl ManifestContext {
         source_table.extend(sources);
         drop(source_table);
         {
-            // Which import each bank came of, for the browser; a bank an
-            // inline map redefines is the map's now, not the import's.
-            let mut imports = self.shared.bank_imports.write().expect("bank imports");
+            // Which import each bank came of, for the browser. A bank an
+            // inline map redefines is the map's now, not the import's. A
+            // name the open set's folder had taken up is the score's now
+            // too: the browser says whose it is, and the next set leaves it
+            // alone rather than putting the set's old bank back over it.
+            let mut owners = self.shared.bank_owners.write().expect("bank owners");
             for (name, _) in &staged {
                 match import {
                     Some(import) => {
-                        imports.insert(name.clone(), Arc::from(import));
+                        owners.insert(name.clone(), BankOwner::Import(Arc::from(import)));
                     }
                     None => {
-                        imports.remove(name);
+                        owners.remove(name);
                     }
                 }
-            }
-        }
-        {
-            // The same for a name the open set's folder had taken up: the
-            // score has redefined it, so it is the score's now - the browser
-            // says whose it is, and the next set leaves it alone rather than
-            // putting the set's old bank back over it.
-            let mut of_set = self.shared.set_banks.write().expect("set banks");
-            for (name, _) in &staged {
-                of_set.remove(name);
             }
         }
         custom.extend(staged);
@@ -532,9 +532,13 @@ impl ManifestContext {
                     self.failure("samples() source brought no sounds".to_owned());
                 }
                 let mut registered = self.custom.write().expect("custom banks");
+                let mut owners = self.shared.bank_owners.write().expect("bank owners");
                 for (name, bank) in parsed {
+                    // A host bank is neither an import's nor the set's.
+                    owners.remove(&name);
                     registered.insert(name, bank);
                 }
+                drop(owners);
                 *self
                     .shared
                     .custom_file_names
@@ -594,9 +598,13 @@ impl ManifestContext {
                 .publication
                 .enter(PublicationKind::Local, budget)?;
             let mut custom = self.custom.write().expect("custom banks");
+            let mut owners = self.shared.bank_owners.write().expect("bank owners");
             for (name, bank) in parsed {
+                // A host bank is neither an import's nor the set's.
+                owners.remove(&name);
                 custom.insert(name, bank);
             }
+            drop(owners);
             *self
                 .shared
                 .custom_file_names
@@ -814,26 +822,24 @@ impl ManifestContext {
     /// A map could not be read: a checker may say so where it was asked for.
     /// True when this is news, false when the map already stood failed for
     /// this reason.
-    fn note_source_failed(&self, map: &str, error: &str) -> bool {
+    ///
+    /// A map that `layer` files under a Settings pack is that pack's spec,
+    /// quoted. The pack's row says why, and keeps what it brought last
+    /// time, while the rows are still those of the adoption that asked.
+    fn note_source_failed(&self, map: &str, error: &str, layer: BankLayer) -> bool {
         let previous = self
             .shared
             .note_source_standing(map, SourceState::Failed(error.to_owned()));
         let news = !previous
             .is_some_and(|standing| standing.state == SourceState::Failed(error.to_owned()));
-        // A Settings pack's map is its spec, quoted. Its row says so; what
-        // it brought last time stays, which is kinder than silence.
-        if let Ok(spec) = serde_json::from_str::<String>(map) {
-            let mut slots = self
-                .shared
-                .global_slots
+        if let BankLayer::Global { generation } = layer
+            && let Ok(spec) = serde_json::from_str::<String>(map)
+        {
+            self.shared
+                .global_rows
                 .lock()
-                .expect("global source slots");
-            if let Some(slot) = slots
-                .iter_mut()
-                .find(|slot| slot.kind == GlobalKind::Pack && slot.spec == spec)
-            {
-                slot.state = GlobalSourceState::Failed(error.to_owned());
-            }
+                .expect("global source rows")
+                .fail(generation, GlobalKind::Pack, &spec, error);
         }
         news
     }
@@ -851,21 +857,11 @@ impl ManifestContext {
     /// counterpart to [`Self::note_source_failed`], for the rows a batch
     /// stops in front of rather than the packs it fails one by one.
     fn note_folder_standing(&self, error: &str, spec: &str, generation: u64) {
-        let mut slots = self
-            .shared
-            .global_slots
+        self.shared
+            .global_rows
             .lock()
-            .expect("global source slots");
-        if self.shared.global_generation.load(Ordering::Acquire) != generation {
-            return;
-        }
-        if let Some(slot) = slots
-            .iter_mut()
-            .find(|slot| slot.kind == GlobalKind::Folder && slot.spec == spec)
-            && slot.state == GlobalSourceState::Loading
-        {
-            slot.state = GlobalSourceState::Failed(error.to_owned());
-        }
+            .expect("global source rows")
+            .fail(generation, GlobalKind::Folder, spec, error);
     }
 }
 
@@ -1045,8 +1041,21 @@ fn run_folders_work(
             let Some(folder) = folder_of_spec(spec) else {
                 continue 'folders;
             };
-            let (banks, state) = walk_global_folder(&folder);
-            match fill_global_folder_slot(&context.shared, spec, generation, banks, state) {
+            let rows = || {
+                context
+                    .shared
+                    .global_rows
+                    .lock()
+                    .expect("global source rows")
+            };
+            // The listing starts here. A file deleted before it is not
+            // listed, and one deleted during it sends the walk round again.
+            if !rows().begin_walk(generation, spec) {
+                continue 'folders;
+            }
+            let (banks, outcome) = walk_global_folder(&folder);
+            let fill = rows().finish_walk(generation, spec, banks, outcome);
+            match fill {
                 FolderFill::Filled => {
                     changed = true;
                     rebuild_global(&context.shared, &context.global);
@@ -1118,7 +1127,7 @@ pub(super) fn run_manifest_worker(context: ManifestContext, jobs: ManifestJobs) 
                         match registered {
                             Ok(()) => context.note_source(map),
                             Err(error) => {
-                                let news = context.note_source_failed(&map, &error);
+                                let news = context.note_source_failed(&map, &error, layer);
                                 // Deadline and cancellation are structural
                                 // outcomes; a later effect or preload may
                                 // never launder them.
@@ -1147,7 +1156,7 @@ pub(super) fn run_manifest_worker(context: ManifestContext, jobs: ManifestJobs) 
                 // never loading with no job behind it.
                 if let Err(spent) = budget.check() {
                     for (map, _) in unreached {
-                        context.note_source_failed(&map, &spent);
+                        context.note_source_failed(&map, &spent, layer);
                         stopped.push(map);
                     }
                 }
@@ -1311,7 +1320,7 @@ impl SampleLibrary {
                     Ok(())
                 }
                 Err(error) => {
-                    context.note_source_failed(map_json, &error);
+                    context.note_source_failed(map_json, &error, BankLayer::Score);
                     Err(error)
                 }
             },
@@ -2995,6 +3004,71 @@ pub(super) mod tests {
             assert!(library.global_source_reports().is_empty());
         }
 
+        /// A pack turned off while its list is on its way reads off when
+        /// that list fails to arrive: the failure belongs to the adoption
+        /// that asked for it.
+        #[test]
+        fn a_pack_turned_off_while_its_list_fails_reads_off() {
+            let (url, entered, release, server) = stalled_server("not a list".to_owned());
+
+            let library = SampleLibrary::empty();
+            library.adopt_global_sources(&[GlobalSource {
+                spec: url.clone(),
+                enabled: true,
+            }]);
+            entered
+                .recv_timeout(ARRIVAL_TIMEOUT)
+                .expect("the pack was asked for");
+            library.adopt_global_sources(&[GlobalSource {
+                spec: url.clone(),
+                enabled: false,
+            }]);
+            release.send(()).expect("release the answer");
+            server.join().expect("pack server");
+            library.wait_until_idle(Duration::from_secs(2));
+
+            assert_eq!(
+                library.global_source_reports()[0].state,
+                GlobalSourceState::Off,
+                "the old adoption's failure does not reach the row turned off"
+            );
+        }
+
+        /// A score that asks for the pack a Settings row imported, and fails,
+        /// leaves that row as it stands: the row is the player's import, not
+        /// the score's.
+        #[test]
+        fn a_score_import_that_fails_leaves_the_settings_row_of_its_pack_alone() {
+            let (url, arrival, server) = serve_once("/pack.json", r#"{"kick":"kick.wav"}"#.into());
+
+            let library = SampleLibrary::empty();
+            library.adopt_global_sources(&[GlobalSource {
+                spec: url.clone(),
+                enabled: true,
+            }]);
+            arrival
+                .recv_timeout(ARRIVAL_TIMEOUT)
+                .expect("the pack was asked for");
+            server.join().expect("pack server");
+            library.wait_until_idle(Duration::from_secs(2));
+            let ready = GlobalSourceState::Ready { banks: 1 };
+            assert_eq!(library.global_source_reports()[0].state, ready);
+
+            let mut builtin = ScoreSampleAccess::denied();
+            builtin.permit_builtin_sources();
+            let map = serde_json::to_string(&url).expect("a quoted spec");
+            assert!(
+                library.register_score_custom(&map, None, &builtin).is_err(),
+                "the score's policy does not allow the pack's origin"
+            );
+
+            assert_eq!(
+                library.global_source_reports()[0].state,
+                ready,
+                "the score's failure does not reach the Settings row"
+            );
+        }
+
         /// A pack that shares a name with the open set's folder leaves the
         /// set's bookkeeping alone: the set's bank stays the set's, and the
         /// next set can still put it down.
@@ -3027,10 +3101,11 @@ pub(super) mod tests {
             assert!(
                 library
                     .shared
-                    .set_banks
+                    .bank_owners
                     .read()
-                    .expect("set banks")
-                    .contains_key("bd"),
+                    .expect("bank owners")
+                    .get("bd")
+                    .is_some_and(BankOwner::is_set),
                 "the set's displacement record survived the pack"
             );
             let bd = library
@@ -3584,27 +3659,31 @@ pub(super) mod tests {
             // enqueue a real walk on a fine budget, and the always-running worker
             // could land it either side of the spent call below - a race, not a
             // result.
-            *library
-                .shared
-                .global_slots
-                .lock()
-                .expect("global source slots") = specs
-                .iter()
-                .enumerate()
-                .map(|(row, spec)| GlobalSlot {
-                    row,
-                    spec: spec.clone(),
-                    kind: GlobalKind::Folder,
-                    banks: HashMap::new(),
-                    state: GlobalSourceState::Loading,
-                    rewalk: false,
-                })
-                .collect::<Vec<_>>();
-            let generation = library
-                .shared
-                .global_generation
-                .fetch_add(1, Ordering::AcqRel)
-                + 1;
+            let generation = {
+                let mut rows = library
+                    .shared
+                    .global_rows
+                    .lock()
+                    .expect("global source rows");
+                let generation = rows.begin();
+                assert!(
+                    rows.install(
+                        generation,
+                        specs
+                            .iter()
+                            .enumerate()
+                            .map(|(row, spec)| GlobalSlot {
+                                row,
+                                spec: spec.clone(),
+                                kind: GlobalKind::Folder,
+                                banks: HashMap::new(),
+                                stage: RowStage::WalkQueued,
+                            })
+                            .collect(),
+                    )
+                );
+                generation
+            };
 
             // A spent budget: the check between folders is the walk's first act.
             let budget = rustel_sample_fetch_deadline_in_past();
@@ -3648,27 +3727,31 @@ pub(super) mod tests {
             // enqueue a real walk on a fine budget, and the always-running worker
             // could land it either side of the spent call below - a race, not a
             // result.
-            *library
-                .shared
-                .global_slots
-                .lock()
-                .expect("global source slots") = specs
-                .iter()
-                .enumerate()
-                .map(|(row, spec)| GlobalSlot {
-                    row,
-                    spec: spec.clone(),
-                    kind: GlobalKind::Folder,
-                    banks: HashMap::new(),
-                    state: GlobalSourceState::Loading,
-                    rewalk: false,
-                })
-                .collect::<Vec<_>>();
-            let generation = library
-                .shared
-                .global_generation
-                .fetch_add(1, Ordering::AcqRel)
-                + 1;
+            let generation = {
+                let mut rows = library
+                    .shared
+                    .global_rows
+                    .lock()
+                    .expect("global source rows");
+                let generation = rows.begin();
+                assert!(
+                    rows.install(
+                        generation,
+                        specs
+                            .iter()
+                            .enumerate()
+                            .map(|(row, spec)| GlobalSlot {
+                                row,
+                                spec: spec.clone(),
+                                kind: GlobalKind::Folder,
+                                banks: HashMap::new(),
+                                stage: RowStage::WalkQueued,
+                            })
+                            .collect(),
+                    )
+                );
+                generation
+            };
             // Through the whole worker, not just the folder arm: a real job on a
             // real queue, its verdict read from the completion the caller owns.
             // A job with no time at all is spent the moment the worker takes it.

@@ -1,0 +1,12 @@
+[package]
+name = "rustel-smf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Standard MIDI File reading and writing"
+
+[dependencies]
+midly = { version = "0.5.3", default-features = false, features = ["std"] }
+rustel-core = { path = "../core" }

@@ -305,6 +305,7 @@ impl App {
                 || self.pads.open_count() > 0,
             has_pad: self.scenes.current().pad.is_some(),
             has_last_file: self.last_file.is_some(),
+            patterns_menu_open: self.patterns_menu_open,
             recording: self.take_chip().is_some(),
             recording_sample: self.sample_take.is_some(),
             recording_tape: self.recorder.is_some(),
@@ -409,6 +410,10 @@ impl App {
         // surface underneath rather than the menu.
         if events.iter().any(|event| matches!(event, Event::Close(_))) {
             self.menu = None;
+            // A group the reader opened folds again with the bar, so the
+            // next File menu starts where it always starts and `p` always
+            // opens the Strudel patterns rows.
+            self.patterns_menu_open = false;
             self.settle_focus();
             #[cfg(feature = "hydra")]
             self.sync_settings_webcam_preview();
@@ -464,8 +469,13 @@ impl App {
             Do::NewSession => self.new_session(),
             Do::OpenSet => self.open_set_prompt(SetPrompt::OpenSet),
             Do::OpenRecent => self.open_set_prompt(SetPrompt::OpenRecent),
+            // The group header's own choice: turn the Strudel patterns
+            // rows of the File menu in or out. The menu stays open and
+            // the next frame shows the rows it brings.
+            Do::StrudelPatterns => self.patterns_menu_open = !self.patterns_menu_open,
             Do::ImportStrudel => self.open_set_prompt(SetPrompt::ImportStrudel),
             Do::ExportPatterns => self.export_patterns(),
+            Do::ImportMidi => self.open_set_prompt(SetPrompt::ImportMidi),
             Do::RenameSet => self.open_set_prompt(SetPrompt::RenameSet),
             Do::ConsolidateSamples => self.consolidate_samples(),
             Do::DeleteScene => self.arm_delete_scene(),
@@ -508,10 +518,10 @@ impl App {
             Do::FirstError => self.jump_to_first_error(),
             Do::SmartAction => self.open_smart_action(),
             Do::Update => self.dispatch_editor(Command::Evaluate)?,
-            Do::RewindUpdate => {
-                self.next_rewind = true;
-                self.dispatch_editor(Command::Evaluate)?;
-            }
+            Do::RewindUpdate => self.evaluate_with(LaunchRequest {
+                rewind: true,
+                ..LaunchRequest::default()
+            })?,
             Do::SceneRewind => self.toggle_scene_rewind(),
             Do::Stop => self.dispatch_editor(Command::Stop)?,
             Do::Record => {

@@ -1904,7 +1904,7 @@ mod tests {
         log.push(
             Level::Warn,
             "drop",
-            "not audio, a folder of audio, or a score",
+            "not audio, a folder of audio, a score, or a MIDI file",
         );
         assert_eq!(log.unseen(), 1, "the commentary interrupts nobody");
 

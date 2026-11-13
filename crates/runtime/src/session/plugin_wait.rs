@@ -1200,6 +1200,18 @@ mod tests {
         assert_eq!(ahead.part(3, 44_100), whole(4, false));
     }
 
+    /// True when the plugin `name` answers a key with its default preset.
+    /// A read of the preset folders can still be in the line of the plugin
+    /// thread, and the key answers none until it lands. So each try waits
+    /// for that thread first.
+    fn keys_after_the_read(name: &str) -> bool {
+        let host = crate::vst::host();
+        (0..4).any(|_| {
+            host.wait_idle();
+            host.key(name, None, false).is_ok_and(|key| key.is_some())
+        })
+    }
+
     /// The copies of the plugins of the bundles in `folder`, after the work
     /// of the plugin thread.
     fn copies_in(folder: &std::path::Path) -> usize {
@@ -1780,10 +1792,7 @@ mod tests {
         let (host, fixture) = (crate::vst::host(), "rustel fixture");
         let loaded = host.resolve(fixture, true);
         assert!(matches!(loaded, crate::vst::Resolved::Ready(..)));
-        assert!(
-            host.key(fixture, None, false)
-                .is_ok_and(|key| key.is_some())
-        );
+        assert!(keys_after_the_read(fixture));
         let slot = rustel_audio::effect_slot(chain, 0);
         host.prepare(fixture, Some("half"), false, 48_000, slot);
         assert_eq!(
@@ -2014,10 +2023,7 @@ mod tests {
         // the line at once, and a wait for the plugin thread waits for it.
         let loaded = host.resolve(fixture, true);
         assert!(matches!(loaded, crate::vst::Resolved::Ready(..)));
-        assert!(
-            host.key(fixture, None, false)
-                .is_ok_and(|key| key.is_some())
-        );
+        assert!(keys_after_the_read(fixture));
         host.wait_idle();
         // Each new copy takes 300 ms in its build, so the copy of a text is
         // not ready at its commit seam.

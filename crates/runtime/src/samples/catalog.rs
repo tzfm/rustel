@@ -9,12 +9,11 @@ const MAX_TRACKED_VIDEO_CLIPS: usize = 8;
 /// Drop the clips no host shows: a strip only this table holds, a
 /// refusal, and a sound with no picture. A decode under way stays.
 #[cfg(feature = "video")]
-fn make_room_for_a_clip(videos: &mut HashMap<Arc<str>, crate::video::VideoPicture>) {
-    use crate::video::VideoPicture;
-    videos.retain(|_, picture| match picture {
-        VideoPicture::Decoding => true,
-        VideoPicture::Ready(strip) => Arc::strong_count(strip) > 1,
-        VideoPicture::Failed(_) | VideoPicture::NotVideo | VideoPicture::ByNote(_) => false,
+fn make_room_for_a_clip(videos: &mut HashMap<Arc<str>, VideoClip>) {
+    videos.retain(|_, clip| match clip {
+        VideoClip::Decoding => true,
+        VideoClip::Ready(strip) => Arc::strong_count(strip) > 1,
+        VideoClip::Refused { .. } | VideoClip::NotVideo => false,
     });
 }
 
@@ -384,25 +383,18 @@ fn source_sort_key(slot: &GlobalSlot) -> String {
 /// Rebuild the flat imported layer from the rows. Banks with the same name
 /// get stable source-scoped aliases rather than silently replacing one another.
 pub(super) fn rebuild_global(shared: &Shared, global: &RwLock<HashMap<String, Bank>>) {
-    let slots = shared.global_slots.lock().expect("global source slots");
+    let global_rows = shared.global_rows.lock().expect("global source rows");
     let renames = shared.renames.read().expect("bank renames");
     let source_renames = shared.source_renames.read().expect("source bank renames");
     let mut auto_aliases = shared.auto_aliases.write().expect("automatic bank aliases");
     let mut flat: HashMap<String, Bank> = HashMap::new();
     let mut source_of: HashMap<String, Arc<str>> = HashMap::new();
-    let mut rows: Vec<&GlobalSlot> = slots.iter().collect();
+    let mut rows: Vec<&GlobalSlot> = global_rows.slots.iter().collect();
     rows.sort_by_key(|slot| (source_sort_key(slot), slot.row));
     for slot in rows {
-        // Off and unreadable rows bring nothing; a pack still fetching keeps
-        // what it brought last time.
-        if matches!(
-            slot.state,
-            GlobalSourceState::Off | GlobalSourceState::Missing(_) | GlobalSourceState::Failed(_)
-        ) && slot.banks.is_empty()
-        {
-            continue;
-        }
-        if matches!(slot.state, GlobalSourceState::Off) {
+        // An Off row brings nothing. Every other row brings what it holds:
+        // a row still on its way keeps what it brought last time.
+        if matches!(slot.stage, RowStage::Off) {
             continue;
         }
         let mut banks: Vec<_> = slot.banks.iter().collect();
@@ -446,7 +438,7 @@ pub(super) fn rebuild_global(shared: &Shared, global: &RwLock<HashMap<String, Ba
     drop(auto_aliases);
     drop(source_renames);
     drop(renames);
-    drop(slots);
+    drop(global_rows);
     // One write each, so the browser never sees a moment with the old
     // sources gone and the new ones not yet in.
     let mut global = global.write().expect("global banks");
@@ -457,87 +449,26 @@ pub(super) fn rebuild_global(shared: &Shared, global: &RwLock<HashMap<String, Ba
     *shared.global_source_of.write().expect("global sources") = source_of;
 }
 
-/// A pack's list has landed: fill its row, unless the row has been
-/// replaced since the fetch was asked for.
-pub(super) fn fill_global_slot(
-    shared: &Shared,
-    spec: Option<&str>,
-    generation: u64,
-    banks: Vec<(String, Bank)>,
-) -> bool {
-    if shared.global_generation.load(Ordering::Acquire) != generation {
-        return false;
-    }
-    let Some(spec) = spec else {
-        return false;
-    };
-    let mut slots = shared.global_slots.lock().expect("global source slots");
-    let Some(slot) = slots
-        .iter_mut()
-        .find(|slot| slot.kind == GlobalKind::Pack && slot.spec == spec)
-    else {
-        return false;
-    };
-    slot.state = if banks.is_empty() {
-        GlobalSourceState::Failed("brought no sounds".to_owned())
-    } else {
-        GlobalSourceState::Ready { banks: banks.len() }
-    };
-    slot.banks = banks.into_iter().collect();
-    true
-}
-
-/// A folder's walk has finished: fill its row with what it holds and how
-/// it stands, unless the row has been replaced since the walk was asked
-/// for or a file was deleted from it meanwhile.
-pub(super) fn fill_global_folder_slot(
-    shared: &Shared,
-    spec: &str,
-    generation: u64,
-    banks: Vec<(String, Bank)>,
-    state: GlobalSourceState,
-) -> FolderFill {
-    if shared.global_generation.load(Ordering::Acquire) != generation {
-        return FolderFill::Superseded;
-    }
-    let mut slots = shared.global_slots.lock().expect("global source slots");
-    let Some(slot) = slots
-        .iter_mut()
-        .find(|slot| slot.kind == GlobalKind::Folder && slot.spec == spec)
-    else {
-        return FolderFill::Superseded;
-    };
-    if std::mem::take(&mut slot.rewalk) {
-        return FolderFill::Stale;
-    }
-    slot.state = state;
-    slot.banks = banks.into_iter().collect();
-    FolderFill::Filled
-}
-
 /// What one imported folder holds, and how its row should read: missing
 /// when the folder is not there, failed when it is there and will not
 /// read.
-pub(super) fn walk_global_folder(folder: &str) -> (Vec<(String, Bank)>, GlobalSourceState) {
+pub(super) fn walk_global_folder(folder: &str) -> (Vec<(String, Bank)>, RowStage) {
     let root = Path::new(folder.trim());
     let root = match root.canonicalize() {
         Ok(root) => root,
         Err(error) => {
             let why = format!("cannot read {}: {error}", root.display());
-            let state = if error.kind() == std::io::ErrorKind::NotFound {
-                GlobalSourceState::Missing(why)
+            let stage = if error.kind() == std::io::ErrorKind::NotFound {
+                RowStage::Missing(why)
             } else {
-                GlobalSourceState::Failed(why)
+                RowStage::Failed(why)
             };
-            return (Vec::new(), state);
+            return (Vec::new(), stage);
         }
     };
     match folder_banks(&root, &[]) {
-        Ok(banks) => {
-            let count = banks.len();
-            (banks, GlobalSourceState::Ready { banks: count })
-        }
-        Err(error) => (Vec::new(), GlobalSourceState::Failed(error)),
+        Ok(banks) => (banks, RowStage::Ready),
+        Err(error) => (Vec::new(), RowStage::Failed(error)),
     }
 }
 
@@ -619,7 +550,7 @@ impl SampleLibrary {
             return Err(error.clone());
         }
         let mut custom = self.custom.write().expect("custom banks");
-        let mut adopted = self.shared.set_banks.write().expect("set banks");
+        let mut owners = self.shared.bank_owners.write().expect("bank owners");
         // A refresh leaves alone a name the session holds outside this set:
         // a score or prebake registered it, and only opening a set takes a
         // name over (see `publish_score_custom`).
@@ -627,7 +558,9 @@ impl SampleLibrary {
             banks
                 .into_iter()
                 .filter(|(name, _)| {
-                    !refresh || adopted.contains_key(name) || !custom.contains_key(name)
+                    !refresh
+                        || owners.get(name).is_some_and(BankOwner::is_set)
+                        || !custom.contains_key(name)
                 })
                 .collect::<Vec<_>>()
         });
@@ -642,7 +575,8 @@ impl SampleLibrary {
             .as_ref()
             .is_ok_and(|banks| {
                 let held = |name: &str| {
-                    custom.contains_key(name) && !matches!(adopted.get(name), Some(None))
+                    custom.contains_key(name)
+                        && !matches!(owners.get(name), Some(BankOwner::Set { displaced: None }))
                 };
                 let kept = custom.keys().filter(|name| held(name)).count();
                 let additional = banks.iter().filter(|(name, _)| !held(name)).count();
@@ -654,13 +588,20 @@ impl SampleLibrary {
         }
         // Switching sets closes the previous one even when the new folder
         // does not read or does not fit: one set's `kicks` never plays in
-        // the next.
-        for (name, displaced) in std::mem::take(&mut *adopted) {
-            match displaced {
-                Some(bank) => {
-                    custom.insert(name, bank);
+        // the next. What a set bank hid comes back under its import.
+        let closed: Vec<(String, BankOwner)> =
+            owners.extract_if(|_, owner| owner.is_set()).collect();
+        for (name, owner) in closed {
+            match owner {
+                BankOwner::Set {
+                    displaced: Some(Displaced { bank, import }),
+                } => {
+                    custom.insert(name.clone(), bank);
+                    if let Some(import) = import {
+                        owners.insert(name, BankOwner::Import(import));
+                    }
                 }
-                None => {
+                _ => {
                     custom.remove(&name);
                 }
             }
@@ -678,14 +619,20 @@ impl SampleLibrary {
             return Err(error);
         }
         for (name, bank) in staged {
-            adopted.insert(name.clone(), custom.insert(name, bank));
+            let previous = custom.insert(name.clone(), bank);
+            let import = match owners.remove(&name) {
+                Some(BankOwner::Import(import)) => Some(import),
+                _ => None,
+            };
+            let displaced = previous.map(|bank| Displaced { bank, import });
+            owners.insert(name, BankOwner::Set { displaced });
         }
         *self
             .shared
             .custom_file_names
             .write()
             .expect("custom filenames") = local_names::index(custom.values());
-        Ok(adopted.len())
+        Ok(owners.values().filter(|owner| owner.is_set()).count())
     }
 
     /// Rename imported banks, by the name they arrived under.
@@ -768,20 +715,19 @@ impl SampleLibrary {
     /// A source that cannot be read is reported and skipped. It is never
     /// fatal: a folder on an unplugged drive must not stop the studio from
     /// opening, and the sound browser shows the source as missing.
+    ///
+    /// When a later adoption begins before this one puts its rows down,
+    /// this one changes nothing.
     pub fn adopt_global_sources(&self, sources: &[GlobalSource]) -> Vec<GlobalSourceReport> {
-        let sources = deduplicated_global_sources(sources);
+        // The rows of the last adoption stay up while this one plans its
+        // own, and no job of the last adoption lands in the meantime.
         let generation = self
             .shared
-            .global_generation
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-        let previous = std::mem::take(
-            &mut *self
-                .shared
-                .global_slots
-                .lock()
-                .expect("global source slots"),
-        );
+            .global_rows
+            .lock()
+            .expect("global source rows")
+            .begin();
+        let sources = deduplicated_global_sources(sources);
         let mut slots: Vec<GlobalSlot> = Vec::with_capacity(sources.len());
         let mut packs: Vec<(usize, String)> = Vec::new();
         let mut folders: Vec<String> = Vec::new();
@@ -790,33 +736,30 @@ impl SampleLibrary {
             if spec.is_empty() {
                 continue;
             }
+            let slot = |kind, stage| GlobalSlot {
+                row,
+                spec: spec.to_owned(),
+                kind,
+                banks: HashMap::new(),
+                stage,
+            };
             if !source.enabled {
-                slots.push(GlobalSlot {
-                    row,
-                    spec: spec.to_owned(),
-                    kind: if folder_of_spec(spec).is_some() {
-                        GlobalKind::Folder
-                    } else {
-                        GlobalKind::Pack
-                    },
-                    banks: HashMap::new(),
-                    state: GlobalSourceState::Off,
-                    rewalk: false,
-                });
+                let kind = if folder_of_spec(spec).is_some() {
+                    GlobalKind::Folder
+                } else {
+                    GlobalKind::Pack
+                };
+                slots.push(slot(kind, RowStage::Off));
                 continue;
             }
             if let Some(folder) = folder_of_spec(spec) {
                 // A folder that is not there has nothing to walk: its row
                 // says so at once, and nothing waits in line for it.
                 if matches!(Path::new(folder.trim()).try_exists(), Ok(false)) {
-                    slots.push(GlobalSlot {
-                        row,
-                        spec: spec.to_owned(),
-                        kind: GlobalKind::Folder,
-                        banks: HashMap::new(),
-                        state: GlobalSourceState::Missing("no such folder".to_owned()),
-                        rewalk: false,
-                    });
+                    slots.push(slot(
+                        GlobalKind::Folder,
+                        RowStage::Missing("no such folder".to_owned()),
+                    ));
                     continue;
                 }
                 // The walk happens on the manifest worker, exactly as a
@@ -824,49 +767,33 @@ impl SampleLibrary {
                 // time until the new walk lands, so re-adopting - which
                 // every add, remove and reorder does - never silences a
                 // library for the length of a directory scan.
-                let carried = previous
-                    .iter()
-                    .find(|slot| slot.kind == GlobalKind::Folder && slot.spec == spec)
-                    .map(|slot| slot.banks.clone())
-                    .unwrap_or_default();
-                slots.push(GlobalSlot {
-                    row,
-                    spec: spec.to_owned(),
-                    kind: GlobalKind::Folder,
-                    banks: carried,
-                    state: GlobalSourceState::Loading,
-                    rewalk: false,
-                });
+                slots.push(slot(GlobalKind::Folder, RowStage::WalkQueued));
                 folders.push(spec.to_owned());
                 continue;
             }
             // A pack keeps what it brought last time until its new list
             // lands: a refetch must not silence it in the meantime.
-            let carried = previous
-                .iter()
-                .find(|slot| slot.kind == GlobalKind::Pack && slot.spec == spec)
-                .map(|slot| slot.banks.clone())
-                .unwrap_or_default();
-            slots.push(GlobalSlot {
-                row,
-                spec: spec.to_owned(),
-                kind: GlobalKind::Pack,
-                banks: carried,
-                state: GlobalSourceState::Loading,
-                rewalk: false,
-            });
+            slots.push(slot(GlobalKind::Pack, RowStage::Fetching));
             packs.push((row, spec.to_owned()));
         }
-        *self
+        #[cfg(test)]
+        tests::adoption_planned();
+        let installed = self
             .shared
-            .global_slots
+            .global_rows
             .lock()
-            .expect("global source slots") = slots;
+            .expect("global source rows")
+            .install(generation, slots);
+        if !installed {
+            // A later adoption began while this one planned. The rows are
+            // that adoption's to put down.
+            return self.global_source_reports();
+        }
         rebuild_global(&self.shared, &self.global);
         if !folders.is_empty()
             && let Err(error) = self.enqueue_manifest_work_async_locked(
                 ManifestWork::Folders {
-                    specs: folders.clone(),
+                    specs: folders,
                     generation,
                 },
                 MANIFEST_BATCH_TIMEOUT,
@@ -875,30 +802,20 @@ impl SampleLibrary {
             // The queue refused the walk, so nothing will ever fill these
             // rows: say so on them rather than leaving `fetching…` up for
             // the rest of the session.
-            let mut slots = self
-                .shared
-                .global_slots
+            self.shared
+                .global_rows
                 .lock()
-                .expect("global source slots");
-            for slot in slots.iter_mut() {
-                if slot.kind == GlobalKind::Folder && folders.contains(&slot.spec) {
-                    slot.state = GlobalSourceState::Failed(error.clone());
-                }
-            }
+                .expect("global source rows")
+                .refuse(generation, GlobalKind::Folder, &error);
         }
         if !packs.is_empty()
             && let Err(error) = self.register_global_packs(&packs, generation)
         {
-            let mut slots = self
-                .shared
-                .global_slots
+            self.shared
+                .global_rows
                 .lock()
-                .expect("global source slots");
-            for slot in slots.iter_mut() {
-                if slot.kind == GlobalKind::Pack && slot.state == GlobalSourceState::Loading {
-                    slot.state = GlobalSourceState::Failed(error.clone());
-                }
-            }
+                .expect("global source rows")
+                .refuse(generation, GlobalKind::Pack, &error);
         }
         self.global_source_reports()
     }
@@ -926,19 +843,11 @@ impl SampleLibrary {
     /// How every imported source stands right now, in row order - for the
     /// sources page, which asks again as packs land.
     pub fn global_source_reports(&self) -> Vec<GlobalSourceReport> {
-        let slots = self
-            .shared
-            .global_slots
+        self.shared
+            .global_rows
             .lock()
-            .expect("global source slots");
-        let mut rows: Vec<&GlobalSlot> = slots.iter().collect();
-        rows.sort_by_key(|slot| slot.row);
-        rows.iter()
-            .map(|slot| GlobalSourceReport {
-                spec: slot.spec.clone(),
-                state: slot.state.clone(),
-            })
-            .collect()
+            .expect("global source rows")
+            .reports()
     }
 
     /// The fetch policy the host gives a score, so an imported pack is
@@ -960,13 +869,16 @@ impl SampleLibrary {
         }
         {
             let custom = self.custom.read().expect("custom banks");
-            for name in self.shared.set_banks.read().expect("set banks").keys() {
-                if let Some(bank) = custom.get(name) {
+            let owners = self.shared.bank_owners.read().expect("bank owners");
+            for (name, owner) in owners.iter() {
+                if owner.is_set()
+                    && let Some(bank) = custom.get(name)
+                {
                     own.extend(bank_file_urls(bank).into_iter().cloned());
                 }
             }
         }
-        // The lock order of `publish_score_custom`: grants, banks, set banks.
+        // The lock order of `publish_score_custom`: grants, banks, owners.
         let mut grants = self
             .shared
             .score_sources
@@ -991,19 +903,20 @@ impl SampleLibrary {
                 .any(|url| withdrawn.contains(url))
         };
         let mut custom = self.custom.write().expect("custom banks");
-        let mut adopted = self.shared.set_banks.write().expect("set banks");
+        let mut owners = self.shared.bank_owners.write().expect("bank owners");
         // A bank the set hid comes back when the set closes, but not one
         // taken back.
-        for displaced in adopted.values_mut() {
-            if displaced.as_ref().is_some_and(taken) {
+        for owner in owners.values_mut() {
+            if let BankOwner::Set { displaced } = owner
+                && displaced.as_ref().is_some_and(|hidden| taken(&hidden.bank))
+            {
                 *displaced = None;
             }
         }
-        let mut dropped = Vec::new();
         custom.retain(|name, bank| {
-            let keep = adopted.contains_key(name) || !taken(bank);
+            let keep = owners.get(name).is_some_and(BankOwner::is_set) || !taken(bank);
             if !keep {
-                dropped.push(name.clone());
+                owners.remove(name);
             }
             keep
         });
@@ -1012,12 +925,7 @@ impl SampleLibrary {
             .custom_file_names
             .write()
             .expect("custom filenames") = local_names::index(custom.values());
-        drop((adopted, custom, grants));
-        self.shared
-            .bank_imports
-            .write()
-            .expect("bank imports")
-            .retain(|name, _| !dropped.contains(name));
+        drop((owners, custom, grants));
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1367,26 +1275,25 @@ impl SampleLibrary {
     pub fn banks_for_import(&self, spec: &str) -> Vec<String> {
         // Read original names from the source row. An alias must not erase
         // the identity used to edit that same alias again.
-        let slots = self
-            .shared
-            .global_slots
-            .lock()
-            .expect("global source slots");
-        let mut names: Vec<String> = slots
+        let rows = self.shared.global_rows.lock().expect("global source rows");
+        let mut names: Vec<String> = rows
+            .slots
             .iter()
             .filter(|slot| slot.spec == spec)
             .flat_map(|slot| slot.banks.keys().cloned())
             .collect();
-        drop(slots);
+        drop(rows);
         // Score-shaped imports may exist outside a Settings source slot.
-        let imports = self.shared.bank_imports.read().expect("bank imports");
+        let owners = self.shared.bank_owners.read().expect("bank owners");
         names.extend(
-            imports
+            owners
                 .iter()
-                .filter(|(_, import)| import.as_ref() == spec)
+                .filter(|(_, owner)| {
+                    matches!(owner, BankOwner::Import(import) if import.as_ref() == spec)
+                })
                 .map(|(name, _)| name.clone()),
         );
-        drop(imports);
+        drop(owners);
         names.sort();
         names.dedup();
         names
@@ -1428,19 +1335,19 @@ impl SampleLibrary {
                 .find_map(|(_, urls)| urls.first())
                 .map(|url| url.to_string()),
         };
-        // One order for the three, and the same one `publish_score_custom`
-        // and `adopt_set_folder` take them in: `custom`, then the imports,
-        // then the set's. The browser reads them on the studio's thread
-        // while the loader writes them on the worker's, and a pair taken in
-        // both orders is a pair that can wait on itself.
+        // One order for the two, and the same one `publish_score_custom`
+        // and `adopt_set_folder` take them in: `custom`, then the owners.
+        // The browser reads them on the studio's thread while the loader
+        // writes them on the worker's, and a pair taken in both orders is a
+        // pair that can wait on itself.
         let custom = self.custom.read().expect("custom banks");
-        let imports = self.shared.bank_imports.read().expect("bank imports");
-        let of_set = self.shared.set_banks.read().expect("set banks");
+        let owners = self.shared.bank_owners.read().expect("bank owners");
         for (name, bank) in custom.iter() {
+            let owner = owners.get(name);
             // The set's own folder brought this one, so say so: a `bd` that
             // is the set's rather than the pinned one is the difference
             // between a surprise and a choice.
-            let set = of_set.contains_key(name);
+            let set = owner.is_some_and(BankOwner::is_set);
             entries.push(SoundEntry {
                 name: name.clone(),
                 variants: variants(bank),
@@ -1456,11 +1363,13 @@ impl SampleLibrary {
                     SoundCategory::Score
                 },
                 location: location(bank),
-                import: imports.get(name).map(|import| import.to_string()),
+                import: match owner {
+                    Some(BankOwner::Import(import)) => Some(import.to_string()),
+                    _ => None,
+                },
             });
         }
-        drop(of_set);
-        drop(imports);
+        drop(owners);
         drop(custom);
         let mut names: HashSet<String> = entries.iter().map(|entry| entry.name.clone()).collect();
         let source_of = self.shared.global_source_of.read().expect("global sources");
@@ -1710,16 +1619,19 @@ impl SampleLibrary {
         else {
             return Some(crate::video::VideoPicture::NotVideo);
         };
+        // Read before the decode reads the ceiling, so a refusal never
+        // carries a count newer than the ceiling that refused it.
+        let ceiling_moves = file_limit::video_ceiling_moves();
         {
             let mut videos = self.shared.videos.lock().expect("video thumbnails");
-            let moves = file_limit::video_ceiling_moves();
-            if self.shared.video_ceiling_seen.swap(moves, Ordering::AcqRel) != moves {
+            match videos.get(&url) {
                 // A new ceiling may take a clip the old one refused.
-                videos
-                    .retain(|_, picture| !matches!(picture, crate::video::VideoPicture::Failed(_)));
-            }
-            if let Some(picture) = videos.get(&url) {
-                return Some(picture.clone());
+                Some(VideoClip::Refused {
+                    ceiling_moves: refused_at,
+                    ..
+                }) if *refused_at != ceiling_moves => {}
+                Some(clip) => return Some(clip.picture()),
+                None => {}
             }
             if videos.len() >= MAX_TRACKED_VIDEO_CLIPS {
                 make_room_for_a_clip(&mut videos);
@@ -1729,7 +1641,7 @@ impl SampleLibrary {
                     "too many video clips in one set".to_owned(),
                 ));
             }
-            videos.insert(Arc::clone(&url), crate::video::VideoPicture::Decoding);
+            videos.insert(Arc::clone(&url), VideoClip::Decoding);
         }
         // The decode reads the container through the loader's own paths,
         // on a thread of its own so a poll never decodes. A weak handle,
@@ -1742,17 +1654,20 @@ impl SampleLibrary {
                 let Some(shared) = shared.upgrade() else {
                     return;
                 };
-                let picture = match decode_video_picture(&shared, &decoding) {
-                    Ok(Some(strip)) => crate::video::VideoPicture::Ready(Arc::new(strip)),
-                    Ok(None) => crate::video::VideoPicture::NotVideo,
-                    Err(message) => crate::video::VideoPicture::Failed(message),
+                let clip = match decode_video_picture(&shared, &decoding) {
+                    Ok(Some(strip)) => VideoClip::Ready(Arc::new(strip)),
+                    Ok(None) => VideoClip::NotVideo,
+                    Err(message) => VideoClip::Refused {
+                        message,
+                        ceiling_moves,
+                    },
                 };
                 let mut videos = shared.videos.lock().expect("video thumbnails");
                 // A decode the library cancelled is not the clip's answer.
                 if shared.publication.cancellation().load(Ordering::Acquire) {
                     videos.remove(&decoding);
                 } else {
-                    videos.insert(decoding, picture);
+                    videos.insert(decoding, clip);
                 }
             })
             .is_err()
@@ -1997,29 +1912,15 @@ impl SampleLibrary {
         }
     }
 
-    /// Disk-cache fetches still in the line for files under `base`: the
-    /// number a pack's row counts down while the library is being cached.
-    ///
-    /// Only claims that still have a job, or a file in a loader's hand: a
-    /// claim left behind with no job would pin the last file of a pack on
-    /// the row forever.
+    /// Disk-cache fetches still in the line, or in a loader's hand, for
+    /// files under `base`: the number a pack's row counts down while the
+    /// library is being cached. A fetch counts until its outcome is
+    /// recorded.
     pub fn pending_cache_under(&self, base: &str) -> usize {
         let prefix = source_prefix(base);
-        let mut caching = self.shared.caching.lock().expect("disk-cache claims");
-        let state = self.shared.jobs.state.lock().expect("sample load queue");
-        let loading = self.shared.loading.lock().expect("loading sample");
-        let live = |url: &str| {
-            state.now.iter().any(|job| &*job.url == url)
-                || state.bets.iter().any(|job| &*job.url == url)
-                || loading.iter().any(|hand| hand.as_ref() == url)
-        };
-        // Drop orphan claims so a later ask can try again, and so the row
-        // reaches "done" instead of counting ghosts.
-        caching.retain(|url| !url.starts_with(&*prefix) || live(url));
-        caching
-            .iter()
-            .filter(|url| url.starts_with(&*prefix))
-            .count()
+        self.shared
+            .jobs
+            .disk_claims(|url| url.starts_with(&*prefix))
     }
 
     /// How much of a shipped pack is already on disk: files held, files
@@ -2055,11 +1956,10 @@ impl SampleLibrary {
     /// Whether a file in a loader's hand belongs to the pack at `base`.
     pub fn loading_under(&self, base: &str) -> Option<String> {
         let prefix = source_prefix(base);
-        let loading = self.shared.loading.lock().expect("loading sample");
-        loading
-            .iter()
-            .find(|url| url.starts_with(&*prefix))
-            .map(|url| file_name_of_url(url))
+        self.shared
+            .jobs
+            .in_hand(|url| url.starts_with(&*prefix))
+            .map(|url| file_name_of_url(&url))
     }
 
     fn is_font_source(&self, source: &DefaultSource) -> bool {
@@ -2178,20 +2078,12 @@ impl SampleLibrary {
         (held, total, bytes)
     }
 
-    /// Disk-cache fetches still in the line for this exact set of files.
-    /// User packs do not share a CDN prefix the way shipped packs do, so
-    /// the row counts the URLs it named rather than a base string.
+    /// Disk-cache fetches still in the line, or in a loader's hand, for
+    /// this exact set of files. User packs do not share a CDN prefix the
+    /// way shipped packs do, so the row counts the URLs it named rather
+    /// than a base string.
     pub fn pending_cache_of(&self, files: &HashSet<Arc<str>>) -> usize {
-        let mut caching = self.shared.caching.lock().expect("disk-cache claims");
-        let state = self.shared.jobs.state.lock().expect("sample load queue");
-        let loading = self.shared.loading.lock().expect("loading sample");
-        let live = |url: &str| {
-            state.now.iter().any(|job| &*job.url == url)
-                || state.bets.iter().any(|job| &*job.url == url)
-                || loading.iter().any(|hand| hand.as_ref() == url)
-        };
-        caching.retain(|url| !files.contains(url) || live(url));
-        caching.iter().filter(|url| files.contains(*url)).count()
+        self.shared.jobs.disk_claims(|url| files.contains(url))
     }
 
     /// Disk-cache fetches still in the line for a user import, counted
@@ -2203,11 +2095,10 @@ impl SampleLibrary {
 
     /// Whether a file in a loader's hand belongs to this set of URLs.
     pub fn loading_among(&self, files: &HashSet<Arc<str>>) -> Option<String> {
-        let loading = self.shared.loading.lock().expect("loading sample");
-        loading
-            .iter()
-            .find(|url| files.contains(*url))
-            .map(|url| file_name_of_url(url))
+        self.shared
+            .jobs
+            .in_hand(|url| files.contains(url))
+            .map(|url| file_name_of_url(&url))
     }
 
     /// The file in hand for a user import, when the loader has one.
@@ -2228,12 +2119,8 @@ impl SampleLibrary {
     pub fn import_source_files(&self, spec: &str) -> (usize, HashSet<Arc<str>>) {
         let spec = spec.trim();
         let banks: Vec<Bank> = {
-            let slots = self
-                .shared
-                .global_slots
-                .lock()
-                .expect("global source slots");
-            let Some(slot) = slots.iter().find(|slot| slot.spec == spec) else {
+            let rows = self.shared.global_rows.lock().expect("global source rows");
+            let Some(slot) = rows.slots.iter().find(|slot| slot.spec == spec) else {
                 return (0, HashSet::new());
             };
             slot.banks.values().cloned().collect()
@@ -2299,6 +2186,77 @@ pub(super) fn under_current_policy(
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// The step a test runs on this thread once an adoption has planned
+        /// its rows and before it puts them down.
+        static WHEN_PLANNED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Run the step a test set for this moment of an adoption, once.
+    pub(super) fn adoption_planned() {
+        if let Some(step) = WHEN_PLANNED.with(|slot| slot.borrow_mut().take()) {
+            step();
+        }
+    }
+
+    /// A folder turned off while its walk waits in line plays nothing of
+    /// that walk, also when the walk lands while the next adoption plans
+    /// its rows.
+    #[test]
+    fn a_walk_that_lands_while_the_next_adoption_plans_brings_nothing() {
+        let root = tempfile::tempdir().expect("folder");
+        std::fs::create_dir(root.path().join("kick")).expect("kick folder");
+        std::fs::write(root.path().join("kick/0.wav"), b"kick").expect("a file");
+        let spec = root.path().display().to_string();
+        let library = Arc::new(SampleLibrary::empty_without_loading());
+        // The rows are staged straight on: an adoption would queue a real
+        // walk, and the worker could land it before the step below.
+        let first = {
+            let mut rows = library
+                .shared
+                .global_rows
+                .lock()
+                .expect("global source rows");
+            let first = rows.begin();
+            assert!(rows.install(
+                first,
+                vec![GlobalSlot {
+                    row: 0,
+                    spec: spec.clone(),
+                    kind: GlobalKind::Folder,
+                    banks: HashMap::new(),
+                    stage: RowStage::WalkQueued,
+                }],
+            ));
+            first
+        };
+        let (heard, played) = std::sync::mpsc::channel();
+        let during = Arc::clone(&library);
+        let specs = vec![spec.clone()];
+        WHEN_PLANNED.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let budget = sample_fetch::FetchBudget::for_one_fetch();
+                during
+                    .run_folders_work_for_test(&specs, first, &budget)
+                    .expect("the walk of the first adoption");
+                let _ = heard.send(during.knows("kick"));
+            }));
+        });
+
+        let reports = library.adopt_global_sources(&[GlobalSource {
+            spec,
+            enabled: false,
+        }]);
+        assert_eq!(
+            played.try_recv(),
+            Ok(false),
+            "the folder turned off played while the next rows were planned"
+        );
+        assert_eq!(reports[0].state, GlobalSourceState::Off);
+        assert!(!library.knows("kick"));
+    }
+
     #[test]
     fn the_dedup_keeps_case_distinct_folders_and_folds_same_folder_spellings() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -2326,16 +2284,22 @@ mod tests {
     #[cfg(feature = "video")]
     #[test]
     fn a_full_clip_table_gives_back_what_no_host_shows() {
-        use crate::video::{VideoPicture, VideoThumbnails};
+        use crate::video::VideoThumbnails;
         let strip = || {
             Arc::new(VideoThumbnails::from_frames(1, 1, vec![(0.0, vec![0; 4])]).expect("strip"))
         };
         let shown = strip();
-        let mut videos: HashMap<Arc<str>, VideoPicture> = HashMap::new();
-        videos.insert("shown".into(), VideoPicture::Ready(Arc::clone(&shown)));
-        videos.insert("left".into(), VideoPicture::Ready(strip()));
-        videos.insert("refused".into(), VideoPicture::Failed("no".into()));
-        videos.insert("decoding".into(), VideoPicture::Decoding);
+        let mut videos: HashMap<Arc<str>, VideoClip> = HashMap::new();
+        videos.insert("shown".into(), VideoClip::Ready(Arc::clone(&shown)));
+        videos.insert("left".into(), VideoClip::Ready(strip()));
+        videos.insert(
+            "refused".into(),
+            VideoClip::Refused {
+                message: "no".into(),
+                ceiling_moves: 0,
+            },
+        );
+        videos.insert("decoding".into(), VideoClip::Decoding);
         make_room_for_a_clip(&mut videos);
         let mut kept: Vec<&str> = videos.keys().map(|url| &**url).collect();
         kept.sort_unstable();
@@ -2383,8 +2347,8 @@ mod tests {
         let (low_strip, high_strip) = (strip(), strip());
         {
             let mut videos = library.shared.videos.lock().expect("video thumbnails");
-            videos.insert(low, VideoPicture::Ready(Arc::clone(&low_strip)));
-            videos.insert(high, VideoPicture::Ready(Arc::clone(&high_strip)));
+            videos.insert(low, VideoClip::Ready(Arc::clone(&low_strip)));
+            videos.insert(high, VideoClip::Ready(Arc::clone(&high_strip)));
         }
         assert!(matches!(
             library.video_thumbnails("keys"),
@@ -2405,6 +2369,86 @@ mod tests {
             shows("keys:1 note:60", &high_strip),
             "n wraps in the key's files"
         );
+    }
+
+    /// A refusal that a decode reaches after the video ceiling moved, from
+    /// a fetch that began under the old ceiling, does not stand: the next
+    /// ask decodes the clip again.
+    #[cfg(feature = "video")]
+    #[test]
+    fn a_refusal_from_before_the_ceiling_moved_does_not_stand() {
+        use crate::samples::manifest_worker_tests::drain_request;
+        use crate::video::VideoPicture;
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind server");
+        let url = format!(
+            "http://{}/clip-{}.mp4",
+            listener.local_addr().expect("address"),
+            std::process::id()
+        );
+        let (asked, first_asked) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let answer = |stream: std::net::TcpStream, status: &str| {
+                let mut stream = drain_request(stream);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            };
+            let first = listener.accept().expect("the first ask").0;
+            asked.send(()).expect("announce the first ask");
+            released.recv().expect("release the first answer");
+            answer(first, "404 Not Found");
+            let second = listener.accept().expect("the next ask").0;
+            answer(second, "410 Gone");
+        });
+        let cache = tempfile::tempdir().expect("host cache");
+        let library = SampleLibrary::with_background_loaders_at(
+            HashMap::new(),
+            Vec::new(),
+            HashMap::new(),
+            String::new(),
+            cache.path().to_owned(),
+            Loading::NotStarted,
+        )
+        .expect("library");
+        library.banks.write().expect("banks").insert(
+            "clip".to_owned(),
+            Bank::Array(vec![Arc::from(url.as_str())]),
+        );
+        assert!(matches!(
+            library.video_thumbnails("clip"),
+            Some(VideoPicture::Decoding)
+        ));
+        first_asked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the decode asked for the clip");
+        file_limit::count_video_ceiling_move_for_test();
+        assert!(
+            matches!(
+                library.video_thumbnails("clip"),
+                Some(VideoPicture::Decoding)
+            ),
+            "a poll after the move, while the decode still runs"
+        );
+        release.send(()).expect("release the first answer");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let answer = loop {
+            match library.video_thumbnails("clip") {
+                Some(VideoPicture::Decoding) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => break other,
+            }
+        };
+        assert!(
+            matches!(&answer, Some(VideoPicture::Failed(why)) if !why.contains("status code 404")),
+            "the refusal from before the move stands: {answer:?}"
+        );
+        server.join().expect("server");
     }
 
     #[cfg(test)]
@@ -2548,5 +2592,147 @@ mod tests {
         let pack = grant(&format!("{origin}/p.wav"));
         assert!(matches!(pack, ScoreFetchAccess::Remote { .. }), "{pack:?}");
         assert!(library.knows("also") && library.knows("pack"));
+    }
+
+    /// A set that takes a name over from a score's import files that name
+    /// under the set alone, and the import stops counting it. The next set
+    /// gives the score's bank back under its import.
+    #[test]
+    fn a_set_bank_over_an_imported_name_is_not_filed_under_the_import() {
+        use crate::samples::manifest_worker_tests::drain_request;
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind server");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let body = r#"{"bd":"bd.wav"}"#;
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut stream = drain_request(stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write response");
+        });
+        let library = SampleLibrary::empty();
+        let mut access = ScoreSampleAccess::denied();
+        access.permit_source(&origin).expect("the server's origin");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let import = format!("{origin}/kit-{}-{unique}.json", std::process::id());
+        let map = serde_json::to_string(&import).expect("a quoted import");
+        library
+            .register_score_custom(&map, None, &access)
+            .expect("the import");
+        server.join().expect("server");
+        assert_eq!(library.banks_for_import(&import), ["bd"]);
+
+        let set = tempfile::tempdir().expect("set folder");
+        std::fs::create_dir(set.path().join("bd")).expect("bd folder");
+        std::fs::write(set.path().join("bd/0.wav"), b"").expect("set file");
+        library.adopt_set_folder(set.path()).expect("the set");
+        let bd = |library: &SampleLibrary| {
+            library
+                .catalogue()
+                .into_iter()
+                .find(|entry| entry.name == "bd")
+                .expect("a bd bank")
+        };
+        let taken = bd(&library);
+        assert_eq!(
+            (taken.origin, taken.import),
+            (SoundOrigin::Set, None),
+            "the set's own bd is filed under the set"
+        );
+        assert!(
+            library.banks_for_import(&import).is_empty(),
+            "the import does not count the set's bd"
+        );
+
+        let next = tempfile::tempdir().expect("next set folder");
+        std::fs::write(next.path().join("song.strudel"), b"").expect("a score");
+        library.adopt_set_folder(next.path()).expect("the next set");
+        let given_back = bd(&library);
+        assert_eq!(
+            (given_back.origin, given_back.import.as_deref()),
+            (SoundOrigin::Score, Some(import.as_str())),
+            "the score's bd comes back under its import"
+        );
+    }
+
+    /// A host registration over a name the open set took up makes the name
+    /// the host's. Closing the set leaves the host's bank in place.
+    #[test]
+    fn a_host_bank_over_a_set_name_stays_when_the_set_closes() {
+        let library = SampleLibrary::empty();
+        let set = tempfile::tempdir().expect("set folder");
+        std::fs::create_dir(set.path().join("bd")).expect("bd folder");
+        std::fs::write(set.path().join("bd/0.wav"), b"").expect("set file");
+        library.adopt_set_folder(set.path()).expect("the set");
+        library
+            .register_trusted_custom(r#"{"bd":["http://127.0.0.1:9/host.wav"]}"#, None)
+            .expect("the host bank");
+
+        let next = tempfile::tempdir().expect("next set folder");
+        library.adopt_set_folder(next.path()).expect("the next set");
+        let bd = library
+            .catalogue()
+            .into_iter()
+            .find(|entry| entry.name == "bd")
+            .expect("the host's bd");
+        assert_eq!(
+            (bd.origin, bd.location.as_deref()),
+            (SoundOrigin::Score, Some("http://127.0.0.1:9/host.wav"))
+        );
+    }
+
+    /// A set bank hides a name an import brought, and the import is taken
+    /// back. The next set does not file the name under the import.
+    #[test]
+    fn a_withdrawn_import_under_a_set_bank_files_nothing_once_the_set_closes() {
+        use crate::samples::manifest_worker_tests::drain_request;
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind server");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let body = r#"{"bd":"bd.wav"}"#;
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut stream = drain_request(stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write response");
+        });
+        let library = SampleLibrary::empty();
+        let mut access = ScoreSampleAccess::denied();
+        access.permit_source(&origin).expect("the server's origin");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let import = format!("{origin}/withdrawn-{}-{unique}.json", std::process::id());
+        let map = serde_json::to_string(&import).expect("a quoted import");
+        library
+            .register_score_custom(&map, None, &access)
+            .expect("the import");
+        server.join().expect("server");
+        let set = tempfile::tempdir().expect("set folder");
+        std::fs::create_dir(set.path().join("bd")).expect("bd folder");
+        std::fs::write(set.path().join("bd/0.wav"), b"").expect("set file");
+        library.adopt_set_folder(set.path()).expect("the set");
+
+        library.withdraw_sources(&ScoreSampleAccess::denied());
+        let next = tempfile::tempdir().expect("next set folder");
+        library.adopt_set_folder(next.path()).expect("the next set");
+        assert!(
+            library.banks_for_import(&import).is_empty(),
+            "the import files a name it no longer brings"
+        );
     }
 }

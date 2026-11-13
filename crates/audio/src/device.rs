@@ -153,7 +153,7 @@ struct ChainRoomRequest {
 struct ChainRoomCache {
     entries: Vec<ChainRoomEntry>,
     /// The number of the last box shipped. It only grows, so a box of a
-    /// closed output matches no entry.
+    /// closed output frees no part of a later box.
     serial: u64,
     /// The most bytes the rooms may hold together:
     /// [`crate::scalar::MAX_CHAIN_ROOM_BYTES`].
@@ -164,19 +164,36 @@ struct ChainRoomCache {
 #[derive(Clone, Copy)]
 struct ChainRoomEntry {
     chain: u64,
-    /// The reverb the room holds, or will hold once its box arrives, and its
-    /// size in bytes.
-    reverb: Option<(crate::reverb::ReverbParams, usize)>,
-    /// The size of the delay line of the room in bytes, 0 with no line.
-    delay: usize,
-    /// The number of the last box shipped for the chain.
-    serial: u64,
+    phase: RoomPhase,
     /// A reverb the budget refused, and its size. The same request waits for
     /// room in the budget, and the producer does not make it again.
     refused: Option<(crate::reverb::ReverbParams, usize)>,
-    /// When the callback last found no bus for the room. The chain waits a
-    /// second before the next try.
-    no_bus: Option<Instant>,
+}
+
+/// Where the parts of the room of a chain are, as the producer knows them.
+#[derive(Clone, Copy)]
+enum RoomPhase {
+    /// No part of the room is out. A request ships at once.
+    Open,
+    /// At least one part is out: on its way to the callback, in the room of
+    /// the chain, or in a room that left its bus and did not come back yet.
+    Out {
+        /// The reverb of the room, and its parameters.
+        reverb: Option<(crate::reverb::ReverbParams, RoomPart)>,
+        /// The delay line of the room.
+        line: Option<RoomPart>,
+    },
+    /// The callback found no bus for the last box. No part is out, and no
+    /// box ships before `until`.
+    NoBus { until: Instant },
+}
+
+/// A part of the room of a chain that the producer shipped: its size in
+/// bytes, and the number of the box that carried it.
+#[derive(Clone, Copy)]
+struct RoomPart {
+    bytes: usize,
+    serial: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -201,21 +218,28 @@ struct InsertRestart {
     key: crate::insert::InsertKey,
     /// The time of the first ask.
     asked: Instant,
-    /// The time of the last release, and whether it was forced.
-    released: Option<(Instant, bool)>,
+    phase: RestartPhase,
+}
+
+/// How far the ask for a shipped copy got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestartPhase {
+    /// No release went yet.
+    Asked,
+    /// The last release went at `at`. A forced release takes a busy or heard
+    /// copy too.
+    Released { at: Instant, forced: bool },
     /// The copy came back. It waits for the provider in `insert_waiting`.
-    returned: bool,
+    Returned,
 }
 
 /// One continuously running output fed by the scheduler through a
 /// fixed-capacity SPSC ring. The query thread owns pushes and generation
 /// changes; the audio callback owns DSP and pops.
 pub struct LiveScalarDevice {
-    stream: Option<cpal::Stream>,
-    callback_gate: Option<Arc<CallbackGate>>,
-    /// The silent output's stop flag and thread; joined before any
-    /// replacement stream starts so only one thread touches `LiveShared`.
-    silent: Option<SilentHandle>,
+    /// The output that plays. None after a recycle closed it and no
+    /// replacement started.
+    output: Option<OpenOutput>,
     /// The audio input, when one is open beside the output.
     input: Option<AudioInput>,
     /// Producer-side record of each orbit's installed reverb parameters,
@@ -296,10 +320,6 @@ pub struct LiveScalarDevice {
     /// What the callback's backend wrote when it was prepared, read before
     /// the callback took it: see [`LiveScalarBackend::prepared_bytes`].
     backend_bytes: usize,
-    /// The backend of the stream. The callback uses it until it retires,
-    /// then a close gives each insert of it back on the producer: see
-    /// [`Self::hand_back_inserts`]. None for a manual output.
-    backend: Option<Arc<BackendCell>>,
 }
 
 /// What an open output holds in memory, as the producer can see it without
@@ -768,6 +788,17 @@ impl BackendCell {
 enum OutputHandle {
     Native(cpal::Stream),
     Silent(SilentHandle),
+}
+
+/// The activated output of a live device: its stream or silent thread, the
+/// gate that admits its callback, and the backend the callback renders with.
+struct OpenOutput {
+    handle: OutputHandle,
+    gate: Arc<CallbackGate>,
+    /// The callback uses the backend until the gate retires, then a close
+    /// gives each insert of it back on the producer: see
+    /// [`LiveScalarDevice::hand_back_inserts`]. None for a manual output.
+    backend: Option<Arc<BackendCell>>,
 }
 
 /// Owns only the candidate stream, not the device or its shared Stop state.
