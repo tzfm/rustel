@@ -1022,8 +1022,6 @@ pub struct Session {
     /// Full-screen owners drain this instead of allowing writes behind their
     /// alternate screen. It is bounded independently of score complexity.
     pending_diagnostics: VecDeque<SessionDiagnostic>,
-    bindings_ready: bool,
-    voicings_ready: bool,
     /// Whether this Session has claimed its native module settings instead of
     /// continuing to inherit the ambient Rust compatibility state.
     core_settings_owned: bool,
@@ -1276,8 +1274,6 @@ impl Session {
             import_errors: std::collections::BTreeMap::new(),
             direct_diagnostic_logging: rustel_voice::default_direct_diagnostic_logging(),
             pending_diagnostics: VecDeque::new(),
-            bindings_ready: false,
-            voicings_ready: false,
             core_settings_owned: false,
             core_settings_initialized: false,
             reported_query_throw: None,

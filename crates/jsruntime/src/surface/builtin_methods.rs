@@ -275,6 +275,43 @@ pub(crate) fn prove_builtin_global(ctx: &Ctx<'_>, name: &str) -> Option<BuiltinG
         .then(|| global.clone())
 }
 
+/// The names a fully installed realm proves, taken before any score runs
+/// in it: what a realm with no surface yet would prove once installed.
+pub(crate) struct PristineNames {
+    methods: BTreeMap<Box<str>, BuiltinMethod>,
+    globals: BTreeMap<&'static str, BuiltinGlobal>,
+}
+
+impl PristineNames {
+    /// What `ctx`, freshly installed, proves. `None` when the mini-notation
+    /// callee, the lane method or an intrinsic does not prove, which a fresh
+    /// installation always proves.
+    pub(crate) fn of(ctx: &Ctx<'_>) -> Option<Self> {
+        if !prove_mini_callee(ctx) || !prove_lane_method(ctx) || !prove_surface_intrinsics(ctx) {
+            return None;
+        }
+        let methods = host_builtin_methods(ctx).ok()?;
+        let methods = methods.borrow();
+        let globals = methods
+            .globals
+            .keys()
+            .filter_map(|name| Some((*name, prove_builtin_global(ctx, name)?)))
+            .collect();
+        Some(Self {
+            methods: methods.methods.clone(),
+            globals,
+        })
+    }
+
+    pub(crate) fn method(&self, name: &str) -> Option<BuiltinMethod> {
+        self.methods.get(name).cloned()
+    }
+
+    pub(crate) fn global(&self, name: &str) -> Option<BuiltinGlobal> {
+        self.globals.get(name).cloned()
+    }
+}
+
 /// Record the lane method `p` that installation put on the prototype.
 pub(crate) fn record_lane_method<'js>(
     ctx: &Ctx<'js>,

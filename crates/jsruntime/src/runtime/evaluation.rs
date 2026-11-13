@@ -38,7 +38,9 @@ impl JsRuntime {
 
     pub fn install_voicings_prebake(&self) -> Result<(), String> {
         let _settings = self.core_settings.bind();
-        with_ctx(self, |ctx| voicing_surface::install(&ctx))
+        with_ctx(self, |ctx| voicing_surface::install(&ctx))?;
+        self.voicings_installed.set(true);
+        Ok(())
     }
     /// Transpile and execute one user setup/prebake file without replacing the
     /// active graph.
@@ -144,6 +146,7 @@ impl JsRuntime {
         budget: std::time::Duration,
         cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(rustel_transpiler::TranspileOutput, ScoreEffects), QueryError> {
+        self.ensure_surface().map_err(QueryError::Message)?;
         let _settings = self.core_settings.bind();
         let effect_policy_owner = EffectPolicyOwner::enter(self);
         let effect_transaction = EffectTransactionOwner::enter(self, EffectPolicy::SETUP)?;
@@ -1316,6 +1319,17 @@ impl JsRuntime {
         let evaluation = candidate_settings.with(|| {
             self.with_deadline(budget, || {
                 let staged = self.with_heap_boundary(|| {
+                    let native = {
+                        let _published_owner = self.core_settings.bind();
+                        self.native_score(&output.output)
+                    };
+                    if native.is_none() {
+                        // JavaScript evaluates the score, on the whole surface.
+                        // An installation seals the gate, so the score's own
+                        // surface writes are recorded again after it.
+                        self.ensure_surface().map_err(QueryError::Message)?;
+                        self.record_surface_writes(&output.surface_writes);
+                    }
                     // Forking the voicing registry reads enumerable properties
                     // from score-controlled objects. A getter can run arbitrary
                     // JavaScript, so candidate setup shares the score deadline.
@@ -1323,9 +1337,10 @@ impl JsRuntime {
                     self.begin_voicing_candidate()
                         .map_err(QueryError::Message)?;
                     let _published_owner = self.core_settings.bind();
-                    self.execute_native(&output.output).unwrap_or_else(|| {
-                        self.execute_score(&output.output, &output.line_map, true)
-                    })
+                    match native {
+                        Some(score) => self.stage_native(score),
+                        None => self.execute_score(&output.output, &output.line_map, true),
+                    }
                 });
                 if self.cancelled.get() {
                     Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled))
@@ -1377,6 +1392,7 @@ impl JsRuntime {
         source: &str,
         options: &rustel_transpiler::TranspileOptions,
     ) -> Result<rustel_transpiler::TranspileOutput, String> {
+        self.ensure_surface()?;
         let candidate_settings = self.core_settings.detached_snapshot();
         let effect_policy_owner = EffectPolicyOwner::enter(self);
         let _effect_transaction =

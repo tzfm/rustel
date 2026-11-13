@@ -330,6 +330,12 @@ pub struct JsRuntime {
     /// Whether the last score evaluated by the score evaluator ran on the
     /// native tier.
     pub(super) evaluated_natively: Cell<bool>,
+    /// Whether the semantic surface and the voicing globals are installed.
+    /// A realm without them has run no score text: it evaluates natively,
+    /// and the first score, prelude or import that needs JavaScript installs
+    /// them. See [`JsRuntime::ensure_surface`].
+    pub(super) bindings_installed: Cell<bool>,
+    pub(super) voicings_installed: Cell<bool>,
     /// Live bytes and the ceiling, shared with the allocator enforcing them.
     pub(super) heap: std::rc::Rc<alloc::HeapBudget>,
     /// Shared with the interrupt handler. `Some(deadline)` while an evaluation

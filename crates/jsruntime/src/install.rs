@@ -146,6 +146,7 @@ impl JsRuntime {
             // Last: every layer that can replace a built-in method has run.
             seal_builtin_methods(&ctx, &surface.proto, &surface.globals)
                 .map_err(|error| error.to_string())?;
+            self.bindings_installed.set(true);
             Ok(())
         })
     }

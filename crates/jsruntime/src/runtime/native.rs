@@ -11,8 +11,9 @@
 
 use super::*;
 use crate::surface::{
-    BuiltinGlobal, ListKind, MINI_CALLEE, SPECIAL_REGISTERED_METHODS, prove_builtin_global,
-    prove_builtin_method, prove_lane_method, prove_mini_callee, prove_surface_intrinsics,
+    BuiltinGlobal, BuiltinMethod, ListKind, MINI_CALLEE, PristineNames, SPECIAL_REGISTERED_METHODS,
+    prove_builtin_global, prove_builtin_method, prove_lane_method, prove_mini_callee,
+    prove_surface_intrinsics,
 };
 use rustel_transpiler::{ScoreExpr, ScoreStatement};
 
@@ -42,69 +43,145 @@ struct Turn {
     cps: Option<f64>,
 }
 
+/// A natively built score, ready to stage.
+pub(super) struct NativeScore {
+    pattern: Pattern,
+    cps: Option<f64>,
+}
+
+/// Where the native tier reads what a name means.
+enum Names<'a, 'js> {
+    /// An installed realm: each name must still hold its recorded slot.
+    Realm(&'a Ctx<'js>),
+    /// A realm with no surface yet, where no score has run: the names a
+    /// fresh installation proves.
+    Pristine(&'a PristineNames),
+}
+
+impl Names<'_, '_> {
+    fn method(&self, name: &str) -> Option<BuiltinMethod> {
+        match self {
+            Self::Realm(ctx) => prove_builtin_method(ctx, name),
+            Self::Pristine(names) => names.method(name),
+        }
+    }
+
+    fn global(&self, name: &str) -> Option<BuiltinGlobal> {
+        match self {
+            Self::Realm(ctx) => prove_builtin_global(ctx, name),
+            Self::Pristine(names) => names.global(name),
+        }
+    }
+
+    fn mini(&self) -> bool {
+        match self {
+            Self::Realm(ctx) => prove_mini_callee(ctx),
+            Self::Pristine(_) => true,
+        }
+    }
+
+    fn lane(&self) -> bool {
+        match self {
+            Self::Realm(ctx) => prove_lane_method(ctx),
+            Self::Pristine(_) => true,
+        }
+    }
+}
+
+thread_local! {
+    /// What a fresh installation proves, taken once per thread from a
+    /// throwaway realm. A realm with no surface reads its names here.
+    static PRISTINE: std::cell::OnceCell<Option<Rc<PristineNames>>> =
+        const { std::cell::OnceCell::new() };
+}
+
+/// The names of a fresh installation. See [`PRISTINE`].
+fn pristine_names() -> Option<Rc<PristineNames>> {
+    PRISTINE.with(|pristine| {
+        pristine
+            .get_or_init(|| {
+                let realm = JsRuntime::new().ok()?;
+                realm.ensure_surface().ok()?;
+                with_ctx(&realm, |ctx| PristineNames::of(&ctx)).map(Rc::new)
+            })
+            .clone()
+    })
+}
+
 impl JsRuntime {
-    /// Evaluate transpiled `code` without JavaScript and stage its pattern
-    /// as [`Self::execute_score`] does. `None` when the native tier does not
-    /// prove the whole score: the JavaScript tier then evaluates it.
-    pub(super) fn execute_native(&self, code: &str) -> Option<Result<(), QueryError>> {
+    /// Build the score in transpiled `code` without JavaScript. `None` when
+    /// the native tier does not prove the whole score: the JavaScript tier
+    /// then evaluates it, and owns every error.
+    pub(super) fn native_score(&self, code: &str) -> Option<NativeScore> {
         if !self.native_tier.get() {
             return None;
         }
         let program = rustel_transpiler::score_program(code)?;
-        with_ctx(self, |ctx| {
-            if !prove_surface_intrinsics(&ctx) || gain_curve_set(&ctx) {
-                return None;
-            }
-            // Composers read the default alignment when they are called,
-            // and every score starts from `In`.
-            rustel_core::compose::set_default_alignment(rustel_core::compose::Alignment::In);
-            let mut turn = Turn::default();
-            let mut last = None;
-            for statement in &program.statements {
-                last = match statement {
-                    ScoreStatement::Binding { name, value } => {
-                        let Native::Pattern(pattern) = turn.evaluate(&ctx, value, self)? else {
-                            return None;
-                        };
-                        if prove_builtin_global(&ctx, name).is_some()
-                            || turn.bindings.insert(name.clone(), pattern).is_some()
-                        {
-                            return None;
-                        }
-                        None
+        if self.bindings_installed.get() {
+            with_ctx(self, |ctx| {
+                (prove_surface_intrinsics(&ctx) && !gain_curve_set(&ctx))
+                    .then(|| self.build_native(&program, &Names::Realm(&ctx)))
+                    .flatten()
+            })
+        } else {
+            let names = pristine_names()?;
+            self.build_native(&program, &Names::Pristine(&names))
+        }
+    }
+
+    fn build_native(
+        &self,
+        program: &rustel_transpiler::ScoreProgram,
+        names: &Names<'_, '_>,
+    ) -> Option<NativeScore> {
+        // Composers read the default alignment when they are called, and
+        // every score starts from `In`.
+        rustel_core::compose::set_default_alignment(rustel_core::compose::Alignment::In);
+        let mut turn = Turn::default();
+        let mut last = None;
+        for statement in &program.statements {
+            last = match statement {
+                ScoreStatement::Binding { name, value } => {
+                    let Native::Pattern(pattern) = turn.evaluate(names, value, self)? else {
+                        return None;
+                    };
+                    if names.global(name).is_some()
+                        || turn.bindings.insert(name.clone(), pattern).is_some()
+                    {
+                        return None;
                     }
-                    ScoreStatement::Expression(expression) => {
-                        Some(turn.evaluate(&ctx, expression, self)?)
-                    }
-                };
-            }
-            let pattern = if turn.lanes.is_empty() {
-                // With no lane, the score plays its last expression.
-                match last? {
-                    Native::Pattern(pattern) => pattern,
-                    Native::Number(_) | Native::String => return None,
+                    None
                 }
-            } else {
-                rustel_core::stack(
-                    turn.lanes
-                        .into_iter()
-                        .map(|lane| crate::install::lane_tagged(&lane.pattern, lane.tag))
-                        .collect(),
-                )
+                ScoreStatement::Expression(expression) => {
+                    Some(turn.evaluate(names, expression, self)?)
+                }
             };
-            Some(self.stage_native(&ctx, pattern, turn.cps))
+        }
+        let pattern = if turn.lanes.is_empty() {
+            // With no lane, the score plays its last expression.
+            match last? {
+                Native::Pattern(pattern) => pattern,
+                Native::Number(_) | Native::String => return None,
+            }
+        } else {
+            rustel_core::stack(
+                turn.lanes
+                    .into_iter()
+                    .map(|lane| crate::install::lane_tagged(&lane.pattern, lane.tag))
+                    .collect(),
+            )
+        };
+        Some(NativeScore {
+            pattern,
+            cps: turn.cps,
         })
     }
 
-    /// Stage a natively built score: its tempo with the score's effects,
-    /// and its pattern where the commit picks it up.
-    fn stage_native(
-        &self,
-        ctx: &Ctx<'_>,
-        pattern: Pattern,
-        cps: Option<f64>,
-    ) -> Result<(), QueryError> {
-        if let Some(cps) = cps {
+    /// Stage a natively built score as [`Self::execute_score`] stages one:
+    /// its tempo with the score's effects, and its pattern where the commit
+    /// picks it up.
+    pub(super) fn stage_native(&self, score: NativeScore) -> Result<(), QueryError> {
+        if let Some(cps) = score.cps {
             let mut transaction = self.effect_transaction.borrow_mut();
             let effects = transaction.as_mut().ok_or_else(|| {
                 QueryError::Message("a native score set its tempo outside a score turn".into())
@@ -113,11 +190,13 @@ impl JsRuntime {
         }
         let offsets = self.timeline_state.take();
         self.last_good_timeline.borrow_mut().get_or_insert(offsets);
-        let wrapper = derive_wrapper(ctx.clone(), pattern, &[])
-            .map_err(|error| QueryError::Message(describe_js_error(ctx, error)))?;
-        host_score_candidate(ctx)
-            .and_then(|candidate| candidate.set(0, wrapper))
-            .map_err(|error| QueryError::Message(describe_js_error(ctx, error)))?;
+        with_ctx(self, |ctx| {
+            let wrapper = derive_wrapper(ctx.clone(), score.pattern, &[])
+                .map_err(|error| QueryError::Message(describe_js_error(&ctx, error)))?;
+            host_score_candidate(&ctx)
+                .and_then(|candidate| candidate.set(0, wrapper))
+                .map_err(|error| QueryError::Message(describe_js_error(&ctx, error)))
+        })?;
         self.evaluated_natively.set(true);
         Ok(())
     }
@@ -126,7 +205,7 @@ impl JsRuntime {
 impl Turn {
     fn evaluate(
         &mut self,
-        ctx: &Ctx<'_>,
+        names: &Names<'_, '_>,
         expression: &ScoreExpr,
         runtime: &JsRuntime,
     ) -> Option<Native> {
@@ -134,23 +213,25 @@ impl Turn {
             ScoreExpr::Number(value) => Native::Number(*value),
             ScoreExpr::String(_) => Native::String,
             ScoreExpr::Name(name) => Native::Pattern(self.bindings.get(name)?.clone()),
-            ScoreExpr::Call { callee, arguments } => self.call(ctx, callee, arguments, runtime)?,
+            ScoreExpr::Call { callee, arguments } => {
+                self.call(names, callee, arguments, runtime)?
+            }
             ScoreExpr::Method {
                 receiver,
                 method,
                 arguments,
             } => {
-                let Native::Pattern(receiver) = self.evaluate(ctx, receiver, runtime)? else {
+                let Native::Pattern(receiver) = self.evaluate(names, receiver, runtime)? else {
                     return None;
                 };
-                self.method(ctx, receiver, method, arguments, runtime)?
+                self.method(names, receiver, method, arguments, runtime)?
             }
         })
     }
 
     fn call(
         &mut self,
-        ctx: &Ctx<'_>,
+        names: &Names<'_, '_>,
         callee: &str,
         arguments: &[ScoreExpr],
         runtime: &JsRuntime,
@@ -162,26 +243,26 @@ impl Turn {
             let [ScoreExpr::String(source), ScoreExpr::Number(offset)] = arguments else {
                 return None;
             };
-            if !prove_mini_callee(ctx) || offset.fract() != 0.0 || !offset.is_finite() {
+            if !names.mini() || offset.fract() != 0.0 || !offset.is_finite() {
                 return None;
             }
             return crate::surface::transpiled_mini(source, *offset as i64)
                 .ok()
                 .map(Native::Pattern);
         }
-        match prove_builtin_global(ctx, callee)? {
+        match names.global(callee)? {
             BuiltinGlobal::Control => {
                 let spec = crate::pattern::control_registry().get(callee)?;
                 let [argument] = arguments else {
                     return None;
                 };
-                let value = self.pattern_argument(ctx, argument, runtime)?;
+                let value = self.pattern_argument(names, argument, runtime)?;
                 Some(Native::Pattern(spec.standalone(&value)))
             }
             BuiltinGlobal::List(kind) => {
                 let mut patterns = Vec::with_capacity(arguments.len());
                 for argument in arguments {
-                    let Native::Pattern(pattern) = self.evaluate(ctx, argument, runtime)? else {
+                    let Native::Pattern(pattern) = self.evaluate(names, argument, runtime)? else {
                         return None;
                     };
                     patterns.push(pattern);
@@ -207,30 +288,30 @@ impl Turn {
 
     fn method(
         &mut self,
-        ctx: &Ctx<'_>,
+        names: &Names<'_, '_>,
         receiver: Pattern,
         method: &str,
         arguments: &[ScoreExpr],
         runtime: &JsRuntime,
     ) -> Option<Native> {
         if method == LANE_METHOD {
-            return self.lane(ctx, receiver, arguments);
+            return self.lane(names, receiver, arguments);
         }
         if SPECIAL_REGISTERED_METHODS.contains(&method) || PLUGIN_METHODS.contains(&method) {
             return None;
         }
-        let builtin = prove_builtin_method(ctx, method)?;
+        let builtin = names.method(method)?;
         // A registered method that sequences or refuses its arguments shapes
         // JavaScript values the native tier does not hold, so it takes its
         // exact count only.
-        if let crate::surface::BuiltinMethod::Registered(registration) = &builtin
+        if let BuiltinMethod::Registered(registration) = &builtin
             && arguments.len() != registration.arity.saturating_sub(1)
         {
             return None;
         }
         let mut values = Vec::with_capacity(arguments.len());
         for argument in arguments {
-            values.push(self.pattern_argument(ctx, argument, runtime)?);
+            values.push(self.pattern_argument(names, argument, runtime)?);
         }
         builtin.apply(&receiver, values).map(Native::Pattern)
     }
@@ -240,11 +321,11 @@ impl Turn {
     /// score may set, so it is left to JavaScript.
     fn pattern_argument(
         &mut self,
-        ctx: &Ctx<'_>,
+        names: &Names<'_, '_>,
         argument: &ScoreExpr,
         runtime: &JsRuntime,
     ) -> Option<Pattern> {
-        match self.evaluate(ctx, argument, runtime)? {
+        match self.evaluate(names, argument, runtime)? {
             Native::Pattern(pattern) => Some(pattern),
             Native::Number(value) => Some(rustel_core::pure(rustel_core::Value::F64(value))),
             Native::String => None,
@@ -255,11 +336,16 @@ impl Turn {
     /// does. A muted lane plays nothing. A solo lane, a name a JavaScript
     /// object would order apart, and a name used twice are left to
     /// JavaScript.
-    fn lane(&mut self, ctx: &Ctx<'_>, pattern: Pattern, arguments: &[ScoreExpr]) -> Option<Native> {
+    fn lane(
+        &mut self,
+        names: &Names<'_, '_>,
+        pattern: Pattern,
+        arguments: &[ScoreExpr],
+    ) -> Option<Native> {
         let [ScoreExpr::String(id), ScoreExpr::Number(number)] = arguments else {
             return None;
         };
-        if !prove_lane_method(ctx) {
+        if !names.lane() {
             return None;
         }
         let tag = (*number >= 0.0 && number.fract() == 0.0).then(|| format!("#{}", *number as u64));

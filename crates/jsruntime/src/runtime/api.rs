@@ -148,6 +148,8 @@ impl JsRuntime {
             callback_ir,
             native_tier: Cell::new(true),
             evaluated_natively: Cell::new(false),
+            bindings_installed: Cell::new(false),
+            voicings_installed: Cell::new(false),
             heap: budget,
             deadline,
             interrupted,
@@ -176,6 +178,18 @@ impl JsRuntime {
 
     pub fn run_gc(&self) {
         self.rt.run_gc();
+    }
+
+    /// Install the semantic surface and the voicing globals, once. Every
+    /// entry that runs score text calls this first.
+    pub fn ensure_surface(&self) -> Result<(), String> {
+        if !self.bindings_installed.get() {
+            self.install_semantic_bindings()?;
+        }
+        if !self.voicings_installed.get() {
+            self.install_voicings_prebake()?;
+        }
+        Ok(())
     }
 
     /// Let scores the native tier proves skip JavaScript, or send every

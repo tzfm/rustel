@@ -38,6 +38,7 @@ impl JsRuntime {
         cancellation: &std::sync::atomic::AtomicBool,
         scope: ImportScope,
     ) -> Result<Vec<ScoreEffects>, QueryError> {
+        self.ensure_surface().map_err(QueryError::Message)?;
         let queued = Rc::new(RefCell::new(Vec::<String>::new()));
         let setup = |source: &str| {
             self.evaluate_prelude_with_effects_cancellable(source, options, budget, cancellation)
