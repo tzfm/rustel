@@ -34,6 +34,7 @@ use std::path::Path;
 mod arrange_marks;
 mod callback_ir;
 mod frequency_sliders;
+mod score_program;
 mod surface_writes;
 pub use callback_ir::{
     CallbackArgument, CallbackMethodCall, MAX_CALLBACK_IR_SOURCE_BYTES,
@@ -41,6 +42,7 @@ pub use callback_ir::{
     lower_pattern_transform_callback,
 };
 pub use frequency_sliders::is_frequency_control;
+pub use score_program::{ScoreExpr, ScoreProgram, ScoreStatement, score_program};
 pub use surface_writes::{SurfaceWrites, surface_writes};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
