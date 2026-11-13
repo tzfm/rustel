@@ -801,13 +801,16 @@ pub(crate) fn mapped(pattern: &Pattern, map: &OwnedHapMapFn) -> Option<Pattern> 
 }
 
 /// The `appLeft` of `functions` and `values` by `op`, when `functions` is a
-/// sequence or a constant and `values` is a constant of a plain value: each
-/// step meets the constant where the step is. The constant is another hap
-/// in each cycle, so a step that crosses a bound of a cycle is cut there,
-/// as the meeting cuts its hap.
+/// sequence or a constant and `values` is one layer of plain values, or a
+/// constant of one: each step meets the values where the step is, and is
+/// cut to each that it meets, as the meeting cuts its hap. A constant is
+/// another hap in each cycle, so it cuts a step that crosses a bound of a
+/// cycle there.
 ///
-/// `None` also for a meeting that [`Meeting::in_place`] does not make, and
-/// for cut steps that are not in the order of time.
+/// `None` for values of more layers than one, which answer each step layer
+/// by layer, for a value that is not data, for a meeting that
+/// [`Meeting::in_place`] does not make, and for cut steps that are not in
+/// the order of time.
 pub(crate) fn applied(
     functions: &Pattern,
     values: &Pattern,
@@ -815,12 +818,14 @@ pub(crate) fn applied(
     flow: LookupFlow,
 ) -> Option<Pattern> {
     let layers = layers(functions)?;
-    // A constant is one layer of one step that fills each cycle.
-    constant(values)?;
     let values = self::layers(values)?;
     let [values] = &*values else {
         return None;
     };
+    // A value of the script is read through its host, at each query.
+    if !values.is_data() {
+        return None;
+    }
     let apply = Combine::Composed(op);
     without_query_signals(|| {
         let met = layers
@@ -1188,6 +1193,64 @@ mod tests {
     }
 
     #[test]
+    fn values_applied_to_a_sequence_answer_as_the_application() {
+        let controls =
+            |pattern: Pattern, key: &str| pattern.map_control(ControlSpec::new([key]), false);
+        let mut folds = Vec::new();
+        for (name, layers) in sequences() {
+            for (value_name, value_layers) in sequences() {
+                let name = format!("{name} with {value_name}");
+                // Numbers under arithmetic, and control objects that the
+                // values set.
+                let added = |pattern: Pattern| {
+                    compose(
+                        &pattern,
+                        &built(&value_layers),
+                        ComposeOp::Add,
+                        Alignment::In,
+                    )
+                };
+                let set = |pattern: Pattern| {
+                    compose(
+                        &controls(pattern, "n"),
+                        &controls(built(&value_layers), "gain"),
+                        ComposeOp::Set,
+                        Alignment::In,
+                    )
+                };
+                let chains: [&dyn Fn(Pattern) -> Pattern; 2] = [&added, &set];
+                for chain in chains {
+                    let folded = chain(built(&layers));
+                    if matches!(folded.node_kind(), Node::Sequence(_)) {
+                        folds.push(name.clone());
+                    }
+                    assert_same_answers(&name, &folded, &unfolded(|| chain(built(&layers))));
+                }
+            }
+        }
+        // Steps meet steps of another period, and steps that they cut.
+        for name in [
+            "steps with steps of several cycles",
+            "steps of several cycles with steps",
+            "steps with a period of a cycle and a half",
+            "a period of a cycle and a half with steps of several cycles",
+            "a chord and fast steps with one value a cycle",
+        ] {
+            assert_eq!(
+                folds.iter().filter(|fold| *fold == name).count(),
+                2,
+                "{name}"
+            );
+        }
+        // Values of two layers answer each step layer by layer.
+        assert!(
+            !folds
+                .iter()
+                .any(|fold| fold.ends_with("with a chord and fast steps"))
+        );
+    }
+
+    #[test]
     fn a_stack_and_a_speed_of_sequences_answer_as_their_own_nodes() {
         let all = || sequences().into_iter().map(|(_, layers)| built(&layers));
         let stacked = || stack(all().collect());
@@ -1211,11 +1274,11 @@ mod tests {
     #[test]
     fn a_fold_leaves_what_it_does_not_know_to_its_node() {
         let steps = || built(&sequences()[0].1);
-        // A value that is no constant, a factor that is not above zero, a
-        // handle that is marked volatile, and a stack with a signal in it.
-        let patterned = fastcat(vec![pure(Value::F64(1.0)), pure(Value::F64(2.0))]);
+        // Values of two layers, a factor that is not above zero, a handle
+        // that is marked volatile, and a stack with a signal in it.
+        let layered = built(&sequences()[1].1);
         let unknown = [
-            compose(&steps(), &patterned, ComposeOp::Add, Alignment::In),
+            compose(&steps(), &layered, ComposeOp::Add, Alignment::In),
             steps().fast(frac((-2, 1))),
             compose(
                 &steps().mark_volatile(),
