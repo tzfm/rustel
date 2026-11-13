@@ -2744,13 +2744,7 @@ pub(crate) fn build(node: &Node) -> Option<Tables> {
     match node {
         Node::Silence => Some(Tables::new(Vec::new(), Work::leaf(Cycles::NONE))),
         Node::Pure(value) if value.is_data(0) => pure(value),
-        Node::Sequence(steps) if steps.iter().all(|step| step.value.is_data(0)) => {
-            let cycle = crate::State::new(TimeSpan::new(Fraction::ZERO, Fraction::ONE));
-            Some(Tables::new(
-                vec![Layer::new(1, crate::query_sequence(steps, &cycle))?],
-                Work::leaf(Cycles::walk()),
-            ))
-        }
+        Node::Sequence(layers) => sequence(layers),
         Node::AddContext(pattern, locations) => {
             stepped(&*pattern.tables()?, Step::Locations(locations.clone()))
         }
@@ -3584,6 +3578,29 @@ fn joined(
         }
         entries.into_layer(period)
     })
+}
+
+/// The tables of a [`crate::sequence`]: the steps of each layer as one cycle
+/// a period, at the layer's speed, as a [`fast`] of them is.
+fn sequence(layers: &[crate::SequenceLayer]) -> Option<Tables> {
+    let mut all = Vec::new();
+    let mut work: Option<Work> = None;
+    for layer in layers {
+        let steps = Tables::new(
+            vec![Layer::new(1, layer.period_haps())?],
+            Work::leaf(Cycles::walk()),
+        );
+        let timed = if layer.period == Fraction::ONE {
+            steps
+        } else {
+            fast(&steps, Fraction::ONE.checked_div(layer.period)?)?
+        };
+        all.extend(timed.layers.iter().cloned());
+        work = Some(work.map_or(timed.work, |work| work.max(timed.work)));
+    }
+    // One node answers for every layer at its speed: the levels of a leaf.
+    let work = Work { levels: 1, ..work? };
+    Some(Tables::new(all, work))
 }
 
 /// `fast(factor)`: every time divided by `factor`. The new period is the

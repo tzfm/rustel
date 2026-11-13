@@ -15,12 +15,15 @@
 
 use rustel_core::register::default_registry;
 use rustel_core::{
-    Pattern, QueryLimit, SequenceStep, Value, choose_cycles, fastcat, pure, query_error_pattern,
-    query_limit_pattern, sequence, silence, stack,
+    Pattern, QueryLimit, Value, choose_cycles, fastcat, pure, query_error_pattern,
+    query_limit_pattern, silence, stack,
 };
 use rustel_fraction::Fraction;
 
 mod krill_unicode_generated;
+mod rhythm;
+
+use rhythm::Rhythm;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Span {
@@ -1395,15 +1398,109 @@ fn sequence_weight(value: f64) -> Fraction {
     native_weight(if value == 0.0 { 1.0 } else { value })
 }
 
+/// What a construct builds: a graph, or the plain values of a [`Rhythm`],
+/// which become one node.
+enum Built {
+    Rhythm(Rhythm),
+    Graph(Pattern),
+}
+
+impl Built {
+    fn into_pattern(self) -> Pattern {
+        match self {
+            Built::Rhythm(rhythm) => rhythm.into_pattern(),
+            Built::Graph(pattern) => pattern,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test to build one node for each value, as each construct
+    /// that is no [`Rhythm`] builds: the graph that a rhythm must answer as.
+    static ONE_NODE_FOR_EACH_VALUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The rhythm of each of `parts`, when each is one and the plain values of
+/// a construct may share a node.
+fn rhythms<'a>(parts: impl IntoIterator<Item = &'a Built>) -> Option<Vec<&'a Rhythm>> {
+    #[cfg(test)]
+    if ONE_NODE_FOR_EACH_VALUE.get() {
+        return None;
+    }
+    parts
+        .into_iter()
+        .map(|part| match part {
+            Built::Rhythm(rhythm) => Some(rhythm),
+            Built::Graph(_) => None,
+        })
+        .collect()
+}
+
+/// `fastcat` of `parts`.
+fn concatenated(parts: Vec<Built>) -> Built {
+    let rhythm = match parts.len() {
+        // No part is silence, and one part is that part.
+        0 | 1 => None,
+        _ => rhythms(&parts).and_then(|parts| Rhythm::concatenated(&parts)),
+    };
+    match rhythm {
+        Some(rhythm) => Built::Rhythm(rhythm),
+        None => Built::Graph(fastcat(
+            parts.into_iter().map(Built::into_pattern).collect(),
+        )),
+    }
+}
+
+/// `stack` of `parts`.
+fn stacked(parts: Vec<Built>) -> Built {
+    if rhythms(&parts).is_none() {
+        return Built::Graph(stack(parts.into_iter().map(Built::into_pattern).collect()));
+    }
+    let parts = parts
+        .into_iter()
+        .filter_map(|part| match part {
+            Built::Rhythm(rhythm) => Some(rhythm),
+            Built::Graph(_) => None,
+        })
+        .collect();
+    match Rhythm::stacked(parts) {
+        Ok(rhythm) => Built::Rhythm(rhythm),
+        Err(parts) => Built::Graph(stack(parts.into_iter().map(Rhythm::into_pattern).collect())),
+    }
+}
+
+/// `built` at `rate` times its speed, with the locations of the factor on
+/// each hap. `graph` makes the graph of the same speed change. A rate that
+/// is `None` or not above zero has no rhythm.
+fn at_rate(
+    built: Built,
+    rate: Option<Fraction>,
+    locations: Vec<(usize, usize)>,
+    graph: impl FnOnce(Pattern) -> Pattern,
+) -> Built {
+    let built = match (built, rate) {
+        (Built::Rhythm(rhythm), Some(rate)) if rhythms([]).is_some() => match rhythm.faster(rate) {
+            Ok(rhythm) => return Built::Rhythm(rhythm.located(&locations)),
+            Err(rhythm) => Built::Rhythm(rhythm),
+        },
+        (built, _) => built,
+    };
+    Built::Graph(with_argument_context(
+        graph(built.into_pattern()),
+        locations,
+    ))
+}
+
 /// Expand `!n` replication, then divide one cycle among the steps in
 /// proportion to their `@n` weights: plain `fastcat` when every weight is 1,
 /// `timecat` otherwise.
-fn build_seq(items: &[Step]) -> Pattern {
+fn build_seq(items: &[Step]) -> Built {
     let expanded: Vec<(Fraction, &Ast)> = expanded_steps(items)
         .map(|(step, weight)| (weight, &step.ast))
         .collect();
     if expanded.is_empty() {
-        return silence();
+        return Built::Rhythm(Rhythm::rest());
     }
 
     // A single step always fills the whole cycle, so its weight is irrelevant
@@ -1414,22 +1511,19 @@ fn build_seq(items: &[Step]) -> Pattern {
     // `stepcat` reifies a singleton before it computes a total, so
     // `bd@1e-10` plays.
     if expanded.len() == 1 {
-        return build_validated(expanded[0].1);
+        return compile(expanded[0].1);
     }
 
     // A zero weight total is silence: negative weights that cancel
     // (`bd@-1 sd@1`) or weights that round to zero (`bd@1e-10 sd@1e-10`) have
     // no windows to divide the cycle into.
     if total_weight(items) == Fraction::ZERO {
-        return silence();
+        return Built::Rhythm(Rhythm::rest());
     }
 
-    // All-equal weights: plain fastcat, or its one node when every step is
-    // a plain value.
+    // All-equal weights: plain fastcat.
     if expanded.iter().all(|(w, _)| *w == Fraction::ONE) {
-        let steps: Vec<&Ast> = expanded.iter().map(|(_, ast)| *ast).collect();
-        return plain_sequence(&steps)
-            .unwrap_or_else(|| fastcat(steps.into_iter().map(build_validated).collect()));
+        return concatenated(expanded.iter().map(|(_, ast)| compile(ast)).collect());
     }
 
     // Weighted: `timecat`, which is
@@ -1438,118 +1532,40 @@ fn build_seq(items: &[Step]) -> Pattern {
     // would repeat the step instead of leaving a gap.
     let windows = sequence_windows(items)
         .expect("Mini weight windows must be validated before pattern construction");
-    let mut parts = Vec::new();
-    for ((w, a), (begin, end)) in expanded.iter().zip(windows) {
-        // A weight can resolve to zero: the bounded `Fraction::from_f64`
-        // rounds a near-zero `@1e-10` to 0/1. Its window is empty, and
-        // `compress(b, b)` signals a "Division by zero" query error. Only a
-        // `queryArc` boundary drains that signal. No boundary is active at
-        // build time, so the error stays pending, and a later raw query or
-        // transform program on this thread reads it as its own. Use a silent
-        // part instead, as the stepwise and stepcat builders do.
-        if *w == Fraction::ZERO {
-            parts.push(silence());
-            continue;
-        }
-        parts.push(build_validated(a).compress(begin, end));
+    // A weight can resolve to zero: the bounded `Fraction::from_f64`
+    // rounds a near-zero `@1e-10` to 0/1. Its window is empty, and
+    // `compress(b, b)` signals a "Division by zero" query error. Only a
+    // `queryArc` boundary drains that signal. No boundary is active at
+    // build time, so the error stays pending, and a later raw query or
+    // transform program on this thread reads it as its own. Use a silent
+    // part instead, as the stepwise and stepcat builders do.
+    let parts: Vec<Option<Built>> = expanded
+        .iter()
+        .map(|(weight, ast)| (*weight != Fraction::ZERO).then(|| compile(ast)))
+        .collect();
+    let rhythm = rhythms(parts.iter().flatten()).and_then(|_| {
+        let parts: Vec<Option<&Rhythm>> = parts
+            .iter()
+            .map(|part| match part {
+                Some(Built::Rhythm(rhythm)) => Some(rhythm),
+                _ => None,
+            })
+            .collect();
+        Rhythm::squeezed(&parts, &windows)
+    });
+    if let Some(rhythm) = rhythm {
+        return Built::Rhythm(rhythm);
     }
-    stack(parts)
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Set by a test to build one node for each value, as every other
-    /// construct builds: the graph a [`plain_sequence`] must answer as.
-    static ONE_NODE_FOR_EACH_VALUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// The one node of a sequence of two or more equal steps, when every step is
-/// a plain value: an atom, a rest, a chord of atoms, or a sequence of such
-/// steps of equal weight. `None` when a step is any other construct, which
-/// `fastcat` then concatenates.
-///
-/// The node answers as the `fastcat` does, with the same step count. It
-/// holds one entry for each atom, where the `fastcat` holds a node for each
-/// atom, each location and each level.
-fn plain_sequence(steps: &[&Ast]) -> Option<Pattern> {
-    #[cfg(test)]
-    if ONE_NODE_FOR_EACH_VALUE.get() {
-        return None;
-    }
-    let mut values = Vec::new();
-    plain_steps(steps, (Fraction::ZERO, Fraction::ONE), &mut values)?;
-    let count = Fraction::int(i128::try_from(steps.len()).ok()?);
-    Some(sequence(values)?.with_steps(Some(count)))
-}
-
-/// Add the values of `steps`, which divide `window` equally, to `values`.
-fn plain_steps(
-    steps: &[&Ast],
-    (from, to): (Fraction, Fraction),
-    values: &mut Vec<SequenceStep>,
-) -> Option<()> {
-    let count = Fraction::int(i128::try_from(steps.len()).ok()?);
-    let width = to.checked_sub(from)?;
-    let at = |index: usize| {
-        let index = Fraction::int(i128::try_from(index).ok()?);
-        from.checked_add(width.checked_mul(index)?.checked_div(count)?)
-    };
-    for (index, step) in steps.iter().enumerate() {
-        plain_step(step, (at(index)?, at(index + 1)?), values)?;
-    }
-    Some(())
-}
-
-/// Add the values of one step, which fills `window`, to `values`.
-fn plain_step(
-    step: &Ast,
-    window: (Fraction, Fraction),
-    values: &mut Vec<SequenceStep>,
-) -> Option<()> {
-    let mut atom = |value: &str, span: &Span| {
-        // A token that is entirely `-` or `~` is a rest.
-        if value != "-" && value != "~" {
-            values.push(SequenceStep {
-                begin: window.0,
-                end: window.1,
-                value: atom_value(value),
-                location: current_leaf_span(span),
-            });
-        }
-    };
-    match step {
-        Ast::Atom { value, span, .. } => atom(value, span),
-        Ast::Silence { .. } => {}
-        // A chord: every atom over the whole step, in the order written.
-        Ast::Stack { items, .. } => {
-            for item in items {
-                match item {
-                    Ast::Atom { value, span, .. } => atom(value, span),
-                    Ast::Silence { .. } => {}
-                    _ => return None,
-                }
-            }
-        }
-        Ast::Seq { items, .. } => {
-            let inner: Vec<(Fraction, &Ast)> = expanded_steps(items)
-                .map(|(step, weight)| (weight, &step.ast))
-                .collect();
-            match inner.as_slice() {
-                [] => {}
-                // One step fills the window whatever its weight.
-                [(_, only)] => plain_step(only, window, values)?,
-                inner => {
-                    if inner.iter().any(|(weight, _)| *weight != Fraction::ONE) {
-                        return None;
-                    }
-                    let inner: Vec<&Ast> = inner.iter().map(|(_, ast)| *ast).collect();
-                    plain_steps(&inner, window, values)?;
-                }
-            }
-        }
-        _ => return None,
-    }
-    Some(())
+    Built::Graph(stack(
+        parts
+            .into_iter()
+            .zip(windows)
+            .map(|(part, (begin, end))| match part {
+                Some(part) => part.into_pattern().compress(begin, end),
+                None => silence(),
+            })
+            .collect(),
+    ))
 }
 
 thread_local! {
@@ -1649,6 +1665,12 @@ fn with_argument_context(pattern: Pattern, spans: Vec<(usize, usize)>) -> Patter
 }
 
 fn build_validated(ast: &Ast) -> Pattern {
+    compile(ast).into_pattern()
+}
+
+/// The pattern of `ast`, as plain values where the construct is made of
+/// them and as a graph where it is not.
+fn compile(ast: &Ast) -> Built {
     match ast {
         // krill's `step_char` includes `-` and `~`, so both are legal inside a
         // token (`-1`, `c-3`). But a token that is ENTIRELY `-` or `~` is a
@@ -1656,19 +1678,18 @@ fn build_validated(ast: &Ast) -> Pattern {
         //
         // `a - b [- c]` yields only a, b, c, with the `-` slots silent rather
         // than atoms literally named "-".
-        Ast::Atom { value, .. } if value == "-" || value == "~" => silence(),
-        Ast::Atom { value, span, .. } => match current_leaf_span(span) {
-            // `pure(value).withLoc(...getLeafLocation(code, ast, offset))` -
-            // the same whitespace-corrected span `getLeafLocations` reports,
-            // carried as hap context for editor highlighting.
-            Some(loc) => pure(atom_value(value)).with_added_context(vec![loc]),
-            None => pure(atom_value(value)),
-        },
-        Ast::Silence { .. } => silence(),
+        Ast::Atom { value, .. } if value == "-" || value == "~" => Built::Rhythm(Rhythm::rest()),
+        // `pure(value).withLoc(...getLeafLocation(code, ast, offset))` -
+        // the same whitespace-corrected span `getLeafLocations` reports,
+        // carried as hap context for editor highlighting.
+        Ast::Atom { value, span, .. } => {
+            Built::Rhythm(Rhythm::atom(atom_value(value), current_leaf_span(span)))
+        }
+        Ast::Silence { .. } => Built::Rhythm(Rhythm::rest()),
         Ast::Seq { items, .. } => build_seq(items),
         Ast::Replicated { pat, amount, .. } => {
             let amount = native_weight(*amount);
-            build_validated(pat).repeat_cycles(amount).fast(amount)
+            Built::Graph(build_validated(pat).repeat_cycles(amount).fast(amount))
         }
         Ast::Alt { lanes, .. } => {
             // `<a b, c d>` - each comma-separated sequence gets its own slow
@@ -1679,30 +1700,35 @@ fn build_validated(ast: &Ast) -> Pattern {
             // `b` three cycles. Each lane is `timecat(...).slow(total)`, and
             // the lanes are stacked.
             if lanes.is_empty() {
-                return silence();
+                return Built::Rhythm(Rhythm::rest());
             }
-            stack(
+            stacked(
                 lanes
                     .iter()
                     .map(|lane| {
                         let total = total_weight(&lane.items);
                         if total == Fraction::ZERO {
-                            silence()
+                            Built::Rhythm(Rhythm::rest())
                         } else {
-                            build_seq(&lane.items).slow(total)
+                            at_rate(
+                                build_seq(&lane.items),
+                                Fraction::ONE.checked_div(total),
+                                Vec::new(),
+                                |lane| lane.slow(total),
+                            )
                         }
                     })
                     .collect(),
             )
         }
-        Ast::Stack { items, .. } => stack(items.iter().map(build_validated).collect()),
+        Ast::Stack { items, .. } => stacked(items.iter().map(compile).collect()),
         Ast::Polymeter {
             items,
             steps_per_cycle,
             ..
         } => {
             if items.is_empty() {
-                return silence();
+                return Built::Rhythm(Rhythm::rest());
             }
             let default_steps = ast_weight(&items[0]);
             // The steps pattern is always mapped before it reaches `fast`,
@@ -1714,7 +1740,7 @@ fn build_validated(ast: &Ast) -> Pattern {
                 .as_deref()
                 .map(build_validated)
                 .unwrap_or_else(|| pure(Value::F64(default_steps.to_f64())));
-            stack(
+            Built::Graph(stack(
                 items
                     .iter()
                     .map(|item| {
@@ -1756,18 +1782,22 @@ fn build_validated(ast: &Ast) -> Pattern {
                         apply_patterned_fast(build_validated(item), factor)
                     })
                     .collect(),
-            )
+            ))
         }
-        Ast::Choose { items, seed, .. } => {
-            choose_cycles(items.iter().map(build_validated).collect(), *seed)
-        }
-        Ast::Feet { items, .. } => fastcat(items.iter().map(build_validated).collect()),
+        Ast::Choose { items, seed, .. } => Built::Graph(choose_cycles(
+            items.iter().map(build_validated).collect(),
+            *seed,
+        )),
+        Ast::Feet { items, .. } => concatenated(items.iter().map(compile).collect()),
         Ast::Fast { pat, factor, .. } => match static_fraction_site(factor) {
             // The eager path scalarizes the factor; the factor atom's span
             // is appended so every hap still carries it.
-            Some(value) => {
-                with_argument_context(build_validated(pat).fast(value), argument_context(factor))
-            }
+            Some(value) => at_rate(
+                compile(pat),
+                Some(value),
+                argument_context(factor),
+                |pattern| pattern.fast(value),
+            ),
             None => {
                 let factor =
                     build_validated(factor).fmap(|value| match fraction_site_value(value) {
@@ -1779,14 +1809,16 @@ fn build_validated(ast: &Ast) -> Pattern {
                             Value::Undefined
                         }
                     });
-                apply_patterned_fast(build_validated(pat), factor)
+                Built::Graph(apply_patterned_fast(build_validated(pat), factor))
             }
         },
         Ast::Slow { pat, factor, .. } => {
             if let Some(value) = static_fraction_site(factor) {
-                return with_argument_context(
-                    build_validated(pat).slow(value),
+                return at_rate(
+                    compile(pat),
+                    Fraction::ONE.checked_div(value),
                     argument_context(factor),
+                    |pattern| pattern.slow(value),
                 );
             }
             let reciprocal =
@@ -1809,7 +1841,7 @@ fn build_validated(ast: &Ast) -> Pattern {
                         Value::Undefined
                     }
                 });
-            apply_patterned_fast(build_validated(pat), reciprocal)
+            Built::Graph(apply_patterned_fast(build_validated(pat), reciprocal))
         }
         Ast::Euclid {
             pat,
@@ -1817,7 +1849,7 @@ fn build_validated(ast: &Ast) -> Pattern {
             steps,
             rotation,
             ..
-        } => {
+        } => Built::Graph({
             if let (Some(pulses_value), Some(steps_value), true) = (
                 static_number_fraction(euclid_argument_source(&pulses.ast)),
                 static_number_fraction(euclid_argument_source(&steps.ast)),
@@ -1897,10 +1929,10 @@ fn build_validated(ast: &Ast) -> Pattern {
                     })
                     .inner_join()
             }
-        }
+        }),
         Ast::Degrade {
             pat, amount, seed, ..
-        } => build_validated(pat).degrade_by_seeded(amount.unwrap_or(0.5), *seed),
+        } => Built::Graph(build_validated(pat).degrade_by_seeded(amount.unwrap_or(0.5), *seed)),
         Ast::Tail { pat, element, span } => {
             // The editor highlights `bd:3` as one band. A chain of plain
             // atoms is built as one value under the span of the whole pair.
@@ -1910,18 +1942,21 @@ fn build_validated(ast: &Ast) -> Pattern {
             if let Some(values) = tail_atom_chain(pat, element)
                 && let Some(loc) = current_leaf_span(span)
             {
-                return pure(Value::List(values)).with_added_context(vec![loc]);
+                return Built::Rhythm(Rhythm::atom(Value::List(values), Some(loc)));
             }
-            build_validated(pat).app_left_with(build_validated(element), |left, right| match left {
-                Value::List(values) => {
-                    let mut values = values.clone();
-                    values.push(right.clone());
-                    Value::List(values)
-                }
-                value => Value::List(vec![value.clone(), right.clone()]),
-            })
+            Built::Graph(build_validated(pat).app_left_with(
+                build_validated(element),
+                |left, right| match left {
+                    Value::List(values) => {
+                        let mut values = values.clone();
+                        values.push(right.clone());
+                        Value::List(values)
+                    }
+                    value => Value::List(vec![value.clone(), right.clone()]),
+                },
+            ))
         }
-        Ast::Range { start, end, .. } => {
+        Ast::Range { start, end, .. } => Built::Graph({
             if let (Some(start_value), Some(end_value)) =
                 (static_number_fraction(start), static_number_fraction(end))
             {
@@ -1952,7 +1987,7 @@ fn build_validated(ast: &Ast) -> Pattern {
                     })
                     .inner_join()
             }
-        }
+        }),
     }
 }
 
@@ -3322,7 +3357,7 @@ mod tests {
     }
 
     /// Build `source` at `offset` with one node for each value, the graph
-    /// a sequence node stands for.
+    /// that a rhythm stands for.
     fn one_node_for_each_value(source: &str, offset: usize) -> rustel_core::Pattern {
         struct Restore;
         impl Drop for Restore {
@@ -3335,13 +3370,89 @@ mod tests {
         super::mini_at(source, offset).expect(source)
     }
 
+    /// Sources of plain values at a constant speed, and sources with a step
+    /// that is another construct, which keeps its own nodes.
+    const RHYTHMS: &[&str] = &[
+        "a b c",
+        "a ~ b -",
+        "a [b c] d",
+        "[a b] [c [d e]] f",
+        "[a,b] c",
+        "[a, b, ~] - [c,d]",
+        "a!3 b",
+        "a b!2 [c d]!2",
+        "[a@2] b",
+        "0 1 [2 3] -4.5",
+        "<[a b]!3 [c d e]> f",
+        "<[a [b,c]] [d e f]>",
+        "a b, c d e",
+        "bd*4, ~ sd ~ sd, hh hh hh hh",
+        "a b@2 c",
+        "a@3 b",
+        "a@3 ~ b@2.5",
+        "[a b@3 c] d",
+        "<a b> c d",
+        "<a b>",
+        "<a b c>*2",
+        "<a b>/2",
+        "<a@2 b c>/3",
+        "<a b, c d e>",
+        "<a [b c]> <d e f>",
+        "a <b <c d>>",
+        "a*2 b c",
+        "a*4",
+        "[a b]*3",
+        "[a b c]/2",
+        "[a b]*1.5",
+        "[a b]/1.5 c",
+        "a*3 [b*2 c]",
+        "[a b@3]*2 c",
+        "[a, b c]*2",
+        "a/2 b",
+        "<a b>!2 c",
+        "<a@3 b> c",
+        "a . b c . d",
+        "a:b c",
+        "a:b*2 c:1",
+        "a*0 b",
+        "a*-1 b",
+        "a/0 b",
+        "<a b>*0",
+        "a",
+        "[a]",
+        "<a>",
+        "<a:b>",
+        "a*1",
+        "a/1",
+        "<<a>>/1",
+        "[a, b]",
+        "a@0 b c",
+        "a@-1 b@2 c",
+        "<a@0 b>",
+        "~ ~",
+        "~",
+        "[~ ~] a",
+        "<~ a>",
+        // A step that is another construct keeps its own nodes.
+        "a(3,8) b",
+        "a? b c",
+        "[a b, c d e] f",
+        "{a b c}%4 d",
+        "a*<2 3> b",
+        "a!2.5 b",
+        "a|b c",
+        "0 .. 3 a",
+    ];
+
     #[test]
-    fn a_sequence_of_plain_values_answers_as_one_node_for_each_value() {
+    fn plain_values_answer_as_one_node_for_each_value() {
         let third = |n: i128| Fraction::new(n, 3);
         let spans = [
             (Fraction::ZERO, Fraction::ONE),
             (Fraction::ZERO, Fraction::from(3)),
+            (Fraction::ZERO, Fraction::from(13)),
             (third(1), third(5)),
+            (third(-7), third(22)),
             (Fraction::new(7, 8), Fraction::new(9, 8)),
             (Fraction::new(-3, 2), Fraction::new(-1, 4)),
             // A span of no width asks for what sounds at its one time.
@@ -3349,36 +3460,24 @@ mod tests {
             (Fraction::new(1, 2), Fraction::new(1, 2)),
             (third(4), third(4)),
             (Fraction::from(2), Fraction::from(2)),
+            (Fraction::new(-5, 8), Fraction::new(-5, 8)),
         ];
-        for source in [
-            "a b c",
-            "a ~ b -",
-            "a [b c] d",
-            "[a b] [c [d e]] f",
-            "[a,b] c",
-            "[a, b, ~] - [c,d]",
-            "a!3 b",
-            "a b!2 [c d]!2",
-            "[a@2] b",
-            "0 1 [2 3] -4.5",
-            "<[a b]!3 [c d e]> f",
-            "<[a [b,c]] [d e f]>",
-            "a b, c d e",
-            "bd*4, ~ sd ~ sd, hh hh hh hh",
-            // A step that is another construct keeps the whole sequence
-            // on one node for each value.
-            "a b@2 c",
-            "<a b> c d",
-            "a*2 b c",
-            "a(3,8) b",
-            "a? b c",
-            "a:b c",
-            "[a b, c d e] f",
-            "{a b c}%4 d",
-        ] {
+        for source in RHYTHMS {
             let one_node = super::mini_at(source, 7).expect(source);
             let each_value = one_node_for_each_value(source, 7);
+            assert_eq!(one_node.steps, each_value.steps, "the steps of {source}");
+            // A function that reads its argument takes a `pure` another way.
+            assert_eq!(
+                one_node.as_pure(),
+                each_value.as_pure(),
+                "the constant of {source}"
+            );
             for (begin, end) in spans {
+                assert_eq!(
+                    format!("{:?}", one_node.try_query_arc_sorted(begin, end).err()),
+                    format!("{:?}", each_value.try_query_arc_sorted(begin, end).err()),
+                    "the refusal of {source} over {begin:?}..{end:?}"
+                );
                 assert_eq!(
                     format!("{:?}", one_node.query_arc(begin, end)),
                     format!("{:?}", each_value.query_arc(begin, end)),
@@ -3388,13 +3487,38 @@ mod tests {
         }
     }
 
+    /// The step count that each construct reports inside another construct,
+    /// which a stack and a polymeter of them read.
     #[test]
-    fn a_sequence_of_plain_values_is_one_node() {
+    fn plain_values_report_the_steps_of_one_node_for_each_value() {
+        for source in RHYTHMS {
+            for outer in ["{{{}}}%4", "{{{}, x y z}}", "[{}, x y]", "{}?"] {
+                let source = outer.replace("{}", source);
+                let Ok(one_node) = super::mini_at(&source, 0) else {
+                    continue;
+                };
+                assert_eq!(
+                    one_node.steps,
+                    one_node_for_each_value(&source, 0).steps,
+                    "the steps of {source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_values_at_a_constant_speed_are_one_node() {
         for (source, plain) in [
             ("a [b c] ~ [d,e]", true),
             ("<[a b]!3 [c d e]>", true),
-            ("a b@2 c", false),
-            ("a*2 b c", false),
+            ("a b@2 c", true),
+            ("a*2 b c", true),
+            ("bd*2, hh*4, <a b>/2", true),
+            // An atom is a `pure` on both sides.
+            ("a", false),
+            ("<a>", true),
+            ("a(3,8) b", false),
+            ("a? b", false),
         ] {
             let built = super::mini_at(source, 0).expect(source);
             assert_eq!(
