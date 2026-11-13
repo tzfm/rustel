@@ -15,8 +15,8 @@
 
 use rustel_core::register::default_registry;
 use rustel_core::{
-    Pattern, QueryLimit, Value, choose_cycles, fastcat, pure, query_error_pattern,
-    query_limit_pattern, silence, stack,
+    Pattern, QueryLimit, SequenceStep, Value, choose_cycles, fastcat, pure, query_error_pattern,
+    query_limit_pattern, sequence, silence, stack,
 };
 use rustel_fraction::Fraction;
 
@@ -1424,14 +1424,12 @@ fn build_seq(items: &[Step]) -> Pattern {
         return silence();
     }
 
-    // All-equal weights: plain fastcat.
+    // All-equal weights: plain fastcat, or its one node when every step is
+    // a plain value.
     if expanded.iter().all(|(w, _)| *w == Fraction::ONE) {
-        return fastcat(
-            expanded
-                .iter()
-                .map(|(_, ast)| build_validated(ast))
-                .collect(),
-        );
+        let steps: Vec<&Ast> = expanded.iter().map(|(_, ast)| *ast).collect();
+        return plain_sequence(&steps)
+            .unwrap_or_else(|| fastcat(steps.into_iter().map(build_validated).collect()));
     }
 
     // Weighted: `timecat`, which is
@@ -1456,6 +1454,102 @@ fn build_seq(items: &[Step]) -> Pattern {
         parts.push(build_validated(a).compress(begin, end));
     }
     stack(parts)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test to build one node for each value, as every other
+    /// construct builds: the graph a [`plain_sequence`] must answer as.
+    static ONE_NODE_FOR_EACH_VALUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The one node of a sequence of two or more equal steps, when every step is
+/// a plain value: an atom, a rest, a chord of atoms, or a sequence of such
+/// steps of equal weight. `None` when a step is any other construct, which
+/// `fastcat` then concatenates.
+///
+/// The node answers as the `fastcat` does, with the same step count. It
+/// holds one entry for each atom, where the `fastcat` holds a node for each
+/// atom, each location and each level.
+fn plain_sequence(steps: &[&Ast]) -> Option<Pattern> {
+    #[cfg(test)]
+    if ONE_NODE_FOR_EACH_VALUE.get() {
+        return None;
+    }
+    let mut values = Vec::new();
+    plain_steps(steps, (Fraction::ZERO, Fraction::ONE), &mut values)?;
+    let count = Fraction::int(i128::try_from(steps.len()).ok()?);
+    Some(sequence(values)?.with_steps(Some(count)))
+}
+
+/// Add the values of `steps`, which divide `window` equally, to `values`.
+fn plain_steps(
+    steps: &[&Ast],
+    (from, to): (Fraction, Fraction),
+    values: &mut Vec<SequenceStep>,
+) -> Option<()> {
+    let count = Fraction::int(i128::try_from(steps.len()).ok()?);
+    let width = to.checked_sub(from)?;
+    let at = |index: usize| {
+        let index = Fraction::int(i128::try_from(index).ok()?);
+        from.checked_add(width.checked_mul(index)?.checked_div(count)?)
+    };
+    for (index, step) in steps.iter().enumerate() {
+        plain_step(step, (at(index)?, at(index + 1)?), values)?;
+    }
+    Some(())
+}
+
+/// Add the values of one step, which fills `window`, to `values`.
+fn plain_step(
+    step: &Ast,
+    window: (Fraction, Fraction),
+    values: &mut Vec<SequenceStep>,
+) -> Option<()> {
+    let mut atom = |value: &str, span: &Span| {
+        // A token that is entirely `-` or `~` is a rest.
+        if value != "-" && value != "~" {
+            values.push(SequenceStep {
+                begin: window.0,
+                end: window.1,
+                value: atom_value(value),
+                location: current_leaf_span(span),
+            });
+        }
+    };
+    match step {
+        Ast::Atom { value, span, .. } => atom(value, span),
+        Ast::Silence { .. } => {}
+        // A chord: every atom over the whole step, in the order written.
+        Ast::Stack { items, .. } => {
+            for item in items {
+                match item {
+                    Ast::Atom { value, span, .. } => atom(value, span),
+                    Ast::Silence { .. } => {}
+                    _ => return None,
+                }
+            }
+        }
+        Ast::Seq { items, .. } => {
+            let inner: Vec<(Fraction, &Ast)> = expanded_steps(items)
+                .map(|(step, weight)| (weight, &step.ast))
+                .collect();
+            match inner.as_slice() {
+                [] => {}
+                // One step fills the window whatever its weight.
+                [(_, only)] => plain_step(only, window, values)?,
+                inner => {
+                    if inner.iter().any(|(weight, _)| *weight != Fraction::ONE) {
+                        return None;
+                    }
+                    let inner: Vec<&Ast> = inner.iter().map(|(_, ast)| *ast).collect();
+                    plain_steps(&inner, window, values)?;
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(())
 }
 
 thread_local! {
@@ -3225,5 +3319,89 @@ mod tests {
                     && hap.part.begin == Fraction::new(1, 2)),
             "the silent replicated step lost its half-slot: {haps:?}"
         );
+    }
+
+    /// Build `source` at `offset` with one node for each value, the graph
+    /// a sequence node stands for.
+    fn one_node_for_each_value(source: &str, offset: usize) -> rustel_core::Pattern {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                super::ONE_NODE_FOR_EACH_VALUE.set(false);
+            }
+        }
+        super::ONE_NODE_FOR_EACH_VALUE.set(true);
+        let _restore = Restore;
+        super::mini_at(source, offset).expect(source)
+    }
+
+    #[test]
+    fn a_sequence_of_plain_values_answers_as_one_node_for_each_value() {
+        let third = |n: i128| Fraction::new(n, 3);
+        let spans = [
+            (Fraction::ZERO, Fraction::ONE),
+            (Fraction::ZERO, Fraction::from(3)),
+            (third(1), third(5)),
+            (Fraction::new(7, 8), Fraction::new(9, 8)),
+            (Fraction::new(-3, 2), Fraction::new(-1, 4)),
+            // A span of no width asks for what sounds at its one time.
+            (Fraction::ZERO, Fraction::ZERO),
+            (Fraction::new(1, 2), Fraction::new(1, 2)),
+            (third(4), third(4)),
+            (Fraction::from(2), Fraction::from(2)),
+        ];
+        for source in [
+            "a b c",
+            "a ~ b -",
+            "a [b c] d",
+            "[a b] [c [d e]] f",
+            "[a,b] c",
+            "[a, b, ~] - [c,d]",
+            "a!3 b",
+            "a b!2 [c d]!2",
+            "[a@2] b",
+            "0 1 [2 3] -4.5",
+            "<[a b]!3 [c d e]> f",
+            "<[a [b,c]] [d e f]>",
+            "a b, c d e",
+            "bd*4, ~ sd ~ sd, hh hh hh hh",
+            // A step that is another construct keeps the whole sequence
+            // on one node for each value.
+            "a b@2 c",
+            "<a b> c d",
+            "a*2 b c",
+            "a(3,8) b",
+            "a? b c",
+            "a:b c",
+            "[a b, c d e] f",
+            "{a b c}%4 d",
+        ] {
+            let one_node = super::mini_at(source, 7).expect(source);
+            let each_value = one_node_for_each_value(source, 7);
+            for (begin, end) in spans {
+                assert_eq!(
+                    format!("{:?}", one_node.query_arc(begin, end)),
+                    format!("{:?}", each_value.query_arc(begin, end)),
+                    "{source} over {begin:?}..{end:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_sequence_of_plain_values_is_one_node() {
+        for (source, plain) in [
+            ("a [b c] ~ [d,e]", true),
+            ("<[a b]!3 [c d e]>", true),
+            ("a b@2 c", false),
+            ("a*2 b c", false),
+        ] {
+            let built = super::mini_at(source, 0).expect(source);
+            assert_eq!(
+                !built.same_construction(&one_node_for_each_value(source, 0)),
+                plain,
+                "{source}"
+            );
+        }
     }
 }

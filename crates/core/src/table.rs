@@ -2744,6 +2744,13 @@ pub(crate) fn build(node: &Node) -> Option<Tables> {
     match node {
         Node::Silence => Some(Tables::new(Vec::new(), Work::leaf(Cycles::NONE))),
         Node::Pure(value) if value.is_data(0) => pure(value),
+        Node::Sequence(steps) if steps.iter().all(|step| step.value.is_data(0)) => {
+            let cycle = crate::State::new(TimeSpan::new(Fraction::ZERO, Fraction::ONE));
+            Some(Tables::new(
+                vec![Layer::new(1, crate::query_sequence(steps, &cycle))?],
+                Work::leaf(Cycles::walk()),
+            ))
+        }
         Node::AddContext(pattern, locations) => {
             stepped(&*pattern.tables()?, Step::Locations(locations.clone()))
         }

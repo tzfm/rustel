@@ -4693,6 +4693,8 @@ const _: fn() = || {
 enum Node {
     Silence,
     Pure(Value),
+    /// The steps of every cycle, as one node. See [`sequence`].
+    Sequence(Arc<[SequenceStep]>),
     /// Mutation control - never built.
     ///
     /// Stands in for a QuickJS value stored in L1: `Rc` is `!Send + !Sync`
@@ -5246,6 +5248,7 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
     match node {
         Node::Silence
         | Node::Pure(_)
+        | Node::Sequence(_)
         | Node::QueryError(_)
         | Node::QueryLimit(_)
         | Node::Signal(_)
@@ -5847,6 +5850,8 @@ impl Pattern {
             }
 
             Node::Pure(value) | Node::PurePickLookup(value, _) => self.query_value(value, state),
+
+            Node::Sequence(steps) => query_sequence(steps, state),
 
             Node::WithQueryTime(pat, f) => {
                 let s = state.with_span(|sp| sp.with_time(|t| f(t)));
@@ -8766,6 +8771,7 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
     match node {
         Node::Silence
         | Node::Pure(_)
+        | Node::Sequence(_)
         | Node::QueryError(_)
         | Node::QueryLimit(_)
         | Node::Signal(_)
@@ -8995,6 +9001,7 @@ fn compute_purity(node: &Node) -> purity::Purity {
         // Query-time errors and limits hold no callback or JavaScript, so they
         // stay queryable with no host installed.
         Node::Pure(value) => value_purity(value),
+        Node::Sequence(steps) => Purity::merge(steps.iter().map(|step| value_purity(&step.value))),
         Node::PurePickLookup(_, lookup) => {
             Purity::merge(lookup.patterns().map(|pattern| pattern.purity.clone()))
         }
@@ -9388,6 +9395,81 @@ pub fn pattern_of_js(outer: Pattern, id: CallbackId) -> Pattern {
 
 pub fn pure(v: Value) -> Pattern {
     Pattern::of(Node::Pure(v)).with_steps(Some(Fraction::ONE))
+}
+
+/// One step of a [`sequence`]: a value over a window of the cycle, with the
+/// source location its hap carries.
+#[derive(Clone, Debug)]
+pub struct SequenceStep {
+    pub begin: Fraction,
+    pub end: Fraction,
+    pub value: Value,
+    pub location: Option<(usize, usize)>,
+}
+
+/// The same steps in every cycle: each step is one hap, whose whole is the
+/// step's window in the cycle and whose value is the step's.
+///
+/// This is what a concatenation of plain values answers, nested
+/// concatenations and stacks of plain values inside it included, and it
+/// answers in the same order. It is one node where they are one node for
+/// each value and each level, so it holds and visits a fraction of them.
+///
+/// The steps are in the order of their haps: each begins inside the cycle
+/// at or after the step before it and ends at or after it, and no step is
+/// empty. `None` for steps that are not so.
+pub fn sequence(steps: Vec<SequenceStep>) -> Option<Pattern> {
+    let inside = |step: &SequenceStep| {
+        Fraction::ZERO <= step.begin && step.begin < step.end && step.end <= Fraction::ONE
+    };
+    let ordered = steps
+        .windows(2)
+        .all(|pair| pair[0].begin <= pair[1].begin && pair[0].end <= pair[1].end);
+    (steps.iter().all(inside) && ordered).then(|| Pattern::of(Node::Sequence(steps.into())))
+}
+
+/// The haps of `steps` in `state`'s span. See [`sequence`].
+fn query_sequence(steps: &[SequenceStep], state: &State) -> Vec<Hap> {
+    let refused = || {
+        refuse(QueryLimit::NativeFraction {
+            operation: "sequence",
+        });
+        Vec::new()
+    };
+    let mut out = Vec::new();
+    for piece in state.span.span_cycles() {
+        if query_stop_requested() {
+            return Vec::new();
+        }
+        let cycle = piece.begin.sam();
+        let (Some(begin), Some(end)) =
+            (piece.begin.checked_sub(cycle), piece.end.checked_sub(cycle))
+        else {
+            return refused();
+        };
+        // A span of no width asks for the step that holds its one time.
+        let instant = begin == end;
+        let first = steps.partition_point(|step| step.end <= begin);
+        for step in &steps[first..] {
+            if step.begin > begin && (instant || step.begin >= end) {
+                break;
+            }
+            let (Some(from), Some(to)) =
+                (cycle.checked_add(step.begin), cycle.checked_add(step.end))
+            else {
+                return refused();
+            };
+            let part = TimeSpan::new(from.max(piece.begin), to.min(piece.end));
+            let mut hap = Hap::new(Some(TimeSpan::new(from, to)), part, step.value.clone());
+            if let Some(location) = step.location {
+                hap.context.extend_from_slice(&[location]);
+            }
+            if !push_budgeted(&mut out, hap) {
+                return Vec::new();
+            }
+        }
+    }
+    out
 }
 
 pub fn pure_pick_lookup(value: Value, lookup: PickLookup) -> Pattern {
@@ -10747,5 +10829,58 @@ mod application_run_tests {
         for (begin, end) in spans() {
             assert_eq!(answers(&run, begin, end), answers(&in_turn, begin, end));
         }
+    }
+}
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::*;
+
+    fn step(begin: (i128, i128), end: (i128, i128), value: f64) -> SequenceStep {
+        SequenceStep {
+            begin: Fraction::new(begin.0, begin.1),
+            end: Fraction::new(end.0, end.1),
+            value: Value::F64(value),
+            location: Some((value as usize, value as usize + 1)),
+        }
+    }
+
+    #[test]
+    fn a_sequence_answers_as_the_concatenation_of_its_values() {
+        let located = |value: f64| {
+            pure(Value::F64(value)).with_added_context(vec![(value as usize, value as usize + 1)])
+        };
+        let one_node = sequence(vec![
+            step((0, 1), (1, 2), 1.0),
+            step((1, 2), (1, 1), 2.0),
+            step((1, 2), (1, 1), 3.0),
+        ])
+        .expect("ordered steps inside the cycle");
+        let nodes = fastcat(vec![located(1.0), stack(vec![located(2.0), located(3.0)])]);
+        for (begin, end) in [
+            (Fraction::ZERO, Fraction::new(3, 1)),
+            (Fraction::new(1, 4), Fraction::new(3, 4)),
+            (Fraction::new(-5, 4), Fraction::new(1, 8)),
+            (Fraction::new(1, 2), Fraction::new(1, 2)),
+        ] {
+            assert_eq!(
+                format!("{:?}", one_node.query_arc(begin, end)),
+                format!("{:?}", nodes.query_arc(begin, end)),
+                "{begin:?}..{end:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn steps_out_of_order_or_outside_the_cycle_make_no_sequence() {
+        for steps in [
+            vec![step((1, 2), (1, 1), 1.0), step((0, 1), (1, 2), 2.0)],
+            vec![step((0, 1), (3, 2), 1.0)],
+            vec![step((1, 2), (1, 2), 1.0)],
+            vec![step((-1, 2), (1, 2), 1.0)],
+        ] {
+            assert!(sequence(steps).is_none());
+        }
+        assert!(sequence(Vec::new()).is_some());
     }
 }

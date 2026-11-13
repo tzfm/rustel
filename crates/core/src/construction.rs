@@ -208,6 +208,7 @@ fn same_opaque_payloads(left: &Node, right: &Node) -> bool {
         // `same_node` compares: the shape settles it, and the pair carries.
         Silence
         | Pure(_)
+        | Sequence(_)
         | QueryError(_)
         | QueryLimit(_)
         | Fast(..)
@@ -359,6 +360,16 @@ fn same_node<'g>(
     match left {
         Node::Silence => matches!(right, Node::Silence),
         Node::Pure(a) => matches!(right, Node::Pure(b) if same_value(a, b)),
+        Node::Sequence(a) => match right {
+            Node::Sequence(b) => {
+                a.len() == b.len()
+                    && a.iter().zip(b.iter()).all(|(a, b)| {
+                        (a.begin, a.end, a.location) == (b.begin, b.end, b.location)
+                            && same_value(&a.value, &b.value)
+                    })
+            }
+            _ => false,
+        },
         #[cfg(non_send_node_mutation)]
         Node::NonSendMutation(_) => false,
         Node::QueryError(a) => matches!(right, Node::QueryError(b) if a == b),
