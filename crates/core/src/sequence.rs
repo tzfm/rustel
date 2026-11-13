@@ -16,7 +16,7 @@
 //! query error leaves its node in place, which raises the error at each
 //! query.
 
-use crate::compose::ComposeOp;
+use crate::compose::{ComposeOp, compose_data_in_place};
 use crate::{
     Combine, Hap, Locations, LookupFlow, MAX_QUERY_SPAN_CYCLES, Meeting, Node, OwnedHapMapFn,
     Pattern, QueryLimit, State, TimeSpan, Value, charge_haps, note_accumulated,
@@ -135,10 +135,20 @@ pub(crate) struct Layer {
     pub(crate) period: Fraction,
     /// Shared by each layer that a fold makes of the same places.
     places: Arc<[Place]>,
+    /// The value of each step, each once, before the controls that `set`
+    /// holds.
     values: Arc<[Value]>,
+    /// A control map that each value takes when it is read: the union of
+    /// the constants that a chain of controls set, the last one last. See
+    /// [`Self::set`].
+    set: Option<Value>,
+    /// The values with `set` in them, made at the first read.
+    read: OnceLock<Arc<[Value]>>,
     /// Whether each value is data only: a hap of the layer then holds
     /// nothing that a query resolves or binds to a runtime.
     data: bool,
+    /// Whether each value is a map of controls.
+    maps: bool,
     /// The locations of each hap before its step's own: those of the
     /// constants that the steps met, the last first.
     before: Locations,
@@ -216,7 +226,10 @@ impl Layer {
             period,
             places,
             data: values.iter().all(|value| value.is_data(0)),
+            maps: values.iter().all(|value| matches!(value, Value::Object(_))),
             values,
+            set: None,
+            read: OnceLock::new(),
             before: Locations::new(),
             after: Locations::new(),
             contexts: OnceLock::new(),
@@ -226,8 +239,56 @@ impl Layer {
     /// This layer with `values` in the place of its own, one for one.
     fn valued(mut self, values: Arc<[Value]>) -> Self {
         self.data = values.iter().all(|value| value.is_data(0));
+        self.maps = values.iter().all(|value| matches!(value, Value::Object(_)));
         self.values = values;
+        self.set = None;
+        self.read = OnceLock::new();
         self
+    }
+
+    /// This layer where each value takes the keys of the one value of
+    /// `values`, a map of controls that fills each cycle, as a `set` of it
+    /// gives them. No value is made now: the map joins those that the
+    /// layer holds, so a chain of such controls makes each value one time,
+    /// at the first read.
+    ///
+    /// `None` for any other meeting: a step that the constant cuts, values
+    /// that are not all maps of controls, another op, and a meeting that
+    /// [`Meeting::in_place`] does not make.
+    fn set(&self, values: &Layer, apply: &Combine, flow: LookupFlow) -> Option<Self> {
+        let Combine::Composed(ComposeOp::Set) = apply else {
+            return None;
+        };
+        if !(self.in_cycles && self.maps && values.fills_each_cycle()) {
+            return None;
+        }
+        let control = values.values().first()?;
+        // Each value is a map of data, so each meets the control as the
+        // first one does.
+        let (first, meets) = (
+            cycle_hap(self.values.first()?.clone()),
+            cycle_hap(control.clone()),
+        );
+        if !(matches!(control, Value::Object(_))
+            && Meeting::meets_in_place(&first, &meets, apply, flow))
+        {
+            return None;
+        }
+        let mut layer = self.with(|layer| {
+            // The value side's locations come first.
+            let mut before = values.context(0);
+            before.append(&layer.before);
+            layer.before = before;
+        });
+        layer.set = Some(match layer.set.take() {
+            Some(mut set) => {
+                compose_data_in_place(ComposeOp::Set, &mut set, control);
+                set
+            }
+            None => control.clone(),
+        });
+        layer.read = OnceLock::new();
+        Some(layer)
     }
 
     /// Whether each value is data only.
@@ -300,7 +361,11 @@ impl Layer {
     /// The hap of step `index` at `whole` and `part`.
     fn hap_at(&self, index: usize, whole: TimeSpan, part: TimeSpan) -> Hap {
         let place = &self.places[index];
-        let mut hap = Hap::new(Some(whole), part, self.values[place.value as usize].clone());
+        let mut hap = Hap::new(
+            Some(whole),
+            part,
+            self.values()[place.value as usize].clone(),
+        );
         hap.context = self.context(index);
         hap
     }
@@ -324,16 +389,37 @@ impl Layer {
             .collect()
     }
 
-    /// The values of the steps, each once.
+    /// The values of the steps, each once, with the controls that a chain
+    /// of constants set.
     pub(crate) fn values(&self) -> &[Value] {
-        &self.values
+        let Some(set) = &self.set else {
+            return &self.values;
+        };
+        self.read.get_or_init(|| {
+            self.values
+                .iter()
+                .map(|value| {
+                    let mut value = value.clone();
+                    compose_data_in_place(ComposeOp::Set, &mut value, set);
+                    value
+                })
+                .collect()
+        })
     }
 
     /// Whether this layer and `other` answer the same haps, with values
-    /// that `same_value` holds to be the same.
+    /// that `same_value` holds to be the same. The values are read as the
+    /// layers hold them: the same values with the same controls set are the
+    /// same, and no value is made to know it.
     pub(crate) fn same(&self, other: &Self, same_value: impl Fn(&Value, &Value) -> bool) -> bool {
         let value = |layer: &Self, place: &Place| layer.values.get(place.value as usize).cloned();
-        self.period == other.period
+        let same_set = match (&self.set, &other.set) {
+            (Some(a), Some(b)) => same_value(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        same_set
+            && self.period == other.period
             && self.before == other.before
             && self.after == other.after
             && self.places.len() == other.places.len()
@@ -656,7 +742,7 @@ pub(crate) fn constant_value(layers: &[Layer]) -> Option<&Value> {
     match layers {
         [layer] if layer.period == Fraction::ONE => match &*layer.places {
             [place] if place.whole == cycle && place.part.is_none() => layer
-                .values
+                .values()
                 .get(place.value as usize)
                 .filter(|value| value.is_data(0)),
             _ => None,
@@ -774,7 +860,7 @@ fn revalued(
         let layers = layers
             .into_iter()
             .map(|layer| {
-                let values: Option<Vec<Value>> = layer.values.iter().map(&mut change).collect();
+                let values: Option<Vec<Value>> = layer.values().iter().map(&mut change).collect();
                 Some(layer.valued(values?.into()))
             })
             .collect::<Option<Vec<_>>>()?;
@@ -842,14 +928,17 @@ pub(crate) fn applied(
         let met = layers
             .iter()
             .map(|layer| {
+                if let Some(set) = layer.set(values, &apply, flow) {
+                    return Some(set);
+                }
                 let (met, pairs) = layer.met(values)?;
                 // What each pair of values makes, with no location: the
                 // locations of both sides are those of the steps.
                 let made = pairs
                     .into_iter()
                     .map(|(function, value)| {
-                        let mut hap = cycle_hap(layer.values.get(function as usize)?.clone());
-                        let meets = cycle_hap(values.values.get(value as usize)?.clone());
+                        let mut hap = cycle_hap(layer.values().get(function as usize)?.clone());
+                        let meets = cycle_hap(values.values().get(value as usize)?.clone());
                         let part = hap.part;
                         (Meeting::in_place(&mut hap, &meets, part, &apply, flow) && is_plain(&hap))
                             .then_some(hap.value)
@@ -1161,7 +1250,22 @@ mod tests {
         for (name, layers) in sequences() {
             // Numbers under arithmetic, and control objects that a
             // constant sets, adds to and sets again.
-            let chains: [(&str, &dyn Fn(Pattern) -> Pattern); 2] = [
+            let chains: [(&str, &dyn Fn(Pattern) -> Pattern); 3] = [
+                // A chain of constants that each set a control: a key that
+                // is new, and a key that an earlier constant set.
+                ("set controls", &|pattern: Pattern| {
+                    let notes = pattern.map_control(ControlSpec::new(["n"]), false);
+                    [("gain", 0.8), ("room", 0.3), ("gain", 0.25), ("n", 7.0)]
+                        .into_iter()
+                        .fold(notes, |so_far, (key, value)| {
+                            compose(
+                                &so_far,
+                                &controls(key, value),
+                                ComposeOp::Set,
+                                Alignment::In,
+                            )
+                        })
+                }),
                 ("arithmetic", &|pattern: Pattern| {
                     let scaled = compose(
                         &pattern,

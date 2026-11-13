@@ -9448,6 +9448,7 @@ fn compute_purity(node: &Node) -> purity::Purity {
         Node::Sequence(layers) => Purity::merge(
             layers
                 .iter()
+                .filter(|layer| !layer.is_data())
                 .flat_map(|layer| layer.values())
                 .filter(|value| !value.is_data(0))
                 .map(value_purity),
