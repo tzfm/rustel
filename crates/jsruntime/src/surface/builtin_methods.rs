@@ -386,8 +386,8 @@ fn holds<'js>(
 
 /// Finish the inventory once every installation layer has run.
 ///
-/// A name stays only while its prototype slot is the object recorded last
-/// for it, so a method that a later layer replaced drops out. The gate opens
+/// A name stays only while its slot is the object recorded last for it, so
+/// a method or global that a later layer replaced drops out. The gate opens
 /// with the seal.
 pub(crate) fn seal_builtin_methods<'js>(
     ctx: &Ctx<'js>,
@@ -407,6 +407,18 @@ pub(crate) fn seal_builtin_methods<'js>(
     for name in replaced {
         methods.methods.remove(&name);
         slots.remove(&*name)?;
+    }
+    let slots = global_slots(ctx)?;
+    let mut replaced = Vec::new();
+    for name in methods.globals.keys() {
+        let slot: rquickjs::Value = slots.get(*name)?;
+        if !holds(ctx, globals, name, false, &slot)? {
+            replaced.push(*name);
+        }
+    }
+    for name in replaced {
+        methods.globals.remove(name);
+        slots.remove(name)?;
     }
     let stack = host_stack(ctx)?;
     let mini: rquickjs::Value = stack.as_object().get(BUILTIN_MINI_CALLEE)?;
