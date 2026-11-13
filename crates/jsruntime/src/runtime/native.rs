@@ -280,6 +280,9 @@ impl JsRuntime {
     /// The JavaScript tier puts a final rewrite over an impure graph, for
     /// the events a worklet graph rides on. Only JavaScript makes such an
     /// event, so a native graph goes in play without it.
+    ///
+    /// A native graph is quick to walk, so it goes in play marked as
+    /// walked: it keeps no table, and its memory is that of its score.
     pub(super) fn stage_native(&self, score: NativeScore) -> Result<(), QueryError> {
         if let Some(cps) = score.cps {
             let mut transaction = self.effect_transaction.borrow_mut();
@@ -291,7 +294,7 @@ impl JsRuntime {
         let offsets = self.timeline_state.take();
         self.last_good_timeline.borrow_mut().get_or_insert(offsets);
         with_ctx(self, |ctx| {
-            let wrapper = derive_wrapper(ctx.clone(), score.pattern, &[])
+            let wrapper = derive_wrapper(ctx.clone(), score.pattern.mark_walked(), &[])
                 .map_err(|error| QueryError::Message(describe_js_error(&ctx, error)))?;
             host_score_candidate(&ctx)
                 .and_then(|candidate| candidate.set(0, wrapper))

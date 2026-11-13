@@ -4299,6 +4299,29 @@ mod tests {
     }
 
     #[test]
+    fn a_walked_graph_builds_no_table() {
+        let graph = || map(vec![leaf(1.0, 0), seq(&[2.0, 3.0]), leaf(4.0, 9)], slowcat).tabled;
+        let child = graph();
+        let walked = child.mark_walked();
+        // A node that is built over a walked graph is walked too.
+        let over = walked.late(frac(1, 4));
+        let tabled = graph();
+        for _ in 0..4 {
+            for (begin, end) in [(frac(0, 1), frac(5, 1)), (frac(1, 3), frac(7, 3))] {
+                assert_eq!(
+                    describe(&walked.query_arc(begin, end)),
+                    describe(&tabled.query_arc(begin, end))
+                );
+                over.query_arc(begin, end);
+            }
+        }
+        assert!(tabled.built_tables().is_some());
+        for pattern in [&walked, &child, &over] {
+            assert!(pattern.built_tables().is_none());
+        }
+    }
+
+    #[test]
     fn bitwise_copies_of_whole_periods_clone_the_entries() {
         let twin = seq(&[0.0, 1.0, 2.0]);
         let tables = twin.tabled.tables().expect("a number sequence has a table");

@@ -2770,6 +2770,7 @@ struct QueryThread {
     deadline_millis: std::cell::Cell<u64>,
     deadline_tick: std::cell::Cell<u32>,
     deadline_expired: std::cell::Cell<bool>,
+    walked: std::cell::Cell<bool>,
 }
 
 thread_local! {
@@ -2783,6 +2784,7 @@ thread_local! {
             deadline_millis: std::cell::Cell::new(0),
             deadline_tick: std::cell::Cell::new(0),
             deadline_expired: std::cell::Cell::new(false),
+            walked: std::cell::Cell::new(false),
         }
     };
 }
@@ -2838,6 +2840,10 @@ static DEADLINE_TICK: QueryCell<std::cell::Cell<u32>> = QueryCell(|q| &q.deadlin
 /// `queryArc` callback re-entry is such a boundary. Keeping expiry sticky
 /// ensures nested queries cannot escape the deadline.
 static DEADLINE_EXPIRED: QueryCell<std::cell::Cell<bool>> = QueryCell(|q| &q.deadline_expired);
+
+/// Set while a query of a graph that is [marked as walked](Pattern::mark_walked)
+/// runs: each node it reaches answers from the graph.
+static QUERY_WALKED: QueryCell<std::cell::Cell<bool>> = QueryCell(|q| &q.walked);
 
 /// Alias kept for the shrink/grow boundary.
 pub const MAX_STEPWISE_SEGMENTS: u64 = MAX_STEPWISE_ENTRIES;
@@ -5585,7 +5591,10 @@ impl Pattern {
 
     /// What one read of the slot finds for the state in force.
     fn held_tables(&self) -> Held {
-        if !self.tables_may_answer() {
+        if !self.tables_may_answer()
+            || self.purity.walked
+            || QUERY_WALKED.with(|walked| walked.get())
+        {
             return Held::Answers;
         }
         match self.node.tables.read() {
@@ -5773,6 +5782,16 @@ impl Pattern {
             || (self.purity.host_voicings && settings::default_voicings_is_host_owned())
     }
 
+    /// This handle, whose queries answer from the graph alone: neither it,
+    /// nor a node under it while it is queried, nor a node built over it
+    /// builds or reads a table. Tables repay a graph that is slow to walk.
+    /// A graph that walks fast keeps the memory instead.
+    pub fn mark_walked(&self) -> Self {
+        let mut pattern = self.clone();
+        pattern.purity.walked = true;
+        pattern
+    }
+
     /// This handle, declared volatile - see [`purity::Purity::volatile`].
     ///
     /// On the handle rather than as a node: every constructor reads its
@@ -5901,6 +5920,18 @@ impl Pattern {
     /// [`Self::query_in`], and whether a table gave the answer, so that it
     /// holds data only.
     fn answer_in(&self, state: &State, order: table::Order) -> (Vec<Hap>, bool) {
+        // A walked graph keeps each node under it off its tables for the
+        // length of the query, also on unwind.
+        struct Walked(bool);
+        impl Drop for Walked {
+            fn drop(&mut self) {
+                QUERY_WALKED.with(|walked| walked.set(self.0));
+            }
+        }
+        let _walked = self
+            .purity
+            .walked
+            .then(|| Walked(QUERY_WALKED.with(|walked| walked.replace(true))));
         let outermost = QUERY_DEPTH.with(|depth| depth.get() == 0);
         if self.is_volatile() {
             note_uncacheable();

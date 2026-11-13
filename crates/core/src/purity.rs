@@ -56,6 +56,11 @@ pub struct Purity {
     /// whole of its own haps. Each node sets it from its own kind, and any
     /// other source of a `Purity` says true.
     pub span_read: bool,
+    /// True when a query of this graph answers from the graph alone: no
+    /// node of it builds or reads a table. See
+    /// [`crate::Pattern::mark_walked`]. Monotonic like `volatile`: a node
+    /// over a graph that walks is walked too.
+    pub walked: bool,
 }
 
 impl Purity {
@@ -67,6 +72,7 @@ impl Purity {
             volatile: false,
             host_voicings: false,
             span_read: true,
+            walked: false,
         }
     }
 
@@ -80,6 +86,7 @@ impl Purity {
             volatile: true,
             host_voicings: false,
             span_read: true,
+            walked: false,
         }
     }
 
@@ -94,6 +101,7 @@ impl Purity {
             volatile: true,
             host_voicings: false,
             span_read: true,
+            walked: false,
         }
     }
 
@@ -111,6 +119,7 @@ impl Purity {
             volatile: true,
             host_voicings: false,
             span_read: true,
+            walked: false,
         }
     }
 
@@ -123,6 +132,7 @@ impl Purity {
             out.volatile |= p.volatile;
             out.host_voicings |= p.host_voicings;
             out.span_read |= p.span_read;
+            out.walked |= p.walked;
             out.reachable.extend(p.reachable);
         }
         out.reachable.sort_unstable();
@@ -138,6 +148,7 @@ impl Purity {
             out.volatile |= p.volatile;
             out.host_voicings |= p.host_voicings;
             out.span_read |= p.span_read;
+            out.walked |= p.walked;
             out.reachable.extend_from_slice(&p.reachable);
         }
         out.reachable.sort_unstable();
