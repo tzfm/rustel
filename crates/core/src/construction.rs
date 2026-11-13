@@ -190,7 +190,7 @@ fn same_opaque_payloads(left: &Node, right: &Node) -> bool {
             matches!(right, PatternOfPureOperand(_, _, g, _) if f.same(g))
         }
         PatternOfHap(_, _, f) => matches!(right, PatternOfHap(_, _, g) if Arc::ptr_eq(f, g)),
-        AppLeft(_, _, f, _) => matches!(right, AppLeft(_, _, g, _) if same_combine(f, g)),
+        AppLeft(_, _, f, _, _) => matches!(right, AppLeft(_, _, g, _, _) if same_combine(f, g)),
         AppRight(_, _, f, _) => matches!(right, AppRight(_, _, g, _) if same_combine(f, g)),
         AppBoth(_, _, f, _) => matches!(right, AppBoth(_, _, g, _) if same_combine(f, g)),
         FmapJsPreservingControls(_, _, f) => match right {
@@ -621,8 +621,8 @@ fn same_node<'g>(
             Node::MidiKeys(b, other) if Arc::ptr_eq(port, other) => child!(a, b),
             _ => false,
         },
-        Node::AppLeft(a, values, _, flow) => match right {
-            Node::AppLeft(b, other_values, _, other_flow) if flow == other_flow => {
+        Node::AppLeft(a, values, _, flow, _) => match right {
+            Node::AppLeft(b, other_values, _, other_flow, _) if flow == other_flow => {
                 pending.push((values, other_values));
                 child!(a, b)
             }

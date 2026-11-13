@@ -4850,7 +4850,7 @@ enum Node {
     /// `appLeft`: a pattern of functions applied to a pattern of values,
     /// keeping the FUNCTION side's whole. This is the fold `register()` uses
     /// when a leading argument is itself a pattern.
-    AppLeft(Pattern, Pattern, Combine, LookupFlow),
+    AppLeft(Pattern, Pattern, Combine, LookupFlow, ConstantValues),
     /// `appRight`: keeps the VALUE side's whole and structure.
     AppRight(Pattern, Pattern, Combine, LookupFlow),
     /// `appBoth`: both sides are queried over the SAME span and the wholes
@@ -4889,6 +4889,85 @@ enum Node {
     /// A user-authored `new Pattern(state => …)`. Holds only the opaque id.
     JsQuery(CallbackId),
     Timeline(Pattern, Pattern, TimelineState),
+}
+
+/// The value side of an `appLeft`, when it answers every cycle with one hap
+/// that fills the cycle and that only its span tells from the next cycle's.
+///
+/// `.gain(0.8)` applies such a side to every hap of the function side. For a
+/// span inside one cycle, the side answers that one hap, moved to the cycle,
+/// with the span as its part. So the hap is found once, by a query of cycle
+/// zero, and each function hap meets a moved copy instead of a query.
+#[derive(Default)]
+pub(crate) struct ConstantValues(std::sync::OnceLock<Option<Box<Hap>>>);
+
+impl ConstantValues {
+    /// The hap `values` answers for cycle zero, when `values` is constant.
+    ///
+    /// A query that already failed or stopped does not look, and a look that
+    /// fails or stops is not kept. Every query so signals what it did before.
+    fn hap(&self, values: &Pattern, state: &State) -> Option<Hap> {
+        if let Some(found) = self.0.get() {
+            return found.as_deref().cloned();
+        }
+        if !values.is_constant_per_cycle() {
+            return self.0.get_or_init(|| None).as_deref().cloned();
+        }
+        if query_error_pending() || query_stop_requested() {
+            return None;
+        }
+        let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
+        let mut haps = values.query(&state.set_span(cycle));
+        if query_error_pending() || query_stop_requested() {
+            return None;
+        }
+        let found = match (haps.pop(), haps.is_empty()) {
+            (Some(hap), true) if hap.whole == Some(cycle) && hap.part == cycle => {
+                Some(Box::new(hap))
+            }
+            _ => None,
+        };
+        self.0.get_or_init(|| found).as_deref().cloned()
+    }
+}
+
+impl Pattern {
+    /// Whether this pattern answers every cycle with one hap that fills the
+    /// cycle and that only its span tells from the next cycle's. Read from
+    /// the node kinds alone: a data value, under maps that do not read the
+    /// span.
+    fn is_constant_per_cycle(&self) -> bool {
+        if self.runtime_settings.is_some() || self.is_volatile() {
+            return false;
+        }
+        match self.node_kind() {
+            Node::Pure(value) => value.is_data(0),
+            Node::AddContext(pattern, _)
+            | Node::FmapNative(pattern, _)
+            | Node::MapHapsNative(pattern, _, SpanUse::Ignores)
+            | Node::MapHapsOwned(pattern, _, SpanUse::Ignores) => pattern.is_constant_per_cycle(),
+            _ => false,
+        }
+    }
+}
+
+impl Hap {
+    /// Move this cycle-zero hap of a [`Pattern::is_constant_per_cycle`]
+    /// pattern to the hap that pattern answers for `span`: the cycle `span`
+    /// starts in as the whole, `span` as the part. `false`, and no move, when
+    /// `span` is empty or leaves that cycle.
+    fn move_into_cycle_of(&mut self, span: TimeSpan) -> bool {
+        let cycle = span.begin.sam();
+        let Some(next) = cycle.checked_add(Fraction::ONE) else {
+            return false;
+        };
+        if span.begin >= span.end || span.end > next {
+            return false;
+        }
+        self.whole = Some(TimeSpan::new(cycle, next));
+        self.part = span;
+        true
+    }
 }
 
 /// Derived combinators keep the runtime of their receiver without adding a
@@ -4971,7 +5050,7 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
             lookup: second,
             ..
         }
-        | Node::AppLeft(first, second, _, _)
+        | Node::AppLeft(first, second, _, _, _)
         | Node::AppRight(first, second, _, _)
         | Node::AppBoth(first, second, _, _) => first
             .runtime_settings
@@ -6004,10 +6083,30 @@ impl Pattern {
 
             // Function haps drive: values are queried over each function
             // hap's wholeOrPart, and the function side's whole wins.
-            Node::AppLeft(pat_func, pat_val, apply, lookup_flow) => {
+            Node::AppLeft(pat_func, pat_val, apply, lookup_flow, constant) => {
                 let mut out = Vec::new();
+                // Asked at the first function hap, so a query with none
+                // queries the value side no more than before.
+                let mut constant_hap: Option<Option<Hap>> = None;
                 for mut hf in pat_func.query(state) {
-                    let inner = pat_val.query(&state.set_span(hf.whole_or_part()));
+                    let met = hf.whole_or_part();
+                    let constant_hap =
+                        constant_hap.get_or_insert_with(|| constant.hap(pat_val, state));
+                    if let Some(hv) = constant_hap
+                        && hv.move_into_cycle_of(met)
+                    {
+                        // The value side answers `met` with this one hap,
+                        // so its part is the function hap's own part.
+                        let part = hf.part;
+                        if !Meeting::in_place(&mut hf, hv, part, apply, *lookup_flow) {
+                            hf = applied_hap(&hf, hv, hf.whole, part, apply, *lookup_flow);
+                        }
+                        if query_stop_requested() || !push_budgeted(&mut out, hf) {
+                            return Vec::new();
+                        }
+                        continue;
+                    }
+                    let inner = pat_val.query(&state.set_span(met));
                     // One value hap meets this function hap, and that one
                     // meeting is the hap's own: the hap is consumed where it
                     // is, as a sampled meeting is. Several meetings share the
@@ -7147,6 +7246,7 @@ impl Pattern {
                 other => Value::List(vec![other.clone(), v.clone()]),
             })),
             LookupFlow::Infer,
+            ConstantValues::default(),
         ))
     }
 
@@ -7187,7 +7287,14 @@ impl Pattern {
         lookup_flow: LookupFlow,
     ) -> Self {
         let steps = self.steps;
-        Pattern::of(Node::AppLeft(self.clone(), other, combine, lookup_flow)).with_steps(steps)
+        Pattern::of(Node::AppLeft(
+            self.clone(),
+            other,
+            combine,
+            lookup_flow,
+            ConstantValues::default(),
+        ))
+        .with_steps(steps)
     }
 
     /// Apply a native curried-value equivalent with `appRight` alignment.
@@ -8502,7 +8609,7 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         Node::Arp(a, b)
         | Node::ArpWithPattern(a, b)
         | Node::Timeline(a, b, _)
-        | Node::AppLeft(a, b, _, _)
+        | Node::AppLeft(a, b, _, _, _)
         | Node::AppRight(a, b, _, _)
         | Node::AppBoth(a, b, _, _) => {
             take_child(a, out);
@@ -8796,7 +8903,7 @@ fn compute_purity(node: &Node) -> purity::Purity {
         Node::PickPatternified {
             selector, lookup, ..
         } => Purity::merge_refs([&selector.purity, &lookup.purity]),
-        Node::AppLeft(a, b, _, _)
+        Node::AppLeft(a, b, _, _, _)
         | Node::AppRight(a, b, _, _)
         | Node::AppBoth(a, b, _, _) => {
             Purity::merge_refs([&a.purity, &b.purity])
@@ -10196,5 +10303,71 @@ mod stable_sort_tests {
         assert_eq!(labels(&sorted), ["a1", "a2", "long", "b", "c"]);
         let already = sort_haps_for_query(sorted);
         assert_eq!(labels(&already), ["a1", "a2", "long", "b", "c"]);
+    }
+}
+
+#[cfg(test)]
+mod constant_values_tests {
+    use super::*;
+
+    fn half(n: i128) -> Fraction {
+        Fraction::new(n, 2)
+    }
+
+    fn span(begin: Fraction, end: Fraction) -> TimeSpan {
+        TimeSpan::new(begin, end)
+    }
+
+    fn summed(functions: Pattern) -> Pattern {
+        let add = |a: &Value, b: &Value| match (a, b) {
+            (Value::F64(a), Value::F64(b)) => Value::F64(a + b),
+            _ => Value::Undefined,
+        };
+        functions.app_left_by(
+            pure(Value::F64(10.0)),
+            Combine::With(Arc::new(add)),
+            LookupFlow::Infer,
+        )
+    }
+
+    fn meetings(
+        pattern: &Pattern,
+        begin: Fraction,
+        end: Fraction,
+    ) -> Vec<(TimeSpan, TimeSpan, f64)> {
+        pattern
+            .query_arc(begin, end)
+            .into_iter()
+            .map(|hap| {
+                (
+                    hap.whole.expect("a discrete hap"),
+                    hap.part,
+                    hap.value.as_f64().expect("a number"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_constant_value_side_meets_each_function_hap_once_per_cycle() {
+        let inside = summed(pure(Value::F64(1.0)));
+        assert_eq!(
+            meetings(&inside, Fraction::ZERO, half(1)),
+            [(
+                span(Fraction::ZERO, Fraction::ONE),
+                span(Fraction::ZERO, half(1)),
+                11.0
+            )]
+        );
+        // A function hap across cycle 1 meets the value hap of each cycle it
+        // covers, and keeps its own whole.
+        let across = summed(pure(Value::F64(1.0)).late(half(1)));
+        assert_eq!(
+            meetings(&across, half(1), half(3)),
+            [
+                (span(half(1), half(3)), span(half(1), Fraction::ONE), 11.0),
+                (span(half(1), half(3)), span(Fraction::ONE, half(3)), 11.0),
+            ]
+        );
     }
 }

@@ -2779,7 +2779,7 @@ pub(crate) fn build(node: &Node) -> Option<Tables> {
             stepped(&*pattern.tables()?, Step::MapOwned(f.clone()))
         }
         Node::ExpandHapsNative(pattern, f, SpanUse::Ignores) => expanded(&*pattern.tables()?, f),
-        Node::AppLeft(functions, values, apply, flow) => match signal_of(values) {
+        Node::AppLeft(functions, values, apply, flow, _) => match signal_of(values) {
             Some(signal) => sampled(&*functions.tables()?, signal, Side::Value, apply, *flow),
             None if sampling(functions) || sampling(values) => {
                 met(functions, values, Side::Value, apply, *flow)
@@ -2935,7 +2935,7 @@ fn signal_of(pattern: &Pattern) -> Option<Signal> {
         }
         Node::Shift(inner, by, _) => (inner, SignalOp::Shift(*by)),
         // The signal is the structure side, and a constant gives the rest.
-        Node::AppLeft(functions, values, apply, flow) => {
+        Node::AppLeft(functions, values, apply, flow, _) => {
             let (hap, levels) = constant_of(values)?;
             (
                 functions,
