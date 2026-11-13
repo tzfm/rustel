@@ -4966,6 +4966,51 @@ impl ConstantValues {
     }
 }
 
+/// One cycle of a concatenation: the haps of the pattern whose turn the
+/// cycle of `state` is. The span of `state` lies in one cycle.
+fn slowcat_cycle(pats: &[Pattern], state: &State) -> Vec<Hap> {
+    if pats.is_empty() {
+        return Vec::new();
+    }
+    let n = pats.len() as i128;
+    let cycle = state.span.begin.sam().numer();
+    let pat = &pats[cycle.rem_euclid(n) as usize];
+    if pat.is_rest() {
+        return Vec::new();
+    }
+
+    // `cycle - floor(cycle / n)` lies between 0 and `cycle` and is
+    // never `i128::MIN`, so it and its negation fit.
+    let offset = Fraction::int(cycle - cycle.div_euclid(n));
+    let shift = |span: TimeSpan, by: Fraction| {
+        Some(TimeSpan::new(
+            span.begin.checked_add(by)?,
+            span.end.checked_add(by)?,
+        ))
+    };
+    let refused = || {
+        refuse(QueryLimit::NativeFraction {
+            operation: "slowcat",
+        });
+        Vec::new()
+    };
+    let Some(inner_span) = shift(state.span, offset.neg()) else {
+        return refused();
+    };
+    let mapped: Option<Vec<Hap>> = pat
+        .query(&state.set_span(inner_span))
+        .into_iter()
+        .map(|mut hap| {
+            hap.part = shift(hap.part, offset)?;
+            if let Some(whole) = hap.whole {
+                hap.whole = Some(shift(whole, offset)?);
+            }
+            Some(hap)
+        })
+        .collect();
+    mapped.unwrap_or_else(refused)
+}
+
 impl Pattern {
     /// Whether this pattern answers every cycle with one hap that fills the
     /// cycle and that only its span tells from the next cycle's. Read from
@@ -5151,6 +5196,11 @@ impl Pattern {
 
     fn node_kind(&self) -> &Node {
         &self.node.kind
+    }
+
+    /// Whether this pattern is silence, which a query has no need to visit.
+    fn is_rest(&self) -> bool {
+        matches!(self.node_kind(), Node::Silence)
     }
 
     /// The precomputed answer of this graph, built on first use. Only a
@@ -5551,6 +5601,48 @@ impl Pattern {
         (haps, data_only)
     }
 
+    /// The haps of this `Pure` or `PurePickLookup` node of `value`: one a
+    /// cycle, each aligned to its whole cycle.
+    fn query_value(&self, value: &Value, state: &State) -> Vec<Hap> {
+        // Charged before the haps are built. This is the one node that
+        // can produce a large vector in a single pass (one hap per
+        // cycle, up to `MAX_QUERY_SPAN_CYCLES` of them), so charging it
+        // afterwards, like the generic wrapper in `query` does, would
+        // let a million haps exist first. Everything else grows by
+        // combining smaller results, which the wrapper catches.
+        let spans = state.span.span_cycles();
+        if !charge_haps(spans.len()) {
+            return Vec::new();
+        }
+        note_materialised(spans.len());
+        let lookup = match self.node_kind() {
+            Node::PurePickLookup(_, _) => {
+                let Some(lookup) = self.as_pick_lookup().map(Arc::new) else {
+                    return Vec::new();
+                };
+                Some(lookup)
+            }
+            _ => None,
+        };
+        // The one node that can spend seconds in a single loop. Poll
+        // the stop signals while it builds: without this, SIGTERM
+        // during `s("bd*2000").queryArc(0, 500)` waited out the whole
+        // construction even though every recursive node would have
+        // unwound within milliseconds.
+        let mut haps = Vec::with_capacity(spans.len());
+        for subspan in spans {
+            if cancellation_requested() || query_deadline_expired() {
+                return Vec::new();
+            }
+            let hap = Hap::new(Some(whole_cycle(subspan.begin)), subspan, value.clone());
+            match &lookup {
+                Some(lookup) => haps.push(hap.with_pick_lookup(Arc::clone(lookup))),
+                None => haps.push(hap),
+            }
+        }
+        haps
+    }
+
     fn query_node(&self, state: &State) -> Vec<Hap> {
         match self.node_kind() {
             Node::Silence => Vec::new(),
@@ -5565,46 +5657,7 @@ impl Pattern {
                 Vec::new()
             }
 
-            // One hap per cycle, each aligned to its whole cycle.
-            Node::Pure(v) | Node::PurePickLookup(v, _) => {
-                // Charged before the haps are built. This is the one node that
-                // can produce a large vector in a single pass (one hap per
-                // cycle, up to `MAX_QUERY_SPAN_CYCLES` of them), so charging it
-                // afterwards, like the generic wrapper in `query` does, would
-                // let a million haps exist first. Everything else grows by
-                // combining smaller results, which the wrapper catches.
-                let spans = state.span.span_cycles();
-                if !charge_haps(spans.len()) {
-                    return Vec::new();
-                }
-                note_materialised(spans.len());
-                let lookup = match self.node_kind() {
-                    Node::PurePickLookup(_, _) => {
-                        let Some(lookup) = self.as_pick_lookup().map(Arc::new) else {
-                            return Vec::new();
-                        };
-                        Some(lookup)
-                    }
-                    _ => None,
-                };
-                // The one node that can spend seconds in a single loop. Poll
-                // the stop signals while it builds: without this, SIGTERM
-                // during `s("bd*2000").queryArc(0, 500)` waited out the whole
-                // construction even though every recursive node would have
-                // unwound within milliseconds.
-                let mut haps = Vec::with_capacity(spans.len());
-                for subspan in spans {
-                    if cancellation_requested() || query_deadline_expired() {
-                        return Vec::new();
-                    }
-                    let hap = Hap::new(Some(whole_cycle(subspan.begin)), subspan, v.clone());
-                    match &lookup {
-                        Some(lookup) => haps.push(hap.with_pick_lookup(Arc::clone(lookup))),
-                        None => haps.push(hap),
-                    }
-                }
-                haps
-            }
+            Node::Pure(value) | Node::PurePickLookup(value, _) => self.query_value(value, state),
 
             Node::WithQueryTime(pat, f) => {
                 let s = state.with_span(|sp| sp.with_time(|t| f(t)));
@@ -5914,10 +5967,12 @@ impl Pattern {
                     .collect()
             }
 
-            Node::Stack(pats) => {
-                extend_budgeted(pats.iter().map(|p| query_stack_child(|| p.query(state))))
-                    .unwrap_or_default()
-            }
+            Node::Stack(pats) => extend_budgeted(
+                pats.iter()
+                    .filter(|p| !p.is_rest())
+                    .map(|p| query_stack_child(|| p.query(state))),
+            )
+            .unwrap_or_default(),
 
             // One constituent per cycle. `offset` keeps constituent cycles
             // contiguous: the fourth cycle of a three-pattern slowcat is the
@@ -5925,45 +5980,7 @@ impl Pattern {
             // `split_queries` keeps a multi-cycle query from being served by
             // a single constituent. A shifted time outside the native range
             // refuses as `NativeFraction { operation: "slowcat" }`.
-            Node::SlowCat(pats) => {
-                if pats.is_empty() {
-                    return Vec::new();
-                }
-                let n = pats.len() as i128;
-                let cycle = state.span.begin.sam().numer();
-                let pat = &pats[cycle.rem_euclid(n) as usize];
-
-                // `cycle - floor(cycle / n)` lies between 0 and `cycle` and is
-                // never `i128::MIN`, so it and its negation fit.
-                let offset = Fraction::int(cycle - cycle.div_euclid(n));
-                let shift = |span: TimeSpan, by: Fraction| {
-                    Some(TimeSpan::new(
-                        span.begin.checked_add(by)?,
-                        span.end.checked_add(by)?,
-                    ))
-                };
-                let refused = || {
-                    refuse(QueryLimit::NativeFraction {
-                        operation: "slowcat",
-                    });
-                    Vec::new()
-                };
-                let Some(inner_span) = shift(state.span, offset.neg()) else {
-                    return refused();
-                };
-                let mapped: Option<Vec<Hap>> = pat
-                    .query(&state.set_span(inner_span))
-                    .into_iter()
-                    .map(|mut hap| {
-                        hap.part = shift(hap.part, offset)?;
-                        if let Some(whole) = hap.whole {
-                            hap.whole = Some(shift(whole, offset)?);
-                        }
-                        Some(hap)
-                    })
-                    .collect();
-                mapped.unwrap_or_else(refused)
-            }
+            Node::SlowCat(pats) => slowcat_cycle(pats, state),
 
             // innerBind: the inner hap's whole survives; context locations
             // concatenate.
@@ -6307,14 +6324,22 @@ impl Pattern {
                 result
             }
 
-            Node::AddContext(pat, locs) => pat
-                .query(state)
-                .into_iter()
-                .map(|mut h| {
-                    h.context.extend_from_slice(locs);
-                    h
-                })
-                .collect(),
+            Node::AddContext(pat, locs) => {
+                // A located value is two nodes, and one visit answers for
+                // both. Any other handle is queried: it may bind a runtime.
+                let haps = match pat.node_kind() {
+                    Node::Pure(value) if pat.runtime_settings.is_none() => {
+                        pat.query_value(value, state)
+                    }
+                    _ => pat.query(state),
+                };
+                haps.into_iter()
+                    .map(|mut h| {
+                        h.context.extend_from_slice(locs);
+                        h
+                    })
+                    .collect()
+            }
 
             // A `PatternOf*` queried without a join would yield PATTERN-VALUED
             // haps, which nothing downstream can serialise; the node resolves
@@ -6772,11 +6797,20 @@ impl Pattern {
             }
 
             Node::SplitQueries(pat) => {
-                let branches = state
-                    .span
-                    .span_cycles()
-                    .into_iter()
-                    .map(|sub| pat.query(&state.set_span(sub)));
+                // The split of a concatenation answers each cycle with the
+                // concatenation's own rule, in one visit. Any other handle
+                // is queried: it may bind a runtime.
+                let concatenated = match pat.node_kind() {
+                    Node::SlowCat(pats) if pat.runtime_settings.is_none() => Some(pats),
+                    _ => None,
+                };
+                let branches = state.span.span_cycles().into_iter().map(|sub| {
+                    let cycle = state.set_span(sub);
+                    match concatenated {
+                        Some(pats) => slowcat_cycle(pats, &cycle),
+                        None => pat.query(&cycle),
+                    }
+                });
                 extend_budgeted(branches).unwrap_or_default()
             }
         }
