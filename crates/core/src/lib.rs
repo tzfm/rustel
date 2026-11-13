@@ -270,6 +270,14 @@ pub fn whole_cycle(t: Fraction) -> TimeSpan {
     TimeSpan::new(t.sam(), t.next_sam())
 }
 
+impl TimeSpan {
+    /// Whether this span is not empty and ends inside the cycle it begins
+    /// in, so [`TimeSpan::span_cycles`] gives it back whole.
+    fn within_one_cycle(&self) -> bool {
+        self.begin < self.end && self.end <= self.begin.next_sam()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Hap
 // ---------------------------------------------------------------------------
@@ -4901,28 +4909,44 @@ enum Node {
 /// The value side of an `appLeft`, when it answers every cycle with one hap
 /// that fills the cycle and that only its span tells from the next cycle's.
 ///
-/// `.gain(0.8)` applies such a side to every hap of the function side. For a
-/// span inside one cycle, the side answers that one hap, moved to the cycle,
-/// with the span as its part. So the hap is found once, by a query of cycle
-/// zero, and each function hap meets a moved copy instead of a query.
+/// `.gain(0.8)` applies such a side to every hap of the function side. Asked
+/// for any span, the side answers one hap per cycle piece of the span, as
+/// [`Node::Pure`] does: its cycle-zero hap, moved to the piece. So that hap
+/// is found once, by a query of cycle zero, and each function hap meets moved
+/// copies instead of a query.
 #[derive(Default)]
-pub(crate) struct ConstantValues(std::sync::OnceLock<Option<Box<Hap>>>);
+pub(crate) struct ConstantValues(std::sync::OnceLock<Option<Box<ConstantHap>>>);
+
+/// The cycle-zero hap of a constant value side, and the settings state it
+/// was found under. It answers only while that state is in force, as a
+/// table does.
+struct ConstantHap {
+    settings: settings::SettingsStateId,
+    hap: Hap,
+}
 
 impl ConstantValues {
-    /// The hap `values` answers for cycle zero, when `values` is constant.
+    /// The hap `values` answers for cycle zero, when `values` is constant
+    /// and the settings state it was found under is in force.
     ///
     /// A query that already failed or stopped does not look, and a look that
     /// fails or stops is not kept. Every query so signals what it did before.
-    fn hap(&self, values: &Pattern, state: &State) -> Option<Hap> {
+    fn hap(&self, values: &Pattern, state: &State) -> Option<&Hap> {
+        let current = |found: &ConstantHap| settings::is_current_state(&found.settings);
         if let Some(found) = self.0.get() {
-            return found.as_deref().cloned();
+            return found
+                .as_deref()
+                .filter(|found| current(found))
+                .map(|found| &found.hap);
         }
         if !values.is_constant_per_cycle() {
-            return self.0.get_or_init(|| None).as_deref().cloned();
+            self.0.get_or_init(|| None);
+            return None;
         }
         if query_error_pending() || query_stop_requested() {
             return None;
         }
+        let settings = settings::current_state_id();
         let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
         let mut haps = values.query(&state.set_span(cycle));
         if query_error_pending() || query_stop_requested() {
@@ -4930,11 +4954,15 @@ impl ConstantValues {
         }
         let found = match (haps.pop(), haps.is_empty()) {
             (Some(hap), true) if hap.whole == Some(cycle) && hap.part == cycle => {
-                Some(Box::new(hap))
+                Some(Box::new(ConstantHap { settings, hap }))
             }
             _ => None,
         };
-        self.0.get_or_init(|| found).as_deref().cloned()
+        self.0
+            .get_or_init(|| found)
+            .as_deref()
+            .filter(|found| current(found))
+            .map(|found| &found.hap)
     }
 }
 
@@ -4960,20 +4988,11 @@ impl Pattern {
 
 impl Hap {
     /// Move this cycle-zero hap of a [`Pattern::is_constant_per_cycle`]
-    /// pattern to the hap that pattern answers for `span`: the cycle `span`
-    /// starts in as the whole, `span` as the part. `false`, and no move, when
-    /// `span` is empty or leaves that cycle.
-    fn move_into_cycle_of(&mut self, span: TimeSpan) -> bool {
-        let cycle = span.begin.sam();
-        let Some(next) = cycle.checked_add(Fraction::ONE) else {
-            return false;
-        };
-        if span.begin >= span.end || span.end > next {
-            return false;
-        }
-        self.whole = Some(TimeSpan::new(cycle, next));
-        self.part = span;
-        true
+    /// pattern to the hap that pattern answers for `piece`, one cycle piece
+    /// of a span: the piece's cycle as the whole, the piece as the part.
+    fn move_to_piece(&mut self, piece: TimeSpan) {
+        self.whole = Some(whole_cycle(piece.begin));
+        self.part = piece;
     }
 }
 
@@ -6104,29 +6123,38 @@ impl Pattern {
                 let mut constant_hap: Option<Option<Hap>> = None;
                 for mut hf in pat_func.query(state) {
                     let met = hf.whole_or_part();
-                    let constant_hap =
-                        constant_hap.get_or_insert_with(|| constant.hap(pat_val, state));
-                    if let Some(hv) = constant_hap
-                        && hv.move_into_cycle_of(met)
-                    {
-                        // The value side answers `met` with this one hap,
-                        // so its part is the function hap's own part.
-                        let part = hf.part;
-                        if !Meeting::in_place(&mut hf, hv, part, apply, *lookup_flow) {
-                            hf = applied_hap(&hf, hv, hf.whole, part, apply, *lookup_flow);
+                    let template =
+                        constant_hap.get_or_insert_with(|| constant.hap(pat_val, state).cloned());
+                    let answered: Vec<Hap>;
+                    let inner: &[Hap] = match template {
+                        // One piece, the common case: the template moved in
+                        // place, with no allocation.
+                        Some(template) if met.within_one_cycle() => {
+                            template.move_to_piece(met);
+                            std::slice::from_ref(template)
                         }
-                        if query_stop_requested() || !push_budgeted(&mut out, hf) {
-                            return Vec::new();
+                        Some(template) => {
+                            answered = met
+                                .span_cycles()
+                                .into_iter()
+                                .map(|piece| {
+                                    let mut hap = template.clone();
+                                    hap.move_to_piece(piece);
+                                    hap
+                                })
+                                .collect();
+                            &answered
                         }
-                        continue;
-                    }
-                    let inner = pat_val.query(&state.set_span(met));
+                        None => {
+                            answered = pat_val.query(&state.set_span(met));
+                            &answered
+                        }
+                    };
                     // One value hap meets this function hap, and that one
                     // meeting is the hap's own: the hap is consumed where it
                     // is, as a sampled meeting is. Several meetings share the
                     // function hap as their base, so each keeps a copy of it.
-                    if inner.len() == 1
-                        && let [hv] = inner.as_slice()
+                    if let [hv] = inner
                         && let Some(part) = hf.part.intersection(&hv.part)
                     {
                         // A refused in-place meeting leaves the hap unchanged.
@@ -6148,7 +6176,7 @@ impl Pattern {
                         }
                         continue;
                     }
-                    for hv in &inner {
+                    for hv in inner {
                         let Some(part) = hf.part.intersection(&hv.part) else {
                             continue;
                         };
