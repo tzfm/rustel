@@ -10752,6 +10752,9 @@ mod callback_query_metrics_tests {
         fn call_value(&self, id: CallbackId, value: &Value) -> Result<Value, String> {
             if id == 0 {
                 let _ = host_call_value(1, value);
+            } else {
+                // The innermost call takes a time that every clock reads.
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             Ok(value.clone())
         }
