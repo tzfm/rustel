@@ -37,7 +37,7 @@ pub use hydra::HydraCandidate;
 #[cfg(feature = "hydra")]
 pub(crate) use hydra::{HydraChains, restore_surface as restore_hydra_surface};
 
-pub(crate) use repl::lane_tagged;
+pub(crate) use repl::{lane_tagged, visual_slot};
 
 pub fn reference_entries() -> impl Iterator<Item = &'static rustel_core::reference::ReferenceEntry>
 {

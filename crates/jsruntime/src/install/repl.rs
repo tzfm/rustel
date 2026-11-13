@@ -11,6 +11,7 @@ mod visuals;
 
 pub(crate) use lanes::lane_tagged;
 pub(super) use visuals::install_clear_scope;
+pub(crate) use visuals::visual_slot;
 
 pub(super) fn install<'js>(
     runtime: &JsRuntime,

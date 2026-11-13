@@ -36,6 +36,14 @@ pub(crate) enum BuiltinMethod {
     Shortcut { op: ComposeOp, how: Alignment },
     /// A composer accessor such as `add`, called with the default alignment.
     Composer(ComposeOp),
+    /// `pick` or one of its kin, given one lookup of patterns by key.
+    Pick {
+        index: rustel_core::PickIndexMode,
+        join: rustel_core::JoinMode,
+    },
+    /// A visual such as `pianoroll`, given the widget id and the slot the
+    /// transpiler writes for it.
+    Visual,
 }
 
 impl BuiltinMethod {
@@ -44,7 +52,8 @@ impl BuiltinMethod {
     }
 
     /// What `receiver.name(...arguments)` builds, as the method builds it.
-    /// `None` where the JavaScript method throws for these arguments.
+    /// `None` where the JavaScript method throws for these arguments, and
+    /// for a method whose arguments are not patterns.
     pub(crate) fn apply(&self, receiver: &Pattern, arguments: Vec<Pattern>) -> Option<Pattern> {
         Some(match self {
             Self::Registered(registration) => {
@@ -70,11 +79,13 @@ impl BuiltinMethod {
                     rustel_core::compose::default_alignment(),
                 )
             }
+            Self::Pick { .. } | Self::Visual => return None,
         })
     }
 
     /// The native transformer that builds what `receiver.name(...arguments)`
-    /// builds. `None` where the JavaScript method throws for these arguments.
+    /// builds. `None` where the JavaScript method throws for these arguments,
+    /// and for a method whose arguments are not patterns.
     ///
     /// Each transformer calls the same native operation as the method, with
     /// the same arguments, so both build the same nodes, contexts and steps.
@@ -134,12 +145,12 @@ impl BuiltinMethod {
                     provable_pure,
                 ))
             }
+            Self::Pick { .. } | Self::Visual => None,
         }
     }
 }
 
-/// The built-in methods recorded by installation.
-/// A global function that a score can call without JavaScript.
+/// A global that a score can use without JavaScript.
 #[derive(Clone)]
 pub(crate) enum BuiltinGlobal {
     /// A free control such as `s`, applied to one value. The control
@@ -149,6 +160,8 @@ pub(crate) enum BuiltinGlobal {
     List(ListKind),
     /// A tempo setter, in cycles per second or per minute.
     Tempo { per_minute: bool },
+    /// A signal such as `sine`: a pattern held as a value, not called.
+    Signal(Pattern),
 }
 
 /// What a list constructor builds of its patterns.
@@ -167,11 +180,13 @@ pub(crate) struct BuiltinMethods {
     sealed: bool,
 }
 
-/// Whether a prototype slot named `name` can be compiled against. The
+/// Whether a prototype slot named `name` can be recorded as `method`. The
 /// wrapper's own `polyJoin` and `query` fields shadow those slots, and a raw
-/// `_name` method takes its arguments unshaped.
-fn compilable(name: &str) -> bool {
-    !name.starts_with('_') && !matches!(name, "polyJoin" | "query")
+/// `_name` method takes its arguments unshaped. A visual's `_name` is the
+/// inline form of the same visual.
+fn recordable(name: &str, method: &BuiltinMethod) -> bool {
+    !matches!(name, "polyJoin" | "query")
+        && (!name.starts_with('_') || matches!(method, BuiltinMethod::Visual))
 }
 
 /// The private record of recorded slots, by name.
@@ -196,7 +211,7 @@ pub(crate) fn record_builtin_method<'js>(
     slot: rquickjs::Value<'js>,
     method: BuiltinMethod,
 ) -> rquickjs::Result<()> {
-    if !compilable(name) {
+    if !recordable(name, &method) {
         return Ok(());
     }
     let methods = host_builtin_methods(ctx)?;

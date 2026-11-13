@@ -275,14 +275,13 @@ pub fn berlin() -> Pattern {
     })
 }
 
-/// Every signal the score language exposes as a bare global, by name.
+/// Every signal the score language exposes as a bare global, by name, but
+/// the [`pointer_signals`].
 ///
 /// Installed as globals in the QuickJS host: a signal is a *value*, not a
-/// function, so `note(saw.range(0, 7))` is valid. The mouse names read
-/// `pointer` when there is one, and [`mouse_position`] when there is not.
-pub fn signals(pointer: Option<&Pointer>) -> Vec<(&'static str, Pattern)> {
-    let mouse = |axis: Option<&HostValue>| axis.map_or_else(mouse_position, HostValue::signal);
-    let (x, y) = (pointer.map(|p| &p.x), pointer.map(|p| &p.y));
+/// function, so `note(saw.range(0, 7))` is valid. Each reads only the time
+/// it is queried at.
+pub fn signals() -> Vec<(&'static str, Pattern)> {
     vec![
         ("saw", saw()),
         ("saw2", saw2()),
@@ -303,17 +302,25 @@ pub fn signals(pointer: Option<&Pointer>) -> Vec<(&'static str, Pattern)> {
         ("time", time()),
         ("open", open()),
         ("close", close()),
-        // Both spellings of each axis are exposed.
-        ("mousex", mouse(x)),
-        ("mouseX", mouse(x)),
-        ("mousey", mouse(y)),
-        ("mouseY", mouse(y)),
         ("rand", rand()),
         ("rand2", rand2()),
         // `brand` is a bare value like the waves, not a function.
         ("brand", brand()),
         ("perlin", perlin()),
         ("berlin", berlin()),
+    ]
+}
+
+/// The mouse signals, by name: both spellings of each axis. They read
+/// `pointer` when there is one, and [`mouse_position`] when there is not.
+pub fn pointer_signals(pointer: Option<&Pointer>) -> [(&'static str, Pattern); 4] {
+    let mouse = |axis: Option<&HostValue>| axis.map_or_else(mouse_position, HostValue::signal);
+    let (x, y) = (pointer.map(|p| &p.x), pointer.map(|p| &p.y));
+    [
+        ("mousex", mouse(x)),
+        ("mouseX", mouse(x)),
+        ("mousey", mouse(y)),
+        ("mouseY", mouse(y)),
     ]
 }
 

@@ -1,6 +1,8 @@
 //! Every score the native tier evaluates plays as the JavaScript tier plays
 //! it: the same graph, the same tempo, and the same haps for whole cycles,
-//! many cycles and playback-sized windows.
+//! many cycles and playback-sized windows. The JavaScript tier's final
+//! rewrite for worklet events is not part of the graph compared, as no
+//! native graph makes such an event.
 
 use rustel_fraction::Fraction;
 use rustel_runtime::{Session, SessionConfig};
@@ -71,12 +73,12 @@ fn native_scores_play_as_javascript_plays_them() {
         assert!(!session.evaluated_natively());
         let scripted = session.active_pattern_for_test().expect("a script graph");
         assert!(
-            built.same_construction(&scripted),
+            built.same_construction(scripted.without_final_controls()),
             "{}: the tiers built different graphs",
             path.display()
         );
         assert_eq!(cps, session.cps(), "{}", path.display());
         assert_eq!(played, answers(&session), "{}", path.display());
     }
-    assert!(native >= 450, "only {native} corpus scores ran natively");
+    assert!(native >= 510, "only {native} corpus scores ran natively");
 }

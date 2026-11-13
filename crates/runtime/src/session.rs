@@ -1622,10 +1622,11 @@ impl Session {
         self.js.evaluated_natively()
     }
 
-    /// The active graph, for tests that compare two builds of a score.
+    /// The active graph as its score built it, for tests that compare two
+    /// builds of a score.
     #[doc(hidden)]
     pub fn active_pattern_for_test(&self) -> Option<rustel_core::Pattern> {
-        self.js.active_pattern()
+        self.js.active_graph_for_test()
     }
 
     /// The generation of the score of the last look of

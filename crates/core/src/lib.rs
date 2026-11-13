@@ -7569,6 +7569,16 @@ impl Pattern {
         .with_steps(self.steps)
     }
 
+    /// The graph [`Self::finalize_js_controls_if`] rewrites, or this graph
+    /// when its root is no such rewrite.
+    #[doc(hidden)]
+    pub fn without_final_controls(&self) -> &Pattern {
+        match &self.node.kind {
+            Node::FmapJsPreservingControls(inner, _, Some(_)) => inner,
+            _ => self,
+        }
+    }
+
     /// `innerJoin` - the inner hap's whole survives. `register()`'s default.
     pub fn inner_join(&self) -> Self {
         Pattern::of(Node::Join(self.clone(), JoinMode::Inner))

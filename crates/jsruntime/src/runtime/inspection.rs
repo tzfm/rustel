@@ -235,6 +235,13 @@ impl JsRuntime {
             .map(|pattern| pattern.with_runtime_settings(self.core_settings.clone()))
     }
 
+    /// The active graph as its score built it, before the export takes this
+    /// runtime's settings, for tests that compare two builds of a score.
+    #[doc(hidden)]
+    pub fn active_graph_for_test(&self) -> Option<Pattern> {
+        self.active_pattern_unwrapped()
+    }
+
     /// Whether the active slot contains a pattern wrapper, without cloning its
     /// graph.
     pub fn has_active_pattern(&self) -> bool {

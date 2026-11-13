@@ -1,13 +1,14 @@
 //! Scores evaluated without JavaScript.
 //!
-//! A transpiled score made only of bindings, mini-notation, numbers, free
-//! controls, list constructors, tempo setters, built-in methods and lanes
-//! builds its graph here, from the same native operations the JavaScript
-//! surface calls, and stages it as [`JsRuntime::execute_score`] does. Every
-//! name is proved against the slot installation recorded for it, so a score
-//! that replaced one is evaluated by JavaScript. The native tier never
-//! reports an error: anything it does not prove, or that would fail, is left
-//! to the JavaScript tier, which owns every message.
+//! A transpiled score made only of bindings, functions, objects,
+//! mini-notation, numbers, signals, free controls, list constructors, tempo
+//! setters, built-in methods and lanes builds its graph here, from the same
+//! native operations the JavaScript surface calls, and stages it as
+//! [`JsRuntime::execute_score`] does. Every name is proved against the slot
+//! installation recorded for it, so a score that replaced one is evaluated
+//! by JavaScript. The native tier never reports an error: anything it does
+//! not prove, or that would fail, is left to the JavaScript tier, which owns
+//! every message.
 
 use super::*;
 use crate::surface::{
@@ -15,14 +16,31 @@ use crate::surface::{
     prove_builtin_global, prove_builtin_method, prove_lane_method, prove_mini_callee,
     prove_surface_intrinsics,
 };
-use rustel_transpiler::{ScoreExpr, ScoreStatement};
+use rustel_transpiler::{ScoreExpr, ScoreFunction, ScoreProgram, ScoreStatement};
 
 /// A value of a natively evaluated score.
-enum Native {
+#[derive(Clone)]
+enum Native<'p> {
     Pattern(Pattern),
     Number(f64),
     /// A raw string, which the native tier only passes on unread.
     String,
+    /// An object's properties, in the order JavaScript enumerates them.
+    Object(Rc<[(&'p str, Native<'p>)]>),
+}
+
+impl Native<'_> {
+    /// The value as the surface reifies an argument: a pattern as it is, a
+    /// number as a pure number. A raw string would go through a string
+    /// parser a score may set, and an object would keep its JavaScript
+    /// identity, so both are left to JavaScript.
+    fn reified(&self) -> Option<Pattern> {
+        match self {
+            Self::Pattern(pattern) => Some(pattern.clone()),
+            Self::Number(value) => Some(rustel_core::pure(rustel_core::Value::F64(*value))),
+            Self::String | Self::Object(_) => None,
+        }
+    }
 }
 
 /// One playing lane, by the name it is collected under.
@@ -34,13 +52,42 @@ struct Lane {
 
 /// What evaluating the statements of a score built.
 #[derive(Default)]
-struct Turn {
-    bindings: BTreeMap<Box<str>, Pattern>,
+struct Turn<'p> {
+    /// The functions the score declares. JavaScript hoists them, so each is
+    /// callable from the first statement.
+    functions: BTreeMap<&'p str, &'p ScoreFunction>,
+    bindings: BTreeMap<&'p str, Native<'p>>,
+    /// The names of each function call in progress, innermost last.
+    frames: Vec<Frame<'p>>,
     lanes: Vec<Lane>,
     /// The next number of an anonymous `$` lane.
     anonymous: u32,
     /// The tempo the score set last, in cycles per second.
     cps: Option<f64>,
+    /// How deep the evaluation is, across calls, and how many expressions
+    /// it evaluated. Past either bound the score is left to JavaScript, so
+    /// a deep or runaway score cannot exhaust the stack or the time here.
+    depth: usize,
+    steps: usize,
+}
+
+/// The deepest evaluation, across function calls, the native tier takes on.
+const MAX_DEPTH: usize = 128;
+
+/// The most expressions the native tier evaluates for one score.
+const MAX_STEPS: usize = 1 << 16;
+
+/// The names one function call binds: its parameters, then its bindings,
+/// which hold no value until their statement runs.
+struct Frame<'p>(Vec<(&'p str, Option<Native<'p>>)>);
+
+/// What a name of a score means where it is read.
+enum Resolved<'t, 'p> {
+    /// A value the score bound, or `None` before its binding runs.
+    Bound(Option<&'t Native<'p>>),
+    Function(&'p ScoreFunction),
+    /// A name the score does not bind, for the host to resolve.
+    Host,
 }
 
 /// A natively built score, ready to stage.
@@ -129,24 +176,28 @@ impl JsRuntime {
         }
     }
 
-    fn build_native(
-        &self,
-        program: &rustel_transpiler::ScoreProgram,
-        names: &Names<'_, '_>,
-    ) -> Option<NativeScore> {
+    fn build_native(&self, program: &ScoreProgram, names: &Names<'_, '_>) -> Option<NativeScore> {
         // Composers read the default alignment when they are called, and
         // every score starts from `In`.
         rustel_core::compose::set_default_alignment(rustel_core::compose::Alignment::In);
         let mut turn = Turn::default();
+        for statement in &program.statements {
+            if let ScoreStatement::Function(function) = statement
+                && turn.functions.insert(&function.name, function).is_some()
+            {
+                return None;
+            }
+        }
         let mut last = None;
         for statement in &program.statements {
             last = match statement {
                 ScoreStatement::Binding { name, value } => {
-                    let Native::Pattern(pattern) = turn.evaluate(names, value, self)? else {
-                        return None;
-                    };
+                    let value = turn.evaluate(names, value, self)?;
+                    // A name the host or a function of the score holds would
+                    // be shadowed or declared twice.
                     if names.global(name).is_some()
-                        || turn.bindings.insert(name.clone(), pattern).is_some()
+                        || turn.functions.contains_key(&**name)
+                        || turn.bindings.insert(name, value).is_some()
                     {
                         return None;
                     }
@@ -155,14 +206,15 @@ impl JsRuntime {
                 ScoreStatement::Expression(expression) => {
                     Some(turn.evaluate(names, expression, self)?)
                 }
+                ScoreStatement::Function(_) => None,
             };
         }
         let pattern = if turn.lanes.is_empty() {
             // With no lane, the score plays its last expression.
-            match last? {
-                Native::Pattern(pattern) => pattern,
-                Native::Number(_) | Native::String => return None,
-            }
+            let Native::Pattern(pattern) = last? else {
+                return None;
+            };
+            pattern
         } else {
             rustel_core::stack(
                 turn.lanes
@@ -180,6 +232,10 @@ impl JsRuntime {
     /// Stage a natively built score as [`Self::execute_score`] stages one:
     /// its tempo with the score's effects, and its pattern where the commit
     /// picks it up.
+    ///
+    /// The JavaScript tier puts a final rewrite over an impure graph, for
+    /// the events a worklet graph rides on. Only JavaScript makes such an
+    /// event, so a native graph goes in play without it.
     pub(super) fn stage_native(&self, score: NativeScore) -> Result<(), QueryError> {
         if let Some(cps) = score.cps {
             let mut transaction = self.effect_transaction.borrow_mut();
@@ -202,17 +258,49 @@ impl JsRuntime {
     }
 }
 
-impl Turn {
+impl<'p> Turn<'p> {
     fn evaluate(
         &mut self,
         names: &Names<'_, '_>,
-        expression: &ScoreExpr,
+        expression: &'p ScoreExpr,
         runtime: &JsRuntime,
-    ) -> Option<Native> {
+    ) -> Option<Native<'p>> {
+        self.steps += 1;
+        if self.steps > MAX_STEPS || self.depth >= MAX_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let value = self.evaluate_here(names, expression, runtime);
+        self.depth -= 1;
+        value
+    }
+
+    fn evaluate_here(
+        &mut self,
+        names: &Names<'_, '_>,
+        expression: &'p ScoreExpr,
+        runtime: &JsRuntime,
+    ) -> Option<Native<'p>> {
         Some(match expression {
             ScoreExpr::Number(value) => Native::Number(*value),
             ScoreExpr::String(_) => Native::String,
-            ScoreExpr::Name(name) => Native::Pattern(self.bindings.get(name)?.clone()),
+            ScoreExpr::Name(name) => match self.resolve(name) {
+                Resolved::Bound(value) => value?.clone(),
+                Resolved::Function(_) => return None,
+                Resolved::Host => match names.global(name)? {
+                    BuiltinGlobal::Signal(pattern) => Native::Pattern(pattern),
+                    _ => return None,
+                },
+            },
+            ScoreExpr::Object(properties) => self.object(names, properties, runtime)?,
+            ScoreExpr::Member { object, property } => {
+                let Native::Object(properties) = self.evaluate(names, object, runtime)? else {
+                    return None;
+                };
+                // A property the object does not own reads its prototype.
+                let (_, value) = properties.iter().find(|(key, _)| key == &&**property)?;
+                value.clone()
+            }
             ScoreExpr::Call { callee, arguments } => {
                 self.call(names, callee, arguments, runtime)?
             }
@@ -229,15 +317,55 @@ impl Turn {
         })
     }
 
+    /// An object literal's properties. JavaScript enumerates integer-like
+    /// keys first and keeps a repeated key at its first place, so an object
+    /// with either is left to JavaScript.
+    fn object(
+        &mut self,
+        names: &Names<'_, '_>,
+        properties: &'p [(Box<str>, ScoreExpr)],
+        runtime: &JsRuntime,
+    ) -> Option<Native<'p>> {
+        let mut object: Vec<(&'p str, Native<'p>)> = Vec::with_capacity(properties.len());
+        for (key, value) in properties {
+            let integer_like = !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_digit());
+            if integer_like || object.iter().any(|(held, _)| held == &&**key) {
+                return None;
+            }
+            object.push((key, self.evaluate(names, value, runtime)?));
+        }
+        Some(Native::Object(object.into()))
+    }
+
+    /// What `name` means here: a name of the innermost call, then of the
+    /// score. A function body never sees its caller's names.
+    fn resolve(&self, name: &str) -> Resolved<'_, 'p> {
+        if let Some(Frame(frame)) = self.frames.last()
+            && let Some((_, value)) = frame.iter().find(|(bound, _)| *bound == name)
+        {
+            return Resolved::Bound(value.as_ref());
+        }
+        if let Some(value) = self.bindings.get(name) {
+            return Resolved::Bound(Some(value));
+        }
+        self.functions
+            .get(name)
+            .map_or(Resolved::Host, |function| Resolved::Function(function))
+    }
+
     fn call(
         &mut self,
         names: &Names<'_, '_>,
         callee: &str,
-        arguments: &[ScoreExpr],
+        arguments: &'p [ScoreExpr],
         runtime: &JsRuntime,
-    ) -> Option<Native> {
-        if self.bindings.contains_key(callee) {
-            return None;
+    ) -> Option<Native<'p>> {
+        match self.resolve(callee) {
+            Resolved::Bound(_) => return None,
+            Resolved::Function(function) => {
+                return self.call_function(names, function, arguments, runtime);
+            }
+            Resolved::Host => {}
         }
         if callee == MINI_CALLEE {
             let [ScoreExpr::String(source), ScoreExpr::Number(offset)] = arguments else {
@@ -283,7 +411,62 @@ impl Turn {
                 self.cps = Some(cps);
                 Some(Native::Pattern(rustel_core::silence()))
             }
+            // A signal is a value: calling it throws.
+            BuiltinGlobal::Signal(_) => None,
         }
+    }
+
+    /// Call a function of the score as JavaScript does: every argument
+    /// evaluated where the call is, then the body with its parameters bound.
+    fn call_function(
+        &mut self,
+        names: &Names<'_, '_>,
+        function: &'p ScoreFunction,
+        arguments: &'p [ScoreExpr],
+        runtime: &JsRuntime,
+    ) -> Option<Native<'p>> {
+        let mut values = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            values.push(self.evaluate(names, argument, runtime)?);
+        }
+        // A missing argument is `undefined`, which the native tier does not
+        // hold. An extra one is evaluated and not bound.
+        if values.len() < function.parameters.len() {
+            return None;
+        }
+        let mut frame = Vec::with_capacity(function.parameters.len() + function.bindings.len());
+        let bound = function
+            .parameters
+            .iter()
+            .zip(values.into_iter().map(Some))
+            .chain(function.bindings.iter().map(|(name, _)| (name, None)));
+        for (name, value) in bound {
+            // A name declared twice is a JavaScript error, or a parameter
+            // that hides another.
+            if frame.iter().any(|(held, _)| *held == &**name) {
+                return None;
+            }
+            frame.push((&**name, value));
+        }
+        self.frames.push(Frame(frame));
+        let result = self.function_body(names, function, runtime);
+        self.frames.pop();
+        result
+    }
+
+    fn function_body(
+        &mut self,
+        names: &Names<'_, '_>,
+        function: &'p ScoreFunction,
+        runtime: &JsRuntime,
+    ) -> Option<Native<'p>> {
+        let parameters = function.parameters.len();
+        for (index, (_, value)) in function.bindings.iter().enumerate() {
+            let value = self.evaluate(names, value, runtime)?;
+            let Frame(frame) = self.frames.last_mut()?;
+            frame[parameters + index].1 = Some(value);
+        }
+        self.evaluate(names, &function.result, runtime)
     }
 
     fn method(
@@ -291,9 +474,9 @@ impl Turn {
         names: &Names<'_, '_>,
         receiver: Pattern,
         method: &str,
-        arguments: &[ScoreExpr],
+        arguments: &'p [ScoreExpr],
         runtime: &JsRuntime,
-    ) -> Option<Native> {
+    ) -> Option<Native<'p>> {
         if method == LANE_METHOD {
             return self.lane(names, receiver, arguments);
         }
@@ -301,13 +484,20 @@ impl Turn {
             return None;
         }
         let builtin = names.method(method)?;
-        // A registered method that sequences or refuses its arguments shapes
-        // JavaScript values the native tier does not hold, so it takes its
-        // exact count only.
-        if let BuiltinMethod::Registered(registration) = &builtin
-            && arguments.len() != registration.arity.saturating_sub(1)
-        {
-            return None;
+        match &builtin {
+            BuiltinMethod::Pick { index, join } => {
+                return self.pick(names, receiver, (*index, *join), arguments, runtime);
+            }
+            BuiltinMethod::Visual => return self.visual(names, receiver, arguments, runtime),
+            // A registered method that sequences or refuses its arguments
+            // shapes JavaScript values the native tier does not hold, so it
+            // takes its exact count only.
+            BuiltinMethod::Registered(registration)
+                if arguments.len() != registration.arity.saturating_sub(1) =>
+            {
+                return None;
+            }
+            _ => {}
         }
         let mut values = Vec::with_capacity(arguments.len());
         for argument in arguments {
@@ -316,20 +506,66 @@ impl Turn {
         builtin.apply(&receiver, values).map(Native::Pattern)
     }
 
-    /// An argument as the surface reifies it: a pattern as it is, a number
-    /// as a pure number. A raw string would go through a string parser a
-    /// score may set, so it is left to JavaScript.
+    /// `selector.pick(lookup)` with one object, as the method builds it:
+    /// the object's properties in order, each value reified.
+    fn pick(
+        &mut self,
+        names: &Names<'_, '_>,
+        selector: Pattern,
+        (index, join): (rustel_core::PickIndexMode, rustel_core::JoinMode),
+        arguments: &'p [ScoreExpr],
+        runtime: &JsRuntime,
+    ) -> Option<Native<'p>> {
+        let [lookup] = arguments else {
+            return None;
+        };
+        let Native::Object(properties) = self.evaluate(names, lookup, runtime)? else {
+            return None;
+        };
+        let entries = properties
+            .iter()
+            .map(|(key, value)| Some(((*key).to_owned(), value.reified()?)))
+            .collect::<Option<Vec<_>>>()?;
+        let lookup = rustel_core::PickLookup::Object {
+            enumerable_len: entries.len(),
+            entries,
+        };
+        Some(Native::Pattern(rustel_core::pick(
+            selector, lookup, index, join,
+        )))
+    }
+
+    /// `pattern.pianoroll(id, slot)` and every other visual: the pattern
+    /// tagged with the slot the second argument names, or as it is.
+    fn visual(
+        &mut self,
+        names: &Names<'_, '_>,
+        pattern: Pattern,
+        arguments: &'p [ScoreExpr],
+        runtime: &JsRuntime,
+    ) -> Option<Native<'p>> {
+        let slot = match arguments {
+            [] | [ScoreExpr::String(_)] => None,
+            [ScoreExpr::String(_), slot] => match self.evaluate(names, slot, runtime)? {
+                Native::Number(slot) => crate::install::visual_slot(slot),
+                _ => None,
+            },
+            _ => return None,
+        };
+        Some(Native::Pattern(match slot {
+            Some(slot) => pattern.with_ui_visual_slot(slot),
+            None => pattern,
+        }))
+    }
+
+    /// An argument as the surface reifies it. See [`Native::reified`].
     fn pattern_argument(
         &mut self,
         names: &Names<'_, '_>,
-        argument: &ScoreExpr,
+        argument: &'p ScoreExpr,
         runtime: &JsRuntime,
     ) -> Option<Pattern> {
-        match self.evaluate(names, argument, runtime)? {
-            Native::Pattern(pattern) => Some(pattern),
-            Native::Number(value) => Some(rustel_core::pure(rustel_core::Value::F64(value))),
-            Native::String => None,
-        }
+        self.evaluate(names, argument, runtime)?.reified()
     }
 
     /// `pattern.p(id, number)`: collect a lane as the REPL's lane method
@@ -341,7 +577,7 @@ impl Turn {
         names: &Names<'_, '_>,
         pattern: Pattern,
         arguments: &[ScoreExpr],
-    ) -> Option<Native> {
+    ) -> Option<Native<'p>> {
         let [ScoreExpr::String(id), ScoreExpr::Number(number)] = arguments else {
             return None;
         };
