@@ -183,6 +183,72 @@ jobs:
   # sets of the studio and the runtime, and `pty_smoke` drives the
   # default-features binary. It has its own job because it is serial and slow,
   # and so that a failure here does not hide the check job's result.
+  bench:
+    name: Engine benchmark (Linux x64)
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ${{ github.workflow }}-bench-${{ inputs.pr_number || github.ref }}
+      cancel-in-progress: true
+    # Two cold release builds with fat LTO: this revision and main.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Confirm checked-out SHA
+        env:
+          EXPECTED_SHA: ${{ inputs.sha }}
+        run: |
+          actual=$(git rev-parse HEAD)
+          if [ "$actual" != "$EXPECTED_SHA" ]; then
+            echo "::error::PR head moved from $EXPECTED_SHA to $actual; dispatch again."
+            exit 1
+          fi
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ inputs.save_cache }}
+
+      - name: Install Linux audio build dependencies
+        run: |
+          if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
+            sudo apt-get update
+            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
+          fi
+
+      - name: Measure this revision
+        run: |
+          cargo build --release -p rustel-bench
+          target/release/rustel-bench run --out "$RUNNER_TEMP/new.json"
+
+      # A shared runner's time moves with its neighbours, so the gate is on
+      # allocations and kept bytes. Both reports keep the times.
+      - name: Measure main and compare
+        if: inputs.pr_number != ''
+        run: |
+          git worktree add "$RUNNER_TEMP/base" "$(git merge-base HEAD origin/main)"
+          if [ ! -d "$RUNNER_TEMP/base/crates/bench" ]; then
+            echo "main has no engine benchmark yet, so there is nothing to compare." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          (cd "$RUNNER_TEMP/base" && cargo build --release -p rustel-bench --target-dir "$GITHUB_WORKSPACE/target/base")
+          target/base/release/rustel-bench run crates/runtime/examples/songs --out "$RUNNER_TEMP/base.json"
+          target/release/rustel-bench compare --memory-only "$RUNNER_TEMP/base.json" "$RUNNER_TEMP/new.json"
+
+      - name: Keep the reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: engine-benchmark
+          path: ${{ runner.temp }}/*.json
+          if-no-files-found: ignore
+          retention-days: 30
+
   studio:
     name: Studio (${{ matrix.name }})
     strategy:
