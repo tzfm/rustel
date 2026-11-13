@@ -164,7 +164,7 @@ enum Names<'a, 'js> {
     Realm(&'a Ctx<'js>),
     /// A realm with no surface yet, where no score has run: the names a
     /// fresh installation proves.
-    Listed(&'a ListedNames),
+    Listed(ListedNames),
 }
 
 impl Names<'_, '_> {
@@ -213,7 +213,7 @@ impl JsRuntime {
                     .flatten()
             })
         } else {
-            self.build_native(program, &Names::Listed(ListedNames::get()))
+            self.build_native(program, &Names::Listed(ListedNames::default()))
         }
     }
 

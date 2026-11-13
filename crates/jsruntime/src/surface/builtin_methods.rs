@@ -325,46 +325,69 @@ pub(crate) fn prove_builtin_global(ctx: &Ctx<'_>, name: &str) -> Option<BuiltinG
 /// checks it against one, so the list cannot drift from the installation.
 const NATIVE_INVENTORY: &str = include_str!("../../assets/native-inventory.txt");
 
-/// The inventory asset by name: what a realm with no surface yet would
-/// prove once installed. Each lookup reads the native tables, so the list
-/// holds no copy of them.
+/// The inventory asset by name, for one evaluation: what a realm with no
+/// surface yet would prove once installed. A lookup searches the lines of
+/// the asset, which are in order, and reads the native tables, so the list
+/// holds no copy of either. A score calls the same few names many times, so
+/// each name is looked up once and kept until the evaluation ends.
+#[derive(Default)]
 pub(crate) struct ListedNames {
-    methods: BTreeMap<&'static str, &'static str>,
-    globals: BTreeMap<&'static str, &'static str>,
+    methods: RefCell<BTreeMap<Box<str>, Option<BuiltinMethod>>>,
+    globals: RefCell<BTreeMap<Box<str>, Option<BuiltinGlobal>>>,
 }
 
 impl ListedNames {
-    pub(crate) fn get() -> &'static Self {
-        static LISTED: std::sync::OnceLock<ListedNames> = std::sync::OnceLock::new();
-        LISTED.get_or_init(|| {
-            let mut listed = Self {
-                methods: BTreeMap::new(),
-                globals: BTreeMap::new(),
-            };
-            for line in NATIVE_INVENTORY.lines() {
-                let Some((section, entry)) = line.split_once(' ') else {
-                    continue;
-                };
-                let Some((name, listing)) = entry.split_once(' ') else {
-                    continue;
-                };
-                match section {
-                    "method" => listed.methods.insert(name, listing),
-                    "global" => listed.globals.insert(name, listing),
-                    _ => None,
-                };
-            }
-            listed
-        })
-    }
-
     pub(crate) fn method(&self, name: &str) -> Option<BuiltinMethod> {
-        BuiltinMethod::listed(self.methods.get(name)?)
+        if let Some(known) = self.methods.borrow().get(name) {
+            return known.clone();
+        }
+        let method = listing("method", name).and_then(BuiltinMethod::listed);
+        self.methods
+            .borrow_mut()
+            .insert(name.into(), method.clone());
+        method
     }
 
     pub(crate) fn global(&self, name: &str) -> Option<BuiltinGlobal> {
-        BuiltinGlobal::listed(name, self.globals.get(name)?)
+        if let Some(known) = self.globals.borrow().get(name) {
+            return known.clone();
+        }
+        let global =
+            listing("global", name).and_then(|listing| BuiltinGlobal::listed(name, listing));
+        self.globals
+            .borrow_mut()
+            .insert(name.into(), global.clone());
+        global
     }
+}
+
+/// The section and the name of a line of the inventory, and what the line
+/// lists for the name.
+fn inventory_entry(line: &'static str) -> Option<((&'static str, &'static str), &'static str)> {
+    let mut words = line.splitn(3, ' ');
+    Some(((words.next()?, words.next()?), words.next()?))
+}
+
+/// What the inventory lists for `name` in `section`, found by a search of
+/// its lines, which are in the order of section and name.
+fn listing(section: &str, name: &str) -> Option<&'static str> {
+    let text = NATIVE_INVENTORY;
+    let (mut low, mut high) = (0, text.len());
+    while low < high {
+        let middle = low + (high - low) / 2;
+        // The line that holds the byte at `middle`.
+        let start = text[..middle].rfind('\n').map_or(0, |end| end + 1);
+        let end = text[middle..]
+            .find('\n')
+            .map_or(text.len(), |end| middle + end);
+        let (entry, listing) = inventory_entry(&text[start..end])?;
+        match entry.cmp(&(section, name)) {
+            std::cmp::Ordering::Equal => return Some(listing),
+            std::cmp::Ordering::Less => low = end + 1,
+            std::cmp::Ordering::Greater => high = start,
+        }
+    }
+    None
 }
 
 impl BuiltinMethod {
@@ -778,9 +801,20 @@ mod tests {
             let asset = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/native-inventory.txt");
             std::fs::write(asset, &proven).expect("write the inventory asset");
         }
+        // A lookup searches the lines, so they are in the order of section
+        // and name, each name once.
+        let entries: Vec<_> = NATIVE_INVENTORY
+            .lines()
+            .map(|line| {
+                inventory_entry(line)
+                    .expect("a section, a name and a listing")
+                    .0
+            })
+            .collect();
+        assert!(entries.windows(2).all(|pair| pair[0] < pair[1]));
         // Every entry this build can read is one the realm proves, with the
         // same meaning. A build with fewer features reads fewer entries.
-        let listed = ListedNames::get();
+        let listed = ListedNames::default();
         for line in NATIVE_INVENTORY.lines() {
             let mut words = line.splitn(3, ' ');
             let (section, name) = (words.next().expect("section"), words.next().expect("name"));
