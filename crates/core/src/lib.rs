@@ -48,6 +48,7 @@ use rustel_fraction::Fraction;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+pub use table::{DEFAULT_TABLE_BUDGET, set_table_budget, table_bytes};
 pub use value::{Key, OrderedMap, Value};
 
 // ---------------------------------------------------------------------------
@@ -5191,9 +5192,16 @@ impl Pattern {
             without_query_signals(|| table::build(self.node_kind()))
         });
         match built {
-            Some(tables) => {
-                let tables = Arc::new(tables.built_under(state, read));
-                let stored = table::TableSlot::Ready(Arc::clone(&tables));
+            Some(mut tables) => {
+                // Past the budget the table answers this query only, and
+                // the node is walked until the state moves on.
+                let (stored, tables) = if tables.charge() {
+                    let tables = Arc::new(tables.built_under(state, read));
+                    (table::TableSlot::Ready(Arc::clone(&tables)), tables)
+                } else {
+                    let tables = Arc::new(tables.reading(read));
+                    (table::TableSlot::GraphAnswers(state), tables)
+                };
                 if let Ok(mut slot) = self.node.tables.write() {
                     // A fresh build outranks a stale table, an empty slot
                     // and a refusal under a state that moved on alike.

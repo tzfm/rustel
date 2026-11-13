@@ -30,6 +30,7 @@ use crate::{
     ValuePredicate, applied_hap, joined_hap, picked_hap,
 };
 use rustel_fraction::Fraction;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// The most haps one table may hold, and the most cycles a build answers
@@ -1101,7 +1102,7 @@ pub(crate) enum TableSlot {
 }
 
 /// Layers answered one after the other, as a stack answers its children.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Tables {
     layers: Vec<Layer>,
     /// What the graph's walk does for a query. See [`Work`].
@@ -1127,6 +1128,51 @@ pub(crate) struct Tables {
     /// answers only while they all hold. See
     /// [`crate::callback_ir::recording_reads`].
     read: Box<[Arc<crate::callback_ir::Standing>]>,
+    /// The share of [`TABLE_BUDGET`] these tables hold while a node keeps
+    /// them. `None` for tables built for one answer only.
+    charge: Option<Charge>,
+}
+
+/// The bytes the kept tables of this process may hold together, unless a
+/// host sets another budget with [`set_table_budget`].
+pub const DEFAULT_TABLE_BUDGET: usize = 32 << 20;
+
+static TABLE_BUDGET: AtomicUsize = AtomicUsize::new(DEFAULT_TABLE_BUDGET);
+static TABLE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Set how many bytes the kept tables of this process may hold together.
+/// Tables kept already stay until they drop. A table past the budget
+/// answers the query that built it and is not kept: its node is walked.
+pub fn set_table_budget(bytes: usize) {
+    TABLE_BUDGET.store(bytes, Ordering::Relaxed);
+}
+
+/// The bytes the kept tables of this process hold now.
+pub fn table_bytes() -> usize {
+    TABLE_BYTES.load(Ordering::Relaxed)
+}
+
+/// A kept table's share of the budget, given back when the table drops.
+#[derive(Debug)]
+struct Charge(usize);
+
+impl Charge {
+    /// `bytes` of the budget, when that much is left.
+    fn take(bytes: usize) -> Option<Self> {
+        let budget = TABLE_BUDGET.load(Ordering::Relaxed);
+        TABLE_BYTES
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                held.checked_add(bytes).filter(|&total| total <= budget)
+            })
+            .ok()
+            .map(|_| Self(bytes))
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        TABLE_BYTES.fetch_sub(self.0, Ordering::Relaxed);
+    }
 }
 
 /// What the graph's walk does for a query, as bounds a table checks before
@@ -2401,12 +2447,19 @@ impl Tables {
             sorted,
             state: None,
             read: Box::new([]),
+            charge: None,
         }
     }
 
     /// These tables, kept for the settings snapshot `state`, which was in
     /// force when their build began, and for the standings `read` of the
     /// compiled programs the build applied.
+    /// These tables for one answer, with the standings of the programs
+    /// their build applied.
+    pub(crate) fn reading(self, read: Box<[Arc<crate::callback_ir::Standing>]>) -> Self {
+        Self { read, ..self }
+    }
+
     pub(crate) fn built_under(
         self,
         state: SettingsStateId,
@@ -2417,6 +2470,29 @@ impl Tables {
             read,
             ..self
         }
+    }
+
+    /// Take this table's share of the budget so a node may keep it. `false`
+    /// when the budget has no room: the table answers once and drops.
+    pub(crate) fn charge(&mut self) -> bool {
+        self.charge = Charge::take(self.bytes());
+        self.charge.is_some()
+    }
+
+    /// About the bytes these tables hold: their entries in each order kept,
+    /// and the union a sorted answer of several layers builds.
+    fn bytes(&self) -> usize {
+        let kept: usize = self
+            .layers
+            .iter()
+            .map(|layer| layer.entries.len() + layer.sorted.as_ref().map_or(0, Vec::len))
+            .sum();
+        let union = if self.layers.len() > 1 {
+            self.layers.iter().map(|layer| layer.entries.len()).sum()
+        } else {
+            0
+        };
+        (kept + union) * std::mem::size_of::<Hap>()
     }
 
     /// Whether the settings in force are those the table was built under,
