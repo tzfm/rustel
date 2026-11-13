@@ -40,11 +40,14 @@ pub mod value;
 pub mod voicings;
 pub mod xen;
 
+mod sequence;
 mod table;
 
 use context_keys::ContextKeys;
 pub use locations::Locations;
 use rustel_fraction::Fraction;
+use sequence::query_sequence;
+pub use sequence::{SequenceLayer, SequenceStep, sequence};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -4709,7 +4712,7 @@ enum Node {
     Silence,
     Pure(Value),
     /// The steps of every cycle, as one node. See [`sequence`].
-    Sequence(Arc<[SequenceLayer]>),
+    Sequence(Arc<[sequence::Layer]>),
     /// Mutation control - never built.
     ///
     /// Stands in for a QuickJS value stored in L1: `Rc` is `!Send + !Sync`
@@ -5362,6 +5365,9 @@ impl Pattern {
         }
         match self.node_kind() {
             Node::Pure(value) => value.is_data(0).then_some(1),
+            // One value that fills each cycle, as a control of a `pure` is
+            // once it is folded.
+            Node::Sequence(layers) => sequence::constant_value(layers).map(|_| 1),
             Node::AddContext(pattern, _)
             | Node::FmapNative(pattern, _)
             | Node::MapHapsNative(pattern, _, SpanUse::Ignores)
@@ -7603,6 +7609,9 @@ impl Pattern {
     /// Append source locations to every hap's context, as
     /// `withContext(ctx => ({...ctx, locations: [...ctx.locations, ...locs]}))`.
     pub fn with_added_context(&self, locs: Vec<(usize, usize)>) -> Self {
+        if let Some(located) = sequence::located(self, &locs) {
+            return located.with_steps(self.steps);
+        }
         let locs = Arc::new(locs);
         let mut pattern = Pattern::of(Node::AddContext(self.clone(), locs)).with_steps(self.steps);
         pattern.pure_loc = self.pure_loc;
@@ -7692,6 +7701,11 @@ impl Pattern {
         lookup_flow: LookupFlow,
     ) -> Self {
         let steps = self.steps;
+        if let Combine::Composed(op) = &combine
+            && let Some(applied) = sequence::applied(self, &other, *op, lookup_flow)
+        {
+            return applied.with_steps(steps);
+        }
         Pattern::of(Node::AppLeft(
             self.clone(),
             other,
@@ -8353,6 +8367,9 @@ impl Pattern {
         // One closure object per distinct spec: the same control built again
         // is the same payload, so its subtree carries its answers.
         let map = controls::interned_control_map(&spec, unnamed_only);
+        if let Some(mapped) = sequence::mapped(self, &map) {
+            return mapped.with_steps(self.steps);
+        }
         Pattern::of(Node::MapHapsOwned(self.clone(), map, SpanUse::Ignores)).with_steps(self.steps)
     }
 
@@ -8774,6 +8791,9 @@ impl Pattern {
 
     /// The [`Node::Fast`] behind [`combinators::checked_fast`].
     pub(crate) fn fast_node(&self, factor: Fraction, operation: &'static str) -> Self {
+        if let Some(faster) = sequence::faster(self, factor) {
+            return faster;
+        }
         Pattern::of(Node::Fast(self.clone(), factor, operation))
     }
 
@@ -9263,8 +9283,8 @@ fn compute_purity(node: &Node) -> purity::Purity {
         Node::Sequence(layers) => Purity::merge(
             layers
                 .iter()
-                .flat_map(|layer| &layer.steps)
-                .map(|step| value_purity(&step.value)),
+                .flat_map(|layer| layer.steps.iter())
+                .map(|step| value_purity(step.value())),
         ),
         Node::PurePickLookup(_, lookup) => {
             Purity::merge(lookup.patterns().map(|pattern| pattern.purity.clone()))
@@ -9661,163 +9681,6 @@ pub fn pure(v: Value) -> Pattern {
     Pattern::of(Node::Pure(v)).with_steps(Some(Fraction::ONE))
 }
 
-/// One step of a [`sequence`]: a value over a window of its layer's period,
-/// with the source locations its hap carries.
-#[derive(Clone, Debug)]
-pub struct SequenceStep {
-    /// Where the step begins and where it ends, as shares of the period.
-    pub begin: Fraction,
-    pub end: Fraction,
-    pub value: Value,
-    pub locations: Locations,
-}
-
-/// Steps that repeat every `period` cycles. See [`sequence`].
-#[derive(Clone, Debug)]
-pub struct SequenceLayer {
-    pub period: Fraction,
-    pub steps: Vec<SequenceStep>,
-}
-
-/// Why a [`SequenceLayer`] stops before the end of a span.
-enum SequenceStop {
-    /// A time left the native range.
-    Range,
-    /// The query stopped, or its budget refused the next hap.
-    Query,
-}
-
-impl SequenceLayer {
-    /// Whether the period is more than zero and the steps are in the order
-    /// of their haps: each begins inside the period at or after the step
-    /// before it and ends at or after it, and no step is empty.
-    fn is_sound(&self) -> bool {
-        let inside = |step: &SequenceStep| {
-            Fraction::ZERO <= step.begin && step.begin < step.end && step.end <= Fraction::ONE
-        };
-        let ordered = self
-            .steps
-            .windows(2)
-            .all(|pair| pair[0].begin <= pair[1].begin && pair[0].end <= pair[1].end);
-        self.period > Fraction::ZERO && self.steps.iter().all(inside) && ordered
-    }
-
-    /// The haps of one period, as a layer with a period of one cycle
-    /// answers them for cycle zero.
-    pub(crate) fn period_haps(&self) -> Vec<Hap> {
-        self.steps
-            .iter()
-            .map(|step| {
-                let window = TimeSpan::new(step.begin, step.end);
-                let mut hap = Hap::new(Some(window), window, step.value.clone());
-                hap.context = step.locations.clone();
-                hap
-            })
-            .collect()
-    }
-
-    /// Push the haps of this layer in `span`.
-    fn query(&self, span: TimeSpan, out: &mut Vec<Hap>) -> Result<(), SequenceStop> {
-        let in_range = |time: Option<Fraction>| time.ok_or(SequenceStop::Range);
-        // A period of one cycle, the common case, maps no time.
-        let cycles = self.period == Fraction::ONE;
-        let periods_at = |time: Fraction| {
-            if cycles {
-                Some(time)
-            } else {
-                time.checked_div(self.period)
-            }
-        };
-        let cycles_at = |time: Fraction| {
-            if cycles {
-                Some(time)
-            } else {
-                time.checked_mul(self.period)
-            }
-        };
-        // The span in periods: each turn of the steps is one cycle of it.
-        let asked = TimeSpan::new(
-            in_range(periods_at(span.begin))?,
-            in_range(periods_at(span.end))?,
-        );
-        for piece in asked.span_cycles() {
-            if query_stop_requested() {
-                return Err(SequenceStop::Query);
-            }
-            let turn = piece.begin.sam();
-            let begin = in_range(piece.begin.checked_sub(turn))?;
-            let end = in_range(piece.end.checked_sub(turn))?;
-            // The steps that meet the piece. A span of no width asks for the
-            // step that holds its one time.
-            let instant = begin == end;
-            let first = self.steps.partition_point(|step| step.end <= begin);
-            let met = self.steps[first..]
-                .partition_point(|step| step.begin <= begin || (!instant && step.begin < end));
-            out.reserve(met);
-            for step in &self.steps[first..first + met] {
-                let from = in_range(turn.checked_add(step.begin))?;
-                let to = in_range(turn.checked_add(step.end))?;
-                let whole = TimeSpan::new(in_range(cycles_at(from))?, in_range(cycles_at(to))?);
-                let part = TimeSpan::new(
-                    in_range(cycles_at(from.max(piece.begin)))?,
-                    in_range(cycles_at(to.min(piece.end)))?,
-                );
-                let mut hap = Hap::new(Some(whole), part, step.value.clone());
-                hap.context = step.locations.clone();
-                if !push_budgeted(out, hap) {
-                    return Err(SequenceStop::Query);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Values at places that are known when the pattern is built. The steps of
-/// each layer repeat every period of the layer. Each step is one hap a
-/// period, whose whole is the step's window and whose value is the step's.
-///
-/// This is what a stack of concatenations of plain values answers, each at
-/// a constant speed, nested concatenations and stacks of plain values
-/// inside them included. It answers in the same order: layer by layer, and
-/// each layer in the order of time. It is one node where they are one node
-/// for each value and each level, so it holds and visits a fraction of them.
-///
-/// `None` for a layer that [is not sound](SequenceLayer::is_sound). A layer
-/// with no step answers nothing and is not kept.
-pub fn sequence(layers: Vec<SequenceLayer>) -> Option<Pattern> {
-    if !layers.iter().all(SequenceLayer::is_sound) {
-        return None;
-    }
-    let layers: Arc<[SequenceLayer]> = layers
-        .into_iter()
-        .filter(|layer| !layer.steps.is_empty())
-        .collect();
-    Some(if layers.is_empty() {
-        silence()
-    } else {
-        Pattern::of(Node::Sequence(layers))
-    })
-}
-
-/// The haps of `layers` in `state`'s span. See [`sequence`].
-fn query_sequence(layers: &[SequenceLayer], state: &State) -> Vec<Hap> {
-    let mut out = Vec::new();
-    for layer in layers {
-        match layer.query(state.span, &mut out) {
-            Ok(()) => {}
-            Err(SequenceStop::Range) => {
-                refuse(QueryLimit::NativeFraction {
-                    operation: "sequence",
-                });
-                return Vec::new();
-            }
-            Err(SequenceStop::Query) => return Vec::new(),
-        }
-    }
-    out
-}
-
 pub fn pure_pick_lookup(value: Value, lookup: PickLookup) -> Pattern {
     Pattern::of(Node::PurePickLookup(value, lookup)).with_steps(Some(Fraction::ONE))
 }
@@ -10110,6 +9973,9 @@ pub fn stack(pats: Vec<Pattern>) -> Pattern {
             }));
         }
     };
+    if let Some(stacked) = sequence::stacked(&pats) {
+        return stacked.with_steps(steps);
+    }
     Pattern::of(Node::Stack(pats)).with_steps(steps)
 }
 
@@ -11423,117 +11289,5 @@ mod restart_tests {
             assert!(!discrete(&section));
         }
         assert!(!discrete(&crate::signal::saw()));
-    }
-}
-
-#[cfg(test)]
-mod sequence_tests {
-    use super::*;
-
-    fn frac((n, d): (i128, i128)) -> Fraction {
-        Fraction::new(n, d)
-    }
-
-    fn located(value: f64) -> Pattern {
-        pure(Value::F64(value)).with_added_context(vec![(value as usize, value as usize + 1)])
-    }
-
-    fn step(begin: (i128, i128), end: (i128, i128), value: f64) -> SequenceStep {
-        let mut locations = Locations::new();
-        locations.push((value as usize, value as usize + 1));
-        SequenceStep {
-            begin: frac(begin),
-            end: frac(end),
-            value: Value::F64(value),
-            locations,
-        }
-    }
-
-    fn layer(period: (i128, i128), steps: Vec<SequenceStep>) -> SequenceLayer {
-        SequenceLayer {
-            period: frac(period),
-            steps,
-        }
-    }
-
-    fn spans() -> [(Fraction, Fraction); 7] {
-        [
-            (Fraction::ZERO, frac((3, 1))),
-            (frac((1, 4)), frac((3, 4))),
-            (frac((-5, 4)), frac((1, 8))),
-            (frac((2, 3)), frac((23, 3))),
-            // A span of no width asks for what sounds at its one time.
-            (frac((1, 2)), frac((1, 2))),
-            (frac((7, 3)), frac((7, 3))),
-            (frac((3, 1)), frac((3, 1))),
-        ]
-    }
-
-    fn assert_same_answers(one_node: &Pattern, nodes: &Pattern) {
-        for (begin, end) in spans() {
-            assert_eq!(
-                format!("{:?}", one_node.query_arc(begin, end)),
-                format!("{:?}", nodes.query_arc(begin, end)),
-                "{begin:?}..{end:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_sequence_answers_as_the_concatenation_of_its_values() {
-        let one_node = sequence(vec![layer(
-            (1, 1),
-            vec![
-                step((0, 1), (1, 2), 1.0),
-                step((1, 2), (1, 1), 2.0),
-                step((1, 2), (1, 1), 3.0),
-            ],
-        )])
-        .expect("ordered steps inside the cycle");
-        let nodes = fastcat(vec![located(1.0), stack(vec![located(2.0), located(3.0)])]);
-        assert_same_answers(&one_node, &nodes);
-    }
-
-    #[test]
-    fn layers_answer_as_a_stack_of_concatenations_at_their_speeds() {
-        let one_node = sequence(vec![
-            layer(
-                (1, 2),
-                vec![step((0, 1), (1, 2), 1.0), step((1, 2), (1, 1), 2.0)],
-            ),
-            // A layer with a rest in it, slower than the cycle.
-            layer((3, 1), vec![step((1, 2), (1, 1), 3.0)]),
-            layer(
-                (3, 2),
-                vec![
-                    step((0, 1), (1, 3), 4.0),
-                    step((1, 3), (2, 3), 5.0),
-                    step((2, 3), (1, 1), 6.0),
-                ],
-            ),
-        ])
-        .expect("ordered steps inside each period");
-        let nodes = stack(vec![
-            fastcat(vec![located(1.0), located(2.0)]).fast(frac((2, 1))),
-            fastcat(vec![silence(), located(3.0)]).slow(frac((3, 1))),
-            fastcat(vec![located(4.0), located(5.0), located(6.0)]).slow(frac((3, 2))),
-        ]);
-        assert_same_answers(&one_node, &nodes);
-    }
-
-    #[test]
-    fn steps_out_of_order_or_outside_the_period_make_no_sequence() {
-        for steps in [
-            vec![step((1, 2), (1, 1), 1.0), step((0, 1), (1, 2), 2.0)],
-            vec![step((0, 1), (3, 2), 1.0)],
-            vec![step((1, 2), (1, 2), 1.0)],
-            vec![step((-1, 2), (1, 2), 1.0)],
-        ] {
-            assert!(sequence(vec![layer((1, 1), steps)]).is_none());
-        }
-        let whole = || vec![step((0, 1), (1, 1), 1.0)];
-        assert!(sequence(vec![layer((0, 1), whole())]).is_none());
-        assert!(sequence(vec![layer((-1, 2), whole())]).is_none());
-        assert!(sequence(Vec::new()).is_some());
     }
 }

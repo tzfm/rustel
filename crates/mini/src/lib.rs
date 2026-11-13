@@ -3514,9 +3514,10 @@ mod tests {
             ("a b@2 c", true),
             ("a*2 b c", true),
             ("bd*2, hh*4, <a b>/2", true),
-            // An atom is a `pure` on both sides.
+            // An atom is a `pure` on both sides, and one value a cycle
+            // is one node on both sides.
             ("a", false),
-            ("<a>", true),
+            ("<a>", false),
             ("a(3,8) b", false),
             ("a? b", false),
         ] {

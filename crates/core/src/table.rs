@@ -1530,25 +1530,6 @@ fn magnitude_bits(x: f64) -> u32 {
     exponent.saturating_sub(1022)
 }
 
-/// Share equal maps among a layer's entries. A period that repeats a control
-/// map then holds it once, and the sharing ends when the layer drops.
-fn share_equal_maps(entries: &mut [Hap]) {
-    let mut kept: std::collections::HashMap<u64, Vec<crate::value::OrderedMap>> =
-        std::collections::HashMap::new();
-    for entry in entries {
-        let crate::Value::Object(map) = &mut entry.value else {
-            continue;
-        };
-        let same = kept.entry(map.data_hash()).or_default();
-        match same.iter().find(|other| other.same_data(map)) {
-            // Equal data, so the entry reads the same map: a reference
-            // count step instead of a second copy.
-            Some(other) => *map = other.clone(),
-            None => same.push(map.clone()),
-        }
-    }
-}
-
 impl Layer {
     fn new(period: i128, mut entries: Vec<Hap>) -> Option<Self> {
         if period < 1 || entries.len() > MAX_ENTRIES {
@@ -1574,7 +1555,8 @@ impl Layer {
                 ),
             });
         }
-        share_equal_maps(&mut entries);
+        // A period that repeats a control map holds it once.
+        crate::value::share_equal_maps(entries.iter_mut().map(|entry| &mut entry.value));
         let ordered = in_time_order(&entries, period);
         let sorted = (!ordered)
             .then(|| crate::sort_haps_for_query(entries.clone()))
@@ -3582,7 +3564,7 @@ fn joined(
 
 /// The tables of a [`crate::sequence`]: the steps of each layer as one cycle
 /// a period, at the layer's speed, as a [`fast`] of them is.
-fn sequence(layers: &[crate::SequenceLayer]) -> Option<Tables> {
+fn sequence(layers: &[crate::sequence::Layer]) -> Option<Tables> {
     let mut all = Vec::new();
     let mut work: Option<Work> = None;
     for layer in layers {
@@ -4304,16 +4286,16 @@ mod tests {
 
     #[test]
     fn a_graph_deeper_than_a_build_walks_is_left_to_the_graph() {
-        let mut deep = pure(Value::F64(1.0));
-        for _ in 0..20_000 {
-            deep = deep.fast(frac(2, 1)).slow(frac(2, 1));
-        }
-        assert!(deep.tables().is_none());
-        let mut shallow = pure(Value::F64(1.0));
-        for _ in 0..20 {
-            shallow = shallow.fast(frac(2, 1)).slow(frac(2, 1));
-        }
-        assert!(shallow.tables().is_some());
+        // A node for each speed change: a fold makes one node of them all.
+        let levels = |count: usize| {
+            crate::sequence::unfolded(|| {
+                (0..count).fold(pure(Value::F64(1.0)), |pattern, _| {
+                    pattern.fast(frac(2, 1)).slow(frac(2, 1))
+                })
+            })
+        };
+        assert!(levels(20_000).tables().is_none());
+        assert!(levels(20).tables().is_some());
     }
 
     #[test]
@@ -5612,8 +5594,11 @@ mod tests {
 
     #[test]
     fn a_gap_below_one_asks_its_child_near_the_query_and_refuses_as_the_graph_does() {
-        let gap = one(plain(5.0), |p| {
-            p.fast(frac(8191, 1)).fast_gap(frac(1, 8192))
+        // A node for the speed change, which names itself in the refusal.
+        let gap = crate::sequence::unfolded(|| {
+            one(plain(5.0), |p| {
+                p.fast(frac(8191, 1)).fast_gap(frac(1, 8192))
+            })
         });
         for tail in [62, 64] {
             let begin = Fraction::int(1 << 40) + frac(1, (1 << tail) + 1);

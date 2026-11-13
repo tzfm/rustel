@@ -1090,6 +1090,25 @@ impl Clone for Value {
     }
 }
 
+/// Share equal maps among `values`. Values that repeat a control map then
+/// hold it once, and the sharing ends when they drop.
+pub(crate) fn share_equal_maps<'a>(values: impl IntoIterator<Item = &'a mut Value>) {
+    let mut kept: std::collections::HashMap<u64, Vec<OrderedMap>> =
+        std::collections::HashMap::new();
+    for value in values {
+        let Value::Object(map) = value else {
+            continue;
+        };
+        let same = kept.entry(map.data_hash()).or_default();
+        match same.iter().find(|other| other.same_data(map)) {
+            // Equal data, so the value reads the same map: a reference
+            // count step instead of a second copy.
+            Some(other) => *map = other.clone(),
+            None => same.push(map.clone()),
+        }
+    }
+}
+
 /// A fast hash for keys compared only within one process: one rotate,
 /// xor and multiply per word. Not resistant to chosen collisions, which
 /// cost a longer equality scan and never a wrong answer.

@@ -47,12 +47,7 @@ impl Rhythm {
         if let Some(location) = location {
             locations.push(location);
         }
-        let step = SequenceStep {
-            begin: Fraction::ZERO,
-            end: Fraction::ONE,
-            value,
-            locations,
-        };
+        let step = SequenceStep::new(Fraction::ZERO, Fraction::ONE, value, locations);
         Self {
             layers: vec![SequenceLayer {
                 period: Fraction::ONE,
@@ -172,7 +167,7 @@ impl Rhythm {
     /// Every hap also at `locations`, after its own.
     pub(crate) fn located(mut self, locations: &[(usize, usize)]) -> Self {
         for step in self.layers.iter_mut().flat_map(|layer| &mut layer.steps) {
-            step.locations.extend_from_slice(locations);
+            step.locate(locations);
         }
         self
     }
@@ -187,8 +182,10 @@ impl Rhythm {
         } = self;
         let pattern = if atom {
             match layers.pop().and_then(|mut layer| layer.steps.pop()) {
-                Some(step) if step.locations.is_empty() => pure(step.value),
-                Some(step) => pure(step.value).with_added_context(step.locations.to_vec()),
+                Some(step) if step.locations().is_empty() => pure(step.value().clone()),
+                Some(step) => {
+                    pure(step.value().clone()).with_added_context(step.locations().to_vec())
+                }
                 None => silence(),
             }
         } else {
@@ -243,7 +240,7 @@ impl Rhythm {
                 .ceil();
             while at < last {
                 for step in &layer.steps {
-                    let (begin, end) = (time(at, step.begin)?, time(at, step.end)?);
+                    let (begin, end) = (time(at, step.begin())?, time(at, step.end())?);
                     if end <= Fraction::ZERO || begin >= Fraction::ONE {
                         continue;
                     }
@@ -251,12 +248,7 @@ impl Rhythm {
                     if crosses || out.len() == MAX_STEPS {
                         return None;
                     }
-                    out.push(SequenceStep {
-                        begin: place(begin)?,
-                        end: place(end)?,
-                        value: step.value.clone(),
-                        locations: step.locations.clone(),
-                    });
+                    out.push(step.at(place(begin)?, place(end)?));
                 }
                 at = at.checked_add(Fraction::ONE)?;
             }
@@ -274,7 +266,7 @@ fn layer(turns: i128, steps: Vec<SequenceStep>) -> Option<Vec<SequenceLayer>> {
     }
     let ordered = steps
         .windows(2)
-        .all(|pair| pair[0].begin <= pair[1].begin && pair[0].end <= pair[1].end);
+        .all(|pair| pair[0].begin() <= pair[1].begin() && pair[0].end() <= pair[1].end());
     ordered.then(|| {
         vec![SequenceLayer {
             period: Fraction::int(turns),
