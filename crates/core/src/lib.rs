@@ -5113,6 +5113,10 @@ impl<'a> ValueSide<'a> {
     }
 }
 
+/// The fewest haps of a query for which [`ApplicationRun::meetings`] makes
+/// its unions.
+const UNIONS_REPAY_FROM: usize = 4;
+
 /// A chain of applications of constant values, the innermost first, with
 /// the constant hap of each.
 ///
@@ -5156,6 +5160,45 @@ impl<'a> ApplicationRun<'a> {
         Some((side, constant))
     }
 
+    /// The meetings a hap inside one cycle makes where it is: each
+    /// application's constant, or one union for several applications in a
+    /// row that `set` plain control objects. With each is the application
+    /// it starts at.
+    ///
+    /// A `set` of control objects is a union that keeps the keys in order
+    /// and takes the later value of a repeated key, so the union of the
+    /// constants first, then with the hap, is the same object. The later
+    /// application's locations come first, as in the meetings one by one.
+    fn meetings(&self) -> Vec<(usize, ValueSide<'a>, std::borrow::Cow<'a, Hap>)> {
+        let sets_controls = |(side, constant): &(ValueSide<'a>, &'a Hap)| {
+            matches!(side.apply, Combine::Composed(compose::ComposeOp::Set))
+                && side.flow == LookupFlow::Set
+                && constant.holds_only_controls()
+        };
+        let mut meetings: Vec<(usize, ValueSide<'a>, std::borrow::Cow<'a, Hap>)> = Vec::new();
+        let mut merging = false;
+        for (index, application) in self.applications.iter().enumerate() {
+            let (side, constant) = *application;
+            let mergeable = sets_controls(application);
+            match meetings.last_mut() {
+                Some((_, _, merged)) if merging && mergeable => {
+                    let merged = merged.to_mut();
+                    compose::compose_data_in_place(
+                        compose::ComposeOp::Set,
+                        &mut merged.value,
+                        &constant.value,
+                    );
+                    let mut context = constant.context.clone();
+                    context.append(&merged.context);
+                    merged.context = context;
+                }
+                _ => meetings.push((index, side, std::borrow::Cow::Borrowed(constant))),
+            }
+            merging = mergeable;
+        }
+        meetings
+    }
+
     /// Answer `state`: each hap of the base meets every constant in turn.
     ///
     /// A hap inside one cycle meets each constant over the same part, so
@@ -5163,8 +5206,11 @@ impl<'a> ApplicationRun<'a> {
     /// that takes another path, and for a hap that covers several cycles,
     /// the hap goes through the applications as their nodes take it.
     fn query(self, state: &State) -> Vec<Hap> {
+        let haps = self.base.query(state);
+        // The unions are made for the query, which a few haps do not repay.
+        let unions = (haps.len() >= UNIONS_REPAY_FROM).then(|| self.meetings());
         let mut out = Vec::new();
-        for mut hf in self.base.query(state) {
+        for mut hf in haps {
             let met = hf.whole_or_part();
             let mut taken = 0;
             if met.within_one_cycle() {
@@ -5172,12 +5218,18 @@ impl<'a> ApplicationRun<'a> {
                 let Some(part) = hf.part.intersection(&met) else {
                     continue;
                 };
-                for (side, constant) in &self.applications {
-                    if !Meeting::in_place(&mut hf, constant, part, side.apply, side.flow) {
-                        break;
-                    }
-                    taken += 1;
-                }
+                let refused = match &unions {
+                    Some(meetings) => meetings
+                        .iter()
+                        .find(|(_, side, constant)| {
+                            !Meeting::in_place(&mut hf, constant, part, side.apply, side.flow)
+                        })
+                        .map(|(first, ..)| *first),
+                    None => self.applications.iter().position(|(side, constant)| {
+                        !Meeting::in_place(&mut hf, constant, part, side.apply, side.flow)
+                    }),
+                };
+                taken = refused.unwrap_or(self.applications.len());
             }
             if taken == self.applications.len() {
                 if query_stop_requested() || !push_budgeted(&mut out, hf) {
@@ -5199,6 +5251,24 @@ impl<'a> ApplicationRun<'a> {
             out.append(&mut haps);
         }
         out
+    }
+}
+
+impl Hap {
+    /// Whether this hap is a control object and nothing more: no lookup,
+    /// live binding, visual or context key rides on it. A `set` meeting
+    /// with it is then a union of its keys and of its locations.
+    fn holds_only_controls(&self) -> bool {
+        self.pick_lookup.is_none()
+            && self.live_controls == [0; 4]
+            && self.slider_binding == 0
+            && self.ui_visuals == 0
+            && self.keys.is_empty()
+            && self.value.is_data(0)
+            && self
+                .value
+                .as_object()
+                .is_some_and(|controls| !compose::union_drops(controls))
     }
 }
 
@@ -10781,6 +10851,32 @@ mod application_run_tests {
                     (ComposeOp::Mul, pure(Value::F64(600.0))),
                     (ComposeOp::Add, pure(Value::F64(200.0))),
                     (ComposeOp::Sub, pure(Value::F64(1.5))),
+                ],
+            ),
+            (
+                "sets on each side of an addition",
+                vec![
+                    (
+                        ComposeOp::Set,
+                        control("s", Value::Str("saw".into()), Some((3, 6))),
+                    ),
+                    (
+                        ComposeOp::Set,
+                        control("gain", Value::F64(0.5), Some((8, 11))),
+                    ),
+                    (ComposeOp::Add, control("gain", Value::F64(0.25), None)),
+                    (
+                        ComposeOp::Set,
+                        control("pan", Value::F64(0.5), Some((20, 23))),
+                    ),
+                    (
+                        ComposeOp::Set,
+                        control("s", Value::Str("sine".into()), None),
+                    ),
+                    (
+                        ComposeOp::Set,
+                        control("room", Value::F64(0.3), Some((30, 33))),
+                    ),
                 ],
             ),
             (
