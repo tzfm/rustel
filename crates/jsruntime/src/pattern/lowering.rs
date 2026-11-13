@@ -6,9 +6,7 @@
 //! a QuickJS callback.
 
 use super::*;
-use rustel_core::callback_ir::{
-    MAX_PATTERN_TRANSFORM_IR_INSTRUCTIONS, PatternTransformInstruction, PatternTransformProgram,
-};
+use rustel_core::callback_ir::{MAX_PATTERN_TRANSFORM_IR_INSTRUCTIONS, PatternTransformProgram};
 use rustel_transpiler::{
     CallbackArgument, CallbackMethodCall, MAX_CALLBACK_TRANSFORM_DEPTH, PatternTransformCandidate,
 };
@@ -83,24 +81,11 @@ pub(crate) fn lower_method_chain<'js>(
             .iter()
             .map(|argument| lower_argument(ctx, argument, &mut dependencies, &mut nested, depth))
             .collect::<Result<Vec<_>, _>>()?;
-        if let BuiltinMethod::Registered(registration) = &method
-            && takes_transform
-        {
-            // A method call whose function slot a nested arrow fills. The
-            // registration itself is the instruction: it applies the
-            // argument patterns exactly as its method call does, so the
-            // program builds the graph the JavaScript call builds.
-            let shaped = registered_method_arguments(registration, arguments).ok_or(Declined)?;
-            instructions.push(PatternTransformInstruction::ApplyRegistered {
-                registration: registration.clone(),
-                arguments: shaped,
-            });
-        } else {
-            let function = method
-                .transformer(&call.method, arguments)
-                .ok_or(Declined)?;
-            instructions.push(PatternTransformInstruction::Apply(function));
-        }
+        instructions.push(
+            method
+                .step(&call.method, arguments, takes_transform)
+                .ok_or(Declined)?,
+        );
         dependencies.methods.push(call.method.clone());
     }
     // A step that cannot keep a pure operand pure is refused here.

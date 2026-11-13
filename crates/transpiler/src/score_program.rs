@@ -12,9 +12,10 @@
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, BinaryOperator, BindingPattern, CallExpression, Expression, Function,
-    ObjectExpression, ObjectPropertyKind, PropertyKey, PropertyKind, Statement, UnaryOperator,
-    VariableDeclaration, VariableDeclarationKind,
+    Argument, ArrowFunctionBody, ArrowFunctionExpression, BinaryOperator, BindingPattern,
+    CallExpression, Expression, FormalParameters, Function, FunctionBody, ObjectExpression,
+    ObjectPropertyKind, PropertyKey, PropertyKind, Statement, UnaryOperator, VariableDeclaration,
+    VariableDeclarationKind,
 };
 use oxc_parser::Parser;
 use oxc_span::SourceType;
@@ -32,18 +33,29 @@ pub enum ScoreStatement {
     Binding { name: Box<str>, value: ScoreExpr },
     /// An expression evaluated for its effects and, last, for its value.
     Expression(ScoreExpr),
-    /// A function declaration, which JavaScript hoists.
-    Function(ScoreFunction),
+    /// `function name(...) {...}`, which JavaScript hoists.
+    Function {
+        name: Box<str>,
+        function: ScoreFunction,
+    },
 }
 
-/// `function name(...parameters) { const ...; return result }`: plain
-/// parameters, bindings, then one returned expression.
+/// What a function declaration or an arrow holds: plain parameters,
+/// bindings, then one result. `(a) => result` has no bindings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScoreFunction {
-    pub name: Box<str>,
     pub parameters: Vec<Box<str>>,
     pub bindings: Vec<(Box<str>, ScoreExpr)>,
     pub result: ScoreExpr,
+}
+
+/// One part of an object literal.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScoreProperty {
+    /// `key: value`, or `key` alone for a name of that spelling.
+    Entry { key: Box<str>, value: ScoreExpr },
+    /// `...source`: every property of another object.
+    Spread(ScoreExpr),
 }
 
 /// One expression of a [`ScoreProgram`].
@@ -55,8 +67,10 @@ pub enum ScoreExpr {
     String(Box<str>),
     /// A name: a binding of the score or of the host.
     Name(Box<str>),
-    /// `{ key: value, ... }`: plain keys and values, in source order.
-    Object(Vec<(Box<str>, ScoreExpr)>),
+    /// `{ key: value, ...source }`: plain keys and spreads, in source order.
+    Object(Vec<ScoreProperty>),
+    /// `[first, second]`: an array with no hole and no spread.
+    Array(Vec<ScoreExpr>),
     /// `object.property`, read and not called.
     Member {
         object: Box<ScoreExpr>,
@@ -73,6 +87,9 @@ pub enum ScoreExpr {
         method: Box<str>,
         arguments: Vec<ScoreExpr>,
     },
+    /// `(...parameters) => result`, or the same with a block of bindings
+    /// and one `return`.
+    Arrow(Box<ScoreFunction>),
 }
 
 /// The [`ScoreProgram`] of transpiled `code`, or `None` when any part of it
@@ -97,12 +114,13 @@ fn score_program_here(code: &str) -> Option<ScoreProgram> {
                 ScoreStatement::Expression(expression(&statement.expression, 0)?)
             }
             Statement::VariableDeclaration(declaration) => {
-                let (name, value) = binding(declaration)?;
+                let (name, value) = binding(declaration, 0)?;
                 ScoreStatement::Binding { name, value }
             }
-            Statement::FunctionDeclaration(function) => {
-                ScoreStatement::Function(score_function(function)?)
-            }
+            Statement::FunctionDeclaration(function) => ScoreStatement::Function {
+                name: function.id.as_ref()?.name.as_str().into(),
+                function: declared_function(function)?,
+            },
             _ => return None,
         });
     }
@@ -111,7 +129,7 @@ fn score_program_here(code: &str) -> Option<ScoreProgram> {
 
 /// `const name = value`, or `let` with no later assignment: no statement a
 /// program reads assigns.
-fn binding(declaration: &VariableDeclaration<'_>) -> Option<(Box<str>, ScoreExpr)> {
+fn binding(declaration: &VariableDeclaration<'_>, depth: usize) -> Option<(Box<str>, ScoreExpr)> {
     if !matches!(
         declaration.kind,
         VariableDeclarationKind::Const | VariableDeclarationKind::Let
@@ -130,23 +148,44 @@ fn binding(declaration: &VariableDeclaration<'_>) -> Option<(Box<str>, ScoreExpr
     }
     Some((
         name.name.as_str().into(),
-        expression(declarator.init.as_ref()?, 0)?,
+        expression(declarator.init.as_ref()?, depth)?,
     ))
 }
 
-fn score_function(function: &Function<'_>) -> Option<ScoreFunction> {
+fn declared_function(function: &Function<'_>) -> Option<ScoreFunction> {
     if function.r#async
         || function.generator
         || function.declare
         || function.type_parameters.is_some()
         || function.this_param.is_some()
         || function.return_type.is_some()
-        || function.params.rest.is_some()
     {
         return None;
     }
-    let parameters = function
-        .params
+    block_function(parameters(&function.params)?, function.body.as_ref()?, 0)
+}
+
+fn arrow_function(arrow: &ArrowFunctionExpression<'_>, depth: usize) -> Option<ScoreFunction> {
+    if arrow.r#async || arrow.type_parameters.is_some() || arrow.return_type.is_some() {
+        return None;
+    }
+    let parameters = parameters(&arrow.params)?;
+    match &arrow.body {
+        ArrowFunctionBody::FunctionBody(body) => block_function(parameters, body, depth),
+        result => Some(ScoreFunction {
+            parameters,
+            bindings: Vec::new(),
+            result: expression(result.as_expression()?, depth)?,
+        }),
+    }
+}
+
+/// Plain names: no default, no pattern, no rest.
+fn parameters(parameters: &FormalParameters<'_>) -> Option<Vec<Box<str>>> {
+    if parameters.rest.is_some() {
+        return None;
+    }
+    parameters
         .items
         .iter()
         .map(|parameter| match &parameter.pattern {
@@ -160,8 +199,16 @@ fn score_function(function: &Function<'_>) -> Option<ScoreFunction> {
             }
             _ => None,
         })
-        .collect::<Option<Vec<Box<str>>>>()?;
-    let body = function.body.as_ref()?;
+        .collect()
+}
+
+/// The function of `parameters` and the body `{ const ...; return result }`,
+/// read at `depth` levels inside its statement.
+fn block_function(
+    parameters: Vec<Box<str>>,
+    body: &FunctionBody<'_>,
+    depth: usize,
+) -> Option<ScoreFunction> {
     if !body.directives.is_empty() {
         return None;
     }
@@ -171,15 +218,14 @@ fn score_function(function: &Function<'_>) -> Option<ScoreFunction> {
     let bindings = leading
         .iter()
         .map(|statement| match statement {
-            Statement::VariableDeclaration(declaration) => binding(declaration),
+            Statement::VariableDeclaration(declaration) => binding(declaration, depth),
             _ => None,
         })
         .collect::<Option<Vec<_>>>()?;
     Some(ScoreFunction {
-        name: function.id.as_ref()?.name.as_str().into(),
         parameters,
         bindings,
-        result: expression(returned.argument.as_ref()?, 0)?,
+        result: expression(returned.argument.as_ref()?, depth)?,
     })
 }
 
@@ -218,6 +264,16 @@ fn expression(node: &Expression<'_>, depth: usize) -> Option<ScoreExpr> {
         }
         Expression::CallExpression(call) => call_expression(call, depth),
         Expression::ObjectExpression(object) => object_expression(object, depth),
+        Expression::ArrayExpression(array) => Some(ScoreExpr::Array(
+            array
+                .elements
+                .iter()
+                .map(|element| expression(element.as_expression()?, depth))
+                .collect::<Option<Vec<_>>>()?,
+        )),
+        Expression::ArrowFunctionExpression(arrow) => {
+            Some(ScoreExpr::Arrow(Box::new(arrow_function(arrow, depth)?)))
+        }
         Expression::StaticMemberExpression(member) if !member.optional => Some(ScoreExpr::Member {
             object: Box::new(expression(&member.object, depth)?),
             property: member.property.name.as_str().into(),
@@ -226,16 +282,19 @@ fn expression(node: &Expression<'_>, depth: usize) -> Option<ScoreExpr> {
     }
 }
 
-/// An object literal of plain `key: value` properties. A `__proto__` key
-/// sets the prototype instead of a property, so it is refused with every
-/// computed key, method, accessor and spread.
+/// An object literal of plain `key: value` properties and spreads. A
+/// `__proto__` key sets the prototype instead of a property, so it is
+/// refused with every computed key, method and accessor.
 fn object_expression(object: &ObjectExpression<'_>, depth: usize) -> Option<ScoreExpr> {
     let properties = object
         .properties
         .iter()
         .map(|property| {
-            let ObjectPropertyKind::ObjectProperty(property) = property else {
-                return None;
+            let property = match property {
+                ObjectPropertyKind::ObjectProperty(property) => property,
+                ObjectPropertyKind::SpreadProperty(spread) => {
+                    return Some(ScoreProperty::Spread(expression(&spread.argument, depth)?));
+                }
             };
             if property.kind != PropertyKind::Init || property.method || property.computed {
                 return None;
@@ -250,7 +309,10 @@ fn object_expression(object: &ObjectExpression<'_>, depth: usize) -> Option<Scor
             if &*key == "__proto__" {
                 return None;
             }
-            Some((key, expression(&property.value, depth)?))
+            Some(ScoreProperty::Entry {
+                key,
+                value: expression(&property.value, depth)?,
+            })
         })
         .collect::<Option<Vec<_>>>()?;
     Some(ScoreExpr::Object(properties))
@@ -284,7 +346,9 @@ fn call_expression(call: &CallExpression<'_>, depth: usize) -> Option<ScoreExpr>
 
 #[cfg(test)]
 mod tests {
-    use super::{ScoreExpr, ScoreFunction, ScoreProgram, ScoreStatement, score_program};
+    use super::{
+        ScoreExpr, ScoreFunction, ScoreProgram, ScoreProperty, ScoreStatement, score_program,
+    };
 
     fn call(callee: &str, arguments: Vec<ScoreExpr>) -> ScoreExpr {
         ScoreExpr::Call {
@@ -345,25 +409,67 @@ mod tests {
         assert_eq!(
             program,
             Some(ScoreProgram {
-                statements: vec![ScoreStatement::Function(ScoreFunction {
+                statements: vec![ScoreStatement::Function {
                     name: "lead".into(),
-                    parameters: vec!["notes".into()],
-                    bindings: vec![(
-                        "base".into(),
-                        call("note", vec![ScoreExpr::Name("notes".into())])
-                    )],
-                    result: method(ScoreExpr::Name("base".into()), "s", vec![mini]),
-                })],
+                    function: ScoreFunction {
+                        parameters: vec!["notes".into()],
+                        bindings: vec![(
+                            "base".into(),
+                            call("note", vec![ScoreExpr::Name("notes".into())])
+                        )],
+                        result: method(ScoreExpr::Name("base".into()), "s", vec![mini]),
+                    },
+                }],
             })
         );
     }
 
     #[test]
+    fn an_arrow_reads_as_a_function_with_or_without_a_block() {
+        let reversed = |bindings| {
+            ScoreExpr::Arrow(Box::new(ScoreFunction {
+                parameters: vec!["x".into()],
+                bindings,
+                result: method(ScoreExpr::Name("x".into()), "rev", vec![]),
+            }))
+        };
+        for (code, bindings) in [
+            ("s.every(4, x => x.rev())", vec![]),
+            ("s.every(4, (x) => { return x.rev() })", vec![]),
+            (
+                "s.every(4, x => { const y = 1; return x.rev() })",
+                vec![("y".into(), ScoreExpr::Number(1.0))],
+            ),
+        ] {
+            let every = method(
+                ScoreExpr::Name("s".into()),
+                "every",
+                vec![ScoreExpr::Number(4.0), reversed(bindings)],
+            );
+            assert_eq!(
+                score_program(code),
+                Some(ScoreProgram {
+                    statements: vec![ScoreStatement::Expression(every)],
+                }),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
     fn an_object_reads_as_its_properties_and_a_member_as_a_read() {
-        let program = score_program("const kit = { kick, 'snare drum': 2 };\nkit.kick.fast(2)");
+        let program =
+            score_program("const kit = { kick, 'snare drum': 2, ...more };\nkit.kick.fast(2)");
         let kit = ScoreExpr::Object(vec![
-            ("kick".into(), ScoreExpr::Name("kick".into())),
-            ("snare drum".into(), ScoreExpr::Number(2.0)),
+            ScoreProperty::Entry {
+                key: "kick".into(),
+                value: ScoreExpr::Name("kick".into()),
+            },
+            ScoreProperty::Entry {
+                key: "snare drum".into(),
+                value: ScoreExpr::Number(2.0),
+            },
+            ScoreProperty::Spread(ScoreExpr::Name("more".into())),
         ]);
         let read = ScoreExpr::Member {
             object: Box::new(ScoreExpr::Name("kit".into())),
@@ -384,6 +490,19 @@ mod tests {
     }
 
     #[test]
+    fn an_array_reads_as_its_elements() {
+        assert_eq!(
+            score_program("[a, 2]"),
+            Some(ScoreProgram {
+                statements: vec![ScoreStatement::Expression(ScoreExpr::Array(vec![
+                    ScoreExpr::Name("a".into()),
+                    ScoreExpr::Number(2.0),
+                ]))],
+            })
+        );
+    }
+
+    #[test]
     fn an_expression_past_the_nesting_limit_is_left_to_javascript() {
         let deep = format!("s{}", ".fast(2)".repeat(crate::MAX_SOURCE_NESTING));
         assert_eq!(score_program(&deep), None);
@@ -392,7 +511,11 @@ mod tests {
     #[test]
     fn any_other_shape_is_left_to_javascript() {
         for code in [
-            "s(m('bd', 2)).fast(x => x)",
+            "s.every(4, async x => x)",
+            "s.every(4, (x = 1) => x)",
+            "s.every(4, ({ x }) => x)",
+            "s.every(4, x => { x.rev() })",
+            "s.every(4, function (x) { return x })",
             "function f(a = 1) { return a }",
             "function f(...a) { return a[0] }",
             "function f() { g(); return 1 }",
@@ -408,7 +531,8 @@ mod tests {
             "({ [key]: 1 })",
             "({ get a() { return 1 } })",
             "({ a() { return 1 } })",
-            "({ ...a })",
+            "[a, , b]",
+            "[...a]",
             "a?.b",
             "'a' + 1",
             "`a${b}`",

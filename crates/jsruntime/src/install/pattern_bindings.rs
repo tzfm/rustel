@@ -830,7 +830,14 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
             }),
         )
         .map_err(|e| e.to_string())?;
-        proto.set(name, f).map_err(|e| e.to_string())?;
+        proto.set(name, f.clone()).map_err(|e| e.to_string())?;
+        record_builtin_method(
+            &ctx,
+            name,
+            f.into_value(),
+            BuiltinMethod::Layer { keep_original },
+        )
+        .map_err(|e| e.to_string())?;
     }
 
     // -- the direct join surface ------------------------------------

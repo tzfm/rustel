@@ -42,7 +42,9 @@ pub use callback_ir::{
     lower_pattern_transform_callback,
 };
 pub use frequency_sliders::is_frequency_control;
-pub use score_program::{ScoreExpr, ScoreFunction, ScoreProgram, ScoreStatement, score_program};
+pub use score_program::{
+    ScoreExpr, ScoreFunction, ScoreProgram, ScoreProperty, ScoreStatement, score_program,
+};
 pub use surface_writes::{SurfaceWrites, surface_writes};
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -9,6 +9,7 @@
 //! copy or forge, so it would prove nothing.
 
 use super::*;
+use rustel_core::callback_ir::PatternTransformInstruction;
 use rustel_core::compose::{Alignment, ComposeOp};
 use rustel_core::controls::ControlSpec;
 use rustel_core::register::Registration;
@@ -44,6 +45,9 @@ pub(crate) enum BuiltinMethod {
     /// A visual such as `pianoroll`, given the widget id and the slot the
     /// transpiler writes for it.
     Visual,
+    /// `layer` or `superimpose`, given transformers: a stack of what each
+    /// one makes of the receiver, with or without the receiver itself.
+    Layer { keep_original: bool },
 }
 
 impl BuiltinMethod {
@@ -79,7 +83,32 @@ impl BuiltinMethod {
                     rustel_core::compose::default_alignment(),
                 )
             }
-            Self::Pick { .. } | Self::Visual => return None,
+            Self::Pick { .. } | Self::Visual | Self::Layer { .. } => return None,
+        })
+    }
+
+    /// The step of a callback program that builds what
+    /// `receiver.name(...arguments)` builds. `None` as for
+    /// [`Self::transformer`].
+    ///
+    /// A registered method whose function slot a transformer fills is its
+    /// own step: the registration applies the argument patterns exactly as
+    /// its method call does, so the program builds the graph the call
+    /// builds.
+    pub(crate) fn step(
+        &self,
+        name: &str,
+        arguments: Vec<Pattern>,
+        holds_transformer: bool,
+    ) -> Option<PatternTransformInstruction> {
+        Some(match self {
+            Self::Registered(registration) if holds_transformer => {
+                PatternTransformInstruction::ApplyRegistered {
+                    arguments: registered_method_arguments(registration, arguments)?,
+                    registration: registration.clone(),
+                }
+            }
+            _ => PatternTransformInstruction::Apply(self.transformer(name, arguments)?),
         })
     }
 
@@ -145,7 +174,7 @@ impl BuiltinMethod {
                     provable_pure,
                 ))
             }
-            Self::Pick { .. } | Self::Visual => None,
+            Self::Pick { .. } | Self::Visual | Self::Layer { .. } => None,
         }
     }
 }
