@@ -60,6 +60,7 @@ use modulation::wrap_phase;
 use orbit::stereo_pan;
 pub(crate) use render::enable_denormal_flush;
 use std::sync::Arc;
+use voice::VoiceEnd;
 use voice::begin_frame;
 use voice::fm_advance;
 use voice::note_end_alive;
@@ -347,21 +348,14 @@ struct Voice {
     /// comes that much later. The voice owns the level of its chain from
     /// this frame: see [`LevelChange`].
     output_frame: u64,
-    /// The level line of a voice whose post gain moves on a chain with
-    /// latency: see [`SendLines::claim_level`].
-    level_line: Option<u8>,
     /// The note is aimed its lead before its musical onset: see
     /// [`OscillatorControls::lead`]. A takeover pairs such a voice with a
     /// copy of its sound: see [`ScalarBackend::kept_onset_stands_for`].
     aimed_early: bool,
     generation: u64,
-    /// The generation whose takeover kept this voice and plays its onset
-    /// again. `None` once the voice stands in for that copy. See
-    /// [`ScalarBackend::keep_started_onsets`].
-    replayed_by: Option<u64>,
-    /// The onset is one frame before the takeover frame, so the copy is on
-    /// the next frame and nowhere else. Read only with `replayed_by` set.
-    replayed_on_next_frame: bool,
+    /// The mark of the takeover that kept this voice. `None` once the voice
+    /// stands in for the copy of its onset.
+    replay: Option<Replay>,
     ui_visuals: u64,
     preview_epoch: u64,
     piano: bool,
@@ -379,13 +373,7 @@ struct Voice {
     delay_wet: f32,
     /// Wet send into the orbit reverb (0 = no send).
     reverb_wet: f32,
-    /// The dry path feeds the orbit insert, not the orbit.
-    through_insert: bool,
-    insert_bus: Option<usize>,
-    /// The reverb send and the delay send go to the room of the chain, in
-    /// front of its effects: see [`ChainRoom`]. Else they go to the orbit.
-    chain_reverb: bool,
-    chain_delay: bool,
+    route: VoiceRoute,
     dry_gain: f32,
     kabel: Option<KabelState>,
     stretch: Option<Box<[crate::stretch::Stretch; 2]>>,
@@ -418,12 +406,7 @@ struct Voice {
     /// Second-channel filter state, present only for stereo sources - the
     /// biquad chain processes each channel independently.
     filters_right: Option<FilterChain>,
-    stop_secs: f32,
-    /// The bank slot this voice reads was emptied under it - an uninstall
-    /// landed - so it renders silence for the rest of the block and retires
-    /// at the block's end. Set on the audio thread; the id may then go to
-    /// another sound, and a voice still reading it would play that.
-    source_gone: bool,
+    end: VoiceEnd,
     /// Free-running LFO modulator phases,
     /// one per `controls.lfos` slot, advanced once per rendered frame.
     /// f64: see [`lfo_phase0`].
@@ -496,13 +479,6 @@ struct Voice {
     /// cannot exhaust a separate lifetime registry and strand held notes.
     cut_group: Option<u32>,
     id: u64,
-    /// Absolute frame at which a later cut-group trigger started fading
-    /// this voice (1 → 0 over 10 ms).
-    cut_fade_frame: Option<u64>,
-    /// Absolute frame at which the polyphony cap started fading this voice
-    /// (1 → 0 over 250 ms). Set once and never cleared: a voice the cap has
-    /// dropped cannot be chosen again.
-    polyphony_fade_frame: Option<u64>,
     /// Per-voice compressor delay + detector, leased from the backend's
     /// pre-allocated pool (never allocated in the callback).
     compressor: Option<Box<CompressorState>>,
@@ -510,6 +486,131 @@ struct Voice {
     /// pool for the same reason: the ring is kilobytes and the callback
     /// allocates nothing.
     limiter: Option<Box<crate::limiter::InlineLimiter>>,
+}
+
+/// The mark of a voice that a takeover kept: the incoming generation plays
+/// the onset of the voice again, and the voice stands in for that copy. See
+/// [`ScalarBackend::keep_started_onsets`].
+#[derive(Clone, Copy, Debug)]
+struct Replay {
+    /// The generation whose takeover kept the voice.
+    by: u64,
+    /// The onset is one frame before the takeover frame, so the copy is on
+    /// the next frame and nowhere else.
+    next_frame_only: bool,
+}
+
+/// Where a voice sends its sound. The activation sets the route, its level
+/// line last, and nothing changes it after.
+#[derive(Clone, Copy, Debug)]
+enum VoiceRoute {
+    /// The voice has no chain. Its dry signal and its sends go to the orbit.
+    Orbit,
+    /// The voice holds the bus of its chain, and its dry signal and its
+    /// sends go to the orbit: an instrument note, or a note whose effects
+    /// the chain did not serve.
+    OnChain { bus: u8 },
+    /// The voice goes through the effects of the chain on `bus`. Its dry
+    /// signal feeds them, except a piano voice, which mixes apart.
+    Through {
+        bus: u8,
+        /// The reverb send goes to the room of the chain, in front of its
+        /// effects: see [`ChainRoom`]. Else it goes to the orbit.
+        room_reverb: bool,
+        /// The delay send goes to the room of the chain, in front of its
+        /// effects. Else it goes to the orbit.
+        room_delay: bool,
+        /// The level line of a voice whose post gain moves on a chain with
+        /// latency: see [`SendLines::claim_level`].
+        level_line: Option<u8>,
+    },
+}
+
+// A bus fits in the `u8` of a route.
+const _: () = assert!(crate::insert::MAX_INSERT_BUSES <= 1 << u8::BITS);
+
+impl VoiceRoute {
+    /// The route of a note that claimed `bus`. The note goes `through` the
+    /// effects of the chain when the chain served one of them. With no bus
+    /// the note has no chain.
+    fn new(bus: Option<usize>, through: bool, room_reverb: bool, room_delay: bool) -> Self {
+        match bus {
+            None => Self::Orbit,
+            Some(bus) if through => Self::Through {
+                bus: bus as u8,
+                room_reverb,
+                room_delay,
+                level_line: None,
+            },
+            Some(bus) => Self::OnChain { bus: bus as u8 },
+        }
+    }
+
+    /// The bus the voice holds, also when its dry signal goes to the orbit.
+    #[inline]
+    fn bus(self) -> Option<usize> {
+        match self {
+            Self::Orbit => None,
+            Self::OnChain { bus } | Self::Through { bus, .. } => Some(usize::from(bus)),
+        }
+    }
+
+    /// The bus of the chain the voice goes through. A piano voice still
+    /// mixes apart.
+    #[inline]
+    fn through_bus(self) -> Option<usize> {
+        match self {
+            Self::Through { bus, .. } => Some(usize::from(bus)),
+            Self::Orbit | Self::OnChain { .. } => None,
+        }
+    }
+
+    #[inline]
+    fn is_through(self) -> bool {
+        matches!(self, Self::Through { .. })
+    }
+
+    /// The bus whose room takes the reverb send of the voice.
+    #[inline]
+    fn room_reverb_bus(self) -> Option<usize> {
+        match self {
+            Self::Through {
+                bus,
+                room_reverb: true,
+                ..
+            } => Some(usize::from(bus)),
+            _ => None,
+        }
+    }
+
+    /// The bus whose room takes the delay send of the voice.
+    #[inline]
+    fn room_delay_bus(self) -> Option<usize> {
+        match self {
+            Self::Through {
+                bus,
+                room_delay: true,
+                ..
+            } => Some(usize::from(bus)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn level_line(self) -> Option<u8> {
+        match self {
+            Self::Through { level_line, .. } => level_line,
+            Self::Orbit | Self::OnChain { .. } => None,
+        }
+    }
+
+    /// Gives a voice through a chain its level line. Another route has no
+    /// level line, and keeps none.
+    fn set_level_line(&mut self, line: Option<u8>) {
+        if let Self::Through { level_line, .. } = self {
+            *level_line = line;
+        }
+    }
 }
 
 /// State advanced only while a voice has an FM operator graph.
@@ -1170,6 +1271,9 @@ struct PolyphonyLimit(usize);
 const POLYPHONY_FADE_SECS: f32 = 0.25;
 /// Duration of the linear choke fade from full gain to silence, in seconds.
 const CUT_FADE_SECS: f32 = 0.01;
+/// A choke stops its voice this long after its fade starts: 1 ms after the
+/// end of the fade.
+const CHOKE_TAIL_SECS: f32 = 0.011;
 
 /// Stable admission order without compacting the large onset descriptions.
 ///
@@ -1593,6 +1697,27 @@ pub(crate) struct InsertMix {
     leaving: crate::live_control::Ramp,
 }
 
+/// What drives the blocks of a backend. The mode decides what the
+/// activation of a note may build, and where the copies a chain gives up
+/// go. An init keeps the mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RenderMode {
+    /// A live callback: see [`ScalarBackend::forbid_inline_reverb`]. The
+    /// activation synthesises no reverb and builds no insert or room: the
+    /// producer installs them. The copies a chain gives up go back to the
+    /// producer, and the callback never waits.
+    Live,
+    /// A render the caller drives. The activation synthesises and builds
+    /// what a note asks for, and the copies a chain gives up are dropped in
+    /// place.
+    #[default]
+    Inline,
+    /// An offline render: see [`ScalarBackend::render_offline`]. As
+    /// [`Self::Inline`], and the render also waits for each block of an
+    /// insert that renders ahead, and names each chain.
+    Offline,
+}
+
 /// The scalar renderer: voices, modulators, effects and orbit mixing,
 /// computed one sample at a time.
 #[derive(Default)]
@@ -1794,13 +1919,7 @@ pub struct ScalarBackend {
     ui_visual_capture_generation_floor: u64,
     /// Per-orbit stereo reverb SEND accumulation (post-pan, scaled by wet).
     reverb_sends: Vec<[[f32; crate::reverb::REVERB_BLOCK]; 2]>,
-    /// Offline renders may synthesise a missing orbit reverb at activation
-    /// time; the LIVE path must never (producer installs instead).
-    allow_inline_reverb: bool,
-    /// An offline render drives the blocks, and waits for an insert that
-    /// renders ahead to publish each block before collecting it. The
-    /// live callback paces itself in real time and never waits.
-    offline: bool,
+    mode: RenderMode,
     /// Onsets whose orbit reverb was not installed yet: the voice plays DRY
     /// this time, like a still-loading skip.
     missing_reverb_events: u64,
@@ -1958,7 +2077,7 @@ impl ScalarBackend {
         let active = self
             .voices
             .iter()
-            .filter(|voice| voice.polyphony_fade_frame.is_none())
+            .filter(|voice| !voice.end.is_culled())
             .count();
         let led = Self::led(&self.voices, 0);
         let frame = self.frame;

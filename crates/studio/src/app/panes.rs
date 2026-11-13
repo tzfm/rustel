@@ -67,7 +67,7 @@ impl App {
         self.close_smart_action_on_scene_change();
         self.note_scene_visit(scene);
         self.strip_mode = SceneStripMode::Idle;
-        self.pointer = None;
+        self.end_pointer_gesture();
         self.invalidate_maps();
         self.rebuild_slider_spans();
         self.lint_pending = true;
@@ -341,6 +341,9 @@ impl App {
         self.dirty_frame = true;
     }
 
+    /// The pane whose horizontal scrollbar is under a screen point. As in
+    /// `pane_at`, a pane that the last frame drew and that has gone since
+    /// is not there.
     pub(super) fn horizontal_scrollbar_at(&self, x: u16, y: u16) -> Option<usize> {
         if !self.ui_settings.show_scrollbars {
             return None;
@@ -354,6 +357,7 @@ impl App {
                     && region.horizontal_scrollbar.contains((x, y).into()))
                 .then_some(pane)
             })
+            .filter(|&pane| pane < self.panes.len())
     }
 
     pub(super) fn vertical_scrollbar_at(&self, pane: usize, x: u16, y: u16) -> bool {
@@ -394,8 +398,9 @@ impl App {
             if pane != self.focused {
                 self.focus_pane(pane);
             }
+            let scene = self.panes[pane].scene;
             let grab = self.grab_horizontal_scrollbar(pane, x);
-            self.pointer = Some(Pointer::HorizontalScrollbar { pane, grab });
+            self.pointer = Some(Pointer::HorizontalScrollbar { scene, grab });
             return true;
         }
         false
@@ -414,10 +419,10 @@ impl App {
         else {
             return HorizontalScrollbarGrab::default();
         };
-        let scene = self.panes[pane].scene;
         let Some(extent) = self
-            .scenes
-            .get(scene)
+            .panes
+            .get(pane)
+            .and_then(|pane| self.scenes.get(pane.scene))
             .and_then(|scene| scene.editor.horizontal_scroll_extent())
         else {
             return HorizontalScrollbarGrab::default();
@@ -446,7 +451,8 @@ impl App {
     }
 
     /// A horizontal scrollbar drag keeps the whole gesture, wherever the
-    /// pointer goes. Returns true when the drag took the event.
+    /// pointer goes, and ends when no pane shows its scene. Returns true
+    /// when the drag took the event.
     pub(super) fn handle_horizontal_scrollbar_pointer(
         &mut self,
         mouse: MouseEvent,
@@ -455,13 +461,16 @@ impl App {
     ) -> bool {
         // Capture the entire gesture, including motion above another panel
         // and a release that is the terminal's only final position report.
-        if let Some(Pointer::HorizontalScrollbar { pane, grab }) = self.pointer.clone()
+        if let Some(Pointer::HorizontalScrollbar { scene, grab }) = self.pointer.clone()
             && matches!(
                 mouse.kind,
                 MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
             )
         {
-            self.drag_horizontal_scrollbar(pane, x, grab);
+            match self.panes.iter().position(|pane| pane.scene == scene) {
+                Some(pane) => self.drag_horizontal_scrollbar(pane, x, grab),
+                None => self.pointer = None,
+            }
             if matches!(mouse.kind, MouseEventKind::Up(_)) {
                 self.pointer = None;
             }
@@ -485,7 +494,9 @@ impl App {
         else {
             return;
         };
-        let scene = self.panes[pane].scene;
+        let Some(scene) = self.panes.get(pane).map(|pane| pane.scene) else {
+            return;
+        };
         let Some(extent) = self
             .scenes
             .get(scene)
@@ -854,7 +865,7 @@ mod tests {
                 assert_eq!(app.focused, 0);
                 assert!(evaluation(&app).is_none());
                 assert!(app.prebake_inflight.is_none() && app.prebake_queue.is_empty());
-                assert_eq!(app.next_launch, Launch::Now);
+                assert_eq!(app.next_evaluation.launch, Launch::Now);
             }
         }
     }
@@ -920,7 +931,7 @@ mod tests {
             let states = editor_states(&app);
             app.playing_pane = Some(1);
             app.audible_scene = Some(visible[1]);
-            let launch = app.next_launch;
+            let launch = app.next_evaluation.launch;
 
             for (glyph, expected) in [(']', 1), (']', 0), ('[', 1), ('[', 0)] {
                 press(&mut app, KeyCode::Char(glyph), KeyModifiers::CONTROL);
@@ -934,7 +945,7 @@ mod tests {
             assert_eq!(editor_states(&app), states);
             assert_eq!(app.playing_pane, Some(1));
             assert_eq!(app.audible_scene, Some(visible[1]));
-            assert_eq!(app.next_launch, launch);
+            assert_eq!(app.next_evaluation.launch, launch);
             assert!(app.pending_evaluation.is_none() && app.inflight.is_empty());
         }
 
@@ -949,7 +960,7 @@ mod tests {
                 let states = editor_states(&app);
                 app.playing_pane = Some(1 - focused);
                 app.audible_scene = Some(other);
-                let launch = app.next_launch;
+                let launch = app.next_evaluation.launch;
                 for (code, modifiers, index) in [
                     (
                         KeyCode::Char(']'),
@@ -975,7 +986,7 @@ mod tests {
                 assert_eq!(editor_states(&app), states);
                 assert_eq!(app.playing_pane, Some(1 - focused));
                 assert_eq!(app.audible_scene, Some(other));
-                assert_eq!(app.next_launch, launch);
+                assert_eq!(app.next_evaluation.launch, launch);
                 assert!(app.pending_evaluation.is_none() && app.inflight.is_empty());
             }
         }
@@ -1557,6 +1568,71 @@ mod tests {
                     assert!(app.pointer.is_none());
                 }
             }
+        }
+
+        /// A horizontal scrollbar drag belongs to the score it began on.
+        /// Closing that score mid-drag takes the second pane away before the
+        /// next frame is drawn, and the drag ends with the score.
+        #[test]
+        fn closing_the_score_under_a_horizontal_scrollbar_drag_ends_the_drag() {
+            use crate::app::tests::support::mouse;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.ui_settings.wrap = false;
+            app.ui_settings.minimap = false;
+            app.ui_settings.apply();
+            app.toggle_split();
+            for pane in 0..2 {
+                let scene = app.panes[pane].scene;
+                app.scenes.get_mut(scene).expect("scene").editor =
+                    Editor::new(&"0123456789".repeat(100)).expect("editor");
+            }
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30))
+                .expect("test terminal");
+            terminal
+                .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                .expect("draw");
+            let bar = app.regions.panes[1].horizontal_scrollbar;
+            assert!(!bar.is_empty(), "the right pane shows its bar");
+
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                bar.x + 1,
+                bar.y,
+            );
+            assert!(matches!(
+                app.pointer,
+                Some(Pointer::HorizontalScrollbar { .. })
+            ));
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+            assert_eq!(app.panes.len(), 1, "the split closed with the score");
+
+            // Motion reports queued behind the key arrive before the next frame.
+            mouse(
+                &mut app,
+                MouseEventKind::Drag(MouseButton::Left),
+                bar.x + 4,
+                bar.y,
+            );
+            assert!(app.pointer.is_none(), "the drag ended with its score");
+            mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                bar.x + 4,
+                bar.y,
+            );
+            // Where the old frame drew the bar, a press finds no bar.
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                bar.x + 1,
+                bar.y,
+            );
+            assert!(!matches!(
+                app.pointer,
+                Some(Pointer::HorizontalScrollbar { .. })
+            ));
         }
 
         #[test]

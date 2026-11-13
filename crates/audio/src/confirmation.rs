@@ -333,46 +333,64 @@ mod realtime {
         })
     }
 
+    /// The progress of the window offered under one credit.
+    enum WindowState {
+        /// No offer is installed.
+        Empty,
+        /// The window collects admissions, activations and host copies.
+        Open {
+            offer: WindowOffer,
+            failure: Option<WindowOutcome>,
+            selected_this_block: bool,
+            copied: u32,
+        },
+        /// The terminal waits until the terminal ring accepts it.
+        Emitting(WindowTerminal),
+    }
+
     struct Window {
-        offer: Option<WindowOffer>,
-        failure: Option<WindowOutcome>,
-        terminal: Option<WindowTerminal>,
-        selected_this_block: bool,
+        state: WindowState,
         ordinals: Box<[Ordinal]>,
         /// Exactly the ordinals in Activated state, including future starts.
         activated: [u64; ACTIVATED_WORDS],
-        copied: u32,
     }
 
     impl Window {
         fn new() -> Self {
             Self {
-                offer: None,
-                failure: None,
-                terminal: None,
-                selected_this_block: false,
+                state: WindowState::Empty,
                 ordinals: vec![Ordinal::default(); MAX_CONFIRMATION_ORDINALS].into_boxed_slice(),
                 activated: [0; ACTIVATED_WORDS],
-                copied: 0,
             }
         }
 
         fn install(&mut self, offer: WindowOffer) {
             self.ordinals[..offer.converted as usize].fill(Ordinal::default());
             self.activated.fill(0);
-            self.offer = Some(offer);
-            self.failure = None;
-            self.terminal = None;
-            self.selected_this_block = false;
-            self.copied = 0;
+            self.state = WindowState::Open {
+                offer,
+                failure: None,
+                selected_this_block: false,
+                copied: 0,
+            };
         }
 
+        fn open_offer(&self) -> Option<WindowOffer> {
+            match self.state {
+                WindowState::Open { offer, .. } => Some(offer),
+                WindowState::Empty | WindowState::Emitting(_) => None,
+            }
+        }
+
+        /// Only an open window records a failure. It keeps the first one.
         fn fail(&mut self, outcome: WindowOutcome) {
-            self.failure.get_or_insert(outcome);
+            if let WindowState::Open { failure, .. } = &mut self.state {
+                failure.get_or_insert(outcome);
+            }
         }
 
         fn ordinal(&mut self, ordinal: u32) -> Option<&mut Ordinal> {
-            if ordinal >= self.offer?.converted {
+            if ordinal >= self.open_offer()?.converted {
                 self.fail(WindowOutcome::InvalidOffer);
                 return None;
             }
@@ -418,26 +436,31 @@ mod realtime {
             }
         }
 
-        fn window(&mut self, key: ConfirmationKey) -> Option<&mut Window> {
+        /// The open window of `key`, with its offer.
+        fn window(&mut self, key: ConfirmationKey) -> Option<(WindowOffer, &mut Window)> {
             self.drain_offers();
             if key.epoch != self.epoch || self.channel.epoch() != self.epoch {
                 return None;
             }
-            self.windows.iter_mut().find(|window| {
-                window.terminal.is_none() && window.offer.is_some_and(|offer| offer.key == key)
+            self.windows.iter_mut().find_map(|window| {
+                let offer = window.open_offer().filter(|offer| offer.key == key)?;
+                Some((offer, window))
             })
         }
 
         pub(crate) fn begin_block(&mut self, start: u64, end: u64) {
             for window in &mut self.windows {
-                window.selected_this_block = false;
+                if let WindowState::Open {
+                    selected_this_block,
+                    ..
+                } = &mut window.state
+                {
+                    *selected_this_block = false;
+                }
             }
             if let Some((_, previous_end)) = self.block {
                 for window in &mut self.windows {
-                    if window.terminal.is_some() {
-                        continue;
-                    }
-                    let Some(offer) = window.offer else {
+                    let Some(offer) = window.open_offer() else {
                         continue;
                     };
                     let words = (offer.converted as usize).div_ceil(ACTIVATED_WORD_BITS);
@@ -468,10 +491,9 @@ mod realtime {
             generation: u64,
             accepted: bool,
         ) {
-            let Some(window) = self.window(tag.key) else {
+            let Some((offer, window)) = self.window(tag.key) else {
                 return;
             };
-            let offer = window.offer.expect("matched window");
             if generation != offer.generation {
                 window.fail(WindowOutcome::InvalidOffer);
                 return;
@@ -497,7 +519,7 @@ mod realtime {
         }
 
         pub(crate) fn superseded(&mut self, tag: ConfirmationOnset) {
-            let Some(window) = self.window(tag.key) else {
+            let Some((_, window)) = self.window(tag.key) else {
                 return;
             };
             let Some(ordinal) = window.ordinal(tag.ordinal) else {
@@ -512,7 +534,7 @@ mod realtime {
         }
 
         pub(crate) fn activation(&mut self, tag: ConfirmationOnset, outcome: ActivationOutcome) {
-            let Some(window) = self.window(tag.key) else {
+            let Some((_, window)) = self.window(tag.key) else {
                 return;
             };
             let Some(ordinal) = window.ordinal(tag.ordinal) else {
@@ -544,13 +566,15 @@ mod realtime {
         pub(crate) fn selected(&mut self, generation: u64, takeover_frame: u64) {
             self.drain_offers();
             for window in &mut self.windows {
-                if window.terminal.is_some() {
-                    continue;
-                }
-                let Some(offer) = window.offer else {
+                let WindowState::Open {
+                    offer,
+                    selected_this_block,
+                    ..
+                } = &mut window.state
+                else {
                     continue;
                 };
-                window.selected_this_block = offer.generation == generation;
+                *selected_this_block = offer.generation == generation;
                 if offer.generation >= generation {
                     continue;
                 }
@@ -588,15 +612,18 @@ mod realtime {
             }
             self.drain_offers();
             for (slot, window) in self.windows.iter_mut().enumerate() {
-                let Some(offer) = window.offer else {
-                    continue;
-                };
-                if window.terminal.is_none() {
+                if let WindowState::Open {
+                    offer,
+                    failure,
+                    selected_this_block,
+                    copied,
+                } = &mut window.state
+                {
                     let intersects_window = start.max(offer.start_frame) < end.min(offer.end_frame);
                     if stopped {
-                        window.failure = Some(WindowOutcome::Cancelled);
+                        *failure = Some(WindowOutcome::Cancelled);
                     }
-                    if window.failure.is_none() && intersects_window {
+                    if failure.is_none() && intersects_window {
                         let words = (offer.converted as usize).div_ceil(ACTIVATED_WORD_BITS);
                         for (word, bits) in window.activated[..words].iter_mut().enumerate() {
                             for offset in activated_offsets(*bits) {
@@ -605,19 +632,19 @@ mod realtime {
                                 if ordinal.musical < end {
                                     ordinal.state = OrdinalState::Copied;
                                     *bits &= !(1u64 << offset);
-                                    window.copied += 1;
+                                    *copied += 1;
                                 }
                             }
                         }
                     }
                     let confirmed = if offer.converted != 0 {
-                        intersects_window && window.copied == offer.converted
+                        intersects_window && *copied == offer.converted
                     } else {
-                        window.selected_this_block
+                        *selected_this_block
                             && offer.generation == selected_generation
                             && intersects_window
                     };
-                    let outcome = window.failure.or({
+                    let outcome = failure.or({
                         if confirmed {
                             Some(WindowOutcome::Confirmed)
                         } else if end >= offer.end_frame {
@@ -626,20 +653,22 @@ mod realtime {
                             None
                         }
                     });
-                    window.terminal = outcome.map(|outcome| WindowTerminal {
-                        key: offer.key,
-                        generation: offer.generation,
-                        takeover_frame: offer.takeover_frame,
-                        outcome,
-                        copied_start_frame: start,
-                        copied_end_frame: end,
-                    });
+                    if let Some(outcome) = outcome {
+                        window.state = WindowState::Emitting(WindowTerminal {
+                            key: offer.key,
+                            generation: offer.generation,
+                            takeover_frame: offer.takeover_frame,
+                            outcome,
+                            copied_start_frame: start,
+                            copied_end_frame: end,
+                        });
+                    }
                 }
-                let Some(terminal) = window.terminal else {
+                let WindowState::Emitting(terminal) = window.state else {
                     continue;
                 };
                 let credit = &self.channel.shared.credits[slot];
-                if !credit.matches(offer.key, OFFERED) {
+                if !credit.matches(terminal.key, OFFERED) {
                     continue;
                 }
                 credit.state.store(TERMINAL, Ordering::Release);
@@ -650,8 +679,7 @@ mod realtime {
                     .push(EmittedTerminal { slot, terminal })
                     .is_ok()
                 {
-                    window.offer = None;
-                    window.terminal = None;
+                    window.state = WindowState::Empty;
                 } else {
                     // Four retained credits fit in the fixed return ring.
                     // Keep the outcome retryable if that invariant is broken.
@@ -732,21 +760,32 @@ mod realtime {
                 consumer.selected(7, 0);
                 consumer.copied(0, 128, 7, false);
                 assert!(channel.pop_terminal().is_none());
-                let window = consumer.window(offered.key).unwrap();
-                assert_eq!(window.copied, 1);
+                let (_, window) = consumer.window(offered.key).unwrap();
+                let WindowState::Open { copied, .. } = window.state else {
+                    unreachable!("window() returns open windows");
+                };
+                assert_eq!(copied, 1);
                 assert_eq!(window.activated[0], 1 << 63);
                 assert_eq!(window.activated[1], 1);
                 assert_eq!(window.activated[ACTIVATED_WORDS - 1], 1 << 63);
 
                 consumer.begin_block(128, 256);
-                assert!(consumer.window(offered.key).unwrap().failure.is_none());
+                let (_, window) = consumer.window(offered.key).unwrap();
+                let WindowState::Open { failure, .. } = window.state else {
+                    unreachable!("window() returns open windows");
+                };
+                assert_eq!(failure, None);
                 consumer.selected(7, 0);
                 if miss_middle_copy {
                     // An invalid host interval does not discharge activation.
                     consumer.copied(128, 128, 7, false);
                 } else {
                     consumer.copied(128, 256, 7, false);
-                    assert_eq!(consumer.window(offered.key).unwrap().copied, 3);
+                    let (_, window) = consumer.window(offered.key).unwrap();
+                    let WindowState::Open { copied, .. } = window.state else {
+                        unreachable!("window() returns open windows");
+                    };
+                    assert_eq!(copied, 3);
                 }
                 assert!(channel.pop_terminal().is_none());
                 consumer.begin_block(256, 384);
@@ -769,6 +808,7 @@ mod realtime {
                         consumer
                             .window(replacement.key)
                             .unwrap()
+                            .1
                             .activated
                             .iter()
                             .all(|bits| *bits == 0)
@@ -777,8 +817,11 @@ mod realtime {
                     consumer.copied(384, 512, 7, false);
                 } else {
                     assert!(channel.pop_terminal().is_none());
-                    let window = consumer.window(offered.key).unwrap();
-                    assert_eq!(window.copied, SPARSE.len() as u32);
+                    let (_, window) = consumer.window(offered.key).unwrap();
+                    let WindowState::Open { copied, .. } = window.state else {
+                        unreachable!("window() returns open windows");
+                    };
+                    assert_eq!(copied, SPARSE.len() as u32);
                     assert!(window.activated.iter().all(|bits| *bits == 0));
                     consumer.begin_block(384, 512);
                     for ordinal in 0..offered.converted {

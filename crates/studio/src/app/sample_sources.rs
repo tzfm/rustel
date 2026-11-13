@@ -38,7 +38,8 @@ pub(super) struct ShippedSource {
     pub(super) cached_files: usize,
     /// Bytes those cached files take on disk.
     pub(super) cache_bytes: u64,
-    /// Counts have been measured since startup or the last completed download.
+    /// Counts have been measured since startup or the last completed
+    /// download, and the pack has files or no manifest was on its way.
     pub(super) counts_ready: bool,
     /// Every file url this pack has named across refreshes - so a row can
     /// show more on disk than the current manifest lists.
@@ -857,9 +858,11 @@ impl App {
     pub(super) fn poll_source_rows(&mut self, loading: bool) {
         self.poll_source_measurement();
         self.follow_precache();
-        // The shipped packs' rows: what each holds, while their lists are
-        // still landing, and how far each download is while one runs.
-        if loading || self.shipped_sources.iter().any(|s| s.sounds == 0) {
+        // The shipped packs' rows: what each holds while a manifest is on its
+        // way or its counts are not ready, and how far each download is while
+        // one runs. A walk keeps a row's counts not ready while its list can
+        // still land. A list that settled with no sounds asks for no walk.
+        if loading || self.shipped_sources.iter().any(|s| !s.counts_ready) {
             self.refresh_shipped_sources();
         }
         self.follow_shipped_caches();
@@ -869,10 +872,7 @@ impl App {
         if sources_open
             || loading
             || self.user_sources.len() != self.prefs.sample_sources.len()
-            || self
-                .user_sources
-                .iter()
-                .any(|user| !user.counts_ready || (!user.local && user.sounds == 0))
+            || self.user_sources.iter().any(|user| !user.counts_ready)
         {
             self.refresh_user_sources();
         }
@@ -1850,6 +1850,95 @@ mod tests {
         );
         receive_source_rows(&mut app, |app| app.user_sources[0].counts_ready);
         assert_eq!(app.user_sources[0].files, 2);
+    }
+
+    /// A pack whose list did not come and an import that is off have
+    /// settled with no sounds. The poll counts them once, and while no
+    /// list is on its way it does not walk them again.
+    #[test]
+    fn rows_that_settled_with_no_sounds_are_not_walked_on_every_poll() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_over(directory.path());
+        app.worker
+            .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
+        // The walk that startup asked of the engine's own library ends here.
+        app.source_measure = None;
+        app.source_refresh = SourceRefresh::default();
+        app.settings_sheet = None;
+
+        app.poll_source_rows(false);
+        assert!(
+            app.source_measure.is_some(),
+            "rows not counted yet are walked"
+        );
+        receive_source_rows(&mut app, |app| app.source_measure.is_none());
+        assert!(
+            app.shipped_sources
+                .iter()
+                .any(|shipped| shipped.counts_ready && shipped.sounds == 0),
+            "a pack whose list settled with no sounds"
+        );
+        app.poll_source_rows(false);
+        assert!(
+            app.source_measure.is_none(),
+            "a pack with no sounds is not walked again"
+        );
+
+        app.prefs.sample_sources = vec![crate::prefs::SampleSourcePref {
+            spec: "https://example.test/pack.json".into(),
+            enabled: false,
+        }];
+        app.adopt_global_sources();
+        receive_source_rows(&mut app, |app| app.source_measure.is_none());
+        let user = &app.user_sources[0];
+        assert!(
+            user.counts_ready && !user.local && user.sounds == 0,
+            "a remote import that is off"
+        );
+        app.poll_source_rows(false);
+        assert!(
+            app.source_measure.is_none(),
+            "an import that is off is not walked again"
+        );
+    }
+
+    /// A pack walked while a list was on its way is walked again once none
+    /// is, though the poll after it sees nothing loading.
+    #[test]
+    fn a_pack_counted_while_its_list_could_land_is_walked_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_over(directory.path());
+        let library = Arc::new(rustel_runtime::samples::SampleLibrary::empty());
+        app.worker.set_library(Arc::clone(&library));
+        // The walk that startup asked of the engine's own library ends here.
+        app.source_measure = None;
+        app.source_refresh = SourceRefresh::default();
+        app.settings_sheet = None;
+        app.prefs.sample_sources = vec![crate::prefs::SampleSourcePref {
+            spec: directory.path().display().to_string(),
+            enabled: true,
+        }];
+        let hold = library.hold_manifest_worker_for_test();
+        app.adopt_global_sources();
+        assert!(library.manifests_pending() > 0, "a list is on its way");
+        receive_source_rows(&mut app, |app| app.source_measure.is_none());
+        assert!(
+            app.shipped_sources
+                .iter()
+                .any(|shipped| !shipped.counts_ready),
+            "a pack with no files waits for the list"
+        );
+
+        drop(hold);
+        library.wait_until_idle(Duration::from_secs(5));
+        app.poll_source_rows(false);
+        assert!(app.source_measure.is_some(), "it is walked again");
+        receive_source_rows(&mut app, |app| app.source_measure.is_none());
+        assert!(
+            app.shipped_sources
+                .iter()
+                .all(|shipped| shipped.counts_ready)
+        );
     }
 
     #[test]

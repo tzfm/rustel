@@ -69,6 +69,30 @@ struct RestDocument {
     order: u64,
 }
 
+/// The score the output plays, as a rollback needs it: see
+/// [`LaneTable::mark_audible`].
+enum Audible {
+    /// The output plays the score in play. A rollback then puts this score
+    /// back, so no lanes of an earlier score stay.
+    // Only a live output marks its score: see `LaneTable::mark_audible`.
+    #[cfg_attr(not(any(feature = "device-audio", test)), allow(dead_code))]
+    InPlay,
+    /// The output plays an earlier score of `document` until it plays the
+    /// score in play. A rollback puts that score back, and each of its
+    /// `lanes` keeps its number by rule 1 of [`pair`].
+    Earlier { document: u64, lanes: Vec<Lane> },
+}
+
+impl Default for Audible {
+    /// Before the output plays a score, a rollback has no lanes.
+    fn default() -> Self {
+        Self::Earlier {
+            document: 0,
+            lanes: Vec::new(),
+        }
+    }
+}
+
 /// The count of the rest orders. One count serves each lane table of the
 /// process, so the host compares the documents at rest of 2 sessions.
 static REST_ORDERS: AtomicU64 = AtomicU64::new(0);
@@ -114,10 +138,8 @@ pub(crate) struct LaneTable {
     /// and this read stays.
     #[cfg(any(feature = "device-audio", test))]
     held: Option<(u64, String, ScoreLanes)>,
-    /// The lanes of the score the output plays, with its document, until
-    /// the output plays the score in play. A rollback puts that score back.
-    /// Each of its lanes then keeps its number.
-    audible: (u64, Vec<Lane>),
+    /// The score the output plays: see [`Audible`].
+    audible: Audible,
     /// The lanes that left the score in play, while a chain has their
     /// number: see [`Self::forget_away`].
     away: Vec<Lane>,
@@ -125,8 +147,6 @@ pub(crate) struct LaneTable {
     rest: HashMap<u64, RestDocument>,
     /// The closed documents: see [`Self::forget`].
     closed: HashSet<u64>,
-    /// True when the output plays the score in play.
-    heard: bool,
     /// The number of the next new lane. No number comes a second time.
     next: u64,
 }
@@ -176,11 +196,10 @@ impl LaneTable {
         } else {
             (tried, none)
         };
-        let (audible_in, audible) = &self.audible;
-        let (own, other) = if *audible_in == reading {
-            (&audible[..], none)
-        } else {
-            (none, &audible[..])
+        let (own, other) = match &self.audible {
+            Audible::Earlier { document, lanes } if *document == reading => (&lanes[..], none),
+            Audible::Earlier { lanes, .. } => (none, &lanes[..]),
+            Audible::InPlay => (none, none),
         };
         let mut paired = vec![None; statements.len()];
         pair(&statements, &mut paired, playing, tried, away, own);
@@ -296,7 +315,7 @@ impl LaneTable {
         let mut before = std::mem::replace(&mut self.playing, read).lanes;
         let left = std::mem::replace(&mut self.document, document);
         // The output plays the score before until it plays this one.
-        let heard = std::mem::take(&mut self.heard);
+        let heard = matches!(self.audible, Audible::InPlay);
         if left != document {
             // The document before goes to rest. The score before is the
             // score of the document of the read at rest.
@@ -306,7 +325,10 @@ impl LaneTable {
             let played = std::mem::replace(&mut before, lanes);
             let away = std::mem::replace(&mut self.away, away);
             if heard {
-                self.audible = (left, played.clone());
+                self.audible = Audible::Earlier {
+                    document: left,
+                    lanes: played.clone(),
+                };
             }
             if !self.is_closed(left) {
                 let order = REST_ORDERS.fetch_add(1, Ordering::Relaxed);
@@ -324,7 +346,10 @@ impl LaneTable {
         let gone = before.iter().filter(|lane| !kept.contains(&lane.number));
         self.away.extend(gone.cloned());
         if heard && left == document {
-            self.audible = (left, before);
+            self.audible = Audible::Earlier {
+                document: left,
+                lanes: before,
+            };
         }
     }
 
@@ -354,8 +379,7 @@ impl LaneTable {
     /// back, so the lanes of the score before go.
     #[cfg(any(feature = "device-audio", test))]
     pub(crate) fn mark_audible(&mut self) {
-        self.heard = true;
-        self.audible.1.clear();
+        self.audible = Audible::InPlay;
     }
 
     /// The label rewrite of the last read wrote places, and not the lane

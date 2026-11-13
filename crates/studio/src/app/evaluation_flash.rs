@@ -431,7 +431,9 @@ mod tests {
                 let mut app = app_over(directory.path());
                 app.ui_settings.evaluation_flash = EvaluationFlashMode::OnSuccess;
                 if armed {
-                    app.armed_revision = Some(source_revision(SCORE));
+                    let scene = app.scenes.current().id;
+                    app.launch_arming
+                        .arm(scene, 1, source_revision(SCORE), None);
                 } else {
                     app.snapshot = Some(sounding(true, false));
                     app.audible_scene = Some(app.scenes.current().id);
@@ -888,11 +890,14 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let mut app = app_over(directory.path());
             app.snapshot = Some(sounding(true, false));
-            app.next_launch = Launch::Quantised { unit_cycles: 4.0 };
+            app.next_evaluation.launch = Launch::Quantised { unit_cycles: 4.0 };
 
             let request_id = evaluate(&mut app, SCORE);
 
-            assert_eq!(app.armed_request, Some(request_id));
+            assert!(matches!(
+                app.launch_arming,
+                LaunchArming::Armed { request, .. } if request == request_id
+            ));
             let started =
                 flash_started(&app).expect("the evaluation gesture is acknowledged immediately");
             assert!(!app.advance_evaluation_flash(started + Duration::from_millis(200)));

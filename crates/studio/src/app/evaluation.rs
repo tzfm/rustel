@@ -141,6 +141,25 @@ pub(super) struct PendingEvaluation {
     pub(super) record: bool,
 }
 
+/// The launch options of the next queued evaluation. A gesture sets them
+/// for the evaluation it dispatches, and that evaluation takes them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct LaunchRequest {
+    pub(super) launch: Launch,
+    /// The score starts from its own cycle zero.
+    pub(super) rewind: bool,
+}
+
+impl Default for LaunchRequest {
+    /// An ordinary update: now, and into the cycle already running.
+    fn default() -> Self {
+        Self {
+            launch: Launch::Now,
+            rewind: false,
+        }
+    }
+}
+
 /// A block's identity survives switching editors, including between tapes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ReplayBlock {
@@ -263,14 +282,21 @@ impl App {
         true
     }
 
+    /// Evaluate the focused tab with the launch options of a gesture. The
+    /// options last for this dispatch only: a dispatch that queues no
+    /// evaluation leaves none of them for a later one.
+    pub(super) fn evaluate_with(&mut self, request: LaunchRequest) -> Result<(), RuntimeError> {
+        self.next_evaluation = request;
+        let dispatched = self.dispatch_editor(Command::Evaluate);
+        self.next_evaluation = LaunchRequest::default();
+        dispatched
+    }
+
     pub(super) fn queue_evaluation(&mut self, revision: Revision, source: Arc<str>) {
-        // Playing the score is the end of a preview under it: what goes out
-        // now is the score alone, so the snippet is no longer sounding and
-        // nothing is owed a restore.
+        // The score alone replaces the preview's composite, so nothing is
+        // owed a restore.
         #[cfg(feature = "hydra")]
-        {
-            self.snippet_preview = None;
-        }
+        self.end_snippet_audition();
         let scene = self.scenes.current().id;
         self.queue_evaluation_for(scene, revision, source, true);
     }
@@ -325,7 +351,7 @@ impl App {
         });
         let on_its_way = match latest {
             Some(pending) => pending.scene == scene.id,
-            None => self.armed_scene == Some(scene.id),
+            None => self.launch_arming.armed_scene() == Some(scene.id),
         };
         if !external
             && !on_its_way
@@ -362,10 +388,10 @@ impl App {
         // decision this one must supersede, not land over.
         if !external
             && !self.options.mini
-            && self.armed_revision.is_none()
+            && !self.launch_arming.is_armed()
             && self.pending_evaluation.is_none()
             && self.inflight.is_empty()
-            && matches!(self.next_launch, Launch::Now)
+            && matches!(self.next_evaluation.launch, Launch::Now)
             && self.is_playing()
             && !self.is_stopping()
             && self.audible_scene == Some(id)
@@ -385,17 +411,13 @@ impl App {
         // Already armed for its line: pressing again would only cancel and
         // re-arm it on the same line, and applying again is the same
         // non-press twice over.
-        if self.armed_revision.as_deref() == Some(source_revision(&source).as_str()) {
+        if self.launch_arming.armed_with(id, &source_revision(&source)) {
             return;
         }
         // Audio dropped into the open set plays from this update, so the
         // set is read again before the score's sound names are judged.
         self.refresh_set_samples();
         if self.refuse_unclean(revision, &source) {
-            // A refused launch is not a launch: nothing inherits a line or
-            // a rewind from an update that never happened.
-            self.next_launch = Launch::Now;
-            self.next_rewind = false;
             return;
         }
         self.log.push(
@@ -479,6 +501,9 @@ impl App {
         self.playing_pane = Some(self.focused);
         // The file is what you hear, whoever asked for the update.
         self.write_scene(scene, Arc::clone(&source));
+        // The re-run replaces the preview's composite.
+        #[cfg(feature = "hydra")]
+        self.end_snippet_audition();
         self.queue_evaluation_for(scene, revision, source, true);
     }
 
@@ -486,6 +511,9 @@ impl App {
     /// one, and say whether it belongs on the tape. Both matter for the
     /// re-install a prebake triggers: it lands on whatever is SOUNDING,
     /// which may not be on screen, and nobody typed it.
+    ///
+    /// A snippet preview stays. A caller that installs a new text ends the
+    /// audition first.
     pub(super) fn queue_evaluation_for(
         &mut self,
         scene: SceneId,
@@ -493,6 +521,9 @@ impl App {
         source: Arc<str>,
         record: bool,
     ) {
+        // Taken whatever happens next, so none of a gesture's options
+        // reaches a later evaluation.
+        let request = std::mem::take(&mut self.next_evaluation);
         // A tape plays on its own clock. The launch setting is about the
         // set - a line to land a change on - and a re-enactment has no use
         // for it: a block waiting on a cycle line leaves the set's music
@@ -500,9 +531,10 @@ impl App {
         // cancels the wait before it lands. So a replay takes the transport
         // at once, whatever the setting says.
         let replaying = self.replays.contains_key(&scene);
+        let mut launch = request.launch;
         if replaying {
-            self.forget_arming();
-            self.next_launch = Launch::Now;
+            self.launch_arming.disarm();
+            launch = Launch::Now;
         }
         // The launch setting is the default for every way of playing, not a
         // modifier-key privilege: an ordinary Ctrl+S while the set plays
@@ -518,12 +550,12 @@ impl App {
         let auditioning = false;
         if !replaying
             && !auditioning
-            && matches!(self.next_launch, Launch::Now)
+            && matches!(launch, Launch::Now)
             && self.is_playing()
             && !self.is_stopping()
             && let Some(unit_cycles) = self.ui_settings.quantise.unit_cycles()
         {
-            self.next_launch = Launch::Quantised { unit_cycles };
+            launch = Launch::Quantised { unit_cycles };
         }
         // Something is being installed, so the set is not on its way out
         // any more, whatever the last snapshot still says.
@@ -572,13 +604,7 @@ impl App {
         // the install is the only way a snippet reliably starts at its
         // start. The scene's ⟲ stays a property of the set: a preview
         // under a score joins the set's cycle and must not yank its clock.
-        let rewind = !replaying
-            && if auditioning {
-                std::mem::take(&mut self.next_rewind)
-            } else {
-                std::mem::take(&mut self.next_rewind) || flagged
-            };
-        let launch = std::mem::replace(&mut self.next_launch, Launch::Now);
+        let rewind = !replaying && (request.rewind || (!auditioning && flagged));
         // Armed only when there is a line to wait for: stopped, the engine
         // plays a quantised request at once, and an arming here would be a
         // countdown to nothing.
@@ -586,10 +612,9 @@ impl App {
             && self.is_playing()
             && !self.is_stopping()
         {
-            self.armed_scene = Some(scene);
-            self.armed_request = Some(request_id);
-            self.armed_revision = Some(revision_hash.clone());
-            self.landing_name = self.scenes.get(scene).map(|scene| scene.name().to_owned());
+            let name = self.scenes.get(scene).map(|scene| scene.name().to_owned());
+            self.launch_arming
+                .arm(scene, request_id, revision_hash.clone(), name);
             self.log.push(
                 LogLevel::Info,
                 "launch",
@@ -597,6 +622,9 @@ impl App {
             );
         }
         if let Some(pending) = &self.pending_evaluation {
+            // The request it replaces is never sent, so no outcome ends an
+            // arming that request carries.
+            self.launch_arming.dropped_unsent(pending.request_id);
             self.finish_evaluation_request(pending.request_id, None);
         }
         self.pending_evaluation = Some(PendingEvaluation {
@@ -1024,17 +1052,19 @@ impl App {
             }
             StudioControlEvent::EngineFailure(failure) => {
                 if failure.playback_stopped {
-                    self.audio_advisory.reset();
-                    self.power_advisory.reset();
-                    self.worker.discard_visual_updates();
-                    self.visual.stop();
+                    // A Stop still draining ends here too. The status says
+                    // so now, because no later snapshot finds a stop to
+                    // settle.
+                    if self.stop_requested {
+                        self.status = "score stopped".into();
+                    }
+                    self.end_playback();
                     self.snapshot = None;
                 }
                 self.set_error(ErrorOwner::Engine, Self::failure_line(&failure));
             }
             StudioControlEvent::LinkRefused => {
-                self.link_enabled = false;
-                self.link_seen_playing = None;
+                self.link = LinkFollow::Off;
                 self.status = "link session not joined".into();
                 self.dirty_frame = true;
             }
@@ -1051,9 +1081,7 @@ impl App {
         // launch makes the worker answer the OLD request with a cancel
         // after the new one is already armed here; that answer is about
         // the old one.
-        if self.armed_request == Some(outcome.request_id) {
-            self.forget_arming();
-        }
+        self.launch_arming.answered(outcome.request_id);
         match outcome.result {
             Ok(install) if install.answered_repeat => {
                 // A repeat launch press answered with the launch already
@@ -1201,15 +1229,12 @@ impl App {
         let input_channels_before = self.lint_input_channels();
         if self.engine_connected {
             self.engine_connected = false;
+            self.end_playback();
             self.pending_evaluation = None;
-            self.pending_slider = None;
             self.inflight.clear();
             self.prebake_queue.clear();
             self.prebake_inflight = None;
             self.snapshot = None;
-            self.audio_advisory.reset();
-            self.power_advisory.reset();
-            self.visual.stop();
             self.set_error(
                 ErrorOwner::Engine,
                 "studio engine worker disconnected".into(),
@@ -1784,7 +1809,8 @@ mod tests {
             let directory = tempfile::tempdir().expect("temp dir");
             let (mut app, scene) = playing_app(directory.path(), true);
             playing_this(&mut app, scene, "$: s(\"bd\")\n");
-            app.armed_revision = Some(source_revision("$: s(\"cp\")\n"));
+            app.launch_arming
+                .arm(scene, 1, source_revision("$: s(\"cp\")\n"), None);
 
             app.scenes.current_mut().editor =
                 Editor::new("$: s(\"bd\")\n$:").expect("type the label");
@@ -2170,6 +2196,261 @@ mod tests {
                 unseen_before + 1,
                 "an unrelated warning keeps its header alert"
             );
+        }
+
+        /// A failure that stops the set ends the snippet previewed under
+        /// it. Closing the column afterwards puts no score back on the
+        /// stopped engine.
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn a_failure_that_stops_the_set_ends_the_preview_under_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let scene = app.scenes.current().id;
+            let score = Arc::<str>::from("$: s(\"bd\")");
+            app.snapshot = Some(sounding(true, false));
+            app.installed_revision = Some(source_revision(&score));
+            app.audible_scene = Some(scene);
+            app.visual_revision = Some(app.editor().revision());
+            app.evaluated_source = Some(Arc::clone(&score));
+            app.preview_snippet_score("$: s(\"hh*8\")");
+            app.pending_evaluation = None;
+            app.inflight.clear();
+
+            app.handle_control(StudioControlEvent::EngineFailure(crate::EngineFailure {
+                kind: "audio".into(),
+                message: "audio stopped while switching to Speakers".into(),
+                recoverable: true,
+                playback_stopped: true,
+            }));
+            assert!(
+                app.snippet_preview.is_none(),
+                "the failure ended the preview"
+            );
+            let next = app.next_request_id;
+            app.stop_preview();
+            assert_eq!(
+                app.next_request_id, next,
+                "closing the column started the set again: {}",
+                app.status
+            );
+            assert!(app.pending_evaluation.is_none() && app.inflight.is_empty());
+        }
+
+        /// A worker lost between a Stop and the snapshot that confirms it
+        /// leaves the header on STOPPED, not on STOPPING for the rest of
+        /// the run.
+        #[test]
+        fn a_worker_lost_during_a_stop_leaves_the_transport_stopped() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.snapshot = Some(sounding(true, false));
+            app.handle_editor_effect(EditorEffect::Stop).expect("stop");
+            app.mark_engine_disconnected();
+
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30))
+                .expect("terminal");
+            terminal
+                .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let rows = (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                rows.iter().any(|row| row.contains("STOPPED")),
+                "the header says the transport stopped: {rows:#?}"
+            );
+            assert!(
+                rows.iter().all(|row| !row.contains("STOPPING")),
+                "the header waits for a stop no worker will confirm: {rows:#?}"
+            );
+        }
+
+        /// A failure that stops the set while a Stop lets the tail ring
+        /// ends that stop. The status line says the score stopped, not that
+        /// its tail still rings.
+        #[test]
+        fn a_failure_during_a_stop_says_the_score_stopped() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.snapshot = Some(sounding(true, false));
+            app.handle_editor_effect(EditorEffect::Stop).expect("stop");
+            assert!(app.status.starts_with("stopping"), "{}", app.status);
+
+            app.handle_control(StudioControlEvent::EngineFailure(crate::EngineFailure {
+                kind: "audio".into(),
+                message: "audio stopped while switching to Speakers".into(),
+                recoverable: true,
+                playback_stopped: true,
+            }));
+            app.handle_control(StudioControlEvent::Snapshot(Box::new(sounding(
+                false, false,
+            ))));
+            assert_eq!(app.status, "score stopped");
+        }
+
+        /// A launch still queued for its line when a failure stops the set
+        /// plays at once on the stopped engine. Its outcome stays its own:
+        /// the install retires the refusal it replaces.
+        #[test]
+        fn a_launch_queued_when_a_failure_stops_the_set_keeps_its_outcome() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.snapshot = Some(sounding(true, false));
+            refuse_alert_update(&mut app, 1);
+            type_text(&mut app, " ");
+            let scene = app.scenes.current();
+            let (id, revision) = (scene.id, scene.editor.revision());
+            let source = Arc::<str>::from(scene.editor.source());
+            app.inflight.insert(
+                2,
+                PendingEvaluation {
+                    request_id: 2,
+                    scene: id,
+                    editor_revision: revision,
+                    source,
+                    launch: Launch::Quantised { unit_cycles: 1.0 },
+                    rewind: false,
+                    record: false,
+                },
+            );
+
+            app.handle_control(StudioControlEvent::EngineFailure(crate::EngineFailure {
+                kind: "audio".into(),
+                message: "audio stopped while switching to Speakers".into(),
+                recoverable: true,
+                playback_stopped: true,
+            }));
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: 2,
+                editor_revision: revision.0,
+                result: Ok(alert_install(false)),
+            });
+            assert_eq!(app.update_failure, None, "the install kept the refusal");
+            assert_eq!(app.errors.get(ErrorOwner::Evaluation), None);
+        }
+
+        /// A refused update that a permit runs again replaces the score
+        /// under a preview, and so it ends the preview. Closing the column
+        /// afterwards puts nothing back over the permitted update.
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn a_permitted_re_run_ends_the_preview_under_the_score() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let scene = app.scenes.current().id;
+            let score = Arc::<str>::from("$: s(\"bd\")\n");
+            app.snapshot = Some(sounding(true, false));
+            app.installed_revision = Some(source_revision(&score));
+            app.audible_scene = Some(scene);
+            app.visual_revision = Some(app.editor().revision());
+            app.evaluated_source = Some(Arc::clone(&score));
+            // The edit the engine refused is still in the buffer.
+            let edit = "$: s(\"bd*2\")\n";
+            app.scenes.current_mut().editor = Editor::new(edit).expect("editor");
+            app.update_failure = Some((scene, app.editor().revision()));
+            app.preview_snippet_score("$: s(\"hh*8\")");
+            app.pending_evaluation = None;
+            app.inflight.clear();
+
+            app.retry_refused_update();
+            assert!(
+                app.pending_evaluation
+                    .iter()
+                    .chain(app.inflight.values())
+                    .any(|sent| &*sent.source == edit),
+                "the permitted update ran again"
+            );
+            let next = app.next_request_id;
+            app.stop_preview();
+            assert_eq!(
+                app.next_request_id, next,
+                "closing the column put the old score back: {}",
+                app.status
+            );
+        }
+
+        /// A setup that applies while a newer preview waits behind it
+        /// installs the sounding text again and keeps that preview.
+        /// Closing the column afterwards puts the score back.
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn a_setup_re_install_keeps_the_preview_waiting_behind_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let scene = app.scenes.current().id;
+            let score = Arc::<str>::from("$: s(\"bd\")\n");
+            app.snapshot = Some(sounding(true, false));
+            app.installed_revision = Some(source_revision(&score));
+            app.audible_scene = Some(scene);
+            app.visual_revision = Some(app.editor().revision());
+            app.evaluated_source = Some(Arc::clone(&score));
+            // The first example sounds under the score.
+            app.preview_snippet_score("$: s(\"hh*8\")");
+            let first = Arc::clone(&app.snippet_preview.as_ref().expect("a preview").source);
+            app.installed_revision = Some(source_revision(&first));
+            app.evaluated_source = Some(first);
+            app.pending_evaluation = None;
+            app.inflight.clear();
+            // A setup goes out, and the second example follows it.
+            app.prebake_inflight = Some(PrebakeRequest {
+                request_id: 4_242,
+                scope: PrebakeScope::Global,
+                source: Arc::from("globalThis.g = 1"),
+                reinstall_after: true,
+            });
+            app.preview_snippet_score("$: s(\"cp*4\")");
+
+            app.handle_prebake(PrebakeOutcome {
+                request_id: 4_242,
+                scope: PrebakeScope::Global,
+                result: Ok(()),
+            });
+            app.pending_evaluation = None;
+            app.inflight.clear();
+            app.stop_preview();
+            assert!(
+                app.pending_evaluation
+                    .iter()
+                    .chain(app.inflight.values())
+                    .any(|sent| sent.source == score),
+                "closing the column did not put the score back: {}",
+                app.status
+            );
+        }
+
+        /// ^⇧S on a setup tab runs the setup and nothing else. The next
+        /// ordinary update of the playing score joins the running cycle.
+        /// It does not take a rewind that nobody asked it for.
+        #[test]
+        fn a_rewind_on_a_setup_tab_does_not_rewind_the_next_update() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let score = app.scenes.current().id;
+            app.snapshot = Some(sounding(true, false));
+            app.audible_scene = Some(score);
+            app.open_prebake(PrebakeScope::Local);
+            press(
+                &mut app,
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+
+            let index = app.scenes.index_of(score).expect("the score");
+            app.select_scene(index);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            let newest = app
+                .pending_evaluation
+                .as_ref()
+                .or_else(|| app.inflight.values().max_by_key(|sent| sent.request_id))
+                .expect("the update went out");
+            assert_eq!(newest.scene, score);
+            assert!(!newest.rewind, "the update joins the running cycle");
         }
 
         #[test]

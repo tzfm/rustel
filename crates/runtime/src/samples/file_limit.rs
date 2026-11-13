@@ -30,7 +30,9 @@ pub fn video_file_ceiling() -> usize {
 pub fn set_video_file_ceiling(bytes: usize) -> usize {
     let wanted = bytes.clamp(rustel_audio::MIN_SAMPLE_PCM_BYTES, MAX_VIDEO_FILE_BYTES);
     if VIDEO_FILE_CEILING.swap(wanted, Ordering::Relaxed) != wanted {
-        VIDEO_CEILING_MOVES.fetch_add(1, Ordering::Relaxed);
+        // Released after the swap: a reader that sees this move reads the
+        // new ceiling after it.
+        VIDEO_CEILING_MOVES.fetch_add(1, Ordering::Release);
     }
     wanted
 }
@@ -38,7 +40,14 @@ pub fn set_video_file_ceiling(bytes: usize) -> usize {
 /// How many times the video file ceiling has moved.
 #[cfg(feature = "video")]
 pub(crate) fn video_ceiling_moves() -> u64 {
-    VIDEO_CEILING_MOVES.load(Ordering::Relaxed)
+    VIDEO_CEILING_MOVES.load(Ordering::Acquire)
+}
+
+/// Count one move of the video file ceiling and leave the ceiling where
+/// it is, for a test that must not change the limit other tests read.
+#[cfg(all(test, feature = "video"))]
+pub(super) fn count_video_ceiling_move_for_test() {
+    VIDEO_CEILING_MOVES.fetch_add(1, Ordering::Release);
 }
 
 /// The most one file may hold, and how a refusal says so.

@@ -188,7 +188,7 @@ impl App {
                 }
                 self.strip_mode = SceneStripMode::Idle;
                 self.invalidate_maps();
-                self.pointer = None;
+                self.end_pointer_gesture();
                 self.rebuild_slider_spans();
                 self.lint_pending = true;
                 self.status = format!(
@@ -488,7 +488,7 @@ impl App {
         // A launch already waiting carries its own text and evaluates it on
         // its line, so it takes the new setup by itself - and installing
         // now would cancel the launch the artist is waiting for.
-        if self.armed_request.is_some() {
+        if self.launch_arming.is_armed() {
             self.status = "setup applied - the armed launch takes it on its line".into();
             return;
         }
@@ -509,7 +509,8 @@ impl App {
         );
         // Not on the tape: nobody changed a score, and a replay that
         // installed one here would be replaying a gesture that never
-        // happened.
+        // happened. A snippet preview stays, and so does the score that
+        // closing the column puts back.
         self.queue_evaluation_for(scene, revision, source, false);
     }
 }
@@ -706,8 +707,8 @@ mod tests {
             assert!(!app.scenes.current().dirty, "the tab stayed dirty");
             assert!(app.inflight.is_empty(), "a setup went out as an evaluation");
             assert!(app.pending_evaluation.is_none());
-            assert!(app.armed_scene.is_none());
-            assert_eq!(app.next_launch, Launch::Now);
+            assert!(app.launch_arming.armed_scene().is_none());
+            assert_eq!(app.next_evaluation.launch, Launch::Now);
 
             settle(&mut app);
             assert_eq!(

@@ -948,9 +948,9 @@ mod tests {
             let viewport = app.editor().viewport();
             app.audible_scene = Some(scene);
             app.playing_pane = Some(0);
-            app.next_launch = Launch::Quantised { unit_cycles: 4.0 };
+            app.next_evaluation.launch = Launch::Quantised { unit_cycles: 4.0 };
             app.pending_recording = Some(73);
-            let launch = app.next_launch;
+            let launch = app.next_evaluation.launch;
             app.new_session_at(123);
             let script = SessionScript::load(&app.recording_path().unwrap()).unwrap();
             assert_eq!(script.saves.len(), 1);
@@ -962,7 +962,7 @@ mod tests {
             assert_eq!(app.installed_revision, Some(hash));
             assert_eq!(app.audible_scene, Some(scene));
             assert_eq!(app.playing_pane, Some(0));
-            assert_eq!(app.next_launch, launch);
+            assert_eq!(app.next_evaluation.launch, launch);
             assert_eq!(app.pending_recording, Some(73));
             assert!(app.pending_evaluation.is_none() && app.inflight.is_empty());
         }

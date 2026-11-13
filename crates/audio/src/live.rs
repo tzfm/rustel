@@ -101,6 +101,36 @@ pub struct LiveBlockReport {
     pub late: usize,
 }
 
+/// The callback's latch of a launch's pre-armed line cut. A flip and a
+/// withdrawal of the arm set it back to [`LineCut::Idle`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineCut {
+    /// No line cut fired since the last flip or withdrawal. An armed word
+    /// can fire.
+    Idle,
+    /// The cut fired, and no arm fires again. With the drop bit in the arm,
+    /// `drop_from` is the line: ring events of the outgoing generation (or
+    /// older) with a musical onset at or after it are refused. This covers
+    /// the late-flip window, where a slow evaluation otherwise lets the old
+    /// score's first beat sound.
+    Fired { drop_from: Option<u64> },
+}
+
+/// The phase of a stop. A stop fades whatever sounds to zero over a ramp of
+/// 10 ms, then stays silent until the first block without the stop flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopRamp {
+    /// No stop. The intake is open.
+    Running,
+    /// The ramp rendered `rendered` frames, fewer than its length. Hosts
+    /// deliver blocks of any size, so the ramp carries across blocks. It
+    /// runs to its end also when the flag clears. The intake is closed.
+    Fading { rendered: usize },
+    /// The ramp ended and the voices are reset. The intake is closed, and a
+    /// stopped block makes no sound.
+    Silent,
+}
+
 /// Callback-owned state. All dynamic storage is allocated by `new`, before the
 /// object reaches a real-time thread.
 pub struct LiveScalarBackend {
@@ -108,9 +138,8 @@ pub struct LiveScalarBackend {
     held: Option<QueuedAudioEvent<crate::CompactKabelControls>>,
     generation: u64,
     sample_rate: u32,
-    /// Frames of the stop ramp already rendered; `None` while not stopped.
-    /// A counter is required because hosts may deliver any block size.
-    stop_fade_pos: Option<usize>,
+    /// The phase of a stop, or `Running` while there is none.
+    stop: StopRamp,
     /// The last onset whose sidechain was armed at ring intake, so re-held
     /// events don't re-arm every block.
     armed_duck: Option<u64>,
@@ -132,18 +161,9 @@ pub struct LiveScalarBackend {
     /// window a restart replaces. Latched at the flip alongside the cut
     /// and cleared with it (a later flip without a cut supersedes).
     takeover_cut_frame: Option<u64>,
-    /// The pre-armed line cut's drop horizon, latched when the arm fires
-    /// (the block that reaches the line). Ring events of the outgoing
-    /// generation (or older) with a target at or after this frame are
-    /// refused until the flip. This covers the late-flip window, where a
-    /// slow evaluation would otherwise let the old score's first beat
-    /// sound. Cleared at the flip, whose own horizons take over, or when
-    /// the arm is withdrawn without one.
-    line_arm_drop_from: Option<u64>,
-    /// The pre-armed line cut fired (the block that reached its frame);
-    /// later blocks must not re-fire it. Reset at every flip so a second
-    /// launch's arm can fire fresh.
-    line_arm_fired: bool,
+    /// The pre-armed line cut, from the block that fires it until the flip,
+    /// whose own horizons take over, or the withdrawal of its arm.
+    line_cut: LineCut,
     /// The insert refusals of the scalar backend the asset channel has: see
     /// [`Self::drain_insert_installs`].
     published_refusals: u64,
@@ -637,26 +657,29 @@ impl LiveScalarBackend {
     #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
     pub(crate) fn drain_sample_installs(&mut self, channel: &crate::assets::SampleChannel) {
         for install in channel.installs.drain_available() {
-            // A null pointer is an uninstall: the producer asked this slot
-            // to be emptied so unused preview PCM can be reclaimed. The
-            // displaced box, if any, still returns through the same ring.
-            if install.sample.is_null() {
-                if let Some(displaced) = self.scalar.clear_sample(install.id)
-                    && channel
-                        .returns
-                        .push(crate::assets::ReturnedSample(Box::into_raw(displaced)))
-                        .is_err()
-                {
-                    channel
-                        .leaked
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (id, sample) = match install {
+                crate::assets::SampleInstall::Install { id, sample } => (id, sample),
+                // The producer asked this slot to be emptied so unused
+                // preview PCM can be reclaimed. The displaced box, if any,
+                // still returns through the same ring.
+                crate::assets::SampleInstall::Clear { id } => {
+                    if let Some(displaced) = self.scalar.clear_sample(id)
+                        && channel
+                            .returns
+                            .push(crate::assets::ReturnedSample(Box::into_raw(displaced)))
+                            .is_err()
+                    {
+                        channel
+                            .leaked
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    continue;
                 }
-                continue;
-            }
+            };
             // SAFETY: the producer boxed this pointer and handed it over via
             // the SPSC ring; this side is its unique owner until installed.
-            let sample = unsafe { Box::from_raw(install.sample) };
-            match self.scalar.install_sample(install.id, sample) {
+            let sample = unsafe { Box::from_raw(sample.as_ptr()) };
+            match self.scalar.install_sample(id, sample) {
                 Ok(Some(displaced)) => {
                     if channel
                         .returns
@@ -710,12 +733,11 @@ impl LiveScalarBackend {
             held: None,
             generation: 0,
             sample_rate,
-            stop_fade_pos: None,
+            stop: StopRamp::Running,
             armed_duck: None,
             takeover_cut_frame: None,
             restart_floor: None,
-            line_arm_drop_from: None,
-            line_arm_fired: false,
+            line_cut: LineCut::Idle,
             published_refusals: 0,
             #[cfg(feature = "device-audio")]
             confirmation_stopped: false,
@@ -756,13 +778,12 @@ impl LiveScalarBackend {
     /// A host waits for this before closing its stream. A stream closed
     /// earlier cuts the ramp and leaves a step in the output.
     pub fn stop_ramp_complete(&self) -> bool {
-        self.stop_fade_pos
-            .is_some_and(|rendered| rendered >= self.stop_ramp_frames())
+        self.stop == StopRamp::Silent
     }
 
     #[cfg(feature = "device-audio")]
     pub(crate) fn intake_is_running(&self) -> bool {
-        self.stop_fade_pos.is_none()
+        self.stop == StopRamp::Running
     }
 
     /// Ends a sub-block of a buffer of the callback, `frames` into the
@@ -770,7 +791,7 @@ impl LiveScalarBackend {
     /// the plugin workers stays as it was through a stop.
     #[cfg(feature = "device-audio")]
     pub(crate) fn end_pool_sub_block(&self, frames: usize, busy: impl FnOnce() -> u64) {
-        if self.stop_fade_pos.is_none() {
+        if self.stop == StopRamp::Running {
             self.scalar.end_pool_sub_block(frames, busy);
         }
     }
@@ -784,7 +805,7 @@ impl LiveScalarBackend {
         frames: usize,
         busy_nanos: u64,
     ) -> Option<crate::pool::PoolFigures> {
-        let stopped = self.stop_fade_pos.is_some();
+        let stopped = self.stop != StopRamp::Running;
         self.scalar.end_pool_buffer(frames, busy_nanos, stopped)
     }
 
@@ -872,24 +893,24 @@ impl LiveScalarBackend {
                 consumer.begin_block(start_frame, start_frame.saturating_add(frames as u64));
             }
         }
-        // A stop runs its whole ramp, also when the flag clears inside the
-        // ramp. The voices then end on zero and never return at full level.
-        let fade_total = self.stop_ramp_frames();
-        let ramping = self
-            .stop_fade_pos
-            .is_some_and(|rendered| rendered < fade_total);
-        if is_stopped || ramping {
-            self.held = None;
-            // Ramp running voices to exactly zero over 10 ms, carrying the
-            // fade across as many host blocks as necessary.
-            let fade_pos = self.stop_fade_pos.get_or_insert(0);
-            let past_ramp = *fade_pos >= fade_total;
-            if *fade_pos < fade_total {
+        // A stop starts its ramp in its first block.
+        if is_stopped && self.stop == StopRamp::Running {
+            self.stop = StopRamp::Fading { rendered: 0 };
+        }
+        match self.stop {
+            StopRamp::Running => {}
+            // A stop runs its whole ramp, also when the flag clears inside
+            // the ramp. The voices then end on zero and never return at full
+            // level.
+            StopRamp::Fading { rendered: from } => {
+                self.held = None;
                 // A stop admits nothing: an onset still pending must not
                 // start a voice under the ramp.
                 self.scalar.retire_pending_at(start_frame);
                 self.scalar.process_block(&mut output[..samples], frames);
-                let from = *fade_pos;
+                // Ramp running voices to exactly zero over 10 ms, carrying
+                // the fade across as many host blocks as necessary.
+                let fade_total = self.stop_ramp_frames();
                 let ramp = |frame: usize| {
                     let position = from + frame;
                     if position + 1 >= fade_total {
@@ -906,35 +927,43 @@ impl LiveScalarBackend {
                 // An orbit routed to another pair is not in `output`. It
                 // fades with the main pair.
                 self.scalar.scale_orbit_mix(frames, ramp);
-                *fade_pos += frames;
-            } else {
+                // The voices live until the ramp ends. A reset after the
+                // first block would end a 10 ms ramp at the block edge with
+                // a step. The block that ends the ramp ran each insert in its
+                // render, so it drains none.
+                let rendered = from + frames;
+                if rendered >= fade_total {
+                    self.scalar
+                        .reset_at(start_frame.saturating_add(frames as u64));
+                    self.stop = StopRamp::Silent;
+                } else {
+                    self.stop = StopRamp::Fading { rendered };
+                }
+                return LiveBlockReport::default();
+            }
+            StopRamp::Silent if is_stopped => {
+                self.held = None;
                 // No block renders after the ramp, and the device still mixes
                 // each routed orbit. The clear keeps the device from playing
                 // the last block of the ramp again.
                 self.scalar.clear_orbit_mix(frames);
-            }
-            // The voices live until the ramp ends. A reset after the first
-            // block would end a 10 ms ramp at the block edge with a step.
-            // After the ramp, reset_at runs on every stopped block. The
-            // call is cheap once the voices are gone (orbit lines clear only
-            // while still active) and keeps the clock aligned for a host
-            // which resumes without tearing the device down. Each block past
-            // the ramp then plays out the tail of each insert with no sound
-            // out. The block that ends the ramp ran each insert in its
-            // render, so it drains none.
-            if *fade_pos >= fade_total {
+                // After the ramp, reset_at runs on every stopped block. The
+                // call is cheap once the voices are gone (orbit lines clear
+                // only while still active) and keeps the clock aligned for a
+                // host which resumes without tearing the device down. Each
+                // block past the ramp then plays out the tail of each insert
+                // with no sound out.
                 self.scalar
                     .reset_at(start_frame.saturating_add(frames as u64));
-                if past_ramp {
-                    self.scalar.drain_stopped_inserts(frames);
-                }
+                self.scalar.drain_stopped_inserts(frames);
+                return LiveBlockReport::default();
             }
-            return LiveBlockReport::default();
-        }
-        // The first block after a stop ends its drain, so the next stop
-        // drains for its whole time.
-        if self.stop_fade_pos.take().is_some() {
-            self.scalar.end_insert_drain();
+            // The first block after a stop ends its drain, so the next stop
+            // drains for its whole time.
+            StopRamp::Silent => {
+                self.scalar.end_insert_drain();
+                self.stop = StopRamp::Running;
+            }
         }
 
         // Reload takeover: the producer publishes (before the generation
@@ -965,9 +994,8 @@ impl LiveScalarBackend {
         // of the next quantised rewind until some later flip. A published
         // flip stores zero, not this marker, and resets the latch on its
         // own path below.
-        if arm_word == LINE_ARM_WITHDRAWN && self.line_arm_fired {
-            self.line_arm_fired = false;
-            self.line_arm_drop_from = None;
+        if arm_word == LINE_ARM_WITHDRAWN {
+            self.line_cut = LineCut::Idle;
         }
         // A note of a plugin chain with latency starts its lead before its
         // output. So the arm fires that lead before the line: the restart
@@ -980,14 +1008,13 @@ impl LiveScalarBackend {
         let restart_lead = takeover_cut.load(Ordering::Acquire) >> 2;
         let lead = restart_lead.max(u64::from(self.scalar.largest_insert_lead()));
         if arm_word & 0b01 != 0
-            && !self.line_arm_fired
+            && self.line_cut == LineCut::Idle
             && start_frame.wrapping_add(frames as u64) > line_frame.saturating_sub(lead)
             && name_line_fire(arm_word, line_arm, line_fired)
         {
-            self.line_arm_fired = true;
-            if arm_word & 0b10 != 0 {
-                self.line_arm_drop_from = Some(line_frame);
-            }
+            self.line_cut = LineCut::Fired {
+                drop_from: (arm_word & 0b10 != 0).then_some(line_frame),
+            };
             self.scalar.retire_pending_from(line_frame, start_frame);
             // The outgoing generation is the one this consumer still plays.
             // No flip has been seen yet, so it is `self.generation`. The
@@ -1050,7 +1077,9 @@ impl LiveScalarBackend {
             // test would drop nothing. Newer events are the restart itself
             // and pass: the producer publishes their generation before it
             // pushes them, and the per-event check above adopts it.
-            if let Some(line_horizon) = self.line_arm_drop_from
+            if let LineCut::Fired {
+                drop_from: Some(line_horizon),
+            } = self.line_cut
                 && !event.controls.piano
                 && event.generation <= self.generation
                 && musical >= line_horizon
@@ -1263,8 +1292,7 @@ impl LiveScalarBackend {
         // flip's own cut intent and takeover frame carry the handoff. A
         // latch left standing (as the mid-drain site once did) kept the
         // NEXT launch's arm from ever firing.
-        self.line_arm_drop_from = None;
-        self.line_arm_fired = false;
+        self.line_cut = LineCut::Idle;
         line_fired.store(0, Ordering::Release);
         #[cfg(feature = "device-audio")]
         {
@@ -2133,8 +2161,9 @@ mod tests {
     fn adopt_flip_hands_over_in_one_place() {
         let mut live = LiveScalarBackend::new(48_000, 8).expect("live backend");
         live.generation = 1;
-        live.line_arm_fired = true;
-        live.line_arm_drop_from = Some(900);
+        live.line_cut = LineCut::Fired {
+            drop_from: Some(900),
+        };
         // The word of the arm that fired at frame 900.
         let fired = AtomicU64::new((900 << 2) | 0b11);
         // A flip as the producer publishes it, with a restart lead of 480
@@ -2150,9 +2179,8 @@ mod tests {
         // 1 -> 3: generation 2 never published.
         adopt(&mut live, 3, 10_000, TakeoverCut::AtTakeover, 1_024, 1_024);
         assert_eq!(live.generation, 3);
-        assert!(!live.line_arm_fired, "a flip lets the fired arm go");
+        assert_eq!(live.line_cut, LineCut::Idle, "a flip lets the fired arm go");
         assert_eq!(fired.load(Ordering::Acquire), 0, "and its word");
-        assert_eq!(live.line_arm_drop_from, None);
         assert_eq!(
             live.scalar.armed_takeover_cut,
             Some((10_000, 1)),
@@ -2748,7 +2776,7 @@ mod tests {
                 let mut output = [0.0; BLOCK * 2];
                 let stopped = &words.stopped;
                 live.process_block_with(&mut output, BLOCK, start, &ring, flip, stopped);
-                if live.line_arm_fired && fired_at.is_none() {
+                if live.line_cut != LineCut::Idle && fired_at.is_none() {
                     fired_at = Some(start);
                     assert_eq!(
                         fired.load(Ordering::Acquire),
@@ -2771,7 +2799,7 @@ mod tests {
             let mut output = [0.0; BLOCK * 2];
             let start = 70 * BLOCK as u64;
             live.process_block_with(&mut output, BLOCK, start, &ring, flip, &words.stopped);
-            assert!(!live.line_arm_fired);
+            assert_eq!(live.line_cut, LineCut::Idle);
             assert_eq!(fired.load(Ordering::Acquire), WORD);
             words.publish(2, start, TakeoverCut::None);
             let start = start + BLOCK as u64;

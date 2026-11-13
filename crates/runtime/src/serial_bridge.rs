@@ -183,20 +183,25 @@ pub struct SerialSubmit {
 /// One routing of an onset to its port: the step inside
 /// [`SerialOutputs::submit`] that decides where the write goes.
 struct SerialRoute<'a> {
-    /// The handle to write through. `None` when the port is remembered as
-    /// unopenable, and also while its open is still in flight: then either
-    /// the write was held ([`Self::buffered`]) or the pre-open cap refused
-    /// it, which is counted and told through [`SerialOutputs::poll`], never
-    /// held.
-    sender: Option<&'a SerialSender>,
+    /// Where the write goes.
+    to: Route<'a>,
     /// The baud note, as [`SerialSubmit::note`] has it.
     note: Option<String>,
-    /// The onset's bytes crossed into the port's bounded pre-open queue
-    /// while its open thread still holds the platform open, so nothing is
-    /// left to send and the write is already accounted for: it flushes in
-    /// strike order the moment the open installs, or is dropped with the
-    /// port's failure.
-    buffered: bool,
+}
+
+/// Where one onset's write goes, by the state of its port.
+enum Route<'a> {
+    /// The port is OPEN. The write goes through this sender.
+    Send(&'a SerialSender),
+    /// The port is OPENING. The write is in the port's bounded pre-open
+    /// queue and counts as accepted. It flushes in strike order when the open
+    /// installs, or is dropped with the port's failure.
+    Held,
+    /// The port is OPENING and a pre-open cap refused the write. The refusal
+    /// is counted and told through [`SerialOutputs::poll`].
+    Refused,
+    /// The port is FAILED. The write goes nowhere.
+    Dropped,
 }
 
 /// How loud a piece of [`SerialOutputs::poll`] news is.
@@ -343,6 +348,45 @@ impl SerialTrouble {
     }
 }
 
+/// One port a set names.
+struct SetPort {
+    /// The score's selector for the port.
+    name: String,
+    /// The baud the set first asked for the port at.
+    baud: u32,
+    state: PortState,
+}
+
+/// Where one port of a set stands. [`SerialOutputs`] draws how a port moves
+/// between these states.
+enum PortState {
+    /// An open of the port is in flight, the set's own or one it adopted.
+    /// The port's selector is in [`SerialOutputs::in_flight`].
+    Opening {
+        /// Writes held for the open, in strike order.
+        held: VecDeque<PendingSerialWrite>,
+        /// Whether the set was told that the port is still opening. The set
+        /// is told once, also when it opens the port again.
+        stall_noted: bool,
+    },
+    /// The port writes through this sender. The set installed it or took it
+    /// from the last set.
+    Open(SerialSender),
+    /// The port's open failed or could not start. The port writes nothing
+    /// for the rest of the set.
+    Failed,
+}
+
+impl PortState {
+    /// An open that just started or was adopted, with no write held yet.
+    fn opening() -> Self {
+        Self::Opening {
+            held: VecDeque::new(),
+            stall_noted: false,
+        }
+    }
+}
+
 /// What one set knows about its ports, and the next set starts without.
 ///
 /// A set begins from `SetState::default()`, so a field added here starts
@@ -351,27 +395,23 @@ impl SerialTrouble {
 /// [`SerialOutputs`] itself.
 #[derive(Default)]
 struct SetState {
-    /// Each port this set names, with the baud the set first asked for it at
-    /// and its sender once one is installed.
-    open: Vec<(String, u32, Option<SerialSender>)>,
-    /// The (index into `open`, requested baud) mismatches already noted, so
+    /// Each port this set names.
+    ports: Vec<SetPort>,
+    /// The (index into `ports`, requested baud) mismatches already noted, so
     /// a mismatch is reported once per set rather than on every onset.
-    /// `open` only grows within a set, so an index names its port for the
+    /// `ports` only grows within a set, so an index names its port for the
     /// whole set.
     baud_noted: HashSet<(usize, u32)>,
     /// What the senders this set took from the last one had already counted,
     /// so [`SerialOutputs::report`] counts from zero with the set.
     carried: rustel_serial::SerialReport,
-    /// Writes held while their port's open is in flight, in strike order.
-    pending: HashMap<String, VecDeque<PendingSerialWrite>>,
+    /// How many writes the OPENING ports hold together. The pre-open cap
+    /// across ports reads this count.
     pending_total: usize,
     /// Writes the pre-open caps refused, counted into
     /// [`SerialOutputs::report`] beside the senders' own refusals and told
     /// once through [`SerialOutputs::poll`].
     pending_refused: u64,
-    /// The ports of this set already told they are still opening, by index
-    /// into `open`.
-    stall_noted: HashSet<usize>,
     /// The delivery troubles this set was told of already.
     troubles_told: HashSet<SerialTrouble>,
     /// News not yet taken by [`SerialOutputs::poll`]. Open failures can land
@@ -379,6 +419,74 @@ struct SetState {
     /// never re-requested - so the port-count cap bounds it; the notices
     /// `poll` makes itself are drained in the same call.
     notices: VecDeque<SerialNews>,
+}
+
+impl SetState {
+    /// Route one onset's write to the port at `index`.
+    ///
+    /// An OPENING port holds the write in its pre-open queue. The queue is
+    /// bounded per port and process-wide, as MIDI's pre-open queue is, so a
+    /// wedged open cannot turn the producer's staging into unbounded memory.
+    /// A refusal is counted and never waits. Past the cap the newest write
+    /// is the one refused, as MIDI refuses its newest batch. The cap is a
+    /// thousand writes deep, which a set fills only against an open that
+    /// never returns, and then none of them is ever written.
+    fn route(&mut self, index: usize, due: Instant, bytes: &[u8]) -> Route<'_> {
+        match &mut self.ports[index].state {
+            PortState::Open(sender) => Route::Send(sender),
+            PortState::Opening { held, .. } => {
+                // The port's open is still running; an onset's write waits
+                // with the bridge, not with the driver.
+                if held.len() >= MAX_PENDING_SERIAL_WRITES_PER_PORT
+                    || self.pending_total >= MAX_PENDING_SERIAL_WRITES_TOTAL
+                {
+                    self.pending_refused = self.pending_refused.saturating_add(1);
+                    return Route::Refused;
+                }
+                held.push_back(PendingSerialWrite {
+                    due,
+                    bytes: bytes.to_vec(),
+                });
+                self.pending_total += 1;
+                Route::Held
+            }
+            PortState::Failed => Route::Dropped,
+        }
+    }
+
+    /// Make the port at `index` OPEN through `sender`. The writes it held
+    /// go out through `sender` first.
+    fn install(&mut self, index: usize, sender: SerialSender) {
+        // Flushed in the order the score struck them. The pre-open cap sits
+        // below the sender's own queue ceiling so this hand-off can never
+        // itself be the refusal it exists to prevent; anything the open
+        // delay made stale is the sender's to drop late, exactly as if it
+        // had been queued on time.
+        for write in self.take_held(index) {
+            sender.send_at(write.due, write.bytes);
+        }
+        self.ports[index].state = PortState::Open(sender);
+    }
+
+    /// Make the port at `index` FAILED for the rest of the set. The writes
+    /// it held are dropped, and `message` is the news.
+    fn fail(&mut self, index: usize, message: String) {
+        self.take_held(index);
+        self.ports[index].state = PortState::Failed;
+        self.notices
+            .push_back(SerialNews::new(SerialNewsKind::Failure, message));
+    }
+
+    /// Take the writes the port at `index` holds while OPENING, in strike
+    /// order.
+    fn take_held(&mut self, index: usize) -> VecDeque<PendingSerialWrite> {
+        let PortState::Opening { held, .. } = &mut self.ports[index].state else {
+            return VecDeque::new();
+        };
+        let held = std::mem::take(held);
+        self.pending_total = self.pending_total.saturating_sub(held.len());
+        held
+    }
 }
 
 /// Open ports, kept for the life of the set, and the opens that outlive one.
@@ -430,10 +538,9 @@ pub struct SerialOutputs {
     opener: Arc<SerialOpenFn>,
     /// Completed opens, each pushed once by the thread that ran it.
     results: Arc<Mutex<VecDeque<SerialOpenResult>>>,
-    /// Opens whose thread has not reported yet, by selector; these outlive
-    /// the set that asked. An entry in the set's `open` with no sender is
-    /// opening while its port is named here, and a remembered failure
-    /// otherwise.
+    /// Opens whose thread has not reported yet, by selector. They outlive the
+    /// set that asked. A port of the set is OPENING while its selector is here,
+    /// and only then.
     in_flight: HashMap<String, InFlightOpen>,
     /// Senders the last set leaves this one, with the baud they opened at:
     /// the ports it had open, and opens an earlier set asked for that
@@ -498,10 +605,10 @@ impl SerialOutputs {
         // What the last set left untaken has sat idle all through it, so
         // its writer lets go of the port as soon as it is dropped.
         self.adoptable.clear();
-        for (port, baud, sender) in last.open {
-            if let Some(sender) = sender {
+        for port in last.ports {
+            if let PortState::Open(sender) = port.state {
                 sender.discard_queued();
-                self.adoptable.insert(port, (baud, sender));
+                self.adoptable.insert(port.name, (port.baud, sender));
             }
         }
     }
@@ -542,9 +649,9 @@ impl SerialOutputs {
             };
             let Some(index) = self
                 .this_set
-                .open
+                .ports
                 .iter()
-                .position(|(name, _, _)| *name == completed.port)
+                .position(|port| port.name == completed.port)
             else {
                 // An earlier set's open, finished before this set named its
                 // port. A sender is kept for this set to adopt rather than
@@ -555,37 +662,22 @@ impl SerialOutputs {
                 }
                 continue;
             };
-            let wanted = self.this_set.open[index].1;
+            let wanted = self.this_set.ports[index].baud;
             match completed.result {
-                Ok(sender) if flight.baud == wanted => {
-                    let writes = self.take_pending(&completed.port);
-                    // Flushed in the order the score struck them. The
-                    // pre-open cap sits below the sender's own queue ceiling
-                    // so this hand-off can never itself be the refusal it
-                    // exists to prevent; anything the open delay made stale
-                    // is the sender's to drop late, exactly as if it had
-                    // been queued on time.
-                    let sender = self.this_set.open[index].2.insert(sender);
-                    for write in writes {
-                        sender.send_at(write.due, write.bytes);
-                    }
-                }
+                Ok(sender) if flight.baud == wanted => self.this_set.install(index, sender),
                 Ok(sender) => {
                     // An earlier set's open, at the baud that set asked for.
                     // This set asked for another, so it opens the port again
                     // at its own; the new open's thread closes this handle
                     // first, and the held writes wait for the new one.
-                    self.reopen(&completed.port, wanted, Some(sender));
+                    self.reopen(index, &completed.port, Some(sender));
                 }
                 Err(message) if flight.set == self.set => {
                     // Nowhere to send what was buffered while the open was
                     // in flight; the failure message is the news, and the
-                    // entry keeps no sender for the life of the set so the
-                    // port is never re-opened per onset.
-                    self.take_pending(&completed.port);
-                    self.this_set
-                        .notices
-                        .push_back(SerialNews::new(SerialNewsKind::Failure, message));
+                    // port stays FAILED for the life of the set so it is
+                    // never re-opened per onset.
+                    self.this_set.fail(index, message);
                 }
                 Err(_) => {
                     // An earlier set's open, adopted and then failed. That
@@ -593,30 +685,21 @@ impl SerialOutputs {
                     // adapter may have come up since the restart - and a
                     // failed open holds nothing, so this set gets one try
                     // of its own, with its writes still held.
-                    self.reopen(&completed.port, wanted, None);
+                    self.reopen(index, &completed.port, None);
                 }
             }
         }
     }
 
-    /// Open `port` again at `baud` for this set, closing `replacing` first,
-    /// keeping its held writes; if that cannot even start, it is this set's
-    /// failure like any other.
-    fn reopen(&mut self, port: &str, baud: u32, replacing: Option<SerialSender>) {
+    /// Open `port`, the port at `index`, again at the baud this set asked
+    /// for, and close `replacing` first. The port stays OPENING and keeps
+    /// its held writes. If the open cannot even start, the port fails like
+    /// any other.
+    fn reopen(&mut self, index: usize, port: &str, replacing: Option<SerialSender>) {
+        let baud = self.this_set.ports[index].baud;
         if let Err(message) = self.start_open(port, baud, replacing) {
-            self.take_pending(port);
-            self.this_set
-                .notices
-                .push_back(SerialNews::new(SerialNewsKind::Failure, message));
+            self.this_set.fail(index, message);
         }
-    }
-
-    /// Take the writes held for `port`, in strike order.
-    fn take_pending(&mut self, port: &str) -> VecDeque<PendingSerialWrite> {
-        let set = &mut self.this_set;
-        let writes = set.pending.remove(port).unwrap_or_default();
-        set.pending_total = set.pending_total.saturating_sub(writes.len());
-        writes
     }
 
     /// Tell each port of this set that has been opening for longer than
@@ -624,22 +707,25 @@ impl SerialOutputs {
     /// so without this its port would be silent with no word about why.
     fn note_stalled_opens(&mut self, now: Instant) {
         let set = &mut self.this_set;
-        for (index, (port, _, sender)) in set.open.iter().enumerate() {
-            if sender.is_some() || set.stall_noted.contains(&index) {
+        for SetPort { name, state, .. } in &mut set.ports {
+            let PortState::Opening { stall_noted, .. } = state else {
+                continue;
+            };
+            if *stall_noted {
                 continue;
             }
-            let Some(flight) = self.in_flight.get(port) else {
+            let Some(flight) = self.in_flight.get(name.as_str()) else {
                 continue;
             };
             let waited = now.saturating_duration_since(flight.since);
             if waited < SERIAL_OPEN_STALL_NOTICE {
                 continue;
             }
-            set.stall_noted.insert(index);
+            *stall_noted = true;
             set.notices.push_back(SerialNews::new(
                 SerialNewsKind::StillOpening,
                 format!(
-                    "serial port \"{port}\" is still opening after {}s; up to \
+                    "serial port \"{name}\" is still opening after {}s; up to \
                      {MAX_PENDING_SERIAL_WRITES_PER_PORT} of its writes wait for it, \
                      and any stale by the time it opens are dropped",
                     waited.as_secs()
@@ -659,35 +745,6 @@ impl SerialOutputs {
                     .push_back(SerialNews::new(SerialNewsKind::Trouble, trouble.text()));
             }
         }
-    }
-
-    /// Hold one write for a port whose platform open is still in flight.
-    ///
-    /// Bounded per port and process-wide, as MIDI's pre-open queue is: a
-    /// wedged open must not turn the producer's staging into unbounded
-    /// memory. Returns whether the write was taken; a refusal is counted,
-    /// never blocked on. Past the cap the newest write is the one refused,
-    /// as MIDI refuses its newest batch: the cap is a thousand writes deep,
-    /// which a set fills only against an open that never returns, and then
-    /// none of them is ever written.
-    fn queue_pending_write(&mut self, port: &str, due: Instant, bytes: &[u8]) -> bool {
-        let set = &mut self.this_set;
-        let port_queued = set.pending.get(port).map_or(0, VecDeque::len);
-        if port_queued >= MAX_PENDING_SERIAL_WRITES_PER_PORT
-            || set.pending_total >= MAX_PENDING_SERIAL_WRITES_TOTAL
-        {
-            set.pending_refused = set.pending_refused.saturating_add(1);
-            return false;
-        }
-        set.pending
-            .entry(port.to_string())
-            .or_default()
-            .push_back(PendingSerialWrite {
-                due,
-                bytes: bytes.to_vec(),
-            });
-        set.pending_total += 1;
-        true
     }
 
     /// Start the platform open of `port` at `baud` on a thread of its own,
@@ -771,25 +828,29 @@ impl SerialOutputs {
     /// with a note when it adopts an open at another baud: an open an
     /// earlier set left behind is adopted, anything else starts here.
     fn name_port(&mut self, port: &str, baud: u32) -> Result<(usize, Option<String>), String> {
-        if self.this_set.open.len() >= MAX_SERIAL_OUTPUT_PORTS {
+        if self.this_set.ports.len() >= MAX_SERIAL_OUTPUT_PORTS {
             return Err(format!(
                 "a score may name at most {MAX_SERIAL_OUTPUT_PORTS} serial ports at once; \
                  \"{port}\" was not opened"
             ));
         }
-        let index = self.this_set.open.len();
+        let index = self.this_set.ports.len();
         // The entry exists before any open does so a completed open always
         // finds its port. If the open cannot even start, the entry stays as
         // the remembered failure so the score is not retried on every
         // onset.
-        self.this_set.open.push((port.to_string(), baud, None));
+        self.this_set.ports.push(SetPort {
+            name: port.to_string(),
+            baud,
+            state: PortState::Failed,
+        });
         if let Some((opened_baud, sender)) = self.adoptable.remove(port) {
             // Taken as it is only if it has never rejected a write: a
             // handle that has may belong to an adapter since unplugged, and
             // one plugged back in answers only a fresh open.
             if opened_baud == baud && sender.report().write_errors == 0 {
                 self.this_set.carried = self.this_set.carried.plus(sender.report());
-                self.this_set.open[index].2 = Some(sender);
+                self.this_set.ports[index].state = PortState::Open(sender);
                 return Ok((index, None));
             }
             // Open at the baud an earlier set asked for, or refusing writes.
@@ -797,6 +858,7 @@ impl SerialOutputs {
             // failing port a fresh try, so this one is closed on the new
             // open's thread and the port opened again at this set's baud.
             self.start_open(port, baud, Some(sender))?;
+            self.this_set.ports[index].state = PortState::opening();
             return Ok((index, None));
         }
         if let Some(flight) = self.in_flight.get(port) {
@@ -810,9 +872,11 @@ impl SerialOutputs {
                     flight.baud
                 )
             });
+            self.this_set.ports[index].state = PortState::opening();
             return Ok((index, note));
         }
         self.start_open(port, baud, None)?;
+        self.this_set.ports[index].state = PortState::opening();
         Ok((index, None))
     }
 
@@ -821,7 +885,17 @@ impl SerialOutputs {
     /// baud, and at most [`MAX_SERIAL_BAUD_NOTES_PER_PORT`] per port.
     fn baud_note(&mut self, index: usize, baud: u32) -> Option<String> {
         let set = &mut self.this_set;
-        let (port, opened_baud, sender) = &set.open[index];
+        let SetPort {
+            name: port,
+            baud: opened_baud,
+            state,
+        } = &set.ports[index];
+        let state = match state {
+            PortState::Open(_) => "open",
+            PortState::Opening { .. } => "opening",
+            // A remembered failure writes nothing, so its baud is no news.
+            PortState::Failed => return None,
+        };
         if *opened_baud == baud
             || set.baud_noted.contains(&(index, baud))
             || set
@@ -833,7 +907,6 @@ impl SerialOutputs {
         {
             return None;
         }
-        let state = if sender.is_some() { "open" } else { "opening" };
         let note = format!(
             "serial port \"{port}\" is already {state} at {opened_baud} baud; \
              serialbaud {baud} was ignored, and writes go out at \
@@ -867,12 +940,12 @@ impl SerialOutputs {
         due: Instant,
         bytes: Vec<u8>,
     ) -> Result<SerialSubmit, String> {
-        let SerialRoute {
-            sender,
-            note,
-            buffered,
-        } = self.sender(port, baud, due, &bytes)?;
-        let accepted = buffered || sender.is_some_and(|sender| sender.send_at(due, bytes));
+        let SerialRoute { to, note } = self.sender(port, baud, due, &bytes)?;
+        let accepted = match to {
+            Route::Send(sender) => sender.send_at(due, bytes),
+            Route::Held => true,
+            Route::Refused | Route::Dropped => false,
+        };
         Ok(SerialSubmit { accepted, note })
     }
 
@@ -894,37 +967,17 @@ impl SerialOutputs {
         }
         let (index, adopted) = match self
             .this_set
-            .open
+            .ports
             .iter()
-            .position(|(name, _, _)| name == port)
+            .position(|named| named.name == port)
         {
             Some(index) => (index, None),
             None => self.name_port(port, baud)?,
         };
-        let installed = self.this_set.open[index].2.is_some();
-        let opening = !installed && self.in_flight.contains_key(port);
-        // A remembered failure writes nothing, so its baud is no news.
-        let note = if adopted.is_some() {
-            adopted
-        } else if installed || opening {
-            self.baud_note(index, baud)
-        } else {
-            None
-        };
-        if opening {
-            // The port's open is still running; an onset's write waits with
-            // the bridge, not with the driver.
-            let buffered = self.queue_pending_write(port, due, bytes);
-            return Ok(SerialRoute {
-                sender: None,
-                note,
-                buffered,
-            });
-        }
+        let note = adopted.or_else(|| self.baud_note(index, baud));
         Ok(SerialRoute {
-            sender: self.this_set.open[index].2.as_ref(),
+            to: self.this_set.route(index, due, bytes),
             note,
-            buffered: false,
         })
     }
 
@@ -938,9 +991,12 @@ impl SerialOutputs {
             ..rustel_serial::SerialReport::default()
         };
         self.this_set
-            .open
+            .ports
             .iter()
-            .filter_map(|(_, _, sender)| sender.as_ref())
+            .filter_map(|port| match &port.state {
+                PortState::Open(sender) => Some(sender),
+                PortState::Opening { .. } | PortState::Failed => None,
+            })
             .fold(refused_before_open, |total, sender| {
                 total.plus(sender.report())
             })
@@ -1095,7 +1151,7 @@ mod tests {
         let route = outputs
             .sender("/dev/definitely-not-a-serial-port", 115_200, due, b"x()")
             .expect("the producer was made to wait for the platform open");
-        assert!(route.buffered);
+        assert!(matches!(route.to, Route::Held));
         let errors = poll_until_reported(&mut outputs);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(errors[0].kind, SerialNewsKind::Failure);
@@ -1113,14 +1169,13 @@ mod tests {
             .sender("/dev/definitely-not-a-serial-port", 115_200, due, b"x()")
             .expect("a remembered failed port is not an error");
         assert!(
-            route.sender.is_none(),
+            matches!(route.to, Route::Dropped),
             "a failed port was retried instead of being remembered"
         );
-        assert!(!route.buffered);
         assert!(outputs.poll().is_empty(), "the failure repeated");
         assert!(outputs.in_flight.is_empty(), "the port was opened again");
-        assert!(
-            outputs.this_set.pending.is_empty(),
+        assert_eq!(
+            outputs.this_set.pending_total, 0,
             "buffered writes outlived the failure"
         );
     }
@@ -1312,14 +1367,17 @@ mod tests {
         let route = outputs
             .sender("slow-open", 115_200, due, b"first()")
             .expect("admission while the open is wedged");
-        assert!(route.buffered, "the producer was made to wait for the open");
+        assert!(
+            matches!(route.to, Route::Held),
+            "the producer was made to wait for the open"
+        );
         assert!(asked.elapsed() < bound, "waited {:?}", asked.elapsed());
         assert_eq!(driver.wait_entered(), "slow-open");
         let asked = std::time::Instant::now();
         let route = outputs
             .sender("slow-open", 115_200, due, b"second()")
             .expect("second admission while the open is wedged");
-        assert!(route.buffered);
+        assert!(matches!(route.to, Route::Held));
         let news = outputs.poll();
         assert!(
             asked.elapsed() < bound,
@@ -1360,13 +1418,18 @@ mod tests {
             let route = outputs
                 .sender("wedged", 115_200, due, b"x()")
                 .expect("a bounded queue is not an error");
-            assert!(route.buffered, "write {index} was refused early");
+            assert!(
+                matches!(route.to, Route::Held),
+                "write {index} was refused early"
+            );
         }
         let route = outputs
             .sender("wedged", 115_200, due, b"x()")
             .expect("a refused write is not an error either");
-        assert!(!route.buffered, "the per-port cap did not refuse");
-        assert!(route.sender.is_none());
+        assert!(
+            matches!(route.to, Route::Refused),
+            "the per-port cap did not refuse"
+        );
         assert_eq!(outputs.report().refused_full, 1, "{:?}", outputs.report());
         // Counted by kind: a runner slow enough to cross the stalled open notice
         // adds that one too, which is not this test's business.
@@ -1404,7 +1467,10 @@ mod tests {
                 let route = outputs
                     .sender(&name, 115_200, due, b"x()")
                     .expect("a bounded queue is not an error");
-                assert!(route.buffered, "{name} was refused below the total");
+                assert!(
+                    matches!(route.to, Route::Held),
+                    "{name} was refused below the total"
+                );
             }
         }
         assert_eq!(
@@ -1414,8 +1480,10 @@ mod tests {
         let route = outputs
             .sender("one-more", 115_200, due, b"x()")
             .expect("a refused write is not an error");
-        assert!(!route.buffered, "the process-wide cap did not refuse");
-        assert!(route.sender.is_none());
+        assert!(
+            matches!(route.to, Route::Refused),
+            "the process-wide cap did not refuse"
+        );
         assert_eq!(outputs.report().refused_full, 1, "{:?}", outputs.report());
         assert!(
             outputs.in_flight.contains_key("one-more"),
@@ -1444,12 +1512,12 @@ mod tests {
         let route = outputs
             .sender("default", 115_200, due, b"x()")
             .expect("admission while the lookup is wedged");
-        assert!(route.buffered);
+        assert!(matches!(route.to, Route::Held));
         assert_eq!(driver.wait_entered(), "default");
         let route = outputs
             .sender("COM-PROMPT", 115_200, due, b"y()")
             .expect("admission of another port");
-        assert!(route.buffered);
+        assert!(matches!(route.to, Route::Held));
         poll_until_opened(&mut outputs, "COM-PROMPT");
         assert!(
             outputs.in_flight.contains_key("default"),
@@ -1459,7 +1527,7 @@ mod tests {
             .sender("COM-PROMPT", 115_200, due, b"z()")
             .expect("the prompt port routes");
         assert!(
-            route.sender.is_some(),
+            matches!(route.to, Route::Send(_)),
             "the prompt port waited on the wedged one"
         );
     }
@@ -1494,8 +1562,10 @@ mod tests {
         let route = outputs
             .sender("one-too-many", 115_200, due, b"x()")
             .expect("a remembered refusal is not an error");
-        assert!(route.sender.is_none());
-        assert!(!route.buffered, "a refused port held a write");
+        assert!(
+            matches!(route.to, Route::Dropped),
+            "a refused port held a write"
+        );
         assert_eq!(driver.calls(), calls, "a thread was started past the cap");
         assert_eq!(outputs.in_flight.len(), MAX_SERIAL_OPENS_IN_FLIGHT);
 
@@ -1507,7 +1577,10 @@ mod tests {
         let route = outputs
             .sender("one-too-many", 115_200, due, b"x()")
             .expect("a place is free again");
-        assert!(route.buffered, "the freed place was not used");
+        assert!(
+            matches!(route.to, Route::Held),
+            "the freed place was not used"
+        );
         assert_eq!(driver.wait_entered(), "one-too-many");
         assert_eq!(driver.calls(), calls + 1);
     }
@@ -1576,6 +1649,48 @@ mod tests {
         assert_eq!(driver.calls(), 1, "the next set opened the port again");
     }
 
+    /// A port opened again at the set's baud keeps its stall note. The set is
+    /// told once that the port is still opening, not once per open.
+    #[test]
+    fn a_port_opened_again_is_told_it_is_still_opening_once() {
+        let (mut outputs, driver) = gated_outputs();
+        let due = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        start_opening(&mut outputs, &driver, "COM-SLOW", 9_600, due, b"old()");
+        outputs.begin_set();
+        outputs
+            .sender("COM-SLOW", 115_200, due, b"new()")
+            .expect("the new set's admission");
+        let stale = || {
+            std::time::Instant::now()
+                .checked_sub(SERIAL_OPEN_STALL_NOTICE + std::time::Duration::from_secs(1))
+                .expect("a clock this close to its epoch")
+        };
+        let told = |news: Vec<SerialNews>| {
+            news.iter()
+                .filter(|notice| notice.kind == SerialNewsKind::StillOpening)
+                .count()
+        };
+        outputs
+            .in_flight
+            .get_mut("COM-SLOW")
+            .expect("in flight")
+            .since = stale();
+        assert_eq!(told(outputs.poll()), 1, "the stalled open was not told");
+        driver.release(Ok(()));
+        poll_until_reopened_by_this_set(&mut outputs, "COM-SLOW");
+        assert_eq!(driver.wait_entered(), "COM-SLOW");
+        outputs
+            .in_flight
+            .get_mut("COM-SLOW")
+            .expect("in flight")
+            .since = stale();
+        assert_eq!(
+            told(outputs.poll()),
+            0,
+            "the port opened again was told twice"
+        );
+    }
+
     /// A set that restarts while a port is still opening adopts that open: it
     /// cannot be called back, an exclusive COM port refuses a second open while
     /// it is pending, and a wedged adapter would strand one more thread per
@@ -1594,7 +1709,7 @@ mod tests {
             .sender("COM-SLOW", 9_600, due, b"new()")
             .expect("the new set's admission");
         assert!(
-            route.buffered,
+            matches!(route.to, Route::Held),
             "the new set did not wait for the adopted open"
         );
         assert!(route.note.is_none(), "{:?}", route.note);
@@ -1624,7 +1739,7 @@ mod tests {
         let route = outputs
             .sender("COM-SLOW", 115_200, due, b"new()")
             .expect("the new set's admission");
-        assert!(route.buffered);
+        assert!(matches!(route.to, Route::Held));
         let note = route.note.expect("the set is told why its writes wait");
         assert!(
             note.contains("still opening at 9600 baud for the last set"),
@@ -1672,7 +1787,7 @@ mod tests {
         let route = outputs
             .sender("COM-BT", 115_200, due, b"new()")
             .expect("the new set's admission");
-        assert!(route.buffered);
+        assert!(matches!(route.to, Route::Held));
 
         driver.release(Err(
             "could not open serial port \"COM-BT\": semaphore timeout".into(),
@@ -1717,8 +1832,7 @@ mod tests {
         let route = outputs
             .sender("COM-BT", 115_200, due, b"x()")
             .expect("a remembered failure is not an error");
-        assert!(route.sender.is_none());
-        assert!(!route.buffered);
+        assert!(matches!(route.to, Route::Dropped));
         assert_eq!(driver.calls(), 2, "the set's own failure was retried");
     }
 
@@ -1738,8 +1852,10 @@ mod tests {
         let route = outputs
             .sender("COM-SLOW", 9_600, due, b"new()")
             .expect("the new set's admission");
-        assert!(route.sender.is_some(), "the finished open was not adopted");
-        assert!(!route.buffered);
+        assert!(
+            matches!(route.to, Route::Send(_)),
+            "the finished open was not adopted"
+        );
         assert_eq!(driver.calls(), 1, "the new set opened the port again");
 
         start_opening(&mut outputs, &driver, "COM-GONE", 9_600, due, b"x()");
@@ -1753,7 +1869,10 @@ mod tests {
         let route = outputs
             .sender("COM-GONE", 9_600, due, b"x()")
             .expect("the port is asked for afresh");
-        assert!(route.buffered, "an earlier set's failure was kept");
+        assert!(
+            matches!(route.to, Route::Held),
+            "an earlier set's failure was kept"
+        );
         assert_eq!(driver.wait_entered(), "COM-GONE");
         assert_eq!(driver.calls(), 3);
     }
@@ -1774,7 +1893,10 @@ mod tests {
         let route = outputs
             .sender("COM-SLOW", 115_200, due, b"new()")
             .expect("the new set's admission");
-        assert!(route.buffered, "the old baud's open was adopted");
+        assert!(
+            matches!(route.to, Route::Held),
+            "the old baud's open was adopted"
+        );
         assert!(route.note.is_none(), "{:?}", route.note);
         assert_eq!(driver.wait_entered(), "COM-SLOW");
         assert_eq!(
@@ -1801,11 +1923,13 @@ mod tests {
         let started = std::time::Instant::now();
         let far = started + std::time::Duration::from_secs(30);
         open_in_first_set(&mut outputs, &driver, "COM-OPEN", 9_600, far, b"");
-        let sender = outputs
+        let Route::Send(sender) = outputs
             .sender("COM-OPEN", 9_600, far, b"")
             .expect("the open port routes")
-            .sender
-            .expect("the port is open");
+            .to
+        else {
+            panic!("the port is open");
+        };
         // The last set leaves a write queued for later, and one it was already
         // too late for, which the sender counts as dropped late.
         let later = started + std::time::Duration::from_millis(700);
@@ -1824,12 +1948,11 @@ mod tests {
         let route = outputs
             .sender("COM-OPEN", 9_600, far, b"")
             .expect("the new set's admission");
-        assert!(!route.buffered, "the open port was not taken as it is");
-        assert!(route.note.is_none(), "{:?}", route.note);
         assert!(
-            route.sender.is_some(),
+            matches!(route.to, Route::Send(_)),
             "the open port was not taken as it is"
         );
+        assert!(route.note.is_none(), "{:?}", route.note);
         // What the sender counted for the last set is not this set's news.
         let counted = outputs.report();
         assert_eq!(
@@ -1841,11 +1964,13 @@ mod tests {
             outputs.poll().is_empty(),
             "the last set's trouble was told to the new one"
         );
-        let sender = outputs
+        let Route::Send(sender) = outputs
             .sender("COM-OPEN", 9_600, far, b"")
             .expect("the taken port routes")
-            .sender
-            .expect("the port is open");
+            .to
+        else {
+            panic!("the port is open");
+        };
         assert!(sender.send_at(
             later + std::time::Duration::from_millis(100),
             b"new()".to_vec()
@@ -1878,7 +2003,10 @@ mod tests {
         let route = outputs
             .sender("COM-OPEN", 115_200, due, b"new()")
             .expect("the new set's admission");
-        assert!(route.buffered, "the old baud's port was taken as it is");
+        assert!(
+            matches!(route.to, Route::Held),
+            "the old baud's port was taken as it is"
+        );
         assert_eq!(driver.wait_entered(), "COM-OPEN");
         assert_eq!(
             driver.held_on_entry(),
@@ -1917,11 +2045,13 @@ mod tests {
             .sender("COM-GONE", 9_600, now, b"")
             .expect("the first set's admission");
         poll_until_opened(&mut outputs, "COM-GONE");
-        let sender = outputs
+        let Route::Send(sender) = outputs
             .sender("COM-GONE", 9_600, now, b"")
             .expect("the open port routes")
-            .sender
-            .expect("the port is open");
+            .to
+        else {
+            panic!("the port is open");
+        };
         assert!(sender.send_at(std::time::Instant::now(), b"x()".to_vec()));
         poll_until(&mut outputs, |outputs| outputs.report().write_errors > 0);
 
@@ -1929,7 +2059,10 @@ mod tests {
         let route = outputs
             .sender("COM-GONE", 9_600, now, b"")
             .expect("the new set's admission");
-        assert!(route.buffered, "a port that rejected writes was kept");
+        assert!(
+            matches!(route.to, Route::Held),
+            "a port that rejected writes was kept"
+        );
         poll_until_opened(&mut outputs, "COM-GONE");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
@@ -1954,7 +2087,7 @@ mod tests {
         let route = outputs
             .sender("COM-OPEN", 115_200, due, b"y()")
             .expect("the new set's admission");
-        assert!(route.buffered);
+        assert!(matches!(route.to, Route::Held));
         assert!(
             asked.elapsed() < bound,
             "the producer waited {:?} for an old handle",
@@ -2078,9 +2211,9 @@ mod tests {
         poll_until(outputs, |outputs| {
             outputs
                 .this_set
-                .open
+                .ports
                 .iter()
-                .any(|(name, _, sender)| name == port && sender.is_some())
+                .any(|named| named.name == port && matches!(named.state, PortState::Open(_)))
         });
     }
 
@@ -2098,10 +2231,11 @@ mod tests {
             Ok(_) => panic!("oversized port name must be refused"),
         }
         for index in 0..MAX_SERIAL_OUTPUT_PORTS {
-            outputs
-                .this_set
-                .open
-                .push((format!("/dev/port-{index}"), 115_200, None));
+            outputs.this_set.ports.push(SetPort {
+                name: format!("/dev/port-{index}"),
+                baud: 115_200,
+                state: PortState::Failed,
+            });
         }
         match outputs.sender("/dev/overflow", 115_200, due, b"x()") {
             Err(message) => assert!(message.contains("at most"), "{message}"),
@@ -2116,14 +2250,14 @@ mod tests {
     fn a_baud_mismatch_keeps_writing_and_notes_once() {
         let mut outputs = SerialOutputs::new();
         let capture = rustel_serial::CapturePort::new();
-        outputs.this_set.open.push((
-            "COM-TEST".to_string(),
-            115_200,
-            Some(SerialSender::with_port(
+        outputs.this_set.ports.push(SetPort {
+            name: "COM-TEST".to_string(),
+            baud: 115_200,
+            state: PortState::Open(SerialSender::with_port(
                 Box::new(capture.clone()),
                 "COM-TEST".into(),
             )),
-        ));
+        });
 
         let route = outputs
             .sender("COM-TEST", 9_600, std::time::Instant::now(), b"")
@@ -2131,7 +2265,9 @@ mod tests {
         let note = route.note.expect("the mismatch is reported");
         assert!(note.contains("already open at 115200 baud"), "{note}");
         assert!(note.contains("serialbaud 9600 was ignored"), "{note}");
-        let sender = route.sender.expect("the open handle still routes writes");
+        let Route::Send(sender) = route.to else {
+            panic!("the open handle still routes writes");
+        };
         // The route is the port already open, so the write goes out at its baud.
         assert_eq!(sender.port_name(), "COM-TEST");
         assert!(sender.send_at(std::time::Instant::now(), b"hit(drum:1)".to_vec()));
@@ -2157,19 +2293,41 @@ mod tests {
             .sender("COM-TEST", 9_600, std::time::Instant::now(), b"")
             .unwrap();
         assert!(route.note.is_none(), "the note repeated");
-        assert!(route.sender.is_some());
+        assert!(matches!(route.to, Route::Send(_)));
         // The open baud itself is never a mismatch.
         let route = outputs
             .sender("COM-TEST", 115_200, std::time::Instant::now(), b"")
             .unwrap();
         assert!(route.note.is_none());
-        assert!(route.sender.is_some());
+        assert!(matches!(route.to, Route::Send(_)));
         // A second distinct wrong baud gets its own single note.
         let route = outputs
             .sender("COM-TEST", 4_800, std::time::Instant::now(), b"")
             .unwrap();
         assert!(route.note.expect("a new baud is news").contains("4800"));
-        assert!(route.sender.is_some());
+        assert!(matches!(route.to, Route::Send(_)));
+    }
+
+    /// A port still opening notes a mismatched baud as opening, and a port
+    /// remembered as failed gets no baud note.
+    #[test]
+    fn a_baud_mismatch_is_noted_while_opening_and_not_once_failed() {
+        let (mut outputs, driver) = gated_outputs();
+        let due = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        start_opening(&mut outputs, &driver, "COM-SLOW", 115_200, due, b"x()");
+        let route = outputs
+            .sender("COM-SLOW", 9_600, due, b"y()")
+            .expect("a mismatch is a note, not a refusal");
+        assert!(matches!(route.to, Route::Held));
+        let note = route.note.expect("the mismatch is reported");
+        assert!(note.contains("already opening at 115200 baud"), "{note}");
+        driver.release(Err("could not open serial port \"COM-SLOW\": gone".into()));
+        poll_until(&mut outputs, |outputs| outputs.in_flight.is_empty());
+        let route = outputs
+            .sender("COM-SLOW", 4_800, due, b"z()")
+            .expect("a remembered failure is not an error");
+        assert!(matches!(route.to, Route::Dropped));
+        assert!(route.note.is_none(), "{:?}", route.note);
     }
 
     /// A score cycling unique baud values cannot grow the note bookkeeping
@@ -2180,22 +2338,22 @@ mod tests {
     fn baud_mismatch_notes_are_capped_but_writes_are_not() {
         let mut outputs = SerialOutputs::new();
         let capture = rustel_serial::CapturePort::new();
-        outputs.this_set.open.push((
-            "COM-CAP".to_string(),
-            115_200,
-            Some(SerialSender::with_port(
+        outputs.this_set.ports.push(SetPort {
+            name: "COM-CAP".to_string(),
+            baud: 115_200,
+            state: PortState::Open(SerialSender::with_port(
                 Box::new(capture.clone()),
                 "COM-CAP".into(),
             )),
-        ));
-        outputs.this_set.open.push((
-            "COM-OTHER".to_string(),
-            115_200,
-            Some(SerialSender::with_port(
+        });
+        outputs.this_set.ports.push(SetPort {
+            name: "COM-OTHER".to_string(),
+            baud: 115_200,
+            state: PortState::Open(SerialSender::with_port(
                 Box::new(rustel_serial::CapturePort::new()),
                 "COM-OTHER".into(),
             )),
-        ));
+        });
         for offset in 0..MAX_SERIAL_BAUD_NOTES_PER_PORT {
             let route = outputs
                 .sender(
@@ -2206,13 +2364,15 @@ mod tests {
                 )
                 .expect("a mismatch is never a refusal");
             assert!(route.note.is_some(), "note {offset} was swallowed early");
-            assert!(route.sender.is_some());
+            assert!(matches!(route.to, Route::Send(_)));
         }
         let route = outputs
             .sender("COM-CAP", 999_999, std::time::Instant::now(), b"")
             .unwrap();
         assert!(route.note.is_none(), "the cap did not stop the notes");
-        let sender = route.sender.expect("the cap must not stop the writes");
+        let Route::Send(sender) = route.to else {
+            panic!("the cap must not stop the writes");
+        };
         assert!(sender.send_at(std::time::Instant::now(), b"go()".to_vec()));
         // The other port's first mismatch is still news.
         let route = outputs

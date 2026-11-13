@@ -732,7 +732,12 @@ impl Editor {
             Command::DeleteForward => self.delete(true, false, moment)?,
             Command::DeleteWordBackward => self.delete(false, true, moment)?,
             Command::DeleteWordForward => self.delete(true, true, moment)?,
-            Command::Move { motion, extend } => self.move_selection(motion, extend)?,
+            Command::Move { motion, extend } => {
+                self.move_selection(motion, extend)?;
+                // Visual's ends do not follow a move made outside Vim, such
+                // as a remote arrow, so Visual ends.
+                self.vim_set_visual_ends(None);
+            }
             Command::SelectAll => {
                 self.history.close_group();
                 self.selections.set_single(Selection::range(
@@ -828,8 +833,8 @@ impl Editor {
             .unwrap_or_else(|| before.map_through(&transaction.edits));
         // Offsets kept beside the selection follow the edit with it, so an
         // edit Vim did not make, such as a slider's, leaves them on the same
-        // text.
-        let visual = self.vim_visual_through(&transaction.edits);
+        // text. An edit that places its own selection ends Visual instead.
+        let visual = self.vim_visual_through(&transaction);
         let find_anchor = self.find_anchor_through(&transaction.edits);
         // Rope clones share storage. Applying to a candidate gives a public
         // malformed transaction a true all-or-nothing boundary.

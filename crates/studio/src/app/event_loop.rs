@@ -141,7 +141,7 @@ impl App {
         self.flush_pending_evaluation();
         #[cfg(feature = "hydra")]
         self.flush_generator_preview(Instant::now());
-        self.flush_pending_slider();
+        self.flush_pending_sliders();
         self.tick_replays();
         self.drain_engine();
         self.pump_link();
@@ -322,6 +322,7 @@ impl App {
             }
         }
         self.push_midi_enablement();
+        self.push_clock_ports();
         let flashing = self.advance_evaluation_flash(now);
         // The rotation's own accent decays the same way: still lit keeps
         // the loop painting at the frame rate rather than waiting on the

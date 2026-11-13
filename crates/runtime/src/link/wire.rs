@@ -100,22 +100,68 @@ pub struct PeerState {
     pub measure_v4: Option<([u8; 4], u16)>,
 }
 
+/// How a discovery message speaks. The discriminant is the kind byte on
+/// the wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(super) enum DiscoveryKind {
+    /// The announcement to the group. It asks for a response.
+    Alive = 1,
+    /// A reply to someone else's announcement, sent to them alone.
+    Response = 2,
+    /// Leaving for good. The message carries the node id and no state
+    /// entries.
+    ByeBye = 3,
+}
+
+impl DiscoveryKind {
+    /// The inverse of `kind as u8`. A byte no kind owns makes no Link
+    /// message.
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Alive),
+            2 => Some(Self::Response),
+            3 => Some(Self::ByeBye),
+            _ => None,
+        }
+    }
+}
+
 /// A discovery message: what a participant said, and how it said it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Discovery {
-    pub alive: bool,
-    /// A reply to someone else's announcement, sent to them alone.
-    pub response: bool,
-    /// Leaving for good; the state fields are empty.
-    pub bye_bye: bool,
+    pub(super) kind: DiscoveryKind,
     pub ttl: u8,
     pub state: PeerState,
 }
 
+/// Which of the two measurement messages a state message is. The
+/// discriminant is the kind byte on the wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(super) enum StateKind {
+    /// Asks the receiver for a pong.
+    Ping = 1,
+    /// The answer to a ping, with the ping's payload after its entries.
+    Pong = 2,
+}
+
+impl StateKind {
+    /// The inverse of `kind as u8`. A byte no kind owns makes no Link
+    /// message.
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Ping),
+            2 => Some(Self::Pong),
+            _ => None,
+        }
+    }
+}
+
 /// A ping or a pong, with the entries either carries.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateMessage {
-    pub pong: bool,
+    pub(super) kind: StateKind,
     /// `sess`: the session the replier stands in.
     pub session_id: Option<[u8; 8]>,
     /// `__gt`: the replier's ghost time as it answered.
@@ -191,19 +237,15 @@ fn put_state_entries(out: &mut Vec<u8>, state: &PeerState, with_endpoints: bool)
 pub fn encode_discovery(message: &Discovery) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(96);
     out.extend_from_slice(&DISCOVERY_HEADER);
-    let kind = if message.bye_bye {
-        3
-    } else if message.response {
-        2
-    } else {
-        1
-    };
-    out.push(kind);
+    out.push(message.kind as u8);
     out.push(message.ttl);
     out.extend_from_slice(&0u16.to_be_bytes());
     out.extend_from_slice(&message.state.node_id);
-    if !message.bye_bye {
-        put_state_entries(&mut out, &message.state, true);
+    match message.kind {
+        DiscoveryKind::Alive | DiscoveryKind::Response => {
+            put_state_entries(&mut out, &message.state, true);
+        }
+        DiscoveryKind::ByeBye => {}
     }
     (out.len() <= MAX_MESSAGE).then_some(out)
 }
@@ -213,7 +255,7 @@ pub fn encode_discovery(message: &Discovery) -> Option<Vec<u8>> {
 pub fn encode_state(message: &StateMessage, echoed_ping_payload: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(48 + echoed_ping_payload.len());
     out.extend_from_slice(&STATE_HEADER);
-    out.push(u8::from(message.pong) + 1);
+    out.push(message.kind as u8);
     if let Some(session_id) = message.session_id {
         put_entry(&mut out, SESSION_KEY, &session_id);
     }
@@ -237,7 +279,9 @@ pub fn encode_state(message: &StateMessage, echoed_ping_payload: &[u8]) -> Optio
 }
 
 /// Decode a datagram by its leading header. Discovery messages carry a
-/// full peer state; state messages carry only what a ping or pong needs.
+/// full peer state. State messages carry only what a ping or pong needs.
+/// A kind byte the protocol does not name decodes to `None`, as a
+/// foreign datagram does.
 pub fn decode<'a>(datagram: &'a [u8]) -> Option<DiscoveryOrState<'a>> {
     let (header, rest) = datagram.split_first_chunk::<8>()?;
     if *header == DISCOVERY_HEADER {
@@ -248,6 +292,7 @@ pub fn decode<'a>(datagram: &'a [u8]) -> Option<DiscoveryOrState<'a>> {
         if *group != [0, 0] {
             return None;
         }
+        let kind = DiscoveryKind::from_byte(kind[0])?;
         let mut state = PeerState {
             node_id: *node_id,
             ..PeerState::default()
@@ -277,16 +322,20 @@ pub fn decode<'a>(datagram: &'a [u8]) -> Option<DiscoveryOrState<'a>> {
             _ => {}
         });
         return Some(DiscoveryOrState::Discovery(Discovery {
-            alive: *kind == [1],
-            response: *kind == [2],
-            bye_bye: *kind == [3],
+            kind,
             ttl: ttl[0],
             state,
         }));
     }
     if *header == STATE_HEADER {
         let (kind, payload) = rest.split_first_chunk::<1>()?;
-        let mut message = StateMessage::default();
+        let mut message = StateMessage {
+            kind: StateKind::from_byte(kind[0])?,
+            session_id: None,
+            ghost_time: None,
+            host_time: None,
+            prev_ghost_time: None,
+        };
         entries(payload, |key, body| match key {
             SESSION_KEY if body.len() == 8 => {
                 message.session_id = read_id(body);
@@ -302,11 +351,7 @@ pub fn decode<'a>(datagram: &'a [u8]) -> Option<DiscoveryOrState<'a>> {
             }
             _ => {}
         });
-        return Some(DiscoveryOrState::State {
-            pong: *kind == [2],
-            message,
-            payload,
-        });
+        return Some(DiscoveryOrState::State { message, payload });
     }
     None
 }
@@ -316,7 +361,6 @@ pub fn decode<'a>(datagram: &'a [u8]) -> Option<DiscoveryOrState<'a>> {
 pub enum DiscoveryOrState<'a> {
     Discovery(Discovery),
     State {
-        pong: bool,
         message: StateMessage,
         /// The payload after the header, echoed into a pong verbatim.
         payload: &'a [u8],
@@ -352,9 +396,7 @@ mod tests {
     #[test]
     fn a_discovery_message_survives_the_wire() {
         let bytes = encode_discovery(&Discovery {
-            alive: true,
-            response: false,
-            bye_bye: false,
+            kind: DiscoveryKind::Alive,
             ttl: 1,
             state: state(),
         })
@@ -364,7 +406,7 @@ mod tests {
         let DiscoveryOrState::Discovery(back) = decode(&bytes).unwrap() else {
             panic!("not a discovery message");
         };
-        assert!(back.alive && !back.response && !back.bye_bye);
+        assert_eq!(back.kind, DiscoveryKind::Alive);
         assert_eq!(back.ttl, 1);
         assert_eq!(back.state, state());
     }
@@ -372,9 +414,7 @@ mod tests {
     #[test]
     fn a_bye_bye_carries_no_state() {
         let bytes = encode_discovery(&Discovery {
-            alive: false,
-            response: false,
-            bye_bye: true,
+            kind: DiscoveryKind::ByeBye,
             ttl: 0,
             state: state(),
         })
@@ -382,7 +422,7 @@ mod tests {
         let DiscoveryOrState::Discovery(back) = decode(&bytes).unwrap() else {
             panic!("not a discovery message");
         };
-        assert!(back.bye_bye);
+        assert_eq!(back.kind, DiscoveryKind::ByeBye);
         assert_eq!(back.state.timeline, None);
         assert_eq!(back.state.session_id, [0; 8]);
     }
@@ -390,9 +430,7 @@ mod tests {
     #[test]
     fn a_response_decodes_as_one() {
         let bytes = encode_discovery(&Discovery {
-            alive: false,
-            response: true,
-            bye_bye: false,
+            kind: DiscoveryKind::Response,
             ttl: 1,
             state: state(),
         })
@@ -400,7 +438,7 @@ mod tests {
         let DiscoveryOrState::Discovery(back) = decode(&bytes).unwrap() else {
             panic!("not a discovery message");
         };
-        assert!(back.response && !back.alive);
+        assert_eq!(back.kind, DiscoveryKind::Response);
     }
 
     #[test]
@@ -415,7 +453,7 @@ mod tests {
 
         let bytes = encode_state(
             &StateMessage {
-                pong: true,
+                kind: StateKind::Pong,
                 session_id: Some([9; 8]),
                 ghost_time: Some(333_333_333),
                 host_time: None,
@@ -425,15 +463,10 @@ mod tests {
         )
         .unwrap();
         assert!(bytes.ends_with(&ping_payload));
-        let DiscoveryOrState::State {
-            pong,
-            message,
-            payload,
-        } = decode(&bytes).unwrap()
-        else {
+        let DiscoveryOrState::State { message, payload } = decode(&bytes).unwrap() else {
             panic!("not a state message");
         };
-        assert!(pong);
+        assert_eq!(message.kind, StateKind::Pong);
         assert_eq!(message.session_id, Some([9; 8]));
         assert_eq!(message.ghost_time, Some(333_333_333));
         assert_eq!(message.host_time, Some(111_111_111));
@@ -453,11 +486,63 @@ mod tests {
     }
 
     #[test]
+    fn a_kind_the_protocol_does_not_name_is_left_alone() {
+        for kind in 0..=u8::MAX {
+            // The kind, the ttl and the group, then the node id and a state.
+            let mut bytes = DISCOVERY_HEADER.to_vec();
+            bytes.extend_from_slice(&[kind, 1, 0, 0]);
+            bytes.extend_from_slice(&state().node_id);
+            put_state_entries(&mut bytes, &state(), true);
+            let named = (1..=3).contains(&kind);
+            assert_eq!(decode(&bytes).is_some(), named, "discovery kind {kind}");
+            let mut bytes = STATE_HEADER.to_vec();
+            bytes.push(kind);
+            let named = (1..=2).contains(&kind);
+            assert_eq!(decode(&bytes).is_some(), named, "state kind {kind}");
+        }
+    }
+
+    #[test]
+    fn each_kind_rides_on_the_byte_link_gives_it() {
+        let discovery = [
+            (1, DiscoveryKind::Alive),
+            (2, DiscoveryKind::Response),
+            (3, DiscoveryKind::ByeBye),
+        ];
+        for (byte, kind) in discovery {
+            let bytes = encode_discovery(&Discovery {
+                kind,
+                ttl: 1,
+                state: state(),
+            })
+            .unwrap();
+            assert_eq!(bytes[8], byte, "{kind:?}");
+            let DiscoveryOrState::Discovery(back) = decode(&bytes).unwrap() else {
+                panic!("not a discovery message");
+            };
+            assert_eq!(back.kind, kind);
+        }
+        for (byte, kind) in [(1, StateKind::Ping), (2, StateKind::Pong)] {
+            let message = StateMessage {
+                kind,
+                session_id: None,
+                ghost_time: None,
+                host_time: Some(1),
+                prev_ghost_time: None,
+            };
+            let bytes = encode_state(&message, &[]).unwrap();
+            assert_eq!(bytes[8], byte, "{kind:?}");
+            let DiscoveryOrState::State { message: back, .. } = decode(&bytes).unwrap() else {
+                panic!("not a state message");
+            };
+            assert_eq!(back.kind, kind);
+        }
+    }
+
+    #[test]
     fn a_truncated_frame_ends_the_walk_rather_than_panicking() {
         let mut bytes = encode_discovery(&Discovery {
-            alive: true,
-            response: false,
-            bye_bye: false,
+            kind: DiscoveryKind::Alive,
             ttl: 1,
             state: state(),
         })

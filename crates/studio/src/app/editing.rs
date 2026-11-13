@@ -239,11 +239,6 @@ impl App {
                 // anyway.
                 if self.refuse_unclean(revision, &source) {
                     self.finish_evaluation_feedback(false);
-                    // A refused launch is not a launch: the next plain
-                    // update must not inherit its cycle line, nor its
-                    // rewind.
-                    self.next_launch = Launch::Now;
-                    self.next_rewind = false;
                     self.dirty_frame = true;
                     return Ok(());
                 }
@@ -302,7 +297,7 @@ impl App {
                 // gesture, so the same bytes are exactly what it is for.
                 // Refusing it would mean "stop first to restart it" - the
                 // thing a rewind update exists to save you from.
-                let rewinding = self.next_rewind
+                let rewinding = self.next_evaluation.rewind
                     || self
                         .scenes
                         .get(scene)
@@ -332,12 +327,13 @@ impl App {
                 // pressing again would only cancel and re-arm it on the
                 // same line. Say so instead.
                 if !rewinding
-                    && self.armed_revision.as_deref() == Some(source_revision(&source).as_str())
+                    && self
+                        .launch_arming
+                        .armed_with(scene, &source_revision(&source))
                 {
-                    if self.current_replay().is_none() && self.armed_scene == Some(scene) {
+                    if self.current_replay().is_none() {
                         self.rebind_unchanged_score(scene, revision, Arc::clone(&source));
                     }
-                    self.next_launch = Launch::Now;
                     self.finish_evaluation_feedback(true);
                     self.status = "already armed - waiting for its cycle line".into();
                     self.dirty_frame = true;
@@ -350,17 +346,12 @@ impl App {
                 if self.piano.open {
                     self.silence_piano();
                 }
-                #[cfg(feature = "hydra")]
-                {
-                    self.generator_preview_pending = false;
-                }
                 self.pending_evaluation = None;
                 self.stop_replays();
                 // A stop is a stop: the engine cancels the armed launch, and
                 // nothing here should keep counting down to it.
-                self.forget_arming();
-                self.landing_name = None;
-                self.next_launch = Launch::Now;
+                self.launch_arming.cancel();
+                self.next_evaluation = LaunchRequest::default();
                 // A stop for a transport already stopped has nothing to
                 // stop: the engine word would only come back as a second
                 // settle, which resets the advisories and discards the
@@ -440,10 +431,7 @@ impl App {
                 // that is on its way out, so there is nothing to put back
                 // and nothing to hang the next one on.
                 #[cfg(feature = "hydra")]
-                {
-                    self.snippet_preview = None;
-                    self.snippet_heard = false;
-                }
+                self.end_snippet_audition();
                 // A stop is a stop, and that includes the sample sounding
                 // under the browser. The audition has no transport of its
                 // own, so the stop silences it here. The browser draws its

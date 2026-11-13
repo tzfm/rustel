@@ -289,6 +289,29 @@ enum Bank {
     Notes(Vec<(f64, Vec<Arc<str>>)>),
 }
 
+/// Who brought a name of the score layer, when an import or the open set's
+/// folder did. A name without an owner came of the score's inline map or of
+/// a host registration.
+enum BankOwner {
+    /// A score's `samples(…)` import, as the argument was written.
+    Import(Arc<str>),
+    /// The open set's own folder. The bank it hid comes back when the set
+    /// closes.
+    Set { displaced: Option<Displaced> },
+}
+
+impl BankOwner {
+    fn is_set(&self) -> bool {
+        matches!(self, Self::Set { .. })
+    }
+}
+
+/// A score bank the open set's folder hid, with the import that brought it.
+struct Displaced {
+    bank: Bank,
+    import: Option<Arc<str>>,
+}
+
 /// Which rate a decoded file lands at.
 ///
 /// An ordinary sample arrives at the context's rate. A wavetable decodes at
@@ -539,19 +562,225 @@ enum BankLayer {
     Global { generation: u64 },
 }
 
+/// The rows of Settings ▸ Samples with the last adoption that began.
+///
+/// One lock holds both. A landing checks its adoption and fills its row in
+/// one step, so a list or a walk of an older adoption changes nothing.
+#[derive(Default)]
+struct GlobalRows {
+    /// Moves when an adoption begins. A job carries the generation it was
+    /// asked under.
+    generation: u64,
+    slots: Vec<GlobalSlot>,
+}
+
+impl GlobalRows {
+    /// Begin an adoption and return its generation. The rows stay up while
+    /// the adoption plans its own, and no job of an older adoption lands
+    /// from now on.
+    fn begin(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+
+    /// Put down the rows of the adoption of `generation`. Returns false and
+    /// changes nothing when a later adoption has begun. A row that waits
+    /// for a job keeps the banks the same source brought last time, so a
+    /// refetch or a new walk does not silence it.
+    fn install(&mut self, generation: u64, mut slots: Vec<GlobalSlot>) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        for slot in slots.iter_mut().filter(|slot| slot.stage.waits()) {
+            if let Some(previous) = self
+                .slots
+                .iter()
+                .find(|previous| previous.kind == slot.kind && previous.spec == slot.spec)
+            {
+                slot.banks = previous.banks.clone();
+            }
+        }
+        self.slots = slots;
+        true
+    }
+
+    /// The first row of `kind` and `spec` whose stage `at` accepts, while
+    /// the rows are still those of `generation`. Every landing goes
+    /// through this gate.
+    fn landing(
+        &mut self,
+        generation: u64,
+        kind: GlobalKind,
+        spec: &str,
+        at: fn(&RowStage) -> bool,
+    ) -> Option<&mut GlobalSlot> {
+        if generation != self.generation {
+            return None;
+        }
+        self.slots
+            .iter_mut()
+            .find(|slot| slot.kind == kind && slot.spec == spec && at(&slot.stage))
+    }
+
+    /// A pack's list has landed. Returns whether it filled its row. A list
+    /// with no sounds in it fails the row.
+    fn fill_pack(&mut self, generation: u64, spec: &str, banks: Vec<(String, Bank)>) -> bool {
+        let Some(slot) = self.landing(generation, GlobalKind::Pack, spec, |stage| {
+            matches!(stage, RowStage::Fetching)
+        }) else {
+            return false;
+        };
+        slot.stage = if banks.is_empty() {
+            RowStage::Failed("brought no sounds".to_owned())
+        } else {
+            RowStage::Ready
+        };
+        slot.banks = banks.into_iter().collect();
+        true
+    }
+
+    /// A folder's walk starts to list the folder. Returns false when no
+    /// row of this adoption waits for the walk.
+    fn begin_walk(&mut self, generation: u64, spec: &str) -> bool {
+        let Some(slot) = self.landing(generation, GlobalKind::Folder, spec, |stage| {
+            matches!(stage, RowStage::WalkQueued | RowStage::Walking { .. })
+        }) else {
+            return false;
+        };
+        slot.stage = RowStage::Walking { rewalk: false };
+        true
+    }
+
+    /// A folder's walk has finished. The row takes what the walk found
+    /// and `outcome`, unless the row was replaced since the walk began or
+    /// a file was deleted from it meanwhile.
+    fn finish_walk(
+        &mut self,
+        generation: u64,
+        spec: &str,
+        banks: Vec<(String, Bank)>,
+        outcome: RowStage,
+    ) -> FolderFill {
+        let Some(slot) = self.landing(generation, GlobalKind::Folder, spec, |stage| {
+            matches!(stage, RowStage::Walking { .. })
+        }) else {
+            return FolderFill::Superseded;
+        };
+        if matches!(slot.stage, RowStage::Walking { rewalk: true }) {
+            return FolderFill::Stale;
+        }
+        slot.stage = outcome;
+        slot.banks = banks.into_iter().collect();
+        FolderFill::Filled
+    }
+
+    /// The job of `generation` for the row of `kind` and `spec` failed.
+    /// The row says why and keeps the banks it carries.
+    fn fail(&mut self, generation: u64, kind: GlobalKind, spec: &str, why: &str) {
+        if let Some(slot) = self.landing(generation, kind, spec, RowStage::waits) {
+            slot.stage = RowStage::Failed(why.to_owned());
+        }
+    }
+
+    /// No job of `generation` will come for the waiting rows of `kind`.
+    /// Each of them says why.
+    fn refuse(&mut self, generation: u64, kind: GlobalKind, why: &str) {
+        if generation != self.generation {
+            return;
+        }
+        for slot in self
+            .slots
+            .iter_mut()
+            .filter(|slot| slot.kind == kind && slot.stage.waits())
+        {
+            slot.stage = RowStage::Failed(why.to_owned());
+        }
+    }
+
+    /// A local file is gone. No row names it any more, and a walk that
+    /// lists a folder at this moment lists it again.
+    fn file_deleted(&mut self, url: &str) {
+        for slot in &mut self.slots {
+            slot.banks
+                .retain(|_, bank| local_names::remove_url(bank, url));
+            if let RowStage::Walking { rewalk } = &mut slot.stage {
+                *rewalk = true;
+            }
+        }
+    }
+
+    /// How every row stands, in row order.
+    fn reports(&self) -> Vec<GlobalSourceReport> {
+        let mut rows: Vec<&GlobalSlot> = self.slots.iter().collect();
+        rows.sort_by_key(|slot| slot.row);
+        rows.iter()
+            .map(|slot| GlobalSourceReport {
+                spec: slot.spec.clone(),
+                state: slot.report(),
+            })
+            .collect()
+    }
+}
+
 /// One row of Settings ▸ Samples, as the library holds it.
 struct GlobalSlot {
     row: usize,
     spec: String,
     kind: GlobalKind,
-    /// What the row brought. A pack keeps its last list while a new one is
-    /// being fetched, so a refetch does not silence it in the meantime.
+    /// What the row brought. A row keeps its last list while a new one is
+    /// on its way, so a refetch does not silence it in the meantime.
     banks: HashMap<String, Bank>,
-    state: GlobalSourceState,
-    /// A file was deleted while this folder was being walked, so the walk
-    /// under way may still list it: its result is dropped and the folder
-    /// is walked again.
-    rewalk: bool,
+    stage: RowStage,
+}
+
+impl GlobalSlot {
+    /// How the row stands, for the browser and the settings sheet. A ready
+    /// row counts the banks it holds.
+    fn report(&self) -> GlobalSourceState {
+        match &self.stage {
+            RowStage::Off => GlobalSourceState::Off,
+            RowStage::Missing(why) => GlobalSourceState::Missing(why.clone()),
+            RowStage::WalkQueued | RowStage::Walking { .. } | RowStage::Fetching => {
+                GlobalSourceState::Loading
+            }
+            RowStage::Ready => GlobalSourceState::Ready {
+                banks: self.banks.len(),
+            },
+            RowStage::Failed(why) => GlobalSourceState::Failed(why.clone()),
+        }
+    }
+}
+
+/// Where one row of Settings ▸ Samples stands. Only its own adoption, or a
+/// job of it, moves a row out of a stage that waits.
+enum RowStage {
+    /// Turned off in Settings. The row brings nothing.
+    Off,
+    /// The folder is not there.
+    Missing(String),
+    /// The folder's walk waits in the manifest line.
+    WalkQueued,
+    /// The folder's walk lists the folder. `rewalk` is set when a file is
+    /// deleted meanwhile: the listing may still name it, so the walk runs
+    /// again.
+    Walking { rewalk: bool },
+    /// The pack's list is on its way.
+    Fetching,
+    /// The list or the walk landed.
+    Ready,
+    /// The row would not read, or its job failed. A failed job leaves the
+    /// banks the row carries in place.
+    Failed(String),
+}
+
+impl RowStage {
+    /// Whether the row waits for a job of its adoption.
+    fn waits(&self) -> bool {
+        matches!(
+            self,
+            Self::WalkQueued | Self::Walking { .. } | Self::Fetching
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -733,7 +962,41 @@ struct LoadQueue {
 struct LoadQueueState {
     now: VecDeque<LoadJob>,
     bets: VecDeque<LoadJob>,
+    /// What the workers do with each url that a disk fetch claims or a
+    /// worker holds. A url leaves once neither is true.
+    work: HashMap<Arc<str>, UrlWork>,
+    /// How many urls in `work` a disk fetch claims. The scheduler takes
+    /// this lock to queue a load, so a reader counts without a walk of
+    /// `work`.
+    disk_claims: usize,
     closed: bool,
+}
+
+/// What the loader does with one url.
+#[derive(Default)]
+struct UrlWork {
+    /// The disk fetch that claims the url, from its queueing until its
+    /// outcome is recorded. A second cache pass does not queue the url
+    /// while the claim stands.
+    disk: Option<DiskFetch>,
+    /// How many workers hold a load of the url for a note.
+    installs: usize,
+}
+
+impl UrlWork {
+    /// Whether a worker has the url in hand, fetching or decoding it.
+    fn in_hand(&self) -> bool {
+        self.disk == Some(DiskFetch::InHand) || self.installs > 0
+    }
+}
+
+/// Where a disk fetch stands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiskFetch {
+    /// Waiting in the line.
+    Queued,
+    /// In a worker's hand.
+    InHand,
 }
 
 #[derive(Clone, Copy)]
@@ -741,6 +1004,37 @@ enum DecodedIdentity {
     Unknown,
     Current(u64),
     Forgotten,
+}
+
+/// A clip's picture as the video table keeps it.
+#[cfg(feature = "video")]
+enum VideoClip {
+    /// A decode runs on a library thread.
+    Decoding,
+    Ready(Arc<crate::video::VideoThumbnails>),
+    /// The file has no picture.
+    NotVideo,
+    /// The decode refused the file. `ceiling_moves` is the count of video
+    /// ceiling moves read before the decode began. The refusal stands only
+    /// while that count holds: a moved ceiling may take the clip.
+    Refused {
+        message: String,
+        ceiling_moves: u64,
+    },
+}
+
+#[cfg(feature = "video")]
+impl VideoClip {
+    /// The answer a painter gets.
+    fn picture(&self) -> crate::video::VideoPicture {
+        use crate::video::VideoPicture;
+        match self {
+            Self::Decoding => VideoPicture::Decoding,
+            Self::Ready(strip) => VideoPicture::Ready(Arc::clone(strip)),
+            Self::NotVideo => VideoPicture::NotVideo,
+            Self::Refused { message, .. } => VideoPicture::Failed(message.clone()),
+        }
+    }
 }
 
 /// Buckets in a remembered sample shape. Wider than any preview row a
@@ -881,16 +1175,14 @@ struct Shared {
     /// Published source maps and registration status share one retention
     /// budget. Publication and eviction are atomic for loader and UI readers.
     source_tables: Mutex<SourceTables>,
-    /// The `samples(...)` import each of the score's banks came from, by
-    /// bank name, as the argument was written.
-    bank_imports: RwLock<HashMap<String, Arc<str>>>,
-    /// The banks the open set's own folder brought, by name, each with the
-    /// bank it displaced - so the next set can take them back out and put
-    /// back what was there first. A set's samples belong to that set, and
-    /// leaving them behind would let one set's `kicks` play in another;
-    /// dropping them by name alone would take a score's `kicks` with them,
-    /// which the set never supplied.
-    set_banks: RwLock<BTreeMap<String, Option<Bank>>>,
+    /// Who brought each name in `custom` that an import or the open set's
+    /// folder brought, by bank name. Taken after `custom`.
+    ///
+    /// A set's samples belong to that set. The next set takes them back out
+    /// and puts back what each one displaced, so one set's `kicks` never
+    /// plays in another, and a score's `kicks` that the set never supplied
+    /// stays.
+    bank_owners: RwLock<HashMap<String, BankOwner>>,
     /// The open set's folder, canonical, while a set is open. Hydra reads
     /// the images and videos a score names inside it.
     set_folder: RwLock<Option<PathBuf>>,
@@ -903,15 +1195,10 @@ struct Shared {
     /// for the next reservation to take before the counter moves. Oldest
     /// first, so a reissued id is as far as it can be from its last owner.
     free_ids: Mutex<VecDeque<SampleId>>,
-    /// The loader's line. Closed when this goes, which is what ends the
-    /// loader threads.
+    /// The loader's line, the disk fetches that claim their files, and the
+    /// files in the workers' hands. Closed when this goes, which is what
+    /// ends the loader threads.
     jobs: Arc<LoadQueue>,
-    /// Files the loader workers have in hand - fetching or decoding - for
-    /// a progress line to name. Empty between jobs.
-    loading: Mutex<HashSet<Arc<str>>>,
-    /// URLs a disk-cache job has claimed, from queueing until the fetch
-    /// settles, so a second cache pass does not enqueue the same file twice.
-    caching: Mutex<HashSet<Arc<str>>>,
     /// Host-trusted sample cache directory this library's loader writes.
     host_cache: PathBuf,
     /// `{base}/{font}.js` for General MIDI files, as the font worker fetches.
@@ -932,11 +1219,7 @@ struct Shared {
     /// rebuilt from these in row order whenever one of them changes, which
     /// is what makes "a later row wins a shared name" true for a folder
     /// against a pack and not only for two of a kind.
-    global_slots: Mutex<Vec<GlobalSlot>>,
-    /// Bumped by every adoption. A pack's manifest lands on the loader's
-    /// own schedule, so one enqueued before a re-adoption must not fill a
-    /// slot the re-adoption has since replaced - or removed.
-    global_generation: std::sync::atomic::AtomicU64,
+    global_rows: Mutex<GlobalRows>,
     /// Which imported source each name in `global` came of, for the
     /// browser to file it under.
     global_source_of: RwLock<HashMap<String, Arc<str>>>,
@@ -959,11 +1242,7 @@ struct Shared {
     /// it. Kept for the `video()` painters; nothing else reads a
     /// container's picture.
     #[cfg(feature = "video")]
-    videos: Mutex<HashMap<Arc<str>, crate::video::VideoPicture>>,
-    /// The video ceiling's moves the table has seen. A move clears the
-    /// table's refusals, so a clip the old ceiling refused is decoded again.
-    #[cfg(feature = "video")]
-    video_ceiling_seen: AtomicU64,
+    videos: Mutex<HashMap<Arc<str>, VideoClip>>,
     /// Persistent score-selected bytes have their own namespace and budget.
     /// One library belongs to one Session, so this also owns that Session's
     /// share of the process-independent cache allowance.

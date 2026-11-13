@@ -426,7 +426,7 @@ impl App {
             self.worker.request_stop();
             self.installed_revision = None;
             self.stop_requested = true;
-            self.forget_arming();
+            self.launch_arming.disarm();
         }
     }
 }

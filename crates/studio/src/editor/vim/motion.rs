@@ -13,18 +13,20 @@ impl Editor {
         motion: Motion,
         moment: HistoryMoment,
     ) -> Result<(), EditorError> {
-        let specified = std::mem::take(&mut self.vim.count);
-        let count = if matches!(motion, Motion::LastLine) {
-            specified
-        } else {
-            specified.max(1)
+        let after = self.vim.pending.count.take();
+        let operator = self.vim.pending.operator.take();
+        // The counts before and after an operator multiply. With neither,
+        // G goes to the last line.
+        let count = match (operator.and_then(|(_, before)| before), after) {
+            (Some(before), Some(after)) => Some(before.saturating_mul(after)),
+            (before, after) => before.or(after),
         };
-        if let Some((operator, before)) = self.vim.operator.take() {
-            let count = if count == 0 && before == 1 {
-                0
-            } else {
-                count.max(1).saturating_mul(before)
-            };
+        let count = match count {
+            Some(count) => count.get(),
+            None if matches!(motion, Motion::LastLine) => 0,
+            None => 1,
+        };
+        if let Some((operator, _)) = operator {
             let head = self.vim_head();
             let motion = if operator == Operator::Change
                 && matches!(motion, Motion::WordNext)

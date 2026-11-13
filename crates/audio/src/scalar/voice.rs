@@ -109,6 +109,105 @@ impl Voice {
     }
 }
 
+/// How a voice ends: its stop, the fades that bring the stop forward, and a
+/// source that left. A fade never brings the stop before the end of its
+/// ramp.
+#[derive(Debug)]
+pub(super) struct VoiceEnd {
+    /// The age of the voice at its stop, in seconds from its start frame.
+    stop_secs: f32,
+    /// The frame a cut starts to fade the voice: 1 to 0 over 10 ms.
+    cut_from: Option<u64>,
+    /// The frame the polyphony cap starts to fade the voice: 1 to 0 over
+    /// [`POLYPHONY_FADE_SECS`]. Set once and never cleared: a voice the cap
+    /// has dropped cannot be chosen again.
+    cull_from: Option<u64>,
+    /// The bank slot this voice reads was emptied under it: an uninstall
+    /// landed. The voice renders silence for the rest of the block and
+    /// retires at the end of the block. Set on the audio thread. The id may
+    /// then go to another sound, and a voice still reading it would play
+    /// that.
+    gone: bool,
+}
+
+impl VoiceEnd {
+    pub(super) fn new(stop_secs: f32) -> Self {
+        Self {
+            stop_secs,
+            cut_from: None,
+            cull_from: None,
+            gone: false,
+        }
+    }
+
+    /// The age of the voice at its stop, in seconds from its start frame.
+    #[inline]
+    pub(super) fn stop_secs(&self) -> f32 {
+        self.stop_secs
+    }
+
+    #[inline]
+    pub(super) fn cut_from(&self) -> Option<u64> {
+        self.cut_from
+    }
+
+    #[inline]
+    pub(super) fn cull_from(&self) -> Option<u64> {
+        self.cull_from
+    }
+
+    /// Whether the polyphony cap dropped the voice.
+    pub(super) fn is_culled(&self) -> bool {
+        self.cull_from.is_some()
+    }
+
+    /// Whether a cut or the polyphony cap fades the voice, now or later.
+    pub(super) fn has_fade(&self) -> bool {
+        self.cut_from.is_some() || self.cull_from.is_some()
+    }
+
+    /// Whether the voice sounds on past `age_secs` from its start frame.
+    pub(super) fn lasts_past(&self, age_secs: f32) -> bool {
+        age_secs < self.stop_secs && !self.gone
+    }
+
+    /// Cuts the voice: it fades from the frame `from` over the cut ramp,
+    /// and stops `tail_secs` after that frame. A cut that fades the voice
+    /// earlier keeps its fade. A choke gives [`CHOKE_TAIL_SECS`], and any
+    /// other cut [`CUT_FADE_SECS`].
+    pub(super) fn cut(&mut self, from: u64, tail_secs: f32, start_frame: u64, sample_rate: u32) {
+        self.cut_from = Some(self.cut_from.map_or(from, |at| at.min(from)));
+        self.stop_after(from, tail_secs, start_frame, sample_rate);
+    }
+
+    /// Culls the voice for the polyphony cap: it fades from the frame `from`
+    /// and stops at the end of that fade.
+    pub(super) fn cull(&mut self, from: u64, start_frame: u64, sample_rate: u32) {
+        self.cull_from = Some(from);
+        self.stop_after(from, POLYPHONY_FADE_SECS, start_frame, sample_rate);
+    }
+
+    /// Ends the voice of a late event of a preview that a newer preview
+    /// replaced. The voice fades from `onset` in place of an earlier cut,
+    /// and stops [`CUT_FADE_SECS`] after its start frame.
+    pub(super) fn retire_late_preview(&mut self, onset: u64) {
+        self.cut_from = Some(onset);
+        self.stop_secs = self.stop_secs.min(CUT_FADE_SECS);
+    }
+
+    /// The bank slot of the voice was emptied.
+    #[inline]
+    pub(super) fn mark_gone(&mut self) {
+        self.gone = true;
+    }
+
+    /// Brings the stop forward to `tail_secs` after the frame `from`.
+    fn stop_after(&mut self, from: u64, tail_secs: f32, start_frame: u64, sample_rate: u32) {
+        let stop = from.saturating_sub(start_frame) as f32 / sample_rate as f32 + tail_secs;
+        self.stop_secs = self.stop_secs.min(stop);
+    }
+}
+
 /// Move every heap-backed lease home before `Voice` is dropped; both ordinary
 /// retirement and a stop/reset run inside the audio callback.
 #[allow(clippy::too_many_arguments, clippy::vec_box)]
@@ -1201,12 +1300,9 @@ impl ScalarBackend {
             let fade = at_frame
                 .saturating_sub(u64::from(voice.lead))
                 .max(self.frame);
-            if voice.cut_fade_frame.is_none() {
-                voice.cut_fade_frame = Some(fade);
-            }
-            let stop_at = (fade.saturating_sub(voice.start_frame)) as f32 / self.sample_rate as f32
-                + CUT_FADE_SECS;
-            voice.stop_secs = voice.stop_secs.min(stop_at);
+            voice
+                .end
+                .cut(fade, CUT_FADE_SECS, voice.start_frame, self.sample_rate);
         }
     }
 
@@ -1284,12 +1380,12 @@ impl ScalarBackend {
             if until.is_none_or(|until| cut_at < until) {
                 let cut_at = cut_at.max(frame);
                 let fade = previous
-                    .cut_fade_frame
+                    .end
+                    .cut_from()
                     .map_or(cut_at, |running| running.min(cut_at));
-                previous.cut_fade_frame = Some(fade);
-                let fade_end =
-                    fade.saturating_sub(previous.start_frame) as f32 / sample_rate as f32 + 0.011;
-                previous.stop_secs = previous.stop_secs.min(fade_end);
+                previous
+                    .end
+                    .cut(fade, CHOKE_TAIL_SECS, previous.start_frame, sample_rate);
             }
         }
         if until.is_some() {
@@ -1350,14 +1446,12 @@ impl ScalarBackend {
             let fade_from = cut_frame
                 .saturating_sub(u64::from(voice.lead))
                 .max(self.frame);
-            voice.cut_fade_frame = Some(match voice.cut_fade_frame {
-                Some(fade) => fade.min(fade_from),
-                None => fade_from,
-            });
-            let stop_at = (fade_from.saturating_sub(voice.start_frame)) as f32
-                / self.sample_rate as f32
-                + CUT_FADE_SECS;
-            voice.stop_secs = voice.stop_secs.min(stop_at);
+            voice.end.cut(
+                fade_from,
+                CUT_FADE_SECS,
+                voice.start_frame,
+                self.sample_rate,
+            );
         }
         self.armed_takeover_cut = Some((cut_frame, outgoing_generation));
     }
@@ -1490,8 +1584,10 @@ impl ScalarBackend {
             let one_frame_before = takeover_frame.checked_sub(1) == Some(voice.musical)
                 && voice.graph_start_frame < voice.start_frame;
             let kept = one_frame_before || (takeover_frame != 0 && voice.musical >= takeover_frame);
-            voice.replayed_by = kept.then_some(incoming);
-            voice.replayed_on_next_frame = one_frame_before;
+            voice.replay = kept.then_some(Replay {
+                by: incoming,
+                next_frame_only: one_frame_before,
+            });
             if kept {
                 last_onset = last_onset.max(Some(voice.musical));
             }
@@ -1541,7 +1637,10 @@ impl ScalarBackend {
             .voices
             .iter_mut()
             .filter(|voice| {
-                let (copy_frame, reach) = if voice.replayed_on_next_frame {
+                let Some(replay) = voice.replay.filter(|replay| replay.by == incoming) else {
+                    return false;
+                };
+                let (copy_frame, reach) = if replay.next_frame_only {
                     (voice.musical.saturating_add(1), 0)
                 } else {
                     (voice.musical, reach)
@@ -1552,10 +1651,10 @@ impl ScalarBackend {
                     !on_time
                 };
                 let silent_from = |fade: u64| fade.saturating_add(u64::from(voice.lead));
-                voice.replayed_by == Some(incoming)
-                    && (voice.graph_start_frame < voice.start_frame) == early_graph
+                (voice.graph_start_frame < voice.start_frame) == early_graph
                     && voice
-                        .cut_fade_frame
+                        .end
+                        .cut_from()
                         .is_none_or(|fade| silent_from(fade) > copy_frame)
                     && copy_frame.abs_diff(musical) <= reach
                     && pairs
@@ -1563,7 +1662,7 @@ impl ScalarBackend {
             .min_by_key(|voice| voice.musical.abs_diff(musical));
         match nearest {
             Some(voice) => {
-                voice.replayed_by = None;
+                voice.replay = None;
                 true
             }
             None => false,
@@ -1589,7 +1688,8 @@ impl ScalarBackend {
                 && voice.graph_start_frame < voice.start_frame
                 && voice.generation < generation
                 && voice
-                    .cut_fade_frame
+                    .end
+                    .cut_from()
                     .is_none_or(|fade| silent_from(fade) > voice.musical)
                 && voice.musical.abs_diff(musical) <= 1
         })
@@ -1620,10 +1720,7 @@ impl ScalarBackend {
         sample_rate: u32,
         max_polyphony: usize,
     ) -> usize {
-        let active = voices
-            .iter()
-            .filter(|voice| voice.polyphony_fade_frame.is_none())
-            .count();
+        let active = voices.iter().filter(|voice| !voice.end.is_culled()).count();
         let musical = event.controls.musical(event.onset_frame);
         let led = Self::led(voices, event.controls.lead.max(lead));
         let fade_at = |oldest: &Voice| match led {
@@ -1662,9 +1759,7 @@ impl ScalarBackend {
         for _ in 0..count {
             // `voices` is pushed in trigger order and `retain_mut` keeps it, so
             // the first still-counted voice is the first triggered.
-            let mut counted = voices
-                .iter_mut()
-                .filter(|voice| voice.polyphony_fade_frame.is_none());
+            let mut counted = voices.iter_mut().filter(|voice| !voice.end.is_culled());
             let oldest = match led {
                 false => counted.next(),
                 true => counted.min_by_key(|voice| (voice.musical, voice.id)),
@@ -1673,11 +1768,9 @@ impl ScalarBackend {
                 break;
             };
             let onset_frame = fade_at(oldest);
-            oldest.polyphony_fade_frame = Some(onset_frame);
-            let stop_at = (onset_frame.saturating_sub(oldest.start_frame)) as f32
-                / sample_rate as f32
-                + POLYPHONY_FADE_SECS;
-            oldest.stop_secs = oldest.stop_secs.min(stop_at);
+            oldest
+                .end
+                .cull(onset_frame, oldest.start_frame, sample_rate);
             faded += 1;
         }
         faded
@@ -1860,12 +1953,12 @@ mod tests {
                 backend.process_block(&mut out, 128);
             }
             assert_eq!(backend.voices.len(), 3);
-            assert!(backend.voices.iter().all(|v| v.cut_fade_frame.is_none()));
+            assert!(backend.voices.iter().all(|v| v.end.cut_from().is_none()));
             backend.process_block(&mut out, 128);
             assert_eq!(backend.voices.len(), 5);
             for voice in &backend.voices {
                 assert_eq!(
-                    voice.cut_fade_frame,
+                    voice.end.cut_from(),
                     (voice.preview_epoch == 1).then_some(512)
                 );
             }
@@ -1876,9 +1969,62 @@ mod tests {
             }
             assert_eq!(backend.voices.len(), 3);
             assert!(backend.voices.iter().all(|v| v.preview_epoch != 1));
-            assert!(backend.voices.iter().all(|v| v.cut_fade_frame.is_none()));
+            assert!(backend.voices.iter().all(|v| v.end.cut_from().is_none()));
             assert!(out.iter().all(|v| v.is_finite()));
             assert!(out.iter().any(|v| v.abs() > 0.001));
+        }
+
+        /// A swap of the audition cuts the sounding voices while a nudged
+        /// choke still waits to fade the older voice. The older voice fades
+        /// from the swap: its level falls over the ramp, not at once.
+        #[test]
+        fn a_swap_inside_a_nudged_choke_fades_the_older_voice() {
+            use crate::sample::{DecodedSample, SampleControls, SampleHold, SampleId};
+            let id = SampleId(9);
+            let mut backend = ScalarBackend::prepared(48_000, 16).unwrap();
+            let pcm = DecodedSample::from_parts(48_000, 1, vec![0.5; 96_000]).expect("pcm");
+            assert!(backend.install_sample(id, Box::new(pcm)).is_ok());
+            // A hit of cut group 1 with its source `nudge` seconds late.
+            let hit = |frame: u64, nudge: f32| {
+                let mut event = OnsetEvent::new(frame, 440.0, 1.0, 2.0);
+                event.sample = Some(SampleControls {
+                    sample: id,
+                    playback_rate: 1.0,
+                    begin: 0.0,
+                    end: 1.0,
+                    hold: SampleHold::Hap,
+                    muted: false,
+                    loop_secs: None,
+                    envelope_peak: 1.0,
+                    reversed: false,
+                    nudge_secs: nudge,
+                    cut: Some(1.0),
+                });
+                event
+            };
+            backend.note(hit(0, 0.0));
+            // The second hit chokes the first at its source, 0.2 s after
+            // its onset.
+            backend.note(hit(5_120, 0.2));
+            let mut out = [0.0f32; 256];
+            for _ in 0..60 {
+                backend.process_block(&mut out, 128);
+            }
+            let level = out[254];
+            assert!(level > 0.05, "the first hit holds its level: {level}");
+            backend.cut_sounding_voices(7_680);
+            let (mut last, mut step) = (level, 0.0f32);
+            for _ in 0..8 {
+                backend.process_block(&mut out, 128);
+                for left in out.iter().step_by(2) {
+                    step = step.max((left - last).abs());
+                    last = *left;
+                }
+            }
+            assert!(backend.voices.is_empty());
+            assert_eq!(last, 0.0);
+            // The 10 ms ramp moves the level by a 480th of it each frame.
+            assert!(step < level / 100.0, "a step of {step} from {level}");
         }
     }
 
@@ -1927,7 +2073,7 @@ mod tests {
                 backend
                     .voices
                     .iter()
-                    .all(|voice| voice.cut_fade_frame.is_none())
+                    .all(|voice| voice.end.cut_from().is_none())
             );
             backend.note(release(backend.frame, 100.0));
             advance(&mut backend, 16);
@@ -1941,7 +2087,7 @@ mod tests {
                 backend
                     .voices
                     .iter()
-                    .all(|voice| voice.cut_fade_frame.is_none())
+                    .all(|voice| voice.end.cut_from().is_none())
             );
         }
 
@@ -1969,7 +2115,7 @@ mod tests {
                     backend
                         .voices
                         .iter()
-                        .all(|voice| voice.polyphony_fade_frame.is_none())
+                        .all(|voice| voice.end.cull_from().is_none())
                 );
                 advance(&mut backend, 16);
                 assert_eq!(backend.voices.len(), limit - 1);
@@ -1977,7 +2123,7 @@ mod tests {
                     backend
                         .voices
                         .iter()
-                        .all(|voice| voice.cut_fade_frame.is_none())
+                        .all(|voice| voice.end.cut_from().is_none())
                 );
                 assert!(backend.voices.iter().any(|voice| voice.freq_hz == 110.0));
             }
@@ -1997,7 +2143,7 @@ mod tests {
             advance(&mut backend, 16);
             assert_eq!(backend.voices.len(), 1);
             assert_eq!(backend.voices[0].freq_hz, 110.0);
-            assert!(backend.voices[0].polyphony_fade_frame.is_none());
+            assert!(backend.voices[0].end.cull_from().is_none());
 
             backend.reset();
             for (freq, group) in [(110.0, None), (440.0, Some(1.0))] {
@@ -2025,7 +2171,7 @@ mod tests {
             backend.begin_takeover_cut(1024, 4);
             advance(&mut backend, 16);
             assert_eq!(backend.voices.len(), 1);
-            assert!(backend.voices[0].cut_fade_frame.is_none());
+            assert!(backend.voices[0].end.cut_from().is_none());
             backend.begin_takeover_cut(backend.frame, 5);
             advance(&mut backend, 16);
             assert_eq!(backend.voices.len(), 1);
@@ -2063,7 +2209,7 @@ mod tests {
                 backend
                     .voices
                     .iter()
-                    .all(|voice| voice.cut_fade_frame.is_none())
+                    .all(|voice| voice.end.cut_from().is_none())
             );
         }
     }
@@ -2709,12 +2855,12 @@ mod tests {
             assert!(
                 backend.voices[..96]
                     .iter()
-                    .all(|voice| voice.polyphony_fade_frame == Some(frame))
+                    .all(|voice| voice.end.cull_from() == Some(frame))
             );
             assert!(
                 backend.voices[96..]
                     .iter()
-                    .all(|voice| voice.polyphony_fade_frame.is_none())
+                    .all(|voice| voice.end.cull_from().is_none())
             );
             backend.set_max_polyphony(64);
             assert_eq!(
@@ -2759,7 +2905,7 @@ mod tests {
                 let mut fades: Vec<_> = backend
                     .voices
                     .iter()
-                    .map(|voice| (voice.freq_hz as u32, voice.polyphony_fade_frame))
+                    .map(|voice| (voice.freq_hz as u32, voice.end.cull_from()))
                     .collect();
                 fades.sort_unstable();
                 fades
@@ -3543,7 +3689,7 @@ mod tests {
                 let waiting = backend
                     .voices
                     .iter()
-                    .filter(|voice| voice.replayed_by.is_some())
+                    .filter(|voice| voice.replay.is_some())
                     .map(|voice| voice.start_frame);
                 assert!(waiting.eq(HITS[(index + 1).min(3)..3].iter().copied()));
             }
@@ -3880,7 +4026,7 @@ mod tests {
         };
         let mut backend = served(false);
         backend.begin_takeover_cut(MUSICAL + 100, 1);
-        assert_eq!(backend.voices[0].cut_fade_frame, Some(MUSICAL + 100 - 480));
+        assert_eq!(backend.voices[0].end.cut_from(), Some(MUSICAL + 100 - 480));
         assert_eq!(cut_in.load(std::sync::atomic::Ordering::Relaxed), 4);
         backend.hand_over_from(2, 896, 640);
         // A tempo change moved the copy 100 frames past the musical onset, 580
@@ -3892,10 +4038,10 @@ mod tests {
         };
         assert!(backend.kept_onset_stands_for(&moved));
         let backend = served(true);
-        assert_eq!(backend.voices[0].cut_fade_frame, Some(MUSICAL + 100 - 480));
+        assert_eq!(backend.voices[0].end.cut_from(), Some(MUSICAL + 100 - 480));
         let mut backend = served(false);
         backend.cut_sounding_voices(MUSICAL + 100);
-        assert_eq!(backend.voices[0].cut_fade_frame, Some(MUSICAL + 100 - 480));
+        assert_eq!(backend.voices[0].end.cut_from(), Some(MUSICAL + 100 - 480));
 
         // An SBD voice of the note starts its graph before its source. For a
         // copy of a generation that a newer flip replaced, the graph plays

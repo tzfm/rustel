@@ -89,8 +89,7 @@ fn validate_snapshot_size(data: &SnapshotData) -> Result<(), RuntimeError> {
 #[derive(Default)]
 struct Store {
     allowed: bool,
-    snapshot: CsoundSnapshot,
-    current: Option<Program>,
+    orchestra: Orchestra,
     revisions: HashMap<InsertKey, Program>,
     chains: HashSet<u64>,
     errors: Vec<String>,
@@ -99,10 +98,106 @@ struct Store {
     prepared: Option<HashMap<(InsertKey, u64), Option<f64>>>,
 }
 
+impl Store {
+    /// Commits `snapshot`. A program compiled from the same sources stays,
+    /// so its instances play on, and `compiled` is dropped. Else `compiled`
+    /// plays the snapshot. With no program, the orchestra is pending.
+    fn adopt(&mut self, snapshot: CsoundSnapshot, compiled: Option<Program>) {
+        collect_errors(self);
+        let program = self
+            .orchestra
+            .compiled_from(&snapshot.0.sources)
+            .cloned()
+            .or(compiled);
+        prune_revisions(self, program.as_ref().map(Program::key));
+        self.orchestra = match program {
+            Some(program) => {
+                self.revisions.insert(program.key(), program.clone());
+                Orchestra::Compiled { snapshot, program }
+            }
+            None => Orchestra::Pending(snapshot),
+        };
+    }
+
+    /// The program of the orchestra. A pending orchestra compiles here, and
+    /// its snapshot keeps its value. A failed compile leaves it pending.
+    fn program(&mut self) -> Result<Program, String> {
+        let snapshot = match &self.orchestra {
+            Orchestra::Pending(snapshot) => snapshot.clone(),
+            Orchestra::Compiled { program, .. } => return Ok(program.clone()),
+        };
+        let program = Program::compile(&snapshot.0.sources)?;
+        self.revisions.insert(program.key(), program.clone());
+        self.orchestra = Orchestra::Compiled {
+            snapshot,
+            program: program.clone(),
+        };
+        Ok(program)
+    }
+}
+
+/// The committed orchestra of a store.
+enum Orchestra {
+    /// The sources of the snapshot are not compiled. [`Store::program`]
+    /// compiles them.
+    Pending(CsoundSnapshot),
+    /// `program` is compiled from the sources of `snapshot`. Its key is in
+    /// the revisions of the store.
+    Compiled {
+        snapshot: CsoundSnapshot,
+        program: Program,
+    },
+}
+
+impl Default for Orchestra {
+    fn default() -> Self {
+        Self::Pending(CsoundSnapshot::default())
+    }
+}
+
+impl Orchestra {
+    fn snapshot(&self) -> &CsoundSnapshot {
+        match self {
+            Self::Pending(snapshot) | Self::Compiled { snapshot, .. } => snapshot,
+        }
+    }
+
+    fn key(&self) -> Option<InsertKey> {
+        match self {
+            Self::Pending(_) => None,
+            Self::Compiled { program, .. } => Some(program.key()),
+        }
+    }
+
+    /// The program, when it is compiled from `sources`.
+    fn compiled_from(&self, sources: &[String]) -> Option<&Program> {
+        match self {
+            Self::Compiled { snapshot, program } if snapshot.0.sources == sources => Some(program),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RenderTimeline {
     saves: Arc<[(f64, CsoundSnapshot)]>,
     current: usize,
+}
+
+impl RenderTimeline {
+    /// Makes the save that plays at `target_time` current. Gives the
+    /// snapshot of that save when the current save changes.
+    fn seek(&mut self, target_time: f64) -> Option<CsoundSnapshot> {
+        let index = self
+            .saves
+            .partition_point(|(at, _)| *at <= target_time)
+            .saturating_sub(1);
+        if index == self.current {
+            return None;
+        }
+        self.current = index;
+        Some(self.saves[index].1.clone())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -145,7 +240,7 @@ impl State {
         let store = self.0.lock().unwrap_or_else(|error| error.into_inner());
         Self(Arc::new(Mutex::new(Store {
             allowed: store.allowed,
-            snapshot: store.snapshot.clone(),
+            orchestra: Orchestra::Pending(store.orchestra.snapshot().clone()),
             render_timeline: store.render_timeline.clone(),
             ..Store::default()
         })))
@@ -155,11 +250,13 @@ impl State {
         let store = self.0.lock().unwrap_or_else(|error| error.into_inner());
         Self(Arc::new(Mutex::new(Store {
             allowed: store.allowed,
-            snapshot: saves
-                .first()
-                .map(|(_, snapshot)| snapshot)
-                .unwrap_or(&store.snapshot)
-                .clone(),
+            orchestra: Orchestra::Pending(
+                saves
+                    .first()
+                    .map(|(_, snapshot)| snapshot)
+                    .unwrap_or(store.orchestra.snapshot())
+                    .clone(),
+            ),
             render_timeline: (!saves.is_empty()).then(|| RenderTimeline {
                 saves: saves.into(),
                 current: 0,
@@ -172,7 +269,8 @@ impl State {
         self.0
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .snapshot
+            .orchestra
+            .snapshot()
             .clone()
     }
 
@@ -239,11 +337,16 @@ impl State {
             }
         }
         data.initialized |= !effects.is_empty();
-        if *data == *self.snapshot().0 {
-            return Ok(None);
-        }
+        let kept = {
+            let store = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            if *data == *store.orchestra.snapshot().0 {
+                return Ok(None);
+            }
+            // The commit keeps a program compiled from these sources.
+            store.orchestra.compiled_from(&data.sources).is_some()
+        };
         validate_snapshot_size(data)?;
-        let program = if !effects.is_empty() {
+        let program = if !effects.is_empty() && !kept {
             Some(Program::compile(&data.sources).map_err(RuntimeError::Message)?)
         } else {
             None
@@ -253,14 +356,10 @@ impl State {
 
     pub(crate) fn commit(&self, candidate: Option<Candidate>) {
         let Some(candidate) = candidate else { return };
-        let mut store = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        collect_errors(&mut store);
-        prune_revisions(&mut store, None);
-        if let Some(program) = &candidate.program {
-            store.revisions.insert(program.key(), program.clone());
-        }
-        store.current = candidate.program;
-        store.snapshot = candidate.snapshot;
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .adopt(candidate.snapshot, candidate.program);
     }
 
     pub(crate) fn score_changed(&self) {
@@ -278,7 +377,7 @@ impl State {
     pub(crate) fn take_errors(&self) -> Vec<String> {
         let mut store = self.0.lock().unwrap_or_else(|error| error.into_inner());
         collect_errors(&mut store);
-        let current = store.current.as_ref().map(Program::key);
+        let current = store.orchestra.key();
         prune_revisions(&mut store, current);
         std::mem::take(&mut store.errors)
     }
@@ -411,37 +510,21 @@ impl State {
     fn program(&self) -> Result<Program, String> {
         self.require_permission()
             .map_err(|error| error.to_string())?;
-        let mut store = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(program) = &store.current {
-            return Ok(program.clone());
-        }
-        let program = Program::compile(&store.snapshot.0.sources)?;
-        store.revisions.insert(program.key(), program.clone());
-        Arc::make_mut(&mut store.snapshot.0).initialized = true;
-        store.current = Some(program.clone());
-        Ok(program)
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .program()
     }
 
     fn program_at(&self, target_time: f64) -> Result<Program, String> {
-        let change = {
-            let store = self.0.lock().unwrap_or_else(|error| error.into_inner());
-            store.render_timeline.as_ref().and_then(|timeline| {
-                let index = timeline
-                    .saves
-                    .partition_point(|(at, _)| *at <= target_time)
-                    .saturating_sub(1);
-                (index != timeline.current).then(|| (index, timeline.saves[index].1.clone()))
-            })
-        };
-        if let Some((index, snapshot)) = change {
-            self.restore(&snapshot);
-            if let Some(timeline) = &mut self
-                .0
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
+        {
+            let mut store = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(snapshot) = store
                 .render_timeline
+                .as_mut()
+                .and_then(|timeline| timeline.seek(target_time))
             {
-                timeline.current = index;
+                store.adopt(snapshot, None);
             }
         }
         self.program()
@@ -815,12 +898,15 @@ mod tests {
         state.reap_completed(4.001);
         assert_eq!(program.pending_events(), 0);
         let dropped = controls();
-        let empty = CsoundSnapshot::default();
-        state.restore(&empty);
-        assert_eq!(state.snapshot(), empty);
+        let other = CsoundSnapshot(Arc::new(SnapshotData {
+            sources: vec!["instr other\nendin".into()],
+            ..SnapshotData::default()
+        }));
+        state.restore(&other);
+        assert_eq!(state.snapshot(), other);
         {
             let store = state.0.lock().unwrap();
-            assert!(store.current.is_none());
+            assert!(matches!(store.orchestra, Orchestra::Pending(_)));
             assert!(store.revisions.contains_key(&program.key()));
         }
         assert_eq!(program.pending_events(), 1);
@@ -828,6 +914,76 @@ mod tests {
         assert_eq!(program.pending_events(), 0);
         assert!(state.take_errors().is_empty());
         assert!(state.0.lock().unwrap().revisions.is_empty());
+    }
+
+    /// A rollback, a commit or a recovery to the sources in play keeps the
+    /// program that plays them, so its notes ring on. A stage to those
+    /// sources compiles no program. The first note does not change the
+    /// committed snapshot.
+    #[test]
+    fn the_sources_in_play_keep_their_program() {
+        let state = State::new(true);
+        let seed = state.snapshot();
+        let program = match state.program() {
+            Ok(program) => program,
+            Err(error)
+                if std::env::var_os("RUSTEL_CSOUND_LIBRARY").is_none()
+                    && error.contains("Csound 6 is not available") =>
+            {
+                return;
+            }
+            Err(error) => panic!("native Csound failed: {error}"),
+        };
+        let key = |state: &State| state.program().map(|program| program.key());
+        let in_revisions = |state: &State| {
+            let store = state.0.lock().unwrap();
+            store.revisions.contains_key(&program.key())
+        };
+        let access = ScoreImportAccess::default();
+        let rollback = state.stage_from_snapshot(&seed, &[], &access).unwrap();
+        state.commit(rollback);
+        assert_eq!(key(&state), Ok(program.key()));
+        assert_eq!(state.snapshot(), seed);
+        let initialized = state
+            .stage(&[CsoundSource::Code(String::new())], &access)
+            .unwrap();
+        assert!(
+            initialized
+                .as_ref()
+                .is_some_and(|candidate| candidate.program.is_none())
+        );
+        state.commit(initialized);
+        assert!(in_revisions(&state));
+        assert_ne!(state.snapshot(), seed);
+        assert_eq!(key(&state), Ok(program.key()));
+        state.restore(&seed);
+        assert!(in_revisions(&state));
+        assert_eq!(state.snapshot(), seed);
+        assert_eq!(key(&state), Ok(program.key()));
+    }
+
+    /// A render save with the sources in play keeps the program of the save
+    /// before it.
+    #[test]
+    fn a_render_save_with_the_sources_in_play_keeps_its_program() {
+        let state = State::new(true);
+        let access = ScoreImportAccess::default();
+        let first = state.snapshot();
+        let second = match state.stage(&[CsoundSource::Code(String::new())], &access) {
+            Ok(candidate) => candidate.expect("the stage gives a candidate").snapshot,
+            Err(error)
+                if std::env::var_os("RUSTEL_CSOUND_LIBRARY").is_none()
+                    && error.to_string().contains("Csound 6 is not available") =>
+            {
+                return;
+            }
+            Err(error) => panic!("native Csound failed: {error}"),
+        };
+        let render = state.with_render_timeline(vec![(0.0, first), (1.0, second)]);
+        let key = |time| render.program_at(time).map(|program| program.key());
+        let played = key(0.5);
+        assert!(played.is_ok(), "{played:?}");
+        assert_eq!(key(1.5), played);
     }
 
     #[test]

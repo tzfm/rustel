@@ -91,7 +91,7 @@ impl App {
         self.panes[self.focused].scene = id;
         self.strip_mode = SceneStripMode::Idle;
         self.invalidate_maps();
-        self.pointer = None;
+        self.end_pointer_gesture();
         self.rebuild_slider_spans();
         self.lint_pending = true;
         // Which tab has the caret is part of how the set was left, so the
@@ -165,7 +165,7 @@ impl App {
             self.dirty_frame = true;
             return Ok(());
         }
-        self.next_launch = match self.ui_settings.quantise.unit_cycles() {
+        let launch = match self.ui_settings.quantise.unit_cycles() {
             Some(unit_cycles) => Launch::Quantised { unit_cycles },
             None => Launch::Now,
         };
@@ -177,7 +177,10 @@ impl App {
             self.focus_pane(target);
         }
         self.select_scene(index);
-        self.dispatch_editor(Command::Evaluate)
+        self.evaluate_with(LaunchRequest {
+            launch,
+            rewind: false,
+        })
     }
 
     pub(super) fn new_scene(&mut self, duplicate: bool) {
@@ -219,6 +222,7 @@ impl App {
                 let index = self.scenes.current_index();
                 self.panes[self.focused].scene = id;
                 self.reconcile_panes();
+                self.end_pointer_gesture();
                 self.strip_mode = SceneStripMode::Idle;
                 self.rebuild_slider_spans();
                 self.persist_manifest();
@@ -466,7 +470,7 @@ impl App {
         self.strip_mode = SceneStripMode::Idle;
         self.armed_slider = None;
         self.invalidate_maps();
-        self.pointer = None;
+        self.end_pointer_gesture();
         self.rebuild_slider_spans();
         self.lint_pending = true;
         self.dirty_frame = true;
@@ -496,7 +500,7 @@ impl App {
                 errors: self.lint.get(&scene.id).is_some_and(|result| {
                     result.input_channels == self.lint_input_channels() && lint_has_problems(result)
                 }),
-                armed: (self.armed_scene == Some(scene.id))
+                armed: (self.launch_arming.armed_scene() == Some(scene.id))
                     .then(|| {
                         self.snapshot
                             .as_ref()

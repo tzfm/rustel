@@ -560,8 +560,13 @@ impl App {
 
                 let revision = scene.editor.revision();
                 let source = Arc::<str>::from(scene.editor.source());
+                // The tape's block replaces the preview's composite.
+                #[cfg(feature = "hydra")]
+                self.end_snippet_audition();
                 self.queue_evaluation_for(id, revision, source, false);
             } else {
+                #[cfg(feature = "hydra")]
+                self.end_snippet_audition();
                 self.queue_evaluation_for(id, Revision(u64::MAX), source, false);
             }
         }
@@ -794,6 +799,64 @@ mod tests {
             assert!(app.scenes.replay_index(&path).is_none());
         }
 
+        /// A run that walks to its next block ends a snippet preview under
+        /// it. The block's code is what sounds next, and the preview keeps
+        /// no restore that could put the score it displaced back over the
+        /// tape.
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn a_block_the_run_loads_ends_a_snippet_preview_under_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let tapes = directory.path().join("sessions");
+            std::fs::create_dir_all(&tapes).expect("sessions");
+            write_tape(
+                &tapes,
+                "2026-09-05T12-09-48",
+                &[(0.0, "$: s(\"sine\")"), (4.0, "$: s(\"sawtooth\")")],
+            );
+            let mut app = app_over(directory.path());
+
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::End, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let id = app.scenes.current().id;
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            assert!(app.replays[&id].run.is_some(), "the run started");
+
+            // A snippet previews under the playing set.
+            let score = Arc::<str>::from("$: s(\"sine\")");
+            app.snapshot = Some(sounding(true, false));
+            app.installed_revision = Some(source_revision(&score));
+            app.evaluated_source = Some(Arc::clone(&score));
+            app.preview_snippet_score("$: s(\"hh*8\")");
+            assert!(app.snippet_preview.is_some(), "the preview sounds");
+
+            // The block's time is up; the run loads the next one.
+            app.inflight.clear();
+            app.replays
+                .get_mut(&id)
+                .unwrap()
+                .run
+                .as_mut()
+                .unwrap()
+                .next_due = Some(Instant::now() - Duration::from_millis(1));
+            app.tick_replays();
+            assert!(app.snippet_preview.is_none(), "the block ended the preview");
+            let next = app.next_request_id;
+            app.stop_preview();
+            assert_eq!(
+                app.next_request_id, next,
+                "no restore came for the preview the tape replaced: {}",
+                app.status
+            );
+            assert!(
+                app.inflight.values().any(|sent| sent.scene == id),
+                "the block's code went to the engine"
+            );
+        }
+
         /// A replay tab open on the tape being written grows a block on every
         /// save from any tab, and the sessions panel will not delete that tape.
         #[test]
@@ -1003,7 +1066,11 @@ mod tests {
                 "a tape does not wait for a cycle line: {:?}",
                 sent.1
             );
-            assert_eq!(app.armed_scene, None, "and nothing is armed");
+            assert_eq!(
+                app.launch_arming.armed_scene(),
+                None,
+                "and nothing is armed"
+            );
             assert!(
                 app.replays[&id].run.is_some(),
                 "the run walks from the chosen block"

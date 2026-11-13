@@ -222,16 +222,7 @@ impl App {
         super::super::graphics::set_tier(self.ui_settings.rendering.resolve(&self.features));
         // Clock ports reach the engine when they change; the engine says
         // in the log if a port cannot be opened.
-        if self.applied_clock.0 != self.ui_settings.clock_out {
-            self.applied_clock.0 = self.ui_settings.clock_out.clone();
-            let _ = self
-                .worker
-                .try_clock_out(self.ui_settings.clock_out.clone());
-        }
-        if self.applied_clock.1 != self.ui_settings.clock_in {
-            self.applied_clock.1 = self.ui_settings.clock_in.clone();
-            let _ = self.worker.try_clock_in(self.ui_settings.clock_in.clone());
-        }
+        self.push_clock_ports();
         self.configure_piano();
         self.worker
             .master()

@@ -5,6 +5,7 @@ mod text_object;
 use motion::motion_for;
 use text_object::TextObjectKind;
 
+use std::num::NonZeroUsize;
 use std::ops::Range;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -89,17 +90,56 @@ enum Motion {
     LastLine,
 }
 
+/// What the keys of a Normal or Visual command have given so far.
+#[derive(Clone, Debug, Default)]
+struct Pending {
+    /// The count typed since the last command, or since the operator.
+    count: Option<NonZeroUsize>,
+    /// An operator that waits for its motion or text object, and the
+    /// count typed before it.
+    operator: Option<(Operator, Option<NonZeroUsize>)>,
+    /// A prefix that reads the next key before every other Vim rule.
+    awaiting: Option<Awaiting>,
+}
+
+impl Pending {
+    /// Nothing waits for a key: no count, no operator and no prefix.
+    fn is_empty(&self) -> bool {
+        self.count.is_none() && self.operator.is_none() && self.awaiting.is_none()
+    }
+}
+
+/// A prefix that owns the next key.
+#[derive(Clone, Debug)]
+enum Awaiting {
+    /// `g` waits for the second `g` of `gg`.
+    G,
+    /// A text object's `i` or `a` waits for the character that names it.
+    TextObject(TextObjectKind),
+    /// `r` waits for its replacement character, and how many to replace.
+    Replace { count: usize },
+    /// `:` reads its command line until Enter runs it.
+    CommandLine { text: String },
+}
+
+/// The Visual a studio chord left, at the revision it left it. Its band
+/// stays selected for the chord to act on.
+#[derive(Clone, Copy, Debug)]
+struct LastVisual {
+    revision: Revision,
+    anchor: ByteOffset,
+    head: ByteOffset,
+    linewise: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct VimState {
     keybindings: EditorKeybindings,
     mode: Mode,
-    count: usize,
-    operator: Option<(Operator, usize)>,
-    /// `r` waits for its replacement character, and how many to replace.
-    replace: Option<usize>,
-    text_object: Option<TextObjectKind>,
-    g: bool,
-    command: Option<String>,
+    pending: Pending,
+    /// The next command that adopts the selection, other than `v` and `V`,
+    /// takes this Visual back as it was, while its band is untouched.
+    last_visual: Option<LastVisual>,
     message: Option<&'static str>,
     motion_blocked: bool,
     register: String,
@@ -141,7 +181,7 @@ impl Editor {
         self.vim_is_insert()
     }
 
-    /// Vim is on and rests in Normal, with no motion or command waiting.
+    /// Vim is on and in Normal mode. A command can still wait for keys.
     pub(crate) fn vim_is_normal(&self) -> bool {
         self.vim.keybindings == EditorKeybindings::Vim && self.vim.mode == Mode::Normal
     }
@@ -173,19 +213,27 @@ impl Editor {
         self.vim.register = text;
     }
 
-    /// Visual's two ends after `edits`, the later one still exclusive.
-    /// Both ends are inclusive in Visual: the later one is the last
-    /// character the band covers, so it follows the edit as the band's own
-    /// end does, and [`Self::vim_set_visual_ends`] steps it back onto its
-    /// character once the edit is in.
-    pub(super) fn vim_visual_through(&self, edits: &[Edit]) -> Option<(ByteOffset, ByteOffset)> {
+    /// Visual's two ends after `transaction`, the later one still
+    /// exclusive. Both ends are inclusive in Visual: the later one is the
+    /// last character the band covers, so it follows the edit as the
+    /// band's own end does, and [`Self::vim_set_visual_ends`] steps it back
+    /// onto its character once the edit is in. `None` when no Visual
+    /// follows the edit: Vim is not in Visual, or the transaction places
+    /// its own selection in place of the band.
+    pub(super) fn vim_visual_through(
+        &self,
+        transaction: &Transaction,
+    ) -> Option<(ByteOffset, ByteOffset)> {
         let Mode::Visual { anchor, head, .. } = self.vim.mode else {
             return None;
         };
+        if transaction.selection_after.is_some() {
+            return None;
+        }
         let (first, last) = (anchor.min(head), anchor.max(head));
         let end = self.document.next_grapheme_boundary(last).unwrap_or(last);
-        let first = super::map_offset(first, edits, false);
-        let end = super::map_offset(end, edits, true);
+        let first = super::map_offset(first, &transaction.edits, false);
+        let end = super::map_offset(end, &transaction.edits, true);
         Some(if anchor <= head {
             (first, end)
         } else {
@@ -193,8 +241,15 @@ impl Editor {
         })
     }
 
+    /// Put Visual on the ends [`Self::vim_visual_through`] gave. Without
+    /// ends, Visual ends and drops the command it waited on. It does not
+    /// close the history group.
     pub(super) fn vim_set_visual_ends(&mut self, ends: Option<(ByteOffset, ByteOffset)>) {
         let Some((anchor_end, head_end)) = ends else {
+            if matches!(self.vim.mode, Mode::Visual { .. }) {
+                self.vim.mode = Mode::Normal;
+                self.vim.pending = Pending::default();
+            }
             return;
         };
         let (first, end) = (anchor_end.min(head_end), anchor_end.max(head_end));
@@ -241,13 +296,7 @@ impl Editor {
 
     pub(crate) fn vim_needs_escape(&self) -> bool {
         self.vim.keybindings == EditorKeybindings::Vim
-            && (self.vim.mode != Mode::Normal
-                || self.vim.count != 0
-                || self.vim.operator.is_some()
-                || self.vim.text_object.is_some()
-                || self.vim.g
-                || self.vim.command.is_some()
-                || self.find_open())
+            && (self.vim.mode != Mode::Normal || self.vim_has_pending_command())
     }
 
     pub(crate) fn vim_label(&self) -> Option<String> {
@@ -257,8 +306,11 @@ impl Editor {
         if self.find_open() {
             return self.find_label();
         }
-        if let Some(command) = &self.vim.command {
-            return Some(format!(":{command}"));
+        if let Some(Awaiting::CommandLine { text }) = &self.vim.pending.awaiting {
+            return Some(match self.vim.message {
+                Some(message) => format!(":{text} \u{b7} {message}"),
+                None => format!(":{text}"),
+            });
         }
         if let Some(message) = self.vim.message {
             return Some(message.to_owned());
@@ -272,9 +324,9 @@ impl Editor {
             Mode::Visual { linewise: true, .. } => "V-LINE",
         }
         .to_owned();
-        if let Some((operator, count)) = self.vim.operator {
+        if let Some((operator, count)) = self.vim.pending.operator {
             label.push(' ');
-            if count > 1 {
+            if let Some(count) = count.filter(|count| count.get() > 1) {
                 label.push_str(&count.to_string());
             }
             label.push(match operator {
@@ -283,18 +335,22 @@ impl Editor {
                 Operator::Yank => 'y',
             });
         }
-        if self.vim.count > 0 {
+        if let Some(count) = self.vim.pending.count {
             label.push(' ');
-            label.push_str(&self.vim.count.to_string());
+            label.push_str(&count.to_string());
         }
-        if self.vim.g {
-            label.push_str(" g");
-        }
-        if let Some(kind) = self.vim.text_object {
-            label.push_str(match kind {
-                TextObjectKind::Inner => " i",
-                TextObjectKind::Around => " a",
-            });
+        match &self.vim.pending.awaiting {
+            Some(Awaiting::G) => label.push_str(" g"),
+            Some(Awaiting::TextObject(TextObjectKind::Inner)) => label.push_str(" i"),
+            Some(Awaiting::TextObject(TextObjectKind::Around)) => label.push_str(" a"),
+            Some(Awaiting::Replace { count }) => {
+                label.push(' ');
+                if *count > 1 {
+                    label.push_str(&count.to_string());
+                }
+                label.push('r');
+            }
+            Some(Awaiting::CommandLine { .. }) | None => {}
         }
         Some(label)
     }
@@ -303,21 +359,29 @@ impl Editor {
         if self.vim.keybindings != EditorKeybindings::Vim {
             return;
         }
-        self.vim.count = 0;
-        self.vim.operator = None;
-        self.vim.replace = None;
-        self.vim.text_object = None;
-        self.vim.g = false;
-        self.vim.command = None;
+        self.vim.pending = Pending::default();
         self.vim.message = None;
         self.close_history_group();
     }
 
+    /// Leave Visual and drop a pending command for a studio chord. The
+    /// band stays selected for the chord to act on.
     pub(crate) fn interrupt_key_mode(&mut self) {
         self.find_cancel();
         self.vim_remap.clear_pending();
         self.vim_cancel_pending();
-        if matches!(self.vim.mode, Mode::Visual { .. }) {
+        if let Mode::Visual {
+            anchor,
+            head,
+            linewise,
+        } = self.vim.mode
+        {
+            self.vim.last_visual = Some(LastVisual {
+                revision: self.document.revision(),
+                anchor,
+                head,
+                linewise,
+            });
             self.vim.mode = Mode::Normal;
         }
     }
@@ -336,11 +400,11 @@ impl Editor {
     /// A paste while `:` waits for its command types into the command
     /// line, as its keys do. `false` when no command line is open.
     pub(crate) fn vim_command_paste(&mut self, text: &str) -> bool {
-        if self.vim.command.is_none() {
+        let Some(Awaiting::CommandLine { text: line }) = &mut self.vim.pending.awaiting else {
             return false;
-        }
+        };
         for character in text.chars() {
-            self.vim_command_type(character);
+            type_into_command_line(line, character);
         }
         true
     }
@@ -418,14 +482,10 @@ impl Editor {
             self.vim_escape()?;
             return Ok(true);
         }
-        // r waits for its replacement character. Esc above cancels it.
-        if let Some(count) = self.vim.replace.take() {
-            if matches!(self.vim.mode, Mode::Visual { .. }) {
-                self.vim_replace_selection(key, moment)?;
-            } else {
-                self.vim_replace(count, key, moment)?;
-            }
-            return Ok(true);
+        // A prefix reads the key after it before every rule below. Esc
+        // above cancels it.
+        if let Some(awaiting) = self.vim.pending.awaiting.take() {
+            return self.vim_complete(awaiting, key, moment);
         }
         // Ctrl+C leaves Insert mode, as it does in Vim. Elsewhere it keeps
         // its studio meaning: copy. Enhanced terminals report Shift too.
@@ -437,8 +497,11 @@ impl Editor {
             return Ok(true);
         }
         if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::CONTROL {
-            if self.vim.mode == Mode::Insert || self.vim.command.is_some() {
+            if self.vim.mode == Mode::Insert {
                 self.vim.message = Some("Register insertion is not supported");
+            } else if self.vim.pending.operator.is_some() {
+                // Vim's Ctrl+R cancels a waiting operator and redoes nothing.
+                self.vim_cancel_pending();
             } else {
                 let count = self.vim_take_count();
                 self.vim_escape()?;
@@ -466,7 +529,12 @@ impl Editor {
                         'd' | 'c' | 'y' | 'x' | 'X' | 'D' | 'C' | 'Y' | 'p' | 'P' | 'v' | 'V'
                     )
                 ));
-        let entered_visual = !pending && acts_on_selection && self.vim_selection_to_visual()?;
+        // `v` and `V` take any selection as character-wise Visual, so only a
+        // command that acts on the band takes back the Visual a chord left.
+        let entered_visual = !pending
+            && acts_on_selection
+            && ((!matches!(key.code, KeyCode::Char('v' | 'V')) && self.vim_resume_visual()?)
+                || self.vim_selection_to_visual()?);
         if entered_visual && matches!(key.code, KeyCode::Char('v' | 'V')) {
             return Ok(true);
         }
@@ -483,32 +551,19 @@ impl Editor {
             return Ok(true);
         }
         if key.modifiers == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('d' | 'u')) {
-            let counted = self.vim.count != 0;
-            let count = self.vim_take_count();
-            if self.vim.operator.take().is_some() {
+            let count = self.vim.pending.count.take();
+            if self.vim.pending.operator.is_some() {
                 self.vim_cancel_pending();
                 return Ok(true);
             }
             self.vim.message = None;
-            self.vim_half_page(key.code == KeyCode::Char('d'), counted.then_some(count))?;
+            self.vim_half_page(key.code == KeyCode::Char('d'), count.map(NonZeroUsize::get))?;
             return Ok(true);
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(false);
         }
         self.vim.message = None;
-        if self.vim.command.is_some() {
-            self.vim_command_key(key)?;
-            return Ok(true);
-        }
-        if let Some(kind) = self.vim.text_object.take() {
-            if let KeyCode::Char(character) = key.code {
-                self.vim_finish_text_object(kind, character, moment)?;
-            } else {
-                self.vim_cancel_pending();
-            }
-            return Ok(true);
-        }
         self.vim_normalize_caret()?;
         let character = match key.code {
             KeyCode::Char(character) => character,
@@ -529,7 +584,7 @@ impl Editor {
             KeyCode::End => '$',
             KeyCode::Delete => 'x',
             KeyCode::Enter => {
-                if self.vim.operator.is_some() {
+                if self.vim.pending.operator.is_some() {
                     self.vim_finish_motion(Motion::Down, moment)?;
                     return Ok(true);
                 }
@@ -544,37 +599,30 @@ impl Editor {
                 return Ok(false);
             }
         };
-        if character.is_ascii_digit() && (character != '0' || self.vim.count != 0) {
-            self.vim.count = self
+        if character.is_ascii_digit() && (character != '0' || self.vim.pending.count.is_some()) {
+            let count = self
                 .vim
+                .pending
                 .count
+                .map_or(0, NonZeroUsize::get)
                 .saturating_mul(10)
                 .saturating_add((character as u8 - b'0') as usize)
                 .min(self.document.maximum_bytes());
-            return Ok(true);
-        }
-        if self.vim.g {
-            self.vim.g = false;
-            if character == 'g' {
-                return self
-                    .vim_finish_motion(Motion::FirstLine, moment)
-                    .map(|()| true);
-            }
-            self.vim_cancel_pending();
+            self.vim.pending.count = NonZeroUsize::new(count);
             return Ok(true);
         }
         if character == 'g' {
-            self.vim.g = true;
+            self.vim.pending.awaiting = Some(Awaiting::G);
             return Ok(true);
         }
         if matches!(character, 'i' | 'a')
-            && (self.vim.operator.is_some() || matches!(self.vim.mode, Mode::Visual { .. }))
+            && (self.vim.pending.operator.is_some() || matches!(self.vim.mode, Mode::Visual { .. }))
         {
-            self.vim.text_object = Some(if character == 'i' {
+            self.vim.pending.awaiting = Some(Awaiting::TextObject(if character == 'i' {
                 TextObjectKind::Inner
             } else {
                 TextObjectKind::Around
-            });
+            }));
             return Ok(true);
         }
         if let Some(motion) = motion_for(character) {
@@ -592,9 +640,11 @@ impl Editor {
                 let range = self.primary_selection().ordered();
                 let start = range.start;
                 self.vim_apply_operator(operator, range, linewise, false, start, moment)?;
-            } else if let Some((pending, count)) = self.vim.operator.take() {
+            } else if let Some((pending, before)) = self.vim.pending.operator.take() {
                 if pending == operator {
-                    let count = count.saturating_mul(self.vim_take_count());
+                    let count = before
+                        .map_or(1, NonZeroUsize::get)
+                        .saturating_mul(self.vim_take_count());
                     let head = self.vim_head();
                     let line = self.document.line_of(head)?;
                     let range = self.vim_line_range(line, line.saturating_add(count - 1));
@@ -603,12 +653,11 @@ impl Editor {
                     self.vim_cancel_pending();
                 }
             } else {
-                let count = self.vim_take_count();
-                self.vim.operator = Some((operator, count));
+                self.vim.pending.operator = Some((operator, self.vim.pending.count.take()));
             }
             return Ok(true);
         }
-        if self.vim.operator.take().is_some() {
+        if self.vim.pending.operator.is_some() {
             self.vim_cancel_pending();
             return Ok(true);
         }
@@ -691,7 +740,7 @@ impl Editor {
             }
             'p' | 'P' => self.vim_put(character == 'P', count, moment)?,
             'r' => {
-                self.vim.replace = Some(count);
+                self.vim.pending.awaiting = Some(Awaiting::Replace { count });
             }
             'u' => {
                 self.vim_escape()?;
@@ -711,18 +760,76 @@ impl Editor {
             }
             ':' => {
                 self.vim_escape()?;
-                self.vim.command = Some(String::new());
+                self.vim.pending.awaiting = Some(Awaiting::CommandLine {
+                    text: String::new(),
+                });
             }
             _ => {}
         }
         Ok(true)
     }
 
-    fn vim_command_key(&mut self, key: KeyEvent) -> Result<(), EditorError> {
+    /// Finish or cancel the prefix that owns `key`. A chord that `g` or a
+    /// text object does not read cancels it and gives `false`. The studio
+    /// then drops the chord, as it drops every key that ends a pending
+    /// command.
+    fn vim_complete(
+        &mut self,
+        awaiting: Awaiting,
+        key: KeyEvent,
+        moment: HistoryMoment,
+    ) -> Result<bool, EditorError> {
+        self.vim.message = None;
+        match awaiting {
+            Awaiting::Replace { count } => {
+                if matches!(self.vim.mode, Mode::Visual { .. }) {
+                    self.vim_replace_selection(key, moment)?;
+                } else {
+                    self.vim_replace(count, key, moment)?;
+                }
+            }
+            Awaiting::CommandLine { text } => return self.vim_command_key(text, key),
+            Awaiting::G | Awaiting::TextObject(_)
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.vim_cancel_pending();
+                return Ok(false);
+            }
+            Awaiting::G => {
+                self.vim_normalize_caret()?;
+                if key.code == KeyCode::Char('g') {
+                    self.vim_finish_motion(Motion::FirstLine, moment)?;
+                } else {
+                    self.vim_cancel_pending();
+                }
+            }
+            Awaiting::TextObject(kind) => match key.code {
+                KeyCode::Char(character) => self.vim_finish_text_object(kind, character, moment)?,
+                _ => self.vim_cancel_pending(),
+            },
+        }
+        Ok(true)
+    }
+
+    /// A key while `:` reads `text`. Enter runs the command, Ctrl+U clears
+    /// the line as Vim's does, Ctrl+D leaves it, Ctrl+R says why it does
+    /// nothing, and Backspace on an empty line closes it. Any other chord
+    /// closes the line and gives `false`, as in [`Self::vim_complete`].
+    fn vim_command_key(&mut self, mut text: String, key: KeyEvent) -> Result<bool, EditorError> {
+        let chord = key.modifiers == KeyModifiers::CONTROL;
         match key.code {
+            KeyCode::Char('u') if chord => text.clear(),
+            // Vim's Ctrl+D lists completions. The line has none to list.
+            KeyCode::Char('d') if chord => {}
+            KeyCode::Char('r') if chord => {
+                self.vim.message = Some("Register insertion is not supported");
+            }
+            _ if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.vim_cancel_pending();
+                return Ok(false);
+            }
             KeyCode::Enter => {
-                let command = self.vim.command.take().unwrap_or_default();
-                match command.trim() {
+                match text.trim() {
                     "u" | "undo" => self.vim_undo(1)?,
                     "red" | "redo" => {
                         self.redo()?;
@@ -735,27 +842,18 @@ impl Editor {
                         Err(_) => self.vim.message = Some("Use :<line>, :undo or :redo"),
                     },
                 }
+                return Ok(true);
             }
             KeyCode::Backspace => {
-                if let Some(command) = self.vim.command.as_mut()
-                    && command.pop().is_none()
-                {
-                    self.vim.command = None;
+                if text.pop().is_none() {
+                    return Ok(true);
                 }
             }
-            KeyCode::Char(character) => self.vim_command_type(character),
+            KeyCode::Char(character) => type_into_command_line(&mut text, character),
             _ => {}
         }
-        Ok(())
-    }
-
-    fn vim_command_type(&mut self, character: char) {
-        if let Some(command) = self.vim.command.as_mut()
-            && command.len() < 64
-            && !character.is_control()
-        {
-            command.push(character);
-        }
+        self.vim.pending.awaiting = Some(Awaiting::CommandLine { text });
+        Ok(true)
     }
 
     /// Undo `count` steps. An undo brings back the selection its change
@@ -780,7 +878,7 @@ impl Editor {
     }
 
     fn vim_take_count(&mut self) -> usize {
-        std::mem::take(&mut self.vim.count).max(1)
+        self.vim.pending.count.take().map_or(1, NonZeroUsize::get)
     }
 
     fn vim_begin_insert(&mut self, moment: HistoryMoment) {
@@ -802,6 +900,7 @@ impl Editor {
             head
         };
         self.vim.mode = Mode::Normal;
+        self.vim.last_visual = None;
         self.vim_cancel_pending();
         // Esc moves the caret out of Insert or Visual. A caret already in
         // place stays, and so does a view the wheel scrolled away from it.
@@ -920,13 +1019,41 @@ impl Editor {
         matches!(self.vim.mode, Mode::Visual { .. })
     }
 
-    fn vim_select_visual(
-        &mut self,
+    /// Take back the Visual a studio chord left, as it was, while nothing
+    /// has changed its band or the text. `true` when Visual came back.
+    fn vim_resume_visual(&mut self) -> Result<bool, EditorError> {
+        let Some(LastVisual {
+            revision,
+            anchor,
+            head,
+            linewise,
+        }) = self.vim.last_visual.take()
+        else {
+            return Ok(false);
+        };
+        if self.vim.mode != Mode::Normal
+            || revision != self.document.revision()
+            || self.selections.len() > 1
+        {
+            return Ok(false);
+        }
+        let band = self.vim_band(anchor, head, linewise)?;
+        let selection = self.primary_selection();
+        if (band.anchor, band.head) != (selection.anchor, selection.head) {
+            return Ok(false);
+        }
+        self.vim_select_visual(anchor, head, linewise)?;
+        Ok(true)
+    }
+
+    /// The selection Visual draws from `anchor` to `head`.
+    fn vim_band(
+        &self,
         anchor: ByteOffset,
         head: ByteOffset,
         linewise: bool,
-    ) -> Result<(), EditorError> {
-        let selection = if linewise {
+    ) -> Result<Selection, EditorError> {
+        Ok(if linewise {
             let first = self.document.line_of(anchor.min(head))?;
             let last = self.document.line_of(anchor.max(head))?;
             let range = self.vim_line_range(first, last);
@@ -939,13 +1066,23 @@ impl Editor {
             Selection::range(anchor, self.document.next_grapheme_boundary(head)?)
         } else {
             Selection::range(self.document.next_grapheme_boundary(anchor)?, head)
-        };
+        })
+    }
+
+    fn vim_select_visual(
+        &mut self,
+        anchor: ByteOffset,
+        head: ByteOffset,
+        linewise: bool,
+    ) -> Result<(), EditorError> {
+        let selection = self.vim_band(anchor, head, linewise)?;
         self.set_selection(selection)?;
         self.vim.mode = Mode::Visual {
             anchor,
             head,
             linewise,
         };
+        self.vim.last_visual = None;
         self.ensure_primary_visible();
         Ok(())
     }
@@ -1325,6 +1462,14 @@ impl Editor {
             self.vim_fill_register(register, linewise);
         }
         self.vim_normalize_caret()
+    }
+}
+
+/// The `:` line takes a typed character while it holds fewer than 64
+/// bytes. It never takes a control character.
+fn type_into_command_line(line: &mut String, character: char) {
+    if line.len() < 64 && !character.is_control() {
+        line.push(character);
     }
 }
 
@@ -1974,5 +2119,185 @@ mod tests {
         press(&mut editor, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(editor.source(), "abc def");
         assert_eq!(editor.primary_selection(), Selection::caret(ByteOffset(0)));
+    }
+
+    /// A count of 1 before an operator is a count, so `1dG` deletes up to
+    /// the first line, as `d1G` does, and not to the last line.
+    #[test]
+    fn a_count_of_one_before_an_operator_is_a_count() {
+        let source: String = (0..10).map(|line| format!("{line}\n")).collect();
+        for keys in ["1dG", "d1G"] {
+            assert_eq!(
+                typed(&source, 8, keys).source(),
+                "5\n6\n7\n8\n9\n",
+                "{keys}"
+            );
+        }
+    }
+
+    /// The key after `g` or a text object's `i` belongs to that prefix. A
+    /// key it does not wait for cancels it: Ctrl+D does not scroll, a digit
+    /// is no count, and the next `g` waits again.
+    #[test]
+    fn a_prefix_owns_the_key_after_it() {
+        for (code, modifiers) in [
+            (KeyCode::Char('d'), KeyModifiers::CONTROL),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL),
+            (KeyCode::Char('2'), KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Tab, KeyModifiers::NONE),
+        ] {
+            let mut editor = editor();
+            type_keys(&mut editor, "3jg");
+            press(&mut editor, code, modifiers);
+            type_keys(&mut editor, "g");
+            assert_eq!(line(&editor), 3, "{code:?} moved the caret");
+            assert_eq!(editor.viewport().top_row, 0, "{code:?} scrolled");
+            assert_eq!(editor.vim_label().as_deref(), Some("NORMAL g"), "{code:?}");
+        }
+        let mut editor = typed("f(\nab\ncd\n)\n", 3, "vi");
+        press(&mut editor, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        type_keys(&mut editor, "(");
+        assert_eq!(
+            editor.primary_selection().ordered(),
+            ByteOffset(3)..ByteOffset(4),
+            "Ctrl+D cancelled the i, so ( selected nothing"
+        );
+    }
+
+    /// Ctrl+R while an operator or a prefix waits cancels it and redoes
+    /// nothing, as in Vim.
+    #[test]
+    fn ctrl_r_cancels_a_waiting_command_without_a_redo() {
+        for keys in ["d", "2d", "g", "di"] {
+            let mut editor = typed("abc\n", 0, "xu");
+            type_keys(&mut editor, keys);
+            press(&mut editor, KeyCode::Char('r'), KeyModifiers::CONTROL);
+            assert_eq!(editor.source(), "abc\n", "{keys} then Ctrl+R");
+            assert_eq!(editor.vim_label().as_deref(), Some("NORMAL"), "{keys}");
+        }
+    }
+
+    /// Ctrl+U clears the `:` line, as Vim's does, and Ctrl+D leaves it.
+    /// Neither scrolls the score behind it.
+    #[test]
+    fn the_command_line_takes_ctrl_u_and_ctrl_d() {
+        let mut editor = editor();
+        press(&mut editor, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        type_keys(&mut editor, ":12");
+        press(&mut editor, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(editor.vim_label().as_deref(), Some(":12"));
+        press(&mut editor, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(editor.vim_label().as_deref(), Some(":"));
+        assert_eq!(line(&editor), 3, "the caret stays");
+        assert_eq!(editor.viewport().top_row, 3, "the view stays");
+    }
+
+    /// Ctrl+R on the `:` line shows why it does nothing beside the line.
+    #[test]
+    fn ctrl_r_on_the_command_line_shows_its_message() {
+        let mut editor = editor();
+        type_keys(&mut editor, ":1");
+        press(&mut editor, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(
+            editor.vim_label().as_deref(),
+            Some(":1 \u{b7} Register insertion is not supported")
+        );
+        type_keys(&mut editor, "2");
+        assert_eq!(editor.vim_label().as_deref(), Some(":12"));
+    }
+
+    /// The footer shows an `r` that waits for its character, with its
+    /// count, as it shows a waiting operator.
+    #[test]
+    fn a_waiting_r_shows_in_the_label() {
+        let mut editor = editor();
+        type_keys(&mut editor, "r");
+        assert_eq!(editor.vim_label().as_deref(), Some("NORMAL r"));
+        type_keys(&mut editor, "x3r");
+        assert_eq!(editor.vim_label().as_deref(), Some("NORMAL 3r"));
+    }
+
+    /// A studio chord leaves V-LINE and keeps its band for the chord. The
+    /// next `y` or `d` takes the band back as whole lines, so `p` puts a
+    /// line below and does not split one.
+    #[test]
+    fn a_line_band_left_by_a_chord_stays_linewise() {
+        for (keys, put) in [("yp", "ab\nab\ncd\n"), ("dp", "cd\nab\n")] {
+            let mut editor = typed("ab\ncd\n", 0, "V");
+            editor.interrupt_key_mode();
+            assert!(editor.vim_is_normal(), "the chord left Visual");
+            type_keys(&mut editor, keys);
+            assert_eq!(editor.source(), put, "{keys}");
+        }
+    }
+
+    /// After a studio chord leaves V-LINE, `v` and `V` take its band as
+    /// character-wise Visual, as they take any other selection.
+    #[test]
+    fn v_takes_a_band_left_by_a_chord_as_characters() {
+        for key in ['v', 'V'] {
+            let mut editor = typed("ab\ncd\nef\n", 0, "Vj");
+            editor.interrupt_key_mode();
+            press(&mut editor, KeyCode::Char(key), KeyModifiers::NONE);
+            assert_eq!(editor.vim_label().as_deref(), Some("VISUAL"), "{key}");
+        }
+    }
+
+    /// An edit that places its own selection, such as a remote key typed
+    /// over the band, ends Visual. No Visual stays over the caret it left.
+    #[test]
+    fn an_edit_that_places_its_selection_ends_visual() {
+        let mut editor = typed("abc\n", 0, "vl");
+        editor
+            .dispatch(
+                super::super::Command::InsertText("x".into()),
+                HistoryMoment(0),
+                &mut super::super::MemoryClipboard::default(),
+            )
+            .expect("type");
+        assert_eq!(editor.source(), "xc\n");
+        assert!(!editor.vim_is_visual(), "Visual ended");
+        assert_eq!(editor.vim_label().as_deref(), Some("NORMAL"));
+    }
+
+    /// An edit that ends Visual also drops the command Visual waited on:
+    /// a count, a `g`, a text object's `i` or an `r`. The next key starts
+    /// a new command, so the `r` replaces nothing.
+    #[test]
+    fn an_edit_that_ends_visual_drops_its_waiting_command() {
+        for keys in ["vl2", "vlg", "vli", "vlr"] {
+            let mut editor = typed("abc\n", 0, keys);
+            editor
+                .dispatch(
+                    super::super::Command::InsertText("x".into()),
+                    HistoryMoment(0),
+                    &mut super::super::MemoryClipboard::default(),
+                )
+                .expect("type");
+            assert_eq!(editor.vim_label().as_deref(), Some("NORMAL"), "{keys}");
+            type_keys(&mut editor, "z");
+            assert_eq!(editor.source(), "xc\n", "{keys}");
+        }
+    }
+
+    /// A remote arrow reaches the editor as a move, not as a Vim key. It
+    /// ends Visual, so the next `x` deletes at the caret.
+    #[test]
+    fn a_move_from_outside_vim_ends_visual() {
+        let mut editor = typed("abc\n", 0, "vl");
+        editor
+            .dispatch(
+                super::super::Command::Move {
+                    motion: super::super::Motion::Right,
+                    extend: false,
+                },
+                HistoryMoment(0),
+                &mut super::super::MemoryClipboard::default(),
+            )
+            .expect("move");
+        assert_eq!(editor.vim_label().as_deref(), Some("NORMAL"));
+        type_keys(&mut editor, "x");
+        assert_eq!(editor.source(), "ab\n");
     }
 }
