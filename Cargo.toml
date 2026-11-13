@@ -120,7 +120,8 @@ incremental = true
 # after a resize and kitty associated text; return to crates.io after a
 # release includes crossterm-rs/crossterm PRs #1125, #1127 and #1128.
 crossterm = { git = "https://github.com/tzfm/crossterm", rev = "f772fd3f90be8a85d0a94866bc9daeb0e082255d" }
-# The connection reactor zeroed a megabyte on every wakeup. The fork reads
-# into a scratch it keeps instead. Return to crates.io after a release
-# includes colinmarc/pulseaudio-rs PR #22 (0.3.2 still zeroes).
-pulseaudio = { git = "https://github.com/undy-aeon/pulseaudio-rs", rev = "49f1f69a6b500bb513164edc2c19c69446f53a8c" }
+# The connection reactor zeroed a megabyte on every wakeup. The commit of
+# colinmarc/pulseaudio-rs PR #22 reads into a scratch it keeps instead.
+# Return to crates.io after a release includes that change (0.3.2 still
+# zeroes).
+pulseaudio = { git = "https://github.com/colinmarc/pulseaudio-rs", rev = "49f1f69a6b500bb513164edc2c19c69446f53a8c" }

@@ -7,6 +7,6 @@
   This revision preserves new jobs that finalizers queue while old jobs are discarded.
   Replace the pin when a compatible official rquickjs release includes the cancellation API and this finalizer fix.
   The API proposals are [QuickJS-NG #1745](https://github.com/quickjs-ng/quickjs/pull/1745) and [rquickjs #763](https://github.com/DelSkayn/rquickjs/pull/763).
-- **pulseaudio 0.3.2:** pinned to [undy-aeon/pulseaudio-rs](https://github.com/undy-aeon/pulseaudio-rs/commit/49f1f69a6b500bb513164edc2c19c69446f53a8c) because the connection reactor's read loop grows its buffer by a zeroed megabyte on every socket wakeup, which costs more than the audio each wakeup carries on a small machine.
-  The fork reads into a scratch it keeps between wakeups instead. Nothing else in the crate is changed.
+- **pulseaudio 0.3.2:** pinned to [the commit of PR #22](https://github.com/colinmarc/pulseaudio-rs/commit/49f1f69a6b500bb513164edc2c19c69446f53a8c) in colinmarc/pulseaudio-rs because the connection reactor's read loop grows its buffer by a zeroed megabyte on every socket wakeup, which costs more than the audio each wakeup carries on a small machine.
+  The commit reads into a scratch it keeps between wakeups instead. Nothing else in the crate is changed.
   Replace the pin when an official release includes [PR #22](https://github.com/colinmarc/pulseaudio-rs/pull/22).
