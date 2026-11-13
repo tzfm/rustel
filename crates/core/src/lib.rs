@@ -1893,6 +1893,12 @@ impl PatternedPureMap {
         Arc::ptr_eq(&self.body, &other.body) && self.chain == other.chain
     }
 
+    /// Whether the body gives the operand itself for every value, as the
+    /// coin of `sometimes` does.
+    fn gives_its_operand(&self) -> bool {
+        Arc::ptr_eq(&self.body, &combinators::coin_body())
+    }
+
     fn apply(&self, value: &Value, operand: &Pattern) -> purity::PurePattern {
         let values = match value {
             Value::List(values) => values.clone(),
@@ -5857,11 +5863,22 @@ impl Pattern {
     /// that fails or is refused only outside the part so answers. Any other
     /// graph is asked over the span, where it reads its values.
     fn query_restarted(&self, shift: Fraction, state: &State, part: TimeSpan) -> Vec<Hap> {
-        let moved = self.late(shift);
         if self.is_cacheable() && !self.purity.span_read {
-            moved.query(&state.set_span(part))
-        } else {
-            moved.query(state)
+            return self.late(shift).query(&state.set_span(part));
+        }
+        match self.node_kind() {
+            // A stack answers its layers one after the other, so each layer
+            // is asked as its own haps allow. A handle that binds a runtime
+            // or is marked volatile is asked as it is.
+            Node::Stack(layers) if self.runtime_settings.is_none() && !self.is_volatile() => {
+                extend_budgeted(
+                    layers.iter().filter(|layer| !layer.is_rest()).map(|layer| {
+                        query_stack_child(|| layer.query_restarted(shift, state, part))
+                    }),
+                )
+                .unwrap_or_default()
+            }
+            _ => self.late(shift).query(state),
         }
     }
 
@@ -9193,6 +9210,25 @@ fn answers_by_its_haps(node: &Node) -> bool {
         Node::AppLeft(functions, ..) => discrete(functions),
         Node::AppRight(_, values, ..) => discrete(values),
         Node::AppBoth(functions, values, ..) => discrete(functions) && discrete(values),
+        // Each hap of the selector asks its pattern over the hap's part, or
+        // over the span and keeps the part: the same haps, for patterns of
+        // discrete haps. A squeeze makes a pattern for each hap.
+        Node::Pick {
+            selector,
+            lookup,
+            mode,
+            ..
+        } => {
+            *mode != JoinMode::Squeeze && discrete(selector) && lookup.patterns().all(discrete)
+        }
+        // The coin of `sometimes`: each hap of the carrier asks the operand
+        // itself over the hap's part.
+        Node::Join(inner, JoinMode::Inner) => match inner.node_kind() {
+            Node::PatternOfPureOperand(carrier, operand, map, _) => {
+                map.gives_its_operand() && discrete(carrier) && discrete(operand)
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -11275,13 +11311,14 @@ mod restart_tests {
             .with_added_context(vec![(n as usize, n as usize + 1)])
     }
 
+    fn steps(from: i32, count: i32) -> Pattern {
+        fastcat((0..count).map(|n| note(f64::from(from + n))).collect())
+    }
+
     /// Sections of discrete haps: steps, stacks, alternations, structures,
-    /// speed changes and controls, with a signal as the value of one.
-    fn sections() -> Vec<Pattern> {
+    /// speed changes, a coin and controls, with a signal as the value of one.
+    fn discrete_sections() -> Vec<Pattern> {
         use crate::compose::{Alignment, ComposeOp, compose};
-        let steps = |from: i32, count: i32| {
-            fastcat((0..count).map(|n| note(f64::from(from + n))).collect())
-        };
         let cutoff = crate::signal::saw()
             .slow(whole(3))
             .fmap(|value| Value::object([("cutoff".to_string(), value.clone())]));
@@ -11300,41 +11337,47 @@ mod restart_tests {
             )
             .late(third(1)),
             steps(60, 5).degrade_by_seeded(0.5, 7),
+            crate::combinators::sometimes_by(&steps(70, 6), 0.5, None),
+            picked(
+                JoinMode::Restart,
+                vec![steps(80, 3), steps(90, 2).slow(whole(2))],
+                third(2),
+            ),
         ]
     }
 
-    /// The same pick, with each section read at the span of the query: a
-    /// volatile section is no graph of discrete haps to the join.
-    fn picked(mode: JoinMode, read_at_the_span: bool) -> Pattern {
-        let sections: Vec<(usize, Pattern)> = sections()
-            .into_iter()
-            .map(|section| {
-                if read_at_the_span {
-                    section.mark_volatile()
-                } else {
-                    section
-                }
-            })
-            .enumerate()
-            .collect();
+    /// Sections with a layer that reads the span: a stack of steps and a
+    /// signal, alone and in another stack.
+    fn sections_with_a_signal() -> Vec<Pattern> {
+        let mixed = stack(vec![steps(100, 4), crate::signal::saw(), steps(110, 3)]);
+        vec![mixed.clone(), stack(vec![steps(120, 2), mixed])]
+    }
+
+    /// A pick of `sections` in turn, each for `cycles` cycles.
+    fn picked(mode: JoinMode, sections: Vec<Pattern>, cycles: Fraction) -> Pattern {
         let count = sections.len();
-        // Each section holds two cycles and a third of one.
         let selector = fastcat((0..count).map(|n| pure(Value::F64(n as f64))).collect())
-            .slow(Fraction::new(7 * count as i128, 3));
+            .slow(cycles * Fraction::int(count as i128));
         pick(
             selector,
             PickLookup::Array {
                 enumerable_len: count,
                 length: count,
-                entries: sections,
+                entries: sections.into_iter().enumerate().collect(),
             },
             PickIndexMode::Clamp,
             mode,
         )
     }
 
+    /// `section` behind a time map that changes no time. The join does not
+    /// know the map, so it asks such a section over the span of the query.
+    fn asked_over_the_span(section: Pattern) -> Pattern {
+        section.with_query_time(|time| time)
+    }
+
     #[test]
-    fn a_restart_asks_a_section_of_discrete_haps_over_its_part_alone() {
+    fn a_restart_asks_discrete_haps_over_their_part_alone() {
         let spans = [
             (Fraction::ZERO, whole(16)),
             (third(-5), third(22)),
@@ -11344,13 +11387,25 @@ mod restart_tests {
             (third(7), third(7)),
             (whole(14), whole(14)),
         ];
+        let sections = || {
+            let mut sections = discrete_sections();
+            sections.extend(sections_with_a_signal());
+            sections
+        };
         for mode in [JoinMode::Restart, JoinMode::Reset] {
             for (begin, end) in spans {
                 // Each span asks new graphs, so that the walk answers it
-                // and no table does.
+                // and no table does. Each section holds two cycles and a
+                // third of one.
+                let cut = picked(mode, sections(), third(7));
+                let whole_span = picked(
+                    mode,
+                    sections().into_iter().map(asked_over_the_span).collect(),
+                    third(7),
+                );
                 assert_eq!(
-                    format!("{:?}", picked(mode, false).query_arc(begin, end)),
-                    format!("{:?}", picked(mode, true).query_arc(begin, end)),
+                    format!("{:?}", cut.query_arc(begin, end)),
+                    format!("{:?}", whole_span.query_arc(begin, end)),
                     "{mode:?} over {begin:?}..{end:?}"
                 );
             }
@@ -11360,14 +11415,14 @@ mod restart_tests {
     #[test]
     fn a_graph_that_reads_the_span_is_no_graph_of_discrete_haps() {
         let discrete = |pattern: &Pattern| !pattern.purity().span_read;
-        for section in sections() {
+        for section in discrete_sections() {
             assert!(discrete(&section));
-            // The join asks a signal at the span, and a time map that the
-            // classification does not know may read it.
-            assert!(!discrete(&section.with_query_time(|time| time)));
+            assert!(!discrete(&asked_over_the_span(section)));
+        }
+        for section in sections_with_a_signal() {
+            assert!(!discrete(&section));
         }
         assert!(!discrete(&crate::signal::saw()));
-        assert!(!discrete(&stack(vec![note(1.0), crate::signal::saw()])));
     }
 }
 

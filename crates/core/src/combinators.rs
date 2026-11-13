@@ -1930,7 +1930,7 @@ pub fn undegrade_by<P: PatOps>(pat: &P, x: f64) -> P {
 
 /// The identity body of `sometimes`'s coin bind: whatever the coin says,
 /// the operand is the answer. One object for the process.
-fn coin_body() -> crate::register::PureBody {
+pub(crate) fn coin_body() -> crate::register::PureBody {
     static IDENTITY: std::sync::OnceLock<crate::register::PureBody> = std::sync::OnceLock::new();
     IDENTITY
         .get_or_init(|| {
