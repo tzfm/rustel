@@ -42,9 +42,7 @@ pub use callback_ir::{
     lower_pattern_transform_callback,
 };
 pub use frequency_sliders::is_frequency_control;
-pub use score_program::{
-    ScoreExpr, ScoreFunction, ScoreProgram, ScoreProperty, ScoreStatement, score_program,
-};
+pub use score_program::{ScoreExpr, ScoreFunction, ScoreProgram, ScoreProperty, ScoreStatement};
 pub use surface_writes::{SurfaceWrites, surface_writes};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,11 +52,14 @@ pub struct ParseDiagnostic {
     pub offset: Option<usize>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParseOutput {
     pub code: String,
     pub diagnostics: Vec<ParseDiagnostic>,
     pub panicked: bool,
+    /// The printed program as a plain score, when the caller asked for it
+    /// and the program is one. See [`TranspileOutput::program`].
+    pub program: Option<ScoreProgram>,
     /// Static names published by score-level `register(...)` calls.
     pub registrations: RegistrationHints,
     /// What the program can write on the surface compiled callbacks read.
@@ -120,8 +121,9 @@ pub const MAX_STRUCTURAL_BYTES: usize = 64 * 1024;
 
 /// The bytes that buy a level of recursion, counted without tokenizing.
 fn structural_bytes(source: &str) -> usize {
-    let punctuation = source
-        .bytes()
+    let bytes = source.as_bytes();
+    let punctuation = bytes
+        .iter()
         .filter(|byte| {
             matches!(
                 byte,
@@ -148,15 +150,26 @@ fn structural_bytes(source: &str) -> usize {
         .count();
     // These word operators can also recurse without spending punctuation.
     // Count raw occurrences: a mistaken lexical classification must not let
-    // one of them hide from this backstop.
-    punctuation
-        + word_operators()
-            .iter()
-            .map(|(word, _)| source.matches(*word).count())
-            .sum::<usize>()
-        // A keyword spelled with an escape, `\u0076oid`, matches no word
-        // above but parses as one, and every such spelling contains `\u`.
-        + source.matches("\\u").count()
+    // one of them hide from this backstop. A keyword spelled with an escape,
+    // `\u0076oid`, matches no word but parses as one, and every such
+    // spelling contains `\u`.
+    let spellings = RawSpellings::get();
+    // Where the next occurrence of each spelling may begin: occurrences of
+    // one spelling are counted where they do not overlap.
+    let mut free = vec![0usize; spellings.all.len()];
+    let mut words = 0;
+    for (index, pair) in bytes.windows(2).enumerate() {
+        if spellings.may_start(pair[0], pair[1]) {
+            let rest = &bytes[index..];
+            for (free, spelling) in free.iter_mut().zip(&spellings.all) {
+                if index >= *free && rest.starts_with(spelling) {
+                    words += 1;
+                    *free = index + spelling.len();
+                }
+            }
+        }
+    }
+    punctuation + words
 }
 
 /// The stack given to the thread this crate parses on.
@@ -635,6 +648,41 @@ fn word_operators() -> &'static [(&'static str, bool)] {
     &WORDS
 }
 
+/// The word operators and the `\u` of an escape, with the two bytes each
+/// begins with, so a scan asks about a place only where one can begin.
+struct RawSpellings {
+    all: Vec<&'static [u8]>,
+    /// For each first byte, the set of second bytes that follow it in a
+    /// spelling.
+    seconds: [[u64; 4]; 256],
+}
+
+impl RawSpellings {
+    fn get() -> &'static Self {
+        static SPELLINGS: std::sync::LazyLock<RawSpellings> = std::sync::LazyLock::new(|| {
+            let all: Vec<&'static [u8]> = word_operators()
+                .iter()
+                .map(|(word, _)| word.as_bytes())
+                .chain([b"\\u".as_slice()])
+                .collect();
+            let mut seconds = [[0u64; 4]; 256];
+            for spelling in &all {
+                let [first, second, ..] = **spelling else {
+                    unreachable!("a keyword or an escape has two bytes or more");
+                };
+                seconds[usize::from(first)][usize::from(second >> 6)] |= 1 << (second & 63);
+            }
+            RawSpellings { all, seconds }
+        });
+        &SPELLINGS
+    }
+
+    /// Whether a spelling begins with these two bytes.
+    fn may_start(&self, first: u8, second: u8) -> bool {
+        self.seconds[usize::from(first)][usize::from(second >> 6)] >> (second & 63) & 1 == 1
+    }
+}
+
 /// Return the width and binary status of a word operator without mistaking part of
 /// an identifier for a token. Strings, comments, and regexes are skipped by
 /// the caller before it asks this question.
@@ -644,6 +692,10 @@ fn word_operator_at(bytes: &[u8], index: usize) -> Option<(usize, bool)> {
     }
 
     if index > 0 && identifier_byte(bytes[index - 1]) {
+        return None;
+    }
+    let (&first, &second) = (bytes.get(index)?, bytes.get(index + 1)?);
+    if !RawSpellings::get().may_start(first, second) {
         return None;
     }
     word_operators().iter().find_map(|(word, binary)| {
@@ -684,7 +736,16 @@ fn measure_nesting(source: &str) -> SourceNesting {
         let byte = bytes[index];
 
         if matches!(stack.last(), Some(Frame::Template)) {
-            match byte {
+            // Template text is scanned in one run to its next escape,
+            // substitution or end.
+            let Some(run) = bytes[index..]
+                .iter()
+                .position(|byte| matches!(byte, b'\\' | b'`' | b'$'))
+            else {
+                break;
+            };
+            index += run;
+            match bytes[index] {
                 b'\\' => index += 1,
                 b'`' => {
                     stack.pop();
@@ -989,6 +1050,11 @@ pub struct TranspileOptions {
     pub wrap_async: bool,
     pub add_return: bool,
     pub emit_mini_locations: bool,
+    /// Whether [`TranspileOutput::mini_locations`] lists the leaves of each
+    /// mini-notation literal, for a host that marks them in the editor.
+    /// Listing them parses each literal one more time, so a host that only
+    /// evaluates the output turns it off.
+    pub list_mini_leaves: bool,
     pub block_offset: usize,
     pub registered_languages: Vec<String>,
     pub widget_methods: Vec<String>,
@@ -1017,6 +1083,7 @@ impl Default for TranspileOptions {
             wrap_async: false,
             add_return: true,
             emit_mini_locations: true,
+            list_mini_leaves: true,
             block_offset: 0,
             registered_languages: Vec::new(),
             widget_methods: Vec::new(),
@@ -1170,6 +1237,12 @@ pub const ALL_VISUAL_WIDGET_PREFIX: &str = "all:";
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TranspileOutput {
     pub output: String,
+    /// The output as a plain score, when it is made only of the shapes a
+    /// [`ScoreProgram`] holds: a host can then evaluate it without
+    /// JavaScript. `None` for any other program, and when the output is not
+    /// the program alone, under [`TranspileOptions::add_return`] or
+    /// [`TranspileOptions::wrap_async`].
+    pub program: Option<ScoreProgram>,
     pub mini_locations: Vec<(usize, usize)>,
     pub diagnostics: Vec<ParseDiagnostic>,
     pub widgets: Vec<WidgetRecord>,
@@ -1221,12 +1294,12 @@ pub struct KabelsalatSpan {
 /// comments, ASI, precedence and source spans. Parse diagnostics are never
 /// discarded; callers decide whether recovery is acceptable.
 pub fn parse_and_print(source: &str) -> ParseOutput {
-    parse_and_print_as(source, SourceType::mjs(), ModuleSyntax::Allowed)
+    parse_and_print_as(source, SourceType::mjs(), ModuleSyntax::Allowed, false)
 }
 
 pub fn parse_and_print_path(source: &str, path: impl AsRef<Path>) -> ParseOutput {
     match SourceType::from_path(path) {
-        Ok(source_type) => parse_and_print_as(source, source_type, ModuleSyntax::Allowed),
+        Ok(source_type) => parse_and_print_as(source, source_type, ModuleSyntax::Allowed, false),
         Err(error) => ParseOutput {
             diagnostics: vec![ParseDiagnostic {
                 message: error.to_string(),
@@ -1241,6 +1314,7 @@ fn parse_and_print_as(
     source: &str,
     source_type: SourceType,
     modules: ModuleSyntax<'_>,
+    read_score: bool,
 ) -> ParseOutput {
     // Before the allocator, before the parser: the recursion this refuses
     // would abort the process rather than return a diagnostic.
@@ -1250,7 +1324,9 @@ fn parse_and_print_as(
             ..ParseOutput::default()
         };
     }
-    let Some(output) = on_parse_stack(|| parse_and_print_here(source, source_type, modules)) else {
+    let Some(output) =
+        on_parse_stack(|| parse_and_print_here(source, source_type, modules, read_score))
+    else {
         return ParseOutput {
             diagnostics: vec![ParseDiagnostic {
                 message: "could not reserve a stack to parse on".into(),
@@ -1311,11 +1387,14 @@ impl<'a> Visit<'a> for StatementNesting {
     }
 }
 
-/// The body of `parse_and_print_as`, always called on a parse stack.
+/// The body of `parse_and_print_as`, always called on a parse stack. With
+/// `read_score`, a program with no error is also read as a [`ScoreProgram`],
+/// from the tree that is printed.
 fn parse_and_print_here(
     source: &str,
     source_type: SourceType,
     modules: ModuleSyntax<'_>,
+    read_score: bool,
 ) -> ParseOutput {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
@@ -1387,6 +1466,9 @@ fn parse_and_print_here(
     if !normalized_jsx_values.is_empty() {
         encode_jsx_values_for_codegen(&allocator, &mut program, &normalized_jsx_values);
     }
+    let score = (read_score && diagnostics.is_empty() && !parsed.panicked)
+        .then(|| score_program::read(&program))
+        .flatten();
     let printed = Codegen::new()
         .with_options(CodegenOptions {
             single_quote: true,
@@ -1419,6 +1501,7 @@ fn parse_and_print_here(
         code,
         diagnostics,
         panicked: parsed.panicked,
+        program: score,
         registrations,
         surface_writes,
         line_map,
@@ -2571,7 +2654,18 @@ fn transpile_here(source: &str, options: &TranspileOptions) -> TranspileOutput {
     let (labels, lanes_by_place) =
         rewrite_labels(&kabel, regexes_are_present, &options.lane_numbers);
     let samples = rewrite_bare_samples(&labels);
-    let mut parsed = parse_and_print_as(&samples, SourceType::mjs(), ModuleSyntax::of(options));
+    // The output is the printed program alone when nothing is added to it.
+    let read_score = !options.add_return && !options.wrap_async;
+    // `transpile` checked the nesting of the score as written. The rewrites
+    // above put each literal and each labeled statement inside one call, so
+    // they add a level or two, which the parse stack holds with room to
+    // spare: the rewritten text is not measured again.
+    let mut parsed = parse_and_print_here(
+        &samples,
+        SourceType::mjs(),
+        ModuleSyntax::of(options),
+        read_score,
+    );
     // The parser read the rewritten text; the score is what the reader sees.
     for diagnostic in &mut parsed.diagnostics {
         if let Some(offset) = diagnostic.offset {
@@ -2588,6 +2682,7 @@ fn transpile_here(source: &str, options: &TranspileOptions) -> TranspileOutput {
     }
     TranspileOutput {
         output,
+        program: parsed.program,
         mini_locations,
         diagnostics,
         line_map: parsed.line_map,
@@ -2898,6 +2993,7 @@ fn rewrite_mini_literals(
                     }
                 };
                 if options.emit_mini_locations
+                    && options.list_mini_leaves
                     && let Ok(mut spans) =
                         rustel_mini::leaf_locations(&value, index + 1 + options.block_offset)
                 {
@@ -5773,6 +5869,69 @@ mod tests {
             transpile("s1.initVideo(\"clips/loop.webm\")", &options).output,
             "s1.initVideo('clips/loop.webm');"
         );
+    }
+
+    #[test]
+    fn a_host_that_only_evaluates_keeps_the_offsets_and_lists_no_leaf() {
+        let output = transpile(
+            r#"note("c4 e4")"#,
+            &TranspileOptions {
+                add_return: false,
+                list_mini_leaves: false,
+                ..TranspileOptions::default()
+            },
+        );
+        assert_eq!(output.output, "note(m('c4 e4', 5));");
+        assert!(output.mini_locations.is_empty());
+    }
+
+    #[test]
+    fn the_printed_program_is_read_as_a_score_when_nothing_is_added_to_it() {
+        let read = |source: &str, add_return: bool| {
+            transpile(
+                source,
+                &TranspileOptions {
+                    add_return,
+                    ..TranspileOptions::default()
+                },
+            )
+            .program
+        };
+        let mini = ScoreExpr::Call {
+            callee: "m".into(),
+            arguments: vec![ScoreExpr::String("bd".into()), ScoreExpr::Number(9.0)],
+        };
+        assert_eq!(
+            read(r#"$: sound("bd")"#, false),
+            Some(ScoreProgram {
+                statements: vec![ScoreStatement::Expression(ScoreExpr::Method {
+                    receiver: Box::new(ScoreExpr::Call {
+                        callee: "sound".into(),
+                        arguments: vec![mini],
+                    }),
+                    method: "p".into(),
+                    arguments: vec![ScoreExpr::String("$".into()), ScoreExpr::Number(0.0)],
+                })],
+            })
+        );
+        assert_eq!(read(r#"$: sound("bd")"#, true), None);
+        assert_eq!(read("if (a) b()", false), None);
+        assert_eq!(read("const a = 1; const a = 2;", false), None);
+    }
+
+    #[test]
+    fn the_raw_budget_counts_each_word_where_it_does_not_overlap() {
+        for (source, count) in [
+            ("item in first", 1),
+            ("a instanceof B", 2),
+            ("typeof typeof x", 2),
+            ("new.target", 2),
+            ("\\u0076oid 0", 1),
+            ("f(a)[b]{c}", 3),
+            ("", 0),
+        ] {
+            assert_eq!(structural_bytes(source), count, "{source}");
+        }
     }
 
     #[test]

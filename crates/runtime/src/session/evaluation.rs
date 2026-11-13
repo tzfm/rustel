@@ -702,6 +702,8 @@ impl Session {
             self.js.snapshot_active_as_last_good();
         }
         let options = TranspileOptions {
+            // The editor lists the leaves with its own layout pass.
+            list_mini_leaves: false,
             widget_methods: rustel_transpiler::VISUAL_WIDGET_METHODS
                 .iter()
                 .map(|method| (*method).to_owned())

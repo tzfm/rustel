@@ -1321,7 +1321,7 @@ impl JsRuntime {
                 let staged = self.with_heap_boundary(|| {
                     let native = {
                         let _published_owner = self.core_settings.bind();
-                        self.native_score(&output.output)
+                        self.native_score(output.program.as_ref())
                     };
                     if native.is_none() {
                         // JavaScript evaluates the score, on the whole surface.

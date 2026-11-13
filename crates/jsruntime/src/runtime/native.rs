@@ -218,23 +218,23 @@ fn pristine_names() -> Option<Rc<PristineNames>> {
 }
 
 impl JsRuntime {
-    /// Build the score in transpiled `code` without JavaScript. `None` when
-    /// the native tier does not prove the whole score: the JavaScript tier
-    /// then evaluates it, and owns every error.
-    pub(super) fn native_score(&self, code: &str) -> Option<NativeScore> {
+    /// Build the transpiled score `program` without JavaScript. `None` when
+    /// the score is no plain program or the native tier does not prove all
+    /// of it: the JavaScript tier then evaluates it, and owns every error.
+    pub(super) fn native_score(&self, program: Option<&ScoreProgram>) -> Option<NativeScore> {
         if !self.native_tier.get() {
             return None;
         }
-        let program = rustel_transpiler::score_program(code)?;
+        let program = program?;
         if self.bindings_installed.get() {
             with_ctx(self, |ctx| {
                 (prove_surface_intrinsics(&ctx) && !gain_curve_set(&ctx))
-                    .then(|| self.build_native(&program, &Names::Realm(&ctx)))
+                    .then(|| self.build_native(program, &Names::Realm(&ctx)))
                     .flatten()
             })
         } else {
             let names = pristine_names()?;
-            self.build_native(&program, &Names::Pristine(&names))
+            self.build_native(program, &Names::Pristine(&names))
         }
     }
 

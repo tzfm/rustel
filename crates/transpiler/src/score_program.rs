@@ -3,22 +3,19 @@
 //!
 //! Recognition is fail-closed: a program that is not made only of the shapes
 //! below stays with the JavaScript evaluator, which owns every other
-//! construct and every error. The program read is the transpiler's own
-//! output, so mini-notation calls, their offsets and lane calls are read as
+//! construct and every error. The program read is the one the transpiler
+//! prints, so mini-notation calls, their offsets and lane calls are read as
 //! the transpiler wrote them. What a name means is the host's to decide.
 //!
 //! No expression nests deeper than [`crate::MAX_SOURCE_NESTING`], so a host
 //! walks a program, and drops it, on any stack.
 
-use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrowFunctionBody, ArrowFunctionExpression, BinaryOperator, BindingPattern,
     CallExpression, Expression, FormalParameters, Function, FunctionBody, ObjectExpression,
-    ObjectPropertyKind, PropertyKey, PropertyKind, Statement, UnaryOperator, VariableDeclaration,
-    VariableDeclarationKind,
+    ObjectPropertyKind, Program, PropertyKey, PropertyKind, Statement, UnaryOperator,
+    VariableDeclaration, VariableDeclarationKind,
 };
-use oxc_parser::Parser;
-use oxc_span::SourceType;
 
 /// A score made only of bindings, functions and expression statements.
 #[derive(Clone, Debug, PartialEq)]
@@ -92,23 +89,14 @@ pub enum ScoreExpr {
     Arrow(Box<ScoreFunction>),
 }
 
-/// The [`ScoreProgram`] of transpiled `code`, or `None` when any part of it
-/// is another shape.
-pub fn score_program(code: &str) -> Option<ScoreProgram> {
-    if crate::check_nesting(code).is_err() {
+/// The [`ScoreProgram`] of a program parsed with no error, or `None` when
+/// any part of it is another shape.
+pub(crate) fn read(program: &Program<'_>) -> Option<ScoreProgram> {
+    if program.hashbang.is_some() || !program.directives.is_empty() {
         return None;
     }
-    crate::on_parse_stack(|| score_program_here(code)).flatten()
-}
-
-fn score_program_here(code: &str) -> Option<ScoreProgram> {
-    let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, code, SourceType::script()).parse();
-    if parsed.panicked || !parsed.diagnostics.is_empty() || !parsed.program.directives.is_empty() {
-        return None;
-    }
-    let mut statements = Vec::with_capacity(parsed.program.body.len());
-    for statement in &parsed.program.body {
+    let mut statements = Vec::with_capacity(program.body.len());
+    for statement in &program.body {
         statements.push(match statement {
             Statement::ExpressionStatement(statement) => {
                 ScoreStatement::Expression(expression(&statement.expression, 0)?)
@@ -346,9 +334,22 @@ fn call_expression(call: &CallExpression<'_>, depth: usize) -> Option<ScoreExpr>
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ScoreExpr, ScoreFunction, ScoreProgram, ScoreProperty, ScoreStatement, score_program,
-    };
+    use super::{ScoreExpr, ScoreFunction, ScoreProgram, ScoreProperty, ScoreStatement, read};
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    /// `code` read as the transpiler reads the program it prints.
+    fn score_program(code: &str) -> Option<ScoreProgram> {
+        crate::on_parse_stack(|| {
+            let allocator = Allocator::default();
+            let parsed = Parser::new(&allocator, code, SourceType::mjs()).parse();
+            (!parsed.panicked && parsed.diagnostics.is_empty())
+                .then(|| read(&parsed.program))
+                .flatten()
+        })
+        .flatten()
+    }
 
     fn call(callee: &str, arguments: Vec<ScoreExpr>) -> ScoreExpr {
         ScoreExpr::Call {
