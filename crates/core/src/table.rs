@@ -3569,7 +3569,7 @@ fn sequence(layers: &[crate::sequence::Layer]) -> Option<Tables> {
     let mut work: Option<Work> = None;
     for layer in layers {
         let steps = Tables::new(
-            vec![Layer::new(1, layer.period_haps())?],
+            vec![Layer::new(1, layer.period_haps()?)?],
             Work::leaf(Cycles::walk()),
         );
         let timed = if layer.period == Fraction::ONE {

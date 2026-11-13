@@ -242,6 +242,9 @@ fn query_order(a: &Hap, b: &Hap) -> std::cmp::Ordering {
         })
 }
 
+/// The most haps that [`stable_sorted`] sorts where they are.
+const FEW_HAPS: usize = 8;
+
 /// A stable sort of `haps` by `order` that moves each hap once.
 ///
 /// The sort orders indices and then moves each hap once. A hap is large, and
@@ -249,6 +252,12 @@ fn query_order(a: &Hap, b: &Hap) -> std::cmp::Ordering {
 /// order, exactly as `sort_by` keeps them.
 fn stable_sorted(mut haps: Vec<Hap>, order: impl Fn(&Hap, &Hap) -> std::cmp::Ordering) -> Vec<Hap> {
     if haps.is_sorted_by(|a, b| order(a, b) != std::cmp::Ordering::Greater) {
+        return haps;
+    }
+    // A few haps sort where they are: the moves cost less than the room
+    // for an order of them.
+    if haps.len() <= FEW_HAPS {
+        haps.sort_by(order);
         return haps;
     }
     let Ok(len) = u32::try_from(haps.len()) else {
@@ -6002,13 +6011,21 @@ impl Pattern {
         if query_stop_requested() {
             return (Vec::new(), true);
         }
-        // A table holds data only, which carries no runtime to attach.
+        // A table holds data only, which carries no runtime to attach. So
+        // does a sequence of data values.
         let (mut haps, data_only) = match self.query_tables(state, order, depth) {
             Some(haps) => (haps, true),
-            None => match order {
-                table::Order::Graph => (self.query_node(state), false),
-                table::Order::Sorted => (sort_haps_for_query(self.query_node(state)), false),
-            },
+            None => {
+                let haps = self.query_node(state);
+                let data_only = matches!(
+                    self.node_kind(),
+                    Node::Sequence(layers) if sequence::holds_data(layers)
+                );
+                match order {
+                    table::Order::Graph => (haps, data_only),
+                    table::Order::Sorted => (sort_haps_for_query(haps), data_only),
+                }
+            }
         };
         if let Some(settings) = metadata_owner.filter(|_| !data_only) {
             for hap in &mut haps {
