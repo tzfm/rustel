@@ -1978,18 +1978,23 @@ fn coin_bind<P: PatOps>(x: f64, whole: &P) -> P {
 pub fn sometimes_by<P: PatOps>(pat: &P, x: f64, f: Option<&FunctionRef>) -> P {
     let plain = degrade_by(pat, x);
     let transformed_base = undegrade_by(pat, 1.0 - x);
-    if f.is_some_and(|f| !f.stands_for_every_application()) {
-        // The function re-applies inside the bind per coin query, so this
-        // branch keeps the opaque form.
-        let f = f.cloned();
-        return P::pat_pure(Value::F64(x)).inner_bind(move |_| {
-            let transformed = call(&transformed_base, f.as_ref());
-            P::pat_stack(vec![plain.clone(), transformed])
-        });
-    }
-    let transformed = call(&transformed_base, f);
-    let whole = P::pat_stack(vec![plain, transformed]);
-    coin_bind(x, &whole)
+    applied_halves(x, plain, transformed_base, f)
+}
+
+/// The two halves of [`sometimes_by`] and [`some_cycles_by`], bound to the
+/// coin. A transform that stands for every application applies once, here.
+/// Any other transform applies inside the bind, per coin hap.
+fn applied_halves<P: PatOps>(x: f64, plain: P, transformed_base: P, f: Option<&FunctionRef>) -> P {
+    let Some(f) = f.filter(|f| !f.stands_for_every_application()) else {
+        let transformed = call(&transformed_base, f);
+        let whole = P::pat_stack(vec![plain, transformed]);
+        return coin_bind(x, &whole);
+    };
+    let f = f.clone();
+    P::pat_pure(Value::F64(x)).inner_bind(move |_| {
+        let transformed = call(&transformed_base, Some(&f));
+        P::pat_stack(vec![plain.clone(), transformed])
+    })
 }
 
 /// [`sometimes_by`], but `segment(1)` on the rand signal makes the coin
@@ -2003,16 +2008,7 @@ pub fn some_cycles_by<P: PatOps>(pat: &P, x: f64, f: Option<&FunctionRef>) -> P 
     );
     let plain = degrade_by_with(pat, &per_cycle, x);
     let transformed_base = degrade_by_with(pat, &inverted, 1.0 - x);
-    if f.is_some_and(|f| !f.stands_for_every_application()) {
-        let f = f.cloned();
-        return P::pat_pure(Value::F64(x)).inner_bind(move |_| {
-            let transformed = call(&transformed_base, f.as_ref());
-            P::pat_stack(vec![plain.clone(), transformed])
-        });
-    }
-    let transformed = call(&transformed_base, f);
-    let whole = P::pat_stack(vec![plain, transformed]);
-    coin_bind(x, &whole)
+    applied_halves(x, plain, transformed_base, f)
 }
 
 // -- envelope shorthands ----------------------------------------------------
