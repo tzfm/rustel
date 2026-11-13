@@ -8,15 +8,7 @@ Software Foundation, either version 3 of the License, or (at your option) any
 later version.
 */
 
-use std::{
-    collections::BTreeMap,
-    fmt,
-    hash::{Hash, Hasher},
-    sync::{
-        Arc, LazyLock, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{fmt, hash::Hash, sync::Arc};
 
 /// An insertion-ordered JavaScript object.
 ///
@@ -38,9 +30,8 @@ enum Entries {
     /// Shared entries a compose made of data values only, so the map holds
     /// data until it is written again. See [`compose::compose_data_in_place`].
     Made(Arc<Vec<(Key, Value)>>),
-    /// Kept for the life of the process, so a clone copies a pointer. See
-    /// [`OrderedMap::interned`].
-    Interned(&'static Vec<(Key, Value)>),
+    /// No entries and no allocation: what a fresh map holds.
+    Empty,
 }
 
 /// The entries a copy of shared entries has room for beyond its own, at
@@ -53,7 +44,7 @@ static EMPTY: Vec<(Key, Value)> = Vec::new();
 impl Default for OrderedMap {
     fn default() -> Self {
         Self {
-            entries: Entries::Interned(&EMPTY),
+            entries: Entries::Empty,
         }
     }
 }
@@ -72,56 +63,12 @@ impl fmt::Debug for OrderedMap {
     }
 }
 
-/// About the most bytes [`OrderedMap::interned`] keeps: each map's entries
-/// and its place in the store. Past it, maps stay shared and interning stops.
-const INTERN_BUDGET: usize = 16 << 20;
-
-/// The bytes one kept map costs besides its entries: the boxed list and
-/// its slot in a shard.
-const KEPT_MAP_BYTES: usize = std::mem::size_of::<Vec<(Key, Value)>>()
-    + std::mem::size_of::<(u64, Vec<Kept>)>()
-    + std::mem::size_of::<Kept>();
-
-/// The entries of one interned map.
-type Kept = &'static Vec<(Key, Value)>;
-
-/// Interned maps by content hash, in one of 16 shards so that builders on
-/// several threads rarely wait for one another.
-type Shard = Mutex<BTreeMap<u64, Vec<Kept>>>;
-
-static INTERNED: LazyLock<[Shard; 16]> =
-    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(BTreeMap::new())));
-static INTERNED_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-/// FNV-1a: the same hash in every run, for keys that are only ever compared
-/// within this process.
-struct Fnv(u64);
-
-impl Default for Fnv {
-    fn default() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
-    }
-}
-
-impl Hasher for Fnv {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-}
-
 impl OrderedMap {
     pub(crate) fn entries(&self) -> &Vec<(Key, Value)> {
         match &self.entries {
             Entries::Shared(entries) => entries,
             Entries::Made(entries) => entries,
-            Entries::Interned(entries) => entries,
+            Entries::Empty => &EMPTY,
         }
     }
 
@@ -138,7 +85,7 @@ impl OrderedMap {
         let unique = match &mut self.entries {
             Entries::Shared(entries) => Arc::get_mut(entries).is_some(),
             Entries::Made(_) => unreachable!("a made map was just downgraded"),
-            Entries::Interned(_) => false,
+            Entries::Empty => false,
         };
         if !unique {
             let mut copy = Vec::with_capacity(self.len() + additional.max(COPY_ROOM));
@@ -152,7 +99,7 @@ impl OrderedMap {
                 entries
             }
             Entries::Made(_) => unreachable!("a made map was just downgraded"),
-            Entries::Interned(_) => unreachable!("an interned map was just copied"),
+            Entries::Empty => unreachable!("an empty map was just copied"),
         }
     }
 
@@ -164,79 +111,37 @@ impl OrderedMap {
         }
     }
 
-    /// An equal map that every caller shares for the life of the process, so
-    /// that cloning it copies a pointer and dropping it does nothing.
-    ///
-    /// For the maps a precomputed table hands out with every hap. `None`
-    /// for a map that holds a script object, pattern, function or hap list,
-    /// or once [`INTERN_BUDGET`] is spent. Such a map stays shared.
-    pub(crate) fn interned(&self) -> Option<OrderedMap> {
-        if let Entries::Interned(_) = self.entries {
-            return Some(self.clone());
-        }
-        let entries = self.entries();
-        // As deep as the map's own data check reads them, so that a kept map
-        // is data. See `Value::is_data`.
-        if !entries.iter().all(|(_, value)| value.is_data(1)) {
-            return None;
-        }
-        let mut hasher = Fnv::default();
-        for (key, value) in entries {
-            key.hash(&mut hasher);
-            hash_data(value, &mut hasher);
-        }
-        let hash = hasher.finish();
-        // FNV-1a mixes its high bits best. Its low bits see only the low
-        // bits of each byte, so `1.0` and `2.0` would share a shard.
-        let shard = &INTERNED[(hash >> 60) as usize];
-        let mut shard = shard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(found) = shard.get(&hash).and_then(|kept| {
-            kept.iter()
-                .copied()
-                .find(|kept| same_entries(kept, entries))
-        }) {
-            return Some(Self {
-                entries: Entries::Interned(found),
-            });
-        }
-        let bytes = entries
-            .iter()
-            .map(|(key, value)| key.len() + data_bytes(value))
-            .sum::<usize>()
-            + std::mem::size_of::<(Key, Value)>() * entries.len()
-            + KEPT_MAP_BYTES;
-        if INTERNED_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes > INTERN_BUDGET {
-            INTERNED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
-            return None;
-        }
-        let kept: Kept = Box::leak(Box::new(entries.clone()));
-        shard.entry(hash).or_default().push(kept);
-        Some(Self {
-            entries: Entries::Interned(kept),
-        })
-    }
-
-    /// Whether cloning this map copies a pointer and dropping it does
-    /// nothing.
-    pub(crate) fn is_interned(&self) -> bool {
-        matches!(self.entries, Entries::Interned(_))
-    }
-
-    /// Whether the map's own storage answers for its data-ness: an interned
-    /// map was checked when it was kept, and a made map was made of data
-    /// values only.
+    /// Whether the map's own storage answers for its data-ness: an empty
+    /// map holds nothing else, and a made map was made of data values only.
     pub(crate) fn holds_only_data(&self) -> bool {
-        matches!(self.entries, Entries::Interned(_) | Entries::Made(_))
+        matches!(self.entries, Entries::Empty | Entries::Made(_))
+    }
+
+    /// A hash of this map's data that agrees with [`Self::same_data`].
+    pub(crate) fn data_hash(&self) -> u64 {
+        let mut hasher = WordHasher::default();
+        hash_data_entries(self.entries(), &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    }
+
+    /// Whether two maps hold the same keys and the same data, in order and
+    /// down to the bits of every number. `==` makes `0.0` equal to `-0.0`,
+    /// which divide apart, and a NaN unequal to itself.
+    pub(crate) fn same_data(&self, other: &Self) -> bool {
+        same_entries(self.entries(), other.entries())
+    }
+
+    /// Whether the map holds no allocation, so a clone copies nothing.
+    pub(crate) fn owns_no_heap(&self) -> bool {
+        matches!(self.entries, Entries::Empty)
     }
 
     /// Mark this map, whose writes a compose of data values just finished,
-    /// as holding data only. A map another writer shares, or one already
-    /// kept, is left alone: the guarantee belongs to this compose's own
-    /// unique copy.
+    /// as holding data only. A map another writer shares, or an empty one,
+    /// is left alone: the guarantee belongs to this compose's own unique
+    /// copy.
     pub(crate) fn mark_made_of_data(&mut self) {
-        let current = std::mem::replace(&mut self.entries, Entries::Interned(&EMPTY));
+        let current = std::mem::replace(&mut self.entries, Entries::Empty);
         self.entries = match current {
             Entries::Shared(entries) if Arc::strong_count(&entries) == 1 => Entries::Made(entries),
             other => other,
@@ -1185,6 +1090,99 @@ impl Clone for Value {
     }
 }
 
+/// A fast hash for keys compared only within one process: one rotate,
+/// xor and multiply per word. Not resistant to chosen collisions, which
+/// cost a longer equality scan and never a wrong answer.
+#[derive(Default)]
+struct WordHasher(u64);
+
+impl WordHasher {
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl std::hash::Hasher for WordHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        for word in words {
+            self.add(u64::from_le_bytes(*word));
+        }
+        let mut tail = [0u8; 8];
+        tail[..rest.len()].copy_from_slice(rest);
+        self.add(u64::from_le_bytes(tail) ^ rest.len() as u64);
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.add(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+}
+
+/// Feed a map's entries to `state`, numbers by their bits.
+fn hash_data_entries(entries: &[(Key, Value)], state: &mut impl std::hash::Hasher) {
+    entries.len().hash(state);
+    for (key, value) in entries {
+        key.hash(state);
+        hash_data(value, state);
+    }
+}
+
+/// Feed a data value to `state`, numbers by their bits.
+fn hash_data(value: &Value, state: &mut impl std::hash::Hasher) {
+    match value {
+        Value::Undefined => 0u8.hash(state),
+        Value::Null => 1u8.hash(state),
+        Value::Bool(value) => (2u8, value).hash(state),
+        Value::F64(value) => (3u8, value.to_bits()).hash(state),
+        Value::Str(value) => (4u8, value).hash(state),
+        Value::List(items) => {
+            (5u8, items.len()).hash(state);
+            for item in items {
+                hash_data(item, state);
+            }
+        }
+        Value::Object(object) => {
+            6u8.hash(state);
+            hash_data_entries(object.entries(), state);
+        }
+        Value::Pattern(_) | Value::JsValue(_) | Value::Function(_) | Value::Haps(_) => {
+            7u8.hash(state)
+        }
+    }
+}
+
+/// Whether two data values are the same down to the bits of every number.
+fn same_data(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
+        (Value::List(a), Value::List(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_data(a, b))
+        }
+        (Value::Object(a), Value::Object(b)) => same_entries(a.entries(), b.entries()),
+        _ => a == b,
+    }
+}
+
+/// [`same_data`] for the entries of two maps, in order.
+fn same_entries(a: &[(Key, Value)], b: &[(Key, Value)]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|((a_key, a), (b_key, b))| a_key == b_key && same_data(a, b))
+}
+
 impl Value {
     #[inline(never)]
     fn clone_shared(&self) -> Self {
@@ -1232,71 +1230,6 @@ fn needs_runtime_settings(value: &Value, depth: u32) -> bool {
     }
 }
 
-/// A content hash of a data value that agrees with [`same_data`]: a number
-/// hashes by its bits.
-fn hash_data(value: &Value, state: &mut impl Hasher) {
-    match value {
-        Value::Undefined => 0u8.hash(state),
-        Value::Null => 1u8.hash(state),
-        Value::Bool(value) => (2u8, value).hash(state),
-        Value::F64(value) => (3u8, value.to_bits()).hash(state),
-        Value::Str(value) => (4u8, value).hash(state),
-        Value::List(items) => {
-            (5u8, items.len()).hash(state);
-            for item in items {
-                hash_data(item, state);
-            }
-        }
-        Value::Object(object) => {
-            (6u8, object.len()).hash(state);
-            for (key, value) in object.iter() {
-                key.hash(state);
-                hash_data(value, state);
-            }
-        }
-        Value::Pattern(_) | Value::JsValue(_) | Value::Function(_) | Value::Haps(_) => {
-            7u8.hash(state)
-        }
-    }
-}
-
-/// Whether two data values are the same down to the bits of every number.
-/// `==` makes `0.0` equal to `-0.0`, which divide apart, and a NaN unequal
-/// to itself, which an interned map could then never find.
-fn same_data(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
-        (Value::List(a), Value::List(b)) => {
-            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_data(a, b))
-        }
-        (Value::Object(a), Value::Object(b)) => same_entries(a.entries(), b.entries()),
-        _ => a == b,
-    }
-}
-
-/// [`same_data`] for the entries of two maps, in order.
-fn same_entries(a: &[(Key, Value)], b: &[(Key, Value)]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|((a_key, a), (b_key, b))| a_key == b_key && same_data(a, b))
-}
-
-/// About how many heap bytes a data value holds.
-fn data_bytes(value: &Value) -> usize {
-    match value {
-        Value::Str(value) => value.len(),
-        Value::List(items) => {
-            items.iter().map(data_bytes).sum::<usize>() + std::mem::size_of_val(items.as_slice())
-        }
-        Value::Object(object) => object
-            .iter()
-            .map(|(key, value)| key.len() + data_bytes(value) + std::mem::size_of::<(Key, Value)>())
-            .sum(),
-        _ => 0,
-    }
-}
-
 impl Value {
     /// Whether this is data only: no script object, pattern, function or hap
     /// list, each of which a query resolves anew.
@@ -1307,8 +1240,8 @@ impl Value {
         match self {
             Value::Undefined | Value::Null | Value::Bool(_) | Value::F64(_) | Value::Str(_) => true,
             Value::List(items) => items.iter().all(|item| item.is_data(depth + 1)),
-            // A kept map was checked as data when it was kept, and a made
-            // map was made of data values only.
+            // An empty map holds nothing, and a made map was made of data
+            // values only.
             Value::Object(object) if object.holds_only_data() => true,
             Value::Object(object) => object.iter().all(|(_, item)| item.is_data(depth + 1)),
             Value::Pattern(_) | Value::JsValue(_) | Value::Function(_) | Value::Haps(_) => false,
@@ -1410,8 +1343,8 @@ impl Value {
             Self::Haps(haps) => haps.0.iter().any(|hap| hap.value.has_js_function()),
             Self::JsValue(_) => true,
             Self::List(items) => items.iter().any(Value::has_js_function),
-            // A kept map was checked as data when it was kept, and a made
-            // map was made of data values only; data holds no function.
+            // An empty map holds nothing, and a made map was made of data
+            // values only. Data holds no function.
             Self::Object(map) if map.holds_only_data() => false,
             Self::Object(map) => map.iter().any(|(_, v)| v.has_js_function()),
             _ => false,
@@ -1428,8 +1361,8 @@ impl Value {
             Self::JsValue(_) => true,
             Self::Haps(haps) => haps.0.iter().any(|hap| hap.value.contains_js_value()),
             Self::List(items) => items.iter().any(Value::contains_js_value),
-            // A kept map was checked as data when it was kept, and a made
-            // map was made of data values only; data holds nothing a host
+            // An empty map holds nothing, and a made map was made of data
+            // values only. Data holds nothing a host
             // owns.
             Self::Object(map) if map.holds_only_data() => false,
             Self::Object(map) => map.iter().any(|(_, value)| value.contains_js_value()),
@@ -1859,43 +1792,6 @@ mod tests {
         }
     }
 
-    fn map(entries: &[(&str, Value)]) -> OrderedMap {
-        OrderedMap::from_entries(
-            entries
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), value.clone())),
-        )
-    }
-
-    #[test]
-    fn an_interned_map_is_shared_and_a_change_copies_it_first() {
-        let shared = map(&[("s", Value::Str("bd".into())), ("n", Value::F64(3.0))]);
-        let interned = shared.interned().expect("a data map is interned");
-        assert!(interned.is_interned());
-        assert_eq!(interned, shared);
-        assert_eq!(format!("{interned:?}"), format!("{shared:?}"));
-        let again = shared.clone().interned().expect("a data map is interned");
-        assert!(std::ptr::eq(interned.entries(), again.entries()));
-        let mut changed = interned.clone();
-        changed.insert("n".into(), Value::F64(4.0));
-        assert!(!changed.is_interned());
-        assert_eq!(interned.get("n"), Some(&Value::F64(3.0)));
-        assert_eq!(changed.get("n"), Some(&Value::F64(4.0)));
-    }
-
-    #[test]
-    fn numbers_are_interned_by_their_bits() {
-        let nan = map(&[("n", Value::F64(f64::NAN))]);
-        let first = nan.interned().expect("a NaN map is data");
-        let second = nan.interned().expect("a NaN map is data");
-        assert!(std::ptr::eq(first.entries(), second.entries()));
-        let zero = map(&[("n", Value::F64(0.0))]).interned().expect("data");
-        let minus = map(&[("n", Value::F64(-0.0))]).interned().expect("data");
-        assert!(!std::ptr::eq(zero.entries(), minus.entries()));
-        let kept = minus.get("n").and_then(Value::as_f64).expect("a number");
-        assert_eq!(kept.to_bits(), (-0.0f64).to_bits());
-    }
-
     #[test]
     fn a_lowered_callback_is_a_native_transformer_and_a_javascript_value() {
         let program = crate::callback_ir::PatternTransformProgram::new([]).unwrap();
@@ -1961,11 +1857,5 @@ mod tests {
                 .is_empty()
         );
         assert!(crate::take_query_error().is_some());
-    }
-
-    #[test]
-    fn a_map_with_a_script_value_is_not_interned() {
-        let opaque = map(&[("x", Value::JsValue(super::JsValueRef::new(3, false)))]);
-        assert!(opaque.interned().is_none());
     }
 }

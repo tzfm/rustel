@@ -348,7 +348,7 @@ impl Hap {
         } = self;
         let value = match value {
             Value::Undefined | Value::Null | Value::Bool(_) | Value::F64(_) => true,
-            Value::Object(object) => object.is_interned(),
+            Value::Object(object) => object.owns_no_heap(),
             _ => false,
         };
         value && context.is_inline() && pick_lookup.is_none() && keys.is_empty()

@@ -1007,13 +1007,9 @@ impl Stage {
         if together.pick_lookup.is_some() {
             return None;
         }
-        // Each hap reads the constant's map. A kept map is known to be data.
-        let mut together = together;
-        let crate::Value::Object(map) = &together.value else {
+        // Each hap reads the constant's map.
+        if !matches!(together.value, crate::Value::Object(_)) {
             return None;
-        };
-        if let Some(kept) = map.interned() {
-            together.value = crate::Value::Object(kept);
         }
         each.push(next.clone());
         Some(Stage::Fused {
@@ -1488,6 +1484,25 @@ fn magnitude_bits(x: f64) -> u32 {
     exponent.saturating_sub(1022)
 }
 
+/// Share equal maps among a layer's entries. A period that repeats a control
+/// map then holds it once, and the sharing ends when the layer drops.
+fn share_equal_maps(entries: &mut [Hap]) {
+    let mut kept: std::collections::HashMap<u64, Vec<crate::value::OrderedMap>> =
+        std::collections::HashMap::new();
+    for entry in entries {
+        let crate::Value::Object(map) = &mut entry.value else {
+            continue;
+        };
+        let same = kept.entry(map.data_hash()).or_default();
+        match same.iter().find(|other| other.same_data(map)) {
+            // Equal data, so the entry reads the same map: a reference
+            // count step instead of a second copy.
+            Some(other) => *map = other.clone(),
+            None => same.push(map.clone()),
+        }
+    }
+}
+
 impl Layer {
     fn new(period: i128, mut entries: Vec<Hap>) -> Option<Self> {
         if period < 1 || entries.len() > MAX_ENTRIES {
@@ -1513,15 +1528,7 @@ impl Layer {
                 ),
             });
         }
-        // Every query clones these values. An interned map clones as a
-        // pointer.
-        for entry in &mut entries {
-            if let crate::Value::Object(object) = &entry.value
-                && let Some(interned) = object.interned()
-            {
-                entry.value = crate::Value::Object(interned);
-            }
-        }
+        share_equal_maps(&mut entries);
         let ordered = in_time_order(&entries, period);
         let sorted = (!ordered)
             .then(|| crate::sort_haps_for_query(entries.clone()))
@@ -4175,11 +4182,8 @@ mod tests {
 
     #[test]
     fn bitwise_copies_of_whole_periods_clone_the_entries() {
-        let twin = named(seq(&[0.0, 1.0, 2.0]), "n");
-        let tables = twin
-            .tabled
-            .tables()
-            .expect("a control sequence has a table");
+        let twin = seq(&[0.0, 1.0, 2.0]);
+        let tables = twin.tabled.tables().expect("a number sequence has a table");
         assert!(tables.layers.iter().all(|layer| layer.copyable));
         let answer = twin.tabled.query_arc(frac(0, 1), frac(3, 1));
         assert_eq!(
