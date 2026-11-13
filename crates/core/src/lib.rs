@@ -8601,7 +8601,18 @@ impl Pattern {
         f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
         spans: SpanUse,
     ) -> Self {
-        Pattern::of(Node::MapHapsNative(self.clone(), Arc::new(f), spans))
+        self.mapped_haps(Arc::new(f), spans)
+    }
+
+    /// The node of `map` over this pattern. A map that reads no span folds
+    /// into a sequence: see [`sequence::mapped_haps`].
+    fn mapped_haps(&self, map: HapMapFn, spans: SpanUse) -> Self {
+        if spans == SpanUse::Ignores
+            && let Some(mapped) = sequence::mapped_haps(self, &map)
+        {
+            return mapped;
+        }
+        Pattern::of(Node::MapHapsNative(self.clone(), map, spans))
     }
 
     /// Maps each hap and gives the closure ownership of it. Use this when the
@@ -8646,12 +8657,8 @@ impl Pattern {
                 });
                 mapped
             });
-        Pattern::of(Node::MapHapsNative(
-            self.clone(),
-            interned,
-            SpanUse::Ignores,
-        ))
-        .with_steps(steps)
+        self.mapped_haps(interned, SpanUse::Ignores)
+            .with_steps(steps)
     }
 
     fn expand_pitch_haps_native(

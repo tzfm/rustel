@@ -76,6 +76,28 @@ impl ContextKeys {
         Arc::make_mut(self.0.get_or_insert_with(Default::default))
     }
 
+    /// Whether these and `other` hold the same keys, down to the bits of a
+    /// number.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        let same_definition = |a: &Option<Arc<Value>>, b: &Option<Arc<Value>>| match (a, b) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b) || crate::same_key(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                Arc::ptr_eq(a, b)
+                    || (a.scale == b.scale
+                        && a.edo_size.map(f64::to_bits) == b.edo_size.map(f64::to_bits)
+                        && same_definition(&a.scale_definition, &b.scale_definition)
+                        && a.tags == b.tags
+                        && a.log_line == b.log_line)
+            }
+            _ => false,
+        }
+    }
+
     /// Each key from `first` where it has one, else from `second`. A
     /// context merge keeps the extending side's key, as `Option::or` does.
     pub(crate) fn merge(first: &Self, second: &Self) -> Self {

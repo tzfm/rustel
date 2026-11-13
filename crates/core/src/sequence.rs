@@ -17,9 +17,10 @@
 //! query.
 
 use crate::compose::{ComposeOp, compose_data_in_place};
+use crate::context_keys::ContextKeys;
 use crate::{
-    Combine, Hap, Locations, LookupFlow, MAX_QUERY_SPAN_CYCLES, Meeting, Node, OwnedHapMapFn,
-    Pattern, QueryLimit, State, TimeSpan, Value, charge_haps, note_accumulated,
+    Combine, Hap, HapMapFn, Locations, LookupFlow, MAX_QUERY_SPAN_CYCLES, Meeting, Node,
+    OwnedHapMapFn, Pattern, QueryLimit, State, TimeSpan, Value, charge_haps, note_accumulated,
     query_stop_requested, refuse, silence, without_query_signals,
 };
 use rustel_fraction::Fraction;
@@ -149,6 +150,9 @@ pub(crate) struct Layer {
     data: bool,
     /// Whether each value is a map of controls.
     maps: bool,
+    /// The keys of the context of each hap, as a map of the haps set them:
+    /// the scale that `scale` names, for one.
+    keys: ContextKeys,
     /// The locations of each hap before its step's own: those of the
     /// constants that the steps met, the last first.
     before: Locations,
@@ -230,6 +234,7 @@ impl Layer {
             values,
             set: None,
             read: OnceLock::new(),
+            keys: ContextKeys::default(),
             before: Locations::new(),
             after: Locations::new(),
             contexts: OnceLock::new(),
@@ -259,7 +264,7 @@ impl Layer {
         let Combine::Composed(ComposeOp::Set) = apply else {
             return None;
         };
-        if !(self.in_cycles && self.maps && values.fills_each_cycle()) {
+        if !(self.in_cycles && self.maps && values.fills_each_cycle() && values.keys.is_empty()) {
             return None;
         }
         let control = values.values().first()?;
@@ -367,6 +372,7 @@ impl Layer {
             self.values()[place.value as usize].clone(),
         );
         hap.context = self.context(index);
+        hap.keys = self.keys.clone();
         hap
     }
 
@@ -419,6 +425,7 @@ impl Layer {
             _ => false,
         };
         same_set
+            && self.keys.same(&other.keys)
             && self.period == other.period
             && self.before == other.before
             && self.after == other.after
@@ -542,6 +549,7 @@ impl Layer {
                 let mut before = values.context(0);
                 before.append(&layer.before);
                 layer.before = before;
+                layer.keys = ContextKeys::merge(&layer.keys, &values.keys);
             });
             return Some((met, pairs));
         }
@@ -626,6 +634,7 @@ impl Layer {
             places: places.into(),
             before: Locations::new(),
             contexts: OnceLock::new(),
+            keys: ContextKeys::merge(&self.keys, &values.keys),
             ..self.clone()
         };
         met.is_in_order().then_some((met, pairs))
@@ -740,7 +749,8 @@ pub(crate) fn is_data(pattern: &Pattern) -> bool {
 pub(crate) fn constant_value(layers: &[Layer]) -> Option<&Value> {
     let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
     match layers {
-        [layer] if layer.period == Fraction::ONE => match &*layer.places {
+        // A reader makes a hap of the value alone, so keys make no constant.
+        [layer] if layer.period == Fraction::ONE && layer.keys.is_empty() => match &*layer.places {
             [place] if place.whole == cycle && place.part.is_none() => layer
                 .values()
                 .get(place.value as usize)
@@ -799,11 +809,16 @@ fn cycle_hap(value: Value) -> Hap {
 /// Whether `hap` holds a value and its locations and nothing more: what a
 /// step of a sequence holds.
 fn is_plain(hap: &Hap) -> bool {
+    holds_a_value_and_keys(hap) && hap.keys.is_empty()
+}
+
+/// Whether `hap` holds a value, its locations and the keys of its context,
+/// and nothing more: what a step holds with the keys of its layer.
+fn holds_a_value_and_keys(hap: &Hap) -> bool {
     hap.live_controls == [0; 4]
         && hap.slider_binding == 0
         && hap.ui_visuals == 0
         && hap.pick_lookup.is_none()
-        && hap.keys.is_empty()
 }
 
 /// The hap that `values` answers in each cycle, as of cycle zero, when the
@@ -894,6 +909,52 @@ pub(crate) fn mapped(pattern: &Pattern, map: &OwnedHapMapFn) -> Option<Pattern> 
         let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
         ((hap.whole, hap.part) == (Some(cycle), cycle) && is_plain(&hap) && hap.context.is_empty())
             .then_some(hap.value)
+    })
+}
+
+/// `pattern` with each hap changed by `map`, a map that reads no span, when
+/// `pattern` is a sequence or a constant of data values. The map can set
+/// the keys of the context, as `scale` does: the haps of a layer then hold
+/// the same keys.
+///
+/// `None` when the map drops a hap, moves it, gives it more than a value
+/// and keys, or gives two haps of one layer other keys.
+pub(crate) fn mapped_haps(pattern: &Pattern, map: &HapMapFn) -> Option<Pattern> {
+    let layers = layers(pattern)?.into_owned();
+    let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
+    without_query_signals(|| {
+        let layers = layers
+            .into_iter()
+            .map(|layer| {
+                let mut keys: Option<ContextKeys> = None;
+                let values = layer
+                    .values()
+                    .iter()
+                    .map(|value| {
+                        // A value of the script is read through its host,
+                        // at each query.
+                        if !value.is_data(0) {
+                            return None;
+                        }
+                        let mut hap = cycle_hap(value.clone());
+                        hap.keys = layer.keys.clone();
+                        let hap = map(&hap)?;
+                        let keys = keys.get_or_insert_with(|| hap.keys.clone());
+                        ((hap.whole, hap.part) == (Some(cycle), cycle)
+                            && holds_a_value_and_keys(&hap)
+                            && hap.context.is_empty()
+                            && keys.same(&hap.keys))
+                        .then_some(hap.value)
+                    })
+                    .collect::<Option<Vec<Value>>>()?;
+                let mut layer = layer.valued(values.into());
+                if let Some(keys) = keys {
+                    layer.keys = keys;
+                }
+                Some(layer)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(node_of_sound(layers))
     })
 }
 
@@ -1057,8 +1118,8 @@ mod tests {
             .iter()
             .map(|hap| {
                 format!(
-                    "{hap:?} {:?} {} {}",
-                    hap.live_controls, hap.slider_binding, hap.ui_visuals
+                    "{hap:?} {:?} {} {} {:?}",
+                    hap.live_controls, hap.slider_binding, hap.ui_visuals, hap.keys
                 )
             })
             .collect()
@@ -1362,6 +1423,58 @@ mod tests {
             !folds
                 .iter()
                 .any(|fold| fold.ends_with("with a chord and fast steps"))
+        );
+    }
+
+    #[test]
+    fn a_scale_of_a_sequence_answers_as_the_map_of_each_hap() {
+        let scaled = |pattern: Pattern, name: &str| {
+            let degrees = pattern.map_control(ControlSpec::new(["n"]), false);
+            crate::combinators::scale(&degrees, Value::Str(name.into()))
+        };
+        for (name, layers) in sequences() {
+            // The scale names each note and its own key of the context,
+            // and controls and another scale come after it.
+            let chains: [(&str, &dyn Fn(Pattern) -> Pattern); 3] = [
+                ("a scale", &|pattern: Pattern| scaled(pattern, "C:minor")),
+                ("controls after a scale", &|pattern: Pattern| {
+                    let gain = pure(Value::F64(0.5)).map_control(ControlSpec::new(["gain"]), false);
+                    compose(
+                        &scaled(pattern, "D:dorian"),
+                        &gain,
+                        ComposeOp::Set,
+                        Alignment::In,
+                    )
+                }),
+                ("a scale of numbers", &|pattern: Pattern| {
+                    crate::combinators::scale(&pattern, Value::Str("E:major".into()))
+                }),
+            ];
+            for (chain_name, chain) in chains {
+                let folded = chain(built(&layers));
+                assert!(
+                    matches!(folded.node_kind(), Node::Sequence(_)),
+                    "{chain_name} of {name}"
+                );
+                assert_same_answers(
+                    &format!("{chain_name} of {name}"),
+                    &folded,
+                    &unfolded(|| chain(built(&layers))),
+                );
+            }
+        }
+        // A step that is no degree drops its hap at each query: the map
+        // keeps its node.
+        let text = |pattern: Pattern| {
+            let words = pattern.fmap(|_| Value::Str("no degree".into()));
+            crate::combinators::scale(&words, Value::Str("C:minor".into()))
+        };
+        let dropped = text(built(&sequences()[0].1));
+        assert!(!matches!(dropped.node_kind(), Node::Sequence(_)));
+        assert_same_answers(
+            "a step that is no degree",
+            &dropped,
+            &unfolded(|| text(built(&sequences()[0].1))),
         );
     }
 
