@@ -840,6 +840,10 @@ pub struct Pattern {
     runtime_settings: Option<settings::RuntimeSettings>,
 }
 
+// A score builds thousands of nodes, so a node's size is most of a graph's
+// memory. A variant that grows every node fails here: box its rare part.
+const _: () = assert!(std::mem::size_of::<NodeCell>() <= 352);
+
 /// A graph node and its precomputed answer, shared by every handle to it.
 struct NodeCell {
     kind: Node,
@@ -1925,8 +1929,9 @@ struct Constructions {
     /// A construction a table build made and could not keep. The next
     /// construction of the same value takes it instead of building, so a
     /// build adds no construction to those the graph makes, and the
-    /// construction still answers one query only.
-    handed: Option<ConstructionEntry>,
+    /// construction still answers one query only. Boxed: every node with a
+    /// memo holds this slot, and few ever fill it.
+    handed: Option<Box<ConstructionEntry>>,
 }
 
 struct ConstructionEntry {
@@ -2031,11 +2036,12 @@ impl ConstructionMemo {
                 callback_ir::note_read(&kept.read);
                 return (kept.pattern.clone(), true);
             }
-            if constructions.handed.as_ref().is_some_and(names)
+            if constructions.handed.as_deref().is_some_and(names)
                 && let Some(handed) = constructions.handed.take()
             {
-                callback_ir::note_read(&handed.read);
-                return (handed.pattern, false);
+                let ConstructionEntry { read, pattern, .. } = *handed;
+                callback_ir::note_read(&read);
+                return (pattern, false);
             }
         }
         // Built outside the lock: construction is arbitrary native code.
@@ -2067,7 +2073,7 @@ impl ConstructionMemo {
                 constructions.kept[victim] = entry;
             }
         } else if hand && plain_key(value) {
-            constructions.handed = Some(entry);
+            constructions.handed = Some(Box::new(entry));
         }
         (built, keep)
     }
@@ -2080,7 +2086,7 @@ impl ConstructionMemo {
             constructions
                 .kept
                 .drain(..)
-                .chain(handed)
+                .chain(handed.map(|entry| *entry))
                 .map(|entry| entry.pattern.0),
         );
     }
