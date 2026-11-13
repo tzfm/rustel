@@ -3995,6 +3995,35 @@ impl PickLookup {
         }
     }
 
+    /// This lookup with what `change` makes of each pattern. `None` when
+    /// `change` makes none of one of them.
+    fn try_map(&self, mut change: impl FnMut(&Pattern) -> Option<Pattern>) -> Option<Self> {
+        Some(match self {
+            Self::Array {
+                enumerable_len,
+                length,
+                entries,
+            } => Self::Array {
+                enumerable_len: *enumerable_len,
+                length: *length,
+                entries: entries
+                    .iter()
+                    .map(|(index, pattern)| Some((*index, change(pattern)?)))
+                    .collect::<Option<_>>()?,
+            },
+            Self::Object {
+                enumerable_len,
+                entries,
+            } => Self::Object {
+                enumerable_len: *enumerable_len,
+                entries: entries
+                    .iter()
+                    .map(|(key, pattern)| Some((key.clone(), change(pattern)?)))
+                    .collect::<Option<_>>()?,
+            },
+        })
+    }
+
     fn patterns(&self) -> Box<dyn Iterator<Item = &Pattern> + '_> {
         match self {
             Self::Array { entries, .. } => Box::new(entries.iter().map(|(_, pattern)| pattern)),
@@ -7851,6 +7880,7 @@ impl Pattern {
         let steps = self.steps;
         if let Combine::Composed(op) = &combine
             && let Some(applied) = sequence::applied(self, &other, *op, lookup_flow)
+                .or_else(|| self.picked_applied(&other, *op, lookup_flow))
         {
             return applied.with_steps(steps);
         }
@@ -8605,14 +8635,83 @@ impl Pattern {
     }
 
     /// The node of `map` over this pattern. A map that reads no span folds
-    /// into a sequence: see [`sequence::mapped_haps`].
+    /// into a sequence: see [`sequence::mapped_haps`]. Over a pick, it is
+    /// the map of each picked pattern: see [`Self::picked_with`].
     fn mapped_haps(&self, map: HapMapFn, spans: SpanUse) -> Self {
-        if spans == SpanUse::Ignores
-            && let Some(mapped) = sequence::mapped_haps(self, &map)
-        {
-            return mapped;
+        if spans == SpanUse::Ignores {
+            // A map of no hap is silence.
+            if self.is_rest() && sequence::folds(self) {
+                return self.clone();
+            }
+            if let Some(mapped) = sequence::mapped_haps(self, &map) {
+                return mapped;
+            }
+            let picked = self.picked_with(&Locations::new(), false, |pattern| {
+                Some(pattern.mapped_haps(Arc::clone(&map), spans))
+            });
+            if let Some(picked) = picked {
+                return picked;
+            }
         }
         Pattern::of(Node::MapHapsNative(self.clone(), map, spans))
+    }
+
+    /// This pick with what `change` makes of each pattern that it picks,
+    /// and with `locations` first on each hap, for a change of the value,
+    /// the keys or the controls of a hap. The join of a pick gives those of
+    /// the picked hap to its own hap, so the change of the picked patterns
+    /// is the change of the pick. See [`sequence::selecting`] for
+    /// `locations` and `whole_cycles`.
+    ///
+    /// `None` when this is no pick, when it is a squeeze, which orders the
+    /// context and the keys another way, when a handle binds a runtime or
+    /// is volatile, and when the selector or `change` refuses.
+    fn picked_with(
+        &self,
+        locations: &Locations,
+        whole_cycles: bool,
+        change: impl FnMut(&Pattern) -> Option<Pattern>,
+    ) -> Option<Self> {
+        let Node::Pick {
+            selector,
+            lookup,
+            index_mode,
+            mode,
+        } = self.node_kind()
+        else {
+            return None;
+        };
+        if *mode == JoinMode::Squeeze || !sequence::folds(self) {
+            return None;
+        }
+        let whole_cycles = whole_cycles && matches!(mode, JoinMode::Reset | JoinMode::Restart);
+        let selector = sequence::selecting(selector, locations, whole_cycles)?;
+        Some(pick(selector, lookup.try_map(change)?, *index_mode, *mode))
+    }
+
+    /// The `appLeft` of this pick and `values` by `op`, when `values` is a
+    /// constant of a plain value and each picked pattern is a sequence of
+    /// steps that lie in one cycle: each step then meets the constant where
+    /// the step is, in the picked pattern as in the pick. The locations of
+    /// the constant come first on each hap, through the selector.
+    fn picked_applied(
+        &self,
+        values: &Pattern,
+        op: compose::ComposeOp,
+        flow: LookupFlow,
+    ) -> Option<Self> {
+        let (value, locations) = sequence::constant_value_at(values)?;
+        self.picked_with(&locations, true, |pattern| {
+            if !sequence::lies_in_cycles(pattern) {
+                return None;
+            }
+            if pattern.is_rest() {
+                return Some(pattern.clone());
+            }
+            let applied = pattern.app_left_by(pure(value.clone()), Combine::Composed(op), flow);
+            // A meeting that the fold leaves to its node is the pick's.
+            matches!(applied.node_kind(), Node::Sequence(_)).then_some(applied)
+        })
     }
 
     /// Maps each hap and gives the closure ownership of it. Use this when the
@@ -11616,6 +11715,156 @@ mod restart_tests {
             expected
         );
         assert_eq!(asked.load(Ordering::Relaxed), asks);
+    }
+
+    /// A sequence of control maps `{n}`, each at its location: `count`
+    /// steps in each of `cycles` cycles, from `from`.
+    fn degrees(from: i32, count: i128, cycles: i128) -> Pattern {
+        let total = count * cycles;
+        let steps = (0..total)
+            .map(|index| {
+                let degree = f64::from(from) + (index % 7) as f64;
+                let mut locations = Locations::new();
+                locations.push((
+                    from as usize + index as usize,
+                    from as usize + index as usize + 1,
+                ));
+                SequenceStep::new(
+                    Fraction::new(index, total),
+                    Fraction::new(index + 1, total),
+                    Value::object([("n".to_string(), Value::F64(degree))]),
+                    locations,
+                )
+            })
+            .collect();
+        sequence(vec![SequenceLayer {
+            period: Fraction::int(cycles),
+            steps,
+        }])
+        .expect("steps in order")
+    }
+
+    /// A pick of `sections` in turn by a sequence, each for `length` cycles.
+    fn picked_by_a_sequence(mode: JoinMode, sections: Vec<Pattern>, length: Fraction) -> Pattern {
+        let count = sections.len() as i128;
+        let steps = (0..count)
+            .map(|index| {
+                let mut locations = Locations::new();
+                locations.push((900 + index as usize, 901 + index as usize));
+                SequenceStep::new(
+                    Fraction::new(index, count),
+                    Fraction::new(index + 1, count),
+                    Value::F64(index as f64),
+                    locations,
+                )
+            })
+            .collect();
+        let selector = sequence(vec![SequenceLayer {
+            period: length * Fraction::int(count),
+            steps,
+        }])
+        .expect("steps in order");
+        pick(
+            selector,
+            PickLookup::Array {
+                enumerable_len: sections.len(),
+                length: sections.len(),
+                entries: sections.into_iter().enumerate().collect(),
+            },
+            PickIndexMode::Clamp,
+            mode,
+        )
+    }
+
+    #[test]
+    fn a_change_after_a_pick_answers_as_the_change_of_what_it_picks() {
+        use crate::compose::{Alignment, ComposeOp, compose};
+        use crate::controls::ControlSpec;
+        let spans = [
+            (Fraction::ZERO, whole(12)),
+            (third(-5), third(22)),
+            (third(7), third(8)),
+            (third(13), third(29)),
+            (third(7), third(7)),
+        ];
+        let control = |key: &str, value: f64, at: usize| {
+            pure(Value::F64(value))
+                .with_added_context(vec![(at, at + 2)])
+                .map_control(ControlSpec::new([key]), false)
+        };
+        // A scale, then two controls: what `n(..).scale(..).gain(..)` is
+        // after a pick.
+        let changed = |pattern: Pattern| {
+            let scaled = crate::combinators::scale(&pattern, Value::Str("C:minor".into()));
+            let quiet = compose(
+                &scaled,
+                &control("gain", 0.5, 700),
+                ComposeOp::Set,
+                Alignment::In,
+            );
+            compose(
+                &quiet,
+                &control("room", 0.2, 710),
+                ComposeOp::Set,
+                Alignment::In,
+            )
+        };
+        let answers = |pattern: &Pattern, begin: Fraction, end: Fraction| -> Vec<String> {
+            pattern
+                .query_arc(begin, end)
+                .iter()
+                .map(|hap| format!("{hap:?} {:?} {:?}", hap.keys, hap.live_controls))
+                .collect()
+        };
+        // Steps in one cycle each, a rest, and a step of three cycles.
+        let short = || vec![degrees(0, 4, 1), silence(), degrees(20, 3, 2)];
+        let long = || vec![degrees(0, 4, 1), degrees(40, 1, 3).slow(whole(3))];
+        for mode in [
+            JoinMode::Inner,
+            JoinMode::Outer,
+            JoinMode::Mix,
+            JoinMode::Restart,
+            JoinMode::Reset,
+        ] {
+            let cases: [(&str, &dyn Fn() -> Pattern, bool); 3] = [
+                // The picked patterns take the scale and the controls.
+                (
+                    "whole cycles",
+                    &|| picked_by_a_sequence(mode, short(), whole(2)),
+                    true,
+                ),
+                // A restart moves a section by a part of a cycle, where
+                // the constant of the pick cuts another way.
+                (
+                    "parts of a cycle",
+                    &|| picked_by_a_sequence(mode, short(), third(7)),
+                    !matches!(mode, JoinMode::Restart | JoinMode::Reset),
+                ),
+                // A step of three cycles is cut by the constant.
+                (
+                    "a long step",
+                    &|| picked_by_a_sequence(mode, long(), whole(2)),
+                    false,
+                ),
+            ];
+            for (name, build, all_inside) in cases {
+                let inside = changed(build());
+                assert_eq!(
+                    matches!(inside.node_kind(), Node::Pick { .. }),
+                    all_inside,
+                    "{mode:?}, {name}"
+                );
+                let outside = sequence::unfolded(|| changed(build()));
+                assert!(!matches!(outside.node_kind(), Node::Pick { .. }));
+                for (begin, end) in spans {
+                    assert_eq!(
+                        answers(&inside, begin, end),
+                        answers(&outside, begin, end),
+                        "{mode:?}, {name}, over {begin:?}..{end:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

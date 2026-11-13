@@ -783,7 +783,7 @@ pub(crate) fn unfolded<R>(build: impl FnOnce() -> R) -> R {
 
 /// Whether a constructor may fold `pattern`: its handle binds no runtime
 /// and is not marked volatile.
-fn folds(pattern: &Pattern) -> bool {
+pub(crate) fn folds(pattern: &Pattern) -> bool {
     #[cfg(test)]
     if UNFOLDED.get() {
         return false;
@@ -892,6 +892,65 @@ pub(crate) fn located(pattern: &Pattern, locations: &[(usize, usize)]) -> Option
         .map(|layer| layer.with(|layer| layer.after.extend_from_slice(locations)))
         .collect();
     Some(node_of_sound(layers))
+}
+
+/// `selector`, the sequence that selects for a pick, with `locations`
+/// before the locations of each hap, when each hap of it holds its value
+/// and its locations alone. The join of a pick puts the locations of its
+/// selector first and keeps the keys of the hap that it picked, so a change
+/// of the picked patterns is then a change of the pick. With no location,
+/// the selector as it is.
+///
+/// `whole_cycles` asks more: each step begins on a whole cycle, so a
+/// restart or a reset moves the picked pattern by whole cycles, and its
+/// cycles stay the cycles of the query.
+pub(crate) fn selecting(
+    selector: &Pattern,
+    locations: &Locations,
+    whole_cycles: bool,
+) -> Option<Pattern> {
+    let whole = |time: Fraction| time.denom() == 1;
+    let layers = folded(selector)?;
+    let plain = layers.iter().all(|layer| {
+        layer.keys.is_empty()
+            && (!whole_cycles
+                || (whole(layer.period)
+                    && layer.places.iter().all(|place| whole(place.whole.begin))))
+    });
+    if !plain {
+        return None;
+    }
+    if locations.is_empty() {
+        return Some(selector.clone());
+    }
+    let layers = layers
+        .iter()
+        .map(|layer| {
+            layer.with(|layer| {
+                let mut before = locations.clone();
+                before.append(&layer.before);
+                layer.before = before;
+            })
+        })
+        .collect();
+    Some(node_of_sound(layers).with_steps(selector.steps))
+}
+
+/// Whether `pattern` is a sequence whose steps each lie in one cycle, or
+/// silence: a constant, which is another hap in each cycle, then cuts no
+/// hap of it.
+pub(crate) fn lies_in_cycles(pattern: &Pattern) -> bool {
+    match folded(pattern) {
+        Some(layers) => layers.iter().all(|layer| layer.in_cycles),
+        None => pattern.is_rest() && folds(pattern),
+    }
+}
+
+/// The value of `values` and its locations, when `values` is a constant
+/// of a plain data value. See [`constant`].
+pub(crate) fn constant_value_at(values: &Pattern) -> Option<(Value, Locations)> {
+    let hap = constant(values)?;
+    is_plain(&hap).then_some((hap.value, hap.context))
 }
 
 /// `pattern` with each hap changed by `map`, a map that reads no span and
