@@ -2792,6 +2792,7 @@ struct QueryThread {
     deadline_tick: std::cell::Cell<u32>,
     deadline_expired: std::cell::Cell<bool>,
     walked: std::cell::Cell<bool>,
+    part_asked: std::cell::Cell<PartAsked>,
 }
 
 thread_local! {
@@ -2806,6 +2807,7 @@ thread_local! {
             deadline_tick: std::cell::Cell::new(0),
             deadline_expired: std::cell::Cell::new(false),
             walked: std::cell::Cell::new(false),
+            part_asked: std::cell::Cell::new(PartAsked::No),
         }
     };
 }
@@ -2865,6 +2867,68 @@ static DEADLINE_EXPIRED: QueryCell<std::cell::Cell<bool>> = QueryCell(|q| &q.dea
 /// Set while a query of a graph that is [marked as walked](Pattern::mark_walked)
 /// runs: each node it reaches answers from the graph.
 static QUERY_WALKED: QueryCell<std::cell::Cell<bool>> = QueryCell(|q| &q.walked);
+
+/// Whether a query on this thread asks a graph over a part of the span of
+/// a restart or a reset join, which cuts the answer to that part. See
+/// [`asked_over_part`].
+static PART_ASKED: QueryCell<std::cell::Cell<PartAsked>> = QueryCell(|q| &q.part_asked);
+
+/// The state of a query over a part of a span.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PartAsked {
+    /// No query asks over a part.
+    No,
+    /// A query asks, and each pattern that a join made in it so far answers
+    /// by its haps.
+    Asked,
+    /// A join of the query made a pattern that refuses the part.
+    Refused,
+}
+
+/// Run `ask`, a query of a graph over a part of a span, for a join that
+/// cuts the answer to the part. `None` when a join of the graph made a
+/// pattern that [refuses the part](refuses_part): the answer for the part
+/// is then not known to be the answer for the span, cut.
+fn asked_over_part<R>(ask: impl FnOnce() -> R) -> Option<R> {
+    /// Puts back the state of the query around this one, also on unwind.
+    struct Around(PartAsked);
+    impl Drop for Around {
+        fn drop(&mut self) {
+            PART_ASKED.with(|asked| asked.set(self.0));
+        }
+    }
+    let around = Around(PART_ASKED.with(|asked| asked.replace(PartAsked::Asked)));
+    let answer = ask();
+    let refused = PART_ASKED.with(std::cell::Cell::get) == PartAsked::Refused;
+    let outer = around.0;
+    drop(around);
+    if !refused {
+        return Some(answer);
+    }
+    // The query that follows asks over the span of this one. A query over
+    // a part around this one made that span, so it is refused too.
+    if outer != PartAsked::No {
+        PART_ASKED.with(|asked| asked.set(PartAsked::Refused));
+    }
+    None
+}
+
+/// Whether a query over a part of a span is in progress on this thread.
+fn part_is_asked() -> bool {
+    PART_ASKED.with(std::cell::Cell::get) != PartAsked::No
+}
+
+/// Whether `made`, a pattern that a join is about to ask in a query over a
+/// part, refuses that query: it reads the span, or it is volatile. The join
+/// then asks it nothing, so a volatile graph is asked one time, by the
+/// query over the span that follows.
+fn refuses_part(made: &Pattern) -> bool {
+    let refuses = made.purity.span_read == purity::SpanRead::Yes || made.is_volatile();
+    if refuses {
+        PART_ASKED.with(|asked| asked.set(PartAsked::Refused));
+    }
+    refuses
+}
 
 /// Alias kept for the shrink/grow boundary.
 pub const MAX_STEPWISE_SEGMENTS: u64 = MAX_STEPWISE_ENTRIES;
@@ -5568,7 +5632,7 @@ impl Pattern {
     fn of(node: Node) -> Self {
         LIVE_NODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut purity = compute_purity(&node);
-        purity.span_read = !answers_by_its_haps(&node);
+        purity.span_read = span_read(&node);
         let runtime_settings = inherited_runtime_settings(&node);
         Pattern {
             node: Arc::new(NodeCell {
@@ -5906,11 +5970,21 @@ impl Pattern {
     /// A graph of discrete haps is asked over the part alone. The join cuts
     /// every other hap away, so the answer after the cut is the same, and
     /// the haps of the other sections of the span are not made. A query
-    /// that fails or is refused only outside the part so answers. Any other
-    /// graph is asked over the span, where it reads its values.
+    /// that fails or is refused only outside the part so answers. A graph
+    /// whose joins make patterns at the query is asked over the part too,
+    /// in a query that walks: each join then says when a pattern that it
+    /// made reads the span, and a table says nothing. Any other graph is
+    /// asked over the span, where it reads its values.
     fn query_restarted(&self, shift: Fraction, state: &State, part: TimeSpan) -> Vec<Hap> {
-        if self.is_cacheable() && !self.purity.span_read {
-            return self.late(shift).query(&state.set_span(part));
+        use purity::SpanRead;
+        let over_part = || self.late(shift).query(&state.set_span(part));
+        let over_span = || self.late(shift).query(state);
+        let reads = match self.is_cacheable() {
+            true => self.purity.span_read,
+            false => SpanRead::Yes,
+        };
+        if reads == SpanRead::No {
+            return over_part();
         }
         match self.node_kind() {
             // A stack answers its layers one after the other, so each layer
@@ -5924,7 +5998,13 @@ impl Pattern {
                 )
                 .unwrap_or_default()
             }
-            _ => self.late(shift).query(state),
+            _ if reads == SpanRead::Made
+                && part != state.span
+                && QUERY_WALKED.with(std::cell::Cell::get) =>
+            {
+                asked_over_part(over_part).unwrap_or_else(over_span)
+            }
+            _ => over_span(),
         }
     }
 
@@ -6776,8 +6856,12 @@ impl Pattern {
 
                 match mode {
                     JoinMode::Inner | JoinMode::Outer | JoinMode::Mix => {
+                        let part_asked = part_is_asked();
                         let mut out = Vec::new();
                         for (a, inner_pat) in resolved {
+                            if part_asked && refuses_part(&inner_pat) {
+                                return Vec::new();
+                            }
                             for b in inner_pat.query(&state.set_span(a.part)) {
                                 let whole = match mode {
                                     JoinMode::Inner => b.whole,
@@ -6814,6 +6898,7 @@ impl Pattern {
                     // hap; context order is INNER-then-outer, the reverse of
                     // bindWhole.
                     JoinMode::Squeeze => {
+                        let part_asked = part_is_asked();
                         let mut out = Vec::new();
                         for (outer, inner_pat) in resolved {
                             // `discreteOnly()`: analog outer haps are dropped.
@@ -6821,6 +6906,9 @@ impl Pattern {
                                 continue;
                             };
                             let focused = inner_pat.focus_span(outer.whole_or_part());
+                            if part_asked && refuses_part(&focused) {
+                                return Vec::new();
+                            }
                             for inner in focused.query(&state.set_span(outer.part)) {
                                 let whole = match inner.whole {
                                     Some(iw) => match iw.intersection(&outer_whole) {
@@ -9257,23 +9345,21 @@ fn poly_extend(pattern: &Pattern, outer_steps: Option<Fraction>) -> Pattern {
     }
 }
 
-/// The single place impurity is derived. Adding a `Node` variant without a
-/// branch here fails to compile, so a new combinator cannot silently be
-/// classified pure.
-/// Whether the answer of `node` for a part of a span is its answer for the
-/// span, with each hap cut to the part and in the same order: each hap is a
-/// whole that only the bounds of a query cut. See
-/// [`purity::Purity::span_read`].
+/// Whether the answer of `node` depends on the span that asks, beyond the
+/// cut of each hap's part. See [`purity::SpanRead`].
 ///
 /// Read from the kind of the node and the classification of its children.
-/// A kind that is not known to answer so says `false`.
-fn answers_by_its_haps(node: &Node) -> bool {
-    let discrete = |pattern: &Pattern| !pattern.purity.span_read;
+/// A kind that is not known to answer by its haps says that it reads the
+/// span.
+fn span_read(node: &Node) -> purity::SpanRead {
+    use purity::SpanRead::{Made, No, Yes};
+    let of = |pattern: &Pattern| pattern.purity.span_read;
+    let most = |patterns: &mut dyn Iterator<Item = &Pattern>| patterns.map(of).max().unwrap_or(No);
     match node {
-        Node::Silence | Node::Pure(_) | Node::PurePickLookup(..) | Node::Sequence(_) => true,
+        Node::Silence | Node::Pure(_) | Node::PurePickLookup(..) | Node::Sequence(_) => No,
         // A time map that keeps the order of time, and maps of each hap that
         // read no span.
-        Node::Fast(pattern, factor, _) => *factor > Fraction::ZERO && discrete(pattern),
+        Node::Fast(pattern, factor, _) if *factor > Fraction::ZERO => of(pattern),
         Node::Shift(pattern, ..)
         | Node::AddContext(pattern, _)
         | Node::FmapNative(pattern, _)
@@ -9282,24 +9368,22 @@ fn answers_by_its_haps(node: &Node) -> bool {
         | Node::MapHapsOwned(pattern, _, SpanUse::Ignores)
         | Node::ExpandHapsNative(pattern, _, SpanUse::Ignores)
         // A hap is kept or dropped by the begin of its whole.
-        | Node::Degrade(pattern, ..) => discrete(pattern),
-        Node::Stack(patterns) => patterns.iter().all(discrete),
+        | Node::Degrade(pattern, ..) => of(pattern),
+        Node::Stack(patterns) => most(&mut patterns.iter()),
         // One cycle at a time: the node inside is asked over each cycle's
         // piece of the span, where each of these kinds maps time in order.
         Node::SplitQueries(inner) => match inner.node_kind() {
-            Node::SlowCat(patterns) | Node::SlowCatPrime(patterns) => {
-                patterns.iter().all(discrete)
-            }
+            Node::SlowCat(patterns) | Node::SlowCatPrime(patterns) => most(&mut patterns.iter()),
             Node::FastGap(pattern, _) | Node::RepeatCycles(pattern, _) | Node::Rev(pattern) => {
-                discrete(pattern)
+                of(pattern)
             }
-            _ => discrete(inner),
+            _ => of(inner),
         },
         // The side that gives the structure is cut by the query. The other
         // side is asked over the whole of each hap, whatever the query.
-        Node::AppLeft(functions, ..) => discrete(functions),
-        Node::AppRight(_, values, ..) => discrete(values),
-        Node::AppBoth(functions, values, ..) => discrete(functions) && discrete(values),
+        Node::AppLeft(functions, ..) => of(functions),
+        Node::AppRight(_, values, ..) => of(values),
+        Node::AppBoth(functions, values, ..) => of(functions).max(of(values)),
         // Each hap of the selector asks its pattern over the hap's part, or
         // over the span and keeps the part: the same haps, for patterns of
         // discrete haps. A squeeze makes a pattern for each hap.
@@ -9308,21 +9392,31 @@ fn answers_by_its_haps(node: &Node) -> bool {
             lookup,
             mode,
             ..
-        } => {
-            *mode != JoinMode::Squeeze && discrete(selector) && lookup.patterns().all(discrete)
-        }
-        // The coin of `sometimes`: each hap of the carrier asks the operand
-        // itself over the hap's part.
-        Node::Join(inner, JoinMode::Inner) => match inner.node_kind() {
-            Node::PatternOfPureOperand(carrier, operand, map, _) => {
-                map.gives_its_operand() && discrete(carrier) && discrete(operand)
+        } if *mode != JoinMode::Squeeze => of(selector).max(most(&mut lookup.patterns())),
+        // Each hap of the carrier asks a pattern over the hap's part. The
+        // coin of `sometimes` asks the operand itself. Any other body makes
+        // the pattern at the query, where the join reads how it answers.
+        Node::Join(
+            inner,
+            mode @ (JoinMode::Inner | JoinMode::Outer | JoinMode::Mix | JoinMode::Squeeze),
+        ) => match inner.node_kind() {
+            Node::PatternOfPureOperand(carrier, operand, map, _)
+                if *mode == JoinMode::Inner && map.gives_its_operand() =>
+            {
+                of(carrier).max(of(operand))
             }
-            _ => false,
+            Node::PatternOfPureOperand(carrier, ..) | Node::PatternOfPure(carrier, ..) => {
+                of(carrier).max(Made)
+            }
+            _ => Yes,
         },
-        _ => false,
+        _ => Yes,
     }
 }
 
+/// The single place impurity is derived. Adding a `Node` variant without a
+/// branch here fails to compile, so a new combinator cannot silently be
+/// classified pure.
 fn compute_purity(node: &Node) -> purity::Purity {
     use purity::Purity;
     fn value_purity(value: &Value) -> Purity {
@@ -11350,9 +11444,172 @@ mod restart_tests {
         }
     }
 
+    /// A sequence of `values`, one a cycle.
+    fn each_cycle(values: &[f64]) -> Pattern {
+        let count = values.len() as i128;
+        let steps = values
+            .iter()
+            .zip(0..)
+            .map(|(value, index)| {
+                SequenceStep::new(
+                    Fraction::new(index, count),
+                    Fraction::new(index + 1, count),
+                    Value::F64(*value),
+                    Locations::new(),
+                )
+            })
+            .collect();
+        sequence(vec![SequenceLayer {
+            period: Fraction::int(count),
+            steps,
+        }])
+        .expect("steps in order")
+    }
+
+    fn transformer(
+        name: &str,
+        apply: impl Fn(Pattern) -> Pattern + Send + Sync + 'static,
+    ) -> Pattern {
+        pure(Value::Function(Box::new(
+            crate::value::FunctionRef::registered(name, Arc::new(apply), true),
+        )))
+    }
+
+    /// `every` of a count for each cycle, with `apply`, over `receiver`: a
+    /// join that makes its patterns at the query.
+    fn every_cycle(
+        counts: &[f64],
+        name: &str,
+        apply: impl Fn(Pattern) -> Pattern + Send + Sync + 'static,
+        receiver: Pattern,
+    ) -> Pattern {
+        crate::register::default_registry()
+            .get("every")
+            .expect("registered every")
+            .call(&[each_cycle(counts), transformer(name, apply)], receiver)
+    }
+
+    /// Sections with a join that makes patterns of discrete haps at the
+    /// query: a count with a transformer, and a count of repeats.
+    fn sections_made_at_the_query() -> Vec<Pattern> {
+        let registry = crate::register::default_registry();
+        let ply = registry.get("ply").expect("registered ply");
+        vec![
+            every_cycle(&[2.0, 3.0], "rev", |pattern| pattern.rev(), steps(130, 4)),
+            ply.call(&[each_cycle(&[2.0, 1.0, 3.0])], steps(140, 3)),
+            stack(vec![
+                steps(150, 2),
+                ply.call(&[each_cycle(&[1.0, 2.0])], steps(160, 2)),
+            ]),
+        ]
+    }
+
+    /// A section with a join that makes a pattern that reads the span.
+    fn section_that_makes_a_signal() -> Pattern {
+        every_cycle(
+            &[1.0, 2.0],
+            "with a signal",
+            |pattern| stack(vec![pattern, crate::signal::saw()]),
+            steps(170, 3),
+        )
+    }
+
+    #[test]
+    fn a_restart_asks_patterns_made_at_the_query_over_their_part() {
+        let spans = [
+            (Fraction::ZERO, whole(16)),
+            (third(-5), third(22)),
+            (third(7), third(8)),
+            (third(13), third(29)),
+            (third(7), third(7)),
+        ];
+        let sections = || {
+            let mut sections = sections_made_at_the_query();
+            sections.push(section_that_makes_a_signal());
+            sections
+        };
+        for mode in [JoinMode::Restart, JoinMode::Reset] {
+            for (begin, end) in spans {
+                // A walk asks over the part, and falls back for the section
+                // that makes a signal. A query that may read a table asks
+                // over the span.
+                let whole_span = picked(
+                    mode,
+                    sections().into_iter().map(asked_over_the_span).collect(),
+                    third(7),
+                );
+                for cut in [
+                    picked(mode, sections(), third(7)).mark_walked(),
+                    picked(mode, sections(), third(7)),
+                ] {
+                    assert_eq!(
+                        format!("{:?}", cut.query_arc(begin, end)),
+                        format!("{:?}", whole_span.query_arc(begin, end)),
+                        "{mode:?} over {begin:?}..{end:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_join_says_at_the_query_when_a_pattern_that_it_made_reads_the_span() {
+        use purity::SpanRead;
+        let state = State::new(TimeSpan::new(third(1), third(8)));
+        for section in sections_made_at_the_query() {
+            assert_eq!(section.purity().span_read, SpanRead::Made);
+            assert!(asked_over_part(|| section.query(&state)).is_some());
+        }
+        let signal = section_that_makes_a_signal();
+        assert_eq!(signal.purity().span_read, SpanRead::Made);
+        assert!(asked_over_part(|| signal.query(&state)).is_none());
+        // A query over a part around the refused one is refused too, and
+        // no query asks over a part after them.
+        let around = asked_over_part(|| asked_over_part(|| signal.query(&state)).is_none());
+        assert_eq!(around, None);
+        assert!(!part_is_asked());
+        assert!(!signal.query(&state).is_empty());
+    }
+
+    #[test]
+    fn a_part_query_asks_no_volatile_pattern_that_a_join_made() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = Arc::new(AtomicUsize::new(0));
+        let section = || {
+            let asked = Arc::clone(&asked);
+            every_cycle(
+                &[1.0, 1.0],
+                "counted",
+                move |pattern| {
+                    let asked = Arc::clone(&asked);
+                    pattern
+                        .with_query_span(move |span| {
+                            asked.fetch_add(1, Ordering::Relaxed);
+                            *span
+                        })
+                        .mark_volatile()
+                },
+                steps(180, 2),
+            )
+        };
+        let sections = |section: Pattern| {
+            picked(JoinMode::Restart, vec![section, steps(190, 2)], whole(2)).mark_walked()
+        };
+        let over_the_span = sections(asked_over_the_span(section()));
+        let expected = format!("{:?}", over_the_span.query_arc(Fraction::ZERO, whole(8)));
+        let asks = asked.swap(0, Ordering::Relaxed);
+        assert!(asks > 0);
+        let cut = sections(section());
+        assert_eq!(
+            format!("{:?}", cut.query_arc(Fraction::ZERO, whole(8))),
+            expected
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), asks);
+    }
+
     #[test]
     fn a_graph_that_reads_the_span_is_no_graph_of_discrete_haps() {
-        let discrete = |pattern: &Pattern| !pattern.purity().span_read;
+        let discrete = |pattern: &Pattern| pattern.purity().span_read == purity::SpanRead::No;
         for section in discrete_sections() {
             assert!(discrete(&section));
             assert!(!discrete(&asked_over_the_span(section)));
