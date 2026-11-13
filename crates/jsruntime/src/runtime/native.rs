@@ -12,7 +12,7 @@
 
 use super::*;
 use crate::surface::{
-    BuiltinGlobal, BuiltinMethod, ListKind, MINI_CALLEE, PristineNames, SPECIAL_REGISTERED_METHODS,
+    BuiltinGlobal, BuiltinMethod, ListKind, ListedNames, MINI_CALLEE, SPECIAL_REGISTERED_METHODS,
     prove_builtin_global, prove_builtin_method, prove_lane_method, prove_mini_callee,
     prove_surface_intrinsics,
 };
@@ -164,57 +164,37 @@ enum Names<'a, 'js> {
     Realm(&'a Ctx<'js>),
     /// A realm with no surface yet, where no score has run: the names a
     /// fresh installation proves.
-    Pristine(&'a PristineNames),
+    Listed(&'a ListedNames),
 }
 
 impl Names<'_, '_> {
     fn method(&self, name: &str) -> Option<BuiltinMethod> {
         match self {
             Self::Realm(ctx) => prove_builtin_method(ctx, name),
-            Self::Pristine(names) => names.method(name),
+            Self::Listed(names) => names.method(name),
         }
     }
 
     fn global(&self, name: &str) -> Option<BuiltinGlobal> {
         match self {
             Self::Realm(ctx) => prove_builtin_global(ctx, name),
-            Self::Pristine(names) => names.global(name),
+            Self::Listed(names) => names.global(name),
         }
     }
 
     fn mini(&self) -> bool {
         match self {
             Self::Realm(ctx) => prove_mini_callee(ctx),
-            Self::Pristine(_) => true,
+            Self::Listed(_) => true,
         }
     }
 
     fn lane(&self) -> bool {
         match self {
             Self::Realm(ctx) => prove_lane_method(ctx),
-            Self::Pristine(_) => true,
+            Self::Listed(_) => true,
         }
     }
-}
-
-thread_local! {
-    /// What a fresh installation proves, taken once per thread from a
-    /// throwaway realm. A realm with no surface reads its names here.
-    static PRISTINE: std::cell::OnceCell<Option<Rc<PristineNames>>> =
-        const { std::cell::OnceCell::new() };
-}
-
-/// The names of a fresh installation. See [`PRISTINE`].
-fn pristine_names() -> Option<Rc<PristineNames>> {
-    PRISTINE.with(|pristine| {
-        pristine
-            .get_or_init(|| {
-                let realm = JsRuntime::new().ok()?;
-                realm.ensure_surface().ok()?;
-                with_ctx(&realm, |ctx| PristineNames::of(&ctx)).map(Rc::new)
-            })
-            .clone()
-    })
 }
 
 impl JsRuntime {
@@ -233,8 +213,7 @@ impl JsRuntime {
                     .flatten()
             })
         } else {
-            let names = pristine_names()?;
-            self.build_native(program, &Names::Pristine(&names))
+            self.build_native(program, &Names::Listed(ListedNames::get()))
         }
     }
 

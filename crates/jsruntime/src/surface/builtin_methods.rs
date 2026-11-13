@@ -194,7 +194,7 @@ pub(crate) enum BuiltinGlobal {
 }
 
 /// What a list constructor builds of its patterns.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum ListKind {
     Stack,
     SlowCat,
@@ -319,41 +319,186 @@ pub(crate) fn prove_builtin_global(ctx: &Ctx<'_>, name: &str) -> Option<BuiltinG
         .then(|| global.clone())
 }
 
-/// The names a fully installed realm proves, taken before any score runs
-/// in it: what a realm with no surface yet would prove once installed.
-pub(crate) struct PristineNames {
-    methods: BTreeMap<Box<str>, BuiltinMethod>,
-    globals: BTreeMap<&'static str, BuiltinGlobal>,
+/// What a fresh installation proves, one name a line: `method` or
+/// `global`, the name, then what the name does, by its kind and the native
+/// table that holds it. A test writes this file from an installed realm and
+/// checks it against one, so the list cannot drift from the installation.
+const NATIVE_INVENTORY: &str = include_str!("../../assets/native-inventory.txt");
+
+/// The inventory asset by name: what a realm with no surface yet would
+/// prove once installed. Each lookup reads the native tables, so the list
+/// holds no copy of them.
+pub(crate) struct ListedNames {
+    methods: BTreeMap<&'static str, &'static str>,
+    globals: BTreeMap<&'static str, &'static str>,
 }
 
-impl PristineNames {
-    /// What `ctx`, freshly installed, proves. `None` when the mini-notation
-    /// callee, the lane method or an intrinsic does not prove, which a fresh
-    /// installation always proves.
-    pub(crate) fn of(ctx: &Ctx<'_>) -> Option<Self> {
-        if !prove_mini_callee(ctx) || !prove_lane_method(ctx) || !prove_surface_intrinsics(ctx) {
-            return None;
-        }
-        let methods = host_builtin_methods(ctx).ok()?;
-        let methods = methods.borrow();
-        let globals = methods
-            .globals
-            .keys()
-            .filter_map(|name| Some((*name, prove_builtin_global(ctx, name)?)))
-            .collect();
-        Some(Self {
-            methods: methods.methods.clone(),
-            globals,
+impl ListedNames {
+    pub(crate) fn get() -> &'static Self {
+        static LISTED: std::sync::OnceLock<ListedNames> = std::sync::OnceLock::new();
+        LISTED.get_or_init(|| {
+            let mut listed = Self {
+                methods: BTreeMap::new(),
+                globals: BTreeMap::new(),
+            };
+            for line in NATIVE_INVENTORY.lines() {
+                let Some((section, entry)) = line.split_once(' ') else {
+                    continue;
+                };
+                let Some((name, listing)) = entry.split_once(' ') else {
+                    continue;
+                };
+                match section {
+                    "method" => listed.methods.insert(name, listing),
+                    "global" => listed.globals.insert(name, listing),
+                    _ => None,
+                };
+            }
+            listed
         })
     }
 
     pub(crate) fn method(&self, name: &str) -> Option<BuiltinMethod> {
-        self.methods.get(name).cloned()
+        BuiltinMethod::listed(self.methods.get(name)?)
     }
 
     pub(crate) fn global(&self, name: &str) -> Option<BuiltinGlobal> {
-        self.globals.get(name).cloned()
+        BuiltinGlobal::listed(name, self.globals.get(name)?)
     }
+}
+
+impl BuiltinMethod {
+    /// This method as the inventory lists it: its kind, then what holds it
+    /// in the native tables. `None` for a registration no registry holds.
+    #[cfg(test)]
+    fn listing(&self) -> Option<String> {
+        Some(match self {
+            Self::Registered(registration) => {
+                let name = registry().names().into_iter().find(|name| {
+                    registry()
+                        .get(name)
+                        .is_some_and(|held| held.same_definition(registration))
+                })?;
+                format!("registered {name}")
+            }
+            Self::Control(spec) => format!("control {}", spec.name()),
+            Self::Shortcut { op, how } => format!("shortcut {} {}", op.name(), how.name()),
+            Self::Composer(op) => format!("composer {}", op.name()),
+            Self::Pick { index, join } => format!("pick {index:?} {join:?}"),
+            Self::Visual => "visual".into(),
+            Self::Layer { keep_original } => {
+                format!("layer {}", if *keep_original { "over" } else { "alone" })
+            }
+        })
+    }
+
+    /// The method a listing names, read from the native tables of this
+    /// build. `None` when this build holds no such entry.
+    fn listed(listing: &str) -> Option<Self> {
+        use rustel_core::{JoinMode, PickIndexMode};
+        let mut words = listing.split(' ');
+        Some(match (words.next()?, words.next(), words.next()) {
+            ("registered", Some(name), None) => {
+                Self::Registered(Box::new(registry().get(name)?.clone()))
+            }
+            ("control", Some(name), None) => Self::Control(control_registry().get(name)?.clone()),
+            ("shortcut", Some(op), Some(how)) => Self::Shortcut {
+                op: ComposeOp::from_name(op)?,
+                how: Alignment::from_name(how)?,
+            },
+            ("composer", Some(op), None) => Self::Composer(ComposeOp::from_name(op)?),
+            ("pick", Some(index), Some(join)) => Self::Pick {
+                index: [
+                    PickIndexMode::Clamp,
+                    PickIndexMode::Remainder,
+                    PickIndexMode::Modulo,
+                ]
+                .into_iter()
+                .find(|mode| format!("{mode:?}") == index)?,
+                join: [
+                    JoinMode::Inner,
+                    JoinMode::Outer,
+                    JoinMode::Mix,
+                    JoinMode::Squeeze,
+                    JoinMode::Reset,
+                    JoinMode::Restart,
+                ]
+                .into_iter()
+                .find(|mode| format!("{mode:?}") == join)?,
+            },
+            ("visual", None, None) => Self::Visual,
+            ("layer", Some("over"), None) => Self::Layer {
+                keep_original: true,
+            },
+            ("layer", Some("alone"), None) => Self::Layer {
+                keep_original: false,
+            },
+            _ => return None,
+        })
+    }
+}
+
+impl BuiltinGlobal {
+    /// This global as the inventory lists it.
+    #[cfg(test)]
+    fn listing(&self) -> String {
+        match self {
+            Self::Control => "control".into(),
+            Self::List(kind) => format!("list {kind:?}"),
+            Self::Tempo { per_minute: true } => "tempo minute".into(),
+            Self::Tempo { per_minute: false } => "tempo second".into(),
+            Self::Signal(_) => "signal".into(),
+        }
+    }
+
+    /// The global `name` that a listing describes, read from the native
+    /// tables of this build.
+    fn listed(name: &str, listing: &str) -> Option<Self> {
+        Some(match listing {
+            "control" => {
+                control_registry().get(name)?;
+                Self::Control
+            }
+            "list Stack" => Self::List(ListKind::Stack),
+            "list SlowCat" => Self::List(ListKind::SlowCat),
+            "list FastCat" => Self::List(ListKind::FastCat),
+            "tempo minute" => Self::Tempo { per_minute: true },
+            "tempo second" => Self::Tempo { per_minute: false },
+            "signal" => {
+                // Built once: a signal read by two scores is one pattern.
+                static SIGNALS: std::sync::OnceLock<Vec<(&'static str, Pattern)>> =
+                    std::sync::OnceLock::new();
+                let signals = SIGNALS.get_or_init(rustel_core::signal::signals);
+                let (_, pattern) = signals.iter().find(|(signal, _)| *signal == name)?;
+                Self::Signal(pattern.clone())
+            }
+            _ => return None,
+        })
+    }
+}
+
+/// What `ctx`, fully installed and before any score, proves: the text of
+/// the inventory asset.
+#[cfg(test)]
+fn proven_inventory(ctx: &Ctx<'_>) -> String {
+    let methods = host_builtin_methods(ctx).expect("the inventory");
+    let methods = methods.borrow();
+    let mut lines = Vec::new();
+    for name in methods.methods.keys() {
+        if let Some(method) = prove_builtin_method(ctx, name) {
+            let listing = method
+                .listing()
+                .expect("a registry holds each registration");
+            lines.push(format!("method {name} {listing}\n"));
+        }
+    }
+    for name in methods.globals.keys() {
+        if let Some(global) = prove_builtin_global(ctx, name) {
+            lines.push(format!("global {name} {}\n", global.listing()));
+        }
+    }
+    lines.sort();
+    lines.concat()
 }
 
 /// Record the lane method `p` that installation put on the prototype.
@@ -616,6 +761,44 @@ mod tests {
                 "{replace}"
             );
         }
+    }
+
+    /// Set `RUSTEL_WRITE_INVENTORY` to write the asset from this realm,
+    /// in a build with every feature.
+    #[test]
+    fn the_inventory_asset_lists_what_a_fresh_installation_proves() {
+        let runtime = JsRuntime::new().expect("runtime");
+        runtime.ensure_surface().expect("the whole surface");
+        let proven = with_ctx(&runtime, |ctx| {
+            assert!(prove_mini_callee(&ctx) && prove_lane_method(&ctx));
+            assert!(prove_surface_intrinsics(&ctx));
+            proven_inventory(&ctx)
+        });
+        if std::env::var_os("RUSTEL_WRITE_INVENTORY").is_some() {
+            let asset = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/native-inventory.txt");
+            std::fs::write(asset, &proven).expect("write the inventory asset");
+        }
+        // Every entry this build can read is one the realm proves, with the
+        // same meaning. A build with fewer features reads fewer entries.
+        let listed = ListedNames::get();
+        for line in NATIVE_INVENTORY.lines() {
+            let mut words = line.splitn(3, ' ');
+            let (section, name) = (words.next().expect("section"), words.next().expect("name"));
+            let readable = match section {
+                "method" => listed.method(name).is_some(),
+                _ => listed.global(name).is_some(),
+            };
+            assert!(
+                !readable || proven.lines().any(|proven| proven == line),
+                "the realm does not prove `{line}`"
+            );
+        }
+        // With every feature, the asset is the whole of what it proves.
+        #[cfg(all(feature = "extensions", feature = "hydra"))]
+        assert_eq!(
+            proven, NATIVE_INVENTORY,
+            "run this test with RUSTEL_WRITE_INVENTORY=1 to write the asset again"
+        );
     }
 
     #[test]
