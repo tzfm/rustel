@@ -1001,7 +1001,7 @@ impl Session {
                 .map_err(render_error)
             }
             RenderFormat::OnsetJson => {
-                write_onset_dump(out_path, &play.onsets)?;
+                write_onset_dump_until(out_path, &play.onsets, &stop)?;
                 Ok(((None, Vec::new()), Vec::new()))
             }
         })?;

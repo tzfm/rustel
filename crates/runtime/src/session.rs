@@ -55,7 +55,7 @@ use crate::hap_json::{
 use crate::osc_bridge::ScoreOscAccess;
 #[cfg(any(feature = "device-audio", test))]
 use crate::producer::{ProducerPhase, ProducerTurnRecord};
-use crate::render::{RenderFormat, write_onset_dump, write_silent_wav};
+use crate::render::{RenderFormat, write_onset_dump_until, write_silent_wav};
 use crate::samples::ScoreSampleAccess;
 use crate::score_import::ScoreImportAccess;
 

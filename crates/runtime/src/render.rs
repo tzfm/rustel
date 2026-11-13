@@ -1725,8 +1725,54 @@ pub fn write_silent_wav(
 
 /// Write a raw onset dump as JSON.
 pub fn write_onset_dump(path: impl AsRef<Path>, onsets: &[OnsetEventJson]) -> io::Result<()> {
-    let file = File::create(path)?;
-    serde_json::to_writer_pretty(file, onsets).map_err(io::Error::other)
+    write_onset_dump_until(path, onsets, &RenderStop::default())
+}
+
+/// [`write_onset_dump`], which a cancel of `stop` ends. A cancelled dump
+/// leaves no file, and its error is [`rustel_audio::RENDER_CANCELLED`].
+pub(crate) fn write_onset_dump_until(
+    path: impl AsRef<Path>,
+    onsets: &[OnsetEventJson],
+    stop: &RenderStop,
+) -> io::Result<()> {
+    /// A file that takes no write after a cancel.
+    struct Cancellable<'a> {
+        file: File,
+        stop: &'a RenderStop,
+    }
+    impl Write for Cancellable<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.stop.cancelled() {
+                return Err(io::Error::other(rustel_audio::RENDER_CANCELLED));
+            }
+            self.file.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+    }
+    let cancelled = || io::Error::other(rustel_audio::RENDER_CANCELLED);
+    if stop.cancelled() {
+        return Err(cancelled());
+    }
+    let path = path.as_ref();
+    // The dump of a long render is large: each write of the encoder goes
+    // to the file in blocks.
+    let mut dump = io::BufWriter::new(Cancellable {
+        file: File::create(path)?,
+        stop,
+    });
+    let written = serde_json::to_writer_pretty(&mut dump, onsets)
+        .map_err(io::Error::other)
+        .and_then(|()| dump.flush());
+    if written.is_err() && stop.cancelled() {
+        drop(dump);
+        // A part of a dump is no JSON.
+        let _ = std::fs::remove_file(path);
+        return Err(cancelled());
+    }
+    written
 }
 
 #[cfg(test)]
@@ -1929,6 +1975,26 @@ mod stretch_chain_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cancelled_onset_dump_leaves_no_file() {
+        let transport = std::sync::Arc::new(rustel_scheduler::Transport::default());
+        let stop = RenderStop {
+            transport: Some(std::sync::Arc::clone(&transport)),
+            finish: None,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "rustel-cancelled-onset-dump-{}.json",
+            std::process::id()
+        ));
+        write_onset_dump_until(&path, &[], &stop).expect("a dump of no onset");
+        assert_eq!(std::fs::read_to_string(&path).expect("the dump"), "[]");
+        std::fs::remove_file(&path).expect("remove the dump");
+        transport.stop();
+        let error = write_onset_dump_until(&path, &[], &stop).expect_err("a cancelled dump");
+        assert_eq!(error.to_string(), rustel_audio::RENDER_CANCELLED);
+        assert!(!path.exists());
+    }
 
     // Exact PCM cannot distinguish these kernel choices. Observe only the
     // backend constructed by this test thread, without changing selection.
