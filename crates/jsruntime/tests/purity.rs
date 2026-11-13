@@ -301,11 +301,11 @@ fn impure_pattern_without_host_panics() {
 #[test]
 fn query_time_javascript_is_always_impure() {
     for source in [
-        // Patterned first argument: the transformer is chosen per hap.
-        r#"s("bd sd").every("<2 3>", x => x.fast(2))"#,
-        r#"s("bd sd").sometimesBy("<0.3 0.6>", x => x.speed(2))"#,
-        // Scalar probability: the combinator body's own fmap is lazy. A free
-        // variable keeps the callback JavaScript.
+        // Patterned first argument: each hap applies the transformer at the
+        // query. A free variable keeps the callback JavaScript.
+        r#"const k = 2; s("bd sd").every("<2 3>", x => x.fast(k))"#,
+        r#"const k = 2; s("bd sd").sometimesBy("<0.3 0.6>", x => x.speed(k))"#,
+        // Scalar probability: the combinator body's own fmap is lazy.
         r#"const k = 2; s("bd sd").sometimesBy(1, x => x.speed(k))"#,
         r#"const k = 2; s("bd sd").someCyclesBy(1, x => x.speed(k))"#,
     ] {
@@ -350,6 +350,13 @@ fn eager_and_compiled_callbacks_leave_a_genuinely_pure_graph() {
         (r#"s("bd sd").superimpose(x => x.fast(2))"#, true),
         (r#"s("bd sd").sometimesBy(1, x => x.speed(2))"#, true),
         (r#"s("bd sd").someCyclesBy(1, x => x.speed(2))"#, true),
+        // A patterned first argument applies the compiled callback at the
+        // query, once for each value.
+        (r#"s("bd sd").every("<2 3>", x => x.fast(2))"#, true),
+        (
+            r#"s("bd sd").sometimesBy("<0.3 0.6>", x => x.speed(2))"#,
+            true,
+        ),
     ] {
         let rt = JsRuntime::new().unwrap();
         rt.install_semantic_bindings().unwrap();

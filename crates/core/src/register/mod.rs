@@ -302,6 +302,33 @@ fn admits_pure_view(function_argument: FunctionArgument, value: &Value) -> bool 
     }
 }
 
+/// The argument values of one application of a patterned call, each at its
+/// position. `riding` holds the values of the chain, `chain` of them, and
+/// `constants` holds each constant at its position, with `None` where the
+/// next value of the chain goes. With no constants, every argument rides.
+pub(crate) fn argument_values(
+    riding: &Value,
+    chain: usize,
+    constants: &[Option<Value>],
+) -> Vec<Value> {
+    let riding = match riding {
+        Value::List(values) => values.clone(),
+        single => vec![single.clone()],
+    };
+    debug_assert_eq!(riding.len(), chain);
+    if constants.is_empty() {
+        return riding;
+    }
+    let mut riding = riding.into_iter();
+    constants
+        .iter()
+        .map(|constant| match constant {
+            Some(value) => value.clone(),
+            None => riding.next().unwrap_or(Value::Null),
+        })
+        .collect()
+}
+
 impl Registration {
     /// Whether a leading argument is a function, in any role.
     pub fn takes_function(&self) -> bool {
@@ -457,47 +484,38 @@ impl Registration {
             // not by a flag. A `Native` body applied to a pure operand is
             // provably pure, so purity can be inherited soundly; anything else
             // goes through the dynamic constructor and is impure.
-            let unpack = move |v: &Value| -> Vec<Value> {
-                let vals = match v {
-                    Value::List(xs) => xs.clone(),
-                    single => vec![single.clone()],
-                };
-                debug_assert_eq!(vals.len(), n_chain);
-                vals
-            };
-            let apply = move |v: &Value| {
-                let values = if constants.is_empty() {
-                    unpack(v)
-                } else {
-                    let riding = unpack(v);
-                    let mut riding = riding.into_iter();
-                    constants
-                        .iter()
-                        .map(|constant| match constant {
-                            Some(value) => value.clone(),
-                            None => riding.next().unwrap_or(Value::Null),
-                        })
-                        .collect()
-                };
-                let pure_view = values
+            //
+            // A body that consumes a transformer applies a function among
+            // its values. It takes the pure route when no value can be a
+            // function of the script: each function is a constant with a
+            // pure view, and each argument of the chain is data that its
+            // graph holds.
+            let pure_view = !self.takes_function()
+                || (constants
                     .iter()
-                    .all(|value| admits_pure_view(function_argument, value));
-                func.apply(&values, pat_for_fn.clone(), pure_view)
-            };
+                    .flatten()
+                    .all(|constant| admits_pure_view(function_argument, constant))
+                    && chain.iter().all(crate::sequence::is_data));
             let inner = match (&self.func, pat.as_pure_pattern()) {
-                // A body that consumes a transformer cannot take the pure
-                // route: the argument values are only known at query time, so
-                // there is no way to know the transformer is native.
-                _ if self.takes_function() => acc.fmap_to_pattern(apply),
                 // Native body + pure operand: the closure's return type proves
                 // no JavaScript can appear, so purity is inherited SOUNDLY.
                 // The operand rides in the node as a compared child, so an
                 // unchanged operand carries its answers across evaluations.
-                (CombinatorFn::Native(n), Some(pure_operand)) => {
-                    acc.fmap_to_pure_pattern_with_operand(&pure_operand, n.pure.clone(), n_chain)
-                }
+                (CombinatorFn::Native(n), Some(pure_operand)) if pure_view => acc
+                    .fmap_to_pure_pattern_with_operand(
+                        &pure_operand,
+                        n.pure.clone(),
+                        n_chain,
+                        constants,
+                    ),
                 // Anything else is an opaque closure -> always impure.
-                _ => acc.fmap_to_pattern(apply),
+                _ => acc.fmap_to_pattern(move |riding: &Value| {
+                    let values = argument_values(riding, n_chain, &constants);
+                    let pure_view = values
+                        .iter()
+                        .all(|value| admits_pure_view(function_argument, value));
+                    func.apply(&values, pat_for_fn.clone(), pure_view)
+                }),
             };
             let inner = inner.retaining_callbacks(retained);
             match self.join {
@@ -1298,6 +1316,60 @@ mod purity_rule_tests {
             receiver,
         );
         assert!(every_two.is_pure());
+    }
+
+    #[test]
+    fn a_patterned_call_with_a_constant_native_transformer_keeps_a_pure_operand_pure() {
+        use rustel_fraction::Fraction;
+        let registry = default_registry();
+        let every = registry.get("every").expect("registered every");
+        let rev = || {
+            pure(Value::Function(Box::new(FunctionRef::registered(
+                "rev",
+                Arc::new(|pattern| pattern.rev()),
+                true,
+            ))))
+        };
+        // Two counts, one a cycle: data that the graph holds.
+        let counts = || {
+            let step = |index: i128, count: f64| {
+                crate::SequenceStep::new(
+                    Fraction::new(index, 2),
+                    Fraction::new(index + 1, 2),
+                    Value::F64(count),
+                    crate::Locations::new(),
+                )
+            };
+            crate::sequence(vec![crate::SequenceLayer {
+                period: Fraction::int(2),
+                steps: vec![step(0, 2.0), step(1, 3.0)],
+            }])
+            .expect("steps in order")
+        };
+        let receiver = || {
+            crate::fastcat(
+                ["a", "b", "c"]
+                    .map(|name| pure(Value::Str(name.into())))
+                    .to_vec(),
+            )
+        };
+        let kept = every.call(&[counts(), rev()], receiver());
+        assert!(kept.is_pure() && kept.is_cacheable());
+        // Counts behind a time map are not data that the graph holds, and a
+        // function of the script has no pure view: each call takes the
+        // dynamic constructor.
+        let behind_a_map = every.call(&[counts().with_query_time(|time| time), rev()], receiver());
+        assert!(!behind_a_map.is_pure());
+        let script = pure(Value::Function(Box::new(FunctionRef::js(1))));
+        assert!(!every.call(&[counts(), script], receiver()).is_pure());
+        // Both constructors build the same patterns.
+        for (begin, end) in [(0, 6), (1, 2), (-3, 5), (2, 2)] {
+            let (begin, end) = (Fraction::int(begin), Fraction::int(end));
+            assert_eq!(
+                format!("{:?}", kept.query_arc(begin, end)),
+                format!("{:?}", behind_a_map.query_arc(begin, end)),
+            );
+        }
     }
 }
 

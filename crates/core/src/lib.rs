@@ -1895,14 +1895,30 @@ type ToPurePatternFn = Arc<dyn Fn(&Value) -> purity::PurePattern + Send + Sync>;
 pub struct PatternedPureMap {
     body: register::PureBody,
     chain: usize,
+    /// The constant arguments of the call, each at its position, with
+    /// `None` at a position that a value of the chain fills. Empty when
+    /// every argument rides in the chain.
+    constants: Box<[Option<Value>]>,
 }
 
 impl PatternedPureMap {
-    /// Two payloads agree when they hold the same registered body and
-    /// unpack to the same width. Pointer equality is enough for the body:
-    /// the registry mints one object per combinator for the process.
+    /// Two payloads agree when they hold the same registered body, unpack
+    /// to the same width and hold the same constants. Pointer equality is
+    /// enough for the body: the registry mints one object per combinator
+    /// for the process.
     fn same(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.body, &other.body) && self.chain == other.chain
+        Arc::ptr_eq(&self.body, &other.body)
+            && self.chain == other.chain
+            && self.constants.len() == other.constants.len()
+            && self
+                .constants
+                .iter()
+                .zip(other.constants.iter())
+                .all(|pair| match pair {
+                    (Some(a), Some(b)) => same_key(a, b),
+                    (None, None) => true,
+                    _ => false,
+                })
     }
 
     /// Whether the body gives the operand itself for every value, as the
@@ -1912,11 +1928,7 @@ impl PatternedPureMap {
     }
 
     fn apply(&self, value: &Value, operand: &Pattern) -> purity::PurePattern {
-        let values = match value {
-            Value::List(values) => values.clone(),
-            single => vec![single.clone()],
-        };
-        debug_assert_eq!(values.len(), self.chain);
+        let values = register::argument_values(value, self.chain, &self.constants);
         let pure = operand
             .as_pure_pattern()
             .expect("a PatternOfPureOperand is built from a pure operand");
@@ -7903,17 +7915,27 @@ impl Pattern {
     /// node: the adopt walk compares that operand structurally, so an
     /// unchanged operand agrees across evaluations and its answers carry,
     /// where a hidden capture would refuse on every rebuild.
+    ///
+    /// `constants` are the arguments that do not ride in this pattern, each
+    /// at its position, with `None` at each position that a value of this
+    /// pattern fills: empty when every argument rides. The caller answers
+    /// for the pure view of each: see [`register::Registration::call`].
     pub fn fmap_to_pure_pattern_with_operand(
         &self,
         operand: &purity::PurePattern,
         body: register::PureBody,
         chain: usize,
+        constants: Vec<Option<Value>>,
     ) -> Self {
         let steps = self.steps;
         Pattern::of(Node::PatternOfPureOperand(
             self.clone(),
             operand.pattern().clone(),
-            Arc::new(PatternedPureMap { body, chain }),
+            Arc::new(PatternedPureMap {
+                body,
+                chain,
+                constants: constants.into(),
+            }),
             ConstructionMemo::default(),
         ))
         .with_steps(steps)

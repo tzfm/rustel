@@ -1951,7 +1951,7 @@ fn coin_bind<P: PatOps>(x: f64, whole: &P) -> P {
     ) {
         let joined = carrier
             .0
-            .fmap_to_pure_pattern_with_operand(&operand, coin_body(), 1)
+            .fmap_to_pure_pattern_with_operand(&operand, coin_body(), 1, Vec::new())
             .inner_join();
         return P::from_pure_view(crate::purity::PurePattern(joined));
     }

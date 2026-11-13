@@ -638,6 +638,17 @@ pub(crate) fn holds_data(layers: &[Layer]) -> bool {
     layers.iter().all(Layer::is_data)
 }
 
+/// Whether the graph of `pattern` holds each value that it answers, and
+/// each is data only: a sequence or a constant of data values.
+pub(crate) fn is_data(pattern: &Pattern) -> bool {
+    match pattern.node_kind() {
+        Node::Sequence(layers) => holds_data(layers),
+        Node::Pure(value) => value.is_data(0),
+        Node::AddContext(inner, _) => is_data(inner),
+        _ => false,
+    }
+}
+
 /// The one data value of `layers`, when they are one value that fills each
 /// cycle, as a `pure` is.
 pub(crate) fn constant_value(layers: &[Layer]) -> Option<&Value> {

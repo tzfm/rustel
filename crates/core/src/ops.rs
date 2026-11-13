@@ -996,9 +996,10 @@ impl PatOps for PurePattern {
     fn apply_fn(&self, f: &crate::value::FunctionRef) -> Self {
         f.apply_pure(self.clone()).unwrap_or_else(|| {
             // Unreachable: a registration that consumes a function argument
-            // declares `function_argument`, which keeps the general path on the
-            // dynamic constructor, and the fast path checks the argument
-            // values. Kept as the self-check that keeps that claim honest.
+            // declares `function_argument`. Its general path then takes the
+            // pure route only with constant functions that have a pure view,
+            // and the fast path checks the argument values. Kept as the
+            // self-check that keeps that claim honest.
             PurePattern::assert_pure(f.apply(self.pattern().clone()))
         })
     }

@@ -42,10 +42,11 @@ pub enum PatternTransformInstruction {
     /// Executing delegates to
     /// [`Registration::call`](crate::register::Registration::call), so the
     /// program builds exactly the graph the method call builds, including the
-    /// patternified general path a patterned argument takes. That path is
-    /// impure by construction - the same call in JavaScript is impure the
-    /// same way - so this instruction runs through its ordinary view only;
-    /// its pure view wraps that result as host-built.
+    /// patternified general path a patterned argument takes. This
+    /// instruction runs through its ordinary view only. A call that keeps
+    /// the operand pure is its own pure view. Any other call is impure by
+    /// construction - the same call in JavaScript is impure the same way -
+    /// and its pure view wraps that result as host-built.
     ApplyRegistered {
         registration: Box<crate::register::Registration>,
         arguments: Vec<Pattern>,
@@ -418,15 +419,20 @@ impl PatternTransformProgram {
                 PatternTransformInstruction::Apply(function) => function
                     .apply_pure_unbound(pattern)
                     .expect("validated callback IR instruction lost its native purity proof"),
-                // The registered call is impure by construction, as its
-                // JavaScript method call is. Its pure view runs the same
-                // ordinary view and wraps the result as host-built, the way
-                // the host arm of a stale lowered callback does.
+                // The pure view runs the ordinary view. A call that kept
+                // the operand pure answers as its graph does. Any other is
+                // impure by construction, as its JavaScript method call is,
+                // and is wrapped as host-built, the way the host arm of a
+                // stale lowered callback does.
                 PatternTransformInstruction::ApplyRegistered {
                     registration,
                     arguments,
                 } => {
-                    PurePattern::host_built(registration.call(arguments, pattern.pattern().clone()))
+                    let built = registration.call(arguments, pattern.pattern().clone());
+                    match built.as_pure_pattern() {
+                        Some(pure) => pure,
+                        None => PurePattern::host_built(built),
+                    }
                 }
             };
         }
