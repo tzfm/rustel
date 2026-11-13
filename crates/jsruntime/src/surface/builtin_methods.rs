@@ -363,15 +363,19 @@ impl ListedNames {
 
 /// The section and the name of a line of the inventory, and what the line
 /// lists for the name.
-fn inventory_entry(line: &'static str) -> Option<((&'static str, &'static str), &'static str)> {
+fn inventory_entry(line: &str) -> Option<((&str, &str), &str)> {
     let mut words = line.splitn(3, ' ');
     Some(((words.next()?, words.next()?), words.next()?))
 }
 
-/// What the inventory lists for `name` in `section`, found by a search of
-/// its lines, which are in the order of section and name.
+/// What the inventory lists for `name` in `section`.
 fn listing(section: &str, name: &str) -> Option<&'static str> {
-    let text = NATIVE_INVENTORY;
+    listing_in(NATIVE_INVENTORY, section, name)
+}
+
+/// What `text` lists for `name` in `section`, found by a search of its
+/// lines, which are in the order of section and name.
+fn listing_in<'t>(text: &'t str, section: &str, name: &str) -> Option<&'t str> {
     let (mut low, mut high) = (0, text.len());
     while low < high {
         let middle = low + (high - low) / 2;
@@ -380,7 +384,8 @@ fn listing(section: &str, name: &str) -> Option<&'static str> {
         let end = text[middle..]
             .find('\n')
             .map_or(text.len(), |end| middle + end);
-        let (entry, listing) = inventory_entry(&text[start..end])?;
+        // A checkout can end each line with a carriage return too.
+        let (entry, listing) = inventory_entry(text[start..end].trim_end_matches('\r'))?;
         match entry.cmp(&(section, name)) {
             std::cmp::Ordering::Equal => return Some(listing),
             std::cmp::Ordering::Less => low = end + 1,
@@ -833,6 +838,16 @@ mod tests {
             proven, NATIVE_INVENTORY,
             "run this test with RUSTEL_WRITE_INVENTORY=1 to write the asset again"
         );
+    }
+
+    #[test]
+    fn a_search_reads_lines_that_end_with_a_carriage_return() {
+        let checkout = NATIVE_INVENTORY.replace('\n', "\r\n");
+        for line in NATIVE_INVENTORY.lines() {
+            let ((section, name), listed) =
+                inventory_entry(line).expect("a section, a name and a listing");
+            assert_eq!(listing_in(&checkout, section, name), Some(listed), "{line}");
+        }
     }
 
     #[test]
