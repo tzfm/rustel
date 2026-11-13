@@ -383,9 +383,25 @@ enum Build {
         order: u64,
         error: String,
     },
-    /// A new try: of a build that did not start, with its error, or of a
-    /// copy that faulted, with none. See [`Host::retry`].
-    Retrying(Option<String>),
+    /// A new try of a build that did not start, with its error: see
+    /// [`Host::retry`].
+    Retrying {
+        error: String,
+    },
+    /// The new copy for the slot of a live copy that faulted in an engine:
+    /// see [`Host::retry`].
+    Renewing,
+}
+
+impl Build {
+    /// True while the build works on its copy: a first build, a new try, or
+    /// the new copy of a copy that faulted.
+    fn runs(&self) -> bool {
+        matches!(
+            self,
+            Build::Running | Build::Retrying { .. } | Build::Renewing
+        )
+    }
 }
 
 /// The wait of a key at a rate before its next try: see [`Host::retry`].
@@ -435,6 +451,146 @@ enum Rank {
     Rest(u64, u64),
 }
 
+/// Where the read of the preset folders is: see [`Host::read_presets`].
+#[derive(Default)]
+enum PresetRead {
+    /// No read ended since the start of the host or since the root
+    /// changed. An ask for a preset waits, and claims a read.
+    #[default]
+    Unread,
+    /// A read is in the line of the plugin thread or runs.
+    Reading {
+        /// The asks keep the answers of the last read of the root until
+        /// this read ends. False for the first read and after a change of
+        /// the root: the asks wait.
+        answered: bool,
+        /// What changed while the read ran: one more read follows at once.
+        again: ReadAgain,
+    },
+    /// `preset_index` holds a read of the root, and the asks have their
+    /// answers.
+    Read,
+}
+
+/// What changed while a read of the preset folders ran: see
+/// [`PresetRead::Reading`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadAgain {
+    /// Nothing changed while the read ran.
+    No,
+    /// The folders or their files changed. The read that follows keeps the
+    /// answers of the read that ran.
+    Folders,
+    /// The root changed, and maybe the folders too. The asks wait for the
+    /// read of the new root.
+    Root,
+}
+
+impl PresetRead {
+    /// Claims a read. True when the caller runs the read. With `force`,
+    /// the folders changed: a read that runs now reads again after its
+    /// end. With no `force`, a read that ended gives no new read.
+    fn claim(&mut self, force: bool) -> bool {
+        let answered = match self {
+            PresetRead::Reading { again, .. } => {
+                if force && *again == ReadAgain::No {
+                    *again = ReadAgain::Folders;
+                }
+                return false;
+            }
+            PresetRead::Read if !force => return false,
+            PresetRead::Read => true,
+            PresetRead::Unread => false,
+        };
+        *self = PresetRead::Reading {
+            answered,
+            again: ReadAgain::No,
+        };
+        true
+    }
+
+    /// The root changed. The asks wait for a read of the new root, and a
+    /// read that runs now reads again after its end.
+    fn root_changed(&mut self) {
+        *self = match self {
+            PresetRead::Reading { .. } => PresetRead::Reading {
+                answered: false,
+                again: ReadAgain::Root,
+            },
+            PresetRead::Unread | PresetRead::Read => PresetRead::Unread,
+        };
+    }
+
+    /// The read ended, and `preset_index` holds what it read. True when a
+    /// change while it ran claims the read that follows: the caller runs
+    /// that read at once. A state with no read stays as it is.
+    fn finished(&mut self) -> bool {
+        let PresetRead::Reading { again, .. } = *self else {
+            return false;
+        };
+        *self = match again {
+            ReadAgain::No => PresetRead::Read,
+            ReadAgain::Folders => PresetRead::Reading {
+                answered: true,
+                again: ReadAgain::No,
+            },
+            ReadAgain::Root => PresetRead::Reading {
+                answered: false,
+                again: ReadAgain::No,
+            },
+        };
+        again != ReadAgain::No
+    }
+
+    /// The read that held the claim ended in a panic, with no index. A read
+    /// of the root that ended before still answers the asks. With none,
+    /// the next ask claims a new read.
+    fn abandoned(&mut self) {
+        if let PresetRead::Reading { answered, .. } = *self {
+            *self = if answered {
+                PresetRead::Read
+            } else {
+                PresetRead::Unread
+            };
+        }
+    }
+
+    /// True when `preset_index` holds a read of the root that answers the
+    /// asks.
+    fn answered(&self) -> bool {
+        matches!(
+            self,
+            PresetRead::Read | PresetRead::Reading { answered: true, .. }
+        )
+    }
+
+    /// True while a read is in the line of the plugin thread or runs.
+    fn reading(&self) -> bool {
+        matches!(self, PresetRead::Reading { .. })
+    }
+}
+
+/// The watch of the preset folders that is on: see
+/// [`Host::arm_preset_watch`].
+struct PresetWatch {
+    /// The word to the thread of the watch. A channel that reads as gone
+    /// ended its watch, and the folders are read when the player asks
+    /// again.
+    word: Sender<Word>,
+    /// Each preset folder the watch was armed for, with the path its watch
+    /// reads: the folder, or the folder nearest above a missing one. A
+    /// folder that comes in or goes moves its path, and the watch is armed
+    /// again.
+    watched: Vec<(PathBuf, PathBuf)>,
+}
+
+impl PresetWatch {
+    /// Ends the thread of the watch.
+    fn stop(self) {
+        let _ = self.word.send(Word::Stop);
+    }
+}
+
 #[derive(Default)]
 struct State {
     /// The number of a plugin is its place here plus 1. Rows are only added.
@@ -447,13 +603,8 @@ struct State {
     /// The preset files of each plugin, by the lower case class id each
     /// file names: see [`preset::scan_folders`].
     preset_index: HashMap<String, Vec<(String, PathBuf)>>,
-    /// True once the preset folders were read. A read in the line of the
-    /// plugin thread turns it back: see [`Host::read_presets`].
-    presets_read: bool,
-    /// A read of the preset folders is in the line of the plugin thread.
-    presets_reading: bool,
-    /// The folders changed while a read ran: one more read follows.
-    presets_again: bool,
+    /// Where the read of the preset folders is: see [`PresetRead`].
+    preset_read: PresetRead,
     /// The bundles whose load reads the preset folders of their plugins
     /// now. A plugin of such a bundle is ready before its files are in
     /// `preset_index`, so its preset answers wait for the read: see
@@ -462,15 +613,9 @@ struct State {
     /// The folders with `.vstpreset` files the player added, in any
     /// structure, read after the preset folder.
     preset_extra: Vec<PathBuf>,
-    /// The word to the watch of the preset folders: see
-    /// [`Host::arm_preset_watch`]. A channel that reads as gone ended its
-    /// watch, and the folders are read when the player asks again.
-    preset_watch: Option<Sender<Word>>,
-    /// Each preset folder the watch was armed for, with the path its watch
-    /// reads: the folder, or the folder nearest above a missing one. A
-    /// folder that comes in or goes moves its path, and the watch is armed
-    /// again: see [`Host::arm_preset_watch`].
-    preset_watched: Vec<(PathBuf, PathBuf)>,
+    /// `None` while no watch is on: the host has no preset folders, the
+    /// system gives no watch, or no arm ran yet.
+    preset_watch: Option<PresetWatch>,
     /// The reads of the preset folders so far. A caller that holds the
     /// number of its last read asks again when this moves: the watch read
     /// the folders, and its answer may have changed.
@@ -903,7 +1048,7 @@ impl State {
     /// runs or waits in the line: see [`Host::retry`].
     fn trying(&self, key: InsertKey, rate: u32) -> bool {
         self.builds.iter().any(|((other, at, _), built)| {
-            (*other, *at) == (key, rate) && matches!(built, Build::Retrying(Some(_)))
+            (*other, *at) == (key, rate) && matches!(built, Build::Retrying { .. })
         })
     }
 
@@ -1010,9 +1155,16 @@ impl State {
         self.rendering.contains(build) || self.renders.contains(&build.2.chain)
     }
 
+    /// True for a render chain that did not end: its render can still take
+    /// its ready copies. No render takes a ready copy of an ended render
+    /// chain. See [`Host::keep`].
+    fn render_runs(&self, chain: u64) -> bool {
+        self.renders.contains(&chain) && !self.ended.contains(&chain)
+    }
+
     /// Takes each ended chain with no build left out of the render chains:
     /// see [`Host::keep`]. A ready copy of an ended render chain stays out of
-    /// the bound until its end job takes it.
+    /// the bound until a job of the plugin thread takes it.
     fn drop_ended_renders(&mut self) {
         let Self {
             renders,
@@ -1054,7 +1206,7 @@ impl State {
                         rank.map(|_| Rank::Failed(*order))
                     }
                     Build::Ready(copy) => self.rank(build, copy.order(), &rows),
-                    Build::Running | Build::Retrying(_) => None,
+                    Build::Running | Build::Retrying { .. } | Build::Renewing => None,
                 };
                 let under = rank.filter(|rank| below.is_none_or(|below| *rank < below));
                 under.map(|rank| (*build, rank))
@@ -1167,7 +1319,7 @@ impl State {
         });
         if let Some(made) = faulted {
             let tail = match (self.builds.get(&made.build), self.taken.get(&made.build)) {
-                (Some(Build::Retrying(None)), _) => " · a new copy loads",
+                (Some(Build::Renewing), _) => " · a new copy loads",
                 (_, Some(taken)) if !made.of(taken) => " · a new copy waits for the next note",
                 _ => "",
             };
@@ -1180,7 +1332,7 @@ impl State {
             .iter()
             .filter(|((key, _, slot), _)| of_row(key) && !self.renders.contains(&slot.chain));
         let failed = live.filter_map(|(_, built)| match built {
-            Build::Retrying(Some(error)) => Some((u64::MAX, error, " · a new try runs")),
+            Build::Retrying { error } => Some((u64::MAX, error, " · a new try runs")),
             Build::Failed { order, error } => Some((*order, error, "")),
             _ => None,
         });
@@ -1602,10 +1754,10 @@ impl Host {
             let mut state = self.state();
             state.preset_root = Some(folder);
             state.preset_index.clear();
-            state.presets_read = false;
-            if state.presets_reading {
-                state.presets_again = true;
-            }
+            // With no index, no answer stays: a name the old root answered
+            // waits for the read of the new root too.
+            state.keep_preset_answers();
+            state.preset_read.root_changed();
         }
         self.arm_preset_watch();
     }
@@ -1644,11 +1796,12 @@ impl Host {
             .collect();
         {
             let mut state = self.state();
-            if state.preset_watch.is_some() && state.preset_watched == watched {
+            let watch = state.preset_watch.as_ref();
+            if watch.is_some_and(|watch| watch.watched == watched) {
                 return;
             }
             if let Some(watch) = state.preset_watch.take() {
-                let _ = watch.send(Word::Stop);
+                watch.stop();
             }
         }
         if folders.is_empty() {
@@ -1671,9 +1824,13 @@ impl Host {
         ) else {
             return;
         };
+        // An arm on another thread can put its watch in place after the
+        // check above. This watch takes that place, and the thread of that
+        // watch ends here: no later word could reach it.
         let mut state = self.state();
-        state.preset_watched = watched;
-        state.preset_watch = Some(word);
+        if let Some(other) = state.preset_watch.replace(PresetWatch { word, watched }) {
+            other.stop();
+        }
     }
 
     /// Takes the read of the preset folders for this caller, on the plugin
@@ -1683,17 +1840,8 @@ impl Host {
     /// nothing asks for one more.
     fn claim_presets_read(&self, force: bool) -> Option<(Option<PathBuf>, Vec<PathBuf>)> {
         let mut state = self.state();
-        if state.presets_reading {
-            if force {
-                state.presets_again = true;
-            }
-            return None;
-        }
-        if state.presets_read && !force {
-            return None;
-        }
-        state.presets_reading = true;
-        Some((state.preset_root.clone(), state.preset_extra.clone()))
+        let claimed = state.preset_read.claim(force);
+        claimed.then(|| (state.preset_root.clone(), state.preset_extra.clone()))
     }
 
     /// Reads the folder of one plugin under the preset root again, in the
@@ -1779,6 +1927,18 @@ impl Host {
     /// folder keeps the file of the root. Names compare in the form of
     /// [`canonical`], as a lookup does.
     fn finish_presets(&self, root: Option<PathBuf>, extra: Vec<PathBuf>) {
+        // A read that ends in a panic gives its claim back: see
+        // `PresetRead::abandoned`. The flag goes down when the read ends,
+        // or when the read that follows takes the claim.
+        struct Claimed<'a>(&'a Host, bool);
+        impl Drop for Claimed<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.state().preset_read.abandoned();
+                }
+            }
+        }
+        let mut claimed = Claimed(self, true);
         let mut index = crate::preset::scan_folders(&extra);
         let plugins = {
             let state = self.state();
@@ -1805,25 +1965,29 @@ impl Host {
             files.sort();
         }
         let stamps = self.stamp_preset_files(None);
-        let (again, stale) = {
+        let (next, stale) = {
             let mut state = self.state();
             state.preset_index = index;
             // A file of the read can answer a preset that was missing
             // before, and a file can leave or give way.
             state.keep_preset_answers();
             state.presets_version += 1;
-            state.presets_read = true;
-            state.presets_reading = false;
+            // A change while the read ran claims the read that follows
+            // here, in the lock that ends this read.
+            let follows = state.preset_read.finished();
+            claimed.1 = follows;
             let stale = state.stale_copies(&stamps);
             state.end_stale_waits(&stamps);
-            (std::mem::take(&mut state.presets_again), stale)
+            let next = follows.then(|| (state.preset_root.clone(), state.preset_extra.clone()));
+            (next, stale)
         };
         // Each copy the read ends keeps no state of a file saved again: it
         // ends here, in the job of the read.
         for copy in stale {
             copy.end_here();
         }
-        if again && let Some((root, extra)) = self.claim_presets_read(true) {
+        claimed.1 = false;
+        if let Some((root, extra)) = next {
             return self.finish_presets(root, extra);
         }
         // The folders as they are now take the watch of the next change:
@@ -2205,7 +2369,7 @@ impl Host {
     /// change of the folders themselves: a long read says so, and no
     /// caller waits for it.
     pub fn presets_reading(&self) -> bool {
-        self.state().presets_reading
+        self.state().preset_read.reading()
     }
 
     /// Copies a `.vstpreset` file into the preset folder of its plugin: the
@@ -2278,7 +2442,7 @@ impl Host {
         state: MutexGuard<'_, State>,
         row: Option<usize>,
     ) -> Option<Vec<(String, PathBuf)>> {
-        if !state.presets_read {
+        if !state.preset_read.answered() {
             drop(state);
             self.read_presets(false);
             return None;
@@ -2602,7 +2766,7 @@ impl Host {
     /// name with no answer yet keeps each key of its slot. An ended chain of
     /// a render loses its values, its lines and the counts of its copies:
     /// see [`Host::prepare_render`]. Its ready copies stay out of the bound
-    /// until their end job.
+    /// until a job of the plugin thread takes them.
     ///
     /// Gives the slot and the key of each copy an engine holds for a chain
     /// the caller names, with a key no copy of its slot asks for. The engine
@@ -2755,18 +2919,20 @@ impl Host {
                 .collect()
         };
         // A copy that waits for a slot keeps its plugin loaded. No open
-        // score asks for these copies now, so they end first. A render keeps
-        // its copies.
+        // score asks for these copies now, so they end first. A render that
+        // did not end keeps its copies. The ready copies of an ended render
+        // end here too: after a shutdown the line refuses the next end job.
         let parked = {
             let mut state = self.state();
             let rows = unkept(&state);
             let unkept = |build: &(InsertKey, u32, InsertSlot)| {
                 let row = row_of(build.0.plugin);
-                row.is_some_and(|row| rows.contains(&row))
-                    && !state.renders.contains(&build.2.chain)
+                row.is_some_and(|row| rows.contains(&row)) && !state.render_runs(build.2.chain)
             };
             let ends: HashSet<_> = state.builds.keys().copied().filter(unkept).collect();
-            state.take_ready(|build| ends.contains(build))
+            let parked = state.take_ready(|build| ends.contains(build));
+            state.drop_ended_renders();
+            parked
         };
         for instance in parked {
             instance.end_here();
@@ -2938,7 +3104,7 @@ impl Host {
             // A read of the folders in the line can still bring the file:
             // the answer says missing now, and the next ask decides again,
             // for a kept answer would hold the missing past the read.
-            if !state.presets_reading {
+            if !state.preset_read.reading() {
                 state
                     .known_presets
                     .insert(wanted, KnownPreset::MissingSince(Instant::now()));
@@ -3105,7 +3271,7 @@ impl Host {
         let finished = {
             let mut state = self.state();
             if let Some(found) = state.builds.get(&build) {
-                if wait && matches!(found, Build::Running | Build::Retrying(_)) {
+                if wait && found.runs() {
                     // A request with no wait or a new try started this build.
                     drop(state);
                     self.wait_idle();
@@ -3385,8 +3551,8 @@ impl Host {
         let state = self.state();
         match state.builds.get(&build) {
             Some(Build::Ready(_)) => Prepared::Ready(key),
-            Some(Build::Running | Build::Retrying(None)) => Prepared::Pending,
-            Some(Build::Retrying(Some(_))) => Prepared::Retrying,
+            Some(Build::Running | Build::Renewing) => Prepared::Pending,
+            Some(Build::Retrying { .. }) => Prepared::Retrying,
             // A render chain gets no try: see `Host::retry`.
             Some(Build::Failed { .. })
                 if !state.renders.contains(&slot.chain) && state.trying(key, sample_rate) =>
@@ -3605,8 +3771,8 @@ impl Host {
             let build = (key, sample_rate, copy.slot);
             match state.builds.get(&build) {
                 Some(Build::Failed { error, .. }) if !state.trying(key, sample_rate) => {
-                    let error = Some(error.clone());
-                    state.builds.insert(build, Build::Retrying(error));
+                    let error = error.clone();
+                    state.builds.insert(build, Build::Retrying { error });
                 }
                 Some(_) => continue,
                 None => {
@@ -3627,7 +3793,7 @@ impl Host {
                         state.no_room(&claimed.0);
                         continue;
                     }
-                    state.builds.insert(build, Build::Retrying(None));
+                    state.builds.insert(build, Build::Renewing);
                 }
             }
             let host = self.clone();
@@ -3721,10 +3887,7 @@ impl Host {
         values: Option<&[InsertParam]>,
     ) -> Option<Result<u32, String>> {
         let waits = |state: &mut State| {
-            let running = matches!(
-                state.builds.get(&build),
-                Some(Build::Running | Build::Retrying(_))
-            );
+            let running = state.builds.get(&build).is_some_and(Build::runs);
             if running && state.unwanted(&build) {
                 state.builds.remove(&build);
                 return false;
@@ -3809,7 +3972,8 @@ impl Host {
         // faulted: see `Host::retry`. A try for the slot of a copy that
         // faulted makes its new copy too.
         let (tried, again) = match state.builds.get(&build) {
-            Some(Build::Retrying(error)) => (error.is_some(), error.is_none() || faulted),
+            Some(Build::Retrying { .. }) => (true, faulted),
+            Some(Build::Renewing) => (false, true),
             _ => (false, false),
         };
         if !waits(&mut state) {
@@ -3914,7 +4078,7 @@ impl Host {
             }
             // The try is marked and its job joins the line under one lock,
             // as in `Host::insert`.
-            state.builds.insert(other, Build::Retrying(Some(error)));
+            state.builds.insert(other, Build::Retrying { error });
             let host = self.clone();
             let claimed = (Arc::clone(claimed.0), claimed.1.clone());
             self.enqueue(move || {
@@ -4748,8 +4912,10 @@ mod tests {
 
         // A new try keeps its plugin loaded.
         let trying = (key, rate, InsertSlot::effect(2, 0));
-        let error = Some(String::new());
-        host.state().builds.insert(trying, Build::Retrying(error));
+        let error = String::new();
+        host.state()
+            .builds
+            .insert(trying, Build::Retrying { error });
         host.unload_unused(&[]);
         host.wait_idle();
         assert_eq!(effect_row(&host), Some(Status::Ready));
@@ -4779,11 +4945,15 @@ mod tests {
         let tried = (key, rate, InsertSlot::effect(slot.chain, 2));
         host.state().taken.insert(tried, faulted);
         let renewed = (key, rate, InsertSlot::effect(slot.chain, 1));
-        for (build, error) in [(renewed, None), (tried, Some(String::new()))] {
+        let error = String::new();
+        for (build, marked) in [
+            (renewed, Build::Renewing),
+            (tried, Build::Retrying { error }),
+        ] {
             let claimed = {
                 let mut state = host.state();
                 state.waits.insert((key, rate), wait(MAX_TRY_WAIT));
-                state.builds.insert(build, Build::Retrying(error));
+                state.builds.insert(build, marked);
                 state.build_of(key).expect("the fixture plugin")
             };
             let worker = host.clone();
@@ -4883,7 +5053,7 @@ mod tests {
         // load. The plugin has no class then, so the read has none of its
         // files.
         let start = Instant::now();
-        while !host.state().presets_read {
+        while !host.state().preset_read.answered() {
             assert!(start.elapsed() < WAIT_LIMIT, "the read of the scan");
             host.wait_idle();
         }
@@ -4915,6 +5085,78 @@ mod tests {
         drop(saving);
         host.wait_idle();
         assert!(matches!(delay(), Ok(Some(_))));
+        drop(host);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A new preset root answers no preset with a file of the root before
+    /// it, also for a name the old root answered. A read of the old root
+    /// that ends after the change gives the asks no answer: they wait for
+    /// the read of the new root, which follows at once.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_preset_root_answers_no_file_of_the_root_before() {
+        use rustel_vst3_fixture::NAME;
+        let (root, host, plugin) = fixture_host("new-root");
+        let bytes = rustel_vst3_fixture::preset(0.5, 0.0);
+        let (old, new) = (root.join("old"), root.join("new"));
+        for (folder, name) in [(&old, "Old"), (&new, "New")] {
+            let folder = folder.join(NAME);
+            std::fs::create_dir_all(&folder).expect("preset folder");
+            let file = folder.join(format!("{name}.vstpreset"));
+            std::fs::write(file, &bytes).expect("preset file");
+        }
+        host.set_preset_folder(old);
+        assert_eq!(host.presets(NAME), None, "the ask starts the read");
+        host.wait_idle();
+        assert_eq!(host.presets(NAME), Some(vec!["Old".to_owned()]));
+        let first = host.preset(plugin, "Old");
+        assert!(matches!(first, FoundPreset::Number(_)), "{first:?}");
+
+        // A read of the folders opens each file of a folder the player
+        // added. A pipe holds the read there until the other end of the
+        // pipe opens and closes.
+        let added = root.join("added");
+        std::fs::create_dir_all(&added).expect("added folder");
+        let pipe = added.join("Pipe.vstpreset");
+        let made = std::process::Command::new("mkfifo").arg(&pipe).status();
+        assert!(made.is_ok_and(|made| made.success()), "the pipe");
+        let open = || {
+            let (opened, end) = mpsc::channel();
+            let pipe = pipe.clone();
+            std::thread::spawn(move || {
+                let _ = opened.send(std::fs::OpenOptions::new().write(true).open(pipe));
+            });
+            let end = end.recv_timeout(WAIT_LIMIT).expect("a read opens the pipe");
+            end.expect("the other end of the pipe")
+        };
+        // The change of the added folders claims a read of the old root,
+        // and the root changes before that read ends.
+        let version = host.presets_version();
+        host.set_preset_folders(vec![added]);
+        host.set_preset_folder(new);
+        // The read of the old root goes on past the pipe, and ends.
+        drop(open());
+        let start = Instant::now();
+        while host.presets_version() == version {
+            assert!(start.elapsed() < WAIT_LIMIT, "the read of the old root");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // The read of the new root follows, and holds at the pipe.
+        let held = open();
+        let during = host.presets(NAME);
+        let old_name = host.preset(plugin, "Old");
+        std::fs::remove_file(&pipe).expect("the pipe");
+        drop(held);
+        host.wait_idle();
+        assert_eq!(during, None, "an ask waits for the read of the new root");
+        assert_eq!(
+            old_name,
+            FoundPreset::Pending,
+            "a name the old root answered"
+        );
+        assert_eq!(host.presets(NAME), Some(vec!["New".to_owned()]));
+        assert_eq!(host.preset(plugin, "Old"), FoundPreset::Missing);
         drop(host);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5084,6 +5326,84 @@ mod tests {
         host.prepare(NAME, None, false, 48_000, InsertSlot::effect(2, 0));
         host.wait_idle();
         assert_eq!(prepared(), Prepared::Unavailable(reason));
+        drop(host);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Parks a render copy of the effect `plugin` for each of
+    /// `ENDS_PER_JOB + 1` render chains: one copy more than an end job ends.
+    /// Gives the chains and the cell of each copy.
+    fn park_render_copies(host: &Host, plugin: u32) -> (Vec<u64>, Vec<Arc<CopyState>>) {
+        let key = InsertKey { plugin, preset: 0 };
+        let chains: Vec<u64> = (0..=ENDS_PER_JOB as u64).collect();
+        let mut cells = Vec::new();
+        for &chain in &chains {
+            let build = (key, 48_000, InsertSlot::effect(chain, 0));
+            let read = host.prepare_render(build.0, build.1, build.2, &[], true);
+            assert_eq!(read.expect("the render build").recv(), Ok(Ok(0)));
+            let state = host.state();
+            let Some(Build::Ready(copy)) = state.builds.get(&build) else {
+                panic!("the copy of the render");
+            };
+            cells.push(copy.shared_cell());
+        }
+        (chains, cells)
+    }
+
+    /// A shutdown ends each ready copy of a render that ended, also when the
+    /// closed line refuses the next end job of its copies. Each plugin then
+    /// has no running copy and unloads, and each ended chain leaves the
+    /// render chains.
+    #[test]
+    fn a_shutdown_ends_the_copies_of_an_ended_render() {
+        let (root, host, plugin) = fixture_host("shutdown");
+        let (chains, cells) = park_render_copies(&host, plugin);
+        // A job holds the plugin thread until the line closes. So the end
+        // job of the chains runs after the shutdown, and the line refuses
+        // the next end job.
+        let line = host.clone();
+        host.enqueue(move || {
+            while !line.shared.closed.load(Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+        });
+        host.keep(1, Vec::new(), Vec::new(), Vec::new(), chains);
+        host.shutdown(WAIT_LIMIT);
+        let ended = cells.iter().all(|cell| cell.ended.load(Ordering::Acquire));
+        assert!(ended, "each copy of the ended render");
+        let plugins = host.plugins();
+        let loaded = plugins.iter().filter(|info| info.status == Status::Ready);
+        assert_eq!(loaded.count(), 0, "each plugin unloads");
+        assert!(
+            host.state().renders.is_empty(),
+            "each ended chain leaves the render chains"
+        );
+        drop(host);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An unload ends each ready copy of a render that ended for a plugin
+    /// it does not keep, also while the next end job of the copies waits
+    /// behind it. Each plugin then has no running copy and unloads.
+    #[test]
+    fn an_unload_ends_the_copies_of_an_ended_render() {
+        let (root, host, plugin) = fixture_host("unload");
+        let (chains, cells) = park_render_copies(&host, plugin);
+        // A job holds the plugin thread. So the first end job of the chains
+        // runs before the unload, and the next end job after it.
+        let (release, line) = mpsc::channel::<()>();
+        host.enqueue(move || {
+            let _ = line.recv();
+        });
+        host.keep(1, Vec::new(), Vec::new(), Vec::new(), chains);
+        host.unload_unused(&[]);
+        drop(release);
+        host.wait_idle();
+        let ended = cells.iter().all(|cell| cell.ended.load(Ordering::Acquire));
+        assert!(ended, "each copy of the ended render");
+        let plugins = host.plugins();
+        let loaded = plugins.iter().filter(|info| info.status == Status::Ready);
+        assert_eq!(loaded.count(), 0, "each plugin unloads");
         drop(host);
         let _ = std::fs::remove_dir_all(&root);
     }

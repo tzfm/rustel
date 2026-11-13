@@ -2744,9 +2744,9 @@ mod tests {
                 shared
                     .samples
                     .installs
-                    .push(crate::assets::SampleInstall {
+                    .push(crate::assets::SampleInstall::Install {
                         id: crate::SampleId(1),
-                        sample: Box::into_raw(Box::new(sample)),
+                        sample: std::ptr::NonNull::from(Box::leak(Box::new(sample))),
                     })
                     .is_ok()
             );
@@ -2777,9 +2777,9 @@ mod tests {
                     shared
                         .samples
                         .installs
-                        .push(crate::assets::SampleInstall {
+                        .push(crate::assets::SampleInstall::Install {
                             id: crate::SampleId(1),
-                            sample: Box::into_raw(Box::new(old)),
+                            sample: std::ptr::NonNull::from(Box::leak(Box::new(old))),
                         })
                         .is_ok()
                 );
@@ -2817,9 +2817,9 @@ mod tests {
                     shared
                         .samples
                         .installs
-                        .push(crate::assets::SampleInstall {
+                        .push(crate::assets::SampleInstall::Install {
                             id: crate::SampleId(1),
-                            sample: Box::into_raw(Box::new(replacement)),
+                            sample: std::ptr::NonNull::from(Box::leak(Box::new(replacement))),
                         })
                         .is_ok()
                 );
@@ -2864,9 +2864,9 @@ mod tests {
                         shared
                             .samples
                             .installs
-                            .push(crate::assets::SampleInstall {
+                            .push(crate::assets::SampleInstall::Install {
                                 id: crate::SampleId(1),
-                                sample: Box::into_raw(Box::new(table)),
+                                sample: std::ptr::NonNull::from(Box::leak(Box::new(table))),
                             })
                             .is_ok()
                     );

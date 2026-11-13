@@ -15,7 +15,7 @@ later version.
 //! device that is not there is reported ONCE and then ignored, and nothing here
 //! may end a set.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -118,11 +118,74 @@ impl InputOpener for PlatformInputOpener {
 
 /// The worker's ownership record for one exact `Arc<InputPort>`.
 struct OpenInput {
-    listener: Option<Box<dyn ManagedListener>>,
-    retry_at: Option<Instant>,
     port: Arc<InputPort>,
-    attempts: u64,
-    failure_reported: bool,
+    link: InputLink,
+}
+
+/// How far the worker got with the platform listener of one port.
+enum InputLink {
+    /// The port is newly desired, and no attempt to open it is on record.
+    Untried,
+    /// The platform listener is open. Only the worker drops it.
+    Connected { _listener: Box<dyn ManagedListener> },
+    /// The last open failed, and the first failure was reported. The worker
+    /// tries again at `retry_at`. `attempts` counts the failures, from 1.
+    Backoff { attempts: u64, retry_at: Instant },
+}
+
+impl InputLink {
+    fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected { .. })
+    }
+
+    /// Whether the worker tries to open the port at `now`.
+    fn due(&self, now: Instant) -> bool {
+        match self {
+            Self::Untried => true,
+            Self::Connected { .. } => false,
+            Self::Backoff { retry_at, .. } => *retry_at <= now,
+        }
+    }
+
+    fn next_retry(&self) -> Option<Instant> {
+        match self {
+            Self::Backoff { retry_at, .. } => Some(*retry_at),
+            Self::Untried | Self::Connected { .. } => None,
+        }
+    }
+
+    /// Keep the result of an open that finished at `now`.
+    ///
+    /// Returns the failure to report. A failure that follows a failure is
+    /// not reported again.
+    fn record(
+        &mut self,
+        result: Result<Box<dyn ManagedListener>, String>,
+        now: Instant,
+        base: Duration,
+    ) -> Option<String> {
+        debug_assert!(!self.is_connected(), "only a due link is opened");
+        match result {
+            Ok(listener) => {
+                *self = Self::Connected {
+                    _listener: listener,
+                };
+                None
+            }
+            Err(message) => {
+                let (attempts, report) = match self {
+                    Self::Backoff { attempts, .. } => (attempts.saturating_add(1), None),
+                    Self::Untried | Self::Connected { .. } => (1, Some(message)),
+                };
+                *self = Self::Backoff {
+                    attempts,
+                    // A retry time past the clock's range retries at once.
+                    retry_at: now.checked_add(retry_delay(attempts, base)).unwrap_or(now),
+                };
+                report
+            }
+        }
+    }
 }
 
 struct ManagerState {
@@ -153,7 +216,6 @@ struct ManagerShared {
     stopping: AtomicBool,
     connected: AtomicUsize,
     applied_revision: AtomicU64,
-    worker_alive: AtomicBool,
 }
 
 impl Default for ManagerShared {
@@ -164,7 +226,6 @@ impl Default for ManagerShared {
             stopping: AtomicBool::new(false),
             connected: AtomicUsize::new(0),
             applied_revision: AtomicU64::new(0),
-            worker_alive: AtomicBool::new(false),
         }
     }
 }
@@ -202,9 +263,64 @@ pub struct MidiInputStatus {
 /// platform connections and is the only thread that may open or drop them.
 pub struct MidiInputs {
     shared: Arc<ManagerShared>,
-    /// Dropping a `JoinHandle` detaches it. We intentionally never join here:
-    /// a platform open or listener destructor may be wedged in a driver.
-    worker: Option<std::thread::JoinHandle<()>>,
+    worker: InputWorker,
+}
+
+/// Whether a manager thread applies what [`MidiInputs::sync_allowed`]
+/// publishes.
+enum InputWorker {
+    /// The spawned thread applies each revision until it finishes. Dropping
+    /// the handle detaches the thread. The manager never joins it, because a
+    /// platform open or listener destructor may be wedged in a driver.
+    Running(std::thread::JoinHandle<()>),
+    /// No thread applies a revision. Each desired port hears `reason` once.
+    Unavailable {
+        reason: String,
+        /// The selectors of the desired ports that heard `reason`.
+        told: BTreeSet<String>,
+    },
+}
+
+impl InputWorker {
+    fn unavailable(reason: String) -> Self {
+        Self::Unavailable {
+            reason,
+            told: BTreeSet::new(),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        matches!(self, Self::Running(handle) if !handle.is_finished())
+    }
+
+    /// Become unavailable when the thread has finished.
+    ///
+    /// Only `MidiInputs::drop` asks the thread to stop. While the manager
+    /// lives, a finished thread is one that unwound.
+    fn notice_exit(&mut self) {
+        if matches!(self, Self::Running(handle) if handle.is_finished()) {
+            *self = Self::unavailable("the MIDI input manager stopped".into());
+        }
+    }
+
+    /// While unavailable, report the reason once for each port in `desired`
+    /// that has not heard it. A port that leaves `desired` and comes back
+    /// hears it again.
+    fn tell(&mut self, desired: &[Arc<InputPort>], state: &mut ManagerState) {
+        let Self::Unavailable { reason, told } = self else {
+            return;
+        };
+        told.retain(|selector| desired.iter().any(|port| &port.selector == selector));
+        for port in desired {
+            if !told.contains(&port.selector) {
+                told.insert(port.selector.clone());
+                push_report(
+                    state,
+                    format!("MIDI input \"{}\" is not open: {reason}", port.selector),
+                );
+            }
+        }
+    }
 }
 
 impl MidiInputs {
@@ -219,14 +335,9 @@ impl MidiInputs {
             .name("rustel-midi-in".into())
             .spawn(move || run_input_manager(worker_shared, opener, config));
         let worker = match worker {
-            Ok(worker) => Some(worker),
+            Ok(worker) => InputWorker::Running(worker),
             Err(error) => {
-                let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-                push_report(
-                    &mut state,
-                    format!("could not start MIDI input manager: {error}"),
-                );
-                None
+                InputWorker::unavailable(format!("could not start MIDI input manager: {error}"))
             }
         };
         Self { shared, worker }
@@ -240,7 +351,9 @@ impl MidiInputs {
     /// open and discards a result whose exact port is no longer desired.
     ///
     /// Returns bounded asynchronous reports accumulated since the previous
-    /// call, for the live loop to render in its own `live_error` shape.
+    /// call, for the live loop to render in its own `live_error` shape. When
+    /// no manager thread runs, each desired port gets one report that says
+    /// why.
     pub fn sync(
         &mut self,
         bus: &InputBus,
@@ -281,6 +394,8 @@ impl MidiInputs {
         } else {
             state.desired_limit_reported = false;
         }
+        self.worker.notice_exit();
+        self.worker.tell(&desired, &mut state);
         if !same_ports(&state.desired, &desired) {
             state.desired = desired;
             state.revision = state.revision.wrapping_add(1);
@@ -303,7 +418,7 @@ impl MidiInputs {
             applied_revision: self.shared.applied_revision.load(Ordering::Acquire),
             pending_reports: state.reports.len(),
             reports_dropped: state.reports_dropped,
-            worker_alive: self.shared.worker_alive.load(Ordering::Acquire),
+            worker_alive: self.worker.is_running(),
         }
     }
 }
@@ -322,7 +437,6 @@ impl Drop for MidiInputs {
         // race on this atomic stop flag.
         self.shared.stopping.store(true, Ordering::Release);
         self.shared.wake.notify_all();
-        let _detached = self.worker.take();
     }
 }
 
@@ -382,8 +496,10 @@ fn run_input_manager(
     opener: Arc<dyn InputOpener>,
     config: ManagerConfig,
 ) {
-    shared.worker_alive.store(true, Ordering::Release);
     let mut open = Vec::<OpenInput>::with_capacity(MAX_RETAINED_INPUTS);
+    // Declared after `open`, so an unwind zeroes the count before it drops a
+    // listener.
+    let _connected = ConnectedOnExit(&shared.connected);
 
     while !shared.stopping.load(Ordering::Acquire) {
         let (revision, desired) = {
@@ -404,7 +520,9 @@ fn run_input_manager(
         }
         open = retained;
         shared.connected.store(
-            open.iter().filter(|entry| entry.listener.is_some()).count(),
+            open.iter()
+                .filter(|entry| entry.link.is_connected())
+                .count(),
             Ordering::Release,
         );
         drop(retired);
@@ -428,20 +546,15 @@ fn run_input_manager(
         for port in desired.iter().take(MAX_RETAINED_INPUTS) {
             if !open.iter().any(|entry| Arc::ptr_eq(&entry.port, port)) {
                 open.push(OpenInput {
-                    listener: None,
-                    retry_at: None,
                     port: Arc::clone(port),
-                    attempts: 0,
-                    failure_reported: false,
+                    link: InputLink::Untried,
                 });
             }
         }
         shared.applied_revision.store(revision, Ordering::Release);
 
         let now = Instant::now();
-        let attempt = open.iter().position(|entry| {
-            entry.listener.is_none() && entry.retry_at.is_none_or(|retry_at| retry_at <= now)
-        });
+        let attempt = open.iter().position(|entry| entry.link.due(now));
         if let Some(index) = attempt {
             let port = Arc::clone(&open[index].port);
             let result = opener.open(Arc::clone(&port));
@@ -463,22 +576,9 @@ fn run_input_manager(
                     drop(result);
                     continue;
                 };
-                match result {
-                    Ok(listener) => {
-                        entry.listener = Some(listener);
-                        entry.retry_at = None;
-                        entry.attempts = 0;
-                        entry.failure_reported = false;
-                    }
-                    Err(message) => {
-                        entry.attempts = entry.attempts.saturating_add(1);
-                        entry.retry_at = Instant::now()
-                            .checked_add(retry_delay(entry.attempts, config.retry_base));
-                        if !entry.failure_reported {
-                            push_report(&mut state, message);
-                            entry.failure_reported = true;
-                        }
-                    }
+                if let Some(message) = entry.link.record(result, Instant::now(), config.retry_base)
+                {
+                    push_report(&mut state, message);
                 }
             } else {
                 // If this is a listener, its potentially blocking Drop occurs
@@ -489,7 +589,9 @@ fn run_input_manager(
             }
             drop(state);
             shared.connected.store(
-                open.iter().filter(|entry| entry.listener.is_some()).count(),
+                open.iter()
+                    .filter(|entry| entry.link.is_connected())
+                    .count(),
                 Ordering::Release,
             );
             continue;
@@ -497,8 +599,7 @@ fn run_input_manager(
 
         let next_retry = open
             .iter()
-            .filter(|entry| entry.listener.is_none())
-            .filter_map(|entry| entry.retry_at)
+            .filter_map(|entry| entry.link.next_retry())
             .min();
         let wait = next_retry
             .map(|retry_at| retry_at.saturating_duration_since(Instant::now()))
@@ -514,10 +615,19 @@ fn run_input_manager(
     }
 
     shared.connected.store(0, Ordering::Release);
-    // Listener destruction is worker-owned and may block. `MidiInputs::drop`
-    // detached this thread before we reach it.
+    // Listener destruction is worker-owned and may block. Nothing joins this
+    // thread: dropping `MidiInputs` detaches it.
     drop(open);
-    shared.worker_alive.store(false, Ordering::Release);
+}
+
+/// Stores 0 in the connected count when the worker leaves
+/// [`run_input_manager`], an unwind included.
+struct ConnectedOnExit<'a>(&'a AtomicUsize);
+
+impl Drop for ConnectedOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Release);
+    }
 }
 
 #[cfg(test)]
@@ -955,5 +1065,99 @@ mod tests {
         }
         inputs.sync(&bus, 0, 0);
         assert!(inputs.status().desired <= MAX_RETAINED_INPUTS);
+    }
+
+    /// A manager whose thread could not start, as `with_opener` leaves it.
+    fn unstarted_inputs() -> MidiInputs {
+        MidiInputs {
+            shared: Arc::default(),
+            worker: InputWorker::unavailable(
+                "could not start MIDI input manager: no thread left".into(),
+            ),
+        }
+    }
+
+    #[test]
+    fn a_manager_with_no_thread_tells_each_newly_wanted_port_why_once() {
+        let mut inputs = unstarted_inputs();
+        let bus = InputBus::new();
+        let (_, keys) = bus.intern("keys").unwrap();
+        bus.intern("pads").unwrap();
+        let reason = "could not start MIDI input manager: no thread left";
+        assert_eq!(
+            inputs.sync(&bus, 0, 0),
+            [
+                format!("MIDI input \"keys\" is not open: {reason}"),
+                format!("MIDI input \"pads\" is not open: {reason}"),
+            ]
+        );
+        assert!(
+            inputs.sync(&bus, 0, 0).is_empty(),
+            "a port that stayed wanted heard the reason twice"
+        );
+
+        // A port the score lets go of and then asks for again hears it again.
+        bus.commit_generation(1, vec![Arc::clone(&keys)]).unwrap();
+        assert!(inputs.sync(&bus, 1, 1).is_empty());
+        bus.commit_generation(2, vec![keys, Arc::new(InputPort::new("pads".into()))])
+            .unwrap();
+        assert_eq!(
+            inputs.sync(&bus, 2, 2),
+            [format!("MIDI input \"pads\" is not open: {reason}")]
+        );
+    }
+
+    /// Opens every port but `panics_on`, whose open panics.
+    struct PanickingOpener {
+        panics_on: &'static str,
+    }
+
+    impl InputOpener for PanickingOpener {
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "this test double panics as a broken driver might"
+        )]
+        fn open(&self, port: Arc<InputPort>) -> Result<Box<dyn ManagedListener>, String> {
+            if port.selector == self.panics_on {
+                panic!("the driver panicked while opening {}", port.selector);
+            }
+            Ok(Box::new(()))
+        }
+    }
+
+    #[test]
+    fn a_worker_that_panics_tells_every_wanted_port_and_counts_none_connected() {
+        let mut inputs = quiet_inputs(Arc::new(PanickingOpener { panics_on: "pads" }));
+        let bus = InputBus::new();
+        let (_, keys) = bus.intern("keys").unwrap();
+        assert!(inputs.sync(&bus, 0, 0).is_empty());
+        wait_for_status(&inputs, |status| status.connected == 1);
+
+        bus.commit_generation(1, vec![keys, Arc::new(InputPort::new("pads".into()))])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let reports = loop {
+            let reports = inputs.sync(&bus, 1, 1);
+            if !reports.is_empty() {
+                break reports;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the ports of a dead worker went silent"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let reason = "the MIDI input manager stopped";
+        assert_eq!(
+            reports,
+            [
+                format!("MIDI input \"keys\" is not open: {reason}"),
+                format!("MIDI input \"pads\" is not open: {reason}"),
+            ]
+        );
+        assert!(inputs.sync(&bus, 1, 1).is_empty());
+        wait_for_status(&inputs, |status| {
+            status.connected == 0 && !status.worker_alive
+        });
     }
 }

@@ -6807,3 +6807,27 @@ fn an_instrument_insert_that_holds_a_note_stays_awake() {
     assert_eq!(render(true), 2);
     assert_eq!(render(false), 0);
 }
+
+/// An init keeps a live mode: the activation synthesises no reverb, so a
+/// note plays dry while its orbit has no reverb, and the note counts.
+#[test]
+fn an_init_keeps_a_live_mode() {
+    use rustel_audio::{AudioBackend, ReverbControls};
+
+    let mut backend = ScalarBackend::prepared(48_000, 1).expect("backend");
+    backend.forbid_inline_reverb();
+    backend.init(48_000).expect("init");
+    let mut event = OnsetEvent::new(0, 440.0, 0.5, 0.05);
+    event.controls.reverb = Some(ReverbControls {
+        wet: 0.5,
+        size_secs: 0.5,
+        fade_secs: 0.1,
+        lp_start_hz: 8_000.0,
+        lp_end_hz: 1_000.0,
+        ir: None,
+    });
+    backend.note(event);
+    let mut out = [0.0f32; 256];
+    backend.process_block(&mut out, 128);
+    assert_eq!(backend.missing_reverb_events(), 1);
+}

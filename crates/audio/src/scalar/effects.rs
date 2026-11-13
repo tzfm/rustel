@@ -1006,15 +1006,28 @@ impl ScalarBackend {
             .map(|reverb| reverb.params())
     }
 
-    /// Live-path policy switch: forbid IR synthesis at activation time.
+    /// Marks this backend as live: the activation synthesises no reverb and
+    /// builds no insert or room, and the copies a chain gives up go back to
+    /// the producer. It replaces an offline mode, and an init keeps it.
     pub fn forbid_inline_reverb(&mut self) {
-        self.allow_inline_reverb = false;
+        debug_assert_ne!(
+            self.mode,
+            RenderMode::Offline,
+            "an offline render is not live"
+        );
+        self.mode = RenderMode::Live;
     }
 
-    /// Marks this backend as driven by an offline render, which waits for
-    /// inserts that render ahead. The live callback never waits.
+    /// Marks this backend as driven by an offline render, which builds at
+    /// activation and waits for inserts that render ahead. It replaces a live
+    /// mode, and an init keeps it.
     pub fn render_offline(&mut self) {
-        self.offline = true;
+        debug_assert_ne!(
+            self.mode,
+            RenderMode::Live,
+            "a live backend renders no offline blocks"
+        );
+        self.mode = RenderMode::Offline;
     }
 
     /// Sets the pre-roll of a render: the file starts `frames` into the

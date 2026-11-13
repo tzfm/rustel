@@ -61,9 +61,8 @@ fn plain_sample_voice(v: &Voice) -> bool {
         && v.live_cutoff.binding == 0
         && v.live_resonance.binding == 0
         && v.live_gain.binding == 0
-        && v.cut_fade_frame.is_none()
-        && v.polyphony_fade_frame.is_none()
-        && !v.through_insert
+        && !v.end.has_fade()
+        && !v.route.is_through()
         && v.controls.vibrato.is_none()
         && v.controls.pitch_env.is_none()
         && v.controls.tremolo.is_none()
@@ -89,7 +88,7 @@ fn chain_delay_of<'a>(
     rooms: &'a mut [Option<Box<ChainRoom>>],
     v: &Voice,
 ) -> Option<&'a mut OrbitDelay> {
-    let bus = v.insert_bus.filter(|_| v.chain_delay)?;
+    let bus = v.route.room_delay_bus()?;
     rooms.get_mut(bus)?.as_deref_mut()?.delay.as_mut()
 }
 
@@ -100,7 +99,7 @@ fn chain_reverb_of<'a>(
     rooms: &'a mut [Option<Box<ChainRoom>>],
     v: &Voice,
 ) -> Option<&'a mut [[f32; crate::reverb::REVERB_BLOCK]; 2]> {
-    let bus = v.insert_bus.filter(|_| v.chain_reverb)?;
+    let bus = v.route.room_reverb_bus()?;
     let room = rooms.get_mut(bus)?.as_deref_mut()?;
     room.reverb.is_some().then_some(&mut room.reverb_send)
 }
@@ -175,7 +174,7 @@ fn render_plain_voice(
                 // The slot was emptied under the voice - an uninstall
                 // landed. The voice ends with the block, as the general
                 // body ends it.
-                v.source_gone = true;
+                v.end.mark_gone();
                 (0.0, 0.0)
             } else if *delay_frames > 0 {
                 *delay_frames -= 1;
@@ -518,7 +517,6 @@ impl AudioBackend for ScalarBackend {
         self.orbit_peaks = [0.0; MAX_ORBITS];
         self.live_control_targets = Vec::with_capacity(MAX_ACTIVE_VOICES * 2);
         self.insert_values = Vec::with_capacity(MAX_INSERT_VALUES);
-        self.allow_inline_reverb = true;
         self.orbit_delays = (0..MAX_ORBITS)
             .map(|_| OrbitDelay {
                 left: vec![0.0; sample_rate as usize],
@@ -871,8 +869,8 @@ impl ScalarBackend {
         let insert_clocks = &mut self.insert_clocks;
         let insert_provider = self.insert_provider.as_deref();
         let missing_insert_events = &mut self.missing_insert_events;
-        let allow_inline_reverb = self.allow_inline_reverb;
-        let offline = self.offline;
+        let allow_inline_reverb = self.mode != RenderMode::Live;
+        let offline = self.mode == RenderMode::Offline;
         let missing_reverb_events = &mut self.missing_reverb_events;
         let voice_ceiling_drops = &mut self.voice_ceiling_drops;
         let pressure = &mut self.pressure;
@@ -1924,11 +1922,9 @@ impl ScalarBackend {
                     musical,
                     lead: output_lead,
                     output_frame: start_frame.max(start).saturating_add(u64::from(output_lead)),
-                    level_line: None,
                     aimed_early: e.controls.lead > 0,
                     generation: e.generation,
-                    replayed_by: None,
-                    replayed_on_next_frame: false,
+                    replay: None,
                     ui_visuals: e.ui_visuals,
                     preview_epoch: e.controls.preview_epoch,
                     piano: e.controls.piano,
@@ -1937,10 +1933,7 @@ impl ScalarBackend {
                     distort_curve: e.controls.distort.map(|d| d.curve(d.shape())),
                     delay_wet,
                     reverb_wet,
-                    through_insert,
-                    insert_bus,
-                    chain_reverb,
-                    chain_delay,
+                    route: VoiceRoute::new(insert_bus, through_insert, chain_reverb, chain_delay),
                     dry_gain: e.controls.dry.unwrap_or(1.0),
                     kabel,
                     // Leased from the pool built at init. An exhausted pool
@@ -1979,7 +1972,7 @@ impl ScalarBackend {
                         || voice_controls.coarse.is_some()
                         || voice_controls.crush.is_some()
                         || voice_controls.shape.is_some(),
-                    stop_secs,
+                    end: VoiceEnd::new(stop_secs),
                     mod_lfo_phases: {
                         let mut phases = [0.0f64; crate::backend::MAX_VOICE_MODS];
                         for (slot, phase) in voice_controls.lfos.iter().zip(phases.iter_mut()) {
@@ -2029,8 +2022,6 @@ impl ScalarBackend {
                     },
                     cut_group: e.cut.or_else(|| e.sample.and_then(|sample| sample.cut)).map(f32::to_bits),
                     id: self.next_voice_id,
-                    cut_fade_frame: None,
-                    polyphony_fade_frame: None,
                     compressor: if let Some(c) = e.controls.compressor {
                         self.compressor_pool.pop().map(|mut state| {
                             *state = CompressorState::new(
@@ -2080,15 +2071,11 @@ impl ScalarBackend {
                     },
                     coarse_hold: [0.0; 2],
                     fx_mod_hold: FxParamHold::default(),
-                    source_gone: false,
                 };
                 // A voice of its cut group with a later musical onset chokes
                 // this one: see `choke_previous`.
                 if let Some(fade) = choked_at {
-                    voice.cut_fade_frame = Some(fade);
-                    let fade_end =
-                        fade.saturating_sub(voice.start_frame) as f32 / sample_rate as f32 + 0.011;
-                    voice.stop_secs = voice.stop_secs.min(fade_end);
+                    voice.end.cut(fade, CHOKE_TAIL_SECS, voice.start_frame, sample_rate);
                 }
                 // A takeover cut's horizon: a pending onset of the OUTGOING
                 // generation that activates here still pre-fades - the cut
@@ -2102,11 +2089,7 @@ impl ScalarBackend {
                     && !voice.piano
                 {
                     let fade = cut_frame.saturating_sub(u64::from(voice.lead)).max(start);
-                    let stop_at = (fade.saturating_sub(voice.start_frame)) as f32
-                        / self.sample_rate as f32
-                        + CUT_FADE_SECS;
-                    voice.stop_secs = voice.stop_secs.min(stop_at);
-                    voice.cut_fade_frame = Some(voice.cut_fade_frame.map_or(fade, |at| at.min(fade)));
+                    voice.end.cut(fade, CUT_FADE_SECS, voice.start_frame, self.sample_rate);
                 }
                 // Change ownership at the new preview's actual onset, after
                 // its source has resolved. Notes within one preview remain
@@ -2115,25 +2098,22 @@ impl ScalarBackend {
                     self.preview_epoch = voice.preview_epoch;
                     for old in &mut self.voices {
                         if old.preview_epoch != 0 && old.preview_epoch < voice.preview_epoch {
-                            let frame = old.cut_fade_frame
+                            let frame = old.end.cut_from()
                                 .unwrap_or(e.onset_frame).min(e.onset_frame);
-                            old.cut_fade_frame = Some(frame);
-                            let stop_at = frame.saturating_sub(old.start_frame) as f32
-                                / sample_rate as f32 + CUT_FADE_SECS;
-                            old.stop_secs = old.stop_secs.min(stop_at);
+                            old.end.cut(frame, CUT_FADE_SECS, old.start_frame, sample_rate);
                         }
                     }
                 } else if voice.preview_epoch != 0 && voice.preview_epoch < self.preview_epoch {
                     // A late outgoing event must not revive a retired preview.
-                    voice.cut_fade_frame = Some(e.onset_frame);
-                    voice.stop_secs = voice.stop_secs.min(CUT_FADE_SECS);
+                    voice.end.retire_late_preview(e.onset_frame);
                 }
                 // A voice with an output lead gives its chain its level on
                 // the frame of its output, also when the voice ends before
                 // that frame: see `LevelChange`.
                 if let Some(bus) = voice
-                    .insert_bus
-                    .filter(|_| voice.through_insert && !voice.piano && voice.lead > 0)
+                    .route
+                    .through_bus()
+                    .filter(|_| !voice.piano && voice.lead > 0)
                 {
                     let frame = voice.output_frame;
                     let change = LevelChange {
@@ -2157,12 +2137,13 @@ impl ScalarBackend {
                     if postgain_moves(&e.controls) {
                         let voices = &self.voices;
                         let held = |id| voices.iter().any(|voice| voice.id == id);
-                        voice.level_line = self
+                        let line = self
                             .send_lines
                             .as_deref_mut()
                             .filter(|lines| voice.lead <= lines.reach())
                             .and_then(|lines| lines.claim_level(voice.id, bus, voice.output_frame, start, held));
-                        if voice.level_line.is_none() {
+                        voice.route.set_level_line(line);
+                        if line.is_none() {
                             *early_level_changes += 1;
                         }
                     }
@@ -2173,8 +2154,8 @@ impl ScalarBackend {
                 // room of the chain goes through the effects, and waits in
                 // them.
                 if send_lead > 0
-                    && ((voice.reverb_wet > 0.0 && !voice.chain_reverb)
-                        || (voice.delay_wet > 0.0 && !voice.chain_delay))
+                    && ((voice.reverb_wet > 0.0 && voice.route.room_reverb_bus().is_none())
+                        || (voice.delay_wet > 0.0 && voice.route.room_delay_bus().is_none()))
                     && self.send_lines.as_ref().is_none_or(|lines| send_lead > lines.reach())
                 {
                     *early_sends += 1;
@@ -2240,12 +2221,12 @@ impl ScalarBackend {
                 .max_by_key(|voice| voice.id)
             {
                 let fade = voice
-                    .cut_fade_frame
+                    .end
+                    .cut_from()
                     .map_or(at.max(start), |running| running.min(at.max(start)));
-                voice.cut_fade_frame = Some(fade);
-                let end =
-                    fade.saturating_sub(voice.start_frame) as f32 / sample_rate as f32 + 0.011;
-                voice.stop_secs = voice.stop_secs.min(end);
+                voice
+                    .end
+                    .cut(fade, CHOKE_TAIL_SECS, voice.start_frame, sample_rate);
             }
             *slot = None;
         }
@@ -2279,23 +2260,6 @@ impl ScalarBackend {
         // The arrays start at zero for each block, so a block with no voice
         // capable of producing ModAdds can leave them untouched.
         let any_param_modulators = self.voices.iter().any(|voice| voice.has_param_modulators);
-        // The chains with an output: the order has a stage, or voices still
-        // feed the chain, or its room still rings. An empty order passes
-        // these voices and the room dry.
-        let effect_buses = effect_order
-            .iter()
-            .zip(insert_postgains.iter())
-            .enumerate()
-            .fold(0u64, |mask, (bus, (order, level))| {
-                let rings = chain_rooms
-                    .get(bus)
-                    .and_then(Option::as_deref)
-                    .is_some_and(ChainRoom::rings);
-                let output = order[0] != crate::insert::NO_STAGE
-                    || level.unfed < INSERT_QUIET_FRAMES
-                    || rings;
-                mask | (u64::from(output) << bus)
-            });
 
         let mut orbit_inputs = [[0.0f32; 2]; MAX_ORBITS];
         let zero_mod_adds = ModAdds::default();
@@ -2319,10 +2283,34 @@ impl ScalarBackend {
         let plain_disabled = self.disable_plain_path;
         #[cfg(not(test))]
         let plain_disabled = false;
+        // The chains the voices go through, from the same walk. A piano voice
+        // mixes apart and feeds no chain.
+        let mut fed = 0u64;
         for voice in &mut self.voices {
             voice.plain = !plain_disabled && plain_sample_voice(voice);
+            if let Some(bus) = voice.route.through_bus().filter(|_| !voice.piano) {
+                fed |= 1u64 << bus;
+            }
         }
         let any_plain = self.voices.iter().any(|voice| voice.plain);
+        // The chains with an output: the order has a stage, or a voice goes
+        // through the chain, also in a silence of its note, or voices fed the
+        // chain in its last `INSERT_QUIET_FRAMES` frames, or its room still
+        // rings. An empty order passes these voices and the room dry.
+        let effect_buses = effect_order
+            .iter()
+            .zip(insert_postgains.iter())
+            .enumerate()
+            .fold(fed, |mask, (bus, (order, level))| {
+                let rings = chain_rooms
+                    .get(bus)
+                    .and_then(Option::as_deref)
+                    .is_some_and(ChainRoom::rings);
+                let output = order[0] != crate::insert::NO_STAGE
+                    || level.unfed < INSERT_QUIET_FRAMES
+                    || rings;
+                mask | (u64::from(output) << bus)
+            });
         // Per-orbit block pipeline: voices, delay and reverb returns
         // accumulate into ≤128-frame per-orbit buffers (the reverb is a
         // block convolution on WebAudio's 128-frame quantum), then the duck
@@ -2484,7 +2472,7 @@ impl ScalarBackend {
                             // A plugin chain gets no value before the onset. That
                             // value is no sound, and with it the chain is not
                             // silent at the first frame of the note.
-                            if abs < v.start_frame && (!sbd_pre_onset || v.through_insert) {
+                            if abs < v.start_frame && (!sbd_pre_onset || v.route.is_through()) {
                                 continue;
                             }
                             if !sbd_pre_onset && v.fm_state.is_some() && abs & 127 == 0 {
@@ -2517,7 +2505,7 @@ impl ScalarBackend {
                             } else {
                                 ((abs - v.start_frame) as f32 + v.onset_lead) / sr as f32
                             };
-                            if t >= v.stop_secs {
+                            if t >= v.end.stop_secs() {
                                 continue;
                             }
                             // The plain voice's whole frame, out of line: the
@@ -2816,13 +2804,13 @@ impl ScalarBackend {
                                 1.0
                             };
                             let mut env = env * mod_adds.gain_factor();
-                            if let Some(fade) = v.cut_fade_frame
+                            if let Some(fade) = v.end.cut_from()
                                 && abs >= fade
                             {
                                 // setValueAtTime(1, t) + linearRampToValueAtTime(0, t+0.01)
                                 env *= (1.0 - (abs - fade) as f32 / (0.01 * sr as f32)).max(0.0);
                             }
-                            if let Some(fade) = v.polyphony_fade_frame
+                            if let Some(fade) = v.end.cull_from()
                                 && abs >= fade
                             {
                                 // A linear ramp to 0 over 0.25 s on the voice's own
@@ -2838,22 +2826,24 @@ impl ScalarBackend {
                             // at half the amplitude and come out 1.7 dB loud, with
                             // a different shape, rather than simply half as loud.
                             let post_gain = v.controls.postgain * mod_adds.postgain_factor();
-                            let post_insert = v.through_insert && !v.piano;
+                            let chain_bus = v.route.through_bus().filter(|_| !v.piano);
+                            let post_insert = chain_bus.is_some();
                             // The voice owns the level of its chain from the frame
                             // of its output. A voice with a level line gives each
                             // level at its output, and owns the level it gave for
                             // this frame.
                             let output = v.output_frame;
                             let mut level = post_gain;
-                            if let Some(line) = v.level_line
+                            if let Some(line) = v.route.level_line()
                                 && let Some(lines) = send_lines.as_deref_mut()
                             {
                                 lines.set_level(line, v.id, abs + u64::from(v.lead), post_gain);
                                 level = lines.level(line, v.id, abs).unwrap_or(level);
                             }
-                            if post_insert && abs >= output {
-                                let gain =
-                                    &mut insert_postgains[v.insert_bus.expect("insert voice bus")];
+                            if let Some(bus) = chain_bus
+                                && abs >= output
+                            {
+                                let gain = &mut insert_postgains[bus];
                                 gain.own((output, v.id), level, v.lead > 0, sample_rate);
                             }
                             // Pan modulators ride the StereoPanner's pan param
@@ -3443,7 +3433,7 @@ impl ScalarBackend {
                                         // block, and the voice ends with it: the id may
                                         // go to another sound, and a voice still reading
                                         // the slot would play that one under this name.
-                                        v.source_gone = true;
+                                        v.end.mark_gone();
                                         (0.0, 0.0)
                                     } else if *delay_frames > 0 {
                                         *delay_frames -= 1;
@@ -3501,7 +3491,7 @@ impl ScalarBackend {
                                     if bank.get(controls.table).is_none() =>
                                 {
                                     // The table's slot was emptied under the voice.
-                                    v.source_gone = true;
+                                    v.end.mark_gone();
                                     (0.0, 0.0)
                                 }
                                 VoiceSource::Wavetable {
@@ -3810,8 +3800,8 @@ impl ScalarBackend {
                                 let (left, right) = (left * dry, right * dry);
                                 let mix = if v.piano {
                                     &mut piano_mix
-                                } else if v.through_insert {
-                                    &mut insert_blocks[v.insert_bus.expect("insert voice bus")]
+                                } else if let Some(bus) = v.route.through_bus() {
+                                    &mut insert_blocks[bus]
                                 } else {
                                     &mut blocks[v.orbit]
                                 };
@@ -3966,8 +3956,8 @@ impl ScalarBackend {
                                 let (left, right) = (sample * lg * dry, sample * rg * dry);
                                 let mix = if v.piano {
                                     &mut piano_mix
-                                } else if v.through_insert {
-                                    &mut insert_blocks[v.insert_bus.expect("insert voice bus")]
+                                } else if let Some(bus) = v.route.through_bus() {
+                                    &mut insert_blocks[bus]
                                 } else {
                                     &mut blocks[v.orbit]
                                 };
@@ -4792,7 +4782,7 @@ impl ScalarBackend {
         let pressure = &mut self.pressure;
         self.voices.retain_mut(|v| {
             let age = (end.saturating_sub(v.start_frame)) as f32 / sr as f32;
-            if age < v.stop_secs && !v.source_gone {
+            if v.end.lasts_past(age) {
                 true
             } else {
                 retire_voice_resources(
@@ -4814,7 +4804,7 @@ impl ScalarBackend {
 
         self.finish_insert_fades();
         self.frame = end;
-        if self.allow_inline_reverb {
+        if self.mode != RenderMode::Live {
             self.retired_inserts.clear();
             self.retired_chain_rooms.clear();
         }

@@ -145,6 +145,119 @@ impl AppErrors {
     }
 }
 
+/// A quantised launch that waits for its cycle line, and the name its
+/// countdown shows until the line.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) enum LaunchArming {
+    /// No launch waits, and the countdown has no name.
+    #[default]
+    Idle,
+    /// A launch waits for its cycle line. Its request is queued or with
+    /// the worker.
+    Armed {
+        scene: SceneId,
+        /// Only the outcome of this request ends the arming. The worker
+        /// answers a superseded launch with a cancel for the old request
+        /// after the new one is armed here.
+        request: u64,
+        /// The revision hash of the armed text. A second press on that text
+        /// is a no-op, not a re-arm that can slip the launch to the next
+        /// line.
+        revision: String,
+        /// The scene's name when it was armed, for a scene closed since.
+        name: Option<String>,
+    },
+    /// The armed request has its outcome, or a replay took the transport.
+    /// The engine fires a launch one head-room early, so the countdown
+    /// still runs to the line. It keeps this name until the next arming or
+    /// a stop.
+    Landing { name: String },
+}
+
+impl LaunchArming {
+    /// Wait for the cycle line with `request`.
+    pub(super) fn arm(
+        &mut self,
+        scene: SceneId,
+        request: u64,
+        revision: String,
+        name: Option<String>,
+    ) {
+        *self = Self::Armed {
+            scene,
+            request,
+            revision,
+            name,
+        };
+    }
+
+    /// The outcome of `request` arrived. Only the armed request's own
+    /// outcome ends the arming.
+    pub(super) fn answered(&mut self, request: u64) {
+        if self.carries(request) {
+            self.disarm();
+        }
+    }
+
+    /// The arming is over, and the countdown keeps the name.
+    pub(super) fn disarm(&mut self) {
+        if let Self::Armed { name, .. } = self {
+            *self = match name.take() {
+                Some(name) => Self::Landing { name },
+                None => Self::Idle,
+            };
+        }
+    }
+
+    /// A stop: nothing waits, and nothing counts down.
+    pub(super) fn cancel(&mut self) {
+        *self = Self::Idle;
+    }
+
+    /// `request` was replaced before it was sent. No outcome comes for it,
+    /// so an arming it carries ends here.
+    pub(super) fn dropped_unsent(&mut self, request: u64) {
+        if self.carries(request) {
+            *self = Self::Idle;
+        }
+    }
+
+    pub(super) fn is_armed(&self) -> bool {
+        matches!(self, Self::Armed { .. })
+    }
+
+    pub(super) fn armed_scene(&self) -> Option<SceneId> {
+        match self {
+            Self::Armed { scene, .. } => Some(*scene),
+            Self::Idle | Self::Landing { .. } => None,
+        }
+    }
+
+    /// Whether `scene` waits for its line with the text of `revision`.
+    pub(super) fn armed_with(&self, scene: SceneId, revision: &str) -> bool {
+        matches!(self, Self::Armed { scene: armed, revision: text, .. }
+            if *armed == scene && text == revision)
+    }
+
+    /// The name the countdown shows: the armed scene's name now, or the
+    /// name it had when it was armed if it has closed since, or, after the
+    /// arming ends, the name it kept until the line.
+    pub(super) fn countdown_name(&self, scenes: &SceneSet) -> Option<String> {
+        match self {
+            Self::Idle => None,
+            Self::Armed { scene, name, .. } => scenes
+                .get(*scene)
+                .map(|scene| scene.name().to_owned())
+                .or_else(|| name.clone()),
+            Self::Landing { name } => Some(name.clone()),
+        }
+    }
+
+    fn carries(&self, request: u64) -> bool {
+        matches!(self, Self::Armed { request: armed, .. } if *armed == request)
+    }
+}
+
 impl App {
     pub(super) fn set_notice(&mut self, message: String) {
         self.status_notice = Some((message.clone(), Instant::now() + TRANSIENT_MESSAGE_DURATION));
@@ -175,22 +288,27 @@ impl App {
         if !self.stop_requested && !self.is_playing() && !self.is_stopping() {
             return;
         }
+        self.end_playback();
+        // A waiting launch was cancelled by the stop. Keep plain updates:
+        // a stop-then-update restart still wants its evaluation outcome.
+        self.inflight
+            .retain(|_, pending| matches!(pending.launch, Launch::Now));
+    }
+
+    /// Retire the state that lives only while the set plays. Every end of
+    /// playback comes here: the stop the engine confirms, a failure that
+    /// stops the set, and a lost worker. The requests sent to the engine
+    /// stay. A failure cancels none of them, and the stopped engine
+    /// answers each one.
+    pub(super) fn end_playback(&mut self) {
         self.audio_advisory.reset();
         self.power_advisory.reset();
         self.worker.discard_visual_updates();
         self.visual.stop();
-        self.pending_slider = None;
-        // A waiting launch was cancelled by the stop. Keep plain updates:
-        // a stop-then-update restart still wants its evaluation outcome.
-        self.forget_arming();
-        self.landing_name = None;
-        self.inflight
-            .retain(|_, pending| matches!(pending.launch, Launch::Now));
+        self.pending_sliders.clear();
+        self.launch_arming.cancel();
         #[cfg(feature = "hydra")]
-        {
-            self.snippet_preview = None;
-            self.snippet_heard = false;
-        }
+        self.end_snippet_audition();
         self.stop_requested = false;
         self.dirty_frame = true;
     }
@@ -230,9 +348,9 @@ impl App {
     /// too.
     ///
     /// So the first press arms and says so, and the second goes. Any other
-    /// key calls it off - the same shape as the theme picker's second `d`,
-    /// and deliberately not a timer, which would decide by a number nobody
-    /// can defend.
+    /// press, click or paste calls it off - the same shape as the theme
+    /// picker's second `d`, and deliberately not a timer, which would decide
+    /// by a number nobody can defend.
     ///
     /// The external cancellation flag (a signal, `Ctrl-C`) is a different
     /// path entirely and is never asked twice: the answer there was given
@@ -247,18 +365,20 @@ impl App {
         self.quit_now();
     }
 
-    /// Any press that is not the Quit chord cancels an armed quit.
-    pub(super) fn cancel_armed_quit(&mut self, terminal_event: &Event) {
-        if let Event::Key(key) = terminal_event
-            && key.kind == KeyEventKind::Press
-            && self.quit_armed
-            && (key.modifiers.contains(KeyModifiers::ALT)
-                || self.keybinds.action_for(key) != Some(BindAction::Quit))
-        {
-            self.quit_armed = false;
-            self.status = "quit cancelled".into();
-            self.dirty_frame = true;
+    /// Call off a quit that is still armed after the press, click or paste
+    /// that answered it. An answer that confirms has quit by then, so this
+    /// answer was anything else. `status` is the line the answer found. A
+    /// line that the answer wrote stays, because it can be a prompt of its
+    /// own. Otherwise the line says that the quit is off.
+    pub(super) fn call_off_quit(&mut self, status: &str) {
+        if !self.quit_armed {
+            return;
         }
+        self.quit_armed = false;
+        if self.status == status {
+            self.status = "quit cancelled".into();
+        }
+        self.dirty_frame = true;
     }
 
     /// Quit, no questions: the menu's Quit is a choice made with the eyes
@@ -310,12 +430,12 @@ impl App {
     /// another scene with the same text, and launching that one is how the
     /// playing mark, the highlights and the tape move over to it.
     pub(super) fn install_would_be_redundant(&self, scene: SceneId, source: &str) -> bool {
-        // A launch waiting for its cycle line is consumed by QUEUEING an
-        // evaluation. Returning early would leave it in place, so a later
-        // ordinary update would inherit a quantised launch it never asked
-        // for. (An armed scene is no reason: the same text re-pressed is
-        // answered before this, and a different text is a new launch.)
-        if !matches!(self.next_launch, Launch::Now) {
+        // A launch on a cycle line that a gesture asked for goes to the
+        // engine even with the sounding text: the press is a launch, not a
+        // repeat of the last update. (An armed scene is no reason: the same
+        // text re-pressed is answered before this, and a different text is
+        // a new launch.)
+        if !matches!(self.next_evaluation.launch, Launch::Now) {
             return false;
         }
         self.is_playing()
@@ -337,13 +457,6 @@ impl App {
         self.is_playing() && !self.is_stopping() && !self.stop_requested
     }
 
-    /// The arming is over - fired, cancelled or stopped.
-    pub(super) fn forget_arming(&mut self) {
-        self.armed_scene = None;
-        self.armed_request = None;
-        self.armed_revision = None;
-    }
-
     pub(super) fn is_stopping(&self) -> bool {
         self.snapshot
             .as_ref()
@@ -354,7 +467,7 @@ impl App {
         // A launch waiting for its cycle line is armed, not evaluating: the
         // header keeps PLAYING and shows the countdown beside it. An update
         // held for its sounds is the same: the loading line says so.
-        let armed = self.armed_scene.is_some()
+        let armed = self.launch_arming.is_armed()
             && self
                 .snapshot
                 .as_ref()
@@ -453,6 +566,99 @@ mod tests {
                 );
                 assert!(app.quit_armed);
             }
+        }
+
+        /// A click and a paste call an armed quit off as a key does, so the
+        /// next ^Q asks again instead of quitting at once.
+        #[test]
+        fn a_click_or_a_paste_calls_an_armed_quit_off() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+                .expect("test terminal");
+            terminal
+                .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                .expect("draw");
+            let score = app.focused_map().expect("the score is drawn").area();
+            let click = |kind| {
+                Event::Mouse(MouseEvent {
+                    kind,
+                    column: score.x + 1,
+                    row: score.y,
+                    modifiers: KeyModifiers::NONE,
+                })
+            };
+
+            for answer in [
+                vec![
+                    click(MouseEventKind::Down(MouseButton::Left)),
+                    click(MouseEventKind::Up(MouseButton::Left)),
+                ],
+                vec![Event::Paste("x".into())],
+            ] {
+                press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+                assert!(app.quit_armed, "^Q armed the quit");
+                for event in answer.iter().cloned() {
+                    app.handle_terminal_event(event).expect("event handled");
+                }
+                assert!(!app.quit_armed, "{answer:?} left the quit armed");
+                assert_eq!(app.status, "quit cancelled");
+            }
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+            assert!(!app.quit, "a single ^Q quit the studio");
+        }
+
+        /// A key that Vim takes calls an armed quit off as any other key does,
+        /// and the status line says so.
+        #[test]
+        fn a_key_vim_takes_calls_an_armed_quit_off() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+            assert!(app.quit_armed, "^Q armed the quit");
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert!(!app.quit_armed, "j left the quit armed");
+            assert_eq!(app.status, "quit cancelled");
+        }
+
+        /// The press that calls an armed quit off keeps a line that its own
+        /// handler wrote, because that line can be a prompt of its own.
+        #[test]
+        fn calling_the_quit_off_keeps_the_line_the_press_wrote() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+            assert!(app.quit_armed, "^Q armed the quit");
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+            assert!(!app.quit_armed, "^E left the quit armed");
+            assert!(
+                app.status.starts_with("split"),
+                "the split's own line stays: {}",
+                app.status
+            );
+        }
+
+        /// A modifier key alone answers nothing. A terminal that reports every
+        /// key sends Ctrl alone before the second ^Q, and that ^Q still quits.
+        #[test]
+        fn a_modifier_key_alone_leaves_the_quit_armed() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+            assert!(app.quit_armed, "^Q armed the quit");
+            press(
+                &mut app,
+                KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftControl),
+                KeyModifiers::CONTROL,
+            );
+            assert!(app.quit_armed, "Ctrl alone called the quit off");
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+            assert!(app.quit, "the second ^Q did not quit");
         }
 
         #[test]
@@ -782,7 +988,7 @@ mod tests {
             );
             assert!(queued(&mut app), "^⇧S plays from the top");
             assert!(
-                !app.next_rewind,
+                !app.next_evaluation.rewind,
                 "and is spent on the score it was asked for"
             );
 
@@ -962,9 +1168,8 @@ mod tests {
 
         #[test]
         fn an_armed_launch_is_never_redundant() {
-            // Queueing an evaluation is what consumes the arming; returning early
-            // would leave it in place and hand a later ordinary update a
-            // quantised launch it never asked for.
+            // A launch on a cycle line is a press of its own, not a repeat
+            // of the last update, so it is never answered as unchanged.
             let directory = tempfile::tempdir().expect("tempdir");
             let mut app = app_over(directory.path());
             let source = "$: s(\"bd*4\")";
@@ -977,7 +1182,7 @@ mod tests {
                 "the baseline is redundant"
             );
 
-            app.next_launch = Launch::Quantised { unit_cycles: 4.0 };
+            app.next_evaluation.launch = Launch::Quantised { unit_cycles: 4.0 };
             assert!(
                 !app.install_would_be_redundant(current, source),
                 "a pending launch"
@@ -986,8 +1191,8 @@ mod tests {
             // An armed scene is no exemption on its own: the text that is armed
             // is answered before this predicate runs, and any other text is a
             // new launch.
-            app.next_launch = Launch::Now;
-            app.armed_scene = Some(current);
+            app.next_evaluation.launch = Launch::Now;
+            app.launch_arming.arm(current, 1, "armed".into(), None);
             assert!(
                 app.install_would_be_redundant(current, source),
                 "the sounding text"
@@ -1004,10 +1209,8 @@ mod tests {
             let mut app = app_over(directory.path());
             let scene = app.scenes.current().id;
             app.snapshot = Some(sounding(true, false));
-            app.armed_scene = Some(scene);
-            app.armed_request = Some(2);
-            app.armed_revision = Some("armed".into());
-            app.landing_name = Some("intro".into());
+            app.launch_arming
+                .arm(scene, 2, "armed".into(), Some("intro".into()));
             let cancelled = |request_id| EvaluationOutcome {
                 request_id,
                 editor_revision: 0,
@@ -1019,11 +1222,22 @@ mod tests {
                 }),
             };
             app.handle_evaluation(cancelled(1));
-            assert_eq!(app.armed_scene, Some(scene), "the old request's answer");
-            assert_eq!(app.armed_request, Some(2));
+            assert_eq!(
+                app.launch_arming.armed_scene(),
+                Some(scene),
+                "the old request's answer"
+            );
+            assert!(matches!(
+                app.launch_arming,
+                LaunchArming::Armed { request: 2, .. }
+            ));
             app.handle_evaluation(cancelled(2));
-            assert_eq!(app.armed_scene, None, "its own answer ends it");
-            assert_eq!(app.armed_revision, None);
+            assert_eq!(
+                app.launch_arming.armed_scene(),
+                None,
+                "its own answer ends it"
+            );
+            assert!(!app.launch_arming.armed_with(scene, "armed"));
         }
 
         /// Stop forgets the arming, drops the request that carried it, and
@@ -1034,17 +1248,16 @@ mod tests {
             let mut app = app_over(directory.path());
             let scene = app.scenes.current().id;
             app.snapshot = Some(sounding(true, false));
-            app.armed_scene = Some(scene);
-            app.armed_request = Some(7);
-            app.armed_revision = Some("armed".into());
-            app.next_launch = Launch::Quantised { unit_cycles: 1.0 };
+            app.launch_arming.arm(scene, 7, "armed".into(), None);
+            app.next_evaluation.launch = Launch::Quantised { unit_cycles: 1.0 };
             app.handle_editor_effect(EditorEffect::Stop).expect("stop");
-            assert_eq!(app.armed_scene, None);
-            assert_eq!(app.armed_request, None);
-            assert!(matches!(app.next_launch, Launch::Now), "no launch leaks");
+            assert_eq!(app.launch_arming, LaunchArming::Idle);
+            assert!(
+                matches!(app.next_evaluation.launch, Launch::Now),
+                "no launch leaks"
+            );
 
-            app.armed_scene = Some(scene);
-            app.armed_request = Some(8);
+            app.launch_arming.arm(scene, 8, "armed".into(), None);
             app.inflight.insert(
                 8,
                 PendingEvaluation {
@@ -1072,7 +1285,7 @@ mod tests {
             app.handle_control(StudioControlEvent::Stopped(Box::new(
                 crate::engine::StudioStop::idle(),
             )));
-            assert_eq!(app.armed_scene, None);
+            assert_eq!(app.launch_arming.armed_scene(), None);
             assert!(
                 !app.inflight.contains_key(&8),
                 "the quantised request is dropped"
@@ -1103,9 +1316,8 @@ mod tests {
             let mut app = app_over(directory.path());
             let source = "$: s(\"sine*4\")";
             app.snapshot = Some(sounding(true, false));
-            app.armed_scene = Some(app.scenes.current().id);
-            app.armed_request = Some(3);
-            app.armed_revision = Some(source_revision(source));
+            app.launch_arming
+                .arm(app.scenes.current().id, 3, source_revision(source), None);
             let before = app.next_request_id;
             app.handle_editor_effect(EditorEffect::Evaluate {
                 revision: app.editor().revision(),
@@ -1114,7 +1326,91 @@ mod tests {
             .expect("evaluate");
             assert_eq!(app.next_request_id, before, "nothing was queued");
             assert!(app.status.contains("already armed"), "{}", app.status);
-            assert_eq!(app.armed_request, Some(3), "still the same arming");
+            assert!(
+                matches!(app.launch_arming, LaunchArming::Armed { request: 3, .. }),
+                "still the same arming"
+            );
+        }
+
+        /// A duplicate of the armed scene is another scene with the same
+        /// text. A press on it launches the duplicate. It is not answered
+        /// as the launch that already waits.
+        #[test]
+        fn a_press_on_a_duplicate_of_the_armed_scene_launches_the_duplicate() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            app.ui_settings.quantise = crate::settings::Quantise::Cycle;
+            app.snapshot = Some(sounding(true, false));
+            app.scenes.current_mut().editor = Editor::new("$: s(\"sine*4\")").expect("editor");
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            assert!(
+                app.pending_evaluation.is_some() || !app.inflight.is_empty(),
+                "the first press went out"
+            );
+
+            app.new_scene(true);
+            let copy = app.scenes.current().id;
+            let before = app.next_request_id;
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            assert!(!app.status.starts_with("already armed"), "{}", app.status);
+            assert_eq!(
+                app.next_request_id,
+                before + 1,
+                "the duplicate's press went out"
+            );
+            let newest = app
+                .pending_evaluation
+                .as_ref()
+                .or_else(|| app.inflight.values().max_by_key(|sent| sent.request_id))
+                .expect("a queued launch");
+            assert_eq!(newest.scene, copy, "the launch is the duplicate's");
+        }
+
+        /// A launch replaced before it was sent leaves nothing armed. No
+        /// outcome comes for it, so a setup applied after it still installs
+        /// the sounding score again.
+        #[test]
+        fn a_launch_replaced_before_it_was_sent_leaves_nothing_armed() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let scene = app.scenes.current().id;
+            let score: Arc<str> = Arc::from("$: s(\"bd\")\n");
+            app.snapshot = Some(sounding(true, false));
+            app.audible_scene = Some(scene);
+            app.visual_revision = Some(app.editor().revision());
+            app.evaluated_source = Some(Arc::clone(&score));
+            // A setup waits in the queue, and the updates wait behind it.
+            let setup = app.next_request_id;
+            app.next_request_id += 1;
+            app.prebake_queue.push_back(PrebakeRequest {
+                request_id: setup,
+                scope: PrebakeScope::Local,
+                source: Arc::from("globalThis.riff = 1"),
+                reinstall_after: true,
+            });
+            app.next_evaluation.launch = Launch::Quantised { unit_cycles: 1.0 };
+            app.queue_evaluation(app.editor().revision(), Arc::from("$: s(\"hh\")\n"));
+            // An update that plays now takes its place before it is sent.
+            app.queue_evaluation(app.editor().revision(), Arc::from("$: s(\"cp\")\n"));
+
+            // The setup goes out and applies, and the update follows it.
+            app.prebake_inflight = app.prebake_queue.pop_front();
+            app.flush_pending_evaluation();
+            app.handle_prebake(PrebakeOutcome {
+                request_id: setup,
+                scope: PrebakeScope::Local,
+                result: Ok(()),
+            });
+            assert!(!app.status.contains("armed launch"), "{}", app.status);
+            let newest = app
+                .pending_evaluation
+                .as_ref()
+                .or_else(|| app.inflight.values().max_by_key(|sent| sent.request_id))
+                .expect("a queued install");
+            assert_eq!(
+                newest.source, score,
+                "the sounding score takes the new setup"
+            );
         }
 
         #[test]

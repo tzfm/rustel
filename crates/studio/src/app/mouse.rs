@@ -68,9 +68,11 @@ pub(super) enum Pointer {
     },
     /// Dragging the scrollbar that stands in for the minimap.
     Scrollbar,
-    /// Dragging the unwrapped editor's scrollbar along its bottom row.
+    /// Dragging the unwrapped editor's scrollbar along its bottom row. The
+    /// bar is that of the pane that shows the scene when a report arrives,
+    /// and the drag ends when no pane shows it.
     HorizontalScrollbar {
-        pane: usize,
+        scene: SceneId,
         /// Hold the grabbed cell and exact initial scroll offset.
         grab: HorizontalScrollbarGrab,
     },
@@ -125,6 +127,38 @@ pub(super) enum Pointer {
     },
 }
 
+impl Pointer {
+    /// Whether the gesture follows a rail or a strip that its press measured
+    /// on the screen. A resize moves that geometry, so it ends the gesture.
+    pub(super) fn holds_layout(&self) -> bool {
+        match self {
+            Pointer::Knobs { rail } => rail.is_some(),
+            #[cfg(feature = "hydra")]
+            Pointer::GeneratorControl { .. } => true,
+            Pointer::MixerFader { .. }
+            | Pointer::Slider { .. }
+            | Pointer::TimelineBar { .. }
+            | Pointer::BlockStart { .. } => true,
+            // None of these keeps a rail or a strip that its press measured.
+            #[cfg(feature = "hydra")]
+            Pointer::SnippetCodeScroll { .. } => false,
+            Pointer::Editor
+            | Pointer::Volume
+            | Pointer::MixerPanelFader
+            | Pointer::PreviewVolume
+            | Pointer::ThemeCode
+            | Pointer::Log
+            | Pointer::Minimap { .. }
+            | Pointer::Scrollbar
+            | Pointer::HorizontalScrollbar { .. }
+            | Pointer::Panel
+            | Pointer::PromptField
+            | Pointer::ReferenceText { .. }
+            | Pointer::MixerText { .. } => false,
+        }
+    }
+}
+
 impl App {
     /// Whether the status line is showing the last file's path, which a
     /// press on it opens.
@@ -151,16 +185,7 @@ impl App {
         // score's, the log's, the theme code's), so nothing this gesture
         // does can extend it. The wheel extends a live drag on purpose.
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            self.pointer = None;
-            for scene in self.scenes.scenes_mut() {
-                scene.editor.cancel_drag();
-            }
-            if let Some(log) = self.log_panel.as_mut() {
-                log.editor.cancel_drag();
-            }
-            if let Some(theme) = self.theme_editor.as_mut() {
-                theme.code.cancel_drag();
-            }
+            self.end_pointer_gesture();
         }
         // A prompt is a popover: it owns the pointer until it is gone. A
         // press outside it is the press that puts it away, and the wheel
@@ -633,6 +658,23 @@ impl App {
                     | Pointer::MixerText { .. }
             )
         )
+    }
+
+    /// End the gesture a press began. The pointer lets go, and so does every
+    /// editor that keeps a drag for its release: each score, the log and the
+    /// theme code. The wheel extends a live drag, so a drag whose release
+    /// goes elsewhere or never comes must end here.
+    pub(super) fn end_pointer_gesture(&mut self) {
+        self.pointer = None;
+        for scene in self.scenes.scenes_mut() {
+            scene.editor.cancel_drag();
+        }
+        if let Some(log) = self.log_panel.as_mut() {
+            log.editor.cancel_drag();
+        }
+        if let Some(theme) = self.theme_editor.as_mut() {
+            theme.code.cancel_drag();
+        }
     }
 
     /// The wheel, offered to what is under the pointer from the top-most
@@ -2082,6 +2124,210 @@ mod tests {
                 viewport,
                 "the score did not scroll"
             );
+        }
+
+        /// A score drag ends when the caret goes to another scene mid-drag, as
+        /// a pad or a watched file can send it. The release then lands in the
+        /// other scene, and the wheel back in the first one only scrolls.
+        #[test]
+        fn a_scene_change_mid_drag_ends_the_score_drag() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            type_text(
+                &mut app,
+                "$: s(\"bd hh sd hh bd hh sd hh bd hh sd hh bd hh\")",
+            );
+            app.editor_mut().set_wrap(false);
+            let first = app.scenes.current_index();
+            app.new_scene(false);
+            let second = app.scenes.current_index();
+            assert!(app.select_scene(first));
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+                .expect("test terminal");
+            let mut draw = |app: &mut App| {
+                terminal
+                    .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                    .expect("draw");
+            };
+            draw(&mut app);
+
+            let score = app.focused_map().expect("the score is drawn").area();
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                score.x + 2,
+                score.y,
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Drag(MouseButton::Left),
+                score.x + 6,
+                score.y,
+            );
+            assert!(app.select_scene(second));
+            draw(&mut app);
+            mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                score.x + 6,
+                score.y,
+            );
+            assert!(app.select_scene(first));
+            draw(&mut app);
+            let selection = app.editor().primary_selection();
+            assert!(!selection.is_empty(), "the drag selected");
+
+            mouse(&mut app, MouseEventKind::ScrollDown, score.x + 12, score.y);
+            assert_eq!(
+                app.editor().primary_selection(),
+                selection,
+                "the wheel did not extend a drag that had ended"
+            );
+        }
+
+        /// A new scene mid-drag ends the score drag, as every other scene
+        /// change does. Its release lands in the new scene, and once that
+        /// scene is closed the wheel back in the first one only scrolls.
+        #[test]
+        fn a_new_scene_mid_drag_ends_the_score_drag() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            type_text(
+                &mut app,
+                "$: s(\"bd hh sd hh bd hh sd hh bd hh sd hh bd hh\")",
+            );
+            app.editor_mut().set_wrap(false);
+            let first = app.scenes.current_index();
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+                .expect("test terminal");
+            let mut draw = |app: &mut App| {
+                terminal
+                    .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                    .expect("draw");
+            };
+            draw(&mut app);
+
+            let score = app.focused_map().expect("the score is drawn").area();
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                score.x + 2,
+                score.y,
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Drag(MouseButton::Left),
+                score.x + 6,
+                score.y,
+            );
+            app.new_scene(false);
+            assert_ne!(
+                app.scenes.current_index(),
+                first,
+                "the new scene is current"
+            );
+            draw(&mut app);
+            mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                score.x + 6,
+                score.y,
+            );
+            app.close_scene();
+            assert_eq!(app.scenes.current_index(), first, "the first scene is back");
+            draw(&mut app);
+            let selection = app.editor().primary_selection();
+            assert!(!selection.is_empty(), "the drag selected");
+
+            mouse(&mut app, MouseEventKind::ScrollDown, score.x + 12, score.y);
+            assert_eq!(
+                app.editor().primary_selection(),
+                selection,
+                "the wheel did not extend a drag that had ended"
+            );
+        }
+
+        /// A score drag ends when the terminal loses focus: its release may
+        /// never come, and the wheel after it only scrolls.
+        #[test]
+        fn losing_focus_mid_drag_ends_the_score_drag() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            type_text(
+                &mut app,
+                "$: s(\"bd hh sd hh bd hh sd hh bd hh sd hh bd hh\")",
+            );
+            app.editor_mut().set_wrap(false);
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+                .expect("test terminal");
+            terminal
+                .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                .expect("draw");
+
+            let score = app.focused_map().expect("the score is drawn").area();
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                score.x + 2,
+                score.y,
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Drag(MouseButton::Left),
+                score.x + 6,
+                score.y,
+            );
+            app.handle_terminal_event(Event::FocusLost)
+                .expect("focus loss handled");
+            assert!(app.pointer.is_none(), "the gesture let go");
+            let selection = app.editor().primary_selection();
+            assert!(!selection.is_empty(), "the drag selected");
+
+            mouse(&mut app, MouseEventKind::ScrollDown, score.x + 12, score.y);
+            assert_eq!(
+                app.editor().primary_selection(),
+                selection,
+                "the wheel did not extend a drag that had ended"
+            );
+        }
+
+        /// A desk fader's drag follows the rail its press measured. A resize
+        /// moves the rail, so it ends the drag, as it ends an inline slider's.
+        #[test]
+        fn resizing_ends_a_desk_fader_drag() {
+            use crate::mixer_panel::{FaderDesk, MixerEdge, fader_desk, parts};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene, call) = slider_app(directory.path());
+            app.audible_scene = Some(scene);
+            precision_key(&mut app, KeyCode::F(4), KeyModifiers::NONE);
+            app.regions.mixer = Rect::new(0, 18, 120, 12);
+            let desk = parts(app.regions.mixer, MixerEdge::Bottom)
+                .expect("a band that tall is a desk")
+                .desk;
+            let layout = fader_desk(desk, &app.mixer_strip_widths(), 1)
+                .expect("room for the score's one fader");
+            let cell = layout.cell(0).expect("the fader is drawn");
+            let rail = FaderDesk::rail(cell).expect("and so is its rail");
+
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                rail.x,
+                rail.y,
+            );
+            assert!(matches!(app.pointer, Some(Pointer::MixerFader { .. })));
+            assert_value(&app, scene, call, 0.0);
+            app.handle_terminal_event(Event::Resize(100, 30))
+                .expect("resize handled");
+            assert!(app.pointer.is_none(), "the resize ended the drag");
+            mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                rail.right() - 1,
+                rail.y,
+            );
+            assert_value(&app, scene, call, 0.0);
         }
 
         /// The pointer reaches the score as fractions of the frame: at the

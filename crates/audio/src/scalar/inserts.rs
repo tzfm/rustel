@@ -1027,7 +1027,7 @@ impl ScalarBackend {
         let limit = self.sample_rate.saturating_mul(INSERT_IDLE_SECONDS);
         let quiet = self.sample_rate.saturating_mul(INSERT_QUIET_SECONDS);
         let fade = (CUT_FADE_SECS * self.sample_rate as f32) as u64;
-        let listed = self.offline || self.insert_named_list != 0;
+        let listed = self.mode == RenderMode::Offline || self.insert_named_list != 0;
         let full = !self.insert_named.contains(&u64::MAX);
         // With no list, or with no free bus, a chain with no use for a long
         // time gives its bus back, named or not.
@@ -1041,7 +1041,7 @@ impl ScalarBackend {
             // Csound note of the orbit. Such a chain keeps the rule of no
             // list, so a plugin chain does not take its bus.
             let unlisted = full && !in_list && chain < MAX_ORBITS as u64;
-            let named = !listed || self.offline || in_list || unlisted;
+            let named = !listed || self.mode == RenderMode::Offline || in_list || unlisted;
             let by_use = by_use || unlisted;
             let unused = self.frame.saturating_sub(self.insert_last_used[bus]) >= u64::from(limit);
             // Only the rule by use takes a named chain, and only after the
@@ -1053,7 +1053,7 @@ impl ScalarBackend {
             let held = self
                 .voices
                 .iter()
-                .any(|voice| voice.insert_bus == Some(bus))
+                .any(|voice| voice.route.bus() == Some(bus))
                 || self
                     .pending
                     .slots
@@ -1184,13 +1184,10 @@ impl ScalarBackend {
         };
         self.insert_fade_from[bus] = from;
         for voice in self.voices.iter_mut() {
-            if voice.insert_bus == Some(bus) {
-                let stop_at = from.saturating_sub(voice.start_frame) as f32
-                    / self.sample_rate as f32
-                    + CUT_FADE_SECS;
-                voice.stop_secs = voice.stop_secs.min(stop_at);
-                voice.cut_fade_frame =
-                    Some(voice.cut_fade_frame.map_or(from, |fade| fade.min(from)));
+            if voice.route.bus() == Some(bus) {
+                voice
+                    .end
+                    .cut(from, CUT_FADE_SECS, voice.start_frame, self.sample_rate);
             }
         }
         let instrument = crate::insert::EFFECT_CHAIN * crate::insert::MAX_INSERT_BUSES + bus;
@@ -1326,7 +1323,7 @@ impl ScalarBackend {
             let level = &self.insert_postgains[bus];
             // A voice that goes through the chain feeds it until the voice
             // ends, also in a silence of its note.
-            let fed = |voice: &Voice| voice.through_insert && voice.insert_bus == Some(bus);
+            let fed = |voice: &Voice| voice.route.through_bus() == Some(bus);
             self.effect_order[bus].contains(&slot.stage)
                 && (level.quiet.min(level.unfed) < INSERT_QUIET_FRAMES
                     || self.voices.iter().any(fed))
@@ -2101,7 +2098,7 @@ mod tests {
                     if live {
                         assert!(backend.install_insert(slot, build(first_key)).is_none());
                         assert!(backend.prepare_insert(slot, build(next_key)).is_none());
-                        backend.allow_inline_reverb = false;
+                        backend.forbid_inline_reverb();
                     } else {
                         backend.set_insert_provider(Arc::new(move |key, _, _| Some(build(key))));
                         if let Some(held_key) = held_key {
@@ -2854,7 +2851,7 @@ mod tests {
             crate::tripwire::audio_scope(|| backend.reclaim_insert_chains());
             let fade_from = backend.frame;
             assert_eq!(fading(&backend), [3]);
-            assert_eq!(backend.voices[0].cut_fade_frame, Some(fade_from));
+            assert_eq!(backend.voices[0].end.cut_from(), Some(fade_from));
             assert_eq!(cuts.load(Ordering::Relaxed), 1);
             // One chain fades at a time, from its first frame.
             crate::tripwire::audio_scope(|| backend.process_block(&mut output, 128));
@@ -2939,7 +2936,7 @@ mod tests {
             backend.reclaim_insert_chains();
             // Bus 0 has the chain 1000.
             assert_eq!(fading(&backend), [0]);
-            assert_eq!(backend.voices[0].cut_fade_frame, None);
+            assert_eq!(backend.voices[0].end.cut_from(), None);
             assert_eq!(cuts.load(Ordering::Relaxed), cut);
 
             // The active copy goes back when it is not busy and its stage is
@@ -3663,7 +3660,7 @@ mod tests {
                                 .iter()
                                 .find(|voice| voice.start_frame == 0)
                                 .unwrap();
-                            assert_eq!((old.orbit, old.insert_bus), (1, Some(1)));
+                            assert_eq!((old.orbit, old.route.bus()), (1, Some(1)));
                         }
                     }
                     if block == 8 {
@@ -6253,6 +6250,101 @@ mod tests {
             backend.note(note(448, 1));
             block(&mut backend);
             assert_eq!(take(&played), [(3, 0.25, 64), (4, 0.5, 64)]);
+        }
+
+        /// A live backend with a pass effect at stage 0 of chain 1000, and a
+        /// held note of the chain through the effect. Its square tremolo
+        /// silences it exactly for 1200 frames in each cycle. Gives the slot
+        /// and the key of the effect too.
+        fn a_held_note_through_a_pass() -> (ScalarBackend, crate::insert::InsertSlot, InsertKey) {
+            /// Passes its input.
+            struct Pass(InsertKey);
+            impl OrbitInsert for Pass {
+                fn key(&self) -> InsertKey {
+                    self.0
+                }
+                fn set_param(&mut self, _: InsertParam, _: u32) {}
+                fn process(&mut self, _: &mut [f32], _: &mut [f32]) {}
+            }
+            let effect = InsertKey {
+                plugin: 1,
+                preset: 0,
+            };
+            let mut backend = ScalarBackend::prepared(48_000, 8).unwrap();
+            backend.forbid_inline_reverb();
+            let slot = crate::insert::effect_slot(1000, 0);
+            assert!(
+                backend
+                    .install_insert(slot, Box::new(Pass(effect)))
+                    .is_none()
+            );
+            let mut held = OnsetEvent::new(0, 440.0, 0.5, 1.0).with_generation(1);
+            held.controls.insert_chain = Some(1000);
+            held.controls.effects[0] = Some(InsertControls::new(effect));
+            held.controls.tremolo = Some(crate::backend::TremoloControls {
+                frequency_hz: 20.0,
+                depth: 1.0,
+                skew: 0.5,
+                shape: 4,
+                phase_offset: 0.0,
+                time_secs: 0.0,
+            });
+            backend.note(held);
+            (backend, slot, effect)
+        }
+
+        #[test]
+        fn a_voice_through_a_chain_with_no_stage_sounds_after_a_silence() {
+            let (mut backend, _, _) = a_held_note_through_a_pass();
+            // A newer silent note of the chain asks for an instrument and no
+            // effect, so the effect leaves the order of the chain.
+            let mut newer = OnsetEvent::new(512, 440.0, 0.0, 0.1).with_generation(1);
+            newer.controls.insert_chain = Some(1000);
+            newer.controls.instrument = Some(InsertControls::new(InsertKey {
+                plugin: 2,
+                preset: 0,
+            }));
+            backend.note(newer);
+            let mut output = [0.0f32; 256];
+            let mut peak = 0.0f32;
+            for block in 0..40 {
+                output.fill(0.0);
+                backend.process_block(&mut output, 128);
+                // The held note sounds again after its first silence.
+                if block >= 20 {
+                    peak = output
+                        .iter()
+                        .fold(peak, |peak, sample| peak.max(sample.abs()));
+                }
+            }
+            assert_eq!(backend.effect_order[0][0], crate::insert::NO_STAGE);
+            assert!(peak > 0.01, "the held note was silent: {peak}");
+        }
+
+        #[test]
+        fn a_voice_through_a_chain_sounds_after_a_forced_release_ends_its_mark() {
+            let (mut backend, slot, effect) = a_held_note_through_a_pass();
+            let mut output = [0.0f32; 256];
+            for _ in 0..10 {
+                backend.process_block(&mut output, 128);
+            }
+            // A forced release fades the effect out. Its mark ends 500 ms
+            // later, and the stage leaves the order.
+            backend.release_insert(slot, effect, false, true);
+            let mut peak = 0.0f32;
+            for block in 0..330 {
+                output.fill(0.0);
+                backend.process_block(&mut output, 128);
+                // The held note sounds again after the end of the mark and a
+                // silence of its tremolo.
+                if block >= 230 {
+                    peak = output
+                        .iter()
+                        .fold(peak, |peak, sample| peak.max(sample.abs()));
+                }
+            }
+            assert_eq!(backend.effect_order[0][0], crate::insert::NO_STAGE);
+            assert!(peak > 0.01, "the held note was silent: {peak}");
         }
     }
 

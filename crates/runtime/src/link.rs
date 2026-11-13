@@ -351,16 +351,10 @@ impl Actor {
             wire::DiscoveryOrState::Discovery(message) => {
                 self.hear_discovery(message, from, at);
             }
-            wire::DiscoveryOrState::State {
-                pong: false,
-                message,
-                payload,
-            } => self.answer_ping(message, payload, from),
-            wire::DiscoveryOrState::State {
-                pong: true,
-                message,
-                payload: _,
-            } => self.hear_pong(message, from, at),
+            wire::DiscoveryOrState::State { message, payload } => match message.kind {
+                wire::StateKind::Ping => self.answer_ping(message, payload, from),
+                wire::StateKind::Pong => self.hear_pong(message, from, at),
+            },
         }
     }
 
@@ -369,7 +363,7 @@ impl Actor {
         if state.node_id == self.node_id || from.port() == 0 {
             return;
         }
-        if message.bye_bye {
+        if message.kind == wire::DiscoveryKind::ByeBye {
             self.peers.remove(&state.node_id);
             self.publish();
             return;
@@ -403,9 +397,11 @@ impl Actor {
         }
         // An announcement gets a reply to its author alone, so a crowded
         // network still hears from a participant that arrived last.
-        if message.alive && !message.response && (changed || adopted) && self.quiet_long_enough(at)
+        if message.kind == wire::DiscoveryKind::Alive
+            && (changed || adopted)
+            && self.quiet_long_enough(at)
         {
-            self.send_discovery(from, true, false);
+            self.send_discovery(from, wire::DiscoveryKind::Response);
         }
         self.publish();
     }
@@ -422,7 +418,7 @@ impl Actor {
     fn answer_ping(&mut self, _message: wire::StateMessage, payload: &[u8], from: SocketAddr) {
         let reply = wire::encode_state(
             &wire::StateMessage {
-                pong: true,
+                kind: wire::StateKind::Pong,
                 session_id: Some(self.session.id),
                 ghost_time: Some(self.ghost_now()),
                 host_time: None,
@@ -485,7 +481,7 @@ impl Actor {
             measure.next_ping = at + RETRY_INTERVAL;
             let ping = wire::encode_state(
                 &wire::StateMessage {
-                    pong: false,
+                    kind: wire::StateKind::Ping,
                     session_id: None,
                     ghost_time: None,
                     host_time: Some(host_now),
@@ -557,7 +553,7 @@ impl Actor {
             .retain(|_, peer| now.duration_since(peer.last_seen) < PEER_LIFETIME);
         self.maintain_measurement(now);
         if self.announce_now || (now >= self.next_alive && self.quiet_long_enough(now)) {
-            self.send_discovery(self.group, false, false);
+            self.send_discovery(self.group, wire::DiscoveryKind::Alive);
             self.next_alive = now + ALIVE_INTERVAL;
             self.announce_now = false;
         }
@@ -615,7 +611,7 @@ impl Actor {
         }
         let ping = wire::encode_state(
             &wire::StateMessage {
-                pong: false,
+                kind: wire::StateKind::Ping,
                 session_id: None,
                 ghost_time: None,
                 host_time: Some(host_time),
@@ -676,7 +672,7 @@ impl Actor {
 
     /// One announcement: to the group when leaving it unsaid, and to one
     /// address when answering it.
-    fn send_discovery(&mut self, to: SocketAddr, response: bool, bye_bye: bool) {
+    fn send_discovery(&mut self, to: SocketAddr, kind: wire::DiscoveryKind) {
         #[cfg(feature = "test-support")]
         if off_the_wire() {
             return;
@@ -687,12 +683,13 @@ impl Actor {
             session_id: self.session.id,
             timeline: Some(self.session.timeline),
             start_stop: Some(self.session.start_stop),
-            measure_v4: if bye_bye { None } else { self.measure_v4 },
+            measure_v4: match kind {
+                wire::DiscoveryKind::Alive | wire::DiscoveryKind::Response => self.measure_v4,
+                wire::DiscoveryKind::ByeBye => None,
+            },
         };
         let message = wire::Discovery {
-            alive: !response && !bye_bye,
-            response,
-            bye_bye,
+            kind,
             ttl: 1,
             state,
         };
@@ -712,7 +709,7 @@ impl Actor {
     }
 
     fn say_bye_bye(&mut self) {
-        self.send_discovery(self.group, false, true);
+        self.send_discovery(self.group, wire::DiscoveryKind::ByeBye);
     }
 
     fn ghost_now(&self) -> i64 {
@@ -1138,7 +1135,7 @@ mod tests {
             .endpoint;
         for _ in 0..MEASURE_SAMPLES {
             let pong = wire::StateMessage {
-                pong: true,
+                kind: wire::StateKind::Pong,
                 session_id: Some(founder),
                 ghost_time: Some(1_000_000),
                 host_time: Some(host_micros(now)),
@@ -1178,7 +1175,7 @@ mod tests {
             .endpoint;
         actor.hear_pong(
             wire::StateMessage {
-                pong: true,
+                kind: wire::StateKind::Pong,
                 session_id: Some(founder),
                 ghost_time: Some(i64::MAX),
                 host_time: Some(i64::MIN),

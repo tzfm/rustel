@@ -41,28 +41,19 @@ impl Editor {
     }
 
     pub(crate) fn vim_has_pending_command(&self) -> bool {
-        self.find_open()
-            || self.vim.count != 0
-            || self.vim.operator.is_some()
-            || self.vim.replace.is_some()
-            || self.vim.g
-            || self.vim.command.is_some()
-            || self.vim.text_object.is_some()
+        self.find_open() || !self.vim.pending.is_empty()
     }
 
     fn vim_mapping_mode(&self) -> Option<VimMappingMode> {
-        // The key after r, g, or a text object's i or a is read as itself,
-        // as Vim reads it. gg and r{char} never wait for a mapping.
+        // The key after r, g, :, or a text object's i or a is read as
+        // itself, as Vim reads it. gg and r{char} never wait for a mapping.
         if self.vim.keybindings != EditorKeybindings::Vim
-            || self.vim.command.is_some()
-            || self.vim.replace.is_some()
-            || self.vim.g
-            || self.vim.text_object.is_some()
+            || self.vim.pending.awaiting.is_some()
             || self.find_open()
         {
             return None;
         }
-        Some(if self.vim.operator.is_some() {
+        Some(if self.vim.pending.operator.is_some() {
             VimMappingMode::OperatorPending
         } else {
             match self.vim.mode {

@@ -2,12 +2,27 @@
 use super::{Node, Op, js_max, js_min, js_round, truthy};
 use std::f64::consts::TAU;
 
+/// The stage of an ADSR envelope. Idle outputs zero until the gate is positive.
+/// Attack, Decay and Release ramp over the time since the stage start in
+/// `v[0]`. Attack and Release ramp from the start level in `v[1]`.
+#[derive(Clone, Copy, Debug, Default)]
+enum Stage {
+    #[default]
+    Idle,
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct State {
     v: [f64; 12],
     index: usize,
     random: u32,
     flags: u8,
+    /// The envelope stage. Only ADSR nodes use it.
+    stage: Stage,
     pub(super) boolean: bool,
 }
 impl State {
@@ -262,6 +277,16 @@ impl State {
             _ => 0.0,
         }
     }
+    /// Starts the envelope `stage` at `time`.
+    fn enter(&mut self, stage: Stage, time: f64) {
+        self.stage = stage;
+        self.v[0] = time;
+    }
+    /// Starts the envelope `stage` at `time`. Its ramp starts at `level`.
+    fn enter_from_level(&mut self, stage: Stage, time: f64, level: f64) {
+        self.enter(stage, time);
+        self.v[1] = level;
+    }
     fn envelope(
         &mut self,
         time: f64,
@@ -272,58 +297,48 @@ impl State {
         release: f64,
     ) -> f64 {
         let elapsed = time - self.v[0];
-        match self.flags {
-            0 => {
+        match self.stage {
+            Stage::Idle => {
                 if gate > 0.0 {
-                    self.flags = 1;
-                    self.v[0] = time;
-                    self.v[1] = 0.0;
+                    self.enter_from_level(Stage::Attack, time, 0.0);
                 }
                 0.0
             }
-            1 => {
+            Stage::Attack => {
                 if elapsed > attack {
-                    self.flags = 2;
-                    self.v[0] = time;
+                    self.enter(Stage::Decay, time);
                     1.0
                 } else {
                     envelope_lerp(elapsed / attack, self.v[1], 1.0)
                 }
             }
-            2 => {
+            Stage::Decay => {
                 let current = envelope_lerp(elapsed / decay, 1.0, sustain);
                 if gate <= 0.0 {
-                    self.flags = 4;
-                    self.v[0] = time;
-                    self.v[1] = current;
+                    self.enter_from_level(Stage::Release, time, current);
                     return current;
                 }
                 if elapsed > decay {
-                    self.flags = 3;
-                    self.v[0] = time;
+                    self.enter(Stage::Sustain, time);
                     sustain
                 } else {
                     current
                 }
             }
-            3 => {
+            Stage::Sustain => {
                 if gate <= 0.0 {
-                    self.flags = 4;
-                    self.v[0] = time;
-                    self.v[1] = sustain;
+                    self.enter_from_level(Stage::Release, time, sustain);
                 }
                 sustain
             }
-            _ => {
+            Stage::Release => {
                 if elapsed > release {
-                    self.flags = 0;
+                    self.stage = Stage::Idle;
                     return 0.0;
                 }
                 let current = envelope_lerp(elapsed / release, self.v[1], 0.0);
                 if gate > 0.0 {
-                    self.flags = 1;
-                    self.v[0] = time;
-                    self.v[1] = current;
+                    self.enter_from_level(Stage::Attack, time, current);
                 }
                 current
             }
@@ -569,5 +584,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn adsr_releases_from_the_decay_level_and_restarts_from_zero() {
+        let node = Program::from_json(r#"{"nodes":[{"type":"adsr"}]}"#)
+            .unwrap()
+            .nodes[0];
+        let mut state = State::for_node(node, 0);
+        let mut step = |gate: f64, time: f64| {
+            let args = [gate, 0.003, 0.005, 0.3, 0.012];
+            let get = |i: usize, default: f64| args.get(i).copied().unwrap_or(default);
+            state.process(Op::Adsr, args.len(), &get, &|_| false, 48000.0, time)
+        };
+        for time in [0.0, 0.001, 0.002, 0.003, 0.004, 0.005] {
+            step(1.0, time);
+        }
+        // Decay began at 4 ms, so at 6 ms it is 0.4 of the way from 1 to 0.3.
+        assert!((step(0.0, 0.006) - 0.72).abs() <= 1e-12);
+        // Release ramps down from that level, so halfway through it is 0.36.
+        assert!((step(0.0, 0.012) - 0.36).abs() <= 1e-12);
+        assert_eq!(step(0.0, 0.019), 0.0);
+        // A new attack after a finished release starts from zero again.
+        assert_eq!(step(1.0, 0.020), 0.0);
+        assert!((step(1.0, 0.0215) - 0.5).abs() <= 1e-12);
     }
 }

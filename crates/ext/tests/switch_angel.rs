@@ -492,6 +492,143 @@ fn glide_carries_the_previous_voice_into_the_next_pitch_envelope() {
     assert!(second[0].value.get("penv").is_some());
 }
 
+/// Query the active score over one span as the scheduler does, with `_cps`.
+fn triggered(rt: &JsRuntime, begin: Fraction, end: Fraction) -> Vec<rustel_core::Hap> {
+    rt.query_with_controls(Slot::Active, 0, begin, end, &[("_cps", 0.5)])
+        .expect("query glide")
+}
+
+fn is_note(hap: &rustel_core::Hap, name: &str) -> bool {
+    hap.value.get("note") == Some(&rustel_core::Value::Str(name.into()))
+}
+
+/// A stack answers layer by layer, and every scheduler window also carries
+/// the held note's fragment. The held note must not bend the repeated notes
+/// above it, in either layer order. When it sounds again, it starts from its
+/// own pitch, so it stays unbent too, also under a layer that moves.
+#[test]
+fn glide_leaves_repeated_notes_over_a_held_note_unbent() {
+    for (source, unbent, count) in [
+        (
+            r#"note("c3*8, g2").s("sine").glide(0.05)"#,
+            &["c3", "g2"][..],
+            18,
+        ),
+        (
+            r#"note("g2, c3*8").s("sine").glide(0.05)"#,
+            &["c3", "g2"][..],
+            18,
+        ),
+        (
+            r#"note("c3 e3 g3 b3, c2*2").s("sine").glide(0.1)"#,
+            &["c2"][..],
+            4,
+        ),
+    ] {
+        let rt = runtime();
+        rt.evaluate_score(source, &TranspileOptions::default())
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        let mut haps = triggered(&rt, Fraction::ZERO, Fraction::new(1, 4));
+        let mut begin = Fraction::new(1, 4);
+        while begin < Fraction::int(2) {
+            let end = begin.add(Fraction::new(1, 40));
+            haps.extend(triggered(&rt, begin, end));
+            begin = end;
+        }
+        let checked: Vec<_> = haps
+            .iter()
+            .filter(|hap| hap.has_onset() && unbent.iter().any(|name| is_note(hap, name)))
+            .collect();
+        assert_eq!(checked.len(), count, "{source}");
+        for hap in checked {
+            assert!(
+                hap.value.get("penv").is_none(),
+                "{source}: a note that does not move bent: {}",
+                hap.show()
+            );
+        }
+    }
+}
+
+/// A note of the first onset bends from nothing, also when the stack answers
+/// it after a later onset.
+#[test]
+fn glide_bends_a_stacked_note_only_from_the_onset_before_it() {
+    let rt = runtime();
+    rt.evaluate_score(
+        r#"note("c3*8, g3*3").s("sine").glide(0.05)"#,
+        &TranspileOptions::default(),
+    )
+    .expect("evaluate glide");
+    let haps = triggered(&rt, Fraction::ZERO, Fraction::new(1, 4));
+    let g3 = haps
+        .iter()
+        .find(|hap| hap.has_onset() && is_note(hap, "g3"))
+        .expect("g3 begins in the first window");
+    assert!(
+        g3.value.get("penv").is_none(),
+        "g3 bent from a later note: {}",
+        g3.show()
+    );
+}
+
+/// The scheduler queries a span again after a refused or cut-short tick, so
+/// the memory can hold a later onset than the first note of the span. That
+/// note starts from a pitch the later voice had, not from one extrapolated
+/// past it, which can fall below 0 Hz.
+#[test]
+fn glide_starts_a_queried_again_note_from_a_pitch_its_voice_had() {
+    let rt = runtime();
+    rt.evaluate_score(
+        r#"note("c3 e3").s("sine").glide(0.02)"#,
+        &TranspileOptions::default(),
+    )
+    .expect("evaluate glide");
+    let first = triggered(&rt, Fraction::ZERO, Fraction::ONE);
+    let again = triggered(&rt, Fraction::ZERO, Fraction::ONE);
+    assert_eq!(first.len(), 2);
+    assert_eq!(again.len(), 2);
+    assert!(
+        again[0].value.get("penv").is_none(),
+        "c3 must start where the e3 voice started: {}",
+        again[0].show()
+    );
+    assert_eq!(again[1].value.get("penv"), first[1].value.get("penv"));
+}
+
+/// A refused tick queries its window again. A note that ended in that window
+/// does not sound at the newer onset, so it must not stay in the memory as a
+/// held note. The answers after the window are the same as without the second
+/// query.
+#[test]
+fn glide_keeps_later_bends_when_a_window_is_queried_again() {
+    let later = |again: bool| {
+        let rt = runtime();
+        rt.evaluate_score(
+            r#"note("c3 e3 c3").s("sine").glide(0.05)"#,
+            &TranspileOptions::default(),
+        )
+        .expect("evaluate glide");
+        triggered(&rt, Fraction::ZERO, Fraction::new(1, 4));
+        // The first c3 ends and e3 begins at 1/3, inside this window.
+        triggered(&rt, Fraction::new(1, 4), Fraction::new(1, 2));
+        if again {
+            triggered(&rt, Fraction::new(1, 4), Fraction::new(1, 2));
+        }
+        triggered(&rt, Fraction::new(1, 2), Fraction::ONE)
+            .iter()
+            .map(rustel_core::Hap::show)
+            .collect::<Vec<_>>()
+    };
+    let once = later(false);
+    assert!(
+        once.iter()
+            .any(|hap| hap.contains("note:c3") && hap.contains("penv")),
+        "the second c3 bends from e3: {once:?}"
+    );
+    assert_eq!(later(true), once);
+}
+
 /// Any built-in name may be replaced, ours or strudel.cc's; the engine's
 /// answers again once the register call is gone.
 mod sealing {

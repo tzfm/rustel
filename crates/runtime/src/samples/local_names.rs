@@ -171,10 +171,11 @@ impl SampleLibrary {
         let bank = if let Some(value) = custom.get(bank) {
             if !self
                 .shared
-                .set_banks
+                .bank_owners
                 .read()
-                .expect("set banks")
-                .contains_key(bank)
+                .expect("bank owners")
+                .get(bank)
+                .is_some_and(BankOwner::is_set)
             {
                 return Err("only imported local samples can be renamed or deleted".into());
             }
@@ -253,12 +254,14 @@ impl SampleLibrary {
         let url = local_file_url(&path);
         {
             let mut custom = self.custom.write().expect("custom banks");
-            let mut adopted = self.shared.set_banks.write().expect("set banks");
+            let mut owners = self.shared.bank_owners.write().expect("bank owners");
             // A score bank hidden by the set can name the same file. Do not
             // bring that missing file back when the set later closes.
-            for displaced in adopted.values_mut() {
-                if let Some(bank) = displaced
-                    && !remove_url(bank, &url)
+            for owner in owners.values_mut() {
+                if let BankOwner::Set { displaced } = owner
+                    && displaced
+                        .as_mut()
+                        .is_some_and(|hidden| !remove_url(&mut hidden.bank, &url))
                 {
                     *displaced = None;
                 }
@@ -268,12 +271,23 @@ impl SampleLibrary {
                     return true;
                 }
                 // Removing a set bank's last file reveals the score bank
-                // it had displaced, exactly as leaving that set would.
-                if let Some(Some(displaced)) = adopted.remove(name) {
-                    *bank = displaced;
-                    true
-                } else {
-                    false
+                // it had displaced, under its import, exactly as leaving
+                // that set would. Any other bank goes with its owner.
+                match owners.remove(name) {
+                    Some(BankOwner::Set {
+                        displaced:
+                            Some(Displaced {
+                                bank: hidden,
+                                import,
+                            }),
+                    }) => {
+                        *bank = hidden;
+                        if let Some(import) = import {
+                            owners.insert(name.clone(), BankOwner::Import(import));
+                        }
+                        true
+                    }
+                    _ => false,
                 }
             });
             *self
@@ -282,27 +296,11 @@ impl SampleLibrary {
                 .write()
                 .expect("custom filenames") = index(custom.values());
         }
-        {
-            let mut slots = self
-                .shared
-                .global_slots
-                .lock()
-                .expect("global source slots");
-            for slot in slots.iter_mut() {
-                slot.banks.retain(|_, bank| remove_url(bank, &url));
-                match slot.state {
-                    GlobalSourceState::Ready { .. } => {
-                        slot.state = GlobalSourceState::Ready {
-                            banks: slot.banks.len(),
-                        };
-                    }
-                    GlobalSourceState::Loading if slot.kind == GlobalKind::Folder => {
-                        slot.rewalk = true;
-                    }
-                    _ => {}
-                }
-            }
-        }
+        self.shared
+            .global_rows
+            .lock()
+            .expect("global source rows")
+            .file_deleted(&url);
         rebuild_global(&self.shared, &self.global);
         Ok(path)
     }
@@ -409,26 +407,26 @@ impl SampleLibrary {
                 .expect("custom filenames") = index(custom.values());
         }
         {
-            let mut slots = self
-                .shared
-                .global_slots
-                .lock()
-                .expect("global source slots");
-            for slot in slots.iter_mut() {
+            let mut rows = self.shared.global_rows.lock().expect("global source rows");
+            for slot in rows.slots.iter_mut() {
                 for value in slot.banks.values_mut() {
                     replace(value);
                 }
             }
         }
-        for displaced in self
+        for owner in self
             .shared
-            .set_banks
+            .bank_owners
             .write()
-            .expect("set banks")
+            .expect("bank owners")
             .values_mut()
-            .flatten()
         {
-            replace(displaced);
+            if let BankOwner::Set {
+                displaced: Some(hidden),
+            } = owner
+            {
+                replace(&mut hidden.bank);
+            }
         }
         rebuild_global(&self.shared, &self.global);
         Ok(new)
@@ -445,7 +443,7 @@ fn replace_urls(urls: &mut [Arc<str>], old: &str, new: &Arc<str>) {
 
 /// Remove `deleted` from `bank`, dropping note keys it leaves empty.
 /// Returns whether the bank still names a file.
-fn remove_url(bank: &mut Bank, deleted: &str) -> bool {
+pub(super) fn remove_url(bank: &mut Bank, deleted: &str) -> bool {
     match bank {
         Bank::Array(urls) => {
             urls.retain(|url| url.as_ref() != deleted);
@@ -530,10 +528,11 @@ mod delete_tests {
         assert!(
             !library
                 .shared
-                .set_banks
+                .bank_owners
                 .read()
                 .unwrap()
-                .contains_key("takes")
+                .get("takes")
+                .is_some_and(BankOwner::is_set)
         );
         assert!(!library.knows("one"));
         assert!(library.local_sample_path("takes", 0).is_err());
@@ -575,11 +574,19 @@ mod delete_tests {
         );
         assert!(!library.knows("one"));
         assert!(
-            library.shared.global_slots.lock().unwrap()[0]
+            library.shared.global_rows.lock().unwrap().slots[0]
                 .banks
                 .is_empty()
         );
-        assert!(library.shared.set_banks.read().unwrap().is_empty());
+        assert!(
+            !library
+                .shared
+                .bank_owners
+                .read()
+                .unwrap()
+                .values()
+                .any(BankOwner::is_set)
+        );
         library.adopt_global_sources_settled(&sources);
         library.adopt_set_folder(root.path()).unwrap();
         assert_eq!(
@@ -758,13 +765,21 @@ mod delete_tests {
         let deleted = library.local_sample_path("takes", 0).unwrap();
         let kept = library.local_sample_path("takes", 1).unwrap();
         // A walk is under way and has listed the folder, but not yet landed.
-        let (listed, state) = walk_global_folder(&spec);
-        library.shared.global_slots.lock().unwrap()[0].state = GlobalSourceState::Loading;
-        let generation = library.shared.global_generation.load(Ordering::Acquire);
+        let (listed, outcome) = walk_global_folder(&spec);
+        let generation = {
+            let mut rows = library.shared.global_rows.lock().unwrap();
+            rows.slots[0].stage = RowStage::Walking { rewalk: false };
+            rows.generation
+        };
 
         library.delete_local_sample("takes", 0, &deleted).unwrap();
         assert_eq!(
-            fill_global_folder_slot(&library.shared, &spec, generation, listed, state),
+            library
+                .shared
+                .global_rows
+                .lock()
+                .unwrap()
+                .finish_walk(generation, &spec, listed, outcome),
             FolderFill::Stale
         );
         assert_eq!(library.variants_of("takes"), Some(1));
@@ -781,6 +796,34 @@ mod delete_tests {
         );
         assert_eq!(library.local_sample_path("takes", 0).unwrap(), kept);
         assert_eq!(library.variants_of("takes"), Some(1));
+    }
+
+    #[test]
+    fn a_folder_walk_queued_before_a_deletion_lands_without_walking_again() {
+        let root = tempfile::tempdir().unwrap();
+        files(root.path(), "takes", &["a.wav", "b.wav"]);
+        let library = SampleLibrary::empty_without_loading();
+        let spec = root.path().display().to_string();
+        library.adopt_global_sources_settled(&[GlobalSource {
+            spec: spec.clone(),
+            enabled: true,
+        }]);
+        let deleted = library.local_sample_path("takes", 0).unwrap();
+        // The walk waits in the line and has not listed the folder yet.
+        let generation = {
+            let mut rows = library.shared.global_rows.lock().unwrap();
+            rows.slots[0].stage = RowStage::WalkQueued;
+            rows.generation
+        };
+
+        library.delete_local_sample("takes", 0, &deleted).unwrap();
+        let mut rows = library.shared.global_rows.lock().unwrap();
+        assert!(rows.begin_walk(generation, &spec));
+        let (listed, outcome) = walk_global_folder(&spec);
+        assert_eq!(
+            rows.finish_walk(generation, &spec, listed, outcome),
+            FolderFill::Filled
+        );
     }
 
     #[test]

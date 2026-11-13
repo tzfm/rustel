@@ -518,10 +518,10 @@ impl App {
             Do::FirstError => self.jump_to_first_error(),
             Do::SmartAction => self.open_smart_action(),
             Do::Update => self.dispatch_editor(Command::Evaluate)?,
-            Do::RewindUpdate => {
-                self.next_rewind = true;
-                self.dispatch_editor(Command::Evaluate)?;
-            }
+            Do::RewindUpdate => self.evaluate_with(LaunchRequest {
+                rewind: true,
+                ..LaunchRequest::default()
+            })?,
             Do::SceneRewind => self.toggle_scene_rewind(),
             Do::Stop => self.dispatch_editor(Command::Stop)?,
             Do::Record => {

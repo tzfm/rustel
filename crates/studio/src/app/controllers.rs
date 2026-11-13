@@ -439,9 +439,14 @@ impl App {
                     action.label()
                 ),
             );
+            // The press answers an armed quit, as a key press does.
+            let quit_status = self.quit_armed.then(|| self.status.clone());
             let result = self
                 .interrupt_key_input()
                 .and_then(|()| self.dispatch_bind_action(action, false));
+            if let Some(status) = quit_status {
+                self.call_off_quit(&status);
+            }
             self.refresh_editor_shortcut_hints();
             if let Err(error) = result {
                 self.set_error(ErrorOwner::Interface, error.to_string());
@@ -606,8 +611,14 @@ impl App {
                     "pad",
                     format!("{} fires {}", pad.label(), action.label()),
                 );
-                self.interrupt_key_input()?;
-                let result = self.dispatch_bind_action(action, false);
+                // The press answers an armed quit, as a key press does.
+                let quit_status = self.quit_armed.then(|| self.status.clone());
+                let result = self
+                    .interrupt_key_input()
+                    .and_then(|()| self.dispatch_bind_action(action, false));
+                if let Some(status) = quit_status {
+                    self.call_off_quit(&status);
+                }
                 self.refresh_editor_shortcut_hints();
                 result?;
                 self.dirty_frame = true;
@@ -984,6 +995,84 @@ mod tests {
             );
             app.drain_pads();
             assert!(!app.piano.open, "the aged 0-press fired the row");
+        }
+
+        /// A note or a CC that fires a Keybinds row answers an armed quit as a
+        /// key does: the quit is off, and the next ^Q asks again. A panel
+        /// action presses its chord, and a line the action writes stays.
+        #[test]
+        fn a_bound_note_or_cc_calls_an_armed_quit_off() {
+            use crate::keybinds::{BindAction, MidiBind};
+            use rustel_midi::input::MidiEvent;
+            let _pads = PAD_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let tape = write_tape(
+                directory.path(),
+                "2026-09-08T12-00-00",
+                &[(0.0, "$: s(\"sine\")"), (2.0, "$: s(\"sine\") // two")],
+            );
+            app.open_replay_tab(&tape);
+            app.frame = Rect::new(0, 0, 120, 30);
+            let mut regions = view::regions(app.frame, false, 1, false, false, None, None);
+            app.split_replay_timelines(&mut regions);
+            app.regions = regions;
+            assert!(app.timeline_visible(), "the tape shows its timeline");
+            app.keybinds.learn_midi(
+                BindAction::FocusTimeline,
+                MidiBind {
+                    number: 94,
+                    note: true,
+                    channel: None,
+                },
+            );
+            app.keybinds.learn_midi(
+                BindAction::Split,
+                MidiBind {
+                    number: 59,
+                    note: false,
+                    channel: None,
+                },
+            );
+
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+            assert!(app.quit_armed, "^Q armed the quit");
+            app.pads.driver_message_for_test(
+                "ctrl",
+                MidiEvent::NoteOn {
+                    channel: 1,
+                    note: 94,
+                    velocity: 100,
+                },
+                1_000,
+            );
+            app.drain_pads();
+            assert_eq!(app.focus, Focus::Timeline, "the note fired its row");
+            assert!(!app.quit_armed, "the note left the quit armed");
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+            assert!(!app.quit, "a single ^Q after the note quit the studio");
+            assert!(app.quit_armed, "^Q asked again");
+
+            app.pads.driver_message_for_test(
+                "ctrl",
+                MidiEvent::ControlChange {
+                    channel: 1,
+                    controller: 59,
+                    value: 127,
+                },
+                2_000,
+            );
+            app.drain_pads();
+            assert!(!app.quit_armed, "the CC left the quit armed");
+            assert!(
+                app.status.starts_with("the tape has the studio to itself"),
+                "the split's own line stays: {}",
+                app.status
+            );
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+            assert!(!app.quit, "a single ^Q after the CC quit the studio");
         }
 
         /// A MIDI knob bound to a slot drives that slot's fader, absolutely: the

@@ -1059,7 +1059,11 @@ impl LiveScalarDevice {
     pub fn clock_nanos(&self) -> u64 {
         let frames = self.shared.frames.load(Ordering::Acquire);
         if frames == 0 {
-            if let Some(stream) = &self.stream {
+            if let Some(OpenOutput {
+                handle: OutputHandle::Native(stream),
+                ..
+            }) = &self.output
+            {
                 return self.shared.playhead_at(stream.now());
             }
             return 0;
@@ -2474,7 +2478,7 @@ mod tests {
             // Join the callback before injecting the two observations. Both
             // describe exactly the same completed render frontier; only PCM
             // already handed downstream takes longer to reach the listener.
-            device.silent.take().expect("silent callback").stop();
+            device.silent_handle_mut().expect("silent callback").stop();
             device.shared.frames.store(48_000, Ordering::Release);
 
             for requested_frames in [256, 2048] {
@@ -2503,7 +2507,7 @@ mod tests {
         #[test]
         fn live_reload_margin_tracks_in_flight_work_without_certifying_it() {
             let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
-            device.silent.take().expect("silent callback").stop();
+            device.silent_handle_mut().expect("silent callback").stop();
             device.requested_buffer_frames = 256;
             for sample_rate in [44_100, 48_000, 96_000] {
                 device.sample_rate = sample_rate;

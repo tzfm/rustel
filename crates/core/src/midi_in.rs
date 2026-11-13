@@ -127,27 +127,55 @@ pub struct PlacedKey {
     pub den: i64,
 }
 
-/// The note-ons a controller has played, as a fixed ring.
-#[derive(Clone, Copy, Default)]
-struct KeyPlacement {
-    publication: u64,
-    epoch: u64,
-    num: i64,
-    den: i64,
-    /// Lookback at the query that first placed this press. Recomputed from
-    /// the current query clock it would grow on every re-select.
-    ///
-    /// `Default` is an empty slot (`den == 0`). A later forget that resets
-    /// the slot therefore stores a fresh lookback on the re-claim, rather
-    /// than inheriting the pin it just discarded.
-    struck_nanos_ago: u64,
+/// Where a trigger query placed the press in one ring slot.
+#[derive(Clone, Copy)]
+enum KeyPlacement {
+    /// No trigger query has placed the press, or a forget freed its pin.
+    Empty,
+    /// A trigger query placed the press at this pin. A later query selects
+    /// the press at the same pin.
+    Pinned(KeyPin),
     /// A live replacement retired this pin: the outgoing score's rendition
     /// of it sounds before the takeover, so no later query may select the
     /// press again, and no forget may free it to be claimed a second time
     /// (see [`KeyRing::retire_backlog`]).
-    retired: bool,
+    Retired(KeyPin),
 }
 
+impl KeyPlacement {
+    fn pinned_in(&self, epoch: u64) -> Option<KeyPin> {
+        match *self {
+            KeyPlacement::Pinned(pin) if pin.epoch == epoch => Some(pin),
+            _ => None,
+        }
+    }
+}
+
+/// The press that a trigger query placed, with the cycle position and the
+/// lookback that the query gave it.
+#[derive(Clone, Copy)]
+struct KeyPin {
+    publication: u64,
+    epoch: u64,
+    num: i64,
+    /// Never zero. A query that offers a zero denominator places nothing.
+    den: i64,
+    /// Lookback at the query that first placed this press. Recomputed from
+    /// the current query clock it would grow on every re-select.
+    struck_nanos_ago: u64,
+}
+
+impl KeyPin {
+    fn belongs_to(&self, publication: u64, epoch: u64) -> bool {
+        self.publication == publication && self.epoch == epoch
+    }
+
+    fn at(&self) -> f64 {
+        self.num as f64 / self.den as f64
+    }
+}
+
+/// The note-ons a controller has played, as a fixed ring.
 pub struct KeyRing {
     /// Exact publication id for each slot. Zero means the writer has revoked
     /// the slot while recycling it.
@@ -160,7 +188,7 @@ pub struct KeyRing {
     /// all three.
     notes: [AtomicU32; KEY_RING],
     /// Placement is producer-side state. The publication and epoch in each
-    /// entry prevent a recycled slot from inheriting its predecessor's cycle
+    /// pin prevent a recycled slot from inheriting its predecessor's cycle
     /// position.
     placements: Mutex<[KeyPlacement; KEY_RING]>,
     written: AtomicU64,
@@ -190,7 +218,7 @@ impl KeyRing {
             stamps: std::array::from_fn(|_| AtomicU64::new(0)),
             event_epochs: std::array::from_fn(|_| AtomicU64::new(0)),
             notes: std::array::from_fn(|_| AtomicU32::new(0)),
-            placements: Mutex::new([KeyPlacement::default(); KEY_RING]),
+            placements: Mutex::new([KeyPlacement::Empty; KEY_RING]),
             written: AtomicU64::new(0),
             musical_written: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
@@ -266,15 +294,14 @@ impl KeyRing {
         let selected_epoch = self.epoch.load(SeqCst);
         let mut placements = self.placements.lock().unwrap_or_else(|e| e.into_inner());
         for placement in placements.iter_mut() {
-            if placement.den == 0 || placement.epoch != selected_epoch || placement.retired {
+            let Some(pin) = placement.pinned_in(selected_epoch) else {
                 continue;
-            }
-            let at = placement.num as f64 / placement.den as f64;
-            if takeover_cycle.is_finite() && at >= takeover_cycle {
-                *placement = KeyPlacement::default();
+            };
+            *placement = if takeover_cycle.is_finite() && pin.at() >= takeover_cycle {
+                KeyPlacement::Empty
             } else {
-                placement.retired = true;
-            }
+                KeyPlacement::Retired(pin)
+            };
         }
     }
 
@@ -308,11 +335,11 @@ impl KeyRing {
         for placement in placements.iter_mut() {
             // A retired pin already sounded under the score it belonged to:
             // freeing it would let this re-query claim the press again.
-            if placement.den == 0 || placement.epoch != selected_epoch || placement.retired {
-                continue;
-            }
-            if placement.num as f64 / placement.den as f64 >= cursor {
-                *placement = KeyPlacement::default();
+            if placement
+                .pinned_in(selected_epoch)
+                .is_some_and(|pin| pin.at() >= cursor)
+            {
+                *placement = KeyPlacement::Empty;
             }
         }
     }
@@ -328,23 +355,23 @@ impl KeyRing {
         let selected_epoch = self.epoch.load(SeqCst);
         let placements = self.placements.lock().unwrap_or_else(|e| e.into_inner());
         for (slot, placement) in placements.iter().enumerate() {
-            if placement.den == 0 || placement.epoch != selected_epoch || placement.retired {
+            let Some(pin) = placement.pinned_in(selected_epoch) else {
                 continue;
-            }
+            };
             // The driver can recycle the slot during this read, as in
             // `select`: the note then belongs to another press.
-            if self.published[slot].load(SeqCst) != placement.publication {
+            if self.published[slot].load(SeqCst) != pin.publication {
                 continue;
             }
             let packed = self.notes[slot].load(SeqCst);
-            if self.published[slot].load(SeqCst) != placement.publication {
+            if self.published[slot].load(SeqCst) != pin.publication {
                 continue;
             }
             out.push(PlacedKey {
-                press: placement.publication,
+                press: pin.publication,
                 note: (packed >> 16) as u8,
-                num: placement.num,
-                den: placement.den,
+                num: pin.num,
+                den: pin.den,
             });
         }
     }
@@ -424,44 +451,38 @@ impl KeyRing {
             }
 
             let placement = &mut placements[slot];
-            let (num, den, struck_nanos_ago) = if placement.publication == publication
-                && placement.epoch == selected_epoch
-                && placement.den != 0
-            {
-                if placement.retired {
+            let pin = match *placement {
+                KeyPlacement::Retired(pin) if pin.belongs_to(publication, selected_epoch) => {
                     continue;
                 }
-                (placement.num, placement.den, placement.struck_nanos_ago)
-            } else {
-                let Some((place_num, place_den)) = place else {
-                    continue;
-                };
-                if place_den == 0 {
-                    continue;
+                KeyPlacement::Pinned(pin) if pin.belongs_to(publication, selected_epoch) => pin,
+                _ => {
+                    let Some((place_num, place_den)) = place else {
+                        continue;
+                    };
+                    if place_den == 0 {
+                        continue;
+                    }
+                    if now_nanos.saturating_sub(stamp) > KEY_STALE_NANOS {
+                        continue;
+                    }
+                    if self.published[slot].load(SeqCst) != publication
+                        || self.epoch.load(SeqCst) != selected_epoch
+                    {
+                        continue;
+                    }
+                    let pin = KeyPin {
+                        publication,
+                        epoch: selected_epoch,
+                        num: place_num,
+                        den: place_den,
+                        struck_nanos_ago: now_nanos.saturating_sub(stamp),
+                    };
+                    *placement = KeyPlacement::Pinned(pin);
+                    pin
                 }
-                if now_nanos.saturating_sub(stamp) > KEY_STALE_NANOS {
-                    continue;
-                }
-                if self.published[slot].load(SeqCst) != publication
-                    || self.epoch.load(SeqCst) != selected_epoch
-                {
-                    continue;
-                }
-                let struck_nanos_ago = now_nanos.saturating_sub(stamp);
-                *placement = KeyPlacement {
-                    publication,
-                    epoch: selected_epoch,
-                    num: place_num,
-                    den: place_den,
-                    struck_nanos_ago,
-                    retired: false,
-                };
-                (place_num, place_den, struck_nanos_ago)
             };
-            if den == 0 {
-                continue;
-            }
-            let at = num as f64 / den as f64;
+            let at = pin.at();
             if at < begin || at >= end {
                 continue;
             }
@@ -474,9 +495,9 @@ impl KeyRing {
                 note: (packed >> 16) as u8,
                 velocity: (packed >> 8) as u8,
                 channel: packed as u8,
-                num,
-                den,
-                struck_nanos_ago,
+                num: pin.num,
+                den: pin.den,
+                struck_nanos_ago: pin.struck_nanos_ago,
             });
         }
         // If a clear crossed this selection, publish none of the old epoch --
@@ -1838,6 +1859,32 @@ mod tests {
         let fresh = place(&ring, 0.0, 1.0, 3, 4);
         assert_eq!(fresh.len(), KEY_RING);
         assert!(fresh.iter().all(|hit| (hit.num, hit.den) == (3, 4)));
+    }
+
+    /// A recycled slot never inherits the placement of its predecessor,
+    /// pinned or retired. A query places the new press afresh.
+    #[test]
+    fn a_recycled_slot_places_its_new_press_afresh() {
+        let ring = KeyRing::new();
+        ring.push(0, 60, 100, 1);
+        assert_eq!(place(&ring, 0.0, 1.0, 1, 4).len(), 1);
+        ring.retire_backlog(1.0);
+        ring.push(0, 62, 100, 1);
+        assert_eq!(place(&ring, 0.0, 1.0, 1, 4).len(), 1);
+        // Recycle every slot, the retired one and the pinned one too.
+        for index in 0..KEY_RING {
+            ring.push(0, (index % 128) as u8, 90, 2);
+        }
+        let fresh = place(&ring, 0.0, 1.0, 3, 4);
+        assert_eq!(
+            fresh.len(),
+            KEY_RING,
+            "a recycled retired slot dropped its press"
+        );
+        assert!(
+            fresh.iter().all(|hit| (hit.num, hit.den) == (3, 4)),
+            "a recycled slot kept its predecessor's pin"
+        );
     }
 
     #[test]

@@ -751,11 +751,7 @@ impl App {
         // while it is armed AND while it has fired but not yet landed, and
         // the name is remembered past the outcome that ends the arming. A
         // stop ends it; there is nothing to count down to.
-        let launch_name: Option<String> = self
-            .armed_scene
-            .and_then(|id| self.scenes.get(id))
-            .map(|scene| scene.name().to_owned())
-            .or_else(|| self.landing_name.clone());
+        let launch_name: Option<String> = self.launch_arming.countdown_name(&self.scenes);
         let launch_countdown = self
             .snapshot
             .as_ref()
@@ -1177,7 +1173,7 @@ impl App {
             },
             clock_in: self.ui_settings.clock_in.as_deref(),
             clock_out: self.ui_settings.clock_out.as_deref(),
-            link_enabled: self.link_enabled,
+            link_enabled: self.link.is_joined(),
             link: self
                 .snapshot
                 .as_ref()
@@ -1957,6 +1953,13 @@ impl App {
         let fade = settings::highlight_fade().unwrap_or_else(|| self.theme.event_fade());
         #[cfg(feature = "hydra")]
         let preview = self.snippet_preview.clone();
+        // Only the preview's own layout lights its row. Before that layout
+        // is installed, the marks past its offset belong to the snippet of
+        // the outgoing composite.
+        #[cfg(feature = "hydra")]
+        let preview_installed = preview.as_ref().is_some_and(|preview| {
+            self.installed_revision.as_deref() == Some(preview.revision.as_str())
+        });
         if sounding_marks_visible {
             for mark in self.visual.fading_marks(self.theme.event, f64::from(fade)) {
                 // A snippet playing under the score sits past the end of it:
@@ -1964,7 +1967,7 @@ impl App {
                 // score would light up whatever text happens to be there.
                 #[cfg(feature = "hydra")]
                 if let Some(preview) = preview.as_ref().filter(|it| mark.from >= it.offset) {
-                    if let Some(mark) = preview.mark_in_snippet(&mark) {
+                    if preview_installed && let Some(mark) = preview.mark_in_snippet(&mark) {
                         self.snippet_marks.push(mark);
                     }
                     continue;
@@ -1982,7 +1985,9 @@ impl App {
         // - and the first one is how the shelf knows it is sounding.
         #[cfg(feature = "hydra")]
         if !self.snippet_marks.is_empty() {
-            self.snippet_heard = true;
+            if let Some(preview) = &self.snippet_preview {
+                preview.heard();
+            }
             self.dirty_frame = true;
         }
         // A mark letting go keeps the screen drawing until it has.
@@ -3017,7 +3022,9 @@ mod tests {
                 terminal.backend().buffer().clone()
             };
             let quiet = draw(&mut app);
-            app.landing_name = Some("intro".into());
+            app.launch_arming = LaunchArming::Landing {
+                name: "intro".into(),
+            };
             app.snapshot = Some(StudioSnapshot {
                 launch: Some(crate::engine::LaunchInfo {
                     boundary_cycle: 8.0,

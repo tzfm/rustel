@@ -1335,6 +1335,62 @@ fn continued_replacement_until_an_edge_can_end_sooner() {
     assert_eq!(begins, vec![3.0], "{begins:?}");
 }
 
+/// Without an end cycle, an edge with no cycle ends the window at the
+/// cursor, as in a requery. The device keeps each outgoing copy, and a copy
+/// stands in only for a hap on its own begin. The end of an earlier window
+/// does not count. With it, the 2.75 copy would stand in for the hap at
+/// 3.0, and the changed hap at 2.75 would sound together with the copy.
+#[test]
+fn continued_replacement_until_an_edge_with_no_cycle_reads_no_earlier_window() {
+    let new = || fastcat(vec![atom("d"), atom("b"), atom("c"), atom("a")]);
+    for earlier_window in [false, true] {
+        let (mut s, clk, grid) = prefetched_to_three();
+        if earlier_window {
+            let _ = s.replace_pattern_continued(grid(), clk.now(), None, 2.6, 3.1);
+        }
+        let _ = s.replace_pattern_continued_until(new(), clk.now(), None, 2.6, f64::INFINITY, None);
+        let begins = begins_through(&mut s, &clk, 3.1);
+        assert_eq!(
+            begins,
+            vec![3.0],
+            "the copy keeps 2.75 and the replacement plays 3.0 \
+             (earlier window: {earlier_window}): {begins:?}"
+        );
+    }
+}
+
+/// On negative cycles too, an edge with no cycle ends the window at the
+/// cursor. The copy at -0.25 stands in for the changed hap there, and the
+/// hap that moved to -0.375 plays.
+#[test]
+fn continued_replacement_until_an_edge_with_no_cycle_ends_at_a_negative_cursor() {
+    let (_t, mut s, clk) = setup();
+    s.set_pattern(
+        fastcat(vec![atom("a"), atom("b"), atom("c"), atom("d")]),
+        clk.now(),
+    );
+    s.rebase_anchor(0.0, -3.0);
+    assert_eq!(s.tick(&clk), TickStatus::Filled);
+    clk.advance(2.5);
+    assert_eq!(s.tick(&clk), TickStatus::Filled);
+    let _ = s.drain_due(&clk);
+    assert_eq!(
+        s.scheduled_to_cycle(),
+        0.0,
+        "test premise: prefetched to 0.0"
+    );
+    clk.advance(0.1);
+    let new = fastcat(
+        ["e", "e", "e", "e", "e", "d", "e", "e"]
+            .into_iter()
+            .map(atom)
+            .collect(),
+    );
+    let _ = s.replace_pattern_continued_until(new, clk.now(), None, -0.4, f64::INFINITY, None);
+    let begins = begins_through(&mut s, &clk, 3.1);
+    assert_eq!(begins, vec![-0.375, -0.125, 0.0], "{begins:?}");
+}
+
 /// The cover of the producer below: the horizon and a 0.25 s margin.
 const COVER: f64 = HORIZON + 0.25;
 

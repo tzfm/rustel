@@ -10,15 +10,24 @@
 //! An FX install can displace several rooms. Its drain reserves return slots
 //! before it takes each install, and defers work while the return ring is full.
 
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::sample::{DecodedSample, SampleId};
 
-/// One pending install. `Copy` raw payload so ring slots stay POD.
+/// One message of the sample install ring. `Copy` raw payload so ring slots
+/// stay POD.
+// Only a device output sends these messages.
+#[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
 #[derive(Clone, Copy)]
-pub(crate) struct SampleInstall {
-    pub id: SampleId,
-    pub sample: *mut DecodedSample,
+pub(crate) enum SampleInstall {
+    /// The callback takes over the boxed `sample` for slot `id`.
+    Install {
+        id: SampleId,
+        sample: NonNull<DecodedSample>,
+    },
+    /// The callback empties slot `id` and returns the sample it held.
+    Clear { id: SampleId },
 }
 
 /// A displaced sample travelling back for the producer to free.
@@ -512,11 +521,10 @@ impl Drop for SampleChannel {
         // Whoever drops the channel owns both queues exclusively.
         self.reclaim();
         while let Some(install) = self.installs.pop() {
-            if install.sample.is_null() {
-                continue;
+            if let SampleInstall::Install { sample, .. } = install {
+                // SAFETY: never reached the consumer; unique ownership here.
+                drop(unsafe { Box::from_raw(sample.as_ptr()) });
             }
-            // SAFETY: never reached the consumer; unique ownership here.
-            drop(unsafe { Box::from_raw(install.sample) });
         }
         while let Some(install) = self.reverb_installs.pop() {
             // SAFETY: never reached the consumer; unique ownership here.
@@ -821,9 +829,12 @@ mod tests {
     #[test]
     fn channel_drop_frees_each_queued_baton() {
         let channel = SampleChannel::new();
-        for sample in [boxed_sample(), std::ptr::null_mut()] {
-            let id = SampleId(7);
-            let install = SampleInstall { id, sample };
+        let id = SampleId(7);
+        let sample = NonNull::new(boxed_sample()).expect("a boxed sample");
+        for install in [
+            SampleInstall::Install { id, sample },
+            SampleInstall::Clear { id },
+        ] {
             channel.installs.push(install).ok().expect("push");
         }
         let orbit = ReverbInstall {

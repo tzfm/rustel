@@ -547,20 +547,9 @@ pub struct Scheduler {
     /// names the same onset. The next generation clears it. A bend, which
     /// keeps the cycle at its instant, does not set it.
     retimed: bool,
-    /// The outgoing copies the device still plays inside a continued
-    /// replacement's takeover window, by begin. A copy stands in for a hap
-    /// the edit changed or moved there, so that onset does not sound twice;
-    /// see [`Self::replace_pattern_continued`]. A requery from an edge holds
-    /// the copies the device keeps at or after its cursor in the same way.
-    /// A continued replacement also holds a copy that has not played and
-    /// has its mark before the cursor; see [`HeldOnset::behind`].
-    overlap_held: std::collections::HashMap<Fraction, Vec<HeldOnset>>,
-    /// Where that window ends. From there on the device has retired the
-    /// outgoing copies and the replacement plays alone. A copy that an
-    /// earlier tempo aimed before the takeover can lie past the end. It
-    /// stands in for a hap on its own begin, or for a moved hap of the
-    /// window with the same value.
-    overlap_until: Fraction,
+    /// The takeover window of the current generation. A continued
+    /// replacement and a requery from an edge open it.
+    overlap: Option<OverlapWindow>,
     /// Reusable ordinal table for otherwise-identical haps in one query pass.
     ///
     /// Entries are cleared after every pass; only bounded bucket storage is
@@ -614,6 +603,45 @@ struct HeldOnset {
     /// played: it stood in for a hap moved earlier, or an earlier tempo
     /// aimed it. No query gets to its begin.
     behind: bool,
+}
+
+/// The takeover window of a continued replacement or of a requery from an
+/// edge. The device still plays the outgoing copies inside it.
+struct OverlapWindow {
+    /// Where the window ends. From there on the replacement plays alone. A
+    /// copy can lie past the end: an earlier tempo aimed it before the
+    /// takeover, or the takeover edge has no cycle and the window ends at
+    /// the cursor. It stands in for a hap on its own begin, or for a moved
+    /// hap of the window with the same value.
+    until: Fraction,
+    /// The outgoing copies by begin. A copy stands in for a hap the edit
+    /// changed or moved inside the window, so that onset does not sound
+    /// twice. See [`Scheduler::replace_pattern_continued`]. A requery from
+    /// an edge holds the copies the device keeps at or after its cursor in
+    /// the same way. A continued replacement also holds a copy that has not
+    /// played and has its mark before the cursor. See [`HeldOnset::behind`].
+    held: std::collections::HashMap<Fraction, Vec<HeldOnset>>,
+}
+
+impl OverlapWindow {
+    /// Spend the first copy on `begin` that `is_copy` selects. A hap has
+    /// taken it, and no later pass gives it to another hap.
+    fn spend(&mut self, begin: Fraction, is_copy: impl Fn(&HeldOnset) -> bool) {
+        if let Some(held) = self.held.get_mut(&begin)
+            && let Some(spent) = held.iter().position(is_copy)
+        {
+            held.remove(spent);
+        }
+    }
+
+    /// From the end of the window on, drop each copy behind `cursor`. It
+    /// has nothing left to stand in for. A copy ahead waits for the hap on
+    /// its own begin.
+    fn retire_behind(&mut self, cursor: Fraction) {
+        if !self.held.is_empty() && !cursor.lt(&self.until) {
+            self.held.retain(|begin, _| !begin.lt(&cursor));
+        }
+    }
 }
 
 /// How alike two rendered values are: the words they share. An object
@@ -683,8 +711,7 @@ impl Scheduler {
             emitted: std::collections::HashMap::new(),
             superseded: Vec::new(),
             retimed: false,
-            overlap_held: std::collections::HashMap::new(),
-            overlap_until: Fraction::ZERO,
+            overlap: None,
             pass_ordinals: std::collections::HashMap::new(),
             stale_limit: 1.0,
             last_fill_time: 0.0,
@@ -878,7 +905,7 @@ impl Scheduler {
     fn forget_device_copies(&mut self) {
         self.emitted.clear();
         self.superseded.clear();
-        self.overlap_held.clear();
+        self.overlap = None;
         self.retimed = false;
     }
 
@@ -985,10 +1012,13 @@ impl Scheduler {
             self.anchor_cycle = anchor_cycle;
             self.queried_to = cursor;
         }
-        self.carry_device_copies(generation, kept, self.queried_to, false);
+        let held = self.carry_device_copies(generation, kept, self.queried_to, false);
         self.superseded = dropped;
         // No hap moves in a requery: a copy stands in on its own begin.
-        self.overlap_until = self.queried_to;
+        self.overlap = Some(OverlapWindow {
+            until: self.queried_to,
+            held,
+        });
         Some(generation)
     }
 
@@ -1039,14 +1069,16 @@ impl Scheduler {
     /// is not doubled. A copy from `held_from` on can also stand in for a
     /// changed or moved hap. With `hold_behind`, a copy before `held_from`
     /// can stand in for a hap aimed at its own time: the split kept it, so
-    /// it has not played.
+    /// it has not played. Returns the copies that can stand in, by begin.
     fn carry_device_copies(
         &mut self,
         generation: Generation,
         kept: Vec<DeviceCopy>,
         held_from: Fraction,
         hold_behind: bool,
-    ) {
+    ) -> std::collections::HashMap<Fraction, Vec<HeldOnset>> {
+        let mut carried: std::collections::HashMap<Fraction, Vec<HeldOnset>> =
+            std::collections::HashMap::new();
         for (mut key, time) in kept {
             let behind = key.begin.lt(&held_from);
             let held = (!behind || hold_behind).then(|| HeldOnset {
@@ -1061,13 +1093,14 @@ impl Scheduler {
             if self.emitted.insert(key, time).is_none()
                 && let Some(held) = held
             {
-                self.overlap_held.entry(begin).or_default().push(held);
+                carried.entry(begin).or_default().push(held);
             }
         }
         // The set the keys came from has no order; the matching must.
-        for held in self.overlap_held.values_mut() {
+        for held in carried.values_mut() {
             held.sort();
         }
+        carried
     }
 
     /// Take each copy the device holds: the emitted onsets, and the ones
@@ -1245,8 +1278,8 @@ impl Scheduler {
     /// A hap the edit changed or moved in time has no old key either, but
     /// it is not an added hap: the device still plays the outgoing copy of
     /// that onset until the takeover. Emitted, a changed hap sounds together
-    /// with its copy, and a moved hap a moment before or after it. So
-    /// `overlap_held` keeps the outgoing onsets by begin. A copy that no
+    /// with its copy, and a moved hap a moment before or after it. So the
+    /// takeover window keeps the outgoing onsets by begin. A copy that no
     /// incoming hap matches exactly can stand in for one incoming hap with
     /// no old key until the takeover; see [`Self::overlap_stand_ins`]. The
     /// edit sounds from the takeover on. The haps that get no copy are the
@@ -1320,7 +1353,9 @@ impl Scheduler {
     /// at all.
     ///
     /// `end_cycle` ends the window sooner, as a shorter `takeover_cycle`
-    /// does for [`Self::replace_pattern_continued`].
+    /// does for [`Self::replace_pattern_continued`]. Without an end cycle,
+    /// an edge with no cycle ends the window at the cursor, as in a
+    /// requery: a copy stands in only for a hap on its own begin.
     pub fn replace_pattern_continued_until(
         &mut self,
         pattern: Pattern,
@@ -1361,7 +1396,8 @@ impl Scheduler {
     /// Replace the pattern from `from_cycle`, with `carried` (the outgoing
     /// onsets the device keeps) pre-marked under the new generation and the
     /// takeover window ending at `until`. `dropped` are the outgoing onsets
-    /// the device drops at the takeover.
+    /// the device drops at the takeover. With no `until` the window ends at
+    /// the cursor, as for a requery.
     fn replace_pattern_carrying(
         &mut self,
         pattern: Pattern,
@@ -1396,15 +1432,16 @@ impl Scheduler {
         self.queried_to = self.at_or_after_start(self.queried_to);
         // Re-mark under the new generation. The same onsets, by begin, are
         // what a changed or moved hap takes instead.
-        self.carry_device_copies(generation, carried, from, true);
+        let held = self.carry_device_copies(generation, carried, from, true);
         // After a retime that moved the phase, a dropped copy must not come
         // back as a mark.
         if !retimed {
             self.superseded = dropped;
         }
-        if let Some(until) = until {
-            self.overlap_until = until;
-        }
+        self.overlap = Some(OverlapWindow {
+            until: until.unwrap_or(self.queried_to),
+            held,
+        });
         generation
     }
 
@@ -1451,12 +1488,16 @@ impl Scheduler {
     ) -> std::collections::HashMap<usize, (Fraction, HeldOnset)> {
         use std::collections::HashMap;
         let mut stand_ins = HashMap::new();
-        if self.overlap_held.is_empty() {
+        let Some(window) = self
+            .overlap
+            .as_ref()
+            .filter(|window| !window.held.is_empty())
+        else {
             return stand_ins;
-        }
+        };
         // The outgoing copies no incoming hap matches exactly, and the
         // incoming haps of the window with no old key, in query order.
-        let mut unclaimed = self.overlap_held.clone();
+        let mut unclaimed = window.held.clone();
         unclaimed.retain(|begin, _| begin.lt(&query_end));
         // The last field: the hap is inside the window, so it can be a
         // moved hap.
@@ -1470,7 +1511,7 @@ impl Scheduler {
             // From the takeover on the replacement plays alone. The
             // exception is a hap on the begin of a copy the device keeps
             // past it.
-            let inside = whole.begin.lt(&self.overlap_until);
+            let inside = whole.begin.lt(&window.until);
             if !inside && !unclaimed.contains_key(&whole.begin) {
                 continue;
             }
@@ -1687,7 +1728,7 @@ impl Scheduler {
         let generation = self.transport.generation();
         self.emitted
             .retain(|key, _| key.generation != generation || key.begin.lt(&cursor));
-        self.overlap_held.clear();
+        self.overlap = None;
         self.queue.clear();
         self.refused = None;
         self.queried_to = cursor;
@@ -1993,10 +2034,8 @@ impl Scheduler {
                 // the takeover. The copy is spent and the hap counts as
                 // emitted, so a re-query of this begin decides the same
                 // again.
-                if let Some(held) = self.overlap_held.get_mut(&copy_begin)
-                    && let Some(spent) = held.iter().position(|held| *held == copy)
-                {
-                    held.remove(spent);
+                if let Some(window) = &mut self.overlap {
+                    window.spend(copy_begin, |held| *held == copy);
                 }
                 // The hap takes the mark of the copy, at the time of the
                 // copy: one mark for one copy on the device.
@@ -2015,14 +2054,12 @@ impl Scheduler {
                     // The copy with this key is this hap's. A later pass of
                     // the window must not give it to another hap.
                     let key = marked.key();
-                    if let Some(held) = self.overlap_held.get_mut(&key.begin)
-                        && let Some(own) = held.iter().position(|held| {
+                    if let Some(window) = &mut self.overlap {
+                        window.spend(key.begin, |held| {
                             held.end == key.end
                                 && held.occurrence == key.occurrence
                                 && held.value == key.value
-                        })
-                    {
-                        held.remove(own);
+                        });
                     }
                     continue;
                 }
@@ -2079,11 +2116,8 @@ impl Scheduler {
         self.queried_to = unprocessed_begin
             .map(|onset| onset.max(begin).min(end))
             .unwrap_or(end);
-        // Past the takeover a copy behind the cursor has nothing left to
-        // stand in for. A copy ahead waits for the hap on its own begin.
-        if !self.overlap_held.is_empty() && !self.queried_to.lt(&self.overlap_until) {
-            let cursor = self.queried_to;
-            self.overlap_held.retain(|begin, _| !begin.lt(&cursor));
+        if let Some(window) = &mut self.overlap {
+            window.retire_behind(self.queried_to);
         }
         // Once per fill, not once per hap: `retain` is a full scan, and a
         // dense pattern whose live window genuinely exceeds the threshold
@@ -2860,7 +2894,12 @@ mod tests {
             .requery_active_from(0.6, 0.7)
             .expect("active graph can be requeried");
         assert_eq!(scheduler.scheduled_to_cycle(), 0.4);
-        assert!(scheduler.overlap_held.is_empty());
+        assert!(
+            scheduler
+                .overlap
+                .as_ref()
+                .is_none_or(|window| window.held.is_empty())
+        );
         assert!(scheduler.superseded.is_empty());
         assert_eq!(
             requeried_begins(&mut scheduler, &clock, 0.6),
@@ -2895,14 +2934,13 @@ mod tests {
             value: Arc::from("c"),
             occurrence: 0,
         };
-        scheduler.overlap_held.clear();
-        scheduler.carry_device_copies(
+        let held = scheduler.carry_device_copies(
             9,
             vec![(copy(7), 0.5), (copy(8), 0.5)],
             Fraction::ZERO,
             false,
         );
-        assert_eq!(scheduler.overlap_held[&Fraction::new(1, 2)].len(), 1);
+        assert_eq!(held[&Fraction::new(1, 2)].len(), 1);
         assert!(scheduler.emitted.contains_key(&copy(9)));
     }
 

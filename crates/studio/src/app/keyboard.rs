@@ -129,6 +129,24 @@ fn is_stray_control_key(terminal_event: &Event) -> bool {
     false
 }
 
+/// A key press, a pointer press or a paste: the input an armed quit waits
+/// for. A stray control key is noise that the routing drops unread, so it
+/// answers nothing. A modifier key alone answers nothing either. It begins
+/// the chord that follows it, and a terminal that reports every key sends
+/// it before the second ^Q too.
+fn answers_armed_quit(terminal_event: &Event) -> bool {
+    match terminal_event {
+        Event::Key(key) => {
+            key.kind == KeyEventKind::Press
+                && !matches!(key.code, KeyCode::Modifier(_))
+                && !is_stray_control_key(terminal_event)
+        }
+        Event::Mouse(mouse) => matches!(mouse.kind, MouseEventKind::Down(_)),
+        Event::Paste(_) => true,
+        _ => false,
+    }
+}
+
 /// The same character inside a paste - a terminal that folds stray
 /// bytes into one - is dropped from it, the rest of the paste kept.
 /// `None` when nothing of it is left.
@@ -440,7 +458,15 @@ impl App {
     ) -> Result<(), RuntimeError> {
         let terminal_event = self.option_panel_spelling(terminal_event);
         let terminal_event = composed_text_event(terminal_event);
+        // An armed quit waits for the next press, click or paste. It is
+        // answered after the routing, so a surface that takes the event
+        // first cannot skip the answer.
+        let quit_status =
+            (self.quit_armed && answers_armed_quit(&terminal_event)).then(|| self.status.clone());
         let result = self.route_terminal_event(terminal_event, true);
+        if let Some(status) = quit_status {
+            self.call_off_quit(&status);
+        }
         self.refresh_editor_shortcut_hints();
         result
     }
@@ -568,7 +594,6 @@ impl App {
         // A clicked slider keeps the keys its status promises until it is
         // let go, in Vim as outside it. They go on to `armed_slider_key`.
         let slider_key = matches!(&terminal_event, Event::Key(key) if self.armed_slider_takes(key));
-        let quit_was_armed = self.quit_armed;
         if !find_global
             && !slider_key
             && allow_modal_keys
@@ -576,13 +601,6 @@ impl App {
             && let Event::Key(key) = &terminal_event
             && super::vim::dispatch(self, *key)?
         {
-            // A mapping that calls Quit just armed it; any other key is
-            // the "another key calls it off" press.
-            if quit_was_armed && self.quit_armed && key.kind == KeyEventKind::Press {
-                self.quit_armed = false;
-                self.status = "quit cancelled".into();
-                self.dirty_frame = true;
-            }
             return Ok(());
         }
         // A pointer press interrupts. A release or a drag carries on a
@@ -629,10 +647,6 @@ impl App {
         if self.quit_key(&terminal_event) {
             return Ok(());
         }
-        // Cancellation is global for the same reason: a keybind learner must
-        // not capture another chord and leave an invisible quit armed behind
-        // it. A rebound Quit chord remains a valid confirmation.
-        self.cancel_armed_quit(&terminal_event);
         #[cfg(feature = "remote-control")]
         if self.remote_panel_event(&terminal_event) {
             return Ok(());
@@ -651,6 +665,7 @@ impl App {
         if matches!(terminal_event, Event::FocusLost) {
             self.stop_precision_drag();
             self.stop_replay_drag();
+            self.end_pointer_gesture();
         }
         let Some(terminal_event) = without_stray_controls(terminal_event) else {
             return Ok(());
@@ -738,7 +753,7 @@ impl App {
         super::super::graphics::forget_sent_images();
         // The captured rail belongs to the old layout. End the gesture
         // before a resize can move it out from under the pointer.
-        if matches!(self.pointer, Some(Pointer::Slider { .. })) {
+        if self.pointer.as_ref().is_some_and(Pointer::holds_layout) {
             self.pointer = None;
         }
         // The next draw will confirm the terminal's area, but privacy
@@ -970,8 +985,10 @@ impl App {
         // keeps ^N for its draft.
         let rewind_bound = self.keybinds.binding(BindAction::RewindEvaluate);
         if rewind_bound.is_some_and(|combo| combo.matches(key)) && !alt {
-            self.next_rewind = true;
-            self.dispatch_editor(Command::Evaluate)?;
+            self.evaluate_with(LaunchRequest {
+                rewind: true,
+                ..LaunchRequest::default()
+            })?;
             return Ok(true);
         }
         if let Some(action) = self.bind_action_for(key)

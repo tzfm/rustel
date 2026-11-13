@@ -45,6 +45,9 @@ const MIN_RUNWAY_FRAMES: u64 = 256;
 const RING_FRAMES: u64 = 4096;
 /// Commands the callback may post before the worker drains them.
 const COMMAND_CAPACITY: u64 = 256;
+/// The value of a confirmation slot until the worker confirms the end of
+/// its control's stale interval.
+const UNCONFIRMED: u64 = u64::MAX;
 /// Cancellations have their own queue, sized from the existing scheduled-event
 /// and command ceilings. Repeated or unknown IDs share this bound. A full queue
 /// refuses requests without cutting notes, as reported by `refused_commands`.
@@ -72,6 +75,25 @@ enum Command {
     Cut { due: u64, mask: usize },
     /// Drops every scheduled event and restarts the orchestra at `due`.
     Reset { due: u64, mask: usize },
+}
+
+/// A cut or reset before it posts. It becomes a command only when it gets
+/// a slot for the worker's confirmation.
+#[derive(Clone, Copy)]
+enum Control {
+    Cut,
+    Reset,
+}
+
+impl Control {
+    /// The command that carries this control at frame `due`. The worker
+    /// confirms its restart in slot `mask`.
+    fn command(self, due: u64, mask: usize) -> Command {
+        match self {
+            Control::Cut => Command::Cut { due, mask },
+            Control::Reset => Command::Reset { due, mask },
+        }
+    }
 }
 
 /// What the callback and the worker share: a ring of interleaved stereo
@@ -133,7 +155,7 @@ impl Channel {
             samples: UnsafeCell::new(Box::new([0.0; RING_FRAMES as usize * 2])),
             written: AtomicU64::new(0),
             read: AtomicU64::new(0),
-            clean_from: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
+            clean_from: std::array::from_fn(|_| AtomicU64::new(UNCONFIRMED)),
             started: AtomicU64::new(0),
             lead: AtomicU64::new(0),
             wanted: AtomicU64::new(0),
@@ -253,7 +275,10 @@ pub(super) struct Insert {
     /// The frame of the last reset posted. A stopped output repeats its
     /// reset each block, and one post per frame is the whole ask.
     reset_at: Option<u64>,
-    pending_control: Option<Command>,
+    /// A cut or reset that the slot table or the queue refused, with its
+    /// due frame. Until it posts, scores are refused and later controls
+    /// merge into it.
+    pending_control: Option<(Control, u64)>,
     failed: bool,
 }
 
@@ -319,7 +344,7 @@ impl Insert {
         for (slot, due) in self.masks.iter_mut().enumerate() {
             let Some(from) = *due else { continue };
             let end = self.channel.clean_from[slot].load(Ordering::Acquire);
-            if end == u64::MAX {
+            if end == UNCONFIRMED {
                 continue;
             }
             // Only already-rendered, unread frames enter the bitmap.
@@ -336,22 +361,14 @@ impl Insert {
         }
     }
 
-    fn try_post(&mut self, command: Command) -> bool {
-        let (due, reset) = match command {
-            Command::Score { .. } => return self.channel.post(command),
-            Command::Cut { due, .. } => (due, false),
-            Command::Reset { due, .. } => (due, true),
-        };
+    /// Posts a control with a free confirmation slot. False means the slot
+    /// table or the queue is full.
+    fn try_post_control(&mut self, control: Control, due: u64) -> bool {
         let Some(mask) = self.masks.iter().position(Option::is_none) else {
             return false;
         };
-        self.channel.clean_from[mask].store(u64::MAX, Ordering::Relaxed);
-        let command = if reset {
-            Command::Reset { due, mask }
-        } else {
-            Command::Cut { due, mask }
-        };
-        if !self.channel.post(command) {
+        self.channel.clean_from[mask].store(UNCONFIRMED, Ordering::Relaxed);
+        if !self.channel.post(control.command(due, mask)) {
             return false;
         }
         self.masks[mask] = Some(due);
@@ -364,49 +381,63 @@ impl Insert {
 
     fn retry_control(&mut self) {
         self.reclaim_masks();
-        if let Some(command) = self.pending_control
-            && self.try_post(command)
+        if let Some((control, due)) = self.pending_control
+            && self.try_post_control(control, due)
         {
             self.pending_control = None;
         }
     }
 
-    fn post(&mut self, command: Command) {
+    /// Latches a stopped worker and retries a held control. False means
+    /// the insert posts nothing more.
+    fn prepare_post(&mut self) -> bool {
         if self.failed {
-            return;
+            return false;
         }
         if self.stopped() {
             self.failed = true;
-            return;
+            return false;
         }
         self.retry_control();
-        if self.pending_control.is_none() && self.try_post(command) {
+        true
+    }
+
+    fn post_score(&mut self, id: u64, due: u64) {
+        if !self.prepare_post() {
+            return;
+        }
+        if self.pending_control.is_none() && self.channel.post(Command::Score { id, due }) {
+            return;
+        }
+        // A refused score can stay silent.
+        self.counters
+            .refused_commands
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn post_control(&mut self, control: Control, due: u64) {
+        if !self.prepare_post() {
+            return;
+        }
+        if self.pending_control.is_none() && self.try_post_control(control, due) {
             return;
         }
         self.counters
             .refused_commands
             .fetch_add(1, Ordering::Relaxed);
-        // A refused score can stay silent. A cut must reach the worker
-        // before another score, or its stale-frame mask would never end.
-        let (due, reset) = match command {
-            Command::Score { .. } => return,
-            Command::Cut { due, .. } => (due, false),
-            Command::Reset { due, .. } => (due, true),
-        };
-        self.pending_control = Some(match self.pending_control {
-            Some(Command::Reset { due: held, .. }) => Command::Reset {
-                due: due.min(held),
-                mask: 0,
-            },
-            Some(Command::Cut { due: held, .. }) if !reset => Command::Cut {
-                due: due.min(held),
-                mask: 0,
-            },
-            Some(Command::Cut { due: held, .. }) => Command::Reset {
-                due: due.min(held),
-                mask: 0,
-            },
-            _ => command,
+        // A cut must reach the worker before another score, or its
+        // stale-frame mask would never end.
+        self.hold_control(control, due);
+    }
+
+    /// Holds a refused control until `retry_control` posts it. A control
+    /// refused while another waits merges into it: a reset absorbs a cut,
+    /// and the earlier due frame wins.
+    fn hold_control(&mut self, control: Control, due: u64) {
+        self.pending_control = Some(match (self.pending_control, control) {
+            (None, _) => (control, due),
+            (Some((Control::Cut, held)), Control::Cut) => (Control::Cut, due.min(held)),
+            (Some((_, held)), _) => (Control::Reset, due.min(held)),
         });
     }
 }
@@ -424,7 +455,7 @@ impl OrbitInsert for Insert {
         self.channel
             .lead
             .fetch_max(u64::from(frames), Ordering::Release);
-        self.post(Command::Score { id, due });
+        self.post_score(id, due);
     }
 
     fn cancel_score(&mut self, id: u64) {
@@ -440,7 +471,7 @@ impl OrbitInsert for Insert {
 
     fn cut_notes(&mut self, frames: u32) {
         let due = self.frame.saturating_add(u64::from(frames));
-        self.post(Command::Cut { due, mask: 0 });
+        self.post_control(Control::Cut, due);
     }
 
     fn reset(&mut self) {
@@ -449,7 +480,7 @@ impl OrbitInsert for Insert {
             return;
         }
         self.reset_at = Some(due);
-        self.post(Command::Reset { due, mask: 0 });
+        self.post_control(Control::Reset, due);
     }
 
     fn busy(&self) -> bool {
@@ -482,10 +513,7 @@ impl OrbitInsert for Insert {
             .iter()
             .flatten()
             .copied()
-            .chain(self.pending_control.map(|command| match command {
-                Command::Cut { due, .. } | Command::Reset { due, .. } => due,
-                Command::Score { .. } => unreachable!(),
-            }))
+            .chain(self.pending_control.map(|(_, due)| due))
             .min();
         // The worker fills the first runway of an orchestra late: after the
         // first read, or after the compile a note asked for. Those frames,
@@ -949,7 +977,7 @@ mod tests {
                 // native library. So a cut on the last frame the raised
                 // bound covers stands for the note.
                 let due = frame + runway - 1;
-                channel.clean_from[0].store(u64::MAX, Ordering::Relaxed);
+                channel.clean_from[0].store(UNCONFIRMED, Ordering::Relaxed);
                 assert!(channel.post(Command::Cut { due, mask: 0 }));
                 if offline {
                     channel.wanted.store(frame, Ordering::Release);
@@ -1465,5 +1493,35 @@ mod tests {
         // The mark comes before the compile, which fails with no library.
         state.step();
         assert_eq!(channel.started.load(Ordering::Acquire), 900);
+    }
+
+    #[test]
+    fn refused_controls_merge_into_one_with_the_earliest_due() {
+        // Each case refuses two controls, a cut as its frames or a reset as
+        // None, and names the one control that posts once the queue drains.
+        for (first, second, reset, due) in [
+            (Some(64), Some(32), false, 32),
+            (Some(32), Some(64), false, 32),
+            (Some(64), None, true, 0),
+            (None, Some(64), true, 0),
+        ] {
+            let channel = Arc::new(Channel::new());
+            let mut insert = reader(&channel);
+            for at in 0..COMMAND_CAPACITY {
+                assert!(channel.post(Command::Score { id: at, due: at }));
+            }
+            for control in [first, second] {
+                match control {
+                    Some(frames) => insert.cut_notes(frames),
+                    None => insert.reset(),
+                }
+            }
+            assert_eq!(insert.counters.refused_commands.load(Ordering::Relaxed), 2);
+            while channel.drain().is_some() {}
+            insert.score(999, 512);
+            take_control(&channel, due, reset);
+            assert_eq!(channel.drain(), Some(Command::Score { id: 999, due: 512 }));
+            assert_eq!(channel.drain(), None);
+        }
     }
 }

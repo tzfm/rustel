@@ -46,12 +46,58 @@ static PINNED_FOLDERS: Mutex<Option<Vec<PathBuf>>> = Mutex::new(None);
 /// [`set_preset_folders`].
 static PRESET_FOLDERS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 static WORKER: Mutex<Option<rustel_vst3::WorkerProgram>> = Mutex::new(None);
-/// The names of [`set_audio_thread_plugins`]. `None` before the first read
-/// of the switches: see [`audio_thread_plugins`].
-static AUDIO_THREAD: Mutex<Option<Vec<String>>> = Mutex::new(None);
-/// The fault of the first read of the switches, until a plugin line says
-/// it: see [`take_errors`].
-static AUDIO_THREAD_FAULT: Mutex<Option<String>> = Mutex::new(None);
+/// The switches `audio thread only`: see [`audio_thread_plugins`].
+static AUDIO_THREAD: Mutex<AudioThreadSwitches> = Mutex::new(AudioThreadSwitches::Unread);
+
+/// The plugins whose copies run on the audio thread only, as the user
+/// settings and [`set_audio_thread_plugins`] give them.
+enum AudioThreadSwitches {
+    /// The user settings have not been read yet.
+    Unread,
+    /// The names from the user settings, or from the last
+    /// [`set_audio_thread_plugins`].
+    Read(Vec<String>),
+    /// The first read of the user settings failed, so no plugin is on the
+    /// audio thread. `fault` is the plugin line that says why, until
+    /// [`take_errors`] takes it.
+    Unreadable { fault: Option<String> },
+}
+
+impl AudioThreadSwitches {
+    /// Reads the switches in the user settings. Settings the host cannot
+    /// read keep no plugin on the audio thread, and a plugin line says why.
+    /// With no config folder there is no switch, as with no file.
+    fn read() -> Self {
+        match crate::settings::plugin_audio_thread() {
+            Ok(names) => Self::Read(names),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Read(Vec::new()),
+            Err(error) => {
+                let fault = format!("audio thread only off for each plugin: {error}");
+                Self::Unreadable { fault: Some(fault) }
+            }
+        }
+    }
+
+    /// The names of the plugins on the audio thread. The first call reads
+    /// the user settings.
+    fn names(&mut self) -> &[String] {
+        if let Self::Unread = self {
+            *self = Self::read();
+        }
+        match self {
+            Self::Read(names) => names,
+            Self::Unread | Self::Unreadable { .. } => &[],
+        }
+    }
+
+    /// Takes the plugin line of a first read that failed.
+    fn take_fault(&mut self) -> Option<String> {
+        match self {
+            Self::Unreadable { fault } => fault.take(),
+            Self::Unread | Self::Read(_) => None,
+        }
+    }
+}
 
 /// The folders the host reads with no setting from the user: the folders of
 /// [`FOLDERS_ENV`] when the variable is set, and the standard VST3 folders
@@ -144,10 +190,11 @@ pub fn set_worker(program: PathBuf, args: Vec<std::ffi::OsString>) {
 
 /// Keeps the copies of the plugins in `names` on the audio thread, for a
 /// plugin that breaks on another thread. A name is the whole name of a
-/// plugin. A copy an output takes after the call follows the list.
-/// [`AUDIO_THREAD_ENV`] takes the place of this list.
+/// plugin. A copy an output takes after the call follows the list. The
+/// list takes the place of a first read of the switches that failed, and
+/// of its plugin line. [`AUDIO_THREAD_ENV`] takes the place of this list.
 fn set_audio_thread_plugins(names: Vec<String>) {
-    *AUDIO_THREAD.lock().expect("audio thread plugins") = Some(names);
+    *AUDIO_THREAD.lock().expect("audio thread plugins") = AudioThreadSwitches::Read(names);
     if let Some(host) = started() {
         host.set_audio_thread_plugins(&audio_thread_plugins(std::env::var_os(AUDIO_THREAD_ENV)));
     }
@@ -184,20 +231,8 @@ fn audio_thread_plugins(listed: Option<std::ffi::OsString>) -> Vec<String> {
             .map(str::to_owned)
             .collect(),
         None => {
-            // Settings the host cannot read keep no plugin on the audio
-            // thread. A plugin line says why: see `take_errors`. With no
-            // config folder there is no switch, as with no file.
-            let stored = || {
-                crate::settings::plugin_audio_thread().unwrap_or_else(|error| {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        let fault = format!("audio thread only off for each plugin: {error}");
-                        *AUDIO_THREAD_FAULT.lock().expect("audio thread fault") = Some(fault);
-                    }
-                    Vec::new()
-                })
-            };
-            let mut names = AUDIO_THREAD.lock().expect("audio thread plugins");
-            names.get_or_insert_with(stored).clone()
+            let mut switches = AUDIO_THREAD.lock().expect("audio thread plugins");
+            switches.names().to_vec()
         }
     }
 }
@@ -413,10 +448,12 @@ pub fn loads() -> Vec<String> {
 /// The problems of the plugin thread since the last call, after the fault
 /// of the first read of the switches: see [`audio_thread_plugins`].
 pub(crate) fn take_errors() -> Vec<String> {
-    let fault = AUDIO_THREAD_FAULT
-        .lock()
-        .expect("audio thread fault")
-        .take();
+    let fault = match AUDIO_THREAD.try_lock() {
+        // The first read of the switches holds them while it reads the user
+        // settings. Its line comes with a later call.
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        locked => locked.expect("audio thread plugins").take_fault(),
+    };
     let errors = started().map(Host::take_errors).unwrap_or_default();
     fault.into_iter().chain(errors).collect()
 }
@@ -450,14 +487,42 @@ mod tests {
     }
 
     /// The variable of the plugins on the audio thread splits its names at
-    /// `;`, and takes the place of the switches.
+    /// `;`, and takes the place of the switches. A switch set after a first
+    /// read of the switches that failed drops the plugin line of that read.
     #[test]
     fn the_audio_thread_variable_takes_the_place_of_the_switches() {
         set_audio_thread_plugins(vec!["Vital".into()]);
         assert_eq!(audio_thread_plugins(None), ["Vital"]);
         let listed = audio_thread_plugins(Some("Serum 2;OTT".into()));
         assert_eq!(listed, ["Serum 2", "OTT"]);
+        let fault = "audio thread only off for each plugin: invalid rustel.json";
+        let failed = AudioThreadSwitches::Unreadable {
+            fault: Some(fault.to_owned()),
+        };
+        *AUDIO_THREAD.lock().expect("audio thread plugins") = failed;
+        set_audio_thread_plugins(vec!["Vital".into()]);
+        assert_eq!(audio_thread_plugins(None), ["Vital"]);
+        let lines = take_errors();
+        assert!(!lines.iter().any(|line| line == fault), "{lines:?}");
         set_audio_thread_plugins(Vec::new());
         assert!(audio_thread_plugins(None).is_empty());
+    }
+
+    /// A call for the plugin lines does not wait for the first read of the
+    /// switches, which holds them while it reads the user settings.
+    #[test]
+    fn the_plugin_lines_do_not_wait_for_the_first_read_of_the_switches() {
+        let reading = AUDIO_THREAD.lock().expect("audio thread plugins");
+        let (finished, completion) = std::sync::mpsc::channel();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = finished.send(take_errors());
+            });
+            let result = completion.recv_timeout(Duration::from_secs(2));
+            // Release before the scoped join, also when the call waits.
+            drop(reading);
+            result
+        });
+        result.expect("the plugin lines came while the switches were read");
     }
 }

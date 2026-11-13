@@ -614,8 +614,8 @@ impl App {
                     .iter()
                     .find(|span| span.from < chip.span.to && chip.span.from < span.to)
                 {
-                    self.pending_slider = Some((span.id.clone(), span.clamp(value), false));
-                    self.flush_pending_slider();
+                    self.owe_slider(span.id.clone(), span.clamp(value), false);
+                    self.flush_pending_sliders();
                 }
             }
             return;
@@ -727,9 +727,9 @@ impl App {
             }
             self.sliders = kept;
             self.sliders_revision = Some(after);
-            self.pending_slider = Some((id, engine_value, smooth));
+            self.owe_slider(id, engine_value, smooth);
             self.slider_tape_due = Some(Instant::now() + TAPE_GESTURE_SETTLE);
-            self.flush_pending_slider();
+            self.flush_pending_sliders();
         }
         self.status = if self.armed_slider == Some((scene_id, chip.call.start)) {
             self.slider_hint(value, chip.span.step, chip.travel)
@@ -744,22 +744,35 @@ impl App {
         self.dirty_frame = true;
     }
 
-    pub(super) fn flush_pending_slider(&mut self) {
+    /// Owe the engine this slider's newest value. A newer move of the same
+    /// slider replaces the older one, and every other slider keeps its own.
+    fn owe_slider(&mut self, id: String, value: f64, smooth: bool) {
+        match self
+            .pending_sliders
+            .iter_mut()
+            .find(|(owed, _, _)| *owed == id)
+        {
+            Some(owed) => *owed = (id, value, smooth),
+            None => self.pending_sliders.push((id, value, smooth)),
+        }
+    }
+
+    /// Send the owed slider values in the order they were owed. A value
+    /// the full command queue refuses stays owed for the next turn.
+    pub(super) fn flush_pending_sliders(&mut self) {
         if !self.engine_connected || !self.is_playing() {
-            self.pending_slider = None;
+            self.pending_sliders.clear();
             return;
         }
-        let Some((id, value, smooth)) = self.pending_slider.take() else {
-            return;
-        };
-        let sent = if smooth {
-            self.worker.try_set_slider_smoothed(&id, value)
-        } else {
-            self.worker.try_set_slider(&id, value)
-        };
-        if !sent {
-            self.pending_slider = Some((id, value, smooth));
-        }
+        let worker = &self.worker;
+        self.pending_sliders.retain(|(id, value, smooth)| {
+            let sent = if *smooth {
+                worker.try_set_slider_smoothed(id, *value)
+            } else {
+                worker.try_set_slider(id, *value)
+            };
+            !sent
+        });
     }
 }
 
@@ -1149,7 +1162,7 @@ mod tests {
                     app.open_replay_tab(&path);
                 } else {
                     app.new_scene(true);
-                    app.next_launch = Launch::Quantised { unit_cycles: 4.0 };
+                    app.next_evaluation.launch = Launch::Quantised { unit_cycles: 4.0 };
                 }
                 let queued_scene = app.scenes.current().id;
                 assert_ne!(queued_scene, scene);
@@ -1169,9 +1182,9 @@ mod tests {
                 let queued = app.evaluation_revisions.get(&hash).expect("queued source");
                 assert_eq!(queued.scene, queued_scene);
                 assert_eq!(queued.replay_block.is_some(), replay);
-                let armed = (app.armed_scene, app.armed_request);
+                let armed = app.launch_arming.clone();
                 if !replay {
-                    assert_eq!(armed.0, Some(queued_scene));
+                    assert_eq!(armed.armed_scene(), Some(queued_scene));
                 }
 
                 // Return before the queued layout arrives, then replace and update
@@ -1188,7 +1201,7 @@ mod tests {
                 press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
                 assert!(app.status.starts_with("unchanged"), "{}", app.status);
                 assert_eq!(app.next_request_id, request);
-                assert_eq!((app.armed_scene, app.armed_request), armed);
+                assert_eq!(app.launch_arming, armed);
                 assert!(app.live_chip_at(scene, call).is_some());
                 assert_eq!(app.visual_revision, Some(app.editor().revision()));
 
@@ -1218,9 +1231,7 @@ mod tests {
                 None,
             );
             app.snapshot = Some(sounding(true, false));
-            app.armed_scene = Some(scene);
-            app.armed_request = Some(3);
-            app.armed_revision = Some(hash.clone());
+            app.launch_arming.arm(scene, 3, hash.clone(), None);
 
             press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
             app.handle_terminal_event(Event::Paste(source.into()))
@@ -1229,7 +1240,10 @@ mod tests {
             press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
             assert!(app.status.starts_with("already armed"), "{}", app.status);
             assert_eq!(app.next_request_id, request);
-            assert_eq!(app.armed_request, Some(3));
+            assert!(matches!(
+                app.launch_arming,
+                LaunchArming::Armed { request: 3, .. }
+            ));
             assert!(app.pending_evaluation.is_none() && app.inflight.is_empty());
             assert!(app.live_chip_at(scene, call).is_some());
             assert_eq!(
@@ -1495,7 +1509,7 @@ mod tests {
             );
 
             // Nothing was ever handed to an engine that has not got it.
-            assert!(app.pending_slider.is_none());
+            assert!(app.pending_sliders.is_empty());
 
             // And an edit that eats the call takes the control with it, before
             // any lint pass has a chance to say so.
@@ -1516,6 +1530,56 @@ mod tests {
             assert!(
                 app.live_chip_at(scene, from).is_none(),
                 "a control whose call is gone is gone"
+            );
+        }
+
+        /// Two faders moved while the engine takes no command each keep
+        /// their final value owed. The move of the second fader does not
+        /// take the place of the first one's.
+        #[test]
+        fn faders_moved_while_the_engine_is_busy_each_keep_their_value_owed() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let source =
+                "$: s(\"sine\").lpf(slider(2900, 0, 5000, 50)).gain(slider(0.5, 0, 1, 0.05))\n";
+            let (mut app, scene, cutoff) = slider_app_with_source(directory.path(), source);
+            let gain = source.find("slider(0.5").expect("the gain fader");
+            app.evaluation_revisions.remember(
+                source_revision(source),
+                app.editor().revision(),
+                source.into(),
+                scene,
+                None,
+            );
+            let layout = rustel_runtime::ui_events::visual_layout(source, 1).expect("layout");
+            app.handle_control(StudioControlEvent::Layout(layout));
+            app.snapshot = Some(sounding(true, false));
+            let id_after = |app: &App, call: usize| {
+                app.sliders
+                    .iter()
+                    .filter(|span| span.from > call)
+                    .min_by_key(|span| span.from)
+                    .map(|span| span.id.clone())
+                    .expect("an engine-bound fader")
+            };
+            let (cutoff_id, gain_id) = (id_after(&app, cutoff), id_after(&app, gain));
+            // The engine takes no command from here on.
+            app.worker.shutdown();
+
+            let chip = app.live_chip_at(scene, cutoff).expect("the cutoff fader");
+            app.set_slider(scene, &chip, 3000.0);
+            let chip = app.live_chip_at(scene, gain).expect("the gain fader");
+            app.set_slider(scene, &chip, 0.75);
+            assert!(
+                app.pending_sliders
+                    .iter()
+                    .any(|(id, value, _)| *id == cutoff_id && *value == 3000.0),
+                "the cutoff's final value is owed"
+            );
+            assert!(
+                app.pending_sliders
+                    .iter()
+                    .any(|(id, value, _)| *id == gain_id && *value == 0.75),
+                "the gain's final value is owed"
             );
         }
 

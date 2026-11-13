@@ -228,11 +228,12 @@ use completion::{Landing, ReferenceAnchor};
 use controllers::StickRun;
 use device_picker::{ACTIVITY_LIGHT_MILLIS, INPUT_LIGHT_PEAK};
 use editing::edits_document;
-use evaluation::{PendingEvaluation, ReplayBlock, RevisionCache, virtual_rows_for};
+use evaluation::{LaunchRequest, PendingEvaluation, ReplayBlock, RevisionCache, virtual_rows_for};
 use evaluation_flash::{EvaluationFeedback, EvaluationFlash, outcome_success};
 use event_loop::MAX_EVENTS_PER_TURN;
 use focus::{Focus, RotationStop, advance_focus_rotation_flash};
 use keyboard::transport_key;
+use link::LinkFollow;
 use list_keys::{PickerKey, page_selection, picker_key};
 use mixer::{
     FADER_KEY_STEP_DB, MixerState, MixerTarget, VOLUME_KEY_STEP_DB, VOLUME_SCROLL_STEP_DB,
@@ -268,7 +269,7 @@ use sessions::TAPE_GESTURE_SETTLE;
 use sets::{SetPrompt, SetSwitch};
 use slider::{LiveChip, LiveSliderSet, SliderSpan, SliderTrack, slider_stepped};
 use theme_sheets::THEME_APPLY_SETTLE;
-use transport::{AppErrors, ErrorOwner};
+use transport::{AppErrors, ErrorOwner, LaunchArming};
 
 const DEFAULT_SCORE: &str = r#"// Type normally. Use the Play menu to update or stop.
 $: s("[bd <hh oh>]*2").bank("tr909").dec(.4)._pianoroll()
@@ -1218,30 +1219,15 @@ struct App {
     midi_enabled: Option<super::devices::MidiEnablement>,
     /// What the engine was last told, so it is told again only on a change.
     applied_midi_enabled: Option<super::devices::MidiEnablement>,
-    /// How the next evaluate takes effect: a launch sets it, an edit is
-    /// always now.
-    next_launch: Launch,
-    /// The next thing played starts from its own cycle zero: ^⇧S, or the
-    /// setting that says every score moved to does. Consumed by the
-    /// evaluation it belongs to, the way `next_launch` is.
-    next_rewind: bool,
+    /// The launch options of the next queued evaluation: a pad's cycle
+    /// line, or the rewind of ^⇧S. They last for the gesture that set them.
+    next_evaluation: LaunchRequest,
     /// The revision pinned in the audible editor's edit trail, so it can be
     /// unpinned when the next evaluation replaces it.
     visual_pin: Option<(SceneId, Revision)>,
-    /// The scene whose launch is waiting for its cycle line.
-    armed_scene: Option<SceneId>,
-    /// The request that armed it: only ITS outcome ends the arming. The
-    /// worker answers a superseded launch with a cancel for the OLD request
-    /// after the new one is already armed here, and that answer must not
-    /// wipe the new arming.
-    armed_request: Option<u64>,
-    /// The text that is armed, so pressing update again on it is a no-op
-    /// rather than a re-arm that can slip the launch to the next line.
-    armed_revision: Option<String>,
-    /// The armed scene's name, kept past the fire: the reload runs a
-    /// head-room early, but the line is still ahead and the countdown
-    /// keeps its name until then.
-    landing_name: Option<String>,
+    /// The launch that waits for its cycle line, and the name its
+    /// countdown shows until the line.
+    launch_arming: LaunchArming,
     settings_sheet: Option<SettingsSheet>,
     settings_navigation: SettingsNavigation,
     /// A source a take registered for itself: when it settles it still
@@ -1315,16 +1301,14 @@ struct App {
     /// only that message without erasing unrelated status written since.
     lint_status: Option<(SceneId, Revision, String)>,
     pending_evaluation: Option<PendingEvaluation>,
-    /// The newest slider move the engine has not accepted yet.
-    pending_slider: Option<(String, f64, bool)>,
+    /// The newest move of each slider the engine has not taken yet, in the
+    /// order the sliders were first owed.
+    pending_sliders: Vec<(String, f64, bool)>,
     next_request_id: u64,
     snapshot: Option<StudioSnapshot>,
-    /// Whether the Link session was asked for. Kept nowhere: each run
-    /// starts out of the session.
-    link_enabled: bool,
-    /// What the Link session's transport last said, once a stand was
-    /// taken on it. `None` when no session is joined.
-    link_seen_playing: Option<bool>,
+    /// Whether the Link session is joined, and what its transport last
+    /// said. Kept nowhere: each run starts out of the session.
+    link: LinkFollow,
     audio_advisory: audio_advisory::AudioAdvisory,
     power_advisory: power_advisory::PowerAdvisory,
     /// The output the last play went through, or the one picked in the
@@ -1569,11 +1553,6 @@ struct App {
     generator_feedback_since: Option<Instant>,
     #[cfg(feature = "hydra")]
     generator_last_preview: Option<Instant>,
-    /// Whether anything has been heard from the preview yet: a mark of its
-    /// own coming back. Until then it is still on its way, and the shelf
-    /// says so rather than looking broken.
-    #[cfg(feature = "hydra")]
-    snippet_heard: bool,
     /// When the engine's current loading cue first arrived.
     loading_since: Option<Instant>,
     /// Whether the header's loading line, and its words, were due at the
@@ -1871,13 +1850,9 @@ impl App {
             settings_sheet: None,
             settings_navigation: SettingsNavigation::default(),
             quiet_settled_source: None,
-            next_launch: Launch::Now,
-            next_rewind: false,
+            next_evaluation: LaunchRequest::default(),
             visual_pin: None,
-            armed_scene: None,
-            armed_request: None,
-            armed_revision: None,
-            landing_name: None,
+            launch_arming: LaunchArming::Idle,
             readiness: HashMap::new(),
             readiness_polled_at: now,
             readiness_due: None,
@@ -1905,11 +1880,10 @@ impl App {
             evaluation_alerts: HashMap::new(),
             lint_status: None,
             pending_evaluation: None,
-            pending_slider: None,
+            pending_sliders: Vec::new(),
             next_request_id: 1,
             snapshot: None,
-            link_enabled: false,
-            link_seen_playing: None,
+            link: LinkFollow::Off,
             audio_advisory: audio_advisory::AudioAdvisory::default(),
             power_advisory: power_advisory::PowerAdvisory::default(),
             resting_output: None,
@@ -2017,8 +1991,6 @@ impl App {
             generator_feedback_since: None,
             #[cfg(feature = "hydra")]
             generator_last_preview: None,
-            #[cfg(feature = "hydra")]
-            snippet_heard: false,
             loading_since: None,
             loading_due: (false, false),
             #[cfg(feature = "hydra")]

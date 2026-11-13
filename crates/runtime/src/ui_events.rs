@@ -1686,11 +1686,12 @@ pub struct UiEventSink {
     sender: Option<SyncSender<UiEventWrite>>,
     latest_audio: Arc<Mutex<Option<UiAudioWrite>>>,
     writer_alive: Arc<AtomicBool>,
-    writer_done: Arc<AtomicBool>,
     counters: Arc<UiEventSinkCounters>,
     worker: Option<JoinHandle<()>>,
 }
 
+/// Clears the alive flag when the writer thread body ends, on a return or
+/// on a panic. A bounded teardown can join the thread after the flag clears.
 struct WriterAliveGuard(Arc<AtomicBool>);
 
 impl Drop for WriterAliveGuard {
@@ -1757,8 +1758,6 @@ impl UiEventSink {
         let worker_audio = Arc::clone(&latest_audio);
         let writer_alive = Arc::new(AtomicBool::new(true));
         let worker_alive = Arc::clone(&writer_alive);
-        let writer_done = Arc::new(AtomicBool::new(false));
-        let worker_done = Arc::clone(&writer_done);
         let counters = Arc::new(UiEventSinkCounters::default());
         let worker_counters = Arc::clone(&counters);
         let worker = thread::Builder::new()
@@ -1766,16 +1765,11 @@ impl UiEventSink {
             .spawn(move || {
                 let _alive = WriterAliveGuard(worker_alive);
                 run(receiver, worker_audio, worker_counters, capacity);
-                // Signalled after the run closure returns on every exit path
-                // (queue drained, write error, or detached consumer), so a
-                // bounded teardown can join without risking a blocked join.
-                worker_done.store(true, Ordering::Release);
             })?;
         Ok(Self {
             sender: Some(sender),
             latest_audio,
             writer_alive,
-            writer_done,
             counters,
             worker: Some(worker),
         })
@@ -1946,12 +1940,13 @@ impl UiEventSink {
     ///
     /// Teardown for live sessions: queued records get a fair chance to reach
     /// the consumer before process exit, but a writer stuck on a full or dead
-    /// pipe never blocks shutdown. Returns whether the writer finished within
-    /// `grace`; a still-running writer is left detached to end on its own.
+    /// pipe never blocks shutdown. Returns true when the writer ends within
+    /// `grace` without a panic. A writer that still runs at the deadline is
+    /// left detached to end on its own.
     pub fn finish_timeout(mut self, grace: std::time::Duration) -> bool {
         drop(self.sender.take());
         let deadline = std::time::Instant::now() + grace;
-        while !self.writer_done.load(Ordering::Acquire) {
+        while self.writer_alive.load(Ordering::Acquire) {
             if std::time::Instant::now() >= deadline {
                 // Detach: dropping the handle lets the thread finish in the
                 // background; the process must not wait behind a blocked pipe.
@@ -2239,6 +2234,22 @@ mod tests {
         fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
             let _ = self.0.send(());
             Err(io::Error::new(io::ErrorKind::BrokenPipe, "test failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PanickingWriter;
+
+    impl Write for PanickingWriter {
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "this test double must panic when called"
+        )]
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            panic!("test writer panic");
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -3521,6 +3532,69 @@ unknown(slider(440, 20, 20000));"#;
         }
         assert_eq!(sink.stats().write_errors, 1);
         sink.finish().expect("writer thread");
+    }
+
+    #[test]
+    fn bounded_teardown_reports_a_panicked_writer_without_waiting_out_its_grace() {
+        let sink = UiEventSink::with_writer(1, PanickingWriter).expect("spawn panicking writer");
+        assert_eq!(sink.try_send(envelope()), UiEventSendStatus::Queued);
+
+        let grace = Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        assert!(
+            !sink.finish_timeout(grace),
+            "a panicked writer counted as finished"
+        );
+        assert!(
+            started.elapsed() < grace,
+            "teardown waited out its grace for a writer that had already ended"
+        );
+    }
+
+    #[test]
+    fn bounded_teardown_detaches_a_blocked_writer_at_the_end_of_its_grace() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        let writer = GatedWriter {
+            entered: entered_tx,
+            released: Arc::clone(&released),
+            finished: finished_tx,
+        };
+        let sink = UiEventSink::with_writer(1, writer).expect("spawn gated writer");
+        assert_eq!(sink.try_send(envelope()), UiEventSendStatus::Queued);
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer did not enter its blocking write");
+
+        let (answer_tx, answer_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = answer_tx.send(sink.finish_timeout(Duration::from_millis(50)));
+        });
+        let answer = answer_rx.recv_timeout(Duration::from_secs(1));
+
+        let (release_lock, wake) = &*released;
+        *release_lock.lock().expect("release lock") = true;
+        wake.notify_all();
+        assert_eq!(answer, Ok(false), "teardown joined a blocked writer");
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached writer did not drain and exit after release");
+    }
+
+    #[test]
+    fn bounded_teardown_drains_the_queue_and_reports_a_clean_writer_end() {
+        let writer = SharedWriter::default();
+        let captured = Arc::clone(&writer.0);
+        let sink = UiEventSink::with_writer(1, writer).expect("spawn writer");
+        assert_eq!(sink.try_send(envelope()), UiEventSendStatus::Queued);
+
+        assert!(
+            sink.finish_timeout(Duration::from_secs(5)),
+            "a clean writer end counted as a failure"
+        );
+        let bytes = captured.lock().expect("captured output").clone();
+        assert_eq!(bytes.iter().filter(|&&byte| byte == b'\n').count(), 1);
     }
 
     #[test]

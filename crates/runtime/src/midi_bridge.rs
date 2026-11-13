@@ -415,8 +415,9 @@ struct MidiOpenManager {
     requests: Arc<(Mutex<MidiOpenQueue>, Condvar)>,
     results: Arc<Mutex<VecDeque<MidiOpenResult>>>,
     dropped_results: Arc<AtomicU64>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    startup_error: Option<String>,
+    /// The opener worker, or the message that every request gets when the
+    /// worker thread fails to start.
+    worker: Result<std::thread::JoinHandle<()>, String>,
 }
 
 fn bound_midi_error(mut message: String) -> (String, bool) {
@@ -533,30 +534,23 @@ impl MidiOpenManager {
                     }
                 })
         };
-        let (thread, startup_error) = match spawned {
-            Ok(thread) => (Some(thread), None),
-            Err(error) => {
-                let (message, _) = bound_midi_error(format!(
-                    "cannot start the MIDI output opener worker: {error}"
-                ));
-                (None, Some(message))
-            }
-        };
+        let worker = spawned.map_err(|error| {
+            let (message, _) = bound_midi_error(format!(
+                "cannot start the MIDI output opener worker: {error}"
+            ));
+            message
+        });
         Self {
             requests,
             results,
             dropped_results,
-            thread,
-            startup_error,
+            worker,
         }
     }
 
     fn enqueue(&self, request: MidiOpenRequest) -> Result<(), String> {
-        if self.thread.is_none() {
-            return Err(self
-                .startup_error
-                .clone()
-                .unwrap_or_else(|| "the MIDI output opener is unavailable".into()));
+        if let Err(message) = &self.worker {
+            return Err(message.clone());
         }
         let (lock, ready) = &*self.requests;
         let mut queue = lock.lock().unwrap_or_else(|error| error.into_inner());
@@ -617,7 +611,7 @@ impl Drop for MidiOpenManager {
         drop(queue);
         ready.notify_all();
         // Detach: the opener may be inside a platform call with no deadline.
-        let _ = self.thread.take();
+        // The handle in `worker` drops with the manager and is never joined.
     }
 }
 

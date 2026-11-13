@@ -84,6 +84,24 @@ impl App {
         }
     }
 
+    /// Tell the engine the clock ports, when what it last took is out of
+    /// date. A port counts as told only once its send went through, so a
+    /// send the full queue refuses is asked again on the next turn.
+    pub(super) fn push_clock_ports(&mut self) {
+        if self.applied_clock.0 != self.ui_settings.clock_out
+            && self
+                .worker
+                .try_clock_out(self.ui_settings.clock_out.clone())
+        {
+            self.applied_clock.0 = self.ui_settings.clock_out.clone();
+        }
+        if self.applied_clock.1 != self.ui_settings.clock_in
+            && self.worker.try_clock_in(self.ui_settings.clock_in.clone())
+        {
+            self.applied_clock.1 = self.ui_settings.clock_in.clone();
+        }
+    }
+
     /// The ports of one family, as the last probe saw them. The dock
     /// refreshes on its own cadence, so this is whatever is plugged in
     /// now rather than whatever was there at launch.
@@ -265,7 +283,7 @@ impl App {
                 panel.first = geometry.first;
                 panel.hold_scroll = true;
                 self.panel = Some(panel);
-                self.set_link(!self.link_enabled);
+                self.set_link(!self.link.is_joined());
             }
         } else if let Some(index) = geometry.entry_at(x, y)
             && index < self.devices.inventory().entries(panel.kind).len()
@@ -484,7 +502,7 @@ impl App {
         if panel.kind == DeviceKind::Link
             && (code == KeyCode::Char(' ') || (code == KeyCode::Enter && !primary))
         {
-            self.set_link(!self.link_enabled);
+            self.set_link(!self.link.is_joined());
             self.panel = Some(panel);
             self.dirty_frame = true;
             return Ok(true);
@@ -890,6 +908,59 @@ mod tests {
             assert_eq!(app.prefs.midi_out_enabled, Some(Vec::new()));
             assert_eq!(app.ui_settings.clock_out, None, "the clock is released");
             assert!(app.status.contains("clock"), "{}", app.status);
+        }
+
+        /// A clock port the engine did not take is still owed. The studio
+        /// records a port as told only when the send went through, so the
+        /// next turn asks again.
+        #[test]
+        fn a_clock_port_the_engine_did_not_take_is_still_owed() {
+            use crate::devices::{DeviceEntry, DeviceInventory, MidiEnablement};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            // The engine still runs the clock through Synth, and the settings
+            // say none. The turn alone tells it. A clock out of none opens no
+            // port.
+            app.applied_clock.0 = Some("Synth".into());
+            app.ui_settings.clock_out = None;
+            for _ in 0..400 {
+                app.pump_turn();
+                if app.applied_clock.0.is_none() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(app.applied_clock.0, None, "no turn told the engine");
+
+            let inventory = DeviceInventory {
+                midi_outputs: vec![DeviceEntry {
+                    name: "Synth".to_owned(),
+                    id: String::new(),
+                    detail: String::new(),
+                    is_default: false,
+                }],
+                ..DeviceInventory::default()
+            };
+            app.devices.install_for_tests(inventory.clone());
+            app.midi_enabled = Some(MidiEnablement::from_prefs(
+                Some(&["Synth".to_owned()]),
+                Some(&[]),
+                &inventory,
+            ));
+            app.panel = Some(crate::devices::DevicePanel {
+                kind: DeviceKind::Midi,
+                selected: 2,
+                ..crate::devices::DevicePanel::default()
+            });
+            // The engine takes no command from here on.
+            app.worker.shutdown();
+
+            app.handle_panel_key(KeyCode::Right, false)
+                .expect("handled");
+            assert_eq!(app.ui_settings.clock_out.as_deref(), Some("Synth"));
+            app.pump_turn();
+            assert_eq!(app.applied_clock.0, None, "the engine was never told");
         }
 
         #[test]

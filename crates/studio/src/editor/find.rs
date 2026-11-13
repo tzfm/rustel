@@ -36,22 +36,38 @@ impl FindDirection {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct FindState {
-    open: bool,
-    pattern: String,
-    direction: FindDirection,
-    last_pattern: Option<String>,
-    /// The direction the last search ran in. `n` follows it, whatever a
-    /// prompt closed since then asked for.
-    last_direction: FindDirection,
-    count: usize,
-    keep_open: bool,
-    /// Where the find bar opened. As-you-type searches start here so the
-    /// caret does not walk forward with every keystroke.
-    anchor: usize,
+    /// The prompt, while it is open.
+    prompt: Option<FindPrompt>,
+    /// The pattern Enter last searched for, and its direction. `n`
+    /// follows that direction, whatever a prompt closed since then asked
+    /// for.
+    last_search: Option<(String, FindDirection)>,
     /// The caret the last match left, and that match. A search from that
     /// caret walks on past the whole match.
     last_match: Option<(usize, Range<usize>)>,
+}
+
+/// The one-line find prompt.
+#[derive(Clone, Debug)]
+struct FindPrompt {
+    kind: PromptKind,
+    pattern: String,
+    direction: FindDirection,
+    /// Where the prompt opened. As-you-type searches start here so the
+    /// caret does not walk forward with every keystroke.
+    anchor: usize,
+    /// Why the last search from the prompt found nothing or could not run.
     message: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PromptKind {
+    /// The find bar outside Vim. It searches as the pattern changes, and
+    /// Enter searches again and keeps it open.
+    Bar,
+    /// Vim's `/` or `?`. Enter searches `count` matches on and closes it,
+    /// unless the pattern is bad.
+    VimSearch { count: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,66 +79,71 @@ enum FindError {
 impl Editor {
     /// Open the one-line find prompt. `keep_open` is the find bar outside
     /// Vim: Enter searches again and the prompt stays. Vim's `/` closes on
-    /// Enter and repeats with `n`/`N`.
+    /// Enter and repeats with `n`/`N`. Its Enter goes `count` matches on.
+    /// The find bar has no count.
     pub(crate) fn begin_find(&mut self, direction: FindDirection, keep_open: bool, count: usize) {
-        self.find.open = true;
-        self.find.direction = direction;
-        self.find.count = count;
-        self.find.keep_open = keep_open;
-        self.find.message = None;
         // Vim's `n` walks on from the last match whatever prompt opens and
         // closes in between. The find bar starts every search afresh.
         if keep_open {
             self.find.last_match = None;
         }
-        self.find.pattern.clear();
-        self.find.anchor = self.primary_selection().head.0;
+        self.find.prompt = Some(FindPrompt {
+            kind: if keep_open {
+                PromptKind::Bar
+            } else {
+                PromptKind::VimSearch { count }
+            },
+            pattern: String::new(),
+            direction,
+            anchor: self.primary_selection().head.0,
+            message: None,
+        });
     }
 
     pub(crate) fn find_open(&self) -> bool {
-        self.find.open
+        self.find.prompt.is_some()
     }
 
-    /// Where the find bar opened, after `edits`.
-    pub(super) fn find_anchor_through(&self, edits: &[super::Edit]) -> usize {
-        super::map_offset(ByteOffset(self.find.anchor), edits, true).0
+    /// Where the open prompt opened, after `edits`.
+    pub(super) fn find_anchor_through(&self, edits: &[super::Edit]) -> Option<usize> {
+        let prompt = self.find.prompt.as_ref()?;
+        Some(super::map_offset(ByteOffset(prompt.anchor), edits, true).0)
     }
 
-    pub(super) fn find_set_anchor(&mut self, anchor: usize) {
-        self.find.anchor = anchor;
+    pub(super) fn find_set_anchor(&mut self, anchor: Option<usize>) {
+        if let (Some(prompt), Some(anchor)) = (self.find.prompt.as_mut(), anchor) {
+            prompt.anchor = anchor;
+        }
     }
 
     pub(crate) fn find_cancel(&mut self) {
-        self.find.open = false;
-        self.find.count = 0;
-        self.find.message = None;
+        self.find.prompt = None;
     }
 
     /// The prompt as the footer draws it, with the reason when the last
     /// Enter could not search.
     pub(crate) fn find_label(&self) -> Option<String> {
-        if !self.find.open {
-            return None;
-        }
-        let marker = self.find.direction.marker();
-        Some(match self.find.message {
-            Some(message) => format!("{marker}{} \u{b7} {message}", self.find.pattern),
-            None => format!("{marker}{}", self.find.pattern),
+        let prompt = self.find.prompt.as_ref()?;
+        let marker = prompt.direction.marker();
+        Some(match prompt.message {
+            Some(message) => format!("{marker}{} \u{b7} {message}", prompt.pattern),
+            None => format!("{marker}{}", prompt.pattern),
         })
     }
 
     /// The non-Vim footer label. Vim reports the prompt through
     /// `vim_label`, beside the mode, and keeps its `/` or `?`.
     pub(crate) fn find_footer_label(&self) -> Option<String> {
-        if self.uses_modal_keys() || !self.find.open {
+        if self.uses_modal_keys() {
             return None;
         }
-        let mut label = if self.find.pattern.is_empty() {
+        let prompt = self.find.prompt.as_ref()?;
+        let mut label = if prompt.pattern.is_empty() {
             "FIND".to_owned()
         } else {
-            format!("FIND {}", self.find.pattern)
+            format!("FIND {}", prompt.pattern)
         };
-        if let Some(message) = self.find.message {
+        if let Some(message) = prompt.message {
             label.push_str(&format!(" \u{b7} {message}"));
         }
         Some(label)
@@ -130,7 +151,7 @@ impl Editor {
 
     /// A key while the prompt is open. Every key belongs to the prompt.
     pub(crate) fn find_key(&mut self, key: KeyEvent) -> bool {
-        if !self.find.open {
+        if !self.find_open() {
             return false;
         }
         if key.kind == KeyEventKind::Release {
@@ -161,14 +182,14 @@ impl Editor {
     }
 
     pub(crate) fn find_paste(&mut self, text: &str) {
-        if !self.find.open {
+        let Some(prompt) = self.find.prompt.as_mut() else {
             return;
-        }
+        };
         for character in text.chars().filter(|character| !character.is_control()) {
-            if self.find.pattern.len() + character.len_utf8() > MAX_PATTERN_BYTES {
+            if prompt.pattern.len() + character.len_utf8() > MAX_PATTERN_BYTES {
                 break;
             }
-            self.find.pattern.push(character);
+            prompt.pattern.push(character);
         }
         self.find_preview();
     }
@@ -176,110 +197,143 @@ impl Editor {
     /// `n` and `N`: repeat the last search. `reverse` asks for the other
     /// direction without changing the direction `/` or `?` set.
     pub(crate) fn repeat_find(&mut self, reverse: bool, count: usize) {
-        let Some(pattern) = self.find.last_pattern.clone() else {
+        let Some((pattern, direction)) = self.find.last_search.clone() else {
             self.vim_say("No previous search");
             return;
         };
         let direction = if reverse {
-            self.find.last_direction.opposite()
+            direction.opposite()
         } else {
-            self.find.last_direction
+            direction
         };
         match self.find_apply(&pattern, direction, count.max(1)) {
-            Ok(()) => self.find.message = None,
+            Ok(()) => {}
             Err(FindError::NoMatch) => self.vim_say("Pattern not found"),
             Err(FindError::BadPattern) => self.vim_say("Bad pattern"),
         }
     }
 
     fn find_append(&mut self, character: char) {
-        if self.find.pattern.len() + character.len_utf8() > MAX_PATTERN_BYTES {
+        let Some(prompt) = self.find.prompt.as_mut() else {
+            return;
+        };
+        if prompt.pattern.len() + character.len_utf8() > MAX_PATTERN_BYTES {
             return;
         }
-        self.find.pattern.push(character);
+        prompt.pattern.push(character);
         self.find_preview();
     }
 
     /// The find bar searches as the pattern changes. The first match at or
     /// after where the bar opened is selected, and Enter walks on from it.
     fn find_preview(&mut self) {
-        if !self.find.keep_open {
+        let Some(FindPrompt {
+            kind: PromptKind::Bar,
+            pattern,
+            anchor,
+            ..
+        }) = &self.find.prompt
+        else {
             return;
-        }
-        if self.find.pattern.is_empty() {
+        };
+        let (pattern, anchor) = (pattern.clone(), *anchor);
+        let message = if pattern.is_empty() {
             // No query, no match. Put the caret back where the bar opened
             // instead of leaving the last match selected.
-            self.find.message = None;
-            let anchor = self.find.anchor;
             let _ = self.set_selection(Selection::caret(ByteOffset(anchor)));
             self.find.last_match = None;
-            return;
-        }
-        let pattern = self.find.pattern.clone();
-        let anchor = self.find.anchor;
-        match self.find_apply_from(&pattern, FindDirection::Forward, 1, anchor, false) {
-            Ok(()) => self.find.message = None,
-            Err(FindError::BadPattern) => self.find.message = Some(BAD_PATTERN),
-            Err(FindError::NoMatch) => self.find.message = Some(NO_MATCH),
+            None
+        } else {
+            match self.find_apply_from(&pattern, FindDirection::Forward, 1, anchor, false) {
+                Ok(()) => None,
+                Err(FindError::BadPattern) => Some(BAD_PATTERN),
+                Err(FindError::NoMatch) => Some(NO_MATCH),
+            }
+        };
+        if let Some(prompt) = self.find.prompt.as_mut() {
+            prompt.message = message;
         }
     }
 
     fn find_backspace(&mut self) {
-        self.find.pattern.pop();
-        self.find.message = None;
+        let Some(prompt) = self.find.prompt.as_mut() else {
+            return;
+        };
+        prompt.pattern.pop();
+        prompt.message = None;
         // Vim's command line closes when its pattern empties. The find bar
         // stays open until Esc or a click elsewhere.
-        if self.find.pattern.is_empty() && !self.find.keep_open {
+        if prompt.pattern.is_empty() && matches!(prompt.kind, PromptKind::VimSearch { .. }) {
             self.find_cancel();
         } else {
             self.find_preview();
         }
     }
 
+    /// Enter. The find bar stays open. Vim's prompt closes, except on a
+    /// bad pattern, where it stays open and keeps its count.
     fn find_commit(&mut self) {
-        let pattern = if self.find.pattern.is_empty() {
+        let Some(mut prompt) = self.find.prompt.take() else {
+            return;
+        };
+        let pattern = if prompt.pattern.is_empty() {
             // Only Vim's empty `/` repeats the last search. The find bar
             // does not drag an earlier Vim pattern into a fresh search.
             if self.uses_modal_keys() {
-                self.find.last_pattern.clone().unwrap_or_default()
+                self.find
+                    .last_search
+                    .as_ref()
+                    .map(|(pattern, _)| pattern.clone())
+                    .unwrap_or_default()
             } else {
                 String::new()
             }
         } else {
-            self.find.pattern.clone()
+            prompt.pattern.clone()
         };
         if pattern.is_empty() {
-            // The find bar waits for a pattern; Vim's command line closes.
-            if !self.find.keep_open {
-                self.find_cancel();
+            // The find bar waits for a pattern. Vim's command line closes.
+            if matches!(prompt.kind, PromptKind::Bar) {
+                self.find.prompt = Some(prompt);
             }
             return;
         }
-        let direction = self.find.direction;
-        let count = self.find.count.max(1);
+        let count = match prompt.kind {
+            PromptKind::Bar => 1,
+            PromptKind::VimSearch { count } => count.max(1),
+        };
         // A new Vim pattern searches from the caret, not on from a match of
         // the old one.
-        if !self.find.keep_open && self.find.last_pattern.as_deref() != Some(pattern.as_str()) {
+        if matches!(prompt.kind, PromptKind::VimSearch { .. })
+            && self
+                .find
+                .last_search
+                .as_ref()
+                .is_none_or(|(last, _)| *last != pattern)
+        {
             self.find.last_match = None;
         }
-        self.find.pattern = pattern.clone();
-        self.find.last_pattern = Some(pattern.clone());
-        self.find.last_direction = direction;
-        self.find.count = 0;
-        match self.find_apply(&pattern, direction, count) {
-            Ok(()) => {
-                self.find.message = None;
-                if !self.find.keep_open {
-                    self.find.open = false;
-                }
+        prompt.pattern = pattern.clone();
+        self.find.last_search = Some((pattern.clone(), prompt.direction));
+        match (
+            self.find_apply(&pattern, prompt.direction, count),
+            prompt.kind,
+        ) {
+            (Ok(()), PromptKind::Bar) => {
+                prompt.message = None;
+                self.find.prompt = Some(prompt);
             }
-            Err(FindError::BadPattern) => self.find.message = Some(BAD_PATTERN),
-            Err(FindError::NoMatch) => {
-                self.find.message = Some(NO_MATCH);
-                if !self.find.keep_open {
-                    self.find.open = false;
-                    self.vim_say("Pattern not found");
-                }
+            (Err(FindError::BadPattern), _) => {
+                prompt.message = Some(BAD_PATTERN);
+                self.find.prompt = Some(prompt);
+            }
+            (Err(FindError::NoMatch), PromptKind::Bar) => {
+                prompt.message = Some(NO_MATCH);
+                self.find.prompt = Some(prompt);
+            }
+            (Ok(()), PromptKind::VimSearch { .. }) => {}
+            (Err(FindError::NoMatch), PromptKind::VimSearch { .. }) => {
+                self.vim_say("Pattern not found");
             }
         }
     }
@@ -623,6 +677,38 @@ mod tests {
                 editor.primary_selection().head,
                 ByteOffset(8),
                 "n still searches forward"
+            );
+        }
+
+        /// The count before `/` waits through a bad pattern, so the
+        /// corrected search lands on the match it asked for, not on the
+        /// first.
+        #[test]
+        fn a_count_survives_a_bad_pattern() {
+            use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+            let mut editor = editor("x a a a a");
+            editor.set_keybindings(crate::editor::EditorKeybindings::Vim);
+            let press = |editor: &mut Editor, code| {
+                editor
+                    .vim_key(
+                        KeyEvent::new(code, KeyModifiers::NONE),
+                        crate::editor::HistoryMoment(0),
+                        None,
+                    )
+                    .expect("key");
+            };
+            for character in ['3', '/', 'a', '('] {
+                press(&mut editor, KeyCode::Char(character));
+            }
+            press(&mut editor, KeyCode::Enter);
+            assert!(editor.find_open(), "a bad pattern keeps the prompt open");
+            press(&mut editor, KeyCode::Backspace);
+            press(&mut editor, KeyCode::Enter);
+            assert!(!editor.find_open());
+            assert_eq!(
+                editor.primary_selection().head,
+                ByteOffset(6),
+                "the third a"
             );
         }
     }

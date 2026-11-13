@@ -28,7 +28,7 @@ later version.
 pub mod input;
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -568,29 +568,84 @@ impl MidiPort for CapturePort {
 
 struct Queue {
     heap: BinaryHeap<Reverse<Queued>>,
-    /// Batches whose first message has crossed the queue/port boundary.
-    /// Cutover must retain their queued tail (especially note-offs), because
-    /// the in-flight message can no longer be cancelled safely.
-    started_batches: HashSet<u64>,
-    /// Messages still in the heap for each tagged score batch.
-    remaining_by_batch: HashMap<u64, usize>,
+    /// The score batches that have messages in the heap, by id. A batch
+    /// leaves the map with its last message.
+    batches: HashMap<u64, Batch>,
     /// Earliest per-batch hard expiry, for an O(1) no-work producer poll.
     next_expiry_frame: Option<u64>,
     stopping: bool,
 }
 
 impl Queue {
-    /// Remove the queued tail of a batch whose note-on is known not to have
-    /// reached the device. This is deliberately narrower than a generic send
-    /// failure: a port error is ambiguous, so its fail-safe note-off remains.
-    fn purge_unsounded_batch(&mut self, batch_id: u64) -> usize {
-        let before = self.heap.len();
-        self.heap
-            .retain(|queued| queued.0.batch_id != Some(batch_id));
-        self.remaining_by_batch.remove(&batch_id);
-        self.started_batches.remove(&batch_id);
-        before - self.heap.len()
+    /// Update the batch of `taken`, a message that the worker has popped.
+    /// `late` is true when the worker drops the message instead of sending it.
+    ///
+    /// Only a sound-starting message that the worker sends starts its batch.
+    /// `plan` puts mapped controller changes before a note-on, and a CC that
+    /// blocks in the port must not commit a note that a cutover can still
+    /// remove. A score batch has at most one sound-starting message, so a
+    /// late one removes the batch: the note-off of a note that does not sound
+    /// has nothing to stop. A port error does not remove the batch. The
+    /// note-on can have reached the device, and its note-off is the fail-safe.
+    fn settle_taken(&mut self, taken: &Queued, late: bool) {
+        let Some(batch_id) = taken.batch else {
+            return;
+        };
+        let starts_sound = taken.message.starts_sound();
+        if late && starts_sound {
+            self.heap.retain(|queued| queued.0.batch != Some(batch_id));
+            self.batches.remove(&batch_id);
+            return;
+        }
+        let Some(batch) = self.batches.get_mut(&batch_id) else {
+            return;
+        };
+        if starts_sound {
+            batch.phase = BatchPhase::Started;
+        }
+        batch.remaining = batch.remaining.saturating_sub(1);
+        if batch.remaining == 0 {
+            self.batches.remove(&batch_id);
+        }
     }
+}
+
+/// One score onset in the queue: the facts that all its messages share.
+///
+/// A cutover keeps or removes all messages of a batch together. This
+/// includes a note-off that is due after the takeover. Thus a cutover does
+/// not keep the note-off of a removed onset, which can cut a replacement
+/// note. It does not remove the note-off of an onset that sounds.
+struct Batch {
+    generation: u64,
+    onset_frame: u64,
+    /// How many messages of the batch are still in the heap.
+    remaining: usize,
+    phase: BatchPhase,
+}
+
+impl Batch {
+    /// The audio frame from which a queued batch is stale. A started batch
+    /// has none.
+    fn expires_at_frame(&self) -> Option<u64> {
+        match self.phase {
+            BatchPhase::Queued { expires_at_frame } => expires_at_frame,
+            BatchPhase::Started => None,
+        }
+    }
+}
+
+/// How far the worker has taken a batch.
+enum BatchPhase {
+    /// The worker has taken no sound-starting message of the batch to send.
+    /// A cutover can still remove all its queued messages. From
+    /// `expires_at_frame` on, the batch is stale even when its onset is
+    /// before that frame.
+    Queued { expires_at_frame: Option<u64> },
+    /// The worker has taken a sound-starting message to send. A cutover
+    /// cannot cancel that message, so the batch keeps its queued tail and
+    /// does not expire.
+    Started,
 }
 
 #[derive(PartialEq, Eq)]
@@ -599,20 +654,9 @@ struct Queued {
     /// Ties broken by arrival so a note-on never sorts after the note-off
     /// queued alongside it at the same instant.
     seq: u64,
-    /// Score generation and onset frame are attached to the WHOLE batch.
-    /// Every message produced by one onset carries the same pair, including a
-    /// note-off due after a live-code takeover. This lets a cutover discard a
-    /// future old onset atomically without either keeping its later note-off
-    /// to cut a replacement note or dropping the off for an onset that already
-    /// sounded. Host-originated messages leave `generation` empty.
-    generation: Option<u64>,
-    onset_frame: u64,
-    /// Hard audio-frame boundary after which an untouched pre-takeover batch
-    /// is stale even if its original onset was before that takeover.
-    expires_at_frame: Option<u64>,
-    /// Unique within this sender. Present only for score-owned batches that a
-    /// generation cutover may prune.
-    batch_id: Option<u64>,
+    /// The id of the score batch in `Queue::batches` that this message is
+    /// part of. A host message has no batch, and a cutover does not remove it.
+    batch: Option<u64>,
     message: MidiMessage,
 }
 
@@ -842,8 +886,7 @@ impl MidiSender {
         let queue = Arc::new((
             Mutex::new(Queue {
                 heap: BinaryHeap::new(),
-                started_batches: HashSet::new(),
-                remaining_by_batch: HashMap::new(),
+                batches: HashMap::new(),
                 next_expiry_frame: None,
                 stopping: false,
             }),
@@ -922,40 +965,20 @@ impl MidiSender {
                         let Some(Reverse(due)) = guard.heap.pop() else {
                             continue;
                         };
-                        let batch_id = due.batch_id;
-                        if let Some(batch_id) = batch_id {
-                            // Only crossing the sound-start boundary commits
-                            // the batch. `plan` deliberately places mapped
-                            // controller changes before a note-on; a blocked
-                            // CC must not pin that still-cancellable note and
-                            // let it escape after a generation cutover.
-                            // Conversely, publishing commitment while holding
-                            // the queue lock before a note-on send means a
-                            // simultaneous cutover can never split that onset
-                            // from its fail-safe note-off.
-                            if due.message.starts_sound() {
-                                guard.started_batches.insert(batch_id);
-                            }
-                            let last_queued = guard
-                                .remaining_by_batch
-                                .get_mut(&batch_id)
-                                .is_some_and(|remaining| {
-                                    *remaining = remaining.saturating_sub(1);
-                                    *remaining == 0
-                                });
-                            if last_queued {
-                                guard.remaining_by_batch.remove(&batch_id);
-                            }
+                        let late = now.duration_since(due.due) > MAX_QUEUE_LATENESS
+                            && !due.message.ends_sound();
+                        // The batch changes under the queue lock and before
+                        // the send, so a cutover cannot split a note-on from
+                        // its fail-safe note-off.
+                        guard.settle_taken(&due, late);
+                        if late {
+                            dropped_late.fetch_add(1, Ordering::Relaxed);
+                            continue;
                         }
                         // Send with the lock released: a slow or wedged port
                         // must not block the scheduler pushing new messages.
                         drop(guard);
-                        let is_late_drop = now.duration_since(due.due) > MAX_QUEUE_LATENESS
-                            && !due.message.ends_sound();
-                        let purge_unsounded_batch = is_late_drop && due.message.starts_sound();
-                        if is_late_drop {
-                            dropped_late.fetch_add(1, Ordering::Relaxed);
-                        } else if owned_port
+                        if owned_port
                             .send_scheduled(due.due, due.message.as_slice())
                             .is_err()
                         {
@@ -964,13 +987,6 @@ impl MidiSender {
                             sent.fetch_add(1, Ordering::Relaxed);
                         }
                         guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(batch_id) = batch_id {
-                            if purge_unsounded_batch {
-                                guard.purge_unsounded_batch(batch_id);
-                            } else if !guard.remaining_by_batch.contains_key(&batch_id) {
-                                guard.started_batches.remove(&batch_id);
-                            }
-                        }
                     }
                 })
                 .map_err(|error| format!("cannot start MIDI sender worker: {error}"))?
@@ -998,8 +1014,7 @@ impl MidiSender {
             queue: Arc::new((
                 Mutex::new(Queue {
                     heap: BinaryHeap::new(),
-                    started_batches: HashSet::new(),
-                    remaining_by_batch: HashMap::new(),
+                    batches: HashMap::new(),
                     next_expiry_frame: None,
                     stopping: true,
                 }),
@@ -1051,7 +1066,7 @@ impl MidiSender {
     /// does not fit. A capacity refusal counts every refused message in
     /// [`MidiReport::refused_full`].
     pub fn send_batch_at(&self, messages: &[(Instant, MidiMessage)]) -> bool {
-        self.send_batch_tagged(None, 0, None, messages)
+        self.send_batch_tagged(None, messages)
     }
 
     /// Queue one score onset with the generation/frame used by audio cutover.
@@ -1081,16 +1096,18 @@ impl MidiSender {
         expires_at_frame: Option<u64>,
         messages: &[(Instant, MidiMessage)],
     ) -> bool {
-        self.send_batch_tagged(Some(generation), onset_frame, expires_at_frame, messages)
+        let batch = Batch {
+            generation,
+            onset_frame,
+            remaining: messages.len(),
+            phase: BatchPhase::Queued { expires_at_frame },
+        };
+        self.send_batch_tagged(Some(batch), messages)
     }
 
-    fn send_batch_tagged(
-        &self,
-        generation: Option<u64>,
-        onset_frame: u64,
-        expires_at_frame: Option<u64>,
-        messages: &[(Instant, MidiMessage)],
-    ) -> bool {
+    /// Queue `messages` in one admission decision. `batch` is the score
+    /// onset that the messages make up. Host messages have no batch.
+    fn send_batch_tagged(&self, batch: Option<Batch>, messages: &[(Instant, MidiMessage)]) -> bool {
         if messages.is_empty() {
             return false;
         }
@@ -1105,25 +1122,23 @@ impl MidiSender {
                 .fetch_add(messages.len() as u64, Ordering::Relaxed);
             return false;
         }
-        let batch_id = generation.map(|_| self.batch_seq.fetch_add(1, Ordering::Relaxed));
-        if let Some(batch_id) = batch_id {
-            guard.remaining_by_batch.insert(batch_id, messages.len());
-        }
-        if let Some(deadline) = expires_at_frame {
-            guard.next_expiry_frame = Some(
-                guard
-                    .next_expiry_frame
-                    .map_or(deadline, |known| known.min(deadline)),
-            );
-        }
+        let batch_id = batch.map(|batch| {
+            let batch_id = self.batch_seq.fetch_add(1, Ordering::Relaxed);
+            if let Some(deadline) = batch.expires_at_frame() {
+                guard.next_expiry_frame = Some(
+                    guard
+                        .next_expiry_frame
+                        .map_or(deadline, |known| known.min(deadline)),
+                );
+            }
+            guard.batches.insert(batch_id, batch);
+            batch_id
+        });
         for &(due, message) in messages {
             guard.heap.push(Reverse(Queued {
                 due,
                 seq: self.seq.fetch_add(1, Ordering::Relaxed),
-                generation,
-                onset_frame,
-                expires_at_frame,
-                batch_id,
+                batch: batch_id,
                 message,
             }));
         }
@@ -1137,10 +1152,10 @@ impl MidiSender {
     /// This shares the admission mutex, so a producer cannot interleave a
     /// partial batch with the cutover. The predicate is batch metadata rather
     /// than message due-time: every untouched note-on/off pair is removed
-    /// together. Once the worker has popped a sound-starting message, the batch
-    /// is committed and its queued tail is retained; the in-flight note can no
-    /// longer be cancelled, and pruning its note-off could strand it.
-    /// Untagged host messages are never score-cutover state.
+    /// together. Once the worker has taken a sound-starting message to send,
+    /// the batch is committed and its queued tail is retained. The in-flight
+    /// note can no longer be cancelled, and pruning its note-off could strand
+    /// it. Untagged host messages are never score-cutover state.
     pub fn prune_generation_from(&self, generation: u64, takeover_frame: u64) -> usize {
         self.prune_generation_reporting_started(generation, takeover_frame)
             .0
@@ -1164,61 +1179,59 @@ impl MidiSender {
         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let Queue {
             heap,
-            started_batches,
-            remaining_by_batch,
+            batches,
             next_expiry_frame,
             ..
         } = &mut *guard;
-        let before = heap.len();
-        let mut removed_by_batch = HashMap::<u64, usize>::new();
-        let mut queued_messages = std::mem::take(heap).into_vec();
         let mut marked_expiry = false;
-        let mut started_notes = Vec::new();
-        queued_messages.retain_mut(|item| {
-            let queued = &mut item.0;
-            let started = queued
-                .batch_id
-                .is_some_and(|batch_id| started_batches.contains(&batch_id));
-            let superseded =
-                queued.generation == Some(generation) && queued.onset_frame >= takeover_frame;
-            let remove = superseded && !started;
-            if superseded && started && queued.message.is_note_off() {
-                started_notes.push(StartedNote {
-                    onset_frame: queued.onset_frame,
-                    note_off: queued.message,
-                });
+        batches.retain(|_, batch| {
+            if batch.generation != generation {
+                return true;
             }
-            if remove && let Some(batch_id) = queued.batch_id {
-                *removed_by_batch.entry(batch_id).or_default() += 1;
+            let from_takeover = batch.onset_frame >= takeover_frame;
+            match &mut batch.phase {
+                BatchPhase::Started => true,
+                BatchPhase::Queued { .. } if from_takeover => false,
+                BatchPhase::Queued { expires_at_frame } => {
+                    marked_expiry = true;
+                    *expires_at_frame = Some(
+                        (*expires_at_frame)
+                            .map_or(takeover_frame, |deadline| deadline.min(takeover_frame)),
+                    );
+                    true
+                }
             }
-            if !remove && !started && queued.generation == Some(generation) {
-                marked_expiry = true;
-                queued.expires_at_frame = Some(
-                    queued
-                        .expires_at_frame
-                        .map_or(takeover_frame, |deadline| deadline.min(takeover_frame)),
-                );
-            }
-            !remove
         });
-        *heap = BinaryHeap::from(queued_messages);
         if marked_expiry {
             *next_expiry_frame = Some(
                 (*next_expiry_frame).map_or(takeover_frame, |known| known.min(takeover_frame)),
             );
         }
-        for (batch_id, count) in removed_by_batch {
-            let empty = remaining_by_batch
-                .get_mut(&batch_id)
-                .is_some_and(|remaining| {
-                    *remaining = remaining.saturating_sub(count);
-                    *remaining == 0
+        let before = heap.len();
+        let mut queued_messages = std::mem::take(heap).into_vec();
+        let mut started_notes = Vec::new();
+        queued_messages.retain(|item| {
+            let queued = &item.0;
+            let Some(batch_id) = queued.batch else {
+                return true;
+            };
+            // The messages of a batch removed above go with it.
+            let Some(batch) = batches.get(&batch_id) else {
+                return false;
+            };
+            if matches!(batch.phase, BatchPhase::Started)
+                && batch.generation == generation
+                && batch.onset_frame >= takeover_frame
+                && queued.message.is_note_off()
+            {
+                started_notes.push(StartedNote {
+                    onset_frame: batch.onset_frame,
+                    note_off: queued.message,
                 });
-            if empty {
-                remaining_by_batch.remove(&batch_id);
-                started_batches.remove(&batch_id);
             }
-        }
+            true
+        });
+        *heap = BinaryHeap::from(queued_messages);
         let removed = before - heap.len();
         drop(guard);
         if removed != 0 {
@@ -1231,10 +1244,10 @@ impl MidiSender {
 
     /// Discard untouched pre-takeover batches at their exact hard boundary.
     ///
-    /// Each queued message carries the deadline assigned when its generation
+    /// Each queued batch carries the deadline assigned when its generation
     /// was replaced, so rapid A→B→C transitions prune A at A's boundary rather
     /// than extending it to C's later retirement deadline. Sound-started
-    /// batches retain their fail-safe tail; untagged host work is unaffected.
+    /// batches keep their fail-safe tail. Untagged host work is unaffected.
     pub fn prune_expired_at(&self, current_frame: u64) -> usize {
         let (lock, condvar) = &*self.queue;
         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1246,44 +1259,23 @@ impl MidiSender {
         }
         let Queue {
             heap,
-            started_batches,
-            remaining_by_batch,
+            batches,
             next_expiry_frame,
             ..
         } = &mut *guard;
         let before = heap.len();
-        let mut removed_by_batch = HashMap::<u64, usize>::new();
-        heap.retain(|queued| {
-            let queued = &queued.0;
-            let started = queued
-                .batch_id
-                .is_some_and(|batch_id| started_batches.contains(&batch_id));
-            let remove = queued
-                .expires_at_frame
-                .is_some_and(|deadline| deadline <= current_frame)
-                && !started;
-            if remove && let Some(batch_id) = queued.batch_id {
-                *removed_by_batch.entry(batch_id).or_default() += 1;
-            }
-            !remove
+        batches.retain(|_, batch| {
+            batch
+                .expires_at_frame()
+                .is_none_or(|deadline| deadline > current_frame)
         });
-        for (batch_id, count) in removed_by_batch {
-            let empty = remaining_by_batch
-                .get_mut(&batch_id)
-                .is_some_and(|remaining| {
-                    *remaining = remaining.saturating_sub(count);
-                    *remaining == 0
-                });
-            if empty {
-                remaining_by_batch.remove(&batch_id);
-                started_batches.remove(&batch_id);
-            }
-        }
-        *next_expiry_frame = heap
-            .iter()
-            .filter_map(|queued| queued.0.expires_at_frame)
-            .filter(|deadline| *deadline > current_frame)
-            .min();
+        heap.retain(|queued| {
+            queued
+                .0
+                .batch
+                .is_none_or(|batch_id| batches.contains_key(&batch_id))
+        });
+        *next_expiry_frame = batches.values().filter_map(Batch::expires_at_frame).min();
         let removed = before - heap.len();
         drop(guard);
         if removed != 0 {
@@ -1324,8 +1316,7 @@ impl MidiSender {
     /// caller owns the queue lock.
     fn replace_queue_with_silence(&self, guard: &mut Queue, now: Instant) {
         guard.heap.clear();
-        guard.started_batches.clear();
-        guard.remaining_by_batch.clear();
+        guard.batches.clear();
         guard.next_expiry_frame = None;
         for channel in 1..=16u8 {
             // CC 123 all-notes-off, then CC 120 all-sound-off for devices that
@@ -1334,10 +1325,7 @@ impl MidiSender {
                 guard.heap.push(Reverse(Queued {
                     due: now,
                     seq: self.seq.fetch_add(1, Ordering::Relaxed),
-                    generation: None,
-                    onset_frame: 0,
-                    expires_at_frame: None,
-                    batch_id: None,
+                    batch: None,
                     message: MidiMessage::control_change(channel, controller, 0),
                 }));
             }
@@ -1576,28 +1564,19 @@ mod tests {
         heap.push(Reverse(Queued {
             due: now + Duration::from_millis(10),
             seq: 2,
-            generation: None,
-            onset_frame: 0,
-            expires_at_frame: None,
-            batch_id: None,
+            batch: None,
             message: MidiMessage::note_off(1, 60),
         }));
         heap.push(Reverse(Queued {
             due: now,
             seq: 1,
-            generation: None,
-            onset_frame: 0,
-            expires_at_frame: None,
-            batch_id: None,
+            batch: None,
             message: MidiMessage::note_on(1, 62, 100),
         }));
         heap.push(Reverse(Queued {
             due: now,
             seq: 0,
-            generation: None,
-            onset_frame: 0,
-            expires_at_frame: None,
-            batch_id: None,
+            batch: None,
             message: MidiMessage::note_on(1, 60, 100),
         }));
         let order: Vec<u64> = std::iter::from_fn(|| heap.pop().map(|Reverse(q)| q.seq)).collect();
@@ -1780,10 +1759,17 @@ mod tests {
         let retained = guard
             .heap
             .iter()
-            .map(|queued| (queued.0.onset_frame, queued.0.message))
+            .map(|queued| {
+                let onset_frame = queued
+                    .0
+                    .batch
+                    .and_then(|batch_id| guard.batches.get(&batch_id))
+                    .map(|batch| batch.onset_frame);
+                (onset_frame, queued.0.message)
+            })
             .collect::<Vec<_>>();
         assert_eq!(retained.len(), 2);
-        assert!(retained.iter().all(|(frame, _)| *frame == 99));
+        assert!(retained.iter().all(|(frame, _)| *frame == Some(99)));
         assert!(
             retained
                 .iter()
@@ -1852,9 +1838,7 @@ mod tests {
             let (lock, _) = &*sender.queue;
             let clean = {
                 let guard = lock.lock().unwrap_or_else(|error| error.into_inner());
-                guard.heap.is_empty()
-                    && guard.remaining_by_batch.is_empty()
-                    && guard.started_batches.is_empty()
+                guard.heap.is_empty() && guard.batches.is_empty()
             };
             if clean {
                 break;
