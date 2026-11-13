@@ -146,6 +146,12 @@ fn tagged<'js>(
     tag: String,
 ) -> rquickjs::Result<rquickjs::Value<'js>> {
     let (pattern, sidecar) = reify_bridged(ctx, pattern)?;
+    Ok(derive_wrapper(ctx.clone(), lane_tagged(&pattern, tag), &[sidecar])?.into_value())
+}
+
+/// A lane's pattern with its plugin notes tagged with the lane: what a
+/// playing lane contributes to the score.
+pub(crate) fn lane_tagged(pattern: &rustel_core::Pattern, tag: String) -> rustel_core::Pattern {
     // One map object per lane name: the tag is the only thing the map
     // reads, so the same lane built by a later evaluation is the same
     // payload and its answers carry across evaluations.
@@ -163,8 +169,7 @@ fn tagged<'js>(
                 });
             map
         });
-    let pattern = pattern.fmap_keeping_live_with(map);
-    Ok(derive_wrapper(ctx.clone(), pattern, &[sidecar])?.into_value())
+    pattern.fmap_keeping_live_with(map)
 }
 
 /// The body of one lane tag map: a plugin note gets the lane name, every
@@ -401,12 +406,13 @@ pub(super) fn install<'js>(
     proto
         .prop(
             "p",
-            Property::from(collect)
+            Property::from(collect.clone())
                 .writable()
                 .enumerable()
                 .configurable(),
         )
         .map_err(|error| error.to_string())?;
+    record_lane_method(ctx, collect.into_value()).map_err(|error| error.to_string())?;
 
     let quiet = Function::new(ctx.clone(), quiet).map_err(|error| error.to_string())?;
     configure_function(&quiet, "", 0, true).map_err(|error| error.to_string())?;

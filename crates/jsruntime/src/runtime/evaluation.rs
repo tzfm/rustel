@@ -1310,6 +1310,7 @@ impl JsRuntime {
             }
         }
         self.clear_staged_score();
+        self.evaluated_natively.set(false);
         let _staged_score_guard = StagedScoreGuard(self);
         let millis = budget.as_millis().min(u128::from(u64::MAX)) as u64;
         let evaluation = candidate_settings.with(|| {
@@ -1322,7 +1323,9 @@ impl JsRuntime {
                     self.begin_voicing_candidate()
                         .map_err(QueryError::Message)?;
                     let _published_owner = self.core_settings.bind();
-                    self.execute_score(&output.output, &output.line_map, true)
+                    self.execute_native(&output.output).unwrap_or_else(|| {
+                        self.execute_score(&output.output, &output.line_map, true)
+                    })
                 });
                 if self.cancelled.get() {
                     Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled))

@@ -1613,6 +1613,25 @@ impl Session {
         self.plugin_lead_changed();
     }
 
+    /// Let scores the native tier proves skip JavaScript, or send every
+    /// score to JavaScript, for tests and same-machine A/B.
+    #[doc(hidden)]
+    pub fn set_native_tier(&self, enabled: bool) {
+        self.js.set_native_tier(enabled);
+    }
+
+    /// Whether the last evaluated score ran on the native tier.
+    #[doc(hidden)]
+    pub fn evaluated_natively(&self) -> bool {
+        self.js.evaluated_natively()
+    }
+
+    /// The active graph, for tests that compare two builds of a score.
+    #[doc(hidden)]
+    pub fn active_pattern_for_test(&self) -> Option<rustel_core::Pattern> {
+        self.js.active_pattern()
+    }
+
     /// The generation of the score of the last look of
     /// [`Self::plugins_pending`] at the plugin copies. `None` before the
     /// first look.

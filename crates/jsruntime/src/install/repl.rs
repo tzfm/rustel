@@ -9,6 +9,7 @@ mod tempo;
 mod timeline;
 mod visuals;
 
+pub(crate) use lanes::lane_tagged;
 pub(super) use visuals::install_clear_scope;
 
 pub(super) fn install<'js>(

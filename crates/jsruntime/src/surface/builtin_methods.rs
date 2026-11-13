@@ -15,7 +15,7 @@ use rustel_core::register::Registration;
 use rustel_core::value::FunctionRef;
 
 /// The global the transpiler calls for every mini-notation literal.
-const MINI_CALLEE: &str = "m";
+pub(crate) const MINI_CALLEE: &str = "m";
 
 /// The intrinsics that every built-in method reads when it shapes its
 /// arguments, as the holder each one lives on and its name there.
@@ -41,6 +41,36 @@ pub(crate) enum BuiltinMethod {
 impl BuiltinMethod {
     fn is_accessor(&self) -> bool {
         matches!(self, Self::Composer(_))
+    }
+
+    /// What `receiver.name(...arguments)` builds, as the method builds it.
+    /// `None` where the JavaScript method throws for these arguments.
+    pub(crate) fn apply(&self, receiver: &Pattern, arguments: Vec<Pattern>) -> Option<Pattern> {
+        Some(match self {
+            Self::Registered(registration) => {
+                let arguments = registered_method_arguments(registration, arguments)?;
+                registration.call(&arguments, receiver.clone())
+            }
+            Self::Control(spec) => apply_control_method(
+                spec,
+                receiver,
+                control_arguments(spec, arguments, |_| false),
+            ),
+            Self::Shortcut { op, how } => {
+                let other = (!arguments.is_empty()).then(|| sequence_patterns(arguments))?;
+                rustel_core::compose::compose(receiver, &other, *op, *how)
+            }
+            // The accessor reads the default alignment when it is called.
+            Self::Composer(op) => {
+                let other = (!arguments.is_empty()).then(|| sequence_patterns(arguments))?;
+                rustel_core::compose::compose(
+                    receiver,
+                    &other,
+                    *op,
+                    rustel_core::compose::default_alignment(),
+                )
+            }
+        })
     }
 
     /// The native transformer that builds what `receiver.name(...arguments)`
@@ -109,9 +139,31 @@ impl BuiltinMethod {
 }
 
 /// The built-in methods recorded by installation.
+/// A global function that a score can call without JavaScript.
+#[derive(Clone)]
+pub(crate) enum BuiltinGlobal {
+    /// A free control such as `s`, applied to one value. The control
+    /// registry holds its spec under the same name.
+    Control,
+    /// A list constructor such as `stack` or `cat`.
+    List(ListKind),
+    /// A tempo setter, in cycles per second or per minute.
+    Tempo { per_minute: bool },
+}
+
+/// What a list constructor builds of its patterns.
+#[derive(Clone, Copy)]
+pub(crate) enum ListKind {
+    Stack,
+    SlowCat,
+    FastCat,
+}
+
+/// The built-in methods and globals recorded by installation.
 #[derive(Default)]
 pub(crate) struct BuiltinMethods {
     methods: BTreeMap<Box<str>, BuiltinMethod>,
+    globals: BTreeMap<&'static str, BuiltinGlobal>,
     sealed: bool,
 }
 
@@ -177,6 +229,78 @@ pub(crate) fn record_builtin_alias<'js>(
         return Ok(());
     }
     record_builtin_method(ctx, alias, slot, method)
+}
+
+/// The private record of recorded global slots, by name.
+fn global_slots<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<rquickjs::Object<'js>> {
+    let stack = host_stack(ctx)?;
+    let existing: rquickjs::Value = stack.as_object().get(BUILTIN_GLOBAL_SLOTS)?;
+    if let Some(slots) = existing.into_object() {
+        return Ok(slots);
+    }
+    let slots = rquickjs::Object::new(ctx.clone())?;
+    slots.set_prototype(None)?;
+    stack.as_object().set(BUILTIN_GLOBAL_SLOTS, slots.clone())?;
+    Ok(slots)
+}
+
+/// Record that installation put `slot` on the globals as `name`. A later
+/// record of the same name replaces this one, as the later installation
+/// replaces the slot.
+pub(crate) fn record_builtin_global<'js>(
+    ctx: &Ctx<'js>,
+    name: &'static str,
+    slot: rquickjs::Value<'js>,
+    global: BuiltinGlobal,
+) -> rquickjs::Result<()> {
+    global_slots(ctx)?.set(name, slot)?;
+    host_builtin_methods(ctx)?
+        .borrow_mut()
+        .globals
+        .insert(name, global);
+    Ok(())
+}
+
+/// The global `name`, while it is still the slot installation recorded for
+/// it: an own data property of the globals.
+pub(crate) fn prove_builtin_global(ctx: &Ctx<'_>, name: &str) -> Option<BuiltinGlobal> {
+    let methods = host_builtin_methods(ctx).ok()?;
+    let methods = methods.borrow();
+    if !methods.sealed {
+        return None;
+    }
+    let global = methods.globals.get(name)?;
+    let slot: rquickjs::Value = global_slots(ctx).ok()?.get(name).ok()?;
+    (!slot.is_undefined() && holds(ctx, &ctx.globals(), name, false, &slot).ok()?)
+        .then(|| global.clone())
+}
+
+/// Record the lane method `p` that installation put on the prototype.
+pub(crate) fn record_lane_method<'js>(
+    ctx: &Ctx<'js>,
+    slot: rquickjs::Value<'js>,
+) -> rquickjs::Result<()> {
+    host_stack(ctx)?.as_object().set(BUILTIN_LANE_METHOD, slot)
+}
+
+/// Whether the prototype's `p` is still the sealed lane method.
+pub(crate) fn prove_lane_method(ctx: &Ctx<'_>) -> bool {
+    let sealed = host_builtin_methods(ctx).is_ok_and(|methods| methods.borrow().sealed);
+    let Some(slot) = host_stack(ctx).ok().and_then(|stack| {
+        stack
+            .as_object()
+            .get::<_, rquickjs::Value>(BUILTIN_LANE_METHOD)
+            .ok()
+    }) else {
+        return false;
+    };
+    let Some(proto) = rquickjs::Class::<NativePatternWrapper>::prototype(ctx)
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    sealed && !slot.is_undefined() && holds(ctx, &proto, "p", false, &slot).unwrap_or(false)
 }
 
 /// Record the global `m` that installation defined.

@@ -291,7 +291,9 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
             }),
         )
         .map_err(|e| e.to_string())?;
-        globals.set(name, free).map_err(|e| e.to_string())?;
+        globals.set(name, free.clone()).map_err(|e| e.to_string())?;
+        record_builtin_global(&ctx, name, free.into_value(), BuiltinGlobal::Control)
+            .map_err(|error| error.to_string())?;
     }
 
     // -- combinators declared in the controls module (installed LAST) --
