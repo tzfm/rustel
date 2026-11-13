@@ -1703,7 +1703,14 @@ fn compile(ast: &Ast) -> Built {
         Ast::Seq { items, .. } => build_seq(items),
         Ast::Replicated { pat, amount, .. } => {
             let amount = native_weight(*amount);
-            Built::Graph(build_validated(pat).repeat_cycles(amount).fast(amount))
+            let built = match compile(pat) {
+                Built::Rhythm(rhythm) if rhythms([]).is_some() => match rhythm.replicated(amount) {
+                    Ok(rhythm) => return Built::Rhythm(rhythm),
+                    Err(rhythm) => Built::Rhythm(rhythm),
+                },
+                built => built,
+            };
+            Built::Graph(built.into_pattern().repeat_cycles(amount).fast(amount))
         }
         Ast::Alt { lanes, .. } => {
             // `<a b, c d>` - each comma-separated sequence gets its own slow
@@ -3464,6 +3471,23 @@ mod tests {
         "[a b](2,8)",
         "a(8,8)",
         "a(1,1)",
+        "a!3 b",
+        "a!2",
+        "a!1 b",
+        "<a b!3>",
+        "[a b]!2 c",
+        "<a b>!2 c",
+        "<a b c>!3",
+        "[a, b]!3 c",
+        "a/2!2 b",
+        "[a!2 b]!2",
+        "a!3(3,8)",
+        "a!2*3 b",
+        // Layers that are not in the order of time when they repeat, and a
+        // count that is not whole or not above zero, keep their nodes.
+        "[a b, c]!2 d",
+        "a!0 b",
+        "a!-2 b",
         // A structure that cuts a value, or holds no whole count of pulses
         // in one cycle, keeps its nodes.
         "[a b c](3,8)",

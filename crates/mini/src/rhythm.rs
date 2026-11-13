@@ -202,6 +202,37 @@ impl Rhythm {
         }
     }
 
+    /// `repeatCycles(count).fast(count)`, for a whole count above zero: each
+    /// cycle of this rhythm, `count` times in the cycle. On `Err`, the
+    /// rhythm as it was.
+    pub(crate) fn replicated(self, count: Fraction) -> Result<Self, Self> {
+        let layers = (|| {
+            if count.denom() != 1 || count < Fraction::ONE {
+                return None;
+            }
+            let turns = self.turns()?;
+            let mut steps = Vec::new();
+            for turn in 0..turns {
+                let mut at = Fraction::ZERO;
+                while at < count {
+                    let next = at.checked_add(Fraction::ONE)?;
+                    let window = (at.checked_div(count)?, next.checked_div(count)?);
+                    self.squeeze_cycle(turn, window, turns, &mut steps)?;
+                    at = next;
+                }
+            }
+            layer(turns, steps)
+        })();
+        match layers {
+            Some(layers) => Ok(Self {
+                layers,
+                steps: self.steps,
+                atom: false,
+            }),
+            None => Err(self),
+        }
+    }
+
     /// Every hap also at `locations`, after its own.
     pub(crate) fn located(mut self, locations: &[(usize, usize)]) -> Self {
         for step in self.layers.iter_mut().flat_map(|layer| &mut layer.steps) {
