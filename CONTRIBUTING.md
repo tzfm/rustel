@@ -319,6 +319,28 @@ Sample downloads use per-platform hosted caches. The loader rechecks cached file
 
 Concurrency is per job and platform. A newer run cancels the older run for the same ref, including `main`. Heavy PR dispatches use the PR number as their concurrency key, so a newer dispatch supersedes an older one for that PR. A heavy PR run is valid only for the SHA recorded in its summary.
 
+## Performance checks
+
+`rustel-bench` measures every seam of a score: session start, first and
+later evaluations, an edit, the first query, steady queries and
+one-eighth-cycle playback windows. For each seam it records wall time,
+process CPU time, allocations, the bytes the seam keeps and its peak.
+
+```sh
+cargo build --release -p rustel-bench
+target/release/rustel-bench run --out base.json
+# change the engine, rebuild, then:
+target/release/rustel-bench run --out new.json
+target/release/rustel-bench compare base.json new.json
+```
+
+With no path, `run` measures `crates/runtime/examples/songs`. Name scores or
+folders to measure others, and add `--quick` for one round per score.
+`compare` exits with status 1 when a seam got worse past its tolerance or a
+score stopped evaluating. Allocation counts and kept bytes do not depend on
+machine load, so they gate within a few percent. Time gates at 25%: compare
+two runs made on one machine in one session.
+
 ## Public evidence privacy
 
 Do not commit details that identify a contributor's workstation: ownership,

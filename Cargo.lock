@@ -4415,6 +4415,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustel-bench"
+version = "0.1.6"
+dependencies = [
+ "libc",
+ "rustel-core",
+ "rustel-fraction",
+ "rustel-runtime",
+ "serde_json",
+]
+
+[[package]]
 name = "rustel-core"
 version = "0.1.6"
 dependencies = [
