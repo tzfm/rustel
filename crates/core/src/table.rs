@@ -4397,8 +4397,12 @@ mod tests {
     #[test]
     fn a_hap_budget_refuses_exactly_where_the_graph_refuses() {
         let span = TimeSpan::new(frac(0, 1), frac(1, 1));
-        let dropped = one(seq(&[1.0]), |p| {
-            p.fast(frac(2000, 1)).filter_values(|_| false)
+        // The filter keeps its node, so the table and the graph make the
+        // haps that it drops.
+        let dropped = crate::sequence::unfolded(|| {
+            one(seq(&[1.0]), |p| {
+                p.fast(frac(2000, 1)).filter_values(|_| false)
+            })
         });
         let refused = outcome(&dropped.graph, span, 1000);
         assert!(refused.is_err());

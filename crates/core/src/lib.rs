@@ -7882,10 +7882,12 @@ impl Pattern {
         if self.is_rest() && sequence::folds(self) {
             return self.clone();
         }
-        if let Combine::Composed(op) = &combine
-            && let Some(applied) = sequence::applied(self, &other, *op, lookup_flow)
-                .or_else(|| self.picked_applied(&other, *op, lookup_flow))
-        {
+        let folded =
+            sequence::applied(self, &other, &combine, lookup_flow).or_else(|| match &combine {
+                Combine::Composed(op) => self.picked_applied(&other, *op, lookup_flow),
+                Combine::With(_) => None,
+            });
+        if let Some(applied) = folded {
             return applied.with_steps(steps);
         }
         Pattern::of(Node::AppLeft(
@@ -7935,6 +7937,9 @@ impl Pattern {
         lookup_flow: LookupFlow,
     ) -> Self {
         let steps = other.steps;
+        if let Some(applied) = sequence::applied_out(self, &other, &combine, lookup_flow) {
+            return applied.with_steps(steps);
+        }
         Pattern::of(Node::AppRight(self.clone(), other, combine, lookup_flow)).with_steps(steps)
     }
 
@@ -8573,12 +8578,15 @@ impl Pattern {
         &self,
         predicate: impl Fn(&Value) -> bool + Send + Sync + 'static,
     ) -> Self {
-        Pattern::of(Node::FilterValues(self.clone(), Arc::new(predicate))).with_steps(self.steps)
+        self.filter_values_with(Arc::new(predicate))
     }
 
     /// [`filter_values`] with an already-built predicate, for a combinator
     /// that interned one by what it reads. See [`interned_closure`].
     pub fn filter_values_with(&self, predicate: ValuePredicate) -> Self {
+        if let Some(filtered) = sequence::filtered(self, &predicate) {
+            return filtered.with_steps(self.steps);
+        }
         Pattern::of(Node::FilterValues(self.clone(), predicate)).with_steps(self.steps)
     }
 

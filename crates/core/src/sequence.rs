@@ -16,12 +16,12 @@
 //! query error leaves its node in place, which raises the error at each
 //! query.
 
-use crate::compose::{ComposeOp, compose_data_in_place};
+use crate::compose::{ComposeOp, compose_data_in_place, is_op_closure};
 use crate::context_keys::ContextKeys;
 use crate::{
     Combine, Hap, HapMapFn, Locations, LookupFlow, MAX_QUERY_SPAN_CYCLES, Meeting, Node,
-    OwnedHapMapFn, Pattern, QueryLimit, State, TimeSpan, Value, charge_haps, note_accumulated,
-    query_stop_requested, refuse, silence, without_query_signals,
+    OwnedHapMapFn, Pattern, QueryLimit, State, TimeSpan, Value, ValuePredicate, applied_hap,
+    charge_haps, note_accumulated, query_stop_requested, refuse, silence, without_query_signals,
 };
 use rustel_fraction::Fraction;
 use std::sync::{Arc, OnceLock};
@@ -213,6 +213,14 @@ impl Layer {
         }
         Some(Self::new(period, places.into(), values.into()))
     }
+}
+
+/// The side of an application that a layer is. The locations of the value
+/// side come first on a hap, and the keys of the function side.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Functions,
+    Values,
 }
 
 /// Why a [`Layer`] stops before the end of a span.
@@ -529,27 +537,39 @@ impl Layer {
     }
 
     /// This layer where each step meets the steps of `values`, as the hap
-    /// of the step meets their haps in an `appLeft`: the step keeps its
+    /// of the step meets their haps in an application: the step keeps its
     /// whole, and its part is cut to the part of each step of `values` that
-    /// it meets. With the layer, each pair of values that meet: a step with
-    /// the value `n` holds what the pair `n` makes, which the caller puts in
-    /// the place of the pairs.
+    /// it meets. `side` is the side of the application that this layer is:
+    /// the function side of an `appLeft`, or the value side of an
+    /// `appRight`, where `values` holds the functions. With the layer, each
+    /// pair of values that meet, this layer's first: a step with the value
+    /// `n` holds what the pair `n` makes, which the caller puts in the
+    /// place of the pairs.
     ///
     /// `None` for more steps than a fold makes, for a period past the
     /// largest term, and for steps that are then not in the order of time.
-    fn met(&self, values: &Layer) -> Option<(Layer, Vec<(u32, u32)>)> {
+    fn met(&self, values: &Layer, side: Side) -> Option<(Layer, Vec<(u32, u32)>)> {
+        let keys = match side {
+            Side::Functions => ContextKeys::merge(&self.keys, &values.keys),
+            Side::Values => ContextKeys::merge(&values.keys, &self.keys),
+        };
         // A step that lies in one cycle meets a value that fills the cycle
         // over the whole part: the places stay, and the locations of the
-        // value go before those of each step.
+        // value go beside those of each step.
         if self.in_cycles && values.fills_each_cycle() {
             let pairs = (0..u32::try_from(self.values.len()).ok()?)
                 .map(|value| (value, 0))
                 .collect();
             let met = self.with(|layer| {
-                let mut before = values.context(0);
-                before.append(&layer.before);
-                layer.before = before;
-                layer.keys = ContextKeys::merge(&layer.keys, &values.keys);
+                match side {
+                    Side::Functions => {
+                        let mut before = values.context(0);
+                        before.append(&layer.before);
+                        layer.before = before;
+                    }
+                    Side::Values => layer.after.append(&values.context(0)),
+                }
+                layer.keys = keys;
             });
             return Some((met, pairs));
         }
@@ -573,9 +593,13 @@ impl Layer {
             let start = self.period.checked_mul(Fraction::int(turn))?;
             for place in self.places.iter() {
                 let (whole, part) = (moved(place.whole, start)?, moved(place.part(), start)?);
-                // The locations of each hap of this step, but those after.
+                // The locations of each hap of this step. Those after stay
+                // with the layer of the function side, which they end.
                 let mut own = self.before.clone();
                 own.append(&place.locations);
+                if side == Side::Values {
+                    own.append(&self.after);
+                }
                 // The turns of `values` that the part meets, in order.
                 let mut at = part.begin.checked_div(values.period)?.floor();
                 let last = part.end.checked_div(values.period)?.ceil();
@@ -615,8 +639,18 @@ impl Layer {
                         };
                         let value = u32::try_from(value).ok()?;
                         // The value side's locations come first.
-                        let mut locations = values.context(value_index);
-                        locations.append(&own);
+                        let locations = match side {
+                            Side::Functions => {
+                                let mut locations = values.context(value_index);
+                                locations.append(&own);
+                                locations
+                            }
+                            Side::Values => {
+                                let mut locations = own.clone();
+                                locations.append(&values.context(value_index));
+                                locations
+                            }
+                        };
                         places.push(Place {
                             whole,
                             part: (piece != whole).then(|| Box::new(piece)),
@@ -633,8 +667,12 @@ impl Layer {
             period,
             places: places.into(),
             before: Locations::new(),
+            after: match side {
+                Side::Functions => self.after.clone(),
+                Side::Values => Locations::new(),
+            },
             contexts: OnceLock::new(),
-            keys: ContextKeys::merge(&self.keys, &values.keys),
+            keys,
             ..self.clone()
         };
         met.is_in_order().then_some((met, pairs))
@@ -1017,57 +1055,163 @@ pub(crate) fn mapped_haps(pattern: &Pattern, map: &HapMapFn) -> Option<Pattern> 
     })
 }
 
-/// The `appLeft` of `functions` and `values` by `op`, when `functions` is a
-/// sequence or a constant and `values` is one layer of plain values, or a
-/// constant of one: each step meets the values where the step is, and is
-/// cut to each that it meets, as the meeting cuts its hap. A constant is
+/// Whether a fold may run `apply` when a pattern is built: it is a compose
+/// op, a function of its two values and nothing more.
+fn runs_at_the_build(apply: &Combine) -> bool {
+    match apply {
+        Combine::Composed(_) => true,
+        Combine::With(closure) => is_op_closure(closure),
+    }
+}
+
+/// What `function` and `value` make by `apply`, as the hap of a step makes
+/// it where the two meet, when they make a value and nothing more.
+fn made(function: &Value, value: &Value, apply: &Combine, flow: LookupFlow) -> Option<Value> {
+    let mut hap = cycle_hap(function.clone());
+    let meets = cycle_hap(value.clone());
+    let part = hap.part;
+    // A meeting that is not made in place is made as its node makes it.
+    if !Meeting::in_place(&mut hap, &meets, part, apply, flow) {
+        hap = applied_hap(&hap, &meets, hap.whole, part, apply, flow);
+    }
+    is_plain(&hap).then_some(hap.value)
+}
+
+/// The `appLeft` of `functions` and `values` by `apply`, when `functions`
+/// is a sequence or a constant and `values` is one layer of plain values,
+/// or a constant of one: each step meets the values where the step is, and
+/// is cut to each that it meets, as the meeting cuts its hap. A constant is
 /// another hap in each cycle, so it cuts a step that crosses a bound of a
 /// cycle there.
 ///
 /// `None` for values of more layers than one, which answer each step layer
-/// by layer, for a value that is not data, for a meeting that
-/// [`Meeting::in_place`] does not make, and for cut steps that are not in
-/// the order of time.
+/// by layer, for a value that is not data, for a function that is no
+/// compose op, for a meeting that makes more than a value, and for cut
+/// steps that are not in the order of time.
 pub(crate) fn applied(
     functions: &Pattern,
     values: &Pattern,
-    op: ComposeOp,
+    apply: &Combine,
     flow: LookupFlow,
 ) -> Option<Pattern> {
+    if !runs_at_the_build(apply) {
+        return None;
+    }
     let layers = layers(functions)?;
     let values = self::layers(values)?;
     let [values] = &*values else {
         return None;
     };
     // A value of the script is read through its host, at each query.
-    if !values.is_data() {
+    if !(values.is_data() && holds_data(&layers)) {
         return None;
     }
-    let apply = Combine::Composed(op);
     without_query_signals(|| {
         let met = layers
             .iter()
             .map(|layer| {
-                if let Some(set) = layer.set(values, &apply, flow) {
+                if let Some(set) = layer.set(values, apply, flow) {
                     return Some(set);
                 }
-                let (met, pairs) = layer.met(values)?;
+                let (met, pairs) = layer.met(values, Side::Functions)?;
                 // What each pair of values makes, with no location: the
                 // locations of both sides are those of the steps.
-                let made = pairs
+                let values = pairs
                     .into_iter()
                     .map(|(function, value)| {
-                        let mut hap = cycle_hap(layer.values().get(function as usize)?.clone());
-                        let meets = cycle_hap(values.values().get(value as usize)?.clone());
-                        let part = hap.part;
-                        (Meeting::in_place(&mut hap, &meets, part, &apply, flow) && is_plain(&hap))
-                            .then_some(hap.value)
+                        made(
+                            layer.values().get(function as usize)?,
+                            values.values().get(value as usize)?,
+                            apply,
+                            flow,
+                        )
                     })
                     .collect::<Option<Vec<Value>>>()?;
-                Some(met.valued(made.into()))
+                Some(met.valued(values.into()))
             })
             .collect::<Option<Vec<_>>>()?;
         Some(node_of_sound(met))
+    })
+}
+
+/// The `appRight` of `functions` and `values` by `apply`, when `values` is
+/// a sequence and `functions` is one layer of data values, or a constant
+/// of one, as the `struct` of a sequence is: each step of `values` keeps
+/// its whole, and is cut to each step of `functions` that it meets.
+///
+/// `None` for functions of more layers than one, which answer each step
+/// layer by layer, for a value that is not data, for a function that is no
+/// compose op, for a meeting that makes more than a value, and for cut
+/// steps that are not in the order of time.
+pub(crate) fn applied_out(
+    functions: &Pattern,
+    values: &Pattern,
+    apply: &Combine,
+    flow: LookupFlow,
+) -> Option<Pattern> {
+    if !runs_at_the_build(apply) {
+        return None;
+    }
+    let functions = layers(functions)?;
+    let [functions] = &*functions else {
+        return None;
+    };
+    let values = layers(values)?;
+    // A value of the script is read through its host, at each query.
+    if !(functions.is_data() && holds_data(&values)) {
+        return None;
+    }
+    without_query_signals(|| {
+        let met = values
+            .iter()
+            .map(|layer| {
+                let (met, pairs) = layer.met(functions, Side::Values)?;
+                // What each pair of values makes, with no location: the
+                // locations of both sides are those of the steps.
+                let values = pairs
+                    .into_iter()
+                    .map(|(value, function)| {
+                        let hf = cycle_hap(functions.values().get(function as usize)?.clone());
+                        let hv = cycle_hap(layer.values().get(value as usize)?.clone());
+                        let hap = applied_hap(&hf, &hv, hv.whole, hv.part, apply, flow);
+                        is_plain(&hap).then_some(hap.value)
+                    })
+                    .collect::<Option<Vec<Value>>>()?;
+                Some(met.valued(values.into()))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(node_of_sound(met))
+    })
+}
+
+/// `pattern` with no step whose value `keep` refuses, when `pattern` is a
+/// sequence of data values: what a filter of the values answers.
+pub(crate) fn filtered(pattern: &Pattern, keep: &ValuePredicate) -> Option<Pattern> {
+    let layers = folded(pattern)?;
+    if !holds_data(layers) {
+        return None;
+    }
+    without_query_signals(|| {
+        let layers = layers
+            .iter()
+            .map(|layer| {
+                let kept: Vec<bool> = layer.values().iter().map(|value| keep(value)).collect();
+                if kept.iter().all(|kept| *kept) {
+                    return layer.clone();
+                }
+                let places: Arc<[Place]> = layer
+                    .places
+                    .iter()
+                    .filter(|place| kept.get(place.value as usize).copied().unwrap_or(false))
+                    .cloned()
+                    .collect();
+                layer.with(|layer| {
+                    layer.in_cycles = lie_in_cycles(layer.period, &places);
+                    layer.places = places;
+                })
+            })
+            .collect();
+        Some(node_of_sound(layers))
     })
 }
 
@@ -1483,6 +1627,64 @@ mod tests {
                 .iter()
                 .any(|fold| fold.ends_with("with a chord and fast steps"))
         );
+    }
+
+    #[test]
+    fn a_structure_of_a_sequence_answers_as_the_application() {
+        // Steps that keep and steps that drop, in one cycle and in a period
+        // of a cycle and a half.
+        let structures = || {
+            vec![
+                (
+                    "a structure of one cycle",
+                    vec![layer(
+                        (1, 1),
+                        vec![
+                            step((0, 1), (1, 4), 1.0),
+                            step((1, 4), (1, 2), 0.0),
+                            step((1, 2), (1, 1), 1.0),
+                        ],
+                    )],
+                ),
+                (
+                    "a structure of two layers",
+                    vec![
+                        layer(
+                            (3, 2),
+                            vec![step((0, 1), (1, 3), 0.0), step((1, 3), (1, 1), 1.0)],
+                        ),
+                        layer((1, 2), vec![step((1, 4), (3, 4), 1.0)]),
+                    ],
+                ),
+            ]
+        };
+        let mut folds = Vec::new();
+        for (name, layers) in sequences() {
+            for (structure_name, structure) in structures() {
+                let name = format!("{name} with {structure_name}");
+                // `struct` and `mask`, and numbers that the values add to.
+                let chains: [(&str, ComposeOp, Alignment); 3] = [
+                    ("struct", ComposeOp::KeepIf, Alignment::Out),
+                    ("mask", ComposeOp::KeepIf, Alignment::In),
+                    ("add out", ComposeOp::Add, Alignment::Out),
+                ];
+                for (chain_name, op, how) in chains {
+                    let chain = |pattern: Pattern| compose(&pattern, &built(&structure), op, how);
+                    let folded = chain(built(&layers));
+                    if matches!(folded.node_kind(), Node::Sequence(_) | Node::Silence) {
+                        folds.push(format!("{chain_name} of {name}"));
+                    }
+                    assert_same_answers(
+                        &format!("{chain_name} of {name}"),
+                        &folded,
+                        &unfolded(|| chain(built(&layers))),
+                    );
+                }
+            }
+        }
+        // Values of two layers answer each step layer by layer, and so do
+        // functions of two layers: any other pair is one node.
+        assert!(folds.len() >= 18, "{folds:#?}");
     }
 
     #[test]

@@ -427,6 +427,24 @@ fn compose_inner<P: PatOps>(pat: &P, other: &P, op: ComposeOp, how: Alignment) -
     }
 }
 
+/// The closure of each compose op that a pattern was built with. See
+/// [`interned_combine`].
+static OP_CLOSURES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(ComposeOp, bool), crate::CombineFn>>,
+> = std::sync::OnceLock::new();
+
+/// Whether `combine` is the closure of a compose op: a function of its two
+/// values and nothing more, which a fold may run when a pattern is built.
+pub(crate) fn is_op_closure(combine: &crate::CombineFn) -> bool {
+    OP_CLOSURES.get().is_some_and(|closures| {
+        closures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .any(|closure| Arc::ptr_eq(closure, combine))
+    })
+}
+
 /// The combine closure one compose op builds, interned: the same op built
 /// by a later evaluation is the same closure object, so that node agrees
 /// with its counterpart by pointer and the answers of the unchanged
@@ -434,11 +452,8 @@ fn compose_inner<P: PatOps>(pat: &P, other: &P, op: ComposeOp, how: Alignment) -
 /// `keepif` body, which discards `b`'s value rather than unioning it.
 /// See [`crate::interned_closure`].
 fn interned_combine(op: ComposeOp, scalar_only: bool) -> crate::CombineFn {
-    static POOL: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(ComposeOp, bool), crate::CombineFn>>,
-    > = std::sync::OnceLock::new();
     crate::interned_closure(
-        POOL.get_or_init(Default::default),
+        OP_CLOSURES.get_or_init(Default::default),
         (op, scalar_only),
         || {
             let combine: crate::CombineFn = Arc::new(move |a: &Value, b: &Value| {
