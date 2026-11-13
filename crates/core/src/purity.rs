@@ -46,6 +46,16 @@ pub struct Purity {
     /// dictionary in place, so the graph is volatile exactly then. See
     /// [`crate::Pattern::is_cacheable`]. Monotonic like `volatile`.
     pub host_voicings: bool,
+    /// True when an answer may depend on the span that asks beyond the cut
+    /// of each hap's part: a signal is read at the span, and a node that
+    /// this classification does not know may read it. False for a graph of
+    /// discrete haps, whose answer for a part of a span is its answer for
+    /// the span, with each hap cut to the part and in the same order.
+    ///
+    /// Not monotonic: a node can ask a child that reads the span over each
+    /// whole of its own haps. Each node sets it from its own kind, and any
+    /// other source of a `Purity` says true.
+    pub span_read: bool,
 }
 
 impl Purity {
@@ -56,6 +66,7 @@ impl Purity {
             opaque: false,
             volatile: false,
             host_voicings: false,
+            span_read: true,
         }
     }
 
@@ -68,6 +79,7 @@ impl Purity {
             opaque: false,
             volatile: true,
             host_voicings: false,
+            span_read: true,
         }
     }
 
@@ -81,6 +93,7 @@ impl Purity {
             opaque: false,
             volatile: true,
             host_voicings: false,
+            span_read: true,
         }
     }
 
@@ -97,6 +110,7 @@ impl Purity {
             opaque: true,
             volatile: true,
             host_voicings: false,
+            span_read: true,
         }
     }
 
@@ -108,6 +122,7 @@ impl Purity {
             out.opaque |= p.opaque;
             out.volatile |= p.volatile;
             out.host_voicings |= p.host_voicings;
+            out.span_read |= p.span_read;
             out.reachable.extend(p.reachable);
         }
         out.reachable.sort_unstable();
@@ -122,6 +137,7 @@ impl Purity {
             out.opaque |= p.opaque;
             out.volatile |= p.volatile;
             out.host_voicings |= p.host_voicings;
+            out.span_read |= p.span_read;
             out.reachable.extend_from_slice(&p.reachable);
         }
         out.reachable.sort_unstable();

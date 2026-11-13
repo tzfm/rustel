@@ -4515,7 +4515,7 @@ fn query_pick(
                     outer_whole.begin.cycle_pos()
                 };
                 let inner_haps = restarted_from_tables(inner_pattern, shift, state, outer.part)
-                    .unwrap_or_else(|| inner_pattern.late(shift).query(state));
+                    .unwrap_or_else(|| inner_pattern.query_restarted(shift, state, outer.part));
                 for inner in inner_haps {
                     let Some(part) = inner.part.intersection(&outer.part) else {
                         continue;
@@ -5528,7 +5528,8 @@ impl Pattern {
     /// once per node and can never be forgotten by a new combinator.
     fn of(node: Node) -> Self {
         LIVE_NODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let purity = compute_purity(&node);
+        let mut purity = compute_purity(&node);
+        purity.span_read = !answers_by_its_haps(&node);
         let runtime_settings = inherited_runtime_settings(&node);
         Pattern {
             node: Arc::new(NodeCell {
@@ -5844,6 +5845,24 @@ impl Pattern {
     /// owners already carried by its child graph intact.
     pub(crate) fn force_runtime_settings(&mut self, settings: settings::RuntimeSettings) {
         self.runtime_settings = Some(settings);
+    }
+
+    /// The haps of this pattern, moved `shift` later, that a restart or a
+    /// reset join reads for an outer hap with `part`: the haps of the
+    /// query's span, which the join then cuts to the part.
+    ///
+    /// A graph of discrete haps is asked over the part alone. The join cuts
+    /// every other hap away, so the answer after the cut is the same, and
+    /// the haps of the other sections of the span are not made. A query
+    /// that fails or is refused only outside the part so answers. Any other
+    /// graph is asked over the span, where it reads its values.
+    fn query_restarted(&self, shift: Fraction, state: &State, part: TimeSpan) -> Vec<Hap> {
+        let moved = self.late(shift);
+        if self.is_cacheable() && !self.purity.span_read {
+            moved.query(&state.set_span(part))
+        } else {
+            moved.query(state)
+        }
     }
 
     /// The query. Everything else is built on this.
@@ -6768,8 +6787,7 @@ impl Pattern {
                             } else {
                                 outer_whole.begin.cycle_pos()
                             };
-                            let shifted = inner_pat.late(shift);
-                            for inner in shifted.query(state) {
+                            for inner in inner_pat.query_restarted(shift, state, outer.part) {
                                 let Some(part) = inner.part.intersection(&outer.part) else {
                                     continue;
                                 };
@@ -9135,6 +9153,50 @@ fn poly_extend(pattern: &Pattern, outer_steps: Option<Fraction>) -> Pattern {
 /// The single place impurity is derived. Adding a `Node` variant without a
 /// branch here fails to compile, so a new combinator cannot silently be
 /// classified pure.
+/// Whether the answer of `node` for a part of a span is its answer for the
+/// span, with each hap cut to the part and in the same order: each hap is a
+/// whole that only the bounds of a query cut. See
+/// [`purity::Purity::span_read`].
+///
+/// Read from the kind of the node and the classification of its children.
+/// A kind that is not known to answer so says `false`.
+fn answers_by_its_haps(node: &Node) -> bool {
+    let discrete = |pattern: &Pattern| !pattern.purity.span_read;
+    match node {
+        Node::Silence | Node::Pure(_) | Node::PurePickLookup(..) | Node::Sequence(_) => true,
+        // A time map that keeps the order of time, and maps of each hap that
+        // read no span.
+        Node::Fast(pattern, factor, _) => *factor > Fraction::ZERO && discrete(pattern),
+        Node::Shift(pattern, ..)
+        | Node::AddContext(pattern, _)
+        | Node::FmapNative(pattern, _)
+        | Node::FilterValues(pattern, _)
+        | Node::MapHapsNative(pattern, _, SpanUse::Ignores)
+        | Node::MapHapsOwned(pattern, _, SpanUse::Ignores)
+        | Node::ExpandHapsNative(pattern, _, SpanUse::Ignores)
+        // A hap is kept or dropped by the begin of its whole.
+        | Node::Degrade(pattern, ..) => discrete(pattern),
+        Node::Stack(patterns) => patterns.iter().all(discrete),
+        // One cycle at a time: the node inside is asked over each cycle's
+        // piece of the span, where each of these kinds maps time in order.
+        Node::SplitQueries(inner) => match inner.node_kind() {
+            Node::SlowCat(patterns) | Node::SlowCatPrime(patterns) => {
+                patterns.iter().all(discrete)
+            }
+            Node::FastGap(pattern, _) | Node::RepeatCycles(pattern, _) | Node::Rev(pattern) => {
+                discrete(pattern)
+            }
+            _ => discrete(inner),
+        },
+        // The side that gives the structure is cut by the query. The other
+        // side is asked over the whole of each hap, whatever the query.
+        Node::AppLeft(functions, ..) => discrete(functions),
+        Node::AppRight(_, values, ..) => discrete(values),
+        Node::AppBoth(functions, values, ..) => discrete(functions) && discrete(values),
+        _ => false,
+    }
+}
+
 fn compute_purity(node: &Node) -> purity::Purity {
     use purity::Purity;
     fn value_purity(value: &Value) -> Purity {
@@ -11193,6 +11255,119 @@ mod value_signal_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    fn whole(n: i128) -> Fraction {
+        Fraction::new(n, 1)
+    }
+
+    fn third(n: i128) -> Fraction {
+        Fraction::new(n, 3)
+    }
+
+    fn note(n: f64) -> Pattern {
+        pure(Value::object([("note".to_string(), Value::F64(n))]))
+            .with_added_context(vec![(n as usize, n as usize + 1)])
+    }
+
+    /// Sections of discrete haps: steps, stacks, alternations, structures,
+    /// speed changes and controls, with a signal as the value of one.
+    fn sections() -> Vec<Pattern> {
+        use crate::compose::{Alignment, ComposeOp, compose};
+        let steps = |from: i32, count: i32| {
+            fastcat((0..count).map(|n| note(f64::from(from + n))).collect())
+        };
+        let cutoff = crate::signal::saw()
+            .slow(whole(3))
+            .fmap(|value| Value::object([("cutoff".to_string(), value.clone())]));
+        vec![
+            steps(0, 4),
+            stack(vec![steps(10, 3), steps(20, 2).slow(whole(2))]),
+            slowcat(vec![steps(30, 2), note(33.0), steps(34, 3)]).fast(third(2)),
+            compose(&steps(40, 8), &cutoff, ComposeOp::Set, Alignment::In),
+            crate::combinators::struct_with(
+                &steps(50, 2).slow(whole(3)),
+                &fastcat(
+                    [true, false, true, true]
+                        .map(|on| pure(Value::Bool(on)))
+                        .to_vec(),
+                ),
+            )
+            .late(third(1)),
+            steps(60, 5).degrade_by_seeded(0.5, 7),
+        ]
+    }
+
+    /// The same pick, with each section read at the span of the query: a
+    /// volatile section is no graph of discrete haps to the join.
+    fn picked(mode: JoinMode, read_at_the_span: bool) -> Pattern {
+        let sections: Vec<(usize, Pattern)> = sections()
+            .into_iter()
+            .map(|section| {
+                if read_at_the_span {
+                    section.mark_volatile()
+                } else {
+                    section
+                }
+            })
+            .enumerate()
+            .collect();
+        let count = sections.len();
+        // Each section holds two cycles and a third of one.
+        let selector = fastcat((0..count).map(|n| pure(Value::F64(n as f64))).collect())
+            .slow(Fraction::new(7 * count as i128, 3));
+        pick(
+            selector,
+            PickLookup::Array {
+                enumerable_len: count,
+                length: count,
+                entries: sections,
+            },
+            PickIndexMode::Clamp,
+            mode,
+        )
+    }
+
+    #[test]
+    fn a_restart_asks_a_section_of_discrete_haps_over_its_part_alone() {
+        let spans = [
+            (Fraction::ZERO, whole(16)),
+            (third(-5), third(22)),
+            (third(7), third(8)),
+            (whole(2), third(7)),
+            (third(13), third(29)),
+            (third(7), third(7)),
+            (whole(14), whole(14)),
+        ];
+        for mode in [JoinMode::Restart, JoinMode::Reset] {
+            for (begin, end) in spans {
+                // Each span asks new graphs, so that the walk answers it
+                // and no table does.
+                assert_eq!(
+                    format!("{:?}", picked(mode, false).query_arc(begin, end)),
+                    format!("{:?}", picked(mode, true).query_arc(begin, end)),
+                    "{mode:?} over {begin:?}..{end:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_graph_that_reads_the_span_is_no_graph_of_discrete_haps() {
+        let discrete = |pattern: &Pattern| !pattern.purity().span_read;
+        for section in sections() {
+            assert!(discrete(&section));
+            // The join asks a signal at the span, and a time map that the
+            // classification does not know may read it.
+            assert!(!discrete(&section.with_query_time(|time| time)));
+        }
+        assert!(!discrete(&crate::signal::saw()));
+        assert!(!discrete(&stack(vec![note(1.0), crate::signal::saw()])));
     }
 }
 
