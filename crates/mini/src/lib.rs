@@ -1492,6 +1492,20 @@ fn at_rate(
     ))
 }
 
+/// `built` with the structure of a Euclidean rhythm, when `built` is plain
+/// values and the rhythm is a whole count of pulses in a whole count of
+/// steps, in one cycle. A rhythm of more pulses than steps, or of steps
+/// that each hold to the next pulse, keeps the nodes of its structure.
+fn struck(built: &Built, pulses: i32, steps: f64, rotation: i32) -> Option<Rhythm> {
+    let rhythm = rhythms([built])?.pop()?;
+    let whole = pulses >= 1 && steps.fract() == 0.0 && f64::from(pulses) <= steps;
+    if !whole || steps > f64::from(u16::MAX) {
+        return None;
+    }
+    let mask = rustel_core::euclid::euclid_rot(pulses, steps as usize, rotation as isize).ok()?;
+    rhythm.struck(&mask)
+}
+
 /// Expand `!n` replication, then divide one cycle among the steps in
 /// proportion to their `@n` weights: plain `fastcat` when every weight is 1,
 /// `timecat` otherwise.
@@ -1868,13 +1882,17 @@ fn compile(ast: &Ast) -> Built {
                 if let Some(rotation) = rotation.as_deref() {
                     spans.extend(argument_context(euclid_argument_source(&rotation.ast)));
                 }
+                let (pulses, steps, rotation) = (
+                    pulses_value.to_f64() as i32,
+                    steps_value.to_f64(),
+                    rotation_value.to_f64() as i32,
+                );
+                let built = compile(pat);
+                if let Some(rhythm) = struck(&built, pulses, steps, rotation) {
+                    return Built::Rhythm(rhythm.located(&spans));
+                }
                 with_argument_context(
-                    euclid_pattern(
-                        build_validated(pat),
-                        pulses_value.to_f64() as i32,
-                        steps_value.to_f64(),
-                        rotation_value.to_f64() as i32,
-                    ),
+                    euclid_pattern(built.into_pattern(), pulses, steps, rotation),
                     spans,
                 )
             } else {
@@ -3433,8 +3451,27 @@ mod tests {
         "~",
         "[~ ~] a",
         "<~ a>",
-        // A step that is another construct keeps its own nodes.
         "a(3,8) b",
+        "a(3,8)",
+        "a(3,8,2)",
+        "a(5,8,-3) b",
+        "[a,b](3,8) c",
+        "<a b>(3,8)",
+        "<a b c>(2,5) d",
+        "a(3,8)*2",
+        "a(3,8)/2 b",
+        "[a b](2,4)",
+        "[a b](2,8)",
+        "a(8,8)",
+        "a(1,1)",
+        // A structure that cuts a value, or holds no whole count of pulses
+        // in one cycle, keeps its nodes.
+        "[a b c](3,8)",
+        "a(9,8)",
+        "a(0,8) b",
+        "a(-3,8) b",
+        "a(3,-8) b",
+        // A step that is another construct keeps its own nodes.
         "a? b c",
         "[a b, c d e] f",
         "{a b c}%4 d",
@@ -3513,12 +3550,16 @@ mod tests {
             ("<[a b]!3 [c d e]>", true),
             ("a b@2 c", true),
             ("a*2 b c", true),
+            ("a(3,8)", true),
+            ("a(3,8,2) [b,c](5,8)", true),
+            // A step that crosses its cycle is cut where the cycle ends.
+            ("a/2 b", true),
+            ("a <b c>/2 d", true),
             ("bd*2, hh*4, <a b>/2", true),
             // An atom is a `pure` on both sides, and one value a cycle
             // is one node on both sides.
             ("a", false),
             ("<a>", false),
-            ("a(3,8) b", false),
             ("a? b", false),
         ] {
             let built = super::mini_at(source, 0).expect(source);

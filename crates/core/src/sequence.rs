@@ -37,7 +37,10 @@ const MAX_PERIOD_TERM: i128 = 1 << 20;
 /// of its layer's period, with the source locations its hap carries.
 #[derive(Clone, Debug)]
 pub struct SequenceStep {
-    window: TimeSpan,
+    /// The whole of the step's hap, as shares of the period.
+    whole: TimeSpan,
+    /// The part of the hap, inside the whole.
+    part: TimeSpan,
     value: Value,
     locations: Locations,
 }
@@ -46,21 +49,28 @@ impl SequenceStep {
     /// A step that holds `value` from `begin` to `end`, as shares of the
     /// period, at `locations`.
     pub fn new(begin: Fraction, end: Fraction, value: Value, locations: Locations) -> Self {
+        let window = TimeSpan::new(begin, end);
         Self {
-            window: TimeSpan::new(begin, end),
+            whole: window,
+            part: window,
             value,
             locations,
         }
     }
 
-    /// Where the step begins, as a share of the period.
+    /// Where the part of the step begins, as a share of the period.
     pub fn begin(&self) -> Fraction {
-        self.window.begin
+        self.part.begin
     }
 
-    /// Where the step ends, as a share of the period.
+    /// Where the part of the step ends, as a share of the period.
     pub fn end(&self) -> Fraction {
-        self.window.end
+        self.part.end
+    }
+
+    /// Where the whole of the step begins and ends, as shares of the period.
+    pub fn whole(&self) -> (Fraction, Fraction) {
+        (self.whole.begin, self.whole.end)
     }
 
     pub fn value(&self) -> &Value {
@@ -71,10 +81,13 @@ impl SequenceStep {
         &self.locations
     }
 
-    /// This step from `begin` to `end`.
-    pub fn at(&self, begin: Fraction, end: Fraction) -> Self {
+    /// This step with `whole` as its whole and `part`, a span inside it, as
+    /// its part: a step that the bound of a cycle cut holds a part of its
+    /// whole.
+    pub fn placed(&self, whole: (Fraction, Fraction), part: (Fraction, Fraction)) -> Self {
         Self {
-            window: TimeSpan::new(begin, end),
+            whole: TimeSpan::new(whole.0, whole.1),
+            part: TimeSpan::new(part.0, part.1),
             ..self.clone()
         }
     }
@@ -164,8 +177,8 @@ impl From<SequenceLayer> for Layer {
                     }
                 };
                 Place {
-                    whole: step.window,
-                    part: None,
+                    whole: step.whole,
+                    part: (step.part != step.whole).then(|| Box::new(step.part)),
                     value,
                     locations: step.locations,
                 }

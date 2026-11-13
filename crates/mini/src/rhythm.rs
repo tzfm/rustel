@@ -114,6 +114,44 @@ impl Rhythm {
         })
     }
 
+    /// This rhythm with the structure of `mask`, which divides each cycle
+    /// into equal steps: in each step that is set, the values that sound
+    /// over the whole step, from the start of the step to its end. `None`
+    /// for a value that begins or ends inside a set step, which the
+    /// structure cuts.
+    pub(crate) fn struck(&self, mask: &[u8]) -> Option<Self> {
+        let count = whole(mask.len())?;
+        let turns = self.turns()?;
+        let period = Fraction::int(turns);
+        let mut steps = Vec::new();
+        for turn in 0..turns {
+            // The steps of this cycle, at their places in it.
+            let mut cycle = Vec::new();
+            self.squeeze_cycle(turn, (Fraction::ZERO, Fraction::ONE), 1, &mut cycle)?;
+            let start = Fraction::int(turn);
+            for (index, _) in mask.iter().enumerate().filter(|(_, set)| **set != 0) {
+                let begin = start.checked_add(whole(index)?.checked_div(count)?)?;
+                let end = start.checked_add(whole(index + 1)?.checked_div(count)?)?;
+                for step in &cycle {
+                    if step.end() <= begin || step.begin() >= end {
+                        continue;
+                    }
+                    let cut = step.begin() > begin || step.end() < end;
+                    if cut || steps.len() == MAX_STEPS {
+                        return None;
+                    }
+                    let window = (begin.checked_div(period)?, end.checked_div(period)?);
+                    steps.push(step.placed(window, window));
+                }
+            }
+        }
+        Some(Self {
+            layers: layer(turns, steps)?,
+            steps: Some(count),
+            atom: false,
+        })
+    }
+
     /// `stack` of `parts`. On `Err`, the parts as they were: their step
     /// counts have no common multiple in the native range.
     pub(crate) fn stacked(parts: Vec<Rhythm>) -> Result<Self, Vec<Rhythm>> {
@@ -203,9 +241,10 @@ impl Rhythm {
 
     /// Add the steps of cycle `turn` to `out`, in the order a query of that
     /// cycle answers them. Each is squeezed into `window` of the cycle,
-    /// which is one of the `turns` cycles of the period of `out`. `None`
-    /// for a step that crosses a bound of the cycle: a query of the cycle
-    /// cuts it there.
+    /// which is one of the `turns` cycles of the period of `out`. A step
+    /// that crosses a bound of the cycle is cut there, as a query of the
+    /// cycle cuts its hap: the part is the piece in the cycle, and the
+    /// whole stays whole.
     fn squeeze_cycle(
         &self,
         turn: i128,
@@ -244,11 +283,16 @@ impl Rhythm {
                     if end <= Fraction::ZERO || begin >= Fraction::ONE {
                         continue;
                     }
-                    let crosses = begin < Fraction::ZERO || end > Fraction::ONE;
-                    if crosses || out.len() == MAX_STEPS {
+                    if out.len() == MAX_STEPS {
                         return None;
                     }
-                    out.push(step.at(place(begin)?, place(end)?));
+                    let whole = step.whole();
+                    let whole = (place(time(at, whole.0)?)?, place(time(at, whole.1)?)?);
+                    let part = (
+                        place(begin.max(Fraction::ZERO))?,
+                        place(end.min(Fraction::ONE))?,
+                    );
+                    out.push(step.placed(whole, part));
                 }
                 at = at.checked_add(Fraction::ONE)?;
             }
