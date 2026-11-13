@@ -3472,6 +3472,11 @@ fn joined(
     if !matches!(mode, JoinMode::Inner | JoinMode::Outer | JoinMode::Mix) {
         return None;
     }
+    // A sampled layer's values exist only in a query: its entries name no
+    // pattern.
+    if carrier.layers.iter().any(|layer| layer.sampled.is_some()) {
+        return None;
+    }
     let settings = crate::settings::current_state_id();
     // The pattern each carrier value names, each built once.
     let mut named: Vec<(&crate::Value, Pattern)> = Vec::new();
