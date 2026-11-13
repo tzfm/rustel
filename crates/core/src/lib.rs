@@ -5011,6 +5011,195 @@ fn slowcat_cycle(pats: &[Pattern], state: &State) -> Vec<Hap> {
     mapped.unwrap_or_else(refused)
 }
 
+/// The value side of one `appLeft` node, as a query meets it.
+#[derive(Clone, Copy)]
+struct ValueSide<'a> {
+    functions: &'a Pattern,
+    values: &'a Pattern,
+    apply: &'a Combine,
+    flow: LookupFlow,
+    constant: &'a ConstantValues,
+}
+
+impl<'a> ValueSide<'a> {
+    /// The value side of `node`, when `node` is an `appLeft`.
+    fn of(node: &'a Node) -> Option<Self> {
+        let Node::AppLeft(functions, values, apply, flow, constant) = node else {
+            return None;
+        };
+        Some(Self {
+            functions,
+            values,
+            apply,
+            flow: *flow,
+            constant,
+        })
+    }
+
+    /// The constant hap of this side, when a known compose op applies it:
+    /// what [`Meeting::in_place`] can make where a function hap is.
+    fn constant_hap(&self, state: &State) -> Option<&'a Hap> {
+        matches!(self.apply, Combine::Composed(_))
+            .then(|| self.constant.hap(self.values, state))
+            .flatten()
+    }
+
+    /// Meet the function hap `hf` with the value side and push what they
+    /// make. `false` when the query stops.
+    ///
+    /// `template` is the side's constant hap for one query, to move from
+    /// piece to piece. It is asked at the first function hap, so a query
+    /// with none queries the value side no more than before.
+    fn meet(
+        &self,
+        mut hf: Hap,
+        template: &mut Option<Option<Hap>>,
+        state: &State,
+        out: &mut Vec<Hap>,
+    ) -> bool {
+        let met = hf.whole_or_part();
+        let template =
+            template.get_or_insert_with(|| self.constant.hap(self.values, state).cloned());
+        let answered: Vec<Hap>;
+        let inner: &[Hap] = match template {
+            // One piece, the common case: the template moved in place, with
+            // no allocation.
+            Some(template) if met.within_one_cycle() => {
+                template.move_to_piece(met);
+                std::slice::from_ref(template)
+            }
+            Some(template) => {
+                answered = met
+                    .span_cycles()
+                    .into_iter()
+                    .map(|piece| {
+                        let mut hap = template.clone();
+                        hap.move_to_piece(piece);
+                        hap
+                    })
+                    .collect();
+                &answered
+            }
+            None => {
+                answered = self.values.query(&state.set_span(met));
+                &answered
+            }
+        };
+        // One value hap meets this function hap, and that one meeting is
+        // the hap's own: the hap is consumed where it is, as a sampled
+        // meeting is. Several meetings share the function hap as their
+        // base, so each keeps a copy of it.
+        if let [hv] = inner
+            && let Some(part) = hf.part.intersection(&hv.part)
+        {
+            // A refused in-place meeting leaves the hap unchanged.
+            if !Meeting::in_place(&mut hf, hv, part, self.apply, self.flow) {
+                hf = applied_hap(&hf, hv, hf.whole, part, self.apply, self.flow);
+            }
+            return !query_stop_requested() && push_budgeted(out, hf);
+        }
+        for hv in inner {
+            let Some(part) = hf.part.intersection(&hv.part) else {
+                continue;
+            };
+            let hap = applied_hap(&hf, hv, hf.whole, part, self.apply, self.flow);
+            if query_stop_requested() || !push_budgeted(out, hap) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// A chain of applications of constant values, the innermost first, with
+/// the constant hap of each.
+///
+/// `note("c a").s("saw").gain(0.8)` and `sine.range(200, 800)` are such
+/// chains: one node for each application, and each node meets every hap of
+/// the node under it. A query of the outermost node answers for the chain:
+/// it queries the pattern under the chain once, and each of that pattern's
+/// haps meets the constants in turn, where the hap is.
+struct ApplicationRun<'a> {
+    base: &'a Pattern,
+    applications: Vec<(ValueSide<'a>, &'a Hap)>,
+}
+
+impl<'a> ApplicationRun<'a> {
+    /// The chain that `outermost` ends, when it ends one: two applications
+    /// or more make a run.
+    fn ending_at(outermost: ValueSide<'a>, state: &State) -> Option<Self> {
+        let constant = outermost.constant_hap(state)?;
+        let (mut innermost, second) = Self::link(outermost.functions, state)?;
+        let mut applications = vec![(outermost, constant), (innermost, second)];
+        while let Some((side, constant)) = Self::link(innermost.functions, state) {
+            applications.push((side, constant));
+            innermost = side;
+        }
+        applications.reverse();
+        Some(Self {
+            base: innermost.functions,
+            applications,
+        })
+    }
+
+    /// The application `pattern` is, when it can join a run from above: one
+    /// of a constant, through a handle that binds no runtime of its own. A
+    /// query must go through any other handle.
+    fn link(pattern: &'a Pattern, state: &State) -> Option<(ValueSide<'a>, &'a Hap)> {
+        if pattern.runtime_settings.is_some() {
+            return None;
+        }
+        let side = ValueSide::of(pattern.node_kind())?;
+        let constant = side.constant_hap(state)?;
+        Some((side, constant))
+    }
+
+    /// Answer `state`: each hap of the base meets every constant in turn.
+    ///
+    /// A hap inside one cycle meets each constant over the same part, so
+    /// each meeting is made where the hap is. From the first application
+    /// that takes another path, and for a hap that covers several cycles,
+    /// the hap goes through the applications as their nodes take it.
+    fn query(self, state: &State) -> Vec<Hap> {
+        let mut out = Vec::new();
+        for mut hf in self.base.query(state) {
+            let met = hf.whole_or_part();
+            let mut taken = 0;
+            if met.within_one_cycle() {
+                // No shared time is no meeting, in every application.
+                let Some(part) = hf.part.intersection(&met) else {
+                    continue;
+                };
+                for (side, constant) in &self.applications {
+                    if !Meeting::in_place(&mut hf, constant, part, side.apply, side.flow) {
+                        break;
+                    }
+                    taken += 1;
+                }
+            }
+            if taken == self.applications.len() {
+                if query_stop_requested() || !push_budgeted(&mut out, hf) {
+                    return Vec::new();
+                }
+                continue;
+            }
+            let mut haps = vec![hf];
+            for (side, constant) in &self.applications[taken..] {
+                let mut template = Some(Some((*constant).clone()));
+                let mut met = Vec::with_capacity(haps.len());
+                for hf in haps {
+                    if !side.meet(hf, &mut template, state, &mut met) {
+                        return Vec::new();
+                    }
+                }
+                haps = met;
+            }
+            out.append(&mut haps);
+        }
+        out
+    }
+}
+
 impl Pattern {
     /// Whether this pattern answers every cycle with one hap that fills the
     /// cycle and that only its span tells from the next cycle's. Read from
@@ -6133,77 +6322,16 @@ impl Pattern {
 
             // Function haps drive: values are queried over each function
             // hap's wholeOrPart, and the function side's whole wins.
-            Node::AppLeft(pat_func, pat_val, apply, lookup_flow, constant) => {
+            node @ Node::AppLeft(..) => {
+                let side = ValueSide::of(node).expect("an application");
+                if let Some(run) = ApplicationRun::ending_at(side, state) {
+                    return run.query(state);
+                }
+                let mut template = None;
                 let mut out = Vec::new();
-                // Asked at the first function hap, so a query with none
-                // queries the value side no more than before.
-                let mut constant_hap: Option<Option<Hap>> = None;
-                for mut hf in pat_func.query(state) {
-                    let met = hf.whole_or_part();
-                    let template =
-                        constant_hap.get_or_insert_with(|| constant.hap(pat_val, state).cloned());
-                    let answered: Vec<Hap>;
-                    let inner: &[Hap] = match template {
-                        // One piece, the common case: the template moved in
-                        // place, with no allocation.
-                        Some(template) if met.within_one_cycle() => {
-                            template.move_to_piece(met);
-                            std::slice::from_ref(template)
-                        }
-                        Some(template) => {
-                            answered = met
-                                .span_cycles()
-                                .into_iter()
-                                .map(|piece| {
-                                    let mut hap = template.clone();
-                                    hap.move_to_piece(piece);
-                                    hap
-                                })
-                                .collect();
-                            &answered
-                        }
-                        None => {
-                            answered = pat_val.query(&state.set_span(met));
-                            &answered
-                        }
-                    };
-                    // One value hap meets this function hap, and that one
-                    // meeting is the hap's own: the hap is consumed where it
-                    // is, as a sampled meeting is. Several meetings share the
-                    // function hap as their base, so each keeps a copy of it.
-                    if let [hv] = inner
-                        && let Some(part) = hf.part.intersection(&hv.part)
-                    {
-                        // A refused in-place meeting leaves the hap unchanged.
-                        if Meeting::in_place(&mut hf, hv, part, apply, *lookup_flow) {
-                            if query_stop_requested() {
-                                return Vec::new();
-                            }
-                            if !push_budgeted(&mut out, hf) {
-                                return Vec::new();
-                            }
-                        } else {
-                            let hap = applied_hap(&hf, hv, hf.whole, part, apply, *lookup_flow);
-                            if query_stop_requested() {
-                                return Vec::new();
-                            }
-                            if !push_budgeted(&mut out, hap) {
-                                return Vec::new();
-                            }
-                        }
-                        continue;
-                    }
-                    for hv in inner {
-                        let Some(part) = hf.part.intersection(&hv.part) else {
-                            continue;
-                        };
-                        let hap = applied_hap(&hf, hv, hf.whole, part, apply, *lookup_flow);
-                        if query_stop_requested() {
-                            return Vec::new();
-                        }
-                        if !push_budgeted(&mut out, hap) {
-                            return Vec::new();
-                        }
+                for hf in side.functions.query(state) {
+                    if !side.meet(hf, &mut template, state, &mut out) {
+                        return Vec::new();
                     }
                 }
                 out
@@ -10455,5 +10583,169 @@ mod constant_values_tests {
                 (span(half(1), half(3)), span(Fraction::ONE, half(3)), 11.0),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod application_run_tests {
+    use super::*;
+    use crate::compose::{Alignment, ComposeOp, compose};
+
+    fn third(n: i128) -> Fraction {
+        Fraction::new(n, 3)
+    }
+
+    fn control(key: &str, value: Value, location: Option<(usize, usize)>) -> Pattern {
+        let controls = pure(Value::object([(key.to_string(), value)]));
+        match location {
+            Some(location) => controls.with_added_context(vec![location]),
+            None => controls,
+        }
+    }
+
+    /// `base` with each of `values` applied to it in turn.
+    fn chain(base: &Pattern, values: &[(ComposeOp, Pattern)]) -> Pattern {
+        values.iter().fold(base.clone(), |pattern, (op, values)| {
+            compose(&pattern, values, *op, Alignment::In)
+        })
+    }
+
+    /// The same chain, with each value behind a stack of one. A stack
+    /// answers as its pattern does and is not read as constant, so each
+    /// application meets its value through a query, one node at a time.
+    fn chain_of_queries(base: &Pattern, values: &[(ComposeOp, Pattern)]) -> Pattern {
+        let queried: Vec<(ComposeOp, Pattern)> = values
+            .iter()
+            .map(|(op, values)| (*op, stack(vec![values.clone()])))
+            .collect();
+        chain(base, &queried)
+    }
+
+    /// Everything a meeting decides of each hap `pattern` answers.
+    fn answers(pattern: &Pattern, begin: Fraction, end: Fraction) -> Vec<String> {
+        pattern
+            .query_arc(begin, end)
+            .iter()
+            .map(|hap| {
+                format!(
+                    "{hap:?} {:?} {} {} {} {}",
+                    hap.live_controls,
+                    hap.slider_binding,
+                    hap.ui_visuals,
+                    hap.keys.is_empty(),
+                    hap.pick_lookup.is_some()
+                )
+            })
+            .collect()
+    }
+
+    fn bases() -> Vec<(&'static str, Pattern)> {
+        let note = |n: f64| pure(Value::object([("note".to_string(), Value::F64(n))]));
+        vec![
+            ("two notes a cycle", fastcat(vec![note(0.0), note(1.0)])),
+            (
+                "a note of three cycles",
+                note(2.0).slow(Fraction::new(3, 1)),
+            ),
+            (
+                "a note with a key of the chain",
+                compose(
+                    &note(3.0),
+                    &control("gain", Value::F64(0.1), Some((1, 2))),
+                    ComposeOp::Set,
+                    Alignment::In,
+                ),
+            ),
+            ("a number", pure(Value::F64(5.0))),
+            ("a string", pure(Value::Str("bd".into()))),
+            ("a signal", crate::signal::saw()),
+            ("a tagged note", note(4.0).with_ui_visual_slot(3)),
+        ]
+    }
+
+    fn spans() -> [(Fraction, Fraction); 4] {
+        [
+            (Fraction::ZERO, Fraction::ONE),
+            (Fraction::ZERO, Fraction::new(4, 1)),
+            (third(1), third(5)),
+            (third(7), third(8)),
+        ]
+    }
+
+    #[test]
+    fn a_chain_of_constants_answers_as_each_application_in_turn() {
+        let chains = [
+            (
+                "controls",
+                vec![
+                    (
+                        ComposeOp::Set,
+                        control("s", Value::Str("saw".into()), Some((3, 6))),
+                    ),
+                    (ComposeOp::Set, control("gain", Value::F64(0.8), None)),
+                    (
+                        ComposeOp::Set,
+                        control("s", Value::Str("sine".into()), Some((10, 14))),
+                    ),
+                    (
+                        ComposeOp::Set,
+                        control("cutoff", Value::F64(800.0), Some((20, 23))),
+                    ),
+                ],
+            ),
+            (
+                "arithmetic",
+                vec![
+                    (ComposeOp::Mul, pure(Value::F64(600.0))),
+                    (ComposeOp::Add, pure(Value::F64(200.0))),
+                    (ComposeOp::Sub, pure(Value::F64(1.5))),
+                ],
+            ),
+            (
+                "a number among controls",
+                vec![
+                    (ComposeOp::Set, control("s", Value::Str("saw".into()), None)),
+                    // A bare number sets nothing on a control object.
+                    (ComposeOp::Set, pure(Value::F64(3.0))),
+                    (
+                        ComposeOp::Add,
+                        control("gain", Value::F64(0.8), Some((4, 7))),
+                    ),
+                    (ComposeOp::Set, control("pan", Value::F64(0.5), None)),
+                ],
+            ),
+        ];
+        for (chain_name, values) in &chains {
+            for (base_name, base) in bases() {
+                let (run, in_turn) = (chain(&base, values), chain_of_queries(&base, values));
+                for (begin, end) in spans() {
+                    assert_eq!(
+                        answers(&run, begin, end),
+                        answers(&in_turn, begin, end),
+                        "{chain_name} on {base_name} over {begin:?}..{end:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_chain_under_a_queried_value_still_answers_as_one() {
+        // The outer application queries its value, so only the two inner
+        // applications make a run, under a node that is none.
+        let base = fastcat(vec![pure(Value::F64(1.0)), pure(Value::F64(2.0))]);
+        let inner = [
+            (ComposeOp::Mul, pure(Value::F64(3.0))),
+            (ComposeOp::Add, pure(Value::F64(4.0))),
+        ];
+        let patterned = fastcat(vec![pure(Value::F64(10.0)), pure(Value::F64(20.0))]);
+        let outer = |inner: Pattern| compose(&inner, &patterned, ComposeOp::Add, Alignment::In);
+        let (run, in_turn) = (
+            outer(chain(&base, &inner)),
+            outer(chain_of_queries(&base, &inner)),
+        );
+        for (begin, end) in spans() {
+            assert_eq!(answers(&run, begin, end), answers(&in_turn, begin, end));
+        }
     }
 }
