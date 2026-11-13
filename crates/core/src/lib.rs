@@ -7878,6 +7878,10 @@ impl Pattern {
         lookup_flow: LookupFlow,
     ) -> Self {
         let steps = self.steps;
+        // No hap meets a value, so the values are not asked.
+        if self.is_rest() && sequence::folds(self) {
+            return self.clone();
+        }
         if let Combine::Composed(op) = &combine
             && let Some(applied) = sequence::applied(self, &other, *op, lookup_flow)
                 .or_else(|| self.picked_applied(&other, *op, lookup_flow))
@@ -8554,6 +8558,10 @@ impl Pattern {
     fn map_control(&self, spec: controls::ControlSpec, unnamed_only: bool) -> Self {
         // One closure object per distinct spec: the same control built again
         // is the same payload, so its subtree carries its answers.
+        // A control of no hap is silence.
+        if self.is_rest() && sequence::folds(self) {
+            return self.clone();
+        }
         let map = controls::interned_control_map(&spec, unnamed_only);
         if let Some(mapped) = sequence::mapped(self, &map) {
             return mapped.with_steps(self.steps);
@@ -11816,8 +11824,11 @@ mod restart_tests {
                 .map(|hap| format!("{hap:?} {:?} {:?}", hap.keys, hap.live_controls))
                 .collect()
         };
-        // Steps in one cycle each, a rest, and a step of three cycles.
-        let short = || vec![degrees(0, 4, 1), silence(), degrees(20, 3, 2)];
+        // Steps in one cycle each, a rest, a control of a rest as `n("~")`
+        // is, and a step of three cycles.
+        let rest = || silence().map_control(ControlSpec::new(["n"]), false);
+        assert!(rest().is_rest() && changed(rest()).is_rest());
+        let short = || vec![degrees(0, 4, 1), silence(), rest(), degrees(20, 3, 2)];
         let long = || vec![degrees(0, 4, 1), degrees(40, 1, 3).slow(whole(3))];
         for mode in [
             JoinMode::Inner,
