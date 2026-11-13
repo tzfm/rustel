@@ -207,12 +207,10 @@ jobs:
             exit 1
           fi
 
+      # No build cache: this job builds PR code, and a cache it could write
+      # would reach later runs on main. Two cold builds fit the timeout.
       - name: Install pinned Rust toolchain
         run: rustup show
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          save-if: ${{ inputs.save_cache }}
 
       - name: Install Linux audio build dependencies
         run: |
