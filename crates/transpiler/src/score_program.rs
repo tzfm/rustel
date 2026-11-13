@@ -341,7 +341,7 @@ mod tests {
 
     /// `code` read as the transpiler reads the program it prints.
     fn score_program(code: &str) -> Option<ScoreProgram> {
-        crate::on_parse_stack(|| {
+        crate::on_parse_stack(code, |code| {
             let allocator = Allocator::default();
             let parsed = Parser::new(&allocator, code, SourceType::mjs()).parse();
             (!parsed.panicked && parsed.diagnostics.is_empty())

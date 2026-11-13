@@ -997,7 +997,7 @@ thread_local! {
 /// Run `work` with every parse of this crate on the calling thread.
 ///
 /// `transpile` and the other entries parse on a thread with
-/// `PARSE_STACK_BYTES` of stack. During this call they spawn no thread. A
+/// `PARSE_STACK_BYTES` of stack. During this call they use no thread. A
 /// host with no threads, or with a large stack of its own, wraps its calls in
 /// this function. The nesting checks still run first. A source which defeats
 /// the lexical scan overflows the stack of the caller, so the caller owns the
@@ -1016,33 +1016,95 @@ pub fn on_caller_stack<T>(work: impl FnOnce() -> T) -> T {
     work()
 }
 
-/// Run `work` on a thread with `PARSE_STACK_BYTES` of stack, or on the calling
-/// thread inside [`on_caller_stack`].
+/// One parse and the send of its answer.
+type ParseJob = Box<dyn FnOnce() + Send>;
+
+/// The thread that parses for one calling thread, with `PARSE_STACK_BYTES`
+/// of stack. It takes one job at a time: the caller waits for each answer.
+struct ParseStack {
+    jobs: std::sync::mpsc::SyncSender<ParseJob>,
+}
+
+impl ParseStack {
+    /// Start the thread. `None` when the host gives none.
+    ///
+    /// The thread runs each job inside [`on_caller_stack`]: a parse that a
+    /// job starts from its own top level, as `transpile` does, is already
+    /// on this stack and runs in place. The thread ends when the thread it
+    /// parses for drops this handle.
+    fn start() -> Option<Self> {
+        let (jobs, taken) = std::sync::mpsc::sync_channel::<ParseJob>(0);
+        std::thread::Builder::new()
+            .name("rustel-parse".into())
+            .stack_size(PARSE_STACK_BYTES)
+            .spawn(move || {
+                on_caller_stack(|| {
+                    for job in taken {
+                        job();
+                    }
+                });
+            })
+            .ok()?;
+        Some(Self { jobs })
+    }
+}
+
+thread_local! {
+    /// The parse stack of this thread, started at its first parse.
+    static PARSE_STACK: std::cell::RefCell<Option<ParseStack>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `work` on `source` on the parse stack of this thread, or on the
+/// calling thread inside [`on_caller_stack`]. `None` when the host gives no
+/// thread to parse on.
 ///
 /// Every parse in this crate goes through here, except `callback_ir`. That
 /// module parses on the caller's stack and bounds its input with
 /// `MAX_CALLBACK_IR_SOURCE_BYTES`. The lexical nesting limit stops deep
 /// ordinary expressions; the raw size limit also bounds recursion when the
-/// lexical scan is defeated. This stack covers the bounded depth.
+/// lexical scan is defeated. The stack covers the bounded depth.
 ///
-/// The thread runs `work` inside [`on_caller_stack`]: a parse that `work`
-/// starts from its own top level, as `transpile` does, is already on this
-/// stack and runs in place instead of starting another thread.
-fn on_parse_stack<T: Send>(work: impl FnOnce() -> T + Send) -> Option<T> {
+/// The parse stack is one thread for each calling thread, kept from parse
+/// to parse: a new thread and its stack for each parse cost more than a
+/// small score takes to parse. The text goes to it as a copy and the answer
+/// comes back as a value, so `work` holds nothing of the caller. A panic of
+/// `work` continues on the calling thread.
+fn on_parse_stack<T: Send + 'static>(
+    source: &str,
+    work: impl FnOnce(&str) -> T + Send + 'static,
+) -> Option<T> {
     if ON_CALLER_STACK.get() {
-        return Some(work());
+        return Some(work(source));
     }
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(PARSE_STACK_BYTES)
-            .spawn_scoped(scope, || on_caller_stack(work))
-            .ok()
-            .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
-            })
-    })
+    let text = source.to_owned();
+    let (answer, answered) = std::sync::mpsc::sync_channel(1);
+    let job: ParseJob = Box::new(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&text)));
+        // The caller waits for the answer. One that is gone wants none.
+        let _ = answer.send(outcome);
+    });
+    let sent = PARSE_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if stack.is_none() {
+            *stack = ParseStack::start();
+        }
+        let sent = stack
+            .as_ref()
+            .is_some_and(|stack| stack.jobs.send(job).is_ok());
+        if !sent {
+            // A thread that takes no job is replaced at the next parse.
+            *stack = None;
+        }
+        sent
+    });
+    if !sent {
+        return None;
+    }
+    match answered.recv().ok()? {
+        Ok(answer) => Some(answer),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1156,7 +1218,7 @@ pub fn script_imports(source: &str) -> Vec<String> {
     if !source.contains("import") || check_nesting(source).is_err() {
         return Vec::new();
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         let mut imports = Imports::default();
@@ -1294,12 +1356,12 @@ pub struct KabelsalatSpan {
 /// comments, ASI, precedence and source spans. Parse diagnostics are never
 /// discarded; callers decide whether recovery is acceptable.
 pub fn parse_and_print(source: &str) -> ParseOutput {
-    parse_and_print_as(source, SourceType::mjs(), ModuleSyntax::Allowed, false)
+    parse_and_print_as(source, SourceType::mjs())
 }
 
 pub fn parse_and_print_path(source: &str, path: impl AsRef<Path>) -> ParseOutput {
     match SourceType::from_path(path) {
-        Ok(source_type) => parse_and_print_as(source, source_type, ModuleSyntax::Allowed, false),
+        Ok(source_type) => parse_and_print_as(source, source_type),
         Err(error) => ParseOutput {
             diagnostics: vec![ParseDiagnostic {
                 message: error.to_string(),
@@ -1310,12 +1372,7 @@ pub fn parse_and_print_path(source: &str, path: impl AsRef<Path>) -> ParseOutput
     }
 }
 
-fn parse_and_print_as(
-    source: &str,
-    source_type: SourceType,
-    modules: ModuleSyntax<'_>,
-    read_score: bool,
-) -> ParseOutput {
+fn parse_and_print_as(source: &str, source_type: SourceType) -> ParseOutput {
     // Before the allocator, before the parser: the recursion this refuses
     // would abort the process rather than return a diagnostic.
     if let Err(diagnostic) = check_nesting(source) {
@@ -1324,9 +1381,9 @@ fn parse_and_print_as(
             ..ParseOutput::default()
         };
     }
-    let Some(output) =
-        on_parse_stack(|| parse_and_print_here(source, source_type, modules, read_score))
-    else {
+    let Some(output) = on_parse_stack(source, move |source| {
+        parse_and_print_here(source, source_type, ModuleSyntax::Allowed, false)
+    }) else {
         return ParseOutput {
             diagnostics: vec![ParseDiagnostic {
                 message: "could not reserve a stack to parse on".into(),
@@ -1523,7 +1580,7 @@ pub fn unresolved_reads(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
     if check_nesting(source).is_err() {
         return Vec::new();
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked || !parsed.diagnostics.is_empty() {
@@ -1591,7 +1648,9 @@ pub fn running_calls(source: &str, names: &[&str]) -> Vec<(String, std::ops::Ran
     if check_nesting(source).is_err() {
         return Vec::new();
     }
-    on_parse_stack(|| {
+    // The parse stack takes the names as its own.
+    let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked || !parsed.diagnostics.is_empty() {
@@ -1600,7 +1659,7 @@ pub fn running_calls(source: &str, names: &[&str]) -> Vec<(String, std::ops::Ran
         let built = SemanticBuilder::new().build(&parsed.program);
         let mut calls = RunningCalls {
             scoping: built.semantic.scoping(),
-            watched: names.iter().copied().collect(),
+            watched: names.iter().map(String::as_str).collect(),
             deferred: 0,
             immediate: HashSet::new(),
             found: Vec::new(),
@@ -1721,7 +1780,7 @@ pub fn setup_definitions(source: &str) -> SetupDefinitions {
     if check_nesting(source).is_err() {
         return SetupDefinitions::default();
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked {
@@ -1894,7 +1953,7 @@ pub fn global_writes(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
     if check_nesting(source).is_err() {
         return Vec::new();
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked {
@@ -2160,7 +2219,7 @@ pub fn awaits_in_code(source: &str) -> bool {
         // does is never sent to a wrapper that cannot compile it.
         return true;
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked {
@@ -2606,7 +2665,9 @@ pub fn transpile(source: &str, options: &TranspileOptions) -> TranspileOutput {
     if let Err(diagnostic) = check_nesting(source) {
         return refuse(diagnostic.message);
     }
-    let Some(output) = on_parse_stack(|| transpile_here(source, options)) else {
+    let options = options.clone();
+    let Some(output) = on_parse_stack(source, move |source| transpile_here(source, &options))
+    else {
         return refuse("could not reserve a stack to parse on".into());
     };
     output
@@ -4517,7 +4578,7 @@ pub fn lane_statements(source: &str) -> Option<Vec<LaneStatement>> {
     if check_nesting(source).is_err() {
         return None;
     }
-    let mut lanes = on_parse_stack(|| lane_statements_here(source))?;
+    let mut lanes = on_parse_stack(source, lane_statements_here)?;
     if lanes.is_empty() {
         lanes.push(LaneStatement {
             label: String::new(),
@@ -4633,8 +4694,10 @@ fn add_final_return_on_parse_stack(code: &str, empty_is_undefined: bool) -> Stri
     if check_nesting(code).is_err() {
         return code.to_string();
     }
-    on_parse_stack(|| add_final_return_here(code, empty_is_undefined))
-        .unwrap_or_else(|| code.to_string())
+    on_parse_stack(code, move |code| {
+        add_final_return_here(code, empty_is_undefined)
+    })
+    .unwrap_or_else(|| code.to_string())
 }
 
 fn add_final_return_here(code: &str, empty_is_undefined: bool) -> String {
@@ -5464,9 +5527,9 @@ mod tests {
         ] {
             let opener = worst.chars().next().unwrap();
             assert!(structural_bytes(&worst) <= MAX_STRUCTURAL_BYTES);
-            let parsed = on_parse_stack(|| {
+            let parsed = on_parse_stack(&worst, |worst| {
                 let allocator = Allocator::default();
-                Parser::new(&allocator, &worst, SourceType::mjs())
+                Parser::new(&allocator, worst, SourceType::mjs())
                     .parse()
                     .diagnostics
                     .len()
@@ -7735,7 +7798,26 @@ p._scope({ text: "/* not a comment */" });"#;
 
     /// The thread `on_parse_stack` runs its work on.
     fn parse_thread() -> Option<std::thread::ThreadId> {
-        on_parse_stack(|| std::thread::current().id())
+        on_parse_stack("", |_| std::thread::current().id())
+    }
+
+    #[test]
+    fn one_parse_stack_serves_each_parse_of_a_thread() {
+        let first = parse_thread().expect("a thread to parse on");
+        assert_ne!(first, std::thread::current().id());
+        assert_eq!(parse_thread(), Some(first));
+        // A panic of the work continues on the caller, and the same stack
+        // parses again.
+        let panicked = std::panic::catch_unwind(|| {
+            on_parse_stack("", |_| -> () { panic!("a parse that fails") })
+        });
+        assert!(panicked.is_err());
+        assert_eq!(parse_thread(), Some(first));
+        // Another calling thread has a parse stack of its own.
+        let other = std::thread::spawn(parse_thread)
+            .join()
+            .expect("the other thread");
+        assert!(other.is_some_and(|other| other != first));
     }
 
     #[test]
@@ -7780,7 +7862,7 @@ p._scope({ text: "/* not a comment */" });"#;
     fn on_caller_stack_restores_the_previous_setting() {
         let caller = std::thread::current().id();
         let spawns = || parse_thread().is_some_and(|thread| thread != caller);
-        assert!(spawns(), "a parse outside the call spawns its thread");
+        assert!(spawns(), "a parse outside the call runs on its thread");
         on_caller_stack(|| {
             on_caller_stack(|| ());
             assert_eq!(
