@@ -2976,9 +2976,46 @@ fn signal_of(pattern: &Pattern) -> Option<Signal> {
     Some(signal)
 }
 
+/// A signal on the value side of a meeting, for a query that walks the
+/// graph: the walk reads the signal as a table of the meeting samples it,
+/// with no query of the signal's graph.
+pub(crate) struct ValueSignal(Signal);
+
+impl ValueSignal {
+    /// `values` as a signal, when it is one that a table can sample.
+    pub(crate) fn of(values: &Pattern) -> Option<Self> {
+        signal_of(values).map(Self)
+    }
+
+    /// The haps `values` answers for `span`, in its order, into `out`.
+    /// `part` is the part of the hap that asks, which lies in one cycle.
+    /// `None` for a span that only the graph answers. `probe` is a copy of
+    /// the query's state.
+    pub(crate) fn answer(
+        &self,
+        span: TimeSpan,
+        part: TimeSpan,
+        probe: &mut State,
+        out: &mut Vec<Hap>,
+    ) -> Option<()> {
+        self.0.answer(span, part, probe, out)
+    }
+}
+
 /// The hap of cycle zero of a pattern whose tables hold one whole hap a
 /// cycle, such as `pure(value)`, and the levels of its walk.
 fn constant_of(pattern: &Pattern) -> Option<(Box<Hap>, u32)> {
+    let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
+    // A constant by its node kinds is read from its graph, apart from the
+    // query around this build. It needs no table, so it is a constant with
+    // any table budget.
+    if let Some(levels) = pattern.constant_levels() {
+        if !pattern.tables_may_answer() {
+            return None;
+        }
+        let hap = crate::without_query_signals(|| pattern.constant_cycle(&State::new(cycle)))?;
+        return hap.keys.is_empty().then(|| (Box::new(hap), levels));
+    }
     let tables = pattern.tables()?;
     let [layer] = tables.layers.as_slice() else {
         return None;
@@ -2986,7 +3023,6 @@ fn constant_of(pattern: &Pattern) -> Option<(Box<Hap>, u32)> {
     let [entry] = layer.entries.as_slice() else {
         return None;
     };
-    let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
     (layer.period == 1
         && layer.sampled.is_none()
         && entry.keys.is_empty()

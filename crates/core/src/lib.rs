@@ -4867,7 +4867,7 @@ enum Node {
     /// `appLeft`: a pattern of functions applied to a pattern of values,
     /// keeping the FUNCTION side's whole. This is the fold `register()` uses
     /// when a leading argument is itself a pattern.
-    AppLeft(Pattern, Pattern, Combine, LookupFlow, ConstantValues),
+    AppLeft(Pattern, Pattern, Combine, LookupFlow, ValueReading),
     /// `appRight`: keeps the VALUE side's whole and structure.
     AppRight(Pattern, Pattern, Combine, LookupFlow),
     /// `appBoth`: both sides are queried over the SAME span and the wholes
@@ -4908,63 +4908,135 @@ enum Node {
     Timeline(Pattern, Pattern, TimelineState),
 }
 
-/// The value side of an `appLeft`, when it answers every cycle with one hap
-/// that fills the cycle and that only its span tells from the next cycle's.
-///
-/// `.gain(0.8)` applies such a side to every hap of the function side. Asked
-/// for any span, the side answers one hap per cycle piece of the span, as
-/// [`Node::Pure`] does: its cycle-zero hap, moved to the piece. So that hap
-/// is found once, by a query of cycle zero, and each function hap meets moved
-/// copies instead of a query.
+/// How the value side of an `appLeft` is read with no query of its graph for
+/// each function hap, found once by the first query that meets the side.
 #[derive(Default)]
-pub(crate) struct ConstantValues(std::sync::OnceLock<Option<Box<ConstantHap>>>);
+pub(crate) struct ValueReading(std::sync::OnceLock<Option<Box<Reading>>>);
 
-/// The cycle-zero hap of a constant value side, and the settings state it
-/// was found under. It answers only while that state is in force, as a
-/// table does.
-struct ConstantHap {
+/// What a value side was found to be, and the settings state it was found
+/// under. It answers only while that state is in force, as a table does.
+struct Reading {
     settings: settings::SettingsStateId,
-    hap: Hap,
+    values: ReadValues,
 }
 
-impl ConstantValues {
-    /// The hap `values` answers for cycle zero, when `values` is constant
-    /// and the settings state it was found under is in force.
+enum ReadValues {
+    /// The side answers every cycle with one hap that fills the cycle and
+    /// that only its span tells from the next cycle's, as `.gain(0.8)`
+    /// gives. Asked for any span, the side answers one hap per cycle piece
+    /// of the span, as [`Node::Pure`] does: this hap of cycle zero, moved
+    /// to the piece. In a box, so that a signal's reading is not as large.
+    Constant(Box<Hap>),
+    /// The side is a signal, as `.lpf(sine.range(200, 2000))` gives, which
+    /// answers as a table samples it.
+    Signal(table::ValueSignal),
+}
+
+impl ValueReading {
+    /// What `values` was found to be, when the settings state it was found
+    /// under is in force.
     ///
-    /// A query that already failed or stopped does not look, and a look that
-    /// fails or stops is not kept. Every query so signals what it did before.
-    fn hap(&self, values: &Pattern, state: &State) -> Option<&Hap> {
-        let current = |found: &ConstantHap| settings::is_current_state(&found.settings);
+    /// A constant is found by a query of cycle zero. A query that already
+    /// failed or stopped does not look, and a look that fails or stops is
+    /// not kept. Every query so signals what it did before.
+    fn of(&self, values: &Pattern, state: &State) -> Option<&ReadValues> {
+        let current = |reading: &Reading| settings::is_current_state(&reading.settings);
         if let Some(found) = self.0.get() {
             return found
                 .as_deref()
-                .filter(|found| current(found))
-                .map(|found| &found.hap);
+                .filter(|reading| current(reading))
+                .map(|reading| &reading.values);
         }
-        if !values.is_constant_per_cycle() {
-            self.0.get_or_init(|| None);
-            return None;
-        }
-        if query_error_pending() || query_stop_requested() {
+        let unsettled = || query_error_pending() || query_stop_requested();
+        if unsettled() {
             return None;
         }
         let settings = settings::current_state_id();
-        let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
-        let mut haps = values.query(&state.set_span(cycle));
-        if query_error_pending() || query_stop_requested() {
+        let found = match values.constant_cycle(state) {
+            Some(hap) => Some(ReadValues::Constant(Box::new(hap))),
+            None => table::ValueSignal::of(values).map(ReadValues::Signal),
+        };
+        if unsettled() {
             return None;
         }
-        let found = match (haps.pop(), haps.is_empty()) {
-            (Some(hap), true) if hap.whole == Some(cycle) && hap.part == cycle => {
-                Some(Box::new(ConstantHap { settings, hap }))
-            }
-            _ => None,
-        };
         self.0
-            .get_or_init(|| found)
+            .get_or_init(|| found.map(|values| Box::new(Reading { settings, values })))
             .as_deref()
-            .filter(|found| current(found))
-            .map(|found| &found.hap)
+            .filter(|reading| current(reading))
+            .map(|reading| &reading.values)
+    }
+}
+
+/// How one query reads a value side. It is settled at the first function
+/// hap, so a query with none reads nothing.
+enum Answering<'a> {
+    /// The side's constant hap, to move from piece to piece.
+    Constant(Hap),
+    /// The side's signal, and a copy of the query's state for it to read.
+    Signal(&'a table::ValueSignal, State),
+    /// A query of the side's graph for each function hap.
+    Graph,
+}
+
+/// What one query keeps from function hap to function hap while a
+/// [`ValueSide`] meets them.
+#[derive(Default)]
+struct Meetings<'a> {
+    answering: Option<Answering<'a>>,
+    /// The haps the value side answers for one function hap.
+    values: Vec<Hap>,
+}
+
+impl<'a> Meetings<'a> {
+    /// The meetings of a side that is known to answer `constant`.
+    fn with_constant(constant: &Hap) -> Self {
+        Self {
+            // The hap moves from piece to piece, so the query owns a copy.
+            answering: Some(Answering::Constant(constant.clone())),
+            values: Vec::new(),
+        }
+    }
+
+    /// The haps `side` answers over `met` for a function hap with `part`.
+    fn values(
+        &mut self,
+        side: &ValueSide<'a>,
+        met: TimeSpan,
+        part: TimeSpan,
+        state: &State,
+    ) -> &[Hap] {
+        let Self { answering, values } = self;
+        let graph = |values: &mut Vec<Hap>| *values = side.values.query(&state.set_span(met));
+        match answering.get_or_insert_with(|| side.answering(state)) {
+            Answering::Constant(constant) => {
+                // One piece, the common case: the constant moved in place,
+                // with no allocation.
+                if met.within_one_cycle() {
+                    constant.move_to_piece(met);
+                    std::slice::from_ref(constant)
+                } else {
+                    values.clear();
+                    values.extend(met.span_cycles().into_iter().map(|piece| {
+                        let mut hap = constant.clone();
+                        hap.move_to_piece(piece);
+                        hap
+                    }));
+                    values
+                }
+            }
+            // A table samples a signal for a part in one cycle, and so does
+            // the walk. Any other part asks the graph.
+            Answering::Signal(signal, probe) => {
+                if !(part.within_one_cycle() && signal.answer(met, part, probe, values).is_some()) {
+                    graph(values);
+                }
+                values
+            }
+            Answering::Graph => {
+                graph(values);
+                values
+            }
+        }
     }
 }
 
@@ -5020,13 +5092,13 @@ struct ValueSide<'a> {
     values: &'a Pattern,
     apply: &'a Combine,
     flow: LookupFlow,
-    constant: &'a ConstantValues,
+    reading: &'a ValueReading,
 }
 
 impl<'a> ValueSide<'a> {
     /// The value side of `node`, when `node` is an `appLeft`.
     fn of(node: &'a Node) -> Option<Self> {
-        let Node::AppLeft(functions, values, apply, flow, constant) = node else {
+        let Node::AppLeft(functions, values, apply, flow, reading) = node else {
             return None;
         };
         Some(Self {
@@ -5034,59 +5106,45 @@ impl<'a> ValueSide<'a> {
             values,
             apply,
             flow: *flow,
-            constant,
+            reading,
         })
     }
 
     /// The constant hap of this side, when a known compose op applies it:
     /// what [`Meeting::in_place`] can make where a function hap is.
     fn constant_hap(&self, state: &State) -> Option<&'a Hap> {
-        matches!(self.apply, Combine::Composed(_))
-            .then(|| self.constant.hap(self.values, state))
-            .flatten()
+        if !matches!(self.apply, Combine::Composed(_)) {
+            return None;
+        }
+        match self.reading.of(self.values, state)? {
+            ReadValues::Constant(hap) => Some(hap),
+            ReadValues::Signal(_) => None,
+        }
+    }
+
+    /// How a query of `state` reads this side: with no query of its graph
+    /// when the side was found to be a constant or a signal, and the signal
+    /// may answer as its table does.
+    fn answering(&self, state: &State) -> Answering<'a> {
+        match self.reading.of(self.values, state) {
+            Some(ReadValues::Constant(hap)) => Answering::Constant(Hap::clone(hap)),
+            Some(ReadValues::Signal(signal)) if self.values.tables_may_answer() => {
+                Answering::Signal(signal, state.clone())
+            }
+            _ => Answering::Graph,
+        }
     }
 
     /// Meet the function hap `hf` with the value side and push what they
     /// make. `false` when the query stops.
-    ///
-    /// `template` is the side's constant hap for one query, to move from
-    /// piece to piece. It is asked at the first function hap, so a query
-    /// with none queries the value side no more than before.
     fn meet(
         &self,
         mut hf: Hap,
-        template: &mut Option<Option<Hap>>,
+        meetings: &mut Meetings<'a>,
         state: &State,
         out: &mut Vec<Hap>,
     ) -> bool {
-        let met = hf.whole_or_part();
-        let template =
-            template.get_or_insert_with(|| self.constant.hap(self.values, state).cloned());
-        let answered: Vec<Hap>;
-        let inner: &[Hap] = match template {
-            // One piece, the common case: the template moved in place, with
-            // no allocation.
-            Some(template) if met.within_one_cycle() => {
-                template.move_to_piece(met);
-                std::slice::from_ref(template)
-            }
-            Some(template) => {
-                answered = met
-                    .span_cycles()
-                    .into_iter()
-                    .map(|piece| {
-                        let mut hap = template.clone();
-                        hap.move_to_piece(piece);
-                        hap
-                    })
-                    .collect();
-                &answered
-            }
-            None => {
-                answered = self.values.query(&state.set_span(met));
-                &answered
-            }
-        };
+        let inner = meetings.values(self, hf.whole_or_part(), hf.part, state);
         // One value hap meets this function hap, and that one meeting is
         // the hap's own: the hap is consumed where it is, as a sampled
         // meeting is. Several meetings share the function hap as their
@@ -5239,10 +5297,10 @@ impl<'a> ApplicationRun<'a> {
             }
             let mut haps = vec![hf];
             for (side, constant) in &self.applications[taken..] {
-                let mut template = Some(Some((*constant).clone()));
+                let mut meetings = Meetings::with_constant(constant);
                 let mut met = Vec::with_capacity(haps.len());
                 for hf in haps {
-                    if !side.meet(hf, &mut template, state, &mut met) {
+                    if !side.meet(hf, &mut meetings, state, &mut met) {
                         return Vec::new();
                     }
                 }
@@ -5278,16 +5336,39 @@ impl Pattern {
     /// the node kinds alone: a data value, under maps that do not read the
     /// span.
     fn is_constant_per_cycle(&self) -> bool {
+        self.constant_levels().is_some()
+    }
+
+    /// The levels of this graph, its own node included, when the pattern
+    /// [is constant per cycle](Self::is_constant_per_cycle).
+    fn constant_levels(&self) -> Option<u32> {
         if self.runtime_settings.is_some() || self.is_volatile() {
-            return false;
+            return None;
         }
         match self.node_kind() {
-            Node::Pure(value) => value.is_data(0),
+            Node::Pure(value) => value.is_data(0).then_some(1),
             Node::AddContext(pattern, _)
             | Node::FmapNative(pattern, _)
             | Node::MapHapsNative(pattern, _, SpanUse::Ignores)
-            | Node::MapHapsOwned(pattern, _, SpanUse::Ignores) => pattern.is_constant_per_cycle(),
-            _ => false,
+            | Node::MapHapsOwned(pattern, _, SpanUse::Ignores) => {
+                pattern.constant_levels()?.checked_add(1)
+            }
+            _ => None,
+        }
+    }
+
+    /// The hap this pattern answers for cycle zero, when the pattern
+    /// [is constant per cycle](Self::is_constant_per_cycle) and its graph
+    /// answers so. No node of such a graph reads the controls of `state`.
+    fn constant_cycle(&self, state: &State) -> Option<Hap> {
+        if !self.is_constant_per_cycle() {
+            return None;
+        }
+        let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
+        let mut haps = self.query(&state.set_span(cycle));
+        match (haps.pop(), haps.is_empty()) {
+            (Some(hap), true) if hap.whole == Some(cycle) && hap.part == cycle => Some(hap),
+            _ => None,
         }
     }
 }
@@ -6402,10 +6483,10 @@ impl Pattern {
                 if let Some(run) = ApplicationRun::ending_at(side, state) {
                     return run.query(state);
                 }
-                let mut template = None;
+                let mut meetings = Meetings::default();
                 let mut out = Vec::new();
                 for hf in side.functions.query(state) {
-                    if !side.meet(hf, &mut template, state, &mut out) {
+                    if !side.meet(hf, &mut meetings, state, &mut out) {
                         return Vec::new();
                     }
                 }
@@ -7525,7 +7606,7 @@ impl Pattern {
                 other => Value::List(vec![other.clone(), v.clone()]),
             })),
             LookupFlow::Infer,
-            ConstantValues::default(),
+            ValueReading::default(),
         ))
     }
 
@@ -7571,7 +7652,7 @@ impl Pattern {
             other,
             combine,
             lookup_flow,
-            ConstantValues::default(),
+            ValueReading::default(),
         ))
         .with_steps(steps)
     }
@@ -10774,7 +10855,7 @@ mod application_run_tests {
     }
 
     /// Everything a meeting decides of each hap `pattern` answers.
-    fn answers(pattern: &Pattern, begin: Fraction, end: Fraction) -> Vec<String> {
+    pub(super) fn answers(pattern: &Pattern, begin: Fraction, end: Fraction) -> Vec<String> {
         pattern
             .query_arc(begin, end)
             .iter()
@@ -10924,6 +11005,96 @@ mod application_run_tests {
         );
         for (begin, end) in spans() {
             assert_eq!(answers(&run, begin, end), answers(&in_turn, begin, end));
+        }
+    }
+}
+
+#[cfg(test)]
+mod value_signal_tests {
+    use super::application_run_tests::answers;
+    use super::*;
+    use crate::combinators::range;
+    use crate::compose::{Alignment, ComposeOp, compose};
+    use crate::signal::{saw, sine};
+
+    fn whole(n: i128) -> Fraction {
+        Fraction::new(n, 1)
+    }
+
+    fn third(n: i128) -> Fraction {
+        Fraction::new(n, 3)
+    }
+
+    fn signals() -> Vec<(&'static str, Pattern)> {
+        let cutoff = |signal: Pattern| {
+            signal.fmap(|value| Value::object([("cutoff".to_string(), value.clone())]))
+        };
+        vec![
+            ("a signal", saw()),
+            ("a ranged signal", range(&sine(), 200.0, 2000.0)),
+            (
+                "a slow ranged signal",
+                range(&sine(), 200.0, 2000.0).slow(whole(4)),
+            ),
+            ("a fast late signal", saw().fast(whole(3)).late(third(1))),
+            (
+                "a control of a slow signal",
+                cutoff(range(&saw(), 0.0, 1.0).slow(whole(2))),
+            ),
+            (
+                "a signal with a place in the text",
+                cutoff(sine()).with_added_context(vec![(4, 8)]),
+            ),
+        ]
+    }
+
+    fn structures() -> Vec<(&'static str, Pattern)> {
+        let note = |n: f64| pure(Value::object([("note".to_string(), Value::F64(n))]));
+        vec![
+            ("two notes a cycle", fastcat(vec![note(0.0), note(1.0)])),
+            (
+                "eight notes a cycle",
+                fastcat((0..8).map(|n| note(f64::from(n))).collect()),
+            ),
+            ("a note of three cycles", note(2.0).slow(whole(3))),
+            ("a number", pure(Value::F64(5.0))),
+            ("a signal", saw()),
+        ]
+    }
+
+    fn spans() -> [(Fraction, Fraction); 6] {
+        [
+            (Fraction::ZERO, Fraction::ONE),
+            (Fraction::ZERO, whole(4)),
+            (third(1), third(5)),
+            (third(7), third(8)),
+            (third(2), third(2)),
+            (third(-4), third(-1)),
+        ]
+    }
+
+    #[test]
+    fn a_signal_value_side_answers_as_a_query_of_it_for_each_hap() {
+        for op in [ComposeOp::Set, ComposeOp::Add, ComposeOp::Mul] {
+            for (begin, end) in spans() {
+                // Each span asks new graphs, so that the walk answers it and
+                // no table does.
+                for ((structure_name, structure), (signal_name, signal)) in
+                    structures().into_iter().flat_map(|structure| {
+                        signals().into_iter().map(move |s| (structure.clone(), s))
+                    })
+                {
+                    let read = compose(&structure, &signal, op, Alignment::In);
+                    // A stack answers as its pattern does and is no signal,
+                    // so the application queries it for each hap.
+                    let queried = compose(&structure, &stack(vec![signal]), op, Alignment::In);
+                    assert_eq!(
+                        answers(&read, begin, end),
+                        answers(&queried, begin, end),
+                        "{op:?} of {signal_name} on {structure_name} over {begin:?}..{end:?}"
+                    );
+                }
+            }
         }
     }
 }
