@@ -4578,7 +4578,13 @@ pub fn lane_statements(source: &str) -> Option<Vec<LaneStatement>> {
     if check_nesting(source).is_err() {
         return None;
     }
-    let mut lanes = on_parse_stack(source, lane_statements_here)?;
+    // A text with no slash in its code holds no regular expression. The
+    // scan then parses nothing and nests no call, so it runs where it is.
+    let mut lanes = if has_code_slash(source) {
+        on_parse_stack(source, lane_statements_here)?
+    } else {
+        lane_statements_here(source)
+    };
     if lanes.is_empty() {
         lanes.push(LaneStatement {
             label: String::new(),
@@ -4614,8 +4620,8 @@ pub fn same_instructions(playing: &str, typed: &str) -> bool {
     }
 }
 
-/// The body of `lane_statements`, always called on a parse stack. Empty when
-/// the score has no code.
+/// The body of `lane_statements`, called on a parse stack for a text that
+/// the scan parses. Empty when the score has no code.
 fn lane_statements_here(source: &str) -> Vec<LaneStatement> {
     let bytes = source.as_bytes();
     let regexes_are_present = !RegexLiteralRanges::parse(source).is_empty();
