@@ -15,6 +15,10 @@ crates/studio/src/themes/** text eol=lf
 # normalises CRLF itself, so a checkout with eol rewriting stays correct.
 crates/studio-e2e/goldens/** text eol=lf
 
+# The native inventory is compared with what a fresh installation proves,
+# byte for byte, so it is LF wherever it lands.
+crates/jsruntime/assets/native-inventory.txt text eol=lf
+
 # check-engine.sh compares the base engine profile's dependency snapshot with
 # cargo's output line for line, so the snapshot is LF wherever it lands.
 .github/scripts/engine-base-dependencies.txt text eol=lf

@@ -27,6 +27,7 @@ later version.
 use crate::ops::PatOps;
 use crate::util;
 use crate::value::{OrderedMap, Value};
+use std::sync::Arc;
 
 /// The eight alignments an operator can compose under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,7 +101,7 @@ impl Alignment {
 }
 
 /// One entry of the COMPOSERS table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, std::hash::Hash)]
 pub enum ComposeOp {
     /// The right operand wins.
     Set,
@@ -356,24 +357,33 @@ pub(crate) fn union_drops(b: &OrderedMap) -> bool {
 /// `b`'s keys added to `out`: common keys replaced where they are by the
 /// combined value, then `b`'s new keys in `b`'s order.
 fn union_into(op: ComposeOp, out: &mut OrderedMap, b: &OrderedMap) {
-    out.reserve(b.len());
-    for (key, b_value) in b {
-        out.upsert(key, |a_value| match a_value {
-            Some(a_value) => op.apply_scalar(a_value, b_value),
-            None => b_value.clone(),
-        });
+    let entries = b.entries();
+    if entries.is_empty() {
+        return;
+    }
+    // One hold of the entries for every key of `b`, not one per key: each
+    // hold pays for the map's copy and its shared-count bookkeeping.
+    let out = out.entries_mut(entries.len());
+    for (key, b_value) in entries {
+        match out.iter_mut().find(|(name, _)| name == key) {
+            Some((_, current)) => *current = op.apply_scalar(current, b_value),
+            None => out.push((key.clone(), b_value.clone())),
+        }
     }
 }
 
 /// [`compose_op`] of two data values, which hold no script object, made
 /// where `a` is. A union of two maps adds `b`'s keys to `a`'s map, which it
-/// copies only when it is shared.
+/// copies only when it is shared. Data made of data is data, so the union's
+/// map is marked as holding data only, and the next compose of it does not
+/// walk its entries to learn that again.
 pub(crate) fn compose_data_in_place(op: ComposeOp, a: &mut Value, b: &Value) {
     debug_assert!(a.is_data(0) && b.is_data(0));
     if let (Value::Object(map), Value::Object(other)) = (&mut *a, b)
         && !union_drops(other)
     {
         union_into(op, map, other);
+        map.mark_made_of_data();
         return;
     }
     *a = compose_op(op, a, b);
@@ -403,14 +413,8 @@ fn compose_inner<P: PatOps>(pat: &P, other: &P, op: ComposeOp, how: Alignment) -
     // `keepif` bypasses `_composeOp` so that `b`'s value is discarded rather
     // than unioned, then strips the undefineds the falsy branch produced.
     if op == ComposeOp::KeepIf {
-        apply_alignment(
-            pat,
-            other,
-            how,
-            move |a, b| op.apply_scalar(a, b),
-            lookup_flow,
-        )
-        .remove_undefineds()
+        apply_alignment(pat, other, how, interned_combine(op, true), lookup_flow)
+            .remove_undefineds()
     } else {
         // A direct alignment names its op, so that a precomputed table can
         // run it on the structure hap's value where that value is.
@@ -418,15 +422,50 @@ fn compose_inner<P: PatOps>(pat: &P, other: &P, op: ComposeOp, how: Alignment) -
             Alignment::In => pat.app_left_composed(other.clone(), op, lookup_flow),
             Alignment::Out => pat.app_right_composed(other.clone(), op, lookup_flow),
             Alignment::Mix => pat.app_both_composed(other.clone(), op, lookup_flow),
-            _ => apply_alignment(
-                pat,
-                other,
-                how,
-                move |a, b| compose_op(op, a, b),
-                lookup_flow,
-            ),
+            _ => apply_alignment(pat, other, how, interned_combine(op, false), lookup_flow),
         }
     }
+}
+
+/// The closure of each compose op that a pattern was built with. See
+/// [`interned_combine`].
+static OP_CLOSURES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(ComposeOp, bool), crate::CombineFn>>,
+> = std::sync::OnceLock::new();
+
+/// Whether `combine` is the closure of a compose op: a function of its two
+/// values and nothing more, which a fold may run when a pattern is built.
+pub(crate) fn is_op_closure(combine: &crate::CombineFn) -> bool {
+    OP_CLOSURES.get().is_some_and(|closures| {
+        closures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .any(|closure| Arc::ptr_eq(closure, combine))
+    })
+}
+
+/// The combine closure one compose op builds, interned: the same op built
+/// by a later evaluation is the same closure object, so that node agrees
+/// with its counterpart by pointer and the answers of the unchanged
+/// subtree carry across evaluations and edits. `scalar_only` is the
+/// `keepif` body, which discards `b`'s value rather than unioning it.
+/// See [`crate::interned_closure`].
+fn interned_combine(op: ComposeOp, scalar_only: bool) -> crate::CombineFn {
+    crate::interned_closure(
+        OP_CLOSURES.get_or_init(Default::default),
+        (op, scalar_only),
+        || {
+            let combine: crate::CombineFn = Arc::new(move |a: &Value, b: &Value| {
+                if scalar_only {
+                    op.apply_scalar(a, b)
+                } else {
+                    compose_op(op, a, b)
+                }
+            });
+            combine
+        },
+    )
 }
 
 /// The `_op*` family. `combine(a, b)` receives the LEFT pattern's value first,
@@ -440,13 +479,13 @@ fn apply_alignment<P: PatOps>(
     pat: &P,
     other: &P,
     how: Alignment,
-    combine: impl Fn(&Value, &Value) -> Value + Send + Sync + Clone + 'static,
+    combine: crate::CombineFn,
     lookup_flow: crate::LookupFlow,
 ) -> P {
     match how {
-        Alignment::In => pat.app_left_with_lookup(other.clone(), combine, lookup_flow),
-        Alignment::Out => pat.app_right_with_lookup(other.clone(), combine, lookup_flow),
-        Alignment::Mix => pat.app_both_with_lookup(other.clone(), combine, lookup_flow),
+        Alignment::In => pat.app_left_interned(other.clone(), combine, lookup_flow),
+        Alignment::Out => pat.app_right_interned(other.clone(), combine, lookup_flow),
+        Alignment::Mix => pat.app_both_interned(other.clone(), combine, lookup_flow),
 
         Alignment::Squeeze => {
             let other = other.clone();

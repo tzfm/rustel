@@ -14,80 +14,82 @@ later version.
 
 use crate::host_value::{HostValue, Pointer};
 use crate::rng::rand_at_time;
-use crate::{Pattern, Value, signal};
+use crate::{Pattern, Value, signal, signal_static};
 use rustel_fraction::Fraction;
 
 pub fn saw() -> Pattern {
-    signal(|time, _| Value::F64(time.to_f64().rem_euclid(1.0)))
+    signal_static(|time, _| Value::F64(time.to_f64().rem_euclid(1.0)))
 }
 
 pub fn saw2() -> Pattern {
-    signal(|time, _| Value::F64(time.to_f64().rem_euclid(1.0) * 2.0 - 1.0))
+    signal_static(|time, _| Value::F64(time.to_f64().rem_euclid(1.0) * 2.0 - 1.0))
 }
 
 pub fn isaw() -> Pattern {
-    signal(|time, _| Value::F64(1.0 - time.to_f64().rem_euclid(1.0)))
+    signal_static(|time, _| Value::F64(1.0 - time.to_f64().rem_euclid(1.0)))
 }
 
 pub fn isaw2() -> Pattern {
-    signal(|time, _| Value::F64((1.0 - time.to_f64().rem_euclid(1.0)) * 2.0 - 1.0))
+    signal_static(|time, _| Value::F64((1.0 - time.to_f64().rem_euclid(1.0)) * 2.0 - 1.0))
 }
 
 // sine/cosine go through crate::fdlibm rather than the platform libm, so
 // hap values are bit-identical to strudel.cc's.
 pub fn sine2() -> Pattern {
-    signal(|time, _| Value::F64(crate::fdlibm::sin(std::f64::consts::TAU * time.to_f64())))
+    signal_static(|time, _| Value::F64(crate::fdlibm::sin(std::f64::consts::TAU * time.to_f64())))
 }
 
 pub fn sine() -> Pattern {
-    signal(|time, _| {
+    signal_static(|time, _| {
         Value::F64((crate::fdlibm::sin(std::f64::consts::TAU * time.to_f64()) + 1.0) / 2.0)
     })
 }
 
 pub fn cosine2() -> Pattern {
-    signal(|time, _| Value::F64(crate::fdlibm::cos(std::f64::consts::TAU * time.to_f64())))
+    signal_static(|time, _| Value::F64(crate::fdlibm::cos(std::f64::consts::TAU * time.to_f64())))
 }
 
 pub fn cosine() -> Pattern {
-    signal(|time, _| {
+    signal_static(|time, _| {
         Value::F64((crate::fdlibm::cos(std::f64::consts::TAU * time.to_f64()) + 1.0) / 2.0)
     })
 }
 
 pub fn square() -> Pattern {
-    signal(|time, _| Value::F64((time.to_f64() * 2.0).rem_euclid(2.0).floor()))
+    signal_static(|time, _| Value::F64((time.to_f64() * 2.0).rem_euclid(2.0).floor()))
 }
 
 pub fn square2() -> Pattern {
-    signal(|time, _| Value::F64((time.to_f64() * 2.0).rem_euclid(2.0).floor() * 2.0 - 1.0))
+    signal_static(|time, _| Value::F64((time.to_f64() * 2.0).rem_euclid(2.0).floor() * 2.0 - 1.0))
 }
 
 /// Flipped squares: high first.
 pub fn isquare() -> Pattern {
-    signal(|time, _| Value::F64(1.0 - (time.to_f64() * 2.0).rem_euclid(2.0).floor()))
+    signal_static(|time, _| Value::F64(1.0 - (time.to_f64() * 2.0).rem_euclid(2.0).floor()))
 }
 
 pub fn isquare2() -> Pattern {
-    signal(|time, _| Value::F64((1.0 - (time.to_f64() * 2.0).rem_euclid(2.0).floor()) * 2.0 - 1.0))
+    signal_static(|time, _| {
+        Value::F64((1.0 - (time.to_f64() * 2.0).rem_euclid(2.0).floor()) * 2.0 - 1.0)
+    })
 }
 
 pub fn time() -> Pattern {
-    signal(|time, _| Value::F64(time.to_f64()))
+    signal_static(|time, _| Value::F64(time.to_f64()))
 }
 
 /// Rises from zero to one over one cycle, then stays at one.
 pub fn open() -> Pattern {
-    signal(|time, _| Value::F64(time.min(Fraction::ONE).to_f64()))
+    signal_static(|time, _| Value::F64(time.min(Fraction::ONE).to_f64()))
 }
 
 /// Falls from one to zero over one cycle, then stays at zero.
 pub fn close() -> Pattern {
-    signal(|time, _| Value::F64((1.0 - time.to_f64()).max(0.0)))
+    signal_static(|time, _| Value::F64((1.0 - time.to_f64()).max(0.0)))
 }
 
 pub fn rand() -> Pattern {
-    signal(|time, controls| {
+    signal_static(|time, controls| {
         let seed = controls
             .get("randSeed")
             .and_then(Value::as_f64)
@@ -118,7 +120,7 @@ pub fn itri2() -> Pattern {
 /// the same constant a headless strudel.cc run settles on. A score that
 /// reaches for the mouse is not an error, it is a constant.
 pub fn mouse_position() -> Pattern {
-    signal(|_, _| Value::F64(0.0))
+    signal_static(|_, _| Value::F64(0.0))
 }
 
 /// Bipolar rand.
@@ -235,7 +237,7 @@ pub fn brand() -> Pattern {
 /// Smoothed value noise: smootherstep between random values at whole-cycle
 /// times.
 pub fn perlin() -> Pattern {
-    signal(|time, controls| {
+    signal_static(|time, controls| {
         let seed = controls
             .get("randSeed")
             .and_then(Value::as_f64)
@@ -256,7 +258,7 @@ pub fn perlin() -> Pattern {
 /// NEXT random value, then drops - sawteeth of random height rather than
 /// perlin's smoothed hills. Halving keeps a sum of two 0..1 values in 0..1.
 pub fn berlin() -> Pattern {
-    signal(|time, controls| {
+    signal_static(|time, controls| {
         let seed = controls
             .get("randSeed")
             .and_then(Value::as_f64)
@@ -273,14 +275,13 @@ pub fn berlin() -> Pattern {
     })
 }
 
-/// Every signal the score language exposes as a bare global, by name.
+/// Every signal the score language exposes as a bare global, by name, but
+/// the [`pointer_signals`].
 ///
 /// Installed as globals in the QuickJS host: a signal is a *value*, not a
-/// function, so `note(saw.range(0, 7))` is valid. The mouse names read
-/// `pointer` when there is one, and [`mouse_position`] when there is not.
-pub fn signals(pointer: Option<&Pointer>) -> Vec<(&'static str, Pattern)> {
-    let mouse = |axis: Option<&HostValue>| axis.map_or_else(mouse_position, HostValue::signal);
-    let (x, y) = (pointer.map(|p| &p.x), pointer.map(|p| &p.y));
+/// function, so `note(saw.range(0, 7))` is valid. Each reads only the time
+/// it is queried at.
+pub fn signals() -> Vec<(&'static str, Pattern)> {
     vec![
         ("saw", saw()),
         ("saw2", saw2()),
@@ -301,17 +302,25 @@ pub fn signals(pointer: Option<&Pointer>) -> Vec<(&'static str, Pattern)> {
         ("time", time()),
         ("open", open()),
         ("close", close()),
-        // Both spellings of each axis are exposed.
-        ("mousex", mouse(x)),
-        ("mouseX", mouse(x)),
-        ("mousey", mouse(y)),
-        ("mouseY", mouse(y)),
         ("rand", rand()),
         ("rand2", rand2()),
         // `brand` is a bare value like the waves, not a function.
         ("brand", brand()),
         ("perlin", perlin()),
         ("berlin", berlin()),
+    ]
+}
+
+/// The mouse signals, by name: both spellings of each axis. They read
+/// `pointer` when there is one, and [`mouse_position`] when there is not.
+pub fn pointer_signals(pointer: Option<&Pointer>) -> [(&'static str, Pattern); 4] {
+    let mouse = |axis: Option<&HostValue>| axis.map_or_else(mouse_position, HostValue::signal);
+    let (x, y) = (pointer.map(|p| &p.x), pointer.map(|p| &p.y));
+    [
+        ("mousex", mouse(x)),
+        ("mouseX", mouse(x)),
+        ("mousey", mouse(y)),
+        ("mouseY", mouse(y)),
     ]
 }
 

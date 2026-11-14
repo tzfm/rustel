@@ -295,7 +295,24 @@ pub(super) fn install<'js>(
     globals: &rquickjs::Object<'js>,
     pointer: Option<&rustel_core::host_value::Pointer>,
 ) -> Result<(), String> {
-    for (name, pattern) in rustel_core::signal::signals(pointer) {
+    // A signal that reads only time means the same in every realm, so a
+    // score can read it without JavaScript. The mouse signals read this
+    // realm's pointer.
+    for (name, pattern) in rustel_core::signal::signals() {
+        let wrapper = new_wrapper(ctx, NativePatternWrapper::plain(pattern.clone()))
+            .map_err(|error| error.to_string())?;
+        globals
+            .set(name, wrapper.clone())
+            .map_err(|error| error.to_string())?;
+        record_builtin_global(
+            ctx,
+            name,
+            wrapper.into_value(),
+            BuiltinGlobal::Signal(pattern),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    for (name, pattern) in rustel_core::signal::pointer_signals(pointer) {
         let wrapper = new_wrapper(ctx, NativePatternWrapper::plain(pattern))
             .map_err(|error| error.to_string())?;
         globals

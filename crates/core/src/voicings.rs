@@ -991,58 +991,63 @@ pub fn voicing<P: crate::ops::PatOps>(pat: &P) -> P {
     // A host-owned default dictionary is refreshed in place at query entry,
     // so while one is selected the answer can move without any settings
     // snapshot changing.
-    let voiced = pat.expand_pitch_haps_native(|hap| {
-        // A plain string value is `{chord: value}`.
-        let owned;
-        let map: &OrderedMap = match &hap.value {
-            Value::Str(chord) => {
-                owned =
-                    OrderedMap::from_entries([("chord".to_string(), Value::Str(chord.clone()))]);
-                &owned
-            }
-            Value::Object(map) => map,
-            Value::JsValue(_) => {
-                owned = match crate::materialize_js_value(&hap.value) {
-                    Value::Object(map) => map,
-                    _ => return Vec::new(),
-                };
-                &owned
-            }
-            _ => return Vec::new(),
-        };
-        let Some(notes) = render_voicing(map) else {
-            // Upstream: caught throw → `[voicing]: unknown chord` + silence.
-            return Vec::new();
-        };
-        const VOICING_CONTROLS: [&str; 7] = [
-            "dictionary",
-            "chord",
-            "anchor",
-            "offset",
-            "mode",
-            "n",
-            "octaves",
-        ];
-        let mut rest = OrderedMap::new();
-        for (key, value) in map.iter() {
-            if !VOICING_CONTROLS.contains(&key) {
-                rest.insert(key.to_string(), value.clone());
-            }
-        }
-        notes
-            .into_iter()
-            .map(|note| {
-                let mut value = OrderedMap::from_entries([("note".to_string(), note)]);
-                for (key, entry) in rest.iter() {
-                    value.insert(key.to_string(), entry.clone());
-                }
-                let mut out = hap.clone();
-                out.value = Value::Object(value);
-                out
-            })
-            .collect()
-    });
+    // One closure object for every voicing, so a rebuilt voicing agrees
+    // with its counterpart by pointer. See [`crate::interned_closure`].
+    let voiced = pat.expand_pitch_haps_native_static(voicing_hap);
     voiced.mark_host_voicings()
+}
+
+/// The per-hap body of [`voicing`]: capture-free, everything it reads it
+/// reads from the hap or the settings.
+fn voicing_hap(hap: &crate::Hap) -> Vec<crate::Hap> {
+    // A plain string value is `{chord: value}`.
+    let owned;
+    let map: &OrderedMap = match &hap.value {
+        Value::Str(chord) => {
+            owned = OrderedMap::from_entries([("chord".to_string(), Value::Str(chord.clone()))]);
+            &owned
+        }
+        Value::Object(map) => map,
+        Value::JsValue(_) => {
+            owned = match crate::materialize_js_value(&hap.value) {
+                Value::Object(map) => map,
+                _ => return Vec::new(),
+            };
+            &owned
+        }
+        _ => return Vec::new(),
+    };
+    let Some(notes) = render_voicing(map) else {
+        // Upstream: caught throw → `[voicing]: unknown chord` + silence.
+        return Vec::new();
+    };
+    const VOICING_CONTROLS: [&str; 7] = [
+        "dictionary",
+        "chord",
+        "anchor",
+        "offset",
+        "mode",
+        "n",
+        "octaves",
+    ];
+    let mut rest = OrderedMap::new();
+    for (key, value) in map.iter() {
+        if !VOICING_CONTROLS.contains(&key) {
+            rest.insert(key.to_string(), value.clone());
+        }
+    }
+    notes
+        .into_iter()
+        .map(|note| {
+            let mut value = OrderedMap::from_entries([("note".to_string(), note)]);
+            for (key, entry) in rest.iter() {
+                value.insert(key.to_string(), entry.clone());
+            }
+            let mut out = hap.clone();
+            out.value = Value::Object(value);
+            out
+        })
+        .collect()
 }
 
 /// Every chord symbol a dictionary knows, sorted by name.

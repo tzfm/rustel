@@ -146,26 +146,52 @@ fn tagged<'js>(
     tag: String,
 ) -> rquickjs::Result<rquickjs::Value<'js>> {
     let (pattern, sidecar) = reify_bridged(ctx, pattern)?;
-    let pattern = pattern.fmap_keeping_live(move |value| {
-        let plugin = |controls: &rustel_core::OrderedMap| {
-            controls.contains_key("vst") || controls.contains_key("vsti")
-        };
-        match value {
-            Value::Object(controls) if plugin(controls) => {}
-            // A value JavaScript owns shows its keys after a copy.
-            Value::JsValue(_) => {}
-            _ => return None,
-        }
-        let Value::Object(mut controls) = rustel_core::materialize_js_value(value) else {
-            return None;
-        };
-        if !plugin(&controls) {
-            return None;
-        }
-        controls.insert("__rustel_lane".into(), Value::Str(tag.clone()));
-        Some(Value::Object(controls))
-    });
-    Ok(derive_wrapper(ctx.clone(), pattern, &[sidecar])?.into_value())
+    Ok(derive_wrapper(ctx.clone(), lane_tagged(&pattern, tag), &[sidecar])?.into_value())
+}
+
+/// A lane's pattern with its plugin notes tagged with the lane: what a
+/// playing lane contributes to the score.
+pub(crate) fn lane_tagged(pattern: &rustel_core::Pattern, tag: String) -> rustel_core::Pattern {
+    // One map object per lane name: the tag is the only thing the map
+    // reads, so the same lane built by a later evaluation is the same
+    // payload and its answers carry across evaluations.
+    static POOL: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, rustel_core::OwnedHapMapFn>>,
+    > = std::sync::OnceLock::new();
+    let map =
+        rustel_core::interned_closure(POOL.get_or_init(Default::default), tag.clone(), || {
+            let map: rustel_core::OwnedHapMapFn =
+                std::sync::Arc::new(move |hap: rustel_core::Hap| {
+                    Some(match tagged_value(&hap.value, &tag) {
+                        Some(value) => hap.into_value_keeping_live(value),
+                        None => hap,
+                    })
+                });
+            map
+        });
+    pattern.fmap_keeping_live_with(map)
+}
+
+/// The body of one lane tag map: a plugin note gets the lane name, every
+/// other value passes through untouched.
+fn tagged_value(value: &Value, tag: &str) -> Option<Value> {
+    let plugin = |controls: &rustel_core::OrderedMap| {
+        controls.contains_key("vst") || controls.contains_key("vsti")
+    };
+    match value {
+        Value::Object(controls) if plugin(controls) => {}
+        // A value JavaScript owns shows its keys after a copy.
+        Value::JsValue(_) => {}
+        _ => return None,
+    }
+    let Value::Object(mut controls) = rustel_core::materialize_js_value(value) else {
+        return None;
+    };
+    if !plugin(&controls) {
+        return None;
+    }
+    controls.insert("__rustel_lane".into(), Value::Str(tag.into()));
+    Some(Value::Object(controls))
 }
 
 /// The shadow of a score when its evaluation ran a plugin call: the lanes
@@ -380,12 +406,13 @@ pub(super) fn install<'js>(
     proto
         .prop(
             "p",
-            Property::from(collect)
+            Property::from(collect.clone())
                 .writable()
                 .enumerable()
                 .configurable(),
         )
         .map_err(|error| error.to_string())?;
+    record_lane_method(ctx, collect.into_value()).map_err(|error| error.to_string())?;
 
     let quiet = Function::new(ctx.clone(), quiet).map_err(|error| error.to_string())?;
     configure_function(&quiet, "", 0, true).map_err(|error| error.to_string())?;

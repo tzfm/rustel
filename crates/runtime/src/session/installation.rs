@@ -202,18 +202,11 @@ impl Session {
         Ok(Some((generation_before, generation_after)))
     }
 
+    /// Install the score surface, once. A score the native tier evaluates
+    /// needs none, so score evaluation installs it only when JavaScript
+    /// runs. See `JsRuntime::ensure_surface`.
     pub(super) fn ensure_bindings(&mut self) -> Result<(), RuntimeError> {
-        if self.bindings_ready {
-            return Ok(());
-        }
-        self.js
-            .install_semantic_bindings()
-            .map_err(RuntimeError::Js)?;
-        // `s` is not an alias of `m`. The mini pattern is the argument to the
-        // `s` control, so `s("bd sd")` produces `{s: "bd"}` control objects,
-        // not bare `"bd"` values.
-        self.bindings_ready = true;
-        Ok(())
+        self.js.ensure_surface().map_err(RuntimeError::Js)
     }
 
     /// Install an explicit Rust `Pattern` as the active graph (no JS).

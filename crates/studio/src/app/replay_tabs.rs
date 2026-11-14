@@ -667,11 +667,15 @@ mod tests {
                 "block 3 is due after block 2's five seconds"
             );
             assert!(
-                app.inflight.values().any(|sent| sent.scene == id),
+                app.inflight
+                    .values()
+                    .chain(app.pending_evaluation.iter())
+                    .any(|sent| sent.scene == id),
                 "the block's code went to the engine"
             );
 
             // When the block's time is up the next one loads and plays.
+            app.pending_evaluation = None;
             app.inflight.clear();
             app.replays
                 .get_mut(&id)
@@ -684,7 +688,10 @@ mod tests {
             assert_eq!(app.replays[&id].selected, 2);
             assert_eq!(app.scenes.current().editor.source(), "$: s(\"square\")");
             assert!(
-                app.inflight.values().any(|sent| sent.scene == id),
+                app.inflight
+                    .values()
+                    .chain(app.pending_evaluation.iter())
+                    .any(|sent| sent.scene == id),
                 "the block's code went to the engine"
             );
             assert_eq!(app.replays[&id].run.map(|run| run.event), Some(2));
@@ -834,6 +841,7 @@ mod tests {
             assert!(app.snippet_preview.is_some(), "the preview sounds");
 
             // The block's time is up; the run loads the next one.
+            app.pending_evaluation = None;
             app.inflight.clear();
             app.replays
                 .get_mut(&id)
@@ -852,7 +860,10 @@ mod tests {
                 app.status
             );
             assert!(
-                app.inflight.values().any(|sent| sent.scene == id),
+                app.inflight
+                    .values()
+                    .chain(app.pending_evaluation.iter())
+                    .any(|sent| sent.scene == id),
                 "the block's code went to the engine"
             );
         }

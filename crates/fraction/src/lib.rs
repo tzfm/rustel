@@ -739,6 +739,34 @@ impl Fraction {
         }
     }
 
+    /// `(self / o).floor()` as a whole count, with no reduced quotient on
+    /// the 64-bit path. `None` as [`Self::checked_div`] gives it.
+    pub fn checked_div_floor(self, o: Self) -> Option<i128> {
+        match self.small_quotient(o) {
+            Some((n, d)) => Some(i128::from(n.div_euclid(d))),
+            None => Some(self.checked_div(o)?.floor().n),
+        }
+    }
+
+    /// `(self / o).ceil()` as a whole count, with no reduced quotient on
+    /// the 64-bit path. `None` as [`Self::checked_div`] gives it.
+    pub fn checked_div_ceil(self, o: Self) -> Option<i128> {
+        match self.small_quotient(o) {
+            // The floor of the negated quotient, negated: no remainder to
+            // test, and no overflow for products below 2^62.
+            Some((n, d)) => Some(-i128::from((-n).div_euclid(d))),
+            None => Some(self.checked_div(o)?.ceil().n),
+        }
+    }
+
+    /// `self / o` as a numerator and a positive denominator that are not
+    /// reduced, for a divisor above zero on the 64-bit path.
+    #[inline]
+    fn small_quotient(self, o: Self) -> Option<(i64, i64)> {
+        let ((n, d), (on, od)) = (self.small()?, o.small()?);
+        (on > 0).then_some((n * od, d * on))
+    }
+
     #[inline]
     fn mul_eq_self(self, o: Self) -> bool {
         self.n == o.n && self.d.get() == o.d.get()
@@ -1650,6 +1678,42 @@ mod native_fast_path_tests {
                         "{fraction:?} and {whole:?}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn the_whole_counts_around_a_quotient_agree_with_the_reduced_quotient() {
+        let terms = [
+            Fraction::ZERO,
+            Fraction::ONE,
+            Fraction::new(-1, 1),
+            Fraction::new(13, 96),
+            Fraction::new(-13, 96),
+            Fraction::new(60, 1),
+            Fraction::new(-60, 1),
+            Fraction::new(7, 3),
+            Fraction::new(-7, 3),
+            Fraction::new((1 << 31) - 1, 1),
+            Fraction::new(1, (1 << 31) - 1),
+            Fraction::new(1 << 31, 3),
+            Fraction::new(-5, 1 << 40),
+            Fraction::new(i128::MAX, 2),
+            Fraction::new(i128::MIN + 1, 1),
+        ];
+        for left in terms {
+            for right in terms {
+                let quotient = left.checked_div(right);
+                assert_eq!(
+                    left.checked_div_floor(right),
+                    quotient.map(|quotient| quotient.floor().numer()),
+                    "floor of {left:?} / {right:?}"
+                );
+                assert_eq!(
+                    left.checked_div_ceil(right),
+                    quotient.map(|quotient| quotient.ceil().numer()),
+                    "ceil of {left:?} / {right:?}"
+                );
             }
         }
     }

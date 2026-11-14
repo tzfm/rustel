@@ -30,6 +30,7 @@ use crate::{
     ValuePredicate, applied_hap, joined_hap, picked_hap,
 };
 use rustel_fraction::Fraction;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// The most haps one table may hold, and the most cycles a build answers
@@ -38,6 +39,47 @@ const MAX_ENTRIES: usize = 8192;
 
 /// The most haps one query reserves room for ahead of making them.
 const MAX_RESERVED: usize = 1 << 16;
+
+// Buffers of haps that one query hands out and takes back, so that a
+// nested answer does not allocate its own. Per thread, without locks; a
+// buffer returns on drop, empty but with its room.
+thread_local! {
+    static HAP_BUFFERS: std::cell::RefCell<Vec<Vec<Hap>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One buffer from [`HAP_BUFFERS`], returned when it drops.
+struct HapBuffer(Vec<Hap>);
+
+impl HapBuffer {
+    fn take() -> Self {
+        let pooled = HAP_BUFFERS.with(|pool| pool.borrow_mut().pop());
+        Self(pooled.unwrap_or_default())
+    }
+}
+
+impl Drop for HapBuffer {
+    fn drop(&mut self) {
+        if self.0.capacity() <= MAX_RESERVED {
+            self.0.clear();
+            HAP_BUFFERS.with(|pool| pool.borrow_mut().push(std::mem::take(&mut self.0)));
+        }
+    }
+}
+
+impl std::ops::Deref for HapBuffer {
+    type Target = Vec<Hap>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for HapBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// The most graph levels one table build walks. Each level is a few native
 /// frames, so this stays well below [`crate::MAX_PATTERN_DEPTH`].
@@ -625,7 +667,7 @@ impl Signal {
             }
             Source::Fixed(fixed) => {
                 let by = asked.begin.checked_sub(fixed.whole.begin)?;
-                let mut scratch = Vec::new();
+                let mut scratch = HapBuffer::take();
                 for (hap, sampler) in fixed.haps.iter().zip(&fixed.samplers) {
                     let hap = retimed(hap, |t| t.checked_add(by))?;
                     match sampler {
@@ -856,7 +898,8 @@ impl Stage {
                 if !answered {
                     source.answer(whole, part, probe, signal)?;
                 }
-                let mut next = Vec::with_capacity(signal.len());
+                let mut next = HapBuffer::take();
+                next.reserve(signal.len());
                 for structure in &out[start..] {
                     for met in signal.iter() {
                         if let Some(cut) = structure.part.intersection(&met.part) {
@@ -965,13 +1008,9 @@ impl Stage {
         if together.pick_lookup.is_some() {
             return None;
         }
-        // Each hap reads the constant's map. A kept map is known to be data.
-        let mut together = together;
-        let crate::Value::Object(map) = &together.value else {
+        // Each hap reads the constant's map.
+        if !matches!(together.value, crate::Value::Object(_)) {
             return None;
-        };
-        if let Some(kept) = map.interned() {
-            together.value = crate::Value::Object(kept);
         }
         each.push(next.clone());
         Some(Stage::Fused {
@@ -1047,8 +1086,23 @@ impl Step {
     }
 }
 
+/// The answer tables one node holds, in the state a query finds them.
+#[derive(Debug, Default)]
+pub(crate) enum TableSlot {
+    /// No build has put tables here yet.
+    #[default]
+    Empty,
+    /// A build under this settings state made none, so the graph answers.
+    /// A later state may build again: the compiled programs a build applies
+    /// can change with the state.
+    GraphAnswers(SettingsStateId),
+    /// Built tables, answering while [`Tables::current`] upholds them and
+    /// replaced by a fresh build the first query after they stop.
+    Ready(Arc<Tables>),
+}
+
 /// Layers answered one after the other, as a stack answers its children.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Tables {
     layers: Vec<Layer>,
     /// What the graph's walk does for a query. See [`Work`].
@@ -1074,6 +1128,51 @@ pub(crate) struct Tables {
     /// answers only while they all hold. See
     /// [`crate::callback_ir::recording_reads`].
     read: Box<[Arc<crate::callback_ir::Standing>]>,
+    /// The share of [`TABLE_BUDGET`] these tables hold while a node keeps
+    /// them. `None` for tables built for one answer only.
+    charge: Option<Charge>,
+}
+
+/// The bytes the kept tables of this process may hold together, unless a
+/// host sets another budget with [`set_table_budget`].
+pub const DEFAULT_TABLE_BUDGET: usize = 32 << 20;
+
+static TABLE_BUDGET: AtomicUsize = AtomicUsize::new(DEFAULT_TABLE_BUDGET);
+static TABLE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Set how many bytes the kept tables of this process may hold together.
+/// Tables kept already stay until they drop. A table past the budget
+/// answers the query that built it and is not kept: its node is walked.
+pub fn set_table_budget(bytes: usize) {
+    TABLE_BUDGET.store(bytes, Ordering::Relaxed);
+}
+
+/// The bytes the kept tables of this process hold now.
+pub fn table_bytes() -> usize {
+    TABLE_BYTES.load(Ordering::Relaxed)
+}
+
+/// A kept table's share of the budget, given back when the table drops.
+#[derive(Debug)]
+struct Charge(usize);
+
+impl Charge {
+    /// `bytes` of the budget, when that much is left.
+    fn take(bytes: usize) -> Option<Self> {
+        let budget = TABLE_BUDGET.load(Ordering::Relaxed);
+        TABLE_BYTES
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                held.checked_add(bytes).filter(|&total| total <= budget)
+            })
+            .ok()
+            .map(|_| Self(bytes))
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        TABLE_BYTES.fetch_sub(self.0, Ordering::Relaxed);
+    }
 }
 
 /// What the graph's walk does for a query, as bounds a table checks before
@@ -1456,15 +1555,8 @@ impl Layer {
                 ),
             });
         }
-        // Every query clones these values. An interned map clones as a
-        // pointer.
-        for entry in &mut entries {
-            if let crate::Value::Object(object) = &entry.value
-                && let Some(interned) = object.interned()
-            {
-                entry.value = crate::Value::Object(interned);
-            }
-        }
+        // A period that repeats a control map holds it once.
+        crate::value::share_equal_maps(entries.iter_mut().map(|entry| &mut entry.value));
         let ordered = in_time_order(&entries, period);
         let sorted = (!ordered)
             .then(|| crate::sort_haps_for_query(entries.clone()))
@@ -1761,7 +1853,7 @@ impl Layer {
         }
         out.reserve(self.most(entries, span, periods)?.min(MAX_RESERVED));
         let mut probe = state.clone();
-        let mut signal = Vec::new();
+        let mut signal = HapBuffer::take();
         for k in periods.first..=periods.last {
             let shift = k.checked_mul(self.period)?;
             let inside = periods.is_inside(k);
@@ -2337,12 +2429,19 @@ impl Tables {
             sorted,
             state: None,
             read: Box::new([]),
+            charge: None,
         }
     }
 
     /// These tables, kept for the settings snapshot `state`, which was in
     /// force when their build began, and for the standings `read` of the
     /// compiled programs the build applied.
+    /// These tables for one answer, with the standings of the programs
+    /// their build applied.
+    pub(crate) fn reading(self, read: Box<[Arc<crate::callback_ir::Standing>]>) -> Self {
+        Self { read, ..self }
+    }
+
     pub(crate) fn built_under(
         self,
         state: SettingsStateId,
@@ -2353,6 +2452,29 @@ impl Tables {
             read,
             ..self
         }
+    }
+
+    /// Take this table's share of the budget so a node may keep it. `false`
+    /// when the budget has no room: the table answers once and drops.
+    pub(crate) fn charge(&mut self) -> bool {
+        self.charge = Charge::take(self.bytes());
+        self.charge.is_some()
+    }
+
+    /// About the bytes these tables hold: their entries in each order kept,
+    /// and the union a sorted answer of several layers builds.
+    fn bytes(&self) -> usize {
+        let kept: usize = self
+            .layers
+            .iter()
+            .map(|layer| layer.entries.len() + layer.sorted.as_ref().map_or(0, Vec::len))
+            .sum();
+        let union = if self.layers.len() > 1 {
+            self.layers.iter().map(|layer| layer.entries.len()).sum()
+        } else {
+            0
+        };
+        (kept + union) * std::mem::size_of::<Hap>()
     }
 
     /// Whether the settings in force are those the table was built under,
@@ -2604,11 +2726,12 @@ pub(crate) fn build(node: &Node) -> Option<Tables> {
     match node {
         Node::Silence => Some(Tables::new(Vec::new(), Work::leaf(Cycles::NONE))),
         Node::Pure(value) if value.is_data(0) => pure(value),
+        Node::Sequence(layers) => sequence(layers),
         Node::AddContext(pattern, locations) => {
-            stepped(pattern.tables()?, Step::Locations(locations.clone()))
+            stepped(&*pattern.tables()?, Step::Locations(locations.clone()))
         }
-        Node::Fast(pattern, factor, _) => fast(pattern.tables()?, *factor),
-        Node::Shift(pattern, by, _) => shift(pattern.tables()?, *by),
+        Node::Fast(pattern, factor, _) => fast(&*pattern.tables()?, *factor),
+        Node::Shift(pattern, by, _) => shift(&*pattern.tables()?, *by),
         Node::Stack(patterns) => stack(patterns),
         Node::SplitQueries(inner) => split_queries(inner),
         Node::Pick {
@@ -2616,53 +2739,71 @@ pub(crate) fn build(node: &Node) -> Option<Tables> {
             lookup,
             index_mode,
             mode,
-        } => picked(selector.tables()?, lookup, *index_mode, *mode),
+        } => picked(&*selector.tables()?, lookup, *index_mode, *mode),
         Node::Join(inner, mode) => match inner.node_kind() {
-            Node::PatternOfPure(carrier, f, memo) => joined(carrier.tables()?, f, memo, *mode),
+            Node::PatternOfPure(carrier, f, memo) => joined(&*carrier.tables()?, f, memo, *mode),
+            Node::PatternOfPureOperand(carrier, operand, map, memo) => {
+                // The registered body fixed to this node's operand: one
+                // closure per build, never per evaluation.
+                let construct: crate::ToPurePatternFn = {
+                    let map = Arc::clone(map);
+                    let operand = operand.clone();
+                    Arc::new(move |value| map.apply(value, &operand))
+                };
+                joined(&*carrier.tables()?, &construct, memo, *mode)
+            }
             _ => None,
         },
-        Node::FmapNative(pattern, f) => stepped(pattern.tables()?, Step::Map(f.clone())),
-        Node::FilterValues(pattern, keep) => stepped(pattern.tables()?, Step::Keep(keep.clone())),
+        Node::FmapNative(pattern, f) => stepped(&*pattern.tables()?, Step::Map(f.clone())),
+        Node::FilterValues(pattern, keep) => stepped(&*pattern.tables()?, Step::Keep(keep.clone())),
         Node::MapHapsNative(pattern, f, SpanUse::Ignores) => {
-            stepped(pattern.tables()?, Step::MapHap(f.clone()))
+            stepped(&*pattern.tables()?, Step::MapHap(f.clone()))
         }
         Node::MapHapsOwned(pattern, f, SpanUse::Ignores) => {
-            stepped(pattern.tables()?, Step::MapOwned(f.clone()))
+            stepped(&*pattern.tables()?, Step::MapOwned(f.clone()))
         }
-        Node::ExpandHapsNative(pattern, f, SpanUse::Ignores) => expanded(pattern.tables()?, f),
-        Node::AppLeft(functions, values, apply, flow) => match signal_of(values) {
-            Some(signal) => sampled(functions.tables()?, signal, Side::Value, apply, *flow),
+        Node::ExpandHapsNative(pattern, f, SpanUse::Ignores) => expanded(&*pattern.tables()?, f),
+        Node::AppLeft(functions, values, apply, flow, _) => match signal_of(values) {
+            Some(signal) => sampled(&*functions.tables()?, signal, Side::Value, apply, *flow),
             None if sampling(functions) || sampling(values) => {
                 met(functions, values, Side::Value, apply, *flow)
             }
-            None => applied(functions.tables()?, values.tables()?, |function, value| {
-                let part = function.part.intersection(&value.part)?;
-                Some(applied_hap(
-                    function,
-                    value,
-                    function.whole,
-                    part,
-                    apply,
-                    *flow,
-                ))
-            }),
+            None => applied(
+                &*functions.tables()?,
+                &*values.tables()?,
+                |function, value| {
+                    let part = function.part.intersection(&value.part)?;
+                    Some(applied_hap(
+                        function,
+                        value,
+                        function.whole,
+                        part,
+                        apply,
+                        *flow,
+                    ))
+                },
+            ),
         },
         Node::AppRight(functions, values, apply, flow) => match signal_of(functions) {
-            Some(signal) => sampled(values.tables()?, signal, Side::Function, apply, *flow),
+            Some(signal) => sampled(&*values.tables()?, signal, Side::Function, apply, *flow),
             None if sampling(values) || sampling(functions) => {
                 met(values, functions, Side::Function, apply, *flow)
             }
-            None => applied(values.tables()?, functions.tables()?, |value, function| {
-                let part = function.part.intersection(&value.part)?;
-                Some(applied_hap(
-                    function,
-                    value,
-                    value.whole,
-                    part,
-                    apply,
-                    *flow,
-                ))
-            }),
+            None => applied(
+                &*values.tables()?,
+                &*functions.tables()?,
+                |value, function| {
+                    let part = function.part.intersection(&value.part)?;
+                    Some(applied_hap(
+                        function,
+                        value,
+                        value.whole,
+                        part,
+                        apply,
+                        *flow,
+                    ))
+                },
+            ),
         },
         _ => None,
     }
@@ -2778,7 +2919,7 @@ fn signal_of(pattern: &Pattern) -> Option<Signal> {
         }
         Node::Shift(inner, by, _) => (inner, SignalOp::Shift(*by)),
         // The signal is the structure side, and a constant gives the rest.
-        Node::AppLeft(functions, values, apply, flow) => {
+        Node::AppLeft(functions, values, apply, flow, _) => {
             let (hap, levels) = constant_of(values)?;
             (
                 functions,
@@ -2811,9 +2952,46 @@ fn signal_of(pattern: &Pattern) -> Option<Signal> {
     Some(signal)
 }
 
+/// A signal on the value side of a meeting, for a query that walks the
+/// graph: the walk reads the signal as a table of the meeting samples it,
+/// with no query of the signal's graph.
+pub(crate) struct ValueSignal(Signal);
+
+impl ValueSignal {
+    /// `values` as a signal, when it is one that a table can sample.
+    pub(crate) fn of(values: &Pattern) -> Option<Self> {
+        signal_of(values).map(Self)
+    }
+
+    /// The haps `values` answers for `span`, in its order, into `out`.
+    /// `part` is the part of the hap that asks, which lies in one cycle.
+    /// `None` for a span that only the graph answers. `probe` is a copy of
+    /// the query's state.
+    pub(crate) fn answer(
+        &self,
+        span: TimeSpan,
+        part: TimeSpan,
+        probe: &mut State,
+        out: &mut Vec<Hap>,
+    ) -> Option<()> {
+        self.0.answer(span, part, probe, out)
+    }
+}
+
 /// The hap of cycle zero of a pattern whose tables hold one whole hap a
 /// cycle, such as `pure(value)`, and the levels of its walk.
 fn constant_of(pattern: &Pattern) -> Option<(Box<Hap>, u32)> {
+    let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
+    // A constant by its node kinds is read from its graph, apart from the
+    // query around this build. It needs no table, so it is a constant with
+    // any table budget.
+    if let Some(levels) = pattern.constant_levels() {
+        if !pattern.tables_may_answer() {
+            return None;
+        }
+        let hap = crate::without_query_signals(|| pattern.constant_cycle(&State::new(cycle)))?;
+        return hap.keys.is_empty().then(|| (Box::new(hap), levels));
+    }
     let tables = pattern.tables()?;
     let [layer] = tables.layers.as_slice() else {
         return None;
@@ -2821,7 +2999,6 @@ fn constant_of(pattern: &Pattern) -> Option<(Box<Hap>, u32)> {
     let [entry] = layer.entries.as_slice() else {
         return None;
     };
-    let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
     (layer.period == 1
         && layer.sampled.is_none()
         && entry.keys.is_empty()
@@ -2838,7 +3015,15 @@ fn signal_work(signal: &Signal, width: Fraction, extent: f64, bits: u32) -> Opti
     // outermost in. A constant walks the cycles of its span, and each cycle
     // bound in it can cut the signal's haps once more.
     let mut cycles = Cycles::NONE;
-    let mut most = 1u64;
+    // A signal answers one hap over the span it is asked over. A constant
+    // answers its hap once a cycle of the span, counted below: a whole hap
+    // a cycle, not one more than that, or every meeting of one multiplies
+    // the haps the next is charged for.
+    let mut most = if matches!(signal.source, Source::Constant(_)) {
+        0u64
+    } else {
+        1u64
+    };
     let mut wide = width;
     // The signal, and one level for each node above it. A constant's own
     // pattern is a child of its meeting.
@@ -3051,7 +3236,7 @@ fn met_constant(
         source: Source::Constant(hap),
         ops: Vec::new(),
     };
-    let tables = sampled(structure.tables()?, signal, side, apply, flow)?;
+    let tables = sampled(&*structure.tables()?, signal, side, apply, flow)?;
     // The constant's own walk sits below the meeting.
     Some(Tables::new(
         tables.layers,
@@ -3287,6 +3472,11 @@ fn joined(
     if !matches!(mode, JoinMode::Inner | JoinMode::Outer | JoinMode::Mix) {
         return None;
     }
+    // A sampled layer's values exist only in a query: its entries name no
+    // pattern.
+    if carrier.layers.iter().any(|layer| layer.sampled.is_some()) {
+        return None;
+    }
     let settings = crate::settings::current_state_id();
     // The pattern each carrier value names, each built once.
     let mut named: Vec<(&crate::Value, Pattern)> = Vec::new();
@@ -3377,6 +3567,29 @@ fn joined(
     })
 }
 
+/// The tables of a [`crate::sequence`]: the steps of each layer as one cycle
+/// a period, at the layer's speed, as a [`fast`] of them is.
+fn sequence(layers: &[crate::sequence::Layer]) -> Option<Tables> {
+    let mut all = Vec::new();
+    let mut work: Option<Work> = None;
+    for layer in layers {
+        let steps = Tables::new(
+            vec![Layer::new(1, layer.period_haps()?)?],
+            Work::leaf(Cycles::walk()),
+        );
+        let timed = if layer.period == Fraction::ONE {
+            steps
+        } else {
+            fast(&steps, Fraction::ONE.checked_div(layer.period)?)?
+        };
+        all.extend(timed.layers.iter().cloned());
+        work = Some(work.map_or(timed.work, |work| work.max(timed.work)));
+    }
+    // One node answers for every layer at its speed: the levels of a leaf.
+    let work = Work { levels: 1, ..work? };
+    Some(Tables::new(all, work))
+}
+
 /// `fast(factor)`: every time divided by `factor`. The new period is the
 /// least whole number of cycles that holds a whole number of old periods.
 fn fast(tables: &Tables, factor: Fraction) -> Option<Tables> {
@@ -3463,9 +3676,9 @@ fn split_queries(inner: &Pattern) -> Option<Tables> {
     match inner.node_kind() {
         Node::SlowCat(patterns) => return slowcat(patterns),
         Node::SlowCatPrime(patterns) => return slowcat_prime(patterns),
-        Node::Rev(pattern) => return rev(pattern.tables()?),
-        Node::FastGap(pattern, factor) => return fast_gap(pattern.tables()?, *factor),
-        Node::RepeatCycles(pattern, count) => return repeat_cycles(pattern.tables()?, *count),
+        Node::Rev(pattern) => return rev(&*pattern.tables()?),
+        Node::FastGap(pattern, factor) => return fast_gap(&*pattern.tables()?, *factor),
+        Node::RepeatCycles(pattern, count) => return repeat_cycles(&*pattern.tables()?, *count),
         _ => {}
     }
     let tables = inner.tables()?;
@@ -3523,7 +3736,7 @@ fn slowcat_prime(patterns: &[Pattern]) -> Option<Tables> {
 }
 
 /// The walk of every constituent of an alternation, together.
-fn constituents(children: &[&Tables]) -> Work {
+fn constituents(children: &[Arc<Tables>]) -> Work {
     children
         .iter()
         .map(|child| child.work)
@@ -4078,25 +4291,45 @@ mod tests {
 
     #[test]
     fn a_graph_deeper_than_a_build_walks_is_left_to_the_graph() {
-        let mut deep = pure(Value::F64(1.0));
-        for _ in 0..20_000 {
-            deep = deep.fast(frac(2, 1)).slow(frac(2, 1));
+        // A node for each speed change: a fold makes one node of them all.
+        let levels = |count: usize| {
+            crate::sequence::unfolded(|| {
+                (0..count).fold(pure(Value::F64(1.0)), |pattern, _| {
+                    pattern.fast(frac(2, 1)).slow(frac(2, 1))
+                })
+            })
+        };
+        assert!(levels(20_000).tables().is_none());
+        assert!(levels(20).tables().is_some());
+    }
+
+    #[test]
+    fn a_walked_graph_builds_no_table() {
+        let graph = || map(vec![leaf(1.0, 0), seq(&[2.0, 3.0]), leaf(4.0, 9)], slowcat).tabled;
+        let child = graph();
+        let walked = child.mark_walked();
+        // A node that is built over a walked graph is walked too.
+        let over = walked.late(frac(1, 4));
+        let tabled = graph();
+        for _ in 0..4 {
+            for (begin, end) in [(frac(0, 1), frac(5, 1)), (frac(1, 3), frac(7, 3))] {
+                assert_eq!(
+                    describe(&walked.query_arc(begin, end)),
+                    describe(&tabled.query_arc(begin, end))
+                );
+                over.query_arc(begin, end);
+            }
         }
-        assert!(deep.tables().is_none());
-        let mut shallow = pure(Value::F64(1.0));
-        for _ in 0..20 {
-            shallow = shallow.fast(frac(2, 1)).slow(frac(2, 1));
+        assert!(tabled.built_tables().is_some());
+        for pattern in [&walked, &child, &over] {
+            assert!(pattern.built_tables().is_none());
         }
-        assert!(shallow.tables().is_some());
     }
 
     #[test]
     fn bitwise_copies_of_whole_periods_clone_the_entries() {
-        let twin = named(seq(&[0.0, 1.0, 2.0]), "n");
-        let tables = twin
-            .tabled
-            .tables()
-            .expect("a control sequence has a table");
+        let twin = seq(&[0.0, 1.0, 2.0]);
+        let tables = twin.tabled.tables().expect("a number sequence has a table");
         assert!(tables.layers.iter().all(|layer| layer.copyable));
         let answer = twin.tabled.query_arc(frac(0, 1), frac(3, 1));
         assert_eq!(
@@ -4164,8 +4397,12 @@ mod tests {
     #[test]
     fn a_hap_budget_refuses_exactly_where_the_graph_refuses() {
         let span = TimeSpan::new(frac(0, 1), frac(1, 1));
-        let dropped = one(seq(&[1.0]), |p| {
-            p.fast(frac(2000, 1)).filter_values(|_| false)
+        // The filter keeps its node, so the table and the graph make the
+        // haps that it drops.
+        let dropped = crate::sequence::unfolded(|| {
+            one(seq(&[1.0]), |p| {
+                p.fast(frac(2000, 1)).filter_values(|_| false)
+            })
         });
         let refused = outcome(&dropped.graph, span, 1000);
         assert!(refused.is_err());
@@ -5389,8 +5626,11 @@ mod tests {
 
     #[test]
     fn a_gap_below_one_asks_its_child_near_the_query_and_refuses_as_the_graph_does() {
-        let gap = one(plain(5.0), |p| {
-            p.fast(frac(8191, 1)).fast_gap(frac(1, 8192))
+        // A node for the speed change, which names itself in the refusal.
+        let gap = crate::sequence::unfolded(|| {
+            one(plain(5.0), |p| {
+                p.fast(frac(8191, 1)).fast_gap(frac(1, 8192))
+            })
         });
         for tail in [62, 64] {
             let begin = Fraction::int(1 << 40) + frac(1, (1 << tail) + 1);

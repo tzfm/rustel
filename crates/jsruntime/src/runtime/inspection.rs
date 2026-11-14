@@ -132,6 +132,7 @@ impl JsRuntime {
         self.keep_last_good_imports();
         // The timeline offsets of this score are the offsets in play now.
         *self.last_good_timeline.borrow_mut() = None;
+        let replaces = self.last_good_active.borrow().is_some();
         with_ctx(self, |ctx| {
             *self.last_good_active.borrow_mut() = host_active(&ctx)
                 .ok()
@@ -153,6 +154,13 @@ impl JsRuntime {
                 let _ = sets.set(2, active_registry);
             }
         });
+        // A wrapper and its own query function hold each other, so only a
+        // collection frees the wrapper of the replaced score, and its graph
+        // with it. A native score runs no script: the script heap does not
+        // grow, and the engine does not collect of its own.
+        if replaces && self.evaluated_natively.get() {
+            with_ctx_running_no_script(self, |ctx| ctx.run_gc());
+        }
     }
 
     /// Restore the last successfully installed active wrapper and its slider,
@@ -233,6 +241,13 @@ impl JsRuntime {
     pub fn active_pattern(&self) -> Option<Pattern> {
         self.active_pattern_unwrapped()
             .map(|pattern| pattern.with_runtime_settings(self.core_settings.clone()))
+    }
+
+    /// The active graph as its score built it, before the export takes this
+    /// runtime's settings, for tests that compare two builds of a score.
+    #[doc(hidden)]
+    pub fn active_graph_for_test(&self) -> Option<Pattern> {
+        self.active_pattern_unwrapped()
     }
 
     /// Whether the active slot contains a pattern wrapper, without cloning its

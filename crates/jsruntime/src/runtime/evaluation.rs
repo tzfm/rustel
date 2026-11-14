@@ -38,7 +38,9 @@ impl JsRuntime {
 
     pub fn install_voicings_prebake(&self) -> Result<(), String> {
         let _settings = self.core_settings.bind();
-        with_ctx(self, |ctx| voicing_surface::install(&ctx))
+        with_ctx(self, |ctx| voicing_surface::install(&ctx))?;
+        self.voicings_installed.set(true);
+        Ok(())
     }
     /// Transpile and execute one user setup/prebake file without replacing the
     /// active graph.
@@ -144,6 +146,7 @@ impl JsRuntime {
         budget: std::time::Duration,
         cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(rustel_transpiler::TranspileOutput, ScoreEffects), QueryError> {
+        self.ensure_surface().map_err(QueryError::Message)?;
         let _settings = self.core_settings.bind();
         let effect_policy_owner = EffectPolicyOwner::enter(self);
         let effect_transaction = EffectTransactionOwner::enter(self, EffectPolicy::SETUP)?;
@@ -979,8 +982,14 @@ impl JsRuntime {
                         .set(0, wrapper)
                         .map_err(|error| QueryError::Message(error.to_string()))
                 } else {
-                    host_active(&ctx)
-                        .map_err(|error| QueryError::Message(error.to_string()))?
+                    let active = host_active(&ctx)
+                        .map_err(|error| QueryError::Message(error.to_string()))?;
+                    // The graph an edit replaces hands its answer tables to
+                    // the one taking over, before the slot is written.
+                    if let Ok(previous) = active.get::<rquickjs::Value>(0) {
+                        Self::adopt_replaced_tables(&previous, &wrapper.borrow().pattern);
+                    }
+                    active
                         .set(0, wrapper)
                         .map_err(|error| QueryError::Message(error.to_string()))
                 }
@@ -995,6 +1004,23 @@ impl JsRuntime {
                 let _ = candidate.as_object().set("length", 0);
             }
         });
+    }
+
+    /// Hand the answer tables of the outgoing active graph to the graph that
+    /// replaces it. Only the new graph's nodes take over tables that still
+    /// answer for them; both wrappers are left exactly as they were.
+    ///
+    /// The handover runs where the score's own settings scope is still in
+    /// force, so a table built under a snapshot the next score already moved
+    /// past refuses itself instead of landing stale.
+    fn adopt_replaced_tables(previous: &rquickjs::Value<'_>, next: &rustel_core::Pattern) {
+        let Some(object) = previous.as_object() else {
+            return;
+        };
+        let Some(wrapper) = rquickjs::Class::<NativePatternWrapper>::from_object(object) else {
+            return;
+        };
+        next.adopt_tables_from(&wrapper.borrow().pattern);
     }
 
     /// Publish the exact staged JS wrapper, restoring the exact prior wrapper
@@ -1028,6 +1054,15 @@ impl JsRuntime {
             let previous: rquickjs::Value = active
                 .get(0)
                 .map_err(|error| QueryError::Message(error.to_string()))?;
+
+            // The graph an edit replaces hands its answer tables to the one
+            // taking over, before the slot is written. A publication that
+            // later refuses keeps its tables with the wrapper that owns them.
+            if let Some(object) = candidate.as_object()
+                && let Some(next) = rquickjs::Class::<NativePatternWrapper>::from_object(object)
+            {
+                Self::adopt_replaced_tables(&previous, &next.borrow().pattern);
+            }
 
             let _ = alloc::take_heap_exhausted();
             let publication = active.set(0, candidate);
@@ -1278,11 +1313,23 @@ impl JsRuntime {
             }
         }
         self.clear_staged_score();
+        self.evaluated_natively.set(false);
         let _staged_score_guard = StagedScoreGuard(self);
         let millis = budget.as_millis().min(u128::from(u64::MAX)) as u64;
         let evaluation = candidate_settings.with(|| {
             self.with_deadline(budget, || {
                 let staged = self.with_heap_boundary(|| {
+                    let native = {
+                        let _published_owner = self.core_settings.bind();
+                        self.native_score(output.program.as_ref())
+                    };
+                    if native.is_none() {
+                        // JavaScript evaluates the score, on the whole surface.
+                        // An installation seals the gate, so the score's own
+                        // surface writes are recorded again after it.
+                        self.ensure_surface().map_err(QueryError::Message)?;
+                        self.record_surface_writes(&output.surface_writes);
+                    }
                     // Forking the voicing registry reads enumerable properties
                     // from score-controlled objects. A getter can run arbitrary
                     // JavaScript, so candidate setup shares the score deadline.
@@ -1290,7 +1337,10 @@ impl JsRuntime {
                     self.begin_voicing_candidate()
                         .map_err(QueryError::Message)?;
                     let _published_owner = self.core_settings.bind();
-                    self.execute_score(&output.output, &output.line_map, true)
+                    match native {
+                        Some(score) => self.stage_native(score),
+                        None => self.execute_score(&output.output, &output.line_map, true),
+                    }
                 });
                 if self.cancelled.get() {
                     Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled))
@@ -1342,6 +1392,7 @@ impl JsRuntime {
         source: &str,
         options: &rustel_transpiler::TranspileOptions,
     ) -> Result<rustel_transpiler::TranspileOutput, String> {
+        self.ensure_surface()?;
         let candidate_settings = self.core_settings.detached_snapshot();
         let effect_policy_owner = EffectPolicyOwner::enter(self);
         let _effect_transaction =

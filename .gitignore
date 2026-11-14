@@ -36,4 +36,6 @@ crates/runtime/tests/e2e/golden/*.actual
 *.strudel
 # Include corpus and regression scores despite the general `*.strudel` ignore.
 !crates/runtime/tests/e2e/scores/**/*.strudel
+# Include the songs the query benchmark measures.
+!crates/runtime/examples/songs/*.strudel
 rustel-set.json

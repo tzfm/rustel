@@ -34,12 +34,15 @@ use std::path::Path;
 mod arrange_marks;
 mod callback_ir;
 mod frequency_sliders;
+mod score_program;
 mod surface_writes;
 pub use callback_ir::{
-    CallbackArgument, CallbackMethodCall, MAX_CALLBACK_IR_SOURCE_BYTES, PatternTransformCandidate,
-    PatternTransformFallbackReason, lower_pattern_transform_callback,
+    CallbackArgument, CallbackMethodCall, MAX_CALLBACK_IR_SOURCE_BYTES,
+    MAX_CALLBACK_TRANSFORM_DEPTH, PatternTransformCandidate, PatternTransformFallbackReason,
+    lower_pattern_transform_callback,
 };
 pub use frequency_sliders::is_frequency_control;
+pub use score_program::{ScoreExpr, ScoreFunction, ScoreProgram, ScoreProperty, ScoreStatement};
 pub use surface_writes::{SurfaceWrites, surface_writes};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,11 +52,14 @@ pub struct ParseDiagnostic {
     pub offset: Option<usize>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParseOutput {
     pub code: String,
     pub diagnostics: Vec<ParseDiagnostic>,
     pub panicked: bool,
+    /// The printed program as a plain score, when the caller asked for it
+    /// and the program is one. See [`TranspileOutput::program`].
+    pub program: Option<ScoreProgram>,
     /// Static names published by score-level `register(...)` calls.
     pub registrations: RegistrationHints,
     /// What the program can write on the surface compiled callbacks read.
@@ -115,8 +121,9 @@ pub const MAX_STRUCTURAL_BYTES: usize = 64 * 1024;
 
 /// The bytes that buy a level of recursion, counted without tokenizing.
 fn structural_bytes(source: &str) -> usize {
-    let punctuation = source
-        .bytes()
+    let bytes = source.as_bytes();
+    let punctuation = bytes
+        .iter()
         .filter(|byte| {
             matches!(
                 byte,
@@ -143,15 +150,26 @@ fn structural_bytes(source: &str) -> usize {
         .count();
     // These word operators can also recurse without spending punctuation.
     // Count raw occurrences: a mistaken lexical classification must not let
-    // one of them hide from this backstop.
-    punctuation
-        + word_operators()
-            .iter()
-            .map(|(word, _)| source.matches(*word).count())
-            .sum::<usize>()
-        // A keyword spelled with an escape, `\u0076oid`, matches no word
-        // above but parses as one, and every such spelling contains `\u`.
-        + source.matches("\\u").count()
+    // one of them hide from this backstop. A keyword spelled with an escape,
+    // `\u0076oid`, matches no word but parses as one, and every such
+    // spelling contains `\u`.
+    let spellings = RawSpellings::get();
+    // Where the next occurrence of each spelling may begin: occurrences of
+    // one spelling are counted where they do not overlap.
+    let mut free = vec![0usize; spellings.all.len()];
+    let mut words = 0;
+    for (index, pair) in bytes.windows(2).enumerate() {
+        if spellings.may_start(pair[0], pair[1]) {
+            let rest = &bytes[index..];
+            for (free, spelling) in free.iter_mut().zip(&spellings.all) {
+                if index >= *free && rest.starts_with(spelling) {
+                    words += 1;
+                    *free = index + spelling.len();
+                }
+            }
+        }
+    }
+    punctuation + words
 }
 
 /// The stack given to the thread this crate parses on.
@@ -630,6 +648,41 @@ fn word_operators() -> &'static [(&'static str, bool)] {
     &WORDS
 }
 
+/// The word operators and the `\u` of an escape, with the two bytes each
+/// begins with, so a scan asks about a place only where one can begin.
+struct RawSpellings {
+    all: Vec<&'static [u8]>,
+    /// For each first byte, the set of second bytes that follow it in a
+    /// spelling.
+    seconds: [[u64; 4]; 256],
+}
+
+impl RawSpellings {
+    fn get() -> &'static Self {
+        static SPELLINGS: std::sync::LazyLock<RawSpellings> = std::sync::LazyLock::new(|| {
+            let all: Vec<&'static [u8]> = word_operators()
+                .iter()
+                .map(|(word, _)| word.as_bytes())
+                .chain([b"\\u".as_slice()])
+                .collect();
+            let mut seconds = [[0u64; 4]; 256];
+            for spelling in &all {
+                let [first, second, ..] = **spelling else {
+                    unreachable!("a keyword or an escape has two bytes or more");
+                };
+                seconds[usize::from(first)][usize::from(second >> 6)] |= 1 << (second & 63);
+            }
+            RawSpellings { all, seconds }
+        });
+        &SPELLINGS
+    }
+
+    /// Whether a spelling begins with these two bytes.
+    fn may_start(&self, first: u8, second: u8) -> bool {
+        self.seconds[usize::from(first)][usize::from(second >> 6)] >> (second & 63) & 1 == 1
+    }
+}
+
 /// Return the width and binary status of a word operator without mistaking part of
 /// an identifier for a token. Strings, comments, and regexes are skipped by
 /// the caller before it asks this question.
@@ -639,6 +692,10 @@ fn word_operator_at(bytes: &[u8], index: usize) -> Option<(usize, bool)> {
     }
 
     if index > 0 && identifier_byte(bytes[index - 1]) {
+        return None;
+    }
+    let (&first, &second) = (bytes.get(index)?, bytes.get(index + 1)?);
+    if !RawSpellings::get().may_start(first, second) {
         return None;
     }
     word_operators().iter().find_map(|(word, binary)| {
@@ -679,7 +736,16 @@ fn measure_nesting(source: &str) -> SourceNesting {
         let byte = bytes[index];
 
         if matches!(stack.last(), Some(Frame::Template)) {
-            match byte {
+            // Template text is scanned in one run to its next escape,
+            // substitution or end.
+            let Some(run) = bytes[index..]
+                .iter()
+                .position(|byte| matches!(byte, b'\\' | b'`' | b'$'))
+            else {
+                break;
+            };
+            index += run;
+            match bytes[index] {
                 b'\\' => index += 1,
                 b'`' => {
                     stack.pop();
@@ -931,7 +997,7 @@ thread_local! {
 /// Run `work` with every parse of this crate on the calling thread.
 ///
 /// `transpile` and the other entries parse on a thread with
-/// `PARSE_STACK_BYTES` of stack. During this call they spawn no thread. A
+/// `PARSE_STACK_BYTES` of stack. During this call they use no thread. A
 /// host with no threads, or with a large stack of its own, wraps its calls in
 /// this function. The nesting checks still run first. A source which defeats
 /// the lexical scan overflows the stack of the caller, so the caller owns the
@@ -950,29 +1016,95 @@ pub fn on_caller_stack<T>(work: impl FnOnce() -> T) -> T {
     work()
 }
 
-/// Run `work` on a thread with `PARSE_STACK_BYTES` of stack, or on the calling
-/// thread inside [`on_caller_stack`].
+/// One parse and the send of its answer.
+type ParseJob = Box<dyn FnOnce() + Send>;
+
+/// The thread that parses for one calling thread, with `PARSE_STACK_BYTES`
+/// of stack. It takes one job at a time: the caller waits for each answer.
+struct ParseStack {
+    jobs: std::sync::mpsc::SyncSender<ParseJob>,
+}
+
+impl ParseStack {
+    /// Start the thread. `None` when the host gives none.
+    ///
+    /// The thread runs each job inside [`on_caller_stack`]: a parse that a
+    /// job starts from its own top level, as `transpile` does, is already
+    /// on this stack and runs in place. The thread ends when the thread it
+    /// parses for drops this handle.
+    fn start() -> Option<Self> {
+        let (jobs, taken) = std::sync::mpsc::sync_channel::<ParseJob>(0);
+        std::thread::Builder::new()
+            .name("rustel-parse".into())
+            .stack_size(PARSE_STACK_BYTES)
+            .spawn(move || {
+                on_caller_stack(|| {
+                    for job in taken {
+                        job();
+                    }
+                });
+            })
+            .ok()?;
+        Some(Self { jobs })
+    }
+}
+
+thread_local! {
+    /// The parse stack of this thread, started at its first parse.
+    static PARSE_STACK: std::cell::RefCell<Option<ParseStack>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `work` on `source` on the parse stack of this thread, or on the
+/// calling thread inside [`on_caller_stack`]. `None` when the host gives no
+/// thread to parse on.
 ///
 /// Every parse in this crate goes through here, except `callback_ir`. That
 /// module parses on the caller's stack and bounds its input with
 /// `MAX_CALLBACK_IR_SOURCE_BYTES`. The lexical nesting limit stops deep
 /// ordinary expressions; the raw size limit also bounds recursion when the
-/// lexical scan is defeated. This stack covers the bounded depth.
-fn on_parse_stack<T: Send>(work: impl FnOnce() -> T + Send) -> Option<T> {
+/// lexical scan is defeated. The stack covers the bounded depth.
+///
+/// The parse stack is one thread for each calling thread, kept from parse
+/// to parse: a new thread and its stack for each parse cost more than a
+/// small score takes to parse. The text goes to it as a copy and the answer
+/// comes back as a value, so `work` holds nothing of the caller. A panic of
+/// `work` continues on the calling thread.
+fn on_parse_stack<T: Send + 'static>(
+    source: &str,
+    work: impl FnOnce(&str) -> T + Send + 'static,
+) -> Option<T> {
     if ON_CALLER_STACK.get() {
-        return Some(work());
+        return Some(work(source));
     }
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(PARSE_STACK_BYTES)
-            .spawn_scoped(scope, work)
-            .ok()
-            .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
-            })
-    })
+    let text = source.to_owned();
+    let (answer, answered) = std::sync::mpsc::sync_channel(1);
+    let job: ParseJob = Box::new(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&text)));
+        // The caller waits for the answer. One that is gone wants none.
+        let _ = answer.send(outcome);
+    });
+    let sent = PARSE_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if stack.is_none() {
+            *stack = ParseStack::start();
+        }
+        let sent = stack
+            .as_ref()
+            .is_some_and(|stack| stack.jobs.send(job).is_ok());
+        if !sent {
+            // A thread that takes no job is replaced at the next parse.
+            *stack = None;
+        }
+        sent
+    });
+    if !sent {
+        return None;
+    }
+    match answered.recv().ok()? {
+        Ok(answer) => Some(answer),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -980,6 +1112,11 @@ pub struct TranspileOptions {
     pub wrap_async: bool,
     pub add_return: bool,
     pub emit_mini_locations: bool,
+    /// Whether [`TranspileOutput::mini_locations`] lists the leaves of each
+    /// mini-notation literal, for a host that marks them in the editor.
+    /// Listing them parses each literal one more time, so a host that only
+    /// evaluates the output turns it off.
+    pub list_mini_leaves: bool,
     pub block_offset: usize,
     pub registered_languages: Vec<String>,
     pub widget_methods: Vec<String>,
@@ -1008,6 +1145,7 @@ impl Default for TranspileOptions {
             wrap_async: false,
             add_return: true,
             emit_mini_locations: true,
+            list_mini_leaves: true,
             block_offset: 0,
             registered_languages: Vec::new(),
             widget_methods: Vec::new(),
@@ -1080,7 +1218,7 @@ pub fn script_imports(source: &str) -> Vec<String> {
     if !source.contains("import") || check_nesting(source).is_err() {
         return Vec::new();
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         let mut imports = Imports::default();
@@ -1161,6 +1299,12 @@ pub const ALL_VISUAL_WIDGET_PREFIX: &str = "all:";
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TranspileOutput {
     pub output: String,
+    /// The output as a plain score, when it is made only of the shapes a
+    /// [`ScoreProgram`] holds: a host can then evaluate it without
+    /// JavaScript. `None` for any other program, and when the output is not
+    /// the program alone, under [`TranspileOptions::add_return`] or
+    /// [`TranspileOptions::wrap_async`].
+    pub program: Option<ScoreProgram>,
     pub mini_locations: Vec<(usize, usize)>,
     pub diagnostics: Vec<ParseDiagnostic>,
     pub widgets: Vec<WidgetRecord>,
@@ -1212,12 +1356,12 @@ pub struct KabelsalatSpan {
 /// comments, ASI, precedence and source spans. Parse diagnostics are never
 /// discarded; callers decide whether recovery is acceptable.
 pub fn parse_and_print(source: &str) -> ParseOutput {
-    parse_and_print_as(source, SourceType::mjs(), ModuleSyntax::Allowed)
+    parse_and_print_as(source, SourceType::mjs())
 }
 
 pub fn parse_and_print_path(source: &str, path: impl AsRef<Path>) -> ParseOutput {
     match SourceType::from_path(path) {
-        Ok(source_type) => parse_and_print_as(source, source_type, ModuleSyntax::Allowed),
+        Ok(source_type) => parse_and_print_as(source, source_type),
         Err(error) => ParseOutput {
             diagnostics: vec![ParseDiagnostic {
                 message: error.to_string(),
@@ -1228,11 +1372,7 @@ pub fn parse_and_print_path(source: &str, path: impl AsRef<Path>) -> ParseOutput
     }
 }
 
-fn parse_and_print_as(
-    source: &str,
-    source_type: SourceType,
-    modules: ModuleSyntax<'_>,
-) -> ParseOutput {
+fn parse_and_print_as(source: &str, source_type: SourceType) -> ParseOutput {
     // Before the allocator, before the parser: the recursion this refuses
     // would abort the process rather than return a diagnostic.
     if let Err(diagnostic) = check_nesting(source) {
@@ -1241,7 +1381,9 @@ fn parse_and_print_as(
             ..ParseOutput::default()
         };
     }
-    let Some(output) = on_parse_stack(|| parse_and_print_here(source, source_type, modules)) else {
+    let Some(output) = on_parse_stack(source, move |source| {
+        parse_and_print_here(source, source_type, ModuleSyntax::Allowed, false)
+    }) else {
         return ParseOutput {
             diagnostics: vec![ParseDiagnostic {
                 message: "could not reserve a stack to parse on".into(),
@@ -1302,11 +1444,14 @@ impl<'a> Visit<'a> for StatementNesting {
     }
 }
 
-/// The body of `parse_and_print_as`, always called on a parse stack.
+/// The body of `parse_and_print_as`, always called on a parse stack. With
+/// `read_score`, a program with no error is also read as a [`ScoreProgram`],
+/// from the tree that is printed.
 fn parse_and_print_here(
     source: &str,
     source_type: SourceType,
     modules: ModuleSyntax<'_>,
+    read_score: bool,
 ) -> ParseOutput {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
@@ -1378,6 +1523,9 @@ fn parse_and_print_here(
     if !normalized_jsx_values.is_empty() {
         encode_jsx_values_for_codegen(&allocator, &mut program, &normalized_jsx_values);
     }
+    let score = (read_score && diagnostics.is_empty() && !parsed.panicked)
+        .then(|| score_program::read(&program))
+        .flatten();
     let printed = Codegen::new()
         .with_options(CodegenOptions {
             single_quote: true,
@@ -1410,6 +1558,7 @@ fn parse_and_print_here(
         code,
         diagnostics,
         panicked: parsed.panicked,
+        program: score,
         registrations,
         surface_writes,
         line_map,
@@ -1431,7 +1580,7 @@ pub fn unresolved_reads(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
     if check_nesting(source).is_err() {
         return Vec::new();
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked || !parsed.diagnostics.is_empty() {
@@ -1499,7 +1648,9 @@ pub fn running_calls(source: &str, names: &[&str]) -> Vec<(String, std::ops::Ran
     if check_nesting(source).is_err() {
         return Vec::new();
     }
-    on_parse_stack(|| {
+    // The parse stack takes the names as its own.
+    let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked || !parsed.diagnostics.is_empty() {
@@ -1508,7 +1659,7 @@ pub fn running_calls(source: &str, names: &[&str]) -> Vec<(String, std::ops::Ran
         let built = SemanticBuilder::new().build(&parsed.program);
         let mut calls = RunningCalls {
             scoping: built.semantic.scoping(),
-            watched: names.iter().copied().collect(),
+            watched: names.iter().map(String::as_str).collect(),
             deferred: 0,
             immediate: HashSet::new(),
             found: Vec::new(),
@@ -1629,7 +1780,7 @@ pub fn setup_definitions(source: &str) -> SetupDefinitions {
     if check_nesting(source).is_err() {
         return SetupDefinitions::default();
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked {
@@ -1802,7 +1953,7 @@ pub fn global_writes(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
     if check_nesting(source).is_err() {
         return Vec::new();
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked {
@@ -2068,7 +2219,7 @@ pub fn awaits_in_code(source: &str) -> bool {
         // does is never sent to a wrapper that cannot compile it.
         return true;
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked {
@@ -2514,7 +2665,9 @@ pub fn transpile(source: &str, options: &TranspileOptions) -> TranspileOutput {
     if let Err(diagnostic) = check_nesting(source) {
         return refuse(diagnostic.message);
     }
-    let Some(output) = on_parse_stack(|| transpile_here(source, options)) else {
+    let options = options.clone();
+    let Some(output) = on_parse_stack(source, move |source| transpile_here(source, &options))
+    else {
         return refuse("could not reserve a stack to parse on".into());
     };
     output
@@ -2562,7 +2715,18 @@ fn transpile_here(source: &str, options: &TranspileOptions) -> TranspileOutput {
     let (labels, lanes_by_place) =
         rewrite_labels(&kabel, regexes_are_present, &options.lane_numbers);
     let samples = rewrite_bare_samples(&labels);
-    let mut parsed = parse_and_print_as(&samples, SourceType::mjs(), ModuleSyntax::of(options));
+    // The output is the printed program alone when nothing is added to it.
+    let read_score = !options.add_return && !options.wrap_async;
+    // `transpile` checked the nesting of the score as written. The rewrites
+    // above put each literal and each labeled statement inside one call, so
+    // they add a level or two, which the parse stack holds with room to
+    // spare: the rewritten text is not measured again.
+    let mut parsed = parse_and_print_here(
+        &samples,
+        SourceType::mjs(),
+        ModuleSyntax::of(options),
+        read_score,
+    );
     // The parser read the rewritten text; the score is what the reader sees.
     for diagnostic in &mut parsed.diagnostics {
         if let Some(offset) = diagnostic.offset {
@@ -2579,6 +2743,7 @@ fn transpile_here(source: &str, options: &TranspileOptions) -> TranspileOutput {
     }
     TranspileOutput {
         output,
+        program: parsed.program,
         mini_locations,
         diagnostics,
         line_map: parsed.line_map,
@@ -2889,6 +3054,7 @@ fn rewrite_mini_literals(
                     }
                 };
                 if options.emit_mini_locations
+                    && options.list_mini_leaves
                     && let Ok(mut spans) =
                         rustel_mini::leaf_locations(&value, index + 1 + options.block_offset)
                 {
@@ -4412,7 +4578,13 @@ pub fn lane_statements(source: &str) -> Option<Vec<LaneStatement>> {
     if check_nesting(source).is_err() {
         return None;
     }
-    let mut lanes = on_parse_stack(|| lane_statements_here(source))?;
+    // A text with no slash in its code holds no regular expression. The
+    // scan then parses nothing and nests no call, so it runs where it is.
+    let mut lanes = if has_code_slash(source) {
+        on_parse_stack(source, lane_statements_here)?
+    } else {
+        lane_statements_here(source)
+    };
     if lanes.is_empty() {
         lanes.push(LaneStatement {
             label: String::new(),
@@ -4448,8 +4620,8 @@ pub fn same_instructions(playing: &str, typed: &str) -> bool {
     }
 }
 
-/// The body of `lane_statements`, always called on a parse stack. Empty when
-/// the score has no code.
+/// The body of `lane_statements`, called on a parse stack for a text that
+/// the scan parses. Empty when the score has no code.
 fn lane_statements_here(source: &str) -> Vec<LaneStatement> {
     let bytes = source.as_bytes();
     let regexes_are_present = !RegexLiteralRanges::parse(source).is_empty();
@@ -4528,8 +4700,10 @@ fn add_final_return_on_parse_stack(code: &str, empty_is_undefined: bool) -> Stri
     if check_nesting(code).is_err() {
         return code.to_string();
     }
-    on_parse_stack(|| add_final_return_here(code, empty_is_undefined))
-        .unwrap_or_else(|| code.to_string())
+    on_parse_stack(code, move |code| {
+        add_final_return_here(code, empty_is_undefined)
+    })
+    .unwrap_or_else(|| code.to_string())
 }
 
 fn add_final_return_here(code: &str, empty_is_undefined: bool) -> String {
@@ -5359,9 +5533,9 @@ mod tests {
         ] {
             let opener = worst.chars().next().unwrap();
             assert!(structural_bytes(&worst) <= MAX_STRUCTURAL_BYTES);
-            let parsed = on_parse_stack(|| {
+            let parsed = on_parse_stack(&worst, |worst| {
                 let allocator = Allocator::default();
-                Parser::new(&allocator, &worst, SourceType::mjs())
+                Parser::new(&allocator, worst, SourceType::mjs())
                     .parse()
                     .diagnostics
                     .len()
@@ -5764,6 +5938,69 @@ mod tests {
             transpile("s1.initVideo(\"clips/loop.webm\")", &options).output,
             "s1.initVideo('clips/loop.webm');"
         );
+    }
+
+    #[test]
+    fn a_host_that_only_evaluates_keeps_the_offsets_and_lists_no_leaf() {
+        let output = transpile(
+            r#"note("c4 e4")"#,
+            &TranspileOptions {
+                add_return: false,
+                list_mini_leaves: false,
+                ..TranspileOptions::default()
+            },
+        );
+        assert_eq!(output.output, "note(m('c4 e4', 5));");
+        assert!(output.mini_locations.is_empty());
+    }
+
+    #[test]
+    fn the_printed_program_is_read_as_a_score_when_nothing_is_added_to_it() {
+        let read = |source: &str, add_return: bool| {
+            transpile(
+                source,
+                &TranspileOptions {
+                    add_return,
+                    ..TranspileOptions::default()
+                },
+            )
+            .program
+        };
+        let mini = ScoreExpr::Call {
+            callee: "m".into(),
+            arguments: vec![ScoreExpr::String("bd".into()), ScoreExpr::Number(9.0)],
+        };
+        assert_eq!(
+            read(r#"$: sound("bd")"#, false),
+            Some(ScoreProgram {
+                statements: vec![ScoreStatement::Expression(ScoreExpr::Method {
+                    receiver: Box::new(ScoreExpr::Call {
+                        callee: "sound".into(),
+                        arguments: vec![mini],
+                    }),
+                    method: "p".into(),
+                    arguments: vec![ScoreExpr::String("$".into()), ScoreExpr::Number(0.0)],
+                })],
+            })
+        );
+        assert_eq!(read(r#"$: sound("bd")"#, true), None);
+        assert_eq!(read("if (a) b()", false), None);
+        assert_eq!(read("const a = 1; const a = 2;", false), None);
+    }
+
+    #[test]
+    fn the_raw_budget_counts_each_word_where_it_does_not_overlap() {
+        for (source, count) in [
+            ("item in first", 1),
+            ("a instanceof B", 2),
+            ("typeof typeof x", 2),
+            ("new.target", 2),
+            ("\\u0076oid 0", 1),
+            ("f(a)[b]{c}", 3),
+            ("", 0),
+        ] {
+            assert_eq!(structural_bytes(source), count, "{source}");
+        }
     }
 
     #[test]
@@ -7567,7 +7804,26 @@ p._scope({ text: "/* not a comment */" });"#;
 
     /// The thread `on_parse_stack` runs its work on.
     fn parse_thread() -> Option<std::thread::ThreadId> {
-        on_parse_stack(|| std::thread::current().id())
+        on_parse_stack("", |_| std::thread::current().id())
+    }
+
+    #[test]
+    fn one_parse_stack_serves_each_parse_of_a_thread() {
+        let first = parse_thread().expect("a thread to parse on");
+        assert_ne!(first, std::thread::current().id());
+        assert_eq!(parse_thread(), Some(first));
+        // A panic of the work continues on the caller, and the same stack
+        // parses again.
+        let panicked = std::panic::catch_unwind(|| {
+            on_parse_stack("", |_| -> () { panic!("a parse that fails") })
+        });
+        assert!(panicked.is_err());
+        assert_eq!(parse_thread(), Some(first));
+        // Another calling thread has a parse stack of its own.
+        let other = std::thread::spawn(parse_thread)
+            .join()
+            .expect("the other thread");
+        assert!(other.is_some_and(|other| other != first));
     }
 
     #[test]
@@ -7612,7 +7868,7 @@ p._scope({ text: "/* not a comment */" });"#;
     fn on_caller_stack_restores_the_previous_setting() {
         let caller = std::thread::current().id();
         let spawns = || parse_thread().is_some_and(|thread| thread != caller);
-        assert!(spawns(), "a parse outside the call spawns its thread");
+        assert!(spawns(), "a parse outside the call runs on its thread");
         on_caller_stack(|| {
             on_caller_stack(|| ());
             assert_eq!(

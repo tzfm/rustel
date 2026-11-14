@@ -3997,7 +3997,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 [[package]]
 name = "pulseaudio"
 version = "0.3.2"
-source = "git+https://github.com/undy-aeon/pulseaudio-rs?rev=49f1f69a6b500bb513164edc2c19c69446f53a8c#49f1f69a6b500bb513164edc2c19c69446f53a8c"
+source = "git+https://github.com/colinmarc/pulseaudio-rs?rev=49f1f69a6b500bb513164edc2c19c69446f53a8c#49f1f69a6b500bb513164edc2c19c69446f53a8c"
 dependencies = [
  "bitflags 2.13.1",
  "byteorder",
@@ -4419,6 +4419,17 @@ dependencies = [
  "serde",
  "serde_json",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rustel-bench"
+version = "0.1.6"
+dependencies = [
+ "libc",
+ "rustel-core",
+ "rustel-fraction",
+ "rustel-runtime",
+ "serde_json",
 ]
 
 [[package]]

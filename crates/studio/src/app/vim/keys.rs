@@ -582,6 +582,10 @@ mod tests {
         app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
         app.ui_settings.vim_list_navigation = true;
         app.sync_editor_keybindings();
+        // The fixture plugins of the one host of the process: the lock keeps
+        // another fixture test's 600 ms load from finding this test's module
+        // warm, and this test's resolve from warming another's.
+        let _fixture = crate::engine::load_mode_tests::fixture_test_lock();
         let plugins = tempfile::tempdir().expect("plugin folder");
         rustel_vst3_fixture::install(plugins.path());
         rustel_runtime::vst::pin_standard_folders(vec![plugins.path().to_path_buf()]);
@@ -627,6 +631,10 @@ mod tests {
         let (inside, rows, selected) = vst(&app);
         assert_eq!(inside, None);
         assert_eq!(rows[selected], PluginRow::Section(VstSection::Params));
+        // Every fixture test leaves the host with no folder, as it found
+        // it: a later test that reads the folders of the process sees no
+        // plugin this one pinned.
+        rustel_runtime::vst::pin_standard_folders(Vec::new());
     }
 
     /// j k h l drive the knobs column the way the arrows do: the rows

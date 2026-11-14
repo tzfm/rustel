@@ -793,12 +793,22 @@ pub fn max_polyphony() -> Option<usize> {
 /// Set the score override in the currently bound candidate/runtime.
 /// Host defaults belong to the host and must not be written through this setter.
 pub fn set_max_polyphony(voices: usize) {
+    let voices = Some(voices.clamp(1, MAX_CONFIGURABLE_POLYPHONY));
+    // Writing the value already in force changes nothing, so it publishes
+    // nothing: the settings identity, which every result cache keys on,
+    // stays put.
+    if max_polyphony() == voices {
+        return;
+    }
     update_current(|settings| {
-        settings.max_polyphony = Some(voices.clamp(1, MAX_CONFIGURABLE_POLYPHONY));
+        settings.max_polyphony = voices;
     });
 }
 
 pub(crate) fn set_rng_mode(mode: u8) {
+    if rng_mode() == mode {
+        return;
+    }
     update_current(|settings| settings.rng_mode = mode);
 }
 
@@ -807,6 +817,9 @@ pub(crate) fn rng_mode() -> u8 {
 }
 
 pub(crate) fn set_default_join(alignment: u8) {
+    if default_join() == alignment {
+        return;
+    }
     update_current(|settings| settings.default_join = alignment);
 }
 

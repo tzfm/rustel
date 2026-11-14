@@ -1,0 +1,11 @@
+// Percussion stacks with euclids, gain patterns and offbeat hats.
+setcpm(45);
+
+stack(
+  note("e1 ~ e1 e1 ~ e1").s("sbd").gain("<0.8 1>").dist(0.2),
+  s("bd").gain(0.9),
+  s("sd(5,8)").gain(0.6),
+  s("hh(7,16)").gain("<0.2 0.35>"),
+  s("[~ oh:2]*2").dec(0.25).bpf(3000).bpq(0.5),
+  s("cp(3,8)").gain(0.4)
+)

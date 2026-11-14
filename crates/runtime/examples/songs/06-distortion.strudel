@@ -1,0 +1,16 @@
+// Distortion chains: drive, crush and shape on stacked synth and drum voices.
+setcpm(50);
+
+function grit(notes) {
+  return note(notes).s("sawtooth").dist("<0.2 0.45>").crush(8).gain(0.7)
+}
+
+stack(
+  grit("<a1 [a1 c2] a1 [g1 a1]>"),
+  grit("<a3 c4 e4 a4>*2").gain(0.4),
+  note("<[a2, a3] [f2, f3] [g2, g3] [e2, e3]>").s("supersaw").dist(0.3).gain(0.6),
+  s("bd*4").dist(0.35).gain(0.9),
+  s("sd(3,8)").dist(0.25).gain(0.6),
+  s("hh*8").crush(6).gain(0.3),
+  s("[~ oh:2]*2").dist(0.2).lpf(2000)
+)

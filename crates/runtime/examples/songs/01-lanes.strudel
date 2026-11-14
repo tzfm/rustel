@@ -1,0 +1,10 @@
+// A small set of lanes over slow cycle sequences: the entry cost of a score.
+setcpm(30);
+
+stack(
+  note("< [c4 e4 g4] [a3 c4 e4] >").s("gm_piano").release(0.4),
+  note("< [c2 c3] [f2 f3] [g2 g3] [a2 a3] >").s("supersaw").release(0.8).gain(0.9),
+  s("bd ~ ~ ~").gain(0.9),
+  s("~ sd ~ sd").gain(0.7),
+  s("hh*4").gain(0.3)
+)

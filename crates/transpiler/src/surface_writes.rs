@@ -97,7 +97,7 @@ pub fn surface_writes(source: &str) -> SurfaceWrites {
     if crate::check_nesting(source).is_err() {
         return unbounded();
     }
-    crate::on_parse_stack(|| {
+    crate::on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked || !parsed.diagnostics.is_empty() {

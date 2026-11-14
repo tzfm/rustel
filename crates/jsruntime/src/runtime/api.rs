@@ -146,6 +146,10 @@ impl JsRuntime {
             hap_budget: Cell::new(rustel_core::DEFAULT_HAP_BUDGET),
             query_threw: RefCell::new(None),
             callback_ir,
+            native_tier: Cell::new(true),
+            evaluated_natively: Cell::new(false),
+            bindings_installed: Cell::new(false),
+            voicings_installed: Cell::new(false),
             heap: budget,
             deadline,
             interrupted,
@@ -174,6 +178,31 @@ impl JsRuntime {
 
     pub fn run_gc(&self) {
         self.rt.run_gc();
+    }
+
+    /// Install the semantic surface and the voicing globals, once. Every
+    /// entry that runs score text calls this first.
+    pub fn ensure_surface(&self) -> Result<(), String> {
+        if !self.bindings_installed.get() {
+            self.install_semantic_bindings()?;
+        }
+        if !self.voicings_installed.get() {
+            self.install_voicings_prebake()?;
+        }
+        Ok(())
+    }
+
+    /// Let scores the native tier proves skip JavaScript, or send every
+    /// score to JavaScript, for tests and same-machine A/B.
+    #[doc(hidden)]
+    pub fn set_native_tier(&self, enabled: bool) {
+        self.native_tier.set(enabled);
+    }
+
+    /// Whether the last evaluated score ran on the native tier.
+    #[doc(hidden)]
+    pub fn evaluated_natively(&self) -> bool {
+        self.evaluated_natively.get()
     }
 
     /// Select callback-IR execution policy for tests and same-machine A/B.

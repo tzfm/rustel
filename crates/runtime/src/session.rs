@@ -55,7 +55,7 @@ use crate::hap_json::{
 use crate::osc_bridge::ScoreOscAccess;
 #[cfg(any(feature = "device-audio", test))]
 use crate::producer::{ProducerPhase, ProducerTurnRecord};
-use crate::render::{RenderFormat, write_onset_dump, write_silent_wav};
+use crate::render::{RenderFormat, write_onset_dump_until, write_silent_wav};
 use crate::samples::ScoreSampleAccess;
 use crate::score_import::ScoreImportAccess;
 
@@ -1024,8 +1024,6 @@ pub struct Session {
     /// Full-screen owners drain this instead of allowing writes behind their
     /// alternate screen. It is bounded independently of score complexity.
     pending_diagnostics: VecDeque<SessionDiagnostic>,
-    bindings_ready: bool,
-    voicings_ready: bool,
     /// Whether this Session has claimed its native module settings instead of
     /// continuing to inherit the ambient Rust compatibility state.
     core_settings_owned: bool,
@@ -1279,8 +1277,6 @@ impl Session {
             import_errors: std::collections::BTreeMap::new(),
             direct_diagnostic_logging: rustel_voice::default_direct_diagnostic_logging(),
             pending_diagnostics: VecDeque::new(),
-            bindings_ready: false,
-            voicings_ready: false,
             core_settings_owned: false,
             core_settings_initialized: false,
             reported_query_throw: None,
@@ -1614,6 +1610,26 @@ impl Session {
     pub fn set_plugin_lead_for_test(&mut self, lead: f64) {
         self.plugin_lead = (lead, self.transport.stops());
         self.plugin_lead_changed();
+    }
+
+    /// Let scores the native tier proves skip JavaScript, or send every
+    /// score to JavaScript, for tests and same-machine A/B.
+    #[doc(hidden)]
+    pub fn set_native_tier(&self, enabled: bool) {
+        self.js.set_native_tier(enabled);
+    }
+
+    /// Whether the last evaluated score ran on the native tier.
+    #[doc(hidden)]
+    pub fn evaluated_natively(&self) -> bool {
+        self.js.evaluated_natively()
+    }
+
+    /// The active graph as its score built it, for tests that compare two
+    /// builds of a score.
+    #[doc(hidden)]
+    pub fn active_pattern_for_test(&self) -> Option<rustel_core::Pattern> {
+        self.js.active_graph_for_test()
     }
 
     /// The generation of the score of the last look of

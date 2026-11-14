@@ -32,7 +32,7 @@ later version.
 //! rather than a false-pure pattern escaping to the tight-lookahead path.
 
 use crate::purity::PurePattern;
-use crate::{Hap, Pattern, Value};
+use crate::{Combine, Hap, Pattern, Value};
 use rustel_fraction::Fraction;
 
 /// The purity-parametric combinator surface.
@@ -97,11 +97,17 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     fn fmap(&self, f: impl Fn(&Value) -> Value + Send + Sync + 'static) -> Self;
     fn map_control(&self, spec: crate::controls::ControlSpec, unnamed_only: bool) -> Self;
     fn filter_values(&self, predicate: impl Fn(&Value) -> bool + Send + Sync + 'static) -> Self;
+    /// [`Self::filter_values`] with an already-built predicate, for a
+    /// combinator that interned one by what it reads.
+    fn filter_values_with(&self, predicate: crate::ValuePredicate) -> Self;
     fn filter_haps(&self, predicate: impl Fn(&Hap) -> bool + Send + Sync + 'static) -> Self;
     fn filter_haps_function(&self, function: Option<&crate::value::FunctionRef>) -> Self;
     fn filter_when_function(&self, function: Option<&crate::value::FunctionRef>) -> Self;
     /// Native `withHaps` with per-hap drop (tonal `scale`'s shape).
     fn map_haps_native(&self, f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static) -> Self;
+    /// [`Self::map_haps_native`] for a body that captures nothing: one
+    /// closure object per body for the whole process.
+    fn map_haps_native_static(&self, body: fn(&Hap) -> Option<Hap>) -> Self;
     /// Internal pitch-only rewrite: named gain, cutoff and resonance controls must not be transformed.
     #[doc(hidden)]
     fn map_pitch_haps_native(
@@ -109,6 +115,17 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
         f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
     ) -> Self {
         self.map_haps_native(f)
+    }
+    /// Internal pitch-only rewrite interned by the name it reads: one
+    /// closure object per name for the whole process.
+    #[doc(hidden)]
+    fn map_pitch_haps_native_interned(
+        &self,
+        key: &str,
+        f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+    ) -> Self {
+        let _ = key;
+        self.map_pitch_haps_native(f)
     }
     fn fit(&self) -> Self;
     /// One hap → N haps sharing its span (`voicing()`'s shape).
@@ -120,6 +137,12 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
         f: impl Fn(&Hap) -> Vec<Hap> + Send + Sync + 'static,
     ) -> Self {
         self.expand_haps_native(f)
+    }
+    /// Internal voicing expansion for a body that captures nothing: one
+    /// closure object per body for the whole process.
+    #[doc(hidden)]
+    fn expand_pitch_haps_native_static(&self, body: fn(&Hap) -> Vec<Hap>) -> Self {
+        self.expand_pitch_haps_native(body)
     }
     /// `tag(name)` - mark haps for a later `hasTag` filter.
     fn tag(&self, name: std::sync::Arc<str>) -> Self;
@@ -169,6 +192,28 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
         &self,
         other: Self,
         combine: impl Fn(&Value, &Value) -> Value + Send + Sync + 'static,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self;
+    /// `app_*_with_lookup` with an already-built combine, for a combinator
+    /// that interned one by what it reads. See [`crate::interned_closure`].
+    fn app_left_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self;
+    /// [`Self::app_left_interned`] at `appRight` alignment.
+    fn app_right_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self;
+    /// [`Self::app_left_interned`] at `appBoth` alignment.
+    fn app_both_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
         lookup_flow: crate::LookupFlow,
     ) -> Self;
     /// `app_*_with_lookup` of [`crate::compose::compose_op`] for `op`.
@@ -353,6 +398,11 @@ impl PatOps for Pattern {
     fn filter_values(&self, predicate: impl Fn(&Value) -> bool + Send + Sync + 'static) -> Self {
         Pattern::filter_values(self, predicate)
     }
+    /// [`Self::filter_values`] with an already-built predicate, for a
+    /// combinator that interned one by what it reads.
+    fn filter_values_with(&self, predicate: crate::ValuePredicate) -> Self {
+        Pattern::filter_values_with(self, predicate)
+    }
     fn filter_haps(&self, predicate: impl Fn(&Hap) -> bool + Send + Sync + 'static) -> Self {
         Pattern::filter_haps(self, predicate)
     }
@@ -371,17 +421,30 @@ impl PatOps for Pattern {
     fn map_haps_native(&self, f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static) -> Self {
         Pattern::map_haps_native(self, f)
     }
+    fn map_haps_native_static(&self, body: fn(&Hap) -> Option<Hap>) -> Self {
+        Pattern::map_haps_native_static(self, body)
+    }
     fn map_pitch_haps_native(
         &self,
         f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
     ) -> Self {
         Pattern::map_pitch_haps_native(self, f)
     }
+    fn map_pitch_haps_native_interned(
+        &self,
+        key: &str,
+        f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+    ) -> Self {
+        Pattern::map_pitch_haps_native_interned(self, key, f)
+    }
     fn expand_pitch_haps_native(
         &self,
         f: impl Fn(&Hap) -> Vec<Hap> + Send + Sync + 'static,
     ) -> Self {
         Pattern::expand_pitch_haps_native(self, f)
+    }
+    fn expand_pitch_haps_native_static(&self, body: fn(&Hap) -> Vec<Hap>) -> Self {
+        Pattern::expand_pitch_haps_native_static(self, body)
     }
     fn map_control(&self, spec: crate::controls::ControlSpec, unnamed_only: bool) -> Self {
         Pattern::map_control(self, spec, unnamed_only)
@@ -461,6 +524,30 @@ impl PatOps for Pattern {
         lookup_flow: crate::LookupFlow,
     ) -> Self {
         Pattern::app_both_with_lookup(self, other, combine, lookup_flow)
+    }
+    fn app_left_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        Pattern::app_left_by(self, other, Combine::With(combine), lookup_flow)
+    }
+    fn app_right_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        Pattern::app_right_by(self, other, Combine::With(combine), lookup_flow)
+    }
+    fn app_both_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        Pattern::app_both_by(self, other, Combine::With(combine), lookup_flow)
     }
     fn app_left_composed(
         &self,
@@ -661,6 +748,9 @@ impl PatOps for PurePattern {
     fn filter_values(&self, predicate: impl Fn(&Value) -> bool + Send + Sync + 'static) -> Self {
         PurePattern::assert_pure(self.pattern().filter_values(predicate))
     }
+    fn filter_values_with(&self, predicate: crate::ValuePredicate) -> Self {
+        PurePattern::assert_pure(self.pattern().filter_values_with(predicate))
+    }
     fn filter_haps(&self, predicate: impl Fn(&Hap) -> bool + Send + Sync + 'static) -> Self {
         PurePattern::assert_pure(self.pattern().filter_haps(predicate))
     }
@@ -677,17 +767,30 @@ impl PatOps for PurePattern {
     fn map_haps_native(&self, f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static) -> Self {
         PurePattern::assert_pure(self.pattern().map_haps_native(f))
     }
+    fn map_haps_native_static(&self, body: fn(&Hap) -> Option<Hap>) -> Self {
+        PurePattern::assert_pure(self.pattern().map_haps_native_static(body))
+    }
     fn map_pitch_haps_native(
         &self,
         f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
     ) -> Self {
         PurePattern::assert_pure(self.pattern().map_pitch_haps_native(f))
     }
+    fn map_pitch_haps_native_interned(
+        &self,
+        key: &str,
+        f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+    ) -> Self {
+        PurePattern::assert_pure(self.pattern().map_pitch_haps_native_interned(key, f))
+    }
     fn expand_pitch_haps_native(
         &self,
         f: impl Fn(&Hap) -> Vec<Hap> + Send + Sync + 'static,
     ) -> Self {
         PurePattern::assert_pure(self.pattern().expand_pitch_haps_native(f))
+    }
+    fn expand_pitch_haps_native_static(&self, body: fn(&Hap) -> Vec<Hap>) -> Self {
+        PurePattern::assert_pure(self.pattern().expand_pitch_haps_native_static(body))
     }
     fn map_control(&self, spec: crate::controls::ControlSpec, unnamed_only: bool) -> Self {
         PurePattern::assert_pure(self.pattern().map_control(spec, unnamed_only))
@@ -789,6 +892,42 @@ impl PatOps for PurePattern {
             lookup_flow,
         ))
     }
+    fn app_left_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        PurePattern::assert_pure(self.pattern().app_left_by(
+            other.pattern().clone(),
+            Combine::With(combine),
+            lookup_flow,
+        ))
+    }
+    fn app_right_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        PurePattern::assert_pure(self.pattern().app_right_by(
+            other.pattern().clone(),
+            Combine::With(combine),
+            lookup_flow,
+        ))
+    }
+    fn app_both_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        PurePattern::assert_pure(self.pattern().app_both_by(
+            other.pattern().clone(),
+            Combine::With(combine),
+            lookup_flow,
+        ))
+    }
     fn app_left_composed(
         &self,
         other: Self,
@@ -857,9 +996,10 @@ impl PatOps for PurePattern {
     fn apply_fn(&self, f: &crate::value::FunctionRef) -> Self {
         f.apply_pure(self.clone()).unwrap_or_else(|| {
             // Unreachable: a registration that consumes a function argument
-            // declares `function_argument`, which keeps the general path on the
-            // dynamic constructor, and the fast path checks the argument
-            // values. Kept as the self-check that keeps that claim honest.
+            // declares `function_argument`. Its general path then takes the
+            // pure route only with constant functions that have a pure view,
+            // and the fast path checks the argument values. Kept as the
+            // self-check that keeps that claim honest.
             PurePattern::assert_pure(f.apply(self.pattern().clone()))
         })
     }

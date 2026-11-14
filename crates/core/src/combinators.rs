@@ -1034,7 +1034,7 @@ pub fn chop<P: PatOps>(pat: &P, n: i64) -> P {
         }
         P::pat_fastcat(slices)
     })
-    .map_haps_native(|hap| {
+    .map_haps_native_static(|hap| {
         let mut hap = hap.clone();
         hap.context.clear();
         Some(hap)
@@ -1886,8 +1886,29 @@ fn pure_signal<P: PatOps>(pattern: crate::Pattern) -> P {
 /// Structure comes from `pat` (app-left); the chooser is sampled over each
 /// hap's whole.
 pub fn degrade_by_with<P: PatOps>(pat: &P, with_pat: &P, x: f64) -> P {
-    let gate = with_pat.filter_values(move |v| util::parse_numeral(v).is_ok_and(|n| n > x));
-    pat.app_left_with_lookup(gate, |a, _| a.clone(), crate::LookupFlow::Left)
+    // The gate is a pure function of `x`: one predicate object per
+    // threshold, so the same degrade built by a later evaluation is the
+    // same payload.
+    static POOL: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u64, crate::ValuePredicate>>,
+    > = std::sync::OnceLock::new();
+    let gate_predicate =
+        crate::interned_closure(POOL.get_or_init(Default::default), x.to_bits(), || {
+            let predicate: crate::ValuePredicate =
+                std::sync::Arc::new(move |v| util::parse_numeral(v).is_ok_and(|n| n > x));
+            predicate
+        });
+    let gate = with_pat.filter_values_with(gate_predicate);
+    // The combine keeps the left value whatever the gate says: one closure
+    // object for every degrade, so that node agrees by pointer.
+    static KEEP_LEFT: std::sync::OnceLock<crate::CombineFn> = std::sync::OnceLock::new();
+    let keep_left = KEEP_LEFT
+        .get_or_init(|| {
+            let combine: crate::CombineFn = std::sync::Arc::new(|a: &Value, _: &Value| a.clone());
+            combine
+        })
+        .clone();
+    pat.app_left_interned(gate, keep_left, crate::LookupFlow::Left)
         .set_steps(pat.pat_steps())
 }
 
@@ -1909,35 +1930,55 @@ pub fn undegrade_by<P: PatOps>(pat: &P, x: f64) -> P {
 
 /// Applies `f` to roughly `x` of the events. The halves are complementary:
 /// the transformed copy takes exactly the events the plain copy dropped.
-/// The scalar carrier and `inner_bind` are required: they split crossing
-/// wholes at cycle boundaries and invoke `f` lazily, per queried carrier hap.
+/// The bind to the scalar carrier is required: it splits crossing wholes at
+/// cycle boundaries. Its closure ignores the carrier.
+///
+/// A transform whose one application stands for every later one has its
+/// halves built once, here, as [`first_of`]/[`last_of`] build their
+/// transformed part: the carrier hap carries nothing the transform reads,
+/// and building the halves per carrier hap re-ran the transform for every
+/// hap of every query. Any other transform keeps its application per
+/// carrier hap, where a query runs it: a JavaScript transform runs at query
+/// time, exactly once per carrier hap, and a lowered transform whose
+/// program can go stale must reach its callback again once it does. What
+/// that application is wrapped in — both halves, the coin signals — is
+/// pure, so it is still built once, and only the application itself is
+/// rebuilt per carrier hap.
 pub fn sometimes_by<P: PatOps>(pat: &P, x: f64, f: Option<&FunctionRef>) -> P {
-    let pat = pat.clone();
-    let f = f.cloned();
+    let plain = degrade_by(pat, x);
+    let transformed_base = undegrade_by(pat, 1.0 - x);
+    applied_halves(x, plain, transformed_base, f)
+}
+
+/// The two halves of [`sometimes_by`] and [`some_cycles_by`], bound to the
+/// coin. A transform that stands for every application applies once, here:
+/// the bind then asks the same halves for each cycle of the carrier and
+/// adds nothing to their haps, which is a split of the queries. Any other
+/// transform applies inside the bind, per coin hap.
+fn applied_halves<P: PatOps>(x: f64, plain: P, transformed_base: P, f: Option<&FunctionRef>) -> P {
+    let Some(f) = f.filter(|f| !f.stands_for_every_application()) else {
+        let transformed = call(&transformed_base, f);
+        return P::pat_stack(vec![plain, transformed]).split_queries();
+    };
+    let f = f.clone();
     P::pat_pure(Value::F64(x)).inner_bind(move |_| {
-        let plain = degrade_by(&pat, x);
-        let transformed = call(&undegrade_by(&pat, 1.0 - x), f.as_ref());
-        P::pat_stack(vec![plain, transformed])
+        let transformed = call(&transformed_base, Some(&f));
+        P::pat_stack(vec![plain.clone(), transformed])
     })
 }
 
 /// [`sometimes_by`], but `segment(1)` on the rand signal makes the coin
 /// flip once per CYCLE rather than per hap.
 pub fn some_cycles_by<P: PatOps>(pat: &P, x: f64, f: Option<&FunctionRef>) -> P {
-    let pat = pat.clone();
-    let f = f.cloned();
-    P::pat_pure(Value::F64(x)).inner_bind(move |_| {
-        let per_cycle = segment(&pure_signal::<P>(crate::signal::rand()), Fraction::ONE);
-        let inverted = segment(
-            &pure_signal::<P>(crate::signal::rand())
-                .fmap(|v| Value::F64(1.0 - util::parse_numeral(v).unwrap_or(f64::NAN))),
-            Fraction::ONE,
-        );
-        P::pat_stack(vec![
-            degrade_by_with(&pat, &per_cycle, x),
-            call(&degrade_by_with(&pat, &inverted, 1.0 - x), f.as_ref()),
-        ])
-    })
+    let per_cycle = segment(&pure_signal::<P>(crate::signal::rand()), Fraction::ONE);
+    let inverted = segment(
+        &pure_signal::<P>(crate::signal::rand())
+            .fmap(|v| Value::F64(1.0 - util::parse_numeral(v).unwrap_or(f64::NAN))),
+        Fraction::ONE,
+    );
+    let plain = degrade_by_with(pat, &per_cycle, x);
+    let transformed_base = degrade_by_with(pat, &inverted, 1.0 - x);
+    applied_halves(x, plain, transformed_base, f)
 }
 
 // -- envelope shorthands ----------------------------------------------------
@@ -2306,8 +2347,65 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
             });
         }
     };
-    let scale_tag: std::sync::Arc<str> = std::sync::Arc::from(scale_name.as_str());
-    pat.map_pitch_haps_native(move |hap| {
+    let key = scale_name.clone();
+    let steps = ScaleSteps::new(scale_name);
+    pat.map_pitch_haps_native_interned(&key, move |hap| scale_hap(hap, &steps))
+}
+
+/// The lowest degree [`ScaleSteps`] keeps.
+const LOWEST_KEPT_DEGREE: i64 = -64;
+
+/// How many degrees [`ScaleSteps`] keeps, from [`LOWEST_KEPT_DEGREE`] up.
+const KEPT_DEGREES: usize = 128;
+
+/// One scale as a `scale` call site reads it: the name, the tag its haps
+/// carry, and the note of each degree asked so far.
+///
+/// [`crate::tonaljs::scale_step`] resolves the scale name, its tonic and the
+/// octave transposition on every call. A degree's note depends on nothing
+/// else, so each degree in the kept range is resolved once, on first use,
+/// and later haps read it. A degree outside the range resolves every time,
+/// as before.
+struct ScaleSteps {
+    name: String,
+    tag: std::sync::Arc<str>,
+    degrees: Box<[std::sync::OnceLock<Result<String, String>>]>,
+}
+
+impl ScaleSteps {
+    fn new(name: String) -> Self {
+        Self {
+            tag: std::sync::Arc::from(name.as_str()),
+            name,
+            degrees: (0..KEPT_DEGREES)
+                .map(|_| std::sync::OnceLock::new())
+                .collect(),
+        }
+    }
+
+    /// [`crate::tonaljs::scale_step`] of `step` in this scale.
+    fn step(&self, step: f64) -> Result<String, String> {
+        // `scale_step` rounds up first, so a step and its ceiling have one
+        // note. Only a finite ceiling inside the range is kept.
+        let degree = step.ceil();
+        let slot = (LOWEST_KEPT_DEGREE as f64..(LOWEST_KEPT_DEGREE + KEPT_DEGREES as i64) as f64)
+            .contains(&degree)
+            .then(|| (degree as i64 - LOWEST_KEPT_DEGREE) as usize);
+        match slot {
+            Some(slot) => self.degrees[slot]
+                .get_or_init(|| crate::tonaljs::scale_step(degree, &self.name))
+                .clone(),
+            None => crate::tonaljs::scale_step(step, &self.name),
+        }
+    }
+}
+
+/// The body of one `scale` rewrite: a pure function of the hap and the
+/// scale name. Kept as a named function so [`scale`] can intern its map by
+/// the name alone - see [`crate::interned_closure`].
+fn scale_hap(hap: &crate::Hap, steps: &ScaleSteps) -> Option<crate::Hap> {
+    let scale_name = steps.name.as_str();
+    {
         let hap = &*materialized_hap(hap);
         // A plain value behaves as `{ n: value }`; note / n / value is
         // picked out and the rest carried along.
@@ -2360,7 +2458,7 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
                     return None;
                 }
             };
-            match crate::tonaljs::nearest_scale_note(&scale_name, midi) {
+            match crate::tonaljs::nearest_scale_note(scale_name, midi) {
                 Ok(quantized) => Value::Str(quantized),
                 Err(error) => {
                     crate::signal_query_error(move || error.clone());
@@ -2398,15 +2496,13 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
                     // anything else is NaN.
                     let anchor_midi = match anchor {
                         Value::F64(n) => *n,
-                        Value::Str(s) => {
-                            crate::util::note_to_midi(s, 3).unwrap_or(f64::NAN)
-                        }
+                        Value::Str(s) => crate::util::note_to_midi(s, 3).unwrap_or(f64::NAN),
                         _ => f64::NAN,
                     };
-                    crate::tonaljs::step_in_named_scale(number, &scale_name, Some(anchor_midi))
+                    crate::tonaljs::step_in_named_scale(number, scale_name, Some(anchor_midi))
                         .map(Value::F64)
                 }
-                None => crate::tonaljs::scale_step(number, &scale_name).map(Value::Str),
+                None => steps.step(number).map(Value::Str),
             };
             let stepped = match stepped {
                 Ok(value) => value,
@@ -2437,9 +2533,48 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
         };
         Some(
             hap.with_value(|_| value.clone())
-                .with_scale_context(scale_tag.clone()),
+                .with_scale_context(steps.tag.clone()),
         )
-    })
+    }
+}
+
+#[cfg(test)]
+mod scale_steps_tests {
+    use super::{KEPT_DEGREES, LOWEST_KEPT_DEGREE, ScaleSteps};
+
+    #[test]
+    fn a_kept_degree_is_the_note_scale_step_resolves() {
+        let mut steps: Vec<f64> = (LOWEST_KEPT_DEGREE - 3
+            ..LOWEST_KEPT_DEGREE + KEPT_DEGREES as i64 + 3)
+            .map(|degree| degree as f64)
+            .collect();
+        steps.extend([
+            -0.5,
+            0.25,
+            2.5,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            -1e300,
+            1e300,
+        ]);
+        let tonics = ["C", "C#", "Eb4", "B2", "Fb", ""];
+        for (type_name, _, _) in crate::tonaljs_scales::SCALE_DICTIONARY {
+            for tonic in tonics {
+                let name = format!("{tonic}:{type_name}");
+                let kept = ScaleSteps::new(name.clone());
+                for &step in &steps {
+                    let expected = crate::tonaljs::scale_step(step, &name);
+                    assert_eq!(kept.step(step).is_ok(), expected.is_ok(), "{name} {step}");
+                    if let Ok(note) = expected {
+                        assert_eq!(kept.step(step), Ok(note), "{name} {step}");
+                    }
+                }
+            }
+        }
+        let unknown = ScaleSteps::new("C:no such scale".to_string());
+        assert!(unknown.step(1.0).is_err());
+    }
 }
 
 #[cfg(test)]

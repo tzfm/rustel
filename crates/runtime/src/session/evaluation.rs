@@ -86,10 +86,6 @@ impl Session {
         if crate::sounds::variant_selection(source).is_some() {
             self.prebake_selects_variants = true;
         }
-        // Setup/prebake is the canonical home for voicing dictionaries and
-        // MIDI maps. Install those configuration globals before executing it,
-        // just as ordinary score evaluation does.
-        self.ensure_voicings()?;
         self.js.set_cps(self.scheduler.cps());
         self.js.set_cycle_time(self.evaluation_cycle());
         // The setup and its imports keep what they register for every
@@ -661,11 +657,8 @@ impl Session {
         #[cfg(any(test, feature = "test-support"))]
         self.panic_if_injected(SessionPanicPoint::Evaluation);
         self.claim_core_settings();
-        // scale/transpose/scaleTranspose are native registry combinators in
-        // rustel-core. The voicings bundle still installs because chord and
-        // voicing do not yet have complete native implementations.
-        self.ensure_bindings()?;
-        self.ensure_voicings()?;
+        // The score surface installs when JavaScript first runs: a score the
+        // native tier evaluates needs none.
         self.js.set_cps(self.scheduler.cps());
         let cycle = seed.map_or_else(|| self.evaluation_cycle(), |(_, _, cycle)| cycle);
         self.js.set_cycle_time(cycle);
@@ -709,6 +702,8 @@ impl Session {
             self.js.snapshot_active_as_last_good();
         }
         let options = TranspileOptions {
+            // The editor lists the leaves with its own layout pass.
+            list_mini_leaves: false,
             widget_methods: rustel_transpiler::VISUAL_WIDGET_METHODS
                 .iter()
                 .map(|method| (*method).to_owned())

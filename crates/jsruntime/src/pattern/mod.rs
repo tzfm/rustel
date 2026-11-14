@@ -72,8 +72,11 @@ pub(super) fn bridge_pattern_callable<'js>(
     function: Function<'js>,
 ) -> rquickjs::Result<(rustel_core::value::FunctionRef, Sidecar<'js>)> {
     let (id, sidecar) = bridge_callable(ctx, function.clone())?;
-    let function = compiled_pattern_callable(ctx, id, function)
-        .unwrap_or_else(|| rustel_core::value::FunctionRef::js(id));
+    let (function, nested) = compiled_pattern_callable(ctx, id, function)
+        .unwrap_or_else(|| (rustel_core::value::FunctionRef::js(id), Vec::new()));
+    let mut sidecars = vec![sidecar];
+    sidecars.extend(nested);
+    let sidecar = Sidecar::merge_all(sidecars).map_err(|_| rquickjs::Error::Allocation)?;
     Ok((function, sidecar))
 }
 
@@ -92,7 +95,7 @@ fn compiled_pattern_callable<'js>(
     ctx: &Ctx<'js>,
     id: CallbackId,
     function: Function<'js>,
-) -> Option<rustel_core::value::FunctionRef> {
+) -> Option<(rustel_core::value::FunctionRef, Vec<Sidecar<'js>>)> {
     use rustel_core::callback_ir::PatternTransformProgram;
     use rustel_core::value::FunctionRef;
 
@@ -107,14 +110,15 @@ fn compiled_pattern_callable<'js>(
         .ok()?;
     let candidate = recognise_pattern_callable(&state, &source).ok()?;
     let mode = state.mode.get();
-    let function = match &*candidate {
+    let (function, sidecars) = match &*candidate {
         rustel_transpiler::PatternTransformCandidate::Identity => {
             let program = PatternTransformProgram::new([]).ok()?;
-            if mode == PatternTransformIrMode::Auto {
+            let function = if mode == PatternTransformIrMode::Auto {
                 FunctionRef::lowered_js(id, program)
             } else {
                 FunctionRef::js_pattern_ir(id, program)
-            }
+            };
+            (function, Vec::new())
         }
         rustel_transpiler::PatternTransformCandidate::MethodChain(calls) => {
             // A closed gate admits no chain, so nothing is compiled for it.
@@ -123,7 +127,7 @@ fn compiled_pattern_callable<'js>(
             {
                 return None;
             }
-            let lowered = lower_method_chain(ctx, calls).ok()?;
+            let lowered = lower_method_chain(ctx, calls, 0).ok()?;
             let program = {
                 let mut gate = state.gate.borrow_mut();
                 if !gate.admits(&lowered.dependencies) {
@@ -133,15 +137,16 @@ fn compiled_pattern_callable<'js>(
                     gate.issue(&lowered.dependencies, mode == PatternTransformIrMode::Auto);
                 lowered.program.with_standings(standings)
             };
-            if mode == PatternTransformIrMode::Auto {
+            let function = if mode == PatternTransformIrMode::Auto {
                 FunctionRef::lowered_js(id, program)
             } else {
                 FunctionRef::js_pattern_ir(id, program)
-            }
+            };
+            (function, lowered.sidecars)
         }
     };
     state.count(|stats| stats.lowered = stats.lowered.saturating_add(1));
-    Some(function)
+    Some((function, sidecars))
 }
 
 /// Recognise one callback source, through the realm's cache.
@@ -397,9 +402,14 @@ pub(super) fn new_wrapper_with_query_surface<'js>(
     let steps_value = match steps {
         Some(steps) => {
             let stack = host_stack(ctx)?;
-            match stack.as_object().get::<_, Function>(FRACTION_FACTORY) {
-                Ok(factory) => factory.call((fraction_seed(ctx, steps)?,))?,
-                Err(_) => rquickjs::Value::new_undefined(ctx.clone()),
+            if stack
+                .as_object()
+                .get::<_, Function>(FRACTION_FACTORY)
+                .is_ok()
+            {
+                crate::fraction::fraction_value(ctx, steps)?
+            } else {
+                rquickjs::Value::new_undefined(ctx.clone())
             }
         }
         None => rquickjs::Value::new_undefined(ctx.clone()),
