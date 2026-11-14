@@ -22,7 +22,10 @@ use crate::producer::{
 use crate::session::{
     LiveAudioScheduleError, LiveQueryBudgetMode, MIN_LIVE_QUERY_JS_BUDGET, RollbackAttempt,
 };
-use crate::{FileWatch, RuntimeError, Session, WatchLanguage, WatchPoll, WatchTarget};
+use crate::{
+    FileWatch, LIVE_REPLACEMENT_MIN_HEADROOM, RuntimeError, Session, WatchLanguage, WatchPoll,
+    WatchTarget,
+};
 #[cfg(feature = "vst")]
 use crate::{PLUGIN_WAIT, SEAM_WAIT};
 
@@ -216,6 +219,30 @@ impl PluginTurns {
     }
 }
 
+/// The longest runway a retry of a late restored score gets. A longer stall
+/// (a suspended machine, say) would otherwise buy that much silence before
+/// the score comes back. It matches the 2 s ceiling of one score evaluation.
+const MAX_RETRY_RUNWAY: Duration = Duration::from_secs(2);
+
+/// Why the first window of a replacement never published.
+#[derive(Clone, Copy, Debug)]
+enum Refusal {
+    /// The window finished after its takeover, at this producer clock time.
+    /// The machine was slow, not the score.
+    Late { at: f64 },
+    /// The score refused the window: every onset, or its preparation.
+    Unplayable,
+}
+
+/// The score a rollback put back, until its first window publishes.
+#[derive(Clone, Copy, Debug)]
+struct RolledBack {
+    generation: u64,
+    /// The producer clock just after the install. A late first window
+    /// measures from here the runway its retry needs.
+    installed_at: f64,
+}
+
 /// Events the producer may hold undelivered. Generous for ordinary dense
 /// scores (the ring drains as audio plays) and small enough that a runaway
 /// span cannot lock out later edits for minutes.
@@ -284,14 +311,15 @@ pub struct LiveFileProducer {
     /// accepted output before treating a later empty transfer as prefill.
     prefill_waiting_for_progress: bool,
     /// A refused replacement whose rollback could not run yet (the session
-    /// deferred it for want of horizon): retried at the top of every turn
-    /// until the audible score is back or a newer replacement supersedes it,
-    /// never latched.
-    rollback_pending: bool,
-    /// The generation a rollback installed. If THAT refuses every onset too
+    /// deferred it for want of horizon), with the cause of the refusal:
+    /// retried at the top of every turn until the audible score is back or
+    /// a newer replacement supersedes it, never latched.
+    rollback_pending: Option<Refusal>,
+    /// The score a rollback installed. If THAT refuses every onset too
     /// there is nothing left to go back to, and rolling back again would
-    /// burn a generation per turn forever.
-    rolled_back_to: Option<u64>,
+    /// burn a generation per turn forever. If it is only late, the machine
+    /// was slow: it goes back again, with the runway it needed.
+    rolled_back_to: Option<RolledBack>,
     /// Desktop IPC evaluate arms a cutover that the unwatched step is allowed
     /// to publish. A watched cutover must still finish on the watched route.
     unwatched_cutover_allowed: bool,
@@ -416,7 +444,7 @@ impl LiveFileProducer {
             pending_prebake_report: None,
             prefill_candidate_committed: false,
             prefill_waiting_for_progress: false,
-            rollback_pending: false,
+            rollback_pending: None,
             rolled_back_to: None,
             unwatched_cutover_allowed: false,
             control_requery_pending: false,
@@ -508,7 +536,7 @@ impl LiveFileProducer {
             pending_prebake_report: None,
             prefill_candidate_committed: false,
             prefill_waiting_for_progress: false,
-            rollback_pending: false,
+            rollback_pending: None,
             rolled_back_to: None,
             unwatched_cutover_allowed: false,
             control_requery_pending: false,
@@ -1051,7 +1079,7 @@ impl LiveFileProducer {
         self.generation_needs_prefill = true;
         self.prefill_candidate_committed = false;
         self.prefill_waiting_for_progress = false;
-        self.rollback_pending = false;
+        self.rollback_pending = None;
         self.control_requery_pending = false;
         self.check_takeover_freshness = true;
         self.cut_takeover_deferred_for_loading = false;
@@ -1210,17 +1238,19 @@ impl LiveFileProducer {
         }
     }
 
-    /// Put the last audible score back after a replacement refused every
-    /// onset of its first window. Applied re-arms the cutover to the
-    /// restored generation; Deferred (the session would not run score code
-    /// on this turn's horizon) leaves the rollback pending for the next
-    /// turn; only "nothing to go back to" latches. Returns the message the
-    /// turn ends with, already reported as a diagnostic.
+    /// Put the last audible score back after the first window of a
+    /// replacement was refused. Applied re-arms the cutover to the restored
+    /// generation. Deferred (the session would not run score code on this
+    /// turn's horizon) leaves the rollback pending for the next turn. A
+    /// restored score that cannot play, or nothing to go back to, latches.
+    /// Returns the message the turn ends with, already reported as a
+    /// diagnostic.
     fn roll_back_refused_replacement(
         &mut self,
         session: &mut Session,
-        clock: impl FnMut() -> f64,
+        mut clock: impl FnMut() -> f64,
         error: &RuntimeError,
+        refusal: Refusal,
     ) -> RuntimeError {
         let generation_before = session.generation();
         // Whatever the rollback's outcome, the refused replacement never
@@ -1231,32 +1261,56 @@ impl LiveFileProducer {
         if let Some(refused) = self.pending_generation {
             self.abandoned_generation = Some(refused);
         }
-        // The refused candidate IS the last rollback: the score we went
-        // back to cannot be played either. Latch rather than loop.
-        if self.rolled_back_to == Some(generation_before) {
-            self.rollback_pending = false;
-            self.prefill_candidate_committed = true;
-            let message = format!(
-                "the new score could not be played ({error}); the last audible score could not be played either - save a score that can"
-            );
-            session.report_diagnostic(
-                "live-error",
-                message.clone(),
-                serde_json::json!({
-                    "live_error": {
-                        "kind": "refused-replacement",
-                        "message": message,
-                        "recoverable": true,
-                    }
-                }),
-            );
-            return RuntimeError::Message(message);
+        // The refused candidate IS the last rollback.
+        let restored = self
+            .rolled_back_to
+            .filter(|restored| restored.generation == generation_before);
+        if let Some(restored) = restored {
+            match refusal {
+                // The score we went back to cannot be played either. Latch
+                // rather than loop.
+                Refusal::Unplayable => {
+                    self.rollback_pending = None;
+                    self.prefill_candidate_committed = true;
+                    let message = format!(
+                        "the new score could not be played ({error}); the last audible score could not be played either - save a score that can"
+                    );
+                    session.report_diagnostic(
+                        "live-error",
+                        message.clone(),
+                        serde_json::json!({
+                            "live_error": {
+                                "kind": "refused-replacement",
+                                "message": message,
+                                "recoverable": true,
+                            }
+                        }),
+                    );
+                    return RuntimeError::Message(message);
+                }
+                // The machine was slow, not the score. Each try gets the
+                // runway the last one needed, so a steady load lands the
+                // next one. A latch here left the set silent until a new
+                // save or a restart.
+                Refusal::Late { at } => {
+                    let needed =
+                        Duration::try_from_secs_f64(at - restored.installed_at).unwrap_or_default();
+                    session.set_replacement_headroom_floor(
+                        needed
+                            .saturating_add(LIVE_REPLACEMENT_MIN_HEADROOM)
+                            .min(MAX_RETRY_RUNWAY),
+                    );
+                }
+            }
         }
-        let (message, kind) = match session.rollback_to_previous_source_with_clock(clock) {
+        let (message, kind) = match session.rollback_to_previous_source_with_clock(&mut clock) {
             Ok(RollbackAttempt::Applied) => {
                 self.turn_rollbacks = self.turn_rollbacks.saturating_add(1);
                 self.arm_replacement(generation_before, session.generation());
-                self.rolled_back_to = Some(session.generation());
+                self.rolled_back_to = Some(RolledBack {
+                    generation: session.generation(),
+                    installed_at: clock(),
+                });
                 // The refused replacement never published; its requery anchor
                 // belongs to the score that came back, not to a window that
                 // will never fire again.
@@ -1265,15 +1319,18 @@ impl LiveFileProducer {
                 // replaced: the engine must not keep a line cut withdrawn
                 // for a replacement that is gone.
                 debug_assert!(!self.cut_takeover_deferred_for_loading);
-                (
+                let message = if restored.is_some() {
+                    "the last audible score came back too late; trying again with more time"
+                        .to_owned()
+                } else {
                     format!(
                         "the new score could not be played ({error}); the last audible score keeps playing"
-                    ),
-                    "refused-replacement",
-                )
+                    )
+                };
+                (message, "refused-replacement")
             }
             Ok(RollbackAttempt::Deferred) => {
-                self.rollback_pending = true;
+                self.rollback_pending = Some(refusal);
                 self.prefill_candidate_committed = false;
                 // The deferred rollback is not a cut deferral: nothing is
                 // waiting for loading on a cut line any more.
@@ -1286,7 +1343,7 @@ impl LiveFileProducer {
                 )
             }
             Ok(RollbackAttempt::Unavailable) => {
-                self.rollback_pending = false;
+                self.rollback_pending = None;
                 self.prefill_candidate_committed = true;
                 self.cut_takeover_deferred_for_loading = false;
                 (
@@ -1297,7 +1354,7 @@ impl LiveFileProducer {
                 )
             }
             Err(rollback_error) => {
-                self.rollback_pending = false;
+                self.rollback_pending = None;
                 self.prefill_candidate_committed = true;
                 self.cut_takeover_deferred_for_loading = false;
                 (
@@ -1990,14 +2047,18 @@ impl LiveFileProducer {
                     session.generation()
                 )));
             }
-            if self.rollback_pending {
+            if let Some(refusal) = self.rollback_pending {
                 // The rollback the last turn could not run: try again with
                 // this turn's clock. It stays pending, never latched, until
                 // the audible score is back or there is none to go back to.
                 let refused = RuntimeError::Message("the new score could not be played".into());
-                let outcome =
-                    self.roll_back_refused_replacement(session, &mut schedule_now, &refused);
-                if self.rollback_pending || self.prefill_candidate_committed {
+                let outcome = self.roll_back_refused_replacement(
+                    session,
+                    &mut schedule_now,
+                    &refused,
+                    refusal,
+                );
+                if self.rollback_pending.is_some() || self.prefill_candidate_committed {
                     return Err(outcome);
                 }
             }
@@ -2317,6 +2378,7 @@ impl LiveFileProducer {
                             session,
                             &mut schedule_now,
                             &error,
+                            Refusal::Unplayable,
                         ));
                     }
                     if self.generation_needs_prefill {
@@ -2440,6 +2502,7 @@ impl LiveFileProducer {
                             session,
                             &mut schedule_now,
                             &error,
+                            Refusal::Unplayable,
                         ));
                     }
                     if self.generation_needs_prefill {
@@ -2513,6 +2576,9 @@ impl LiveFileProducer {
                         session,
                         &mut schedule_now,
                         &error,
+                        Refusal::Late {
+                            at: publication_now,
+                        },
                     ));
                 }
             }
@@ -3458,7 +3524,7 @@ mod tests {
             .reload_at("~", true, 0.0)
             .expect("refused replacement");
         producer.arm_replacement(audible, refused);
-        producer.rollback_pending = true;
+        producer.rollback_pending = Some(Refusal::Unplayable);
 
         // The artist saves again; the watch installs the new identity before
         // the turn reaches its rollback retry.
@@ -3497,7 +3563,7 @@ mod tests {
             "the new save's cutover publishes, not the old score's"
         );
         assert_eq!(session.generation(), saved, "nothing rolled the save back");
-        assert!(!producer.rollback_pending);
+        assert!(producer.rollback_pending.is_none());
         assert!(producer.pending_generation.is_none());
         assert!(
             producer.take_abandoned_generation().is_none(),
@@ -4477,6 +4543,82 @@ mod tests {
             Some(session.generation()),
             "the latched rollback never publishes either"
         );
+    }
+
+    /// A slow machine can make the rollback late too. That score can play,
+    /// so it goes back again with the runway it needed, and the set comes
+    /// back by itself.
+    #[test]
+    fn a_rollback_that_lands_late_tries_again_with_more_time() {
+        const OLD: &str = "setcps(1); note('c4')";
+        let mut session = Session::new().expect("session");
+        session.set_direct_diagnostic_logging(false);
+        session.set_continuity_margin(0.0);
+        session.evaluate(OLD).expect("initial score");
+        let mut producer = LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+        producer
+            .step_unwatched_with_clock_and_cutover(
+                &mut session,
+                || 0.0,
+                48_000,
+                |_, _, _| panic!("initial generation must not cut over"),
+                |_| true,
+            )
+            .expect("initial prefill");
+        let audible = session.generation();
+        session
+            .mark_audible_generation(audible)
+            .expect("injected replay-policy target");
+        let transport = session.transport();
+        let edit = session
+            .reload_with_clock_cancellable(
+                "setcps(1); note('d4')",
+                false,
+                transport.stopped_flag(),
+                || 1.0,
+            )
+            .expect("replacement");
+        producer.arm_replacement(audible, edit);
+
+        // Each turn queries at its first clock and finishes at the second.
+        let clock = std::cell::Cell::new((0.0, 0.0));
+        let mut published = Vec::new();
+        let mut turn = |session: &mut Session, query: f64, done: f64| {
+            clock.set((query, done));
+            producer.step_unwatched_with_clock_and_cutover_and_preparation(
+                session,
+                || {
+                    let (now, later) = clock.get();
+                    clock.set((later, later));
+                    now
+                },
+                48_000,
+                |_| Ok(rustel_audio::KabelPublication::default()),
+                |_| {},
+                |generation, frame, _cut| published.push((generation, frame)),
+                |_| true,
+            )
+        };
+
+        turn(&mut session, 1.6, 1.7).expect_err("the edit is late");
+        assert_eq!(session.generation(), edit + 1, "the old score is back");
+        let error = turn(&mut session, 1.7, 2.5).expect_err("the rollback is late too");
+        assert!(error.to_string().contains("trying again"), "{error}");
+        assert_eq!(
+            session.generation(),
+            edit + 2,
+            "the old score goes back again"
+        );
+        turn(&mut session, 2.6, 2.6).expect("a calm turn plays it");
+
+        let needed = 2.5 - 1.7;
+        assert!(
+            matches!(published[..], [(generation, frame)]
+                if generation == edit + 2
+                    && frame >= ((2.5 + needed) * 48_000.0) as u64),
+            "the retry waits as long as the late try needed: {published:?}"
+        );
+        assert_eq!(session.active_source(), Some(OLD));
     }
 
     /// With no audible score to go back to, the refused candidate still
