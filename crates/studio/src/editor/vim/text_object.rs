@@ -87,7 +87,6 @@ impl Editor {
                 head.0 - start,
                 character as u8,
                 kind,
-                count,
             )
             .map(|range| start + range.start..start + range.end)
         } else {
@@ -208,13 +207,7 @@ fn closing_quote(bytes: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-fn quote_range(
-    text: &str,
-    head: usize,
-    quote: u8,
-    kind: TextObjectKind,
-    count: usize,
-) -> Option<Range<usize>> {
+fn quote_range(text: &str, head: usize, quote: u8, kind: TextObjectKind) -> Option<Range<usize>> {
     let mut quotes = Vec::new();
     let mut escaped = false;
     for (index, byte) in text.bytes().enumerate() {
@@ -237,12 +230,10 @@ fn quote_range(
     if close < head {
         return None;
     }
+    // Vim ignores a count on quote objects. `2di"` deletes the same
+    // characters as `di"`, the text between the quotes.
     if kind == TextObjectKind::Inner {
-        return Some(if count > 1 {
-            open..close + 1
-        } else {
-            open + 1..close
-        });
+        return Some(open + 1..close);
     }
     let trailing = text.as_bytes()[close + 1..]
         .iter()

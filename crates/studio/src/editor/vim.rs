@@ -1553,6 +1553,18 @@ mod tests {
         }
     }
 
+    /// A count on a quote object stays on that one string. `2di"` deletes
+    /// the inside, as `di"` does, and `2da"` still takes the quotes.
+    #[test]
+    fn a_count_on_a_quote_stays_on_one_string() {
+        let source = "s(\"bd\")\n";
+        assert_eq!(typed(source, 3, "di\"").source(), "s(\"\")\n");
+        assert_eq!(typed(source, 3, "2di\"").source(), "s(\"\")\n");
+        assert_eq!(typed(source, 3, "d2i\"").source(), "s(\"\")\n");
+        assert_eq!(typed(source, 3, "da\"").source(), "s()\n");
+        assert_eq!(typed(source, 3, "2da\"").source(), "s()\n");
+    }
+
     /// `$` is inclusive, so a count that ends on an empty line takes it.
     #[test]
     fn a_counted_dollar_takes_an_empty_last_line() {
