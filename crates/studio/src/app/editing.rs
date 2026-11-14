@@ -323,13 +323,14 @@ impl App {
                     self.dirty_frame = true;
                     return Ok(());
                 }
-                // The text that is already armed is waiting for its line;
-                // pressing again would only cancel and re-arm it on the
-                // same line. Say so instead.
-                if !rewinding
-                    && self
-                        .launch_arming
-                        .armed_with(scene, &source_revision(&source))
+                // The text that is already armed is waiting for its line.
+                // Pressing the same kind of launch again would cancel it
+                // and take the next line. A rewind still replaces a join:
+                // starting from the top is a different launch.
+                if self
+                    .launch_arming
+                    .armed_with(scene, &source_revision(&source))
+                    && (!rewinding || self.launch_arming.starts_from_zero())
                 {
                     if self.current_replay().is_none() {
                         self.rebind_unchanged_score(scene, revision, Arc::clone(&source));

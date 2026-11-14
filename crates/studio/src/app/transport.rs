@@ -145,6 +145,15 @@ impl AppErrors {
     }
 }
 
+/// Where an armed launch starts the score.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LaunchStart {
+    /// The score joins the cycle that is already running.
+    Join,
+    /// The score starts at its own cycle zero.
+    FromZero,
+}
+
 /// A quantised launch that waits for its cycle line, and the name its
 /// countdown shows until the line.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -160,12 +169,14 @@ pub(super) enum LaunchArming {
         /// answers a superseded launch with a cancel for the old request
         /// after the new one is armed here.
         request: u64,
-        /// The revision hash of the armed text. A second press on that text
-        /// is a no-op, not a re-arm that can slip the launch to the next
-        /// line.
+        /// The revision hash of the armed text. A second press of the same
+        /// kind keeps this launch. [`LaunchStart`] says which kind.
         revision: String,
         /// The scene's name when it was armed, for a scene closed since.
         name: Option<String>,
+        /// Where the score starts when the line arrives. A second press of
+        /// the same kind waits. A rewind replaces a join.
+        start: LaunchStart,
     },
     /// The armed request has its outcome, or a replay took the transport.
     /// The engine fires a launch one head-room early, so the countdown
@@ -175,7 +186,8 @@ pub(super) enum LaunchArming {
 }
 
 impl LaunchArming {
-    /// Wait for the cycle line with `request`.
+    /// Wait for the cycle line with `request`. The launch joins the
+    /// cycle that is running. [`Self::mark_from_zero`] marks a rewind.
     pub(super) fn arm(
         &mut self,
         scene: SceneId,
@@ -188,7 +200,26 @@ impl LaunchArming {
             request,
             revision,
             name,
+            start: LaunchStart::Join,
         };
+    }
+
+    /// The armed launch starts the score at cycle zero.
+    pub(super) fn mark_from_zero(&mut self) {
+        if let Self::Armed { start, .. } = self {
+            *start = LaunchStart::FromZero;
+        }
+    }
+
+    /// Whether the armed launch starts the score at cycle zero.
+    pub(super) fn starts_from_zero(&self) -> bool {
+        matches!(
+            self,
+            Self::Armed {
+                start: LaunchStart::FromZero,
+                ..
+            }
+        )
     }
 
     /// The outcome of `request` arrived. Only the armed request's own
@@ -1330,6 +1361,69 @@ mod tests {
                 matches!(app.launch_arming, LaunchArming::Armed { request: 3, .. }),
                 "still the same arming"
             );
+        }
+
+        /// A second rewind of text that is already waiting stays on that
+        /// line. Re-arming inside the head-room lands a whole line later.
+        #[test]
+        fn a_second_rewind_of_armed_text_stays_on_its_line() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            app.ui_settings.quantise = crate::settings::Quantise::Cycle;
+            app.snapshot = Some(sounding(true, false));
+            assert_eq!(app.scenes.toggle_rewind(), Some(true));
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            let armed = app.launch_arming.clone();
+            let request = app.next_request_id;
+            assert!(
+                app.launch_arming.starts_from_zero(),
+                "the first rewind is waiting"
+            );
+
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            assert_eq!(
+                app.next_request_id, request,
+                "the second press queued nothing"
+            );
+            assert_eq!(app.launch_arming, armed);
+            assert!(app.status.contains("already armed"), "{}", app.status);
+        }
+
+        /// A rewind replaces a join that is already waiting. The musician
+        /// asked to start from the top, which the join would not do.
+        #[test]
+        fn a_rewind_replaces_an_armed_join() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            app.ui_settings.quantise = crate::settings::Quantise::Cycle;
+            app.snapshot = Some(sounding(true, false));
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            let request = app.next_request_id;
+            assert!(
+                !app.launch_arming.starts_from_zero(),
+                "the first press joins the cycle"
+            );
+
+            press(
+                &mut app,
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert!(
+                app.next_request_id > request,
+                "the rewind replaced the join"
+            );
+            assert!(app.launch_arming.starts_from_zero());
+            let LaunchArming::Armed { request: armed, .. } = app.launch_arming else {
+                panic!("the rewind is armed");
+            };
+            let sent = app
+                .pending_evaluation
+                .as_ref()
+                .filter(|pending| pending.request_id == armed)
+                .or_else(|| app.inflight.get(&armed))
+                .expect("the rewind was queued");
+            assert!(sent.rewind);
         }
 
         /// A duplicate of the armed scene is another scene with the same

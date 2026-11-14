@@ -615,6 +615,9 @@ impl App {
             let name = self.scenes.get(scene).map(|scene| scene.name().to_owned());
             self.launch_arming
                 .arm(scene, request_id, revision_hash.clone(), name);
+            if rewind {
+                self.launch_arming.mark_from_zero();
+            }
             self.log.push(
                 LogLevel::Info,
                 "launch",
