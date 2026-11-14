@@ -1394,12 +1394,20 @@ mod tests {
 
     fn assert_same_answers(name: &str, one_node: &Pattern, nodes: &Pattern) {
         assert_eq!(one_node.steps, nodes.steps, "the steps of {name}");
-        for (begin, end) in spans() {
-            assert_eq!(
-                answers(one_node, begin, end),
-                answers(nodes, begin, end),
-                "{name} over {begin:?}..{end:?}"
-            );
+        assert_same_haps(name, one_node, nodes);
+    }
+
+    /// A walked handle answers from the layers, and any other handle from
+    /// their tables.
+    fn assert_same_haps(name: &str, one_node: &Pattern, nodes: &Pattern) {
+        for (walk, one_node) in [(false, one_node.clone()), (true, one_node.mark_walked())] {
+            for (begin, end) in spans() {
+                assert_eq!(
+                    answers(&one_node, begin, end),
+                    answers(nodes, begin, end),
+                    "{name} over {begin:?}..{end:?}, walked: {walk}"
+                );
+            }
         }
     }
 
@@ -1491,9 +1499,7 @@ mod tests {
             located_value(1.0),
             unfolded(|| stack(vec![located_value(2.0), located_value(3.0)])),
         ]);
-        for (begin, end) in spans() {
-            assert_eq!(answers(&one_node, begin, end), answers(&nodes, begin, end));
-        }
+        assert_same_haps("a concatenation", &one_node, &nodes);
     }
 
     #[test]
@@ -1527,9 +1533,7 @@ mod tests {
                 .slow(frac((3, 2))),
             ])
         });
-        for (begin, end) in spans() {
-            assert_eq!(answers(&one_node, begin, end), answers(&nodes, begin, end));
-        }
+        assert_same_haps("layers", &one_node, &nodes);
     }
 
     #[test]
