@@ -452,6 +452,16 @@ impl Layer {
     /// `span`.
     fn push(&self, turn: &Turn, span: TimeSpan, out: &mut Vec<Hap>) -> Result<(), SequenceStop> {
         let instant = span.begin == span.end;
+        // The steps are in the order of time, so the first and the last
+        // bound them all: a span before or after these bounds meets none.
+        let (Some(earliest), Some(latest)) = (self.places.first(), self.places.last()) else {
+            return Ok(());
+        };
+        let from = earliest.part().begin;
+        let before = from > turn.begin && (instant || from >= turn.end);
+        if before || latest.part().end <= turn.begin {
+            return Ok(());
+        }
         // The steps that the span meets.
         let first = self
             .places
@@ -1412,8 +1422,8 @@ mod tests {
     }
 
     /// Sequences of numbers: steps, a rest, a chord, a slow layer with a
-    /// step of three cycles, a layer of one cycle and a half, and a value
-    /// that fills each cycle.
+    /// step of three cycles, a layer of one cycle and a half, a value that
+    /// fills each cycle, and layers with time before and after their steps.
     fn sequences() -> Vec<(&'static str, Vec<SequenceLayer>)> {
         vec![
             (
@@ -1454,6 +1464,17 @@ mod tests {
             (
                 "one value a cycle",
                 vec![layer((1, 1), vec![step((0, 1), (1, 1), 11.0)])],
+            ),
+            (
+                "layers with time around their steps",
+                vec![
+                    layer(
+                        (1, 1),
+                        vec![step((1, 2), (5, 8), 12.0), step((5, 8), (7, 8), 13.0)],
+                    ),
+                    layer((2, 1), vec![step((1, 8), (1, 4), 14.0)]),
+                    layer((2, 1), vec![step((3, 4), (7, 8), 15.0)]),
+                ],
             ),
         ]
     }
