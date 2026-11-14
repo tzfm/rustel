@@ -66,6 +66,10 @@ impl Pattern {
     /// of the state in force, never left to dead-end its node.
     #[doc(hidden)]
     pub fn adopt_tables_from(&self, previous: &Pattern) {
+        // A graph that walks reads no table, so it takes none.
+        if self.purity.walked {
+            return;
+        }
         /// A pair entered, waiting for the verdicts of its children.
         struct Leave<'a> {
             left: &'a Pattern,
@@ -761,6 +765,19 @@ mod tests {
     fn queried_twice(pattern: &Pattern) {
         numbers(pattern);
         numbers(pattern);
+    }
+
+    #[test]
+    fn a_graph_that_walks_takes_no_table() {
+        let build = || fastcat(vec![pure(Value::F64(1.0)), pure(Value::F64(2.0))]).rev();
+        let one = build();
+        queried_twice(&one);
+        assert!(one.built_tables().is_some());
+        let (walked, tabled) = (build().mark_walked(), build());
+        walked.adopt_tables_from(&one);
+        assert!(walked.built_tables().is_none());
+        tabled.adopt_tables_from(&one);
+        assert!(tabled.built_tables().is_some());
     }
 
     #[test]
