@@ -5376,12 +5376,13 @@ struct ApplicationRun<'a> {
 
 impl<'a> ApplicationRun<'a> {
     /// The chain that `outermost` ends, when it ends one: two applications
-    /// or more make a run.
-    fn ending_at(outermost: ValueSide<'a>, state: &State) -> Option<Self> {
+    /// or more make a run. `asked` is the handle of `outermost`, which the
+    /// query came through.
+    fn ending_at(outermost: ValueSide<'a>, asked: &Pattern, state: &State) -> Option<Self> {
         let constant = outermost.constant_hap(state)?;
-        let (mut innermost, second) = Self::link(outermost.functions, state)?;
+        let (mut innermost, second) = Self::link(outermost.functions, asked, state)?;
         let mut applications = vec![(outermost, constant), (innermost, second)];
-        while let Some((side, constant)) = Self::link(innermost.functions, state) {
+        while let Some((side, constant)) = Self::link(innermost.functions, asked, state) {
             applications.push((side, constant));
             innermost = side;
         }
@@ -5393,10 +5394,15 @@ impl<'a> ApplicationRun<'a> {
     }
 
     /// The application `pattern` is, when it can join a run from above: one
-    /// of a constant, through a handle that binds no runtime of its own. A
-    /// query must go through any other handle.
-    fn link(pattern: &'a Pattern, state: &State) -> Option<(ValueSide<'a>, &'a Hap)> {
-        if pattern.runtime_settings.is_some() {
+    /// of a constant, through a handle that binds no runtime, or the
+    /// runtime of `asked`, which is in force. A query must go through a
+    /// handle that binds another runtime.
+    fn link(
+        pattern: &'a Pattern,
+        asked: &Pattern,
+        state: &State,
+    ) -> Option<(ValueSide<'a>, &'a Hap)> {
+        if pattern.runtime_settings.is_some() && !pattern.same_runtime_owner(asked) {
             return None;
         }
         let side = ValueSide::of(pattern.node_kind())?;
@@ -6914,7 +6920,7 @@ impl Pattern {
             // hap's wholeOrPart, and the function side's whole wins.
             node @ Node::AppLeft(..) => {
                 let side = ValueSide::of(node).expect("an application");
-                if let Some(run) = ApplicationRun::ending_at(side, state) {
+                if let Some(run) = ApplicationRun::ending_at(side, self, state) {
                     return run.query(state);
                 }
                 let mut meetings = Meetings::default();
@@ -11574,6 +11580,69 @@ mod application_run_tests {
                         "{chain_name} on {base_name} over {begin:?}..{end:?}"
                     );
                 }
+            }
+        }
+    }
+
+    /// A function call gives a handle that binds the runtime of the call,
+    /// and each pattern made of it binds that runtime too.
+    #[test]
+    fn a_chain_reads_through_the_handles_of_the_runtime_in_force_alone() {
+        use crate::rng::{self, RngMode};
+        use crate::settings::RuntimeSettings;
+        let runtime = |mode: RngMode| {
+            let settings = RuntimeSettings::default();
+            settings.with(|| rng::use_rng(mode));
+            settings
+        };
+        let (one, other) = (runtime(RngMode::Precise), runtime(RngMode::Legacy));
+        // A base that tells the runtime in force when a query asks it.
+        let told = || {
+            fastcat(vec![pure(Value::F64(0.0)), pure(Value::F64(1.0))]).fmap(|_| {
+                let mode = Value::Str(format!("{:?}", rng::rng_mode()));
+                Value::object([("mode".to_string(), mode)])
+            })
+        };
+        let values = [
+            (ComposeOp::Set, control("s", Value::Str("saw".into()), None)),
+            (
+                ComposeOp::Set,
+                control("gain", Value::F64(0.8), Some((4, 7))),
+            ),
+            (ComposeOp::Set, control("pan", Value::F64(0.5), None)),
+            (
+                ComposeOp::Set,
+                control("room", Value::F64(0.3), Some((9, 12))),
+            ),
+        ];
+        type Chain = fn(&Pattern, &[(ComposeOp, Pattern)]) -> Pattern;
+        // Each handle of the chain binds the runtime of the base.
+        let of_one = |chain: Chain| chain(&told().with_runtime_settings(one.clone()), &values);
+        // A handle in the chain binds another runtime than the outermost.
+        let of_two = |chain: Chain| {
+            let inner = chain(&told(), &values[..2]).with_runtime_settings(other.clone());
+            let mut outer = chain(&inner, &values[2..]);
+            outer.force_runtime_settings(one.clone());
+            outer
+        };
+        for (name, mode, run, in_turn) in [
+            (
+                "one runtime",
+                "Precise",
+                of_one(chain),
+                of_one(chain_of_queries),
+            ),
+            (
+                "two runtimes",
+                "Legacy",
+                of_two(chain),
+                of_two(chain_of_queries),
+            ),
+        ] {
+            for (begin, end) in spans() {
+                let answered = answers(&run, begin, end);
+                assert!(answered.iter().all(|hap| hap.contains(mode)), "{name}");
+                assert_eq!(answered, answers(&in_turn, begin, end), "{name}");
             }
         }
     }
