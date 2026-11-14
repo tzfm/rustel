@@ -6037,6 +6037,86 @@ impl Pattern {
         }
     }
 
+    /// The haps that an `appRight` makes of this pattern of functions and
+    /// the value haps `values`, from one query of this pattern, when its
+    /// graph is one of discrete haps. Each value hap asks the functions
+    /// over its whole. A graph of discrete haps answers for a part of a
+    /// span as for the span, cut and in the same order, so one query over
+    /// all the wholes holds the answer for each.
+    ///
+    /// `None` for a few value haps, which their own queries serve, for
+    /// wholes that leave most of the time between them free, for a graph
+    /// that may read the span, and for a whole of no width.
+    fn met_in_one_query(
+        &self,
+        values: &[Hap],
+        apply: &Combine,
+        flow: LookupFlow,
+        state: &State,
+    ) -> Option<Vec<Hap>> {
+        /// The fewest value haps that one query of the functions repays.
+        const REPAYS_FROM: usize = 4;
+        let discrete = self.is_cacheable() && self.purity.span_read == purity::SpanRead::No;
+        if values.len() < REPAYS_FROM || !discrete {
+            return None;
+        }
+        let asked = |hv: &Hap| hv.whole_or_part();
+        if values.iter().any(|hv| asked(hv).begin >= asked(hv).end) {
+            return None;
+        }
+        let all = TimeSpan::new(
+            values.iter().map(|hv| asked(hv).begin).min()?,
+            values.iter().map(|hv| asked(hv).end).max()?,
+        );
+        // The functions between the wholes are made for nothing.
+        let width = |span: TimeSpan| span.end.to_f64() - span.begin.to_f64();
+        let filled: f64 = values.iter().map(|hv| width(asked(hv))).sum();
+        if filled * 2.0 < width(all) {
+            return None;
+        }
+        let functions = self.query(&state.set_span(all));
+        // The functions in the order of time, and the latest end among
+        // those up to each: the haps that meet a span are then a range of
+        // them, read in the order of the answer.
+        let mut by_begin: Vec<usize> = (0..functions.len()).collect();
+        by_begin.sort_by(|a, b| functions[*a].part.begin.cmp(&functions[*b].part.begin));
+        let mut latest_end: Vec<Fraction> = Vec::with_capacity(by_begin.len());
+        for index in &by_begin {
+            let end = functions[*index].part.end;
+            latest_end.push(latest_end.last().map_or(end, |latest| end.max(*latest)));
+        }
+        let mut meeting = Vec::new();
+        let mut out = Vec::new();
+        for hv in values {
+            let span = asked(hv);
+            let first = latest_end.partition_point(|end| *end <= span.begin);
+            let after = by_begin.partition_point(|index| functions[*index].part.begin < span.end);
+            meeting.clear();
+            meeting.extend(
+                by_begin
+                    .get(first..after)
+                    .unwrap_or_default()
+                    .iter()
+                    .copied()
+                    .filter(|index| functions[*index].part.end > span.begin),
+            );
+            meeting.sort_unstable();
+            for hf in meeting.iter().map(|index| &functions[*index]) {
+                // The part of the function hap, as the query of the whole
+                // cuts it, then where the two haps meet.
+                let cut = TimeSpan::new(hf.part.begin.max(span.begin), hf.part.end.min(span.end));
+                let Some(part) = cut.intersection(&hv.part) else {
+                    continue;
+                };
+                let hap = applied_hap(hf, hv, hv.whole, part, apply, flow);
+                if query_stop_requested() || !push_budgeted(&mut out, hap) {
+                    return Some(Vec::new());
+                }
+            }
+        }
+        Some(out)
+    }
+
     /// The query. Everything else is built on this.
     pub fn query(&self, state: &State) -> Vec<Hap> {
         self.query_in(state, table::Order::Graph)
@@ -6720,8 +6800,12 @@ impl Pattern {
             // the function side first, so it cannot be made in place as
             // `appLeft`'s lone meeting is.
             Node::AppRight(pat_func, pat_val, apply, lookup_flow) => {
+                let values = pat_val.query(state);
+                if let Some(met) = pat_func.met_in_one_query(&values, apply, *lookup_flow, state) {
+                    return met;
+                }
                 let mut out = Vec::new();
-                for hv in pat_val.query(state) {
+                for hv in values {
                     let funcs = pat_func.query(&state.set_span(hv.whole_or_part()));
                     for hf in funcs {
                         if let Some(part) = hf.part.intersection(&hv.part) {
@@ -11880,6 +11964,54 @@ mod restart_tests {
                         answers(&inside, begin, end),
                         answers(&outside, begin, end),
                         "{mode:?}, {name}, over {begin:?}..{end:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_structure_asks_discrete_functions_in_one_query() {
+        use crate::compose::{Alignment, ComposeOp, compose};
+        let spans = [
+            (Fraction::ZERO, whole(4)),
+            (third(-5), third(22)),
+            (third(7), third(8)),
+            (third(7), third(7)),
+        ];
+        let answers = |pattern: &Pattern, begin: Fraction, end: Fraction| -> Vec<String> {
+            pattern
+                .query_arc(begin, end)
+                .iter()
+                .map(|hap| format!("{hap:?} {:?} {:?}", hap.keys, hap.live_controls))
+                .collect()
+        };
+        // Steps that fill the cycle, steps that overlap, and long steps.
+        let structures = || {
+            let on = |count: i32| fastcat((0..count).map(|_| pure(Value::Bool(true))).collect());
+            vec![
+                on(12),
+                stack(vec![on(3), on(4).late(third(1))]),
+                on(5).slow(whole(3)),
+            ]
+        };
+        for (index, functions) in discrete_sections().into_iter().enumerate() {
+            for (kind, structure) in structures().into_iter().enumerate() {
+                assert_eq!(functions.purity().span_read, purity::SpanRead::No);
+                let structured = |functions: &Pattern| {
+                    compose(functions, &structure, ComposeOp::KeepIf, Alignment::Out)
+                };
+                // Behind a time map that changes no time, the functions are
+                // asked for each step of the structure.
+                let (one_query, each_step) = (
+                    structured(&functions),
+                    structured(&asked_over_the_span(functions.clone())),
+                );
+                for (begin, end) in spans {
+                    assert_eq!(
+                        answers(&one_query, begin, end),
+                        answers(&each_step, begin, end),
+                        "section {index}, structure {kind}, over {begin:?}..{end:?}"
                     );
                 }
             }
