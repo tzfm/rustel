@@ -6122,76 +6122,45 @@ impl Pattern {
         self.is_cacheable() && self.purity.span_read == purity::SpanRead::No
     }
 
-    /// Whether a query of `other` is a query of this pattern: one node,
-    /// asked through handles that bind one runtime and walk alike.
-    fn asks_as(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.node, &other.node)
-            && self.same_runtime_owner(other)
-            && self.purity.walked == other.purity.walked
-    }
-
-    /// How many of the first outer haps of `held`, the haps of a join with
-    /// the pattern that each holds, one query of this pattern serves: the
-    /// haps that hold this [discrete](Self::is_discrete) pattern at parts
-    /// that follow one another with no time between.
-    fn held_in_a_row(&self, held: &[(Hap, Pattern)]) -> usize {
-        let Some(((first, _), rest)) = held.split_first() else {
-            return 0;
-        };
-        if !self.is_discrete() || first.part.begin >= first.part.end {
-            return 1;
-        }
-        let mut end = first.part.end;
-        1 + rest
-            .iter()
-            .take_while(|(outer, pattern)| {
-                let follows = outer.part.begin == end && outer.part.end > end;
-                end = outer.part.end;
-                follows && self.asks_as(pattern)
-            })
-            .count()
-    }
-
-    /// The haps of this [discrete](Self::is_discrete) pattern for the part
-    /// of each hap of `outers`, from one query over all the parts, which
-    /// [follow one another](Self::held_in_a_row). Each hap comes with the
-    /// index of its outer hap and is cut to the part of that hap, in the
-    /// order that a query for each part answers: part after part.
+    /// The haps of this [discrete](Self::is_discrete) pattern for each of
+    /// `parts`, from one query over all of them: the haps of each part in
+    /// turn, each cut to its part, as a query for each part answers. The
+    /// parts follow one another with no time between them.
     ///
     /// `None` for an answer with a hap of no width, which a part that
     /// begins at its time and a part that ends there read differently.
-    fn asked_for_parts(
-        &self,
-        outers: &[(Hap, Pattern)],
-        state: &State,
-    ) -> Option<Vec<(usize, Hap)>> {
-        let all = TimeSpan::new(outers.first()?.0.part.begin, outers.last()?.0.part.end);
+    fn asked_for_parts(&self, parts: &[TimeSpan], state: &State) -> Option<Vec<Hap>> {
+        let all = TimeSpan::new(parts.first()?.begin, parts.last()?.end);
         let haps = self.query(&state.set_span(all));
         if haps.iter().any(|hap| hap.part.begin >= hap.part.end) {
             return None;
         }
         // Each hap at each part that it meets, and whether the part is the
-        // last one, which takes the hap. The sort keeps the order of the
-        // answer in each part.
+        // last one, which takes the hap.
         let mut met = Vec::with_capacity(haps.len());
         for (index, hap) in haps.iter().enumerate() {
-            let first = outers.partition_point(|(outer, _)| outer.part.end <= hap.part.begin);
-            let after = outers.partition_point(|(outer, _)| outer.part.begin < hap.part.end);
-            met.extend((first..after).map(|outer| (outer, index, outer + 1 == after)));
+            let first = parts.partition_point(|part| part.end <= hap.part.begin);
+            let after = parts.partition_point(|part| part.begin < hap.part.end);
+            met.extend((first..after).map(|part| (part, index, part + 1 == after)));
         }
-        met.sort_by_key(|(outer, ..)| *outer);
+        // Haps in the order of the parts, each in one part: the answer.
+        if met.len() == haps.len() && met.is_sorted_by_key(|(part, ..)| *part) {
+            return Some(haps);
+        }
+        // The sort keeps the order of the answer in each part.
+        met.sort_by_key(|(part, ..)| *part);
         let mut haps: Vec<Option<Hap>> = haps.into_iter().map(Some).collect();
         met.into_iter()
-            .map(|(outer, index, last)| {
+            .map(|(part, index, last)| {
                 let hap = match last {
                     true => haps[index].take(),
                     false => haps[index].clone(),
                 };
                 let mut hap = hap?;
-                let part = outers[outer].0.part;
+                let part = parts[part];
                 hap.part =
                     TimeSpan::new(hap.part.begin.max(part.begin), hap.part.end.min(part.end));
-                Some((outer, hap))
+                Some(hap)
             })
             .collect()
     }
@@ -7111,55 +7080,36 @@ impl Pattern {
                     JoinMode::Inner | JoinMode::Outer | JoinMode::Mix => {
                         let part_asked = part_is_asked();
                         let mut out = Vec::new();
-                        // The hap of the outer hap `a` and `b`, a hap of
-                        // the pattern that `a` holds. `false` stops the join.
-                        let mut join = |a: &Hap, b: Hap| {
-                            let whole = match mode {
-                                JoinMode::Inner => b.whole,
-                                JoinMode::Outer => a.whole,
-                                // `bind`'s whole_func: undefined if either
-                                // side is analog, else `intersection_e`.
-                                JoinMode::Mix => match (a.whole, b.whole) {
-                                    (Some(x), Some(y)) => match x.intersection(&y) {
-                                        Some(i) => Some(i),
-                                        // `intersection_e` THROWS, and the
-                                        // throw reaches `queryArc`, which
-                                        // then yields no haps at all.
-                                        None => {
-                                            signal_query_error(|| {
-                                                "TimeSpans do not intersect".into()
-                                            });
-                                            return true;
-                                        }
-                                    },
-                                    _ => None,
-                                },
-                                _ => unreachable!("handled by the outer match"),
-                            };
-                            push_budgeted(&mut out, joined_hap(a, b, whole))
-                        };
-                        // Outer haps that hold one pattern in a row ask it
-                        // one time. Any other hap asks for its part.
-                        let mut held = resolved.as_slice();
-                        while let Some((_, inner_pat)) = held.first() {
-                            if part_asked && refuses_part(inner_pat) {
+                        for (a, inner_pat) in resolved {
+                            if part_asked && refuses_part(&inner_pat) {
                                 return Vec::new();
                             }
-                            let (outers, rest) = held.split_at(inner_pat.held_in_a_row(held));
-                            held = rest;
-                            let in_one_query = match outers {
-                                [_] => None,
-                                _ => inner_pat.asked_for_parts(outers, state),
-                            };
-                            let joined = match in_one_query {
-                                Some(haps) => haps.into_iter().all(|(a, b)| join(&outers[a].0, b)),
-                                None => outers.iter().all(|(a, _)| {
-                                    let haps = inner_pat.query(&state.set_span(a.part));
-                                    haps.into_iter().all(|b| join(a, b))
-                                }),
-                            };
-                            if !joined {
-                                return Vec::new();
+                            for b in inner_pat.query(&state.set_span(a.part)) {
+                                let whole = match mode {
+                                    JoinMode::Inner => b.whole,
+                                    JoinMode::Outer => a.whole,
+                                    // `bind`'s whole_func: undefined if either
+                                    // side is analog, else `intersection_e`.
+                                    JoinMode::Mix => match (a.whole, b.whole) {
+                                        (Some(x), Some(y)) => match x.intersection(&y) {
+                                            Some(i) => Some(i),
+                                            // `intersection_e` THROWS, and the
+                                            // throw reaches `queryArc`, which
+                                            // then yields no haps at all.
+                                            None => {
+                                                signal_query_error(|| {
+                                                    "TimeSpans do not intersect".into()
+                                                });
+                                                continue;
+                                            }
+                                        },
+                                        _ => None,
+                                    },
+                                    _ => unreachable!("handled by the outer match"),
+                                };
+                                if !push_budgeted(&mut out, joined_hap(&a, b, whole)) {
+                                    return Vec::new();
+                                }
                             }
                         }
                         out
@@ -7559,7 +7509,17 @@ impl Pattern {
                     Node::SlowCat(pats) if pat.runtime_settings.is_none() => Some(pats),
                     _ => None,
                 };
-                let branches = state.span.span_cycles().into_iter().map(|sub| {
+                let pieces = state.span.span_cycles();
+                // A graph of discrete haps answers for all the cycles in
+                // one query.
+                let in_one_query = match pieces.len() > 1 && pat.is_discrete() {
+                    true => pat.asked_for_parts(&pieces, state),
+                    false => None,
+                };
+                if let Some(haps) = in_one_query {
+                    return haps;
+                }
+                let branches = pieces.into_iter().map(|sub| {
                     let cycle = state.set_span(sub);
                     match concatenated {
                         Some(pats) => slowcat_cycle(pats, &cycle),
@@ -12241,7 +12201,7 @@ mod restart_tests {
     }
 
     #[test]
-    fn a_join_asks_a_discrete_pattern_once_for_the_haps_that_hold_it_in_a_row() {
+    fn a_split_of_queries_asks_a_discrete_pattern_once_for_all_the_cycles() {
         let spans = [
             (Fraction::ZERO, whole(4)),
             (third(-5), third(22)),
@@ -12255,38 +12215,32 @@ mod restart_tests {
                 .map(|hap| format!("{hap:?} {:?} {:?}", hap.keys, hap.live_controls))
                 .collect()
         };
-        // Haps in a row, a hap each cycle, haps with time between them, and
-        // haps at the same time.
-        let carriers = || {
-            vec![
-                steps(200, 3).slow(whole(2)),
-                note(210.0),
-                fastcat(vec![note(220.0), silence(), note(221.0)]),
-                stack(vec![steps(230, 2), note(232.0)]),
-            ]
-        };
-        let joins: [fn(&Pattern) -> Pattern; 3] =
-            [Pattern::inner_join, Pattern::outer_join, Pattern::mix_join];
         for (index, section) in discrete_sections().into_iter().enumerate() {
             assert_eq!(section.purity().span_read, purity::SpanRead::No);
-            for (kind, carrier) in carriers().into_iter().enumerate() {
-                for (mode, join) in joins.iter().enumerate() {
-                    let held =
-                        |section: Pattern| join(&carrier.fmap_to_pattern(move |_| section.clone()));
-                    // Behind a time map that changes no time, the section
-                    // is asked for the part of each hap that holds it.
-                    let (one_query, each_part) = (
-                        held(section.clone()),
-                        held(asked_over_the_span(section.clone())),
-                    );
-                    for (begin, end) in spans {
-                        assert_eq!(
-                            answers(&one_query, begin, end),
-                            answers(&each_part, begin, end),
-                            "section {index}, carrier {kind}, join {mode}, over {begin:?}..{end:?}"
-                        );
-                    }
-                }
+            // Behind a time map that changes no time, the section is asked
+            // for each cycle.
+            let (one_query, each_cycle) = (
+                section.split_queries(),
+                asked_over_the_span(section.clone()).split_queries(),
+            );
+            // The bind of a value to the section, which `sometimes` was
+            // before it was a split: each cycle of the value asks the
+            // section and adds nothing to its haps.
+            let bound = pure(Value::F64(0.5))
+                .fmap_to_pattern(move |_| section.clone())
+                .inner_join();
+            for (begin, end) in spans {
+                let split = answers(&one_query, begin, end);
+                assert_eq!(
+                    split,
+                    answers(&each_cycle, begin, end),
+                    "section {index}, each cycle, over {begin:?}..{end:?}"
+                );
+                assert_eq!(
+                    split,
+                    answers(&bound, begin, end),
+                    "section {index}, the bind, over {begin:?}..{end:?}"
+                );
             }
         }
     }
