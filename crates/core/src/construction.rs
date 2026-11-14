@@ -621,7 +621,7 @@ fn same_node<'g>(
             _ => false,
         },
         Node::Cpm(a, rate) => match right {
-            Node::Cpm(b, other) if rate == other => child!(a, b),
+            Node::Cpm(b, other) if rate.cpm == other.cpm => child!(a, b),
             _ => false,
         },
         Node::MidiKeys(a, port) => match right {

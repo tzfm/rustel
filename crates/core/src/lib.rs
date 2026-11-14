@@ -561,6 +561,19 @@ impl Hap {
         self.part = f(&self.part);
     }
 
+    /// Each time of the hap through `map`, which gives one time for one
+    /// time. A hap that is not cut reads the times of its part one time.
+    fn map_times(&mut self, map: impl Fn(Fraction) -> Fraction) {
+        let part = self.part.with_time(&map);
+        if let Some(whole) = self.whole.as_mut() {
+            *whole = match *whole == self.part {
+                true => part,
+                false => whole.with_time(&map),
+            };
+        }
+        self.part = part;
+    }
+
     /// Replace only the visible part of a hap, retaining its notional whole.
     ///
     /// Native extension nodes use this for the same intersected-child shape
@@ -1945,6 +1958,36 @@ impl PatternedPureMap {
 /// they build (and any cache inside it) live across queries instead of being
 /// rebuilt and thrown away each time.
 const CONSTRUCTION_MEMO_ENTRIES: usize = 32;
+
+/// The rate of a `cpm`, in cycles each minute, and the speed change that
+/// it makes of the tempo of the scheduler.
+struct TempoRate {
+    cpm: Fraction,
+    /// The speed change at the tempo that asked first, with the bits of
+    /// that tempo. A float reads as a fraction slowly, and a session seldom
+    /// changes its tempo.
+    read: std::sync::OnceLock<(u64, Option<Fraction>)>,
+}
+
+impl TempoRate {
+    fn new(cpm: Fraction) -> Self {
+        Self {
+            cpm,
+            read: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// How many times as fast the pattern runs at `cps` cycles each second
+    /// of the scheduler. `None` for a speed outside the native range.
+    fn speed_at(&self, cps: f64) -> Option<Fraction> {
+        let read = || Fraction::from_f64(self.cpm.to_f64() / 60.0 / cps);
+        let (kept, speed) = *self.read.get_or_init(|| (cps.to_bits(), read()));
+        match kept == cps.to_bits() {
+            true => speed,
+            false => read(),
+        }
+    }
+}
 
 /// Patterns a `PatternOfPure` closure has already built, by the value it was
 /// asked about and the settings snapshot it was asked under.
@@ -4474,7 +4517,7 @@ fn pick_property_key(value: &Value) -> String {
 /// The graph asks the moved pattern over the whole query span and keeps what
 /// meets `part`. Tables answer a span as the clip of a wider one, so asking
 /// them over `part` alone gives the same haps in the same order. They answer
-/// only when the walk of the whole span stays within every limit, two levels
+/// only when the walk of the whole span stays within every limit, one level
 /// down, so a refusal stays the graph's.
 fn restarted_from_tables(
     pattern: &Pattern,
@@ -4485,8 +4528,8 @@ fn restarted_from_tables(
     if query_error_pending() || query_stop_requested() {
         return None;
     }
-    // The moved pattern, then `pattern` below it.
-    let depth = QUERY_DEPTH.with(std::cell::Cell::get).checked_add(2)?;
+    // `pattern`, which the graph asks with no node for the move.
+    let depth = QUERY_DEPTH.with(std::cell::Cell::get).checked_add(1)?;
     let tables = pattern.tables_for_query()?;
     let moved = |span: TimeSpan| {
         Some(TimeSpan::new(
@@ -5000,7 +5043,7 @@ enum Node {
     /// Run this pattern at an absolute cycles-per-minute rate. Unlike a
     /// plain `fast(cpm / 60)`, this divides by the scheduler's `_cps`, so
     /// `.cpm(30)` means the same thing when the session default is 0.5 CPS.
-    Cpm(Pattern, Fraction),
+    Cpm(Pattern, TempoRate),
     MidiKeys(Pattern, Arc<midi_in::InputPort>),
     /// `appLeft`: a pattern of functions applied to a pattern of values,
     /// keeping the FUNCTION side's whole. This is the fold `register()` uses
@@ -6006,8 +6049,9 @@ impl Pattern {
     /// asked over the span, where it reads its values.
     fn query_restarted(&self, shift: Fraction, state: &State, part: TimeSpan) -> Vec<Hap> {
         use purity::SpanRead;
-        let over_part = || self.late(shift).query(&state.set_span(part));
-        let over_span = || self.late(shift).query(state);
+        // What `self.late(shift)` answers, with no node for it.
+        let over_part = || self.query_moved(shift, "late", &state.set_span(part));
+        let over_span = || self.query_moved(shift, "late", state);
         let reads = match self.is_cacheable() {
             true => self.purity.span_read,
             false => SpanRead::Yes,
@@ -6035,6 +6079,29 @@ impl Pattern {
             }
             _ => over_span(),
         }
+    }
+
+    /// The haps of this pattern, `factor` times as fast: what a
+    /// [`Node::Fast`] over it answers.
+    fn query_faster(&self, factor: Fraction, operation: &'static str, state: &State) -> Vec<Hap> {
+        let asked =
+            state.with_span(|span| span.with_time(|t| fast_query_time(t, factor, operation)));
+        let mut haps = self.query(&asked);
+        for hap in &mut haps {
+            hap.map_times(|t| fast_hap_time(t, factor, operation));
+        }
+        haps
+    }
+
+    /// The haps of this pattern, `by` later: what a [`Node::Shift`] over
+    /// it answers.
+    fn query_moved(&self, by: Fraction, operation: &'static str, state: &State) -> Vec<Hap> {
+        let asked = state.with_span(|span| span.with_time(|t| shift_query_time(t, by, operation)));
+        let mut haps = self.query(&asked);
+        for hap in &mut haps {
+            hap.map_times(|t| shift_hap_time(t, by, operation));
+        }
+        haps
     }
 
     /// Whether the graph is one of discrete haps: it answers for a part of
@@ -6397,28 +6464,9 @@ impl Pattern {
                 })
                 .collect(),
 
-            Node::Fast(pat, factor, operation) => {
-                let s =
-                    state.with_span(|sp| sp.with_time(|t| fast_query_time(t, *factor, operation)));
-                pat.query(&s)
-                    .into_iter()
-                    .map(|mut h| {
-                        h.update_span(|sp| sp.with_time(|t| fast_hap_time(t, *factor, operation)));
-                        h
-                    })
-                    .collect()
-            }
+            Node::Fast(pat, factor, operation) => pat.query_faster(*factor, operation, state),
 
-            Node::Shift(pat, by, operation) => {
-                let s = state.with_span(|sp| sp.with_time(|t| shift_query_time(t, *by, operation)));
-                pat.query(&s)
-                    .into_iter()
-                    .map(|mut h| {
-                        h.update_span(|sp| sp.with_time(|t| shift_hap_time(t, *by, operation)));
-                        h
-                    })
-                    .collect()
-            }
+            Node::Shift(pat, by, operation) => pat.query_moved(*by, operation, state),
 
             Node::WithQuerySpan(pat, f) => pat.query(&state.with_span(|sp| f(sp))),
 
@@ -6615,16 +6663,18 @@ impl Pattern {
                     .unwrap_or(0.5);
                 combinators::loop_at_cps(pat, *factor, cps).query(state)
             }
-            Node::Cpm(pat, cpm) => {
+            Node::Cpm(pat, rate) => {
                 let scheduler_cps = state
                     .controls
                     .get("_cps")
                     .and_then(Value::as_f64)
                     .filter(|cps| cps.is_finite() && *cps > 0.0)
                     .unwrap_or(0.5);
-                let target_cps = cpm.to_f64() / 60.0;
-                pat.fast(Fraction::from_f64(target_cps / scheduler_cps).unwrap_or(Fraction::ZERO))
-                    .query(state)
+                // What `pat.fast(speed)` answers, with no node for it.
+                match rate.speed_at(scheduler_cps) {
+                    Some(speed) if speed.numer() != 0 => pat.query_faster(speed, "fast", state),
+                    _ => Vec::new(),
+                }
             }
 
             Node::MidiKeys(lengths, port) => query_midi_keys(lengths, port, state),
@@ -9039,7 +9089,7 @@ impl Pattern {
     }
 
     pub fn cpm(&self, cpm: Fraction) -> Self {
-        Pattern::of(Node::Cpm(self.clone(), cpm))
+        Pattern::of(Node::Cpm(self.clone(), TempoRate::new(cpm)))
     }
 
     /// Sets each [`combinators::slice`] event's `speed` so its slice fills the
