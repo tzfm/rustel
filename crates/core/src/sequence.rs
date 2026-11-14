@@ -448,83 +448,40 @@ impl Layer {
             })
     }
 
-    /// Push the haps of this layer in `span`.
-    fn query(&self, span: TimeSpan, out: &mut Vec<Hap>) -> Result<(), SequenceStop> {
-        let in_range = |time: Option<Fraction>| time.ok_or(SequenceStop::Range);
-        // A time, in periods. A period of one cycle is the common one.
-        let one_cycle = self.period == Fraction::ONE;
-        let periods = |time: Fraction| match one_cycle {
-            true => Ok(time),
-            false => in_range(time.checked_div(self.period)),
-        };
-        // The turns of the period that the span meets. A span of no width
-        // meets the turn that holds its one time.
+    /// Push the haps of this layer in `turn` of its period, for a query of
+    /// `span`.
+    fn push(&self, turn: &Turn, span: TimeSpan, out: &mut Vec<Hap>) -> Result<(), SequenceStop> {
         let instant = span.begin == span.end;
-        let first = periods(span.begin)?.floor().numer();
-        let last = if instant {
-            first.checked_add(1).ok_or(SequenceStop::Range)?
-        } else {
-            periods(span.end)?.ceil().numer()
-        };
-        // One turn is one cycle of the steps: a span of more turns than a
-        // query walks cycles is refused as that query is.
-        if last
-            .checked_sub(first)
-            .is_none_or(|turns| turns > MAX_QUERY_SPAN_CYCLES)
-        {
-            refuse(QueryLimit::QuerySpan {
-                cycles: MAX_QUERY_SPAN_CYCLES,
-            });
+        // The steps that the span meets.
+        let first = self
+            .places
+            .partition_point(|place| place.part().end <= turn.begin);
+        let met = self.places[first..].partition_point(|place| {
+            let from = place.part().begin;
+            from <= turn.begin || (!instant && from < turn.end)
+        });
+        if met == 0 {
+            return Ok(());
+        }
+        if !charge_haps(out.len() + met) {
             return Err(SequenceStop::Query);
         }
-        for turn in first..last {
-            // The query of the node asked before the first turn.
-            if turn != first && query_stop_requested() {
-                return Err(SequenceStop::Query);
-            }
-            // Where the turn starts. A whole count of cycles moves a time
-            // with no division.
-            let start = match one_cycle {
-                true => Fraction::int(turn),
-                false => in_range(self.period.checked_mul(Fraction::int(turn)))?,
+        out.reserve(met);
+        for (index, place) in self.places.iter().enumerate().skip(first).take(met) {
+            let whole = TimeSpan::new(turn.moved(place.whole.begin)?, turn.moved(place.whole.end)?);
+            let within = place.part();
+            let part = match &place.part {
+                // A step that is not cut and lies in the span is its
+                // whole.
+                None if within.begin >= turn.begin && within.end <= turn.end => whole,
+                _ => TimeSpan::new(
+                    turn.moved(within.begin)?.max(span.begin),
+                    turn.moved(within.end)?.min(span.end),
+                ),
             };
-            let whole_cycles = (start.denom() == 1).then(|| start.numer());
-            let moved = |time: Fraction| {
-                in_range(match whole_cycles {
-                    Some(cycles) => time.checked_add_int(cycles),
-                    None => time.checked_add(start),
-                })
-            };
-            // The span, from the start of the turn, and the steps it meets.
-            let begin = in_range(span.begin.checked_sub(start))?;
-            let end = in_range(span.end.checked_sub(start))?;
-            let first = self
-                .places
-                .partition_point(|place| place.part().end <= begin);
-            let met = self.places[first..].partition_point(|place| {
-                let from = place.part().begin;
-                from <= begin || (!instant && from < end)
-            });
-            if !charge_haps(out.len() + met) {
-                return Err(SequenceStop::Query);
-            }
-            out.reserve(met);
-            for (index, place) in self.places.iter().enumerate().skip(first).take(met) {
-                let whole = TimeSpan::new(moved(place.whole.begin)?, moved(place.whole.end)?);
-                let within = place.part();
-                let part = match &place.part {
-                    // A step that is not cut and lies in the span is its
-                    // whole.
-                    None if within.begin >= begin && within.end <= end => whole,
-                    _ => TimeSpan::new(
-                        moved(within.begin)?.max(span.begin),
-                        moved(within.end)?.min(span.end),
-                    ),
-                };
-                out.push(self.hap_at(index, whole, part));
-            }
-            note_accumulated(out.len());
+            out.push(self.hap_at(index, whole, part));
         }
+        note_accumulated(out.len());
         Ok(())
     }
 
@@ -748,11 +705,114 @@ fn node_of_sound(layers: Vec<Layer>) -> Pattern {
     }
 }
 
+/// One turn of a period, for a query of a span.
+#[derive(Clone, Copy)]
+struct Turn {
+    index: i128,
+    /// Where the turn starts.
+    start: Fraction,
+    /// The cycles in `start` when it is a whole count of them, which moves
+    /// a time with no division.
+    whole_cycles: Option<i128>,
+    /// The span, from the start of the turn.
+    begin: Fraction,
+    end: Fraction,
+}
+
+impl Turn {
+    /// `time`, which is from the start of the turn, as a time of the query.
+    fn moved(&self, time: Fraction) -> Result<Fraction, SequenceStop> {
+        match self.whole_cycles {
+            Some(cycles) => time.checked_add_int(cycles),
+            None => time.checked_add(self.start),
+        }
+        .ok_or(SequenceStop::Range)
+    }
+}
+
+/// The turns of a period that a span meets. Layers of one period read each
+/// turn here, so layers that follow one another work it out one time.
+struct Turns {
+    period: Fraction,
+    span: TimeSpan,
+    indices: std::ops::Range<i128>,
+    /// The turn that was read last.
+    read: Option<Turn>,
+}
+
+impl Turns {
+    fn of(period: Fraction, span: TimeSpan) -> Result<Self, SequenceStop> {
+        let in_range = |turn: Option<i128>| turn.ok_or(SequenceStop::Range);
+        // A span of no width meets the turn that holds its one time.
+        let first = in_range(span.begin.checked_div_floor(period))?;
+        let last = match span.begin == span.end {
+            true => in_range(first.checked_add(1))?,
+            false => in_range(span.end.checked_div_ceil(period))?,
+        };
+        // One turn is one cycle of the steps: a span of more turns than a
+        // query walks cycles is refused as that query is.
+        if last
+            .checked_sub(first)
+            .is_none_or(|turns| turns > MAX_QUERY_SPAN_CYCLES)
+        {
+            refuse(QueryLimit::QuerySpan {
+                cycles: MAX_QUERY_SPAN_CYCLES,
+            });
+            return Err(SequenceStop::Query);
+        }
+        Ok(Self {
+            period,
+            span,
+            indices: first..last,
+            read: None,
+        })
+    }
+
+    fn turn(&mut self, index: i128) -> Result<Turn, SequenceStop> {
+        if let Some(turn) = self.read.filter(|turn| turn.index == index) {
+            return Ok(turn);
+        }
+        let in_range = |time: Option<Fraction>| time.ok_or(SequenceStop::Range);
+        let start = match self.period == Fraction::ONE {
+            true => Fraction::int(index),
+            false => in_range(self.period.checked_mul(Fraction::int(index)))?,
+        };
+        let turn = Turn {
+            index,
+            start,
+            whole_cycles: (start.denom() == 1).then(|| start.numer()),
+            begin: in_range(self.span.begin.checked_sub(start))?,
+            end: in_range(self.span.end.checked_sub(start))?,
+        };
+        self.read = Some(turn);
+        Ok(turn)
+    }
+}
+
+/// Push the haps of `layers`, which share a period, in `span`: each layer
+/// in turn, as a stack of them answers.
+fn query_layers(layers: &[Layer], span: TimeSpan, out: &mut Vec<Hap>) -> Result<(), SequenceStop> {
+    let Some(first) = layers.first() else {
+        return Ok(());
+    };
+    let mut turns = Turns::of(first.period, span)?;
+    for layer in layers {
+        for index in turns.indices.clone() {
+            // The query of the node asked before the first turn.
+            if index != turns.indices.start && query_stop_requested() {
+                return Err(SequenceStop::Query);
+            }
+            layer.push(&turns.turn(index)?, span, out)?;
+        }
+    }
+    Ok(())
+}
+
 /// The haps of `layers` in `state`'s span. See [`sequence`].
 pub(crate) fn query_sequence(layers: &[Layer], state: &State) -> Vec<Hap> {
     let mut out = Vec::new();
-    for layer in layers {
-        match layer.query(state.span, &mut out) {
+    for layers in layers.chunk_by(|a, b| a.period == b.period) {
+        match query_layers(layers, state.span, &mut out) {
             Ok(()) => {}
             Err(SequenceStop::Range) => {
                 refuse(QueryLimit::NativeFraction {
