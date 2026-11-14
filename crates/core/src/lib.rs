@@ -5098,6 +5098,8 @@ pub(crate) struct ValueReading(std::sync::OnceLock<Option<Box<Reading>>>);
 struct Reading {
     settings: settings::SettingsStateId,
     values: ReadValues,
+    /// The run that this application ends, as its first query found it.
+    run: std::sync::OnceLock<RunUnions>,
 }
 
 enum ReadValues {
@@ -5140,11 +5142,62 @@ impl ValueReading {
             return None;
         }
         self.0
-            .get_or_init(|| found.map(|values| Box::new(Reading { settings, values })))
+            .get_or_init(|| {
+                found.map(|values| {
+                    Box::new(Reading {
+                        settings,
+                        values,
+                        run: std::sync::OnceLock::new(),
+                    })
+                })
+            })
             .as_deref()
             .filter(|reading| current(reading))
             .map(|reading| &reading.values)
     }
+
+    /// The run that the application of this reading ends, when a query
+    /// through a handle of the runtime of `asked` kept one, and the
+    /// settings state it was found under is in force.
+    fn run(&self, asked: &Pattern) -> Option<&RunUnions> {
+        let reading = self.0.get()?.as_deref()?;
+        let run = reading.run.get()?;
+        let same_owner = match (&run.owner, &asked.runtime_settings) {
+            (Some(kept), Some(asked)) => kept.same_handle(asked),
+            (None, None) => true,
+            _ => false,
+        };
+        (same_owner && settings::is_current_state(&reading.settings)).then_some(run)
+    }
+
+    /// Keep `run` for the queries that follow. The first run stays.
+    fn keep_run(&self, run: RunUnions) {
+        if let Some(reading) = self.0.get().and_then(|found| found.as_deref()) {
+            let _ = reading.run.set(run);
+        }
+    }
+}
+
+/// A run of applications of constants, as one query found it: what a hap
+/// inside one cycle meets where it is, with no walk of the run.
+struct RunUnions {
+    /// The runtime of the handle that the query came through.
+    owner: Option<settings::RuntimeSettings>,
+    /// The pattern under the run.
+    base: Pattern,
+    /// How many applications the run holds.
+    count: usize,
+    meetings: Box<[RunMeeting]>,
+}
+
+/// One meeting of a run: the constant of one application, or one union for
+/// several applications in a row that `set` plain control objects.
+struct RunMeeting {
+    /// The application that the meeting starts at, from the innermost.
+    first: usize,
+    apply: Combine,
+    flow: LookupFlow,
+    constant: Hap,
 }
 
 /// How one query reads a value side. It is settled at the first function
@@ -5355,10 +5408,6 @@ impl<'a> ValueSide<'a> {
     }
 }
 
-/// The fewest haps of a query for which [`ApplicationRun::meetings`] makes
-/// its unions.
-const UNIONS_REPAY_FROM: usize = 4;
-
 /// A chain of applications of constant values, the innermost first, with
 /// the constant hap of each.
 ///
@@ -5417,20 +5466,21 @@ impl<'a> ApplicationRun<'a> {
     /// and takes the later value of a repeated key, so the union of the
     /// constants first, then with the hap, is the same object. The later
     /// application's locations come first, as in the meetings one by one.
-    fn meetings(&self) -> Vec<(usize, ValueSide<'a>, std::borrow::Cow<'a, Hap>)> {
+    fn meetings(&self) -> Box<[RunMeeting]> {
         let sets_controls = |(side, constant): &(ValueSide<'a>, &'a Hap)| {
             matches!(side.apply, Combine::Composed(compose::ComposeOp::Set))
                 && side.flow == LookupFlow::Set
                 && constant.holds_only_controls()
         };
-        let mut meetings: Vec<(usize, ValueSide<'a>, std::borrow::Cow<'a, Hap>)> = Vec::new();
+        let mut meetings: Vec<RunMeeting> = Vec::new();
         let mut merging = false;
-        for (index, application) in self.applications.iter().enumerate() {
+        for (first, application) in self.applications.iter().enumerate() {
             let (side, constant) = *application;
             let mergeable = sets_controls(application);
             match meetings.last_mut() {
-                Some((_, _, merged)) if merging && mergeable => {
-                    let merged = merged.to_mut();
+                Some(RunMeeting {
+                    constant: merged, ..
+                }) if merging && mergeable => {
                     compose::compose_data_in_place(
                         compose::ComposeOp::Set,
                         &mut merged.value,
@@ -5440,23 +5490,59 @@ impl<'a> ApplicationRun<'a> {
                     context.append(&merged.context);
                     merged.context = context;
                 }
-                _ => meetings.push((index, side, std::borrow::Cow::Borrowed(constant))),
+                _ => meetings.push(RunMeeting {
+                    first,
+                    // A clone of the op, or of the handle of a function.
+                    apply: side.apply.clone(),
+                    flow: side.flow,
+                    // The run keeps the constant for the queries that follow.
+                    constant: constant.clone(),
+                }),
             }
             merging = mergeable;
         }
-        meetings
+        meetings.into()
     }
 
+    /// The haps of the application `outermost` in `state`, when it ends a
+    /// run. `asked` is the handle of `outermost`, which the query came
+    /// through. The first query of a run keeps its unions, and each query
+    /// after it reads them.
+    fn answer(outermost: ValueSide<'a>, asked: &'a Pattern, state: &State) -> Option<Vec<Hap>> {
+        if let Some(unions) = outermost.reading.run(asked) {
+            return unions.query(state, || Self::ending_at(outermost, asked, state));
+        }
+        let run = Self::ending_at(outermost, asked, state)?;
+        let unions = RunUnions {
+            owner: asked.runtime_settings.clone(),
+            // The handle of the pattern under the run.
+            base: run.base.clone(),
+            count: run.applications.len(),
+            meetings: run.meetings(),
+        };
+        let answer = unions.query(state, || Some(run));
+        outermost.reading.keep_run(unions);
+        answer
+    }
+}
+
+impl RunUnions {
     /// Answer `state`: each hap of the base meets every constant in turn.
     ///
     /// A hap inside one cycle meets each constant over the same part, so
     /// each meeting is made where the hap is. From the first application
     /// that takes another path, and for a hap that covers several cycles,
-    /// the hap goes through the applications as their nodes take it.
-    fn query(self, state: &State) -> Vec<Hap> {
+    /// the hap goes through the applications as their nodes take it:
+    /// `walked` gives the run with each application then. `None` when it
+    /// gives no run.
+    fn query<'a>(
+        &self,
+        state: &State,
+        walked: impl FnOnce() -> Option<ApplicationRun<'a>>,
+    ) -> Option<Vec<Hap>> {
         let haps = self.base.query(state);
-        // The unions are made for the query, which a few haps do not repay.
-        let unions = (haps.len() >= UNIONS_REPAY_FROM).then(|| self.meetings());
+        let mut walked = Some(walked);
+        let mut run = None;
         let mut out = Vec::with_capacity(haps.len());
         for mut hf in haps {
             let met = hf.whole_or_part();
@@ -5466,39 +5552,41 @@ impl<'a> ApplicationRun<'a> {
                 let Some(part) = hf.part.intersection(&met) else {
                     continue;
                 };
-                let refused = match &unions {
-                    Some(meetings) => meetings
-                        .iter()
-                        .find(|(_, side, constant)| {
-                            !Meeting::in_place(&mut hf, constant, part, side.apply, side.flow)
-                        })
-                        .map(|(first, ..)| *first),
-                    None => self.applications.iter().position(|(side, constant)| {
-                        !Meeting::in_place(&mut hf, constant, part, side.apply, side.flow)
-                    }),
-                };
-                taken = refused.unwrap_or(self.applications.len());
+                let refused = self.meetings.iter().find(|meeting| {
+                    !Meeting::in_place(
+                        &mut hf,
+                        &meeting.constant,
+                        part,
+                        &meeting.apply,
+                        meeting.flow,
+                    )
+                });
+                taken = refused.map_or(self.count, |meeting| meeting.first);
             }
-            if taken == self.applications.len() {
+            if taken == self.count {
                 if query_stop_requested() || !push_budgeted(&mut out, hf) {
-                    return Vec::new();
+                    return Some(Vec::new());
                 }
                 continue;
             }
+            if let Some(walked) = walked.take() {
+                run = walked();
+            }
+            let applications = &run.as_ref()?.applications;
             let mut haps = vec![hf];
-            for (side, constant) in &self.applications[taken..] {
+            for (side, constant) in applications.get(taken..)? {
                 let mut meetings = Meetings::with_constant(constant);
                 let mut met = Vec::with_capacity(haps.len());
                 for hf in haps {
                     if !side.meet(hf, &mut meetings, state, &mut met) {
-                        return Vec::new();
+                        return Some(Vec::new());
                     }
                 }
                 haps = met;
             }
             out.append(&mut haps);
         }
-        out
+        Some(out)
     }
 }
 
@@ -6901,8 +6989,8 @@ impl Pattern {
             // hap's wholeOrPart, and the function side's whole wins.
             node @ Node::AppLeft(..) => {
                 let side = ValueSide::of(node).expect("an application");
-                if let Some(run) = ApplicationRun::ending_at(side, self, state) {
-                    return run.query(state);
+                if let Some(haps) = ApplicationRun::answer(side, self, state) {
+                    return haps;
                 }
                 let mut meetings = Meetings::default();
                 let functions = side.functions.query(state);
