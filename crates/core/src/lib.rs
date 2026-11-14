@@ -231,6 +231,11 @@ pub fn sort_haps_for_query(haps: Vec<Hap>) -> Vec<Hap> {
 /// Part begin, part end, then the whole. An analog hap's missing whole
 /// sorts first.
 fn query_order(a: &Hap, b: &Hap) -> std::cmp::Ordering {
+    // The haps of a chord have the same times, and equal times compare
+    // with no arithmetic.
+    if a.part == b.part && a.whole == b.whole {
+        return std::cmp::Ordering::Equal;
+    }
     a.part
         .begin
         .cmp(&b.part.begin)
