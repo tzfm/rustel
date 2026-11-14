@@ -5186,7 +5186,11 @@ impl<'a> Meetings<'a> {
         state: &State,
     ) -> &[Hap] {
         let Self { answering, values } = self;
-        let graph = |values: &mut Vec<Hap>| *values = side.values.query(&state.set_span(met));
+        let graph = |values: &mut Vec<Hap>| {
+            *values = side
+                .values
+                .query(&state.set_span(side.values.asked_for(met, part)));
+        };
         match answering.get_or_insert_with(|| side.answering(state)) {
             Answering::Constant(constant) => {
                 // One piece, the common case: the constant moved in place,
@@ -6116,6 +6120,19 @@ impl Pattern {
         self.is_cacheable() && self.purity.span_read == purity::SpanRead::No
     }
 
+    /// The span to ask this side of an application over, for a hap of the
+    /// other side that sounds over `whole` and is cut to `part`: what the
+    /// two haps make is cut to `part` too. A graph of
+    /// [discrete](Self::is_discrete) haps answers for the part as for the
+    /// whole, cut, so it is asked over the part alone. Any other graph is
+    /// asked over the whole, and so is each graph for a part of no width.
+    fn asked_for(&self, whole: TimeSpan, part: TimeSpan) -> TimeSpan {
+        match part != whole && part.begin < part.end && self.is_discrete() {
+            true => part,
+            false => whole,
+        }
+    }
+
     /// The haps of this [discrete](Self::is_discrete) pattern for each of
     /// `parts`, from one query over all of them: the haps of each part in
     /// turn, each cut to its part, as a query for each part answers. The
@@ -6180,7 +6197,8 @@ impl Pattern {
         if values.len() < REPAYS_FROM || !self.is_discrete() {
             return None;
         }
-        let asked = |hv: &Hap| hv.whole_or_part();
+        // This graph answers for the part of a hap as for its whole, cut.
+        let asked = |hv: &Hap| hv.part;
         if values.iter().any(|hv| asked(hv).begin >= asked(hv).end) {
             return None;
         }
@@ -6909,7 +6927,8 @@ impl Pattern {
                 }
                 let mut out = Vec::new();
                 for hv in values {
-                    let funcs = pat_func.query(&state.set_span(hv.whole_or_part()));
+                    let asked = pat_func.asked_for(hv.whole_or_part(), hv.part);
+                    let funcs = pat_func.query(&state.set_span(asked));
                     for hf in funcs {
                         if let Some(part) = hf.part.intersection(&hv.part) {
                             let hap = applied_hap(&hf, &hv, hv.whole, part, apply, *lookup_flow);
@@ -12230,6 +12249,49 @@ mod restart_tests {
                     answers(&bound, begin, end),
                     "section {index}, the bind, over {begin:?}..{end:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn an_application_asks_a_discrete_side_over_the_part_of_a_hap() {
+        use crate::compose::{Alignment, ComposeOp, compose};
+        // Windows inside a note of three cycles, a window of no width, and
+        // spans that hold the note.
+        let spans = [
+            (third(1), third(2)),
+            (third(4), third(5)),
+            (third(7), third(8)),
+            (third(7), third(7)),
+            (Fraction::ZERO, whole(4)),
+            (third(-5), third(22)),
+        ];
+        let answers = |pattern: &Pattern, begin: Fraction, end: Fraction| -> Vec<String> {
+            pattern
+                .query_arc(begin, end)
+                .iter()
+                .map(|hap| format!("{hap:?} {:?} {:?}", hap.keys, hap.live_controls))
+                .collect()
+        };
+        let long = || note(300.0).slow(whole(3));
+        for (index, section) in discrete_sections().into_iter().enumerate() {
+            // The long note gives the structure, on each side in turn.
+            for alignment in [Alignment::In, Alignment::Out] {
+                let met = |section: &Pattern| match alignment {
+                    Alignment::Out => compose(section, &long(), ComposeOp::Set, alignment),
+                    _ => compose(&long(), section, ComposeOp::Set, alignment),
+                };
+                // Behind a time map that changes no time, the section is
+                // asked over the whole of the note.
+                let (over_part, over_whole) =
+                    (met(&section), met(&asked_over_the_span(section.clone())));
+                for (begin, end) in spans {
+                    assert_eq!(
+                        answers(&over_part, begin, end),
+                        answers(&over_whole, begin, end),
+                        "section {index}, {alignment:?}, over {begin:?}..{end:?}"
+                    );
+                }
             }
         }
     }
