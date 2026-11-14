@@ -879,14 +879,18 @@ pub(crate) fn unfolded<R>(build: impl FnOnce() -> R) -> R {
     build()
 }
 
-/// Whether a constructor may fold `pattern`: its handle binds no runtime
-/// and is not marked volatile.
+/// Whether a constructor may fold `pattern`: its handle is not marked
+/// volatile, and the runtime that it binds, if any, changes no answer.
 pub(crate) fn folds(pattern: &Pattern) -> bool {
     #[cfg(test)]
     if UNFOLDED.get() {
         return false;
     }
-    pattern.runtime_settings.is_none() && !pattern.is_volatile()
+    // A runtime goes to the functions and the patterns that a value holds.
+    // Silence and data hold none, so they answer the same under each
+    // runtime.
+    let reads_no_runtime = || pattern.is_rest() || is_data(pattern);
+    !pattern.is_volatile() && (pattern.runtime_settings.is_none() || reads_no_runtime())
 }
 
 /// The layers of `pattern`, when it is a sequence that a constructor folds
@@ -1280,7 +1284,7 @@ pub(crate) fn filtered(pattern: &Pattern, keep: &ValuePredicate) -> Option<Patte
 pub(crate) fn stacked(patterns: &[Pattern]) -> Option<Pattern> {
     let mut stacked = Vec::new();
     for pattern in patterns {
-        if pattern.is_rest() && pattern.runtime_settings.is_none() {
+        if pattern.is_rest() && folds(pattern) {
             continue;
         }
         stacked.extend(layers(pattern)?.iter().cloned());
@@ -1797,6 +1801,32 @@ mod tests {
             &dropped,
             &unfolded(|| text(built(&sequences()[0].1))),
         );
+    }
+
+    /// A function call gives a handle that binds the runtime of the call.
+    #[test]
+    fn a_fold_reads_data_through_the_runtime_that_a_handle_binds() {
+        let bound = |pattern: Pattern| {
+            pattern.with_runtime_settings(crate::settings::RuntimeSettings::default())
+        };
+        let changed = |pattern: Pattern| {
+            stack(vec![
+                pattern,
+                bound(located_value(2.0)),
+                bound(crate::silence()),
+            ])
+            .map_control(ControlSpec::new(["n"]), false)
+            .fast(frac((3, 2)))
+        };
+        for (name, layers) in sequences() {
+            let folded = changed(bound(built(&layers)));
+            assert!(matches!(folded.node_kind(), Node::Sequence(_)), "{name}");
+            assert_same_answers(name, &folded, &unfolded(|| changed(bound(built(&layers)))));
+        }
+        // A list of haps is no data: a query reads it under the runtime.
+        let haps = bound(pure(Value::Haps(crate::value::HapList::new(Vec::new()))));
+        let kept = stack(vec![built(&sequences()[0].1), haps]);
+        assert!(matches!(kept.node_kind(), Node::Stack(_)));
     }
 
     #[test]
