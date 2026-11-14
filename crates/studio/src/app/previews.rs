@@ -1130,92 +1130,140 @@ pub(super) const LABELLED_SCORE_PREFIX: &str = "score: ";
 /// which is what keeps `s("bd:4")` - a colon inside a call - out of it.
 #[cfg(feature = "hydra")]
 fn has_label_statement(text: &str) -> bool {
-    let mut depth = 0i32;
+    let mut nest = Nest::new();
     for line in text.lines() {
-        let trimmed = line.trim_start();
-        if depth == 0 && !trimmed.starts_with("//") {
-            let ident = trimmed
-                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
-                .unwrap_or(trimmed.len());
-            if ident > 0 && trimmed[ident..].trim_start().starts_with(':') {
-                return true;
+        if nest.at_statement() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("//") {
+                let ident = trimmed
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                    .unwrap_or(trimmed.len());
+                if ident > 0 && trimmed[ident..].trim_start().starts_with(':') {
+                    return true;
+                }
             }
         }
-        depth += line_bracket_delta(line);
+        nest.feed(line);
     }
     false
 }
 
 /// The byte offset of the last top-level statement that starts a pattern.
 ///
-/// Scanning from the end finds the expression a bare score ends on: the
-/// chain's own first line, never its `.method()` continuations, and never a
-/// declaration, which returns nothing to play.
+/// The scan keeps the chain's first line. A `.method()` line, a comment
+/// and a declaration are skipped. Brackets inside a comment, a string or
+/// a template leave the depth alone.
 #[cfg(feature = "hydra")]
 fn playable_statement_start(text: &str) -> Option<usize> {
-    let mut depth = 0i32;
+    let mut nest = Nest::new();
     let mut at = 0;
     let mut candidate = None;
     for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if depth == 0
-            && !trimmed.starts_with("//")
-            && !trimmed.is_empty()
-            && !line.starts_with([' ', '\t'])
-        {
-            let head_end = trimmed
-                .find(|c: char| !c.is_ascii_alphanumeric())
-                .unwrap_or(trimmed.len());
-            let head = &trimmed[..head_end];
-            if !matches!(
-                head,
-                "const"
-                    | "let"
-                    | "var"
-                    | "function"
-                    | "class"
-                    | "import"
-                    | "export"
-                    | "return"
-                    | "throw"
-                    | "}"
-            ) {
-                candidate = Some(at);
+        let body = line.trim_end_matches(['\n', '\r']);
+        if nest.at_statement() {
+            let trimmed = body.trim_start();
+            if !trimmed.starts_with("//") && !trimmed.is_empty() && !body.starts_with([' ', '\t']) {
+                let head_end = trimmed
+                    .find(|c: char| !c.is_ascii_alphanumeric())
+                    .unwrap_or(trimmed.len());
+                let head = &trimmed[..head_end];
+                let starts = !head.is_empty() || trimmed.starts_with('(');
+                if starts
+                    && !matches!(
+                        head,
+                        "const"
+                            | "let"
+                            | "var"
+                            | "function"
+                            | "class"
+                            | "import"
+                            | "export"
+                            | "return"
+                            | "throw"
+                    )
+                {
+                    candidate = Some(at);
+                }
             }
         }
-        depth += line_bracket_delta(line);
+        nest.feed(body);
         at += line.len();
     }
     candidate
 }
 
-/// Brackets opened minus brackets closed on one line, strings and line
-/// comments skipped so a colon or brace inside mini notation cannot tip the
-/// nesting over.
+/// Where the score scan is, carried from line to line.
+///
+/// A block comment and a template literal span lines. `"` and `'` end at
+/// the line, as they do in the language. Brackets count only in code.
 #[cfg(feature = "hydra")]
-fn line_bracket_delta(line: &str) -> i32 {
-    let mut delta = 0;
-    let mut in_string: Option<char> = None;
-    let mut chars = line.char_indices().peekable();
-    while let Some((index, c)) = chars.next() {
-        match in_string {
-            Some(quote) => {
-                if c == '\\' {
-                    chars.next();
-                } else if c == quote {
-                    in_string = None;
-                }
-            }
-            None => match c {
-                '"' | '\'' | '`' => in_string = Some(c),
-                '/' if line[index..].starts_with("//") => break,
-                '(' | '[' | '{' => delta += 1,
-                ')' | ']' | '}' => delta -= 1,
-                _ => {}
-            },
+struct Nest {
+    lex: Lex,
+    depth: i32,
+}
+
+#[cfg(feature = "hydra")]
+#[derive(Clone, Copy)]
+enum Lex {
+    Code,
+    Block,
+    Quote(char),
+}
+
+#[cfg(feature = "hydra")]
+impl Nest {
+    fn new() -> Self {
+        Self {
+            lex: Lex::Code,
+            depth: 0,
         }
     }
-    delta
+
+    /// A statement can start here: code, and no bracket still open.
+    fn at_statement(&self) -> bool {
+        matches!(self.lex, Lex::Code) && self.depth == 0
+    }
+
+    fn feed(&mut self, line: &str) {
+        let mut chars = line.chars().peekable();
+        while let Some(character) = chars.next() {
+            match self.lex {
+                Lex::Block => {
+                    if character == '*' && chars.next_if_eq(&'/').is_some() {
+                        self.lex = Lex::Code;
+                    }
+                }
+                Lex::Quote(quote) => {
+                    if character == '\\' {
+                        chars.next();
+                    } else if character == quote {
+                        self.lex = Lex::Code;
+                    }
+                }
+                Lex::Code => {
+                    if character == '/' && chars.peek() == Some(&'/') {
+                        break;
+                    }
+                    if character == '/' && chars.next_if_eq(&'*').is_some() {
+                        self.lex = Lex::Block;
+                        continue;
+                    }
+                    if matches!(character, '"' | '\'' | '`') {
+                        self.lex = Lex::Quote(character);
+                        continue;
+                    }
+                    match character {
+                        '(' | '[' | '{' => self.depth += 1,
+                        ')' | ']' | '}' => self.depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if matches!(self.lex, Lex::Quote('"' | '\'')) {
+            self.lex = Lex::Code;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2734,6 +2782,56 @@ mod tests {
         #[test]
         fn a_colon_inside_a_call_is_not_a_label() {
             let text = "s(\"bd:4*4\").bank(\"tr909\")\n";
+            assert_eq!(labelled_score_text(text), format!("score: {text}"));
+        }
+
+        #[cfg(feature = "hydra")]
+        /// A method chain written at the left margin is still one expression.
+        /// The label belongs on the call, and the `.method()` lines stay
+        /// continuations.
+        #[test]
+        fn a_column_zero_chain_is_labelled_at_its_head() {
+            let text = "s(\"bd*8\")\n.rlpf(sine)\n.gain(.8)\n";
+            assert_eq!(
+                labelled_score_text(text),
+                "score: s(\"bd*8\")\n.rlpf(sine)\n.gain(.8)\n"
+            );
+        }
+
+        #[cfg(feature = "hydra")]
+        /// Brackets and a colon inside a block comment are not the score.
+        /// The pattern after the comment is what gets the label.
+        #[test]
+        fn a_block_comment_leaves_the_pattern_labelled() {
+            let commented = "/*\n(the kick)\n*/\ns(\"bd\")\n";
+            assert_eq!(
+                labelled_score_text(commented),
+                "/*\n(the kick)\n*/\nscore: s(\"bd\")\n"
+            );
+            let labelled_in_comment = "/*\ndrums: later\n*/\ns(\"bd\")\n";
+            assert_eq!(
+                labelled_score_text(labelled_in_comment),
+                "/*\ndrums: later\n*/\nscore: s(\"bd\")\n"
+            );
+        }
+
+        #[cfg(feature = "hydra")]
+        /// A template that spans lines can hold brackets. The pattern after
+        /// it is still at the top level, and that is the line that is labelled.
+        #[test]
+        fn a_template_that_spans_lines_keeps_the_following_pattern() {
+            let text = "const name = `bd (\nmore)`\ns(\"bd\")\n";
+            assert_eq!(
+                labelled_score_text(text),
+                "const name = `bd (\nmore)`\nscore: s(\"bd\")\n"
+            );
+        }
+
+        #[cfg(feature = "hydra")]
+        /// A pattern wrapped in parentheses is still the expression to play.
+        #[test]
+        fn a_parenthesised_pattern_is_labelled() {
+            let text = "(s(\"bd\"))\n";
             assert_eq!(labelled_score_text(text), format!("score: {text}"));
         }
 
