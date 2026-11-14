@@ -1678,10 +1678,15 @@ mod tests {
         let mut session = Session::new().expect("session");
         session.evaluate(r#"s("bd*8")"#).expect("evaluate");
         session.transport().stop();
-        // `play` restarts the transport, so stop from a handle DURING the run.
+        // `play` restarts the transport, so stop from a handle DURING the
+        // run: as soon as the run starts the transport. A stop after a
+        // fixed time lands later in a run that takes less time.
         let handle = session.transport();
         let stopper = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            let patience = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while handle.is_stopped() && std::time::Instant::now() < patience {
+                std::thread::yield_now();
+            }
             handle.stop();
         });
         let started = std::time::Instant::now();
