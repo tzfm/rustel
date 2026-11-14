@@ -1928,41 +1928,10 @@ pub fn undegrade_by<P: PatOps>(pat: &P, x: f64) -> P {
     degrade_by_with(pat, &inverted, x)
 }
 
-/// The identity body of `sometimes`'s coin bind: whatever the coin says,
-/// the operand is the answer. One object for the process.
-pub(crate) fn coin_body() -> crate::register::PureBody {
-    static IDENTITY: std::sync::OnceLock<crate::register::PureBody> = std::sync::OnceLock::new();
-    IDENTITY
-        .get_or_init(|| {
-            let body: crate::register::PureBody = std::sync::Arc::new(|_, pat| pat);
-            body
-        })
-        .clone()
-}
-
-/// The coin bind of `sometimes`: `pure(x)` inner-joined to `whole`, with
-/// `whole` riding in the node as a compared child so an unchanged operand
-/// carries its answers across evaluations. Falls back to the opaque bind
-/// when `whole` is not pure.
-fn coin_bind<P: PatOps>(x: f64, whole: &P) -> P {
-    if let (Some(carrier), Some(operand)) = (
-        P::pat_pure(Value::F64(x)).as_pure_view(),
-        whole.as_pure_view(),
-    ) {
-        let joined = carrier
-            .0
-            .fmap_to_pure_pattern_with_operand(&operand, coin_body(), 1, Vec::new())
-            .inner_join();
-        return P::from_pure_view(crate::purity::PurePattern(joined));
-    }
-    let whole = whole.clone();
-    P::pat_pure(Value::F64(x)).inner_bind(move |_| whole.clone())
-}
-
 /// Applies `f` to roughly `x` of the events. The halves are complementary:
 /// the transformed copy takes exactly the events the plain copy dropped.
-/// The scalar carrier and `inner_bind` are required: they split crossing
-/// wholes at cycle boundaries, and the closure ignores its carrier.
+/// The bind to the scalar carrier is required: it splits crossing wholes at
+/// cycle boundaries. Its closure ignores the carrier.
 ///
 /// A transform whose one application stands for every later one has its
 /// halves built once, here, as [`first_of`]/[`last_of`] build their
@@ -1982,13 +1951,14 @@ pub fn sometimes_by<P: PatOps>(pat: &P, x: f64, f: Option<&FunctionRef>) -> P {
 }
 
 /// The two halves of [`sometimes_by`] and [`some_cycles_by`], bound to the
-/// coin. A transform that stands for every application applies once, here.
-/// Any other transform applies inside the bind, per coin hap.
+/// coin. A transform that stands for every application applies once, here:
+/// the bind then asks the same halves for each cycle of the carrier and
+/// adds nothing to their haps, which is a split of the queries. Any other
+/// transform applies inside the bind, per coin hap.
 fn applied_halves<P: PatOps>(x: f64, plain: P, transformed_base: P, f: Option<&FunctionRef>) -> P {
     let Some(f) = f.filter(|f| !f.stands_for_every_application()) else {
         let transformed = call(&transformed_base, f);
-        let whole = P::pat_stack(vec![plain, transformed]);
-        return coin_bind(x, &whole);
+        return P::pat_stack(vec![plain, transformed]).split_queries();
     };
     let f = f.clone();
     P::pat_pure(Value::F64(x)).inner_bind(move |_| {

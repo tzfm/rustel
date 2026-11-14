@@ -1939,12 +1939,6 @@ impl PatternedPureMap {
                 })
     }
 
-    /// Whether the body gives the operand itself for every value, as the
-    /// coin of `sometimes` does.
-    fn gives_its_operand(&self) -> bool {
-        Arc::ptr_eq(&self.body, &combinators::coin_body())
-    }
-
     fn apply(&self, value: &Value, operand: &Pattern) -> purity::PurePattern {
         let values = register::argument_values(value, self.chain, &self.constants);
         let pure = operand
@@ -9719,17 +9713,12 @@ fn span_read(node: &Node) -> purity::SpanRead {
             ..
         } if *mode != JoinMode::Squeeze => of(selector).max(most(&mut lookup.patterns())),
         // Each hap of the carrier asks a pattern over the hap's part. The
-        // coin of `sometimes` asks the operand itself. Any other body makes
-        // the pattern at the query, where the join reads how it answers.
+        // body makes the pattern at the query, where the join reads how it
+        // answers.
         Node::Join(
             inner,
-            mode @ (JoinMode::Inner | JoinMode::Outer | JoinMode::Mix | JoinMode::Squeeze),
+            JoinMode::Inner | JoinMode::Outer | JoinMode::Mix | JoinMode::Squeeze,
         ) => match inner.node_kind() {
-            Node::PatternOfPureOperand(carrier, operand, map, _)
-                if *mode == JoinMode::Inner && map.gives_its_operand() =>
-            {
-                of(carrier).max(of(operand))
-            }
             Node::PatternOfPureOperand(carrier, ..) | Node::PatternOfPure(carrier, ..) => {
                 of(carrier).max(Made)
             }
