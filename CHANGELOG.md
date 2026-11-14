@@ -18,7 +18,7 @@
 - A Studio export names a plugin that does not load, and Ctrl+C stops `rustel export` to MP3.
 - Samples, images and videos load only from allowed sources. `--allow-sample-origin` adds a source, and Settings ▸ Permissions allows a refused folder.
 - Scores render faster on small machines and 64-bit ARM, queries of repeating patterns run up to 180 times faster, and decoded samples load faster the next time.
-- On a slow machine, an edit of a playing score arrives late instead of being refused. A dense synth score no longer refuses its edits.
+- On a slow machine, an edit of a playing score arrives late instead of being refused, and the set no longer goes silent when the old score also comes back late. A dense synth score no longer refuses its edits.
 - On Linux, the audio keeps its priority over the studio, and rustelup offers to install rtkit when needed.
 - Vim mode follows Vim more closely in motions, operators, text objects, Visual mode, search, paste, undo and vimrc files.
 - The studio themes, except rustel-dark, live in [rustel-studio-themes](https://github.com/tzfm/rustel-studio-themes). A build without the `themes` feature keeps rustel-dark.
