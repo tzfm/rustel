@@ -6174,12 +6174,12 @@ mod tests {
                 let mut event: OnsetEvent =
                     OnsetEvent::new(frame, 440.0, 0.5, 0.01).with_generation(generation);
                 event.controls.insert_chain = Some(1000);
-                for place in 0..2 {
+                for (place, effect_controls) in event.controls.effects[..2].iter_mut().enumerate() {
                     let mut controls = InsertControls::new(key(place as u32 + 1));
                     for (id, value) in [(3, 0.75), (4, 0.5)] {
                         assert!(controls.push(InsertParam { id, value }));
                     }
-                    event.controls.effects[place] = Some(controls);
+                    *effect_controls = Some(controls);
                 }
                 event
             };

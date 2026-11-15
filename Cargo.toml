@@ -57,7 +57,7 @@ version = "0.1.6"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 # The toolchain rust-toolchain.toml pins, the only one tested.
-rust-version = "1.98.1"
+rust-version = "1.100.0"
 # The public repository. Members inherit this for their published metadata.
 repository = "https://github.com/tzfm/rustel"
 

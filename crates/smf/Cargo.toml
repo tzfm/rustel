@@ -10,3 +10,6 @@ description = "Standard MIDI File reading and writing"
 [dependencies]
 midly = { version = "0.5.3", default-features = false, features = ["std"] }
 rustel-core = { path = "../core" }
+
+[lints]
+workspace = true

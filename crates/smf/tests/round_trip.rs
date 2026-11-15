@@ -20,12 +20,12 @@ fn message(tick: u64, kind: MessageKind) -> Message {
 fn bytes(tracks: Vec<Track>) -> Vec<u8> {
     Timeline {
         ppq: 480,
-        tempo_micros_per_quarter: tempo_micros_per_quarter(120.0).unwrap(),
+        tempo_micros_per_quarter: tempo_micros_per_quarter(120.0).expect("valid tempo"),
         meter: Meter::FOUR_FOUR,
         tracks,
     }
     .to_bytes()
-    .unwrap()
+    .expect("encode the MIDI fixture")
 }
 
 #[test]

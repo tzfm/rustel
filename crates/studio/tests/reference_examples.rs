@@ -26,10 +26,7 @@ fn session(csound: bool) -> Session {
 /// paired with the reason it is excused, so a new exclusion must be argued.
 fn excused(example: &str) -> bool {
     // Remote-sample examples fetch a URL; the guard runs offline.
-    if example.contains("https://") || example.contains("http://") {
-        return true;
-    }
-    false
+    example.contains("https://") || example.contains("http://")
 }
 
 #[test]

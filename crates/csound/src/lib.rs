@@ -44,7 +44,7 @@ fn starvation_line(counters: &Counters) -> Option<String> {
     let starved = counters.starved_frames.load(Ordering::Relaxed);
     counters
         .starved_reported
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reported| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |reported| {
             (starved.saturating_sub(reported) > STARVED_LINE_FRAMES).then_some(starved)
         })
         .ok()
@@ -129,7 +129,7 @@ impl Program {
         let sources = Arc::new(sources.to_vec());
         engine::Engine::new(&sources, 48_000)?;
         let preset = NEXT_PROGRAM
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| "Csound orchestra revision limit reached")?;
         Ok(Self {
             key: InsertKey {

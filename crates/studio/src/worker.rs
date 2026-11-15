@@ -978,7 +978,7 @@ impl StudioWorker {
         }
         let request_id = self
             .next_recording_request
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .ok()?;
         self.commands
             .try_send(EngineCommand::RecordSample { request_id, path })
@@ -1034,7 +1034,7 @@ fn try_send_recording(
         return None;
     }
     let request_id = next_request
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .ok()?;
     commands
         .try_send(EngineCommand::Record { request_id, path })

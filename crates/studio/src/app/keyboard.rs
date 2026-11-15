@@ -1503,10 +1503,7 @@ impl App {
         }
         // Alt+↑/↓ nudge the slider under the caret, the one control a
         // score offers that is not text.
-        if self.nudge_slider_key(key) {
-            return true;
-        }
-        false
+        self.nudge_slider_key(key)
     }
 
     /// A held key, for whatever took its press: an armed slider, the
@@ -1592,10 +1589,7 @@ impl App {
         }
         // A repeat keeps the same modified-arrow meaning as its press;
         // otherwise held Option+arrows fall through to caret navigation.
-        if self.nudge_slider_key(key) {
-            return Ok(true);
-        }
-        Ok(false)
+        Ok(self.nudge_slider_key(key))
     }
 
     /// A paste: to the text field that owns it, to the drop its path

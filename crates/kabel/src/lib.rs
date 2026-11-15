@@ -361,7 +361,7 @@ impl Program {
             }
         }
         let id = NEXT_PROGRAM_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| "KabelSalat program identity space is exhausted".to_owned())?;

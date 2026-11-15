@@ -7,7 +7,7 @@ static NEXT_SAMPLE_IDENTITY: AtomicU64 = AtomicU64::new(2);
 
 fn next_sample_identity() -> Result<u64, String> {
     NEXT_SAMPLE_IDENTITY
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
             identity.checked_add(1)
         })
         .map_err(|_| "decoded sample identity exhausted".to_owned())

@@ -145,7 +145,7 @@ fn slider_with_id<'js>(
             .map_err(|_| throw_type_error(&ctx, "invalid native slider binding"))?
     } else {
         let binding = NEXT_SLIDER_BINDING
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| throw_type_error(&ctx, "native slider binding capacity exhausted"))?;
         bindings.set(id.as_str(), binding.to_string())?;
         binding

@@ -797,10 +797,13 @@ fn pooled_inserts_process_without_allocation_on_any_thread() {
             install(rustel_audio::instrument_slot(chain), plugin);
             controls.instrument = Some(rustel_audio::InsertControls::new(key(plugin)));
         }
-        for stage in 0..[1, 2, 1, 0][chain as usize] {
+        for (stage, effect_controls) in controls.effects[..[1, 2, 1, 0][chain as usize]]
+            .iter_mut()
+            .enumerate()
+        {
             let effect = plugin + 1 + stage as u32;
             install(rustel_audio::effect_slot(chain, stage), effect);
-            controls.effects[stage] = Some(rustel_audio::InsertControls::new(key(effect)));
+            *effect_controls = Some(rustel_audio::InsertControls::new(key(effect)));
         }
         assert!(
             backend.try_note_prepared(OnsetEvent::new(0, 440.0, 0.5, 1.0).with_controls(controls))

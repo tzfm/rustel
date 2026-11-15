@@ -8,7 +8,7 @@ impl LiveStop {
     pub(super) fn request(&self) {
         let _ = self
             .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 matches!(state, OUTPUT_RUNNING | OUTPUT_RESUME_PENDING)
                     .then_some(OUTPUT_STOP_REQUESTED)
             });
@@ -17,7 +17,7 @@ impl LiveStop {
     pub(super) fn resume(&self) {
         let _ = self
             .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| match state {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| match state {
                 OUTPUT_STOP_REQUESTED => Some(OUTPUT_RESUME_PENDING),
                 OUTPUT_STOP_ACKNOWLEDGED => Some(OUTPUT_RUNNING),
                 _ => None,
@@ -39,7 +39,7 @@ impl LiveStop {
         }
         let _ = self
             .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| match state {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| match state {
                 OUTPUT_STOP_REQUESTED => Some(OUTPUT_STOP_ACKNOWLEDGED),
                 OUTPUT_RESUME_PENDING => Some(OUTPUT_RUNNING),
                 _ => None,
