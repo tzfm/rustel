@@ -60,18 +60,54 @@ const TONE: TUID = uid(0x52757374, 0x656C4669, 0x78747572, 0x65546F6E);
 /// The processor class id as a `.vstpreset` file writes it.
 const PROCESSOR_TEXT: &str = "52757374656C46697874757265507263";
 
+/// This crate's folder in the Cargo 1.100 build layout:
+/// `build/<package>/<hash>/out/`.
+const BUILD_PACKAGE: &str = "rustel-vst3-fixture";
+
+/// The compiled plugin library of this crate. Cargo before 1.100 placed it
+/// next to the test program in `deps/`. Cargo 1.100 gives every build unit
+/// its own `build/<package>/<hash>/out/` folder, so the library then sits
+/// with this crate's unit, away from the test program.
+fn library() -> PathBuf {
+    let name = format!(
+        "{}rustel_vst3_fixture{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    );
+    let program = std::env::current_exe().expect("test program path");
+    let beside = program.parent().expect("test program folder").join(&name);
+    if beside.is_file() {
+        return beside;
+    }
+    newest_unit_copy(&program, &name).unwrap_or(beside)
+}
+
+/// The newest copy of `name` under this crate's unit folders of the profile
+/// the test program runs from. A changed build makes a new hash folder and
+/// keeps the old copy until Cargo collects it, so the newest is the live one.
+fn newest_unit_copy(program: &Path, name: &str) -> Option<PathBuf> {
+    let units = program
+        .ancestors()
+        .skip(1)
+        .find(|folder| folder.join("build").join(BUILD_PACKAGE).is_dir())?
+        .join("build")
+        .join(BUILD_PACKAGE);
+    std::fs::read_dir(units)
+        .expect("read the fixture unit folders")
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path().join("out").join(name);
+            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
+}
+
 /// Puts the plugin in a VST3 bundle under `folder` and returns the bundle
-/// path. The plugin library sits next to the test program.
+/// path.
 pub fn install(folder: &Path) -> PathBuf {
-    let library = std::env::current_exe()
-        .expect("test program path")
-        .parent()
-        .expect("test program folder")
-        .join(format!(
-            "{}rustel_vst3_fixture{}",
-            std::env::consts::DLL_PREFIX,
-            std::env::consts::DLL_SUFFIX
-        ));
+    let library = library();
     let bundle = folder.join(format!("{NAME}.vst3"));
     let contents = bundle.join("Contents");
     let binary = if cfg!(target_os = "macos") {
