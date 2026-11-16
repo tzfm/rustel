@@ -90,6 +90,13 @@ fn hex(digest: &[u8]) -> String {
 /// Read one sidecar, refusing anything short, long, or misshapen.
 fn read_sidecar(path: &std::path::Path) -> Option<DecodedSample> {
     let limit = HEADER_LEN + rustel_audio::sample_pcm_ceiling();
+    // An entry over the ceiling in force, left by a higher one, is dead
+    // weight: no read can use it again, so it leaves now instead of at
+    // eviction.
+    if std::fs::metadata(path).is_ok_and(|meta| meta.len() > limit as u64) {
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
     let bytes = super::access::read_sample_cache(path, limit).ok()?;
     if bytes.len() < HEADER_LEN || &bytes[..4] != b"RSPC" {
         return None;
@@ -282,6 +289,20 @@ mod tests {
         assert!(read_sidecar(&path).is_none());
         std::fs::write(&path, b"not a sidecar at all").unwrap();
         assert!(read_sidecar(&path).is_none());
+    }
+
+    #[test]
+    fn an_entry_over_the_ceiling_leaves_rather_than_staying_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = sample(48_000, 1, vec![0.25; 5 * 1024 * 1024 / 4]);
+        let path = sidecar_path(dir.path(), b"bytes", 48_000, super::super::Codec::Wav);
+        write_sidecar(&path, &stored, MAX_DECODED_BYTES);
+        let was = rustel_audio::sample_pcm_ceiling();
+        rustel_audio::set_sample_pcm_ceiling(rustel_audio::MIN_SAMPLE_PCM_BYTES);
+        let miss = read_sidecar(&path);
+        rustel_audio::set_sample_pcm_ceiling(was);
+        assert!(miss.is_none());
+        assert!(!path.exists(), "the dead entry is removed");
     }
 
     #[cfg(unix)]
