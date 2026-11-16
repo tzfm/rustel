@@ -89,7 +89,8 @@ fn hex(digest: &[u8]) -> String {
 
 /// Read one sidecar, refusing anything short, long, or misshapen.
 fn read_sidecar(path: &std::path::Path) -> Option<DecodedSample> {
-    let bytes = std::fs::read(path).ok()?;
+    let limit = HEADER_LEN + rustel_audio::sample_pcm_ceiling();
+    let bytes = super::access::read_sample_cache(path, limit).ok()?;
     if bytes.len() < HEADER_LEN || &bytes[..4] != b"RSPC" {
         return None;
     }
@@ -281,6 +282,19 @@ mod tests {
         assert!(read_sidecar(&path).is_none());
         std::fs::write(&path, b"not a sidecar at all").unwrap();
         assert!(read_sidecar(&path).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_sidecar_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = sample(48_000, 1, vec![0.25; 100]);
+        let path = sidecar_path(dir.path(), b"bytes", 48_000, super::super::Codec::Wav);
+        write_sidecar(&path, &stored, MAX_DECODED_BYTES);
+        let linked = path.with_extension("link");
+        std::os::unix::fs::symlink(&path, &linked).expect("link to the valid sidecar");
+        assert!(read_sidecar(&linked).is_none());
+        assert_eq!(read_sidecar(&path).unwrap().pcm(), stored.pcm());
     }
 
     /// The sidecars stay under their cap: a new one takes the place of the

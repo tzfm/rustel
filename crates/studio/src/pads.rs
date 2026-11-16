@@ -57,8 +57,8 @@ pub struct CcTurn {
 /// just arrived, and the ones from the start of the hitch are gone.
 const PRESS_QUEUE: usize = 32;
 
-/// How many knob controllers wait. A later value of the same controller
-/// replaces the one already waiting, so the fader hears where the hand is.
+/// How many controller messages wait. Relative knobs and buttons need
+/// every message in order. A full queue drops the oldest message.
 const CC_QUEUE: usize = 32;
 
 /// A bounded queue shared by the MIDI callback and the UI thread.
@@ -95,23 +95,6 @@ impl<T> MidiQueue<T> {
     }
 }
 
-impl MidiQueue<CcTurn> {
-    /// Keep the latest value of this controller. A sweep stays one event.
-    fn push_turn(&self, turn: CcTurn) {
-        let Ok(mut events) = self.events.try_lock() else {
-            return;
-        };
-        if let Some(existing) = events
-            .iter_mut()
-            .find(|queued| queued.controller == turn.controller && queued.channel == turn.channel)
-        {
-            *existing = turn;
-            return;
-        }
-        enqueue(&mut events, self.capacity, turn);
-    }
-}
-
 fn enqueue<T>(events: &mut std::collections::VecDeque<T>, capacity: usize, value: T) {
     if events.len() == capacity {
         events.pop_front();
@@ -125,7 +108,7 @@ pub struct PadListener {
     listeners: Vec<MidiListener>,
     ports: Vec<String>,
     presses: std::sync::Arc<MidiQueue<PadPress>>,
-    /// The knobs, on their own queue: a slider follows the latest value.
+    /// Controller messages, in order on their own bounded queue.
     turns: std::sync::Arc<MidiQueue<CcTurn>>,
     /// When any message last arrived on any port, in milliseconds since
     /// the UNIX epoch: an activity light, stamped on the driver's thread
@@ -360,7 +343,7 @@ fn on_driver_message(
             controller,
             value,
         } => {
-            shared.turns.push_turn(CcTurn {
+            shared.turns.append(CcTurn {
                 controller,
                 channel,
                 value,
@@ -520,7 +503,7 @@ impl PadListener {
     /// TEST. A knob turned, as the driver would report it.
     #[cfg(test)]
     pub fn turn_for_test(&self, turn: CcTurn) {
-        self.turns.push_turn(turn);
+        self.turns.append(turn);
     }
 
     /// HARNESS. Plug a virtual controller in, as a USB pad appearing at a
@@ -705,11 +688,9 @@ mod tests {
         assert!(listener.try_recv().is_err(), "a knob is not a pad");
     }
 
-    /// A burst keeps the newest presses and the latest value of each knob.
-    /// The queues are bounded, so a hitch cannot grow them or replay the
-    /// positions a hand has already left.
+    /// A burst keeps the newest messages in order, within each queue's cap.
     #[test]
-    fn a_burst_keeps_the_newest_presses_and_the_latest_knob_value() {
+    fn a_burst_keeps_the_newest_presses_and_controller_messages() {
         let listener = PadListener::default();
         for note in 0..64u8 {
             listener.driver_message_for_test("pads", note_on(note), u64::from(note) * 100);
@@ -739,21 +720,19 @@ mod tests {
             0,
         );
         let turns: Vec<CcTurn> = std::iter::from_fn(|| listener.try_recv_cc().ok()).collect();
-        assert_eq!(
-            turns,
-            vec![
-                CcTurn {
-                    controller: 7,
-                    channel: 1,
-                    value: 99,
-                },
-                CcTurn {
-                    controller: 1,
-                    channel: 1,
-                    value: 10,
-                },
-            ]
-        );
+        let expected: Vec<CcTurn> = (101 - CC_QUEUE as u8..100)
+            .map(|value| CcTurn {
+                controller: 7,
+                channel: 1,
+                value,
+            })
+            .chain([CcTurn {
+                controller: 1,
+                channel: 1,
+                value: 10,
+            }])
+            .collect();
+        assert_eq!(turns, expected);
     }
 
     /// The gate's memory is bounded and the oldest slot is the one reused:

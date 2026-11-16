@@ -23,7 +23,7 @@
 - Vim mode follows Vim more closely in motions, operators, text objects, Visual mode, search, paste, undo and vimrc files.
 - The studio themes, except rustel-dark, live in [rustel-studio-themes](https://github.com/tzfm/rustel-studio-themes). A build without the `themes` feature keeps rustel-dark.
 - Add MIDI file export. `rustel export --format midi` writes a Type 1 file, one track a lane. Studio adds a MIDI format to the export sheet.
-- Add MIDI file import. `rustel import-midi` writes a score. A dropped `.mid` file or File ▸ Import MIDI opens it as a new Studio scene.
+- Add MIDI file import. `rustel import-midi` writes a score and keeps note lengths on the chosen grid. Track names do not activate solo mode. A dropped `.mid` file or File ▸ Import MIDI opens it as a new Studio scene.
 - File ▸ Strudel patterns folds the pattern import and export into one row that opens in place.
 - Fixed: a studio.json that another rustel version wrote keeps its settings.
 - Fixed: the first chord or scale preview sounds, a scale preview keeps its tempo on a slow machine, and a sample preview says when it waits for its sample.
@@ -33,7 +33,7 @@
 - Fixed: a Hydra callback with a round number such as `mouse.x / 3000` compiles.
 - Fixed: an edit of a playing Csound pattern no longer plays the old notes it replaces, unless Csound already started them.
 - Fixed: File ▸ Export patterns names the export's whole path in the status line, shortened in the middle when the row cannot hold it, and a click on it shows the file in the desktop's file manager.
-- Fixed: a second rewind stays on the line it already waits for. A preview labels a bare score at its pattern when a method starts at the left margin or a comment holds brackets. In Vim mode, a count on an inner quote stays inside the quotes. A burst of pads or knobs keeps the newest messages.
+- Fixed: a second rewind stays on the line it already waits for. A preview labels a bare score at its pattern when a method starts at the left margin or a comment holds brackets. In Vim mode, a count on an inner quote stays inside the quotes. A burst of pads or knobs keeps the newest messages in order, including relative knob steps and button taps.
 ### Sound changes
 
 - The room and the delay of a note through `.vst()` go through the plugin, as its dry sound does.

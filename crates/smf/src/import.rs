@@ -427,7 +427,8 @@ fn lane_labels(lanes: &BTreeMap<(usize, u8), RawLane>) -> BTreeMap<(usize, u8), 
             } else {
                 base
             };
-            let base = if base.as_bytes()[0].is_ascii_digit() {
+            // An S prefix solos a score lane, including after a uniqueness suffix.
+            let base = if base.as_bytes()[0].is_ascii_digit() || base.starts_with('S') {
                 format!("midi_{base}")
             } else {
                 base

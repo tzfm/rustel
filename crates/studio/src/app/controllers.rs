@@ -1160,6 +1160,69 @@ mod tests {
             assert!(value(&app, scene, call).abs() < 1e-9);
         }
 
+        #[test]
+        fn queued_relative_knob_messages_each_move_the_fader() {
+            use crate::pads::CcTurn;
+            use crate::settings::{MappingSource, SliderCc, Takeover};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene, call) =
+                slider_app_with_source(directory.path(), "$: s(\"bd\").n(slider(5, 0, 10, 1))\n");
+            app.audible_scene = Some(scene);
+            app.ui_settings.mappings[0] = Some(MappingSource::Knob(SliderCc {
+                controller: 74,
+                channel: Some(2),
+            }));
+            app.ui_settings.takeover[0] = Takeover::Relative;
+
+            for _ in 0..3 {
+                app.pads.turn_for_test(CcTurn {
+                    controller: 74,
+                    channel: 2,
+                    value: 65,
+                });
+            }
+            app.drain_pads();
+            assert_eq!(
+                value(&app, scene, call),
+                8.0,
+                "three messages move three steps"
+            );
+        }
+
+        #[test]
+        fn a_queued_cc_press_and_release_fires_the_bound_action() {
+            use crate::keybinds::{BindAction, MidiBind};
+            use crate::pads::CcTurn;
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.keybinds.learn_midi(
+                BindAction::SetPanel,
+                MidiBind {
+                    number: 59,
+                    note: false,
+                    channel: Some(1),
+                },
+            );
+            app.midi_cc_last.insert((59, 1), (0, Instant::now()));
+            let open = app.set_panel.is_some();
+
+            for value in [127, 0] {
+                app.pads.turn_for_test(CcTurn {
+                    controller: 59,
+                    channel: 1,
+                    value,
+                });
+            }
+            app.drain_pads();
+            assert_ne!(
+                app.set_panel.is_some(),
+                open,
+                "the press toggles the panel once"
+            );
+        }
+
         /// Learning a slot from the settings sheet: Enter waits, the first stick
         /// pushed past the threshold or the next control change is kept, channel
         /// included; Esc cancels; both are remembered; and a control already on

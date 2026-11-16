@@ -1670,6 +1670,11 @@ impl Layer {
         let mut signal = Hap::new(None, state.span, crate::Value::Undefined);
         let mut kept = from;
         for index in from..out.len() {
+            // Sampling does work after the structural haps have been copied.
+            if !stop.allows(kept, 1) {
+                out.truncate(kept);
+                return Some(clipped);
+            }
             let hap = &mut out[index];
             let whole = hap.whole?;
             probe.span = whole;
@@ -4319,6 +4324,32 @@ mod tests {
         let refused = late(&many.graph);
         assert!(refused.is_err());
         assert_eq!(late(&many.tabled), refused);
+    }
+
+    #[test]
+    fn cancellation_during_signal_sampling_stops_the_remaining_work() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        // The signal and the query scope share the cancellation flag and count.
+        let signal_cancelled = Arc::clone(&cancelled);
+        let signal_calls = Arc::clone(&calls);
+        let signal = crate::signal(move |_, _| {
+            signal_calls.fetch_add(1, Ordering::Relaxed);
+            signal_cancelled.store(true, Ordering::Relaxed);
+            Value::F64(1.0)
+        });
+        let pattern = crate::combinators::segment(&signal, frac(64, 1));
+        let span = TimeSpan::new(frac(0, 1), frac(64, 1));
+        let result = crate::with_cancellation(&cancelled, || {
+            pattern.query_arc_outcome_with_budget(&State::new(span), u64::MAX)
+        });
+        assert!(matches!(result, Err(crate::QueryLimit::Cancelled)));
+        assert!(
+            calls.load(Ordering::Relaxed) < 4096,
+            "cancellation must stop before every signal value is sampled"
+        );
     }
 
     /// Spans one twentieth of a cycle wide, as a live tick asks, here and

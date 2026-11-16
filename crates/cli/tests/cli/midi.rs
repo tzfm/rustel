@@ -237,3 +237,49 @@ fn export_import_export_keeps_the_notes() {
     assert_eq!(first.lanes.len(), second.lanes.len());
     assert_eq!(first.lanes[0].notes, second.lanes[0].notes);
 }
+
+#[test]
+fn imported_track_names_do_not_solo_other_lanes() {
+    use rustel_smf::{Message, MessageKind, Timeline, Track};
+
+    let tracks = ["Strings", "S", "S", "bass", "midi_Strings"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| Track {
+            name: name.to_owned(),
+            channel: index as u8 + 1,
+            messages: vec![
+                Message {
+                    tick: 0,
+                    kind: MessageKind::NoteOn {
+                        note: 60 + index as u8,
+                        velocity: 100,
+                    },
+                },
+                Message {
+                    tick: 480,
+                    kind: MessageKind::NoteOff {
+                        note: 60 + index as u8,
+                    },
+                },
+            ],
+        })
+        .collect();
+    let bytes = Timeline {
+        ppq: 480,
+        tempo_micros_per_quarter: 500_000,
+        meter: Meter::FOUR_FOUR,
+        tracks,
+    }
+    .to_bytes()
+    .expect("encode the MIDI fixture");
+    let imported = import_smf(&bytes, &ImportOptions::default()).expect("import the MIDI fixture");
+    let result = run(&["query", "--json", "-e", &imported.source]);
+    assert!(result.status.success(), "{}", text(&result.stderr));
+    let result: serde_json::Value = serde_json::from_slice(&result.stdout).expect("query JSON");
+    let haps = result["haps"].as_array().expect("the imported notes");
+    assert_eq!(haps.len(), 5, "{result}");
+    for channel in 1..=5 {
+        assert!(haps.iter().any(|hap| hap["value"]["midichan"] == channel));
+    }
+}

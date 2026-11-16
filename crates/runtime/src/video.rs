@@ -84,26 +84,34 @@ impl VideoThumbnails {
         height: u32,
         frames: Vec<(f32, Vec<u8>)>,
     ) -> Result<Self, String> {
-        let stride = width as usize * height as usize * 4;
         if width == 0 || height == 0 {
             return Err("a strip is at least one pixel".to_owned());
         }
-        let mut times = Vec::with_capacity(frames.len());
-        let mut packed = Vec::with_capacity(stride * frames.len());
+        let stride = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "the frame dimensions exceed host memory".to_owned())?;
+        let capacity = stride
+            .checked_mul(frames.len())
+            .ok_or_else(|| "the strip size exceeds host memory".to_owned())?;
+        if frames.is_empty() {
+            return Err("a strip has at least one frame".to_owned());
+        }
         let mut last = f32::MIN;
-        for (time, frame) in frames {
-            if !time.is_finite() || time <= last {
+        for (time, frame) in &frames {
+            if !time.is_finite() || *time <= last {
                 return Err("frame times are finite and ascending".to_owned());
             }
             if frame.len() != stride {
                 return Err("a frame is width * height * 4 bytes".to_owned());
             }
+            last = *time;
+        }
+        let mut times = Vec::with_capacity(frames.len());
+        let mut packed = Vec::with_capacity(capacity);
+        for (time, frame) in frames {
             times.push(time);
             packed.extend_from_slice(&frame);
-            last = time;
-        }
-        if times.is_empty() {
-            return Err("a strip has at least one frame".to_owned());
         }
         Ok(Self {
             width,
@@ -863,6 +871,12 @@ mod tests {
             VideoThumbnails::from_frames(2, 2, vec![(f32::NAN, red)]).is_err(),
             "times are finite"
         );
+        for (width, height) in [(u32::MAX, u32::MAX), (1 << 30, 1 << 30)] {
+            assert!(
+                VideoThumbnails::from_frames(width, height, vec![(0.0, vec![0; 4])]).is_err(),
+                "invalid dimensions must not allocate their claimed size"
+            );
+        }
     }
 
     #[test]

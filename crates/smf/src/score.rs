@@ -227,8 +227,13 @@ fn choose_grid(lanes: &[ScoreLane<'_>], bar_ticks: f64) -> Option<(u32, f64)> {
                 if lane.channel == 10 && drum_name_for_note(note.note).is_none() {
                     continue;
                 }
-                let position = note.start as f64 / step_ticks;
-                max_error = max_error.max((position - position.round()).abs());
+                let ticks = [note.start, note.end];
+                // Drum gates use one step, but pitched gates keep their ends.
+                let count = if lane.channel == 10 { 1 } else { 2 };
+                for tick in &ticks[..count] {
+                    let position = *tick as f64 / step_ticks;
+                    max_error = max_error.max((position - position.round()).abs());
+                }
             }
         }
         if max_error <= 0.05 {
@@ -416,6 +421,38 @@ mod tests {
         ];
         let output = emit_one(&notes, 1, None);
         assert!(output.source.contains("note(\"c4@2 d4 e4\")"));
+    }
+
+    #[test]
+    fn short_gates_choose_a_grid_that_keeps_the_note_ends() {
+        let notes = [
+            RawNote {
+                note: 60,
+                start: 0,
+                end: 120,
+            },
+            RawNote {
+                note: 62,
+                start: 480,
+                end: 720,
+            },
+        ];
+        let output = emit_one(&notes, 1, None);
+        assert_eq!(output.grid_steps_per_bar, 16);
+        assert!(output.grid_exact);
+        assert!(output.source.contains("note(\"c4 ~@3 d4@2 ~@10\")"));
+    }
+
+    #[test]
+    fn an_off_grid_note_end_is_reported_as_quantized() {
+        let notes = [RawNote {
+            note: 60,
+            start: 0,
+            end: 721,
+        }];
+        let output = emit_one(&notes, 1, None);
+        assert_eq!(output.grid_steps_per_bar, 8);
+        assert!(!output.grid_exact);
     }
 
     #[test]
