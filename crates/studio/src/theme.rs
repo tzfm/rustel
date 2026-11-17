@@ -1883,7 +1883,8 @@ impl ThemePicker {
     /// The panel's place: bottom-right, like the device picker.
     pub fn geometry(&self, available: Rect) -> Option<(Rect, Rect)> {
         let rows = (self.match_count() as u16).clamp(1, 12);
-        let height = rows + 6;
+        // Borders, the search row, a gap and three hint rows.
+        let height = rows + 7;
         let width = 34u16;
         if available.width < width + 2 || available.height < height + 1 {
             return None;
@@ -2086,31 +2087,70 @@ impl ratatui::widgets::Widget for ThemePickerView<'_> {
             Some(note @ (CameraNote::Off | CameraNote::Failed)) => (note.lines(), theme.warn),
             Some(note @ CameraNote::Starting) => (note.lines(), theme.accent),
             Some(note @ CameraNote::Live) => (note.lines(), theme.ok),
-            None if self.vim && self.picker.vim_insert() => (
-                ["VIM INSERT · Esc returns to Command", "Enter keep · ^n/e/d"],
-                theme.muted,
-            ),
+            None if self.vim && self.picker.vim_insert() => {
+                (["VIM INSERT · Esc for Command", "Enter keep"], theme.muted)
+            }
             None if self.vim => (
-                [
-                    "VIM NORMAL · j/k browse · i types",
-                    "Enter keep · Esc back · ^n/e/d",
-                ],
+                ["VIM NORMAL · j/k browse", "Enter keep · Esc back"],
                 theme.muted,
             ),
-            None => (
-                ["↑/↓ browse · Enter keep", "Esc back · ^n/e/d"],
-                theme.muted,
-            ),
+            None => (["↑/↓ browse", "Enter keep · Esc back"], theme.muted),
         };
         for (offset, line) in lines.into_iter().enumerate() {
             buffer.set_stringn(
                 list.x,
-                panel.bottom().saturating_sub(3 - offset as u16),
+                panel.bottom().saturating_sub(4 - offset as u16),
                 line,
                 usize::from(list.width),
                 Style::default().fg(colour),
             );
         }
+        draw_theme_actions(
+            buffer,
+            Rect::new(list.x, panel.bottom().saturating_sub(2), list.width, 1),
+            self.picker,
+            theme,
+        );
+    }
+}
+
+/// The picker's own verbs, each named beside its chord, on a row of their
+/// own so a reader sees them before trying a key. A delete waiting for its
+/// second press says so in the warning colour.
+fn draw_theme_actions(
+    buffer: &mut ratatui::buffer::Buffer,
+    row: Rect,
+    picker: &ThemePicker,
+    theme: &Theme,
+) {
+    let chord = |key: &str| format!("{}{key}", crate::editor::PRIMARY_MODIFIER);
+    let armed = picker.deleting.is_some() && picker.deleting.as_deref() == picker.selected_name();
+    let key = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let word = Style::default().fg(theme.muted);
+    let warn = Style::default().fg(theme.warn).add_modifier(Modifier::BOLD);
+    let delete = if armed {
+        [(chord("D"), warn), (" again".to_owned(), warn)]
+    } else {
+        [(chord("D"), key), (" delete".to_owned(), word)]
+    };
+    let spans = [
+        (chord("N"), key),
+        (" new · ".to_owned(), word),
+        (chord("E"), key),
+        (" edit · ".to_owned(), word),
+    ]
+    .into_iter()
+    .chain(delete);
+    let mut x = row.x;
+    for (text, style) in spans {
+        let room = usize::from(row.right().saturating_sub(x));
+        if room == 0 {
+            break;
+        }
+        let (end, _) = buffer.set_stringn(x, row.y, &text, room, style);
+        x = end;
     }
 }
 
@@ -2909,6 +2949,52 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget;
 
+    /// The picker names its verbs beside their chords on a row of its own,
+    /// in both input modes and under a camera note, and a delete waiting
+    /// for its second press says what the next press does.
+    #[test]
+    fn the_picker_names_new_edit_and_delete() {
+        use ratatui::layout::Rect;
+        let theme = Theme::built_in_default();
+        let area = Rect::new(0, 0, 60, 30);
+        let lines = |picker: &ThemePicker, vim: bool, camera: Option<CameraNote>| {
+            let mut buffer = Buffer::empty(area);
+            ThemePickerView {
+                picker,
+                theme: &theme,
+                camera,
+                vim,
+            }
+            .render(area, &mut buffer);
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer.cell((x, y)).unwrap().symbol().to_owned())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut picker = ThemePicker::open(&theme);
+        for (vim, camera) in [(false, None), (true, None), (false, Some(CameraNote::Off))] {
+            let shown = lines(&picker, vim, camera);
+            assert!(
+                shown
+                    .iter()
+                    .any(|line| line.contains("^N new · ^E edit · ^D delete")),
+                "vim {vim}, camera {camera:?}:\n{}",
+                shown.join("\n")
+            );
+            assert!(shown.iter().all(|line| !line.contains("^n/e/d")));
+        }
+        picker.deleting = picker.selected_name().map(str::to_owned);
+        let shown = lines(&picker, false, None);
+        assert!(
+            shown.iter().any(|line| line.contains("^D again")),
+            "the armed delete:\n{}",
+            shown.join("\n")
+        );
+    }
+
     /// The one row whose arrow keys do something draws the arrows. It is
     /// also the rainbow row, and the rainbow paints the text the row built,
     /// so the arrows must be part of that text.
@@ -3419,7 +3505,7 @@ mod tests {
                     (list.x..list.right())
                         .map(|x| {
                             buffer
-                                .cell((x, panel.bottom() - 3 + row))
+                                .cell((x, panel.bottom() - 4 + row))
                                 .map_or(" ", |cell| cell.symbol())
                         })
                         .collect::<String>()
@@ -3480,7 +3566,7 @@ mod tests {
         picker.set_vim_insert(true);
         let insert = render(&picker, true);
         assert!(insert.contains("VIM INSERT"), "{insert}");
-        assert!(insert.contains("returns to Co"), "{insert}");
+        assert!(insert.contains("Esc for Command"), "{insert}");
     }
 
     #[test]

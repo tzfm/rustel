@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The theme picker shows its Ctrl+N new, Ctrl+E edit and Ctrl+D delete keys.
+- Fixed: the theme editor opened from the theme picker shows on top of the reference.
+
 ## v0.1.7
 
 - Release archives and installers include signed build provenance for independent verification with GitHub CLI.
