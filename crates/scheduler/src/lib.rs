@@ -513,6 +513,11 @@ pub struct Scheduler {
     query_hap_budget: u64,
     /// Where each cycle is on the clock.
     tempo: TempoMap,
+    /// Whether a hap's `cps` control changes the tempo. An outside clock
+    /// that owns the tempo turns this off.
+    pattern_tempo: bool,
+    /// A fill changed the tempo, so the horizon it covered can be short.
+    tempo_changed: bool,
     /// Cycle position already queried up to.
     queried_to: Fraction,
     /// Explicit transport starts exclude earlier cycles, even if a control
@@ -676,6 +681,32 @@ const MOVED_PAIRS_LIMIT: usize = 4_096;
 /// one sound this near are one doubled voice to the ear.
 const SAME_INSTANT_SECS: f64 = 1e-3;
 
+/// The most fills one tick makes. A faster tempo can leave the horizon
+/// short after a fill, so the tick fills again.
+const MAX_FILLS_PER_TICK: usize = 8;
+
+/// The tempo a hap value asks for with its `cps` control: a finite number
+/// above zero.
+fn hap_tempo(value: &Value) -> Option<f64> {
+    value
+        .get("cps")?
+        .as_f64()
+        .filter(|cps| cps.is_finite() && *cps > 0.0)
+}
+
+/// Put haps in onset order, and a tempo change first among the onsets of
+/// one cycle, so each onset is timed at the tempo in force at it. The sort
+/// is stable.
+fn sort_for_tempo(haps: &mut [Hap]) {
+    let begin = |hap: &Hap| hap.whole.map_or(hap.part.begin, |whole| whole.begin);
+    haps.sort_by(|a, b| {
+        begin(a).cmp(&begin(b)).then_with(|| {
+            let changes = |hap: &Hap| hap_tempo(&hap.value).is_some();
+            changes(b).cmp(&changes(a))
+        })
+    });
+}
+
 /// The largest phase move, in cycles, that [`Scheduler::retime`] reads as
 /// rounding. A clock bend passes the cycle at its instant back unchanged.
 const RETIME_BEND_CYCLES: f64 = 1e-9;
@@ -703,6 +734,8 @@ impl Scheduler {
             horizon,
             query_hap_budget: rustel_core::DEFAULT_HAP_BUDGET,
             tempo: TempoMap::new(cps),
+            pattern_tempo: true,
+            tempo_changed: false,
             queried_to: Fraction::ZERO,
             query_start: None,
             queue: Vec::new(),
@@ -1112,9 +1145,25 @@ impl Scheduler {
             .chain(std::mem::take(&mut self.superseded))
     }
 
-    /// The rate used for query controls and cycle-to-wall-clock conversion.
+    /// The tempo that plays, as of the last tick: the session tempo, or
+    /// one a pattern set since.
     pub fn cps(&self) -> f64 {
         self.tempo.cps()
+    }
+
+    /// Whether a hap's `cps` control changes the tempo.
+    pub fn pattern_tempo(&self) -> bool {
+        self.pattern_tempo
+    }
+
+    /// Let a hap's `cps` control change the tempo, or not. Turning it off
+    /// keeps the tempo that plays and drops each change still ahead.
+    pub fn set_pattern_tempo(&mut self, enabled: bool) {
+        if !enabled {
+            let cps = self.tempo.cps();
+            self.tempo.set_cps(cps);
+        }
+        self.pattern_tempo = enabled;
     }
 
     /// Wall-clock time of `cycle` under the current anchor.
@@ -1848,6 +1897,33 @@ impl Scheduler {
         &mut self,
         clock: &dyn Clock,
         max_span_cycles: f64,
+        profile: Option<&mut SchedulerTickProfile>,
+    ) -> TickStatus {
+        self.tempo.advance(clock.now());
+        let status = self.fill(clock, max_span_cycles, profile);
+        // A faster tempo leaves less time in the cycles a fill covered.
+        // Fill again until the horizon is covered.
+        let mut fills = 1;
+        while status == TickStatus::Filled
+            && std::mem::take(&mut self.tempo_changed)
+            && fills < MAX_FILLS_PER_TICK
+        {
+            fills += 1;
+            match self.fill(clock, max_span_cycles, None) {
+                TickStatus::Filled | TickStatus::HorizonFull => {}
+                other => return other,
+            }
+        }
+        self.tempo_changed = false;
+        status
+    }
+
+    /// Query the pattern once, from the cursor, for the time the horizon
+    /// lacks.
+    fn fill(
+        &mut self,
+        clock: &dyn Clock,
+        max_span_cycles: f64,
         mut profile: Option<&mut SchedulerTickProfile>,
     ) -> TickStatus {
         if self.transport.is_stopped() {
@@ -1890,8 +1966,11 @@ impl Scheduler {
         } else {
             MAX_TICK_SPAN_CYCLES
         };
-        let cycles_needed =
-            ((target_time - self.scheduled_to()) * self.tempo.cps()).clamp(0.0, max_span_cycles);
+        // The query finds again each tempo change from the cursor on.
+        self.tempo.forget_from(self.queried_to);
+        let cycles_needed = ((target_time - self.scheduled_to())
+            * self.tempo.cps_at_cycle(self.queried_to))
+        .clamp(0.0, max_span_cycles);
         // Quantize to whole millicycles so query windows stay exact rationals
         // over 1000. Truncation normally leaves a small deficit for the next tick.
         //
@@ -1925,7 +2004,7 @@ impl Scheduler {
         // patterns read to distinguish it from a lookahead.
         state
             .controls
-            .push(("_cps".into(), Value::F64(self.tempo.cps())));
+            .push(("_cps".into(), Value::F64(self.tempo.cps_at_cycle(begin))));
         // Apply the top-level query error boundary: thrown queries produce
         // no onsets, while resource refusals remain distinct from silence so
         // callers can retry or report an incomplete render.
@@ -1946,7 +2025,7 @@ impl Scheduler {
             profile.callback_kind_sample = callback.kind_sample();
             profile.callback_nanos = callback.busy_nanos();
         }
-        let haps: Vec<Hap> = match query {
+        let mut haps: Vec<Hap> = match query {
             Ok(rustel_core::QueryArcOutcome::Haps(haps)) => haps,
             // The `queryArc` catch: this window is silent, and the throw is
             // kept so somebody can say why.
@@ -1988,6 +2067,15 @@ impl Scheduler {
         let mut queue_full = false;
         // Earliest onset the cap left unqueued; the cursor stops there.
         let mut unprocessed_begin: Option<Fraction> = None;
+        // A tempo change times the onsets after it, so they come in order.
+        let has_tempo = self.pattern_tempo
+            && haps
+                .iter()
+                .any(|hap| hap.has_onset() && hap_tempo(&hap.value).is_some());
+        if has_tempo {
+            sort_for_tempo(&mut haps);
+        }
+        let mut tempo_changed = false;
         // Inside a continued replacement's takeover window: the changed or
         // moved haps the device's outgoing copies stand in for.
         let mut stand_ins = self.overlap_stand_ins(&haps, generation, end);
@@ -2015,6 +2103,16 @@ impl Scheduler {
                 continue;
             }
             let Some(whole) = hap.whole else { continue };
+            let target_time = self.tempo.time_at_cycle(whole.begin);
+            // After a slower tempo, an onset past the horizon waits for a
+            // later fill. The cursor stops at it.
+            if tempo_changed && target_time > now + self.horizon {
+                unprocessed_begin = Some(whole.begin);
+                break;
+            }
+            if has_tempo && let Some(cps) = hap_tempo(&hap.value) {
+                tempo_changed |= self.tempo.change_at(whole.begin, cps);
+            }
             let value_show = hap.value.show();
             let mut key = EmittedKey {
                 generation,
@@ -2026,7 +2124,6 @@ impl Scheduler {
             let occurrence = self.pass_ordinals.entry(key.clone()).or_insert(0);
             key.occurrence = *occurrence;
             *occurrence += 1;
-            let target_time = self.tempo.time_at_cycle(whole.begin);
             if let Some((copy_begin, copy)) = stand_ins.remove(&at) {
                 // The device plays an outgoing copy in this hap's place until
                 // the takeover. The copy is spent and the hap counts as
@@ -2084,7 +2181,7 @@ impl Scheduler {
                 whole_end: whole.end,
                 duration,
                 target_time,
-                cps: None,
+                cps: self.tempo.pattern_cps_at(whole.begin),
                 value: hap.value,
                 live_controls: hap.live_controls,
                 ui_visuals,
@@ -2109,6 +2206,7 @@ impl Scheduler {
             }
         }
         self.clear_pass_ordinals();
+        self.tempo_changed |= tempo_changed;
         // The cursor advances only past onsets this fill queued, so a
         // queue-full fill resumes at its earliest unqueued onset; the `emitted`
         // keys keep the retry from queueing an onset twice.
