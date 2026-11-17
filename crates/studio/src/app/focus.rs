@@ -86,9 +86,11 @@ impl App {
         self.raised.get(&kind).copied().unwrap_or(0)
     }
 
-    /// The sheets that stack with the reference column.
-    const SHEETS: [PanelKind; 6] = [
+    /// The sheets that stack with the reference column, the theme editor
+    /// among them: the one raised last lies over the others.
+    const SHEETS: [PanelKind; 7] = [
         PanelKind::Theme,
+        PanelKind::ThemeEditor,
         PanelKind::Devices,
         PanelKind::Settings,
         PanelKind::Export,
@@ -126,11 +128,7 @@ impl App {
         }
         let mut open: Vec<PanelKind> = Self::SHEETS
             .into_iter()
-            .chain([
-                PanelKind::Reference,
-                PanelKind::ThemeEditor,
-                PanelKind::Memory,
-            ])
+            .chain([PanelKind::Reference, PanelKind::Memory])
             .filter(|kind| self.panel_open(*kind))
             // A DOCKED log is furniture, not a sheet: it has its own room
             // on the screen and covers nothing, so Esc from the score has
@@ -1051,6 +1049,47 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+
+        /// The theme picker raised over the reference hands its place to the
+        /// editor it opens: ^N and ^E land on top, where the keys go, and
+        /// the column raised again lies back over the editor.
+        #[test]
+        fn the_editor_opened_over_the_reference_is_on_top() {
+            for verb in ['n', 'e'] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = app_over(directory.path());
+                app.theme = Theme::built_in_default();
+                app.toggle_reference_browse();
+                let mut terminal = Terminal::new(TestBackend::new(140, 48)).unwrap();
+                paint(&mut app, &mut terminal);
+                theme_shortcut(&mut app);
+                press(&mut app, KeyCode::Char(verb), KeyModifiers::CONTROL);
+                assert!(app.theme_editor.is_some() && app.reference_panel.is_some());
+                assert!(
+                    !app.reference_on_top(),
+                    "^{verb}: the editor was raised last"
+                );
+                assert!(app.theme_editor_sheet_visible(), "^{verb}: the sheet shows");
+                assert_eq!(app.front_panel(), Some(PanelKind::ThemeEditor));
+                assert_eq!(app.focus, Focus::Panel(PanelKind::ThemeEditor));
+
+                let frame = paint(&mut app, &mut terminal);
+                let sheet = crate::theme_editor::ThemeEditorView::geometry(app.frame)
+                    .expect("room for the editor");
+                let shared = sheet.intersection(app.regions.reference);
+                assert!(!shared.is_empty(), "the editor and the column share cells");
+                let corner = |x| frame.cell((x, sheet.y)).unwrap().symbol().to_owned();
+                assert_eq!(
+                    (corner(sheet.x), corner(sheet.right() - 1)),
+                    ("╭".to_owned(), "╮".to_owned()),
+                    "^{verb}: the editor's corners lie over the column"
+                );
+
+                app.focus_panel(PanelKind::Reference);
+                assert!(app.reference_on_top(), "the column raised again");
+                assert!(!app.theme_editor_sheet_visible(), "the editor steps aside");
             }
         }
 

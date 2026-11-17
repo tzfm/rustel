@@ -14,11 +14,13 @@ pub(super) const THEME_APPLY_SETTLE: Duration = Duration::from_millis(200);
 
 impl App {
     /// The theme editor's sheet steps aside - still open, drawn again
-    /// later - while any other surface is up, so the snippet shelf or the
-    /// settings can actually be seen and used over it.
+    /// later - while another sheet is up, so the settings can actually be
+    /// seen and used over it. The reference column stacks with it by when
+    /// each was raised: the snippet shelf opened over the editor covers it,
+    /// and the editor opened over the column covers the column.
     pub(super) fn theme_editor_sheet_visible(&self) -> bool {
         self.theme_editor.is_some()
-            && self.reference_panel.is_none()
+            && !self.reference_on_top()
             && self.settings_sheet.is_none()
             && self.log_panel.is_none()
             && self.export_sheet.is_none()
