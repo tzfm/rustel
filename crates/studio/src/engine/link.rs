@@ -24,6 +24,7 @@ impl super::StudioEngine {
         if !on {
             self.link = None;
             self.link_playing_sent = None;
+            self.update_pattern_tempo();
             return Ok(());
         }
         if self.clock_in.is_some() {
@@ -36,6 +37,7 @@ impl super::StudioEngine {
         let link = Link::start(bpm, cycle).map_err(|error| format!("Link: {error}"))?;
         self.link = Some(link);
         self.link_playing_sent = None;
+        self.update_pattern_tempo();
         // The first turn may follow at once; a session just joined has
         // a grid worth hearing immediately.
         self.link_followed_at = Instant::now() - midi_clock::FOLLOW_INTERVAL;

@@ -80,6 +80,7 @@ struct RecoveryCheckpoint {
     cycle: f64,
     query_hap_budget: u64,
     trace_enabled: bool,
+    pattern_tempo: bool,
     js_memory_limit: usize,
     #[cfg(feature = "device-audio")]
     confirmed_generation: Option<u64>,
@@ -226,6 +227,7 @@ impl Session {
             cycle,
             query_hap_budget: self.scheduler.query_hap_budget(),
             trace_enabled: self.scheduler.trace_enabled(),
+            pattern_tempo: self.scheduler.pattern_tempo(),
             js_memory_limit: self.js.memory_limit(),
             #[cfg(feature = "device-audio")]
             confirmed_generation: self.audible_source.as_ref().map(|source| source.generation),
@@ -262,6 +264,7 @@ impl Session {
             .scheduler
             .set_query_hap_budget(checkpoint.query_hap_budget);
         fresh.scheduler.set_trace_enabled(checkpoint.trace_enabled);
+        fresh.scheduler.set_pattern_tempo(checkpoint.pattern_tempo);
         fresh.samples = self.samples.clone();
         fresh.csound = self.csound.clone();
         fresh.direct_diagnostic_logging = self.direct_diagnostic_logging;

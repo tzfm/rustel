@@ -240,6 +240,16 @@ impl Session {
         self.config.cps = self.scheduler.cps();
     }
 
+    /// Let a pattern's `cps` control change the tempo, or not. An outside
+    /// clock that owns the tempo turns it off, and the tempo that plays
+    /// becomes the session tempo.
+    pub fn set_pattern_tempo(&mut self, enabled: bool) {
+        self.scheduler.set_pattern_tempo(enabled);
+        if !enabled {
+            self.config.cps = self.scheduler.cps();
+        }
+    }
+
     /// Make the next live reload take over at `time` (device seconds):
     /// the old generation keeps sounding until then, the new one is queried
     /// from there. Consumed by that reload.

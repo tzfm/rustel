@@ -1871,6 +1871,15 @@ pub(super) fn play_live(
     } else {
         None
     };
+    // An outside clock owns the tempo: a pattern's `cps` control does not
+    // change it.
+    #[cfg(feature = "midi")]
+    let clock_in_owns = clock_in.is_some();
+    #[cfg(not(feature = "midi"))]
+    let clock_in_owns = false;
+    if link_session.is_some() || clock_in_owns {
+        session.set_pattern_tempo(false);
+    }
     let mut link_followed_at = Instant::now() - rustel_runtime::midi_clock::FOLLOW_INTERVAL;
     let mut link_playing_sent = None;
     let mut link_seen_playing = None;

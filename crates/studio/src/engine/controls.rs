@@ -191,10 +191,19 @@ impl StudioEngine {
         self.clock_in = None;
         self.clock_locked = false;
         self.clock_external_cps = None;
+        self.update_pattern_tempo();
         if let Some(port) = port {
             self.clock_in = Some(ClockIn::open(port)?);
+            self.update_pattern_tempo();
         }
         Ok(())
+    }
+
+    /// A pattern's `cps` control changes the tempo unless an outside clock
+    /// owns it.
+    pub(super) fn update_pattern_tempo(&mut self) {
+        let owned = self.link.is_some() || self.clock_in.is_some();
+        self.session.set_pattern_tempo(!owned);
     }
 
     /// The MIDI clock out this tick: transport news, then the ticks due
