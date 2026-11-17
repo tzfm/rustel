@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.1.7
+
 - Release archives and installers include signed build provenance for independent verification with GitHub CLI.
 - A video file plays as a sample: `mp4`, `m4v`, `mov`, `mkv` and `webm` play their audio track.
 - `_video()` and `video()` draw a video sample's picture in sync with its sound. H.264, HEVC, AV1, VP9, VP8 and Motion JPEG decode natively.
@@ -34,6 +36,7 @@
 - Fixed: an edit of a playing Csound pattern no longer plays the old notes it replaces, unless Csound already started them.
 - Fixed: File ▸ Export patterns names the export's whole path in the status line, shortened in the middle when the row cannot hold it, and a click on it shows the file in the desktop's file manager.
 - Fixed: a second rewind stays on the line it already waits for. A preview labels a bare score at its pattern when a method starts at the left margin or a comment holds brackets. In Vim mode, a count on an inner quote stays inside the quotes. A burst of pads or knobs keeps the newest messages in order, including relative knob steps and button taps.
+
 ### Sound changes
 
 - The room and the delay of a note through `.vst()` go through the plugin, as its dry sound does.
