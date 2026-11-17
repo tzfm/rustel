@@ -84,9 +84,9 @@ jobs:
           $bash = Join-Path $root 'bin\bash.exe'
           if (-not (Test-Path $bash)) { throw 'Git Bash is required' }
           Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $bash)
-      - name: Linux audio and serial headers
+      - name: Linux audio, serial and D-Bus headers
         if: matrix.os_name == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev libudev-dev libdbus-1-dev
       - name: Check release panic recovery
         shell: bash
         run: bash .github/scripts/check-panic-unwind.sh --target ${{ matrix.target }}
