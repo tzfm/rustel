@@ -2,12 +2,8 @@
  "comment": "Pinned gm soundfont map (packages/soundfonts/gm.mjs).",
  "corrections": {
   "comment": "Upstream's list names files that do not exist at the base; each is corrected here to the file that does, or dropped. The count is what a refresh should expect to fix again.",
-  "count": 3,
-  "from_upstream": [
-   "0330_FluidR3_GM_sf2_fible -> 0330_FluidR3_GM_sf2_file (gm_electric_bass_finger)",
-   "0370_GeneralUserGS_sf2_fil e -> 0370_GeneralUserGS_sf2_file (gm_slap_bass_2)",
-   "gm_gunshot: an empty name, dropped"
-  ]
+  "count": 0,
+  "from_upstream": []
  },
  "base": "https://felixroos.github.io/webaudiofontdata/sound",
  "fonts": {
