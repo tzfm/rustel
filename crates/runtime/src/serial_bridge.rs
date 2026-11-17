@@ -1049,6 +1049,7 @@ mod tests {
             target_time: 4.0,
             live_controls: [0; 4],
             ui_visuals: 0,
+            cps: None,
             value: ValueJson::Raw(value),
             value_show: String::new(),
             log_line: None,

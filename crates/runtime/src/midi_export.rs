@@ -436,6 +436,7 @@ mod tests {
             whole_begin: "0/1".into(),
             duration_secs,
             target_time,
+            cps: None,
             value: ValueJson::Raw(value),
             value_show: String::new(),
             ui_visuals: 0,

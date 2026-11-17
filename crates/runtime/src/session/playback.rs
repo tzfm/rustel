@@ -164,10 +164,12 @@ impl Session {
                         onset_id: event.onset_id,
                         generation: event.generation,
                         whole_begin: event.whole_begin.show(),
-                        duration_secs: event.duration.to_f64() / self.config.cps,
+                        duration_secs: event.duration.to_f64()
+                            / event.cps.unwrap_or(self.config.cps),
                         target_time: event.target_time,
                         live_controls: event.live_controls,
                         ui_visuals: event.ui_visuals,
+                        cps: event.cps,
                         value: ValueJson::from_value(&event.value),
                         value_show: event.value.show(),
                         log_line: event.log_line.as_deref().map(str::to_owned),

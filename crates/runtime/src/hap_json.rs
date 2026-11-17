@@ -111,6 +111,10 @@ pub struct OnsetEventJson {
     /// Gate length derived from the exact whole span and the active CPS.
     pub duration_secs: f64,
     pub target_time: f64,
+    /// The tempo, in cycles per second, that a pattern set for this onset.
+    /// Absent when the onset plays at the session tempo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cps: Option<f64>,
     pub value: ValueJson,
     pub value_show: String,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -120,6 +124,14 @@ pub struct OnsetEventJson {
     /// them, so it stays out of the serialised form when empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_line: Option<String>,
+}
+
+impl OnsetEventJson {
+    /// The tempo of this onset: the one a pattern set for it, or else
+    /// `session_cps`.
+    pub fn cps_or(&self, session_cps: f64) -> f64 {
+        self.cps.unwrap_or(session_cps)
+    }
 }
 
 fn is_zero(value: &u64) -> bool {

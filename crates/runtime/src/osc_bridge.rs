@@ -258,7 +258,7 @@ pub fn osc_onset(onset: &OnsetEventJson, cps: f64) -> Option<OscOnset> {
         copied_text_bytes: 0,
     };
 
-    let cps = finite_f32(cps).filter(|cps| *cps > 0.0)?;
+    let cps = finite_f32(onset.cps_or(cps)).filter(|cps| *cps > 0.0)?;
     let cycle = finite_f32(parse_rational(&onset.whole_begin).unwrap_or(0.0))?;
     let delta = finite_f32(onset.duration_secs)?;
     if !onset.target_time.is_finite() {
@@ -377,6 +377,7 @@ mod tests {
             target_time: 9.5,
             live_controls: [0; 4],
             ui_visuals: 0,
+            cps: None,
             value: ValueJson::Raw(value),
             value_show: String::new(),
             log_line: None,

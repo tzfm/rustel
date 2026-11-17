@@ -92,7 +92,7 @@ pub(crate) fn scalar_event_detailed(
 /// `whole_begin` has no cycle of its own. The clock time then serves as the
 /// musical time.
 fn onset_cycle(onset: &OnsetEventJson, cps: f64) -> f64 {
-    whole_begin_cycle(&onset.whole_begin).unwrap_or(onset.target_time * cps)
+    whole_begin_cycle(&onset.whole_begin).unwrap_or(onset.target_time * onset.cps_or(cps))
 }
 
 /// [`scalar_event_detailed`] at the clock time `target_time`, in seconds,
@@ -112,6 +112,7 @@ fn scalar_event_at(
     origin: u64,
     floor: f64,
 ) -> Result<rustel_audio::OnsetEvent, rustel_voice::VoiceError> {
+    let cps = onset.cps_or(cps);
     let value = match &onset.value {
         crate::ValueJson::Null => serde_json::Value::Null,
         crate::ValueJson::Bool(flag) => serde_json::Value::Bool(*flag),
@@ -1819,6 +1820,7 @@ mod stretch_chain_tests {
                 target_time: time,
                 live_controls: [0; 4],
                 ui_visuals: 0,
+                cps: None,
                 value: crate::ValueJson::Raw(value),
                 value_show: String::new(),
                 log_line: None,
@@ -2290,6 +2292,7 @@ mod tests {
             target_time: 0.0,
             live_controls: [0; 4],
             ui_visuals: 0,
+            cps: None,
             value: crate::ValueJson::Raw(value),
             value_show: String::new(),
             log_line: None,

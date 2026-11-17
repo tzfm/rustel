@@ -54,6 +54,9 @@ pub struct Event {
     pub duration: Fraction,
     /// Wall-clock seconds at which it should sound.
     pub target_time: f64,
+    /// The tempo, in cycles per second, that a pattern set for this onset.
+    /// `None` when the onset plays at the session tempo.
+    pub cps: Option<f64>,
     pub value: Value,
     /// Direct gain, cutoff and resonance slider tokens. Zero means unbound.
     pub live_controls: [u64; 4],
@@ -2081,6 +2084,7 @@ impl Scheduler {
                 whole_end: whole.end,
                 duration,
                 target_time,
+                cps: None,
                 value: hap.value,
                 live_controls: hap.live_controls,
                 ui_visuals,
@@ -2527,6 +2531,7 @@ mod tests {
                 whole_end: Fraction::ONE,
                 duration: Fraction::ONE,
                 target_time: 0.50,
+                cps: None,
                 value: Value::Str("late".into()),
                 live_controls: [0; 4],
                 ui_visuals: 0,
@@ -2539,6 +2544,7 @@ mod tests {
                 whole_end: Fraction::ONE,
                 duration: Fraction::ONE,
                 target_time: 0.25,
+                cps: None,
                 value: Value::Str("early".into()),
                 live_controls: [0; 4],
                 ui_visuals: 0,
@@ -2561,6 +2567,7 @@ mod tests {
             whole_end: Fraction::ONE,
             duration: Fraction::ONE,
             target_time: f64::NAN,
+            cps: None,
             value: Value::Str("nan".into()),
             live_controls: [0; 4],
             ui_visuals: 0,
@@ -2612,6 +2619,7 @@ mod tests {
             whole_end: Fraction::ONE,
             duration: Fraction::ONE,
             target_time,
+            cps: None,
             value: Value::object([
                 ("s".into(), Value::Str(name.into())),
                 ("gain".into(), Value::F64(0.5)),

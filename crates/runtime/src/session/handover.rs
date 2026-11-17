@@ -1051,6 +1051,7 @@ mod tests {
                 whole_begin: whole_begin.into(),
                 duration_secs: 0.1,
                 target_time: 0.5,
+                cps: None,
                 value: ValueJson::Raw(serde_json::json!({"note": note, "s": "tri"})),
                 value_show: String::new(),
                 ui_visuals: 0,
