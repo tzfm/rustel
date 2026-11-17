@@ -7,7 +7,7 @@ pub(super) const CPS: ControlRow = ControlRow {
         name: "cps",
         synonyms: &[],
         summary: "the tempo, in cycles per second - state of the engine, not of the event",
-        description: "The free cps(value) form changes the session tempo atomically, like setCps(value), and may be placed in a labeled lane. The default is 0.5. At query time the scheduler injects _cps, which is what loopAt and glide read to tell a real trigger from a lookahead. A chained .cps(value) plays that pattern at the requested cycles per second.",
+        description: "The free cps(value) form changes the session tempo atomically, like setCps(value), and may be placed in a labeled lane. The default is 0.5. A pattern, such as cps(\"<0.5 1>\"), changes the tempo at the onset of each of its events, unless Link or MIDI clock leads the tempo. At query time the scheduler injects _cps, which is what loopAt and glide read to tell a real trigger from a lookahead. A chained .cps(value) plays that pattern at the requested cycles per second.",
         params: &[ReferenceParam {
             name: "value",
             r#type: "number",

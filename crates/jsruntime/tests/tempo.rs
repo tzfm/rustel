@@ -118,7 +118,7 @@ fn score_reinjection_repairs_public_slots_without_recreating_canonical_functions
     let runtime = runtime();
     evaluate(
         &runtime,
-        "globalThis.__canonicalSetCps = setCps; globalThis.__canonicalSetCpm = setCpm; globalThis.__canonicalScope = rustelScope; globalThis.__canonicalSilence = silence; pure('root')",
+        "globalThis.__canonicalSetCps = setCps; globalThis.__canonicalSetCpm = setCpm; globalThis.__canonicalCps = cps; globalThis.__canonicalScope = rustelScope; globalThis.__canonicalSilence = silence; pure('root')",
     )
     .unwrap();
     runtime
@@ -129,7 +129,7 @@ fn score_reinjection_repairs_public_slots_without_recreating_canonical_functions
 
     let effects = evaluate(
         &runtime,
-        "globalThis.__repaired = Number(setCps === __canonicalSetCps && setcps === __canonicalSetCps && cps === __canonicalSetCps && __canonicalScope.cps === __canonicalSetCps && __canonicalScope.setCpm === __canonicalSetCpm && __canonicalScope.setcpm === __canonicalSetCpm && setCps.name === 'tempoMutated'); globalThis.__ordinaryAssignmentFlags = Number(!Object.getOwnPropertyDescriptor(globalThis, 'setCps').enumerable && !Object.getOwnPropertyDescriptor(__canonicalScope, 'setCpm').enumerable && Object.getOwnPropertyDescriptor(globalThis, 'setcps').writable && Object.getOwnPropertyDescriptor(globalThis, 'setcps').enumerable && Object.getOwnPropertyDescriptor(globalThis, 'setcps').configurable && Object.getOwnPropertyDescriptor(__canonicalScope, 'setcpm').writable && Object.getOwnPropertyDescriptor(__canonicalScope, 'setcpm').enumerable && Object.getOwnPropertyDescriptor(__canonicalScope, 'setcpm').configurable); globalThis.__closedSilence = Number(cps(1.25) === __canonicalSilence); pure('repaired')",
+        "globalThis.__repaired = Number(setCps === __canonicalSetCps && setcps === __canonicalSetCps && cps === __canonicalCps && __canonicalScope.cps === __canonicalCps && __canonicalScope.setCpm === __canonicalSetCpm && __canonicalScope.setcpm === __canonicalSetCpm && setCps.name === 'tempoMutated'); globalThis.__ordinaryAssignmentFlags = Number(!Object.getOwnPropertyDescriptor(globalThis, 'setCps').enumerable && !Object.getOwnPropertyDescriptor(__canonicalScope, 'setCpm').enumerable && Object.getOwnPropertyDescriptor(globalThis, 'setcps').writable && Object.getOwnPropertyDescriptor(globalThis, 'setcps').enumerable && Object.getOwnPropertyDescriptor(globalThis, 'setcps').configurable && Object.getOwnPropertyDescriptor(__canonicalScope, 'setcpm').writable && Object.getOwnPropertyDescriptor(__canonicalScope, 'setcpm').enumerable && Object.getOwnPropertyDescriptor(__canonicalScope, 'setcpm').configurable); globalThis.__closedSilence = Number(cps(1.25) === __canonicalSilence); pure('repaired')",
     )
     .expect("reinject score");
     assert_eq!(effects.cps, Some(1.25));

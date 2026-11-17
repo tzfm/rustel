@@ -627,7 +627,7 @@ impl JsRuntime {
             // function identities stay stable for the runtime's lifetime.
             let canonical = host_repl_tempo_surface(&ctx)
                 .map_err(|error| QueryError::Message(error.to_string()))?;
-            if canonical.len() >= 6 {
+            if canonical.len() >= 7 {
                 let scope: rquickjs::Object = canonical
                     .get(0)
                     .map_err(|error| QueryError::Message(error.to_string()))?;
@@ -649,7 +649,7 @@ impl JsRuntime {
                         .map_err(|error| QueryError::Message(describe_js_error(&ctx, error)))?;
                 }
                 let cps: rquickjs::Value = canonical
-                    .get(1)
+                    .get(6)
                     .map_err(|error| QueryError::Message(error.to_string()))?;
                 repair
                     .call::<_, bool>((ctx.globals(), "cps", cps.clone()))

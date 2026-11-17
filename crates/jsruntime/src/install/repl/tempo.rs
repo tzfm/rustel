@@ -15,6 +15,9 @@ struct NativeTempoSetter<'js> {
     silence: rquickjs::Value<'js>,
     #[qjs(skip_trace)]
     unit: TempoUnit,
+    /// The free `cps` form: a pattern argument makes a tempo lane.
+    #[qjs(skip_trace)]
+    lane: bool,
     #[qjs(skip_trace)]
     transaction: Rc<RefCell<Option<ScoreEffects>>>,
     #[qjs(skip_trace)]
@@ -68,11 +71,14 @@ impl<'js> JsClass<'js> for NativeTempoSetter<'js> {
         this: &JsCell<'js, Self>,
         params: Params<'a, 'js>,
     ) -> rquickjs::Result<rquickjs::Value<'js>> {
-        let value = params
+        let argument = params
             .arg(0)
             .unwrap_or_else(|| common::undefined(params.ctx()));
-        let value = Self::unpure(params.ctx(), value)?;
+        let value = Self::unpure(params.ctx(), argument.clone())?;
         let state = this.borrow();
+        if state.lane && value.as_number().is_none() {
+            return tempo_lane(params.ctx(), &argument);
+        }
         if !state.policy.get().allows(EffectPolicy::TEMPO) {
             return Err(throw_effect_policy(
                 params.ctx(),
@@ -108,6 +114,21 @@ impl<'js> JsClass<'js> for NativeTempoSetter<'js> {
         )?;
         Ok(state.silence.clone())
     }
+}
+
+/// The free `cps(pattern)` form: a lane of `{cps: value}` haps. The
+/// scheduler changes the tempo at the onset of each.
+fn tempo_lane<'js>(
+    ctx: &Ctx<'js>,
+    argument: &rquickjs::Value<'js>,
+) -> rquickjs::Result<rquickjs::Value<'js>> {
+    let (pattern, sidecar) = reify_bridged(ctx, argument)?;
+    let lane = pattern.fmap(|value| {
+        let cps =
+            rustel_core::util::parse_numeral(value).map_or_else(|_| value.clone(), Value::F64);
+        Value::object([("cps".into(), cps)])
+    });
+    Ok(derive_wrapper(ctx.clone(), lane, &[sidecar])?.into_value())
 }
 
 fn define_data_property(
@@ -198,6 +219,7 @@ fn setter<'js>(
     ctx: &Ctx<'js>,
     silence: rquickjs::Value<'js>,
     unit: TempoUnit,
+    lane: bool,
     name: &str,
 ) -> Result<Function<'js>, String> {
     let function = rquickjs::Class::instance(
@@ -205,6 +227,7 @@ fn setter<'js>(
         NativeTempoSetter {
             silence,
             unit,
+            lane,
             transaction: runtime.effect_transaction.clone(),
             policy: runtime.effect_policy.clone(),
             refusal: runtime.effect_policy_refusal.clone(),
@@ -224,8 +247,23 @@ pub(super) fn install<'js>(
     globals: &rquickjs::Object<'js>,
 ) -> Result<(), String> {
     let silence: rquickjs::Value = globals.get("silence").map_err(|error| error.to_string())?;
-    let cps = setter(runtime, ctx, silence.clone(), TempoUnit::Cps, "setCps")?;
-    let cpm = setter(runtime, ctx, silence, TempoUnit::Cpm, "setCpm")?;
+    let cps = setter(
+        runtime,
+        ctx,
+        silence.clone(),
+        TempoUnit::Cps,
+        false,
+        "setCps",
+    )?;
+    let cpm = setter(
+        runtime,
+        ctx,
+        silence.clone(),
+        TempoUnit::Cpm,
+        false,
+        "setCpm",
+    )?;
+    let lane = setter(runtime, ctx, silence, TempoUnit::Cps, true, "cps")?;
     let scope: rquickjs::Object = globals
         .get("rustelScope")
         .map_err(|error| error.to_string())?;
@@ -255,11 +293,16 @@ pub(super) fn install<'js>(
     // In REPL scores the free `cps(...)` form is a tempo lane. A scalar
     // value can cross the same atomic score-effect boundary as setCps; the
     // returned silence still supports label syntax and harmless chains such
-    // as `tempochanges: cps(1).gain(0)` without emitting an audio event.
+    // as `tempochanges: cps(1).gain(0)` without emitting an audio event. A
+    // pattern, such as `cps("<0.5 1>")`, plays as haps whose `cps` control
+    // changes the tempo at each onset.
     globals
-        .set("cps", cps.clone())
+        .set("cps", lane.clone())
         .map_err(|error| error.to_string())?;
-    scope.set("cps", cps).map_err(|error| error.to_string())?;
+    scope
+        .set("cps", lane.clone())
+        .map_err(|error| error.to_string())?;
+    canonical.set(6, lane).map_err(|error| error.to_string())?;
     // `getCps()` reads the tempo that `setCps` staged in this evaluation,
     // or else the tempo that plays.
     let staged = runtime.effect_transaction.clone();

@@ -2931,6 +2931,58 @@ mod tests {
         assert_eq!(active_values(&session), ["2 0.5 0.5"]);
     }
 
+    /// A free `cps` pattern is a tempo lane: each of its onsets changes the
+    /// tempo there, and the notes after it play and last at that tempo.
+    #[test]
+    fn a_free_cps_pattern_changes_the_tempo_at_its_onsets() {
+        let source = "kick: note(\"c4*4\")\ntempo: cps(\"<1 2>\").gain(0)";
+        let notes = |report: &PlayReport| {
+            report
+                .onsets
+                .iter()
+                .filter(|onset| onset.value_show.contains("note:c4"))
+                .map(|onset| (onset.target_time, onset.duration_secs, onset.cps))
+                .collect::<Vec<_>>()
+        };
+
+        let mut session = Session::new().expect("session");
+        session.evaluate(source).expect("a tempo lane");
+        let played = notes(&session.play(1.45).expect("play"));
+        let want = [
+            (0.0, 0.25, Some(1.0)),
+            (0.25, 0.25, Some(1.0)),
+            (0.5, 0.25, Some(1.0)),
+            (0.75, 0.25, Some(1.0)),
+            (1.0, 0.125, Some(2.0)),
+            (1.125, 0.125, Some(2.0)),
+            (1.25, 0.125, Some(2.0)),
+            (1.375, 0.125, Some(2.0)),
+        ];
+        assert_eq!(played.len(), want.len(), "{played:?}");
+        for (got, want) in played.iter().zip(want) {
+            assert!(
+                (got.0 - want.0).abs() < 1e-9 && (got.1 - want.1).abs() < 1e-9 && got.2 == want.2,
+                "{got:?} != {want:?}"
+            );
+        }
+        assert_eq!(
+            session.config().cps,
+            0.5,
+            "a pattern tempo leaves the session tempo"
+        );
+
+        // An outside clock that owns the tempo keeps the session tempo.
+        let mut session = Session::new().expect("session");
+        session.set_pattern_tempo(false);
+        session.evaluate(source).expect("a tempo lane");
+        let played = notes(&session.play(2.25).expect("play"));
+        assert_eq!(played.len(), 5, "{played:?}");
+        for (index, (time, duration, cps)) in played.iter().enumerate() {
+            assert!((time - index as f64 * 0.5).abs() < 1e-9, "{played:?}");
+            assert!((duration - 0.5).abs() < 1e-9 && cps.is_none(), "{played:?}");
+        }
+    }
+
     #[test]
     fn pattern_cpm_matches_the_same_session_cpm_at_a_non_one_default() {
         let mut local = Session::new().expect("local-tempo session");
