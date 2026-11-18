@@ -495,13 +495,45 @@ pub fn visual_layout(
     visual_layout_with_live_numbers(source, generation, &[])
 }
 
+/// The layout's sliders with the live numbers past the cap left out, so a
+/// score with many sliders of its own keeps its layout.
+/// Each slider comes with whether it is a live number.
+fn within_the_slider_cap(sliders: Vec<(bool, UiSlider)>) -> Vec<UiSlider> {
+    let own = sliders.iter().filter(|(live, _)| !live).count();
+    let mut room = MAX_UI_LAYOUT_SLIDERS.saturating_sub(own);
+    sliders
+        .into_iter()
+        .filter_map(|(live, slider)| {
+            if live {
+                if room == 0 {
+                    return None;
+                }
+                room -= 1;
+            }
+            Some(slider)
+        })
+        .collect()
+}
+
+/// A number of a score that its evaluations make live: see
+/// `TranspileOptions::live_numbers`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveNumber {
+    /// The literal's bytes in the score.
+    pub literal: std::ops::Range<usize>,
+    /// The value the cell starts at, when a client moved it away from
+    /// the literal. `None` starts it at the literal.
+    pub value: Option<f64>,
+}
+
 /// [`visual_layout`] for a source evaluated with live numbers: each live
 /// number is a slider of the layout, with the full finite range, so a
-/// client moves it as it moves a slider.
+/// client moves it as it moves a slider. The score's own sliders come
+/// first: a live number past the layout's cap is left out of it.
 pub fn visual_layout_with_live_numbers(
     source: &str,
     generation: u64,
-    live_numbers: &[std::ops::Range<usize>],
+    live_numbers: &[LiveNumber],
 ) -> Result<UiLayoutEnvelope, UiLayoutValidationError> {
     let output = transpile(
         source,
@@ -513,7 +545,10 @@ pub fn visual_layout_with_live_numbers(
                 .collect(),
             id: Some("ui_layout".to_owned()),
             allow_module_syntax: false,
-            live_numbers: live_numbers.to_vec(),
+            live_numbers: live_numbers
+                .iter()
+                .map(|number| number.literal.clone())
+                .collect(),
             ..TranspileOptions::default()
         },
     );
@@ -582,16 +617,22 @@ pub fn visual_layout_with_live_numbers(
                     id: widget.id.clone(),
                     from: widget.from,
                     to: widget.to,
-                    value,
+                    value: live_numbers
+                        .iter()
+                        .find(|number| number.literal == (widget.from..widget.to))
+                        .and_then(|number| number.value)
+                        .unwrap_or(value),
                     min: f64::MIN,
                     max: f64::MAX,
                     step: f64::MIN_POSITIVE,
                 },
                 _ => return None,
             };
-            slider.validate(0).ok().map(|()| slider)
+            let live = widget.widget_type == LIVE_NUMBER_WIDGET;
+            slider.validate(0).ok().map(|()| (live, slider))
         })
         .collect::<Vec<_>>();
+    let sliders = within_the_slider_cap(sliders);
     let layout = UiLayout::new(
         generation,
         source_revision(source),
@@ -2731,6 +2772,40 @@ unknown(slider(440, 20, 20000));"#;
         let slider = &layout.ui_layout.sliders[0];
         assert_eq!((slider.value, slider.min, slider.max), (0.5, -2.0, 2.0));
         assert_eq!(slider.step, 0.004);
+    }
+
+    /// A live number is a slider at the value its host left it at, and
+    /// the score's own sliders keep the layout when the cap is reached.
+    #[test]
+    fn a_live_number_is_a_slider_within_the_cap() {
+        let live = |source: &str, needle: &str, value| {
+            let at = source.rfind(needle).expect("the number");
+            LiveNumber {
+                literal: at..at + needle.len(),
+                value,
+            }
+        };
+        let source = "s('bd').gain(0.5)";
+        let layout = visual_layout_with_live_numbers(source, 1, &[live(source, "0.5", Some(0.2))])
+            .expect("layout");
+        assert_eq!(layout.ui_layout.sliders.len(), 1);
+        assert_eq!(layout.ui_layout.sliders[0].value, 0.2);
+
+        let full = std::iter::repeat_n("slider(.5)", MAX_UI_LAYOUT_SLIDERS)
+            .collect::<Vec<_>>()
+            .join(";")
+            + ";s('bd').gain(0.5)";
+        let layout = visual_layout_with_live_numbers(&full, 1, &[live(&full, "0.5", None)])
+            .expect("the score's sliders keep the layout");
+        assert_eq!(layout.ui_layout.sliders.len(), MAX_UI_LAYOUT_SLIDERS);
+        assert!(
+            layout
+                .ui_layout
+                .sliders
+                .iter()
+                .all(|slider| slider.max != f64::MAX),
+            "the live number is left out"
+        );
     }
 
     #[test]

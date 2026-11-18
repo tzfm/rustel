@@ -821,6 +821,9 @@ impl App {
                 // evaluation at all, which is why this is not recorded at
                 // evaluation time.
                 self.installed_revision = Some(hash.clone());
+                if self.layout_due.as_ref() == Some(&hash) {
+                    self.layout_due = None;
+                }
                 let evaluated = self.evaluation_revisions.get(&hash);
                 match &evaluated {
                     Some(entry) => self
@@ -1115,6 +1118,7 @@ impl App {
             }
             Ok(install) => {
                 self.visual.start();
+                self.layout_due = sent.as_ref().map(|sent| source_revision(&sent.source));
                 if let Some(sent) = &sent.as_ref().filter(|sent| sent.record) {
                     self.record_save(SaveStatus::Installed, &sent.source, None, None);
                 }

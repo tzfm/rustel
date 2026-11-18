@@ -6,10 +6,9 @@
 //! one text. A text can wait for its launch line or its sounds while a newer
 //! text is sent, so each text keeps its own ranges, found by its revision.
 
-use std::ops::Range;
 use std::sync::Arc;
 
-use crate::ui_events::source_revision;
+use crate::ui_events::{LiveNumber, source_revision};
 
 use super::Session;
 
@@ -20,11 +19,11 @@ const KEPT_TEXTS: usize = 8;
 #[derive(Debug, Default)]
 pub(super) struct LiveNumbers {
     /// Newest last: the revision of a text and its ranges.
-    texts: Vec<(String, Arc<[Range<usize>]>)>,
+    texts: Vec<(String, Arc<[LiveNumber]>)>,
 }
 
 impl LiveNumbers {
-    fn set(&mut self, revision: String, ranges: Arc<[Range<usize>]>) {
+    fn set(&mut self, revision: String, ranges: Arc<[LiveNumber]>) {
         self.texts.retain(|(kept, _)| *kept != revision);
         if ranges.is_empty() {
             return;
@@ -35,7 +34,7 @@ impl LiveNumbers {
         self.texts.push((revision, ranges));
     }
 
-    fn of(&self, revision: &str) -> Arc<[Range<usize>]> {
+    fn of(&self, revision: &str) -> Arc<[LiveNumber]> {
         self.texts
             .iter()
             .rev()
@@ -45,16 +44,16 @@ impl LiveNumbers {
 }
 
 impl Session {
-    /// The numbers of `source` that its evaluations make live, as byte
-    /// ranges of it. They replace the ranges given before for the same
-    /// text. No ranges evaluates every number as written.
-    pub fn set_live_numbers(&mut self, source: &str, ranges: Vec<Range<usize>>) {
+    /// The numbers of `source` that its evaluations make live. They
+    /// replace the numbers given before for the same text. No numbers
+    /// evaluates every number as written.
+    pub fn set_live_numbers(&mut self, source: &str, numbers: Vec<LiveNumber>) {
         self.live_numbers
-            .set(source_revision(source), Arc::from(ranges));
+            .set(source_revision(source), Arc::from(numbers));
     }
 
-    /// The live numbers of `source`: the ranges last given for this text.
-    pub fn live_numbers(&self, source: &str) -> Arc<[Range<usize>]> {
+    /// The live numbers of `source`: the numbers last given for this text.
+    pub fn live_numbers(&self, source: &str) -> Arc<[LiveNumber]> {
         self.live_numbers.of(&source_revision(source))
     }
 }
@@ -63,9 +62,12 @@ impl Session {
 mod tests {
     use super::*;
 
-    /// One range, as the store keeps it.
-    fn one(start: usize) -> Arc<[Range<usize>]> {
-        std::iter::once(start..start + 1).collect()
+    /// One number, as the store keeps it.
+    fn one(start: usize) -> Arc<[LiveNumber]> {
+        Arc::from([LiveNumber {
+            literal: start..start + 1,
+            value: None,
+        }])
     }
 
     #[test]
@@ -83,5 +85,26 @@ mod tests {
         }
         assert!(store.of("b").is_empty(), "the oldest text is let go");
         assert_eq!(store.of(&KEPT_TEXTS.to_string()), one(KEPT_TEXTS));
+    }
+
+    /// A number its host moved starts at the moved value, not at the
+    /// literal, so a reinstall of the same text plays on with no jump.
+    #[test]
+    fn a_moved_number_starts_where_its_host_left_it() {
+        let mut session = Session::new().expect("session");
+        session.set_direct_diagnostic_logging(false);
+        let source = "note(48).s('sine').gain(0.5)";
+        let at = source.find("0.5").expect("the gain");
+        let literal = at..at + 3;
+        session.set_live_numbers(
+            source,
+            vec![LiveNumber {
+                literal: literal.clone(),
+                value: Some(0.25),
+            }],
+        );
+        session.evaluate(source).expect("score");
+        let id = rustel_transpiler::live_number_id(literal);
+        assert_eq!(session.slider_value(&id).expect("slider read"), Some(0.25));
     }
 }

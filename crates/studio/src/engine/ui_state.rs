@@ -10,7 +10,7 @@ use rustel_scheduler::ScheduleTraceEvent;
 use rustel_runtime::Session;
 use rustel_runtime::ui_analysis::{UiAudioAnalysisSet, UiAudioAnalyzer};
 use rustel_runtime::ui_events::{
-    MAX_UI_LAYOUT_SLIDERS, MAX_UI_LAYOUT_VISUALS, UiAcceptedOnset, UiAudioMetadata,
+    LiveNumber, MAX_UI_LAYOUT_SLIDERS, MAX_UI_LAYOUT_VISUALS, UiAcceptedOnset, UiAudioMetadata,
     UiEventSendStatus, UiLayout, UiLayoutEnvelope, UiLayoutValidationError, UiSlider,
     UiTraceBatchRequest, correlate_submitted_traces, dispatch_trace_batches, ingest_pending_traces,
     prune_pending_traces, source_revision, visual_layout_with_live_numbers,
@@ -51,7 +51,7 @@ impl LayoutDelivery {
         &mut self,
         source: &str,
         generation: u64,
-        live_numbers: impl FnOnce() -> Arc<[std::ops::Range<usize>]>,
+        live_numbers: impl FnOnce() -> Arc<[LiveNumber]>,
     ) -> Result<bool, UiLayoutValidationError> {
         if self.observed_generation == Some(generation) {
             return Ok(false);

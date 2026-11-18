@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::LazyLock;
 
+use rustel_runtime::ui_events::{LiveNumber as EngineLiveNumber, MAX_UI_LAYOUT_SLIDERS};
 use rustel_transpiler::{live_number_id, live_number_range};
 
 use super::*;
@@ -43,6 +44,27 @@ pub(super) fn takes_a_live_number(callee: &str, control: bool, at: usize) -> boo
             .collect()
     });
     (control && at == 0) || PATTERNIFIED.get(callee).is_some_and(|count| at < *count)
+}
+
+/// Whether the score defines `name` itself - a `function`, a `const`,
+/// `let` or `var`, or a `register` call - so its calls are the score's own
+/// and take their numbers as they are written.
+pub(super) fn defined_in(source: &str, name: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '$');
+    source.match_indices(name).any(|(at, _)| {
+        let (before, after) = (&source[..at], &source[at + name.len()..]);
+        if before.ends_with(word) || after.starts_with(word) {
+            return false;
+        }
+        let quoted = before
+            .strip_suffix(['\'', '"', '`'])
+            .is_some_and(|before| before.trim_end().ends_with("register("));
+        let declared = before.trim_end();
+        quoted
+            || ["function", "const", "let", "var"]
+                .iter()
+                .any(|keyword| declared.ends_with(keyword) && declared.len() < before.len())
+    })
 }
 
 /// A scene's live numbers, pinned to the text revision they were placed in
@@ -117,20 +139,32 @@ impl App {
                 moved: None,
             })
             .collect();
-        let ranges = numbers.iter().map(|number| number.range.clone()).collect();
-        // A full queue sends the numbers as written: the next move of the
-        // rail makes its number live again.
-        let _ = self.worker.try_set_live_numbers(Arc::from(source), ranges);
+        let sent = numbers
+            .iter()
+            .map(|number| EngineLiveNumber {
+                literal: number.range.clone(),
+                value: None,
+            })
+            .collect();
+        if !self.worker.try_set_live_numbers(Arc::from(source), sent) {
+            // A full queue: the evaluation plays every number as written,
+            // and the next move of a rail makes its number live again.
+            self.live_numbers.remove(&scene);
+            return;
+        }
         self.place_live_numbers(scene, numbers);
     }
 
     /// Move a number of the current score to `value`, written as `text`, as
     /// a live number: its cell is set, and a number of the playing score
-    /// that is not live yet becomes live. False when the number cannot be
-    /// moved live - the set is stopped, or another score plays, or another
-    /// update is on its way - and the caller writes it as an edit.
+    /// that is not live yet becomes live. `held` is the text from the
+    /// call's name to the number: the playing score must hold it as it is.
+    /// False when the number cannot be moved live - the set is stopped, or
+    /// another score plays, or another update is on its way - and the
+    /// caller writes it as an edit.
     pub(super) fn move_live_number(
         &mut self,
+        held: Range<usize>,
         literal: Range<usize>,
         value: f64,
         text: &str,
@@ -144,7 +178,7 @@ impl App {
             .live_numbers_now(scene)
             .iter()
             .any(|number| number.range == literal);
-        if !live && !self.make_live(scene, literal.clone()) {
+        if !live && !self.make_live(scene, held, literal.clone()) {
             return false;
         }
         self.write_live_number(scene, literal, value, text)
@@ -161,41 +195,56 @@ impl App {
     }
 
     /// Whether the scene's number at `literal`, a range of its current
-    /// text, is live already or held as it is by the playing score, so a
-    /// rail moves it live.
-    pub(super) fn number_plays(&self, scene: SceneId, literal: Range<usize>) -> bool {
+    /// text, is live already or held as it is by the playing score, with
+    /// the text `held` that leads to it, so a rail moves it live.
+    pub(super) fn number_plays(
+        &self,
+        scene: SceneId,
+        held: Range<usize>,
+        literal: Range<usize>,
+    ) -> bool {
         self.live_numbers_now(scene)
             .iter()
             .any(|number| number.range == literal)
-            || self.playing_literal(scene, literal).is_some()
+            || self.playing_literal(scene, held, literal).is_some()
     }
 
     /// The number at `literal`, a range of the scene's current text, as
-    /// the playing score holds it: the same text, which the edits since
-    /// moved to where it is now. A number typed or retyped since is not in
-    /// the playing score.
-    fn playing_literal(&self, scene: SceneId, literal: Range<usize>) -> Option<Range<usize>> {
+    /// the playing score holds it. `held`, the text from the call's name to
+    /// the number, is the same text there, which the edits since moved to
+    /// where it is now. A number typed or retyped since, or a call renamed
+    /// since, is not in the playing score.
+    fn playing_literal(
+        &self,
+        scene: SceneId,
+        held: Range<usize>,
+        literal: Range<usize>,
+    ) -> Option<Range<usize>> {
         let installed = self.evaluated_source.as_deref()?;
         let at = self.visual_revision?;
         let editor = &self.scenes.get(scene)?.editor;
         let source = editor.source();
-        let number = source.get(literal.clone())?;
+        let text = source.get(held.clone())?;
+        let offset = literal.start.checked_sub(held.start)?;
         installed
-            .match_indices(number)
-            .map(|(start, _)| start..start + number.len())
-            .find(|range| editor.map_range_since(at, range.clone()).as_ref() == Some(&literal))
+            .match_indices(text)
+            .map(|(start, _)| start..start + text.len())
+            .find(|range| editor.map_range_since(at, range.clone()).as_ref() == Some(&held))
+            .map(|range| range.start + offset..range.start + offset + literal.len())
     }
 
     /// Install the playing score again with the number at `literal` - a
     /// range of the current text - as a live cell, beside the numbers that
     /// are live already. False when that cannot be done without changing
     /// what plays.
-    fn make_live(&mut self, scene: SceneId, literal: Range<usize>) -> bool {
+    fn make_live(&mut self, scene: SceneId, held: Range<usize>, literal: Range<usize>) -> bool {
         // An update on its way installs a newer text: this one must not
         // replace it, and the move is written as an edit for it to carry.
-        if self.pending_evaluation.is_some()
-            || !self.inflight.is_empty()
+        // So must an update whose layout has not landed: until it lands,
+        // the installed text named here is the score before it.
+        if self.reinstall_on_its_way()
             || self.launch_arming.is_armed()
+            || self.sliders.len() >= MAX_UI_LAYOUT_SLIDERS
         {
             return false;
         }
@@ -203,26 +252,42 @@ impl App {
         else {
             return false;
         };
-        let Some(new) = self.playing_literal(scene, literal.clone()) else {
+        let Some(new) = self.playing_literal(scene, held, literal.clone()) else {
             return false;
         };
-        // The numbers that are live already, by the ranges their ids name
-        // in the playing score.
-        let mut live = self.live_numbers_now(scene);
-        let mut ranges: Vec<Range<usize>> = live
+        // The numbers that are live already, by the cells the playing score
+        // holds for them, each with the value its rail left it at. A number
+        // with no cell there is not live in it.
+        let mut live: Vec<LiveNumber> =
+            self.live_numbers_now(scene)
+                .into_iter()
+                .filter_map(|number| {
+                    let span = self.sliders.iter().find(|span| {
+                        span.from < number.range.end && number.range.start < span.to
+                    })?;
+                    live_number_range(&span.id)?;
+                    Some(LiveNumber {
+                        id: span.id.clone(),
+                        ..number
+                    })
+                })
+                .collect();
+        let mut sent: Vec<EngineLiveNumber> = live
             .iter()
             .filter_map(|number| {
-                self.sliders
-                    .iter()
-                    .find(|span| span.id == number.id)
-                    .map(|_| live_number_range(&number.id))
+                Some(EngineLiveNumber {
+                    literal: live_number_range(&number.id)?,
+                    value: number.moved,
+                })
             })
-            .flatten()
             .collect();
-        ranges.push(new.clone());
+        sent.push(EngineLiveNumber {
+            literal: new.clone(),
+            value: None,
+        });
         if !self
             .worker
-            .try_set_live_numbers(Arc::clone(&installed), ranges)
+            .try_set_live_numbers(Arc::clone(&installed), sent)
         {
             return false;
         }
@@ -265,7 +330,7 @@ impl App {
             return false;
         };
         let written = literal.start..literal.start + text.len();
-        let numbers = numbers
+        let numbers: Vec<LiveNumber> = numbers
             .into_iter()
             .filter_map(|number| {
                 if number.range == literal {
@@ -281,12 +346,31 @@ impl App {
                 })
             })
             .collect();
-        self.place_live_numbers(scene, numbers);
         // Before the reinstall that made it live lands, the running score
         // has no cell for it: the value goes when the layout comes, by
         // `sync_live_numbers`.
-        self.hand_written_value(scene, before, literal, text.len(), value, false);
+        if self.hand_written_value(scene, before, literal, text.len(), value, false)
+            || self.reinstall_on_its_way()
+        {
+            self.place_live_numbers(scene, numbers);
+            return true;
+        }
+        // The reinstall landed with no cell for it: the number stays as
+        // written there. The move is an edit, as any other rail's.
+        let numbers = numbers
+            .into_iter()
+            .filter(|number| number.range != written)
+            .collect();
+        self.place_live_numbers(scene, numbers);
+        self.auto_evaluate_due = false;
+        self.auto_evaluate();
         true
+    }
+
+    /// An install of this app is on its way, or installed with its layout
+    /// still to land.
+    fn reinstall_on_its_way(&self) -> bool {
+        self.pending_evaluation.is_some() || !self.inflight.is_empty() || self.layout_due.is_some()
     }
 
     /// Where the audible spans lost a live number to a write - its literal
@@ -383,6 +467,17 @@ mod tests {
         app
     }
 
+    /// Live numbers that start at their literals.
+    fn as_written(ranges: &[Range<usize>]) -> Vec<EngineLiveNumber> {
+        ranges
+            .iter()
+            .map(|literal| EngineLiveNumber {
+                literal: literal.clone(),
+                value: None,
+            })
+            .collect()
+    }
+
     const CUTOFF: &str = "$: s(\"sine\").seg(4).lpf(4000)\n";
 
     /// The texts sent to the engine since the test began, newest last.
@@ -430,7 +525,7 @@ mod tests {
         let layout = rustel_runtime::ui_events::visual_layout_with_live_numbers(
             installed,
             2,
-            std::slice::from_ref(&cell),
+            &as_written(std::slice::from_ref(&cell)),
         )
         .expect("layout");
         app.handle_control(StudioControlEvent::Layout(layout));
@@ -483,8 +578,12 @@ mod tests {
         };
         let (cutoff, gain) = (at("4000"), at("0.5"));
         let layout = |generation, cells: &[Range<usize>]| {
-            rustel_runtime::ui_events::visual_layout_with_live_numbers(installed, generation, cells)
-                .expect("layout")
+            rustel_runtime::ui_events::visual_layout_with_live_numbers(
+                installed,
+                generation,
+                &as_written(cells),
+            )
+            .expect("layout")
         };
         app.handle_control(StudioControlEvent::Layout(layout(
             2,
@@ -586,6 +685,69 @@ mod tests {
         };
         assert!(waits("16"), "the seg typed since waits");
         assert!(!waits("4000"), "the playing cutoff moves live");
+    }
+
+    /// A rail moves live only what the playing score holds: a call renamed
+    /// since, or an update whose layout has not landed, keeps the move in
+    /// the score, and nothing is installed again.
+    #[test]
+    fn a_renamed_call_or_a_layout_still_due_keeps_the_write_in_the_score() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut app = playing_with_an_unevaluated_edit(directory.path(), CUTOFF, "4000");
+        let call = app.editor().source().find("lpf").expect("the call");
+        app.editor_mut()
+            .dispatch(
+                Command::ReplaceRange {
+                    from: ByteOffset(call),
+                    to: ByteOffset(call + 1),
+                    text: "h".into(),
+                },
+                HistoryMoment(2),
+                &mut MemoryClipboard::default(),
+            )
+            .expect("the rename");
+        app.open_knobs_panel(true);
+        app.drag_knob(0, Rect::new(0, 0, 24, 1), 4);
+        assert!(!app.editor().source().contains("4000"), "the rail wrote");
+        assert!(sent(&app).is_empty(), "hpf is not the playing lpf");
+
+        let mut app = playing_with_an_unevaluated_edit(directory.path(), CUTOFF, "4000");
+        app.layout_due = Some(source_revision("a newer score"));
+        app.drag_knob(0, Rect::new(0, 0, 24, 1), 4);
+        assert!(!app.editor().source().contains("4000"), "the rail wrote");
+        assert!(sent(&app).is_empty(), "the newer score is not replaced");
+    }
+
+    /// A reinstall that lands with no cell for the number leaves it as
+    /// written: the next move is an edit, which auto evaluate carries.
+    #[test]
+    fn a_number_the_reinstall_left_as_written_moves_as_an_edit() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let installed = CUTOFF;
+        let mut app = playing_with_an_unevaluated_edit(directory.path(), installed, "4000");
+        app.ui_settings.auto_evaluate = true;
+        let rail = Rect::new(0, 0, 24, 1);
+        app.drag_knob(0, rail, 4);
+        // The reinstall was sent and answered, and its layout has no cell.
+        app.pending_evaluation = None;
+        app.inflight.clear();
+        let layout = rustel_runtime::ui_events::visual_layout_with_live_numbers(installed, 2, &[])
+            .expect("layout");
+        app.handle_control(StudioControlEvent::Layout(layout));
+        app.drag_knob(0, rail, 20);
+        assert!(app.live_numbers_now(app.scenes.current().id).is_empty());
+        let sent = sent(&app);
+        assert_eq!(sent.len(), 1, "the edit is evaluated");
+        assert!(sent[0].contains("seg(16)"), "as any edit is");
+    }
+
+    #[test]
+    fn a_name_the_score_defines_is_its_own() {
+        assert!(defined_in("const seg = (n, p) => p; seg(4, x)", "seg"));
+        assert!(defined_in("function fast(n) {}", "fast"));
+        assert!(defined_in("register('pg', (x, pat) => pat)", "pg"));
+        assert!(!defined_in("$: s(\"bd\").seg(4)", "seg"));
+        assert!(!defined_in("const segment = 4; s(\"bd\").seg(4)", "seg"));
     }
 
     /// A stopped set has no score to move: the rail writes the score, and

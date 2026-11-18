@@ -2247,7 +2247,8 @@ impl App {
             return true;
         }
         if self.knob_takes_a_live_number(knob)
-            && self.move_live_number(literal.clone(), value, &text)
+            && let Some(held) = self.knob_held(&literal)
+            && self.move_live_number(held, literal.clone(), value, &text)
         {
             return true;
         }
@@ -2278,8 +2279,11 @@ impl App {
                 let fader = chips
                     .iter()
                     .any(|chip| chip.span.from <= literal.start && literal.end <= chip.span.to);
-                !fader
-                    && !(self.knob_takes_a_live_number(knob) && self.number_plays(scene, literal))
+                let moves_live = self.knob_takes_a_live_number(knob)
+                    && self
+                        .knob_held(&literal)
+                        .is_some_and(|held| self.number_plays(scene, held, literal.clone()));
+                !fader && !moves_live
             })
             .collect();
         if let Some(rows) = self.knobs_rows.as_mut() {
@@ -2307,7 +2311,19 @@ impl App {
                 .is_some_and(|call| {
                     call.plugin.is_none()
                         && super::live_numbers::takes_a_live_number(&call.name, call.control, at)
+                        && !super::live_numbers::defined_in(&self.editor().source(), &call.name)
                 })
+    }
+
+    /// The score's bytes a live move of a rail's number relies on: from
+    /// the call's name to the number. While the playing score holds them
+    /// as they are, its number there is the one the rail moves.
+    fn knob_held(&self, literal: &Range<usize>) -> Option<Range<usize>> {
+        let call = self.knobs_parse.as_ref()?.call.as_ref()?;
+        let source = self.editor().source();
+        let before = source.get(..call.open)?.trim_end();
+        let start = before.strip_suffix(call.name.as_str())?.len();
+        (start <= literal.start).then_some(start..literal.end)
     }
 
     /// A rail's value as the score writes it: a plugin parameter to three

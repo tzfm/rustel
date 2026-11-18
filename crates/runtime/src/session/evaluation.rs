@@ -708,6 +708,7 @@ impl Session {
         if self.generation() == 0 {
             self.js.snapshot_active_as_last_good();
         }
+        let live_numbers = self.live_numbers(source);
         let options = TranspileOptions {
             widget_methods: rustel_transpiler::VISUAL_WIDGET_METHODS
                 .iter()
@@ -717,7 +718,10 @@ impl Session {
             // so a plugin note names the same lane after an edit.
             #[cfg(feature = "vst")]
             lane_numbers: self.lanes.read(source),
-            live_numbers: self.live_numbers(source).to_vec(),
+            live_numbers: live_numbers
+                .iter()
+                .map(|number| number.literal.clone())
+                .collect(),
             ..TranspileOptions::default()
         };
         let evaluated = match seed {
@@ -749,6 +753,17 @@ impl Session {
             // one to take.
             #[cfg_attr(not(feature = "hydra"), allow(unused_mut))]
             Ok((_, mut effects, settings)) => {
+                // A live number its host moved away from the literal starts
+                // where the host left it, before anything queries it: the
+                // cell plays on through the install, with no jump back.
+                for number in live_numbers.iter() {
+                    if let Some(value) = number.value {
+                        let id = rustel_transpiler::live_number_id(number.literal.clone());
+                        // A number the evaluation did not make live has no
+                        // cell, and the host's next move says so.
+                        let _ = self.js.set_slider_value(&id, value);
+                    }
+                }
                 // The recording is taken here, not at the commit seam, because
                 // the arms below drop `effects` for any score that names no
                 // pattern - and a visuals-only score is exactly that. It is

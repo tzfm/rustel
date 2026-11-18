@@ -179,7 +179,7 @@ enum EngineCommand {
     /// before the text's `Evaluate`, which reads them.
     SetLiveNumbers {
         source: Arc<str>,
-        ranges: Vec<std::ops::Range<usize>>,
+        numbers: Vec<rustel_runtime::ui_events::LiveNumber>,
     },
     /// Move one of the running score's sliders without re-evaluating.
     SetSlider {
@@ -656,17 +656,17 @@ impl StudioWorker {
 
     /// Name the numbers of `source` that its evaluations make live: see
     /// [`rustel_runtime::Session::set_live_numbers`]. False when the
-    /// command queue is full; the app sends it again with the evaluation it
-    /// goes before.
+    /// command queue is full: the app then forgets the numbers, and the
+    /// next move of a rail makes its number live again.
     pub fn try_set_live_numbers(
         &self,
         source: Arc<str>,
-        ranges: Vec<std::ops::Range<usize>>,
+        numbers: Vec<rustel_runtime::ui_events::LiveNumber>,
     ) -> bool {
         !self.shutdown_requested.load(Ordering::Acquire)
             && self
                 .commands
-                .try_send(EngineCommand::SetLiveNumbers { source, ranges })
+                .try_send(EngineCommand::SetLiveNumbers { source, numbers })
                 .is_ok()
     }
 
@@ -1667,8 +1667,8 @@ fn process_command(
             );
             false
         }
-        EngineCommand::SetLiveNumbers { source, ranges } => {
-            engine.set_live_numbers(&source, ranges);
+        EngineCommand::SetLiveNumbers { source, numbers } => {
+            engine.set_live_numbers(&source, numbers);
             false
         }
         EngineCommand::SetSlider { id, value, smooth } => {
