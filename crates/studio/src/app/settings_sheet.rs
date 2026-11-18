@@ -982,9 +982,17 @@ impl App {
                 return true;
             }
             SettingsAction::RemoveSource(at) => {
-                if at < self.prefs.sample_sources.len() {
-                    let gone = self.prefs.sample_sources.remove(at);
-                    sheet.selected = at.min(self.prefs.sample_sources.len().saturating_sub(1));
+                if let Some(gone) = self.prefs.remove_sample_source(at) {
+                    // The cursor stays on the list: the next import, else
+                    // the one before, else a pack. On the cache controls
+                    // two Enters would clear the cache.
+                    let imports = self.prefs.sample_sources.len();
+                    sheet.selected = if imports + self.shipped_sources.len() == 0 {
+                        0
+                    } else {
+                        super::super::settings::SOURCE_CONTROL_COUNT
+                            + at.min(imports.saturating_sub(1))
+                    };
                     self.save_prefs_soon();
                     self.adopt_global_sources();
                     self.status = format!(
@@ -1525,6 +1533,65 @@ mod tests {
             assert_eq!(app.ui_settings.animation, !before);
             press(&mut app, KeyCode::Char('g'), chord);
             assert_eq!(app.ui_settings.animation, before);
+        }
+
+        /// `d` on an import keeps the cursor on the list, never on the
+        /// cache controls, where two Enters clear the whole cache. The
+        /// source's bank aliases go with it. Vim keys act the same.
+        #[test]
+        fn removing_a_source_keeps_the_cursor_on_the_list_and_drops_its_aliases() {
+            use crate::settings::{SOURCE_CONTROL_COUNT, SettingsPage};
+
+            for vim in [false, true] {
+                let directory = tempfile::tempdir().expect("temp dir");
+                let mut app = app_over(directory.path());
+                if vim {
+                    app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+                    app.sync_editor_keybindings();
+                }
+                let specs = ["https://example.com/a.json", "https://example.com/b.json"];
+                app.prefs.sample_sources = specs
+                    .iter()
+                    .map(|spec| crate::prefs::SampleSourcePref {
+                        spec: (*spec).into(),
+                        enabled: true,
+                    })
+                    .collect();
+                for spec in specs {
+                    app.prefs
+                        .sample_source_renames
+                        .entry(spec.into())
+                        .or_default()
+                        .insert("kick".into(), "boom".into());
+                }
+                app.toggle_settings_sheet();
+                let sheet = app.settings_sheet.as_mut().expect("sheet open");
+                sheet.show_page(SettingsPage::Sources);
+                sheet.selected = SOURCE_CONTROL_COUNT + 1;
+                app.focus = Focus::Panel(PanelKind::Settings);
+                let selected = |app: &App| app.settings_sheet.as_ref().expect("sheet").selected;
+
+                press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+                assert_eq!(app.prefs.sample_sources.len(), 1, "vim {vim}");
+                assert_eq!(selected(&app), SOURCE_CONTROL_COUNT, "the import before");
+                assert!(!app.prefs.sample_source_renames.contains_key(specs[1]));
+                assert!(app.prefs.sample_source_renames.contains_key(specs[0]));
+
+                press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+                assert!(app.prefs.sample_sources.is_empty(), "vim {vim}");
+                assert!(app.prefs.sample_source_renames.is_empty());
+                assert!(
+                    selected(&app) >= SOURCE_CONTROL_COUNT,
+                    "not on the cache controls"
+                );
+
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                assert!(
+                    !app.settings_sheet.expect("sheet").confirm_clear_cache,
+                    "Enter does not arm the cache clear"
+                );
+            }
         }
 
         #[test]

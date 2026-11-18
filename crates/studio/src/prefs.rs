@@ -712,6 +712,23 @@ impl StudioPrefs {
         changed
     }
 
+    /// Drop the source at `at` with its bank aliases. The aliases stay
+    /// while another row still names the same source.
+    pub fn remove_sample_source(&mut self, at: usize) -> Option<SampleSourcePref> {
+        if at >= self.sample_sources.len() {
+            return None;
+        }
+        let gone = self.sample_sources.remove(at);
+        if !self
+            .sample_sources
+            .iter()
+            .any(|source| source.spec == gone.spec)
+        {
+            self.sample_source_renames.remove(&gone.spec);
+        }
+        Some(gone)
+    }
+
     /// Drop every local source inside a set folder under the sets folder
     /// when that set folder is gone, bank aliases and all, and return
     /// their specs. Nothing goes while the sets folder itself is not
@@ -1532,6 +1549,40 @@ mod tests {
                     live.join("kit").display().to_string(),
                 ]
             );
+        }
+
+        /// A removed source takes its bank aliases with it, unless another
+        /// row still names the same source.
+        #[test]
+        fn removing_a_source_drops_its_aliases() {
+            let (a, b) = (
+                "https://example.com/a.json".to_string(),
+                "/kits/b".to_string(),
+            );
+            let mut prefs = with_sources(&[a.clone(), b.clone(), a.clone()]);
+            for spec in [&a, &b] {
+                prefs
+                    .sample_source_renames
+                    .entry(spec.clone())
+                    .or_default()
+                    .insert("kick".into(), "boom".into());
+            }
+
+            assert_eq!(
+                prefs.remove_sample_source(1).map(|gone| gone.spec),
+                Some(b.clone())
+            );
+            assert!(!prefs.sample_source_renames.contains_key(&b));
+            assert!(prefs.remove_sample_source(5).is_none());
+
+            prefs.remove_sample_source(0);
+            assert!(
+                prefs.sample_source_renames.contains_key(&a),
+                "a row still names it"
+            );
+            prefs.remove_sample_source(0);
+            assert!(prefs.sample_source_renames.is_empty());
+            assert!(prefs.sample_sources.is_empty());
         }
 
         /// Sources inside a set folder that is gone from the sets folder are
