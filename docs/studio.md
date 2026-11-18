@@ -698,7 +698,8 @@ each move sets the number, as a slider does. Any other number in an options
 object, a number in the other places of a plugin call, or a number of a
 function defined in the score sounds at once while the set plays and auto
 evaluate is on, with the next update. A stopped set, or auto evaluate off,
-keeps the typing pause.
+keeps the typing pause. A plugin key that a rail turns on sounds at once
+too, as an update of its own, when no other edit waits for an update.
 
 While the set plays and auto evaluate is off, a rail that the next update
 must carry is muted, on a dashed rail, with "not live" beside its value.

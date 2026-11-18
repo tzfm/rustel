@@ -1526,6 +1526,16 @@ mod tests {
         assert_eq!(text.as_deref(), Some(call));
         assert_eq!(at, at_name.find(")\n").expect("the end"), "after the )");
 
+        let free = "$: n(\"c\"|)\n";
+        let (text, at, _) = pick(free);
+        assert_eq!(text.as_deref(), Some(call));
+        assert_eq!(at, free.find(")\n").expect("the end"), "after s's )");
+
+        let split = "$: n(\"c\").gain|\n  (0.2)\n";
+        let (text, at, _) = pick(split);
+        assert_eq!(text.as_deref(), Some(call));
+        assert_eq!(at, split.find(")\n").expect("the end"), "across the line");
+
         let (text, at, _) = pick("$: n(\"c\").|");
         assert_eq!(text.as_deref(), Some("vsti(\"Serum 2\")"));
         assert_eq!(at, "$: n(\"c\").".len());

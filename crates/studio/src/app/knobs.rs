@@ -2536,7 +2536,7 @@ impl App {
         // The written entry lands inside the object, and the hand keeps
         // the rail it just turned back on.
         self.refresh_knobs(Rect::default());
-        let mut literal = None;
+        let mut back = None;
         if let Some(rows) = self.knobs_rows.as_ref()
             // Two entries can share a name. The score reads the last,
             // so the last is the one the hand keeps.
@@ -2544,16 +2544,31 @@ impl App {
             && let Some(panel) = self.knobs_panel.as_mut()
         {
             panel.selected = at;
-            literal = rows.knobs[at]
-                .state
-                .as_ref()
-                .map(|state| state.literal.clone());
+            // With the key twice, which entry came back is not known.
+            let alone = rows
+                .knobs
+                .iter()
+                .filter(|row| row.place == knob.place)
+                .count()
+                == 1;
+            back = alone.then(|| rows.knobs[at].clone());
         }
-        // The playing score still holds the number: it moves live again.
-        if let Some(playing) = held.and_then(|held| held.playing)
-            && let Some(literal) = literal
-        {
-            self.relive_number(playing, literal, value);
+        let literal = back
+            .as_ref()
+            .filter(|row| self.knob_may_move_live(row))
+            .and_then(|row| row.state.as_ref())
+            .map(|state| state.literal.clone());
+        if let Some(literal) = literal {
+            // The playing score still holds the number: it moves live
+            // again. A score that played the text as it was takes the
+            // entry as an update of its own, with the number live.
+            let live = match held.and_then(|held| held.playing) {
+                Some(playing) => self.relive_number(playing, literal.clone(), value),
+                None => false,
+            };
+            if !live {
+                self.update_with_new_number(&source, literal);
+            }
         }
         self.status = format!("knobs: {} on at {}", knob.label, short_number(value));
         self.dirty_frame = true;
@@ -3584,6 +3599,71 @@ mod tests {
             default_text: String::new(),
             role: ParamRole::Plain,
         }
+    }
+
+    /// A plugin key turned on in a playing call that lacked it, with no
+    /// other edit since the update, goes in as an update of its own with
+    /// the number live, so the next moves sound with no evaluation.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_plugin_key_turned_on_goes_live_with_its_own_update() {
+        use super::super::tests::support::sounding;
+        use rustel_runtime::ui_events::source_revision;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let score = "$: s(\"bd\").vst(\"FX\", { })\n";
+        let mut app = plugin_app(directory.path(), score, vec![plugin_param("gain", 0)]);
+        app.ui_settings.auto_evaluate = false;
+        let scene = app.scenes.current().id;
+        app.evaluation_revisions.remember(
+            source_revision(score),
+            app.editor().revision(),
+            score.into(),
+            scene,
+            None,
+        );
+        let layout = rustel_runtime::ui_events::visual_layout(score, 1).expect("layout");
+        app.handle_control(StudioControlEvent::Layout(layout));
+        app.snapshot = Some(sounding(true, false));
+        app.refresh_knobs(Rect::default());
+        let at = app
+            .knobs_rows
+            .as_ref()
+            .and_then(|rows| rows.knobs.iter().position(|knob| knob.label == "gain"))
+            .expect("the gain rail, off");
+        app.drag_knob(at, Rect::new(0, 0, 24, 1), 12);
+        let source = app.editor().source();
+        assert!(source.contains("gain: "), "on: {source}");
+        let sent: Vec<_> = app
+            .inflight
+            .values()
+            .map(|pending| pending.source.to_string())
+            .chain(
+                app.pending_evaluation
+                    .as_ref()
+                    .map(|pending| pending.source.to_string()),
+            )
+            .collect();
+        assert_eq!(sent, [source], "the update carries the new entry");
+
+        // Another edit waiting keeps the new key for the next update.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut app = plugin_app(directory.path(), score, vec![plugin_param("gain", 0)]);
+        app.ui_settings.auto_evaluate = false;
+        let scene = app.scenes.current().id;
+        let played = "$: s(\"hh\").vst(\"FX\", { })\n";
+        app.evaluation_revisions.remember(
+            source_revision(played),
+            app.editor().revision(),
+            played.into(),
+            scene,
+            None,
+        );
+        let layout = rustel_runtime::ui_events::visual_layout(played, 1).expect("layout");
+        app.handle_control(StudioControlEvent::Layout(layout));
+        app.snapshot = Some(sounding(true, false));
+        app.refresh_knobs(Rect::default());
+        app.drag_knob(at, Rect::new(0, 0, 24, 1), 12);
+        assert!(app.inflight.is_empty() && app.pending_evaluation.is_none());
     }
 
     /// The add list is wider than the column and as tall as it. It scrolls

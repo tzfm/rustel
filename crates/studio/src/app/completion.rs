@@ -735,8 +735,9 @@ impl App {
     /// Where a new link of a chain goes when it is put in at the caret.
     /// At the head of a link, at the caret. Inside the arguments of a
     /// call, past the nearest call around the caret that is itself a link,
-    /// so a pick in `.vst("OTT", { gain: 1| })` follows the `)` and does not
-    /// nest in the call. A call with no `)` yet has no end to follow.
+    /// or past the outermost call when none is, so a pick in
+    /// `.vst("OTT", { gain: 1| })` follows the `)` and does not nest in the
+    /// call. A call with no `)` yet has no end to follow.
     pub(super) fn link_place_at_caret(&self) -> LinkPlace {
         let source = self.editor().source();
         let caret = self.editor().primary_selection().head.0;
@@ -754,7 +755,7 @@ impl App {
         // Between a call's name and its `(`, as in `gain|(0.2)`, the
         // caret is on that call.
         let rest = &code[caret..];
-        let gap = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+        let gap = rest.len() - rest.trim_start().len();
         if code.as_bytes().get(caret + gap) == Some(&b'(')
             && let Some(name) = scan::name_before(&typed, typed.len())
         {
@@ -763,16 +764,22 @@ impl App {
         if self.chain_position_at_caret().is_some() {
             return LinkPlace::Here;
         }
+        // The nearest call that is a link, else the outermost call, as
+        // `s` of `$: s("bd"|)`.
+        let mut outermost = None;
         for open in scan::open_parens(&typed, typed.len()) {
             let Some(name) = scan::name_before(&typed, open) else {
                 continue;
             };
-            if !typed[..name.start].trim_end().ends_with('.') {
-                continue;
+            if typed[..name.start].trim_end().ends_with('.') {
+                return past(open, typed[name].to_owned());
             }
-            return past(open, typed[name].to_owned());
+            outermost = Some((open, name));
         }
-        LinkPlace::Here
+        match outermost {
+            Some((open, name)) => past(open, typed[name].to_owned()),
+            None => LinkPlace::Here,
+        }
     }
 
     /// The completion list for a new link in a chain, anchored to the
@@ -3309,6 +3316,7 @@ mod link_place_tests {
             ("$: s(\"bd\").lpf(|)", "$: s(\"bd\").lpf().lpf()"),
             ("$: s(\"bd\").lpf(4|00)", "$: s(\"bd\").lpf(400).lpf()"),
             ("$: s(\"bd\").lpf(|", "$: s(\"bd\").lpf("),
+            ("$: lpf(|400)", "$: lpf(400).lpf()"),
         ] {
             let directory = tempfile::tempdir().expect("temp dir");
             let mut app = crate::app::tests::support::app_over(directory.path());

@@ -307,6 +307,46 @@ impl App {
             && self.make_live_at(scene, literal, playing, Some(value))
     }
 
+    /// A rail put a number the playing score lacks into the text that
+    /// was `before` it, and `before` is the playing score: the update
+    /// holds the rail's edit alone, so the current text goes in with the
+    /// number at `literal` live. False when other edits wait, or another
+    /// update is on its way.
+    pub(super) fn update_with_new_number(&mut self, before: &str, literal: Range<usize>) -> bool {
+        let scene = self.scenes.current().id;
+        if !self.plays_live(scene)
+            || self.reinstall_on_its_way()
+            || self.launch_arming.is_armed()
+            || self.sliders.len() >= MAX_UI_LAYOUT_SLIDERS
+            || self.evaluated_source.as_deref() != Some(before)
+        {
+            return false;
+        }
+        let Some((revision, source)) = self
+            .scenes
+            .get(scene)
+            .map(|entry| (entry.editor.revision(), entry.editor.source()))
+        else {
+            return false;
+        };
+        let mut numbers = self.live_numbers_now(scene);
+        numbers.retain(|number| number.range != literal);
+        numbers.push(LiveNumber {
+            id: live_number_id(literal.clone()),
+            range: literal,
+            moved: None,
+        });
+        self.place_live_numbers(scene, numbers);
+        self.next_evaluation = LaunchRequest {
+            in_place: true,
+            ..LaunchRequest::default()
+        };
+        // This update carries the edit the typing pause would.
+        self.auto_evaluate_due = false;
+        self.queue_evaluation_for(scene, revision, Arc::from(source), true);
+        true
+    }
+
     /// Install the playing score again with the number at `literal` - a
     /// range of the current text - as a live cell, beside the numbers that
     /// are live already. False when that cannot be done without changing
