@@ -207,16 +207,22 @@ impl App {
         self.log_panel = match &self.log_panel {
             Some(_) => None,
             None => {
+                let oldest = self.log.oldest_unseen();
                 self.log.mark_seen();
                 self.count_for_the_breakdown();
-                self.status = match self.log.path() {
-                    Some(path) => format!(
+                let mut panel = LogPanel::opened(self.ui_settings.log_verbose);
+                self.status = match (oldest, self.log.path()) {
+                    (Some(line), _) => {
+                        panel.reveal(line);
+                        "log - from the oldest warning; End shows the newest".into()
+                    }
+                    (None, Some(path)) => format!(
                         "log - also in {}",
                         status_file_path(path, self.ui_settings.show_full_paths)
                     ),
-                    None => "log".into(),
+                    (None, None) => "log".into(),
                 };
-                Some(LogPanel::opened(self.ui_settings.log_verbose))
+                Some(panel)
             }
         };
         // F9 outright closes the log even while it is docked - the same

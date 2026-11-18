@@ -2325,6 +2325,7 @@ impl App {
     }
 
     fn forget_scene(&mut self, id: SceneId) {
+        self.resolve_left_scene_alerts(id);
         self.scene_visits.retain(|visited| *visited != id);
         self.lint.remove(&id);
         self.live_sliders.remove(&id);

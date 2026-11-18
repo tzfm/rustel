@@ -1008,20 +1008,29 @@ impl App {
     }
 
     /// Make `reports` the ones the Sources page reads, and return the ones
-    /// they replace. A source that reads Ready has nothing left to warn
-    /// about: its earlier import failure, if it had one, is resolved.
+    /// they replace. A source that reads Ready, is turned off, or is gone
+    /// from the list has nothing left to warn about: its earlier import
+    /// failure, if it had one, is resolved.
     fn replace_source_reports(
         &mut self,
         reports: Vec<rustel_runtime::samples::GlobalSourceReport>,
     ) -> Vec<rustel_runtime::samples::GlobalSourceReport> {
-        for report in &reports {
-            if matches!(
+        use rustel_runtime::samples::GlobalSourceState;
+        let settled = reports.iter().filter(|report| {
+            matches!(
                 report.state,
-                rustel_runtime::samples::GlobalSourceState::Ready { .. }
-            ) {
-                self.log
-                    .resolve_alert(&super::super::engine::import_alert(&report.spec));
-            }
+                GlobalSourceState::Ready { .. } | GlobalSourceState::Off
+            )
+        });
+        let removed = self
+            .source_reports
+            .iter()
+            .filter(|before| reports.iter().all(|report| report.spec != before.spec));
+        for report in settled.chain(removed) {
+            self.dirty_frame |= self
+                .log
+                .resolve_alert(&super::super::engine::import_alert(&report.spec))
+                > 0;
         }
         std::mem::replace(&mut self.source_reports, reports)
     }
@@ -2624,6 +2633,47 @@ mod tests {
                     .any(|line| line.resolved && line.text.contains(&spec)),
                 "the line stays, resolved"
             );
+        }
+
+        /// A failed source taken off the list, or turned off, has nothing
+        /// left to warn about: the chip lets it go and the line stays.
+        #[test]
+        fn a_failed_source_stops_counting_once_it_is_removed_or_off() {
+            for remove in [true, false] {
+                let directory = tempfile::tempdir().expect("temp dir");
+                let mut app = app_over(directory.path());
+                let kit = directory.path().join("kit");
+                std::fs::write(&kit, "not a folder").expect("fixture");
+                let spec = kit.display().to_string();
+                app.prefs.sample_sources = vec![crate::prefs::SampleSourcePref {
+                    spec: spec.clone(),
+                    enabled: true,
+                }];
+                let unseen = app.log.unseen();
+                app.adopt_global_sources();
+                app.settle_sample_sources();
+                assert_eq!(app.log.unseen(), unseen + 1, "the chip counts it");
+
+                if remove {
+                    app.prefs.sample_sources.clear();
+                } else {
+                    app.prefs.sample_sources[0].enabled = false;
+                }
+                app.adopt_global_sources();
+                app.settle_sample_sources();
+                assert_eq!(
+                    app.log.unseen(),
+                    unseen,
+                    "remove {remove}: the chip lets go"
+                );
+                assert!(
+                    app.log
+                        .lines()
+                        .iter()
+                        .any(|line| line.resolved && line.text.contains(&spec)),
+                    "remove {remove}: the line stays, resolved"
+                );
+            }
         }
     }
 }

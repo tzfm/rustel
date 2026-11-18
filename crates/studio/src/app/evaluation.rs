@@ -1209,6 +1209,15 @@ impl App {
         }
     }
 
+    /// A tab that left the studio takes its refusals with it: nothing it
+    /// held can sound again, so its check and update alerts resolve.
+    pub(super) fn resolve_left_scene_alerts(&mut self, scene: SceneId) {
+        self.evaluation_alerts.remove(&scene);
+        let resolved = self.log.resolve_alert(&format!("evaluation:{scene:?}"))
+            + self.log.resolve_alert(&lint_alert(scene));
+        self.dirty_frame |= resolved > 0;
+    }
+
     /// An install from `scene` retires the footer failure of any other
     /// scene: the footer reports the latest update, and that one worked. The
     /// other scene's log alert stays open until its own text is accepted.
@@ -2683,6 +2692,38 @@ mod tests {
                 answered_repeat,
                 held: false,
             }
+        }
+
+        /// A closed tab can sound no more, so its refusal stops counting on
+        /// the header and stays in the log, resolved.
+        #[test]
+        fn closing_a_refused_scene_resolves_its_alert() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let unseen_before = app.log.unseen();
+            refuse_alert_update(&mut app, 1);
+            app.new_scene(false);
+            refuse_alert_update(&mut app, 2);
+            assert_eq!(app.log.unseen(), unseen_before + 2);
+
+            app.close_scene();
+            assert_eq!(
+                app.log.unseen(),
+                unseen_before + 1,
+                "the open tab keeps its own"
+            );
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.text.contains("request 2") && line.resolved)
+            );
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.text.contains("request 1") && !line.resolved)
+            );
         }
 
         #[test]

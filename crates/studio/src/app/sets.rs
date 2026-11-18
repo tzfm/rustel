@@ -1629,9 +1629,12 @@ impl App {
         // Every tab of the old set leaves with it. Its ids are never handed
         // out again, so what was kept under them goes whole, as each tab's
         // would on closing, and the engine hears that tabs left.
+        let leaving: Vec<SceneId> = self.scenes.scenes().iter().map(|scene| scene.id).collect();
+        for id in leaving {
+            self.resolve_left_scene_alerts(id);
+        }
         self.scene_visits.clear();
         self.lint.clear();
-        self.evaluation_alerts.clear();
         self.live_sliders.clear();
         self.readiness.clear();
         self.tabs_closed += 1;

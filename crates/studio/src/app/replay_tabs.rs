@@ -192,6 +192,7 @@ impl App {
         let id = self.scenes.current().id;
         match self.scenes.close_current() {
             Ok(_) => {
+                self.resolve_left_scene_alerts(id);
                 self.replays.remove(&id);
                 if self.focus == Focus::Timeline {
                     self.focus = Focus::Editor;

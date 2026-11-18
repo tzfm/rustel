@@ -219,6 +219,7 @@ impl App {
                 self.reconcile_panes();
                 self.strip_mode = SceneStripMode::Idle;
                 self.rebuild_slider_spans();
+                self.resolve_left_scene_alerts(id);
                 self.lint.remove(&id);
                 self.live_sliders.remove(&id);
                 self.readiness.remove(&id);
