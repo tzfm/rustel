@@ -513,6 +513,18 @@ pub struct SampleSourcePref {
     pub enabled: bool,
 }
 
+/// Add `aliases` to the source `into`. An alias already set there wins.
+fn merge_aliases(
+    renames: &mut std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    into: String,
+    aliases: std::collections::BTreeMap<String, String>,
+) {
+    let kept = renames.entry(into).or_default();
+    for (bank, alias) in aliases {
+        kept.entry(bank).or_insert(alias);
+    }
+}
+
 fn yes() -> bool {
     true
 }
@@ -664,12 +676,8 @@ impl StudioPrefs {
         // Later source rows used to win name collisions. Migrate them first;
         // an alias already set directly on the surviving parent wins all.
         for (child, parent) in ownership.into_iter().rev() {
-            let Some(child_aliases) = self.sample_source_renames.remove(&child) else {
-                continue;
-            };
-            let parent_aliases = self.sample_source_renames.entry(parent).or_default();
-            for (bank, alias) in child_aliases {
-                parent_aliases.entry(bank).or_insert(alias);
+            if let Some(child_aliases) = self.sample_source_renames.remove(&child) {
+                merge_aliases(&mut self.sample_source_renames, parent, child_aliases);
             }
         }
         self.sample_sources = sources
@@ -701,15 +709,36 @@ impl StudioPrefs {
             let spelling = spec.strip_suffix(folder.as_str()).unwrap_or_default();
             let moved = format!("{spelling}{}", moved.display());
             if let Some(aliases) = self.sample_source_renames.remove(&source.spec) {
-                let kept = self.sample_source_renames.entry(moved.clone()).or_default();
-                for (bank, alias) in aliases {
-                    kept.entry(bank).or_insert(alias);
-                }
+                merge_aliases(&mut self.sample_source_renames, moved.clone(), aliases);
             }
             source.spec = moved;
             changed = true;
         }
         changed
+    }
+
+    /// Point the source at `at` at `spec`. Its bank aliases follow it. They
+    /// also stay on the old source while another row still names it.
+    pub fn change_sample_source(&mut self, at: usize, spec: String) -> bool {
+        let Some(source) = self.sample_sources.get_mut(at) else {
+            return false;
+        };
+        let old = std::mem::replace(&mut source.spec, spec);
+        let spec = &self.sample_sources[at].spec;
+        if old == *spec {
+            return true;
+        }
+        let shared = self.sample_sources.iter().any(|source| source.spec == old);
+        // Cloned only when the old row's aliases must stay too.
+        let aliases = if shared {
+            self.sample_source_renames.get(&old).cloned()
+        } else {
+            self.sample_source_renames.remove(&old)
+        };
+        if let Some(aliases) = aliases {
+            merge_aliases(&mut self.sample_source_renames, spec.clone(), aliases);
+        }
+        true
     }
 
     /// Drop the source at `at` with its bank aliases. The aliases stay
@@ -1549,6 +1578,36 @@ mod tests {
                     live.join("kit").display().to_string(),
                 ]
             );
+        }
+
+        /// An edited source keeps its bank aliases under the new spec. The
+        /// old spec keeps them only while another row still names it.
+        #[test]
+        fn editing_a_source_moves_its_aliases() {
+            let (a, b, c) = (
+                "/kits/a".to_string(),
+                "/kits/b".to_string(),
+                "/kits/c".to_string(),
+            );
+            let mut prefs = with_sources(&[a.clone(), a.clone()]);
+            prefs
+                .sample_source_renames
+                .entry(a.clone())
+                .or_default()
+                .insert("kick".into(), "boom".into());
+
+            assert!(prefs.change_sample_source(0, b.clone()));
+            assert_eq!(specs(&prefs), [b.as_str(), a.as_str()]);
+            assert_eq!(prefs.sample_source_renames[&b]["kick"], "boom");
+            assert!(
+                prefs.sample_source_renames.contains_key(&a),
+                "a row still names it"
+            );
+
+            assert!(prefs.change_sample_source(1, c.clone()));
+            assert!(!prefs.sample_source_renames.contains_key(&a));
+            assert_eq!(prefs.sample_source_renames[&c]["kick"], "boom");
+            assert!(!prefs.change_sample_source(2, a));
         }
 
         /// A removed source takes its bank aliases with it, unless another

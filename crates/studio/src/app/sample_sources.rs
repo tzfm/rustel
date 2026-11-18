@@ -428,15 +428,27 @@ impl App {
                     .iter()
                     .find(|report| report.spec == spec)
                     .map(|report| report.state.clone());
+                // Each renamed bank under the name it plays as, the
+                // player's alias or the automatic one.
                 let alias_detail = self.worker.library().and_then(|library| {
-                    let aliases = library.automatic_aliases_for_import(spec);
-                    (!aliases.is_empty()).then(|| {
-                        aliases
-                            .into_iter()
-                            .map(|(from, to)| format!("{from}→{to}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
+                    let mut banks: Vec<String> = library
+                        .automatic_aliases_for_import(spec)
+                        .into_iter()
+                        .map(|(from, _)| from)
+                        .collect();
+                    if let Some(manual) = self.prefs.sample_source_renames.get(&source.spec) {
+                        banks.extend(manual.keys().cloned());
+                    }
+                    banks.sort();
+                    banks.dedup();
+                    let aliases: Vec<String> = banks
+                        .into_iter()
+                        .filter_map(|from| {
+                            let to = library.alias_for_import(spec, &from);
+                            (to != from).then(|| format!("{from}→{to}"))
+                        })
+                        .collect();
+                    (!aliases.is_empty()).then(|| aliases.join(", "))
                 });
                 let (state, dimmed, cache_fill) = match state {
                     Some(GlobalSourceState::Ready { banks }) => {
@@ -1785,6 +1797,50 @@ mod tests {
         assert_eq!(app.status, "the remote packs have nothing to cache yet");
         assert!(app.shipped_sources.iter().all(|source| source.counts_ready));
         assert!(app.precache.is_none());
+    }
+
+    /// A bank the player aliased reads under that alias on its row, not
+    /// under the automatic one it had before.
+    #[test]
+    fn a_source_row_shows_the_players_alias_over_the_automatic_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_over(directory.path());
+        let library = Arc::new(rustel_runtime::samples::SampleLibrary::empty());
+        app.worker.set_library(Arc::clone(&library));
+        let specs: Vec<String> = ["alpha", "beta"]
+            .into_iter()
+            .map(|name| {
+                let bank = directory.path().join(name).join("kick");
+                std::fs::create_dir_all(&bank).unwrap();
+                std::fs::write(
+                    bank.join("0.wav"),
+                    include_bytes!("../../../audio/assets/bd.wav"),
+                )
+                .unwrap();
+                directory.path().join(name).display().to_string()
+            })
+            .collect();
+        app.prefs.sample_sources = specs
+            .iter()
+            .map(|spec| crate::prefs::SampleSourcePref {
+                spec: spec.clone(),
+                enabled: true,
+            })
+            .collect();
+        app.source_reports = library.adopt_global_sources_settled(&app.prefs.global_sources());
+        app.reconcile_user_sources();
+        let beta = |app: &App| app.source_rows()[1].state.clone();
+        assert!(beta(&app).contains("kick→kick_1"), "{}", beta(&app));
+
+        app.prefs
+            .sample_source_renames
+            .entry(specs[1].clone())
+            .or_default()
+            .insert("kick".into(), "thump".into());
+        library.set_source_bank_renames(app.prefs.source_bank_renames());
+        let state = beta(&app);
+        assert!(state.contains("kick→thump"), "{state}");
+        assert!(!state.contains("kick_1"), "{state}");
     }
 
     #[test]

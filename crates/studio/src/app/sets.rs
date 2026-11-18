@@ -1150,8 +1150,7 @@ impl App {
                     if self.refuse_set_output_source(&spec) {
                         return true;
                     }
-                    if let Some(source) = self.prefs.sample_sources.get_mut(at) {
-                        source.spec = spec.clone();
+                    if self.prefs.change_sample_source(at, spec.clone()) {
                         self.save_prefs_soon();
                         self.adopt_global_sources();
                         self.status = format!("sample source changed to {spec}");
