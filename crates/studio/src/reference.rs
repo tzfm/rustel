@@ -5146,14 +5146,16 @@ mod tests {
         }
 
         #[test]
-        fn completion_lists_never_read_descriptions() {
+        fn a_reference_opened_in_code_reads_documentation_too() {
+            // Ctrl+F in a pattern opens the reference in the pattern scope.
             let reference = Reference::load_all();
-            for scope in [ReferenceScope::Pattern, ReferenceScope::Kabelsalat] {
-                for query in ["wobble", "switch angel", "reverb room"] {
-                    let ranked = reference.rank_in(query, false, scope);
-                    assert_eq!(ranked.extended_from, ranked.results.len(), "{query:?}");
-                }
-            }
+            let panel = ReferencePanel::browse_in(&reference, "wobble", ReferenceScope::Pattern);
+            let ranked = reference.rank_in("wobble", false, ReferenceScope::Pattern);
+            assert_eq!(ranked.extended_from, 0);
+            assert!(!ranked.results.is_empty());
+            assert_eq!(panel.results, ranked.results);
+            let ranked = reference.rank_in("reverb room", false, ReferenceScope::Pattern);
+            assert!(ranked.extended_from < ranked.results.len());
         }
 
         #[test]

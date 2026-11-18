@@ -589,8 +589,8 @@ impl Reference {
 
     /// Entries matching a query, best first: the exact name, then names
     /// that start with it, then names and synonyms that contain it, then
-    /// summaries that mention it. The browser scopes then add the extended
-    /// matches after all of these: entries whose text holds every typed
+    /// summaries that mention it. The extended matches come after all of
+    /// these: entries whose text holds every typed
     /// word, see [`ExtendedQuery`]. An empty query lists ordinary entries,
     /// hidden-from-completion entries last. Graph bypasses require an
     /// underscore query or `tag:bypass`. A [`Category`] the settings
@@ -623,16 +623,13 @@ impl Reference {
         self.rank_in(query, snippets_last, scope).results
     }
 
-    /// The same search, with the browser's extended matches after the
-    /// basic ones. Only a browser scope reads them: a completion list
-    /// offers names to type, and a word from a description is not one.
+    /// The same search, with the extended matches after the basic ones.
+    /// Every scope reads them: the reference opens in the caret's scope,
+    /// and a reader searching there asks the same question as anywhere.
     pub fn rank_in(&self, query: &str, snippets_last: bool, scope: ReferenceScope) -> Ranked {
         let filter = TagFilter::parse(query);
         let query = filter.rest;
-        let extended = scope
-            .is_browser()
-            .then(|| ExtendedQuery::parse(query))
-            .flatten();
+        let extended = ExtendedQuery::parse(query);
         let mut ranked = self
             .entries
             .iter()
