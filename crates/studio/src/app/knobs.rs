@@ -3691,6 +3691,25 @@ mod tests {
         app.drag_knob(at, Rect::new(0, 0, 24, 1), 18);
         assert!(app.inflight.is_empty() && app.pending_evaluation.is_none());
         assert_ne!(app.editor().source(), source, "the move wrote");
+        assert!(app.plays_but_live_moves(&app.editor().source()));
+        // A digit typed into the live number is an edit that waits.
+        let typed = |app: &mut App, text: &str, at: usize, to: usize| {
+            app.editor_mut()
+                .dispatch(
+                    crate::editor::Command::ReplaceRange {
+                        from: crate::editor::ByteOffset(at),
+                        to: crate::editor::ByteOffset(to),
+                        text: text.into(),
+                    },
+                    crate::editor::HistoryMoment(9),
+                    &mut crate::editor::MemoryClipboard::default(),
+                )
+                .expect("the typed edit");
+        };
+        let digit = app.editor().source().find("gain: 0.").expect("the gain") + "gain: 0.".len();
+        typed(&mut app, "0", digit, digit);
+        assert!(!app.plays_but_live_moves(&app.editor().source()));
+        typed(&mut app, "", digit, digit + 1);
         known(&mut app);
         let mix = row(&app, "mix");
         app.drag_knob(mix, Rect::new(0, 0, 24, 1), 12);

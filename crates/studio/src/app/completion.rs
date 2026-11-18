@@ -779,7 +779,18 @@ impl App {
             // call to follow: `if (x|)`, `function f(x|)`.
             let keyword = matches!(
                 &typed[name.clone()],
-                "if" | "for" | "while" | "switch" | "catch" | "function" | "return"
+                "if" | "for"
+                    | "while"
+                    | "switch"
+                    | "catch"
+                    | "function"
+                    | "return"
+                    | "typeof"
+                    | "await"
+                    | "delete"
+                    | "throw"
+                    | "void"
+                    | "yield"
             );
             let defined = lead.ends_with("function") && lead.len() < name.start;
             if !keyword && !defined {

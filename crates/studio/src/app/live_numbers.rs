@@ -115,6 +115,8 @@ struct LiveNumber {
     /// The value a rail last moved it to since the score was evaluated.
     /// The running score plays it, whatever was typed over it since.
     moved: Option<f64>,
+    /// The text that move wrote. Other text there was typed.
+    written: Option<String>,
 }
 
 impl App {
@@ -135,6 +137,7 @@ impl App {
                     id: number.id.clone(),
                     range,
                     moved: number.moved,
+                    written: number.written.clone(),
                 })
             })
             .collect()
@@ -169,6 +172,7 @@ impl App {
                 id: live_number_id(number.range.clone()),
                 range: number.range,
                 moved: None,
+                written: None,
             })
             .collect();
         let sent = numbers
@@ -310,7 +314,9 @@ impl App {
     /// Whether `source`, the current scene's text, is the playing score
     /// but for the numbers rails moved live: each live number's literal
     /// there, put in place of its cell's literal in the playing score,
-    /// gives `source` back.
+    /// gives `source` back, and holds what its rail last wrote - or, with
+    /// no move, what the playing score holds. A digit typed into a live
+    /// number is an edit that waits.
     pub(super) fn plays_but_live_moves(&self, source: &str) -> bool {
         let scene = self.scenes.current().id;
         let Some(installed) = self.evaluated_source.as_deref() else {
@@ -319,11 +325,27 @@ impl App {
         if installed == source {
             return true;
         }
-        let mut moves: Vec<(Range<usize>, Range<usize>)> = self
-            .live_numbers_now(scene)
+        let numbers = self.live_numbers_now(scene);
+        let mut moves: Vec<(Range<usize>, Range<usize>)> = numbers
             .into_iter()
-            .filter_map(|number| Some((live_number_range(&number.id)?, number.range)))
+            .map_while(|number| {
+                let cell = live_number_range(&number.id)?;
+                let now = source.get(number.range.clone())?;
+                let expected = number
+                    .written
+                    .as_deref()
+                    .or_else(|| installed.get(cell.clone()))?;
+                (now == expected).then_some((cell, number.range))
+            })
             .collect();
+        if moves.len()
+            != self
+                .live_numbers
+                .get(&scene)
+                .map_or(0, |set| set.numbers.len())
+        {
+            return false;
+        }
         moves.sort_by_key(|(cell, _)| cell.start);
         let rebuilt = (|| {
             let mut rebuilt = String::with_capacity(source.len());
@@ -368,6 +390,7 @@ impl App {
             id: live_number_id(literal.clone()),
             range: literal,
             moved: None,
+            written: None,
         });
         self.place_live_numbers(scene, numbers);
         self.next_evaluation = LaunchRequest {
@@ -458,10 +481,21 @@ impl App {
         {
             return false;
         }
+        // A value the rail already wrote is the text there now.
+        let written = moved
+            .and_then(|_| self.scenes.get(scene))
+            .and_then(|entry| {
+                entry
+                    .editor
+                    .source()
+                    .get(literal.clone())
+                    .map(str::to_owned)
+            });
         live.push(LiveNumber {
             id,
             range: literal,
             moved,
+            written,
         });
         self.place_live_numbers(scene, live);
         self.next_evaluation = LaunchRequest {
@@ -504,6 +538,7 @@ impl App {
                     return Some(LiveNumber {
                         range: written.clone(),
                         moved: Some(value),
+                        written: Some(text.to_owned()),
                         ..number
                     });
                 }
