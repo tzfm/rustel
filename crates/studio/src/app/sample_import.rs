@@ -1538,7 +1538,7 @@ mod tests {
         #[test]
         fn an_edit_onto_another_rows_source_is_refused() {
             let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
+            let mut app = crate::app::tests::support::app_over(directory.path());
             let specs: Vec<String> = ["a", "b"]
                 .into_iter()
                 .map(|name| {
