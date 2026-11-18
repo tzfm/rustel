@@ -345,6 +345,41 @@ impl Session {
         }
     }
 
+    /// Whether an onset goes out on a MIDI, OSC or serial route the way
+    /// [`Self::has_pending_external_output`] counts it: a MIDI intent with a
+    /// planned message, an approved OSC destination, or a serial write.
+    #[cfg(feature = "device-audio")]
+    pub(super) fn sends_externally(&self, onset: &OnsetEventJson) -> bool {
+        #[cfg(feature = "midi")]
+        if let Some(port) = crate::midi_bridge::midi_route(onset)
+            && self
+                .js
+                .with_runtime_settings(|| {
+                    crate::midi_bridge::midi_onset_with_port(onset, port.into_owned())
+                })
+                .is_some_and(|intent| {
+                    rustel_midi::has_output(&intent.controls)
+                        && !rustel_midi::plan(&intent.controls, intent.duration_secs).is_empty()
+                })
+        {
+            return true;
+        }
+        #[cfg(feature = "osc")]
+        if let Some((host, port)) = crate::osc_bridge::osc_route(onset)
+            && self.config.score_osc_access.approve(host, port).is_ok()
+        {
+            return true;
+        }
+        #[cfg(feature = "serial")]
+        if crate::serial_bridge::serial_route(onset).is_some()
+            && crate::serial_bridge::serial_onset(onset).is_some()
+        {
+            return true;
+        }
+        let _ = onset;
+        false
+    }
+
     #[cfg(feature = "device-audio")]
     pub(super) fn has_pending_external_output(&self) -> bool {
         #[cfg(feature = "serial")]

@@ -127,9 +127,9 @@ impl Session {
 
     /// What the active score does in the next
     /// [`REPLACEMENT_LOOK_AHEAD_CYCLES`] cycles from `now`. Asked only of a
-    /// replacement whose first window refused every onset, to tell a score
-    /// nothing can play from one whose first window fell where its sounds
-    /// are missing.
+    /// replacement whose first window refused every onset or held none, to
+    /// tell a score nothing can play from one whose first window fell where
+    /// its sounds are missing or between its notes.
     ///
     /// The span starts at `now`, not at the beginning of that cycle: an
     /// onset that has already passed is not evidence the replacement will
@@ -139,7 +139,7 @@ impl Session {
     /// It runs on the producer thread, so query and conversion share the
     /// same 15 ms ceiling as [`Self::kick_sample_loads_from`]. A look-ahead
     /// whose query fails answers [`ReplacementLookAhead::Nothing`] and the
-    /// replacement is refused as it was before this was asked; one that
+    /// replacement is judged as it was before this was asked; one that
     /// runs out of time answers the best evidence it has seen by then,
     /// rather than refusing a score already shown to play. Nothing is
     /// scheduled and nothing is reported: the onsets are converted and
@@ -174,12 +174,13 @@ impl Session {
         let generation = self.generation();
         let (look_ahead, _notices) = rustel_voice::with_diagnostic_policy(false, || {
             // Every onset in the stretch is converted, not only up to the
-            // first that renders: an invalid control anywhere ahead
-            // refuses the replacement the way the same voice in the first
-            // window would.
+            // first that renders: after a refused first window, an invalid
+            // control anywhere ahead refuses the replacement the way the
+            // same voice in the first window would.
             let mut rendered = false;
             let mut loading = None;
             let mut invalid_control = None;
+            let mut refused = None;
             for hap in haps.iter().filter(|hap| hap.has_onset()) {
                 if Instant::now() >= deadline {
                     break;
@@ -204,6 +205,12 @@ impl Session {
                     ui_visuals: hap.ui_visuals_context(),
                     log_line: None,
                 };
+                // An external route plays without a native voice, as it
+                // does in the first window.
+                if self.sends_externally(&onset) {
+                    rendered = true;
+                    continue;
+                }
                 match self.live_audio_event(&onset, sample_rate, cps, lookup) {
                     Ok(event) => {
                         self.csound.discard(&event.controls);
@@ -215,15 +222,17 @@ impl Session {
                     Err(error @ rustel_voice::VoiceError::InvalidControl(_)) => {
                         invalid_control.get_or_insert_with(|| error.to_string());
                     }
-                    Err(_) => {}
+                    Err(error) => refused = Some(error.to_string()),
                 }
             }
             if let Some(message) = invalid_control {
-                ReplacementLookAhead::InvalidControl(message)
+                ReplacementLookAhead::InvalidControl { message, rendered }
             } else if rendered {
                 ReplacementLookAhead::Renders
             } else if let Some(message) = loading {
                 ReplacementLookAhead::Loading(message)
+            } else if let Some(message) = refused {
+                ReplacementLookAhead::Refused(message)
             } else {
                 ReplacementLookAhead::Nothing
             }
@@ -1552,7 +1561,12 @@ impl Session {
         //     replacement prefill, look ahead:
         //       Renders                       -> Ok: publish, skip and log
         //       Loading                       -> AwaitingSamples (retry)
-        //       InvalidControl or Nothing     -> CandidateRefusedScore
+        //       InvalidControl, Refused, Nothing -> CandidateRefusedScore
+        //
+        //   no onset at all, replacement prefill, look ahead (below):
+        //     InvalidControl, nothing renders -> CandidateRefusedScore
+        //     Refused                         -> CandidateRefusedScore
+        //     anything else                   -> Ok: publish as before
         if !onsets.is_empty()
             && events.is_empty()
             && !self.has_pending_external_output()
@@ -1589,7 +1603,7 @@ impl Session {
                             )),
                         ));
                     }
-                    ReplacementLookAhead::InvalidControl(message) => {
+                    ReplacementLookAhead::InvalidControl { message, .. } => {
                         return Err(LiveAudioScheduleError::CandidateRefusedScore(
                             RuntimeError::Message(format!(
                                 "scalar audio refused a voice ahead of the \
@@ -1597,7 +1611,7 @@ impl Session {
                             )),
                         ));
                     }
-                    ReplacementLookAhead::Nothing => {
+                    ReplacementLookAhead::Refused(_) | ReplacementLookAhead::Nothing => {
                         return Err(LiveAudioScheduleError::CandidateRefusedScore(
                             RuntimeError::Message(format!(
                                 "scalar audio refused every onset of the \
@@ -1606,6 +1620,41 @@ impl Session {
                         ));
                     }
                 }
+            }
+        }
+        // A replacement whose first window holds no onset at all is judged
+        // on the cycles ahead. If none of its notes there can render, it is
+        // refused: once published there is no first window left to refuse
+        // it, and the set would go silent. Everything else publishes as it
+        // did before this check: a note that renders or goes out on an
+        // external route (an invalid voice beside it is skipped, as in
+        // steady state), silence, rests longer than the look-ahead, and
+        // samples still loading.
+        if replaces_score && onsets.is_empty() && !self.has_pending_external_output() {
+            match self.replacement_renders_ahead(now, sample_rate, lookup) {
+                ReplacementLookAhead::InvalidControl {
+                    message,
+                    rendered: false,
+                } => {
+                    return Err(LiveAudioScheduleError::CandidateRefusedScore(
+                        RuntimeError::Message(format!(
+                            "scalar audio refused a voice ahead of the \
+                             replacement's first window ({message})"
+                        )),
+                    ));
+                }
+                ReplacementLookAhead::Refused(message) => {
+                    return Err(LiveAudioScheduleError::CandidateRefusedScore(
+                        RuntimeError::Message(format!(
+                            "scalar audio refused every onset after the \
+                             replacement's first window ({message})"
+                        )),
+                    ));
+                }
+                ReplacementLookAhead::InvalidControl { rendered: true, .. }
+                | ReplacementLookAhead::Renders
+                | ReplacementLookAhead::Loading(_)
+                | ReplacementLookAhead::Nothing => {}
             }
         }
         // The window goes to the producer: its compensated events are the
@@ -2349,6 +2398,64 @@ mod tests {
                 &output,
                 voice("unknown-test-sample", 1.0),
             );
+        }
+
+        /// A replacement with no onset in its first window and only refused
+        /// notes after it is refused too, and the last audible score keeps
+        /// playing. The same score publishes when a note ahead renders, goes
+        /// out on a MIDI route, or waits for a sample still loading.
+        #[test]
+        fn an_empty_first_window_with_only_refused_notes_ahead_is_refused() {
+            let mut cases = vec![
+                ("unknown-test-sample", vec![], false),
+                ("sine", vec![], true),
+                ("held", vec![], true),
+            ];
+            #[cfg(feature = "midi")]
+            cases.push((
+                "unknown-test-sample",
+                vec![("midiport".into(), Value::Str("test-port".into()))],
+                true,
+            ));
+            for (sound_ahead, route, publishes) in cases {
+                let (mut session, mut producer, output) = confirmed_score();
+                session.samples = Some(Arc::new(
+                    crate::samples::SampleLibrary::with_loading_sample_for_test("held"),
+                ));
+                let cycle = session.scheduled_to_cycle().floor().max(0.0) as usize;
+                let horizon = REPLACEMENT_LOOK_AHEAD_CYCLES as usize;
+                // `pure` gives one onset a lane, at its cycle start: the lane
+                // `now` stands in has its onset behind it, and the next lane
+                // is a rest, so the first window holds no onset. The lane
+                // after that is the case's note, the last one refuses.
+                let lanes = (0..horizon)
+                    .map(|lane| {
+                        let offset = (lane + horizon - cycle % horizon) % horizon;
+                        let (sound, extra) = match offset {
+                            0 | 1 => return rustel_core::silence(),
+                            2 => (sound_ahead, route.clone()),
+                            _ => ("unknown-test-sample", Vec::new()),
+                        };
+                        let mut controls = vec![
+                            ("s".into(), Value::Str(sound.into())),
+                            ("note".into(), Value::F64(48.0)),
+                            ("gain".into(), Value::F64(0.05)),
+                        ];
+                        controls.extend(extra);
+                        pure(Value::object(controls))
+                    })
+                    .collect();
+                let candidate = rustel_core::slowcat(lanes);
+                if publishes {
+                    let events = publish_candidate(&mut session, &mut producer, &output, candidate);
+                    assert!(
+                        events.is_empty(),
+                        "{sound_ahead}: the first window is a rest: {events:?}"
+                    );
+                } else {
+                    assert_refused_candidate(&mut session, &mut producer, &output, candidate);
+                }
+            }
         }
 
         #[test]
