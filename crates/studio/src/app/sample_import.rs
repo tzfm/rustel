@@ -126,7 +126,7 @@ pub(super) fn is_midi_path(path: &std::path::Path) -> bool {
         })
 }
 
-fn normalized_sample_source(spec: &str) -> String {
+pub(super) fn normalized_sample_source(spec: &str) -> String {
     let spec = spec.trim();
     let path = std::path::Path::new(spec);
     if path.is_file()
@@ -1563,6 +1563,21 @@ mod tests {
                 .map(|source| source.spec.as_str())
                 .collect();
             assert_eq!(now, [specs[0].as_str(), specs[1].as_str()]);
+            assert!(
+                app.status.contains("already a sample source"),
+                "{}",
+                app.status
+            );
+
+            // Another spelling of the same folder is the same source.
+            let slashed = format!("{}{}", specs[0], std::path::MAIN_SEPARATOR);
+            app.status.clear();
+            app.open_set_prompt(SetPrompt::EditSampleSource(1));
+            if let Some((_, picker)) = app.set_prompt.as_mut() {
+                picker.offer(&slashed);
+            }
+            assert!(app.handle_set_prompt_key(KeyCode::Enter, false, false));
+            assert_eq!(app.prefs.sample_sources[1].spec, specs[1]);
             assert!(
                 app.status.contains("already a sample source"),
                 "{}",

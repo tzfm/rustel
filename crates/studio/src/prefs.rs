@@ -724,11 +724,11 @@ impl StudioPrefs {
         let Some(source) = self.sample_sources.get_mut(at) else {
             return false;
         };
-        let old = std::mem::replace(&mut source.spec, spec);
-        let spec = &self.sample_sources[at].spec;
-        if old == *spec {
+        if source.spec == spec {
             return false;
         }
+        let old = std::mem::replace(&mut source.spec, spec);
+        let spec = &self.sample_sources[at].spec;
         let shared = self.sample_sources.iter().any(|source| source.spec == old);
         // Cloned only when the old row's aliases must stay too.
         let aliases = if shared {
@@ -740,6 +740,25 @@ impl StudioPrefs {
             merge_aliases(&mut self.sample_source_renames, spec.clone(), aliases);
         }
         true
+    }
+
+    /// Whether a row other than `except` already names `spec`. A folder
+    /// matches however it is spelled: `local:`, a trailing slash, `..`.
+    pub fn another_row_names_source(&self, spec: &str, except: usize) -> bool {
+        let folder = |spec: &str| {
+            rustel_runtime::samples::folder_of_spec(spec)
+                .map(|folder| comparable_path(std::path::Path::new(&folder)))
+        };
+        let wanted = folder(spec);
+        self.sample_sources
+            .iter()
+            .enumerate()
+            .filter(|(row, _)| *row != except)
+            .any(|(_, source)| match (&wanted, folder(&source.spec)) {
+                (Some(wanted), Some(folder)) => *wanted == folder,
+                (None, None) => source.spec.trim() == spec.trim(),
+                _ => false,
+            })
     }
 
     /// Drop the source at `at` with its bank aliases. The aliases stay

@@ -1145,19 +1145,14 @@ impl App {
                     self.add_sample_source(&spec);
                 }
                 SetPrompt::EditSampleSource(at) => {
-                    let spec = path.to_string_lossy().trim().to_owned();
+                    let spec =
+                        super::sample_import::normalized_sample_source(&path.to_string_lossy());
                     self.return_from_source_prompt();
                     if self.refuse_set_output_source(&spec) {
                         return true;
                     }
-                    // As on add: one row per source.
-                    let taken = self
-                        .prefs
-                        .sample_sources
-                        .iter()
-                        .enumerate()
-                        .any(|(row, source)| row != at && source.spec == spec);
-                    if taken {
+                    // One row per source, however its folder is spelled.
+                    if self.prefs.another_row_names_source(&spec, at) {
                         self.status = format!("{spec} is already a sample source");
                         return true;
                     }
