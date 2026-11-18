@@ -1521,6 +1521,11 @@ mod tests {
         assert_eq!(text, None);
         assert!(status.starts_with("close the vst( call first"), "{status}");
 
+        let at_name = "$: n(\"c\").gain|(0.2)\n";
+        let (text, at, _) = pick(at_name);
+        assert_eq!(text.as_deref(), Some(call));
+        assert_eq!(at, at_name.find(")\n").expect("the end"), "after the )");
+
         let (text, at, _) = pick("$: n(\"c\").|");
         assert_eq!(text.as_deref(), Some("vsti(\"Serum 2\")"));
         assert_eq!(at, "$: n(\"c\").".len());

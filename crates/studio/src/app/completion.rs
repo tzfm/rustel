@@ -738,9 +738,6 @@ impl App {
     /// so a pick in `.vst("OTT", { gain: 1| })` follows the `)` and does not
     /// nest in the call. A call with no `)` yet has no end to follow.
     pub(super) fn link_place_at_caret(&self) -> LinkPlace {
-        if self.chain_position_at_caret().is_some() {
-            return LinkPlace::Here;
-        }
         let source = self.editor().source();
         let caret = self.editor().primary_selection().head.0;
         let Some(before) = source.get(..caret) else {
@@ -748,6 +745,24 @@ impl App {
         };
         let code = rustel_runtime::lint::code_only(&source);
         let typed = rustel_runtime::lint::code_only(before);
+        let past = |open: usize, callee: String| match super::args::members(&code, open, false)
+            .and_then(|members| members.last().map(|last| last.end))
+        {
+            Some(close) => LinkPlace::After(close + 1),
+            None => LinkPlace::Open(callee),
+        };
+        // Between a call's name and its `(`, as in `gain|(0.2)`, the
+        // caret is on that call.
+        let rest = &code[caret..];
+        let gap = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+        if code.as_bytes().get(caret + gap) == Some(&b'(')
+            && let Some(name) = scan::name_before(&typed, typed.len())
+        {
+            return past(caret + gap, typed[name].to_owned());
+        }
+        if self.chain_position_at_caret().is_some() {
+            return LinkPlace::Here;
+        }
         for open in scan::open_parens(&typed, typed.len()) {
             let Some(name) = scan::name_before(&typed, open) else {
                 continue;
@@ -755,13 +770,7 @@ impl App {
             if !typed[..name.start].trim_end().ends_with('.') {
                 continue;
             }
-            let callee = typed[name].to_owned();
-            return match super::args::members(&code, open, false)
-                .and_then(|members| members.last().map(|last| last.end))
-            {
-                Some(close) => LinkPlace::After(close + 1),
-                None => LinkPlace::Open(callee),
-            };
+            return past(open, typed[name].to_owned());
         }
         LinkPlace::Here
     }
