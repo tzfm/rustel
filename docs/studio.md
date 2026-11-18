@@ -697,9 +697,10 @@ auto evaluate off, keeps the typing pause.
 
 While the set plays and auto evaluate is off, a rail that the next update
 must carry is muted, on a dashed rail, with "not live" beside its value.
-Its hint says "plays after an update". That is a number the playing score does not hold yet, such as the
-`8` of a `seg(8)` you typed and did not evaluate, or a number no live cell
-can stand in for. The move still writes the score.
+Its hint says "plays after an update". That is a number the playing score
+does not hold yet, such as the `8` of a `seg(8)` you typed and did not
+evaluate, or a number no live cell can stand in for. The move still writes
+the score.
 
 A number with no `slider(...)` gets bounds the studio works out:
 
