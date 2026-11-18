@@ -1151,9 +1151,9 @@ impl App {
                     if self.refuse_set_output_source(&spec) {
                         return true;
                     }
-                    // One row per source, however its folder is spelled.
-                    if self.prefs.another_row_names_source(&spec, at) {
-                        self.status = format!("{spec} is already a sample source");
+                    // One row per source, as add keeps it.
+                    if self.prefs.edit_folds_sources(at, &spec) {
+                        self.status = format!("{spec} overlaps another sample source");
                         return true;
                     }
                     if self.prefs.change_sample_source(at, spec.clone()) {

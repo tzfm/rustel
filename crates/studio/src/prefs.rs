@@ -742,23 +742,29 @@ impl StudioPrefs {
         true
     }
 
-    /// Whether a row other than `except` already names `spec`. A folder
-    /// matches however it is spelled: `local:`, a trailing slash, `..`.
-    pub fn another_row_names_source(&self, spec: &str, except: usize) -> bool {
-        let folder = |spec: &str| {
-            rustel_runtime::samples::folder_of_spec(spec)
-                .map(|folder| comparable_path(std::path::Path::new(&folder)))
-        };
-        let wanted = folder(spec);
-        self.sample_sources
+    /// Whether pointing row `at` at `spec` would fold one row into
+    /// another: the same source, or one folder inside the other, however
+    /// it is spelled. The fold itself is `deduplicate_sample_sources`.
+    pub fn edit_folds_sources(&self, at: usize, spec: &str) -> bool {
+        let same = self
+            .sample_sources
             .iter()
             .enumerate()
-            .filter(|(row, _)| *row != except)
-            .any(|(_, source)| match (&wanted, folder(&source.spec)) {
-                (Some(wanted), Some(folder)) => *wanted == folder,
-                (None, None) => source.spec.trim() == spec.trim(),
-                _ => false,
-            })
+            .any(|(row, source)| row != at && source.spec.trim() == spec.trim());
+        let dropped = |sources: &[rustel_runtime::samples::GlobalSource]| {
+            let (kept, _) =
+                rustel_runtime::samples::deduplicated_global_sources_with_owners(sources);
+            sources.len() - kept.len()
+        };
+        let now = self.global_sources();
+        let mut trial = now.clone();
+        let Some(row) = trial.get_mut(at) else {
+            return false;
+        };
+        row.spec = spec.to_owned();
+        // An off row folds in too, once it is turned back on.
+        row.enabled = true;
+        same || dropped(&trial) > dropped(&now)
     }
 
     /// Drop the source at `at` with its bank aliases. The aliases stay
