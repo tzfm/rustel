@@ -46,24 +46,30 @@ pub(super) fn takes_a_live_number(callee: &str, control: bool, at: usize) -> boo
     (control && at == 0) || PATTERNIFIED.get(callee).is_some_and(|count| at < *count)
 }
 
-/// Whether the score defines `name` itself - a `function`, a `const`,
-/// `let` or `var`, or a `register` call - so its calls are the score's own
-/// and take their numbers as they are written.
+/// Whether the score defines `name` itself, so its calls are the score's
+/// own and take their numbers as they are written: a `function` of that
+/// name, a `register` of it, or the name bound any other way - `const`,
+/// `let`, `var`, a destructuring `{ name }`. A name the score only calls,
+/// as `name(` or `.name(`, or uses as an object key, is not its own.
 pub(super) fn defined_in(source: &str, name: &str) -> bool {
     let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '$');
+    let quote = |c: char| matches!(c, '\'' | '"' | '`');
     source.match_indices(name).any(|(at, _)| {
         let (before, after) = (&source[..at], &source[at + name.len()..]);
         if before.ends_with(word) || after.starts_with(word) {
             return false;
         }
-        let quoted = before
-            .strip_suffix(['\'', '"', '`'])
-            .is_some_and(|before| before.trim_end().ends_with("register("));
+        if before.ends_with(quote) {
+            return before[..before.len() - 1].trim_end().ends_with("register(");
+        }
         let declared = before.trim_end();
-        quoted
-            || ["function", "const", "let", "var"]
-                .iter()
-                .any(|keyword| declared.ends_with(keyword) && declared.len() < before.len())
+        if declared.ends_with("function") && declared.len() < before.len() {
+            return true;
+        }
+        // A binding: neither a call, nor a method, nor a key, nor a word of
+        // a string.
+        let next = after.trim_start().chars().next();
+        !declared.ends_with('.') && !after.starts_with(quote) && !matches!(next, Some('(' | ':'))
     })
 }
 
@@ -194,36 +200,39 @@ impl App {
             && self.current_prebake().is_none()
     }
 
-    /// Whether the scene's number at `literal`, a range of its current
-    /// text, is live already or held as it is by the playing score, with
-    /// the text `held` that leads to it, so a rail moves it live.
-    pub(super) fn number_plays(
+    /// Whether a rail moves the scene's number at `literal` live: it is
+    /// live already, or the playing score holds it as it is, with the text
+    /// `held` that leads to it, and the layout has room for its cell.
+    /// `source` is the scene's current text.
+    pub(super) fn number_moves_live(
         &self,
         scene: SceneId,
+        source: &str,
         held: Range<usize>,
         literal: Range<usize>,
     ) -> bool {
         self.live_numbers_now(scene)
             .iter()
             .any(|number| number.range == literal)
-            || self.playing_literal(scene, held, literal).is_some()
+            || (self.sliders.len() < MAX_UI_LAYOUT_SLIDERS
+                && self.playing_literal(scene, source, held, literal).is_some())
     }
 
-    /// The number at `literal`, a range of the scene's current text, as
-    /// the playing score holds it. `held`, the text from the call's name to
-    /// the number, is the same text there, which the edits since moved to
-    /// where it is now. A number typed or retyped since, or a call renamed
-    /// since, is not in the playing score.
+    /// The number at `literal`, a range of `source`, the scene's current
+    /// text, as the playing score holds it. `held`, the text from the
+    /// call's name to the number, is the same text there, which the edits
+    /// since moved to where it is now. A number typed or retyped since, or
+    /// a call renamed since, is not in the playing score.
     fn playing_literal(
         &self,
         scene: SceneId,
+        source: &str,
         held: Range<usize>,
         literal: Range<usize>,
     ) -> Option<Range<usize>> {
         let installed = self.evaluated_source.as_deref()?;
         let at = self.visual_revision?;
         let editor = &self.scenes.get(scene)?.editor;
-        let source = editor.source();
         let text = source.get(held.clone())?;
         let offset = literal.start.checked_sub(held.start)?;
         installed
@@ -252,7 +261,10 @@ impl App {
         else {
             return false;
         };
-        let Some(new) = self.playing_literal(scene, held, literal.clone()) else {
+        let Some(source) = self.scenes.get(scene).map(|entry| entry.editor.source()) else {
+            return false;
+        };
+        let Some(new) = self.playing_literal(scene, &source, held, literal.clone()) else {
             return false;
         };
         // The numbers that are live already, by the cells the playing score
@@ -746,8 +758,14 @@ mod tests {
         assert!(defined_in("const seg = (n, p) => p; seg(4, x)", "seg"));
         assert!(defined_in("function fast(n) {}", "fast"));
         assert!(defined_in("register('pg', (x, pat) => pat)", "pg"));
+        assert!(defined_in("const { fast } = lib; fast(2, x)", "fast"));
         assert!(!defined_in("$: s(\"bd\").seg(4)", "seg"));
         assert!(!defined_in("const segment = 4; s(\"bd\").seg(4)", "seg"));
+        assert!(!defined_in(
+            "$: s(\"bd\").set({ lpf: 800 }).lpf(400)",
+            "lpf"
+        ));
+        assert!(!defined_in("$: s(\"fast bd\").fast(2)", "fast"));
     }
 
     /// A stopped set has no score to move: the rail writes the score, and

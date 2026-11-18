@@ -567,7 +567,7 @@ mod tests {
         // Generation 7 has been evaluated; the device is still on 6.
         assert!(
             delivery
-                .observe(source, 7, Default::default)
+                .observe(source, 7, || Arc::from([]))
                 .expect("layout")
         );
         assert!(delivery.try_deliver(&mut accepted));
@@ -657,7 +657,7 @@ mod tests {
         let source = "note(\"c4\").scope()";
         assert!(
             delivery
-                .observe(source, 7, Default::default)
+                .observe(source, 7, || Arc::from([]))
                 .expect("layout")
         );
         assert!(!delivery.ready_for(7));
@@ -680,7 +680,7 @@ mod tests {
         let mut delivery = LayoutDelivery::default();
         assert!(
             delivery
-                .observe("note(60)._pianoroll()", 1, Default::default)
+                .observe("note(60)._pianoroll()", 1, || Arc::from([]))
                 .expect("initial layout")
         );
         assert!(delivery.try_deliver(&mut accepted));
@@ -691,7 +691,7 @@ mod tests {
         )
         .collect::<Vec<_>>()
         .join(";\n");
-        assert!(delivery.observe(&invalid, 2, Default::default).is_err());
+        assert!(delivery.observe(&invalid, 2, || Arc::from([])).is_err());
         let reset = delivery.pending.as_ref().expect("empty reset layout");
         assert_eq!(reset.ui_layout.generation, 2);
         assert_eq!(reset.ui_layout.source_revision, source_revision(&invalid));

@@ -2246,8 +2246,7 @@ impl App {
         if unchanged {
             return true;
         }
-        if self.knob_takes_a_live_number(knob)
-            && let Some(held) = self.knob_held(&literal)
+        if let Some(held) = self.knob_live_held(knob, &self.editor().source())
             && self.move_live_number(held, literal.clone(), value, &text)
         {
             return true;
@@ -2268,6 +2267,8 @@ impl App {
             return;
         };
         let chips = self.live_chips(scene);
+        // One copy of the text for every rail of the frame.
+        let source = self.editor().source();
         let waits: Vec<bool> = rows
             .knobs
             .iter()
@@ -2279,10 +2280,9 @@ impl App {
                 let fader = chips
                     .iter()
                     .any(|chip| chip.span.from <= literal.start && literal.end <= chip.span.to);
-                let moves_live = self.knob_takes_a_live_number(knob)
-                    && self
-                        .knob_held(&literal)
-                        .is_some_and(|held| self.number_plays(scene, held, literal.clone()));
+                let moves_live = self
+                    .knob_live_held(knob, &source)
+                    .is_some_and(|held| self.number_moves_live(scene, &source, held, literal));
                 !fader && !moves_live
             })
             .collect();
@@ -2293,34 +2293,29 @@ impl App {
         }
     }
 
-    /// Whether a live cell can stand in for a rail's plain number: see
-    /// [`super::live_numbers::takes_a_live_number`]. An entry of an options
-    /// object is read as it is written, so a cell there would not be a
-    /// number.
-    fn knob_takes_a_live_number(&self, knob: &Knob) -> bool {
+    /// The bytes of `source`, the current score, that a live move of the
+    /// rail's number relies on - from the call's name to the number - when
+    /// a live cell can stand in for that number: see
+    /// [`super::live_numbers::takes_a_live_number`]. While the playing
+    /// score holds those bytes as they are, its number there is the one the
+    /// rail moves. An entry of an options object is read as it is written,
+    /// so a cell there would not be a number.
+    fn knob_live_held(&self, knob: &Knob, source: &str) -> Option<Range<usize>> {
         let KnobPlace::Argument(at) = knob.place else {
-            return false;
+            return None;
         };
-        knob.state
+        let literal = &knob
+            .state
             .as_ref()
-            .is_some_and(|state| state.fader.is_none())
-            && self
-                .knobs_parse
-                .as_ref()
-                .and_then(|parse| parse.call.as_ref())
-                .is_some_and(|call| {
-                    call.plugin.is_none()
-                        && super::live_numbers::takes_a_live_number(&call.name, call.control, at)
-                        && !super::live_numbers::defined_in(&self.editor().source(), &call.name)
-                })
-    }
-
-    /// The score's bytes a live move of a rail's number relies on: from
-    /// the call's name to the number. While the playing score holds them
-    /// as they are, its number there is the one the rail moves.
-    fn knob_held(&self, literal: &Range<usize>) -> Option<Range<usize>> {
+            .filter(|state| state.fader.is_none())?
+            .literal;
         let call = self.knobs_parse.as_ref()?.call.as_ref()?;
-        let source = self.editor().source();
+        let live = call.plugin.is_none()
+            && super::live_numbers::takes_a_live_number(&call.name, call.control, at)
+            && !super::live_numbers::defined_in(source, &call.name);
+        if !live {
+            return None;
+        }
         let before = source.get(..call.open)?.trim_end();
         let start = before.strip_suffix(call.name.as_str())?.len();
         (start <= literal.start).then_some(start..literal.end)

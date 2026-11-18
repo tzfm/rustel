@@ -1118,7 +1118,7 @@ impl App {
             }
             Ok(install) => {
                 self.visual.start();
-                self.layout_due = sent.as_ref().map(|sent| source_revision(&sent.source));
+                self.layout_due = Some(install.source_revision.clone());
                 if let Some(sent) = &sent.as_ref().filter(|sent| sent.record) {
                     self.record_save(SaveStatus::Installed, &sent.source, None, None);
                 }
