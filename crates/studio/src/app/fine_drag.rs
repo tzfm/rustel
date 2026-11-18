@@ -54,8 +54,8 @@ impl FineDrag {
     }
 
     /// The drag follows a grip, not the pointer's place.
-    pub(super) fn relative(&self) -> bool {
-        self.grip.is_some() || self.fine()
+    pub(super) fn gripped(&self) -> bool {
+        self.grip.is_some()
     }
 
     /// The rail ratio a pointer at `pointer` sets, and the gain it moved
@@ -147,7 +147,7 @@ mod tests {
     fn a_plain_drag_follows_the_pointer() {
         let mut drag = fine(false);
         assert_eq!(drag.follow(0.8, 0.2), (0.8, 1.0));
-        assert!(!drag.relative());
+        assert!(!drag.gripped());
     }
 
     #[test]
@@ -170,7 +170,7 @@ mod tests {
         assert_eq!(gain, 1.0);
         let (ratio, _) = drag.follow(0.8, 0.0);
         assert!((ratio - 0.62).abs() < 1e-12, "{ratio}");
-        assert!(!drag.active() && drag.relative());
+        assert!(!drag.active() && drag.gripped());
     }
 
     #[test]

@@ -2771,9 +2771,9 @@ impl App {
         if rail.width < 3 {
             return;
         }
-        // The off stop is a place on the rail: a relative drag rests at
-        // the rail's minimum instead.
-        if knob.optional && x <= rail.x && !self.fine_drag.relative() {
+        // The off stop is a place on the rail: the press finds it, a
+        // relative drag already holding a grip moves past it.
+        if knob.optional && x <= rail.x && !self.fine_drag.gripped() {
             if knob.state.is_some() {
                 self.knob_off(&knob);
             }

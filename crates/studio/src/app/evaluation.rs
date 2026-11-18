@@ -821,7 +821,9 @@ impl App {
                 // evaluation at all, which is why this is not recorded at
                 // evaluation time.
                 self.installed_revision = Some(hash.clone());
-                if self.layout_due.as_ref() == Some(&hash) {
+                let generation = layout.ui_layout.generation;
+                self.layout_generation = Some(generation);
+                if self.layout_due.is_some_and(|due| due <= generation) {
                     self.layout_due = None;
                 }
                 let evaluated = self.evaluation_revisions.get(&hash);
@@ -1119,10 +1121,12 @@ impl App {
             Ok(install) => {
                 self.visual.start();
                 // A held update can land its layout before this answer:
-                // then nothing is due.
-                self.layout_due = (self.installed_revision.as_ref()
-                    != Some(&install.source_revision))
-                .then(|| install.source_revision.clone());
+                // then nothing is due. Generations, not hashes: a reinstall
+                // of the same text still owes its own layout.
+                self.layout_due = self
+                    .layout_generation
+                    .is_none_or(|landed| landed < install.generation)
+                    .then_some(install.generation);
                 if let Some(sent) = &sent.as_ref().filter(|sent| sent.record) {
                     self.record_save(SaveStatus::Installed, &sent.source, None, None);
                 }
@@ -2087,6 +2091,52 @@ mod tests {
                 "the answer does not restart the visuals"
             );
             assert!(!app.is_evaluating(), "both requests were answered");
+        }
+
+        /// A reinstall of the same text owes its own layout: until that
+        /// layout lands, the cells the reinstall made are not known yet.
+        #[test]
+        fn a_reinstall_of_the_same_text_owes_its_own_layout() {
+            use rustel_runtime::ui_events::{UiLayout, UiLayoutEnvelope, source_revision};
+            let revision = source_revision("$: s(\"bd\")");
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let layout = |generation| {
+                StudioControlEvent::Layout(UiLayoutEnvelope::new(
+                    UiLayout::new(
+                        generation,
+                        revision.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .expect("a layout"),
+                ))
+            };
+            let install = |generation| crate::StudioInstall {
+                generation,
+                source_revision: revision.clone(),
+                pending_cutover: false,
+                answered_repeat: false,
+                held: false,
+            };
+            app.handle_control(layout(1));
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: 1,
+                editor_revision: 0,
+                result: Ok(install(2)),
+            });
+            assert_eq!(app.layout_due, Some(2), "the same text, a new generation");
+            app.handle_control(layout(2));
+            assert_eq!(app.layout_due, None);
+
+            app.handle_control(layout(3));
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: 2,
+                editor_revision: 0,
+                result: Ok(install(3)),
+            });
+            assert_eq!(app.layout_due, None, "its layout came first");
         }
 
         /// A live replacement can report several layers of engine routing around

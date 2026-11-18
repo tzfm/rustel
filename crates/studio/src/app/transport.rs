@@ -339,6 +339,7 @@ impl App {
         self.pending_sliders.clear();
         // No layout is owed by a set that stopped.
         self.layout_due = None;
+        self.layout_generation = None;
         self.launch_arming.cancel();
         #[cfg(feature = "hydra")]
         self.end_snippet_audition();

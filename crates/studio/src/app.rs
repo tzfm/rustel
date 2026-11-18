@@ -1262,9 +1262,11 @@ struct App {
     /// stack up faster than the music absorbs them, and it is audible.
     installed_revision: Option<String>,
     inflight: HashMap<u64, PendingEvaluation>,
-    /// Hash of a text the engine installed whose layout has not landed
-    /// yet. Until it lands, `evaluated_source` names the score before it.
-    layout_due: Option<String>,
+    /// Generation the engine installed whose layout has not landed yet.
+    /// Until it lands, `evaluated_source` names the score before it.
+    layout_due: Option<u64>,
+    /// Generation of the last layout that landed.
+    layout_generation: Option<u64>,
     /// The text the footer's update message is about: the scene and the
     /// revision the engine refused. Once that text has changed and the
     /// checker finds it fine, the message comes down without waiting for
@@ -1877,6 +1879,7 @@ impl App {
             evaluation_revisions,
             installed_revision: None,
             layout_due: None,
+            layout_generation: None,
             inflight: HashMap::new(),
             update_failure: None,
             blocked_imports: Vec::new(),

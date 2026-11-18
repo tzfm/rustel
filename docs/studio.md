@@ -688,7 +688,7 @@ A plain number that the engine reads as a pattern also sounds at once while
 the set plays, with no update and with auto evaluate on or off. That is the
 number of an audio control, such as the `4000` of `lpf(4000)`, and each
 number of a function such as `pg(0.8)`, `fast(2)` or `seg(4)`, and the
-distortion and volume of an `FX` waveshaper such as `soft(4.5)`. The first
+distortion of an `FX` waveshaper such as `soft(4.5)`. The first
 move installs the playing score again, unchanged, with that number live.
 Edits you have not evaluated stay out of the sound. After that each move
 sets the number, as a slider does. A number in an options object, of a
@@ -741,7 +741,8 @@ from there, with no jump. Some terminals keep a Shift or Alt drag for their
 own text selection. Press f in the column or in the expanded slider to lock
 fine drags on, and f again to turn the lock off. The column's title says
 "fine" while the lock is on, and the status line says "fine" during a fine
-drag.
+drag. A press on the off stop still turns the rail off. A fine drag that
+took hold moves past it to the rail's minimum.
 
 The far left of a rail is an off stop. On an object entry it takes the entry
 out of the score and leaves its comments where they are. Backspace or

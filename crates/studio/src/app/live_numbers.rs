@@ -44,8 +44,8 @@ pub(super) fn takes_a_live_number(callee: &str, control: bool, at: usize) -> boo
             .collect()
     });
     // A waveshaper of an `FX` stage, such as `soft(4.5)`, reads its
-    // distortion and its volume as patterns.
-    let waveshaper = rustel_audio::DISTORTION_ALGORITHMS.contains(&callee) && at < 2;
+    // first number as a pattern. The engine reads no second one.
+    let waveshaper = rustel_audio::DISTORTION_ALGORITHMS.contains(&callee) && at == 0;
     (control && at == 0) || waveshaper || PATTERNIFIED.get(callee).is_some_and(|count| at < *count)
 }
 
@@ -56,11 +56,14 @@ pub(super) fn takes_a_live_number(callee: &str, control: bool, at: usize) -> boo
 /// as `name(` or `.name(`, uses as an object key, or writes in a string or
 /// a comment, is not its own.
 pub(super) fn defined_in(source: &str, name: &str) -> bool {
-    registered(source, name) || bound(&rustel_runtime::lint::code_only(source), name)
+    let code = rustel_runtime::lint::code_only(source);
+    registered(source, &code, name) || bound(&code, name)
 }
 
-/// `register('name', …)`, with any quote.
-fn registered(source: &str, name: &str) -> bool {
+/// `register('name', …)`, with any quote. `code` is `source` with its
+/// strings and comments blanked, so a `register(` there is a real call.
+fn registered(source: &str, code: &str, name: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '$');
     source.match_indices(name).any(|(at, _)| {
         let (before, after) = (&source[..at], &source[at + name.len()..]);
         let Some(quote) = before
@@ -70,7 +73,10 @@ fn registered(source: &str, name: &str) -> bool {
         else {
             return false;
         };
-        after.starts_with(quote) && before[..before.len() - 1].trim_end().ends_with("register(")
+        let Some(call) = code[..at - 1].trim_end().strip_suffix("register(") else {
+            return false;
+        };
+        after.starts_with(quote) && !call.ends_with(word)
     })
 }
 
@@ -697,11 +703,11 @@ mod tests {
         #[cfg(feature = "extensions")]
         assert!(takes_a_live_number("pg", false, 0), "an extension function");
         assert!(takes_a_live_number("euclid", false, 1));
+        assert!(takes_a_live_number("fold", false, 0), "a waveshaper");
         assert!(
-            takes_a_live_number("fold", false, 1),
-            "a waveshaper's volume"
+            !takes_a_live_number("fold", false, 1),
+            "the engine reads no volume"
         );
-        assert!(!takes_a_live_number("fold", false, 2));
         assert!(
             !takes_a_live_number("euclid", false, 2),
             "the pattern itself"
@@ -751,7 +757,7 @@ mod tests {
         assert!(sent(&app).is_empty(), "hpf is not the playing lpf");
 
         let mut app = playing_with_an_unevaluated_edit(directory.path(), CUTOFF, "4000");
-        app.layout_due = Some(source_revision("a newer score"));
+        app.layout_due = Some(u64::MAX);
         app.drag_knob(0, Rect::new(0, 0, 24, 1), 4);
         assert!(!app.editor().source().contains("4000"), "the rail wrote");
         assert!(sent(&app).is_empty(), "the newer score is not replaced");
@@ -795,6 +801,14 @@ mod tests {
         assert!(!defined_in("$: s(\"fast bd\").fast(2)", "fast"));
         assert!(!defined_in("$: s(\"go fast now\").fast(2)", "fast"));
         assert!(!defined_in("$: s(\"x\").lpf(800) // lpf sweep", "lpf"));
+        assert!(!defined_in(
+            "// register('fast', f)\n$: s(\"bd\").fast(2)",
+            "fast"
+        ));
+        assert!(!defined_in(
+            "myregister('fast', f); $: s(\"bd\").fast(2)",
+            "fast"
+        ));
     }
 
     /// A stopped set has no score to move: the rail writes the score, and
