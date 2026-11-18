@@ -1,6 +1,7 @@
 //! Layout delivery, trace correlation, preview updates, and UI audio analysis.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rustel_audio::{LIVE_ANALYSIS_WINDOW_SAMPLES, LiveScalarDevice};
@@ -44,18 +45,18 @@ pub(super) struct LayoutDelivery {
 }
 
 impl LayoutDelivery {
-    /// `live_numbers` are the numbers the evaluation made live: each is a
-    /// slider of the layout.
+    /// `live_numbers` gives the numbers the evaluation made live: each is a
+    /// slider of the layout. It is read only for a new generation.
     pub(super) fn observe(
         &mut self,
         source: &str,
         generation: u64,
-        live_numbers: &[std::ops::Range<usize>],
+        live_numbers: impl FnOnce() -> Arc<[std::ops::Range<usize>]>,
     ) -> Result<bool, UiLayoutValidationError> {
         if self.observed_generation == Some(generation) {
             return Ok(false);
         }
-        let parsed = visual_layout_with_live_numbers(source, generation, live_numbers);
+        let parsed = visual_layout_with_live_numbers(source, generation, &live_numbers());
         self.observed_generation = Some(generation);
         self.delivered_generation = None;
         self.source_revision = None;
@@ -415,10 +416,11 @@ impl StudioUiState {
             self.generation_sources
                 .entry(session_generation)
                 .or_insert_with(|| (source_revision(source), session.cps()));
-            let live_numbers = session.live_numbers(source);
+            // Hashing the text each turn would cost the producer: only a
+            // new generation asks for its live numbers.
             match self
                 .layout
-                .observe(source, session_generation, &live_numbers)
+                .observe(source, session_generation, || session.live_numbers(source))
             {
                 Ok(true) => self.layout.sync_slider_values(session),
                 Ok(false) => {}
@@ -563,7 +565,11 @@ mod tests {
         assert!(!delivery.delivered());
 
         // Generation 7 has been evaluated; the device is still on 6.
-        assert!(delivery.observe(source, 7, &[]).expect("layout"));
+        assert!(
+            delivery
+                .observe(source, 7, Default::default)
+                .expect("layout")
+        );
         assert!(delivery.try_deliver(&mut accepted));
 
         assert!(delivery.delivered());
@@ -649,7 +655,11 @@ mod tests {
     fn layout_is_retried_and_gates_its_generation() {
         let mut delivery = LayoutDelivery::default();
         let source = "note(\"c4\").scope()";
-        assert!(delivery.observe(source, 7, &[]).expect("layout"));
+        assert!(
+            delivery
+                .observe(source, 7, Default::default)
+                .expect("layout")
+        );
         assert!(!delivery.ready_for(7));
 
         let mut refused = |update| match update {
@@ -670,7 +680,7 @@ mod tests {
         let mut delivery = LayoutDelivery::default();
         assert!(
             delivery
-                .observe("note(60)._pianoroll()", 1, &[])
+                .observe("note(60)._pianoroll()", 1, Default::default)
                 .expect("initial layout")
         );
         assert!(delivery.try_deliver(&mut accepted));
@@ -681,7 +691,7 @@ mod tests {
         )
         .collect::<Vec<_>>()
         .join(";\n");
-        assert!(delivery.observe(&invalid, 2, &[]).is_err());
+        assert!(delivery.observe(&invalid, 2, Default::default).is_err());
         let reset = delivery.pending.as_ref().expect("empty reset layout");
         assert_eq!(reset.ui_layout.generation, 2);
         assert_eq!(reset.ui_layout.source_revision, source_revision(&invalid));
