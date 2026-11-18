@@ -602,6 +602,7 @@ impl KnobsView<'_> {
             Some(0) => "→ opens the presets",
             Some(_) => "Enter takes · ← closes",
             None => match self.knobs.get(self.panel.selected) {
+                Some(knob) if knob.waits && knob.optional => "⌫ off · plays on update",
                 Some(knob) if knob.waits => "plays after an update",
                 Some(knob) if knob.optional && knob.state.is_none() => "→ on · e edit · f fine",
                 Some(knob) if knob.optional => "⌫ off · e edit · f fine",

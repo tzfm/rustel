@@ -314,7 +314,8 @@ impl App {
     /// update is on its way.
     pub(super) fn update_with_new_number(&mut self, before: &str, literal: Range<usize>) -> bool {
         let scene = self.scenes.current().id;
-        if !self.plays_live(scene)
+        if !self.engine_connected
+            || !self.plays_live(scene)
             || self.reinstall_on_its_way()
             || self.launch_arming.is_armed()
             || self.sliders.len() >= MAX_UI_LAYOUT_SLIDERS

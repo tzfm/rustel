@@ -698,12 +698,14 @@ each move sets the number, as a slider does. Any other number in an options
 object, a number in the other places of a plugin call, or a number of a
 function defined in the score sounds at once while the set plays and auto
 evaluate is on, with the next update. A stopped set, or auto evaluate off,
-keeps the typing pause. A plugin key that a rail turns on sounds at once
-too, as an update of its own, when no other edit waits for an update.
+keeps the typing pause. While the set plays, a plugin key that a rail
+turns on sounds at once, as an update of its own, when no other edit waits
+for an update.
 
 While the set plays and auto evaluate is off, a rail that the next update
 must carry is muted, on a dashed rail, with "not live" beside its value.
-Its hint says "plays after an update". That is a number the playing score
+Its hint says "plays after an update", or "⌫ off · plays on update" for an
+entry with an off stop. That is a number the playing score
 does not hold yet, such as the `8` of a `seg(8)` you typed and did not
 evaluate, or a number no live cell can stand in for. The move still writes
 the score.

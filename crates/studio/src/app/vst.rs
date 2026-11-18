@@ -1531,6 +1531,15 @@ mod tests {
         assert_eq!(text.as_deref(), Some(call));
         assert_eq!(at, free.find(")\n").expect("the end"), "after s's )");
 
+        let defined = "function f(x) { return n(\"c\"|) }\n";
+        let (text, at, _) = pick(defined);
+        assert_eq!(text.as_deref(), Some(call));
+        assert_eq!(
+            at,
+            defined.find(") }").expect("n's end"),
+            "after n's ), not f's"
+        );
+
         let split = "$: n(\"c\").gain|\n  (0.2)\n";
         let (text, at, _) = pick(split);
         assert_eq!(text.as_deref(), Some(call));

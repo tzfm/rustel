@@ -771,10 +771,20 @@ impl App {
             let Some(name) = scan::name_before(&typed, open) else {
                 continue;
             };
-            if typed[..name.start].trim_end().ends_with('.') {
+            let lead = typed[..name.start].trim_end();
+            if lead.ends_with('.') {
                 return past(open, typed[name].to_owned());
             }
-            outermost = Some((open, name));
+            // A keyword's brackets, or a function's parameters, are no
+            // call to follow: `if (x|)`, `function f(x|)`.
+            let keyword = matches!(
+                &typed[name.clone()],
+                "if" | "for" | "while" | "switch" | "catch" | "function" | "return"
+            );
+            let defined = lead.ends_with("function") && lead.len() < name.start;
+            if !keyword && !defined {
+                outermost = Some((open, name));
+            }
         }
         match outermost {
             Some((open, name)) => past(open, typed[name].to_owned()),
