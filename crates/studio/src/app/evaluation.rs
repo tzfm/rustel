@@ -1213,6 +1213,10 @@ impl App {
     /// held can sound again, so its check and update alerts resolve.
     pub(super) fn resolve_left_scene_alerts(&mut self, scene: SceneId) {
         self.evaluation_alerts.remove(&scene);
+        if self.update_failure.is_some_and(|(about, _)| about == scene) {
+            self.update_failure = None;
+            self.clear_error(ErrorOwner::Evaluation);
+        }
         let resolved = self.log.resolve_alert(&format!("evaluation:{scene:?}"))
             + self.log.resolve_alert(&lint_alert(scene));
         self.dirty_frame |= resolved > 0;
@@ -2712,6 +2716,11 @@ mod tests {
                 unseen_before + 1,
                 "the open tab keeps its own"
             );
+            assert_eq!(
+                app.update_failure, None,
+                "the footer lets the closed tab go"
+            );
+            assert_eq!(app.errors.get(ErrorOwner::Evaluation), None);
             assert!(
                 app.log
                     .lines()

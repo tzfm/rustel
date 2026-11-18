@@ -207,20 +207,23 @@ impl App {
         self.log_panel = match &self.log_panel {
             Some(_) => None,
             None => {
-                let oldest = self.log.oldest_unseen();
+                let oldest = self.log.oldest_unseen_at();
                 self.log.mark_seen();
                 self.count_for_the_breakdown();
                 let mut panel = LogPanel::opened(self.ui_settings.log_verbose);
-                self.status = match (oldest, self.log.path()) {
-                    (Some(line), _) => {
-                        panel.reveal(line);
-                        "log - from the oldest warning; End shows the newest".into()
+                let opened = match oldest {
+                    Some(at) => {
+                        panel.reveal(at);
+                        "log - from the oldest warning, End shows the newest"
                     }
-                    (None, Some(path)) => format!(
-                        "log - also in {}",
+                    None => "log",
+                };
+                self.status = match self.log.path() {
+                    Some(path) => format!(
+                        "{opened} - also in {}",
                         status_file_path(path, self.ui_settings.show_full_paths)
                     ),
-                    (None, None) => "log".into(),
+                    None => opened.into(),
                 };
                 Some(panel)
             }

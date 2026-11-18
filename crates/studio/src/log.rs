@@ -287,6 +287,15 @@ impl StudioLog {
         // A keyless warning badges as news for a stay; a keyed alert badges
         // until its condition clears it. See [`BADGE_STAY`].
         let expires_at = (unseen && alert.is_none()).then(|| now + BADGE_STAY);
+        // One condition counts once: raised again, its older lines give
+        // their badge to the newest one and stay as history.
+        if unseen && let Some(key) = alert.as_deref() {
+            for line in &mut self.lines {
+                if line.alert.as_deref() == Some(key) {
+                    line.unseen = false;
+                }
+            }
+        }
         // The same line again, straight after itself: counted on the row it
         // already has. The file above still got its own record - the file
         // is the stopwatch, the panel is what a person reads.
@@ -424,12 +433,14 @@ impl StudioLog {
             .count()
     }
 
-    /// Where in [`Self::lines`] the oldest line the header still counts
-    /// sits, so the log can open on the cause instead of the newest line.
-    pub fn oldest_unseen(&self) -> Option<usize> {
+    /// When the oldest line the header still counts was said, so the log
+    /// can open on the cause instead of the newest line. A clock, not a
+    /// place in the ring: the ring can drop lines before the panel draws.
+    pub fn oldest_unseen_at(&self) -> Option<f64> {
         self.lines
             .iter()
-            .position(|line| line.unseen && !line.resolved)
+            .find(|line| line.unseen && !line.resolved)
+            .map(|line| line.at)
     }
 
     pub fn mark_seen(&mut self) {
@@ -580,9 +591,9 @@ pub struct LogPanel {
     /// The colouring reads this: with a filter on, an editor row and a
     /// place in the ring are no longer the same number.
     shown: Vec<Line>,
-    /// A line of the ring to bring to the top on the next prepare, once
+    /// The clock of a line to bring to the top on the next prepare, once
     /// the view knows its size: the oldest warning the badge counted.
-    reveal: Option<usize>,
+    reveal: Option<f64>,
     /// ⇧F9: the log is docked, like a visuals dock or the mixer, and is
     /// not a sheet that other sheets displace and `dismiss_dialogs`
     /// closes. Off by default: the log is then a floating sheet.
@@ -774,10 +785,10 @@ impl LogPanel {
         }
     }
 
-    /// Open on `line` of the ring rather than the newest one. The view
+    /// Open on the line said at `at` rather than the newest one. The view
     /// stops following, so the line stays put while news arrives.
-    pub fn reveal(&mut self, line: usize) {
-        self.reveal = Some(line);
+    pub fn reveal(&mut self, at: f64) {
+        self.reveal = Some(at);
         self.following = false;
     }
 
@@ -859,12 +870,12 @@ impl LogPanel {
         let rows = usize::from(list.height);
         self.editor.set_view_size(usize::from(list.width), rows);
         self.sync(log, rows);
-        if let Some(line) = self.reveal.take() {
+        if let Some(at) = self.reveal.take() {
             let floor = self.floor();
             let row = log
                 .lines()
                 .iter()
-                .take(line)
+                .take_while(|line| line.at < at)
                 .filter(|line| line.level >= floor)
                 .count();
             self.set_top(self.editor.screen_row_of_line(row), rows);
@@ -1439,8 +1450,7 @@ mod resolved_tests {
         for index in 0..60 {
             log.push(Level::Info, "update", format!("newer news {index}"));
         }
-        let oldest = log.oldest_unseen().expect("a counted warning");
-        assert_eq!(log.lines()[oldest].text, "kit could not be imported");
+        let oldest = log.oldest_unseen_at().expect("a counted warning");
 
         let mut panel = LogPanel::opened(false);
         panel.reveal(oldest);
@@ -1455,10 +1465,29 @@ mod resolved_tests {
 
         log.mark_seen();
         assert_eq!(
-            log.oldest_unseen(),
+            log.oldest_unseen_at(),
             None,
             "nothing counted, nothing to open on"
         );
+    }
+
+    /// One failing source said again between other lines counts once, and
+    /// its resolve still marks every line it raised.
+    #[test]
+    fn a_keyed_alert_said_again_counts_once() {
+        let mut log = StudioLog::open(None);
+        for index in 0..3 {
+            log.push_alert(Level::Warn, "samples", "kit 404", "samples:kit");
+            log.push(
+                Level::Info,
+                "samples",
+                format!("other kit {index} imported"),
+            );
+        }
+        log.push_alert(Level::Warn, "check", "refused", "lint:1");
+        assert_eq!(log.unseen(), 2, "one per condition");
+        assert_eq!(log.resolve_alert("samples:kit"), 3);
+        assert_eq!(log.unseen(), 1);
     }
 
     /// A keyed warning counts until its key resolves; the line stays, marked
