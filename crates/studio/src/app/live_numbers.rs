@@ -307,19 +307,51 @@ impl App {
             && self.make_live_at(scene, literal, playing, Some(value))
     }
 
-    /// A rail put a number the playing score lacks into the text that
-    /// was `before` it, and `before` is the playing score: the update
-    /// holds the rail's edit alone, so the current text goes in with the
-    /// number at `literal` live. False when other edits wait, or another
-    /// update is on its way.
-    pub(super) fn update_with_new_number(&mut self, before: &str, literal: Range<usize>) -> bool {
+    /// Whether `source`, the current scene's text, is the playing score
+    /// but for the numbers rails moved live: each live number's literal
+    /// there, put in place of its cell's literal in the playing score,
+    /// gives `source` back.
+    pub(super) fn plays_but_live_moves(&self, source: &str) -> bool {
         let scene = self.scenes.current().id;
-        if !self.engine_connected
+        let Some(installed) = self.evaluated_source.as_deref() else {
+            return false;
+        };
+        if installed == source {
+            return true;
+        }
+        let mut moves: Vec<(Range<usize>, Range<usize>)> = self
+            .live_numbers_now(scene)
+            .into_iter()
+            .filter_map(|number| Some((live_number_range(&number.id)?, number.range)))
+            .collect();
+        moves.sort_by_key(|(cell, _)| cell.start);
+        let rebuilt = (|| {
+            let mut rebuilt = String::with_capacity(source.len());
+            let mut at = 0;
+            for (cell, now) in moves {
+                rebuilt.push_str(installed.get(at..cell.start)?);
+                rebuilt.push_str(source.get(now)?);
+                at = cell.end;
+            }
+            rebuilt.push_str(installed.get(at..)?);
+            Some(rebuilt)
+        })();
+        rebuilt.as_deref() == Some(source)
+    }
+
+    /// A rail put a number the playing score lacks into the text, and
+    /// the text before it was `clean`: the playing score but for live
+    /// moves. The update holds the rail's edit alone, so the current text
+    /// goes in with the number at `literal` live. False when other edits
+    /// wait, or another update is on its way.
+    pub(super) fn update_with_new_number(&mut self, clean: bool, literal: Range<usize>) -> bool {
+        let scene = self.scenes.current().id;
+        if !clean
+            || !self.engine_connected
             || !self.plays_live(scene)
             || self.reinstall_on_its_way()
             || self.launch_arming.is_armed()
             || self.sliders.len() >= MAX_UI_LAYOUT_SLIDERS
-            || self.evaluated_source.as_deref() != Some(before)
         {
             return false;
         }

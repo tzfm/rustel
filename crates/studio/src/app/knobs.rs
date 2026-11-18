@@ -2461,6 +2461,9 @@ impl App {
             return false;
         };
         let source = self.editor().source();
+        // Before the write: the playing score is this text but for the
+        // numbers rails moved live.
+        let clean = self.plays_but_live_moves(&source);
         let held = self.knobs_panel.as_ref().and_then(|panel| {
             panel
                 .off
@@ -2567,7 +2570,7 @@ impl App {
                 None => false,
             };
             if !live {
-                self.update_with_new_number(&source, literal);
+                self.update_with_new_number(clean, literal);
             }
         }
         self.status = format!("knobs: {} on at {}", knob.label, short_number(value));
@@ -3611,7 +3614,11 @@ mod tests {
         use rustel_runtime::ui_events::source_revision;
         let directory = tempfile::tempdir().expect("tempdir");
         let score = "$: s(\"bd\").vst(\"FX\", { })\n";
-        let mut app = plugin_app(directory.path(), score, vec![plugin_param("gain", 0)]);
+        let mut app = plugin_app(
+            directory.path(),
+            score,
+            vec![plugin_param("gain", 0), plugin_param("mix", 0)],
+        );
         app.ui_settings.auto_evaluate = false;
         let scene = app.scenes.current().id;
         app.evaluation_revisions.remember(
@@ -3643,7 +3650,60 @@ mod tests {
                     .map(|pending| pending.source.to_string()),
             )
             .collect();
-        assert_eq!(sent, [source], "the update carries the new entry");
+        assert_eq!(
+            sent,
+            std::slice::from_ref(&source),
+            "the update carries the new entry"
+        );
+
+        // The update lands with gain live, and gain moves live. A second
+        // key turned on still goes in at once: a live move is no edit.
+        app.inflight.clear();
+        app.pending_evaluation = None;
+        let gain = source.find("0.").expect("the gain");
+        let cell = gain..gain + source[gain..].find([' ', ',', '}']).expect("its end");
+        let layout = rustel_runtime::ui_events::visual_layout_with_live_numbers(
+            &source,
+            2,
+            &[rustel_runtime::ui_events::LiveNumber {
+                literal: cell,
+                value: None,
+            }],
+        )
+        .expect("layout");
+        app.handle_control(StudioControlEvent::Layout(layout));
+        // The host knows no such plugin here: each new text is told again.
+        let known = |app: &mut App| {
+            app.refresh_knobs(Rect::default());
+            if let Some(parse) = app.knobs_parse.as_mut() {
+                parse.params = Some(vec![plugin_param("gain", 0), plugin_param("mix", 0)]);
+            }
+            app.refresh_knobs(Rect::default());
+        };
+        known(&mut app);
+        let row = |app: &App, label: &str| {
+            app.knobs_rows
+                .as_ref()
+                .and_then(|rows| rows.knobs.iter().position(|knob| knob.label == label))
+                .expect("the rail")
+        };
+        let at = row(&app, "gain");
+        app.drag_knob(at, Rect::new(0, 0, 24, 1), 18);
+        assert!(app.inflight.is_empty() && app.pending_evaluation.is_none());
+        assert_ne!(app.editor().source(), source, "the move wrote");
+        known(&mut app);
+        let mix = row(&app, "mix");
+        app.drag_knob(mix, Rect::new(0, 0, 24, 1), 12);
+        let source = app.editor().source();
+        assert!(source.contains("mix: "), "on: {source}");
+        assert_eq!(
+            app.pending_evaluation
+                .as_ref()
+                .map(|pending| pending.source.to_string())
+                .or_else(|| app.inflight.values().next().map(|p| p.source.to_string())),
+            Some(source),
+            "the second key goes in at once"
+        );
 
         // Another edit waiting keeps the new key for the next update.
         let directory = tempfile::tempdir().expect("tempdir");
