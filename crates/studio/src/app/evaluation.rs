@@ -1118,7 +1118,11 @@ impl App {
             }
             Ok(install) => {
                 self.visual.start();
-                self.layout_due = Some(install.source_revision.clone());
+                // A held update can land its layout before this answer:
+                // then nothing is due.
+                self.layout_due = (self.installed_revision.as_ref()
+                    != Some(&install.source_revision))
+                .then(|| install.source_revision.clone());
                 if let Some(sent) = &sent.as_ref().filter(|sent| sent.record) {
                     self.record_save(SaveStatus::Installed, &sent.source, None, None);
                 }

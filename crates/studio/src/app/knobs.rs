@@ -2246,7 +2246,8 @@ impl App {
         if unchanged {
             return true;
         }
-        if let Some(held) = self.knob_live_held(knob, &self.editor().source())
+        if self.knob_may_move_live(knob)
+            && let Some(held) = self.knob_live_held(knob, &self.editor().source())
             && self.move_live_number(held, literal.clone(), value, &text)
         {
             return true;
@@ -2293,6 +2294,25 @@ impl App {
         }
     }
 
+    /// What a live move of the rail needs before the score's text is read:
+    /// a plain number, no fader, of a call that takes a live cell there.
+    fn knob_may_move_live(&self, knob: &Knob) -> bool {
+        let KnobPlace::Argument(at) = knob.place else {
+            return false;
+        };
+        knob.state
+            .as_ref()
+            .is_some_and(|state| state.fader.is_none())
+            && self
+                .knobs_parse
+                .as_ref()
+                .and_then(|parse| parse.call.as_ref())
+                .is_some_and(|call| {
+                    call.plugin.is_none()
+                        && super::live_numbers::takes_a_live_number(&call.name, call.control, at)
+                })
+    }
+
     /// The bytes of `source`, the current score, that a live move of the
     /// rail's number relies on - from the call's name to the number - when
     /// a live cell can stand in for that number: see
@@ -2301,19 +2321,12 @@ impl App {
     /// rail moves. An entry of an options object is read as it is written,
     /// so a cell there would not be a number.
     fn knob_live_held(&self, knob: &Knob, source: &str) -> Option<Range<usize>> {
-        let KnobPlace::Argument(at) = knob.place else {
+        if !self.knob_may_move_live(knob) {
             return None;
-        };
-        let literal = &knob
-            .state
-            .as_ref()
-            .filter(|state| state.fader.is_none())?
-            .literal;
+        }
+        let literal = &knob.state.as_ref()?.literal;
         let call = self.knobs_parse.as_ref()?.call.as_ref()?;
-        let live = call.plugin.is_none()
-            && super::live_numbers::takes_a_live_number(&call.name, call.control, at)
-            && !super::live_numbers::defined_in(source, &call.name);
-        if !live {
+        if super::live_numbers::defined_in(source, &call.name) {
             return None;
         }
         let before = source.get(..call.open)?.trim_end();

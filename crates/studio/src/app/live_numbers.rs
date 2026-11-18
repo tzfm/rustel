@@ -50,29 +50,46 @@ pub(super) fn takes_a_live_number(callee: &str, control: bool, at: usize) -> boo
 }
 
 /// Whether the score defines `name` itself, so its calls are the score's
-/// own and take their numbers as they are written: a `function` of that
-/// name, a `register` of it, or the name bound any other way - `const`,
+/// own and take their numbers as they are written: a `register` of that
+/// name, a `function` of it, or the name bound any other way - `const`,
 /// `let`, `var`, a destructuring `{ name }`. A name the score only calls,
-/// as `name(` or `.name(`, or uses as an object key, is not its own.
+/// as `name(` or `.name(`, uses as an object key, or writes in a string or
+/// a comment, is not its own.
 pub(super) fn defined_in(source: &str, name: &str) -> bool {
-    let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '$');
-    let quote = |c: char| matches!(c, '\'' | '"' | '`');
+    registered(source, name) || bound(&rustel_runtime::lint::code_only(source), name)
+}
+
+/// `register('name', …)`, with any quote.
+fn registered(source: &str, name: &str) -> bool {
     source.match_indices(name).any(|(at, _)| {
         let (before, after) = (&source[..at], &source[at + name.len()..]);
+        let Some(quote) = before
+            .chars()
+            .next_back()
+            .filter(|c| matches!(c, '\'' | '"' | '`'))
+        else {
+            return false;
+        };
+        after.starts_with(quote) && before[..before.len() - 1].trim_end().ends_with("register(")
+    })
+}
+
+/// The name bound in `code`, the score with its strings and comments
+/// blanked.
+fn bound(code: &str, name: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '$');
+    code.match_indices(name).any(|(at, _)| {
+        let (before, after) = (&code[..at], &code[at + name.len()..]);
         if before.ends_with(word) || after.starts_with(word) {
             return false;
-        }
-        if before.ends_with(quote) {
-            return before[..before.len() - 1].trim_end().ends_with("register(");
         }
         let declared = before.trim_end();
         if declared.ends_with("function") && declared.len() < before.len() {
             return true;
         }
-        // A binding: neither a call, nor a method, nor a key, nor a word of
-        // a string.
+        // Neither a call, nor a method, nor a key.
         let next = after.trim_start().chars().next();
-        !declared.ends_with('.') && !after.starts_with(quote) && !matches!(next, Some('(' | ':'))
+        !declared.ends_with('.') && !matches!(next, Some('(' | ':'))
     })
 }
 
@@ -776,6 +793,8 @@ mod tests {
             "lpf"
         ));
         assert!(!defined_in("$: s(\"fast bd\").fast(2)", "fast"));
+        assert!(!defined_in("$: s(\"go fast now\").fast(2)", "fast"));
+        assert!(!defined_in("$: s(\"x\").lpf(800) // lpf sweep", "lpf"));
     }
 
     /// A stopped set has no score to move: the rail writes the score, and
