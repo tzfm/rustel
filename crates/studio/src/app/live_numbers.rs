@@ -58,6 +58,9 @@ struct LiveNumber {
     id: String,
     /// The number's literal at the set's revision.
     range: Range<usize>,
+    /// The value a rail last moved it to since the score was evaluated.
+    /// The running score plays it, whatever was typed over it since.
+    moved: Option<f64>,
 }
 
 impl App {
@@ -77,6 +80,7 @@ impl App {
                 Some(LiveNumber {
                     id: number.id.clone(),
                     range,
+                    moved: number.moved,
                 })
             })
             .collect()
@@ -103,13 +107,14 @@ impl App {
         if !current || !self.live_numbers.contains_key(&scene) {
             return;
         }
-        // The numbers this text carries take their ids from it.
+        // The numbers this text carries take their ids and values from it.
         let numbers: Vec<LiveNumber> = self
             .live_numbers_now(scene)
             .into_iter()
             .map(|number| LiveNumber {
                 id: live_number_id(number.range.clone()),
                 range: number.range,
+                moved: None,
             })
             .collect();
         let ranges = numbers.iter().map(|number| number.range.clone()).collect();
@@ -207,6 +212,7 @@ impl App {
         live.push(LiveNumber {
             id: live_number_id(new),
             range: literal,
+            moved: None,
         });
         self.place_live_numbers(scene, live);
         self.next_evaluation = LaunchRequest {
@@ -245,14 +251,16 @@ impl App {
         let numbers = numbers
             .into_iter()
             .filter_map(|number| {
-                let range = if number.range == literal {
-                    written.clone()
-                } else {
-                    editor.map_range_since(before, number.range)?
-                };
+                if number.range == literal {
+                    return Some(LiveNumber {
+                        range: written.clone(),
+                        moved: Some(value),
+                        ..number
+                    });
+                }
                 Some(LiveNumber {
-                    id: number.id,
-                    range,
+                    range: editor.map_range_since(before, number.range.clone())?,
+                    ..number
                 })
             })
             .collect();
@@ -286,13 +294,11 @@ impl App {
     }
 
     /// Once a layout lands, every live number the running score holds
-    /// plays what the score says: a move written before its cell existed
-    /// is handed over now.
+    /// plays the value a rail last moved it to: a move made before its
+    /// cell existed, or before a reinstall reset it, is handed over now.
+    /// A number typed over and not evaluated stays out of the sound.
     pub(super) fn sync_live_numbers(&mut self) {
         let Some(scene) = self.audible_scene else {
-            return;
-        };
-        let Some(source) = self.scenes.get(scene).map(|entry| entry.editor.source()) else {
             return;
         };
         let owed: Vec<(String, f64)> = self
@@ -300,8 +306,8 @@ impl App {
             .into_iter()
             .filter_map(|number| {
                 let span = self.sliders.iter().find(|span| span.id == number.id)?;
-                let written = source.get(number.range)?.trim().parse::<f64>().ok()?;
-                (written.is_finite() && written != span.value).then(|| (span.id.clone(), written))
+                let moved = number.moved?;
+                (moved != span.value).then(|| (span.id.clone(), moved))
             })
             .collect();
         for (id, value) in owed {
@@ -442,6 +448,66 @@ mod tests {
         );
         assert_eq!(span(&app), Some(written(&app)), "the cell follows the rail");
         assert!(app.editor().source().contains("seg(16)"));
+    }
+
+    /// A live number typed over and not evaluated stays out of the sound
+    /// when another rail makes its number live: the reinstall hands each
+    /// cell the value its rail last moved it to, not the typed text.
+    #[test]
+    fn a_number_typed_over_stays_out_when_another_goes_live() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let installed = "$: s(\"sine\").seg(4).lpf(4000).gain(0.5)\n";
+        let mut app = playing_with_an_unevaluated_edit(directory.path(), installed, "4000");
+        let rail = Rect::new(0, 0, 24, 1);
+        app.drag_knob(0, rail, 4);
+        let at = |needle: &str| {
+            let start = installed.find(needle).expect("the number");
+            start..start + needle.len()
+        };
+        let (cutoff, gain) = (at("4000"), at("0.5"));
+        let layout = |generation, cells: &[Range<usize>]| {
+            rustel_runtime::ui_events::visual_layout_with_live_numbers(installed, generation, cells)
+                .expect("layout")
+        };
+        app.handle_control(StudioControlEvent::Layout(layout(
+            2,
+            std::slice::from_ref(&cutoff),
+        )));
+        let id = live_number_id(cutoff.clone());
+        let cell = |app: &App| {
+            app.sliders
+                .iter()
+                .find(|span| span.id == id)
+                .map(|span| span.value)
+        };
+        let moved = cell(&app).expect("the cutoff is live");
+
+        // A key deletes a digit inside the written cutoff.
+        let source = app.editor().source();
+        let start = source.find("lpf(").expect("the call") + 4;
+        app.editor_mut()
+            .dispatch(
+                Command::ReplaceRange {
+                    from: ByteOffset(start + 1),
+                    to: ByteOffset(start + 2),
+                    text: String::new(),
+                },
+                HistoryMoment(2),
+                &mut MemoryClipboard::default(),
+            )
+            .expect("the typed edit");
+        let caret = app.editor().source().find("0.5").expect("the gain");
+        app.editor_mut()
+            .set_selection(Selection::caret(ByteOffset(caret)))
+            .expect("the caret on the gain");
+        app.open_knobs_panel(true);
+        app.drag_knob(0, rail, 20);
+        assert!(
+            !app.editor().source().contains("0.5"),
+            "the gain rail wrote"
+        );
+        app.handle_control(StudioControlEvent::Layout(layout(3, &[cutoff, gain])));
+        assert_eq!(cell(&app), Some(moved), "the cutoff plays its rail's value");
     }
 
     /// A function the engine patternifies takes a live number as a control
