@@ -791,6 +791,10 @@ impl App {
                     | "throw"
                     | "void"
                     | "yield"
+                    | "in"
+                    | "of"
+                    | "instanceof"
+                    | "new"
             );
             let defined = lead.ends_with("function") && lead.len() < name.start;
             if !keyword && !defined {

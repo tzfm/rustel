@@ -1540,6 +1540,15 @@ mod tests {
             "after n's ), not f's"
         );
 
+        let operator = "$: x instanceof (n(\"c\"|))\n";
+        let (text, at, _) = pick(operator);
+        assert_eq!(text.as_deref(), Some(call));
+        assert_eq!(
+            at,
+            operator.find("))").expect("n's end"),
+            "after n's ), not the brackets'"
+        );
+
         let split = "$: n(\"c\").gain|\n  (0.2)\n";
         let (text, at, _) = pick(split);
         assert_eq!(text.as_deref(), Some(call));

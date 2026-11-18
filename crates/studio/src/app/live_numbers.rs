@@ -426,6 +426,8 @@ impl App {
         new: Range<usize>,
         moved: Option<f64>,
     ) -> bool {
+        // A key a rail just put back moved the cells after it.
+        self.follow_slider_spans();
         // An update on its way installs a newer text: this one must not
         // replace it, and the move is written as an edit for it to carry.
         // So must an update whose layout has not landed: until it lands,
@@ -894,6 +896,60 @@ mod tests {
         );
         app.refresh_knobs(Rect::default());
         assert!(!app.knobs_rows.as_ref().expect("the rails").knobs[at].waits);
+    }
+
+    /// A key a rail takes off and puts back leaves the live keys after it
+    /// live: their cells follow the text the key put back.
+    #[test]
+    fn a_key_turned_off_and_on_keeps_the_next_key_live() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let installed = "$: s(\"sine\").seg(4).vsti(\"Diva\", { output: 0.123456, cutoff: 0.5 })\n";
+        let mut app = playing_with_an_unevaluated_edit(directory.path(), installed, "0.5");
+        app.ui_settings.auto_evaluate = false;
+        let rail = Rect::new(0, 0, 24, 1);
+        app.refresh_knobs(Rect::default());
+        let position = |app: &App, label: &str| {
+            app.knobs_rows
+                .as_ref()
+                .and_then(|rows| rows.knobs.iter().position(|knob| knob.label == label))
+                .expect("the rail")
+        };
+        let (output, cutoff) = (position(&app, "output"), position(&app, "cutoff"));
+        let cell = |key: &str| {
+            let at = installed.find(key).expect("the key") + key.len();
+            at..at + installed[at..].find([',', ' ']).expect("the end")
+        };
+        let land = |app: &mut App, generation, cells: &[Range<usize>]| {
+            app.inflight.clear();
+            app.pending_evaluation = None;
+            let layout = rustel_runtime::ui_events::visual_layout_with_live_numbers(
+                installed,
+                generation,
+                &as_written(cells),
+            )
+            .expect("layout");
+            app.handle_control(StudioControlEvent::Layout(layout));
+        };
+
+        app.drag_knob(cutoff, rail, 20);
+        assert_eq!(sent(&app).len(), 1, "the first move makes cutoff live");
+        land(&mut app, 2, &[cell("cutoff: ")]);
+        app.drag_knob(output, rail, 0);
+        assert!(!app.editor().source().contains("output"), "the off stop");
+        app.drag_knob(output, rail, 12);
+        assert!(app.editor().source().contains("output"), "back on");
+        assert_eq!(sent(&app).len(), 1, "the playing score goes again");
+        land(&mut app, 3, &[cell("output: "), cell("cutoff: ")]);
+        assert!(
+            !app.editor().source().contains("0.123456"),
+            "the key comes back shorter, and the cells after it move"
+        );
+
+        let before = sent(&app).len();
+        app.drag_knob(cutoff, rail, 4);
+        assert_eq!(sent(&app).len(), before, "cutoff still moves live");
+        app.refresh_knobs(Rect::default());
+        assert!(!app.knobs_rows.as_ref().expect("the rails").knobs[cutoff].waits);
     }
 
     /// A function the engine patternifies takes a live number as a control
