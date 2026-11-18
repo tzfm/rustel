@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// The heading over the extended matches when basic matches come first.
+pub(super) const EXTENDED_HEADING: &str = "more matches";
+
 /// How many other names a row shows before saying `+n`.
 pub(super) const ALIASES_SHOWN: usize = 3;
 
@@ -1804,18 +1807,23 @@ impl ReferenceView<'_> {
             }
             // The tag a run of results is filed under, over the first of
             // them: the samples tab's heading without its fold marker,
-            // because nothing folds here.
-            if let BrowseRow::Tag(position) = *browse_row {
-                if let Some(entry) = self
-                    .panel
-                    .results
-                    .get(position)
-                    .and_then(|&index| self.reference.entry(index))
-                {
+            // because nothing folds here. The extended heading reads the
+            // same, over the entries found by their documentation.
+            if let BrowseRow::Tag(_) | BrowseRow::Extended(_) = *browse_row {
+                let heading = match *browse_row {
+                    BrowseRow::Tag(position) => self
+                        .panel
+                        .results
+                        .get(position)
+                        .and_then(|&index| self.reference.entry(index))
+                        .map(Entry::heading),
+                    _ => Some(EXTENDED_HEADING),
+                };
+                if let Some(heading) = heading {
                     buffer.set_stringn(
                         list.x,
                         y,
-                        format!(" {} ", entry.heading()),
+                        format!(" {heading} "),
                         usize::from(list.width),
                         Style::default()
                             .fg(theme.foreground)

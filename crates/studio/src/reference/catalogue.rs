@@ -589,7 +589,9 @@ impl Reference {
 
     /// Entries matching a query, best first: the exact name, then names
     /// that start with it, then names and synonyms that contain it, then
-    /// summaries that mention it. An empty query lists ordinary entries,
+    /// summaries that mention it. The browser scopes then add the extended
+    /// matches, found in descriptions, parameters, tags, extension names
+    /// and examples, after all of these. An empty query lists ordinary entries,
     /// hidden-from-completion entries last. Graph bypasses require an
     /// underscore query or `tag:bypass`. A [`Category`] the settings
     /// hide stays out unless a `tag:` word names the category.
@@ -618,8 +620,19 @@ impl Reference {
     /// Complete within one namespace. An explicit tag still browses every
     /// matching entry, including entries hidden in settings.
     pub fn search_in(&self, query: &str, snippets_last: bool, scope: ReferenceScope) -> Vec<usize> {
+        self.rank_in(query, snippets_last, scope).results
+    }
+
+    /// The same search, with the browser's extended matches after the
+    /// basic ones. Only a browser scope reads them: a completion list
+    /// offers names to type, and a word from a description is not one.
+    pub fn rank_in(&self, query: &str, snippets_last: bool, scope: ReferenceScope) -> Ranked {
         let filter = TagFilter::parse(query);
         let query = filter.rest;
+        let extended = scope
+            .is_browser()
+            .then(|| ExtendedQuery::parse(query))
+            .flatten();
         let mut ranked = self
             .entries
             .iter()
@@ -688,8 +701,12 @@ impl Reference {
                         .cloned()
                         .collect()
                 };
-                let score =
-                    super::super::fuzzy::score(query, &entry.name, &aliases, &entry.summary)?;
+                let basic =
+                    super::super::fuzzy::score(query, &entry.name, &aliases, &entry.summary);
+                let (tier, score) = match basic {
+                    Some(score) => (Tier::Basic, score),
+                    None => (Tier::Extended, extended.as_ref()?.score(entry)?),
+                };
                 // Deprioritize these entries when browsing without a query.
                 let score = if query.is_empty() && entry.no_autocomplete {
                     score - 30
@@ -716,23 +733,30 @@ impl Reference {
                 } else {
                     score
                 };
-                Some((score, index))
+                Some((tier, score, index))
             })
             .collect::<Vec<_>>();
         ranked.sort_by(|left, right| {
-            right.0.cmp(&left.0).then_with(|| {
-                // Break case-insensitive score ties with an exact name match:
-                // `s` selects the sound control; `S` selects the unsupported call.
-                let exact = |index: usize| self.entries[index].name == query;
-                exact(right.1).cmp(&exact(left.1)).then_with(|| {
-                    self.entries[left.1]
-                        .name
-                        .to_lowercase()
-                        .cmp(&self.entries[right.1].name.to_lowercase())
+            left.0
+                .cmp(&right.0)
+                .then(right.1.cmp(&left.1))
+                .then_with(|| {
+                    // Break case-insensitive score ties with an exact name match:
+                    // `s` selects the sound control; `S` selects the unsupported call.
+                    let exact = |index: usize| self.entries[index].name == query;
+                    exact(right.2).cmp(&exact(left.2)).then_with(|| {
+                        self.entries[left.2]
+                            .name
+                            .to_lowercase()
+                            .cmp(&self.entries[right.2].name.to_lowercase())
+                    })
                 })
-            })
         });
-        ranked.into_iter().map(|(_, index)| index).collect()
+        let extended_from = ranked.partition_point(|(tier, ..)| *tier == Tier::Basic);
+        Ranked {
+            results: ranked.into_iter().map(|(.., index)| index).collect(),
+            extended_from,
+        }
     }
 }
 

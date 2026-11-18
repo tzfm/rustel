@@ -36,6 +36,7 @@ pub(crate) use sound_effect::SoundEffect;
 
 mod audition;
 mod catalogue;
+mod extended;
 mod geometry;
 mod panel;
 mod samples;
@@ -58,6 +59,7 @@ use audition::{keyboard_rows, render_keyboard, render_samples_pulse};
 #[cfg(test)]
 use catalogue::canonical_spellings;
 use catalogue::display_origin;
+use extended::ExtendedQuery;
 use geometry::tabs;
 pub use geometry::{
     entry_body_area, inner_area, samples_pulse_rows, samples_wave_area, samples_wave_rows, tab_at,
@@ -293,6 +295,22 @@ impl Category {
     }
 }
 
+/// A search's results, best first, and where its extended matches begin.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Ranked {
+    pub results: Vec<usize>,
+    /// The position in `results` of the first extended match; see
+    /// [`extended`]. Equal to the length when there is none.
+    pub extended_from: usize,
+}
+
+/// Which search found a result. The basic tier always ranks first.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Tier {
+    Basic,
+    Extended,
+}
+
 /// The first `tag:` filter in a query and the text to search alongside it.
 /// Tag names match case-insensitive prefixes, so `tag:vis piano` finds
 /// visualization entries matching `piano` before the tag is fully typed.
@@ -363,6 +381,9 @@ pub enum BrowseRow {
     Entry(usize),
     /// The other names of the entry on the row above. A label, not a choice.
     Aliases(usize),
+    /// The heading over the extended matches, above the entry at this
+    /// position, when basic matches come before them.
+    Extended(usize),
 }
 
 /// One row of the samples tab: a family of banks sharing a machine name, a
@@ -521,6 +542,9 @@ pub struct ReferencePanel {
     pub(crate) vim_insert: bool,
     pub query: String,
     pub results: Vec<usize>,
+    /// The position in `results` of the first extended match; see
+    /// [`Ranked`].
+    extended_from: usize,
     /// The caret is not on a blank line, so a snippet cannot go where it
     /// is. Snippets sink to the bottom of the list rather than leaving it:
     /// wanting one is a reason to make room for it, not a reason to be
@@ -3267,6 +3291,7 @@ mod tests {
                     BrowseRow::Aliases(position) => {
                         assert_eq!(seen.last(), Some(&position), "under its entry");
                     }
+                    BrowseRow::Extended(_) => panic!("an empty search has no extended matches"),
                 }
             }
             assert_eq!(headings[..3], ["temporal", "tonal", "audio"]);
@@ -5063,6 +5088,103 @@ mod tests {
         /// The name of the entry a search ranks first.
         fn first_result<'a>(reference: &'a Reference, query: &str) -> &'a str {
             &reference.entry(reference.search(query)[0]).unwrap().name
+        }
+
+        /// Whether the basic search matches the entry by name or summary.
+        fn basic_match(entry: &Entry, query: &str) -> bool {
+            let aliases: Vec<String> = entry
+                .synonyms
+                .iter()
+                .chain(&entry.keywords)
+                .cloned()
+                .collect();
+            crate::fuzzy::score(query, &entry.name, &aliases, &entry.summary).is_some()
+        }
+
+        #[test]
+        fn the_browser_lists_extended_matches_after_every_basic_one() {
+            let reference = Reference::load_all();
+            for query in ["switch angel", "angel", "reverb room", "squelch", "stutter"] {
+                let ranked = reference.rank_in(query, false, ReferenceScope::All);
+                for (position, &index) in ranked.results.iter().enumerate() {
+                    let entry = reference.entry(index).unwrap();
+                    assert_eq!(
+                        basic_match(entry, query),
+                        position < ranked.extended_from,
+                        "{query:?}: {} is in the wrong tier",
+                        entry.name
+                    );
+                }
+            }
+            // An extension's name finds every entry it brings.
+            let ranked = reference.rank_in("switch angel", false, ReferenceScope::All);
+            let found: Vec<&str> = ranked
+                .results
+                .iter()
+                .map(|&index| reference.entry(index).unwrap().name.as_str())
+                .collect();
+            let brought = reference.from_origin("Switch Angel");
+            assert!(!brought.is_empty());
+            for name in brought {
+                assert!(found.contains(&name), "{name}");
+            }
+        }
+
+        #[test]
+        fn extended_matches_lead_when_no_name_matches() {
+            let reference = Reference::load_all();
+            let ranked = reference.rank_in("wobble", false, ReferenceScope::All);
+            assert_eq!(ranked.extended_from, 0);
+            assert!(!ranked.results.is_empty(), "a description says wobble");
+            let panel = ReferencePanel::browse_for(&reference, "wobble");
+            assert!(
+                !panel.browse_rows().contains(&BrowseRow::Extended(0)),
+                "no heading when nothing comes before"
+            );
+            assert_eq!(panel.selected_result(), Some(ranked.results[0]));
+        }
+
+        #[test]
+        fn completion_lists_never_read_descriptions() {
+            let reference = Reference::load_all();
+            for scope in [ReferenceScope::Pattern, ReferenceScope::Kabelsalat] {
+                for query in ["wobble", "switch angel", "reverb room"] {
+                    let ranked = reference.rank_in(query, false, scope);
+                    assert_eq!(ranked.extended_from, ranked.results.len(), "{query:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn the_extended_heading_sits_between_the_tiers_and_the_cursor_steps_over_it() {
+            let reference = Reference::load_all();
+            let mut panel = ReferencePanel::browse_for(&reference, "switch angel");
+            let ranked = reference.rank_in("switch angel", false, ReferenceScope::All);
+            assert!(ranked.extended_from > 0 && ranked.extended_from < ranked.results.len());
+            let rows = panel.browse_rows().to_vec();
+            let heading = rows
+                .iter()
+                .position(|row| *row == BrowseRow::Extended(ranked.extended_from))
+                .expect("one heading over the extended matches");
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| matches!(row, BrowseRow::Extended(_)))
+                    .count(),
+                1
+            );
+            assert!(rows[..heading].iter().all(|row| match row {
+                BrowseRow::Entry(position) => *position < ranked.extended_from,
+                _ => true,
+            }));
+            assert!(rows[heading + 1..].iter().all(|row| match row {
+                BrowseRow::Entry(position) => *position >= ranked.extended_from,
+                BrowseRow::Aliases(_) => true,
+                _ => false,
+            }));
+            for _ in 0..rows.len() {
+                assert!(panel.selected_result().is_some(), "row {}", panel.selected);
+                panel.move_by(1);
+            }
         }
 
         #[test]

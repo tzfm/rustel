@@ -175,6 +175,7 @@ impl ReferencePanel {
             vim_insert: false,
             query: String::new(),
             results: Vec::new(),
+            extended_from: 0,
             snippets_last: false,
             scope: ReferenceScope::All,
             selected: 0,
@@ -361,8 +362,11 @@ impl ReferencePanel {
                 .filter(|bank| bank.only_compatible)
                 .map_or(vocabulary.names.len(), |bank| bank.count);
             self.results = vocabulary.rank(self.query.trim(), count);
+            self.extended_from = self.results.len();
         } else {
-            self.results = reference.search_in(&self.query, self.snippets_last, self.scope);
+            let ranked = reference.rank_in(&self.query, self.snippets_last, self.scope);
+            self.results = ranked.results;
+            self.extended_from = ranked.extended_from;
         }
         self.rows = self.with_alias_rows(reference, self.grouped_rows(reference));
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
@@ -373,7 +377,10 @@ impl ReferencePanel {
         // zero, which in a grouped list is the first heading; the row under
         // it is always a name, because a heading with nothing under it is
         // never emitted.
-        if matches!(self.rows.get(self.selected), Some(BrowseRow::Tag(_))) {
+        if matches!(
+            self.rows.get(self.selected),
+            Some(BrowseRow::Tag(_) | BrowseRow::Extended(_))
+        ) {
             self.selected += 1;
         }
     }
@@ -385,8 +392,27 @@ impl ReferencePanel {
     /// A search orders the headings by their best member instead. What was
     /// typed has to stay on the first row the cursor lands on, or the search
     /// stops answering. Ungrouped this is the results, one row each.
+    ///
+    /// Extended matches follow the basic ones under a heading of their
+    /// own, in rank order. With no basic match they are the answer, and
+    /// are grouped like one.
     fn grouped_rows(&self, reference: &Reference) -> Vec<BrowseRow> {
-        let flat = || (0..self.results.len()).map(BrowseRow::Entry).collect();
+        let basic = 0..self.extended_from;
+        let extended = self.extended_from..self.results.len();
+        if basic.is_empty() {
+            return self.grouped(reference, extended);
+        }
+        let mut rows = self.grouped(reference, basic);
+        if !extended.is_empty() {
+            rows.push(BrowseRow::Extended(extended.start));
+            rows.extend(extended.map(BrowseRow::Entry));
+        }
+        rows
+    }
+
+    /// The results at `positions`, gathered under their tags.
+    fn grouped(&self, reference: &Reference, positions: std::ops::Range<usize>) -> Vec<BrowseRow> {
+        let flat = || positions.clone().map(BrowseRow::Entry).collect();
         // A word list - scales, chords, colours - has no tags to group by.
         // Nor does a `tag:` query: the filter has already said what the
         // whole list is, the count line says it again, and one heading over
@@ -397,8 +423,8 @@ impl ReferencePanel {
             return flat();
         }
         let mut runs: Vec<(&str, Vec<usize>)> = Vec::new();
-        for (position, &index) in self.results.iter().enumerate() {
-            let Some(entry) = reference.entry(index) else {
+        for position in positions.clone() {
+            let Some(entry) = reference.entry(self.results[position]) else {
                 continue;
             };
             match runs.iter_mut().find(|(tag, _)| *tag == entry.heading()) {
@@ -418,7 +444,7 @@ impl ReferencePanel {
                     .unwrap_or(HEADINGS_BY_USE.len())
             });
         }
-        let mut rows = Vec::with_capacity(self.results.len() + runs.len());
+        let mut rows = Vec::with_capacity(positions.len() + runs.len());
         for (_, members) in &runs {
             rows.push(BrowseRow::Tag(members[0]));
             rows.extend(members.iter().copied().map(BrowseRow::Entry));
@@ -457,7 +483,7 @@ impl ReferencePanel {
     /// behind it.
     pub fn selected_result(&self) -> Option<usize> {
         match self.rows.get(self.selected)? {
-            BrowseRow::Tag(_) | BrowseRow::Aliases(_) => None,
+            BrowseRow::Tag(_) | BrowseRow::Aliases(_) | BrowseRow::Extended(_) => None,
             BrowseRow::Entry(position) => self.results.get(*position).copied(),
         }
     }
@@ -811,7 +837,7 @@ impl ReferencePanel {
                 let mut step = if delta < 0 { -1 } else { 1 };
                 while matches!(
                     self.rows.get(at as usize),
-                    Some(BrowseRow::Tag(_) | BrowseRow::Aliases(_))
+                    Some(BrowseRow::Tag(_) | BrowseRow::Aliases(_) | BrowseRow::Extended(_))
                 ) {
                     if at + step < 0 || at + step > last {
                         step = -step;
@@ -1579,7 +1605,7 @@ impl ReferencePanel {
         }
         match self.rows.get(index) {
             // A heading is a label: there is nothing behind it to open.
-            Some(BrowseRow::Tag(_)) | None => PanelAction::Nothing,
+            Some(BrowseRow::Tag(_) | BrowseRow::Extended(_)) | None => PanelAction::Nothing,
             Some(BrowseRow::Entry(_)) => {
                 self.selected = index;
                 self.confirm(reference)

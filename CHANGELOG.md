@@ -3,6 +3,7 @@
 ## Unreleased
 
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
+- The reference search also finds entries by extension name, description, tags, parameters and examples. These matches come after name matches, under more matches.
 - The theme picker shows its Ctrl+N new, Ctrl+E edit and Ctrl+D delete keys.
 - Fixed: the theme editor opened from the theme picker shows on top of the reference.
 
