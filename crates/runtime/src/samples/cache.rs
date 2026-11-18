@@ -1355,7 +1355,7 @@ mod tests {
             let error = library
                 .register_trusted_custom(&map, None)
                 .expect_err("an HTML page is not a map");
-            assert!(error.contains("is a web page, not a sample map"), "{error}");
+            assert!(error.contains("a web page, not a sample map"), "{error}");
             assert!(!entry.exists(), "a body that is not JSON is evicted");
 
             library

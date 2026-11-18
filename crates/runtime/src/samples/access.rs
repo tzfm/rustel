@@ -564,11 +564,15 @@ fn repo_page_source(source: &str) -> Option<String> {
     let mut path = vec![user, repo];
     match segments.next() {
         None => {}
-        Some("tree" | "blob" | "raw") => {
+        Some(kind @ ("tree" | "blob" | "raw")) => {
             let start = path.len();
             path.extend(segments);
-            // The branch is what these pages name first.
-            if path.len() == start {
+            // The branch is what these pages name first, and a file page
+            // reads only when the file is a map.
+            let names_a_map = path
+                .last()
+                .is_some_and(|name| name.to_ascii_lowercase().ends_with(".json"));
+            if path.len() == start || (kind != "tree" && !names_a_map) {
                 return None;
             }
         }
@@ -1020,6 +1024,7 @@ mod tests {
                 "https://github.com/me",
                 "https://github.com/me/kit/issues/1",
                 "https://github.com/me/kit/tree",
+                "https://github.com/me/kit/blob/main/README.md",
                 "https://user@github.com/me/kit",
                 "https://github.com:8443/me/kit",
                 "https://example.com/me/kit",

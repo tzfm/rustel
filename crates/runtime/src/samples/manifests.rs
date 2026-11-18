@@ -1179,7 +1179,7 @@ fn parse_sample_map(url: &str, bytes: &[u8]) -> Result<serde_json::Value, String
             .trim_start()
             .starts_with('<')
         {
-            format!("{url} is a web page, not a sample map - link the .json file itself")
+            format!("{url}: a web page, not a sample map - link the .json file itself")
         } else {
             format!("{url}: not JSON: {error}")
         }
