@@ -94,13 +94,7 @@ impl ManifestContext {
                         budget,
                         publication: &self.shared.publication,
                     },
-                    |bytes| {
-                        serde_json::from_str(
-                            std::str::from_utf8(bytes)
-                                .map_err(|error| format!("{url}: not UTF-8: {error}"))?,
-                        )
-                        .map_err(|error| format!("{url}: not JSON: {error}"))
-                    },
+                    |bytes| parse_sample_map(&url, bytes),
                 )?;
                 budget.check()?;
                 // The directory the manifest came from is only a fallback base.
@@ -474,12 +468,7 @@ impl ManifestContext {
                 budget.check()?;
                 // A body that is not JSON is evicted, so the next
                 // registration fetches it again.
-                let fetched: serde_json::Value = std::str::from_utf8(&bytes)
-                    .map_err(|error| format!("{url}: not UTF-8: {error}"))
-                    .and_then(|text| {
-                        serde_json::from_str(text)
-                            .map_err(|error| format!("{url}: not JSON: {error}"))
-                    })
+                let fetched = parse_sample_map(&url, &bytes)
                     .inspect_err(|_| evict_host_cache_entry(&dir, &url))?;
                 budget.check()?;
                 // The same three-way order as the score path. The pinned
@@ -1178,6 +1167,19 @@ pub(super) fn run_manifest_worker(context: ManifestContext, jobs: ManifestJobs) 
             let _ = completion.send(result);
         }
     }
+}
+
+/// A fetched sample map, or why `url` did not give one. A web page is said
+/// to be one: its HTML would otherwise read as a JSON error on line 1 or 7.
+fn parse_sample_map(url: &str, bytes: &[u8]) -> Result<serde_json::Value, String> {
+    let text = std::str::from_utf8(bytes).map_err(|error| format!("{url}: not UTF-8: {error}"))?;
+    serde_json::from_str(text).map_err(|error| {
+        if text.trim_start().starts_with('<') {
+            format!("{url} is a web page, not a sample map - link its strudel.json")
+        } else {
+            format!("{url}: not JSON: {error}")
+        }
+    })
 }
 
 pub(super) fn parse_bank(entry: &serde_json::Value, base: &str) -> Option<Bank> {

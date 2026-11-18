@@ -803,13 +803,25 @@ fn single_hop_get_with_resolver(
 /// `samples`. That guess is usually wrong, and the bare 404 does not show
 /// that the repository name was a guess. State it here, where the URL is
 /// known.
+///
+/// The branch is a guess too: with none written it is `main`. A repository
+/// whose default branch is `master` answers 404 there.
 fn github_hint(url: &str, code: u16) -> String {
-    let guessed = url.starts_with("https://raw.githubusercontent.com/")
-        && url.contains("/samples/")
-        && code == 404;
-    if guessed {
+    let Some(path) = url.strip_prefix("https://raw.githubusercontent.com/") else {
+        return String::new();
+    };
+    if code != 404 {
+        return String::new();
+    }
+    let mut parts = path.split('/');
+    let (_user, repo, branch) = (parts.next(), parts.next(), parts.next());
+    if repo == Some("samples") {
         " - `github:user` on its own looks for a repository called \
          `samples`; write `github:user/repo` if it is called something else"
+            .to_owned()
+    } else if branch == Some("main") && path.ends_with("/strudel.json") {
+        " - no strudel.json on branch `main`; name the branch and folder \
+         as `github:user/repo/branch/folder`"
             .to_owned()
     } else {
         String::new()
@@ -2493,11 +2505,28 @@ mod github_hint_tests {
         assert!(hint.contains("github:user/repo"), "{hint}");
         assert!(hint.contains("called `samples`"), "{hint}");
 
-        // A repository that was named, and one that answered: nothing to
-        // explain, so nothing is said.
+        // A named repository with no map on `main` may keep it on another
+        // branch, and the hint says how to name one.
+        let branch = github_hint(
+            "https://raw.githubusercontent.com/yaxu/clean-breaks/main/strudel.json",
+            404,
+        );
+        assert!(
+            branch.contains("github:user/repo/branch/folder"),
+            "{branch}"
+        );
+        // A named branch, a missing sound, and one that answered: nothing
+        // to explain, so nothing is said.
         assert!(
             github_hint(
-                "https://raw.githubusercontent.com/yaxu/clean-breaks/main/strudel.json",
+                "https://raw.githubusercontent.com/yaxu/clean-breaks/dev/strudel.json",
+                404
+            )
+            .is_empty()
+        );
+        assert!(
+            github_hint(
+                "https://raw.githubusercontent.com/yaxu/clean-breaks/main/bd/1.wav",
                 404
             )
             .is_empty()

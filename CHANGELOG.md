@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A sample source can be a repository page such as `https://github.com/user/repo`. It reads as `github:user/repo`, and a web page or a missing map says what to write instead.
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
 - The theme picker shows its Ctrl+N new, Ctrl+E edit and Ctrl+D delete keys.
 - Fixed: the theme editor opened from the theme picker shows on top of the reference.

@@ -1885,6 +1885,20 @@ static SHORTHANDS: &[Shorthand] = &[
     },
 ];
 
+/// A code host whose repository page a shorthand already reads. A player
+/// pastes the page they see in the browser, and it reads as the shorthand:
+/// `https://github.com/user/repo` is `github:user/repo`.
+struct RepoPage {
+    host: &'static str,
+    shorthand: &'static str,
+}
+
+/// Every repository page there is. A row, not a branch.
+static REPO_PAGES: &[RepoPage] = &[RepoPage {
+    host: "github.com",
+    shorthand: "github:",
+}];
+
 /// What a source string turned out to name.
 enum SampleSource {
     /// A folder to scan, as written after the prefix and not yet trimmed

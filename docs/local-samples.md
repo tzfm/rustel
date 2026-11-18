@@ -68,6 +68,8 @@ You can also drop an audio file or folder onto Studio.
 | Shorthand | Source |
 | --- | --- |
 | `github:user/repo` | Repository `strudel.json` |
+| `https://github.com/user/repo` | Same as `github:user/repo` |
+| `github:user/repo/branch/folder` | `strudel.json` in that folder |
 | `bubo:drum` | `github:Bubobubobubobubo/dough-drum` |
 | `shabda:bass,kick` | Samples searched by word |
 | `shabda/speech/en-US/m:music,vocode` | Speech; optional language/gender default to `en-GB/f` |

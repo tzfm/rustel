@@ -482,7 +482,7 @@ impl Shorthand {
 /// shorthand asks for - the manifest name when a map is being fetched, and
 /// nothing when the answer is a base for other paths to hang off.
 pub(super) fn read_source(source: &str, subpath: &str) -> SampleSource {
-    let mut source = source.to_owned();
+    let mut source = repo_page_source(source).unwrap_or_else(|| source.to_owned());
     // A spelling can expand into another spelling - `bubo:` expands into
     // `github:` - so this walks. Bounded by the table's own length: a row
     // added in a cycle must not hang the score that named it.
@@ -539,6 +539,46 @@ fn speech_path(rest: &str, pattern: &str, language: &str, gender: &str) -> Strin
         .replace("{gender}", gender)
 }
 
+/// A repository page in [`REPO_PAGES`] as the shorthand that reads it.
+///
+/// The repository itself, a folder in it (`tree/<branch>/<dir>`) and a file
+/// in it (`blob/` or `raw/`) map to `<shorthand>user/repo[/branch[/path]]`.
+/// Anything else, such as an issue page or a URL with a login or a port,
+/// is `None` and is fetched as written.
+fn repo_page_source(source: &str) -> Option<String> {
+    let url = Url::parse(source.trim_ascii()).ok()?;
+    if !matches!(url.scheme(), "https" | "http")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?;
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    let page = REPO_PAGES.iter().find(|page| page.host == host)?;
+    let mut segments = url.path_segments()?.filter(|segment| !segment.is_empty());
+    let user = segments.next()?;
+    let repo = segments.next()?;
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    let mut path = vec![user, repo];
+    match segments.next() {
+        None => {}
+        Some("tree" | "blob" | "raw") => {
+            let start = path.len();
+            path.extend(segments);
+            // The branch is what these pages name first.
+            if path.len() == start {
+                return None;
+            }
+        }
+        Some(_) => return None,
+    }
+    Some(format!("{}{}", page.shorthand, path.join("/")))
+}
+
+/// `user[/repo[/branch[/path]]]` under raw.githubusercontent. A path that
+/// names a `.json` file is the map itself, so `subpath` is not added to it.
 fn github_path(path: &str, subpath: &str) -> String {
     let path = path.strip_suffix('/').unwrap_or(path);
     let mut components = path.split('/');
@@ -546,7 +586,12 @@ fn github_path(path: &str, subpath: &str) -> String {
     let repo = components.next().unwrap_or("samples");
     let branch = components.next().unwrap_or("main");
     let mut other: Vec<&str> = components.collect();
-    other.push(subpath);
+    let names_a_map = other
+        .last()
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".json"));
+    if !names_a_map {
+        other.push(subpath);
+    }
     format!(
         "https://raw.githubusercontent.com/{user}/{repo}/{branch}/{}",
         other.join("/")
@@ -927,6 +972,61 @@ mod tests {
             assert_eq!(url("shabda/speechify:x"), "shabda/speechify:x");
 
             assert_eq!(SHORTHANDS.len(), 5, "a new shorthand is a row, and a test");
+        }
+
+        /// A repository page reads as the `github:` shorthand, so both
+        /// spellings fetch the same map.
+        #[test]
+        fn a_repository_page_reads_as_its_shorthand() {
+            let url = |source: &str| match read_source(source, GITHUB_SAMPLE_MANIFEST) {
+                SampleSource::Url(url) => url,
+                SampleSource::LocalFolder(rest) => panic!("{source} read as the folder {rest:?}"),
+            };
+            let repo = url("github:terefang/strudel-tunes");
+            assert_eq!(
+                repo,
+                "https://raw.githubusercontent.com/terefang/strudel-tunes/main/strudel.json"
+            );
+            for page in [
+                "https://github.com/terefang/strudel-tunes",
+                "https://github.com/terefang/strudel-tunes/",
+                "https://www.github.com/terefang/strudel-tunes.git",
+                "http://github.com/terefang/strudel-tunes?tab=readme#top",
+                " https://github.com/terefang/strudel-tunes\n",
+            ] {
+                assert_eq!(url(page), repo, "{page}");
+            }
+            assert_eq!(
+                url("https://github.com/me/kit/tree/dev/drums"),
+                "https://raw.githubusercontent.com/me/kit/dev/drums/strudel.json"
+            );
+            assert_eq!(
+                url("https://github.com/me/kit/blob/dev/maps/mine.json"),
+                "https://raw.githubusercontent.com/me/kit/dev/maps/mine.json"
+            );
+            assert_eq!(
+                url("github:me/kit/dev/maps/mine.json"),
+                "https://raw.githubusercontent.com/me/kit/dev/maps/mine.json",
+                "a shorthand naming a map is that map"
+            );
+            // A base is the folder, from either spelling.
+            assert_eq!(
+                expand_base("https://github.com/me/kit"),
+                expand_base("github:me/kit")
+            );
+            // Pages that are not a repository, and URLs with a login or a
+            // port, are fetched as written.
+            for other in [
+                "https://github.com/me",
+                "https://github.com/me/kit/issues/1",
+                "https://github.com/me/kit/tree",
+                "https://user@github.com/me/kit",
+                "https://github.com:8443/me/kit",
+                "https://example.com/me/kit",
+                "ftp://github.com/me/kit",
+            ] {
+                assert_eq!(url(other), other.trim_ascii(), "{other}");
+            }
         }
 
         #[test]
