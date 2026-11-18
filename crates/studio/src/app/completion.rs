@@ -43,6 +43,16 @@ pub(super) enum Landing {
     Call,
 }
 
+/// Where a link of a chain goes: see [`App::link_place_at_caret`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum LinkPlace {
+    Here,
+    /// Past the `)` of the call the caret stands in.
+    After(usize),
+    /// The call the caret stands in has no `)` yet: its name.
+    Open(String),
+}
+
 impl App {
     /// The caret as a name lookup reads it. A bar caret stands between two
     /// characters. Vim's block caret in Normal covers one, so on a name it
@@ -720,6 +730,40 @@ impl App {
         }
         let range = reference_name_range(&source, start.0 + from..caret.0);
         Some(ByteOffset(range.start)..caret)
+    }
+
+    /// Where a new link of a chain goes when it is put in at the caret.
+    /// At the head of a link, at the caret. Inside the arguments of a
+    /// call, past the nearest call around the caret that is itself a link,
+    /// so a pick in `.vst("OTT", { gain: 1| })` follows the `)` and does not
+    /// nest in the call. A call with no `)` yet has no end to follow.
+    pub(super) fn link_place_at_caret(&self) -> LinkPlace {
+        if self.chain_position_at_caret().is_some() {
+            return LinkPlace::Here;
+        }
+        let source = self.editor().source();
+        let caret = self.editor().primary_selection().head.0;
+        let Some(before) = source.get(..caret) else {
+            return LinkPlace::Here;
+        };
+        let code = rustel_runtime::lint::code_only(&source);
+        let typed = rustel_runtime::lint::code_only(before);
+        for open in scan::open_parens(&typed, typed.len()) {
+            let Some(name) = scan::name_before(&typed, open) else {
+                continue;
+            };
+            if !typed[..name.start].trim_end().ends_with('.') {
+                continue;
+            }
+            let callee = typed[name].to_owned();
+            return match super::args::members(&code, open, false)
+                .and_then(|members| members.last().map(|last| last.end))
+            {
+                Some(close) => LinkPlace::After(close + 1),
+                None => LinkPlace::Open(callee),
+            };
+        }
+        LinkPlace::Here
     }
 
     /// The completion list for a new link in a chain, anchored to the
@@ -3239,6 +3283,38 @@ mod tests {
                 assert_eq!(callee, "lfo", "the completion falls back to the callee");
                 assert_eq!(prefix, "si", "the token under the caret survives");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod link_place_tests {
+    use super::*;
+    use crate::editor::{Editor, Selection};
+
+    /// A call picked with the caret in the arguments of a call of its own
+    /// name goes after that call. A call with no `)` yet says so.
+    #[test]
+    fn a_call_never_goes_in_a_call_of_its_own_name() {
+        for (marked, after) in [
+            ("$: s(\"bd\").lpf(|)", "$: s(\"bd\").lpf().lpf()"),
+            ("$: s(\"bd\").lpf(4|00)", "$: s(\"bd\").lpf(400).lpf()"),
+            ("$: s(\"bd\").lpf(|", "$: s(\"bd\").lpf("),
+        ] {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let caret = marked.find('|').expect("the caret");
+            app.scenes.current_mut().editor =
+                Editor::new(&marked.replace('|', "")).expect("editor");
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(caret)))
+                .expect("caret");
+            let index = app.reference.lookup("lpf").expect("lpf");
+            let panel = app.reference_entry_panel(index, ReferenceScope::default(), None);
+            app.set_reference_panel(Some(panel));
+            app.reference_anchor = None;
+            app.confirm_reference_name("lpf".into()).expect("the pick");
+            assert_eq!(app.editor().source(), after, "{marked}");
         }
     }
 }

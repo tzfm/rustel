@@ -222,6 +222,27 @@ impl App {
             if let Some(anchor) = self.reference_anchor.as_mut() {
                 anchor.landing = Landing::Call;
             } else {
+                // A call never goes in a call of its own name: `vst` picked
+                // in `.vst(|` follows that call's `)`.
+                if self
+                    .enclosing_call_at_caret()
+                    .is_some_and(|(callee, _)| callee == name)
+                {
+                    match self.link_place_at_caret() {
+                        LinkPlace::Here => {}
+                        LinkPlace::After(at) => {
+                            let _ = self
+                                .editor_mut()
+                                .set_selection(crate::editor::Selection::caret(ByteOffset(at)));
+                        }
+                        LinkPlace::Open(callee) => {
+                            self.status =
+                                format!("close the {callee}( call first: {name} goes after it");
+                            self.dirty_frame = true;
+                            return Ok(());
+                        }
+                    }
+                }
                 let selection = self.editor().primary_selection();
                 let range = if selection.is_empty() {
                     self.chain_position_at_caret()

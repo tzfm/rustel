@@ -889,10 +889,38 @@ impl App {
             text
         };
         let caret = self.editor().primary_selection().head.0;
-        Some(match text.strip_prefix('.') {
-            Some(call) if self.editor().source()[..caret].ends_with('.') => call.to_owned(),
-            _ => text,
-        })
+        let Some(link) = text.strip_prefix('.') else {
+            return Some(text);
+        };
+        if self.editor().source()[..caret].ends_with('.') {
+            return Some(link.to_owned());
+        }
+        // A plugin call opened with no name yet takes the name, not a
+        // second call inside it.
+        if let Some((callee, _, 0)) = self.enclosing_call_argument_at_caret()
+            && matches!(callee.as_str(), "vst" | "vsti")
+            && let Some(name) = open_plugin.as_ref().map(|(name, _, _)| name)
+        {
+            let source = self.editor().source();
+            let open = source[..caret].rfind('(')?;
+            if source[open + 1..caret].trim().is_empty() {
+                return Some(format!("{name:?}"));
+            }
+        }
+        match self.link_place_at_caret() {
+            LinkPlace::Here => {}
+            LinkPlace::After(at) => {
+                let _ = self
+                    .editor_mut()
+                    .set_selection(crate::editor::Selection::caret(ByteOffset(at)));
+            }
+            LinkPlace::Open(callee) => {
+                self.status = format!("close the {callee}( call first: the plugin goes after it");
+                self.dirty_frame = true;
+                return None;
+            }
+        }
+        Some(text)
     }
 
     /// The turn loop reads the plugin list for the vst tab at
@@ -1465,5 +1493,36 @@ mod tests {
                 .as_deref(),
             Some(".vsti(\"Serum 2\")")
         );
+    }
+
+    /// A plugin call picked with the caret in another call's arguments
+    /// goes after that call, never inside it. An empty plugin call takes
+    /// the name. A call with no `)` yet says so and writes nothing.
+    #[test]
+    fn a_picked_plugin_call_never_nests_in_a_call() {
+        let call = ".vsti(\"Serum 2\")";
+        let pick = |marked: &str| {
+            let caret = marked.find('|').expect("the caret");
+            let mut app = vst_app(&marked.replace('|', ""), caret);
+            let text = app.plugin_text_at_caret(call.into());
+            let at = app.editor().primary_selection().head.0;
+            (text, at, app.status.clone())
+        };
+
+        let closed = "$: n(\"c\").vst(\"OTT\", { gain: 1| })\n";
+        let (text, at, _) = pick(closed);
+        assert_eq!(text.as_deref(), Some(call));
+        assert_eq!(at, closed.find(" })").expect("the end") + 2, "after the )");
+
+        let (text, _, _) = pick("$: n(\"c\").vsti(|");
+        assert_eq!(text.as_deref(), Some("\"Serum 2\""), "the name only");
+
+        let (text, _, status) = pick("$: n(\"c\").vst(\"OTT\", { gain: 1 |");
+        assert_eq!(text, None);
+        assert!(status.starts_with("close the vst( call first"), "{status}");
+
+        let (text, at, _) = pick("$: n(\"c\").|");
+        assert_eq!(text.as_deref(), Some("vsti(\"Serum 2\")"));
+        assert_eq!(at, "$: n(\"c\").".len());
     }
 }

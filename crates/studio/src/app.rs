@@ -227,7 +227,7 @@ mod viz_panel;
 mod vst;
 
 use bank_context::bank_machines_ranked;
-use completion::{Landing, ReferenceAnchor};
+use completion::{Landing, LinkPlace, ReferenceAnchor};
 use controllers::StickRun;
 use device_picker::{ACTIVITY_LIGHT_MILLIS, INPUT_LIGHT_PEAK};
 use editing::edits_document;

@@ -593,8 +593,10 @@ Type to search the plugins by name. In the view of a half, the search finds
 its rows: parameters by name, title or group, presets by name. Enter on a
 plugin writes
 `.vst("name")` for an effect and `.vsti("name")` for an instrument at the
-caret. Enter on a parameter writes the parameter with its default, and Enter
-on a preset writes `preset: "name"`.
+caret. With the caret in the arguments of a call, the new call goes after
+that call's `)`, not inside it. An empty `.vst(` takes the name only. A call
+with no `)` yet must be closed first. Enter on a parameter writes the
+parameter with its default, and Enter on a preset writes `preset: "name"`.
 
 F12 enables Piano mode. Use it to enter notes from the keyboard. Leave Piano
 mode before you use those keys to edit ordinary text.
