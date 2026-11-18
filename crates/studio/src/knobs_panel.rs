@@ -206,6 +206,9 @@ pub struct HeldOff {
     /// call still reads as it was left, the entry goes back exactly as
     /// it was: its place, its comments, its fader.
     pub text: Option<HeldText>,
+    /// Where the playing score holds the number, as of the evaluation at
+    /// that revision: back on, the rail moves that number live again.
+    pub playing: Option<(Revision, Range<usize>)>,
 }
 
 /// What came out of a call with an entry the hand took off, to put back.

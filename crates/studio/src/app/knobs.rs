@@ -2400,6 +2400,9 @@ impl App {
         let Some(entry) = cuts.iter().position(|cut| cut.contains(&literal.start)) else {
             return;
         };
+        let playing = self
+            .knob_live_held(knob, &source)
+            .and_then(|held| self.playing_number(&source, held, literal.clone()));
         let held_text = HeldText {
             after: String::new(),
             literal: literal.start - cuts[entry].start..literal.end - cuts[entry].start,
@@ -2432,6 +2435,7 @@ impl App {
                 knob: held,
                 fader,
                 text: after.map(|after| HeldText { after, ..held_text }),
+                playing,
             });
         }
         // The rows answer at once, the rail held off at its row.
@@ -2532,6 +2536,7 @@ impl App {
         // The written entry lands inside the object, and the hand keeps
         // the rail it just turned back on.
         self.refresh_knobs(Rect::default());
+        let mut literal = None;
         if let Some(rows) = self.knobs_rows.as_ref()
             // Two entries can share a name. The score reads the last,
             // so the last is the one the hand keeps.
@@ -2539,6 +2544,16 @@ impl App {
             && let Some(panel) = self.knobs_panel.as_mut()
         {
             panel.selected = at;
+            literal = rows.knobs[at]
+                .state
+                .as_ref()
+                .map(|state| state.literal.clone());
+        }
+        // The playing score still holds the number: it moves live again.
+        if let Some(playing) = held.and_then(|held| held.playing)
+            && let Some(literal) = literal
+        {
+            self.relive_number(playing, literal, value);
         }
         self.status = format!("knobs: {} on at {}", knob.label, short_number(value));
         self.dirty_frame = true;

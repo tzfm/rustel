@@ -268,11 +268,68 @@ impl App {
             .map(|range| range.start + offset..range.start + offset + literal.len())
     }
 
+    /// The number at `literal`, a range of `source`, the current text,
+    /// in the playing score, with the revision that score was evaluated
+    /// at: its live cell, or the number as the score holds it.
+    pub(super) fn playing_number(
+        &self,
+        source: &str,
+        held: Range<usize>,
+        literal: Range<usize>,
+    ) -> Option<(Revision, Range<usize>)> {
+        let scene = self.scenes.current().id;
+        if !self.plays_live(scene) || self.reinstall_on_its_way() {
+            return None;
+        }
+        let playing = match self
+            .live_numbers_now(scene)
+            .into_iter()
+            .find(|number| number.range == literal)
+        {
+            Some(number) => live_number_range(&number.id)?,
+            None => self.playing_literal(scene, source, held, literal)?,
+        };
+        Some((self.visual_revision?, playing))
+    }
+
+    /// A number a rail took off and put back: while the score that played
+    /// at its off still plays, the number at `literal` in the current text
+    /// is that score's number at `playing`, and it goes live at `value`.
+    pub(super) fn relive_number(
+        &mut self,
+        (at, playing): (Revision, Range<usize>),
+        literal: Range<usize>,
+        value: f64,
+    ) -> bool {
+        let scene = self.scenes.current().id;
+        self.plays_live(scene)
+            && self.visual_revision == Some(at)
+            && self.make_live_at(scene, literal, playing, Some(value))
+    }
+
     /// Install the playing score again with the number at `literal` - a
     /// range of the current text - as a live cell, beside the numbers that
     /// are live already. False when that cannot be done without changing
     /// what plays.
     fn make_live(&mut self, scene: SceneId, held: Range<usize>, literal: Range<usize>) -> bool {
+        let Some(source) = self.scenes.get(scene).map(|entry| entry.editor.source()) else {
+            return false;
+        };
+        let Some(new) = self.playing_literal(scene, &source, held, literal.clone()) else {
+            return false;
+        };
+        self.make_live_at(scene, literal, new, None)
+    }
+
+    /// [`Self::make_live`] for the playing score's number at `new`, which
+    /// starts at `moved` when a rail already moved it.
+    fn make_live_at(
+        &mut self,
+        scene: SceneId,
+        literal: Range<usize>,
+        new: Range<usize>,
+        moved: Option<f64>,
+    ) -> bool {
         // An update on its way installs a newer text: this one must not
         // replace it, and the move is written as an edit for it to carry.
         // So must an update whose layout has not landed: until it lands,
@@ -285,12 +342,6 @@ impl App {
         }
         let (Some(installed), Some(at)) = (self.evaluated_source.clone(), self.visual_revision)
         else {
-            return false;
-        };
-        let Some(source) = self.scenes.get(scene).map(|entry| entry.editor.source()) else {
-            return false;
-        };
-        let Some(new) = self.playing_literal(scene, &source, held, literal.clone()) else {
             return false;
         };
         // The numbers that are live already, by the cells the playing score
@@ -319,9 +370,14 @@ impl App {
                 })
             })
             .collect();
+        // A number that was live already has a cell of its own: the new
+        // one replaces it.
+        let id = live_number_id(new.clone());
+        live.retain(|number| number.id != id);
+        sent.retain(|number| number.literal != new);
         sent.push(EngineLiveNumber {
             literal: new.clone(),
-            value: None,
+            value: moved,
         });
         if !self
             .worker
@@ -330,9 +386,9 @@ impl App {
             return false;
         }
         live.push(LiveNumber {
-            id: live_number_id(new),
+            id,
             range: literal,
-            moved: None,
+            moved,
         });
         self.place_live_numbers(scene, live);
         self.next_evaluation = LaunchRequest {
@@ -662,6 +718,74 @@ mod tests {
         );
         app.handle_control(StudioControlEvent::Layout(layout(3, &[cutoff, gain])));
         assert_eq!(cell(&app), Some(moved), "the cutoff plays its rail's value");
+    }
+
+    /// A plugin option taken off at the far-left stop and put back is the
+    /// playing score's number still: it moves live again, with no update.
+    #[test]
+    fn an_option_turned_off_and_on_moves_live_again() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let installed = "$: s(\"sine\").seg(4).vsti(\"Diva\", { output: 0.25, cutoff: 0.5 })\n";
+        let mut app = playing_with_an_unevaluated_edit(directory.path(), installed, "0.25");
+        app.ui_settings.auto_evaluate = false;
+        let rail = Rect::new(0, 0, 24, 1);
+        app.refresh_knobs(Rect::default());
+        let at = app
+            .knobs_rows
+            .as_ref()
+            .and_then(|rows| rows.knobs.iter().position(|knob| knob.label == "output"))
+            .expect("the output rail");
+        let output = installed.find("0.25").expect("the output");
+        let cell = output..output + "0.25".len();
+        let land = |app: &mut App, generation| {
+            app.inflight.clear();
+            app.pending_evaluation = None;
+            let layout = rustel_runtime::ui_events::visual_layout_with_live_numbers(
+                installed,
+                generation,
+                &as_written(std::slice::from_ref(&cell)),
+            )
+            .expect("layout");
+            app.handle_control(StudioControlEvent::Layout(layout));
+        };
+
+        app.drag_knob(at, rail, 20);
+        assert_eq!(sent(&app).len(), 1, "the first move makes it live");
+        land(&mut app, 2);
+
+        app.drag_knob(at, rail, 0);
+        assert!(!app.editor().source().contains("output"), "the off stop");
+        app.drag_knob(at, rail, 12);
+        assert!(app.editor().source().contains("output"), "back on");
+        assert_eq!(
+            sent(&app)
+                .iter()
+                .map(|text| text.as_ref())
+                .collect::<Vec<_>>(),
+            [installed],
+            "the playing score goes again, the number live"
+        );
+        land(&mut app, 3);
+        let before = sent(&app).len();
+        app.drag_knob(at, rail, 16);
+        assert_eq!(sent(&app).len(), before, "a move evaluates nothing");
+        let id = live_number_id(cell);
+        let written: f64 = {
+            let source = app.editor().source();
+            let start = source.find("output: ").expect("the entry") + "output: ".len();
+            let end = start + source[start..].find([',', ' ']).expect("the end");
+            source[start..end].parse().expect("a number")
+        };
+        assert_eq!(
+            app.sliders
+                .iter()
+                .find(|span| span.id == id)
+                .map(|span| span.value),
+            Some(written),
+            "the cell follows the rail"
+        );
+        app.refresh_knobs(Rect::default());
+        assert!(!app.knobs_rows.as_ref().expect("the rails").knobs[at].waits);
     }
 
     /// A function the engine patternifies takes a live number as a control
