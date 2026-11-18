@@ -687,12 +687,19 @@ column only edits what is written.
 A plain number that the engine reads as a pattern also sounds at once while
 the set plays, with no update and with auto evaluate on or off. That is the
 number of an audio control, such as the `4000` of `lpf(4000)`, and each
-number of a function such as `pg(0.8)`, `fast(2)` or `seg(4)`. The first move installs the playing score again, unchanged, with
-that number live. Edits you have not evaluated stay out of the sound. After
-that each move sets the number, as a slider does. A number in an options
-object, of a plugin call or of a function defined in the score sounds at
-once while the set plays and auto evaluate is on, with the next update. A
-stopped set, or auto evaluate off, keeps the typing pause.
+number of a function such as `pg(0.8)`, `fast(2)` or `seg(4)`. The first
+move installs the playing score again, unchanged, with that number live.
+Edits you have not evaluated stay out of the sound. After that each move
+sets the number, as a slider does. A number in an options object, of a
+plugin call or of a function defined in the score sounds at once while the
+set plays and auto evaluate is on, with the next update. A stopped set, or
+auto evaluate off, keeps the typing pause.
+
+While the set plays and auto evaluate is off, a rail that the next update
+must carry is muted, on a dashed rail, and its hint says "plays after an
+update". That is a number the playing score does not hold yet, such as the
+`8` of a `seg(8)` you typed and did not evaluate, or a number no live cell
+can stand in for. The move still writes the score.
 
 A number with no `slider(...)` gets bounds the studio works out:
 

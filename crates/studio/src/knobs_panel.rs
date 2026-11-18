@@ -63,6 +63,10 @@ pub struct Knob {
     /// A frequency control on a positive range, as the inline sliders
     /// decide it, so the rail travels the way the ear hears it.
     pub log: bool,
+    /// The set plays, and a move is not heard until the next update: the
+    /// playing score does not hold this number yet, or holds it where no
+    /// live cell can stand. Drawn muted, on a dashed rail.
+    pub waits: bool,
 }
 
 impl Knob {
@@ -585,6 +589,7 @@ impl KnobsView<'_> {
             Some(0) => "→ opens the presets",
             Some(_) => "Enter takes · ← closes",
             None => match self.knobs.get(self.panel.selected) {
+                Some(knob) if knob.waits => "plays after an update",
                 Some(knob) if knob.optional && knob.state.is_none() => "→ on · Enter edit",
                 Some(knob) if knob.optional => "⌫ off · Enter edit",
                 Some(_) => "←/→ move · Enter edit",
@@ -667,7 +672,7 @@ impl KnobsView<'_> {
         chosen: bool,
     ) {
         let theme = self.theme;
-        let on = knob.state.is_some();
+        let on = knob.state.is_some() && !knob.waits;
         let reading = match &knob.state {
             Some(state) => short_number(state.value),
             None => "off".to_owned(),
@@ -717,11 +722,13 @@ impl KnobsView<'_> {
             // says so at a glance, the way a dimmed light does.
             if knob.optional && position == 0 {
                 text.push(if notch.is_none() { '█' } else { '·' });
+            } else if position == handle {
+                text.push('█');
             } else {
-                text.push(if position == handle { '█' } else { '─' });
+                text.push(if knob.waits { '╌' } else { '─' });
             }
         }
-        let mut style = Style::default().fg(if notch.is_some() {
+        let mut style = Style::default().fg(if notch.is_some() && !knob.waits {
             theme.accent
         } else {
             theme.muted
@@ -908,6 +915,7 @@ mod tests {
             default: value,
             optional: false,
             log: true,
+            waits: false,
         };
         // Half the rail is the geometric mean, and an octave is the same
         // share of it anywhere in the range, where a linear rail gives an

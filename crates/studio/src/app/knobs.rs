@@ -409,6 +409,7 @@ fn make_knob(label: String, place: KnobPlace, state: KnobState) -> Knob {
         step: 0.01,
         default: 0.0,
         log: false,
+        waits: false,
     }
 }
 
@@ -953,6 +954,7 @@ impl App {
             }
         }
         self.assemble_knobs();
+        self.mark_waiting_knobs();
         // The presets of the plugin call, read for the section under the
         // rails: a new call asks for its own names, and a new read of the
         // preset folders brings them again. The names stay empty for a
@@ -1162,6 +1164,7 @@ impl App {
                         default: defaults.default,
                         optional: true,
                         log: false,
+                        waits: false,
                     },
                     &mut knobs,
                 );
@@ -1230,6 +1233,7 @@ impl App {
                     default: option.start().clamp(min, max),
                     optional: true,
                     log: false,
+                    waits: false,
                 });
             }
             knobs.sort_by_key(|knob| {
@@ -2195,8 +2199,13 @@ impl App {
     /// Say what a move did, the way the inline sliders do: the value and
     /// the step, so the next move is a known quantity.
     fn knob_status(&mut self, knob: &Knob, value: f64) {
+        let waits = if knob.waits {
+            " · plays after an update"
+        } else {
+            ""
+        };
         self.status = format!(
-            "knobs: {} {} · step {}",
+            "knobs: {} {} · step {}{waits}",
             knob.label,
             short_number(value),
             short_number(knob.step)
@@ -2243,6 +2252,41 @@ impl App {
             return true;
         }
         self.knobs_write(literal, &text)
+    }
+
+    /// Mark the rails a move of which waits for the next update while the
+    /// set plays: a number the playing score does not hold yet, such as a
+    /// call typed since, or holds where no live cell can stand. With auto
+    /// evaluate on, every move is an update, so none waits.
+    fn mark_waiting_knobs(&mut self) {
+        let scene = self.scenes.current().id;
+        if self.ui_settings.auto_evaluate || !self.plays_live(scene) {
+            return;
+        }
+        let Some(rows) = self.knobs_rows.as_ref() else {
+            return;
+        };
+        let chips = self.live_chips(scene);
+        let waits: Vec<bool> = rows
+            .knobs
+            .iter()
+            .map(|knob| {
+                let Some(state) = knob.state.as_ref() else {
+                    return false;
+                };
+                let literal = state.literal.clone();
+                let fader = chips
+                    .iter()
+                    .any(|chip| chip.span.from <= literal.start && literal.end <= chip.span.to);
+                !fader
+                    && !(self.knob_takes_a_live_number(knob) && self.number_plays(scene, literal))
+            })
+            .collect();
+        if let Some(rows) = self.knobs_rows.as_mut() {
+            for (knob, waits) in rows.knobs.iter_mut().zip(waits) {
+                knob.waits = waits;
+            }
+        }
     }
 
     /// Whether a live cell can stand in for a rail's plain number: see
@@ -2920,6 +2964,7 @@ mod tests {
             default: 800.0,
             optional: true,
             log: false,
+            waits: false,
         };
         let param = ParamDefaults {
             default: 0.25,

@@ -136,7 +136,7 @@ impl App {
         text: &str,
     ) -> bool {
         let scene = self.scenes.current().id;
-        if self.audible_scene != Some(scene) || !self.is_playing() || self.is_stopping() {
+        if !self.plays_live(scene) {
             return false;
         }
         self.follow_slider_spans();
@@ -150,6 +150,42 @@ impl App {
         self.write_live_number(scene, literal, value, text)
     }
 
+    /// Whether a rail can move a number of the scene live: the set plays
+    /// the scene itself, not a tape or a prebake of it.
+    pub(super) fn plays_live(&self, scene: SceneId) -> bool {
+        self.audible_scene == Some(scene)
+            && self.is_playing()
+            && !self.is_stopping()
+            && self.current_replay().is_none()
+            && self.current_prebake().is_none()
+    }
+
+    /// Whether the scene's number at `literal`, a range of its current
+    /// text, is live already or held as it is by the playing score, so a
+    /// rail moves it live.
+    pub(super) fn number_plays(&self, scene: SceneId, literal: Range<usize>) -> bool {
+        self.live_numbers_now(scene)
+            .iter()
+            .any(|number| number.range == literal)
+            || self.playing_literal(scene, literal).is_some()
+    }
+
+    /// The number at `literal`, a range of the scene's current text, as
+    /// the playing score holds it: the same text, which the edits since
+    /// moved to where it is now. A number typed or retyped since is not in
+    /// the playing score.
+    fn playing_literal(&self, scene: SceneId, literal: Range<usize>) -> Option<Range<usize>> {
+        let installed = self.evaluated_source.as_deref()?;
+        let at = self.visual_revision?;
+        let editor = &self.scenes.get(scene)?.editor;
+        let source = editor.source();
+        let number = source.get(literal.clone())?;
+        installed
+            .match_indices(number)
+            .map(|(start, _)| start..start + number.len())
+            .find(|range| editor.map_range_since(at, range.clone()).as_ref() == Some(&literal))
+    }
+
     /// Install the playing score again with the number at `literal` - a
     /// range of the current text - as a live cell, beside the numbers that
     /// are live already. False when that cannot be done without changing
@@ -160,8 +196,6 @@ impl App {
         if self.pending_evaluation.is_some()
             || !self.inflight.is_empty()
             || self.launch_arming.is_armed()
-            || self.current_replay().is_some()
-            || self.current_prebake().is_some()
         {
             return false;
         }
@@ -169,26 +203,9 @@ impl App {
         else {
             return false;
         };
-        let Some(editor) = self.scenes.get(scene).map(|entry| &entry.editor) else {
+        let Some(new) = self.playing_literal(scene, literal.clone()) else {
             return false;
         };
-        let source = editor.source();
-        let Some(number) = source.get(literal.clone()) else {
-            return false;
-        };
-        // The number as the playing score holds it: the same text, which the
-        // edits since moved to where it is now. A number typed since is not
-        // in the playing score.
-        let Some(start) = installed
-            .match_indices(number)
-            .map(|(start, _)| start)
-            .find(|&start| {
-                editor.map_range_since(at, start..start + number.len()) == Some(literal.clone())
-            })
-        else {
-            return false;
-        };
-        let new = start..start + number.len();
         // The numbers that are live already, by the ranges their ids name
         // in the playing score.
         let mut live = self.live_numbers_now(scene);
@@ -553,6 +570,22 @@ mod tests {
         );
         assert!(!takes_a_live_number("midi", false, 0));
         assert!(!takes_a_live_number("myOwnFunction", false, 0));
+    }
+
+    /// While the set plays, a rail whose number the playing score does
+    /// not hold - typed since, not evaluated - waits for the update and
+    /// says so. The cutoff the score plays moves live and does not wait.
+    #[test]
+    fn a_rail_the_playing_score_lacks_waits_for_the_update() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let waits = |number: &str| {
+            let mut app = playing_with_an_unevaluated_edit(directory.path(), CUTOFF, number);
+            app.ui_settings.auto_evaluate = false;
+            app.refresh_knobs(Rect::default());
+            app.knobs_rows.as_ref().expect("the rails").knobs[0].waits
+        };
+        assert!(waits("16"), "the seg typed since waits");
+        assert!(!waits("4000"), "the playing cutoff moves live");
     }
 
     /// A stopped set has no score to move: the rail writes the score, and
