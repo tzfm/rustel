@@ -5125,7 +5125,7 @@ mod tests {
                 .map(|&index| reference.entry(index).unwrap().name.as_str())
                 .collect();
             let brought = reference.from_origin("Switch Angel");
-            assert!(!brought.is_empty());
+            assert_eq!(brought.is_empty(), !cfg!(feature = "extensions"));
             for name in brought {
                 assert!(found.contains(&name), "{name}");
             }
