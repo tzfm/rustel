@@ -687,7 +687,8 @@ column only edits what is written.
 A plain number that the engine reads as a pattern also sounds at once while
 the set plays, with no update and with auto evaluate on or off. That is the
 number of an audio control, such as the `4000` of `lpf(4000)`, and each
-number of a function such as `pg(0.8)`, `fast(2)` or `seg(4)`. The first
+number of a function such as `pg(0.8)`, `fast(2)` or `seg(4)`, and the
+distortion and volume of an `FX` waveshaper such as `soft(4.5)`. The first
 move installs the playing score again, unchanged, with that number live.
 Edits you have not evaluated stay out of the sound. After that each move
 sets the number, as a slider does. A number in an options object, of a
@@ -731,6 +732,16 @@ Shift+→ move one step. A drag lands on a whole number when the cell or the
 pixel under the pointer holds one that the rail's steps reach. It holds the
 rail it started on: the pointer can leave the column, and the rail follows
 it until you let go.
+
+Hold Shift or Alt while you drag any slider for a fine drag: a rail of the
+column, a score slider, the expanded slider or a desk fader. The value
+stops jumping to the pointer and moves a tenth as far as the pointer, from
+where you took hold. Let go of the key and the drag goes on at full speed
+from there, with no jump. Some terminals keep a Shift or Alt drag for their
+own text selection. Press f in the column or in the expanded slider to lock
+fine drags on, and f again to turn the lock off. The column's title says
+"fine" while the lock is on, and the status line says "fine" during a fine
+drag.
 
 The far left of a rail is an off stop. On an object entry it takes the entry
 out of the score and leaves its comments where they are. Backspace or

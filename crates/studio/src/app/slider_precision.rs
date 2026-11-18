@@ -91,6 +91,7 @@ pub(super) struct PrecisionView {
     frequency: bool,
     pixels: bool,
     smoothing: bool,
+    fine_lock: bool,
 }
 
 impl PrecisionView {
@@ -171,7 +172,11 @@ impl PrecisionView {
         } else if self.state.entry.is_some() {
             "Enter applies · Esc cancels entry"
         } else {
-            "←/→ adjust · Shift: one step · type value · Esc closes"
+            if self.fine_lock {
+                "←/→ adjust · Shift: one step · F: fine drag on · Esc closes"
+            } else {
+                "←/→ adjust · Shift: one step · F or Shift/Alt drag: fine · Esc closes"
+            }
         };
         frame.render_widget(
             Paragraph::new(hints).style(Style::default().fg(theme.muted)),
@@ -275,6 +280,7 @@ impl App {
             frequency: chip.frequency,
             pixels: self.features.pixel_mouse,
             smoothing: self.ui_settings.slider_smoothing,
+            fine_lock: self.fine_drag.lock,
         })
     }
 
@@ -409,6 +415,9 @@ impl App {
                     }
                     self.prefs.set_ui_settings(&self.ui_settings);
                     self.save_prefs_soon();
+                }
+                KeyCode::Char('f' | 'F') if !primary && !alt && key.kind == KeyEventKind::Press => {
+                    self.toggle_fine_lock();
                 }
                 KeyCode::Char('s' | 'S') if !primary && !alt && key.kind == KeyEventKind::Press => {
                     self.ui_settings.slider_smoothing = !self.ui_settings.slider_smoothing;

@@ -1309,6 +1309,7 @@ impl App {
                             active: rows.preset.as_deref(),
                         }),
                     panel,
+                    fine_lock: self.fine_drag.lock,
                 }),
             mixer_selection: self.mixer_selection.as_ref(),
             reference_on_top: self.reference_on_top(),

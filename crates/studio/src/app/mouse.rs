@@ -178,6 +178,7 @@ impl App {
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<(), RuntimeError> {
         let (x, y) = (mouse.column, mouse.row);
+        self.fine_drag.report(mouse.modifiers);
         // A press begins a new gesture wherever it lands. Whatever the last
         // one held is over, even when its release never came (let go
         // outside the window, or taken by a sheet or menu on its way): its
@@ -666,6 +667,7 @@ impl App {
     /// goes elsewhere or never comes must end here.
     pub(super) fn end_pointer_gesture(&mut self) {
         self.pointer = None;
+        self.fine_drag.release();
         for scene in self.scenes.scenes_mut() {
             scene.editor.cancel_drag();
         }

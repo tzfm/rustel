@@ -221,10 +221,11 @@ impl App {
             ""
         };
         format!(
-            "{} · mouse: {mouse}{scale} · {}←/→ {} · Enter expands · Esc lets go",
+            "{} · mouse: {mouse}{scale} · {}←/→ {}{} · Enter expands · Esc lets go",
             format_value(value),
             crate::terminal::symbol("⇧"),
-            format_value(step)
+            format_value(step),
+            self.fine_drag_hint()
         )
     }
 
@@ -548,15 +549,9 @@ impl App {
         let Some(chip) = self.live_chip_at(scene, call_from) else {
             return;
         };
-        let cell_width = self
-            .features
-            .pixel_mouse
-            .then_some(self.features.cell_pixels)
-            .flatten()
-            .map(|(width, _)| width);
-        let ratio = track.ratio(x, self.pointer_subcell, cell_width);
         let span = &chip.span;
-        let resolution = track.resolution(cell_width);
+        let now = chip.travel.ratio(span.value, span.min, span.max);
+        let (ratio, resolution) = self.rail_drag(track, x, now);
         let value = pointer_value(
             chip.travel,
             ratio,

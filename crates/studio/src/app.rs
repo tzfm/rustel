@@ -25,6 +25,7 @@
 //! | sets and the set panel (^B) | `sets.rs` |
 //! | tapes, the replay tab and timeline | `replay_tabs.rs`, `replay_edit.rs`, `replay_pointer.rs`, `sessions.rs` |
 //! | inline sliders in the score | `slider.rs`, `slider_precision.rs` |
+//! | fine, relative drags of every slider rail | `fine_drag.rs` |
 //! | the knobs column beside the score, and the numbers it moves live | `knobs.rs`, `live_numbers.rs` |
 //! | the visuals docks | `viz_panel.rs` |
 //! | Hydra visuals behind the score | `hydra_backdrop.rs`, `stage_pixels.rs` |
@@ -164,6 +165,7 @@ mod event_loop;
 mod export_sheet;
 mod external_changes;
 mod find;
+mod fine_drag;
 mod focus;
 mod hydra_backdrop;
 #[cfg(feature = "hydra")]
@@ -1465,6 +1467,8 @@ struct App {
     /// terminal that reports pixels sets it; one that reports cells leaves
     /// it at 0.
     pointer_subcell: f64,
+    /// Fine drags: held Shift or Alt, the fine lock, and a drag's grip.
+    fine_drag: fine_drag::FineDrag,
     /// The same fraction down a cell, for the controls that stand up.
     ///
     /// A slider lies along its row and needs only the horizontal fraction.
@@ -1967,6 +1971,7 @@ impl App {
             regions: StudioRegions::default(),
             pointer: None,
             pointer_subcell: 0.0,
+            fine_drag: fine_drag::FineDrag::default(),
             pointer_subrow: 0.0,
             last_pty_cell_pixels: None,
             focus: Focus::Editor,

@@ -1318,6 +1318,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 knobs: knobs.knobs,
                 presets: knobs.presets,
                 panel: knobs.panel,
+                fine_lock: knobs.fine_lock,
                 theme,
                 focused: view.focused_panel == Some(PanelKind::Knobs),
                 area: layout.knobs,

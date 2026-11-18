@@ -200,8 +200,8 @@ impl HelpContext {
                 ("Left / Right", "step the armed slider"),
                 ("Enter / Esc", "expand for exact entry / let go"),
                 (
-                    "drag / wheel",
-                    "set or nudge under the pointer - a controller reaches a slider through the mixer's desk and a mapping slot, not through this",
+                    "drag · Shift/Alt drag · wheel",
+                    "set under the pointer / fine, a tenth as far / nudge - a controller reaches a slider through the mixer's desk and a mapping slot, not through this",
                 ),
             ],
             Self::Viz => [
@@ -238,8 +238,8 @@ impl HelpContext {
                     "type a value / add a knob / suggested knobs back / take a knob out",
                 ),
                 (
-                    "Home · End · Esc",
-                    "bottom or off / top / back to the score",
+                    "Home · End · f · Esc",
+                    "bottom or off / top / fine drag lock / back to the score",
                 ),
             ],
             Self::Set => [

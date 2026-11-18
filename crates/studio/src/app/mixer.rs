@@ -1041,19 +1041,16 @@ impl App {
         let Some(chip) = self.live_chip_at(scene, call_from) else {
             return;
         };
-        let cell_width = self
-            .features
-            .pixel_mouse
-            .then_some(self.features.cell_pixels)
-            .flatten()
-            .map(|(width, _)| width);
-        let ratio = rail.ratio(x, self.pointer_subcell, cell_width);
-        let value = chip.travel.at(ratio, chip.span.min, chip.span.max);
+        let span = &chip.span;
+        let now = chip.travel.ratio(span.value, span.min, span.max);
+        let (ratio, _) = self.rail_drag(rail, x, now);
+        let value = chip.travel.at(ratio, span.min, span.max);
         self.set_slider_with_smoothing(scene, &chip, value, self.ui_settings.slider_smoothing);
         self.status = format!(
-            "{} {}",
+            "{} {}{}",
             chip.label.clone().unwrap_or_else(|| "slider".to_owned()),
-            slider::format_value(chip.span.clamp(value))
+            slider::format_value(span.clamp(value)),
+            self.fine_drag_hint()
         );
     }
 

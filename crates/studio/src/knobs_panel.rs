@@ -438,6 +438,8 @@ pub struct KnobsData<'a> {
     /// The presets of the plugin call, under the rails.
     pub presets: Option<PresetsSection<'a>>,
     pub panel: &'a KnobsPanel,
+    /// The fine lock is on: every rail drag moves a tenth as far.
+    pub fine_lock: bool,
 }
 
 /// The panel as the painter draws it. The reading is each frame's own. The
@@ -452,6 +454,8 @@ pub struct KnobsView<'a> {
     /// The presets of the plugin call, under the rails.
     pub presets: Option<PresetsSection<'a>>,
     pub panel: &'a KnobsPanel,
+    /// The fine lock is on: the title says so.
+    pub fine_lock: bool,
     pub theme: &'a Theme,
     pub focused: bool,
     pub area: Rect,
@@ -474,10 +478,13 @@ impl Widget for KnobsView<'_> {
         }
         // The call the rails belong to, always: the accent while the
         // column has the keys, muted while the score has them.
-        let title = match self.name {
+        let mut title = match self.name {
             Some(name) => format!("knobs · {name}"),
             None => "knobs".to_owned(),
         };
+        if self.fine_lock {
+            title.push_str(" · fine");
+        }
         let title_style = if self.focused {
             Style::default()
                 .fg(theme.accent)
@@ -593,9 +600,9 @@ impl KnobsView<'_> {
             Some(_) => "Enter takes · ← closes",
             None => match self.knobs.get(self.panel.selected) {
                 Some(knob) if knob.waits => "plays after an update",
-                Some(knob) if knob.optional && knob.state.is_none() => "→ on · Enter edit",
-                Some(knob) if knob.optional => "⌫ off · Enter edit",
-                Some(_) => "←/→ move · Enter edit",
+                Some(knob) if knob.optional && knob.state.is_none() => "→ on · e edit · f fine",
+                Some(knob) if knob.optional => "⌫ off · e edit · f fine",
+                Some(_) => "←/→ · e edit · f fine",
                 None => "",
             },
         };
@@ -916,7 +923,8 @@ mod tests {
     }
 
     /// A rail that waits for an update says "not live" beside its reading,
-    /// on a dashed rail. A live rail says neither.
+    /// on a dashed rail. A live rail says neither. The title says when the
+    /// fine lock is on.
     #[test]
     fn a_waiting_rail_says_it_is_not_live() {
         let knob = |waits| Knob {
@@ -947,6 +955,7 @@ mod tests {
                 knobs: &knobs,
                 presets: None,
                 panel: &panel,
+                fine_lock: waits,
                 theme: &theme,
                 focused: false,
                 area,
@@ -959,6 +968,7 @@ mod tests {
             };
             assert_eq!(row(1).contains("not live"), waits, "{}", row(1));
             assert_eq!(row(2).contains('╌'), waits, "{}", row(2));
+            assert_eq!(row(0).contains("· fine"), waits, "the lock: {}", row(0));
         }
     }
 

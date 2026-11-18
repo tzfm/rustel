@@ -1383,7 +1383,7 @@ impl App {
                     | KeyCode::End
                     | KeyCode::Delete
                     | KeyCode::Backspace
-                    | KeyCode::Char('e' | 'E' | 'a' | 'A' | 'r' | 'R')
+                    | KeyCode::Char('e' | 'E' | 'a' | 'A' | 'r' | 'R' | 'f' | 'F')
             )
         };
         // Any key but a second `r` keeps the rails a first `r` offered to
@@ -1417,6 +1417,7 @@ impl App {
                 KeyCode::Char('e' | 'E') | KeyCode::Enter => self.open_knobs_form(),
                 KeyCode::Char('a' | 'A') => self.open_knobs_add(),
                 KeyCode::Char('r' | 'R') => self.knobs_reset_key(),
+                KeyCode::Char('f' | 'F') => self.toggle_fine_lock(),
                 KeyCode::Delete | KeyCode::Backspace => self.knobs_delete(),
                 KeyCode::Left => self.nudge_knob(-1, shift),
                 KeyCode::Right => self.nudge_knob(1, shift),
@@ -2770,7 +2771,9 @@ impl App {
         if rail.width < 3 {
             return;
         }
-        if knob.optional && x <= rail.x {
+        // The off stop is a place on the rail: a relative drag rests at
+        // the rail's minimum instead.
+        if knob.optional && x <= rail.x && !self.fine_drag.relative() {
             if knob.state.is_some() {
                 self.knob_off(&knob);
             }
@@ -2788,19 +2791,16 @@ impl App {
                 width: rail.width,
             }
         };
-        let cell_width = self
-            .features
-            .pixel_mouse
-            .then_some(self.features.cell_pixels)
-            .flatten()
-            .map(|(width, _)| width);
-        let ratio = track.ratio(x, self.pointer_subcell, cell_width);
         let travel = if knob.log {
             Travel::Logarithmic
         } else {
             Travel::Linear
         };
-        let resolution = track.resolution(cell_width);
+        let now = knob
+            .state
+            .as_ref()
+            .map_or(0.0, |state| travel.ratio(state.value, knob.min, knob.max));
+        let (ratio, resolution) = self.rail_drag(track, x, now);
         let value = pointer_value(travel, ratio, resolution, knob.min, knob.max, knob.step);
         if knob.state.is_none() {
             self.knob_on(&knob, value);
@@ -2808,6 +2808,8 @@ impl App {
         }
         self.set_knob(&knob, value);
         self.knob_status(&knob, value);
+        let hint = self.fine_drag_hint();
+        self.status.push_str(&hint);
     }
 
     /// The wheel over the panel walks its rails.
