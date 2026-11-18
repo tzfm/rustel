@@ -429,32 +429,34 @@ impl App {
                     .find(|report| report.spec == spec)
                     .map(|report| report.state.clone());
                 // Each renamed bank under the name it plays as, the
-                // player's alias or the automatic one.
-                let alias_detail = self.worker.library().and_then(|library| {
-                    let mut banks: Vec<String> = library
-                        .automatic_aliases_for_import(spec)
-                        .into_iter()
-                        .map(|(from, _)| from)
-                        .collect();
-                    if let Some(manual) = self.prefs.sample_source_renames.get(&source.spec) {
-                        banks.extend(manual.keys().cloned());
-                    }
-                    banks.sort();
-                    banks.dedup();
-                    let aliases: Vec<String> = banks
-                        .into_iter()
-                        .filter_map(|from| {
-                            let to = library.alias_for_import(spec, &from);
-                            (to != from).then(|| format!("{from}→{to}"))
-                        })
-                        .collect();
-                    (!aliases.is_empty()).then(|| aliases.join(", "))
-                });
+                // player's alias or the automatic one. Only a ready row
+                // reads it.
+                let alias_detail = || {
+                    self.worker.library().and_then(|library| {
+                        let mut banks: Vec<String> = library
+                            .automatic_aliases_for_import(spec)
+                            .into_iter()
+                            .map(|(from, _)| from)
+                            .collect();
+                        if let Some(manual) = self.prefs.sample_source_renames.get(&source.spec) {
+                            banks.extend(manual.keys().cloned());
+                        }
+                        banks.sort();
+                        banks.dedup();
+                        let aliases: Vec<String> = banks
+                            .into_iter()
+                            .filter_map(|from| {
+                                let to = library.alias_for_import(spec, &from);
+                                (to != from).then(|| format!("{from}→{to}"))
+                            })
+                            .collect();
+                        (!aliases.is_empty()).then(|| aliases.join(", "))
+                    })
+                };
                 let (state, dimmed, cache_fill) = match state {
                     Some(GlobalSourceState::Ready { banks }) => {
                         let decorate = |state: String| {
-                            alias_detail
-                                .as_ref()
+                            alias_detail()
                                 .map_or(state.clone(), |aliases| format!("{state} · {aliases}"))
                         };
                         if local {

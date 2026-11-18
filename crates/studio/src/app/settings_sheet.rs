@@ -1573,7 +1573,11 @@ mod tests {
 
                 press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
                 assert_eq!(app.prefs.sample_sources.len(), 1, "vim {vim}");
-                assert_eq!(selected(&app), SOURCE_CONTROL_COUNT, "the import before");
+                assert_eq!(
+                    selected(&app),
+                    SOURCE_CONTROL_COUNT,
+                    "the import before, vim {vim}"
+                );
                 assert!(!app.prefs.sample_source_renames.contains_key(specs[1]));
                 assert!(app.prefs.sample_source_renames.contains_key(specs[0]));
 
@@ -1582,14 +1586,14 @@ mod tests {
                 assert!(app.prefs.sample_source_renames.is_empty());
                 assert!(
                     selected(&app) >= SOURCE_CONTROL_COUNT,
-                    "not on the cache controls"
+                    "not on the cache controls, vim {vim}"
                 );
 
                 press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
                 press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
                 assert!(
                     !app.settings_sheet.expect("sheet").confirm_clear_cache,
-                    "Enter does not arm the cache clear"
+                    "Enter does not arm the cache clear, vim {vim}"
                 );
             }
         }

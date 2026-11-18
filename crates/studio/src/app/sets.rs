@@ -1150,6 +1150,17 @@ impl App {
                     if self.refuse_set_output_source(&spec) {
                         return true;
                     }
+                    // As on add: one row per source.
+                    let taken = self
+                        .prefs
+                        .sample_sources
+                        .iter()
+                        .enumerate()
+                        .any(|(row, source)| row != at && source.spec == spec);
+                    if taken {
+                        self.status = format!("{spec} is already a sample source");
+                        return true;
+                    }
                     if self.prefs.change_sample_source(at, spec.clone()) {
                         self.save_prefs_soon();
                         self.adopt_global_sources();

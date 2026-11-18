@@ -717,8 +717,9 @@ impl StudioPrefs {
         changed
     }
 
-    /// Point the source at `at` at `spec`. Its bank aliases follow it. They
-    /// also stay on the old source while another row still names it.
+    /// Point the source at `at` at `spec` and return whether it changed.
+    /// Its bank aliases follow it, and an alias already set on `spec` wins.
+    /// They also stay on the old source while another row still names it.
     pub fn change_sample_source(&mut self, at: usize, spec: String) -> bool {
         let Some(source) = self.sample_sources.get_mut(at) else {
             return false;
@@ -726,7 +727,7 @@ impl StudioPrefs {
         let old = std::mem::replace(&mut source.spec, spec);
         let spec = &self.sample_sources[at].spec;
         if old == *spec {
-            return true;
+            return false;
         }
         let shared = self.sample_sources.iter().any(|source| source.spec == old);
         // Cloned only when the old row's aliases must stay too.
@@ -1607,6 +1608,10 @@ mod tests {
             assert!(prefs.change_sample_source(1, c.clone()));
             assert!(!prefs.sample_source_renames.contains_key(&a));
             assert_eq!(prefs.sample_source_renames[&c]["kick"], "boom");
+            assert!(
+                !prefs.change_sample_source(1, c),
+                "the same spec is no change"
+            );
             assert!(!prefs.change_sample_source(2, a));
         }
 
