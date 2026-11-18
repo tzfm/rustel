@@ -666,8 +666,9 @@ mod tests {
 
     /// A function the engine patternifies takes a live number as a control
     /// does: `fast(2)` moves live, and `pg(0.8)` with the extensions, and
-    /// so does the distortion of an `FX(soft(4.5))` stage. A
-    /// function that takes its number as it is keeps the write in the score.
+    /// so does the distortion of an `FX(soft(4.5))` stage, and an entry of
+    /// a plugin's options. A function that takes its number as it is, or
+    /// an entry it reads as written, keeps the write in the score.
     #[test]
     fn a_patternified_function_moves_live_and_a_plain_one_does_not() {
         for (source, number, live) in [
@@ -677,6 +678,12 @@ mod tests {
             ("$: s(\"sine\").seg(4).ply(3)\n", "3", true),
             ("$: s(\"sine\").seg(4).FX(soft(4.5))\n", "4.5", true),
             ("$: s(\"sine\").seg(4).midi(\"out\", 3)\n", "3", false),
+            (
+                "$: s(\"sine\").seg(4).vsti(\"Diva\", { output: 0.111 })\n",
+                "0.111",
+                true,
+            ),
+            ("$: s(\"sine\").seg(4).set({ q: 0.2 })\n", "0.2", false),
         ] {
             let directory = tempfile::tempdir().expect("tempdir");
             let mut app = playing_with_an_unevaluated_edit(directory.path(), source, number);

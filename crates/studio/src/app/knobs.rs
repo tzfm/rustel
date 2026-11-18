@@ -2297,10 +2297,9 @@ impl App {
 
     /// What a live move of the rail needs before the score's text is read:
     /// a plain number, no fader, of a call that takes a live cell there.
+    /// A plugin reads each entry of its options object as a pattern, so
+    /// a cell there drives the parameter.
     fn knob_may_move_live(&self, knob: &Knob) -> bool {
-        let KnobPlace::Argument(at) = knob.place else {
-            return false;
-        };
         knob.state
             .as_ref()
             .is_some_and(|state| state.fader.is_none())
@@ -2308,9 +2307,16 @@ impl App {
                 .knobs_parse
                 .as_ref()
                 .and_then(|parse| parse.call.as_ref())
-                .is_some_and(|call| {
-                    call.plugin.is_none()
-                        && super::live_numbers::takes_a_live_number(&call.name, call.control, at)
+                .is_some_and(|call| match knob.place {
+                    KnobPlace::Argument(at) => {
+                        call.plugin.is_none()
+                            && super::live_numbers::takes_a_live_number(
+                                &call.name,
+                                call.control,
+                                at,
+                            )
+                    }
+                    KnobPlace::Entry(_) => call.plugin.is_some(),
                 })
     }
 
@@ -2320,7 +2326,7 @@ impl App {
     /// [`super::live_numbers::takes_a_live_number`]. While the playing
     /// score holds those bytes as they are, its number there is the one the
     /// rail moves. An entry of an options object is read as it is written,
-    /// so a cell there would not be a number.
+    /// so a cell there would not be a number, unless a plugin reads it.
     fn knob_live_held(&self, knob: &Knob, source: &str) -> Option<Range<usize>> {
         if !self.knob_may_move_live(knob) {
             return None;
