@@ -1533,6 +1533,43 @@ mod tests {
             assert_eq!(app.log.unseen(), warnings, "a refusal is not a warning");
         }
 
+        /// `e` cannot point a row at a source another row already has, as
+        /// add keeps one row per source. The edited row keeps its spec.
+        #[test]
+        fn an_edit_onto_another_rows_source_is_refused() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let specs: Vec<String> = ["a", "b"]
+                .into_iter()
+                .map(|name| {
+                    let kit = directory.path().join(name);
+                    std::fs::create_dir_all(&kit).expect("kit");
+                    std::fs::write(kit.join("kick.wav"), b"fixture").expect("sample");
+                    kit.display().to_string()
+                })
+                .collect();
+            for spec in &specs {
+                app.add_sample_source(spec);
+            }
+            app.open_set_prompt(SetPrompt::EditSampleSource(1));
+            if let Some((_, picker)) = app.set_prompt.as_mut() {
+                picker.offer(&specs[0]);
+            }
+            assert!(app.handle_set_prompt_key(KeyCode::Enter, false, false));
+            let now: Vec<&str> = app
+                .prefs
+                .sample_sources
+                .iter()
+                .map(|source| source.spec.as_str())
+                .collect();
+            assert_eq!(now, [specs[0].as_str(), specs[1].as_str()]);
+            assert!(
+                app.status.contains("already a sample source"),
+                "{}",
+                app.status
+            );
+        }
+
         fn midi_fixture(directory: &std::path::Path, end: u64) -> std::path::PathBuf {
             let path = directory.join("song.mid");
             let bytes = rustel_smf::Timeline {
