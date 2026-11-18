@@ -804,8 +804,8 @@ fn single_hop_get_with_resolver(
 /// that the repository name was a guess. State it here, where the URL is
 /// known.
 ///
-/// The branch is a guess too: with none written it is `main`. A repository
-/// whose default branch is `master` answers 404 there.
+/// The branch is a guess too: with none written it is `main`, and a
+/// repository whose default branch is `master` answers 404 there.
 fn github_hint(url: &str, code: u16) -> String {
     let Some(path) = url.strip_prefix("https://raw.githubusercontent.com/") else {
         return String::new();
@@ -820,8 +820,8 @@ fn github_hint(url: &str, code: u16) -> String {
          `samples`; write `github:user/repo` if it is called something else"
             .to_owned()
     } else if branch == Some("main") && path.ends_with("/strudel.json") {
-        " - no strudel.json on branch `main`; name the branch and folder \
-         as `github:user/repo/branch/folder`"
+        " - no strudel.json there; if the map is on another branch or in \
+         a folder, write `github:user/repo/branch/folder`"
             .to_owned()
     } else {
         String::new()

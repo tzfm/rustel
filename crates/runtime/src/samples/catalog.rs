@@ -284,8 +284,9 @@ pub fn source_is_local(spec: &str) -> bool {
 
 /// Keep the least-specific enabled local folders. An enabled parent owns all
 /// banks below it, so retaining a child would only scan and list the same
-/// files twice. Remote sources and disabled roots that no enabled parent
-/// owns are preserved in their order.
+/// files twice. Two remote rows that read one map are one source too.
+/// Other remote sources and disabled roots that no enabled row owns are
+/// preserved in their order.
 pub fn deduplicated_global_sources(sources: &[GlobalSource]) -> Vec<GlobalSource> {
     deduplicated_global_sources_with_owners(sources).0
 }
@@ -331,7 +332,7 @@ pub fn deduplicated_global_sources_with_owners(
             accepted.push((index, path));
         }
     }
-    let owners: HashMap<usize, usize> = local_paths
+    let mut owners: HashMap<usize, usize> = local_paths
         .iter()
         .filter_map(|(index, path, _)| {
             accepted
@@ -346,6 +347,7 @@ pub fn deduplicated_global_sources_with_owners(
                 .map(|(parent_index, _)| (*index, *parent_index))
         })
         .collect();
+    owners.extend(same_remote_owners(sources));
     let kept = sources
         .iter()
         .enumerate()
@@ -363,6 +365,30 @@ pub fn deduplicated_global_sources_with_owners(
         })
         .collect();
     (kept, ownership)
+}
+
+/// Remote rows that read the same map, such as `github:user/repo` and
+/// `https://github.com/user/repo`, each paired with the first enabled row
+/// of that map, which owns them. A map no enabled row reads keeps its rows.
+fn same_remote_owners(sources: &[GlobalSource]) -> Vec<(usize, usize)> {
+    let map_of =
+        |source: &GlobalSource| match read_source(source.spec.trim(), GITHUB_SAMPLE_MANIFEST) {
+            SampleSource::Url(url) if folder_of_spec(&source.spec).is_none() => Some(url),
+            _ => None,
+        };
+    let maps: Vec<Option<String>> = sources.iter().map(map_of).collect();
+    let mut owners = Vec::new();
+    for (index, map) in maps.iter().enumerate() {
+        let Some(map) = map else { continue };
+        let owner = sources
+            .iter()
+            .zip(&maps)
+            .position(|(source, other)| source.enabled && other.as_ref() == Some(map));
+        if let Some(owner) = owner.filter(|owner| *owner != index) {
+            owners.push((index, owner));
+        }
+    }
+    owners
 }
 
 /// The distinct file URLs a bank names.
@@ -2255,6 +2281,42 @@ mod tests {
         );
         assert_eq!(reports[0].state, GlobalSourceState::Off);
         assert!(!library.knows("kick"));
+    }
+
+    #[test]
+    fn two_spellings_of_one_remote_map_stay_one_source() {
+        let source = |spec: &str, enabled| GlobalSource {
+            spec: spec.to_owned(),
+            enabled,
+        };
+        let sources = [
+            source("https://github.com/me/kit", false),
+            source("github:me/kit", true),
+            source("https://github.com/me/kit/", true),
+            source("github:me/other", true),
+        ];
+        let (kept, ownership) = deduplicated_global_sources_with_owners(&sources);
+        let specs: Vec<&str> = kept.iter().map(|source| source.spec.as_str()).collect();
+        assert_eq!(specs, ["github:me/kit", "github:me/other"]);
+        assert_eq!(
+            ownership,
+            [
+                (
+                    "https://github.com/me/kit".to_owned(),
+                    "github:me/kit".to_owned()
+                ),
+                (
+                    "https://github.com/me/kit/".to_owned(),
+                    "github:me/kit".to_owned()
+                ),
+            ]
+        );
+        // With no enabled row of the map, every row of it stays.
+        let off = [
+            source("github:me/kit", false),
+            source("https://github.com/me/kit", false),
+        ];
+        assert_eq!(deduplicated_global_sources(&off).len(), 2);
     }
 
     #[test]

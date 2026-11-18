@@ -1174,8 +1174,12 @@ pub(super) fn run_manifest_worker(context: ManifestContext, jobs: ManifestJobs) 
 fn parse_sample_map(url: &str, bytes: &[u8]) -> Result<serde_json::Value, String> {
     let text = std::str::from_utf8(bytes).map_err(|error| format!("{url}: not UTF-8: {error}"))?;
     serde_json::from_str(text).map_err(|error| {
-        if text.trim_start().starts_with('<') {
-            format!("{url} is a web page, not a sample map - link its strudel.json")
+        if text
+            .trim_start_matches('\u{feff}')
+            .trim_start()
+            .starts_with('<')
+        {
+            format!("{url} is a web page, not a sample map - link the .json file itself")
         } else {
             format!("{url}: not JSON: {error}")
         }
