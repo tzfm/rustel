@@ -1,19 +1,20 @@
-//! The extended search: entries found by what their documentation says,
-//! not by their names.
+//! The extended search: entries the basic search misses, found by all of
+//! their text.
 //!
-//! The basic search ranks names, synonyms, keywords and summaries. When a
-//! reader types the name of an extension, a word from a description or a
-//! parameter, the basic search has nothing to give. The extended search
-//! answers with the entries whose text holds every typed word. Its
-//! results always follow the basic results, so a name match is never
-//! pushed down.
+//! The basic search ranks names, synonyms, keywords and summaries against
+//! the whole query. When a reader types the name of an extension, a word
+//! from a description or a parameter, or words that are in different
+//! fields, it has nothing to give. The extended search answers with the
+//! entries whose text holds every typed word: names, summary, extension
+//! name, tags, parameters, description and examples. Its results always
+//! follow the basic results, so a basic match is never pushed down.
 
 use super::Entry;
 use crate::fuzzy::Score;
 
-/// The shortest query, in characters, the extended search reads. One or
+/// The shortest word, in characters, the extended search reads. One or
 /// two letters are in almost every description, so they find noise.
-const MIN_QUERY_CHARS: usize = 3;
+const MIN_WORD_CHARS: usize = 3;
 
 /// Where a word was found, strongest first. A word at the start of a word
 /// of the text gets one more point than a word inside one.
@@ -32,14 +33,14 @@ pub(super) struct ExtendedQuery {
 }
 
 impl ExtendedQuery {
-    /// `None` when the query is too short to read.
+    /// The words long enough to read. `None` when there is none.
     pub(super) fn parse(query: &str) -> Option<Self> {
-        let query = query.trim();
-        if query.chars().count() < MIN_QUERY_CHARS {
-            return None;
-        }
-        let words = query.split_whitespace().map(str::to_lowercase).collect();
-        Some(Self { words })
+        let words: Vec<String> = query
+            .split_whitespace()
+            .filter(|word| word.chars().count() >= MIN_WORD_CHARS)
+            .map(str::to_lowercase)
+            .collect();
+        (!words.is_empty()).then_some(Self { words })
     }
 
     /// How well the entry's text answers the query. Every word must be
@@ -87,14 +88,22 @@ fn mention(entry: &Entry, word: &str) -> Option<Score> {
 /// Whether `text` holds `word` (already lower case), ignoring case: `None`
 /// when not, else whether one match starts a word of the text.
 fn find(text: &str, word: &str) -> Option<bool> {
+    // A match starts a word when no letter or digit comes before it.
+    let starts_word = |text: &str, at: usize| {
+        !text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+    };
     if word.is_ascii() {
         // No allocation: this runs over every description on each key.
-        let (text, word) = (text.as_bytes(), word.as_bytes());
-        let last = text.len().checked_sub(word.len())?;
+        // A match begins with an ASCII byte, so `at` is a char boundary.
+        let (bytes, needle) = (text.as_bytes(), word.as_bytes());
+        let last = bytes.len().checked_sub(needle.len())?;
         let mut found = None;
         for at in 0..=last {
-            if text[at..at + word.len()].eq_ignore_ascii_case(word) {
-                if at == 0 || !text[at - 1].is_ascii_alphanumeric() {
+            if bytes[at..at + needle.len()].eq_ignore_ascii_case(needle) {
+                if starts_word(text, at) {
                     return Some(true);
                 }
                 found = Some(false);
@@ -104,12 +113,7 @@ fn find(text: &str, word: &str) -> Option<bool> {
     }
     let text = text.to_lowercase();
     text.match_indices(word)
-        .map(|(at, _)| {
-            !text[..at]
-                .chars()
-                .next_back()
-                .is_some_and(char::is_alphanumeric)
-        })
+        .map(|(at, _)| starts_word(&text, at))
         .max()
 }
 
@@ -141,12 +145,14 @@ mod tests {
     }
 
     #[test]
-    fn short_queries_are_not_read() {
+    fn short_words_are_not_read() {
         let mut acid = entry("acid");
         acid.description = "a squelchy bass line".to_owned();
         assert_eq!(score("a", &acid), None);
         assert_eq!(score(" sq ", &acid), None);
+        assert_eq!(score("x y", &acid), None, "each word is too short");
         assert!(score("squ", &acid).is_some());
+        assert_eq!(score("a squ", &acid), score("squ", &acid));
     }
 
     #[test]
@@ -199,5 +205,14 @@ mod tests {
         entry.description = "Une ÉCHELLE de sons".to_owned();
         assert!(score("échelle", &entry).is_some());
         assert_eq!(score("éché", &entry), None);
+    }
+
+    #[test]
+    fn a_letter_before_the_match_is_inside_a_word_in_any_script() {
+        let mut inside = entry("inside");
+        inside.description = "édelay".to_owned();
+        let mut start = entry("start");
+        start.description = "— delay".to_owned();
+        assert!(score("delay", &start) > score("delay", &inside));
     }
 }

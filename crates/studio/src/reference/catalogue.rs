@@ -590,8 +590,8 @@ impl Reference {
     /// Entries matching a query, best first: the exact name, then names
     /// that start with it, then names and synonyms that contain it, then
     /// summaries that mention it. The browser scopes then add the extended
-    /// matches, found in descriptions, parameters, tags, extension names
-    /// and examples, after all of these. An empty query lists ordinary entries,
+    /// matches after all of these: entries whose text holds every typed
+    /// word, see [`ExtendedQuery`]. An empty query lists ordinary entries,
     /// hidden-from-completion entries last. Graph bypasses require an
     /// underscore query or `tag:bypass`. A [`Category`] the settings
     /// hide stays out unless a `tag:` word names the category.

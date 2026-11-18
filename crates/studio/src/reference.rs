@@ -112,7 +112,8 @@ pub(crate) fn score_key(key: &str) -> String {
 const MAX_VARIANT_ROWS: usize = 64;
 /// How far a snippet falls when the caret is not on a blank line. Larger
 /// than any score the ranker gives, so they land after every real match
-/// rather than merely below the good ones.
+/// of their tier rather than merely below the good ones. A basic match
+/// still ranks above every extended match.
 const SNIPPET_OFF_LINE_PENALTY: i32 = 100_000;
 /// What a name gains when it starts with the query in the case typed.
 /// Larger than the 200 between an exact match and a match from the start,
