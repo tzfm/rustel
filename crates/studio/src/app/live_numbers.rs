@@ -43,7 +43,10 @@ pub(super) fn takes_a_live_number(callee: &str, control: bool, at: usize) -> boo
             })
             .collect()
     });
-    (control && at == 0) || PATTERNIFIED.get(callee).is_some_and(|count| at < *count)
+    // A waveshaper of an `FX` stage, such as `soft(4.5)`, reads its
+    // distortion and its volume as patterns.
+    let waveshaper = rustel_audio::DISTORTION_ALGORITHMS.contains(&callee) && at < 2;
+    (control && at == 0) || waveshaper || PATTERNIFIED.get(callee).is_some_and(|count| at < *count)
 }
 
 /// Whether the score defines `name` itself, so its calls are the score's
@@ -639,7 +642,8 @@ mod tests {
     }
 
     /// A function the engine patternifies takes a live number as a control
-    /// does: `fast(2)` moves live, and `pg(0.8)` with the extensions. A
+    /// does: `fast(2)` moves live, and `pg(0.8)` with the extensions, and
+    /// so does the distortion of an `FX(soft(4.5))` stage. A
     /// function that takes its number as it is keeps the write in the score.
     #[test]
     fn a_patternified_function_moves_live_and_a_plain_one_does_not() {
@@ -648,6 +652,7 @@ mod tests {
             ("$: s(\"sine\").seg(4).pg(0.8)\n", "0.8", true),
             ("$: s(\"sine\").seg(4).fast(2)\n", "2", true),
             ("$: s(\"sine\").seg(4).ply(3)\n", "3", true),
+            ("$: s(\"sine\").seg(4).FX(soft(4.5))\n", "4.5", true),
             ("$: s(\"sine\").seg(4).midi(\"out\", 3)\n", "3", false),
         ] {
             let directory = tempfile::tempdir().expect("tempdir");
@@ -675,6 +680,11 @@ mod tests {
         #[cfg(feature = "extensions")]
         assert!(takes_a_live_number("pg", false, 0), "an extension function");
         assert!(takes_a_live_number("euclid", false, 1));
+        assert!(
+            takes_a_live_number("fold", false, 1),
+            "a waveshaper's volume"
+        );
+        assert!(!takes_a_live_number("fold", false, 2));
         assert!(
             !takes_a_live_number("euclid", false, 2),
             "the pattern itself"
