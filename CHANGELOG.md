@@ -5,7 +5,7 @@
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
 - The theme picker shows its Ctrl+N new, Ctrl+E edit and Ctrl+D delete keys.
 - Fixed: the theme editor opened from the theme picker shows on top of the reference.
-- The knobs column moves a plain number live while the set plays, as a slider does: the number of an audio control such as `lpf(4000)`, or of a function such as `pg(0.8)` or `fast(2)`. It needs no update, and edits not yet evaluated stay out of the sound. A rail that waits for an update is drawn muted, on a dashed rail.
+- The knobs column moves a plain number live while the set plays, as a slider does: the number of an audio control such as `lpf(4000)`, or of a function such as `pg(0.8)` or `fast(2)`. It needs no update, and edits not yet evaluated stay out of the sound. A rail that waits for an update is muted, dashed and marked "not live".
 
 ## v0.1.7
 

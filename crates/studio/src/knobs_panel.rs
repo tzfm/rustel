@@ -26,6 +26,9 @@ pub const KNOBS_WIDTH: u16 = 26;
 /// The least rows the column draws: a title, a rail, and two hint rows.
 pub const KNOBS_HEIGHT: u16 = 6;
 
+/// The word a rail that waits for an update carries beside its reading.
+const WAITS_TAG: &str = "not live";
+
 /// The rows one knob takes: its name and reading, then its rail.
 const KNOB_ROWS: u16 = 2;
 
@@ -701,6 +704,19 @@ impl KnobsView<'_> {
             usize::from(area.right() - x),
             style(if on { theme.accent } else { theme.muted }),
         );
+        // A rail that waits for an update says so between its name and its
+        // reading, where the row has room for the word.
+        let label = knob.label.chars().count() as u16;
+        let tag_x = x.saturating_sub(WAITS_TAG.len() as u16 + 1);
+        if knob.waits && tag_x > area.x + label {
+            buffer.set_stringn(
+                tag_x,
+                area.y,
+                WAITS_TAG,
+                WAITS_TAG.len(),
+                style(theme.muted).add_modifier(Modifier::ITALIC),
+            );
+        }
     }
 
     fn draw_rail(
@@ -897,6 +913,53 @@ mod tests {
             "the scroll counts knobs"
         );
         assert_eq!(knob_at(body(), 0, 9, 6), None, "outside the body");
+    }
+
+    /// A rail that waits for an update says "not live" beside its reading,
+    /// on a dashed rail. A live rail says neither.
+    #[test]
+    fn a_waiting_rail_says_it_is_not_live() {
+        let knob = |waits| Knob {
+            label: "segments".into(),
+            place: KnobPlace::Argument(0),
+            state: Some(KnobState {
+                literal: 0..1,
+                fader: None,
+                value: 8.0,
+            }),
+            min: 1.0,
+            max: 16.0,
+            step: 1.0,
+            default: 8.0,
+            optional: false,
+            log: false,
+            waits,
+        };
+        let theme = Theme::default();
+        let panel = KnobsPanel::default();
+        let area = Rect::new(0, 0, KNOBS_WIDTH, 12);
+        for waits in [true, false] {
+            let knobs = [knob(waits)];
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            KnobsView {
+                name: Some("seg"),
+                listed: false,
+                knobs: &knobs,
+                presets: None,
+                panel: &panel,
+                theme: &theme,
+                focused: false,
+                area,
+            }
+            .render(area, &mut buffer);
+            let row = |y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            };
+            assert_eq!(row(1).contains("not live"), waits, "{}", row(1));
+            assert_eq!(row(2).contains('╌'), waits, "{}", row(2));
+        }
     }
 
     #[test]
