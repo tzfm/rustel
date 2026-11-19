@@ -842,7 +842,9 @@ mod tests {
             app.preview_snippet_score("$: s(\"hh*8\")");
             assert!(app.snippet_preview.is_some(), "the preview sounds");
 
-            // The block's time is up; the run loads the next one.
+            // The block's time is up; the run loads the next one. The
+            // engine took what was sent before.
+            app.worker.wait_until_taken();
             app.pending_evaluation = None;
             app.inflight.clear();
             app.replays

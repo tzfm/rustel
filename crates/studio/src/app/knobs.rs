@@ -3658,6 +3658,7 @@ mod tests {
 
         // The update lands with gain live, and gain moves live. A second
         // key turned on still goes in at once: a live move is no edit.
+        app.worker.wait_until_taken();
         app.inflight.clear();
         app.pending_evaluation = None;
         let gain = source.find("0.").expect("the gain");

@@ -685,44 +685,6 @@ mod tests {
     const CUTOFF: &str = "$: s(\"sine\").seg(4).lpf(4000)\n";
 
     /// The texts sent to the engine since the test began, newest last.
-    /// Why a move sent nothing, for the message of a failed check.
-    fn send_state(app: &App) -> String {
-        let scene = app.scenes.current().id;
-        let live: Vec<_> = app
-            .live_numbers_now(scene)
-            .into_iter()
-            .map(|number| (number.range, live_number_range(&number.id)))
-            .collect();
-        let rows: Vec<_> = app
-            .knobs_rows
-            .as_ref()
-            .map(|rows| {
-                rows.knobs
-                    .iter()
-                    .map(|knob| {
-                        let state = knob.state.as_ref();
-                        (
-                            knob.label.clone(),
-                            state.map(|state| state.literal.clone()),
-                            state.is_some_and(|state| state.fader.is_some()),
-                            knob.waits,
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        format!(
-            "plays live {}, visual revision {}, on its way {}, connected {}, \
-             installed is the text {}, plays but live moves {}, live {live:?}, rows {rows:?}",
-            app.plays_live(scene),
-            app.visual_revision.is_some(),
-            app.reinstall_on_its_way(),
-            app.engine_connected,
-            app.evaluated_source.as_deref() == Some(&*app.editor().source()),
-            app.plays_but_live_moves(&app.editor().source()),
-        )
-    }
-
     fn sent(app: &App) -> Vec<Arc<str>> {
         let mut sent: Vec<_> = app.inflight.values().collect();
         sent.sort_by_key(|pending| pending.request_id);
@@ -827,6 +789,8 @@ mod tests {
             )
             .expect("layout")
         };
+        // The reinstall was answered: the engine took it.
+        app.worker.wait_until_taken();
         app.handle_control(StudioControlEvent::Layout(layout(
             2,
             std::slice::from_ref(&cutoff),
@@ -886,6 +850,8 @@ mod tests {
         let output = installed.find("0.25").expect("the output");
         let cell = output..output + "0.25".len();
         let land = |app: &mut App, generation| {
+            // The reinstall was answered: the engine took it.
+            app.worker.wait_until_taken();
             app.inflight.clear();
             app.pending_evaluation = None;
             let layout = rustel_runtime::ui_events::visual_layout_with_live_numbers(
@@ -911,8 +877,7 @@ mod tests {
                 .map(|text| text.as_ref())
                 .collect::<Vec<_>>(),
             [installed],
-            "the playing score goes again, the number live: {}",
-            send_state(&app)
+            "the playing score goes again, the number live"
         );
         land(&mut app, 3);
         let before = sent(&app).len();
@@ -959,6 +924,8 @@ mod tests {
             at..at + installed[at..].find([',', ' ']).expect("the end")
         };
         let land = |app: &mut App, generation, cells: &[Range<usize>]| {
+            // The reinstall was answered: the engine took it.
+            app.worker.wait_until_taken();
             app.inflight.clear();
             app.pending_evaluation = None;
             let layout = rustel_runtime::ui_events::visual_layout_with_live_numbers(
@@ -977,12 +944,7 @@ mod tests {
         assert!(!app.editor().source().contains("output"), "the off stop");
         app.drag_knob(output, rail, 12);
         assert!(app.editor().source().contains("output"), "back on");
-        assert_eq!(
-            sent(&app).len(),
-            1,
-            "the playing score goes again: {}",
-            send_state(&app)
-        );
+        assert_eq!(sent(&app).len(), 1, "the playing score goes again");
         land(&mut app, 3, &[cell("output: "), cell("cutoff: ")]);
         assert!(
             !app.editor().source().contains("0.123456"),

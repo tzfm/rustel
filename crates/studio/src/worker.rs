@@ -279,6 +279,9 @@ enum EngineCommand {
     RetryPlugins,
     #[cfg(test)]
     InjectPanic(rustel_runtime::SessionPanicPoint),
+    /// Answered once the engine took every command sent before it.
+    #[cfg(test)]
+    Barrier(SyncSender<()>),
     Shutdown,
 }
 
@@ -652,6 +655,27 @@ impl StudioWorker {
                 .commands
                 .try_send(EngineCommand::SetOutput(name.to_owned()))
                 .is_ok()
+    }
+
+    /// Block until the engine took every command sent so far, so the
+    /// queue is empty. A test calls it where the engine would have
+    /// answered: a busy runner can be slow to drain the queue.
+    #[cfg(test)]
+    pub(crate) fn wait_until_taken(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (taken, answer) = sync_channel(1);
+        let mut barrier = EngineCommand::Barrier(taken);
+        while let Err(error) = self.commands.try_send(barrier) {
+            let TrySendError::Full(back) = error else {
+                panic!("engine gone");
+            };
+            assert!(Instant::now() < deadline, "engine never took the queue");
+            barrier = back;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        answer
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("engine took the queue");
     }
 
     /// Name the numbers of `source` that its evaluations make live: see
@@ -1944,6 +1968,11 @@ fn process_command(
         #[cfg(test)]
         EngineCommand::InjectPanic(point) => {
             engine.inject_panic_for_test(point);
+            false
+        }
+        #[cfg(test)]
+        EngineCommand::Barrier(taken) => {
+            let _ = taken.send(());
             false
         }
     }
