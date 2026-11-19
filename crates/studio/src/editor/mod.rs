@@ -714,6 +714,7 @@ impl Editor {
         match command {
             Command::InsertText(text) => {
                 self.replace_selections(&text, EditOrigin::Typing, moment)?;
+                self.vim_record_insert_step(vim::repeat::InsertStep::Text(text));
             }
             Command::ReplaceRange { from, to, text } => {
                 if from <= to && to.0 <= self.document.len_bytes() {
@@ -724,19 +725,42 @@ impl Editor {
             }
             Command::PasteText(text) => {
                 self.paste_text(&text, moment)?;
+                self.vim_record_insert_step(vim::repeat::InsertStep::Paste(text));
             }
-            Command::Newline => self.insert_newline(moment)?,
-            Command::Indent => self.indent(moment)?,
-            Command::Outdent => self.outdent(moment)?,
-            Command::DeleteBackward => self.delete(false, false, moment)?,
-            Command::DeleteForward => self.delete(true, false, moment)?,
-            Command::DeleteWordBackward => self.delete(false, true, moment)?,
-            Command::DeleteWordForward => self.delete(true, true, moment)?,
+            Command::Newline => {
+                self.insert_newline(moment)?;
+                self.vim_record_insert_step(vim::repeat::InsertStep::Newline);
+            }
+            Command::Indent => {
+                self.indent(moment)?;
+                self.vim_record_insert_step(vim::repeat::InsertStep::Indent);
+            }
+            Command::Outdent => {
+                self.outdent(moment)?;
+                self.vim_record_insert_step(vim::repeat::InsertStep::Outdent);
+            }
+            Command::DeleteBackward => {
+                self.delete(false, false, moment)?;
+                self.vim_record_insert_step(vim::repeat::InsertStep::DeleteBackward);
+            }
+            Command::DeleteForward => {
+                self.delete(true, false, moment)?;
+                self.vim_record_insert_step(vim::repeat::InsertStep::DeleteForward);
+            }
+            Command::DeleteWordBackward => {
+                self.delete(false, true, moment)?;
+                self.vim_record_insert_step(vim::repeat::InsertStep::DeleteWordBackward);
+            }
+            Command::DeleteWordForward => {
+                self.delete(true, true, moment)?;
+                self.vim_record_insert_step(vim::repeat::InsertStep::DeleteWordForward);
+            }
             Command::Move { motion, extend } => {
                 self.move_selection(motion, extend)?;
                 // Visual's ends do not follow a move made outside Vim, such
                 // as a remote arrow, so Visual ends.
                 self.vim_set_visual_ends(None);
+                self.vim_break_insert_recording();
             }
             Command::SelectAll => {
                 self.history.close_group();
@@ -765,6 +789,7 @@ impl Editor {
             Command::Paste => {
                 let text = clipboard.get_text()?;
                 self.paste_text(&text, moment)?;
+                self.vim_record_insert_step(vim::repeat::InsertStep::Paste(text));
             }
             Command::Undo => {
                 self.undo()?;
