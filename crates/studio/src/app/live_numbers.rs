@@ -848,6 +848,8 @@ mod tests {
         let output = installed.find("0.25").expect("the output");
         let cell = output..output + "0.25".len();
         let land = |app: &mut App, generation| {
+            // The reinstall was answered: the engine took it.
+            app.worker.wait_until_taken();
             app.inflight.clear();
             app.pending_evaluation = None;
             let layout = rustel_runtime::ui_events::visual_layout_with_live_numbers(
@@ -920,6 +922,8 @@ mod tests {
             at..at + installed[at..].find([',', ' ']).expect("the end")
         };
         let land = |app: &mut App, generation, cells: &[Range<usize>]| {
+            // The reinstall was answered: the engine took it.
+            app.worker.wait_until_taken();
             app.inflight.clear();
             app.pending_evaluation = None;
             let layout = rustel_runtime::ui_events::visual_layout_with_live_numbers(
