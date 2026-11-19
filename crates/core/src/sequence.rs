@@ -16,14 +16,17 @@
 //! query error leaves its node in place, which raises the error at each
 //! query.
 
-use crate::compose::{ComposeOp, compose_data_in_place, is_op_closure};
+use crate::compose::{ComposeOp, compose_data_in_place, is_op_closure, union_drops};
 use crate::context_keys::ContextKeys;
+use crate::value::Table;
 use crate::{
     Combine, Hap, HapMapFn, Locations, LookupFlow, MAX_QUERY_SPAN_CYCLES, Meeting, Node,
     OwnedHapMapFn, Pattern, QueryLimit, State, TimeSpan, Value, ValuePredicate, applied_hap,
     charge_haps, note_accumulated, query_stop_requested, refuse, silence, without_query_signals,
 };
-use rustel_fraction::Fraction;
+use rustel_fraction::{Fraction, TickGrid};
+use std::borrow::Cow;
+use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock};
 
 /// The most steps one layer holds after a fold. A fold that makes more
@@ -171,17 +174,138 @@ pub enum GivenLayer {
 /// Where a layer keeps its steps.
 #[derive(Clone)]
 enum Steps {
-    /// Each step at its place.
-    Places(Listed),
+    /// Each step in a list.
+    Listed(Listing),
     /// The steps as their source writes them for each query.
     Source(Arc<Sourced>),
 }
 
-/// The source of the steps of a layer, and their places when a fold read
-/// them: each layer that a fold makes of the same steps shares them.
+/// The source of the steps of a layer, and their list when a fold read
+/// them: each layer that a fold makes of the same steps shares it.
 struct Sourced {
     steps: Arc<dyn StepSource>,
-    places: OnceLock<Listed>,
+    read: OnceLock<Listing>,
+}
+
+/// The steps of a layer in a list: on a grid when their times fit one,
+/// otherwise each at its place.
+#[derive(Clone)]
+enum Listing {
+    Places(Listed),
+    Grid(Arc<Grid>),
+}
+
+/// A step as a maker gives it, before the layer keeps it in a list.
+struct Raw {
+    whole: TimeSpan,
+    /// `None` for a part that is the whole.
+    part: Option<TimeSpan>,
+    value: u32,
+    locations: Locations,
+}
+
+impl Raw {
+    fn part(&self) -> TimeSpan {
+        self.part.unwrap_or(self.whole)
+    }
+
+    fn place(self) -> Place {
+        Place::at(self.whole, self.part, self.value, self.locations)
+    }
+}
+
+impl Listing {
+    /// The list of `raws`: a grid when their times fit one. A list that
+    /// does not fit becomes places one time, here.
+    fn of(mut raws: Vec<Raw>) -> Self {
+        if let Some(grid) = Grid::build(&mut raws) {
+            return Self::Grid(Arc::new(grid));
+        }
+        let small = |span: &TimeSpan| {
+            i32::try_from(span.begin.denom()).is_ok() && i32::try_from(span.end.denom()).is_ok()
+        };
+        let small_denominators = raws
+            .iter()
+            .all(|raw| small(&raw.whole) && raw.part.as_ref().is_none_or(small));
+        Self::Places(Listed {
+            places: raws.into_iter().map(Raw::place).collect(),
+            small_denominators,
+        })
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Places(listed) => listed.places.len(),
+            Self::Grid(grid) => grid.steps.len(),
+        }
+    }
+
+    fn part(&self, index: usize) -> TimeSpan {
+        match self {
+            Self::Places(listed) => listed.places[index].part(),
+            Self::Grid(grid) => grid.part(index),
+        }
+    }
+
+    fn whole(&self, index: usize) -> TimeSpan {
+        match self {
+            Self::Places(listed) => listed.places[index].whole,
+            Self::Grid(grid) => grid.whole(index),
+        }
+    }
+
+    /// The whole of the step, and its part when it holds one of its own.
+    /// A grid searches its cuts once for both.
+    fn times(&self, index: usize) -> (TimeSpan, Option<TimeSpan>) {
+        match self {
+            Self::Places(listed) => {
+                let place = &listed.places[index];
+                (place.whole, place.part.as_ref().map(|part| **part))
+            }
+            Self::Grid(grid) => grid.times(index),
+        }
+    }
+
+    /// Whether the step holds a part of its own.
+    fn is_cut(&self, index: usize) -> bool {
+        match self {
+            Self::Places(listed) => listed.places[index].part.is_some(),
+            Self::Grid(grid) => grid.cut(index).is_some(),
+        }
+    }
+
+    fn value(&self, index: usize) -> u32 {
+        match self {
+            Self::Places(listed) => listed.places[index].value,
+            Self::Grid(grid) => grid.steps[index].value,
+        }
+    }
+
+    fn locations(&self, index: usize) -> Locations {
+        match self {
+            Self::Places(listed) => listed.places[index].locations.clone(),
+            Self::Grid(grid) => grid.locations(index),
+        }
+    }
+
+    /// The step as a [`Raw`], for a fold to change.
+    fn raw(&self, index: usize) -> Raw {
+        let (whole, part) = self.times(index);
+        Raw {
+            whole,
+            part,
+            value: self.value(index),
+            locations: self.locations(index),
+        }
+    }
+
+    /// Whether each time of the list has a denominator that fits 32 bits.
+    fn small_denominators(&self) -> bool {
+        match self {
+            Self::Places(listed) => listed.small_denominators,
+            Self::Grid(grid) => grid.small_denominators(),
+        }
+    }
 }
 
 /// The places of one layer and whether their times fit a restart at a small offset.
@@ -189,21 +313,6 @@ struct Sourced {
 struct Listed {
     places: Arc<[Place]>,
     small_denominators: bool,
-}
-
-impl Listed {
-    fn new(places: Arc<[Place]>) -> Self {
-        let small = |span: &TimeSpan| {
-            i32::try_from(span.begin.denom()).is_ok() && i32::try_from(span.end.denom()).is_ok()
-        };
-        let small_denominators = places
-            .iter()
-            .all(|place| small(&place.whole) && place.part.as_deref().is_none_or(small));
-        Self {
-            places,
-            small_denominators,
-        }
-    }
 }
 
 /// Where one step of a layer is, and which value it holds.
@@ -220,6 +329,389 @@ struct Place {
     begins: f32,
     /// The locations of the step's own value.
     locations: Locations,
+}
+
+/// One step on a [`Grid`]: 16 bytes, where a [`Place`] takes 112.
+#[derive(Clone, Copy)]
+struct GridStep {
+    /// Where the part begins and ends, in ticks.
+    part_begin: u32,
+    part_end: u32,
+    /// The place of the step's value among the layer's values.
+    value: u32,
+    loc: PackedLoc,
+}
+
+/// The locations of a step in 4 bytes. `0` is no location. A set top bit
+/// is a place in the spare list. Otherwise one range: its begin from the
+/// base of the grid in the high 20 bits and its length plus one in the low
+/// 11, so a range of no length stays apart from no range.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PackedLoc(u32);
+
+impl PackedLoc {
+    const SPARE: u32 = 1 << 31;
+    const LENGTH_BITS: u32 = 11;
+    const LENGTH_MASK: u32 = (1 << Self::LENGTH_BITS) - 1;
+    const OFFSET_LIMIT: u32 = 1 << 20;
+
+    /// Whether the range is short enough, and begins low enough, to pack
+    /// after some base.
+    fn fits((begin, end): (usize, usize)) -> bool {
+        end.checked_sub(begin)
+            .is_some_and(|length| length < Self::LENGTH_MASK as usize)
+            && begin < Grid::SMALL as usize
+    }
+
+    /// The range from `base`, when it fits.
+    fn range(base: u32, (begin, end): (usize, usize)) -> Option<Self> {
+        let offset = u32::try_from(begin).ok()?.checked_sub(base)?;
+        let length = u32::try_from(end.checked_sub(begin)?).ok()?;
+        (offset < Self::OFFSET_LIMIT && length < Self::LENGTH_MASK)
+            .then(|| Self(offset << Self::LENGTH_BITS | (length + 1)))
+    }
+}
+
+/// A step whose whole is not its part.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Cut {
+    /// The place of the step.
+    index: u32,
+    /// The whole, in ticks.
+    begin: u32,
+    end: u32,
+}
+
+/// The steps of a layer on an integer grid of `1 / ticks` cycles, kept
+/// as ticks, when each time of them fits in 32 bits.
+#[derive(Clone)]
+struct Grid {
+    /// The ticks in a cycle: the least common multiple of the denominators.
+    ticks: NonZeroU32,
+    /// The begin that the packed ranges count from, below 2^31. The top bit
+    /// is [`Listing::small_denominators`].
+    base: u32,
+    steps: Box<[GridStep]>,
+    /// The reduced time of each residue, for a tick size that is no power
+    /// of two: a time then takes no gcd.
+    reductions: Option<Arc<TickGrid>>,
+    /// What most layers have none of.
+    side: Option<Arc<Spare>>,
+}
+
+/// The cuts and the spare locations of a [`Grid`].
+struct Spare {
+    /// The cut steps, in the order of their places.
+    cuts: Box<[Cut]>,
+    /// The locations that do not pack.
+    spare: Box<[Locations]>,
+}
+
+impl Grid {
+    const SMALL: u32 = 1 << 31;
+
+    /// The steps of `raws` on a grid, or `None` for times that do not fit.
+    /// A grid takes the locations that do not pack out of `raws`, and
+    /// nothing else.
+    fn build(raws: &mut [Raw]) -> Option<Self> {
+        u32::try_from(raws.len()).ok()?;
+        // The tick size, and the least begin of a range that packs.
+        let mut ticks: u64 = 1;
+        let mut base: Option<u32> = None;
+        // The step before ends where the next begins, and most parts are
+        // the whole, so the same denominator comes again and again.
+        let mut last = 1;
+        let mut small_denominators = true;
+        for raw in raws.iter() {
+            let times = [raw.whole].into_iter().chain(raw.part);
+            for time in times.flat_map(|span| [span.begin, span.end]) {
+                if time.denom() == last {
+                    continue;
+                }
+                last = time.denom();
+                small_denominators &= i32::try_from(last).is_ok();
+                // A denominator past 32 bits refuses before the product of
+                // two of them can overflow.
+                let denom = u64::from(u32::try_from(last).ok()?);
+                if !ticks.is_multiple_of(denom) {
+                    ticks = ticks / gcd(ticks, denom) * denom;
+                    u32::try_from(ticks).ok()?;
+                }
+            }
+            if let (1, Some(range)) = (raw.locations.len(), raw.locations.get(0))
+                && PackedLoc::fits(range)
+            {
+                // The top bit of the base is a flag of the grid.
+                if let Ok(begin) = u32::try_from(range.0)
+                    && begin < Self::SMALL
+                {
+                    base = Some(base.map_or(begin, |base| base.min(begin)));
+                }
+            }
+        }
+        let base = base.unwrap_or(0);
+        let ticks = NonZeroU32::new(u32::try_from(ticks).ok()?)?;
+        // The scale of the denominator before is kept: it comes again.
+        let scaled = std::cell::Cell::new((1, ticks.get()));
+        let on_grid = |time: Fraction| {
+            let (denom, scale) = scaled.get();
+            let scale = if denom == time.denom() {
+                scale
+            } else {
+                let scale = ticks.get() / u32::try_from(time.denom()).ok()?;
+                scaled.set((time.denom(), scale));
+                scale
+            };
+            u32::try_from(u64::from(u32::try_from(time.numer()).ok()?) * u64::from(scale)).ok()
+        };
+        let mut cuts = Vec::new();
+        // The places of the steps whose locations do not pack.
+        let mut spare = Vec::new();
+        let mut fits = true;
+        // The steps are collected in one allocation, with no list first.
+        let steps: Box<[GridStep]> = raws
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| {
+                let mut step = || {
+                    let (begin, end) = (on_grid(raw.whole.begin)?, on_grid(raw.whole.end)?);
+                    let (part_begin, part_end) = match raw.part {
+                        None => (begin, end),
+                        Some(part) => {
+                            cuts.push(Cut {
+                                index: index as u32,
+                                begin,
+                                end,
+                            });
+                            (on_grid(part.begin)?, on_grid(part.end)?)
+                        }
+                    };
+                    let packed = match (raw.locations.len(), raw.locations.get(0)) {
+                        (0, _) => Some(PackedLoc(0)),
+                        (1, Some(range)) => PackedLoc::range(base, range),
+                        _ => None,
+                    };
+                    let loc = packed.unwrap_or_else(|| {
+                        spare.push(index);
+                        PackedLoc(PackedLoc::SPARE | (spare.len() - 1) as u32)
+                    });
+                    Some(GridStep {
+                        part_begin,
+                        part_end,
+                        value: raw.value,
+                        loc,
+                    })
+                };
+                step().unwrap_or_else(|| {
+                    fits = false;
+                    GridStep {
+                        part_begin: 0,
+                        part_end: 0,
+                        value: 0,
+                        loc: PackedLoc(0),
+                    }
+                })
+            })
+            .collect();
+        if !fits || u32::try_from(spare.len()).ok()? >= PackedLoc::SPARE {
+            return None;
+        }
+        // The grid fits, so the locations move with no copy.
+        let side = (!cuts.is_empty() || !spare.is_empty()).then(|| {
+            Arc::new(Spare {
+                cuts: cuts.into(),
+                spare: spare
+                    .iter()
+                    .map(|index| std::mem::take(&mut raws[*index].locations))
+                    .collect(),
+            })
+        });
+        let base = base | if small_denominators { Self::SMALL } else { 0 };
+        Some(Self {
+            ticks,
+            base,
+            steps,
+            reductions: tick_grid(ticks),
+            side,
+        })
+    }
+
+    fn small_denominators(&self) -> bool {
+        self.base & Self::SMALL != 0
+    }
+
+    /// `ticks` as a time in cycles, reduced.
+    #[inline]
+    #[cfg(test)]
+    fn made(&self, ticks: i128) -> Fraction {
+        match i64::try_from(ticks) {
+            Ok(ticks) => self.made_small(ticks),
+            Err(_) => Fraction::from_ticks(ticks, self.ticks),
+        }
+    }
+
+    /// [`Self::made`] of ticks that fit 64 bits, which a query has.
+    #[inline]
+    fn made_small(&self, ticks: i64) -> Fraction {
+        match &self.reductions {
+            Some(reductions) => reductions.time(ticks),
+            None => Fraction::from_ticks(i128::from(ticks), self.ticks),
+        }
+    }
+
+    /// `ticks` as a time in cycles.
+    fn time(&self, ticks: u32) -> Fraction {
+        self.made_small(i64::from(ticks))
+    }
+
+    /// The floor and the ceiling of `time` in ticks. `None` past 64 bits.
+    fn ticks_at(&self, time: Fraction) -> Option<(i64, i64)> {
+        let scaled = i64::try_from(time.numer())
+            .ok()?
+            .checked_mul(i64::from(self.ticks.get()))?;
+        let denom = i64::try_from(time.denom()).ok()?;
+        if denom == 1 {
+            return Some((scaled, scaled));
+        }
+        // A time on a power of two, which most spans are, shifts.
+        let (floor, rest) = match denom & (denom - 1) == 0 {
+            true => (scaled >> denom.trailing_zeros(), scaled & (denom - 1)),
+            false => (scaled.div_euclid(denom), scaled.rem_euclid(denom)),
+        };
+        // A floor under the largest tick has room for one more.
+        Some((floor, floor + i64::from(rest != 0)))
+    }
+
+    fn cuts(&self) -> &[Cut] {
+        self.side.as_ref().map_or(&[], |side| &side.cuts)
+    }
+
+    /// The cut of step `index`.
+    fn cut(&self, index: usize) -> Option<&Cut> {
+        let cuts = self.cuts();
+        let at = cuts.partition_point(|cut| (cut.index as usize) < index);
+        cuts.get(at).filter(|cut| cut.index as usize == index)
+    }
+
+    fn part(&self, index: usize) -> TimeSpan {
+        let step = &self.steps[index];
+        TimeSpan::new(self.time(step.part_begin), self.time(step.part_end))
+    }
+
+    /// The whole of step `index`.
+    fn whole(&self, index: usize) -> TimeSpan {
+        self.times(index).0
+    }
+
+    /// The whole of step `index`, and its part when it is cut.
+    fn times(&self, index: usize) -> (TimeSpan, Option<TimeSpan>) {
+        let part = self.part(index);
+        match self.cut(index) {
+            Some(cut) => (
+                TimeSpan::new(self.time(cut.begin), self.time(cut.end)),
+                Some(part),
+            ),
+            None => (part, None),
+        }
+    }
+
+    /// The locations of step `index`.
+    #[inline]
+    fn locations(&self, index: usize) -> Locations {
+        let packed = self.steps[index].loc.0;
+        if packed == 0 {
+            return Locations::new();
+        }
+        if packed & PackedLoc::SPARE != 0 {
+            let side = self.side.as_ref().expect("a spare location has a side");
+            return side.spare[(packed & !PackedLoc::SPARE) as usize].clone();
+        }
+        let base = self.base & !Self::SMALL;
+        let begin = base + (packed >> PackedLoc::LENGTH_BITS);
+        // The length takes 11 bits, so it fits 16.
+        let length = (packed & PackedLoc::LENGTH_MASK) - 1;
+        Locations::one(begin, length as u16)
+    }
+
+    /// The places of the steps, for the rare query that leaves the range
+    /// of ticks.
+    fn places(&self) -> Vec<Place> {
+        (0..self.steps.len())
+            .map(|index| {
+                let (whole, part) = self.times(index);
+                Place::at(whole, part, self.steps[index].value, self.locations(index))
+            })
+            .collect()
+    }
+
+    /// Whether the steps are in the order of their haps in a period of
+    /// `period` cycles, as [`Layer::is_in_order`] says, compared as ticks.
+    /// `None` for a period whose ticks do not fit.
+    fn in_order(&self, period: Fraction) -> Option<bool> {
+        if period <= Fraction::ZERO {
+            return Some(false);
+        }
+        // A tick is inside the period when `tick / ticks <= n / d`.
+        let bound = period.numer().checked_mul(i128::from(self.ticks.get()))?;
+        let inside = |tick: u32| Some(i128::from(tick).checked_mul(period.denom())? <= bound);
+        let mut cuts = self.cuts().iter().peekable();
+        for (index, step) in self.steps.iter().enumerate() {
+            let cut = cuts.next_if(|cut| cut.index as usize == index);
+            let (begin, end) = cut.map_or((step.part_begin, step.part_end), |c| (c.begin, c.end));
+            let shaped =
+                begin <= step.part_begin && step.part_begin < step.part_end && step.part_end <= end;
+            if !shaped || !inside(end)? {
+                return Some(false);
+            }
+        }
+        Some(self.steps.windows(2).all(|pair| {
+            pair[0].part_begin <= pair[1].part_begin && pair[0].part_end <= pair[1].part_end
+        }))
+    }
+
+    /// Whether the steps of both are at the same ticks and cut alike.
+    fn same_times(&self, other: &Self) -> bool {
+        self.ticks == other.ticks
+            && self.cuts() == other.cuts()
+            && self.steps.len() == other.steps.len()
+            && self
+                .steps
+                .iter()
+                .zip(other.steps.iter())
+                .all(|(a, b)| (a.part_begin, a.part_end) == (b.part_begin, b.part_end))
+    }
+}
+
+thread_local! {
+    /// The tables of reduced times that this thread made, by tick size: the
+    /// layers of one tick size share one.
+    static TICK_GRIDS: std::cell::RefCell<Vec<Arc<TickGrid>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The table of reduced times for `ticks` in a cycle, when no shift reduces
+/// a time and the table is small.
+fn tick_grid(ticks: NonZeroU32) -> Option<Arc<TickGrid>> {
+    if ticks.is_power_of_two() || i64::from(ticks.get()) > TickGrid::MAX_DENOM {
+        return None;
+    }
+    TICK_GRIDS.with_borrow_mut(|grids| {
+        let known = grids
+            .iter()
+            .find(|grid| grid.denom() == i64::from(ticks.get()));
+        known.cloned().or_else(|| {
+            let grid = Arc::new(TickGrid::new(i64::from(ticks.get()))?);
+            grids.push(Arc::clone(&grid));
+            Some(grid)
+        })
+    })
+}
+
+/// The greatest common divisor of two numbers above zero.
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
 }
 
 /// A float that orders as `time` does where the floats of two times
@@ -285,7 +777,7 @@ pub(crate) struct Layer {
     /// no fold dressed. See [`Dress`].
     dress: Option<Arc<Dress>>,
     /// The values as the dress makes them, made at the first read.
-    read: OnceLock<Arc<[Value]>>,
+    values_read: OnceLock<Read>,
     /// Whether each value is data only: a hap of the layer then holds
     /// nothing that a query resolves or binds to a runtime.
     data: bool,
@@ -298,6 +790,70 @@ pub(crate) struct Layer {
     /// query of a layer that has locations of its own.
     contexts: OnceLock<Box<[Locations]>>,
 }
+
+/// The values of a layer as its dress makes them.
+#[derive(Clone)]
+enum Read {
+    /// Each value made as a map of its own.
+    Made(Arc<[Value]>),
+    /// Each value a map that reads the entries of a table the steps share.
+    Shared(Arc<Table>),
+}
+
+/// The values of a layer as its dress makes them.
+#[derive(Clone, Copy)]
+enum Values<'a> {
+    /// A list of the values.
+    Held(&'a [Value]),
+    /// The maps that read a table.
+    Table(&'a Arc<Table>),
+}
+
+/// What makes the haps of the steps of a layer: the list, the values as the
+/// dress makes them, and the locations and keys of each hap, all read once
+/// for a loop of steps.
+struct Maker<'a> {
+    listing: &'a Listing,
+    values: Values<'a>,
+    /// See [`Layer::contexts`].
+    contexts: Option<&'a [Locations]>,
+    keys: &'a ContextKeys,
+}
+
+impl Maker<'_> {
+    /// The hap of step `index` at `whole` and `part`.
+    fn hap(&self, index: usize, whole: TimeSpan, part: TimeSpan) -> Hap {
+        self.make(index, self.listing.value(index), whole, part)
+    }
+
+    /// The hap of step `index`, which holds value `value`.
+    #[inline]
+    fn make(&self, index: usize, value: u32, whole: TimeSpan, part: TimeSpan) -> Hap {
+        let value = self
+            .values
+            .get(value as usize)
+            .expect("a step holds a value of its layer");
+        let mut hap = Hap::new(Some(whole), part, value);
+        hap.context = match self.contexts {
+            Some(contexts) => contexts[index].clone(),
+            None => self.listing.locations(index),
+        };
+        hap.keys = self.keys.clone();
+        hap
+    }
+}
+
+impl Values<'_> {
+    #[inline]
+    fn get(&self, index: usize) -> Option<Value> {
+        match self {
+            Self::Held(values) => values.get(index).cloned(),
+            Self::Table(table) => table.map(index).map(Value::Object),
+        }
+    }
+}
+// A layer is cloned by each fold: its steps stay behind a handle.
+const _: () = assert!(size_of::<Layer>() <= 144);
 
 /// What the folds on a layer give each hap of it, beyond its step. The
 /// layers that a fold dresses alike share one: see [`redressed`].
@@ -340,8 +896,14 @@ impl Dress {
         self.before = before;
         match &mut self.set {
             Some(set) => compose_data_in_place(ComposeOp::Set, set, control),
-            // A handle of the map of the control.
-            None => self.set = Some(control.clone()),
+            // A handle of the map of the control, which holds its own
+            // entries: a map that reads a table would pin that table.
+            None => {
+                self.set = Some(match control {
+                    Value::Object(map) => Value::Object(map.clone().undressed()),
+                    other => other.clone(),
+                })
+            }
         }
     }
 
@@ -480,11 +1042,16 @@ impl Layer {
                 }
             };
             let part = step.part.map(|part| cycles(*part));
-            Place::at(cycles(step.whole), part, value, step.locations)
+            Raw {
+                whole: cycles(step.whole),
+                part,
+                value,
+                locations: step.locations,
+            }
         };
-        // Each place is written one time, where the layer keeps it.
-        let places: Arc<[Place]> = layer.steps.into_iter().map(place).collect();
-        in_range.then(|| Self::new(period, places, values.into()))
+        // Each step is written one time, where the layer keeps it.
+        let raws: Vec<Raw> = layer.steps.into_iter().map(place).collect();
+        in_range.then(|| Self::new(period, raws, values.into()))
     }
 }
 
@@ -505,21 +1072,22 @@ enum SequenceStop {
 }
 
 impl Layer {
-    fn new(period: Fraction, places: Arc<[Place]>, values: Arc<[Value]>) -> Self {
-        let in_cycles = lie_in_cycles(period, &places);
-        Self::holding(
-            period,
-            Steps::Places(Listed::new(places)),
-            in_cycles,
-            values,
-        )
+    fn new(period: Fraction, raws: Vec<Raw>, values: Arc<[Value]>) -> Self {
+        let in_cycles = lie_in_spans(period, raws.iter().map(Raw::part));
+        Self::of_list(period, raws, in_cycles, values)
+    }
+
+    /// The layer of `raws`, which it keeps in a list.
+    fn of_list(period: Fraction, raws: Vec<Raw>, in_cycles: bool, values: Arc<[Value]>) -> Self {
+        let steps = Steps::Listed(Listing::of(raws));
+        Self::holding(period, steps, in_cycles, values)
     }
 
     /// The layer of `layer`, which reads its steps from their source.
     fn of_source(layer: SourcedLayer) -> Self {
         let sourced = Sourced {
             steps: layer.steps,
-            places: OnceLock::new(),
+            read: OnceLock::new(),
         };
         let steps = Steps::Source(Arc::new(sourced));
         Self::holding(layer.period, steps, layer.in_cycles, layer.values)
@@ -535,7 +1103,7 @@ impl Layer {
             maps: values.iter().all(|value| matches!(value, Value::Object(_))),
             values,
             dress: None,
-            read: OnceLock::new(),
+            values_read: OnceLock::new(),
             contexts: OnceLock::new(),
         }
     }
@@ -555,31 +1123,42 @@ impl Layer {
         self.dress = (!dress.is_bare()).then(|| Arc::new(dress));
     }
 
-    /// The place of each step. A layer of a source makes its places at the
-    /// first call: a fold that moves or cuts steps reads them here, and a
-    /// query does not.
-    fn places(&self) -> &[Place] {
-        &match &self.steps {
-            Steps::Places(listed) => listed,
-            Steps::Source(sourced) => sourced.places.get_or_init(|| {
-                let mut places = Vec::with_capacity(sourced.steps.count());
+    /// The list of the steps. A layer of a source makes it at the first
+    /// call: a fold that moves or cuts steps reads it here, and a query
+    /// does not.
+    fn listing(&self) -> &Listing {
+        match &self.steps {
+            Steps::Listed(listing) => listing,
+            Steps::Source(sourced) => sourced.read.get_or_init(|| {
+                let mut raws = Vec::with_capacity(sourced.steps.count());
                 let written = sourced
                     .steps
                     .steps(Fraction::ZERO, self.period, &mut |step| {
-                        let whole = TimeSpan::new(step.begin, step.end);
-                        places.push(Place::at(whole, None, step.value, step.locations));
+                        raws.push(Raw {
+                            whole: TimeSpan::new(step.begin, step.end),
+                            part: None,
+                            value: step.value,
+                            locations: step.locations,
+                        });
                     });
                 debug_assert!(written.is_some(), "a source reads its period");
-                Listed::new(places.into())
+                Listing::of(raws)
             }),
         }
-        .places
     }
 
-    /// The source of the steps, when no fold made their places.
+    /// The list of the steps, when it is made. A read of it makes none.
+    fn listed(&self) -> Option<&Listing> {
+        match &self.steps {
+            Steps::Listed(listing) => Some(listing),
+            Steps::Source(sourced) => sourced.read.get(),
+        }
+    }
+
+    /// The source of the steps, when no fold made their list.
     fn source(&self) -> Option<&dyn StepSource> {
         match &self.steps {
-            Steps::Source(sourced) if sourced.places.get().is_none() => Some(&*sourced.steps),
+            Steps::Source(sourced) if sourced.read.get().is_none() => Some(&*sourced.steps),
             _ => None,
         }
     }
@@ -588,20 +1167,31 @@ impl Layer {
     fn count(&self) -> usize {
         match self.source() {
             Some(source) => source.count(),
-            None => self.places().len(),
+            None => self.listing().len(),
         }
     }
 
-    /// The one step of this layer, when it holds one. A source of more
-    /// steps makes no place to say so.
-    fn one_place(&self) -> Option<&Place> {
+    /// The steps as places, for a test.
+    #[cfg(test)]
+    fn places(&self) -> Vec<Place> {
+        let listing = self.listing();
+        (0..listing.len())
+            .map(|index| listing.raw(index).place())
+            .collect()
+    }
+
+    /// The whole of the one step of this layer, when it holds one, whether
+    /// that step is cut, and its value. A source of more steps makes no
+    /// list to say so.
+    fn one_step(&self) -> Option<(TimeSpan, bool, u32)> {
         if self.source().is_some_and(|source| source.count() != 1) {
             return None;
         }
-        match self.places() {
-            [place] => Some(place),
-            _ => None,
-        }
+        let listing = self.listing();
+        (listing.len() == 1).then(|| {
+            let (whole, part) = listing.times(0);
+            (whole, part.is_some(), listing.value(0))
+        })
     }
 
     /// This layer with `values` in the place of its own, one for one.
@@ -613,7 +1203,7 @@ impl Layer {
             dress.named = None;
             dress.set = None;
         });
-        self.read = OnceLock::new();
+        self.values_read = OnceLock::new();
         self
     }
 
@@ -653,7 +1243,7 @@ impl Layer {
         if !(values.fills_each_cycle() && values.dress().keys.is_empty()) {
             return None;
         }
-        self.set_constant(values.values().first()?, || values.context(0), apply, flow)
+        self.set_constant(&values.value(0)?, || values.context(0), apply, flow)
     }
 
     /// [`Self::set`] for the one value of a constant: `control` is the
@@ -735,7 +1325,7 @@ impl Layer {
     /// makes each value one time, at the first read.
     pub(crate) fn set_here(&mut self, control: &Value, context: Locations) {
         self.change_dress(|dress| Dress::set_here(dress, control, context));
-        self.read = OnceLock::new();
+        self.values_read = OnceLock::new();
         self.contexts = OnceLock::new();
     }
 
@@ -759,12 +1349,10 @@ impl Layer {
     /// values, and the steps are in the order of their haps. See
     /// [`Self::is_in_order`].
     fn is_sound(&self) -> bool {
+        let holds = |value: u32| (value as usize) < self.values.len();
         self.is_in_order()
             && (self.source().is_some()
-                || self
-                    .places()
-                    .iter()
-                    .all(|place| (place.value as usize) < self.values.len()))
+                || (0..self.count()).all(|index| holds(self.listing().value(index))))
     }
 
     /// Whether the period is more than zero and the steps are in the order
@@ -776,48 +1364,64 @@ impl Layer {
         if self.source().is_some() {
             return self.period > Fraction::ZERO;
         }
-        let inside = |place: &Place| {
-            let (whole, part) = (place.whole, place.part());
+        let listing = self.listing();
+        if let Listing::Grid(grid) = listing
+            && let Some(in_order) = grid.in_order(self.period)
+        {
+            return in_order;
+        }
+        let inside = |index: usize| {
+            let (whole, part) = (listing.whole(index), listing.part(index));
             Fraction::ZERO <= whole.begin
                 && whole.begin <= part.begin
                 && part.begin < part.end
                 && part.end <= whole.end
                 && whole.end <= self.period
         };
-        let ordered = self.places().windows(2).all(|pair| {
-            let (a, b) = (pair[0].part(), pair[1].part());
+        let ordered = (1..listing.len()).all(|index| {
+            let (a, b) = (listing.part(index - 1), listing.part(index));
             a.begin <= b.begin && a.end <= b.end
         });
-        self.period > Fraction::ZERO && self.places().iter().all(inside) && ordered
+        self.period > Fraction::ZERO && (0..listing.len()).all(inside) && ordered
+    }
+
+    /// The locations of the hap of each step, when the dress adds some to
+    /// the step's own: made at the first query. `None` when each hap holds
+    /// the locations of its step.
+    fn contexts(&self) -> Option<&[Locations]> {
+        let dress = self.dress();
+        if dress.locates_alone() {
+            return None;
+        }
+        Some(self.contexts.get_or_init(|| {
+            (0..self.count())
+                .map(|index| dress.around(&self.locations_of(index)))
+                .collect()
+        }))
     }
 
     /// The locations of the hap of step `index`: those before, the step's
     /// own, then those after.
     fn context(&self, index: usize) -> Locations {
-        let dress = self.dress();
-        if dress.locates_alone() {
-            return self.places()[index].locations.clone();
+        match self.contexts() {
+            Some(contexts) => contexts[index].clone(),
+            None => self.locations_of(index),
         }
-        let contexts = self.contexts.get_or_init(|| {
-            self.places()
-                .iter()
-                .map(|place| dress.around(&place.locations))
-                .collect()
-        });
-        contexts[index].clone()
     }
 
-    /// The hap of step `index` at `whole` and `part`.
-    fn hap_at(&self, index: usize, whole: TimeSpan, part: TimeSpan) -> Hap {
-        let place = &self.places()[index];
-        let mut hap = Hap::new(
-            Some(whole),
-            part,
-            self.values()[place.value as usize].clone(),
-        );
-        hap.context = self.context(index);
-        hap.keys = self.dress().keys.clone();
-        hap
+    /// The locations of step `index`, as the step holds them.
+    fn locations_of(&self, index: usize) -> Locations {
+        self.listing().locations(index)
+    }
+
+    /// What makes the haps of the steps of this layer, read once for a loop.
+    fn maker(&self) -> Maker<'_> {
+        Maker {
+            listing: self.listing(),
+            values: self.reader(),
+            contexts: self.contexts(),
+            keys: &self.dress().keys,
+        }
     }
 
     /// The haps of one period, as a layer with a period of one cycle
@@ -830,23 +1434,71 @@ impl Layer {
                 span.end.checked_div(self.period)?,
             ))
         };
-        self.places()
-            .iter()
-            .enumerate()
-            .map(|(index, place)| {
-                Some(self.hap_at(index, share(place.whole)?, share(place.part())?))
+        let maker = self.maker();
+        let listing = maker.listing;
+        (0..listing.len())
+            .map(|index| {
+                Some(maker.hap(
+                    index,
+                    share(listing.whole(index))?,
+                    share(listing.part(index))?,
+                ))
             })
             .collect()
     }
 
     /// The values of the steps, each once, with the name of their control
     /// and the controls that a chain of constants set.
-    pub(crate) fn values(&self) -> &[Value] {
+    pub(crate) fn value(&self, index: usize) -> Option<Value> {
+        self.reader().get(index)
+    }
+
+    /// The values as the steps hold them, before the dress. The dress
+    /// holds data only, so the purity of the layer is that of these.
+    pub(crate) fn held_values(&self) -> &[Value] {
+        &self.values
+    }
+
+    /// The values as the dress makes them, read once for a loop of steps.
+    fn reader(&self) -> Values<'_> {
         let dress = self.dress();
         if dress.named.is_none() && dress.set.is_none() {
-            return &self.values;
+            return Values::Held(&self.values);
         }
-        self.read.get_or_init(|| {
+        match self.values_read.get_or_init(|| self.read_values(dress)) {
+            Read::Made(values) => Values::Held(values),
+            Read::Shared(table) => Values::Table(table),
+        }
+    }
+
+    /// [`Self::value`] of each step.
+    pub(crate) fn each_value(&self) -> impl Iterator<Item = Value> + '_ {
+        let values = self.reader();
+        (0..self.values.len()).filter_map(move |index| values.get(index))
+    }
+
+    /// The values as `dress` makes them: one table that their maps read
+    /// where that gives the same maps, else each value made on its own.
+    fn read_values(&self, dress: &Dress) -> Read {
+        let set = match &dress.set {
+            None => Some(None),
+            Some(Value::Object(set)) if !union_drops(set) => Some(Some(set)),
+            Some(_) => None,
+        };
+        let key = match &dress.named {
+            Some(names) => self
+                .values
+                .iter()
+                .all(|value| crate::controls::names_as_one_entry(names, value))
+                .then(|| Some(crate::controls::key_of(names))),
+            None => Some(None),
+        };
+        if let (Some(set), Some(key)) = (set, key)
+            && let Some(table) = Table::new(&self.values, key, set)
+        {
+            return Read::Shared(Arc::new(table));
+        }
+        Read::Made(
             self.values
                 .iter()
                 .map(|value| {
@@ -860,8 +1512,8 @@ impl Layer {
                     }
                     value
                 })
-                .collect()
-        })
+                .collect(),
+        )
     }
 
     /// Whether this layer and `other` answer the same haps, with values
@@ -869,28 +1521,65 @@ impl Layer {
     /// layers hold them: the same values with the same name and the same
     /// controls set are the same, and no value is made to know it.
     pub(crate) fn same(&self, other: &Self, same_value: impl Fn(&Value, &Value) -> bool) -> bool {
-        let value = |layer: &Self, place: &Place| layer.values.get(place.value as usize).cloned();
         let same_dress = match (&self.dress, &other.dress) {
             (Some(a), Some(b)) if Arc::ptr_eq(a, b) => true,
             _ => self.dress().same(other.dress(), &same_value),
         };
-        // Two layers of one source hold the same steps and values.
-        let one_source = match (self.source(), other.source()) {
-            (Some(a), Some(b)) => std::ptr::addr_eq(a, b),
+        if !same_dress || self.period != other.period {
+            return false;
+        }
+        let (own, others) = match (&self.steps, &other.steps) {
+            (Steps::Listed(own), Steps::Listed(others)) => (own, others),
+            (Steps::Source(own), Steps::Source(others)) => {
+                // Two layers of one source hold the same steps, whatever was
+                // read of it, and are the same when their values are.
+                if std::ptr::addr_eq(Arc::as_ptr(&own.steps), Arc::as_ptr(&others.steps)) {
+                    return Arc::ptr_eq(&self.values, &other.values)
+                        || self.values.len() == other.values.len()
+                            && self
+                                .values
+                                .iter()
+                                .zip(&*other.values)
+                                .all(|(a, b)| same_value(a, b));
+                }
+                // Two sources that were made apart are the same when the
+                // lists that were read of both are. A read is never made to
+                // know it, so a source that nobody read is not the same, and
+                // a read only turns a "not the same" into a "same".
+                match (own.read.get(), others.read.get()) {
+                    (Some(own), Some(others)) => (own, others),
+                    _ => return false,
+                }
+            }
+            // A source and a list are not compared: a read would change
+            // the answer.
+            _ => return false,
+        };
+        fn value(layer: &Layer, value: u32) -> Option<&Value> {
+            layer.values.get(value as usize)
+        }
+        let same_step = |index: usize| {
+            own.locations(index) == others.locations(index)
+                && match (
+                    value(self, own.value(index)),
+                    value(other, others.value(index)),
+                ) {
+                    (Some(a), Some(b)) => same_value(a, b),
+                    _ => false,
+                }
+        };
+        // Steps at the same ticks compare with no time made.
+        let same_times = match (own, others) {
+            (Listing::Grid(a), Listing::Grid(b)) => a.same_times(b),
             _ => false,
         };
-        same_dress
-            && self.period == other.period
-            && (one_source
-                || (self.places().len() == other.places().len()
-                    && self.places().iter().zip(other.places()).all(|(a, b)| {
-                        (a.whole, a.part()) == (b.whole, b.part())
-                            && a.locations == b.locations
-                            && match (value(self, a), value(other, b)) {
-                                (Some(a), Some(b)) => same_value(&a, &b),
-                                _ => false,
-                            }
-                    })))
+        own.len() == others.len()
+            && (0..own.len()).all(|index| {
+                (same_times
+                    || (own.whole(index), own.part(index))
+                        == (others.whole(index), others.part(index)))
+                    && same_step(index)
+            })
     }
 
     /// Push the haps of this layer in `turn` of its period, for a query of
@@ -915,7 +1604,18 @@ impl Layer {
             // not read.
             out.truncate(held);
         }
-        let places = self.places();
+        let owned;
+        let places = match self.listing() {
+            Listing::Places(listed) => &*listed.places,
+            Listing::Grid(grid) => {
+                if let Some(pushed) = self.push_grid(grid, turn, span, others, out) {
+                    return pushed;
+                }
+                // A turn past the range of ticks asks the places.
+                owned = grid.places();
+                &owned[..]
+            }
+        };
         let instant = span.begin == span.end;
         // The steps are in the order of time, so the first and the last
         // bound them all: a span before or after these bounds meets none.
@@ -948,6 +1648,7 @@ impl Layer {
             return Err(SequenceStop::Query);
         }
         out.reserve(met);
+        let maker = self.maker();
         for (index, place) in places.iter().enumerate().skip(first).take(met) {
             let whole = TimeSpan::new(turn.moved(place.whole.begin)?, turn.moved(place.whole.end)?);
             let visible = match &place.part {
@@ -955,10 +1656,91 @@ impl Layer {
                 Some(part) => TimeSpan::new(turn.moved(part.begin)?, turn.moved(part.end)?),
             };
             let part = TimeSpan::new(visible.begin.max(span.begin), visible.end.min(span.end));
-            out.push(self.hap_at(index, whole, part));
+            out.push(maker.hap(index, whole, part));
         }
         note_accumulated(out.len() - others);
         Ok(())
+    }
+
+    /// Push the haps of this layer in `turn`, as [`Self::push`] does, from
+    /// the steps on a grid. The search compares ticks, and a time is made
+    /// only for a hap. `None` for a turn that leaves the range of ticks.
+    fn push_grid(
+        &self,
+        grid: &Grid,
+        turn: &Turn,
+        span: TimeSpan,
+        others: usize,
+        out: &mut Vec<Hap>,
+    ) -> Option<Result<(), SequenceStop>> {
+        let (begin_low, begin_high) = grid.ticks_at(turn.begin)?;
+        let (_, end_high) = grid.ticks_at(turn.end)?;
+        let instant = span.begin == span.end;
+        let steps = &grid.steps;
+        // A step begins before a time when its begin is under the ceiling
+        // of the time, and at or before it when its begin is at most the
+        // floor.
+        let begun = steps.partition_point(|step| i64::from(step.part_begin) < begin_high);
+        let reach = |step: &&GridStep| i64::from(step.part_end) > begin_low;
+        let first = begun - steps[..begun].iter().rev().take_while(reach).count();
+        let last_step = begun
+            + steps[begun..].partition_point(|step| {
+                let begins = i64::from(step.part_begin);
+                begins <= begin_low || (!instant && begins < end_high)
+            });
+        let met = last_step - first;
+        if met == 0 {
+            return Some(Ok(()));
+        }
+        // The list held `others` haps before the sequence wrote.
+        if !charge_haps(out.len() - others + met) {
+            return Some(Err(SequenceStop::Query));
+        }
+        out.reserve(met);
+        // The cuts are in the order of the steps: one search finds the first.
+        let cuts = grid.cuts();
+        let mut cuts = &cuts[cuts.partition_point(|cut| (cut.index as usize) < first)..];
+        // A turn that begins on a whole cycle moves a tick by whole cycles of
+        // ticks, so a time is made one time, reduced, from its tick.
+        let offset = turn
+            .whole_cycles
+            .and_then(|cycles| i64::try_from(cycles).ok())
+            .and_then(|cycles| cycles.checked_mul(i64::from(grid.ticks.get())));
+        // The tick of the time made last, and the time: the end of a step is
+        // the begin of the next, which most steps are.
+        let mut last: Option<(u32, Fraction)> = None;
+        let mut at = |tick: u32| -> Result<Fraction, SequenceStop> {
+            if let Some((made, time)) = last
+                && made == tick
+            {
+                return Ok(time);
+            }
+            let time = match offset.and_then(|offset| offset.checked_add(i64::from(tick))) {
+                Some(ticks) => grid.made_small(ticks),
+                None => turn.moved(grid.time(tick))?,
+            };
+            last = Some((tick, time));
+            Ok(time)
+        };
+        let maker = self.maker();
+        let pushed = (first..last_step).try_for_each(|index| {
+            let step = &steps[index];
+            let visible = TimeSpan::new(at(step.part_begin)?, at(step.part_end)?);
+            let whole = match cuts.split_first() {
+                Some((cut, rest)) if cut.index as usize == index => {
+                    cuts = rest;
+                    TimeSpan::new(at(cut.begin)?, at(cut.end)?)
+                }
+                _ => visible,
+            };
+            let part = TimeSpan::new(visible.begin.max(span.begin), visible.end.min(span.end));
+            out.push(maker.make(index, step.value, whole, part));
+            Ok(())
+        });
+        if pushed.is_ok() {
+            note_accumulated(out.len() - others);
+        }
+        Some(pushed)
     }
 
     /// Push the haps of the steps that `source` writes in `turn` of the
@@ -973,6 +1755,8 @@ impl Layer {
         out: &mut Vec<Hap>,
     ) -> Option<Result<(), SequenceStop>> {
         let mut stop = None;
+        let values = self.reader();
+        let dress = self.dress();
         let written = source.steps(turn.begin, turn.end, &mut |step| {
             let times = turn
                 .moved(step.begin)
@@ -984,9 +1768,10 @@ impl Layer {
             };
             let whole = TimeSpan::new(begin, end);
             let part = TimeSpan::new(begin.max(span.begin), end.min(span.end));
-            let value = self.values()[step.value as usize].clone();
+            let value = values
+                .get(step.value as usize)
+                .expect("a step holds a value of its layer");
             let mut hap = Hap::new(Some(whole), part, value);
-            let dress = self.dress();
             hap.context = match dress.locates_alone() {
                 true => step.locations,
                 false => dress.around(&step.locations),
@@ -1012,8 +1797,8 @@ impl Layer {
         let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
         self.period == Fraction::ONE
             && self
-                .one_place()
-                .is_some_and(|place| place.whole == cycle && place.part.is_none())
+                .one_step()
+                .is_some_and(|(whole, cut, _)| whole == cycle && !cut)
     }
 
     /// This layer where each step meets the steps of `values`, as the hap
@@ -1071,24 +1856,28 @@ impl Layer {
         };
         let mut pairs: Vec<(u32, u32)> = Vec::new();
         // Room for a step that meets one value in each turn.
-        let room = usize::try_from(turns)
-            .ok()?
-            .saturating_mul(self.places().len());
-        let mut places = Vec::with_capacity(room.min(MAX_FOLDED_STEPS));
+        let room = usize::try_from(turns).ok()?.saturating_mul(self.count());
+        let mut raws = Vec::with_capacity(room.min(MAX_FOLDED_STEPS));
+        let (own, others) = (self.listing(), values.listing());
+        // The parts of `values` are searched and read for each step, so a
+        // grid makes their times one time.
+        let other_parts: Vec<TimeSpan> = (0..others.len()).map(|at| others.part(at)).collect();
         for turn in 0..turns {
             let start = self.period.checked_mul(Fraction::int(turn))?;
-            for place in self.places().iter() {
-                let whole = moved(place.whole, start)?;
-                let part = match &place.part {
-                    Some(part) => moved(**part, start)?,
+            for index in 0..own.len() {
+                let (own_whole, own_part) = own.times(index);
+                let whole = moved(own_whole, start)?;
+                let part = match own_part {
+                    Some(part) => moved(part, start)?,
                     None => whole,
                 };
+                let (own_value, own_locations) = (own.value(index), own.locations(index));
                 // The locations of each hap of this step. Those after stay
                 // with the layer of the function side, which they end.
-                let mut own = self.dress().before.clone();
-                own.append(&place.locations);
+                let mut around = self.dress().before.clone();
+                around.append(&own_locations);
                 if side == Side::Values {
-                    own.append(&self.dress().after);
+                    around.append(&self.dress().after);
                 }
                 // The turns of `values` that the part meets, in order.
                 let turns_met = part.begin.checked_div_floor(values.period)?
@@ -1102,24 +1891,21 @@ impl Layer {
                         part.begin.checked_sub(value_start)?,
                         part.end.checked_sub(value_start)?,
                     );
-                    let first = values
-                        .places()
-                        .partition_point(|value_place| value_place.part().end <= begin);
-                    let meeting = values.places()[first..]
-                        .iter()
-                        .take_while(|value_place| value_place.part().begin < end);
-                    for (value_index, value_place) in (first..).zip(meeting) {
-                        let value_part = moved(value_place.part(), value_start)?;
+                    let first = other_parts.partition_point(|part| part.end <= begin);
+                    let meeting =
+                        (first..other_parts.len()).take_while(|at| other_parts[*at].begin < end);
+                    for value_index in meeting {
+                        let value_part = moved(other_parts[value_index], value_start)?;
                         let piece = TimeSpan::new(
                             part.begin.max(value_part.begin),
                             part.end.min(value_part.end),
                         );
-                        if places.len() == MAX_FOLDED_STEPS {
+                        if raws.len() == MAX_FOLDED_STEPS {
                             return None;
                         }
                         // The pairs are few: one for each value that a
                         // value meets.
-                        let pair = (place.value, value_place.value);
+                        let pair = (own_value, others.value(value_index));
                         let value = match pairs.iter().position(|known| *known == pair) {
                             Some(value) => value,
                             None => {
@@ -1132,25 +1918,29 @@ impl Layer {
                         let locations = match side {
                             Side::Functions => {
                                 let mut locations = values.context(value_index);
-                                locations.append(&own);
+                                locations.append(&around);
                                 locations
                             }
                             Side::Values => {
-                                let mut locations = own.clone();
+                                let mut locations = around.clone();
                                 locations.append(&values.context(value_index));
                                 locations
                             }
                         };
-                        let part = (piece != whole).then_some(piece);
-                        places.push(Place::at(whole, part, value, locations));
+                        raws.push(Raw {
+                            whole,
+                            part: (piece != whole).then_some(piece),
+                            value,
+                            locations,
+                        });
                     }
                 }
             }
         }
         let mut met = Layer {
-            in_cycles: lie_in_cycles(period, &places),
+            in_cycles: lie_in_spans(period, raws.iter().map(Raw::part)),
             period,
-            steps: Steps::Places(Listed::new(places.into())),
+            steps: Steps::Listed(Listing::of(raws)),
             contexts: OnceLock::new(),
             ..self.clone()
         };
@@ -1175,7 +1965,13 @@ impl Layer {
 /// it lies in one of those `q` parts of a cycle: `q` times the part lies
 /// in one cycle. Whole numbers compare, with no fraction made. `false`
 /// also for a time that leaves their range: a cut then settles it.
+#[cfg(test)]
 fn lie_in_cycles(period: Fraction, places: &[Place]) -> bool {
+    lie_in_spans(period, places.iter().map(Place::part))
+}
+
+/// [`lie_in_cycles`] for the parts of the steps.
+fn lie_in_spans(period: Fraction, parts: impl IntoIterator<Item = TimeSpan>) -> bool {
     let turns = period.denom();
     // The whole cycles in `numer / denom`, with a machine-word division
     // for terms of a machine word.
@@ -1183,8 +1979,7 @@ fn lie_in_cycles(period: Fraction, places: &[Place]) -> bool {
         (Ok(numer), Ok(denom)) => i128::from(numer.div_euclid(denom)),
         _ => numer.div_euclid(denom),
     };
-    places.iter().all(|place| {
-        let part = place.part.as_deref().unwrap_or(&place.whole);
+    parts.into_iter().all(|part| {
         let scaled = |time: Fraction| time.numer().checked_mul(turns);
         let (Some(begins), Some(ends)) = (scaled(part.begin), scaled(part.end)) else {
             return false;
@@ -1315,9 +2110,10 @@ impl Turns {
         })
     }
 
-    fn turn(&mut self, index: i128) -> Result<Turn, SequenceStop> {
-        if let Some(turn) = self.read.filter(|turn| turn.index == index) {
-            return Ok(turn);
+    /// The turn at `index`, kept for the layers that read it next.
+    fn turn(&mut self, index: i128) -> Result<&Turn, SequenceStop> {
+        if self.read.as_ref().is_some_and(|turn| turn.index == index) {
+            return Ok(self.read.as_ref().expect("a turn that was just found"));
         }
         let in_range = |time: Option<Fraction>| time.ok_or(SequenceStop::Range);
         let start = match self.period == Fraction::ONE {
@@ -1341,8 +2137,7 @@ impl Turns {
             begin_key: time_key(begin),
             end_key: time_key(end),
         };
-        self.read = Some(turn);
-        Ok(turn)
+        Ok(self.read.insert(turn))
     }
 }
 
@@ -1361,7 +2156,7 @@ fn query_layers(
     if turns.indices.end.checked_sub(turns.indices.start) == Some(1) {
         let turn = turns.turn(turns.indices.start)?;
         for layer in layers {
-            layer.push(&turn, span, from, out)?;
+            layer.push(turn, span, from, out)?;
         }
         return Ok(());
     }
@@ -1371,7 +2166,7 @@ fn query_layers(
             if index != turns.indices.start && query_stop_requested() {
                 return Err(SequenceStop::Query);
             }
-            layer.push(&turns.turn(index)?, span, from, out)?;
+            layer.push(turns.turn(index)?, span, from, out)?;
         }
     }
     Ok(())
@@ -1419,13 +2214,9 @@ pub(crate) fn repeats_at(layers: &[Layer], by: Fraction, span: TimeSpan) -> bool
         return false;
     }
     layers.iter().all(|layer| {
-        let listed = match &layer.steps {
-            Steps::Places(listed) => Some(listed),
-            Steps::Source(source) => source.places.get(),
-        };
         let period = layer.period;
         // An integer multiple of the reduced numerator is a whole number of periods.
-        listed.is_some_and(|listed| listed.small_denominators)
+        layer.listed().is_some_and(Listing::small_denominators)
             && small(period)
             && (period.numer() == 1 || (by.numer() as i32) % (period.numer() as i32) == 0)
     })
@@ -1449,16 +2240,16 @@ pub(crate) fn is_data(pattern: &Pattern) -> bool {
 
 /// The one data value of `layers`, when they are one value that fills each
 /// cycle, as a `pure` is.
-pub(crate) fn constant_value(layers: &[Layer]) -> Option<&Value> {
+pub(crate) fn constant_value(layers: &[Layer]) -> Option<Cow<'_, Value>> {
     let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
     match layers {
         // A reader makes a hap of the value alone, so keys make no constant.
         [layer] if layer.period == Fraction::ONE && layer.dress().keys.is_empty() => {
-            match layer.one_place() {
-                Some(place) if place.whole == cycle && place.part.is_none() => layer
-                    .values()
-                    .get(place.value as usize)
-                    .filter(|value| value.is_data(0)),
+            match layer.one_step() {
+                Some((whole, false, value)) if whole == cycle => layer
+                    .value(value as usize)
+                    .filter(|value| value.is_data(0))
+                    .map(Cow::Owned),
                 _ => None,
             }
         }
@@ -1547,12 +2338,12 @@ fn holds_a_value_and_keys(hap: &Hap) -> bool {
 /// The value that `values` answers in each cycle on one hap that fills the
 /// cycle, when the graph says it with no query: a `pure` value, at its
 /// locations, or a sequence of one value that fills each cycle.
-fn constant_value_of(values: &Pattern) -> Option<&Value> {
+fn constant_value_of(values: &Pattern) -> Option<Cow<'_, Value>> {
     if !folds(values) {
         return None;
     }
     match values.node_kind() {
-        Node::Pure(value) if value.is_data(0) => Some(value),
+        Node::Pure(value) if value.is_data(0) => Some(Cow::Borrowed(value)),
         Node::AddContext(inner, _) => constant_value_of(inner),
         Node::Sequence(layers) => constant_value(layers),
         _ => None,
@@ -1576,7 +2367,7 @@ fn constant_locations(values: &Pattern) -> Locations {
 /// graph says it with no query. See [`constant_value_of`].
 pub(crate) fn constant(values: &Pattern) -> Option<Hap> {
     // A handle of the value, for the hap to hold.
-    let mut hap = cycle_hap(constant_value_of(values)?.clone());
+    let mut hap = cycle_hap(constant_value_of(values)?.into_owned());
     hap.context = constant_locations(values);
     Some(hap)
 }
@@ -1594,10 +2385,15 @@ fn layers(pattern: &Pattern) -> Option<std::borrow::Cow<'_, [Layer]>> {
         return Some(std::borrow::Cow::Borrowed(layers));
     }
     let hap = constant(pattern)?;
-    let place = Place::at(hap.whole?, None, 0, hap.context);
+    let raw = Raw {
+        whole: hap.whole?,
+        part: None,
+        value: 0,
+        locations: hap.context,
+    };
     Some(std::borrow::Cow::Owned(vec![Layer::new(
         Fraction::ONE,
-        Arc::new([place]),
+        vec![raw],
         Arc::new([hap.value]),
     )]))
 }
@@ -1613,7 +2409,8 @@ fn revalued(
         let layers = layers
             .into_iter()
             .map(|layer| {
-                let values: Option<Vec<Value>> = layer.values().iter().map(&mut change).collect();
+                let values: Option<Vec<Value>> =
+                    layer.each_value().map(|value| change(&value)).collect();
                 Some(layer.valued(values?.into()))
             })
             .collect::<Option<Vec<_>>>()?;
@@ -1652,7 +2449,7 @@ pub(crate) fn selecting(
         layer.dress().keys.is_empty()
             && (!whole_cycles
                 || (whole(layer.period)
-                    && layer.places().iter().all(|place| whole(place.whole.begin))))
+                    && (0..layer.count()).all(|index| whole(layer.listing().whole(index).begin))))
     });
     if !plain {
         return None;
@@ -1675,10 +2472,10 @@ pub(crate) fn is_bare(pattern: &Pattern) -> bool {
         layers.iter().all(|layer| {
             layer.dress().keys.is_empty()
                 && layer.dress().locates_alone()
-                && layer
-                    .places()
-                    .iter()
-                    .all(|place| place.locations.is_empty())
+                && match layer.listing() {
+                    Listing::Grid(grid) => grid.steps.iter().all(|step| step.loc.0 == 0),
+                    listing => (0..listing.len()).all(|index| listing.locations(index).is_empty()),
+                }
         })
     })
 }
@@ -1697,7 +2494,7 @@ pub(crate) fn lies_in_cycles(pattern: &Pattern) -> bool {
 /// of a plain data value. See [`constant`].
 pub(crate) fn constant_value_at(values: &Pattern) -> Option<(Value, Locations)> {
     // A handle of the value, for the caller to hold.
-    let value = constant_value_of(values)?.clone();
+    let value = constant_value_of(values)?.into_owned();
     Some((value, constant_locations(values)))
 }
 
@@ -1768,8 +2565,7 @@ pub(crate) fn mapped_haps(pattern: &Pattern, map: &HapMapFn) -> Option<Pattern> 
                 let mut read = cycle_hap(Value::Undefined);
                 read.keys = layer.dress().keys.clone();
                 let values = layer
-                    .values()
-                    .iter()
+                    .each_value()
                     .map(|value| {
                         // A value of the script is read through its host,
                         // at each query.
@@ -1777,7 +2573,7 @@ pub(crate) fn mapped_haps(pattern: &Pattern, map: &HapMapFn) -> Option<Pattern> 
                             return None;
                         }
                         // A handle of the value, which the layer holds.
-                        read.value = value.clone();
+                        read.value = value;
                         let hap = map(&read)?;
                         let keys = keys.get_or_insert_with(|| hap.keys.clone());
                         ((hap.whole, hap.part) == (Some(cycle), cycle)
@@ -1863,8 +2659,8 @@ pub(crate) fn applied(
                     .into_iter()
                     .map(|(function, value)| {
                         made(
-                            layer.values().get(function as usize)?,
-                            values.values().get(value as usize)?,
+                            &layer.value(function as usize)?,
+                            &values.value(value as usize)?,
                             apply,
                             flow,
                         )
@@ -1914,7 +2710,7 @@ pub(crate) fn set_here(layers: &mut Arc<[Layer]>, control: &Value, context: Loca
             }
         };
         layer.dress = Some(dress);
-        layer.read = OnceLock::new();
+        layer.values_read = OnceLock::new();
         layer.contexts = OnceLock::new();
     }
 }
@@ -1956,8 +2752,8 @@ pub(crate) fn applied_out(
                 let values = pairs
                     .into_iter()
                     .map(|(value, function)| {
-                        let hf = cycle_hap(functions.values().get(function as usize)?.clone());
-                        let hv = cycle_hap(layer.values().get(value as usize)?.clone());
+                        let hf = cycle_hap(functions.value(function as usize)?);
+                        let hv = cycle_hap(layer.value(value as usize)?);
                         let hap = applied_hap(&hf, &hv, hv.whole, hv.part, apply, flow);
                         is_plain(&hap).then_some(hap.value)
                     })
@@ -1980,19 +2776,22 @@ pub(crate) fn filtered(pattern: &Pattern, keep: &ValuePredicate) -> Option<Patte
         let layers = layers
             .iter()
             .map(|layer| {
-                let kept: Vec<bool> = layer.values().iter().map(|value| keep(value)).collect();
+                let kept: Vec<bool> = layer.each_value().map(|value| keep(&value)).collect();
                 if kept.iter().all(|kept| *kept) {
                     return layer.clone();
                 }
-                let places: Arc<[Place]> = layer
-                    .places()
-                    .iter()
-                    .filter(|place| kept.get(place.value as usize).copied().unwrap_or(false))
-                    .cloned()
+                let listing = layer.listing();
+                let raws: Vec<Raw> = (0..listing.len())
+                    .filter(|index| {
+                        kept.get(listing.value(*index) as usize)
+                            .copied()
+                            .unwrap_or(false)
+                    })
+                    .map(|index| listing.raw(index))
                     .collect();
                 layer.with(|layer| {
-                    layer.in_cycles = lie_in_cycles(layer.period, &places);
-                    layer.steps = Steps::Places(Listed::new(places));
+                    layer.in_cycles = lie_in_spans(layer.period, raws.iter().map(Raw::part));
+                    layer.steps = Steps::Listed(Listing::of(raws));
                 })
             })
             .collect();
@@ -2034,28 +2833,26 @@ pub(crate) fn faster(pattern: &Pattern, factor: Fraction) -> Option<Pattern> {
             let period = layer.period.checked_div(factor).filter(small)?;
             // The times of the steps are in cycles, so they change with
             // the speed.
-            let places = layer
-                .places()
-                .iter()
-                .map(|place| {
-                    let part = match &place.part {
-                        Some(part) => Some(faster(**part)?),
+            let listing = layer.listing();
+            let raws = (0..listing.len())
+                .map(|index| {
+                    let (whole, part) = listing.times(index);
+                    let part = match part {
+                        Some(part) => Some(faster(part)?),
                         None => None,
                     };
-                    // A handle of the locations of the step.
-                    let locations = place.locations.clone();
-                    Some(Place::at(
-                        faster(place.whole)?,
+                    Some(Raw {
+                        whole: faster(whole)?,
                         part,
-                        place.value,
-                        locations,
-                    ))
+                        value: listing.value(index),
+                        locations: listing.locations(index),
+                    })
                 })
-                .collect::<Option<Arc<[Place]>>>()?;
+                .collect::<Option<Vec<_>>>()?;
             Some(layer.with(|layer| {
-                layer.in_cycles = lie_in_cycles(period, &places);
+                layer.in_cycles = lie_in_spans(period, raws.iter().map(Raw::part));
                 layer.period = period;
-                layer.steps = Steps::Places(Listed::new(places));
+                layer.steps = Steps::Listed(Listing::of(raws));
             }))
         })
         .collect::<Option<Vec<_>>>()?;
@@ -2075,17 +2872,18 @@ pub(crate) fn plied(pattern: &Pattern, count: usize) -> Option<Pattern> {
     let layers = layers
         .iter()
         .map(|layer| {
-            let steps = layer.places();
+            let steps = layer.listing();
             let listed = steps.len().checked_mul(count)?;
             if !layer.data || listed > MAX_FOLDED_STEPS {
                 return None;
             }
-            let mut places = Vec::with_capacity(listed);
+            let mut raws = Vec::with_capacity(listed);
             let mut before = None;
-            for step in steps.iter() {
-                let (begin, end) = (step.whole.begin, step.whole.end);
+            for index in 0..steps.len() {
+                let whole = steps.whole(index);
+                let (begin, end) = (whole.begin, whole.end);
                 let sounds_on = count > 1 && before.is_some_and(|before| begin < before);
-                if step.part.is_some() || begin >= end || sounds_on {
+                if steps.is_cut(index) || begin >= end || sounds_on {
                     return None;
                 }
                 before = Some(end);
@@ -2100,21 +2898,18 @@ pub(crate) fn plied(pattern: &Pattern, count: usize) -> Option<Pattern> {
                             begin.checked_add(width.checked_mul(at)?)?
                         }
                     };
-                    // A handle of the locations of the step.
-                    let locations = step.locations.clone();
-                    places.push(Place::at(
-                        TimeSpan::new(from, to),
-                        None,
-                        step.value,
-                        locations,
-                    ));
+                    raws.push(Raw {
+                        whole: TimeSpan::new(from, to),
+                        part: None,
+                        value: steps.value(index),
+                        locations: steps.locations(index),
+                    });
                     from = to;
                 }
             }
-            let places: Arc<[Place]> = places.into();
             Some(layer.with(|layer| {
-                layer.in_cycles = lie_in_cycles(layer.period, &places);
-                layer.steps = Steps::Places(Listed::new(places));
+                layer.in_cycles = lie_in_spans(layer.period, raws.iter().map(Raw::part));
+                layer.steps = Steps::Listed(Listing::of(raws));
             }))
         })
         .collect::<Option<Vec<_>>>()?;
@@ -3021,7 +3816,7 @@ mod tests {
         };
         let shared: Vec<u32> = layers[0].places().iter().map(|place| place.value).collect();
         assert_eq!(shared, [0, 1, 0, 1, 2]);
-        assert_eq!(layers[0].values().len(), 3);
+        assert_eq!(layers[0].held_values().len(), 3);
     }
 
     /// The controls that the last meeting of `pattern` holds apart, when
@@ -3644,6 +4439,757 @@ mod tests {
         ];
         for pattern in unknown {
             assert!(!matches!(pattern.node_kind(), Node::Sequence(_)));
+        }
+    }
+
+    fn text(value: &str) -> Value {
+        Value::Str(value.into())
+    }
+
+    fn map_of(entries: &[(&str, Value)]) -> Value {
+        Value::object(
+            entries
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.clone())),
+        )
+    }
+
+    /// A layer of `values` that `names` and `set` dress.
+    fn dressed_layer(values: Vec<Value>, names: Option<&[&str]>, set: Option<Value>) -> Layer {
+        let raws: Vec<Raw> = (0..values.len())
+            .map(|at| {
+                let at = at as i128;
+                let whole = TimeSpan::new(frac((at, 4)), frac((at + 1, 4)));
+                Raw {
+                    whole,
+                    part: None,
+                    value: at as u32,
+                    locations: Locations::new(),
+                }
+            })
+            .collect();
+        let mut layer = Layer::new(frac((1, 1)), raws, values.into());
+        layer.change_dress(|dress| {
+            dress.named = names.map(|names| names.iter().map(|name| Arc::from(*name)).collect());
+            dress.set = set;
+        });
+        layer
+    }
+
+    /// The value of each step as one map of its own: the way a layer made
+    /// each value before the steps shared a table.
+    fn made_plain(layer: &Layer) -> Vec<Value> {
+        let dress = layer.dress();
+        layer
+            .values
+            .iter()
+            .map(|value| {
+                let mut value = match &dress.named {
+                    Some(names) => crate::controls::named_value(names, value.clone()),
+                    None => value.clone(),
+                };
+                if let Some(set) = &dress.set {
+                    compose_data_in_place(ComposeOp::Set, &mut value, set);
+                }
+                value
+            })
+            .collect()
+    }
+
+    /// Every way to read the two maps agrees.
+    fn assert_one_map(shared: &crate::OrderedMap, plain: &crate::OrderedMap, what: &str) {
+        assert_eq!(shared, plain, "{what}: ==");
+        assert_eq!(format!("{shared:?}"), format!("{plain:?}"), "{what}: Debug");
+        assert_eq!(
+            format!("{shared:#?}"),
+            format!("{plain:#?}"),
+            "{what}: Debug#"
+        );
+        assert_eq!(shared.len(), plain.len(), "{what}: len");
+        assert_eq!(shared.is_empty(), plain.is_empty(), "{what}: is_empty");
+        assert_eq!(shared.data_hash(), plain.data_hash(), "{what}: data_hash");
+        assert!(
+            shared.same_data(plain) && plain.same_data(shared),
+            "{what}: same_data"
+        );
+        assert_eq!(
+            shared.holds_only_data(),
+            plain.holds_only_data(),
+            "{what}: data"
+        );
+        assert_eq!(shared.owns_no_heap(), plain.owns_no_heap(), "{what}: heap");
+        assert_eq!(
+            shared.js_entries(),
+            plain.js_entries(),
+            "{what}: js_entries"
+        );
+        assert_eq!(
+            shared.iter().collect::<Vec<_>>(),
+            plain.iter().collect::<Vec<_>>(),
+            "{what}: iter"
+        );
+        assert_eq!(
+            shared.into_iter().collect::<Vec<_>>(),
+            plain.into_iter().collect::<Vec<_>>(),
+            "{what}: into_iter"
+        );
+        for key in ["note", "s", "n", "gain", "release", "value", "new", "none"] {
+            assert_eq!(shared.get(key), plain.get(key), "{what}: get {key}");
+            assert_eq!(
+                shared.contains_key(key),
+                plain.contains_key(key),
+                "{what}: has {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shared_table_reads_as_the_plain_maps() {
+        let set = map_of(&[
+            ("s", text("gm_piano")),
+            ("release", Value::F64(0.28)),
+            ("gain", Value::F64(0.78)),
+        ]);
+        let notes = || vec![text("d#3"), text("a2"), Value::F64(7.0), text("d#3")];
+        let raw = || {
+            vec![
+                map_of(&[("note", text("c3")), ("n", Value::F64(1.0))]),
+                map_of(&[("n", Value::F64(2.0))]),
+                map_of(&[]),
+            ]
+        };
+        let object = |object: Value| Some(object);
+        // The name, the layer's values, its set, and whether the table
+        // reads them.
+        type Case<'a> = (
+            &'a str,
+            Vec<Value>,
+            Option<&'a [&'a str]>,
+            Option<Value>,
+            bool,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "one name and a set",
+                notes(),
+                Some(&["note"]),
+                object(set.clone()),
+                true,
+            ),
+            ("one name, no set", notes(), Some(&["note"]), None, true),
+            (
+                "two names, no list",
+                notes(),
+                Some(&["note", "s"]),
+                object(set.clone()),
+                true,
+            ),
+            (
+                "a raw map and a set",
+                raw(),
+                None,
+                object(set.clone()),
+                true,
+            ),
+            (
+                "a name that the set holds",
+                notes(),
+                Some(&["s"]),
+                object(set.clone()),
+                false,
+            ),
+            (
+                "a raw map with a key that the set holds",
+                vec![map_of(&[("gain", Value::F64(1.0)), ("n", Value::F64(2.0))])],
+                None,
+                object(set.clone()),
+                false,
+            ),
+            (
+                "a list under two names",
+                vec![Value::List(vec![text("c3"), text("gm_piano")])],
+                Some(&["note", "s"]),
+                object(set.clone()),
+                false,
+            ),
+            (
+                "a list under one name",
+                vec![Value::List(vec![text("c3"), text("e3")])],
+                Some(&["note"]),
+                object(set.clone()),
+                true,
+            ),
+            (
+                "an object with a value key",
+                vec![map_of(&[("value", text("c3")), ("n", Value::F64(2.0))])],
+                Some(&["note"]),
+                object(set.clone()),
+                false,
+            ),
+            (
+                "a value that is no data",
+                vec![Value::Haps(crate::value::HapList::new(Vec::new()))],
+                Some(&["note"]),
+                None,
+                false,
+            ),
+            (
+                "a set that a union drops",
+                notes(),
+                Some(&["note"]),
+                object(map_of(&[("value", Value::F64(1.0))])),
+                false,
+            ),
+            (
+                "an object under a name",
+                vec![map_of(&[("n", Value::F64(1.0))]), text("x")],
+                Some(&["dict"]),
+                object(set.clone()),
+                true,
+            ),
+        ];
+        for (what, values, names, set, shared) in cases {
+            let layer = dressed_layer(values, names, set);
+            let plain = made_plain(&layer);
+            assert_eq!(layer.each_value().count(), plain.len(), "{what}: count");
+            assert!(layer.value(plain.len()).is_none(), "{what}: past the end");
+            let read = layer.values_read.get().expect("the layer read its values");
+            assert_eq!(matches!(read, Read::Shared(_)), shared, "{what}: the form");
+            for (index, plain) in plain.iter().enumerate() {
+                let Some(Value::Object(shared)) = layer.value(index) else {
+                    panic!("{what}: step {index} is no map");
+                };
+                let Value::Object(plain) = plain else {
+                    panic!("{what}: plain step {index} is no map");
+                };
+                let name = format!("{what}, step {index}");
+                assert_one_map(&shared, plain, &name);
+                // A compose reads data only.
+                if !Value::Object(plain.clone()).is_data(0) {
+                    continue;
+                }
+                // A write copies the entries into a plain map first.
+                for write in 0..5 {
+                    let (mut shared, mut plain) = (shared.clone(), plain.clone());
+                    let change = |map: &mut crate::OrderedMap| match write {
+                        0 => {
+                            map.insert("gain".into(), Value::F64(9.0));
+                        }
+                        1 => {
+                            map.insert("new".into(), Value::F64(9.0));
+                        }
+                        2 => {
+                            map.remove("s");
+                            map.remove("note");
+                        }
+                        3 => {
+                            if let Some(value) = map.get_mut("release") {
+                                *value = Value::F64(9.0);
+                            }
+                        }
+                        _ => {
+                            let mut over = Value::Object(map.clone());
+                            let by = map_of(&[("n", Value::F64(5.0)), ("fresh", text("f"))]);
+                            compose_data_in_place(ComposeOp::Set, &mut over, &by);
+                            *map = match over {
+                                Value::Object(over) => over,
+                                _ => unreachable!("a map composed with a map"),
+                            };
+                        }
+                    };
+                    change(&mut shared);
+                    change(&mut plain);
+                    assert_one_map(&shared, &plain, &format!("{name}, write {write}"));
+                }
+                // A map that a dressed map is set onto reads the same.
+                let (mut onto, mut onto_plain) = (
+                    map_of(&[("n", Value::F64(0.0)), ("gain", Value::F64(1.0))]),
+                    map_of(&[("n", Value::F64(0.0)), ("gain", Value::F64(1.0))]),
+                );
+                compose_data_in_place(ComposeOp::Set, &mut onto, &Value::Object(shared.clone()));
+                compose_data_in_place(
+                    ComposeOp::Set,
+                    &mut onto_plain,
+                    &Value::Object(plain.clone()),
+                );
+                let (Value::Object(onto), Value::Object(onto_plain)) = (onto, onto_plain) else {
+                    panic!("{what}: a union is no map");
+                };
+                assert_one_map(&onto, &onto_plain, &format!("{name}, set onto"));
+                // An empty map of data set onto it leaves it data.
+                let (mut empty, mut empty_plain) =
+                    (Value::Object(shared.clone()), Value::Object(plain.clone()));
+                compose_data_in_place(ComposeOp::Set, &mut empty, &map_of(&[]));
+                compose_data_in_place(ComposeOp::Set, &mut empty_plain, &map_of(&[]));
+                let (Value::Object(empty), Value::Object(empty_plain)) = (empty, empty_plain)
+                else {
+                    panic!("{what}: a union is no map");
+                };
+                assert_one_map(&empty, &empty_plain, &format!("{name}, empty set onto"));
+            }
+        }
+    }
+
+    /// The order of the entries is the order of the compose of the set
+    /// onto the value: the entries of the step, then those of the set.
+    #[test]
+    fn a_shared_map_holds_the_entries_of_its_step_before_the_set() {
+        let set = map_of(&[("s", text("gm_piano")), ("gain", Value::F64(0.5))]);
+        let layer = dressed_layer(vec![text("c3")], Some(&["note"]), Some(set));
+        let Some(Value::Object(map)) = layer.value(0) else {
+            panic!("a step is a map");
+        };
+        assert_eq!(
+            map.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            ["note", "s", "gain"]
+        );
+    }
+
+    /// A map that reads a table is the raw map of another layer, or the
+    /// set of one, and reads the same as the plain map.
+    #[test]
+    fn a_dressed_map_dresses_another_layer() {
+        let inner_set = map_of(&[("s", text("gm_piano")), ("gain", Value::F64(0.5))]);
+        let inner = dressed_layer(
+            vec![text("c3"), text("e3")],
+            Some(&["note"]),
+            Some(inner_set),
+        );
+        let maps: Vec<Value> = inner.each_value().collect();
+        let outer_set = map_of(&[("release", Value::F64(0.2))]);
+        // The dressed maps as raw values, then as the set.
+        for (values, set) in [
+            (maps.clone(), outer_set.clone()),
+            (vec![text("a2")], maps[0].clone()),
+        ] {
+            let names: Option<&[&str]> = match values[0] {
+                Value::Object(_) => None,
+                _ => Some(&["n"]),
+            };
+            let layer = dressed_layer(values, names, Some(set));
+            assert!(matches!(layer.reader(), Values::Table(_)));
+            for (shared, plain) in layer.each_value().zip(made_plain(&layer)) {
+                let (Value::Object(shared), Value::Object(plain)) = (shared, plain) else {
+                    panic!("a step is no map");
+                };
+                assert_one_map(&shared, &plain, "a dressed map under a dress");
+            }
+        }
+    }
+
+    /// A layer of `cells` steps that fill `[0, 1)` of the period, some cut
+    /// by a wider whole, with the locations that `variant` picks.
+    fn grid_layer(period: (i128, i128), cells: i128, variant: usize) -> SequenceLayer {
+        let steps = (0..cells)
+            .map(|cell| {
+                let at = |n: i128| frac((n, cells));
+                let mut locations = Locations::new();
+                let (begin, end) = match (variant + cell as usize) % 6 {
+                    0 => (0, 0),
+                    1 => (cell as usize * 7, cell as usize * 7 + 3),
+                    // A range of no length is not no range.
+                    2 => (cell as usize, cell as usize),
+                    3 => (cell as usize, cell as usize + 1),
+                    4 => ((1 << 22) + cell as usize, (1 << 22) + cell as usize + 5000),
+                    _ => (0, 1),
+                };
+                match (variant + cell as usize) % 6 {
+                    0 => {}
+                    3 => locations.extend_from_slice(&[(begin, end), (begin + 9, end + 9)]),
+                    _ => locations.push((begin, end)),
+                }
+                let mut step =
+                    SequenceStep::new(at(cell), at(cell + 1), Value::F64(cell as f64), locations);
+                if cell % 3 == 1 {
+                    // The whole reaches into the cells around the part.
+                    let whole = (at((cell - 1).max(0)), at((cell + 2).min(cells)));
+                    step = step.placed(whole, (at(cell), at(cell + 1)));
+                }
+                step
+            })
+            .collect();
+        layer(period, steps)
+    }
+
+    fn haps_of(layer: &Layer, span: (Fraction, Fraction)) -> Vec<String> {
+        let mut out = Vec::new();
+        query_sequence_onto(
+            std::slice::from_ref(layer),
+            &State::new(TimeSpan::new(span.0, span.1)),
+            &mut out,
+        );
+        out.iter()
+            .map(|hap| format!("{hap:?} {:?}", hap.context.to_vec()))
+            .collect()
+    }
+
+    /// The same layer with its steps as places.
+    fn as_places(layer: &Layer) -> Layer {
+        let places: Arc<[Place]> = layer.places().into();
+        layer.with(|layer| {
+            layer.steps = Steps::Listed(Listing::Places(Listed {
+                places,
+                small_denominators: true,
+            }));
+        })
+    }
+
+    fn grid_of(layer: &Layer) -> &Grid {
+        match layer.listing() {
+            Listing::Grid(grid) => grid,
+            Listing::Places(_) => panic!("the steps are not on a grid"),
+        }
+    }
+
+    /// The grid of a layer answers as its places do, over spans that are
+    /// negative, of no width, on a tick or between two, and at the ends of
+    /// a period.
+    #[test]
+    fn a_layer_on_a_grid_answers_as_its_places_do() {
+        let mut seen = 0;
+        for period in [(1, 1), (3, 2), (2, 1), (1, 3)] {
+            for cells in [1, 2, 3, 4, 5, 8, 12] {
+                for variant in 0..6 {
+                    let grid = Layer::of(grid_layer(period, cells, variant)).unwrap();
+                    grid_of(&grid);
+                    let places = as_places(&grid);
+                    for begin in -40..40i128 {
+                        for width in [0, 1, 3, 7, 24] {
+                            let begin = frac((begin, 8));
+                            let span = (begin, begin.add(frac((width, 8))));
+                            assert_eq!(
+                                haps_of(&grid, span),
+                                haps_of(&places, span),
+                                "{period:?} {cells} {variant} {span:?}"
+                            );
+                        }
+                    }
+                    // A span between two ticks.
+                    for span in [(frac((1, 7)), frac((22, 7))), (frac((-5, 3)), frac((2, 9)))] {
+                        assert_eq!(haps_of(&grid, span), haps_of(&places, span));
+                    }
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, 168);
+    }
+
+    /// A grid gives back each time, cut and location that made it.
+    #[test]
+    fn a_grid_gives_back_its_steps() {
+        for cells in [1, 3, 5, 12] {
+            for variant in 0..6 {
+                let raws = |layer: SequenceLayer| {
+                    layer
+                        .steps
+                        .iter()
+                        .map(|step| (step.whole(), step.part.is_some(), step.locations().clone()))
+                        .collect::<Vec<_>>()
+                };
+                let made = grid_layer((1, 1), cells, variant);
+                let layer = Layer::of(made.clone()).unwrap();
+                let listing = layer.listing();
+                for (index, (whole, part, locations)) in raws(made).into_iter().enumerate() {
+                    assert_eq!(listing.whole(index), TimeSpan::new(whole.0, whole.1));
+                    assert_eq!(listing.is_cut(index), part);
+                    assert_eq!(listing.locations(index), locations);
+                }
+            }
+        }
+    }
+
+    /// A tick that is zero is the canonical zero, and the tick size is the
+    /// least common multiple of the denominators.
+    #[test]
+    fn a_grid_is_as_fine_as_its_denominators() {
+        let layer = Layer::of(grid_layer((1, 1), 4, 0)).unwrap();
+        let grid = grid_of(&layer);
+        assert_eq!(grid.ticks.get(), 4);
+        assert_eq!(grid.time(0), Fraction::ZERO);
+        assert_eq!(grid.time(0).denom(), 1);
+        let layer = Layer::of(grid_layer((1, 3), 4, 0)).unwrap();
+        assert_eq!(grid_of(&layer).ticks.get(), 12);
+    }
+
+    /// A layer whose times do not fit 32 bits of ticks keeps its places,
+    /// and a denominator past 32 bits refuses before the tick size is made.
+    #[test]
+    fn a_layer_off_the_grid_keeps_its_places() {
+        let huge = Fraction::new(1, (1 << 40) + 1);
+        let none = Locations::new;
+        let steps = vec![
+            SequenceStep::new(Fraction::ZERO, huge, Value::F64(0.0), none()),
+            SequenceStep::new(huge, Fraction::ONE, Value::F64(1.0), none()),
+        ];
+        let layer = Layer::of(layer((1, 1), steps)).unwrap();
+        assert!(matches!(layer.listing(), Listing::Places(_)));
+        // The product of the two denominators does not fit 64 bits.
+        let wide = Fraction::new((1 << 62) + 1, (1 << 63) + 1);
+        let steps = vec![
+            SequenceStep::new(Fraction::ZERO, frac((1, 2)), Value::F64(0.0), none()),
+            SequenceStep::new(frac((1, 2)), wide, Value::F64(1.0), none()),
+        ];
+        let layer = Layer::of(self::layer((1, 1), steps)).unwrap();
+        assert!(matches!(layer.listing(), Listing::Places(_)));
+        // A negative time does not fit unsigned ticks either.
+        let steps = vec![SequenceStep::new(
+            frac((-1, 2)),
+            frac((1, 2)),
+            Value::F64(0.0),
+            none(),
+        )];
+        let layer = Layer::of(self::layer((1, 1), steps)).unwrap();
+        assert!(matches!(layer.listing(), Listing::Places(_)));
+        // The places of a layer off the grid answer.
+        assert_eq!(haps_of(&layer, (Fraction::ZERO, Fraction::ONE)).len(), 1);
+    }
+
+    /// A range of locations that is too long for a packed one does not push
+    /// the short ranges of other steps into the spare list.
+    #[test]
+    fn a_long_range_leaves_the_short_ones_packed() {
+        let mut long = Locations::new();
+        long.push((0, 100_000));
+        let mut short = Locations::new();
+        short.push((5_000_000, 5_000_003));
+        let steps = vec![
+            SequenceStep::new(Fraction::ZERO, frac((1, 2)), Value::F64(0.0), long),
+            SequenceStep::new(frac((1, 2)), Fraction::ONE, Value::F64(1.0), short),
+        ];
+        let layer = Layer::of(self::layer((1, 1), steps)).unwrap();
+        let grid = grid_of(&layer);
+        assert_eq!(grid.steps[1].loc.0 & PackedLoc::SPARE, 0);
+        assert_eq!(grid.locations(1).to_vec(), [(5_000_000, 5_000_003)]);
+        assert_eq!(grid.locations(0).to_vec(), [(0, 100_000)]);
+    }
+
+    /// `same` leaves a source that nobody read unread, and answers the same
+    /// each time it is asked.
+    #[test]
+    fn same_reads_no_source() {
+        struct Rest;
+        impl StepSource for Rest {
+            fn count(&self) -> usize {
+                1
+            }
+            fn steps(
+                &self,
+                _: Fraction,
+                end: Fraction,
+                each: &mut dyn FnMut(SourceStep),
+            ) -> Option<()> {
+                each(SourceStep {
+                    begin: Fraction::ZERO,
+                    end,
+                    value: 0,
+                    locations: Locations::new(),
+                });
+                Some(())
+            }
+        }
+        let sourced = |source: &Arc<dyn StepSource>| {
+            Layer::of_source(SourcedLayer {
+                period: Fraction::ONE,
+                values: Arc::new([Value::F64(1.0)]),
+                in_cycles: true,
+                steps: Arc::clone(source),
+            })
+        };
+        let one: Arc<dyn StepSource> = Arc::new(Rest);
+        let (a, b) = (sourced(&one), sourced(&one));
+        let other = sourced(&(Arc::new(Rest) as Arc<dyn StepSource>));
+        let listed = Layer::of(layer((1, 1), vec![step((0, 1), (1, 1), 1.0)])).unwrap();
+        let same = |a: &Layer, b: &Layer| a.same(b, |a, b| a.same_data(b));
+        for _ in 0..2 {
+            assert!(same(&a, &b));
+            assert!(!same(&a, &other));
+            assert!(!same(&a, &listed));
+            assert!(!same(&listed, &a));
+        }
+        for layer in [&a, &b, &other] {
+            assert!(layer.source().is_some(), "a source was read");
+        }
+    }
+
+    /// Two layers of the same steps are the same layer, and two grids with
+    /// other steps are not.
+    #[test]
+    fn grids_of_the_same_steps_are_the_same_layer() {
+        let first = Layer::of(grid_layer((1, 1), 5, 2)).unwrap();
+        let second = Layer::of(grid_layer((1, 1), 5, 2)).unwrap();
+        let other = Layer::of(grid_layer((1, 1), 5, 3)).unwrap();
+        let same = |a: &Layer, b: &Layer| a.same(b, |a, b| a.same_data(b));
+        assert!(same(&first, &second));
+        assert!(same(&first, &as_places(&second)));
+        assert!(!same(&first, &other));
+    }
+
+    /// A grid says a layer is in order as its places do: a step past the
+    /// period, out of order, empty, or with a whole inside its part is not.
+    #[test]
+    fn a_grid_checks_the_order_as_its_places_do() {
+        let at = |a: i128, b: i128, whole: (i128, i128)| {
+            let step = step((a, 4), (b, 4), 1.0);
+            step.placed(
+                (frac((whole.0, 4)), frac((whole.1, 4))),
+                (frac((a, 4)), frac((b, 4))),
+            )
+        };
+        let cases = [
+            vec![at(0, 2, (0, 2)), at(2, 4, (2, 4))],
+            vec![at(0, 2, (0, 2)), at(2, 5, (2, 5))],
+            vec![at(2, 4, (2, 4)), at(0, 2, (0, 2))],
+            vec![at(0, 0, (0, 0))],
+            vec![at(1, 3, (0, 4)), at(2, 4, (1, 4))],
+            vec![at(1, 3, (2, 4))],
+            vec![at(0, 3, (0, 3)), at(1, 2, (1, 2))],
+            vec![at(0, 2, (0, 2)), at(1, 4, (1, 4)), at(1, 4, (0, 4))],
+        ];
+        for period in [(1, 1), (1, 2), (3, 2)] {
+            for steps in &cases {
+                let grid = Layer::of(layer(period, steps.clone())).unwrap();
+                grid_of(&grid);
+                assert_eq!(
+                    grid.is_in_order(),
+                    as_places(&grid).is_in_order(),
+                    "{period:?}"
+                );
+            }
+        }
+    }
+
+    /// A grid makes the reduced time of a tick as exact division does,
+    /// with a table of reductions or with a shift, for a tick of either
+    /// sign.
+    #[test]
+    fn a_grid_makes_the_reduced_time_of_a_tick() {
+        for ticks in [1, 3, 6, 12, 64, 100, 1000, 1024, 1025, 4096, 65_537] {
+            let step = |end: i128| {
+                SequenceStep::new(
+                    Fraction::ZERO,
+                    Fraction::new(1, end),
+                    Value::F64(0.0),
+                    Locations::new(),
+                )
+            };
+            let layer = Layer::of(layer((1, 1), vec![step(ticks)])).unwrap();
+            let grid = grid_of(&layer);
+            assert_eq!(grid.ticks.get() as i128, ticks);
+            for tick in (-5000..5000).chain([i128::from(i64::MAX), i128::from(i64::MIN)]) {
+                assert_eq!(
+                    grid.made(tick),
+                    Fraction::new(tick, ticks),
+                    "{tick}/{ticks}"
+                );
+            }
+        }
+    }
+
+    /// The floor and the ceiling of a time in ticks are those of exact
+    /// division, for a time on a tick, between two, and negative.
+    #[test]
+    fn a_time_has_its_floor_and_ceiling_in_ticks() {
+        let layer = Layer::of(grid_layer((1, 1), 12, 0)).unwrap();
+        let grid = grid_of(&layer);
+        for denom in [1, 2, 3, 5, 7, 8, 12, 16, 24, 1 << 20] {
+            for numer in -300..300 {
+                let time = Fraction::new(numer, denom);
+                let exact = time * Fraction::int(12);
+                let (floor, ceil) = grid.ticks_at(time).unwrap();
+                assert_eq!(Fraction::int(i128::from(floor)), exact.floor(), "{time:?}");
+                assert_eq!(Fraction::int(i128::from(ceil)), exact.ceil(), "{time:?}");
+            }
+        }
+        assert!(grid.ticks_at(Fraction::int(i128::MAX / 2)).is_none());
+    }
+
+    /// A source that holds one step in each period.
+    struct OneStep;
+    impl StepSource for OneStep {
+        fn count(&self) -> usize {
+            1
+        }
+        fn steps(
+            &self,
+            _: Fraction,
+            end: Fraction,
+            each: &mut dyn FnMut(SourceStep),
+        ) -> Option<()> {
+            each(SourceStep {
+                begin: Fraction::ZERO,
+                end,
+                value: 0,
+                locations: Locations::new(),
+            });
+            Some(())
+        }
+    }
+
+    fn one_step_layer(source: &Arc<dyn StepSource>, value: f64) -> Layer {
+        Layer::of_source(SourcedLayer {
+            period: Fraction::ONE,
+            values: Arc::new([Value::F64(value)]),
+            in_cycles: true,
+            steps: Arc::clone(source),
+        })
+    }
+
+    /// The answer of `same` for two layers of one source does not change
+    /// when a query reads the source of one of them.
+    #[test]
+    fn same_answers_alike_after_a_source_is_read() {
+        let source: Arc<dyn StepSource> = Arc::new(OneStep);
+        let (a, b) = (one_step_layer(&source, 1.0), one_step_layer(&source, 1.0));
+        let listed = Layer::of(layer((1, 1), vec![step((0, 1), (1, 1), 1.0)])).unwrap();
+        let same = |a: &Layer, b: &Layer| a.same(b, |a, b| a.same_data(b));
+        let before = (
+            same(&a, &b),
+            same(&b, &a),
+            same(&a, &listed),
+            same(&listed, &a),
+        );
+        assert_eq!(before, (true, true, false, false));
+        // A query reads the steps of `a` into a list.
+        assert_eq!(a.listing().len(), 1);
+        assert!(a.source().is_none(), "the source of a was read");
+        let after = (
+            same(&a, &b),
+            same(&b, &a),
+            same(&a, &listed),
+            same(&listed, &a),
+        );
+        assert_eq!(after, before);
+    }
+
+    /// Two layers of one source with other values are not the same.
+    #[test]
+    fn same_tells_two_layers_of_one_source_with_other_values() {
+        let source: Arc<dyn StepSource> = Arc::new(OneStep);
+        let a = one_step_layer(&source, 1.0);
+        let other = a.clone().valued(Arc::new([Value::F64(2.0)]));
+        let alike = a.clone().valued(Arc::new([Value::F64(1.0)]));
+        let same = |a: &Layer, b: &Layer| a.same(b, |a, b| a.same_data(b));
+        assert!(!same(&a, &other));
+        assert!(!same(&other, &a));
+        assert!(same(&a, &alike));
+    }
+
+    /// A raw map with a `value` key under no name reads as the compose of a
+    /// set onto it, which keeps every key of the map.
+    #[test]
+    fn a_raw_map_with_a_value_key_reads_as_the_plain_map() {
+        let set = map_of(&[("s", text("piano")), ("gain", Value::F64(0.5))]);
+        let raw = vec![map_of(&[("value", text("c3")), ("n", Value::F64(1.0))])];
+        let layer = dressed_layer(raw, None, Some(set));
+        let plain = made_plain(&layer);
+        for (index, plain) in plain.iter().enumerate() {
+            let (Some(Value::Object(shared)), Value::Object(plain)) = (layer.value(index), plain)
+            else {
+                panic!("step {index} is no map");
+            };
+            assert_one_map(&shared, plain, "a raw map with a value key");
+            assert_eq!(shared.get("value"), Some(&text("c3")));
         }
     }
 }

@@ -12029,7 +12029,7 @@ fn compute_purity(node: &Node) -> purity::Purity {
             layers
                 .iter()
                 .filter(|layer| !layer.is_data())
-                .flat_map(|layer| layer.values())
+                .flat_map(|layer| layer.held_values())
                 .filter(|value| !value.is_data(0))
                 .map(value_purity),
         ),

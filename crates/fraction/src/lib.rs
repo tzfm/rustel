@@ -23,7 +23,7 @@
 
 use std::cmp::Ordering;
 use std::fmt;
-use std::num::{NonZeroI128, NonZeroU16};
+use std::num::{NonZeroI128, NonZeroU16, NonZeroU32};
 use std::str::FromStr;
 
 use num_bigint::{BigInt, BigUint, Sign};
@@ -436,6 +436,38 @@ impl Fraction {
     /// Use this to validate external input without panicking.
     pub fn checked_new(n: i128, d: i128) -> Option<Self> {
         checked_normalised(n, d)
+    }
+
+    /// The reduced cycle time of a signed tick on a uniform grid.
+    #[inline]
+    pub fn from_ticks(ticks: i128, ticks_per_cycle: NonZeroU32) -> Self {
+        let d = ticks_per_cycle.get();
+        if d.is_power_of_two() {
+            let shift = ticks.trailing_zeros().min(d.trailing_zeros());
+            return Self {
+                n: ticks >> shift,
+                d: den(i128::from(d >> shift)),
+            };
+        }
+        // Terms of 32 bits reduce with a gcd of 32 bits.
+        if let Ok(magnitude) = u32::try_from(ticks.unsigned_abs()) {
+            if magnitude == 0 {
+                return Self::ZERO;
+            }
+            let (mut a, mut b) = (magnitude, d);
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            let n = i128::from(magnitude / a);
+            return Self {
+                n: if ticks < 0 { -n } else { n },
+                d: den(i128::from(d / a)),
+            };
+        }
+        if let Ok(ticks) = i64::try_from(ticks) {
+            return reduced_small(ticks, i64::from(d));
+        }
+        Self::new(ticks, i128::from(d))
     }
 
     #[inline]
@@ -1720,6 +1752,29 @@ mod parse_tokeniser_tests {
 #[cfg(test)]
 mod native_fast_path_tests {
     use super::*;
+
+    #[test]
+    fn signed_ticks_reduce_on_each_grid() {
+        for d in [1, 2, 12, 128, 257, 1 << 31, u32::MAX] {
+            let grid = NonZeroU32::new(d).unwrap();
+            let edges = [
+                i128::MIN,
+                i128::MIN + 1,
+                i128::MAX,
+                i128::from(i64::MIN),
+                i128::from(i64::MIN) + 1,
+                i128::from(i64::MAX),
+                i128::from(i64::MAX) + 1,
+            ];
+            for tick in (-260..=260).chain(edges) {
+                assert_eq!(
+                    Fraction::from_ticks(tick, grid),
+                    Fraction::new(tick, i128::from(d)),
+                    "{tick}/{d}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn adding_whole_cycles_agrees_with_exact_addition_at_the_edges() {

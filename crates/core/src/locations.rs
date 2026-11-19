@@ -65,6 +65,20 @@ impl Locations {
         })
     }
 
+    /// The one range that begins at `begin` and is `length` long, with no
+    /// check of the room, which one range always has.
+    pub(crate) const fn one(begin: u32, length: u16) -> Self {
+        let mut begins = [0; INLINE];
+        let mut lengths = [0; INLINE];
+        begins[0] = begin;
+        lengths[0] = length;
+        Self(Repr::Inline {
+            len: 1,
+            begins,
+            lengths,
+        })
+    }
+
     /// How many ranges there are.
     pub fn len(&self) -> usize {
         match &self.0 {
@@ -320,6 +334,18 @@ impl ExactSizeIterator for Iter<'_> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_range_is_the_list_that_a_push_makes() {
+        for (begin, length) in [(0u32, 0u16), (7, 3), (u32::MAX, u16::MAX)] {
+            let one = Locations::one(begin, length);
+            let range = (begin as usize, begin as usize + usize::from(length));
+            assert_eq!(one, Locations::from(&[range][..]));
+            assert!(one.is_inline());
+            assert_eq!(one.get(0), Some(range));
+            assert_eq!(one.len(), 1);
+        }
+    }
 
     #[test]
     fn short_lists_stay_in_place_and_long_ones_move_to_the_heap() {

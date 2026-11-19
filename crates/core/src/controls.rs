@@ -196,10 +196,27 @@ pub(crate) fn note_names() -> Arc<[Arc<str>]> {
 }
 
 /// The first of `names`, the canonical name of their control, as a map key.
-fn key_of(names: &[Arc<str>]) -> Key {
+pub(crate) fn key_of(names: &[Arc<str>]) -> Key {
     names
         .first()
         .map_or_else(|| Key::from(""), |name| Key::from(Arc::clone(name)))
+}
+
+/// Whether a map holds its value under `value`, apart from its controls.
+fn has_value_key(object: &OrderedMap) -> bool {
+    object.contains_key("value")
+}
+
+/// Whether a list of values is one value for each of `names`.
+fn opens_list(names: &[Arc<str>], value: &Value) -> bool {
+    names.len() > 1 && matches!(value, Value::List(_))
+}
+
+/// Whether [`named_value`] makes the map of one entry of `value`: the key
+/// of the control, and `value` as it is. A data value that holds a `value`
+/// key or opens as a list under more than one name makes another map.
+pub(crate) fn names_as_one_entry(names: &[Arc<str>], value: &Value) -> bool {
+    !opens_list(names, value) && !matches!(value, Value::Object(object) if has_value_key(object))
 }
 
 /// `value` in the named form of the control of `names`: see
@@ -217,7 +234,7 @@ pub(crate) fn named_value(names: &[Arc<str>], mut value: Value) -> Value {
         value = crate::materialize_js_value(&value);
     }
     let mut bag = match &value {
-        Value::Object(object) if object.contains_key("value") => {
+        Value::Object(object) if has_value_key(object) => {
             let mut object = object.clone();
             value = object.remove("value").expect("the key was just checked");
             Some(object)
@@ -225,7 +242,7 @@ pub(crate) fn named_value(names: &[Arc<str>], mut value: Value) -> Value {
         _ => None,
     };
 
-    if names.len() > 1
+    if opens_list(names, &value)
         && let Value::List(values) = value
     {
         let result = bag.get_or_insert_with(OrderedMap::new);
