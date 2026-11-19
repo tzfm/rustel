@@ -793,12 +793,22 @@ pub fn max_polyphony() -> Option<usize> {
 /// Set the score override in the currently bound candidate/runtime.
 /// Host defaults belong to the host and must not be written through this setter.
 pub fn set_max_polyphony(voices: usize) {
+    let voices = Some(voices.clamp(1, MAX_CONFIGURABLE_POLYPHONY));
+    // Writing the value already in force changes nothing, so it publishes
+    // nothing: the settings identity, which every result cache keys on,
+    // stays put.
+    if max_polyphony() == voices {
+        return;
+    }
     update_current(|settings| {
-        settings.max_polyphony = Some(voices.clamp(1, MAX_CONFIGURABLE_POLYPHONY));
+        settings.max_polyphony = voices;
     });
 }
 
 pub(crate) fn set_rng_mode(mode: u8) {
+    if rng_mode() == mode {
+        return;
+    }
     update_current(|settings| settings.rng_mode = mode);
 }
 
@@ -807,6 +817,9 @@ pub(crate) fn rng_mode() -> u8 {
 }
 
 pub(crate) fn set_default_join(alignment: u8) {
+    if default_join() == alignment {
+        return;
+    }
     update_current(|settings| settings.default_join = alignment);
 }
 
@@ -1330,7 +1343,7 @@ mod tests {
     fn legacy_history_snapshots_share_one_mutex_and_native_queries_across_threads() {
         fn notes(chord: &str) -> Vec<crate::Value> {
             crate::voicings::voicings(
-                &crate::pure(crate::Value::Str(chord.to_owned())),
+                &crate::pure(crate::Value::Str(chord.into())),
                 crate::Value::Str("thread-history".into()),
             )
             .query_arc(
@@ -1344,7 +1357,7 @@ mod tests {
         fn expected(notes: [&str; 3]) -> Vec<crate::Value> {
             notes
                 .into_iter()
-                .map(|note| crate::Value::Str(note.to_owned()))
+                .map(|note| crate::Value::Str(note.into()))
                 .collect()
         }
 

@@ -222,7 +222,7 @@ mod tests {
         let runtime = JsRuntime::new().expect("runtime");
         runtime.install_semantic_bindings().expect("bindings");
         for name in ["getDuration", "getDur"] {
-            let error = runtime.ctx.with(|ctx| {
+            let error = runtime.realm().ctx.with(|ctx| {
                 let function: Function = ctx.globals().get(name).expect("unsupported binding");
                 let result: rquickjs::Result<rquickjs::Value> = function.call(("value",));
                 crate::surface::effects::describe_js_error(

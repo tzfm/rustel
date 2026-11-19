@@ -56,7 +56,7 @@ use crate::hap_json::{
 use crate::osc_bridge::ScoreOscAccess;
 #[cfg(any(feature = "device-audio", test))]
 use crate::producer::{ProducerPhase, ProducerTurnRecord};
-use crate::render::{RenderFormat, write_onset_dump, write_silent_wav};
+use crate::render::{RenderFormat, write_onset_dump_until, write_silent_wav};
 use crate::samples::ScoreSampleAccess;
 use crate::score_import::ScoreImportAccess;
 
@@ -218,6 +218,22 @@ pub struct SessionDiagnostic {
     pub kind: String,
     pub message: String,
     pub recoverable: bool,
+}
+
+/// What evaluated a score.
+///
+/// A score of patterns, controls, functions, arrows and lanes needs no
+/// JavaScript: the session builds its graph with no script engine. Any
+/// other score runs in the script engine, which costs more time and
+/// memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoreEngine {
+    /// The session built the score with no script engine.
+    Native,
+    /// The script engine ran the score. `line` is the line of the score,
+    /// counted from 1, where the native route stopped, when it is known:
+    /// the line holds a form or a call that only JavaScript has.
+    Script { line: Option<usize> },
 }
 
 /// The kind of a refusal when the library has not finished loading the
@@ -846,6 +862,11 @@ pub struct Session {
     /// plugin notes carry.
     #[cfg(feature = "vst")]
     lanes: crate::vst::LaneTable,
+    /// What evaluated the last score. See [`Self::score_engine`].
+    score_engine: Option<ScoreEngine>,
+    /// The names of the widget methods, as each transpile takes them: made
+    /// one time, and lent to the options of each evaluation.
+    widget_methods: Vec<String>,
     /// The last look of [`Self::plugins_pending`]: its time, the generation
     /// of the score, and the count.
     #[cfg(feature = "vst")]
@@ -1027,8 +1048,6 @@ pub struct Session {
     /// Full-screen owners drain this instead of allowing writes behind their
     /// alternate screen. It is bounded independently of score complexity.
     pending_diagnostics: VecDeque<SessionDiagnostic>,
-    bindings_ready: bool,
-    voicings_ready: bool,
     /// Whether this Session has claimed its native module settings instead of
     /// continuing to inherit the ambient Rust compatibility state.
     core_settings_owned: bool,
@@ -1157,11 +1176,9 @@ impl Session {
                 "channels must be greater than zero".into(),
             ));
         }
-        let js = config
-            .pointer
-            .clone()
-            .map_or_else(JsRuntime::new, JsRuntime::with_pointer)
-            .map_err(|e| RuntimeError::Js(e.to_string()))?;
+        // The script engine starts at the first score, prelude or import
+        // that needs it.
+        let js = JsRuntime::deferred(config.pointer.clone());
         let transport = Arc::new(Transport::default());
         let scheduler = Scheduler::new(transport.clone(), config.cps, config.horizon);
         let csound = crate::csound::State::new(config.score_import_access.csound_allowed());
@@ -1217,6 +1234,11 @@ impl Session {
             slider_links,
             #[cfg(feature = "vst")]
             lanes: crate::vst::LaneTable::default(),
+            score_engine: None,
+            widget_methods: rustel_transpiler::VISUAL_WIDGET_METHODS
+                .iter()
+                .map(|method| (*method).to_owned())
+                .collect(),
             #[cfg(feature = "vst")]
             plugin_look: None,
             #[cfg(all(feature = "vst", feature = "device-audio"))]
@@ -1283,8 +1305,6 @@ impl Session {
             import_errors: std::collections::BTreeMap::new(),
             direct_diagnostic_logging: rustel_voice::default_direct_diagnostic_logging(),
             pending_diagnostics: VecDeque::new(),
-            bindings_ready: false,
-            voicings_ready: false,
             core_settings_owned: false,
             core_settings_initialized: false,
             reported_query_throw: None,
@@ -1618,6 +1638,40 @@ impl Session {
     pub fn set_plugin_lead_for_test(&mut self, lead: f64) {
         self.plugin_lead = (lead, self.transport.stops());
         self.plugin_lead_changed();
+    }
+
+    /// Let scores the native tier proves skip JavaScript, or send every
+    /// score to JavaScript, for tests and same-machine A/B.
+    #[doc(hidden)]
+    pub fn set_native_tier(&self, enabled: bool) {
+        self.js.set_native_tier(enabled);
+    }
+
+    /// Whether the last evaluated score ran on the native tier.
+    #[doc(hidden)]
+    pub fn evaluated_natively(&self) -> bool {
+        self.js.evaluated_natively()
+    }
+
+    /// What evaluated the last score that this session evaluated with no
+    /// error, or `None` before the first one. A front end shows it, so that
+    /// an edit that moves a score to the script engine is seen.
+    pub fn score_engine(&self) -> Option<ScoreEngine> {
+        self.score_engine
+    }
+
+    /// Whether the script engine of this session started. It starts at the
+    /// first score, prelude or import that needs JavaScript, and a session
+    /// of native scores holds no script heap.
+    pub fn script_engine_started(&self) -> bool {
+        self.js.script_engine_started()
+    }
+
+    /// The active graph as its score built it, for tests that compare two
+    /// builds of a score.
+    #[doc(hidden)]
+    pub fn active_pattern_for_test(&self) -> Option<rustel_core::Pattern> {
+        self.js.active_graph_for_test()
     }
 
     /// The generation of the score of the last look of

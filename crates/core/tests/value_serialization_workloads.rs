@@ -41,7 +41,7 @@ struct Workload {
 
 fn primitive_strings() -> Vec<Value> {
     (0..64)
-        .map(|index| Value::Str(format!("text-{index}-comma,quote\"slash\\line\n")))
+        .map(|index| Value::Str(format!("text-{index}-comma,quote\"slash\\line\n").into()))
         .collect()
 }
 
@@ -58,7 +58,10 @@ fn flat_objects() -> Vec<Value> {
     (0..64)
         .map(|index| {
             Value::object([
-                ("alpha".into(), Value::Str(format!("item-{}", index % 16))),
+                (
+                    "alpha".into(),
+                    Value::Str(format!("item-{}", index % 16).into()),
+                ),
                 ("beta".into(), Value::F64(index as f64 + 0.25)),
                 ("gamma".into(), Value::F64(index as f64 / 7.0)),
                 ("delta".into(), Value::Bool(index % 2 == 0)),
@@ -75,7 +78,7 @@ fn nested_values() -> Vec<Value> {
             Value::object([
                 (
                     "tail".into(),
-                    Value::Str(format!("tail-{index},\"quoted\"")),
+                    Value::Str(format!("tail-{index},\"quoted\"").into()),
                 ),
                 ("10".into(), Value::F64(10.0 + index as f64)),
                 ("2".into(), Value::F64(2.0 + index as f64)),
@@ -118,7 +121,7 @@ fn text_containers(text: &str) -> Vec<Value> {
     (0..32)
         .map(|index| {
             Value::object([
-                (format!("{text}-{index}"), Value::Str(text.repeat(8))),
+                (format!("{text}-{index}"), Value::Str(text.repeat(8).into())),
                 (
                     "items".into(),
                     Value::List(vec![Value::Str(text.into()), Value::F64(index as f64)]),
@@ -329,8 +332,8 @@ fn compact_rendering_preserves_unicode_and_opaque_root_delimiters() {
     for (value, native, opaque) in [
         (Value::List(Vec::new()), "", "[]"),
         (Value::object([]), "", "{}"),
-        (Value::Str(String::new()), "", ""),
-        (Value::List(vec![Value::Str(String::new())]), "", "[]"),
+        (Value::Str("".into()), "", ""),
+        (Value::List(vec![Value::Str("".into())]), "", "[]"),
         (
             Value::List(vec![Value::Str("é,音符".into())]),
             "é 音符",

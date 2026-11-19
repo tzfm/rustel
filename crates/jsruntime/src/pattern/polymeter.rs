@@ -104,7 +104,7 @@ pub(crate) fn native_polymeter_modern<'js>(
         {
             pattern = pattern_with_own_steps(&ctx, &wrapper)?;
         }
-        let Some(steps) = pattern.steps else {
+        let Some(steps) = pattern.steps() else {
             return Err(throw_type_error(
                 &ctx,
                 "polymeter operand lost its step count during filtering",
@@ -256,7 +256,7 @@ pub(crate) fn same_js_value(
 }
 
 pub(crate) fn checked_polymeter_raw_fast(pattern: Pattern, factor: Fraction) -> Pattern {
-    let steps = pattern.steps;
+    let steps = pattern.steps();
     let query_factor = factor;
     pattern
         .with_query_time(move |time| {
@@ -552,7 +552,7 @@ pub(crate) fn native_polymeter_legacy<'js>(
     let mut known_steps = Vec::new();
     for root in &roots {
         if nodes[*root].count != 0
-            && let Some(steps) = patterns[*root].as_ref().expect("root pattern").steps
+            && let Some(steps) = patterns[*root].as_ref().expect("root pattern").steps()
         {
             known_steps.push(steps);
         }

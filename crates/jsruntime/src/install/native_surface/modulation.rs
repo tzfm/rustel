@@ -46,7 +46,7 @@ fn modulator_subcontrol(kind: &str, key: &str) -> String {
 
 fn property_key(value: &Value) -> String {
     match rustel_core::materialize_js_value(value) {
-        Value::Str(value) => value,
+        Value::Str(value) => value.to_string(),
         Value::F64(value) => Value::F64(value).show(),
         Value::Bool(value) => value.to_string(),
         Value::Null => "null".into(),
@@ -61,7 +61,7 @@ fn canonical_control_value(value: &Value) -> Value {
             control_registry()
                 .canonical_name(&value)
                 .unwrap_or(&value)
-                .to_owned(),
+                .into(),
         ),
         value => value,
     }
@@ -103,19 +103,19 @@ fn apply_modulator_value(
                         control_registry()
                             .canonical_name(name)
                             .unwrap_or(name)
-                            .to_owned(),
+                            .into(),
                     )
                 })
                 .unwrap_or(Value::Undefined);
             if let Value::Str(control) = &value
-                && matches!(control.as_str(), "lfo" | "env" | "bmod")
+                && matches!(&**control, "lfo" | "env" | "bmod")
                 && let Some(Value::Object(modulator)) = controls.get(control)
                 && let Some((last, _)) = modulator
                     .js_entries()
                     .into_iter()
                     .rfind(|(name, _)| *name != "__ids")
             {
-                value = Value::Str(format!("{control}_{last}"));
+                value = Value::Str(format!("{control}_{last}").into());
             }
             *stored = Some(value);
         }

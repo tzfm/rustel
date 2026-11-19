@@ -5,6 +5,26 @@
 //! `screen <json>`. The token grants full UI control. TCP is plaintext, so
 //! use a trusted network or an encrypted tunnel.
 //!
+//! A client needs no script in this repo. One line per platform, each
+//! authenticating, evaluating the score, and asking for the screen:
+//!
+//! ```powershell
+//! # PowerShell (Windows)
+//! $c = [Net.Sockets.TcpClient]::new('127.0.0.1',9247).GetStream()
+//! $w = [IO.StreamWriter]::new($c); $w.AutoFlush = $true
+//! 'auth TOKEN','key f5','screen' | ForEach-Object { $w.WriteLine($_) }
+//! ```
+//!
+//! ```sh
+//! # bash (Linux, macOS)
+//! exec 3<>/dev/tcp/127.0.0.1/9247 && printf 'auth TOKEN\nkey f5\nscreen\n' >&3 && cat <&3
+//! ```
+//!
+//! ```sh
+//! # Python (any platform)
+//! python -c "import socket; s=socket.create_connection(('127.0.0.1',9247)); [s.sendall((l+'\n').encode()) for l in ['auth TOKEN','key f5','screen']]; print(s.recv(65536).decode())"
+//! ```
+//!
 //! Each client has a worker thread. A worker passes key and screen requests to
 //! the Studio event loop through a bounded queue. If the queue is full, the
 //! worker replies `err busy`.

@@ -20,6 +20,11 @@ use std::sync::Arc;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ContextKeys(Option<Arc<Keys>>);
 
+impl ContextKeys {
+    /// No key: what a hap holds that nothing gave keys to.
+    pub(crate) const NONE: Self = Self(None);
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Keys {
     /// `hap.context.scale`: set by `.scale()`, read by `.scaleTranspose()`.
@@ -74,6 +79,28 @@ impl ContextKeys {
     /// The keys to change, copied first when another hap shares them.
     pub(crate) fn edit(&mut self) -> &mut Keys {
         Arc::make_mut(self.0.get_or_insert_with(Default::default))
+    }
+
+    /// Whether these and `other` hold the same keys, down to the bits of a
+    /// number.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        let same_definition = |a: &Option<Arc<Value>>, b: &Option<Arc<Value>>| match (a, b) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b) || crate::same_key(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                Arc::ptr_eq(a, b)
+                    || (a.scale == b.scale
+                        && a.edo_size.map(f64::to_bits) == b.edo_size.map(f64::to_bits)
+                        && same_definition(&a.scale_definition, &b.scale_definition)
+                        && a.tags == b.tags
+                        && a.log_line == b.log_line)
+            }
+            _ => false,
+        }
     }
 
     /// Each key from `first` where it has one, else from `second`. A

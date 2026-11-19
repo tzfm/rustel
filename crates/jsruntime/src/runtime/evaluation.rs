@@ -38,7 +38,9 @@ impl JsRuntime {
 
     pub fn install_voicings_prebake(&self) -> Result<(), String> {
         let _settings = self.core_settings.bind();
-        with_ctx(self, |ctx| voicing_surface::install(&ctx))
+        with_ctx(self, |ctx| voicing_surface::install(&ctx))?;
+        self.voicings_installed.set(true);
+        Ok(())
     }
     /// Transpile and execute one user setup/prebake file without replacing the
     /// active graph.
@@ -144,6 +146,7 @@ impl JsRuntime {
         budget: std::time::Duration,
         cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(rustel_transpiler::TranspileOutput, ScoreEffects), QueryError> {
+        self.ensure_surface().map_err(QueryError::Message)?;
         let _settings = self.core_settings.bind();
         let effect_policy_owner = EffectPolicyOwner::enter(self);
         let effect_transaction = EffectTransactionOwner::enter(self, EffectPolicy::SETUP)?;
@@ -152,7 +155,7 @@ impl JsRuntime {
         // fail BEFORE applying any new synchronous side effect, and let the
         // caller retry. This also makes raw/legacy queue creation recoverable
         // without silently attributing its job to the next setup file.
-        let stale_jobs = with_ctx(self, |ctx| discard_pending_jobs(&ctx));
+        let stale_jobs = self.discard_jobs();
         if stale_jobs > 0 {
             return Err(QueryError::Message(format!(
                 "discarded {stale_jobs} queued JavaScript job(s) before prebake setup; retry the setup"
@@ -844,7 +847,7 @@ impl JsRuntime {
                             // steps)` does, and erase structural `as_pure`
                             // classification with the same identity node used
                             // by native withSteps.
-                            let steps = evaluated.borrow().pattern.steps;
+                            let steps = evaluated.borrow().pattern.steps();
                             let (pattern, sidecar) = {
                                 let borrowed = owner.borrow();
                                 (
@@ -858,7 +861,7 @@ impl JsRuntime {
                             derive_wrapper(ctx.clone(), pattern, &[sidecar])
                                 .map_err(|error| QueryError::Message(error.to_string()))?
                         } else {
-                            let steps = evaluated.borrow().pattern.steps;
+                            let steps = evaluated.borrow().pattern.steps();
                             let (id, sidecar) = bridge_callable(&ctx, function.clone())
                                 .map_err(|error| QueryError::Message(error.to_string()))?;
                             let owner = Sidecar::of(&evaluated.borrow());
@@ -979,22 +982,67 @@ impl JsRuntime {
                         .set(0, wrapper)
                         .map_err(|error| QueryError::Message(error.to_string()))
                 } else {
-                    host_active(&ctx)
-                        .map_err(|error| QueryError::Message(error.to_string()))?
+                    let active = host_active(&ctx)
+                        .map_err(|error| QueryError::Message(error.to_string()))?;
+                    // The graph an edit replaces hands its answer tables to
+                    // the one taking over, before the slot is written.
+                    if let Ok(previous) = active.get::<rquickjs::Value>(0) {
+                        Self::adopt_replaced_tables(&previous, &wrapper.borrow().pattern);
+                    }
+                    active
                         .set(0, wrapper)
-                        .map_err(|error| QueryError::Message(error.to_string()))
+                        .map_err(|error| QueryError::Message(error.to_string()))?;
+                    // The wrapper took the place of a native graph in play.
+                    self.native_active.borrow_mut().take();
+                    Ok(())
                 }
             })
         })
     }
 
     pub(super) fn clear_staged_score(&self) {
-        with_ctx(self, |ctx| {
+        self.native_staged.borrow_mut().take();
+        // A runtime with no realm staged no wrapper. The clear of the root
+        // runs no score code.
+        if self.realm.get().is_none() {
+            return;
+        }
+        with_ctx_running_no_script(self, |ctx| {
             if let Ok(candidate) = host_score_candidate(&ctx) {
                 let _ = candidate.set(0, rquickjs::Value::new_undefined(ctx.clone()));
                 let _ = candidate.as_object().set("length", 0);
             }
         });
+    }
+
+    /// Put the staged graph of the native tier in play. A wrapper in the
+    /// active root goes, so one score is in play.
+    fn publish_native(&self, pattern: Pattern) {
+        if self.realm.get().is_some() {
+            with_ctx_running_no_script(self, |ctx| {
+                if let Ok(active) = host_active(&ctx) {
+                    let _ = active.set(0, rquickjs::Value::new_null(ctx.clone()));
+                }
+            });
+        }
+        *self.native_active.borrow_mut() = Some(pattern);
+    }
+
+    /// Hand the answer tables of the outgoing active graph to the graph that
+    /// replaces it. Only the new graph's nodes take over tables that still
+    /// answer for them; both wrappers are left exactly as they were.
+    ///
+    /// The handover runs where the score's own settings scope is still in
+    /// force, so a table built under a snapshot the next score already moved
+    /// past refuses itself instead of landing stale.
+    fn adopt_replaced_tables(previous: &rquickjs::Value<'_>, next: &rustel_core::Pattern) {
+        let Some(object) = previous.as_object() else {
+            return;
+        };
+        let Some(wrapper) = rquickjs::Class::<NativePatternWrapper>::from_object(object) else {
+            return;
+        };
+        next.adopt_tables_from(&wrapper.borrow().pattern);
     }
 
     /// Publish the exact staged JS wrapper, restoring the exact prior wrapper
@@ -1003,15 +1051,24 @@ impl JsRuntime {
     /// replacement is attempted, so callback sidecars and object identity are
     /// never reconstructed from a bare Rust Pattern.
     pub(super) fn commit_staged_score(&self, millis: u64) -> Result<(), QueryError> {
+        let interrupted = || {
+            if self.cancelled.get() {
+                QueryError::Limit(rustel_core::QueryLimit::Cancelled)
+            } else {
+                QueryError::Limit(rustel_core::QueryLimit::JsCpuDeadline { millis })
+            }
+        };
+        let staged = self.native_staged.borrow_mut().take();
+        if let Some(pattern) = staged {
+            if self.bounded_evaluation_interrupted() {
+                return Err(interrupted());
+            }
+            self.publish_native(pattern);
+            return Ok(());
+        }
         with_ctx(self, |ctx| -> Result<(), QueryError> {
             if self.bounded_evaluation_interrupted() {
-                return if self.cancelled.get() {
-                    Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled))
-                } else {
-                    Err(QueryError::Limit(rustel_core::QueryLimit::JsCpuDeadline {
-                        millis,
-                    }))
-                };
+                return Err(interrupted());
             }
 
             let candidate: rquickjs::Value = host_score_candidate(&ctx)
@@ -1029,11 +1086,22 @@ impl JsRuntime {
                 .get(0)
                 .map_err(|error| QueryError::Message(error.to_string()))?;
 
+            // The graph an edit replaces hands its answer tables to the one
+            // taking over, before the slot is written. A publication that
+            // later refuses keeps its tables with the wrapper that owns them.
+            if let Some(object) = candidate.as_object()
+                && let Some(next) = rquickjs::Class::<NativePatternWrapper>::from_object(object)
+            {
+                Self::adopt_replaced_tables(&previous, &next.borrow().pattern);
+            }
+
             let _ = alloc::take_heap_exhausted();
             let publication = active.set(0, candidate);
             let interrupted = self.bounded_evaluation_interrupted();
             let heap_exhausted = alloc::take_heap_exhausted();
             if publication.is_ok() && !interrupted && !heap_exhausted {
+                // The wrapper took the place of a native graph in play.
+                self.native_active.borrow_mut().take();
                 return Ok(());
             }
 
@@ -1085,6 +1153,7 @@ impl JsRuntime {
     ) -> Result<rustel_transpiler::TranspileOutput, QueryError> {
         let (output, _, settings) = self.evaluate_score_cancellable_inner(
             source,
+            None,
             options,
             budget,
             cancellation,
@@ -1092,7 +1161,7 @@ impl JsRuntime {
             None,
         )?;
         self.core_settings.replace_with(&settings);
-        Ok(output)
+        Ok(output.expect("a score with no program read is transpiled"))
     }
 
     /// Bounded score evaluation with atomic host effects.
@@ -1111,6 +1180,7 @@ impl JsRuntime {
     ) -> Result<(rustel_transpiler::TranspileOutput, ScoreEffects), QueryError> {
         let (output, effects, settings) = self.evaluate_score_cancellable_inner(
             source,
+            None,
             options,
             budget,
             cancellation,
@@ -1118,7 +1188,10 @@ impl JsRuntime {
             None,
         )?;
         self.core_settings.replace_with(&settings);
-        Ok((output, effects))
+        Ok((
+            output.expect("a score with no program read is transpiled"),
+            effects,
+        ))
     }
 
     /// Evaluate and stage a score without publishing its native module
@@ -1127,37 +1200,22 @@ impl JsRuntime {
     /// The returned snapshot selects the candidate state for probing and can
     /// be published after acceptance. The private active slot already contains
     /// the candidate wrapper and can still be restored on rejection.
+    ///
+    /// `program` is the program of `source`, when a reader of the score as
+    /// written took it. The native tier evaluates it with no transpile, and
+    /// the answer then holds no transpiler output. A program the native tier
+    /// does not prove is left, and the text is transpiled.
     #[doc(hidden)]
     pub fn evaluate_score_candidate_with_effects_cancellable(
         &self,
         source: &str,
+        program: Option<&rustel_transpiler::ScoreProgram>,
         options: &rustel_transpiler::TranspileOptions,
         budget: std::time::Duration,
         cancellation: &std::sync::atomic::AtomicBool,
     ) -> Result<
         (
-            rustel_transpiler::TranspileOutput,
-            ScoreEffects,
-            rustel_core::settings::RuntimeSettings,
-        ),
-        QueryError,
-    > {
-        self.evaluate_score_cancellable_inner(source, options, budget, cancellation, true, None)
-    }
-
-    /// Stage a candidate from an unpublished settings snapshot without
-    /// publishing or mutating the retained seed.
-    #[doc(hidden)]
-    pub fn evaluate_score_candidate_with_effects_cancellable_seeded(
-        &self,
-        source: &str,
-        options: &rustel_transpiler::TranspileOptions,
-        budget: std::time::Duration,
-        cancellation: &std::sync::atomic::AtomicBool,
-        seed: &rustel_core::settings::RuntimeSettings,
-    ) -> Result<
-        (
-            rustel_transpiler::TranspileOutput,
+            Option<rustel_transpiler::TranspileOutput>,
             ScoreEffects,
             rustel_core::settings::RuntimeSettings,
         ),
@@ -1165,6 +1223,38 @@ impl JsRuntime {
     > {
         self.evaluate_score_cancellable_inner(
             source,
+            program,
+            options,
+            budget,
+            cancellation,
+            true,
+            None,
+        )
+    }
+
+    /// Stage a candidate from an unpublished settings snapshot without
+    /// publishing or mutating the retained seed.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_score_candidate_with_effects_cancellable_seeded(
+        &self,
+        source: &str,
+        program: Option<&rustel_transpiler::ScoreProgram>,
+        options: &rustel_transpiler::TranspileOptions,
+        budget: std::time::Duration,
+        cancellation: &std::sync::atomic::AtomicBool,
+        seed: &rustel_core::settings::RuntimeSettings,
+    ) -> Result<
+        (
+            Option<rustel_transpiler::TranspileOutput>,
+            ScoreEffects,
+            rustel_core::settings::RuntimeSettings,
+        ),
+        QueryError,
+    > {
+        self.evaluate_score_cancellable_inner(
+            source,
+            program,
             options,
             budget,
             cancellation,
@@ -1173,9 +1263,11 @@ impl JsRuntime {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn evaluate_score_cancellable_inner(
         &self,
         source: &str,
+        program: Option<&rustel_transpiler::ScoreProgram>,
         options: &rustel_transpiler::TranspileOptions,
         budget: std::time::Duration,
         cancellation: &std::sync::atomic::AtomicBool,
@@ -1183,12 +1275,21 @@ impl JsRuntime {
         seed: Option<&rustel_core::settings::RuntimeSettings>,
     ) -> Result<
         (
-            rustel_transpiler::TranspileOutput,
+            Option<rustel_transpiler::TranspileOutput>,
             ScoreEffects,
             rustel_core::settings::RuntimeSettings,
         ),
         QueryError,
     > {
+        /// Puts away the room of the literals when the evaluation ends,
+        /// however it ends.
+        struct LiteralRoom;
+        impl Drop for LiteralRoom {
+            fn drop(&mut self) {
+                crate::surface::rest_mini_room();
+            }
+        }
+        let _literal_room = LiteralRoom;
         let candidate_settings = match seed {
             Some(seed) => self.core_settings.detached_from(seed),
             None => self.core_settings.detached_snapshot(),
@@ -1206,14 +1307,15 @@ impl JsRuntime {
         // A job predating this score has no attributable owner. Discard it and
         // refuse before this score executes any JavaScript, matching the setup
         // turn's fail-closed ownership rule.
-        let stale_jobs = with_ctx(self, |ctx| discard_pending_jobs(&ctx));
+        let stale_jobs = self.discard_jobs();
 
         // `register()` writes onto the shared Pattern prototype and the score
         // scope, and both outlive the evaluation that wrote them. Give the
         // names back before the NEXT score runs, so deleting a `register`
         // line and playing again means what it says: the engine's name
         // answers again, and a name of the score's own goes away with it.
-        if allow_score_effects {
+        // A runtime with no realm ran no score, so no score wrote a name.
+        if allow_score_effects && self.realm.get().is_some() {
             with_ctx(self, |ctx| restore_registration_surface(&ctx))
                 .map_err(|error| QueryError::Message(error.to_string()))?;
         }
@@ -1223,7 +1325,7 @@ impl JsRuntime {
         // back before the NEXT score runs, so removing the visuals from a file
         // also removes their hold on the names.
         #[cfg(feature = "hydra")]
-        if allow_score_effects {
+        if allow_score_effects && self.realm.get().is_some() {
             let chains = self.hydra_chains.clone();
             with_ctx(self, |ctx| {
                 crate::install::restore_hydra_surface(&ctx, &chains)
@@ -1242,14 +1344,27 @@ impl JsRuntime {
             return Err(QueryError::Limit(rustel_core::QueryLimit::JsPendingJobs));
         }
 
+        // A program that a reader of the score took builds first. It runs no
+        // script, so it writes nothing on the surface, and a score it builds
+        // needs no transpile.
+        let mut native = candidate_settings.with(|| {
+            let _published_owner = self.core_settings.bind();
+            self.native_score(program, Some(source))
+        });
         // This is intentionally outside both the deadline and heap boundary:
         // the Rust transpiler neither executes on the QuickJS heap nor has a
         // cancellable/fuelled parser yet. The API's claim stops at synchronous
         // QuickJS execution.
-        let output = self
-            .transpile_score(source, options)
-            .map_err(QueryError::Message)?;
-        self.record_surface_writes(&output.surface_writes);
+        let output = match native {
+            Some(_) => None,
+            None => {
+                let output = self
+                    .transpile_score(source, options)
+                    .map_err(QueryError::Message)?;
+                self.record_surface_writes(&output.surface_writes);
+                Some(output)
+            }
+        };
 
         struct CancellationGuard<'a> {
             slot: std::rc::Rc<Cell<Option<*const std::sync::atomic::AtomicBool>>>,
@@ -1278,11 +1393,28 @@ impl JsRuntime {
             }
         }
         self.clear_staged_score();
+        self.evaluated_natively.set(false);
         let _staged_score_guard = StagedScoreGuard(self);
         let millis = budget.as_millis().min(u128::from(u64::MAX)) as u64;
         let evaluation = candidate_settings.with(|| {
             self.with_deadline(budget, || {
                 let staged = self.with_heap_boundary(|| {
+                    // The transpiler reads the program that a reader of the
+                    // score took, so a program the native tier left is not
+                    // built a second time.
+                    if program.is_none()
+                        && let Some(output) = &output
+                    {
+                        let _published_owner = self.core_settings.bind();
+                        native = self.native_score(output.program.as_ref(), None);
+                    }
+                    if let (None, Some(output)) = (&native, &output) {
+                        // JavaScript evaluates the score, on the whole surface.
+                        // An installation seals the gate, so the score's own
+                        // surface writes are recorded again after it.
+                        self.ensure_surface().map_err(QueryError::Message)?;
+                        self.record_surface_writes(&output.surface_writes);
+                    }
                     // Forking the voicing registry reads enumerable properties
                     // from score-controlled objects. A getter can run arbitrary
                     // JavaScript, so candidate setup shares the score deadline.
@@ -1290,7 +1422,15 @@ impl JsRuntime {
                     self.begin_voicing_candidate()
                         .map_err(QueryError::Message)?;
                     let _published_owner = self.core_settings.bind();
-                    self.execute_score(&output.output, &output.line_map, true)
+                    match (native.take(), &output) {
+                        (Some(score), _) => self.stage_native(score),
+                        (None, Some(output)) => {
+                            self.execute_score(&output.output, &output.line_map, true)
+                        }
+                        (None, None) => Err(QueryError::Message(
+                            "a score with no native graph was not transpiled".into(),
+                        )),
+                    }
                 });
                 if self.cancelled.get() {
                     Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled))
@@ -1342,6 +1482,7 @@ impl JsRuntime {
         source: &str,
         options: &rustel_transpiler::TranspileOptions,
     ) -> Result<rustel_transpiler::TranspileOutput, String> {
+        self.ensure_surface()?;
         let candidate_settings = self.core_settings.detached_snapshot();
         let effect_policy_owner = EffectPolicyOwner::enter(self);
         let _effect_transaction =

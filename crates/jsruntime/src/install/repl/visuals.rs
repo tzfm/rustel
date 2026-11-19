@@ -181,17 +181,24 @@ fn set_version_defaults<'js>(
     Ok(())
 }
 
+/// The visual slot a visual method's second argument names: a whole
+/// number below 64. Any other value leaves the pattern as it is.
+pub(crate) fn visual_slot(number: f64) -> Option<u8> {
+    (number.fract() == 0.0 && (0.0..64.0).contains(&number)).then_some(number as u8)
+}
+
 fn visual_pattern<'js>(
     ctx: Ctx<'js>,
     this: This<rquickjs::Class<'js, NativePatternWrapper<'js>>>,
     args: Rest<rquickjs::Value<'js>>,
 ) -> rquickjs::Result<rquickjs::Class<'js, NativePatternWrapper<'js>>> {
+    // Read as a number: JavaScript has no integer type, so `1` and
+    // `2 * 0.5` name the same slot.
     let Some(slot) = args
         .0
         .get(1)
-        .and_then(rquickjs::Value::as_int)
-        .and_then(|slot| u8::try_from(slot).ok())
-        .filter(|slot| *slot < 64)
+        .and_then(rquickjs::Value::as_number)
+        .and_then(visual_slot)
     else {
         return Ok(this.0);
     };
@@ -239,7 +246,12 @@ pub(super) fn install<'js>(
                 Function::new(ctx.clone(), visual_pattern).map_err(|error| error.to_string())?;
             configure_function(&identity, "", 0, true).map_err(|error| error.to_string())?;
             proto
-                .prop(name, Property::from(identity).writable().configurable())
+                .prop(
+                    name,
+                    Property::from(identity.clone()).writable().configurable(),
+                )
+                .map_err(|error| error.to_string())?;
+            record_builtin_method(ctx, name, identity.into_value(), BuiltinMethod::Visual)
                 .map_err(|error| error.to_string())?;
         }
     }

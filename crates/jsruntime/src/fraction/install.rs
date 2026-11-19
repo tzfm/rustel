@@ -60,6 +60,19 @@ pub(crate) fn native_seed<'js>(ctx: Ctx<'js>, seed: Object<'js>) -> rquickjs::Re
     new_fraction(&ctx, numerator, denominator)
 }
 
+/// The Fraction object for an exact Rust fraction: the object
+/// [`native_seed`] makes from the decimal strings of the same parts.
+pub(crate) fn fraction_value<'js>(
+    ctx: &Ctx<'js>,
+    value: rustel_fraction::Fraction,
+) -> rquickjs::Result<Value<'js>> {
+    new_fraction(
+        ctx,
+        BigInt::from(value.numer()),
+        BigInt::from(value.denom()),
+    )
+}
+
 /// Convert the trusted exact string pair produced by the Rust bridge without
 /// routing it back through JavaScript BigInt coercion and the public parser.
 pub(crate) fn seed_factory<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Function<'js>> {

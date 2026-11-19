@@ -120,7 +120,7 @@ fn trusted_host_maps_preserve_only_unchanged_controls_and_keep_callback_ownershi
     );
     let mapped = bound.fmap_js_preserving_controls(7);
     assert!(mapped.purity().impure);
-    assert_eq!(mapped.purity().reachable, [7]);
+    assert_eq!(mapped.purity().reachable(), [7]);
     rustel_core::with_callback_host(&Host, || {
         assert_eq!(query(mapped).live_controls, [41, 42, 0, 0]);
         assert_eq!(
@@ -180,7 +180,7 @@ fn native_outer_control_bind_preserves_timing_and_tracks_both_dependencies() {
             current.clone()
         });
     assert!(callbacks.purity().impure);
-    assert_eq!(callbacks.purity().reachable, [7, 8]);
+    assert_eq!(callbacks.purity().reachable(), [7, 8]);
 }
 
 #[test]

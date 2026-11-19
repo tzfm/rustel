@@ -47,6 +47,9 @@ pub const DEFAULT_JS_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 /// relation at compile time.
 pub const MAX_JS_STACK_BYTES: usize = 32 * 1024 * 1024;
 
+/// What a query of the active slot answers when no score is in play.
+pub(super) const ACTIVE_SLOT_EMPTY: &str = "active slot is empty";
+
 pub(super) const MAX_SCORE_SAMPLE_EFFECTS: usize = 64;
 pub(super) const MAX_SCORE_SAMPLE_EFFECT_BYTES: usize = 4 * 1024 * 1024;
 pub(super) const MAX_PRELOAD_EFFECTS: usize = 256;
@@ -264,8 +267,9 @@ impl Drop for MidiInputCandidate {
 }
 
 pub struct JsRuntime {
-    pub(super) rt: Runtime,
-    pub(super) ctx: Context,
+    /// The script engine, from the first use that needs it. The first field,
+    /// so it goes before the state that its values hold.
+    pub(super) realm: std::cell::OnceCell<Realm>,
     /// Native module settings paired with this QuickJS realm.
     pub(super) core_settings: rustel_core::settings::RuntimeSettings,
     /// The single per-runtime callback id allocator, shared by
@@ -324,6 +328,18 @@ pub struct JsRuntime {
     /// a pattern hot loop. `Compatibility` and `DualRun` are test and
     /// benchmark controls. Ordinary playback uses `Auto`.
     pub(super) callback_ir: Rc<CallbackIr>,
+    /// Whether a score the native tier proves skips JavaScript. On by
+    /// default. See [`JsRuntime::set_native_tier`].
+    pub(super) native_tier: Cell<bool>,
+    /// Whether the last score evaluated by the score evaluator ran on the
+    /// native tier.
+    pub(super) evaluated_natively: Cell<bool>,
+    /// Whether the semantic surface and the voicing globals are installed.
+    /// A realm without them has run no score text: it evaluates natively,
+    /// and the first score, prelude or import that needs JavaScript installs
+    /// them. See [`JsRuntime::ensure_surface`].
+    pub(super) bindings_installed: Cell<bool>,
+    pub(super) voicings_installed: Cell<bool>,
     /// Live bytes and the ceiling, shared with the allocator enforcing them.
     pub(super) heap: std::rc::Rc<alloc::HeapBudget>,
     /// Shared with the interrupt handler. `Some(deadline)` while an evaluation
@@ -374,6 +390,23 @@ pub struct JsRuntime {
     /// must report the policy without clearing it; only depth zero may reset
     /// and finally consume the latch.
     pub(super) effect_policy_owner_depth: std::rc::Rc<Cell<usize>>,
+    /// What the last native build of a score kept for the next one. See
+    /// [`native::Memo`].
+    native_memo: RefCell<native::Memo>,
+    /// The byte of the text of the last score that the native tier left to
+    /// JavaScript where it stopped, when it knows. See
+    /// [`JsRuntime::native_left`].
+    native_left: Cell<Option<u32>>,
+    /// The graph of the native tier that an evaluation staged. No wrapper
+    /// holds a native graph: it has no callback cell, no shadow and no state
+    /// of a script, so the realm has no part in it.
+    pub(super) native_staged: RefCell<Option<Pattern>>,
+    /// The graph of the native tier in play. While it is `Some`, the active
+    /// root of the realm holds no wrapper: one score is in play.
+    pub(super) native_active: RefCell<Option<Pattern>>,
+    /// The graph of the native tier that was in play at the last snapshot.
+    /// While it is `Some`, `last_good_active` is `None`.
+    pub(super) native_last_good: RefCell<Option<Pattern>>,
     /// Last successfully installed active wrapper. A live replacement that
     /// evaluates but then fails its query probe restores this exact wrapper
     /// so the sounding score keeps its Sidecar and callback roots.
@@ -795,12 +828,15 @@ mod import_surface;
 mod imports;
 mod inspection;
 mod lowering_gate;
+mod native;
+mod realm;
 mod teardown;
 
 pub(crate) use lowering_gate::{LoweringDependencies, LoweringGate};
 
 pub use import_surface::ImportScope;
 use import_surface::ImportSurface;
+pub(crate) use realm::Realm;
 
 #[cfg(test)]
 mod caught_panic_tests {

@@ -1,0 +1,1587 @@
+global FXr control
+global FXrel control
+global FXrelease control
+global accelerate control
+global activeLabel control
+global amp control
+global analyze control
+global anchor control
+global att control
+global attack control
+global bandf control
+global bandq control
+global bank control
+global bb control
+global bbexpr control
+global bbst control
+global begin control
+global berlin signal
+global bgain control
+global binshift control
+global bp control
+global bpa control
+global bpattack control
+global bpd control
+global bpdc control
+global bpdecay control
+global bpdepth control
+global bpdepthfreq control
+global bpdepthfrequency control
+global bpe control
+global bpenv control
+global bpf control
+global bpq control
+global bpr control
+global bprate control
+global bprelease control
+global bps control
+global bpshape control
+global bpskew control
+global bpsustain control
+global bpsync control
+global brand signal
+global bus control
+global busgain control
+global byteBeatExpression control
+global byteBeatStartTime control
+global cat list SlowCat
+global ccn control
+global ccv control
+global ch control
+global channel control
+global channels control
+global chord control
+global chorus control
+global clip control
+global close signal
+global coarse control
+global color control
+global comb control
+global compressor control
+global compressorAttack control
+global compressorKnee control
+global compressorRatio control
+global compressorRelease control
+global cosine signal
+global cosine2 signal
+global cps tempo second
+global crush control
+global ctf control
+global ctlNum control
+global ctranspose control
+global curve control
+global cut control
+global cutoff control
+global datt control
+global dec control
+global decay control
+global degree control
+global delay control
+global delayfb control
+global delayfeedback control
+global delays control
+global delayspeed control
+global delaysync control
+global delayt control
+global delaytime control
+global deltaSlide control
+global density control
+global det control
+global detune control
+global dfb control
+global dict control
+global dictionary control
+global dist control
+global distort control
+global distorttype control
+global distortvol control
+global disttype control
+global distvol control
+global djf control
+global drive control
+global dry control
+global dt control
+global duck control
+global duckatt control
+global duckattack control
+global duckdepth control
+global duckons control
+global duckonset control
+global duckorbit control
+global dur control
+global duration control
+global end control
+global enhance control
+global expression control
+global fadeInTime control
+global fadeOutTime control
+global fadeTime control
+global fanchor control
+global fastcat list FastCat
+global fft control
+global fm control
+global fm00 control
+global fm01 control
+global fm02 control
+global fm03 control
+global fm04 control
+global fm05 control
+global fm06 control
+global fm07 control
+global fm08 control
+global fm1 control
+global fm10 control
+global fm11 control
+global fm12 control
+global fm13 control
+global fm14 control
+global fm15 control
+global fm16 control
+global fm17 control
+global fm18 control
+global fm2 control
+global fm20 control
+global fm21 control
+global fm22 control
+global fm23 control
+global fm24 control
+global fm25 control
+global fm26 control
+global fm27 control
+global fm28 control
+global fm3 control
+global fm30 control
+global fm31 control
+global fm32 control
+global fm33 control
+global fm34 control
+global fm35 control
+global fm36 control
+global fm37 control
+global fm38 control
+global fm4 control
+global fm40 control
+global fm41 control
+global fm42 control
+global fm43 control
+global fm44 control
+global fm45 control
+global fm46 control
+global fm47 control
+global fm48 control
+global fm5 control
+global fm50 control
+global fm51 control
+global fm52 control
+global fm53 control
+global fm54 control
+global fm55 control
+global fm56 control
+global fm57 control
+global fm58 control
+global fm6 control
+global fm60 control
+global fm61 control
+global fm62 control
+global fm63 control
+global fm64 control
+global fm65 control
+global fm66 control
+global fm67 control
+global fm68 control
+global fm7 control
+global fm70 control
+global fm71 control
+global fm72 control
+global fm73 control
+global fm74 control
+global fm75 control
+global fm76 control
+global fm77 control
+global fm78 control
+global fm8 control
+global fm80 control
+global fm81 control
+global fm82 control
+global fm83 control
+global fm84 control
+global fm85 control
+global fm86 control
+global fm87 control
+global fm88 control
+global fmatt control
+global fmatt1 control
+global fmatt2 control
+global fmatt3 control
+global fmatt4 control
+global fmatt5 control
+global fmatt6 control
+global fmatt7 control
+global fmatt8 control
+global fmattack control
+global fmattack1 control
+global fmattack2 control
+global fmattack3 control
+global fmattack4 control
+global fmattack5 control
+global fmattack6 control
+global fmattack7 control
+global fmattack8 control
+global fmdec control
+global fmdec1 control
+global fmdec2 control
+global fmdec3 control
+global fmdec4 control
+global fmdec5 control
+global fmdec6 control
+global fmdec7 control
+global fmdec8 control
+global fmdecay control
+global fmdecay1 control
+global fmdecay2 control
+global fmdecay3 control
+global fmdecay4 control
+global fmdecay5 control
+global fmdecay6 control
+global fmdecay7 control
+global fmdecay8 control
+global fme control
+global fme1 control
+global fme2 control
+global fme3 control
+global fme4 control
+global fme5 control
+global fme6 control
+global fme7 control
+global fme8 control
+global fmenv control
+global fmenv1 control
+global fmenv2 control
+global fmenv3 control
+global fmenv4 control
+global fmenv5 control
+global fmenv6 control
+global fmenv7 control
+global fmenv8 control
+global fmh control
+global fmh1 control
+global fmh2 control
+global fmh3 control
+global fmh4 control
+global fmh5 control
+global fmh6 control
+global fmh7 control
+global fmh8 control
+global fmi control
+global fmi00 control
+global fmi01 control
+global fmi02 control
+global fmi03 control
+global fmi04 control
+global fmi05 control
+global fmi06 control
+global fmi07 control
+global fmi08 control
+global fmi1 control
+global fmi10 control
+global fmi11 control
+global fmi12 control
+global fmi13 control
+global fmi14 control
+global fmi15 control
+global fmi16 control
+global fmi17 control
+global fmi18 control
+global fmi2 control
+global fmi20 control
+global fmi21 control
+global fmi22 control
+global fmi23 control
+global fmi24 control
+global fmi25 control
+global fmi26 control
+global fmi27 control
+global fmi28 control
+global fmi3 control
+global fmi30 control
+global fmi31 control
+global fmi32 control
+global fmi33 control
+global fmi34 control
+global fmi35 control
+global fmi36 control
+global fmi37 control
+global fmi38 control
+global fmi4 control
+global fmi40 control
+global fmi41 control
+global fmi42 control
+global fmi43 control
+global fmi44 control
+global fmi45 control
+global fmi46 control
+global fmi47 control
+global fmi48 control
+global fmi5 control
+global fmi50 control
+global fmi51 control
+global fmi52 control
+global fmi53 control
+global fmi54 control
+global fmi55 control
+global fmi56 control
+global fmi57 control
+global fmi58 control
+global fmi6 control
+global fmi60 control
+global fmi61 control
+global fmi62 control
+global fmi63 control
+global fmi64 control
+global fmi65 control
+global fmi66 control
+global fmi67 control
+global fmi68 control
+global fmi7 control
+global fmi70 control
+global fmi71 control
+global fmi72 control
+global fmi73 control
+global fmi74 control
+global fmi75 control
+global fmi76 control
+global fmi77 control
+global fmi78 control
+global fmi8 control
+global fmi80 control
+global fmi81 control
+global fmi82 control
+global fmi83 control
+global fmi84 control
+global fmi85 control
+global fmi86 control
+global fmi87 control
+global fmi88 control
+global fmrel control
+global fmrel1 control
+global fmrel2 control
+global fmrel3 control
+global fmrel4 control
+global fmrel5 control
+global fmrel6 control
+global fmrel7 control
+global fmrel8 control
+global fmrelease control
+global fmrelease1 control
+global fmrelease2 control
+global fmrelease3 control
+global fmrelease4 control
+global fmrelease5 control
+global fmrelease6 control
+global fmrelease7 control
+global fmrelease8 control
+global fmsus control
+global fmsus1 control
+global fmsus2 control
+global fmsus3 control
+global fmsus4 control
+global fmsus5 control
+global fmsus6 control
+global fmsus7 control
+global fmsus8 control
+global fmsustain control
+global fmsustain1 control
+global fmsustain2 control
+global fmsustain3 control
+global fmsustain4 control
+global fmsustain5 control
+global fmsustain6 control
+global fmsustain7 control
+global fmsustain8 control
+global fmwave control
+global fmwave1 control
+global fmwave2 control
+global fmwave3 control
+global fmwave4 control
+global fmwave5 control
+global fmwave6 control
+global fmwave7 control
+global fmwave8 control
+global frameRate control
+global frames control
+global freeze control
+global freq control
+global fshift control
+global fshiftnote control
+global fshiftphase control
+global ftype control
+global fxr control
+global gain control
+global gat control
+global gate control
+global harmonic control
+global hbrick control
+global hcutoff control
+global hold control
+global hours control
+global hp control
+global hpa control
+global hpattack control
+global hpd control
+global hpdc control
+global hpdecay control
+global hpdepth control
+global hpdepthfreq control
+global hpdepthfrequency control
+global hpe control
+global hpenv control
+global hpf control
+global hpq control
+global hpr control
+global hprate control
+global hprelease control
+global hps control
+global hpshape control
+global hpskew control
+global hpsustain control
+global hpsync control
+global hresonance control
+global i control
+global imag control
+global ir control
+global irbegin control
+global iresponse control
+global irspeed control
+global isaw signal
+global isaw2 signal
+global isquare signal
+global isquare2 signal
+global itri signal
+global itri2 signal
+global kcutoff control
+global krush control
+global label control
+global lbrick control
+global legato control
+global leslie control
+global limit control
+global limitchar control
+global lock control
+global loop control
+global loopBegin control
+global loopEnd control
+global loopb control
+global loope control
+global lp control
+global lpa control
+global lpattack control
+global lpd control
+global lpdc control
+global lpdecay control
+global lpdepth control
+global lpdepthfreq control
+global lpdepthfrequency control
+global lpe control
+global lpenv control
+global lpf control
+global lpq control
+global lpr control
+global lprate control
+global lprelease control
+global lps control
+global lpshape control
+global lpskew control
+global lpsustain control
+global lpsync control
+global lrate control
+global lsize control
+global midibend control
+global midichan control
+global midicmd control
+global midimap control
+global midiport control
+global miditouch control
+global minutes control
+global mode control
+global mtranspose control
+global n control
+global noise control
+global note control
+global nrpnn control
+global nrpv control
+global nudge control
+global o control
+global oct control
+global octave control
+global octaveR control
+global octaves control
+global octer control
+global octersub control
+global octersubsub control
+global offset control
+global open signal
+global orbit control
+global oschost control
+global oscport control
+global overgain control
+global overshape control
+global pan control
+global panchor control
+global panorient control
+global panspan control
+global pansplay control
+global panwidth control
+global patt control
+global pattack control
+global pcurve control
+global pdec control
+global pdecay control
+global penv control
+global perlin signal
+global ph control
+global phasdp control
+global phaser control
+global phasercenter control
+global phaserdepth control
+global phaserrate control
+global phasersweep control
+global phc control
+global phd control
+global phs control
+global pitchJump control
+global pitchJumpTime control
+global polyTouch control
+global polyrhythm list Stack
+global postgain control
+global pr list Stack
+global prel control
+global prelease control
+global progNum control
+global psus control
+global psustain control
+global pw control
+global pwr control
+global pwrate control
+global pws control
+global pwsweep control
+global rand signal
+global rand2 signal
+global rdim control
+global real control
+global rel control
+global release control
+global resonance control
+global rfade control
+global ring control
+global ringdf control
+global ringf control
+global rlp control
+global room control
+global roomdim control
+global roomfade control
+global roomlp control
+global roomsize control
+global rsize control
+global s control
+global saw signal
+global saw2 signal
+global scram control
+global seconds control
+global semitone control
+global seq list FastCat
+global sequence list FastCat
+global setCpm tempo minute
+global setCps tempo second
+global setcpm tempo minute
+global setcps tempo second
+global shape control
+global sine signal
+global sine2 signal
+global size control
+global slide control
+global slowcat list SlowCat
+global smear control
+global songPtr control
+global sound control
+global source control
+global speed control
+global spread control
+global square signal
+global square2 signal
+global squiz control
+global src control
+global stack list Stack
+global stepsPerOctave control
+global stretch control
+global sus control
+global sustain control
+global sustainpedal control
+global sysexdata control
+global sysexid control
+global sz control
+global time signal
+global transient control
+global trem control
+global tremdepth control
+global tremolo control
+global tremolodepth control
+global tremolophase control
+global tremoloshape control
+global tremoloskew control
+global tremolosync control
+global tremphase control
+global tremshape control
+global tremskew control
+global tremsync control
+global tri signal
+global tri2 signal
+global triode control
+global tsdelay control
+global uid control
+global unison control
+global unit control
+global v control
+global val control
+global vel control
+global velocity control
+global vib control
+global vibmod control
+global vibrato control
+global vmod control
+global voice control
+global vowel control
+global warp control
+global warpatt control
+global warpattack control
+global warpdc control
+global warpdec control
+global warpdecay control
+global warpdepth control
+global warpenv control
+global warpmode control
+global warprate control
+global warprel control
+global warprelease control
+global warpshape control
+global warpskew control
+global warpsus control
+global warpsustain control
+global warpsync control
+global waveloss control
+global wavetablePhaseRand control
+global wavetablePosition control
+global wavetableWarp control
+global wavetableWarpMode control
+global wt control
+global wtatt control
+global wtattack control
+global wtdc control
+global wtdec control
+global wtdecay control
+global wtdepth control
+global wtenv control
+global wtphaserand control
+global wtrate control
+global wtrel control
+global wtrelease control
+global wtshape control
+global wtskew control
+global wtsus control
+global wtsustain control
+global wtsync control
+global xsdelay control
+global zcrush control
+global zdelay control
+global zmod control
+global znoise control
+global zrand control
+global zzfx control
+method FXr control FXrelease
+method FXrel control FXrelease
+method FXrelease control FXrelease
+method _pianoroll visual
+method _pitchwheel visual
+method _punchcard visual
+method _scope visual
+method _spectrum visual
+method _spiral visual
+method _tscope visual
+method _video visual
+method _wordfall visual
+method accelerate control accelerate
+method acid registered acid
+method activeLabel control activeLabel
+method ad registered ad
+method add composer add
+method adsr registered adsr
+method almostAlways registered almostAlways
+method almostNever registered almostNever
+method always registered always
+method amp control amp
+method analyze control analyze
+method anchor control anchor
+method and composer and
+method apply registered apply
+method applyN registered applyN
+method ar registered ar
+method as registered as
+method att control attack
+method attack control attack
+method band composer band
+method bandf control bandf
+method bandq control bandq
+method bank control bank
+method bb control byteBeatExpression
+method bbexpr control byteBeatExpression
+method bbst control byteBeatStartTime
+method beat registered beat
+method begin control begin
+method bgain control busgain
+method binshift control binshift
+method bjork registered bjork
+method blshift composer blshift
+method bor composer bor
+method bp control bandf
+method bpa control bpattack
+method bpattack control bpattack
+method bpd control bpdecay
+method bpdc control bpdc
+method bpdecay control bpdecay
+method bpdepth control bpdepth
+method bpdepthfreq control bpdepthfrequency
+method bpdepthfrequency control bpdepthfrequency
+method bpe control bpenv
+method bpenv control bpenv
+method bpf control bandf
+method bpq control bandq
+method bpr control bprelease
+method bprate control bprate
+method bprelease control bprelease
+method bps control bpsustain
+method bpshape control bpshape
+method bpskew control bpskew
+method bpsustain control bpsustain
+method bpsync control bpsync
+method brak registered brak
+method brshift composer brshift
+method bus control bus
+method busgain control busgain
+method bxor composer bxor
+method byteBeatExpression control byteBeatExpression
+method byteBeatStartTime control byteBeatStartTime
+method ccn control ccn
+method ccv control ccv
+method ceil registered ceil
+method ch control channels
+method channel control channel
+method channels control channels
+method chop registered chop
+method chord control chord
+method chorus control chorus
+method chunk registered chunk
+method chunkBack registered chunkBack
+method chunkback registered chunkBack
+method clip control clip
+method coarse control coarse
+method color control color
+method colorparty registered colorparty
+method comb control comb
+method compress registered compress
+method compressor control compressor
+method compressorAttack control compressorAttack
+method compressorKnee control compressorKnee
+method compressorRatio control compressorRatio
+method compressorRelease control compressorRelease
+method contract registered contract
+method control registered control
+method cpm registered cpm
+method cps registered cps
+method crush control crush
+method csoundm registered csoundm
+method ctf control cutoff
+method ctlNum control ctlNum
+method ctranspose control ctranspose
+method curve control curve
+method cut control cut
+method cutoff control cutoff
+method datt control duckattack
+method dec control decay
+method decay control decay
+method degrade registered degrade
+method degradeBy registered degradeBy
+method degradeByWith registered degradeByWith
+method degree control degree
+method delay control delay
+method delayfb control delayfeedback
+method delayfeedback control delayfeedback
+method delays control delaysync
+method delayspeed control delayspeed
+method delaysync control delaysync
+method delayt control delaytime
+method delaytime control delaytime
+method deltaSlide control deltaSlide
+method density control density
+method det control detune
+method detune control detune
+method dfb control delayfeedback
+method dict control dictionary
+method dictionary control dictionary
+method dist control distort
+method distort control distort
+method distorttype control distorttype
+method distortvol control distortvol
+method disttype control distorttype
+method distvol control distortvol
+method div composer div
+method djf control djf
+method drive control drive
+method drop registered drop
+method dry control dry
+method ds registered ds
+method dt control delaytime
+method duck control duckorbit
+method duckatt control duckattack
+method duckattack control duckattack
+method duckdepth control duckdepth
+method duckons control duckonset
+method duckonset control duckonset
+method duckorbit control duckorbit
+method dur control duration
+method duration control duration
+method early registered early
+method echo registered echo
+method edoScale registered edoScale
+method eish registered euclidish
+method end control end
+method enhance control enhance
+method eq composer eq
+method eqt composer eqt
+method euclid registered euclid
+method euclidLegato registered euclidLegato
+method euclidLegatoRot registered euclidLegatoRot
+method euclidRot registered euclidRot
+method euclidish registered euclidish
+method euclidrot registered euclidRot
+method every registered firstOf
+method expand registered expand
+method expression control expression
+method extend registered extend
+method fTrans registered ftrans
+method fTranspose registered ftrans
+method fadeInTime control fadeInTime
+method fadeOutTime control fadeTime
+method fadeTime control fadeTime
+method fanchor control fanchor
+method fast registered fast
+method fastChunk registered fastchunk
+method fastGap registered fastGap
+method fastchunk registered fastchunk
+method fastgap registered fastGap
+method fft control fft
+method fill registered fill
+method filter registered filter
+method filterWhen registered filterWhen
+method filtval registered filtval
+method firstOf registered firstOf
+method floor registered floor
+method fm control fmi
+method fm00 control fmi00
+method fm01 control fmi01
+method fm02 control fmi02
+method fm03 control fmi03
+method fm04 control fmi04
+method fm05 control fmi05
+method fm06 control fmi06
+method fm07 control fmi07
+method fm08 control fmi08
+method fm1 control fmi
+method fm10 control fmi10
+method fm11 control fmi11
+method fm12 control fmi12
+method fm13 control fmi13
+method fm14 control fmi14
+method fm15 control fmi15
+method fm16 control fmi16
+method fm17 control fmi17
+method fm18 control fmi18
+method fm2 control fmi2
+method fm20 control fmi20
+method fm21 control fmi21
+method fm22 control fmi22
+method fm23 control fmi23
+method fm24 control fmi24
+method fm25 control fmi25
+method fm26 control fmi26
+method fm27 control fmi27
+method fm28 control fmi28
+method fm3 control fmi3
+method fm30 control fmi30
+method fm31 control fmi31
+method fm32 control fmi32
+method fm33 control fmi33
+method fm34 control fmi34
+method fm35 control fmi35
+method fm36 control fmi36
+method fm37 control fmi37
+method fm38 control fmi38
+method fm4 control fmi4
+method fm40 control fmi40
+method fm41 control fmi41
+method fm42 control fmi42
+method fm43 control fmi43
+method fm44 control fmi44
+method fm45 control fmi45
+method fm46 control fmi46
+method fm47 control fmi47
+method fm48 control fmi48
+method fm5 control fmi5
+method fm50 control fmi50
+method fm51 control fmi51
+method fm52 control fmi52
+method fm53 control fmi53
+method fm54 control fmi54
+method fm55 control fmi55
+method fm56 control fmi56
+method fm57 control fmi57
+method fm58 control fmi58
+method fm6 control fmi6
+method fm60 control fmi60
+method fm61 control fmi61
+method fm62 control fmi62
+method fm63 control fmi63
+method fm64 control fmi64
+method fm65 control fmi65
+method fm66 control fmi66
+method fm67 control fmi67
+method fm68 control fmi68
+method fm7 control fmi7
+method fm70 control fmi70
+method fm71 control fmi71
+method fm72 control fmi72
+method fm73 control fmi73
+method fm74 control fmi74
+method fm75 control fmi75
+method fm76 control fmi76
+method fm77 control fmi77
+method fm78 control fmi78
+method fm8 control fmi8
+method fm80 control fmi80
+method fm81 control fmi81
+method fm82 control fmi82
+method fm83 control fmi83
+method fm84 control fmi84
+method fm85 control fmi85
+method fm86 control fmi86
+method fm87 control fmi87
+method fm88 control fmi88
+method fmatt control fmattack
+method fmatt1 control fmattack
+method fmatt2 control fmattack2
+method fmatt3 control fmattack3
+method fmatt4 control fmattack4
+method fmatt5 control fmattack5
+method fmatt6 control fmattack6
+method fmatt7 control fmattack7
+method fmatt8 control fmattack8
+method fmattack control fmattack
+method fmattack1 control fmattack
+method fmattack2 control fmattack2
+method fmattack3 control fmattack3
+method fmattack4 control fmattack4
+method fmattack5 control fmattack5
+method fmattack6 control fmattack6
+method fmattack7 control fmattack7
+method fmattack8 control fmattack8
+method fmdec control fmdecay
+method fmdec1 control fmdecay
+method fmdec2 control fmdecay2
+method fmdec3 control fmdecay3
+method fmdec4 control fmdecay4
+method fmdec5 control fmdecay5
+method fmdec6 control fmdecay6
+method fmdec7 control fmdecay7
+method fmdec8 control fmdecay8
+method fmdecay control fmdecay
+method fmdecay1 control fmdecay
+method fmdecay2 control fmdecay2
+method fmdecay3 control fmdecay3
+method fmdecay4 control fmdecay4
+method fmdecay5 control fmdecay5
+method fmdecay6 control fmdecay6
+method fmdecay7 control fmdecay7
+method fmdecay8 control fmdecay8
+method fme control fmenv
+method fme1 control fmenv
+method fme2 control fmenv2
+method fme3 control fmenv3
+method fme4 control fmenv4
+method fme5 control fmenv5
+method fme6 control fmenv6
+method fme7 control fmenv7
+method fme8 control fmenv8
+method fmenv control fmenv
+method fmenv1 control fmenv
+method fmenv2 control fmenv2
+method fmenv3 control fmenv3
+method fmenv4 control fmenv4
+method fmenv5 control fmenv5
+method fmenv6 control fmenv6
+method fmenv7 control fmenv7
+method fmenv8 control fmenv8
+method fmh control fmh
+method fmh1 control fmi
+method fmh2 control fmh2
+method fmh3 control fmh3
+method fmh4 control fmh4
+method fmh5 control fmh5
+method fmh6 control fmh6
+method fmh7 control fmh7
+method fmh8 control fmh8
+method fmi control fmi
+method fmi00 control fmi00
+method fmi01 control fmi01
+method fmi02 control fmi02
+method fmi03 control fmi03
+method fmi04 control fmi04
+method fmi05 control fmi05
+method fmi06 control fmi06
+method fmi07 control fmi07
+method fmi08 control fmi08
+method fmi1 control fmi
+method fmi10 control fmi10
+method fmi11 control fmi11
+method fmi12 control fmi12
+method fmi13 control fmi13
+method fmi14 control fmi14
+method fmi15 control fmi15
+method fmi16 control fmi16
+method fmi17 control fmi17
+method fmi18 control fmi18
+method fmi2 control fmi2
+method fmi20 control fmi20
+method fmi21 control fmi21
+method fmi22 control fmi22
+method fmi23 control fmi23
+method fmi24 control fmi24
+method fmi25 control fmi25
+method fmi26 control fmi26
+method fmi27 control fmi27
+method fmi28 control fmi28
+method fmi3 control fmi3
+method fmi30 control fmi30
+method fmi31 control fmi31
+method fmi32 control fmi32
+method fmi33 control fmi33
+method fmi34 control fmi34
+method fmi35 control fmi35
+method fmi36 control fmi36
+method fmi37 control fmi37
+method fmi38 control fmi38
+method fmi4 control fmi4
+method fmi40 control fmi40
+method fmi41 control fmi41
+method fmi42 control fmi42
+method fmi43 control fmi43
+method fmi44 control fmi44
+method fmi45 control fmi45
+method fmi46 control fmi46
+method fmi47 control fmi47
+method fmi48 control fmi48
+method fmi5 control fmi5
+method fmi50 control fmi50
+method fmi51 control fmi51
+method fmi52 control fmi52
+method fmi53 control fmi53
+method fmi54 control fmi54
+method fmi55 control fmi55
+method fmi56 control fmi56
+method fmi57 control fmi57
+method fmi58 control fmi58
+method fmi6 control fmi6
+method fmi60 control fmi60
+method fmi61 control fmi61
+method fmi62 control fmi62
+method fmi63 control fmi63
+method fmi64 control fmi64
+method fmi65 control fmi65
+method fmi66 control fmi66
+method fmi67 control fmi67
+method fmi68 control fmi68
+method fmi7 control fmi7
+method fmi70 control fmi70
+method fmi71 control fmi71
+method fmi72 control fmi72
+method fmi73 control fmi73
+method fmi74 control fmi74
+method fmi75 control fmi75
+method fmi76 control fmi76
+method fmi77 control fmi77
+method fmi78 control fmi78
+method fmi8 control fmi8
+method fmi80 control fmi80
+method fmi81 control fmi81
+method fmi82 control fmi82
+method fmi83 control fmi83
+method fmi84 control fmi84
+method fmi85 control fmi85
+method fmi86 control fmi86
+method fmi87 control fmi87
+method fmi88 control fmi88
+method fmrel control fmrelease
+method fmrel1 control fmrelease
+method fmrel2 control fmrelease2
+method fmrel3 control fmrelease3
+method fmrel4 control fmrelease4
+method fmrel5 control fmrelease5
+method fmrel6 control fmrelease6
+method fmrel7 control fmrelease7
+method fmrel8 control fmrelease8
+method fmrelease control fmrelease
+method fmrelease1 control fmrelease
+method fmrelease2 control fmrelease2
+method fmrelease3 control fmrelease3
+method fmrelease4 control fmrelease4
+method fmrelease5 control fmrelease5
+method fmrelease6 control fmrelease6
+method fmrelease7 control fmrelease7
+method fmrelease8 control fmrelease8
+method fmsus control fmsustain
+method fmsus1 control fmsustain
+method fmsus2 control fmsustain2
+method fmsus3 control fmsustain3
+method fmsus4 control fmsustain4
+method fmsus5 control fmsustain5
+method fmsus6 control fmsustain6
+method fmsus7 control fmsustain7
+method fmsus8 control fmsustain8
+method fmsustain control fmsustain
+method fmsustain1 control fmsustain
+method fmsustain2 control fmsustain2
+method fmsustain3 control fmsustain3
+method fmsustain4 control fmsustain4
+method fmsustain5 control fmsustain5
+method fmsustain6 control fmsustain6
+method fmsustain7 control fmsustain7
+method fmsustain8 control fmsustain8
+method fmtime registered fmtime
+method fmwave control fmwave
+method fmwave1 control fmwave
+method fmwave2 control fmwave2
+method fmwave3 control fmwave3
+method fmwave4 control fmwave4
+method fmwave5 control fmwave5
+method fmwave6 control fmwave6
+method fmwave7 control fmwave7
+method fmwave8 control fmwave8
+method focus registered focus
+method frameRate control frameRate
+method frames control frames
+method freeze control freeze
+method freq control freq
+method fromBipolar registered fromBipolar
+method fshift control fshift
+method fshiftnote control fshiftnote
+method fshiftphase control fshiftphase
+method ftrans registered ftrans
+method ftranspose registered ftrans
+method ftype control ftype
+method fxr control FXrelease
+method gain control gain
+method gat control gate
+method gate control gate
+method grab registered grab
+method gt composer gt
+method gte composer gte
+method harmonic control harmonic
+method hbrick control hbrick
+method hcutoff control hcutoff
+method hold control hold
+method hours control hours
+method hp control hcutoff
+method hpa control hpattack
+method hpattack control hpattack
+method hpd control hpdecay
+method hpdc control hpdc
+method hpdecay control hpdecay
+method hpdepth control hpdepth
+method hpdepthfreq control hpdepthfrequency
+method hpdepthfrequency control hpdepthfrequency
+method hpe control hpenv
+method hpenv control hpenv
+method hpf control hcutoff
+method hpq control hresonance
+method hpr control hprelease
+method hprate control hprate
+method hprelease control hprelease
+method hps control hpsustain
+method hpshape control hpshape
+method hpskew control hpskew
+method hpsustain control hpsustain
+method hpsync control hpsync
+method hresonance control hresonance
+method hurry registered hurry
+method i control i
+method ifit registered ifit
+method imag control imag
+method in shortcut set in
+method inhabit pick Clamp Squeeze
+method inhabitmod pick Remainder Squeeze
+method inside registered inside
+method inspire registered inspire
+method inv registered invert
+method invert registered invert
+method ir control ir
+method irbegin control irbegin
+method iresponse control ir
+method irspeed control irspeed
+method iter registered iter
+method iterBack registered iterBack
+method iterback registered iterBack
+method jux registered jux
+method juxBy registered juxBy
+method juxFlip registered juxFlip
+method juxFlipBy registered juxFlipBy
+method juxby registered juxBy
+method juxflip registered juxFlip
+method juxflipby registered juxFlipBy
+method kcutoff control kcutoff
+method keep composer keep
+method keepif composer keepif
+method keyDown registered keyDown
+method krush control krush
+method label control label
+method lastOf registered lastOf
+method late registered late
+method layer layer alone
+method lbrick control lbrick
+method legato control clip
+method leslie control leslie
+method limit control limit
+method limitchar control limitchar
+method linger registered linger
+method lock control lock
+method log2 registered log2
+method loop control loop
+method loopAtCps registered loopAtCps
+method loopBegin control loopBegin
+method loopEnd control loopEnd
+method loopatcps registered loopAtCps
+method loopb control loopBegin
+method loope control loopEnd
+method lp control cutoff
+method lpa control lpattack
+method lpattack control lpattack
+method lpd control lpdecay
+method lpdc control lpdc
+method lpdecay control lpdecay
+method lpdepth control lpdepth
+method lpdepthfreq control lpdepthfrequency
+method lpdepthfrequency control lpdepthfrequency
+method lpe control lpenv
+method lpenv control lpenv
+method lpf control cutoff
+method lpq control resonance
+method lpr control lprelease
+method lprate control lprate
+method lprelease control lprelease
+method lps control lpsustain
+method lpshape control lpshape
+method lpskew control lpskew
+method lpsustain control lpsustain
+method lpsync control lpsync
+method lrate control lrate
+method lsize control lsize
+method lt composer lt
+method lte composer lte
+method mask shortcut keepif in
+method maskAll shortcut keep in
+method midibend control midibend
+method midichan control midichan
+method midicmd control midicmd
+method midimap control midimap
+method midiport control midiport
+method miditouch control miditouch
+method minutes control minutes
+method mix shortcut set mix
+method mod composer mod
+method mode control mode
+method mpan registered mpan
+method mtranspose control mtranspose
+method mul composer mul
+method n control n
+method ne composer ne
+method net composer net
+method never registered never
+method noise control noise
+method note control note
+method nrpnn control nrpnn
+method nrpv control nrpv
+method nudge control nudge
+method o control orbit
+method oct control octave
+method octave control octave
+method octaveR control octaveR
+method octaves control octaves
+method octer control octer
+method octersub control octersub
+method octersubsub control octersubsub
+method off registered off
+method offset control offset
+method often registered often
+method or composer or
+method orbit control orbit
+method oschost control oschost
+method oscport control oscport
+method out shortcut set out
+method outside registered outside
+method overgain control overgain
+method overshape control overshape
+method pace registered pace
+method palindrome registered palindrome
+method pan control pan
+method panchor control panchor
+method panorient control panorient
+method panspan control panspan
+method pansplay control pansplay
+method panwidth control panwidth
+method patt control pattack
+method pattack control pattack
+method pcurve control pcurve
+method pdec control pdecay
+method pdecay control pdecay
+method penv control penv
+method pg registered pg
+method ph control phaserrate
+method phasdp control phaserdepth
+method phaser control phaserrate
+method phasercenter control phasercenter
+method phaserdepth control phaserdepth
+method phaserrate control phaserrate
+method phasersweep control phasersweep
+method phc control phasercenter
+method phd control phaserdepth
+method phs control phasersweep
+method pianoroll visual
+method pick pick Clamp Inner
+method pickOut pick Clamp Outer
+method pickReset pick Clamp Reset
+method pickRestart pick Clamp Restart
+method pickSqueeze pick Clamp Squeeze
+method pickmod pick Remainder Inner
+method pickmodOut pick Remainder Outer
+method pickmodReset pick Remainder Reset
+method pickmodRestart pick Remainder Restart
+method pickmodSqueeze pick Remainder Squeeze
+method pitchJump control pitchJump
+method pitchJumpTime control pitchJumpTime
+method pitchwheel visual
+method ply registered ply
+method poly shortcut set poly
+method polyTouch control polyTouch
+method postgain control postgain
+method pow composer pow
+method prel control prelease
+method prelease control prelease
+method press registered press
+method pressBy registered pressBy
+method progNum control progNum
+method psus control psustain
+method psustain control psustain
+method punchcard visual
+method pw control pw
+method pwr control pwrate
+method pwrate control pwrate
+method pws control pwsweep
+method pwsweep control pwsweep
+method range registered range
+method range2 registered range2
+method rangex registered rangex
+method rarely registered rarely
+method ratio registered ratio
+method rdim control roomdim
+method real control real
+method rel control release
+method release control release
+method repeatCycles registered repeatCycles
+method replicate registered replicate
+method reset shortcut keepif reset
+method resetAll shortcut keep reset
+method resonance control resonance
+method restart shortcut keepif restart
+method restartAll shortcut keep restart
+method rev registered rev
+method revv registered revv
+method rfade control roomfade
+method rib registered ribbon
+method ribbon registered ribbon
+method ring control ring
+method ringdf control ringdf
+method ringf control ringf
+method rlp control roomlp
+method room control room
+method roomdim control roomdim
+method roomfade control roomfade
+method roomlp control roomlp
+method roomsize control roomsize
+method rootNotes registered rootNotes
+method round registered round
+method rsize control roomsize
+method s control s
+method s_add registered take
+method s_contract registered contract
+method s_expand registered expand
+method s_extend registered extend
+method s_sub registered drop
+method sb registered sb
+method scale registered scale
+method scaleTrans registered scaleTranspose
+method scaleTranspose registered scaleTranspose
+method scope visual
+method scram control scram
+method scramble registered scramble
+method seconds control seconds
+method seed registered seed
+method seg registered segment
+method segment registered segment
+method semitone control semitone
+method set composer set
+method shape control shape
+method shuffle registered shuffle
+method size control roomsize
+method slide control slide
+method slow registered slow
+method slowChunk registered chunk
+method slowchunk registered chunk
+method smear control smear
+method someCycles registered someCycles
+method someCyclesBy registered someCyclesBy
+method sometimes registered sometimes
+method sometimesBy registered sometimesBy
+method songPtr control songPtr
+method sound control s
+method source control source
+method sparsity registered slow
+method spectrum visual
+method speed control speed
+method spiral visual
+method spread control spread
+method sq registered sq
+method squeeze shortcut set squeeze
+method squeezeout shortcut set squeezeout
+method squiz control squiz
+method src control source
+method steps registered pace
+method stepsPerOctave control stepsPerOctave
+method strans registered scaleTranspose
+method stretch control stretch
+method striate registered striate
+method struct shortcut keepif out
+method structAll shortcut keep out
+method strum registered strum
+method stut registered stut
+method stxt registered stxt
+method sub composer sub
+method superimpose layer over
+method sus control sustain
+method sustain control sustain
+method sustainpedal control sustainpedal
+method swap registered swap
+method swing registered swing
+method swingBy registered swingBy
+method sysex registered sysex
+method sysexdata control sysexdata
+method sysexid control sysexid
+method sz control roomsize
+method tag registered tag
+method take registered take
+method toBipolar registered toBipolar
+method trans registered transpose
+method transient control transient
+method transpose registered transpose
+method trem control tremolo
+method tremdepth control tremolodepth
+method tremolo control tremolo
+method tremolodepth control tremolodepth
+method tremolophase control tremolophase
+method tremoloshape control tremoloshape
+method tremoloskew control tremoloskew
+method tremolosync control tremolosync
+method tremphase control tremolophase
+method tremshape control tremoloshape
+method tremskew control tremoloskew
+method tremsync control tremolosync
+method triode control triode
+method tscope visual
+method tsdelay control tsdelay
+method tune registered tune
+method tuning registered tuning
+method uid control uid
+method undegrade registered undegrade
+method undegradeBy registered undegradeBy
+method unison control unison
+method unit control unit
+method v control vib
+method val control val
+method vel control velocity
+method velocity control velocity
+method vib control vib
+method vibmod control vibmod
+method vibrato control vib
+method video visual
+method vmod control vibmod
+method voice control voice
+method voicing registered voicing
+method voicings registered voicings
+method vowel control vowel
+method warp control warp
+method warpatt control warpattack
+method warpattack control warpattack
+method warpdc control warpdc
+method warpdec control warpdecay
+method warpdecay control warpdecay
+method warpdepth control warpdepth
+method warpenv control warpenv
+method warpmode control warpmode
+method warprate control warprate
+method warprel control warprelease
+method warprelease control warprelease
+method warpshape control warpshape
+method warpskew control warpskew
+method warpsus control warpsustain
+method warpsustain control warpsustain
+method warpsync control warpsync
+method waveloss control waveloss
+method wavetablePhaseRand control wtphaserand
+method wavetablePosition control wt
+method wavetableWarp control warp
+method wavetableWarpMode control warpmode
+method when registered when
+method whenKey registered whenKey
+method withBase registered withBase
+method within registered within
+method wordfall visual
+method wt control wt
+method wtatt control wtattack
+method wtattack control wtattack
+method wtdc control wtdc
+method wtdec control wtdecay
+method wtdecay control wtdecay
+method wtdepth control wtdepth
+method wtenv control wtenv
+method wtphaserand control wtphaserand
+method wtrate control wtrate
+method wtrel control wtrelease
+method wtrelease control wtrelease
+method wtshape control wtshape
+method wtskew control wtskew
+method wtsus control wtsustain
+method wtsustain control wtsustain
+method wtsync control wtsync
+method xsdelay control xsdelay
+method zcrush control zcrush
+method zdelay control zdelay
+method zmod control zmod
+method znoise control znoise
+method zoom registered zoom
+method zrand control zrand
+method zzfx control zzfx

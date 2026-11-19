@@ -880,6 +880,13 @@ impl ScalarBackend {
         let wavetable_kernel = dispatch.wavetable();
         let voice_count = self.voices.len();
         let mut activated = 0usize;
+        // A block constructs at most one cap's worth of voices. Each one
+        // costs setup beside its sample budget, so a dense window landing
+        // whole in one block otherwise spends the deadline constructing
+        // voices the polyphony cap culls within the same block. At the
+        // 10 ms callback that still admits 12.8k onsets a second; ordinary
+        // chords and rolls never reach it.
+        let activation_budget = self.max_polyphony.0;
         let live_control_targets = &self.live_control_targets;
 
         // Activate due graphs. Most voices activate at source onset. SBD gets
@@ -905,7 +912,8 @@ impl ScalarBackend {
             if graph_start_frame < end {
                 #[cfg(feature = "device-audio")]
                 let missing_reverbs_before = *missing_reverb_events;
-                if voice_count + activated >= MAX_ACTIVE_VOICES {
+                self.turnover.record_block_activations(1);
+                if voice_count + activated >= MAX_ACTIVE_VOICES || activated >= activation_budget {
                     // Ceiling: drop this onset rather than let the mix cost
                     // grow without bound. Retiring voices free slots, so a
                     // dense-but-sane score never reaches this.
@@ -1765,8 +1773,15 @@ impl ScalarBackend {
                 if !e.controls.piano && self.orbit_channels[orbit].is_none() {
                     self.orbit_channels[orbit] = Some(e.controls.channels.unwrap_or([1, 2]));
                 }
-                let faded =
-                    Self::cull_for_polyphony(&mut self.voices, e, start, output_lead, self.sample_rate, self.max_polyphony.0);
+                let faded = Self::cull_for_polyphony(
+                    &mut self.voices,
+                    e,
+                    start,
+                    output_lead,
+                    self.sample_rate,
+                    self.max_polyphony.0,
+                    self.turnover.per_sec(),
+                );
                 pressure.semantic_polyphony_fades = pressure
                     .semantic_polyphony_fades
                     .saturating_add(u64::try_from(faded).unwrap_or(u64::MAX));
@@ -2180,6 +2195,8 @@ impl ScalarBackend {
                 true
             }
         });
+        self.turnover
+            .advance_block(u32::try_from(frames).unwrap_or(u32::MAX), sample_rate);
 
         // A voice of a cut group with more lead than a later note of the
         // group fades before that note starts. So each note that waits
@@ -2813,10 +2830,11 @@ impl ScalarBackend {
                             if let Some(fade) = v.end.cull_from()
                                 && abs >= fade
                             {
-                                // A linear ramp to 0 over 0.25 s on the voice's own
-                                // gain, paired with the stop at t + 0.25.
+                                // A linear ramp to 0 over the voice's cull fade,
+                                // paired with the stop at its end. The length is
+                                // per voice: see `polyphony_fade_secs`.
                                 env *= (1.0
-                                    - (abs - fade) as f32 / (POLYPHONY_FADE_SECS * sr as f32))
+                                    - (abs - fade) as f32 / (v.end.cull_secs() * sr as f32))
                                     .max(0.0);
                             }
                             // The `post` gain sits AFTER the whole chain and is

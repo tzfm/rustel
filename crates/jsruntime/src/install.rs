@@ -20,7 +20,7 @@ pub(crate) mod kabelsalat;
 pub(crate) mod worklet;
 #[cfg(feature = "hydra")]
 pub use hydra::HYDRA_SCOPE_POLICY;
-mod native_surface;
+pub(crate) mod native_surface;
 mod repl;
 mod slider;
 mod surface;
@@ -36,6 +36,8 @@ use foundation::SemanticSurface;
 pub use hydra::HydraCandidate;
 #[cfg(feature = "hydra")]
 pub(crate) use hydra::{HydraChains, restore_surface as restore_hydra_surface};
+
+pub(crate) use repl::{lane_tagged, visual_slot};
 
 pub fn reference_entries() -> impl Iterator<Item = &'static rustel_core::reference::ReferenceEntry>
 {
@@ -144,6 +146,7 @@ impl JsRuntime {
             // Last: every layer that can replace a built-in method has run.
             seal_builtin_methods(&ctx, &surface.proto, &surface.globals)
                 .map_err(|error| error.to_string())?;
+            self.bindings_installed.set(true);
             Ok(())
         })
     }

@@ -255,7 +255,7 @@ pub fn parse_fractional(value: &Value) -> Result<f64, String> {
             let Value::Str(name) = value else {
                 return Err(format!("cannot parse as fractional: \"{}\"", value.show()));
             };
-            match name.as_str() {
+            match &**name {
                 "pi" => Ok(std::f64::consts::PI),
                 "w" => Ok(1.0),
                 "h" => Ok(0.5),

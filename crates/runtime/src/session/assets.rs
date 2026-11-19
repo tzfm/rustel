@@ -303,16 +303,6 @@ impl Session {
         self.preload_requested = self.preload_requested.saturating_add(requested);
     }
 
-    pub(super) fn ensure_voicings(&mut self) -> Result<(), RuntimeError> {
-        if !self.voicings_ready {
-            self.js
-                .install_voicings_prebake()
-                .map_err(RuntimeError::Js)?;
-            self.voicings_ready = true;
-        }
-        Ok(())
-    }
-
     // Only the device-audio play path consults this today; keep it compiling
     // (not warning) in feature-less builds.
     #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]

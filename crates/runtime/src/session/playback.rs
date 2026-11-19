@@ -1017,7 +1017,7 @@ impl Session {
                 .map_err(render_error)
             }
             RenderFormat::OnsetJson => {
-                write_onset_dump(out_path, &play.onsets)?;
+                write_onset_dump_until(out_path, &play.onsets, &stop)?;
                 Ok(((None, Vec::new()), Vec::new()))
             }
             RenderFormat::Midi => {
@@ -1595,11 +1595,25 @@ mod tests {
         );
     }
 
+    /// A thread that stops the transport of `session` when its next run
+    /// starts, whatever the speed of the run: the run clears the stop that
+    /// is set here, and the thread stops it as soon as it sees that.
+    fn stop_in_the_next_run(session: &Session) -> std::thread::JoinHandle<()> {
+        let handle = session.transport();
+        handle.stop();
+        std::thread::spawn(move || {
+            while handle.is_stopped() {
+                std::thread::yield_now();
+            }
+            handle.stop();
+        })
+    }
+
     #[test]
     fn stopping_the_transport_mid_run_cancels_it() {
         // A `play` that ignores Stop also returns, so termination proves
         // nothing. Stop discards queued events, so a cancelled run yields
-        // fewer onsets. The full run takes seconds; the stop lands at 100 ms.
+        // fewer onsets.
         let mut session = Session::new().expect("session");
         session.evaluate(r#"s("bd*8")"#).expect("evaluate");
         let full = session.play(86_400.0).expect("play").onsets.len();
@@ -1610,11 +1624,7 @@ mod tests {
 
         let mut session = Session::new().expect("session");
         session.evaluate(r#"s("bd*8")"#).expect("evaluate");
-        let handle = session.transport();
-        let stopper = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            handle.stop();
-        });
+        let stopper = stop_in_the_next_run(&session);
         let started = std::time::Instant::now();
         let cancelled = session.play(86_400.0).expect("play").onsets.len();
         let elapsed = started.elapsed();
@@ -1640,11 +1650,7 @@ mod tests {
             }
             let mut session = Session::new().expect("session");
             session.evaluate(r#"s("bd*8")"#).expect("evaluate");
-            let handle = session.transport();
-            let stopper = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                handle.stop();
-            });
+            let stopper = stop_in_the_next_run(&session);
             let error = if mp3 {
                 session.render(60.0, &path, RenderFormat::ScalarMp3).err()
             } else {
@@ -1680,10 +1686,15 @@ mod tests {
         let mut session = Session::new().expect("session");
         session.evaluate(r#"s("bd*8")"#).expect("evaluate");
         session.transport().stop();
-        // `play` restarts the transport, so stop from a handle DURING the run.
+        // `play` restarts the transport, so stop from a handle DURING the
+        // run: as soon as the run starts the transport. A stop after a
+        // fixed time lands later in a run that takes less time.
         let handle = session.transport();
         let stopper = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            let patience = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while handle.is_stopped() && std::time::Instant::now() < patience {
+                std::thread::yield_now();
+            }
             handle.stop();
         });
         let started = std::time::Instant::now();

@@ -173,7 +173,7 @@ fn aligned_stacks_reify_strings_and_keep_short_lane_placement() {
             let short = haps
                 .iter()
                 .filter(
-                    |hap| matches!(&hap.value, Value::Str(value) if value == "x" || value == "y"),
+                    |hap| matches!(&hap.value, Value::Str(value) if &**value == "x" || &**value == "y"),
                 )
                 .map(|hap| {
                     let whole = hap.whole.expect("stack event");
@@ -204,7 +204,7 @@ fn repeat_stack_keeps_each_lanes_step_rate_across_cycles() {
         .expect("repeated lanes");
     let short = haps
         .into_iter()
-        .filter(|hap| matches!(&hap.value, Value::Str(value) if value == "x" || value == "y"))
+        .filter(|hap| matches!(&hap.value, Value::Str(value) if &**value == "x" || &**value == "y"))
         .map(|hap| (hap.whole.expect("stack event").begin, hap.value))
         .collect::<Vec<_>>();
     assert_eq!(

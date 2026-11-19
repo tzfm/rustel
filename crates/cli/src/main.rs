@@ -249,13 +249,26 @@ fn human_live_event(event: &serde_json::Value, verbosity: u8) -> Option<String> 
     fn string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
         value.get(key)?.as_str()
     }
+    // A score that the script engine runs costs more time and memory than
+    // a native one, so the line says it, with the line of the score that
+    // needs the engine. A native score needs no word.
+    fn script_engine(value: &serde_json::Value) -> String {
+        if string(value, "engine") != Some("script") {
+            return String::new();
+        }
+        match value.get("script_line").and_then(serde_json::Value::as_u64) {
+            Some(line) => format!(" · script engine, line {line} needs it"),
+            None => " · script engine".to_owned(),
+        }
+    }
 
     if let Some(live) = event.get("live") {
         return match string(live, "status")? {
             "started" => {
                 let path = string(live, "path").unwrap_or("score");
+                let engine = script_engine(live);
                 if verbosity == 0 {
-                    Some(format!("Started {path}"))
+                    Some(format!("Started {path}{engine}"))
                 } else {
                     let device = string(live, "device").unwrap_or("audio device");
                     let sample_rate = live
@@ -263,7 +276,7 @@ fn human_live_event(event: &serde_json::Value, verbosity: u8) -> Option<String> 
                         .and_then(serde_json::Value::as_u64)
                         .map(|rate| format!(" at {rate} Hz"))
                         .unwrap_or_default();
-                    Some(format!("Started {path} on {device}{sample_rate}"))
+                    Some(format!("Started {path} on {device}{sample_rate}{engine}"))
                 }
             }
             // A run that ended on its own -- a finished `--duration`, a host
@@ -289,7 +302,7 @@ fn human_live_event(event: &serde_json::Value, verbosity: u8) -> Option<String> 
     if let Some(reload) = event.get("reload") {
         let path = string(reload, "path").unwrap_or("score");
         return match string(reload, "status")? {
-            "installed" => Some(format!("Updated {path}")),
+            "installed" => Some(format!("Updated {path}{}", script_engine(reload))),
             "rejected" => Some(format!(
                 "Update failed for {path}: {}",
                 string(reload, "message").unwrap_or("the score was rejected")
@@ -4616,6 +4629,48 @@ mod live_output_contract_tests {
                 }),
             ),
         ]
+    }
+
+    /// A score that the script engine runs says so where it starts and
+    /// where a save installs it, with the line that needs the engine. A
+    /// native score adds no word.
+    #[test]
+    fn a_score_in_the_script_engine_is_said_with_its_line() {
+        let reload = |engine: &str, line: Option<u64>| {
+            serde_json::json!({
+                "reload": {
+                    "path": "song.strudel",
+                    "status": "installed",
+                    "engine": engine,
+                    "script_line": line,
+                }
+            })
+        };
+        let said = |event: &serde_json::Value| human_live_event(event, 0);
+        assert_eq!(
+            said(&reload("native", None)).as_deref(),
+            Some("Updated song.strudel")
+        );
+        assert_eq!(
+            said(&reload("script", Some(12))).as_deref(),
+            Some("Updated song.strudel · script engine, line 12 needs it")
+        );
+        assert_eq!(
+            said(&reload("script", None)).as_deref(),
+            Some("Updated song.strudel · script engine")
+        );
+        let started = serde_json::json!({
+            "live": {
+                "status": "started",
+                "path": "song.strudel",
+                "engine": "script",
+                "script_line": 3,
+            }
+        });
+        assert_eq!(
+            said(&started).as_deref(),
+            Some("Started song.strudel · script engine, line 3 needs it")
+        );
     }
 
     /// `--json` selects structured live events for the play command,

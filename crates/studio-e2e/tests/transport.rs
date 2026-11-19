@@ -141,6 +141,12 @@ fn piano_over_a_stopped_scores_tail_settles_the_transport_header() {
     studio.chord("ctrl+s");
     studio.settle();
     assert!(studio.is_playing());
+    // A stop before the note sounds retires it, and leaves no tail.
+    studio.pump_until(
+        std::time::Duration::from_secs(6),
+        "the long score note sounds",
+        |studio| studio.master_peak() > 0.0,
+    );
     studio.chord("ctrl+g");
     studio.settle();
     assert!(studio.is_stopping(), "the long score note is still ringing");

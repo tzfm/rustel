@@ -86,10 +86,6 @@ impl Session {
         if crate::sounds::variant_selection(source).is_some() {
             self.prebake_selects_variants = true;
         }
-        // Setup/prebake is the canonical home for voicing dictionaries and
-        // MIDI maps. Install those configuration globals before executing it,
-        // just as ordinary score evaluation does.
-        self.ensure_voicings()?;
         self.js.set_cps(self.scheduler.cps());
         self.js.set_cycle_time(self.evaluation_cycle());
         // The setup and its imports keep what they register for every
@@ -661,11 +657,8 @@ impl Session {
         #[cfg(any(test, feature = "test-support"))]
         self.panic_if_injected(SessionPanicPoint::Evaluation);
         self.claim_core_settings();
-        // scale/transpose/scaleTranspose are native registry combinators in
-        // rustel-core. The voicings bundle still installs because chord and
-        // voicing do not yet have complete native implementations.
-        self.ensure_bindings()?;
-        self.ensure_voicings()?;
+        // The score surface installs when JavaScript first runs: a score the
+        // native tier evaluates needs none.
         self.js.set_cps(self.scheduler.cps());
         let cycle = seed.map_or_else(|| self.evaluation_cycle(), |(_, _, cycle)| cycle);
         self.js.set_cycle_time(cycle);
@@ -708,27 +701,53 @@ impl Session {
         if self.generation() == 0 {
             self.js.snapshot_active_as_last_good();
         }
+        // A score with no form of JavaScript alone is read as written, with
+        // no JavaScript parser. Any other text is the transpiler's.
+        // A number the host made live becomes a cell in the transpiler's
+        // output, so a text with live numbers takes the transpiler.
         let live_numbers = self.live_numbers(source);
-        let options = TranspileOptions {
-            widget_methods: rustel_transpiler::VISUAL_WIDGET_METHODS
-                .iter()
-                .map(|method| (*method).to_owned())
-                .collect(),
-            // Each lane of the text gets its number before the evaluation,
-            // so a plugin note names the same lane after an edit.
+        #[cfg_attr(not(feature = "vst"), allow(unused_mut))]
+        let mut read = if live_numbers.is_empty() {
+            rustel_score::read(source, rustel_transpiler::call_form)
+        } else {
+            None
+        };
+        // Each lane of the text gets its number before the evaluation, so a
+        // plugin note names the same lane after an edit.
+        #[cfg(feature = "vst")]
+        let lane_numbers = match &mut read {
+            Some(read) => {
+                let lanes = std::mem::take(&mut read.lanes);
+                self.lanes.read_statements(source, Some(lanes))
+            }
+            None => self.lanes.read(source),
+        };
+        // A read whose lane calls keep their places, as the transpiler
+        // writes them for a list of numbers with another count.
+        #[cfg(feature = "vst")]
+        let read_by_place = read
+            .as_mut()
+            .is_some_and(|read| !read.number_lanes(&lane_numbers));
+        let mut options = TranspileOptions {
+            // The editor lists the leaves with its own layout pass.
+            list_mini_leaves: false,
+            // Lent for this evaluation, and taken back after it.
+            widget_methods: std::mem::take(&mut self.widget_methods),
             #[cfg(feature = "vst")]
-            lane_numbers: self.lanes.read(source),
+            lane_numbers,
             live_numbers: live_numbers
                 .iter()
                 .map(|number| number.literal.clone())
                 .collect(),
             ..TranspileOptions::default()
         };
+        let program = read.as_ref().map(|read| &read.program);
         let evaluated = match seed {
             Some((settings, _, _)) => self
                 .js
                 .evaluate_score_candidate_with_effects_cancellable_seeded(
                     source,
+                    program,
                     &options,
                     budget,
                     cancellation,
@@ -736,16 +755,38 @@ impl Session {
                 ),
             None => self.js.evaluate_score_candidate_with_effects_cancellable(
                 source,
+                program,
                 &options,
                 budget,
                 cancellation,
             ),
         };
-        // The label rewrite found a different count of labeled statements
-        // and wrote places. The notes of this text carry places, and not
-        // the lane numbers of this read.
+        self.widget_methods = std::mem::take(&mut options.widget_methods);
+        if evaluated.is_ok() {
+            self.score_engine = Some(if self.js.evaluated_natively() {
+                ScoreEngine::Native
+            } else {
+                // Where the reader stopped, or the native tier after it.
+                let line_of = |at: u32| {
+                    let before = source.as_bytes().iter().take(at as usize);
+                    before.filter(|byte| **byte == b'\n').count() + 1
+                };
+                let line = match &read {
+                    None => rustel_score::left_at(source, rustel_transpiler::call_form),
+                    Some(_) => self.js.native_left().map(line_of),
+                };
+                ScoreEngine::Script { line }
+            });
+        }
+        // The lane calls of this text hold places, and not the lane numbers
+        // of this read: the label rewrite, or the reader, found a different
+        // count of labeled statements.
         #[cfg(feature = "vst")]
-        if matches!(&evaluated, Ok((output, ..)) if output.lanes_by_place) {
+        if let Ok((output, ..)) = &evaluated
+            && output
+                .as_ref()
+                .map_or(read_by_place, |output| output.lanes_by_place)
+        {
             self.lanes.wrote_places();
         }
         match evaluated {

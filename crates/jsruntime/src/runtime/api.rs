@@ -1,179 +1,123 @@
 use super::*;
 
 impl JsRuntime {
+    /// A runtime with its script engine started.
     pub fn new() -> rquickjs::Result<Self> {
-        // The budget is active from CONSTRUCTION, so no allocation is ever
-        // unbounded. QuickJS's own `set_memory_limit` is deliberately NOT used:
-        // it rejects before calling the allocator, so a refusal would never
-        // reach the structural flag and would be indistinguishable from a user
-        // throw once it surfaced as an exception.
-        let budget = std::rc::Rc::new(alloc::HeapBudget::new(DEFAULT_JS_MEMORY_LIMIT));
-        let rt = Runtime::new_with_alloc(alloc::BudgetedAllocator::new(budget.clone()))?;
-        // QuickJS anchored its stack budget on the pointer it recorded in the
-        // line above and never moves it again, so the size has to be set here,
-        // before any query can recurse beneath it. See `MAX_JS_STACK_BYTES`.
-        rt.set_max_stack_size(MAX_JS_STACK_BYTES);
-        // This runtime never reads a module. The explicit resolver is the
-        // enforcement boundary for dynamically constructed imports
-        // (`eval`/`Function`) that cannot be rejected by source inspection.
-        // It also keeps a later QuickJS default change from silently turning
-        // score text into filesystem or network access. A script that the
-        // host has run resolves to an empty module. See `LoadedImports`.
-        let loaded_imports = LoadedImports::default();
-        rt.set_loader(
-            RejectModuleResolver(loaded_imports.clone()),
-            RejectModuleLoader(loaded_imports.clone()),
-        );
-        let ctx = Context::full(&rt)?;
-        let effect_transaction = Rc::new(RefCell::new(None));
-        let effect_policy = Rc::new(Cell::new(EffectPolicy::NONE));
-        #[cfg(feature = "hydra")]
-        let hydra_chains = Rc::new(RefCell::new(crate::install::HydraChains::default()));
-        let effect_policy_refusal = Rc::new(RefCell::new(None));
-        let effect_policy_owner_depth = Rc::new(Cell::new(0));
-        let callback_ir = Rc::new(CallbackIr::new());
-        ctx.with(|ctx| -> rquickjs::Result<()> {
-            let held = rquickjs::Array::new(ctx.clone())?;
-            held.as_object().set_prototype(None)?;
-            let active = rquickjs::Array::new(ctx.clone())?;
-            active.as_object().set_prototype(None)?;
-            active.set(0, rquickjs::Value::new_null(ctx.clone()))?;
-            let stack = rquickjs::Array::new(ctx.clone())?;
-            // This is host-only storage, not a JavaScript Array surface. A
-            // normal Array prototype lets score code install indexed setters
-            // that observe or swallow the temporary owner pushed while a
-            // cross-turn `__pure` value is rematerialised. Keep Array's own
-            // length/index mechanics while removing that mutable prototype
-            // chain before any user code can run.
-            stack.as_object().set_prototype(None)?;
-            let score_candidate = rquickjs::Array::new(ctx.clone())?;
-            score_candidate.as_object().set_prototype(None)?;
-            let repl_tempo_surface = rquickjs::Array::new(ctx.clone())?;
-            repl_tempo_surface.as_object().set_prototype(None)?;
-            let slider_sets = rquickjs::Array::new(ctx.clone())?;
-            slider_sets.as_object().set_prototype(None)?;
-            let slider_values = rquickjs::Object::new(ctx.clone())?;
-            slider_values.set_prototype(None)?;
-            slider_sets.set(0, slider_values.clone())?;
-            slider_sets.set(1, slider_values)?;
-            slider_sets.set(2, rquickjs::Value::new_null(ctx.clone()))?;
-            // Parallel host-only binding maps: active, candidate, last-good.
-            // Decimal strings retain all 64 token bits without JS Number rounding.
-            let bindings = rquickjs::Object::new(ctx.clone())?;
-            bindings.set_prototype(None)?;
-            slider_sets.set(3, bindings.clone())?;
-            slider_sets.set(4, bindings)?;
-            slider_sets.set(5, rquickjs::Value::new_null(ctx.clone()))?;
-            let voicing_sets = rquickjs::Array::new(ctx.clone())?;
-            voicing_sets.as_object().set_prototype(None)?;
-            let previous = ctx.store_userdata(HostRoots {
-                held,
-                active,
-                stack,
-                score_candidate,
-                repl_tempo_surface,
-                slider_sets,
-                voicing_sets,
-                protected_globals: Rc::new(RefCell::new(BTreeSet::new())),
-                callback_ir: callback_ir.clone(),
-                builtin_methods: Rc::new(RefCell::new(BuiltinMethods::default())),
-                effects: EffectBoundaryState {
-                    policy: effect_policy.clone(),
-                    refusal: effect_policy_refusal.clone(),
-                },
-                heap: budget.clone(),
-            })?;
-            debug_assert!(previous.is_none(), "new runtime already had host roots");
-            Ok(())
-        })?;
-        let deadline = std::rc::Rc::new(Cell::new(None::<std::time::Instant>));
-        let interrupted = std::rc::Rc::new(Cell::new(false));
-        let cancel_flag = std::rc::Rc::new(Cell::new(None::<*const std::sync::atomic::AtomicBool>));
-        let cancelled = std::rc::Rc::new(Cell::new(false));
+        Self::started(None)
+    }
 
-        // One evaluation deadline spans the initial setup call
-        // and every runnable QuickJS job it queues. JS_ExecutePendingJob may be
-        // interrupted safely only if its borrowed error-context pointer is
-        // duplicated before Rust owns it and its pending exception is consumed
-        // immediately. rquickjs 0.14 fixes borrowed-context ownership, but
-        // its bool helper consumes job exceptions without reporting them.
-        // A pending root Promise with an empty job
-        // queue still is unsupported: it needs an external host-I/O source,
-        // not more polling.
-        {
-            let d = deadline.clone();
-            let i = interrupted.clone();
-            let flag = cancel_flag.clone();
-            let c = cancelled.clone();
-            rt.set_interrupt_handler(Some(Box::new(move || {
-                let cancellation_requested = flag.get().is_some_and(|pointer| {
-                    // SAFETY: installed only for the duration of the call that
-                    // borrowed the AtomicBool, and cleared by an RAII guard
-                    // before that borrow can end.
-                    unsafe { &*pointer }.load(std::sync::atomic::Ordering::Relaxed)
-                });
-                if cancellation_requested {
-                    c.set(true);
-                    return true;
-                }
-                match d.get() {
-                    Some(t) if std::time::Instant::now() >= t => {
-                        i.set(true);
-                        true // interrupt
-                    }
-                    _ => false,
-                }
-            })));
-        }
-        Ok(Self {
-            rt,
-            ctx,
+    fn started(pointer: Option<rustel_core::host_value::Pointer>) -> rquickjs::Result<Self> {
+        let runtime = Self::deferred(pointer);
+        let realm = Realm::start(&runtime)?;
+        // The cell of a new runtime is empty, so it takes the realm.
+        let _ = runtime.realm.set(realm);
+        Ok(runtime)
+    }
+
+    /// A runtime whose script engine starts at the first use that needs
+    /// it. `pointer` is what `mousex` and `mousey` read at query time, as
+    /// for [`Self::with_pointer`].
+    pub fn deferred(pointer: Option<rustel_core::host_value::Pointer>) -> Self {
+        Self {
+            realm: std::cell::OnceCell::new(),
             core_settings: rustel_core::settings::RuntimeSettings::default(),
             ids: std::rc::Rc::new(Cell::new(0)),
             logs: std::rc::Rc::new(RefCell::new(Vec::new())),
             contained_query_errors_unlogged: Cell::new(false),
             cycle_time: std::rc::Rc::new(Cell::new(0.0)),
             cps: std::rc::Rc::new(Cell::new(0.5)),
-            loaded_imports,
+            loaded_imports: LoadedImports::default(),
             import_surface: RefCell::default(),
             timeline_state: rustel_core::TimelineState::default(),
             midi_in_bus: std::sync::Arc::new(rustel_core::midi_in::InputBus::new()),
             midi_in_handles: std::rc::Rc::new(RefCell::new(MidiInputHandles::default())),
             #[cfg(feature = "hydra")]
-            hydra_chains,
-            effect_transaction,
-            effect_policy,
+            hydra_chains: Rc::new(RefCell::new(crate::install::HydraChains::default())),
+            effect_transaction: Rc::new(RefCell::new(None)),
+            effect_policy: Rc::new(Cell::new(EffectPolicy::NONE)),
             hap_budget: Cell::new(rustel_core::DEFAULT_HAP_BUDGET),
             query_threw: RefCell::new(None),
-            callback_ir,
-            heap: budget,
-            deadline,
-            interrupted,
-            cancel_flag,
-            cancelled,
+            callback_ir: Rc::new(CallbackIr::new()),
+            native_tier: Cell::new(true),
+            evaluated_natively: Cell::new(false),
+            bindings_installed: Cell::new(false),
+            voicings_installed: Cell::new(false),
+            // The budget is active from the start of the engine, so no
+            // allocation of the engine is ever unbounded.
+            heap: Rc::new(alloc::HeapBudget::new(DEFAULT_JS_MEMORY_LIMIT)),
+            deadline: Rc::new(Cell::new(None)),
+            interrupted: Rc::new(Cell::new(false)),
+            cancel_flag: Rc::new(Cell::new(None)),
+            cancelled: Rc::new(Cell::new(false)),
             query_turn_depth: Cell::new(0),
             effect_query_depth: Cell::new(0),
             heap_boundary_depth: Cell::new(0),
             query_limit_millis: Cell::new(None),
-            effect_policy_refusal,
-            effect_policy_owner_depth,
+            effect_policy_refusal: Rc::new(RefCell::new(None)),
+            effect_policy_owner_depth: Rc::new(Cell::new(0)),
+            native_memo: RefCell::default(),
+            native_left: Cell::new(None),
+            native_staged: RefCell::new(None),
+            native_active: RefCell::new(None),
+            native_last_good: RefCell::new(None),
             last_good_active: RefCell::new(None),
             last_good_timeline: RefCell::new(None),
-            pointer: None,
+            pointer,
             script_may_have_run: Cell::new(true),
-        })
+        }
     }
 
     /// A realm whose `mousex`/`mouseX` and `mousey`/`mouseY` read `pointer`
     /// at query time.
     pub fn with_pointer(pointer: rustel_core::host_value::Pointer) -> rquickjs::Result<Self> {
-        let mut runtime = Self::new()?;
-        runtime.pointer = Some(pointer);
-        Ok(runtime)
+        Self::started(Some(pointer))
     }
 
+    /// Whether the script engine started. A runtime made with
+    /// [`Self::deferred`] starts it at the first score, prelude or import
+    /// that the native tier does not evaluate.
+    pub fn script_engine_started(&self) -> bool {
+        self.realm.get().is_some()
+    }
+
+    /// Collect the script heap, when the script engine started.
     pub fn run_gc(&self) {
-        self.rt.run_gc();
+        if let Some(realm) = self.realm.get() {
+            realm.rt.run_gc();
+        }
+    }
+
+    /// Install the semantic surface and the voicing globals, once. Every
+    /// entry that runs score text calls this first.
+    pub fn ensure_surface(&self) -> Result<(), String> {
+        if !self.bindings_installed.get() {
+            self.install_semantic_bindings()?;
+        }
+        if !self.voicings_installed.get() {
+            self.install_voicings_prebake()?;
+        }
+        Ok(())
+    }
+
+    /// Let scores the native tier proves skip JavaScript, or send every
+    /// score to JavaScript, for tests and same-machine A/B.
+    #[doc(hidden)]
+    pub fn set_native_tier(&self, enabled: bool) {
+        self.native_tier.set(enabled);
+    }
+
+    /// Whether the last evaluated score ran on the native tier.
+    #[doc(hidden)]
+    pub fn evaluated_natively(&self) -> bool {
+        self.evaluated_natively.get()
+    }
+
+    /// The byte of the text of the last evaluated score where the native
+    /// tier stopped: the end of the innermost call that it does not take.
+    /// `None` for a score that ran on the native tier, for one that its
+    /// reader did not read, and where the tier names no call.
+    pub fn native_left(&self) -> Option<u32> {
+        self.native_left.get()
     }
 
     /// Select callback-IR execution policy for tests and same-machine A/B.
@@ -400,7 +344,6 @@ impl JsRuntime {
     /// evaluation mutates live globals in place; if it throws halfway, what
     /// already happened stays. Rolling it back would change the language contract.
     pub fn with_deadline<R>(&self, budget: std::time::Duration, f: impl FnOnce() -> R) -> R {
-        let _settings = self.core_settings.bind();
         struct Guard(
             std::rc::Rc<Cell<Option<std::time::Instant>>>,
             Option<std::time::Instant>,
@@ -417,16 +360,20 @@ impl JsRuntime {
         // cycle from a JS callback; with a fresh budget each time the
         // a fresh budget each time would multiply the allowed work. Inheriting
         // the tighter deadline keeps one save bounded by one budget.
+        let now = std::time::Instant::now();
         let deadline = match prev {
-            Some(outer) => (std::time::Instant::now() + budget).min(outer),
-            None => std::time::Instant::now() + budget,
+            Some(outer) => (now + budget).min(outer),
+            None => now + budget,
         };
         self.deadline.set(Some(deadline));
         let _g = Guard(self.deadline.clone(), prev);
         // The same deadline bounds NATIVE query recursion: QuickJS's
         // interrupt handler only fires while JavaScript runs, and a
         // pattern can spend minutes in Rust below every hap budget.
-        rustel_core::with_query_deadline(deadline, f)
+        // A query turn binds the settings of this runtime before it comes
+        // here, and binds them one time.
+        self.core_settings
+            .with(|| rustel_core::with_query_deadline_from(now, deadline, f))
     }
 
     /// Whether the last deadline-bounded run was interrupted.
@@ -460,8 +407,20 @@ impl JsRuntime {
         false
     }
 
+    /// Discard the jobs that the script engine holds, and give their count.
+    /// The discard runs no job and no score code. A runtime with no realm
+    /// holds no job.
+    pub(super) fn discard_jobs(&self) -> usize {
+        match self.realm.get() {
+            Some(_) => with_ctx_running_no_script(self, |ctx| discard_pending_jobs(&ctx)),
+            None => 0,
+        }
+    }
+
     pub fn jobs_pending(&self) -> bool {
-        self.rt.is_job_pending()
+        self.realm
+            .get()
+            .is_some_and(|realm| realm.rt.is_job_pending())
     }
 
     /// Evaluate arbitrary JS source. Used by tests and by prebake.
@@ -550,7 +509,8 @@ impl JsRuntime {
     /// Only score JavaScript can catch such a panic, so with no script run
     /// since the last call there is nothing to raise.
     pub fn raise_caught_native_panic(&self) {
-        if !self.script_may_have_run.replace(false) {
+        // A runtime with no realm ran no script.
+        if self.realm.get().is_none() || !self.script_may_have_run.replace(false) {
             return;
         }
         with_ctx_running_no_script(self, |ctx| {
@@ -647,6 +607,10 @@ impl JsRuntime {
     }
 
     pub(crate) fn begin_slider_candidate(&self) -> Result<(), String> {
+        // A runtime with no realm holds no slider: there is no set to fork.
+        if self.realm.get().is_none() {
+            return Ok(());
+        }
         with_ctx(self, |ctx| -> Result<(), String> {
             let values = rquickjs::Object::new(ctx.clone()).map_err(|error| error.to_string())?;
             values
@@ -665,6 +629,9 @@ impl JsRuntime {
     }
 
     pub(super) fn discard_slider_candidate(&self) {
+        if self.realm.get().is_none() {
+            return;
+        }
         with_ctx(self, |ctx| {
             if let Ok(sets) = host_slider_sets(&ctx)
                 && let Ok(active) = sets.get::<rquickjs::Value>(0)
@@ -678,6 +645,10 @@ impl JsRuntime {
     }
 
     pub(crate) fn begin_voicing_candidate(&self) -> Result<(), String> {
+        // A runtime with no realm holds no voicing registry.
+        if self.realm.get().is_none() {
+            return Ok(());
+        }
         with_ctx(self, |ctx| -> Result<(), String> {
             let sets = host_voicing_sets(&ctx).map_err(|error| error.to_string())?;
             // Direct JsRuntime embedders may evaluate before installing the
@@ -723,6 +694,9 @@ impl JsRuntime {
     }
 
     pub(super) fn discard_voicing_candidate(&self) {
+        if self.realm.get().is_none() {
+            return;
+        }
         with_ctx(self, |ctx| {
             let Ok(sets) = host_voicing_sets(&ctx) else {
                 return;
@@ -741,6 +715,10 @@ impl JsRuntime {
     }
 
     pub(super) fn commit_score_candidates(&self) -> Result<(), String> {
+        // A runtime with no realm began no candidate.
+        if self.realm.get().is_none() {
+            return Ok(());
+        }
         self.commit_score_candidates_with_hook(|| Ok(()))
     }
 
@@ -946,6 +924,8 @@ impl JsRuntime {
                         .map_err(|error| error.to_string())?
                         .set(0, wrapper)
                         .map_err(|e| e.to_string())?;
+                    // The wrapper took the place of a native graph in play.
+                    self.native_active.borrow_mut().take();
                     Ok(0)
                 }
                 Slot::Held => {
@@ -1014,7 +994,7 @@ impl JsRuntime {
             Slot::Active => host_active(ctx)
                 .map_err(|error| error.to_string())?
                 .get(0)
-                .map_err(|_| "active slot is empty".to_string()),
+                .map_err(|_| ACTIVE_SLOT_EMPTY.to_string()),
             Slot::Held => {
                 let arr = host_held(ctx).map_err(|error| error.to_string())?;
                 arr.get(index)
@@ -1051,6 +1031,11 @@ impl JsRuntime {
         f: impl FnOnce() -> R,
     ) -> Result<R, QueryError> {
         self.sync_host_voicing_default()?;
+        // A graph of the native tier reaches no callback of a script, so no
+        // wrapper owns its query.
+        if self.native_active.borrow().is_some() {
+            return Ok(rustel_core::with_callback_host(self, f));
+        }
         let _scope = QueryScope::push_active_native(self).map_err(QueryError::Message)?;
         Ok(with_ctx(self, |_ctx| {
             let frame = BridgeFrame::new(self.ids.clone());
@@ -1276,7 +1261,7 @@ impl JsRuntime {
 
         // A stale job has no attributable query owner. Always discard it, but
         // preserve caller cancellation as the dominant public reason.
-        let stale_jobs = with_ctx_running_no_script(self, |ctx| discard_pending_jobs(&ctx));
+        let stale_jobs = self.discard_jobs();
         if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled));
         }
@@ -1301,9 +1286,7 @@ impl JsRuntime {
             fn drop(&mut self) {
                 // Cleanup never executes jobs or JavaScript and is therefore
                 // safe after a deadline/cancellation interrupt and on unwind.
-                with_ctx_running_no_script(self.rt, |ctx| {
-                    let _ = discard_pending_jobs(&ctx);
-                });
+                self.rt.discard_jobs();
                 self.rt.cancel_flag.set(self.previous_cancel);
                 self.rt.query_limit_millis.set(self.previous_millis);
                 self.rt.query_turn_depth.set(self.previous_depth);
@@ -1336,7 +1319,7 @@ impl JsRuntime {
         // reason for direct callers; they deliberately do not inspect the
         // current clock or cancellation flag after `f`, which could
         // retroactively reject an already-committed scheduler tick.
-        let jobs = with_ctx_running_no_script(self, |ctx| discard_pending_jobs(&ctx));
+        let jobs = self.discard_jobs();
         let effect_policy = effect_policy_owner.newly_raised_policy();
         if !translate_latched {
             // Scheduler ticks carry the structural refusal in `TickStatus` and
@@ -1407,9 +1390,64 @@ impl JsRuntime {
         cancellation: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<Hap>, QueryError> {
         let _settings = self.core_settings.bind();
+        if matches!(slot, Slot::Active)
+            && let Some(pattern) = self.native_in_play()
+        {
+            return self.query_native(&pattern, begin, end, budget, cancellation);
+        }
         self.with_bounded_query_turn(budget, cancellation, true, || {
             self.query_inner(slot, index, begin, end)
         })
+    }
+
+    /// The native graph in play, when a query of it is a turn of its own
+    /// that runs no script: no query turn is open, and the default voicings
+    /// are not an object of the script engine to read first.
+    fn native_in_play(&self) -> Option<Pattern> {
+        if self.query_turn_depth.get() > 0
+            || self.heap_boundary_depth.get() > 0
+            || rustel_core::voicings::selected_default_voicings_is_host_owned()
+        {
+            return None;
+        }
+        // A handle of the graph, so the cell is free while the query runs.
+        self.native_active.borrow().clone()
+    }
+
+    /// [`Self::query_cancellable`] of a native graph. The graph reaches no
+    /// callback of a script, so the turn holds what bounds native work,
+    /// the deadline and the cancellation flag, and none of the state of a
+    /// script turn: no job, no heap latch and no effect policy.
+    fn query_native(
+        &self,
+        pattern: &Pattern,
+        begin: Fraction,
+        end: Fraction,
+        budget: std::time::Duration,
+        cancellation: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<Hap>, QueryError> {
+        // The refusals of a bounded turn before it starts.
+        if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled));
+        }
+        if budget.is_zero() {
+            return Err(QueryError::Limit(rustel_core::QueryLimit::JsCpuDeadline {
+                millis: 0,
+            }));
+        }
+        self.cancelled.set(false);
+        self.interrupted.set(false);
+        rustel_core::with_cancellation(cancellation, || {
+            // A query of a few nodes reads no clock.
+            rustel_core::with_query_budget(budget, || {
+                // A stack reports a lane that threw through the logger of
+                // the runtime.
+                rustel_core::with_callback_host(self, || {
+                    self.query_sorted_recording_throw(pattern, begin, end)
+                })
+            })
+        })
+        .map_err(QueryError::from)
     }
 
     /// Cancellable query with a caller-specific hap cap. The previous cap is
@@ -1440,6 +1478,19 @@ impl JsRuntime {
     ) -> Result<Vec<Hap>, QueryError> {
         self.sync_host_voicing_default()?;
         if matches!(slot, Slot::Active) {
+            // The handle of the native graph in play, so the cell is free
+            // while the query runs. Such a graph reaches no callback of a
+            // script, so no wrapper owns its query.
+            let held = self.native_active.borrow().clone();
+            if let Some(pattern) = held {
+                return rustel_core::with_callback_host(self, || {
+                    self.query_sorted_recording_throw(&pattern, begin, end)
+                })
+                .map_err(QueryError::from);
+            }
+            if self.realm.get().is_none() {
+                return Err(QueryError::Message(ACTIVE_SLOT_EMPTY.into()));
+            }
             // Reading the slot runs no score code.
             let native = with_ctx_running_no_script(self, |ctx| -> Option<Pattern> {
                 let value: rquickjs::Value = host_active(&ctx).ok()?.get(0).ok()?;
@@ -1537,6 +1588,11 @@ impl JsRuntime {
 
     fn query_shadow_inner(&self, begin: Fraction, end: Fraction) -> Result<Vec<Hap>, QueryError> {
         self.sync_host_voicing_default()?;
+        // A graph of the native tier has no shadow, and a runtime with no
+        // realm has no wrapper.
+        if self.native_active.borrow().is_some() || self.realm.get().is_none() {
+            return Ok(Vec::new());
+        }
         with_ctx(self, |ctx| -> Result<Vec<Hap>, QueryError> {
             let active: rquickjs::Value = host_active(&ctx)
                 .map_err(|error| QueryError::Message(error.to_string()))?

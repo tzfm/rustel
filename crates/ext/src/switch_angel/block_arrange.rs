@@ -101,7 +101,7 @@ impl ExtensionPatternNode for BlockLaneNode {
                         return Vec::new();
                     };
                     if !predicate
-                        .apply_value(&Value::Str(marker.clone()))
+                        .apply_value(&Value::Str(marker.as_str().into()))
                         .js_truthy()
                     {
                         continue;
