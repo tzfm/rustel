@@ -2878,12 +2878,16 @@ mod tests {
                     .register_score_custom(source, None, &access)
                     .expect(source);
             }
+            let kick = format!(
+                "/{}/sets/sub/kick.wav",
+                root.file_name().unwrap().to_str().unwrap()
+            );
             let custom = library.custom.read().expect("custom banks");
             for name in ["near", "far", "top"] {
                 let Some(Bank::Array(urls)) = custom.get(name) else {
                     panic!("{name} was not an array bank");
                 };
-                assert!(urls[0].ends_with("/sets/sub/kick.wav"), "{name}: {urls:?}");
+                assert!(urls[0].ends_with(&kick), "{name}: {urls:?}");
             }
             drop(custom);
 

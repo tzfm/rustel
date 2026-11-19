@@ -751,7 +751,11 @@ fn approve_score_url(
     sources
         .try_reserve(1)
         .map_err(|_| "not enough host memory for sample sources".to_owned())?;
-    let address = join_url(base, file);
+    let address = match base.strip_prefix("local:") {
+        // `/kick.wav` in a local map means the granted root's own.
+        Some(_) if file.starts_with('/') => format!("local:{file}"),
+        _ => join_url(base, file),
+    };
     let (url, source_access) = match address.strip_prefix("local:") {
         Some(path) => access.approve_local(path)?,
         None => access.approve_remote(&address)?,
