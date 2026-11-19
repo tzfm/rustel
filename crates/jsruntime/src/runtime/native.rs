@@ -197,8 +197,8 @@ enum Resolved<'t, 'p> {
 
 /// A natively built score, ready to stage.
 pub(super) struct NativeScore {
-    pattern: Pattern,
-    cps: Option<f64>,
+    pub(super) pattern: Pattern,
+    pub(super) cps: Option<f64>,
 }
 
 /// Where the native tier reads what a name means.
@@ -277,7 +277,7 @@ impl JsRuntime {
         match built {
             Ok((score, reuse)) => {
                 if let Some(reuse) = reuse {
-                    self.native_memo.replace(reuse.finish());
+                    self.native_memo.replace(reuse.finish(score.cps));
                 }
                 Some(score)
             }
@@ -287,6 +287,30 @@ impl JsRuntime {
                 None
             }
         }
+    }
+
+    /// Reuse the active native score when `source` is byte-identical to the
+    /// last native build and no script engine has started.
+    pub fn try_reuse_identical_native_score(
+        &self,
+        source: &str,
+    ) -> Option<(Pattern, Option<f64>, rustel_core::settings::RuntimeSettings)> {
+        if !self.native_tier.get() || self.bindings_installed.get() || self.realm.get().is_some() {
+            return None;
+        }
+        let memo = self.native_memo.borrow();
+        if memo.source.as_deref() != Some(source) {
+            return None;
+        }
+        let pattern = self
+            .native_active
+            .borrow()
+            .as_ref()?
+            .clone()
+            .with_runtime_settings(self.core_settings.clone());
+        self.evaluated_natively.set(true);
+        self.native_left.set(None);
+        Some((pattern, memo.cps, self.core_settings.clone()))
     }
 
     /// The score that `program` builds and what the build keeps, or where
@@ -408,8 +432,14 @@ impl JsRuntime {
             })?;
             effects.cps = Some(cps);
         }
-        let offsets = self.timeline_state.take();
-        self.last_good_timeline.borrow_mut().get_or_insert(offsets);
+        if let Some(offsets) = self
+            .timeline_state
+            .get()
+            .map(rustel_core::TimelineState::take)
+            && !offsets.is_empty()
+        {
+            self.last_good_timeline.borrow_mut().get_or_insert(offsets);
+        }
         *self.native_staged.borrow_mut() = Some(score.pattern.mark_walked());
         self.evaluated_natively.set(true);
         Ok(())

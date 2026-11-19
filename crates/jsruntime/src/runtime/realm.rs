@@ -35,7 +35,10 @@ impl Realm {
         // It also keeps a later QuickJS default change from silently turning
         // score text into filesystem or network access. A script that the
         // host has run resolves to an empty module. See `LoadedImports`.
-        let loaded_imports = runtime.loaded_imports.clone();
+        let loaded_imports = runtime
+            .loaded_imports
+            .get_or_init(LoadedImports::default)
+            .clone();
         rt.set_loader(
             RejectModuleResolver(loaded_imports.clone()),
             RejectModuleLoader(loaded_imports.clone()),

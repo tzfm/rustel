@@ -79,6 +79,8 @@ pub(in crate::runtime) struct Memo {
     by_text: Vec<u32>,
     /// The version that the next new or changed name takes.
     next: u64,
+    /// The tempo that the last native build set, if any.
+    pub(in crate::runtime) cps: Option<f64>,
 }
 
 /// How many bytes two texts are compared at a time.
@@ -458,7 +460,7 @@ impl<'p> Reuse<'p> {
 
     /// The memo of this build: the parts it took and the parts it made, and
     /// each name of the program.
-    pub(super) fn finish(mut self) -> Memo {
+    pub(super) fn finish(mut self, cps: Option<f64>) -> Memo {
         let now = mem::take(&mut self.now);
         // Each name that a taken part or statement read is a name of this
         // build, and takes its number in it.
@@ -535,6 +537,7 @@ impl<'p> Reuse<'p> {
             names,
             by_text,
             next: self.next,
+            cps,
         }
     }
 }

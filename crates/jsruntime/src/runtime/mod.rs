@@ -303,10 +303,10 @@ pub struct JsRuntime {
     /// The tempo that `getCps()` returns when the evaluation in progress has
     /// set none. See [`JsRuntime::set_cps`].
     pub(crate) cps: std::rc::Rc<Cell<f64>>,
-    pub(super) loaded_imports: LoadedImports,
+    pub(super) loaded_imports: OnceCell<LoadedImports>,
     /// The names of score imports. See [`JsRuntime::show_imports`].
     pub(super) import_surface: RefCell<ImportSurface>,
-    pub(super) timeline_state: rustel_core::TimelineState,
+    pub(super) timeline_state: OnceCell<rustel_core::TimelineState>,
     /// MIDI inputs this Session's scores have named, and their live values.
     ///
     /// Shared with the host, which attaches the platform listeners; the tables
@@ -323,7 +323,7 @@ pub struct JsRuntime {
     /// reachable: a score that could reset the arena could make one chain's
     /// index name another chain's shader.
     #[cfg(feature = "hydra")]
-    pub(super) hydra_chains: std::rc::Rc<RefCell<crate::install::HydraChains>>,
+    pub(super) hydra_chains: OnceCell<std::rc::Rc<RefCell<crate::install::HydraChains>>>,
     pub(super) effect_transaction: Rc<RefCell<EffectTransaction>>,
     /// Which host effects the current operation permits. Setup may register
     /// and preload samples; score evaluation may also stage tempo. Queries and

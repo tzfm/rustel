@@ -268,8 +268,12 @@ impl JsRuntime {
     /// Puts back the timeline offsets an evaluation took from the last good
     /// score, when it took them.
     pub(super) fn restore_last_good_timeline(&self) {
-        if let Some(offsets) = self.last_good_timeline.borrow_mut().take() {
-            self.timeline_state.restore(offsets);
+        if let Some(offsets) = self.last_good_timeline.borrow_mut().take()
+            && !offsets.is_empty()
+        {
+            self.timeline_state
+                .get_or_init(rustel_core::TimelineState::default)
+                .restore(offsets);
         }
     }
 

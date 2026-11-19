@@ -1436,7 +1436,10 @@ pub(super) fn install<'js>(
         .set(HYDRA_STATE, state)
         .map_err(|error| error.to_string())?;
 
-    let chains = runtime.hydra_chains.clone();
+    let chains = runtime
+        .hydra_chains
+        .get_or_init(|| Rc::new(RefCell::new(crate::install::HydraChains::default())))
+        .clone();
     let transaction = runtime.effect_transaction.clone();
     let policy = runtime.effect_policy.clone();
     let refusal = runtime.effect_policy_refusal.clone();

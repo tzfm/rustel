@@ -170,7 +170,11 @@ impl JsRuntime {
         options.add_return = false;
         options.wrap_async = false;
         options.allow_module_syntax = false;
-        options.loaded_imports = self.loaded_imports.borrow().iter().cloned().collect();
+        options.loaded_imports = self
+            .loaded_imports
+            .get()
+            .map(|loaded| loaded.borrow().iter().cloned().collect())
+            .unwrap_or_default();
         let output = rustel_transpiler::transpile(source, &options);
         if !output.diagnostics.is_empty() {
             return Err(QueryError::Message(
@@ -554,7 +558,11 @@ impl JsRuntime {
         // A bare top-level `return` is only for the async function wrapper.
         options.add_return = false;
         options.allow_module_syntax = false;
-        options.loaded_imports = self.loaded_imports.borrow().iter().cloned().collect();
+        options.loaded_imports = self
+            .loaded_imports
+            .get()
+            .map(|loaded| loaded.borrow().iter().cloned().collect())
+            .unwrap_or_default();
         let output = rustel_transpiler::transpile(source, &options);
         if !output.diagnostics.is_empty() {
             return Err(output
@@ -700,8 +708,14 @@ impl JsRuntime {
                 // Each score starts its timelines again. The score in play
                 // keeps its offsets until this score goes in play: see
                 // `restore_last_good_active`.
-                let offsets = self.timeline_state.take();
-                self.last_good_timeline.borrow_mut().get_or_insert(offsets);
+                if let Some(offsets) = self
+                    .timeline_state
+                    .get()
+                    .map(rustel_core::TimelineState::take)
+                    && !offsets.is_empty()
+                {
+                    self.last_good_timeline.borrow_mut().get_or_insert(offsets);
+                }
                 // setDefaultJoin is score-scoped: reset before user code.
                 rustel_core::compose::set_default_alignment(rustel_core::compose::Alignment::In);
                 // Scores containing `await` (the transpiler awaits bare
@@ -1293,6 +1307,59 @@ impl JsRuntime {
             }
         }
         let _literal_room = LiteralRoom;
+        // Fast path: when no QuickJS realm has started and no recovery seed
+        // overrides settings, a pure native score cannot mutate RuntimeSettings
+        // or run host effects beyond tempo. Evaluate directly without
+        // snapshotting settings or arming QuickJS interrupt/heap guards.
+        let mut tried_native = false;
+        if self.realm.get().is_none()
+            && seed.is_none()
+            && program.is_some()
+            && self.native_tier.get()
+            && !self.bindings_installed.get()
+            && !budget.is_zero()
+            && !cancellation.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            tried_native = true;
+            struct PolicyGuard<'a>(&'a Cell<EffectPolicy>, EffectPolicy);
+            impl Drop for PolicyGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.set(self.1);
+                }
+            }
+            let policy = if allow_score_effects {
+                EffectPolicy::SCORE
+            } else {
+                EffectPolicy::NONE
+            };
+            let _policy_guard =
+                PolicyGuard(&self.effect_policy, self.effect_policy.replace(policy));
+            let native = self.core_settings.with(|| {
+                let _published_owner = self.core_settings.bind();
+                self.native_score(program, Some(source))
+            });
+            if let Some(score) = native {
+                if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled));
+                }
+                self.clear_staged_score();
+                if let Some(offsets) = self
+                    .timeline_state
+                    .get()
+                    .map(rustel_core::TimelineState::take)
+                    && !offsets.is_empty()
+                {
+                    self.last_good_timeline.borrow_mut().get_or_insert(offsets);
+                }
+                self.evaluated_natively.set(true);
+                self.publish_native(score.pattern.mark_walked());
+                let effects = ScoreEffects {
+                    cps: score.cps,
+                    ..ScoreEffects::default()
+                };
+                return Ok((None, effects, self.core_settings.clone()));
+            }
+        }
         let candidate_settings = match seed {
             Some(seed) => self.core_settings.detached_from(seed),
             None => self.core_settings.detached_snapshot(),
@@ -1328,8 +1395,10 @@ impl JsRuntime {
         // back before the NEXT score runs, so removing the visuals from a file
         // also removes their hold on the names.
         #[cfg(feature = "hydra")]
-        if allow_score_effects && self.realm.get().is_some() {
-            let chains = self.hydra_chains.clone();
+        if allow_score_effects
+            && self.realm.get().is_some()
+            && let Some(chains) = self.hydra_chains.get().cloned()
+        {
             with_ctx(self, |ctx| {
                 crate::install::restore_hydra_surface(&ctx, &chains)
             })
@@ -1350,10 +1419,14 @@ impl JsRuntime {
         // A program that a reader of the score took builds first. It runs no
         // script, so it writes nothing on the surface, and a score it builds
         // needs no transpile.
-        let mut native = candidate_settings.with(|| {
-            let _published_owner = self.core_settings.bind();
-            self.native_score(program, Some(source))
-        });
+        let mut native = if tried_native {
+            None
+        } else {
+            candidate_settings.with(|| {
+                let _published_owner = self.core_settings.bind();
+                self.native_score(program, Some(source))
+            })
+        };
         // This is intentionally outside both the deadline and heap boundary:
         // the Rust transpiler neither executes on the QuickJS heap nor has a
         // cancellable/fuelled parser yet. The API's claim stops at synchronous

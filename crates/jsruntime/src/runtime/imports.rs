@@ -13,7 +13,9 @@ const MAX_REPL_CODE_BYTES: usize = 1024 * 1024;
 impl JsRuntime {
     /// Whether this realm has run the script that `specifier` names.
     pub fn import_loaded(&self, specifier: &str) -> bool {
-        self.loaded_imports.borrow().contains(specifier)
+        self.loaded_imports
+            .get()
+            .is_some_and(|loaded| loaded.borrow().contains(specifier))
     }
 
     /// Run a fetched script as setup code. From then on `import(specifier)`
@@ -91,6 +93,7 @@ impl JsRuntime {
             effects
         })?;
         self.loaded_imports
+            .get_or_init(LoadedImports::default)
             .borrow_mut()
             .insert(specifier.to_owned());
         Ok(effects)

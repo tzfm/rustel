@@ -504,6 +504,9 @@ impl RuntimeSettings {
     /// Atomically publish a detached snapshot to every clone of this runtime.
     #[doc(hidden)]
     pub fn replace_with(&self, source: &Self) {
+        if Arc::ptr_eq(&self.inner, &source.inner) {
+            return;
+        }
         let selected = source
             .inner
             .state
