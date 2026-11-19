@@ -693,14 +693,33 @@ mod tests {
             .into_iter()
             .map(|number| (number.range, live_number_range(&number.id)))
             .collect();
+        let rows: Vec<_> = app
+            .knobs_rows
+            .as_ref()
+            .map(|rows| {
+                rows.knobs
+                    .iter()
+                    .map(|knob| {
+                        let state = knob.state.as_ref();
+                        (
+                            knob.label.clone(),
+                            state.map(|state| state.literal.clone()),
+                            state.is_some_and(|state| state.fader.is_some()),
+                            knob.waits,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         format!(
             "plays live {}, visual revision {}, on its way {}, connected {}, \
-             installed is the text {}, live {live:?}",
+             installed is the text {}, plays but live moves {}, live {live:?}, rows {rows:?}",
             app.plays_live(scene),
             app.visual_revision.is_some(),
             app.reinstall_on_its_way(),
             app.engine_connected,
             app.evaluated_source.as_deref() == Some(&*app.editor().source()),
+            app.plays_but_live_moves(&app.editor().source()),
         )
     }
 
