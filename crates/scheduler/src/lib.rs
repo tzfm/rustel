@@ -1171,6 +1171,38 @@ impl Scheduler {
         self.tempo.time_at_cycle(cycle)
     }
 
+    /// Clock seconds of `end`, counting from cycle zero with each tempo
+    /// change a pattern makes before it. The map knows only the changes a
+    /// fill has met, so a bounce of whole cycles asks here before it starts.
+    /// `query` answers one cycle's haps of that pattern, or `None` when the
+    /// query throws or is refused; the tempo then stays as it is from there.
+    pub fn time_at_cycle_ahead(
+        &self,
+        end: Fraction,
+        mut query: impl FnMut(&State) -> Option<Vec<Hap>>,
+    ) -> f64 {
+        let mut tempo = self.tempo.clone();
+        let mut begin = Fraction::ZERO;
+        while self.pattern_tempo && begin < end {
+            let next = begin.add(Fraction::ONE).min(end);
+            let mut state = State::new(TimeSpan::new(begin, next));
+            state
+                .controls
+                .push(("_cps".into(), Value::F64(tempo.cps_at_cycle(begin))));
+            let Some(mut haps) = query(&state) else {
+                break;
+            };
+            sort_for_tempo(&mut haps);
+            for hap in haps.iter().filter(|hap| hap.has_onset()) {
+                if let (Some(whole), Some(cps)) = (hap.whole, hap_tempo(&hap.value)) {
+                    tempo.change_at(whole.begin, cps);
+                }
+            }
+            begin = next;
+        }
+        tempo.time_at_cycle(end)
+    }
+
     /// Inverse of [`Self::time_at_cycle`], as an f64 cycle position.
     pub fn cycle_at_time(&self, time: f64) -> f64 {
         self.tempo.cycle_at_time(time)

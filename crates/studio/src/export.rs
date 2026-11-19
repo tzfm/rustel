@@ -970,7 +970,9 @@ fn render(
         }
     }
     let duration = match settings.length {
-        Length::Cycles(cycles) => cycles / session.config().cps,
+        // A tempo lane can change the tempo on the way, so the cycles last
+        // as long as the score makes them.
+        Length::Cycles(cycles) => session.seconds_for_cycles(cycles),
         Length::UntilSilence {
             floor_db,
             hold_secs,
@@ -2213,6 +2215,30 @@ mod tests {
                 .any(|sample| sample.abs() > 0.05),
             "unused orchestra history must not block other instruments"
         );
+    }
+
+    /// A tempo lane sets how long a bounce of cycles lasts: one cycle at
+    /// 1 cps and one at 2 cps take 1.5 s, not the 4 s two cycles take at
+    /// the session tempo.
+    #[test]
+    fn a_bounce_of_cycles_follows_a_tempo_lane() {
+        let dir = std::env::temp_dir().join(format!("rustel-export-tempo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let job = ExportJob::start(
+            "lane".into(),
+            plain_score("$: cps(\"<1 2>\").gain(0)\n$: note(\"c3 e3\").s(\"sine\")"),
+            ExportSettings {
+                length: Length::Cycles(2.0),
+                format: ExportFormat::Wav,
+                ..ExportSettings::default()
+            },
+            SessionConfig::default(),
+            dir.join("lane.wav"),
+        )
+        .unwrap();
+        let seconds = await_outcome(&job, std::time::Duration::from_secs(120)).expect("rendered");
+        assert!((seconds - 1.5).abs() < 0.05, "{seconds}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

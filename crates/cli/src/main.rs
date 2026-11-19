@@ -2776,7 +2776,12 @@ fn run_command(
                 );
             }
             let score_cps = session.config().cps;
-            let (duration, whole_cycles) = length.on_a_cycle(score_cps);
+            let (duration, whole_cycles) = match length {
+                // A tempo lane can change the tempo on the way, so N cycles
+                // last as long as the pattern makes them.
+                RenderLength::Cycles(cycles) => (session.seconds_for_cycles(cycles), true),
+                RenderLength::Seconds(_) => length.on_a_cycle(score_cps),
+            };
             let duration = parse_positive_seconds("duration", duration)?;
             if until_silence {
                 if !silence_floor.is_finite() || silence_floor > 0.0 {
@@ -2821,6 +2826,13 @@ fn run_command(
                     );
                 } else {
                     let seconds = report.duration_secs;
+                    // A bounce of whole cycles that ran its asked length says
+                    // that count: a tempo lane can make the seconds of a
+                    // cycle differ from the session tempo.
+                    let cycles = match length {
+                        RenderLength::Cycles(cycles) if (seconds - duration).abs() < 1e-6 => cycles,
+                        _ => seconds * score_cps,
+                    };
                     let format_text = match format {
                         RenderCliFormat::ScalarWav => "16-bit stereo WAV",
                         RenderCliFormat::ScalarF32 => "32-bit float stereo WAV",
@@ -2834,7 +2846,7 @@ fn run_command(
                         style::green(on, "wrote"),
                         style::bold(on, &report.path),
                         seconds,
-                        format_cycles(seconds * score_cps),
+                        format_cycles(cycles),
                         if whole_cycles { "" } else { " (as asked)" },
                         format_text,
                         report.sample_rate,

@@ -5234,6 +5234,39 @@ fn trace_accepts_export_duration_spellings_without_rounding_seconds() {
     assert_eq!(report["duration_secs"], 2.0);
 }
 
+/// A bounce of whole cycles lasts as long as a tempo lane makes them, and
+/// says the cycle count it was asked for.
+#[test]
+fn export_cycles_follow_a_tempo_lane() {
+    for (score, expected_seconds) in [
+        (
+            "$: cps(\"<1 2>\").gain(0)\n$: note(\"c4*4\").s(\"sine\")",
+            3.0,
+        ),
+        // A score with a callback queries its tempo in a host scope.
+        (
+            "$: cps(\"<1 2>\").gain(0)\n$: note(\"c4*4\").s(\"sine\").every(2, x => x.fast(2))",
+            3.0,
+        ),
+        ("cps(1)\n$: note(\"c4*4\").s(\"sine\")", 4.0),
+        ("$: note(\"c4*4\").s(\"sine\")", 8.0),
+    ] {
+        let path = scratch("tempo-lane.json");
+        let report = ok_stdout(&[
+            "export",
+            "--json",
+            "-e",
+            score,
+            "--cycles",
+            "4",
+            "-o",
+            path.to_str().expect("utf-8 path"),
+        ]);
+        let report: serde_json::Value = serde_json::from_str(&report).expect("export report");
+        assert_eq!(report["duration_secs"], expected_seconds, "{score}");
+    }
+}
+
 #[test]
 fn trace_duration_limits_keep_the_resource_error_contract() {
     for length in ["1e12", "1e12s", "1e12m", "1e12b"] {
