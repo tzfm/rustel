@@ -2870,11 +2870,17 @@ mod tests {
                 .expect("root map");
             std::fs::write(root.join("escape.json"), r#"{"out": "../outside.wav"}"#)
                 .expect("escaping map");
+            std::fs::write(root.join("sets/self.json"), r#"{"self": "."}"#).expect("folder map");
+            std::fs::write(
+                root.join("sets/host.json"),
+                r#"{"host": "//x/sub/kick.wav"}"#,
+            )
+            .expect("host map");
 
             let mut access = ScoreSampleAccess::denied();
             access.permit_local_root(&root).expect("local root");
             let library = empty_library();
-            for source in [r#""local:sets/sub/q.json""#, r#""local:q2.json""#] {
+            for source in [r#""local:sets/sub/q.json/""#, r#""local:q2.json""#] {
                 library
                     .register_score_custom(source, None, &access)
                     .expect(source);
@@ -2898,6 +2904,8 @@ mod tests {
 
             for source in [
                 r#""local:escape.json""#,
+                r#""local:sets/self.json""#,
+                r#""local:sets/host.json""#,
                 r#""local:sets/../q2.json""#,
                 r#""local:/q2.json""#,
                 // Only a map read from the root reads files in it.

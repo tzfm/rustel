@@ -45,11 +45,16 @@ impl ScoreSampleAccess {
             Some(from_root) => ("", from_root),
             None => (folder, file),
         };
-        let relative: PathBuf = folder
-            .split(LOCAL_PATH_SEPARATORS)
-            .chain(file.split(LOCAL_PATH_SEPARATORS))
-            .filter(|part| !part.is_empty() && *part != ".")
-            .collect();
+        // `//host/kick.wav`, and `\\kick.wav` on Windows, name no file here.
+        if file.starts_with(LOCAL_PATH_SEPARATORS) {
+            return Err(refused());
+        }
+        let mut named = local_path_parts(file).peekable();
+        // `""` and `"."` name the map's own folder, not a sample.
+        if named.peek().is_none() {
+            return Err(refused());
+        }
+        let relative: PathBuf = local_path_parts(folder).chain(named).collect();
         if !crate::sample_server::relative_sample_path_allowed(&relative) {
             return Err(refused());
         }
@@ -751,6 +756,22 @@ fn repair_vcsl_relative<'a>(base: &str, entry: &'a str) -> std::borrow::Cow<'a, 
 /// The separators a `local:` path is split on. Windows also takes `\\`.
 pub(super) const LOCAL_PATH_SEPARATORS: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
 
+/// The named parts of a `local:` path, without empty and `.` parts, so
+/// `kits//808/./q.json/` is `kits`, `808`, `q.json`.
+pub(super) fn local_path_parts(path: &str) -> impl Iterator<Item = &str> {
+    path.split(LOCAL_PATH_SEPARATORS)
+        .filter(|part| !part.is_empty() && *part != ".")
+}
+
+/// Whether a map entry is a whole web address. Schemes ignore case.
+fn is_web_address(entry: &str) -> bool {
+    ["http://", "https://"].iter().any(|scheme| {
+        entry
+            .get(..scheme.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
+    })
+}
+
 /// What the relative entries of a map hang off.
 #[derive(Clone, Copy)]
 pub(super) enum EntryBase<'a> {
@@ -776,9 +797,8 @@ fn approve_score_url(
     sources
         .try_reserve(1)
         .map_err(|_| "not enough host memory for sample sources".to_owned())?;
-    let is_web = file.starts_with("http://") || file.starts_with("https://");
     let (url, source_access) = match base {
-        EntryBase::Local(folder) if !is_web => access.approve_local(folder, file)?,
+        EntryBase::Local(folder) if !is_web_address(file) => access.approve_local(folder, file)?,
         EntryBase::Local(_) => access.approve_remote(file)?,
         EntryBase::Web(base) => access.approve_remote(&join_url(base, file))?,
     };

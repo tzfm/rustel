@@ -83,12 +83,12 @@ impl ManifestContext {
                         let rest = rest.trim();
                         // A file under the root is a sample map, as a URL is.
                         // Its entries hang off its own folder.
-                        if let Some(map) = read_score_local_map(rest, access)? {
+                        if let Some((map, folder)) = read_score_local_map(rest, access)? {
                             budget.check()?;
                             return self.register_score_custom_value(
                                 &map,
                                 base,
-                                Some(EntryBase::Local(local_map_folder(rest))),
+                                Some(EntryBase::Local(&folder)),
                                 access,
                                 depth + 1,
                                 budget,
@@ -1217,23 +1217,28 @@ fn parse_sample_map(url: &str, bytes: &[u8]) -> Result<serde_json::Value, String
     })
 }
 
-/// The map in the file `local:<path>` names, or `None` when that path is not
-/// a file under the root. A folder, a refused path, or no root at all is the
-/// folder reader's to answer, with its own errors. The open is the confined
-/// one, so a link out of the root reads as no file here.
+/// The map in the file `local:<path>` names, with the folder its entries
+/// hang off, or `None` when that path is not a file under the root. A
+/// folder, a refused path, or no root at all is the folder reader's to
+/// answer, with its own errors. The open is the confined one, so a link out
+/// of the root reads as no file here.
 fn read_score_local_map(
     path: &str,
     access: &ScoreSampleAccess,
-) -> Result<Option<serde_json::Value>, String> {
+) -> Result<Option<(serde_json::Value, String)>, String> {
     let Some(root) = access.local_root.as_ref() else {
         return Ok(None);
     };
-    let relative = Path::new(path);
-    let relative = relative.strip_prefix(".").unwrap_or(relative);
-    if !crate::sample_server::relative_sample_path_allowed(relative) {
+    // An absolute path is refused by the folder reader.
+    if path.starts_with(LOCAL_PATH_SEPARATORS) {
         return Ok(None);
     }
-    let Ok((file, length)) = root.open_score_file(&root.path().join(relative)) else {
+    let parts: Vec<&str> = local_path_parts(path).collect();
+    let relative: PathBuf = parts.iter().collect();
+    if !crate::sample_server::relative_sample_path_allowed(&relative) {
+        return Ok(None);
+    }
+    let Ok((file, length)) = root.open_score_file(&root.path().join(&relative)) else {
         return Ok(None);
     };
     if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
@@ -1256,14 +1261,10 @@ fn read_score_local_map(
     if bytes.len() > MAX_SCORE_SAMPLE_MAP_BYTES {
         return Err(too_large());
     }
-    parse_sample_map(&written, &bytes).map(Some)
-}
-
-/// The folder a `local:` map's entries hang off: `kits/q.json` gives `kits`,
-/// and `q.json` gives the root.
-fn local_map_folder(path: &str) -> &str {
-    path.rsplit_once(LOCAL_PATH_SEPARATORS)
-        .map_or("", |(folder, _)| folder)
+    let map = parse_sample_map(&written, &bytes)?;
+    // The checks above leave at least one part: the file's own name.
+    let folder = parts[..parts.len() - 1].join("/");
+    Ok(Some((map, folder)))
 }
 
 pub(super) fn parse_bank(entry: &serde_json::Value, base: &str) -> Option<Bank> {
