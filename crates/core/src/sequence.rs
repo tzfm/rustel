@@ -2257,6 +2257,27 @@ pub(crate) fn constant_value(layers: &[Layer]) -> Option<Cow<'_, Value>> {
     }
 }
 
+/// The steps in a cycle of `layers` and their value, when the layers are
+/// one data value that fills each of `steps` equal steps and holds nothing
+/// more, as the pulse of a `segment` is. Nothing is made for a layer that
+/// is not one, so that asking costs no memory.
+pub(crate) fn pulse(layers: &[Layer]) -> Option<(i128, &Value)> {
+    let [layer] = layers else {
+        return None;
+    };
+    if layer.period.numer() != 1 || !layer.dress().is_bare() {
+        return None;
+    }
+    let first = TimeSpan::new(Fraction::ZERO, layer.period);
+    let (whole, cut, value) = layer.one_step()?;
+    if whole != first || cut || !layer.locations_of(0).is_empty() {
+        return None;
+    }
+    // A bare dress gives each value as the step holds it.
+    let value = layer.values.get(value as usize)?;
+    value.is_data(0).then_some((layer.period.denom(), value))
+}
+
 #[cfg(test)]
 thread_local! {
     /// Set by a test to build each node that a fold stands for.

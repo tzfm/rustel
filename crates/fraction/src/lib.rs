@@ -442,12 +442,10 @@ impl Fraction {
     #[inline]
     pub fn from_ticks(ticks: i128, ticks_per_cycle: NonZeroU32) -> Self {
         let d = ticks_per_cycle.get();
-        if d.is_power_of_two() {
-            let shift = ticks.trailing_zeros().min(d.trailing_zeros());
-            return Self {
-                n: ticks >> shift,
-                d: den(i128::from(d >> shift)),
-            };
+        if d.is_power_of_two()
+            && let Some(time) = Self::dyadic(ticks, d.trailing_zeros())
+        {
+            return time;
         }
         // Terms of 32 bits reduce with a gcd of 32 bits.
         if let Ok(magnitude) = u32::try_from(ticks.unsigned_abs()) {
@@ -468,6 +466,27 @@ impl Fraction {
             return reduced_small(ticks, i64::from(d));
         }
         Self::new(ticks, i128::from(d))
+    }
+
+    /// `n / 2^shift`, reduced by a shift of the trailing zeros of `n` with
+    /// no gcd. `None` for a `shift` above 126, whose denominator has no room.
+    #[inline]
+    pub fn dyadic(n: i128, shift: u32) -> Option<Self> {
+        if shift > 126 {
+            return None;
+        }
+        if n == 0 {
+            return Some(Self::ZERO);
+        }
+        // The one numerator whose magnitude has no room as it is.
+        if n == i128::MIN {
+            return Self::checked_new(n, 1i128 << shift);
+        }
+        let drop = n.trailing_zeros().min(shift);
+        Some(Fraction {
+            n: n >> drop,
+            d: den(1i128 << (shift - drop)),
+        })
     }
 
     #[inline]
@@ -1888,6 +1907,30 @@ mod native_fast_path_tests {
                 "{n}/{d}"
             );
         }
+    }
+
+    #[test]
+    fn a_dyadic_fraction_is_the_reduced_one() {
+        for shift in 0..=126u32 {
+            for n in [
+                -96i128,
+                -7,
+                -1,
+                0,
+                1,
+                2,
+                3,
+                8,
+                64,
+                1 << 40,
+                i128::MAX,
+                i128::MIN + 1,
+            ] {
+                let expected = Fraction::checked_new(n, 1i128 << shift);
+                assert_eq!(Fraction::dyadic(n, shift), expected, "{n} over 2^{shift}");
+            }
+        }
+        assert_eq!(Fraction::dyadic(1, 127), None);
     }
 
     #[test]

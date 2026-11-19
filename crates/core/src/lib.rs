@@ -40,6 +40,7 @@ pub mod value;
 pub mod voicings;
 pub mod xen;
 
+mod fused;
 mod sequence;
 mod table;
 
@@ -6129,6 +6130,10 @@ struct Meetings<'a> {
     answering: Option<Answering<'a>>,
     /// The haps the value side answers for one function hap.
     values: Vec<Hap>,
+    /// The side as the control of a segment of a wave, when it is one.
+    steps: Option<fused::StepWave>,
+    /// The numbers of the steps of a wave for one function hap.
+    numbers: Vec<(TimeSpan, f64)>,
 }
 
 impl<'a> Meetings<'a> {
@@ -6169,7 +6174,9 @@ impl<'a> Meetings<'a> {
         part: TimeSpan,
         state: &State,
     ) -> (&[Hap], Option<&'a table::Named>) {
-        let Self { answering, values } = self;
+        let Self {
+            answering, values, ..
+        } = self;
         let graph = |values: &mut Vec<Hap>| {
             *values = side
                 .values
@@ -6408,6 +6415,44 @@ impl<'a> ValueSide<'a> {
         true
     }
 
+    /// The haps of the function hap `hf` that a wave in steps makes, one
+    /// for each step that its part meets, with the number of the step set
+    /// under `key`. Whether the query goes on, or `None` for a meeting that
+    /// the haps of the steps make, with `out` as it was.
+    #[allow(clippy::too_many_arguments)]
+    fn meet_steps(
+        &self,
+        hf: &Hap,
+        steps: &fused::StepWave,
+        numbers: &mut Vec<(TimeSpan, f64)>,
+        state: &State,
+        from: usize,
+        out: &mut Vec<Hap>,
+    ) -> Option<bool> {
+        numbers.clear();
+        steps.steps_over(hf.part, &state.controls, numbers)?;
+        if query_stop_requested() {
+            return Some(false);
+        }
+        let start = out.len();
+        out.reserve(numbers.len());
+        for (piece, number) in numbers.iter() {
+            let mut hap = hf.clone();
+            // A hap that takes no number in place takes none in any step.
+            if !Meeting::set_number_in_place(
+                &mut hap, &steps.key, *number, *piece, self.apply, self.flow,
+            ) {
+                out.truncate(start);
+                return None;
+            }
+            if query_stop_requested() || !push_budgeted_from(out, from, hap) {
+                return Some(false);
+            }
+        }
+        fused::note(fused::Hit::StepMany);
+        Some(true)
+    }
+
     /// Meet the function hap `hf` with the value side and push what they
     /// make after the haps of `out`, which held `from` haps of other nodes
     /// before this application wrote. `false` when the query stops.
@@ -6420,6 +6465,28 @@ impl<'a> ValueSide<'a> {
         out: &mut Vec<Hap>,
     ) -> bool {
         let met = hf.whole_or_part();
+        // The control of a segment of a wave takes the number of each step
+        // that the part meets. A hap that it cannot set is met as any other.
+        if let Some(steps) = meetings.steps.as_ref() {
+            let part = hf.part;
+            match steps.number(part, &state.controls) {
+                Some(number) => {
+                    if Meeting::set_number_in_place(
+                        &mut hf, &steps.key, number, part, self.apply, self.flow,
+                    ) {
+                        fused::note(fused::Hit::StepOne);
+                        return !query_stop_requested() && push_budgeted_from(out, from, hf);
+                    }
+                }
+                None => {
+                    if let Some(stopped) =
+                        self.meet_steps(&hf, steps, &mut meetings.numbers, state, from, out)
+                    {
+                        return stopped;
+                    }
+                }
+            }
+        }
         // A gate says whether the hap stays as it is, with no hap of its
         // own. A hap with a lookup keeps it only while its value equals
         // itself, which the meeting reads.
@@ -8000,11 +8067,18 @@ impl Pattern {
                 let side = ValueSide::of(node).expect("an application");
                 with_list(|functions| {
                     side.functions.query_onto(state, functions);
-                    if side.met_in_one_query(functions, state, out) {
+                    // The control of a segment of a wave takes each number
+                    // where the function hap is.
+                    let steps = fused::StepWave::of(side.values, side.apply, side.flow)
+                        .filter(|_| functions.iter().all(fused::StepWave::takes));
+                    if steps.is_none() && side.met_in_one_query(functions, state, out) {
                         return;
                     }
                     let from = out.len();
-                    let mut meetings = Meetings::default();
+                    let mut meetings = Meetings {
+                        steps,
+                        ..Meetings::default()
+                    };
                     out.reserve(functions.len());
                     for hf in functions.drain(..) {
                         if !side.meet(hf, &mut meetings, state, from, out) {
@@ -8014,6 +8088,11 @@ impl Pattern {
                     }
                 });
             }
+
+            // A signal under steps of its own, read in equal steps of a
+            // cycle as `segment` gives, answers in one walk of the steps.
+            Node::AppRight(pair, apply, flow)
+                if fused::app_right_onto(pair, apply, *flow, state, out) => {}
 
             Node::Pick {
                 selector,
@@ -8491,16 +8570,29 @@ impl Pattern {
             Node::AppRight(pair, apply, lookup_flow) => {
                 let PatternPair(pat_func, pat_val) = &**pair;
                 let values = pat_val.query(state);
+                if values.is_empty() {
+                    return values;
+                }
                 if let Some(met) = pat_func.met_in_one_query(&values, apply, *lookup_flow, state) {
                     return met;
                 }
-                let mut out = Vec::new();
+                // A signal under steps of its own answers each value hap
+                // with no query of its graph.
+                let mut sampler = table::signal_of(pat_func).map(|signal| (signal, state.clone()));
+                let mut funcs = Vec::new();
+                let mut out = Vec::with_capacity(values.len());
                 for hv in values {
                     let asked = pat_func.asked_for(hv.whole_or_part(), hv.part);
-                    let funcs = pat_func.query(&state.set_span(asked));
-                    for hf in funcs {
+                    let sampled = sampler.as_mut().is_some_and(|(signal, probe)| {
+                        signal.answer(asked, hv.part, probe, &mut funcs).is_some()
+                    });
+                    if !sampled {
+                        funcs.clear();
+                        pat_func.query_onto(&state.set_span(asked), &mut funcs);
+                    }
+                    for hf in &funcs {
                         if let Some(part) = hf.part.intersection(&hv.part) {
-                            let hap = applied_hap(&hf, &hv, hv.whole, part, apply, *lookup_flow);
+                            let hap = applied_hap(hf, &hv, hv.whole, part, apply, *lookup_flow);
                             if query_stop_requested() {
                                 return Vec::new();
                             }
@@ -14022,6 +14114,283 @@ mod value_signal_tests {
 
     fn third(n: i128) -> Fraction {
         Fraction::new(n, 3)
+    }
+
+    /// The `segment` of a signal answers as the graph of the segment does,
+    /// read where it is or under steps of its own, for spans that cut its
+    /// pulses and for a rate that is not whole.
+    #[test]
+    fn a_segmented_signal_walk_answers_as_its_graph() {
+        for (name, signal) in signals() {
+            for rate in [whole(8), third(8)] {
+                let read = combinators::segment(&signal, rate).mark_walked();
+                let graph = combinators::segment(&signal.mark_volatile(), rate);
+                for (begin, end) in spans() {
+                    assert_eq!(
+                        answers(&read, begin, end),
+                        answers(&graph, begin, end),
+                        "{name} at rate {rate} over {begin}..{end}"
+                    );
+                }
+            }
+        }
+        // A pulse of more cycles than a query may ask refuses as the graph
+        // refuses, also under a constant that meets each of its cycles.
+        let ranged = range(&sine(), 200.0, 2000.0);
+        let slow = Fraction::new(1, MAX_QUERY_SPAN_CYCLES + 5);
+        let read = combinators::segment(&ranged, slow).mark_walked();
+        let graph = combinators::segment(&ranged.mark_volatile(), slow);
+        let span = (whole(0), whole(1));
+        assert_eq!(
+            format!("{:?}", read.try_query_arc_sorted(span.0, span.1)),
+            format!("{:?}", graph.try_query_arc_sorted(span.0, span.1)),
+        );
+    }
+
+    /// The one walk of the steps of a `segment` answers what the walk of
+    /// its graph answers, for each wave under each map, counts that are
+    /// powers of two and counts that are not, and spans that are negative,
+    /// of no width, between two steps, and in one step or many.
+    #[test]
+    fn a_fused_segment_walk_answers_as_the_graph_walk() {
+        use crate::combinators::rangex;
+        type Map = Box<dyn Fn(&Pattern) -> Pattern>;
+        let maps: Vec<(&str, Map)> = vec![
+            ("bare", Box::new(|signal| signal.clone())),
+            ("range", Box::new(|signal| range(signal, 200.0, 2000.0))),
+            ("rangex", Box::new(|signal| rangex(signal, 200.0, 2000.0))),
+            ("arithmetic", Box::new(arithmetic)),
+            ("fast", Box::new(|signal| signal.fast(whole(3)))),
+            (
+                "slow",
+                Box::new(|signal| range(signal, 0.0, 4.0).slow(third(5))),
+            ),
+            ("late", Box::new(|signal| signal.late(third(1)))),
+        ];
+        let spans: Vec<(Fraction, Fraction)> = {
+            let sixteenth = |n: i128| Fraction::new(n, 16);
+            vec![
+                (whole(0), whole(1)),
+                (whole(0), whole(3)),
+                (whole(-2), whole(1)),
+                (third(-4), third(-1)),
+                (third(-5), third(5)),
+                (third(1), third(5)),
+                (third(7), third(8)),
+                (third(2), third(2)),
+                (whole(0), whole(0)),
+                (whole(-1), whole(-1)),
+                (sixteenth(3), sixteenth(3)),
+                (sixteenth(2), sixteenth(2)),
+                (sixteenth(5), sixteenth(6)),
+                (sixteenth(1), sixteenth(9)),
+                (Fraction::new(1, 1000), Fraction::new(3, 1000)),
+                (whole(7), Fraction::new(15, 2)),
+            ]
+        };
+        use std::ops::AddAssign;
+        let mut ran = std::collections::BTreeMap::new();
+        for (wave, signal) in crate::signal::signals() {
+            for (map, apply) in &maps {
+                let signal = apply(&signal);
+                for count in [1, 2, 3, 5, 8, 12, 48, 64, 100] {
+                    let rate = whole(count);
+                    let read = combinators::segment(&signal, rate).mark_walked();
+                    let graph = combinators::segment(&signal.mark_volatile(), rate);
+                    for (begin, end) in &spans {
+                        let (walked, none) =
+                            fused::counting(|| fused::unfused(|| answers(&graph, *begin, *end)));
+                        let (fused, hits) = fused::counting(|| answers(&read, *begin, *end));
+                        let case = format!("{wave} {map} in {count} steps over {begin}..{end}");
+                        assert_eq!(fused, walked, "{case}");
+                        assert_eq!(none, fused::Hits::default(), "{case}: the graph ran fused");
+                        ran.entry(wave).or_insert(0).add_assign(hits.segment);
+                    }
+                }
+            }
+        }
+        // The triangle waves are built from a pattern of two ramps, and no
+        // signal: the graph answers them.
+        let never: Vec<_> = ran
+            .iter()
+            .filter(|(wave, hits)| **hits == 0 && !wave.contains("tri"))
+            .collect();
+        assert!(
+            never.is_empty(),
+            "the walk of the steps never ran for {never:?}"
+        );
+    }
+
+    /// A segment pattern, made again for each case. A control of a segment
+    /// that is to be read as a wave is made again until it is: the name of a
+    /// control comes from a pool that another test can leave out of reach.
+    fn built(make: &dyn Fn() -> Pattern, as_steps: bool) -> Pattern {
+        let sets = Combine::Composed(ComposeOp::Set);
+        for _ in 0..200 {
+            let pattern = make();
+            if !as_steps || fused::StepWave::of(&pattern, &sets, LookupFlow::Set).is_some() {
+                return pattern;
+            }
+            std::thread::yield_now();
+        }
+        panic!("a control of a segment is not read as a control of a wave");
+    }
+
+    /// A segment on the value side of a meeting answers as a query of it
+    /// for each hap of the other side does: the haps of the steps that the
+    /// function hap meets, cut to it, under each control and map.
+    #[test]
+    fn a_segmented_value_side_answers_as_a_query_of_it_for_each_hap() {
+        type Make = Box<dyn Fn() -> Pattern>;
+        let rand = crate::signal::rand;
+        let segments: Vec<(&str, bool, Make)> = vec![
+            (
+                "a segment",
+                false,
+                Box::new(|| combinators::segment(&sine(), whole(8))),
+            ),
+            (
+                "a ranged segment",
+                false,
+                Box::new(|| range(&combinators::segment(&saw(), whole(5)), 200.0, 2000.0)),
+            ),
+            (
+                "a segment of a ranged signal",
+                false,
+                Box::new(|| {
+                    combinators::segment(&range(&sine(), 0.0, 4.0).slow(third(4)), whole(64))
+                }),
+            ),
+            (
+                "a segment of a random signal",
+                false,
+                Box::new(move || combinators::segment(&rand(), whole(8))),
+            ),
+            (
+                "a slow segment",
+                false,
+                Box::new(|| combinators::segment(&saw(), whole(3)).slow(whole(2))),
+            ),
+            (
+                "a named segment",
+                true,
+                Box::new(|| named("cutoff", combinators::segment(&sine(), whole(16)))),
+            ),
+            (
+                "a named ranged segment",
+                true,
+                Box::new(move || {
+                    named(
+                        "gain",
+                        range(&combinators::segment(&rand(), whole(8)), 0.2, 0.9),
+                    )
+                }),
+            ),
+        ];
+        let mut total = fused::Hits::default();
+        for op in [ComposeOp::Set, ComposeOp::Add, ComposeOp::Mul] {
+            for (begin, end) in spans() {
+                for ((structure_name, structure), (name, as_steps, make)) in structures()
+                    .into_iter()
+                    .flat_map(|structure| segments.iter().map(move |s| (structure.clone(), s)))
+                {
+                    let signal = built(make, *as_steps && op == ComposeOp::Set);
+                    let read = compose(&structure, &signal, op, Alignment::In);
+                    let queried =
+                        compose(&structure, &stack(vec![signal.clone()]), op, Alignment::In);
+                    let (graph, none) =
+                        fused::counting(|| fused::unfused(|| answers(&queried, begin, end)));
+                    let case =
+                        format!("{op:?} of {name} on {structure_name} over {begin:?}..{end:?}");
+                    assert_eq!(none, fused::Hits::default(), "{case}: the graph ran fused");
+                    for read in [read.mark_walked(), read] {
+                        let (fused, hits) = fused::counting(|| answers(&read, begin, end));
+                        assert_eq!(fused, graph, "{case}");
+                        total.segment += hits.segment;
+                        total.step_one += hits.step_one;
+                        total.step_many += hits.step_many;
+                    }
+                }
+            }
+        }
+        // The walks ran: each kind of answer was made in some case.
+        assert!(total.segment > 0, "{total:?}");
+        assert!(total.step_one > 0, "{total:?}");
+        assert!(total.step_many > 0, "{total:?}");
+    }
+
+    /// A segment charges the hap budget one hap at a time, as the graph
+    /// does, also for a signal that makes several haps for a step.
+    #[test]
+    fn a_segment_refuses_the_hap_budget_as_the_graph_does() {
+        let many = range(&sine(), 0.0, 1.0).fast(whole(256));
+        let read = combinators::segment(&many, whole(64)).mark_walked();
+        let graph = combinators::segment(&many.mark_volatile(), whole(64));
+        let ask = |pattern: &Pattern, budget: u64| {
+            format!(
+                "{:?}",
+                pattern.try_query_arc_sorted_with_budget(whole(0), whole(1), budget)
+            )
+        };
+        for budget in [0, 1, 10, 63, 64, 100, 255, 256, 257, 10_000] {
+            let (walked, none) = fused::counting(|| fused::unfused(|| ask(&graph, budget)));
+            let (fused, hits) = fused::counting(|| ask(&read, budget));
+            assert_eq!(fused, walked, "a budget of {budget}");
+            assert_eq!(none, fused::Hits::default());
+            // A budget under the steps is the graph's, and one over them is
+            // the walk's.
+            assert_eq!(hits.segment > 0, budget >= 64, "a budget of {budget}");
+        }
+    }
+
+    /// The walk of the steps stops at the hap that passes the budget, and
+    /// leaves no hap, as the graph path of the application does. The walk
+    /// is asked as it is, with no query around it that would charge the
+    /// haps it holds.
+    #[test]
+    fn a_segment_walk_charges_each_hap_of_a_step_to_the_budget() {
+        let many = range(&sine(), 0.0, 1.0).fast(whole(256));
+        let segment = combinators::segment(&many, whole(64));
+        let Node::FilterValues(structured, _) = segment.node_kind() else {
+            panic!("a segment is a filter of an application");
+        };
+        let Node::AppRight(pair, apply, flow) = structured.node_kind() else {
+            panic!("a segment is an application");
+        };
+        let state = State::new(TimeSpan::new(whole(0), whole(1)));
+        for (budget, refused) in [(100, true), (255, true), (256, false), (1000, false)] {
+            let mut out = Vec::new();
+            let (_, refusal) = with_hap_budget(budget, || {
+                fused::app_right_onto(pair, apply, *flow, &state, &mut out)
+            });
+            assert_eq!(refusal.is_some(), refused, "a budget of {budget}");
+            assert_eq!(
+                out.len(),
+                if refused { 0 } else { 256 },
+                "a budget of {budget}"
+            );
+        }
+    }
+
+    /// A segment stops at a requested stop as the graph does, for a span
+    /// that holds no multiple of sixteen steps.
+    #[test]
+    fn a_segment_stops_as_the_graph_does() {
+        let read = combinators::segment(&range(&sine(), 200.0, 2000.0), whole(16)).mark_walked();
+        let graph = combinators::segment(&range(&sine(), 200.0, 2000.0).mark_volatile(), whole(16));
+        let stopped = std::sync::atomic::AtomicBool::new(true);
+        for (begin, end) in [
+            (Fraction::new(1, 16), whole(1)),
+            (Fraction::new(-15, 16), whole(0)),
+        ] {
+            let ask = |pattern: &Pattern| {
+                with_cancellation(&stopped, || {
+                    format!("{:?}", pattern.try_query_arc_sorted(begin, end))
+                })
+            };
+            let walked = fused::unfused(|| ask(&graph));
+            assert_eq!(ask(&read), walked, "over {begin}..{end}");
+        }
     }
 
     fn signals() -> Vec<(&'static str, Pattern)> {

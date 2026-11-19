@@ -22,6 +22,8 @@ later version.
 //! takes a table's own arithmetic outside the native range, goes back to the
 //! graph, so every refusal stays the graph's. See [`Work`].
 
+pub(crate) use crate::fused::Wave;
+pub(crate) use crate::fused::wave_name;
 use crate::settings::SettingsStateId;
 use crate::{
     Combine, Hap, HapExpandFn, HapMapFn, JoinMode, LookupFlow, Meeting, Node, OwnedHapMapFn,
@@ -48,10 +50,10 @@ thread_local! {
 }
 
 /// One buffer from [`HAP_BUFFERS`], returned when it drops.
-struct HapBuffer(Vec<Hap>);
+pub(super) struct HapBuffer(Vec<Hap>);
 
 impl HapBuffer {
-    fn take() -> Self {
+    pub(super) fn take() -> Self {
         let pooled = HAP_BUFFERS.with(|pool| pool.borrow_mut().pop());
         Self(pooled.unwrap_or_default())
     }
@@ -561,7 +563,7 @@ enum Side {
 /// What a meeting meets, and the nodes of its own graph above it, innermost
 /// first: what the graph does to the source's haps before the meeting.
 #[derive(Clone)]
-struct Signal {
+pub(super) struct Signal {
     source: Source,
     ops: Vec<SignalOp>,
 }
@@ -770,7 +772,7 @@ impl Signal {
     /// The haps this signal's graph answers for `span`, in its order, into
     /// `out`, which it clears first. `part` is the part of the hap that asks,
     /// which says where a per-cycle node is.
-    fn answer(
+    pub(super) fn answer(
         &self,
         span: TimeSpan,
         part: TimeSpan,
@@ -907,7 +909,17 @@ impl Signal {
                     let mut met = Vec::with_capacity(out.len());
                     for hap in out.iter() {
                         // The constant asked over this hap's part: one hap
-                        // for each cycle the part meets.
+                        // for each cycle the part meets. A query asks for
+                        // no more cycles and haps than its limits allow:
+                        // the graph refuses past them.
+                        let count = hap.part.cycle_count()?;
+                        if count > crate::MAX_QUERY_SPAN_CYCLES
+                            || crate::hap_budget().is_some_and(|budget| {
+                                met.len() as i128 + count > i128::from(budget)
+                            })
+                        {
+                            return None;
+                        }
                         let first = hap.part.begin.floor().numer();
                         let last = hap.part.end.ceil().numer().checked_sub(1)?;
                         for cycle in first..=last {
@@ -3427,7 +3439,7 @@ fn expanded(tables: &Tables, expand: &HapExpandFn) -> Option<Tables> {
 /// meetings with constants, as a [`Signal`]. `None` for anything else, or for
 /// a graph that may not answer from tables: one that may answer differently
 /// to the same query, or that binds another runtime.
-fn signal_of(pattern: &Pattern) -> Option<Signal> {
+pub(super) fn signal_of(pattern: &Pattern) -> Option<Signal> {
     if !pattern.tables_may_answer() {
         return None;
     }
@@ -3591,7 +3603,7 @@ impl ValueSignal {
 
     /// The pattern under `values` and its control, when `values` is a
     /// control over that pattern.
-    fn named(values: &Pattern) -> Option<(&Pattern, Named)> {
+    pub(super) fn named(values: &Pattern) -> Option<(&Pattern, Named)> {
         if !values.tables_may_answer() {
             return None;
         }
@@ -3637,189 +3649,6 @@ impl ValueSignal {
     ) -> Option<()> {
         self.signal.answer(span, part, probe, out)
     }
-}
-
-/// A signal of numbers, as `sine.range(200, 2000).slow(4)` is: a
-/// [`signal_static`](crate::signal_static) under speed changes, shifts and
-/// arithmetic with numbers. It gives the number that its graph answers for
-/// a hap, with no hap of its own.
-///
-/// The graph answers one hap for the span that a function hap asks over,
-/// and each number of the arithmetic cuts that hap at the cycles of its own
-/// time. A wave answers for a part that meets one of those haps: a part in
-/// one cycle of the time of each number. The time of a number is the time
-/// of the query, or a time that keeps a cycle of the query in one cycle,
-/// for most waves. Any other number is under changes of time that
-/// [`Self::cut_under`] counts, and each part is read in its time.
-pub(crate) struct Wave {
-    body: crate::NumberSignal,
-    /// The changes of time, the outermost first.
-    times: Box<[WaveTime]>,
-    /// The arithmetic, the innermost first: each op with its number.
-    math: Box<[(crate::compose::ComposeOp, f64)]>,
-    /// For each number whose time may cut a cycle of the query, the count
-    /// of the changes of time over it, in rising order.
-    cut_under: Box<[usize]>,
-}
-
-/// One change of time over a [`Wave`].
-enum WaveTime {
-    /// `fast(factor)`: what lies inside is asked at `t * factor`.
-    Fast(Fraction),
-    /// A shift by `by`: what lies inside is asked at `t - by`.
-    Late(Fraction),
-}
-
-impl WaveTime {
-    /// `time` as what lies inside is asked.
-    fn inward(&self, time: Fraction) -> Option<Fraction> {
-        match self {
-            Self::Fast(factor) => time.checked_mul(*factor),
-            Self::Late(by) => time.checked_sub(*by),
-        }
-    }
-}
-
-impl Wave {
-    /// The most changes of time over a wave. With [`Self::plain`] times
-    /// and factors, no time of a wave with so many leaves the native range.
-    const MOST_TIMES: usize = 3;
-
-    /// `pattern` as a wave, when it is one.
-    fn of(pattern: &Pattern) -> Option<Self> {
-        let mut times = Vec::new();
-        let mut math = Vec::new();
-        let mut cut_under = Vec::new();
-        let body = Self::read(
-            pattern,
-            |time| times.push(time),
-            |op, number, cut| {
-                math.push((op, number));
-                cut_under.extend(cut);
-            },
-        )?;
-        // The walk met the outermost number first.
-        math.reverse();
-        cut_under.dedup();
-        Some(Self {
-            body,
-            times: times.into(),
-            math: math.into(),
-            cut_under: cut_under.into(),
-        })
-    }
-
-    /// The body of `pattern`, when it is a wave: each change of time goes
-    /// to `time` and each number of the arithmetic to `number`, the
-    /// outermost first. For a number whose time may cut a cycle of the
-    /// query, `number` also takes the count of the changes of time over it.
-    fn read(
-        mut pattern: &Pattern,
-        mut time: impl FnMut(WaveTime),
-        mut number: impl FnMut(crate::compose::ComposeOp, f64, Option<usize>),
-    ) -> Option<crate::NumberSignal> {
-        let mut times = 0;
-        // Whether a cycle of the query lies in one cycle of the time here.
-        let mut cycles_kept = true;
-        loop {
-            if !pattern.tables_may_answer() {
-                return None;
-            }
-            pattern = match pattern.node_kind() {
-                Node::Signal(signal) => {
-                    return (times <= Self::MOST_TIMES)
-                        .then(|| crate::number_signal(signal))
-                        .flatten();
-                }
-                Node::Fast(inner, factor, _) if **factor > Fraction::ZERO => {
-                    cycles_kept &= factor.numer() == 1;
-                    time(WaveTime::Fast(Self::plain(**factor, 16)?));
-                    times += 1;
-                    inner
-                }
-                Node::Shift(inner, by, _) => {
-                    cycles_kept &= by.denom() == 1;
-                    time(WaveTime::Late(Self::plain(**by, 16)?));
-                    times += 1;
-                    inner
-                }
-                // A run of numbers, the last application first.
-                Node::Constants(inner, run) => {
-                    for meeting in run.iter().rev() {
-                        let (op, other) = meeting.number()?;
-                        op.of_numbers(0.0, 0.0)?;
-                        number(op, other, (!cycles_kept).then_some(times));
-                    }
-                    inner
-                }
-                // A `pure` of a number answers the number in every cycle,
-                // on a hap that carries nothing more: no place in the
-                // text, no key, no visual and no slider.
-                Node::AppLeft(pair, Combine::Composed(op), _, _) => {
-                    let crate::PatternPair(functions, values) = &**pair;
-                    let Node::Pure(crate::Value::F64(other)) = values.node_kind() else {
-                        return None;
-                    };
-                    // An op of arithmetic makes a number of two numbers.
-                    op.of_numbers(0.0, 0.0)?;
-                    if !values.tables_may_answer() {
-                        return None;
-                    }
-                    number(*op, *other, (!cycles_kept).then_some(times));
-                    functions
-                }
-                _ => return None,
-            };
-        }
-    }
-
-    /// `time`, when it and its parts lie below `bits` bits: a time of
-    /// ordinary playback, or a factor a score writes.
-    fn plain(time: Fraction, bits: u32) -> Option<Fraction> {
-        (time.numer().unsigned_abs() >> bits == 0 && time.denom() >> bits == 0).then_some(time)
-    }
-
-    /// The number of the hap that the graph of the wave answers for a
-    /// function hap that asks over `met` and is cut to `part`, a part in
-    /// one cycle, when that one hap meets all of `part`. `None` for a part
-    /// that a number of the wave cuts, and for a time outside ordinary
-    /// playback: the graph answers both, so that every refusal stays the
-    /// graph's.
-    pub(crate) fn number(
-        &self,
-        met: TimeSpan,
-        part: TimeSpan,
-        controls: &crate::OrderedMap,
-    ) -> Option<f64> {
-        for time in [met.end, part.begin, part.end] {
-            Self::plain(time, 48)?;
-        }
-        let mut time = Self::plain(met.begin, 48)?;
-        // The part in the time of each number that may cut it.
-        let mut cut = self.cut_under.iter().copied().peekable();
-        let mut inside = part;
-        for (over, change) in self.times.iter().enumerate() {
-            time = change.inward(time)?;
-            if cut.peek().is_some() {
-                inside = TimeSpan::new(change.inward(inside.begin)?, change.inward(inside.end)?);
-                if cut.next_if_eq(&(over + 1)).is_some() && !in_one_cycle(inside) {
-                    return None;
-                }
-            }
-        }
-        let mut number = (self.body)(time, controls);
-        for (op, other) in &self.math {
-            number = op.of_numbers(number, *other)?;
-        }
-        Some(number)
-    }
-}
-
-/// The name that `values` sets, when it is a control of a [`Wave`]: each
-/// of its haps then holds one number under that name, and nothing more.
-pub(crate) fn wave_name(values: &Pattern) -> Option<crate::Key> {
-    let (inner, named) = ValueSignal::named(values)?;
-    Wave::read(inner, |_| (), |_, _, _| ()).map(|_| named.key)
 }
 
 /// The hap of cycle zero of a pattern whose tables hold one whole hap a
@@ -4672,7 +4501,7 @@ fn reflected(span: TimeSpan, c: i128) -> Option<TimeSpan> {
 }
 
 /// Whether `span` lies in one cycle.
-fn in_one_cycle(span: TimeSpan) -> bool {
+pub(super) fn in_one_cycle(span: TimeSpan) -> bool {
     span.begin
         .floor()
         .checked_add_int(1)
