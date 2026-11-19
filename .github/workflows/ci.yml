@@ -157,15 +157,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
-            sudo apt-get update
-            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
+            bash .github/scripts/apt-install.sh pkg-config libasound2-dev libudev-dev libdbus-1-dev
           fi
 
       - name: Install Csound for native instrument tests
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes libcsound64-6.0
+          bash .github/scripts/apt-install.sh libcsound64-6.0
           echo 'RUSTEL_CSOUND_LIBRARY=libcsound64.so.6.0' >> "$GITHUB_ENV"
 
       # The Hydra tests render for real and wait for a frame; without an ICD a
@@ -177,8 +175,7 @@ jobs:
           if dpkg -s mesa-vulkan-drivers >/dev/null 2>&1; then
             echo "mesa-vulkan-drivers already present"
           else
-            sudo apt-get update
-            sudo apt-get install --yes mesa-vulkan-drivers
+            bash .github/scripts/apt-install.sh mesa-vulkan-drivers
           fi
           ls /usr/share/vulkan/icd.d/
 
@@ -336,8 +333,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
-            sudo apt-get update
-            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
+            bash .github/scripts/apt-install.sh pkg-config libasound2-dev libudev-dev libdbus-1-dev
           fi
 
       - name: Run Miri
@@ -389,8 +385,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
-            sudo apt-get update
-            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
+            bash .github/scripts/apt-install.sh pkg-config libasound2-dev libudev-dev libdbus-1-dev
           fi
 
       # Check the remaining release targets without optimized builds or publication.

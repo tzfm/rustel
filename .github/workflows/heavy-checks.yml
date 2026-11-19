@@ -104,8 +104,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
-            sudo apt-get update
-            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
+            bash .github/scripts/apt-install.sh pkg-config libasound2-dev libudev-dev libdbus-1-dev
           fi
 
       # Portable runs before `auto` so that a host-dependent kernel difference
@@ -216,12 +215,10 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
-            sudo apt-get update
-            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
+            bash .github/scripts/apt-install.sh pkg-config libasound2-dev libudev-dev libdbus-1-dev
           fi
           if ! dpkg -s mesa-vulkan-drivers >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install --yes mesa-vulkan-drivers
+            bash .github/scripts/apt-install.sh mesa-vulkan-drivers
           fi
 
       # The check job's sample-cache step, for the check job's reason: every
