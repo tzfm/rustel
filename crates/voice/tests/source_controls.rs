@@ -162,6 +162,34 @@ fn loop_points_need_looping_and_do_not_replace_a_soundfont_loop() {
     assert!(render("wt_reference", points) == render("wt_reference", json!({})));
 }
 
+/// Loop points outside `0 <= loopBegin < loopEnd <= 1` loop the whole
+/// buffer, as Web Audio does, so a typo never plays outside the sample.
+#[test]
+fn out_of_range_loop_points_loop_the_whole_buffer() {
+    let whole = render("reference_sample", json!({"loop": 1}));
+    for points in [
+        json!({"loopBegin": -0.5}),
+        json!({"loopBegin": -2}),
+        json!({"loopBegin": 1}),
+        json!({"loopBegin": 0.5, "loopEnd": 0.2}),
+        json!({"loopBegin": 0.2, "loopEnd": -0.5}),
+        json!({"loopBegin": -0.5, "loopEnd": 0.3}),
+        json!({"loopBegin": 1.2, "loopEnd": 1.5}),
+        json!({"loopBegin": 0.3, "loopEnd": 0}),
+    ] {
+        let mut controls = points.clone();
+        controls["loop"] = json!(1);
+        assert!(render("reference_sample", controls) == whole, "{points}");
+    }
+    let end = |end: f64| {
+        render(
+            "reference_sample",
+            json!({"loop": 1, "loopBegin": 0.1, "loopEnd": end}),
+        )
+    };
+    assert!(end(1.5) == end(1.0));
+}
+
 #[test]
 fn wavetable_position_envelopes_and_lfos_have_explicit_activation_rules() {
     let plain = render("wt_reference", json!({}));

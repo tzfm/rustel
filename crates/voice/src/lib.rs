@@ -4244,8 +4244,10 @@ fn sample_controls(
             // `loop` truthy: loopStart/loopEnd = loopBegin/loopEnd × the
             // buffer's natural duration.
             None if optional_f64(object.get("loop"), "loop")?.is_some_and(|l| l != 0.0) => {
-                let loop_begin = optional_f64(object.get("loopBegin"), "loopBegin")?.unwrap_or(0.0);
-                let loop_end = optional_f64(object.get("loopEnd"), "loopEnd")?.unwrap_or(1.0);
+                let (loop_begin, loop_end) = loop_fractions(
+                    optional_f64(object.get("loopBegin"), "loopBegin")?.unwrap_or(0.0),
+                    optional_f64(object.get("loopEnd"), "loopEnd")?.unwrap_or(1.0),
+                );
                 Some((
                     checked_f32(loop_begin * natural_duration_secs, "loopBegin")?,
                     checked_f32(loop_end * natural_duration_secs, "loopEnd")?,
@@ -5822,6 +5824,19 @@ fn modulator_controls(
         }
     }
     Ok((lfos, envs, bus_mods))
+}
+
+/// The loop points a sample source plays, as fractions of its buffer.
+/// The end is capped at the buffer. A pair that is then negative, empty or
+/// out of order loops the whole buffer, as Web Audio's loop rule does; this
+/// includes `loopEnd(0)`.
+fn loop_fractions(begin: f64, end: f64) -> (f64, f64) {
+    let end = end.min(1.0);
+    if begin >= 0.0 && begin < end {
+        (begin, end)
+    } else {
+        (0.0, 1.0)
+    }
 }
 
 /// `partials`: an array of magnitudes, or a count of all-1 magnitudes
