@@ -42,10 +42,8 @@ and compiler-generated SIMD remain unchanged. Both modes use the same golden
 files, exact-hash rules, and cross-platform metric tolerances. CI runs the
 portable suite first, then the automatic suite as a separate sequential step.
 Both run only in the heavy tier: on pushes to `main`, scheduled cache-warming
-runs, and a manual dispatch for an exact pull request commit (see
-CONTRIBUTING.md, "How CI runs, and why"). Ordinary pull request CI does not
-run the corpus.
-Run it locally or dispatch Heavy CI for the current commit.
+runs, and every pull request that is not a draft (see CONTRIBUTING.md, "How CI
+runs, and why"). Ordinary pull request CI does not run the corpus.
 
 ## What is in here
 

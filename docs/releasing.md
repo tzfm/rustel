@@ -228,7 +228,7 @@ Set these rulesets:
 
 | Ruleset | Settings |
 | --- | --- |
-| `main` | Require a pull request. Require the `CI result` check from GitHub Actions and an up-to-date branch. Block force pushes and deletion. Add no bypass actors. |
+| `main` | Require a pull request. Require the `CI result` and `Heavy result` checks from GitHub Actions and an up-to-date branch. Block force pushes and deletion. Add no bypass actors. |
 | `main`, with a second maintainer | Also require one approval, dismiss stale approvals, require approval of the most recent push and require resolved review threads. |
 | `v*` tag creation | Restrict creation. Put only the role or team that makes releases on the bypass list. |
 | `v*` tag changes | Restrict updates and deletion. Add no bypass actors. |

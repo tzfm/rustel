@@ -1,19 +1,11 @@
 name: Heavy checks
 
-# Called from the same trusted revision as heavy.yml. The caller grants read
-# cache access for PR code and write access only when testing main.
+# Called from heavy.yml. Jobs check out the event's commit: the merge commit
+# for a PR, the pushed commit for main. The caller grants read cache access
+# for PR code and write access only when testing main.
 on:
   workflow_call:
     inputs:
-      ref:
-        type: string
-        required: true
-      sha:
-        type: string
-        required: true
-      pr_number:
-        type: string
-        default: ''
       save_cache:
         type: boolean
         default: false
@@ -50,7 +42,7 @@ jobs:
             jobs: "4"
     runs-on: ${{ matrix.runner }}
     concurrency:
-      group: ${{ github.workflow }}-corpus-${{ matrix.name }}-${{ inputs.pr_number || github.ref }}
+      group: ${{ github.workflow }}-corpus-${{ matrix.name }}-${{ github.ref }}
       cancel-in-progress: true
     # A cold release build with fat LTO.
     timeout-minutes: 120
@@ -67,7 +59,6 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.ref }}
           persist-credentials: false
       - &git-bash
         name: Put Git Bash ahead of WSL's bash on PATH
@@ -85,17 +76,6 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $bash)
           Write-Host "Git Bash: $bash"
-      - name: Confirm checked-out SHA
-        env:
-          EXPECTED_SHA: ${{ inputs.sha }}
-        run: |
-          actual=$(git rev-parse HEAD)
-          if [ "$actual" != "$EXPECTED_SHA" ]; then
-            echo "::error::PR head moved from $EXPECTED_SHA to $actual; dispatch again."
-            exit 1
-          fi
-          printf 'Checked out `%s`\n' "$actual" >> "$GITHUB_STEP_SUMMARY"
-
       - name: Install pinned Rust toolchain
         run: rustup show
 
@@ -191,7 +171,7 @@ jobs:
         include: *platforms
     runs-on: ${{ matrix.runner }}
     concurrency:
-      group: ${{ github.workflow }}-studio-${{ matrix.name }}-${{ inputs.pr_number || github.ref }}
+      group: ${{ github.workflow }}-studio-${{ matrix.name }}-${{ github.ref }}
       cancel-in-progress: true
     # A cold debug build of the suite on a hosted macOS or Windows runner, where
     # linking is slowest; the Linux leg has finished in about a quarter of it.
@@ -204,21 +184,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.ref }}
           persist-credentials: false
       # Run this before any Bash step so Windows uses Git Bash instead of WSL.
       - *git-bash
-      - name: Confirm checked-out SHA
-        env:
-          EXPECTED_SHA: ${{ inputs.sha }}
-        run: |
-          actual=$(git rev-parse HEAD)
-          if [ "$actual" != "$EXPECTED_SHA" ]; then
-            echo "::error::PR head moved from $EXPECTED_SHA to $actual; dispatch again."
-            exit 1
-          fi
-          printf 'Checked out `%s`\n' "$actual" >> "$GITHUB_STEP_SUMMARY"
-
       # The suite links test binaries larger than the stock hosted image has
       # room for.
       - name: Make room on the hosted Linux image
