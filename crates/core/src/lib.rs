@@ -3202,6 +3202,17 @@ impl QueryThread {
     fn note_accumulated(&self, len: usize) {
         self.peak.set(self.peak.get().max(len as u64));
     }
+
+    /// [`push_budgeted_from`] on the counters of this thread: a walk that
+    /// makes many haps reaches the thread one time.
+    fn push_budgeted(&self, out: &mut Vec<Hap>, from: usize, hap: Hap) -> bool {
+        if !self.charge(out.len() - from + 1) {
+            return false;
+        }
+        out.push(hap);
+        self.note_accumulated(out.len() - from);
+        true
+    }
 }
 
 /// A share of one walk of a graph, for a run that builds an answer in
@@ -3702,14 +3713,7 @@ pub(crate) fn push_budgeted(out: &mut Vec<Hap>, hap: Hap) -> bool {
 /// before this one wrote: the bound is on the haps of this node, as it is
 /// on a list of its own.
 pub(crate) fn push_budgeted_from(out: &mut Vec<Hap>, from: usize, hap: Hap) -> bool {
-    QUERY_THREAD.with(|thread| {
-        if !thread.charge(out.len() - from + 1) {
-            return false;
-        }
-        out.push(hap);
-        thread.note_accumulated(out.len() - from);
-        true
-    })
+    QUERY_THREAD.with(|thread| thread.push_budgeted(out, from, hap))
 }
 
 /// Charge the `held` haps that a node holds so far, as [`extend_budgeted`]
@@ -5983,7 +5987,13 @@ impl RunMeeting {
     /// whole of `hf` covers, or its part. `pieces` holds those haps. What
     /// the meetings make comes after the haps of `out`. `false` when the
     /// query stops.
-    fn meet(&self, hf: Hap, pieces: &mut Vec<Hap>, out: &mut Vec<Hap>) -> bool {
+    fn meet(
+        &self,
+        thread: &QueryThread,
+        hf: Hap,
+        pieces: &mut Vec<Hap>,
+        out: &mut Vec<Hap>,
+    ) -> bool {
         pieces.clear();
         pieces.extend(hf.whole_or_part().span_cycles().into_iter().map(|piece| {
             // The constant of each cycle is a copy of the one of cycle zero.
@@ -5991,7 +6001,7 @@ impl RunMeeting {
             hap.move_to_piece(piece);
             hap
         }));
-        meet_each(hf, pieces, &self.apply, self.flow, 0, out)
+        meet_each(thread, hf, pieces, &self.apply, self.flow, 0, out)
     }
 
     /// The meeting of the constant `value` at `context` by `apply`, as the
@@ -6177,10 +6187,11 @@ impl<'a> Meetings<'a> {
         let Self {
             answering, values, ..
         } = self;
+        // The list keeps its room from one function hap to the next.
         let graph = |values: &mut Vec<Hap>| {
-            *values = side
-                .values
-                .query(&state.set_span(side.values.asked_for(met, part)));
+            values.clear();
+            side.values
+                .query_onto(&state.set_span(side.values.asked_for(met, part)), values);
         };
         match answering.get_or_insert_with(|| side.answering(state)) {
             Answering::Constant(constant) => {
@@ -6422,6 +6433,7 @@ impl<'a> ValueSide<'a> {
     #[allow(clippy::too_many_arguments)]
     fn meet_steps(
         &self,
+        thread: &QueryThread,
         hf: &Hap,
         steps: &fused::StepWave,
         numbers: &mut Vec<(TimeSpan, f64)>,
@@ -6431,7 +6443,7 @@ impl<'a> ValueSide<'a> {
     ) -> Option<bool> {
         numbers.clear();
         steps.steps_over(hf.part, &state.controls, numbers)?;
-        if query_stop_requested() {
+        if thread.stop_requested() {
             return Some(false);
         }
         let start = out.len();
@@ -6445,7 +6457,7 @@ impl<'a> ValueSide<'a> {
                 out.truncate(start);
                 return None;
             }
-            if query_stop_requested() || !push_budgeted_from(out, from, hap) {
+            if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
                 return Some(false);
             }
         }
@@ -6456,8 +6468,22 @@ impl<'a> ValueSide<'a> {
     /// Meet the function hap `hf` with the value side and push what they
     /// make after the haps of `out`, which held `from` haps of other nodes
     /// before this application wrote. `false` when the query stops.
-    fn meet(
+    /// [`Self::meet_on`] for a test, which has no thread in hand.
+    #[cfg(test)]
+    pub(crate) fn meet(
         &self,
+        hf: Hap,
+        meetings: &mut Meetings<'a>,
+        state: &State,
+        from: usize,
+        out: &mut Vec<Hap>,
+    ) -> bool {
+        QUERY_THREAD.with(|thread| self.meet_on(thread, hf, meetings, state, from, out))
+    }
+
+    fn meet_on(
+        &self,
+        thread: &QueryThread,
         mut hf: Hap,
         meetings: &mut Meetings<'a>,
         state: &State,
@@ -6475,12 +6501,12 @@ impl<'a> ValueSide<'a> {
                         &mut hf, &steps.key, number, part, self.apply, self.flow,
                     ) {
                         fused::note(fused::Hit::StepOne);
-                        return !query_stop_requested() && push_budgeted_from(out, from, hf);
+                        return !thread.stop_requested() && thread.push_budgeted(out, from, hf);
                     }
                 }
                 None => {
                     if let Some(stopped) =
-                        self.meet_steps(&hf, steps, &mut meetings.numbers, state, from, out)
+                        self.meet_steps(thread, &hf, steps, &mut meetings.numbers, state, from, out)
                     {
                         return stopped;
                     }
@@ -6490,41 +6516,41 @@ impl<'a> ValueSide<'a> {
         // A gate says whether the hap stays as it is, with no hap of its
         // own. A hap with a lookup keeps it only while its value equals
         // itself, which the meeting reads.
-        if hf.part.within_one_cycle()
-            && hf.pick_lookup.is_none()
+        if hf.pick_lookup.is_none()
             && let Some(gate) = meetings.gate(self, state)
+            && hf.part.within_one_cycle()
             && let Some(part) = hf.part.intersection(&met)
             && let Some(passes) = gate.passes(met, part, &state.controls)
         {
             hf.part = part;
-            return !passes || (!query_stop_requested() && push_budgeted_from(out, from, hf));
+            return !passes || (!thread.stop_requested() && thread.push_budgeted(out, from, hf));
         }
         // A wave gives its number with no hap of its own.
-        if hf.part.within_one_cycle()
-            && let Some((key, wave)) = meetings.wave(self, state)
+        if let Some((key, wave)) = meetings.wave(self, state)
+            && hf.part.within_one_cycle()
             && let Some(part) = hf.part.intersection(&met)
             && let Some(number) = wave.number(met, part, &state.controls)
             && Meeting::set_number_in_place(&mut hf, key, number, part, self.apply, self.flow)
         {
-            return !query_stop_requested() && push_budgeted_from(out, from, hf);
+            return !thread.stop_requested() && thread.push_budgeted(out, from, hf);
         }
         let (inner, named) = meetings.values(self, met, hf.part, state);
         let Some(named) = named else {
-            return meet_each(hf, inner, self.apply, self.flow, from, out);
+            return meet_each(thread, hf, inner, self.apply, self.flow, from, out);
         };
         // The one value of a signal is set under the name of its control.
         if let [hv] = inner
             && let Some(part) = hf.part.intersection(&hv.part)
             && Meeting::set_in_place(&mut hf, &named.key, hv, part, self.apply, self.flow)
         {
-            return !query_stop_requested() && push_budgeted_from(out, from, hf);
+            return !thread.stop_requested() && thread.push_budgeted(out, from, hf);
         }
         // Any other meeting reads each value as the control names it.
         let inner: Vec<Hap> = inner
             .iter()
             .filter_map(|hv| (named.map)(hv.clone()))
             .collect();
-        meet_each(hf, &inner, self.apply, self.flow, from, out)
+        meet_each(thread, hf, &inner, self.apply, self.flow, from, out)
     }
 }
 
@@ -6533,6 +6559,7 @@ impl<'a> ValueSide<'a> {
 /// `out`, which held `from` haps of other nodes before the application
 /// wrote. `false` when the query stops.
 fn meet_each(
+    thread: &QueryThread,
     mut hf: Hap,
     inner: &[Hap],
     apply: &Combine,
@@ -6551,14 +6578,14 @@ fn meet_each(
         if !Meeting::in_place(&mut hf, hv, part, apply, flow) {
             hf = applied_hap(&hf, hv, hf.whole, part, apply, flow);
         }
-        return !query_stop_requested() && push_budgeted_from(out, from, hf);
+        return !thread.stop_requested() && thread.push_budgeted(out, from, hf);
     }
     for hv in inner {
         let Some(part) = hf.part.intersection(&hv.part) else {
             continue;
         };
         let hap = applied_hap(&hf, hv, hf.whole, part, apply, flow);
-        if query_stop_requested() || !push_budgeted_from(out, from, hap) {
+        if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
             return false;
         }
     }
@@ -6580,42 +6607,45 @@ fn query_run(base: &Pattern, meetings: &[RunMeeting], state: &State, out: &mut V
         // The haps that one hap of several cycles makes, meeting by
         // meeting, and the constants of its cycles.
         let (mut made, mut next, mut pieces) = (Vec::new(), Vec::new(), Vec::new());
-        for mut hf in haps.drain(..) {
-            let met = hf.whole_or_part();
-            if !met.within_one_cycle() {
-                made.push(hf);
-                for meeting in meetings {
-                    for hf in made.drain(..) {
-                        if !meeting.meet(hf, &mut pieces, &mut next) {
-                            return None;
+        // The thread is reached one time for all the haps.
+        QUERY_THREAD.with(|thread| {
+            for mut hf in haps.drain(..) {
+                let met = hf.whole_or_part();
+                if !met.within_one_cycle() {
+                    made.push(hf);
+                    for meeting in meetings {
+                        for hf in made.drain(..) {
+                            if !meeting.meet(thread, hf, &mut pieces, &mut next) {
+                                return None;
+                            }
                         }
+                        std::mem::swap(&mut made, &mut next);
                     }
-                    std::mem::swap(&mut made, &mut next);
-                }
-                out.append(&mut made);
-                continue;
-            }
-            // No shared time is no meeting, in every application.
-            let Some(part) = hf.part.intersection(&met) else {
-                continue;
-            };
-            for meeting in meetings {
-                let (apply, flow) = (&meeting.apply, meeting.flow);
-                if Meeting::in_place(&mut hf, &meeting.constant, part, apply, flow) {
+                    out.append(&mut made);
                     continue;
                 }
-                // A meeting reads no time of the constant: the hap of
-                // cycle zero stands for the one of the cycle of `hf`.
-                hf = applied_hap(&hf, &meeting.constant, hf.whole, part, apply, flow);
-                if query_stop_requested() {
+                // No shared time is no meeting, in every application.
+                let Some(part) = hf.part.intersection(&met) else {
+                    continue;
+                };
+                for meeting in meetings {
+                    let (apply, flow) = (&meeting.apply, meeting.flow);
+                    if Meeting::in_place(&mut hf, &meeting.constant, part, apply, flow) {
+                        continue;
+                    }
+                    // A meeting reads no time of the constant: the hap of
+                    // cycle zero stands for the one of the cycle of `hf`.
+                    hf = applied_hap(&hf, &meeting.constant, hf.whole, part, apply, flow);
+                    if thread.stop_requested() {
+                        return None;
+                    }
+                }
+                if thread.stop_requested() || !thread.push_budgeted(out, from, hf) {
                     return None;
                 }
             }
-            if query_stop_requested() || !push_budgeted_from(out, from, hf) {
-                return None;
-            }
-        }
-        Some(())
+            Some(())
+        })
     });
     if answered.is_none() {
         out.truncate(from);
@@ -8080,12 +8110,15 @@ impl Pattern {
                         ..Meetings::default()
                     };
                     out.reserve(functions.len());
-                    for hf in functions.drain(..) {
-                        if !side.meet(hf, &mut meetings, state, from, out) {
-                            out.truncate(from);
-                            return;
+                    // The thread is reached one time for all the haps.
+                    QUERY_THREAD.with(|thread| {
+                        for hf in functions.drain(..) {
+                            if !side.meet_on(thread, hf, &mut meetings, state, from, out) {
+                                out.truncate(from);
+                                return;
+                            }
                         }
-                    }
+                    });
                 });
             }
 

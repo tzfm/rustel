@@ -161,6 +161,14 @@ fn reduced_small(n: i64, d: i64) -> Fraction {
     if n == 0 {
         return Fraction::ZERO;
     }
+    // A power of two takes out its common factor of two with no division.
+    if d & (d - 1) == 0 {
+        let shift = n.trailing_zeros().min(d.trailing_zeros());
+        return Fraction {
+            n: i128::from(n >> shift),
+            d: den(i128::from(d >> shift)),
+        };
+    }
     let divisor = gcd_u64(n.unsigned_abs(), d as u64) as i64;
     Fraction {
         n: i128::from(n / divisor),
@@ -497,7 +505,10 @@ impl Fraction {
     /// Both components as `i64` when each is below [`SMALL_LIMIT`].
     #[inline]
     fn small(self) -> Option<(i64, i64)> {
-        (self.n > -SMALL_LIMIT && self.n < SMALL_LIMIT && self.d.get() < SMALL_LIMIT)
+        // One unsigned compare of the numerator holds both of its bounds.
+        let numerator_fits =
+            self.n.wrapping_add(SMALL_LIMIT - 1) as u128 <= (SMALL_LIMIT * 2 - 2) as u128;
+        (numerator_fits && self.d.get() < SMALL_LIMIT)
             .then_some((self.n as i64, self.d.get() as i64))
     }
 
@@ -622,6 +633,10 @@ impl Fraction {
             return Some(sum);
         }
         if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
+            // The same denominator leaves smaller terms to reduce.
+            if d == od {
+                return Some(reduced_small(n + on, d));
+            }
             return Some(reduced_small(n * od + on * d, d * od));
         }
         let native = || {
@@ -651,6 +666,9 @@ impl Fraction {
             return Some(difference);
         }
         if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
+            if d == od {
+                return Some(reduced_small(n - on, d));
+            }
             return Some(reduced_small(n * od - on * d, d * od));
         }
         let native = || {
@@ -1021,6 +1039,10 @@ impl PartialOrd for Fraction {
 
 impl Ord for Fraction {
     fn cmp(&self, o: &Self) -> Ordering {
+        // Reduced fractions of one denominator order as their numerators do.
+        if self.d == o.d {
+            return self.n.cmp(&o.n);
+        }
         if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
             return (n * od).cmp(&(on * d));
         }
@@ -1771,6 +1793,58 @@ mod parse_tokeniser_tests {
 #[cfg(test)]
 mod native_fast_path_tests {
     use super::*;
+
+    /// Reduce `n / d` with a plain gcd, as the reference for the fast paths.
+    fn reference(n: i128, d: i128) -> Fraction {
+        let divisor = gcd_i128(n, d).max(1);
+        Fraction::new(n / divisor, d / divisor)
+    }
+
+    #[test]
+    fn small_sums_differences_and_orders_match_a_plain_reduction() {
+        // Powers of two, other denominators, whole numbers, negative terms
+        // and terms at the edge of the 64-bit path.
+        let denoms = [1, 2, 3, 4, 6, 8, 12, 16, 64, 80, 1 << 30, (1 << 31) - 1];
+        let numers = [
+            -(1 << 31) + 1,
+            -(1 << 31),
+            -(1 << 30) - 3,
+            -17,
+            -8,
+            -1,
+            0,
+            1,
+            3,
+            5,
+            8,
+            24,
+            1 << 29,
+            (1 << 31) - 2,
+            (1 << 31) - 1,
+            1 << 31,
+        ];
+        let times: Vec<Fraction> = denoms
+            .iter()
+            .flat_map(|&d| numers.iter().map(move |&n| Fraction::new(n, d)))
+            .collect();
+        for &a in &times {
+            for &b in &times {
+                let (an, ad, bn, bd) = (a.numer(), a.denom(), b.numer(), b.denom());
+                assert_eq!(
+                    a + b,
+                    reference(an * bd + bn * ad, ad * bd),
+                    "{a:?} + {b:?}"
+                );
+                assert_eq!(
+                    a - b,
+                    reference(an * bd - bn * ad, ad * bd),
+                    "{a:?} - {b:?}"
+                );
+                assert_eq!(a * b, reference(an * bn, ad * bd), "{a:?} * {b:?}");
+                assert_eq!(a.cmp(&b), (an * bd).cmp(&(bn * ad)), "{a:?} cmp {b:?}");
+            }
+        }
+    }
 
     #[test]
     fn signed_ticks_reduce_on_each_grid() {

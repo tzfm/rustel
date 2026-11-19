@@ -21,8 +21,8 @@ use crate::context_keys::ContextKeys;
 use crate::value::Table;
 use crate::{
     Combine, Hap, HapMapFn, Locations, LookupFlow, MAX_QUERY_SPAN_CYCLES, Meeting, Node,
-    OwnedHapMapFn, Pattern, QueryLimit, State, TimeSpan, Value, ValuePredicate, applied_hap,
-    charge_haps, note_accumulated, query_stop_requested, refuse, silence, without_query_signals,
+    OwnedHapMapFn, Pattern, QUERY_THREAD, QueryLimit, QueryThread, State, TimeSpan, Value,
+    ValuePredicate, applied_hap, refuse, silence, without_query_signals,
 };
 use rustel_fraction::{Fraction, TickGrid};
 use std::borrow::Cow;
@@ -1586,6 +1586,7 @@ impl Layer {
     /// `span`.
     fn push(
         &self,
+        thread: &QueryThread,
         turn: &Turn,
         span: TimeSpan,
         others: usize,
@@ -1597,7 +1598,7 @@ impl Layer {
             && source.count() > KEPT_STEPS
         {
             let held = out.len();
-            if let Some(pushed) = self.push_written(source, turn, span, others, out) {
+            if let Some(pushed) = self.push_written(thread, source, turn, span, others, out) {
                 return pushed;
             }
             // The list of the steps answers a span that the source does
@@ -1608,7 +1609,7 @@ impl Layer {
         let places = match self.listing() {
             Listing::Places(listed) => &*listed.places,
             Listing::Grid(grid) => {
-                if let Some(pushed) = self.push_grid(grid, turn, span, others, out) {
+                if let Some(pushed) = self.push_grid(thread, grid, turn, span, others, out) {
                     return pushed;
                 }
                 // A turn past the range of ticks asks the places.
@@ -1617,13 +1618,14 @@ impl Layer {
             }
         };
         let instant = span.begin == span.end;
+        let (begin_key, end_key) = turn.keys();
         // The steps are in the order of time, so the first and the last
         // bound them all: a span before or after these bounds meets none.
         let (Some(earliest), Some(latest)) = (places.first(), places.last()) else {
             return Ok(());
         };
-        let before = !earliest.begins_by(turn.begin, turn.begin_key)
-            && (instant || !earliest.begins_before(turn.end, turn.end_key));
+        let before = !earliest.begins_by(turn.begin, begin_key)
+            && (instant || !earliest.begins_before(turn.end, end_key));
         if before || latest.part().end <= turn.begin {
             return Ok(());
         }
@@ -1631,20 +1633,20 @@ impl Layer {
         // or at its one time, less those that end at its begin or before.
         // The steps are in the order of their begins and of their ends, so
         // the last ones that begin before the span are those that reach it.
-        let begun = places.partition_point(|place| place.begins_before(turn.begin, turn.begin_key));
+        let begun = places.partition_point(|place| place.begins_before(turn.begin, begin_key));
         let reach = |place: &&Place| place.part().end > turn.begin;
         let first = begun - places[..begun].iter().rev().take_while(reach).count();
         let last = begun
             + places[begun..].partition_point(|place| {
-                place.begins_by(turn.begin, turn.begin_key)
-                    || (!instant && place.begins_before(turn.end, turn.end_key))
+                place.begins_by(turn.begin, begin_key)
+                    || (!instant && place.begins_before(turn.end, end_key))
             });
         let met = last - first;
         if met == 0 {
             return Ok(());
         }
         // The list held `others` haps before the sequence wrote.
-        if !charge_haps(out.len() - others + met) {
+        if !thread.charge(out.len() - others + met) {
             return Err(SequenceStop::Query);
         }
         out.reserve(met);
@@ -1658,7 +1660,7 @@ impl Layer {
             let part = TimeSpan::new(visible.begin.max(span.begin), visible.end.min(span.end));
             out.push(maker.hap(index, whole, part));
         }
-        note_accumulated(out.len() - others);
+        thread.note_accumulated(out.len() - others);
         Ok(())
     }
 
@@ -1667,6 +1669,7 @@ impl Layer {
     /// only for a hap. `None` for a turn that leaves the range of ticks.
     fn push_grid(
         &self,
+        thread: &QueryThread,
         grid: &Grid,
         turn: &Turn,
         span: TimeSpan,
@@ -1683,17 +1686,23 @@ impl Layer {
         let begun = steps.partition_point(|step| i64::from(step.part_begin) < begin_high);
         let reach = |step: &&GridStep| i64::from(step.part_end) > begin_low;
         let first = begun - steps[..begun].iter().rev().take_while(reach).count();
+        // The steps that the span meets are few, so a scan from the first
+        // that begins after the span's begin finds the end sooner than a
+        // search of the rest.
         let last_step = begun
-            + steps[begun..].partition_point(|step| {
-                let begins = i64::from(step.part_begin);
-                begins <= begin_low || (!instant && begins < end_high)
-            });
+            + steps[begun..]
+                .iter()
+                .take_while(|step| {
+                    let begins = i64::from(step.part_begin);
+                    begins <= begin_low || (!instant && begins < end_high)
+                })
+                .count();
         let met = last_step - first;
         if met == 0 {
             return Some(Ok(()));
         }
         // The list held `others` haps before the sequence wrote.
-        if !charge_haps(out.len() - others + met) {
+        if !thread.charge(out.len() - others + met) {
             return Some(Err(SequenceStop::Query));
         }
         out.reserve(met);
@@ -1738,7 +1747,7 @@ impl Layer {
             Ok(())
         });
         if pushed.is_ok() {
-            note_accumulated(out.len() - others);
+            thread.note_accumulated(out.len() - others);
         }
         Some(pushed)
     }
@@ -1748,6 +1757,7 @@ impl Layer {
     /// does not read.
     fn push_written(
         &self,
+        thread: &QueryThread,
         source: &dyn StepSource,
         turn: &Turn,
         span: TimeSpan,
@@ -1784,10 +1794,10 @@ impl Layer {
         }
         written?;
         // The budget reads the steps of a turn after they are written.
-        if !charge_haps(out.len() - others) {
+        if !thread.charge(out.len() - others) {
             return Some(Err(SequenceStop::Query));
         }
-        note_accumulated(out.len() - others);
+        thread.note_accumulated(out.len() - others);
         Some(Ok(()))
     }
 
@@ -2045,7 +2055,6 @@ fn node_of_sound(mut layers: Vec<Layer>) -> Pattern {
 }
 
 /// One turn of a period, for a query of a span.
-#[derive(Clone, Copy)]
 struct Turn {
     index: i128,
     /// Where the turn starts.
@@ -2056,12 +2065,21 @@ struct Turn {
     /// The span, from the start of the turn.
     begin: Fraction,
     end: Fraction,
-    /// The [keys](time_key) of `begin` and of `end`.
-    begin_key: f32,
-    end_key: f32,
+    /// The [keys](time_key) of `begin` and of `end`, made at the first read:
+    /// a grid compares ticks and reads none.
+    keys: std::cell::Cell<Option<(f32, f32)>>,
 }
 
 impl Turn {
+    /// The [keys](time_key) of `begin` and of `end`.
+    fn keys(&self) -> (f32, f32) {
+        self.keys.get().unwrap_or_else(|| {
+            let keys = (time_key(self.begin), time_key(self.end));
+            self.keys.set(Some(keys));
+            keys
+        })
+    }
+
     /// `time`, which is from the start of the turn, as a time of the query.
     fn moved(&self, time: Fraction) -> Result<Fraction, SequenceStop> {
         match self.whole_cycles {
@@ -2134,8 +2152,7 @@ impl Turns {
             whole_cycles,
             begin,
             end,
-            begin_key: time_key(begin),
-            end_key: time_key(end),
+            keys: std::cell::Cell::new(None),
         };
         Ok(self.read.insert(turn))
     }
@@ -2144,6 +2161,7 @@ impl Turns {
 /// Push the haps of `layers`, which share a period, in `span`: each layer
 /// in turn, as a stack of them answers.
 fn query_layers(
+    thread: &QueryThread,
     layers: &[Layer],
     span: TimeSpan,
     from: usize,
@@ -2156,17 +2174,17 @@ fn query_layers(
     if turns.indices.end.checked_sub(turns.indices.start) == Some(1) {
         let turn = turns.turn(turns.indices.start)?;
         for layer in layers {
-            layer.push(turn, span, from, out)?;
+            layer.push(thread, turn, span, from, out)?;
         }
         return Ok(());
     }
     for layer in layers {
         for index in turns.indices.clone() {
             // The query of the node asked before the first turn.
-            if index != turns.indices.start && query_stop_requested() {
+            if index != turns.indices.start && thread.stop_requested() {
                 return Err(SequenceStop::Query);
             }
-            layer.push(turns.turn(index)?, span, from, out)?;
+            layer.push(thread, turns.turn(index)?, span, from, out)?;
         }
     }
     Ok(())
@@ -2189,20 +2207,23 @@ pub(crate) fn query_sequence_onto(layers: &[Layer], state: &State, out: &mut Vec
         out.reserve(steps.min(MOST_ROOM));
     }
     let from = out.len();
-    for layers in layers.chunk_by(|a, b| a.period == b.period) {
-        match query_layers(layers, span, from, out) {
-            Ok(()) => {}
-            Err(stop) => {
-                if matches!(stop, SequenceStop::Range) {
-                    refuse(QueryLimit::NativeFraction {
-                        operation: "sequence",
-                    });
+    // The thread is reached one time for all the layers.
+    QUERY_THREAD.with(|thread| {
+        for layers in layers.chunk_by(|a, b| a.period == b.period) {
+            match query_layers(thread, layers, span, from, out) {
+                Ok(()) => {}
+                Err(stop) => {
+                    if matches!(stop, SequenceStop::Range) {
+                        refuse(QueryLimit::NativeFraction {
+                            operation: "sequence",
+                        });
+                    }
+                    out.truncate(from);
+                    return;
                 }
-                out.truncate(from);
-                return;
             }
         }
-    }
+    });
 }
 
 /// Whether moving these layers by `by` leaves every step in place.
