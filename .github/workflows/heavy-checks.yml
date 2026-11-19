@@ -186,15 +186,25 @@ jobs:
     name: Engine benchmark (Linux x64)
     runs-on: ubuntu-24.04
     concurrency:
-      group: ${{ github.workflow }}-bench-${{ github.ref }}
+      group: ${{ github.workflow }}-bench-${{ inputs.pr_number || github.ref }}
       cancel-in-progress: true
     # Two cold release builds with fat LTO: this revision and main.
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
           fetch-depth: 0
+      - name: Confirm checked-out SHA
+        env:
+          EXPECTED_SHA: ${{ inputs.sha }}
+        run: |
+          actual=$(git rev-parse HEAD)
+          if [ "$actual" != "$EXPECTED_SHA" ]; then
+            echo "::error::PR head moved from $EXPECTED_SHA to $actual; dispatch again."
+            exit 1
+          fi
 
       - name: Install pinned Rust toolchain
         run: rustup show
@@ -206,8 +216,7 @@ jobs:
       - name: Install Linux audio build dependencies
         run: |
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
-            sudo apt-get update
-            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev
+            bash .github/scripts/apt-install.sh pkg-config libasound2-dev libudev-dev libdbus-1-dev
           fi
 
       - name: Measure this revision
@@ -218,7 +227,7 @@ jobs:
       # A shared runner's time moves with its neighbours, so the gate is on
       # allocations and kept bytes. Both reports keep the times.
       - name: Measure main and compare
-        if: github.event_name == 'pull_request'
+        if: inputs.pr_number != ''
         run: |
           git worktree add "$RUNNER_TEMP/base" "$(git merge-base HEAD origin/main)"
           if [ ! -d "$RUNNER_TEMP/base/crates/bench" ]; then
