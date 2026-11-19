@@ -662,12 +662,19 @@ impl StudioWorker {
     /// answered: a busy runner can be slow to drain the queue.
     #[cfg(test)]
     pub(crate) fn wait_until_taken(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
         let (taken, answer) = sync_channel(1);
-        self.commands
-            .send(EngineCommand::Barrier(taken))
-            .expect("engine alive");
+        let mut barrier = EngineCommand::Barrier(taken);
+        while let Err(error) = self.commands.try_send(barrier) {
+            let TrySendError::Full(back) = error else {
+                panic!("engine gone");
+            };
+            assert!(Instant::now() < deadline, "engine never took the queue");
+            barrier = back;
+            std::thread::sleep(Duration::from_millis(1));
+        }
         answer
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .expect("engine took the queue");
     }
 

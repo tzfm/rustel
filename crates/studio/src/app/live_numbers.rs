@@ -789,6 +789,8 @@ mod tests {
             )
             .expect("layout")
         };
+        // The reinstall was answered: the engine took it.
+        app.worker.wait_until_taken();
         app.handle_control(StudioControlEvent::Layout(layout(
             2,
             std::slice::from_ref(&cutoff),
