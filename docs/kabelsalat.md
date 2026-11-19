@@ -4,13 +4,15 @@ Use `K(...)` to build a synth or process another sound with a KabelSalat
 graph. End each audible branch with `.out()`:
 
 ```javascript
-$: K(sine(sFreq).mul(0.2).out()).note("c3 e3 g3 b3")
+$: note("c3 e3 g3 b3").K(sine(sFreq).mul(0.2).out())
 ```
 
-`sFreq` is the event's final frequency in Hz, including a `note` or `freq`
-control applied after `K`. It is rounded in its last digits, so every
-platform binds the same value. `sGate` is the event's gate. `time()` starts
-at zero for each graph. Graph state belongs to one voice, so overlapping notes
+Apply `K` to the pattern that plays the notes, as above. On its own, `K(...)`
+is one event a cycle, so a `note` applied after it plays only its first note.
+
+`sFreq` is the event's final frequency in Hz, from its `note` or `freq`
+control. It is rounded in its last digits, so every platform binds the same
+value. `sGate` is the event's gate. `time()` starts at zero for each graph. Graph state belongs to one voice, so overlapping notes
 have independent oscillators, envelopes, noise generators and delay lines.
 
 ## Patterns and envelopes
@@ -20,12 +22,12 @@ lifts an existing pattern expression into the same input list. Each event
 receives numeric values. Ordinary JavaScript arithmetic works on them.
 
 ```javascript
-$: K(
+$: note("c3 e3 g3 e3").K(
   saw(sFreq / "1 2 1 4")
     .mul(adsr(sGate, 0.01, 0.1, 0.5, 0.15))
     .mul(S(sine.range(0.1, 0.25).slow(4)))
     .out()
-).note("c3 e3 g3 e3").release(0.2)
+).release(0.2)
 ```
 
 Use the pattern's `release` control to leave time for a graph envelope's
@@ -54,7 +56,7 @@ generates its own signal instead. `K` effects share the normal limit of three
 FX stages per voice.
 
 ```javascript
-$: s("sawtooth").note("c2 e2 g2 b2")
+$: note("c2 e2 g2 b2").s("sawtooth")
   .FX(K(audioin().distort(0.4).mul(0.3).out()))
 ```
 
@@ -63,8 +65,8 @@ arrays wrap. `.out()` sends to output channels 0 and 1. `.out(0)` sends to
 the left channel and `.out(1)` to the right. Output contributions add.
 
 ```javascript
-$: K(sine([sFreq, sFreq * 1.005]).mul(0.15).out([0, 1]))
-  .note("c3 g3")
+$: note("c3 g3")
+  .K(sine([sFreq, sFreq * 1.005]).mul(0.15).out([0, 1]))
 ```
 
 The graph has 16 internal output channels. Native stereo playback reads
@@ -78,11 +80,11 @@ The graph API includes chaining, channel expansion, `poly`, `mix`, `split`,
 Use a block when several expressions build the graph:
 
 ```javascript
-$: K(() => {
+$: note("c2 e2 g2").K(() => {
   const voice = module('voice', frequency => frequency.saw().lpf(0.5).mul(0.1));
   voice(n(sFreq)).out();
   n(sFreq * 2).voice().out();
-}).note("c2 e2 g2")
+})
 ```
 
 `register` and `module` expand into the supported primitive nodes. These

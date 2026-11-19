@@ -54,6 +54,17 @@ fn guide_examples_compile_and_produce_audio() {
             .map(|hap| render_graph(&hap.value, source))
             .sum();
         assert!(graphs > 0, "example must contain a graph: {source}");
+        // Each note plays on its own event: every event that starts in this
+        // cycle has its onset here, not only the first of one event a cycle.
+        let starting = haps
+            .iter()
+            .filter(|hap| hap.whole_or_part().begin >= Fraction::ZERO)
+            .count();
+        let onsets = haps.iter().filter(|hap| hap.has_onset()).count();
+        assert!(
+            onsets > 0 && onsets == starting,
+            "example must play each note ({onsets} onsets, {starting} events start): {source}"
+        );
     }
 }
 

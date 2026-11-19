@@ -400,7 +400,7 @@ pub(super) mod tests {
             access
                 .permit_source("https://samples.example")
                 .expect("sample origin");
-            let bank = parse_score_bank(&entry, BASE, &access, &mut Vec::new())
+            let bank = parse_score_bank(&entry, EntryBase::Web(BASE), &access, &mut Vec::new())
                 .expect("approved bank")
                 .expect("note bank");
             assert_the_tie_plays_g2(&bank);
