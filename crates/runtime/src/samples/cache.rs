@@ -2859,10 +2859,11 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join("sets/sub")).expect("sample folder");
             std::fs::write(root.join("sets/sub/kick.wav"), b"RIFF").expect("sample");
+            std::fs::write(root.join("sets/sub/C#3.wav"), b"RIFF").expect("sharp sample");
             std::fs::write(&outside, b"RIFF private").expect("outside file");
             std::fs::write(
                 root.join("sets/sub/q.json"),
-                r#"{"near": "kick.wav", "far": ["/sets/sub/kick.wav"]}"#,
+                r#"{"near": "kick.wav", "far": ["/sets/sub/kick.wav"], "sharp": "C#3.wav"}"#,
             )
             .expect("nested map");
             std::fs::write(root.join("q2.json"), r#"{"top": "sets/sub/kick.wav"}"#)
@@ -2889,12 +2890,19 @@ mod tests {
                 };
                 assert!(urls[0].ends_with(&kick), "{name}: {urls:?}");
             }
+            let Some(Bank::Array(urls)) = custom.get("sharp") else {
+                panic!("sharp was not an array bank");
+            };
+            assert!(urls[0].ends_with("/sets/sub/C%233.wav"), "{urls:?}");
             drop(custom);
 
             for source in [
                 r#""local:escape.json""#,
                 r#""local:sets/../q2.json""#,
                 r#""local:/q2.json""#,
+                // Only a map read from the root reads files in it.
+                r#"{"_base": "local:", "bd": "sets/sub/kick.wav"}"#,
+                r#"{"bd": "local:sets/sub/kick.wav"}"#,
             ] {
                 assert!(
                     library

@@ -25,24 +25,35 @@ impl ScoreSampleAccess {
         }
     }
 
-    /// Approve the file a `local:` map entry names beneath the local root,
-    /// as the file URL it is read from. A leading `/` means the root, as it
-    /// does on a sample server. The read stays confined to the root.
-    pub(super) fn approve_local(&self, path: &str) -> Result<(Arc<str>, ScoreFetchAccess), String> {
+    /// Approve `file`, an entry of a map read from `folder` beneath the
+    /// local root, as the file URL it is read from. A leading `/` means the
+    /// root, as it does on a sample server. Names are taken as written, not
+    /// as URLs, so `C#3.wav` is a file name. The read stays confined to the
+    /// root.
+    pub(super) fn approve_local(
+        &self,
+        folder: &str,
+        file: &str,
+    ) -> Result<(Arc<str>, ScoreFetchAccess), String> {
         let root = self.local_root.as_ref().ok_or_else(|| {
             self.note_local_refused();
             "samples('local:') requires a host-selected local sample root (--allow-local-samples, or the Studio Permissions page)".to_owned()
         })?;
-        let refused = || format!("local:{path} must be a file inside the permitted folder");
-        let url = Url::from_directory_path(root.path())
-            .ok()
-            .and_then(|folder| folder.join(path.trim_start_matches('/')).ok())
-            .ok_or_else(refused)?;
-        let file = url.to_file_path().map_err(|()| refused())?;
-        let relative = file.strip_prefix(root.path()).map_err(|_| refused())?;
-        if !crate::sample_server::relative_sample_path_allowed(relative) {
+        let refused =
+            || format!("local sample {file:?} must be a file inside the permitted folder");
+        let (folder, file) = match file.strip_prefix('/') {
+            Some(from_root) => ("", from_root),
+            None => (folder, file),
+        };
+        let relative: PathBuf = folder
+            .split(LOCAL_PATH_SEPARATORS)
+            .chain(file.split(LOCAL_PATH_SEPARATORS))
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect();
+        if !crate::sample_server::relative_sample_path_allowed(&relative) {
             return Err(refused());
         }
+        let url = Url::from_file_path(root.path().join(relative)).map_err(|()| refused())?;
         Ok((
             Arc::from(url.as_str()),
             ScoreFetchAccess::Local {
@@ -737,8 +748,22 @@ fn repair_vcsl_relative<'a>(base: &str, entry: &'a str) -> std::borrow::Cow<'a, 
     }
 }
 
+/// The separators a `local:` path is split on. Windows also takes `\\`.
+pub(super) const LOCAL_PATH_SEPARATORS: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+
+/// What the relative entries of a map hang off.
+#[derive(Clone, Copy)]
+pub(super) enum EntryBase<'a> {
+    /// An address prefix such as `https://example.com/kits/`.
+    Web(&'a str),
+    /// A folder beneath the local root, for a map read from that root.
+    /// Only a map read with `local:` gets one, so a fetched map never
+    /// reaches local files.
+    Local(&'a str),
+}
+
 fn approve_score_url(
-    base: &str,
+    base: EntryBase<'_>,
     file: &str,
     access: &ScoreSampleAccess,
     sources: &mut Vec<(Arc<str>, ScoreFetchAccess)>,
@@ -751,14 +776,11 @@ fn approve_score_url(
     sources
         .try_reserve(1)
         .map_err(|_| "not enough host memory for sample sources".to_owned())?;
-    let address = match base.strip_prefix("local:") {
-        // `/kick.wav` in a local map means the granted root's own.
-        Some(_) if file.starts_with('/') => format!("local:{file}"),
-        _ => join_url(base, file),
-    };
-    let (url, source_access) = match address.strip_prefix("local:") {
-        Some(path) => access.approve_local(path)?,
-        None => access.approve_remote(&address)?,
+    let is_web = file.starts_with("http://") || file.starts_with("https://");
+    let (url, source_access) = match base {
+        EntryBase::Local(folder) if !is_web => access.approve_local(folder, file)?,
+        EntryBase::Local(_) => access.approve_remote(file)?,
+        EntryBase::Web(base) => access.approve_remote(&join_url(base, file))?,
     };
     sources.push((url.clone(), source_access));
     Ok(url)
@@ -766,7 +788,7 @@ fn approve_score_url(
 
 pub(super) fn parse_score_bank(
     entry: &serde_json::Value,
-    base: &str,
+    base: EntryBase<'_>,
     access: &ScoreSampleAccess,
     sources: &mut Vec<(Arc<str>, ScoreFetchAccess)>,
 ) -> Result<Option<Bank>, String> {
