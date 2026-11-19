@@ -9,6 +9,8 @@
 static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
 
+use std::time::Duration;
+
 use crossterm::event::{KeyCode, KeyModifiers};
 use rustel_runtime::session_log::encode_base64;
 use rustel_studio_e2e::{PanelKind, hermetic, hermetic_recording, row_containing};
@@ -297,4 +299,86 @@ fn unknown_letters_are_refused_and_said() {
     // Esc is what hands the keys back, and only that.
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(studio.focus(), None, "Esc gives the keys back to the score");
+}
+
+/// The tape the first evaluate opened.
+fn open_tape(studio: &rustel_studio_e2e::Hermetic) -> std::path::PathBuf {
+    studio
+        .tapes_directory()
+        .read_dir()
+        .expect("tape folder")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "rustel-session"))
+        .expect("the first evaluate opened a tape")
+}
+
+/// Wait until the tape's last slider record plays `source`. A source the
+/// tape already holds is written as a `ref` to the save that first held it.
+fn wait_for_slider_record(studio: &mut rustel_studio_e2e::Hermetic, source: &str) {
+    let tape = open_tape(studio);
+    let expected = encode_base64(source.as_bytes());
+    let last_slider_plays = |text: &str| {
+        let saves: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record["kind"] == "save")
+            .collect();
+        let Some(last) = saves.iter().rev().find(|record| record["via"] == "slider") else {
+            return false;
+        };
+        let held = match last["ref"].as_u64() {
+            Some(index) => usize::try_from(index)
+                .ok()
+                .and_then(|index| saves.get(index)),
+            None => Some(last),
+        };
+        held.is_some_and(|record| record["source"] == expected.as_str())
+    };
+    let what = format!("a slider record of {source:?} last on the tape");
+    studio.pump_until(Duration::from_secs(5), &what, |_| {
+        std::fs::read_to_string(&tape).is_ok_and(|text| last_slider_plays(&text))
+    });
+}
+
+/// A slider moved with Alt+Up while the set plays is written to the tape
+/// once it settles, as the evaluated score with the new value, so a replay
+/// plays the move. A move back to the evaluated value is written too.
+#[test]
+fn a_settled_slider_move_is_recorded_on_the_tape() {
+    let mut studio = hermetic_recording();
+    let score = "$: s(\"bd\").gain(slider(0.8, 0, 1, 0.1))";
+    studio.set_score(score);
+    studio.chord("ctrl+s");
+    studio.settle();
+    assert!(studio.is_playing(), "the set plays");
+    studio.set_caret(score.find("0.8").expect("slider value"));
+    studio.press(KeyCode::Up, KeyModifiers::ALT);
+    assert!(studio.score().contains("slider(0.9,"), "{}", studio.score());
+    wait_for_slider_record(&mut studio, &score.replace("slider(0.8,", "slider(0.9,"));
+    studio.press(KeyCode::Down, KeyModifiers::ALT);
+    assert!(studio.score().contains("slider(0.8,"), "{}", studio.score());
+    wait_for_slider_record(&mut studio, score);
+}
+
+/// A move on a knobs rail that plays live is written to the tape the same
+/// way, once it settles.
+#[test]
+fn a_settled_knobs_rail_move_is_recorded_on_the_tape() {
+    let mut studio = hermetic_recording();
+    let score = "$: s(\"bd\").lpf(4000)";
+    studio.set_score(score);
+    studio.chord("ctrl+s");
+    studio.settle();
+    assert!(studio.is_playing(), "the set plays");
+    studio.set_caret(score.find("4000").expect("cutoff"));
+    studio.press(KeyCode::F(1), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('v'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('k'), KeyModifiers::NONE);
+    assert_eq!(studio.focus(), Some(PanelKind::Knobs));
+    studio.press(KeyCode::Right, KeyModifiers::NONE);
+    studio.settle();
+    let moved = studio.score();
+    assert_ne!(moved, score, "the rail writes the score");
+    wait_for_slider_record(&mut studio, &moved);
 }

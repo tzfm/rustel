@@ -371,6 +371,17 @@ impl App {
                     // makes even two rapid presses distinct: first drain, second
                     // cut every remaining voice and effect tail now.
                     let cutting = self.stop_requested || self.is_stopping();
+                    // Is what is stopping the set at all? A stop of a tape
+                    // being heard again, or of a preview sounding under the
+                    // score, is not an event of the set the recorder is
+                    // writing, so it must not grow that tape.
+                    let stopping_the_set = self.replay_view.is_none();
+                    #[cfg(feature = "hydra")]
+                    let stopping_the_set = stopping_the_set && self.snippet_preview.is_none();
+                    // A move that played goes on the tape before the stop.
+                    if stopping_the_set {
+                        self.flush_tape_gestures();
+                    }
                     // The worker stops on an atomic now; the snapshot that says so
                     // arrives up to 100ms later. Forgetting here means a Stop
                     // followed immediately by Update restarts, instead of the
@@ -383,13 +394,6 @@ impl App {
                     // that instant so the cycle counter and beat light do not
                     // imply that the score is still advancing through its tail.
                     self.visual.stop();
-                    // Is what is stopping the set at all? A stop of a tape
-                    // being heard again, or of a preview sounding under the
-                    // score, is not an event of the set the recorder is
-                    // writing, so it must not grow that tape.
-                    let stopping_the_set = self.replay_view.is_none();
-                    #[cfg(feature = "hydra")]
-                    let stopping_the_set = stopping_the_set && self.snippet_preview.is_none();
                     if cutting {
                         self.worker.force_stop();
                     } else {
