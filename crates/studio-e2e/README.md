@@ -29,7 +29,7 @@ cargo test -p rustel-studio-e2e -- --test-threads=1
 CI runs this suite on Linux, macOS and Windows in the `studio` job of
 [`.github/workflows/heavy-checks.yml`](../../.github/workflows/heavy-checks.yml),
 called by [`heavy.yml`](../../.github/workflows/heavy.yml). It runs on pushes
-to `main`, on a schedule, and on every pull request that is not a draft.
+to `main`, on a schedule, and on maintainer dispatch for an exact PR commit.
 See [How CI runs, and why](../../CONTRIBUTING.md#how-ci-runs-and-why).
 The job uses the `--features pty` command below. It runs against the
 studio's and the runtime's default feature sets. The check job's workspace

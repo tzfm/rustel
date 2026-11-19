@@ -242,7 +242,16 @@ impl Terminal {
             let found = {
                 let buffer = self.buffer.lock().expect("drain buffer");
                 let start = mark.min(buffer.len());
+                // A diff repaints only the cells that changed: `VIM NORMAL`
+                // to `VIM INSERT` writes `INSERT` alone. So the needle also
+                // counts when the whole screen holds it now and did not at
+                // the mark.
+                let on_screen = |end: usize| {
+                    let (_, rows) = painted(&String::from_utf8_lossy(&buffer[..end]));
+                    rows.iter().any(|row| row.contains(needle))
+                };
                 contains_plain(&String::from_utf8_lossy(&buffer[start..]), needle)
+                    || (on_screen(buffer.len()) && !on_screen(start))
             };
             if found {
                 return true;
@@ -310,6 +319,13 @@ fn set_directory() -> tempfile::TempDir {
 /// so a needle is matched against the screen and not against the byte
 /// stream.
 fn contains_plain(frame: &str, needle: &str) -> bool {
+    let (plain, rows) = painted(frame);
+    plain.contains(needle) || rows.iter().any(|row| row.contains(needle))
+}
+
+/// The text a frame painted, in the order it came, and the screen rows its
+/// cursor placements leave.
+fn painted(frame: &str) -> (String, Vec<String>) {
     const COLS: usize = 120;
     const ROWS: usize = 40;
     let mut grid = vec![(' ', 0); COLS * ROWS];
@@ -389,19 +405,15 @@ fn contains_plain(frame: &str, needle: &str) -> bool {
     // The needles may span a line the painter redrew (a diff repaints a
     // changed span, not the message's whole row), so both the placement-
     // reconstructed text and each row of the final screen are searched.
-    if plain.contains(needle) {
-        return true;
-    }
-    for row in 0..ROWS {
-        let line: String = grid[row * COLS..(row + 1) * COLS]
-            .iter()
-            .map(|(ch, _)| ch)
-            .collect();
-        if line.contains(needle) {
-            return true;
-        }
-    }
-    false
+    let rows = (0..ROWS)
+        .map(|row| {
+            grid[row * COLS..(row + 1) * COLS]
+                .iter()
+                .map(|(ch, _)| ch)
+                .collect()
+        })
+        .collect();
+    (plain, rows)
 }
 
 /// Find visible score text by interpreting the cursor-positioning and erase
