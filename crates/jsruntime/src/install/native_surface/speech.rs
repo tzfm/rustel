@@ -87,7 +87,7 @@ fn speech_text<'js>(
             .as_string()
             .expect("caller checked is_string")
             .to_string()?;
-        Ok(rustel_core::pure(Value::Str(text.into())))
+        Ok(rustel_core::pure(Value::Str(text)))
     };
     let mut sidecars = Vec::new();
     match args.0.first() {

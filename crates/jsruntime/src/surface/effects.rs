@@ -43,7 +43,7 @@ pub(crate) fn stage_effect(
     ctx: &Ctx<'_>,
     policy: &Cell<EffectPolicy>,
     required: u8,
-    transaction: &RefCell<EffectTransaction>,
+    transaction: &RefCell<Option<ScoreEffects>>,
     refusal: &RefCell<Option<String>>,
     message: &'static str,
     stage: impl FnOnce(&Ctx<'_>, &mut ScoreEffects) -> rquickjs::Result<()>,
@@ -52,7 +52,7 @@ pub(crate) fn stage_effect(
         return Err(throw_effect_policy(ctx, refusal, message));
     }
     let mut transaction = transaction.borrow_mut();
-    let Some(effects) = transaction.effects_mut() else {
+    let Some(effects) = transaction.as_mut() else {
         return Err(throw_effect_policy(ctx, refusal, message));
     };
     stage(ctx, effects)

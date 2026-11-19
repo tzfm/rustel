@@ -71,7 +71,7 @@ fn build<'js>(
         if let Value::List(values) = rustel_core::materialize_js_value(input) {
             inputs.extend(values);
         }
-        controls.insert("workletSrc".into(), Value::Str(source.as_str().into()));
+        controls.insert("workletSrc".into(), Value::Str(source.clone()));
         controls.insert("workletInputs".into(), Value::List(inputs));
         Value::Object(controls)
     });

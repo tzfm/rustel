@@ -4422,17 +4422,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustel-bench"
-version = "0.1.7"
-dependencies = [
- "libc",
- "rustel-core",
- "rustel-fraction",
- "rustel-runtime",
- "serde_json",
-]
-
-[[package]]
 name = "rustel-core"
 version = "0.1.7"
 dependencies = [
@@ -4582,7 +4571,6 @@ dependencies = [
  "rustel-mini",
  "rustel-osc",
  "rustel-scheduler",
- "rustel-score",
  "rustel-serial",
  "rustel-smf",
  "rustel-talkit",
@@ -4611,10 +4599,6 @@ dependencies = [
  "rustel-fraction",
  "rustel-jsruntime",
 ]
-
-[[package]]
-name = "rustel-score"
-version = "0.1.7"
 
 [[package]]
 name = "rustel-serial"
@@ -4721,7 +4705,6 @@ dependencies = [
  "oxc_span",
  "oxc_syntax",
  "rustel-mini",
- "rustel-score",
  "serde_json",
 ]
 

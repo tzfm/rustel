@@ -19,7 +19,7 @@ struct NativeTempoSetter<'js> {
     #[qjs(skip_trace)]
     lane: bool,
     #[qjs(skip_trace)]
-    transaction: Rc<RefCell<EffectTransaction>>,
+    transaction: Rc<RefCell<Option<ScoreEffects>>>,
     #[qjs(skip_trace)]
     policy: Rc<Cell<EffectPolicy>>,
     #[qjs(skip_trace)]
@@ -286,14 +286,6 @@ pub(super) fn install<'js>(
         globals
             .set(name, function.clone())
             .map_err(|error| error.to_string())?;
-        let per_minute = name.ends_with("pm");
-        record_builtin_global(
-            ctx,
-            name,
-            function.clone().into_value(),
-            BuiltinGlobal::Tempo { per_minute },
-        )
-        .map_err(|error| error.to_string())?;
         scope
             .set(name, function)
             .map_err(|error| error.to_string())?;
@@ -307,13 +299,6 @@ pub(super) fn install<'js>(
     globals
         .set("cps", lane.clone())
         .map_err(|error| error.to_string())?;
-    record_builtin_global(
-        ctx,
-        "cps",
-        lane.clone().into_value(),
-        BuiltinGlobal::Tempo { per_minute: false },
-    )
-    .map_err(|error| error.to_string())?;
     scope
         .set("cps", lane.clone())
         .map_err(|error| error.to_string())?;
@@ -325,7 +310,7 @@ pub(super) fn install<'js>(
     let get_cps = Function::new(ctx.clone(), move || {
         staged
             .borrow()
-            .written()
+            .as_ref()
             .and_then(|effects| effects.cps)
             .unwrap_or_else(|| playing.get())
     })

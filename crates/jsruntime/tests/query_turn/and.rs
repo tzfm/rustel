@@ -754,7 +754,7 @@ fn raw_and_retains_operands_prunes_transients_and_keeps_nested_accounting() {
         selected_branch
             .active_pattern()
             .expect("raw and selected graph")
-            .steps(),
+            .steps,
         Some(Fraction::int(5))
     );
     for _ in 0..3 {
@@ -837,7 +837,7 @@ fn raw_and_retains_operands_prunes_transients_and_keeps_nested_accounting() {
         false_branch
             .active_pattern()
             .expect("raw and false graph")
-            .steps(),
+            .steps,
         Some(Fraction::int(5))
     );
     for _ in 0..3 {

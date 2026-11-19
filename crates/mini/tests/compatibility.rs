@@ -31,7 +31,7 @@ fn replication_preserves_fractional_step_metadata() {
         ("[^a b]!2.5 c", Fraction::int(7)),
     ];
     for (source, expected) in cases {
-        assert_eq!(mini(source).unwrap().steps(), Some(expected), "{source}");
+        assert_eq!(mini(source).unwrap().steps, Some(expected), "{source}");
     }
 }
 
@@ -47,7 +47,7 @@ fn feet_step_metadata_counts_feet_not_the_childrens_lcm() {
         ("y [x [^a b] . [c]]", Fraction::int(4)),
     ];
     for (source, expected) in cases {
-        assert_eq!(mini(source).unwrap().steps(), Some(expected), "{source}");
+        assert_eq!(mini(source).unwrap().steps, Some(expected), "{source}");
     }
 }
 

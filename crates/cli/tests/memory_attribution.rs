@@ -36,9 +36,13 @@ use rustel_runtime::{ProcessMonitor, Session};
 
 static RUN: Mutex<()> = Mutex::new(());
 
-/// A session with a short score must not approach the QuickJS heap ceiling
-/// of 512 MiB (`DEFAULT_JS_MEMORY_LIMIT`). Tens of megabytes of control
-/// surface is expected; hundreds are the claim under test.
+/// The QuickJS heap ceiling (`DEFAULT_JS_MEMORY_LIMIT`). A live heap this
+/// large would mean the bound is doing work; ordinary scores must sit far
+/// below it.
+const JS_HEAP_CEILING: u64 = 512 * 1024 * 1024;
+/// Ordinary Session construction plus a short score must not approach the
+/// ceiling. Tens of megabytes of control surface is expected; hundreds are
+/// the claim under test.
 const ORDINARY_JS_HEAP_LIMIT: u64 = 256 * 1024 * 1024;
 /// Re-evaluating a short synth the way Ctrl-Enter does must not retain a
 /// new graph per take. Sixteen mebibytes of jitter covers allocator
@@ -392,12 +396,16 @@ fn session_stages_do_not_fill_the_js_heap_ceiling() {
 
     let mut session = Session::new().expect("session");
     push(&mut stages, "session_new", Some(&session));
-    // A new session starts no script engine. The engine starts at the
-    // first score that needs it, so the heap is empty here.
-    assert_eq!(
-        session.js_heap_live(),
-        0,
-        "Session::new started the script engine"
+    let heap_new = session.js_heap_live() as u64;
+    // Construction is a thin QuickJS realm plus native bindings. The
+    // "tens of megabytes" Session comment is process RSS, not this
+    // counter: a new heap here is tens of kilobytes.
+    assert!(heap_new > 0, "Session::new reported an empty QuickJS heap");
+    assert!(
+        heap_new < ORDINARY_JS_HEAP_LIMIT,
+        "Session::new live JS heap {:.1} MiB reaches the ordinary limit; ceiling is {:.0} MiB",
+        mib(heap_new),
+        mib(JS_HEAP_CEILING)
     );
 
     session.evaluate(SYNTH).expect("evaluate synth");

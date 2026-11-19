@@ -250,7 +250,7 @@ impl CallbackHost for JsRuntime {
         program: &rustel_core::callback_ir::PatternTransformProgram,
         pattern: Pattern,
     ) -> Result<Pattern, String> {
-        let state = self.callback_ir();
+        let state = &self.callback_ir;
         let mode = state.mode.get();
         // A stale program no longer stands for its callback. The graph that
         // reached this host still owns the callback, which runs.

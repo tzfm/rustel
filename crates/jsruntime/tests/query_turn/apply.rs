@@ -253,7 +253,7 @@ fn raw_apply_is_eager_host_free_and_preserves_only_returned_ownership() {
         native
             .active_pattern()
             .expect("raw apply native pattern")
-            .steps(),
+            .steps,
         Some(Fraction::int(3))
     );
     for _ in 0..3 {

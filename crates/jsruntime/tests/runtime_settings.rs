@@ -647,7 +647,6 @@ fn session_candidate_settings_remain_detached_until_publication() {
     let (_, _, candidate) = runtime
         .evaluate_score_candidate_with_effects_cancellable(
             "setDefaultJoin('mix'); setDefaultVoicings('lefthand'); chord('C7').voicing()",
-            None,
             &TranspileOptions::default(),
             std::time::Duration::from_secs(1),
             &std::sync::atomic::AtomicBool::new(false),
@@ -690,7 +689,6 @@ fn accepted_candidate_pattern_metadata_follows_later_runtime_settings() {
     let (_, _, candidate) = runtime
         .evaluate_score_candidate_with_effects_cancellable(
             "setDefaultVoicings('guidetones'); pure(null).fmap(() => chord('C7').voicing())",
-            None,
             &TranspileOptions::default(),
             std::time::Duration::from_secs(1),
             &std::sync::atomic::AtomicBool::new(false),
@@ -729,7 +727,6 @@ fn accepted_candidate_function_metadata_follows_later_runtime_settings() {
     let (_, _, candidate) = runtime
         .evaluate_score_candidate_with_effects_cancellable(
             "setDefaultVoicings('guidetones'); pure(null).fmap(() => voicing)",
-            None,
             &TranspileOptions::default(),
             std::time::Duration::from_secs(1),
             &std::sync::atomic::AtomicBool::new(false),
@@ -771,7 +768,6 @@ fn accepted_candidate_pick_lookup_follows_later_runtime_settings() {
     let (_, _, candidate) = runtime
         .evaluate_score_candidate_with_effects_cancellable(
             "setDefaultVoicings('guidetones'); pure({a: chord('C7').voicing()}).set({b: 1})",
-            None,
             &TranspileOptions::default(),
             std::time::Duration::from_secs(1),
             &std::sync::atomic::AtomicBool::new(false),
@@ -814,7 +810,6 @@ fn accepted_candidate_function_argument_follows_later_runtime_settings() {
     let (_, _, candidate) = runtime
         .evaluate_score_candidate_with_effects_cancellable(
             "setDefaultVoicings('guidetones'); pure('C7').layer(voicing)",
-            None,
             &TranspileOptions::default(),
             std::time::Duration::from_secs(1),
             &std::sync::atomic::AtomicBool::new(false),
@@ -845,7 +840,6 @@ fn accepted_candidate_control_graph_follows_later_runtime_settings() {
     let (_, _, candidate) = runtime
         .evaluate_score_candidate_with_effects_cancellable(
             "setDefaultVoicings('guidetones'); chord('C7').layer(voicing)",
-            None,
             &TranspileOptions::default(),
             std::time::Duration::from_secs(1),
             &std::sync::atomic::AtomicBool::new(false),
@@ -876,7 +870,6 @@ fn accepted_candidate_lookup_argument_follows_later_runtime_settings() {
     let (_, _, candidate) = runtime
         .evaluate_score_candidate_with_effects_cancellable(
             "setDefaultVoicings('guidetones'); pure('a').pick(pure({a: chord('C7').voicing()}))",
-            None,
             &TranspileOptions::default(),
             std::time::Duration::from_secs(1),
             &std::sync::atomic::AtomicBool::new(false),

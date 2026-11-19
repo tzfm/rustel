@@ -118,7 +118,7 @@ pub(super) fn source_control_pattern<P: PatOps>(name: &str, values: P) -> P {
     let spec = rustel_core::controls::default_control_registry()
         .get(name)
         .unwrap_or_else(|| panic!("the upstream control registry contains {name}"));
-    values.map_control(spec, false)
+    values.map_control(spec.clone(), false)
 }
 
 pub(super) fn apply_control(pattern: &Pattern, name: &str, value: Pattern) -> Pattern {

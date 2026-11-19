@@ -32,7 +32,7 @@ fn zip_surface_filtering_empty_and_singleton_shapes_are_exact() {
     runtime
         .evaluate_score("zip()", &TranspileOptions::default())
         .unwrap();
-    assert_eq!(runtime.active_pattern().expect("empty zip").steps(), None);
+    assert_eq!(runtime.active_pattern().expect("empty zip").steps, None);
     assert!(
         query_active(&runtime, Fraction::ZERO, Fraction::ONE)
             .unwrap()
@@ -53,10 +53,7 @@ fn zip_surface_filtering_empty_and_singleton_shapes_are_exact() {
         )
         .unwrap();
     assert_eq!(runtime.get_number("zipParserHits"), Some(0.0));
-    assert_eq!(
-        runtime.active_pattern().expect("filtered zip").steps(),
-        None
-    );
+    assert_eq!(runtime.active_pattern().expect("filtered zip").steps, None);
     assert!(
         query_active(&runtime, Fraction::ZERO, Fraction::ONE)
             .unwrap()
@@ -76,7 +73,7 @@ fn zip_surface_filtering_empty_and_singleton_shapes_are_exact() {
         .unwrap();
     assert_eq!(runtime.get_number("zipSingletonDistinct"), Some(1.0));
     assert_eq!(
-        runtime.active_pattern().expect("singleton zip").steps(),
+        runtime.active_pattern().expect("singleton zip").steps,
         Some(Fraction::int(2))
     );
     let haps = query_active(&runtime, Fraction::ZERO, Fraction::ONE).unwrap();
@@ -141,7 +138,7 @@ fn zip_lcm_fanout_is_preflighted_at_the_exact_boundary() {
     let exact = semantic_runtime(&format!("zip(gap({limit}), silence)"));
     assert_eq!(rustel_core::stepwise_entries_materialised(), 2);
     assert_eq!(
-        exact.active_pattern().expect("exact zip").steps(),
+        exact.active_pattern().expect("exact zip").steps,
         Some(Fraction::int(i128::from(limit)))
     );
     assert!(query_active(&exact, Fraction::ZERO, Fraction::ZERO).is_ok());

@@ -1,8 +1,4 @@
 use super::*;
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
-use std::mem;
 
 pub(crate) fn native_pure<'js>(
     ctx: Ctx<'js>,
@@ -75,134 +71,19 @@ pub(crate) fn native_mini<'js>(
     new_wrapper(&ctx, NativePatternWrapper::plain(pattern))
 }
 
-/// The most mini literals one thread remembers. A literal past the bound
-/// forgets them all: every forgotten graph rebuilds at its next parse, so
-/// the bound stays simple and the memory flat.
-const MINI_MEMO_ENTRIES: usize = 1024;
-
-/// The graphs of mini literals, by the source text and then by score
-/// offset. The key holds the text, so sources that share a hash never share
-/// a graph: a lookup is one hash and one compare of the text.
-#[derive(Default)]
-struct MiniMemo {
-    graphs: HashMap<Box<str>, MiniLiterals, BuildHasherDefault<rustel_core::WordHasher>>,
-    /// The graphs that `graphs` holds, by text and offset.
-    held: usize,
-    /// The room that each read of a literal takes its plans in.
-    room: rustel_mini::Room,
-}
-
-/// The graphs of one text, at each score offset the text was read at. Most
-/// texts are read at one offset, which needs no list of its own.
-enum MiniLiterals {
-    One(i64, Pattern),
-    Many(Vec<(i64, Pattern)>),
-}
-
-impl MiniLiterals {
-    fn get(&self, offset: i64) -> Option<&Pattern> {
-        match self {
-            Self::One(at, graph) => (*at == offset).then_some(graph),
-            // The newest offset is the one an edit reads next.
-            Self::Many(graphs) => graphs
-                .iter()
-                .rev()
-                .find(|(at, _)| *at == offset)
-                .map(|(_, graph)| graph),
-        }
-    }
-
-    /// Adds the graph of an offset that is not held yet.
-    fn push(&mut self, offset: i64, graph: Pattern) {
-        match self {
-            Self::Many(graphs) => graphs.push((offset, graph)),
-            Self::One(..) => {
-                // The list takes the first graph out of the old form, which
-                // has no empty pattern to leave behind.
-                let Self::One(at, first) = mem::replace(self, Self::Many(Vec::new())) else {
-                    unreachable!("the match above just saw one graph")
-                };
-                *self = Self::Many(vec![(at, first), (offset, graph)]);
-            }
-        }
-    }
-}
-
-impl MiniMemo {
-    fn get(&self, source: &str, offset: i64) -> Option<&Pattern> {
-        self.graphs.get(source)?.get(offset)
-    }
-
-    fn insert(&mut self, source: &str, offset: i64, graph: Pattern) {
-        // A graph held already stays, and costs no room.
-        if self.get(source, offset).is_some() {
-            return;
-        }
-        if self.held >= MINI_MEMO_ENTRIES {
-            *self = Self::default();
-        }
-        match self.graphs.get_mut(source) {
-            Some(literals) => literals.push(offset, graph),
-            None => {
-                self.graphs
-                    .insert(Box::from(source), MiniLiterals::One(offset, graph));
-            }
-        }
-        self.held += 1;
-    }
-}
-
-thread_local! {
-    /// The graphs this thread parsed from mini literals, by source bytes and
-    /// score offset. The same literal parses to the same graph every
-    /// evaluate, so a repeat evaluate shares the remembered graph instead of
-    /// parsing and allocating it again. The offset stays in the key because
-    /// a literal's haps carry the source locations of its offset.
-    static MINI_MEMO: RefCell<MiniMemo> = RefCell::default();
-}
-
-/// Forget the graphs of mini literals that this thread remembers. The next
-/// evaluation parses each literal of its score, as the first evaluation of
-/// a thread does, and the graphs that no session holds are freed.
-pub fn forget_mini_literals() {
-    MINI_MEMO.with(|memo| *memo.borrow_mut() = MiniMemo::default());
-}
-
-/// Put away the room that the literals of an evaluation were read in. Its
-/// lists are as long as the longest literal, and the evaluation after this
-/// one reads few literals or none: the memo holds their graphs.
-pub(crate) fn rest_mini_room() {
-    MINI_MEMO.with(|memo| memo.borrow_mut().room = rustel_mini::Room::default());
-}
-
 /// The pattern a transpiled mini-notation literal builds. `offset` is the
 /// byte offset of its opening quote in the score. A negative offset parses
 /// without source locations, for code outside the score.
 pub(crate) fn transpiled_mini(source: &str, offset: i64) -> Result<Pattern, String> {
-    // One word costs less to read than to remember: the memo would hold
-    // its two nodes for each place that a score writes it.
-    if let Ok(at) = usize::try_from(offset)
-        && let Some(word) = rustel_mini::word_constant(source, at)
-    {
-        return Ok(word);
-    }
-    // A handle of the remembered graph.
-    if let Some(pattern) = MINI_MEMO.with(|memo| memo.borrow().get(source, offset).cloned()) {
-        return Ok(pattern);
-    }
-    let at = usize::try_from(offset).unwrap_or(0);
-    let pattern = MINI_MEMO
-        .with(|memo| rustel_mini::mini_in(&mut memo.borrow_mut().room, source, at))
+    let pattern = rustel_mini::mini_at(source, usize::try_from(offset).unwrap_or(0))
         .map_err(|error| error.to_string())?;
-    let pattern = if offset < 0 {
+    Ok(if offset < 0 {
         pattern
             .map_haps_native(|hap| Some(hap.clone().with_context(Vec::new())))
-            .with_steps(pattern.steps())
+            .with_steps(pattern.steps)
     } else {
         pattern
-    };
-    MINI_MEMO.with(|memo| memo.borrow_mut().insert(source, offset, pattern.clone()));
-    Ok(pattern)
+    })
 }
 
 /// Public `mini(...strings)`, distinct from transpiler-facing `m(str, offset)`.
@@ -247,7 +128,7 @@ pub(crate) fn native_mini_sequence<'js>(
         patterns.push(
             parsed
                 .map_haps_native(|hap| Some(hap.clone().with_context(Vec::new())))
-                .with_steps(parsed.steps()),
+                .with_steps(parsed.steps),
         );
     }
     let pattern = if patterns.is_empty() {
@@ -592,140 +473,4 @@ pub(crate) fn derive_pick_f<'js>(
         rustel_core::apply_functions_strict(receiver, functions),
         &sidecars,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        MINI_MEMO, MINI_MEMO_ENTRIES, MiniLiterals, MiniMemo, forget_mini_literals, rest_mini_room,
-        transpiled_mini,
-    };
-
-    #[test]
-    fn a_literal_of_one_word_is_read_each_time_and_not_remembered() {
-        let held = || MINI_MEMO.with(|memo| memo.borrow().held);
-        forget_mini_literals();
-        let word = transpiled_mini(" sawtooth ", 3).expect("a word");
-        assert_eq!(held(), 0);
-        assert_eq!(
-            format!("{:?}", word.query_arc(0.into(), 2.into())),
-            format!(
-                "{:?}",
-                rustel_mini::mini_at(" sawtooth ", 3)
-                    .expect("a word")
-                    .query_arc(0.into(), 2.into())
-            ),
-        );
-        // A word outside the score has no place: the memo holds its graph.
-        transpiled_mini("sawtooth", -1).expect("a word");
-        assert_eq!(held(), 1);
-        forget_mini_literals();
-    }
-
-    #[test]
-    fn a_room_put_away_holds_no_list_and_keeps_the_literals() {
-        let room_is_bare = || MINI_MEMO.with(|memo| memo.borrow().room.is_bare());
-        forget_mini_literals();
-        transpiled_mini("bd [sd cp] hh*2 <a b>", 3).expect("a literal");
-        assert!(!room_is_bare());
-        rest_mini_room();
-        assert!(room_is_bare());
-        assert_eq!(MINI_MEMO.with(|memo| memo.borrow().held), 1);
-        // The next literal takes a room of its own.
-        transpiled_mini("hh*4", 40).expect("a literal");
-        assert_eq!(MINI_MEMO.with(|memo| memo.borrow().held), 2);
-        forget_mini_literals();
-    }
-
-    #[test]
-    fn two_texts_never_share_a_graph() {
-        let mut memo = MiniMemo::default();
-        let a = rustel_mini::mini_at("bd sd", 3).expect("a literal");
-        let b = rustel_mini::mini_at("hh cp", 3).expect("another literal");
-        memo.insert("bd sd", 3, a.clone());
-        for other in ["hh cp", "bd", "bd sd ", "bd  sd", ""] {
-            assert!(
-                memo.get(other, 3).is_none(),
-                "{other:?} got the graph of another"
-            );
-        }
-        memo.insert("hh cp", 3, b.clone());
-        memo.insert("hh cp", 9, b);
-        let shown = |p: Option<&rustel_core::Pattern>| {
-            format!("{:?}", p.expect("held").query_arc(0.into(), 1.into()))
-        };
-        assert_eq!(shown(memo.get("bd sd", 3)), shown(Some(&a)));
-        assert_ne!(shown(memo.get("hh cp", 3)), shown(memo.get("bd sd", 3)));
-        assert_eq!(memo.held, 3);
-    }
-
-    #[test]
-    fn a_text_held_at_its_offset_is_not_counted_twice() {
-        let mut memo = MiniMemo::default();
-        let a = rustel_mini::mini_at("bd sd", 3).expect("a literal");
-        memo.insert("bd sd", 3, a.clone());
-        memo.insert("bd sd", 3, a.clone());
-        assert_eq!(memo.held, 1);
-        memo.insert("bd sd", 8, a.clone());
-        memo.insert("bd sd", 8, a);
-        assert_eq!(memo.held, 2);
-        let MiniLiterals::Many(list) = &memo.graphs["bd sd"] else {
-            panic!("two offsets hold a list")
-        };
-        assert_eq!(list.len(), 2, "an offset was listed twice");
-    }
-
-    #[test]
-    fn a_graph_held_at_the_bound_is_not_evicted_by_its_own_insert() {
-        let mut memo = MiniMemo::default();
-        let graph = rustel_mini::mini_at("bd", 0).expect("a literal");
-        for number in 0..MINI_MEMO_ENTRIES {
-            memo.insert(&format!("bd*{number}"), 0, graph.clone());
-        }
-        assert_eq!(memo.held, MINI_MEMO_ENTRIES);
-        memo.insert("bd*0", 0, graph.clone());
-        assert_eq!(
-            memo.held, MINI_MEMO_ENTRIES,
-            "a held graph flushed the memo"
-        );
-        assert!(memo.get("bd*1", 0).is_some());
-        memo.insert("new", 0, graph);
-        assert_eq!(memo.held, 1, "a new graph at the bound keeps the old ones");
-    }
-
-    #[test]
-    fn one_text_at_two_offsets_holds_each_graph_by_its_place() {
-        forget_mini_literals();
-        transpiled_mini("[bd sd] hh", 3).expect("a literal");
-        let second = transpiled_mini("[bd sd] hh", 20).expect("the same text at a new place");
-        let hit =
-            |offset: i64| MINI_MEMO.with(|memo| memo.borrow().get("[bd sd] hh", offset).is_some());
-        assert!(hit(3), "the first place lost its graph");
-        assert!(hit(20), "the second place lost its graph");
-        // Each graph carries the places of its own offset.
-        assert_eq!(
-            format!("{:?}", second.query_arc(0.into(), 1.into())),
-            format!(
-                "{:?}",
-                rustel_mini::mini_at("[bd sd] hh", 20)
-                    .expect("the same literal")
-                    .query_arc(0.into(), 1.into())
-            ),
-        );
-        forget_mini_literals();
-    }
-
-    #[test]
-    fn a_forgotten_literal_is_parsed_again() {
-        let held = || MINI_MEMO.with(|memo| memo.borrow().held);
-        forget_mini_literals();
-        for _ in 0..2 {
-            transpiled_mini("bd sd", 3).expect("a literal");
-            assert_eq!(held(), 1);
-        }
-        forget_mini_literals();
-        assert_eq!(held(), 0);
-        transpiled_mini("bd sd", 3).expect("a literal");
-        assert_eq!(held(), 1);
-    }
 }

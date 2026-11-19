@@ -98,13 +98,10 @@ const WORKLOADS: [Workload; 6] = [
 
 fn value(step: usize, control_rich: bool) -> Value {
     if !control_rich {
-        return Value::Str(format!("v{}", step % 8).into());
+        return Value::Str(format!("v{}", step % 8));
     }
     Value::object([
-        (
-            "s".into(),
-            Value::Str(format!("sample-{}", step % 16).into()),
-        ),
+        ("s".into(), Value::Str(format!("sample-{}", step % 16))),
         ("n".into(), Value::F64((step % 12) as f64)),
         ("gain".into(), Value::F64(0.2 + (step % 7) as f64 * 0.1)),
         ("pan".into(), Value::F64((step % 9) as f64 / 8.0)),

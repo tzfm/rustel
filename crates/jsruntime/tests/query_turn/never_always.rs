@@ -375,7 +375,7 @@ fn raw_never_always_are_eager_host_free_and_preserve_only_returned_ownership() {
         never_native
             .active_pattern()
             .expect("raw never native pattern")
-            .steps(),
+            .steps,
         Some(Fraction::int(3))
     );
     for _ in 0..3 {
@@ -457,7 +457,7 @@ fn raw_never_always_are_eager_host_free_and_preserve_only_returned_ownership() {
         always_native
             .active_pattern()
             .expect("raw always native pattern")
-            .steps(),
+            .steps,
         Some(Fraction::int(5))
     );
     for _ in 0..3 {

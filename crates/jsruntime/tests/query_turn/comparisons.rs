@@ -791,7 +791,7 @@ fn raw_comparisons_retain_operands_and_bound_nested_work() {
             owned
                 .active_pattern()
                 .expect("raw comparison owned graph")
-                .steps(),
+                .steps,
             Some(Fraction::int(5))
         );
         for _ in 0..3 {

@@ -30,7 +30,7 @@ fn map<const N: usize>(entries: [(&str, Value); N]) -> Value {
 }
 
 fn text(value: &str) -> Value {
-    Value::Str(value.into())
+    Value::Str(value.to_owned())
 }
 
 type Resolved = Result<OnsetEvent, VoiceError>;

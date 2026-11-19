@@ -138,7 +138,7 @@ fn parse_numeral(value: &Value) -> Result<f64, String> {
 /// Error-message display: strings bare, other values via [`Value::show`].
 fn js_display(value: &Value) -> String {
     match value {
-        Value::Str(s) => s.to_string(),
+        Value::Str(s) => s.clone(),
         other => other.show(),
     }
 }
@@ -233,12 +233,11 @@ fn get_xen_scale(arg: &Value) -> Result<Vec<f64>, String> {
         Value::Str(name) => {
             if is_edo(name) {
                 edo(name)?
-            } else if let Some((_, ratios)) =
-                XEN_PRESETS.iter().find(|(preset, _)| *preset == &**name)
+            } else if let Some((_, ratios)) = XEN_PRESETS.iter().find(|(preset, _)| preset == name)
             {
                 ratios.to_vec()
             } else {
-                let spec = crate::tune::ScaleSpec::Name(name.to_string());
+                let spec = crate::tune::ScaleSpec::Name(name.clone());
                 if crate::tune::Tune::is_valid_scale(&spec) {
                     let mut tune = crate::tune::Tune::new();
                     tune.load_scale(&spec)?;
@@ -288,7 +287,7 @@ pub fn xen_patterns(pat: &crate::Pattern, ratios: Vec<crate::Pattern>) -> crate:
     if ratios.is_empty() {
         return xen(pat, Value::List(Vec::new()));
     }
-    crate::Pattern::of(crate::Node::XenPatterns(pat.clone(), ratios)).with_steps_of(pat)
+    crate::Pattern::of(crate::Node::XenPatterns(pat.clone(), ratios)).with_steps(pat.steps)
 }
 
 pub(crate) fn query_xen_patterns(
@@ -614,7 +613,7 @@ pub fn tune<P: PatOps>(pat: &P, arg: Value) -> P {
                     .all(|item| matches!(item, Value::F64(n) if !n.is_nan()))
         }
         Value::Str(name) => {
-            crate::tune::Tune::is_valid_scale(&crate::tune::ScaleSpec::Name(name.to_string()))
+            crate::tune::Tune::is_valid_scale(&crate::tune::ScaleSpec::Name(name.clone()))
         }
         _ => false,
     };
@@ -628,7 +627,7 @@ pub fn tune<P: PatOps>(pat: &P, arg: Value) -> P {
     }
     let mut tune_engine = crate::tune::Tune::new();
     let spec = match &arg {
-        Value::Str(name) => crate::tune::ScaleSpec::Name(name.to_string()),
+        Value::Str(name) => crate::tune::ScaleSpec::Name(name.clone()),
         Value::List(items) => {
             crate::tune::ScaleSpec::Frequencies(items.iter().filter_map(Value::as_f64).collect())
         }
@@ -1069,14 +1068,11 @@ pub fn edo_scale<P: PatOps>(pat: &P, arg: Value) -> P {
                     pitches
                         .int_labels
                         .iter()
-                        .map(|label| match label {
-                            Some(label) => Value::Str(label.as_str().into()),
-                            None => Value::Null,
-                        })
+                        .map(|l| l.clone().map_or(Value::Null, Value::Str))
                         .collect(),
                 ),
             );
-            rest.insert("root".into(), Value::Str(pitches.base_freq.as_str().into()));
+            rest.insert("root".into(), Value::Str(pitches.base_freq.clone()));
             // An undefined freq means no key at all.
             if !matches!(freq, Value::Undefined) {
                 rest.insert("freq".into(), freq);
@@ -1180,7 +1176,7 @@ mod tests {
         let definition = |sequence: String| {
             vec![
                 Value::Str("C3".into()),
-                Value::Str(sequence.into()),
+                Value::Str(sequence),
                 Value::F64(2.0),
                 Value::F64(1.0),
             ]
@@ -1214,7 +1210,7 @@ mod tests {
                 Value::Str("LLsLLLs".into()),
                 Value::F64(large),
                 Value::F64(1.0),
-                Value::Str(padding.as_str().into()),
+                Value::Str(padding.clone()),
             ]
         };
         let key = |definition: &[Value]| {
@@ -1246,7 +1242,7 @@ mod tests {
 
         let held = cache.key_bytes;
         let mut oversized = definition(40.0);
-        oversized[4] = Value::Str("x".repeat(MAX_CACHED_EDO_KEY_BYTES).into());
+        oversized[4] = Value::Str("x".repeat(MAX_CACHED_EDO_KEY_BYTES));
         let built = cache.get_or_build(key(&oversized), &oversized).unwrap();
         assert_eq!(built.divisions.len(), 7);
         assert_eq!(
@@ -1437,10 +1433,10 @@ mod tests {
     fn build_edo_pitches_for_test(definition: &str) -> EdoPitches {
         let parts: Vec<&str> = definition.split(':').collect();
         let values = vec![
-            Value::Str(parts[0].into()),
-            Value::Str(parts[1].into()),
-            Value::Str(parts[2].into()),
-            Value::Str(parts[3].into()),
+            Value::Str(parts[0].to_string()),
+            Value::Str(parts[1].to_string()),
+            Value::Str(parts[2].to_string()),
+            Value::Str(parts[3].to_string()),
         ];
         build_edo_pitches(definition, &values).unwrap()
     }

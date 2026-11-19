@@ -12,19 +12,14 @@ later version.
 //! oldest first. They drive the editor's highlighting.
 //!
 //! Every query copies them into each hap it returns, so the common case
-//! stays off the heap: up to [`INLINE`] ranges are kept in place, each as a
-//! begin that fits in `u32` and a length that fits in `u16`, which a word
-//! of a score is. Longer lists, and a list with any other range, share one
-//! allocation.
+//! stays off the heap: up to [`INLINE`] ranges that fit in `u32` are kept in
+//! place. Longer lists share one allocation.
 
 use std::fmt;
 use std::sync::Arc;
 
 /// Ranges kept in place before the list moves to the heap.
-const INLINE: usize = 5;
-
-// The ranges in place take the room of the list on the heap and its tag.
-const _: () = assert!(std::mem::size_of::<Locations>() == 32);
+const INLINE: usize = 3;
 
 /// The source locations of a hap. See the module documentation.
 #[derive(Clone)]
@@ -34,25 +29,9 @@ pub struct Locations(Repr);
 enum Repr {
     Inline {
         len: u8,
-        /// Where each range begins.
-        begins: [u32; INLINE],
-        /// How long each range is.
-        lengths: [u16; INLINE],
+        ranges: [(u32, u32); INLINE],
     },
     Shared(Arc<[(usize, usize)]>),
-}
-
-/// `range` as a list in place holds it: its begin and its length. `None`
-/// for a range that takes more room.
-fn narrow((begin, end): (usize, usize)) -> Option<(u32, u16)> {
-    let length = end.checked_sub(begin)?;
-    Some((u32::try_from(begin).ok()?, u16::try_from(length).ok()?))
-}
-
-/// The range that begins at `begin` and is `length` long.
-fn wide(begin: u32, length: u16) -> (usize, usize) {
-    let begin = begin as usize;
-    (begin, begin + usize::from(length))
 }
 
 impl Locations {
@@ -60,22 +39,7 @@ impl Locations {
     pub const fn new() -> Self {
         Self(Repr::Inline {
             len: 0,
-            begins: [0; INLINE],
-            lengths: [0; INLINE],
-        })
-    }
-
-    /// The one range that begins at `begin` and is `length` long, with no
-    /// check of the room, which one range always has.
-    pub(crate) const fn one(begin: u32, length: u16) -> Self {
-        let mut begins = [0; INLINE];
-        let mut lengths = [0; INLINE];
-        begins[0] = begin;
-        lengths[0] = length;
-        Self(Repr::Inline {
-            len: 1,
-            begins,
-            lengths,
+            ranges: [(0, 0); INLINE],
         })
     }
 
@@ -99,11 +63,8 @@ impl Locations {
     /// The range at `index`, oldest first.
     pub fn get(&self, index: usize) -> Option<(usize, usize)> {
         match &self.0 {
-            Repr::Inline {
-                len,
-                begins,
-                lengths,
-            } => (index < usize::from(*len)).then(|| wide(begins[index], lengths[index])),
+            Repr::Inline { len, ranges } => (index < usize::from(*len))
+                .then(|| (ranges[index].0 as usize, ranges[index].1 as usize)),
             Repr::Shared(ranges) => ranges.get(index).copied(),
         }
     }
@@ -141,24 +102,21 @@ impl Locations {
         if more.is_empty() {
             return;
         }
-        if let Repr::Inline {
-            len,
-            begins,
-            lengths,
-        } = &mut self.0
-        {
+        if let Repr::Inline { len, ranges } = &mut self.0 {
             let start = usize::from(*len);
             if start + more.len() <= INLINE {
-                let mut narrowed = [(0u32, 0u16); INLINE];
-                let fits = narrowed
-                    .iter_mut()
-                    .zip(more)
-                    .all(|(slot, range)| narrow(*range).map(|range| *slot = range).is_some());
-                if fits {
-                    for (at, (begin, length)) in narrowed[..more.len()].iter().enumerate() {
-                        begins[start + at] = *begin;
-                        lengths[start + at] = *length;
+                let mut narrow = [(0u32, 0u32); INLINE];
+                let fits = narrow.iter_mut().zip(more).all(|(slot, &(begin, end))| {
+                    match (u32::try_from(begin), u32::try_from(end)) {
+                        (Ok(begin), Ok(end)) => {
+                            *slot = (begin, end);
+                            true
+                        }
+                        _ => false,
                     }
+                });
+                if fits {
+                    ranges[start..start + more.len()].copy_from_slice(&narrow[..more.len()]);
                     *len += more.len() as u8;
                     return;
                 }
@@ -178,14 +136,10 @@ impl Locations {
     /// in place.
     fn as_slice<'a>(&'a self, inline: &'a mut [(usize, usize); INLINE]) -> &'a [(usize, usize)] {
         match &self.0 {
-            Repr::Inline {
-                len,
-                begins,
-                lengths,
-            } => {
+            Repr::Inline { len, ranges } => {
                 let len = usize::from(*len);
-                for (at, slot) in inline[..len].iter_mut().enumerate() {
-                    *slot = wide(begins[at], lengths[at]);
+                for (slot, &(begin, end)) in inline.iter_mut().zip(&ranges[..len]) {
+                    *slot = (begin as usize, end as usize);
                 }
                 &inline[..len]
             }
@@ -197,25 +151,19 @@ impl Locations {
     pub fn append(&mut self, other: &Locations) {
         match &other.0 {
             Repr::Shared(ranges) => self.extend_from_slice(ranges),
-            Repr::Inline {
-                len,
-                begins,
-                lengths,
-            } => {
+            Repr::Inline { len, ranges } => {
                 let len = usize::from(*len);
                 if len == 0 {
                     return;
                 }
                 if let Repr::Inline {
                     len: own,
-                    begins: own_begins,
-                    lengths: own_lengths,
+                    ranges: own_ranges,
                 } = &mut self.0
                 {
                     let start = usize::from(*own);
                     if start + len <= INLINE {
-                        own_begins[start..start + len].copy_from_slice(&begins[..len]);
-                        own_lengths[start..start + len].copy_from_slice(&lengths[..len]);
+                        own_ranges[start..start + len].copy_from_slice(&ranges[..len]);
                         *own += len as u8;
                         return;
                     }
@@ -336,18 +284,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_range_is_the_list_that_a_push_makes() {
-        for (begin, length) in [(0u32, 0u16), (7, 3), (u32::MAX, u16::MAX)] {
-            let one = Locations::one(begin, length);
-            let range = (begin as usize, begin as usize + usize::from(length));
-            assert_eq!(one, Locations::from(&[range][..]));
-            assert!(one.is_inline());
-            assert_eq!(one.get(0), Some(range));
-            assert_eq!(one.len(), 1);
-        }
-    }
-
-    #[test]
     fn short_lists_stay_in_place_and_long_ones_move_to_the_heap() {
         let mut locations = Locations::new();
         for index in 0..INLINE {
@@ -356,20 +292,7 @@ mod tests {
         }
         locations.push((9, 10));
         assert!(matches!(locations.0, Repr::Shared(_)));
-        let mut all: Vec<(usize, usize)> = (0..INLINE).map(|index| (index, index + 1)).collect();
-        all.push((9, 10));
-        assert_eq!(locations, all);
-    }
-
-    #[test]
-    fn a_range_longer_than_a_word_keeps_its_exact_value() {
-        let long = usize::from(u16::MAX) + 1;
-        for range in [(5, 5 + long), (5, 5 + long - 1), (7, 3)] {
-            let mut locations = Locations::from(vec![(1, 2)]);
-            locations.push(range);
-            assert_eq!(locations.to_vec(), vec![(1, 2), range]);
-            assert_eq!(locations.is_inline(), range == (5, 5 + long - 1));
-        }
+        assert_eq!(locations, vec![(0, 1), (1, 2), (2, 3), (9, 10)]);
     }
 
     #[test]
@@ -384,15 +307,10 @@ mod tests {
         let mut left = Locations::from(vec![(1, 2)]);
         left.append(&Locations::from(vec![(3, 4), (5, 6)]));
         assert_eq!(left, vec![(1, 2), (3, 4), (5, 6)]);
-        let many: Vec<(usize, usize)> = (0..=INLINE).map(|index| (index, index + 1)).collect();
-        let mut spilled = Locations::from(many.clone());
+        let mut spilled = Locations::from(vec![(1, 2), (3, 4), (5, 6), (7, 8)]);
         spilled.append(&Locations::new());
-        assert!(!spilled.is_inline());
-        assert_eq!(spilled, Locations::from(many.clone()));
-        // Lists in place that are too long together move to the heap.
-        let mut joined = Locations::from(many[..INLINE].to_vec());
-        joined.append(&Locations::from(many[INLINE..].to_vec()));
-        assert_eq!(joined, many);
+        let shared = Locations::from(vec![(1, 2), (3, 4), (5, 6), (7, 8)]);
+        assert_eq!(spilled, shared);
         assert_eq!(
             left.iter().rev().collect::<Vec<_>>(),
             vec![(5, 6), (3, 4), (1, 2)]

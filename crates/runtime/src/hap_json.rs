@@ -37,7 +37,7 @@ impl ValueJson {
             Value::Undefined | Value::Null => Self::Null,
             Value::Bool(b) => Self::Bool(*b),
             Value::F64(n) => Self::Number(*n),
-            Value::Str(s) => Self::String(s.to_string()),
+            Value::Str(s) => Self::String(s.clone()),
             // A hap carrying a transformer is an intermediate of the join that
             // produced it; render its identity rather than dropping it.
             Value::Function(f) => Self::String(format!("{f:?}")),

@@ -293,7 +293,6 @@ mod tests {
 
     #[test]
     fn an_entry_over_the_ceiling_leaves_rather_than_staying_dead() {
-        let _turn = crate::samples::ceiling_test_turn();
         let dir = tempfile::tempdir().unwrap();
         let stored = sample(48_000, 1, vec![0.25; 5 * 1024 * 1024 / 4]);
         let path = sidecar_path(dir.path(), b"bytes", 48_000, super::super::Codec::Wav);

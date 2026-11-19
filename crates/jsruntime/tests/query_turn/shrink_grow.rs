@@ -716,7 +716,7 @@ fn patterned_shrink_keeps_receiver_override_and_owned_values_for_late_queries() 
     assert!(values.iter().any(|value| value == "owned-shrinklist-1"));
     assert!(values.iter().any(|value| value == "owned-shrinklist-2"));
     assert_eq!(
-        runtime.active_pattern().expect("patterned shrink").steps(),
+        runtime.active_pattern().expect("patterned shrink").steps,
         Some(Fraction::int(4)),
         "late replacement incorrectly refreshed eager StepJoin metadata"
     );

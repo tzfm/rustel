@@ -21,7 +21,7 @@ pub(super) const REFERENCE: ReferenceEntry = simple_reference!(
 
 fn apply<P: PatOps>(args: &[Value], pattern: P) -> P {
     let text = match value(args, 0) {
-        Value::Str(text) => text.to_string(),
+        Value::Str(text) => text,
         value => value.show(),
     };
     let bytes = text.as_bytes();

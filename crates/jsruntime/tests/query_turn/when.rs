@@ -410,7 +410,7 @@ fn raw_when_is_eager_host_free_and_preserves_only_returned_ownership() {
         false_native
             .active_pattern()
             .expect("raw when false native pattern")
-            .steps(),
+            .steps,
         Some(Fraction::int(3))
     );
     for _ in 0..3 {
@@ -492,7 +492,7 @@ fn raw_when_is_eager_host_free_and_preserves_only_returned_ownership() {
         true_native
             .active_pattern()
             .expect("raw when true native pattern")
-            .steps(),
+            .steps,
         Some(Fraction::int(5))
     );
     for _ in 0..3 {

@@ -773,7 +773,7 @@ fn raw_or_retains_operands_prunes_transients_and_keeps_nested_accounting() {
         truthy_branch
             .active_pattern()
             .expect("raw or truthy graph")
-            .steps(),
+            .steps,
         Some(Fraction::int(5))
     );
     for _ in 0..3 {
@@ -852,7 +852,7 @@ fn raw_or_retains_operands_prunes_transients_and_keeps_nested_accounting() {
         selected_branch
             .active_pattern()
             .expect("raw or selected graph")
-            .steps(),
+            .steps,
         Some(Fraction::int(5))
     );
     for _ in 0..3 {

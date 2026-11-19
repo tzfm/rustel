@@ -121,7 +121,6 @@ rustel-ext = { path = "../ext", optional = true }
 rustel-fraction = { path = "../fraction" }
 rustel-jsruntime = { path = "../jsruntime", default-features = false }
 rustel-mini = { path = "../mini" }
-rustel-score = { path = "../score" }
 rustel-scheduler = { path = "../scheduler" }
 rustel-audio = { path = "../audio" }
 rustel-csound = { path = "../csound" }

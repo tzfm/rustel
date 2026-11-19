@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rustel_fraction::Fraction;
-#[cfg(feature = "device-audio")]
 use rustel_runtime::TakeoverCut;
 use rustel_runtime::{
     FileWatch, MAX_WATCH_SOURCE_BYTES, ReloadStatus, Session, WatchLanguage, WatchPoll, WatchTarget,

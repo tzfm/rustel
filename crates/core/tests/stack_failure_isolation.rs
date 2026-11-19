@@ -148,7 +148,7 @@ fn joins_resolve_the_healthy_siblings_of_a_failed_pattern_branch() {
         (outer.poly_join(), expected.poly_join()),
         (outer.step_join(), expected.step_join()),
     ] {
-        assert_eq!(actual.steps(), expected.steps());
+        assert_eq!(actual.steps, expected.steps);
         let expected_haps = haps(&expected);
         assert!(!expected_haps.is_empty());
         assert_eq!(shape(&haps(&actual)), shape(&expected_haps));
@@ -167,9 +167,9 @@ fn a_failed_child_does_not_change_the_stacks_declared_steps() {
         query_error_pattern("child failed").with_steps(Some(Fraction::int(3))),
         named("b").with_steps(Some(Fraction::int(4))),
     ]);
-    assert_eq!(pattern.steps(), Some(Fraction::int(12)));
+    assert_eq!(pattern.steps, Some(Fraction::int(12)));
     assert_eq!(haps(&pattern).len(), 2);
-    assert_eq!(pattern.steps(), Some(Fraction::int(12)));
+    assert_eq!(pattern.steps, Some(Fraction::int(12)));
     assert_eq!(
         take_query_callback_failure().as_deref(),
         Some("child failed")

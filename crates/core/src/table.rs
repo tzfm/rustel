@@ -22,8 +22,7 @@ later version.
 //! takes a table's own arithmetic outside the native range, goes back to the
 //! graph, so every refusal stays the graph's. See [`Work`].
 
-pub(crate) use crate::fused::Wave;
-pub(crate) use crate::fused::wave_name;
+use crate::compose::ComposeOp;
 use crate::settings::SettingsStateId;
 use crate::{
     Combine, Hap, HapExpandFn, HapMapFn, JoinMode, LookupFlow, Meeting, Node, OwnedHapMapFn,
@@ -31,7 +30,6 @@ use crate::{
     ValuePredicate, applied_hap, joined_hap, picked_hap,
 };
 use rustel_fraction::Fraction;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// The most haps one table may hold, and the most cycles a build answers
@@ -40,47 +38,6 @@ const MAX_ENTRIES: usize = 8192;
 
 /// The most haps one query reserves room for ahead of making them.
 const MAX_RESERVED: usize = 1 << 16;
-
-// Buffers of haps that one query hands out and takes back, so that a
-// nested answer does not allocate its own. Per thread, without locks; a
-// buffer returns on drop, empty but with its room.
-thread_local! {
-    static HAP_BUFFERS: std::cell::RefCell<Vec<Vec<Hap>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// One buffer from [`HAP_BUFFERS`], returned when it drops.
-pub(super) struct HapBuffer(Vec<Hap>);
-
-impl HapBuffer {
-    pub(super) fn take() -> Self {
-        let pooled = HAP_BUFFERS.with(|pool| pool.borrow_mut().pop());
-        Self(pooled.unwrap_or_default())
-    }
-}
-
-impl Drop for HapBuffer {
-    fn drop(&mut self) {
-        if self.0.capacity() <= MAX_RESERVED {
-            self.0.clear();
-            HAP_BUFFERS.with(|pool| pool.borrow_mut().push(std::mem::take(&mut self.0)));
-        }
-    }
-}
-
-impl std::ops::Deref for HapBuffer {
-    type Target = Vec<Hap>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for HapBuffer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
 
 /// The most graph levels one table build walks. Each level is a few native
 /// frames, so this stays well below [`crate::MAX_PATTERN_DEPTH`].
@@ -149,8 +106,6 @@ struct Layer {
     /// cycle of `[0, period)`: entry `cycle_starts[c]` is the first of cycle
     /// `c`, and the last item is the entry count. See [`Find::ByCycle`].
     cycle_starts: Option<Vec<u32>>,
-    /// For entries in any other order. See [`Find::Met`].
-    meetings: Option<Meetings>,
 }
 
 /// The entries a query answers from, and how it finds the ones of a period
@@ -169,93 +124,8 @@ enum Find<'a> {
     /// The entries come cycle by cycle, each part in one cycle. The span's
     /// cycles give the range. See [`Layer::cycle_starts`].
     ByCycle(&'a [u32]),
-    /// The entries come in any order, each part in `[0, period)`. A span
-    /// of one or two cycles looks at the entries that meet them.
-    Met(&'a Meetings),
     /// Every entry is looked at.
     Scan,
-}
-
-/// For each cycle of a period, the entries whose part meets it, in the
-/// order of the entries.
-#[derive(Clone, Debug)]
-struct Meetings {
-    /// Item `starts[c]` of `met` is the first of cycle `c`, and the last
-    /// item is the count.
-    starts: Vec<u32>,
-    met: Vec<u32>,
-}
-
-impl Meetings {
-    /// The most items for each entry: an entry of many cycles is in the
-    /// list of each.
-    const MOST: usize = 4;
-
-    /// `None` for a part outside `[0, period)`, and for lists that hold
-    /// more than [`Self::MOST`] items for each entry.
-    fn of(entries: &[Hap], period: i128) -> Option<Self> {
-        let cycles = usize::try_from(period).ok()?;
-        if cycles > MAX_ENTRIES {
-            return None;
-        }
-        let met_by = |entry: &Hap| {
-            let (first, last) = cycles_met(entry.part.begin, entry.part.end);
-            let (first, last) = (usize::try_from(first).ok()?, usize::try_from(last).ok()?);
-            (last < cycles).then_some(first..=last)
-        };
-        let mut starts = vec![0u32; cycles + 1];
-        let mut count = 0usize;
-        for entry in entries {
-            let cycles = met_by(entry)?;
-            count += cycles.clone().count();
-            if count > entries.len().saturating_mul(Self::MOST) {
-                return None;
-            }
-            for cycle in cycles {
-                starts[cycle + 1] += 1;
-            }
-        }
-        for cycle in 0..cycles {
-            starts[cycle + 1] += starts[cycle];
-        }
-        // Each list fills from its start, so it keeps the order.
-        let mut next = starts.clone();
-        let mut met = vec![0u32; count];
-        for (index, entry) in entries.iter().enumerate() {
-            let index = u32::try_from(index).ok()?;
-            for cycle in met_by(entry)? {
-                met[next[cycle] as usize] = index;
-                next[cycle] += 1;
-            }
-        }
-        Some(Self { starts, met })
-    }
-
-    /// The entries that may meet `begin..end`, a span of the period: the
-    /// lists of its one or two cycles. `None` for a span of more cycles.
-    fn near(&self, begin: Fraction, end: Fraction) -> Option<[&[u32]; 2]> {
-        let cycles = i128::try_from(self.starts.len() - 1).ok()?;
-        let (first, last) = cycles_met(begin, end);
-        let (first, last) = (first.max(0), last.min(cycles - 1));
-        let list = |cycle: i128| {
-            let cycle = usize::try_from(cycle).unwrap_or(0);
-            &self.met[self.starts[cycle] as usize..self.starts[cycle + 1] as usize]
-        };
-        match last - first {
-            0 => Some([list(first), &[]]),
-            1 => Some([list(first), list(last)]),
-            more if more > 1 => None,
-            // The span lies outside the period.
-            _ => Some([&[], &[]]),
-        }
-    }
-}
-
-/// The first and the last cycle that a span from `begin` to `end` meets. A
-/// span that ends at the start of a cycle does not meet that cycle.
-fn cycles_met(begin: Fraction, end: Fraction) -> (i128, i128) {
-    let first = begin.floor().numer();
-    (first, first.max(end.ceil().numer().saturating_sub(1)))
 }
 
 /// The entries of one period that may meet a span. The ones in `inside`
@@ -265,82 +135,6 @@ struct Near<'a> {
     /// Where `haps` begin among the entries.
     start: usize,
     inside: std::ops::Range<usize>,
-    /// Which of `haps` may meet the span, when a [`Meetings`] says so.
-    met: Option<[&'a [u32]; 2]>,
-}
-
-impl<'a> Near<'a> {
-    /// Each entry of a period that lies inside a span.
-    fn all(haps: &'a [Hap]) -> Self {
-        Self {
-            haps,
-            start: 0,
-            inside: 0..0,
-            met: None,
-        }
-    }
-
-    /// The entries in their order, each with its place among all entries.
-    fn each(&self) -> Each<'a> {
-        self.from(0)
-    }
-
-    /// [`Self::each`], for the entries after the ones `inside`.
-    fn after(&self) -> Each<'a> {
-        self.from(self.inside.end)
-    }
-
-    fn from(&self, at: usize) -> Each<'a> {
-        Each {
-            haps: self.haps,
-            start: self.start,
-            at,
-            met: self.met,
-        }
-    }
-
-    /// At most how many entries [`Self::each`] gives.
-    fn count(&self) -> usize {
-        match self.met {
-            Some([one, other]) => one.len() + other.len(),
-            None => self.haps.len(),
-        }
-    }
-}
-
-/// See [`Near::each`].
-struct Each<'a> {
-    haps: &'a [Hap],
-    start: usize,
-    at: usize,
-    met: Option<[&'a [u32]; 2]>,
-}
-
-impl<'a> Iterator for Each<'a> {
-    type Item = (usize, &'a Hap);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let Some([one, other]) = &mut self.met else {
-            let hap = self.haps.get(self.at)?;
-            self.at += 1;
-            return Some((self.start + self.at - 1, hap));
-        };
-        // An entry that meets both cycles is in both lists, and comes one
-        // time.
-        let index = match (one.first(), other.first()) {
-            (Some(&a), Some(&b)) => a.min(b),
-            (Some(&a), None) => a,
-            (None, Some(&b)) => b,
-            (None, None) => return None,
-        };
-        for list in [one, other] {
-            if list.first() == Some(&index) {
-                *list = &list[1..];
-            }
-        }
-        let index = index as usize;
-        Some((index, &self.haps[index]))
-    }
 }
 
 impl Answering<'_> {
@@ -351,7 +145,6 @@ impl Answering<'_> {
         let back = shift.checked_neg()?;
         let begin = span.begin.checked_add_int(back)?;
         let end = span.end.checked_add_int(back)?;
-        let mut met = None;
         let (haps, start, first, last) = match self.find {
             Find::Search => {
                 let from = self.haps.partition_point(|hap| hap.part.end <= begin);
@@ -381,26 +174,20 @@ impl Answering<'_> {
                     at(end.floor().numer()) - from,
                 )
             }
-            Find::Met(meetings) => {
-                met = meetings.near(begin, end);
-                (self.haps, 0, 0, 0)
-            }
             Find::Scan => (self.haps, 0, 0, 0),
         };
         Some(Near {
             haps,
             start,
             inside: first..last.max(first),
-            met,
         })
     }
 
     /// At most how many haps the period `shift` cycles on gives `span`.
     fn most(&self, span: TimeSpan, shift: i128) -> Option<usize> {
         let near = self.near(span, shift)?;
-        let scans = matches!(self.find, Find::Scan | Find::Met(_)) && near.met.is_none();
-        if !scans {
-            return Some(near.count());
+        if !matches!(self.find, Find::Scan) {
+            return Some(near.haps.len());
         }
         // A scan may look at many more entries than meet the span.
         let mut count = 0usize;
@@ -443,6 +230,14 @@ enum Stage {
     /// The outer hap of a pick or a join, met by each hap after the inner
     /// pattern's own meetings, as the graph meets it.
     Outer(Arc<Outer>),
+    /// Meetings in a row, each with a constant whose keys it sets on the
+    /// structure's value: `signal` is the constant that they make together.
+    /// Haps that can meet it in place, each in one of its cycles, meet it
+    /// as one. Others meet `each` in turn.
+    Fused {
+        signal: Signal,
+        each: Vec<Stage>,
+    },
 }
 
 /// The outer hap of a pick or a join, which a [`Stage::Outer`] merges into
@@ -563,7 +358,7 @@ enum Side {
 /// What a meeting meets, and the nodes of its own graph above it, innermost
 /// first: what the graph does to the source's haps before the meeting.
 #[derive(Clone)]
-pub(super) struct Signal {
+struct Signal {
     source: Source,
     ops: Vec<SignalOp>,
 }
@@ -772,7 +567,7 @@ impl Signal {
     /// The haps this signal's graph answers for `span`, in its order, into
     /// `out`, which it clears first. `part` is the part of the hap that asks,
     /// which says where a per-cycle node is.
-    pub(super) fn answer(
+    fn answer(
         &self,
         span: TimeSpan,
         part: TimeSpan,
@@ -830,7 +625,7 @@ impl Signal {
             }
             Source::Fixed(fixed) => {
                 let by = asked.begin.checked_sub(fixed.whole.begin)?;
-                let mut scratch = HapBuffer::take();
+                let mut scratch = Vec::new();
                 for (hap, sampler) in fixed.haps.iter().zip(&fixed.samplers) {
                     let hap = retimed(hap, |t| t.checked_add(by))?;
                     match sampler {
@@ -909,17 +704,7 @@ impl Signal {
                     let mut met = Vec::with_capacity(out.len());
                     for hap in out.iter() {
                         // The constant asked over this hap's part: one hap
-                        // for each cycle the part meets. A query asks for
-                        // no more cycles and haps than its limits allow:
-                        // the graph refuses past them.
-                        let count = hap.part.cycle_count()?;
-                        if count > crate::MAX_QUERY_SPAN_CYCLES
-                            || crate::hap_budget().is_some_and(|budget| {
-                                met.len() as i128 + count > i128::from(budget)
-                            })
-                        {
-                            return None;
-                        }
+                        // for each cycle the part meets.
                         let first = hap.part.begin.floor().numer();
                         let last = hap.part.end.ceil().numer().checked_sub(1)?;
                         for cycle in first..=last {
@@ -978,6 +763,18 @@ impl Sampler {
             .iter()
             .all(|hap| hap.value.is_data(0))
             .then_some(())
+    }
+
+    /// `stage` run after the others. A meeting that sets a constant's keys
+    /// joins one that does so just before it. See [`Stage::Fused`].
+    fn push(&mut self, stage: Stage) {
+        if let Some(last) = self.stages.last_mut()
+            && let Some(fused) = last.fused_with(&stage)
+        {
+            *last = fused;
+            return;
+        }
+        self.stages.push(stage);
     }
 
     /// The bare signal of the first meeting, its side and combination, when
@@ -1059,8 +856,7 @@ impl Stage {
                 if !answered {
                     source.answer(whole, part, probe, signal)?;
                 }
-                let mut next = HapBuffer::take();
-                next.reserve(signal.len());
+                let mut next = Vec::with_capacity(signal.len());
                 for structure in &out[start..] {
                     for met in signal.iter() {
                         if let Some(cut) = structure.part.intersection(&met.part) {
@@ -1070,6 +866,30 @@ impl Stage {
                 }
                 out.truncate(start);
                 out.append(&mut next);
+            }
+            Stage::Fused {
+                signal: source,
+                each,
+            } => {
+                let apply = Combine::Composed(ComposeOp::Set);
+                let Source::Constant(constant) = &source.source else {
+                    return None;
+                };
+                if out[start..].iter().all(|hap| {
+                    source.constant_over(hap.part).is_some()
+                        && Meeting::meets_in_place(hap, constant, &apply, LookupFlow::Set)
+                }) {
+                    for hap in &mut out[start..] {
+                        let part = hap.part;
+                        if !Meeting::in_place(hap, constant, part, &apply, LookupFlow::Set) {
+                            return None;
+                        }
+                    }
+                    return Some(());
+                }
+                for stage in each {
+                    stage.run(whole, part, probe, signal, out, start)?;
+                }
             }
             Stage::Step(step) => {
                 let mut kept = start;
@@ -1094,10 +914,85 @@ impl Stage {
         Some(())
     }
 
+    /// The constant hap this stage meets, when it is a meeting that sets
+    /// that hap's keys on the structure's value as they are, in the
+    /// constant's own time: one that may join others. See [`Stage::Fused`].
+    fn setting(&self) -> Option<&Hap> {
+        let Stage::Meet {
+            signal,
+            side: Side::Value,
+            apply: Combine::Composed(ComposeOp::Set),
+            flow: LookupFlow::Set,
+        } = self
+        else {
+            return None;
+        };
+        let Source::Constant(constant) = &signal.source else {
+            return None;
+        };
+        let keys = constant.value.as_object()?;
+        (signal.ops.is_empty()
+            && constant.pick_lookup.is_none()
+            && !crate::compose::union_drops(keys)
+            && constant.value.is_data(0))
+        .then_some(constant)
+    }
+
+    /// This stage and `next` as one, when both set constants' keys.
+    ///
+    /// Meeting the constant they make together sets what meeting both in
+    /// turn sets: the union keeps the first's keys in order and then adds
+    /// the second's, the second's locations come first, and the second's
+    /// live controls win for its own keys.
+    fn fused_with(&self, next: &Stage) -> Option<Stage> {
+        let constant = next.setting()?;
+        let (before, mut each) = match self {
+            Stage::Fused { signal, each } if signal.ops.is_empty() => match &signal.source {
+                Source::Constant(before) => (&**before, each.clone()),
+                _ => return None,
+            },
+            stage => (stage.setting()?, vec![stage.clone()]),
+        };
+        let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
+        let together = applied_hap(
+            before,
+            constant,
+            Some(cycle),
+            cycle,
+            &Combine::Composed(ComposeOp::Set),
+            LookupFlow::Set,
+        );
+        if together.pick_lookup.is_some() {
+            return None;
+        }
+        // Each hap reads the constant's map. A kept map is known to be data.
+        let mut together = together;
+        let crate::Value::Object(map) = &together.value else {
+            return None;
+        };
+        if let Some(kept) = map.interned() {
+            together.value = crate::Value::Object(kept);
+        }
+        each.push(next.clone());
+        Some(Stage::Fused {
+            signal: Signal {
+                source: Source::Constant(Box::new(together)),
+                ops: Vec::new(),
+            },
+            each,
+        })
+    }
+
     /// `ops` added outside each signal this stage meets.
     fn extend_ops(&mut self, ops: &[SignalOp]) {
         match self {
             Stage::Meet { signal, .. } => signal.ops.extend_from_slice(ops),
+            Stage::Fused { signal, each } => {
+                signal.ops.extend_from_slice(ops);
+                for stage in each {
+                    stage.extend_ops(ops);
+                }
+            }
             Stage::Step(_) | Stage::Outer(_) => {}
         }
     }
@@ -1152,489 +1047,8 @@ impl Step {
     }
 }
 
-/// The answer tables one node holds, in the state a query finds them.
-#[derive(Debug, Default)]
-pub(crate) enum TableSlot {
-    /// No build has put tables here yet.
-    #[default]
-    Empty,
-    /// A build under this settings state made none, so the graph answers.
-    /// A later state may build again: the compiled programs a build applies
-    /// can change with the state.
-    GraphAnswers(SettingsStateId),
-    /// Built tables, answering while [`Tables::current`] upholds them and
-    /// replaced by a fresh build the first query after they stop.
-    Ready(Arc<Tables>),
-    /// The run of short queries that the root of a walked graph answers.
-    Run(Arc<Run>),
-}
-
-/// A run of short queries of the root of a walked graph of discrete haps:
-/// queries that follow one another, as playback asks them. The run keeps
-/// the answer of the rest of the cycle, and each query that the rest holds
-/// is cut from it.
-///
-/// A walk pays for the whole graph at each query, and it makes a hap that
-/// sounds over several queries again for each of them. One walk of the
-/// rest of the cycle pays for both one time.
-#[derive(Debug)]
-pub(crate) struct Run {
-    /// The span of the kept answer. With no kept answer, the span of the
-    /// queries that the graph answers.
-    span: TimeSpan,
-    /// The controls and the settings snapshot of each query of the run.
-    controls: crate::OrderedMap,
-    state: SettingsStateId,
-    kept: Option<Kept>,
-    /// The answer of the cycle after the span, which the queries of the
-    /// run build in parts. One query at a time builds a part: the lock is
-    /// taken with no wait.
-    ahead: std::sync::Mutex<Ahead>,
-    /// Whether the last query at the root was none of this run. A second
-    /// one in a row ends the run. One query of another caller between two
-    /// queries of the run so ends nothing.
-    stranger: AtomicBool,
-}
-
-/// The answer of the cycle after a [`Run`], built in parts. Each query of
-/// the run walks some units of the graph for the whole cycle: a unit is a
-/// layer of a sequence, or a node that answers whole. The cycle then
-/// begins with its answer kept, and no query pays the walk of a whole
-/// cycle.
-#[derive(Debug, Default)]
-pub(crate) struct Ahead {
-    /// The haps of the units that are walked, in the order of the graph.
-    haps: Vec<Hap>,
-    /// How many units are walked.
-    walked: usize,
-    /// How many units the graph has. `None` before the first walk.
-    units: Option<usize>,
-    /// Whether the haps hold data only, as each walk said.
-    data_only: bool,
-    /// Whether a walk gave no answer to keep. The cycle is then walked
-    /// whole when it begins.
-    failed: bool,
-    /// What the first walk met at each node, for the walks after it.
-    seen: Vec<crate::Seen>,
-    /// How many walks build the cycle, and how many units the cycle
-    /// before it had: what its plan is. `None` for a cycle with no cycle
-    /// kept before it, which each query of the run walks a share of.
-    plan: Option<Plan>,
-}
-
-/// The plan of the walks of a cycle, from the cycle that the run keeps.
-#[derive(Clone, Copy, Debug)]
-struct Plan {
-    /// The walks that are left.
-    walks: usize,
-    /// The units of the cycle before: the best guess before the first
-    /// walk says how many this cycle has.
-    units: usize,
-}
-
-impl Ahead {
-    /// Whether each unit is walked: the haps are the answer of the cycle.
-    pub(crate) fn is_whole(&self) -> bool {
-        self.units.is_some_and(|units| self.walked >= units)
-    }
-
-    /// Whether a walk failed.
-    pub(crate) fn failed(&self) -> bool {
-        self.failed
-    }
-
-    /// The most haps that one walk of a planned cycle makes, as the cycle
-    /// before it says. Each walk pays for the nodes above its units again,
-    /// so a cycle of few haps takes few walks.
-    const HAPS_A_WALK: usize = 5;
-
-    /// An answer to build after a cycle of `haps` haps and `units` units.
-    fn planned(haps: usize, units: usize) -> Self {
-        Self {
-            // Room for as many haps as the cycle before, with none to move.
-            haps: Vec::with_capacity(haps),
-            plan: Some(Plan {
-                walks: haps.div_ceil(Self::HAPS_A_WALK).max(1),
-                units,
-            }),
-            ..Self::default()
-        }
-    }
-
-    /// The units to walk now, when `left` more queries of the run come
-    /// before the cycle begins: an even share of the units that are left,
-    /// for the walks of the plan or for each query. The first walk of a
-    /// plan takes one unit, and a cycle with no plan walks one unit.
-    pub(crate) fn share(&self, left: usize) -> std::ops::Range<usize> {
-        let guess = self.plan.map_or(1, |plan| plan.units.max(1));
-        let rest = self
-            .units
-            .map_or(guess, |units| units.saturating_sub(self.walked));
-        let walks = self
-            .plan
-            .map_or(left + 1, |plan| plan.walks.clamp(1, left + 1));
-        // The first walk also finds the units of the cycle, which is work
-        // of its own: it takes one unit where more walks follow.
-        let share = match (self.units, walks) {
-            (None, 2..) => 1,
-            _ => rest.div_ceil(walks),
-        };
-        self.walked..self.walked + share
-    }
-
-    /// The units that are left, for the query that begins the cycle.
-    pub(crate) fn rest(&self) -> std::ops::Range<usize> {
-        self.walked..usize::MAX
-    }
-
-    /// The haps so far, for a walk that writes after them.
-    pub(crate) fn take_haps(&mut self) -> Vec<Hap> {
-        std::mem::take(&mut self.haps)
-    }
-
-    /// Keep `haps`, the haps before a walk and the answer of the walk of
-    /// the units up to `to`, of the `units` that the walk met. A walk that
-    /// met another count than the walk before it, and more haps than a run
-    /// keeps, are failures.
-    pub(crate) fn add(
-        &mut self,
-        haps: Vec<Hap>,
-        data_only: bool,
-        to: usize,
-        units: usize,
-        seen: Vec<crate::Seen>,
-    ) {
-        let first = self.units.is_none();
-        self.failed |= !first && self.units != Some(units);
-        self.data_only = (first || self.data_only) && data_only;
-        self.failed |= haps.len() as u64 > Run::MOST_HAPS;
-        (self.haps, self.seen) = (haps, seen);
-        self.walked = to.min(units);
-        self.units = Some(units);
-        if let Some(plan) = &mut self.plan {
-            plan.walks = plan.walks.saturating_sub(1);
-        }
-    }
-
-    /// The notes of the walks so far, for the next walk.
-    pub(crate) fn take_seen(&mut self) -> Vec<crate::Seen> {
-        std::mem::take(&mut self.seen)
-    }
-
-    /// A walk gave no answer to keep.
-    pub(crate) fn fail(&mut self) {
-        self.failed = true;
-    }
-
-    /// The answer to keep, when each unit is walked and no walk failed,
-    /// and how many units it has.
-    pub(crate) fn into_kept(self) -> Option<(Kept, usize)> {
-        let units = self.units.filter(|_| self.is_whole() && !self.failed)?;
-        Some((Kept::of(self.haps, self.data_only)?, units))
-    }
-}
-
-/// The answer that a [`Run`] keeps: the haps of its span, in the order of
-/// the graph.
-#[derive(Debug)]
-pub(crate) struct Kept {
-    haps: Box<[Hap]>,
-    /// The times of the haps on one grid, when one grid holds them.
-    ticks: Option<Ticks>,
-    /// Whether the haps hold data only, as the walk said.
-    data_only: bool,
-    _charge: Charge,
-}
-
-/// The times of kept haps as whole ticks of one grid. A cut compares and
-/// orders ticks, with no arithmetic of fractions.
-#[derive(Debug)]
-struct Ticks {
-    /// Ticks in one cycle.
-    cycle: i64,
-    /// The part and then the whole of each hap, each from its begin to its
-    /// end.
-    haps: Box<[[i64; 4]]>,
-}
-
-impl Ticks {
-    /// The most ticks in a cycle. Finer times are compared as fractions.
-    const FINEST: i64 = 1 << 20;
-
-    /// `None` for haps that no grid holds: one with no whole, or times
-    /// finer than [`Self::FINEST`] or outside the range of a tick.
-    fn of(haps: &[Hap]) -> Option<Self> {
-        let times = |hap: &Hap| {
-            let whole = hap.whole?;
-            Some([hap.part.begin, hap.part.end, whole.begin, whole.end])
-        };
-        let mut cycle = 1;
-        for hap in haps {
-            for time in times(hap)? {
-                cycle = Self::holding(cycle, time)?;
-            }
-        }
-        // A cut may read the ticks on a grid up to the finest one.
-        let finest = Self::FINEST / cycle;
-        let tick = |time| Self::at(cycle, time).filter(|tick| tick.checked_mul(finest).is_some());
-        let haps = haps
-            .iter()
-            .map(|hap| {
-                let [begin, end, whole_begin, whole_end] = times(hap)?;
-                Some([
-                    tick(begin)?,
-                    tick(end)?,
-                    tick(whole_begin)?,
-                    tick(whole_end)?,
-                ])
-            })
-            .collect::<Option<_>>()?;
-        Some(Self { cycle, haps })
-    }
-
-    /// The ticks in a cycle of the coarsest grid that holds `time` and a
-    /// grid of `cycle` ticks. `None` past [`Self::FINEST`].
-    fn holding(cycle: i64, time: Fraction) -> Option<i64> {
-        let denom = i64::try_from(time.denom()).ok()?;
-        if cycle % denom == 0 {
-            return Some(cycle);
-        }
-        let finer = Fraction::int(cycle.into()).checked_lcm(Fraction::int(denom.into()))?;
-        i64::try_from(finer.numer())
-            .ok()
-            .filter(|&cycle| cycle <= Self::FINEST)
-    }
-
-    /// `time` in ticks of a grid of `cycle` ticks that holds it.
-    fn at(cycle: i64, time: Fraction) -> Option<i64> {
-        let denom = i64::try_from(time.denom()).ok()?;
-        i64::try_from(time.numer()).ok()?.checked_mul(cycle / denom)
-    }
-
-    /// A grid that holds the haps and `span`: how many of its ticks one
-    /// tick of the haps is, and the span on it.
-    fn with(&self, span: TimeSpan) -> Option<(i64, i64, i64)> {
-        let cycle = Self::holding(Self::holding(self.cycle, span.begin)?, span.end)?;
-        Some((
-            cycle / self.cycle,
-            Self::at(cycle, span.begin)?,
-            Self::at(cycle, span.end)?,
-        ))
-    }
-}
-
-/// What a [`Run`] is to a query at its root.
-pub(crate) enum Met {
-    /// The run holds the span of the query. See [`Run::kept`].
-    Held,
-    /// The query goes on from the span of the run: the next span begins
-    /// with it.
-    Next,
-    /// A query that is none of the run, and whether it ends the run.
-    Stranger { ends: bool },
-}
-
-impl Run {
-    /// The most haps of a kept answer. A rest of a cycle with more haps is
-    /// walked query by query: the bound is the most that one query of a
-    /// run costs more than its own walk.
-    pub(crate) const MOST_HAPS: u64 = 1024;
-
-    /// The cycles after a refused rest that the graph answers before a
-    /// query of the run asks for an answer to keep again.
-    const REFUSED_CYCLES: i128 = 15;
-
-    /// Whether a query of `span` may be one of a run: a span with width
-    /// that is shorter than a cycle.
-    pub(crate) fn takes(span: TimeSpan) -> bool {
-        span.begin < span.end
-            && span
-                .end
-                .checked_sub(span.begin)
-                .is_some_and(|width| width < Fraction::ONE)
-    }
-
-    /// The rest of the cycle that a query of `span` ends in, from the
-    /// begin of the query. `None` when the query ends with its cycle.
-    pub(crate) fn rest(span: TimeSpan) -> Option<TimeSpan> {
-        let end = span.end.ceil();
-        (end > span.end).then(|| TimeSpan::new(span.begin, end))
-    }
-
-    /// A run that keeps `kept`, the answer of `span`, for queries as
-    /// `state`.
-    /// The answer has `units` units: the cycle after it is planned from
-    /// it.
-    pub(crate) fn of(span: TimeSpan, state: &State, kept: Kept, units: usize) -> Self {
-        Self {
-            ahead: std::sync::Mutex::new(Ahead::planned(kept.haps.len(), units)),
-            kept: Some(kept),
-            ..Self::walked(span, state)
-        }
-    }
-
-    /// A run with no kept answer: the graph answers each query of `span`.
-    pub(crate) fn walked(span: TimeSpan, state: &State) -> Self {
-        Self {
-            span,
-            controls: state.controls.clone(),
-            state: crate::settings::current_state_id(),
-            kept: None,
-            ahead: std::sync::Mutex::default(),
-            stranger: AtomicBool::new(false),
-        }
-    }
-
-    /// This run with no kept answer, after the last query that the answer
-    /// holds: the span, and the answer that its queries built ahead.
-    pub(crate) fn without_kept(&self, state: &State) -> Self {
-        let run = Self::walked(self.span, state);
-        if let (Some(mut built), Some(mut ahead)) = (self.ahead(), run.ahead()) {
-            std::mem::swap(&mut *built, &mut *ahead);
-        }
-        run
-    }
-
-    /// [`Self::walked`] for a rest whose answer was refused: the graph
-    /// answers the rest and some cycles after it.
-    pub(crate) fn refused(rest: TimeSpan, state: &State) -> Self {
-        let end = rest
-            .end
-            .checked_add_int(Self::REFUSED_CYCLES)
-            .unwrap_or(rest.end);
-        let run = Self::walked(TimeSpan::new(rest.begin, end), state);
-        // The cycle after the refused ones is walked whole when it comes:
-        // its parts would wait for it through each of them.
-        if let Some(mut ahead) = run.ahead() {
-            ahead.fail();
-        }
-        run
-    }
-
-    pub(crate) fn span(&self) -> TimeSpan {
-        self.span
-    }
-
-    /// The cycle after the span, when the span ends with a cycle.
-    pub(crate) fn cycle_ahead(&self) -> Option<TimeSpan> {
-        let end = self.span.end.checked_add_int(1)?;
-        (self.span.end.denom() == 1).then(|| TimeSpan::new(self.span.end, end))
-    }
-
-    /// The answer of [`Self::cycle_ahead`] that the run builds, for the
-    /// one query that builds a part now. `None` while another query does.
-    pub(crate) fn ahead(&self) -> Option<std::sync::MutexGuard<'_, Ahead>> {
-        self.ahead.try_lock().ok()
-    }
-
-    /// The answer that the run keeps for the queries of its span. `None`
-    /// when the graph answers them.
-    pub(crate) fn kept(&self) -> Option<&Kept> {
-        self.kept.as_ref()
-    }
-
-    /// What this run is to a query of `state`.
-    pub(crate) fn met(&self, state: &State) -> Met {
-        let span = state.span;
-        let known = crate::settings::is_current_state(&self.state)
-            && self.controls == state.controls
-            && self.span.begin <= span.begin
-            && span.begin <= self.span.end;
-        if !known {
-            return Met::Stranger {
-                ends: self.stranger.swap(true, Ordering::Relaxed),
-            };
-        }
-        self.stranger.store(false, Ordering::Relaxed);
-        match span.end <= self.span.end {
-            true => Met::Held,
-            false => Met::Next,
-        }
-    }
-}
-
-impl Kept {
-    /// `haps`, the answer of a walk, to keep. `None` for an answer that no
-    /// query can be cut from: a hap with no whole is read at the span, and
-    /// a hap of no width is read differently by a span that begins at its
-    /// time and by one that ends there. `None` also past the budget of the
-    /// tables.
-    pub(crate) fn of(haps: Vec<Hap>, data_only: bool) -> Option<Self> {
-        let cut = |hap: &Hap| hap.whole.is_some() && hap.part.begin < hap.part.end;
-        if !haps.iter().all(cut) {
-            return None;
-        }
-        let charge = Charge::take(haps.len() * std::mem::size_of::<Hap>())?;
-        Some(Self {
-            ticks: Ticks::of(&haps),
-            haps: haps.into_boxed_slice(),
-            data_only,
-            _charge: charge,
-        })
-    }
-
-    pub(crate) fn data_only(&self) -> bool {
-        self.data_only
-    }
-
-    /// The haps that sound in `span`, each cut to it: what a walk of `span`
-    /// answers, in the order of the graph or sorted as a query sorts.
-    pub(crate) fn cut(&self, span: TimeSpan, order: Order) -> Vec<Hap> {
-        let on_grid = self
-            .ticks
-            .as_ref()
-            .and_then(|ticks| Some((ticks, ticks.with(span)?)));
-        let Some((ticks, (scale, begin, end))) = on_grid else {
-            let haps = self.cut_by_fractions(span);
-            return match order {
-                Order::Graph => haps,
-                Order::Sorted => crate::sort_haps_for_query(haps),
-            };
-        };
-        // Each hap that sounds, with its times after the cut: what a query
-        // sorts by. Equal times keep the order of the graph.
-        let mut found = Vec::with_capacity(crate::FEW_HAPS.min(self.haps.len()));
-        for (at, &[from, to, whole_begin, whole_end]) in ticks.haps.iter().enumerate() {
-            let (from, to) = (from * scale, to * scale);
-            if from < end && begin < to {
-                found.push(([from.max(begin), to.min(end), whole_begin, whole_end], at));
-            }
-        }
-        if order == Order::Sorted {
-            found.sort_by_key(|&(times, _)| times);
-        }
-        found
-            .into_iter()
-            .map(|([from, to, ..], at)| {
-                let mut hap = self.haps[at].clone();
-                if from == begin {
-                    hap.part.begin = span.begin;
-                }
-                if to == end {
-                    hap.part.end = span.end;
-                }
-                hap
-            })
-            .collect()
-    }
-
-    /// [`Self::cut`] in the order of the graph, for times on no grid.
-    fn cut_by_fractions(&self, span: TimeSpan) -> Vec<Hap> {
-        let sounds = |hap: &&Hap| hap.part.begin < span.end && span.begin < hap.part.end;
-        // Room for the haps of a short span, which most queries of a run
-        // ask.
-        let mut haps = Vec::with_capacity(crate::FEW_HAPS.min(self.haps.len()));
-        haps.extend(self.haps.iter().filter(sounds).map(|hap| {
-            let mut hap = hap.clone();
-            hap.part = TimeSpan::new(hap.part.begin.max(span.begin), hap.part.end.min(span.end));
-            hap
-        }));
-        haps
-    }
-}
-
 /// Layers answered one after the other, as a stack answers its children.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Tables {
     layers: Vec<Layer>,
     /// What the graph's walk does for a query. See [`Work`].
@@ -1660,51 +1074,6 @@ pub(crate) struct Tables {
     /// answers only while they all hold. See
     /// [`crate::callback_ir::recording_reads`].
     read: Box<[Arc<crate::callback_ir::Standing>]>,
-    /// The share of [`TABLE_BUDGET`] these tables hold while a node keeps
-    /// them. `None` for tables built for one answer only.
-    charge: Option<Charge>,
-}
-
-/// The bytes the kept tables of this process may hold together, unless a
-/// host sets another budget with [`set_table_budget`].
-pub const DEFAULT_TABLE_BUDGET: usize = 32 << 20;
-
-static TABLE_BUDGET: AtomicUsize = AtomicUsize::new(DEFAULT_TABLE_BUDGET);
-static TABLE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-/// Set how many bytes the kept tables of this process may hold together.
-/// Tables kept already stay until they drop. A table past the budget
-/// answers the query that built it and is not kept: its node is walked.
-pub fn set_table_budget(bytes: usize) {
-    TABLE_BUDGET.store(bytes, Ordering::Relaxed);
-}
-
-/// The bytes the kept tables of this process hold now.
-pub fn table_bytes() -> usize {
-    TABLE_BYTES.load(Ordering::Relaxed)
-}
-
-/// A kept table's share of the budget, given back when the table drops.
-#[derive(Debug)]
-struct Charge(usize);
-
-impl Charge {
-    /// `bytes` of the budget, when that much is left.
-    fn take(bytes: usize) -> Option<Self> {
-        let budget = TABLE_BUDGET.load(Ordering::Relaxed);
-        TABLE_BYTES
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
-                held.checked_add(bytes).filter(|&total| total <= budget)
-            })
-            .ok()
-            .map(|_| Self(bytes))
-    }
-}
-
-impl Drop for Charge {
-    fn drop(&mut self) {
-        TABLE_BYTES.fetch_sub(self.0, Ordering::Relaxed);
-    }
 }
 
 /// What the graph's walk does for a query, as bounds a table checks before
@@ -2087,8 +1456,15 @@ impl Layer {
                 ),
             });
         }
-        // A period that repeats a control map holds it once.
-        crate::value::share_equal_maps(entries.iter_mut().map(|entry| &mut entry.value));
+        // Every query clones these values. An interned map clones as a
+        // pointer.
+        for entry in &mut entries {
+            if let crate::Value::Object(object) = &entry.value
+                && let Some(interned) = object.interned()
+            {
+                entry.value = crate::Value::Object(interned);
+            }
+        }
         let ordered = in_time_order(&entries, period);
         let sorted = (!ordered)
             .then(|| crate::sort_haps_for_query(entries.clone()))
@@ -2100,10 +1476,6 @@ impl Layer {
         } else {
             cycle_starts(&entries, period)
         };
-        let meetings = match ordered || cycle_starts.is_some() {
-            true => None,
-            false => Meetings::of(&entries, period),
-        };
         Some(Self {
             period,
             entries,
@@ -2114,7 +1486,6 @@ impl Layer {
             sampled: None,
             whole_haps,
             cycle_starts,
-            meetings,
         })
     }
 
@@ -2147,7 +1518,7 @@ impl Layer {
                 .map(|sampler| {
                     (!sampler.stages.is_empty()).then(|| {
                         let mut sampler = Sampler::clone(sampler);
-                        sampler.stages.push(stage.clone());
+                        sampler.push(stage.clone());
                         sampler.most = sampler.most.saturating_mul(most);
                         Arc::new(sampler)
                     })
@@ -2201,11 +1572,10 @@ impl Layer {
             }),
             Order::Graph => Some(Answering {
                 haps: &self.entries,
-                find: match (&self.cycle_starts, &self.meetings) {
-                    (Some(starts), _) => Find::ByCycle(starts),
-                    (None, Some(meetings)) => Find::Met(meetings),
-                    (None, None) => Find::Scan,
-                },
+                find: self
+                    .cycle_starts
+                    .as_deref()
+                    .map_or(Find::Scan, Find::ByCycle),
             }),
             Order::Sorted => self.sorted.as_deref().map(|haps| Answering {
                 haps,
@@ -2317,7 +1687,7 @@ impl Layer {
             met.settle(hap);
             if then.iter().all(|stage| match stage {
                 Stage::Step(step) => step.run_in_place(hap),
-                Stage::Meet { .. } | Stage::Outer(_) => false,
+                Stage::Meet { .. } | Stage::Outer(_) | Stage::Fused { .. } => false,
             }) {
                 if !hap.value.is_data(0) {
                     return None;
@@ -2351,11 +1721,13 @@ impl Layer {
         for k in periods.first..=periods.last {
             let shift = k.checked_mul(self.period)?;
             let from = out.haps.len();
-            let near = match periods.is_inside(k) {
-                true => Near::all(entries.haps),
-                false => entries.near(span, shift)?,
+            let (near, first) = if periods.is_inside(k) {
+                (entries.haps, 0)
+            } else {
+                let near = entries.near(span, shift)?;
+                (near.haps, near.start)
             };
-            for (index, entry) in near.each() {
+            for (index, entry) in (first..).zip(near) {
                 let Some(part) = shifted_span(entry.part, shift)?.intersection(&span) else {
                     continue;
                 };
@@ -2394,17 +1766,19 @@ impl Layer {
         }
         out.reserve(self.most(entries, span, periods)?.min(MAX_RESERVED));
         let mut probe = state.clone();
-        let mut signal = HapBuffer::take();
+        let mut signal = Vec::new();
         for k in periods.first..=periods.last {
             let shift = k.checked_mul(self.period)?;
             let inside = periods.is_inside(k);
             let from = out.len();
             let mut met = 0;
-            let near = match inside {
-                true => Near::all(entries.haps),
-                false => entries.near(span, shift)?,
+            let (near, first) = if inside {
+                (entries.haps, 0)
+            } else {
+                let near = entries.near(span, shift)?;
+                (near.haps, near.start)
             };
-            for (index, entry) in near.each() {
+            for (index, entry) in (first..).zip(near) {
                 let shifted = shifted_span(entry.part, shift)?;
                 let part = if inside {
                     shifted
@@ -2494,7 +1868,7 @@ impl Layer {
                 clipped |= Self::push_clipped(entry, span, shift, out)?;
             }
             self.copy_shifted(&near.haps[near.inside.clone()], shift, out)?;
-            for (_, entry) in near.after() {
+            for entry in &near.haps[near.inside.end..] {
                 clipped |= Self::push_clipped(entry, span, shift, out)?;
             }
             if !stop.allows(from, out.len() - from) {
@@ -2968,19 +2342,12 @@ impl Tables {
             sorted,
             state: None,
             read: Box::new([]),
-            charge: None,
         }
     }
 
     /// These tables, kept for the settings snapshot `state`, which was in
     /// force when their build began, and for the standings `read` of the
     /// compiled programs the build applied.
-    /// These tables for one answer, with the standings of the programs
-    /// their build applied.
-    pub(crate) fn reading(self, read: Box<[Arc<crate::callback_ir::Standing>]>) -> Self {
-        Self { read, ..self }
-    }
-
     pub(crate) fn built_under(
         self,
         state: SettingsStateId,
@@ -2991,29 +2358,6 @@ impl Tables {
             read,
             ..self
         }
-    }
-
-    /// Take this table's share of the budget so a node may keep it. `false`
-    /// when the budget has no room: the table answers once and drops.
-    pub(crate) fn charge(&mut self) -> bool {
-        self.charge = Charge::take(self.bytes());
-        self.charge.is_some()
-    }
-
-    /// About the bytes these tables hold: their entries in each order kept,
-    /// and the union a sorted answer of several layers builds.
-    fn bytes(&self) -> usize {
-        let kept: usize = self
-            .layers
-            .iter()
-            .map(|layer| layer.entries.len() + layer.sorted.as_ref().map_or(0, Vec::len))
-            .sum();
-        let union = if self.layers.len() > 1 {
-            self.layers.iter().map(|layer| layer.entries.len()).sum()
-        } else {
-            0
-        };
-        (kept + union) * std::mem::size_of::<Hap>()
     }
 
     /// Whether the settings in force are those the table was built under,
@@ -3265,12 +2609,11 @@ pub(crate) fn build(node: &Node) -> Option<Tables> {
     match node {
         Node::Silence => Some(Tables::new(Vec::new(), Work::leaf(Cycles::NONE))),
         Node::Pure(value) if value.is_data(0) => pure(value),
-        Node::Sequence(layers) => sequence(layers),
         Node::AddContext(pattern, locations) => {
-            stepped(&*pattern.tables()?, Step::Locations(locations.clone()))
+            stepped(pattern.tables()?, Step::Locations(locations.clone()))
         }
-        Node::Fast(pattern, factor, _) => fast(&*pattern.tables()?, **factor),
-        Node::Shift(pattern, by, _) => shift(&*pattern.tables()?, **by),
+        Node::Fast(pattern, factor, _) => fast(pattern.tables()?, *factor),
+        Node::Shift(pattern, by, _) => shift(pattern.tables()?, *by),
         Node::Stack(patterns) => stack(patterns),
         Node::SplitQueries(inner) => split_queries(inner),
         Node::Pick {
@@ -3278,81 +2621,54 @@ pub(crate) fn build(node: &Node) -> Option<Tables> {
             lookup,
             index_mode,
             mode,
-        } => picked(&*selector.tables()?, lookup, *index_mode, *mode),
+        } => picked(selector.tables()?, lookup, *index_mode, *mode),
         Node::Join(inner, mode) => match inner.node_kind() {
-            Node::PatternOfPure(carrier, f, memo) => joined(&*carrier.tables()?, f, memo, *mode),
-            Node::PatternOfPureOperand(pair, map, memo) => {
-                let crate::PatternPair(carrier, operand) = &**pair;
-                // The registered body fixed to this node's operand: one
-                // closure per build, never per evaluation.
-                let construct: crate::ToPurePatternFn = {
-                    let map = Arc::clone(map);
-                    let operand = operand.clone();
-                    Arc::new(move |value| map.apply(value, &operand))
-                };
-                joined(&*carrier.tables()?, &construct, memo, *mode)
-            }
+            Node::PatternOfPure(carrier, f, memo) => joined(carrier.tables()?, f, memo, *mode),
             _ => None,
         },
-        Node::FmapNative(pattern, f) => stepped(&*pattern.tables()?, Step::Map(f.clone())),
-        Node::FilterValues(pattern, keep) => stepped(&*pattern.tables()?, Step::Keep(keep.clone())),
+        Node::FmapNative(pattern, f) => stepped(pattern.tables()?, Step::Map(f.clone())),
+        Node::FilterValues(pattern, keep) => stepped(pattern.tables()?, Step::Keep(keep.clone())),
         Node::MapHapsNative(pattern, f, SpanUse::Ignores) => {
-            stepped(&*pattern.tables()?, Step::MapHap(f.clone()))
+            stepped(pattern.tables()?, Step::MapHap(f.clone()))
         }
         Node::MapHapsOwned(pattern, f, SpanUse::Ignores) => {
-            stepped(&*pattern.tables()?, Step::MapOwned(f.clone()))
+            stepped(pattern.tables()?, Step::MapOwned(f.clone()))
         }
-        Node::ExpandHapsNative(pattern, f, SpanUse::Ignores) => expanded(&*pattern.tables()?, f),
-        // The tables of the applications that the node stands for.
-        Node::Constants(base, run) => build(crate::RunMeeting::applications(base, run).node_kind()),
-        Node::AppLeft(pair, apply, flow, _) => {
-            let crate::PatternPair(functions, values) = &**pair;
-            match signal_of(values) {
-                Some(signal) => sampled(&*functions.tables()?, signal, Side::Value, apply, *flow),
-                None if sampling(functions) || sampling(values) => {
-                    met(functions, values, Side::Value, apply, *flow)
-                }
-                None => applied(
-                    &*functions.tables()?,
-                    &*values.tables()?,
-                    |function, value| {
-                        let part = function.part.intersection(&value.part)?;
-                        Some(applied_hap(
-                            function,
-                            value,
-                            function.whole,
-                            part,
-                            apply,
-                            *flow,
-                        ))
-                    },
-                ),
+        Node::ExpandHapsNative(pattern, f, SpanUse::Ignores) => expanded(pattern.tables()?, f),
+        Node::AppLeft(functions, values, apply, flow) => match signal_of(values) {
+            Some(signal) => sampled(functions.tables()?, signal, Side::Value, apply, *flow),
+            None if sampling(functions) || sampling(values) => {
+                met(functions, values, Side::Value, apply, *flow)
             }
-        }
-        Node::AppRight(pair, apply, flow) => {
-            let crate::PatternPair(functions, values) = &**pair;
-            match signal_of(functions) {
-                Some(signal) => sampled(&*values.tables()?, signal, Side::Function, apply, *flow),
-                None if sampling(values) || sampling(functions) => {
-                    met(values, functions, Side::Function, apply, *flow)
-                }
-                None => applied(
-                    &*values.tables()?,
-                    &*functions.tables()?,
-                    |value, function| {
-                        let part = function.part.intersection(&value.part)?;
-                        Some(applied_hap(
-                            function,
-                            value,
-                            value.whole,
-                            part,
-                            apply,
-                            *flow,
-                        ))
-                    },
-                ),
+            None => applied(functions.tables()?, values.tables()?, |function, value| {
+                let part = function.part.intersection(&value.part)?;
+                Some(applied_hap(
+                    function,
+                    value,
+                    function.whole,
+                    part,
+                    apply,
+                    *flow,
+                ))
+            }),
+        },
+        Node::AppRight(functions, values, apply, flow) => match signal_of(functions) {
+            Some(signal) => sampled(values.tables()?, signal, Side::Function, apply, *flow),
+            None if sampling(values) || sampling(functions) => {
+                met(values, functions, Side::Function, apply, *flow)
             }
-        }
+            None => applied(values.tables()?, functions.tables()?, |value, function| {
+                let part = function.part.intersection(&value.part)?;
+                Some(applied_hap(
+                    function,
+                    value,
+                    value.whole,
+                    part,
+                    apply,
+                    *flow,
+                ))
+            }),
+        },
         _ => None,
     }
 }
@@ -3439,7 +2755,7 @@ fn expanded(tables: &Tables, expand: &HapExpandFn) -> Option<Tables> {
 /// meetings with constants, as a [`Signal`]. `None` for anything else, or for
 /// a graph that may not answer from tables: one that may answer differently
 /// to the same query, or that binds another runtime.
-pub(super) fn signal_of(pattern: &Pattern) -> Option<Signal> {
+fn signal_of(pattern: &Pattern) -> Option<Signal> {
     if !pattern.tables_may_answer() {
         return None;
     }
@@ -3462,29 +2778,12 @@ pub(super) fn signal_of(pattern: &Pattern) -> Option<Signal> {
         Node::AddContext(inner, locations) => {
             (inner, SignalOp::Step(Step::Locations(locations.clone())))
         }
-        Node::Fast(inner, factor, _) if **factor > Fraction::ZERO => {
-            (inner, SignalOp::Fast(**factor))
+        Node::Fast(inner, factor, _) if *factor > Fraction::ZERO => {
+            (inner, SignalOp::Fast(*factor))
         }
-        Node::Shift(inner, by, _) => (inner, SignalOp::Shift(**by)),
-        // The signal meets each number in turn, as an application of a
-        // `pure` of the number makes it.
-        Node::Constants(inner, run) => {
-            let mut signal = signal_of(inner)?;
-            signal
-                .ops
-                .extend(run.iter().map(|meeting| SignalOp::Constant {
-                    // A copy of the hap of the number, for the signal.
-                    hap: Box::new(meeting.constant.clone()),
-                    side: Side::Value,
-                    apply: meeting.apply.clone(),
-                    flow: meeting.flow,
-                    levels: 1,
-                }));
-            return Some(signal);
-        }
+        Node::Shift(inner, by, _) => (inner, SignalOp::Shift(*by)),
         // The signal is the structure side, and a constant gives the rest.
-        Node::AppLeft(pair, apply, flow, _) => {
-            let crate::PatternPair(functions, values) = &**pair;
+        Node::AppLeft(functions, values, apply, flow) => {
             let (hap, levels) = constant_of(values)?;
             (
                 functions,
@@ -3497,8 +2796,7 @@ pub(super) fn signal_of(pattern: &Pattern) -> Option<Signal> {
                 },
             )
         }
-        Node::AppRight(pair, apply, flow) => {
-            let crate::PatternPair(functions, values) = &**pair;
+        Node::AppRight(functions, values, apply, flow) => {
             let (hap, levels) = constant_of(functions)?;
             (
                 values,
@@ -3518,153 +2816,9 @@ pub(super) fn signal_of(pattern: &Pattern) -> Option<Signal> {
     Some(signal)
 }
 
-/// A signal on the value side of a meeting, for a query that walks the
-/// graph: the walk reads the signal as a table of the meeting samples it,
-/// with no query of the signal's graph.
-pub(crate) struct ValueSignal {
-    signal: Signal,
-    /// The control that names each value, for a control of a signal. See
-    /// [`Named`].
-    named: Option<Named>,
-    /// The signal under the control, when it is one of numbers. See
-    /// [`Wave`].
-    wave: Option<Wave>,
-    /// The side as a gate, when it is one. See [`Gate`].
-    gate: Option<Gate>,
-}
-
-/// A wave under the gate of a degrade, as `degradeBy` makes its value
-/// side: the side answers a hap where the number of the wave is above the
-/// threshold of the gate, and no hap elsewhere. The meeting of a degrade
-/// keeps the function hap as it is, so the gate says whether the hap stays,
-/// with no hap of the side.
-pub(crate) struct Gate {
-    wave: Wave,
-    above: f64,
-}
-
-impl Gate {
-    /// `values` as a gate, when it is one.
-    fn of(values: &Pattern) -> Option<Self> {
-        if !values.tables_may_answer() {
-            return None;
-        }
-        let Node::FilterValues(inner, gate) = values.node_kind() else {
-            return None;
-        };
-        Some(Self {
-            above: crate::combinators::gate_threshold(gate)?,
-            wave: Wave::of(inner)?,
-        })
-    }
-
-    /// Whether the side answers a hap for a function hap that asks over
-    /// `met` and is cut to `part`, a part in one cycle. `None` as
-    /// [`Wave::number`] gives it.
-    pub(crate) fn passes(
-        &self,
-        met: TimeSpan,
-        part: TimeSpan,
-        controls: &crate::OrderedMap,
-    ) -> Option<bool> {
-        Some(self.wave.number(met, part, controls)? > self.above)
-    }
-}
-
-/// The control of a signal on the value side of a meeting, as
-/// `.lpf(sine)` gives: the signal then answers its values, and the meeting
-/// sets each one under `key` where the function hap is, with no map of the
-/// control. `map` names a value that the control names in another way.
-pub(crate) struct Named {
-    pub(crate) key: crate::Key,
-    pub(crate) map: OwnedHapMapFn,
-}
-
-impl ValueSignal {
-    /// `values` as a signal, when it is one that a table can sample.
-    pub(crate) fn of(values: &Pattern) -> Option<Self> {
-        if let Some((inner, named)) = Self::named(values)
-            && let Some(signal) = signal_of(inner)
-        {
-            return Some(Self {
-                signal,
-                named: Some(named),
-                wave: Wave::of(inner),
-                gate: None,
-            });
-        }
-        signal_of(values).map(|signal| Self {
-            signal,
-            named: None,
-            wave: None,
-            gate: Gate::of(values),
-        })
-    }
-
-    /// The pattern under `values` and its control, when `values` is a
-    /// control over that pattern.
-    pub(super) fn named(values: &Pattern) -> Option<(&Pattern, Named)> {
-        if !values.tables_may_answer() {
-            return None;
-        }
-        let Node::MapHapsOwned(inner, map, SpanUse::Ignores) = values.node_kind() else {
-            return None;
-        };
-        let key = crate::controls::named_by(map)?;
-        // A union with a map of `value` alone keeps the other side.
-        (key.as_str() != "value").then(|| {
-            let map = OwnedHapMapFn::clone(map);
-            (inner, Named { key, map })
-        })
-    }
-
-    /// The control that names each value that [`Self::answer`] gives.
-    /// `None` when the values are those of the side as they are.
-    pub(crate) fn control(&self) -> Option<&Named> {
-        self.named.as_ref()
-    }
-
-    /// The name of the control and the wave under it, when the side is a
-    /// control of a signal of numbers: the meeting then sets the number of
-    /// the wave under the name, with no hap of the side.
-    pub(crate) fn wave(&self) -> Option<(&crate::Key, &Wave)> {
-        Some((&self.named.as_ref()?.key, self.wave.as_ref()?))
-    }
-
-    /// The side as a gate, when it is one.
-    pub(crate) fn gate(&self) -> Option<&Gate> {
-        self.gate.as_ref()
-    }
-
-    /// The haps `values` answers for `span`, in its order, into `out`.
-    /// `part` is the part of the hap that asks, which lies in one cycle.
-    /// `None` for a span that only the graph answers. `probe` is a copy of
-    /// the query's state.
-    pub(crate) fn answer(
-        &self,
-        span: TimeSpan,
-        part: TimeSpan,
-        probe: &mut State,
-        out: &mut Vec<Hap>,
-    ) -> Option<()> {
-        self.signal.answer(span, part, probe, out)
-    }
-}
-
 /// The hap of cycle zero of a pattern whose tables hold one whole hap a
 /// cycle, such as `pure(value)`, and the levels of its walk.
 fn constant_of(pattern: &Pattern) -> Option<(Box<Hap>, u32)> {
-    let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
-    // A constant by its node kinds is read from its graph, apart from the
-    // query around this build. It needs no table, so it is a constant with
-    // any table budget.
-    if let Some(levels) = pattern.constant_levels() {
-        if !pattern.tables_may_answer() {
-            return None;
-        }
-        let hap = crate::without_query_signals(|| pattern.constant_cycle(&State::new(cycle)))?;
-        return hap.keys.is_empty().then(|| (Box::new(hap), levels));
-    }
     let tables = pattern.tables()?;
     let [layer] = tables.layers.as_slice() else {
         return None;
@@ -3672,6 +2826,7 @@ fn constant_of(pattern: &Pattern) -> Option<(Box<Hap>, u32)> {
     let [entry] = layer.entries.as_slice() else {
         return None;
     };
+    let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
     (layer.period == 1
         && layer.sampled.is_none()
         && entry.keys.is_empty()
@@ -3688,15 +2843,7 @@ fn signal_work(signal: &Signal, width: Fraction, extent: f64, bits: u32) -> Opti
     // outermost in. A constant walks the cycles of its span, and each cycle
     // bound in it can cut the signal's haps once more.
     let mut cycles = Cycles::NONE;
-    // A signal answers one hap over the span it is asked over. A constant
-    // answers its hap once a cycle of the span, counted below: a whole hap
-    // a cycle, not one more than that, or every meeting of one multiplies
-    // the haps the next is charged for.
-    let mut most = if matches!(signal.source, Source::Constant(_)) {
-        0u64
-    } else {
-        1u64
-    };
+    let mut most = 1u64;
     let mut wide = width;
     // The signal, and one level for each node above it. A constant's own
     // pattern is a child of its meeting.
@@ -3866,7 +3013,7 @@ fn met(
                     most: 1,
                 },
             };
-            sampler.stages.push(Stage::Meet {
+            sampler.push(Stage::Meet {
                 signal: Signal {
                     source: Source::Fixed(Arc::new(Fixed {
                         whole,
@@ -3909,7 +3056,7 @@ fn met_constant(
         source: Source::Constant(hap),
         ops: Vec::new(),
     };
-    let tables = sampled(&*structure.tables()?, signal, side, apply, flow)?;
+    let tables = sampled(structure.tables()?, signal, side, apply, flow)?;
     // The constant's own walk sits below the meeting.
     Some(Tables::new(
         tables.layers,
@@ -4145,11 +3292,6 @@ fn joined(
     if !matches!(mode, JoinMode::Inner | JoinMode::Outer | JoinMode::Mix) {
         return None;
     }
-    // A sampled layer's values exist only in a query: its entries name no
-    // pattern.
-    if carrier.layers.iter().any(|layer| layer.sampled.is_some()) {
-        return None;
-    }
     let settings = crate::settings::current_state_id();
     // The pattern each carrier value names, each built once.
     let mut named: Vec<(&crate::Value, Pattern)> = Vec::new();
@@ -4240,29 +3382,6 @@ fn joined(
     })
 }
 
-/// The tables of a [`crate::sequence`]: the steps of each layer as one cycle
-/// a period, at the layer's speed, as a [`fast`] of them is.
-fn sequence(layers: &[crate::sequence::Layer]) -> Option<Tables> {
-    let mut all = Vec::new();
-    let mut work: Option<Work> = None;
-    for layer in layers {
-        let steps = Tables::new(
-            vec![Layer::new(1, layer.period_haps()?)?],
-            Work::leaf(Cycles::walk()),
-        );
-        let timed = if layer.period == Fraction::ONE {
-            steps
-        } else {
-            fast(&steps, Fraction::ONE.checked_div(layer.period)?)?
-        };
-        all.extend(timed.layers.iter().cloned());
-        work = Some(work.map_or(timed.work, |work| work.max(timed.work)));
-    }
-    // One node answers for every layer at its speed: the levels of a leaf.
-    let work = Work { levels: 1, ..work? };
-    Some(Tables::new(all, work))
-}
-
 /// `fast(factor)`: every time divided by `factor`. The new period is the
 /// least whole number of cycles that holds a whole number of old periods.
 fn fast(tables: &Tables, factor: Fraction) -> Option<Tables> {
@@ -4349,9 +3468,9 @@ fn split_queries(inner: &Pattern) -> Option<Tables> {
     match inner.node_kind() {
         Node::SlowCat(patterns) => return slowcat(patterns),
         Node::SlowCatPrime(patterns) => return slowcat_prime(patterns),
-        Node::Rev(pattern) => return rev(&*pattern.tables()?),
-        Node::FastGap(pattern, factor) => return fast_gap(&*pattern.tables()?, **factor),
-        Node::RepeatCycles(pattern, count) => return repeat_cycles(&*pattern.tables()?, **count),
+        Node::Rev(pattern) => return rev(pattern.tables()?),
+        Node::FastGap(pattern, factor) => return fast_gap(pattern.tables()?, *factor),
+        Node::RepeatCycles(pattern, count) => return repeat_cycles(pattern.tables()?, *count),
         _ => {}
     }
     let tables = inner.tables()?;
@@ -4409,7 +3528,7 @@ fn slowcat_prime(patterns: &[Pattern]) -> Option<Tables> {
 }
 
 /// The walk of every constituent of an alternation, together.
-fn constituents(children: &[Arc<Tables>]) -> Work {
+fn constituents(children: &[&Tables]) -> Work {
     children
         .iter()
         .map(|child| child.work)
@@ -4501,7 +3620,7 @@ fn reflected(span: TimeSpan, c: i128) -> Option<TimeSpan> {
 }
 
 /// Whether `span` lies in one cycle.
-pub(super) fn in_one_cycle(span: TimeSpan) -> bool {
+fn in_one_cycle(span: TimeSpan) -> bool {
     span.begin
         .floor()
         .checked_add_int(1)
@@ -4964,45 +4083,25 @@ mod tests {
 
     #[test]
     fn a_graph_deeper_than_a_build_walks_is_left_to_the_graph() {
-        // A node for each speed change: a fold makes one node of them all.
-        let levels = |count: usize| {
-            crate::sequence::unfolded(|| {
-                (0..count).fold(pure(Value::F64(1.0)), |pattern, _| {
-                    pattern.fast(frac(2, 1)).slow(frac(2, 1))
-                })
-            })
-        };
-        assert!(levels(20_000).tables().is_none());
-        assert!(levels(20).tables().is_some());
-    }
-
-    #[test]
-    fn a_walked_graph_builds_no_table() {
-        let graph = || map(vec![leaf(1.0, 0), seq(&[2.0, 3.0]), leaf(4.0, 9)], slowcat).tabled;
-        let child = graph();
-        let walked = child.mark_walked();
-        // A node that is built over a walked graph is walked too.
-        let over = walked.late(frac(1, 4));
-        let tabled = graph();
-        for _ in 0..4 {
-            for (begin, end) in [(frac(0, 1), frac(5, 1)), (frac(1, 3), frac(7, 3))] {
-                assert_eq!(
-                    describe(&walked.query_arc(begin, end)),
-                    describe(&tabled.query_arc(begin, end))
-                );
-                over.query_arc(begin, end);
-            }
+        let mut deep = pure(Value::F64(1.0));
+        for _ in 0..20_000 {
+            deep = deep.fast(frac(2, 1)).slow(frac(2, 1));
         }
-        assert!(tabled.built_tables().is_some());
-        for pattern in [&walked, &child, &over] {
-            assert!(pattern.built_tables().is_none());
+        assert!(deep.tables().is_none());
+        let mut shallow = pure(Value::F64(1.0));
+        for _ in 0..20 {
+            shallow = shallow.fast(frac(2, 1)).slow(frac(2, 1));
         }
+        assert!(shallow.tables().is_some());
     }
 
     #[test]
     fn bitwise_copies_of_whole_periods_clone_the_entries() {
-        let twin = seq(&[0.0, 1.0, 2.0]);
-        let tables = twin.tabled.tables().expect("a number sequence has a table");
+        let twin = named(seq(&[0.0, 1.0, 2.0]), "n");
+        let tables = twin
+            .tabled
+            .tables()
+            .expect("a control sequence has a table");
         assert!(tables.layers.iter().all(|layer| layer.copyable));
         let answer = twin.tabled.query_arc(frac(0, 1), frac(3, 1));
         assert_eq!(
@@ -5070,12 +4169,8 @@ mod tests {
     #[test]
     fn a_hap_budget_refuses_exactly_where_the_graph_refuses() {
         let span = TimeSpan::new(frac(0, 1), frac(1, 1));
-        // The filter keeps its node, so the table and the graph make the
-        // haps that it drops.
-        let dropped = crate::sequence::unfolded(|| {
-            one(seq(&[1.0]), |p| {
-                p.fast(frac(2000, 1)).filter_values(|_| false)
-            })
+        let dropped = one(seq(&[1.0]), |p| {
+            p.fast(frac(2000, 1)).filter_values(|_| false)
         });
         let refused = outcome(&dropped.graph, span, 1000);
         assert!(refused.is_err());
@@ -5303,146 +4398,6 @@ mod tests {
         );
     }
 
-    /// Sections of lanes, each restarted for a third of `cycles` cycles:
-    /// the entries of the period come lane by lane, in no time order. A
-    /// lane of steps in a cycle, one of steps across cycles, and one of
-    /// whole cycles.
-    fn sections_of_lanes(cycles: i128) -> Twin {
-        let section = |first: f64| {
-            map(
-                vec![
-                    seq(&[first, 1.0, 2.0, 3.0]),
-                    one(seq(&[5.0, 6.0, 7.0]), |p| p.slow(frac(9, 4))),
-                    alternation(3),
-                ],
-                stack,
-            )
-        };
-        picked_from(
-            one(seq(&[0.0, 1.0, 0.0]), |p| p.slow(Fraction::int(cycles))),
-            vec![section(0.0), section(4.0)],
-            PickIndexMode::Clamp,
-            JoinMode::Restart,
-        )
-    }
-
-    #[test]
-    fn narrow_queries_of_sections_of_lanes_match_the_graph() {
-        let mut spans = [ticks(12), straddles(12), spans()].concat();
-        for cycle in [-1, 0, 1, 4, 11, 12] {
-            let at = Fraction::int(cycle);
-            // A span that ends or begins at the cycle, one across it, and
-            // one of three cycles.
-            spans.extend([
-                (at - frac(1, 8), at),
-                (at, at + frac(1, 8)),
-                (at - frac(1, 8), at + frac(1, 8)),
-                (at - frac(5, 4), at + frac(5, 4)),
-            ]);
-        }
-        assert_twins_over("sections of lanes", &sections_of_lanes(12), &spans);
-    }
-
-    #[test]
-    fn a_narrow_query_of_lanes_looks_at_the_entries_of_its_cycles() {
-        let twin = sections_of_lanes(240);
-        let tables = twin.tabled.tables().expect("a table");
-        let [layer] = tables.layers.as_slice() else {
-            panic!("one layer");
-        };
-        let entries = layer.entries_in(Order::Graph).expect("graph order");
-        assert!(entries.haps.len() > 1000);
-        // In one cycle, and across two.
-        for (begin, end) in [(2003, 2004), (2019, 2021)] {
-            let tick = TimeSpan::new(frac(begin, 20), frac(end, 20));
-            let near = entries.near(tick, 0).expect("the entries near");
-            assert!((1..=14).contains(&near.each().count()), "{tick:?}");
-        }
-    }
-
-    /// A cut of a kept answer is the haps that sound in the span, each
-    /// cut to it, in the order kept or as a query sorts them: for haps
-    /// whose order changes with the cut, for a span on no grid of theirs,
-    /// and for haps too fine for a grid.
-    #[test]
-    fn a_cut_of_a_kept_answer_is_its_haps_cut_and_sorted() {
-        let hap = |whole: (Fraction, Fraction), part: (Fraction, Fraction), value: f64| {
-            Hap::new(
-                Some(TimeSpan::new(whole.0, whole.1)),
-                TimeSpan::new(part.0, part.1),
-                Value::F64(value),
-            )
-        };
-        let long = (frac(0, 1), frac(4, 1));
-        let coarse = vec![
-            // Two parts of one whole, the longer one first.
-            hap(long, (frac(1, 2), frac(2, 1)), 0.0),
-            hap(long, (frac(1, 2), frac(1, 1)), 1.0),
-            hap((frac(1, 2), frac(1, 1)), (frac(1, 2), frac(1, 1)), 2.0),
-            // A chord: equal times keep their order.
-            hap((frac(3, 8), frac(5, 8)), (frac(3, 8), frac(5, 8)), 4.0),
-            hap((frac(3, 8), frac(5, 8)), (frac(3, 8), frac(5, 8)), 3.0),
-            hap((frac(1, 3), frac(2, 3)), (frac(1, 3), frac(2, 3)), 5.0),
-            hap((frac(-1, 4), frac(3, 4)), (frac(0, 1), frac(3, 4)), 6.0),
-            hap((frac(1, 8), frac(1, 4)), (frac(1, 8), frac(1, 4)), 7.0),
-        ];
-        let mut fine = coarse.clone();
-        fine.push(hap(
-            (frac(1, 1_048_583), frac(1, 2)),
-            (frac(1, 1_048_583), frac(1, 2)),
-            8.0,
-        ));
-        for (name, haps, gridded) in [("coarse", coarse, true), ("fine", fine, false)] {
-            let kept = Kept::of(haps.clone(), true).expect("haps to keep");
-            assert_eq!(kept.ticks.is_some(), gridded, "{name}");
-            // The last spans are too fine for a grid.
-            for denom in [8, 24, 7, 1_048_583] {
-                for begin in (0..2 * denom).step_by(1 + denom as usize / 40) {
-                    for width in [1, 3, denom] {
-                        let span = TimeSpan::new(frac(begin, denom), frac(begin + width, denom));
-                        let cut: Vec<Hap> = haps
-                            .iter()
-                            .filter_map(|hap| {
-                                let part = hap.part.intersection(&span)?;
-                                (part.begin < part.end).then(|| Hap {
-                                    part,
-                                    ..hap.clone()
-                                })
-                            })
-                            .collect();
-                        assert_eq!(
-                            describe_all(&kept.cut(span, Order::Graph)),
-                            describe_all(&cut),
-                            "{name} over {span:?}"
-                        );
-                        assert_eq!(
-                            describe_all(&kept.cut(span, Order::Sorted)),
-                            describe_all(&crate::sort_haps_for_query(cut)),
-                            "{name} sorted over {span:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// The walks of a planned cycle take each unit before the cycle
-    /// begins: the first walk one unit, and the walks after it even
-    /// shares of the rest.
-    #[test]
-    fn the_walks_of_a_cycle_take_each_unit_before_it_begins() {
-        let units = 12;
-        let mut ahead = Ahead::planned(40, units);
-        let mut shares = Vec::new();
-        for left in (0..7).rev() {
-            let share = ahead.share(left);
-            shares.push(share.len());
-            ahead.add(Vec::new(), true, share.end, units, Vec::new());
-        }
-        assert_eq!(shares, [1, 2, 2, 2, 2, 2, 1]);
-        assert!(ahead.is_whole());
-    }
-
     #[test]
     fn a_narrow_query_looks_at_its_own_cycle_only() {
         let tick = TimeSpan::new(frac(5003, 20), frac(5004, 20));
@@ -5456,7 +4411,7 @@ mod tests {
             };
             let entries = layer.entries_in(Order::Graph).expect("graph order");
             assert_eq!(
-                entries.near(tick, 0).map(|near| near.count()),
+                entries.near(tick, 0).map(|near| near.haps.len()),
                 Some(per_cycle),
                 "{name}"
             );
@@ -6465,11 +5420,8 @@ mod tests {
 
     #[test]
     fn a_gap_below_one_asks_its_child_near_the_query_and_refuses_as_the_graph_does() {
-        // A node for the speed change, which names itself in the refusal.
-        let gap = crate::sequence::unfolded(|| {
-            one(plain(5.0), |p| {
-                p.fast(frac(8191, 1)).fast_gap(frac(1, 8192))
-            })
+        let gap = one(plain(5.0), |p| {
+            p.fast(frac(8191, 1)).fast_gap(frac(1, 8192))
         });
         for tail in [62, 64] {
             let begin = Fraction::int(1 << 40) + frac(1, (1 << tail) + 1);
@@ -6820,6 +5772,7 @@ mod tests {
                         .iter()
                         .map(|stage| match stage {
                             Stage::Meet { .. } => "meet",
+                            Stage::Fused { .. } => "fused",
                             Stage::Step(_) => "step",
                             Stage::Outer(_) => "outer",
                         })
@@ -6832,9 +5785,8 @@ mod tests {
 
     #[test]
     fn constants_set_in_a_row_meet_once_and_plain_entries_meet_nothing() {
-        // The build makes one application of the three sets.
         let row = set_in_a_row(sampled_notes(&[0.0, 1.0, 2.0]));
-        assert_eq!(stages(&row), vec![vec!["meet", "meet"]]);
+        assert_eq!(stages(&row), vec![vec!["meet", "fused"]]);
         let mixed = map(
             vec![sampled_notes(&[0.0, 1.0]), named(seq(&[5.0, 6.0]), "s")],
             stack,

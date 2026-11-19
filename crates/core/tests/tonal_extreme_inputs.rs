@@ -65,7 +65,7 @@ fn score_combinators_survive_extreme_tonal_inputs() {
         panic!("invalid interval must not abort the query");
     };
     assert_eq!(haps.len(), 1);
-    assert_eq!(haps[0].value, Value::Str("".into()));
+    assert_eq!(haps[0].value, Value::Str(String::new()));
 
     let prefixed = combinators::transpose(&pure(Value::Str("C4".into())), Value::Str("éP5".into()));
     let QueryArcOutcome::Haps(haps) = query_first_cycle(&prefixed) else {

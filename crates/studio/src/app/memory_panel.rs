@@ -210,7 +210,6 @@ impl App {
             } else {
                 snapshot.map(|snapshot| snapshot.script_heap_bytes)
             },
-            score_engine: snapshot.and_then(|snapshot| snapshot.score_engine),
             audio: snapshot.and_then(|snapshot| snapshot.audio_memory),
             visuals: if pinned { None } else { self.visuals_memory() },
             screen: (width, height),

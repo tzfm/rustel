@@ -91,7 +91,7 @@ impl Session {
             // `play()` is a new transport lifetime. A key placed before a
             // caller stopped the exposed Transport handle must not replay in
             // the new offline/render pass.
-            self.js.clear_midi_keys();
+            self.js.midi_input_bus().clear_keys();
         }
         self.transport.start();
         let generation = if reanchor {
@@ -390,7 +390,7 @@ impl Session {
         let mut report = self.play(duration_secs)?;
         let device = rustel_audio::ScalarDevice::open_default()
             .map_err(|error| RuntimeError::Audio(error.to_string()))?;
-        let csound = self.csound().for_render();
+        let csound = self.csound.for_render();
         let (events, notices) =
             rustel_voice::with_diagnostic_policy(self.direct_diagnostic_logging, || {
                 if let Some(library) = &self.samples {
@@ -622,7 +622,7 @@ impl Session {
             // that fails, or one that never plays, leaves them.
             if *at < end_secs && self.generation() != generation_before {
                 held.retain(|onset| onset.target_time < *at);
-                let snapshot = self.csound_snapshot();
+                let snapshot = self.csound.snapshot();
                 if csound_saves.last().is_some_and(|(last, _)| last == at) {
                     csound_saves.pop();
                 }
@@ -658,7 +658,7 @@ impl Session {
                 .then_with(|| a.onset_id.cmp(&b.onset_id))
         });
         onsets.dedup_by_key(|onset| onset.onset_id);
-        let csound = self.csound().with_render_timeline(csound_saves);
+        let csound = self.csound.with_render_timeline(csound_saves);
 
         // The mp3 door is the same render; only the container differs, so a
         // tape bounced either way is the same audio.
@@ -821,7 +821,7 @@ impl Session {
                 session.samples.as_deref(),
                 session.config.dsp_dispatch,
                 session.max_polyphony(),
-                Some(session.csound()),
+                Some(&session.csound),
                 &session.render_stop(None),
             )
             .map(|(pcm, refused, _)| (pcm, refused))
@@ -937,7 +937,7 @@ impl Session {
                     session.samples.as_deref(),
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
-                    Some(session.csound()),
+                    Some(&session.csound),
                     &stop,
                 )
                 .map_err(render_error)?;
@@ -967,7 +967,7 @@ impl Session {
                     rustel_audio::WavSampleFormat::Pcm16,
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
-                    Some(session.csound()),
+                    Some(&session.csound),
                     // The staged WAV feeds the mp3 encoder; stems are refused
                     // for mp3 before this point.
                     false,
@@ -1009,7 +1009,7 @@ impl Session {
                     },
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
-                    Some(session.csound()),
+                    Some(&session.csound),
                     session.stems_export,
                     &stop,
                 )
@@ -1017,7 +1017,7 @@ impl Session {
                 .map_err(render_error)
             }
             RenderFormat::OnsetJson => {
-                write_onset_dump_until(out_path, &play.onsets, &stop)?;
+                write_onset_dump(out_path, &play.onsets)?;
                 Ok(((None, Vec::new()), Vec::new()))
             }
             RenderFormat::Midi => {

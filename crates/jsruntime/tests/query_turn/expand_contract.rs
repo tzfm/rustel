@@ -467,7 +467,7 @@ fn with_steps_tracks_native_query_identity_across_reassignment_and_repetition() 
         "native query reassignment or repeated withSteps fell into JS dispatch"
     );
     let pattern = runtime.active_pattern().expect("copied-query result");
-    assert_eq!(pattern.steps(), Some(Fraction::int(2)));
+    assert_eq!(pattern.steps, Some(Fraction::int(2)));
     assert!(pattern.is_pure(), "copied native query lost native purity");
     assert!(
         pattern.as_pure().is_none(),
@@ -490,7 +490,7 @@ fn raw_expand_contract_keep_timing_purity_ownership_and_pool_neutrality() {
     let with_steps_pattern = with_steps
         .active_pattern()
         .expect("active withSteps result");
-    assert_eq!(with_steps_pattern.steps(), Some(Fraction::int(2)));
+    assert_eq!(with_steps_pattern.steps, Some(Fraction::int(2)));
     assert!(
         with_steps_pattern.is_pure(),
         "metadata-only withSteps lost native purity"
@@ -526,7 +526,7 @@ fn raw_expand_contract_keep_timing_purity_ownership_and_pool_neutrality() {
             runtime
                 .active_pattern()
                 .expect("active scalar result")
-                .steps(),
+                .steps,
             expected_steps,
             "{expression}: steps"
         );
@@ -622,10 +622,7 @@ fn raw_expand_contract_keep_timing_purity_ownership_and_pool_neutrality() {
     let no_steps =
         semantic_runtime("new Pattern(() => [], undefined)._expand(Symbol('unused-factor'))");
     assert_eq!(
-        no_steps
-            .active_pattern()
-            .expect("no-step raw expand")
-            .steps(),
+        no_steps.active_pattern().expect("no-step raw expand").steps,
         None
     );
     assert!(

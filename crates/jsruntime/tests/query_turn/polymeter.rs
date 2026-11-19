@@ -205,7 +205,7 @@ fn polymeter_modern_and_legacy_resource_boundaries_are_exact_and_recover() {
     rustel_core::reset_stepwise_entries_materialised();
     let modern_exact = semantic_runtime("polymeter(gap(1), gap(16383))");
     assert_eq!(
-        modern_exact.active_pattern().expect("modern exact").steps(),
+        modern_exact.active_pattern().expect("modern exact").steps,
         Some(Fraction::int(16_383))
     );
     assert_eq!(rustel_core::stepwise_entries_materialised(), 2);
@@ -239,7 +239,7 @@ fn polymeter_modern_and_legacy_resource_boundaries_are_exact_and_recover() {
     rustel_core::reset_stepwise_entries_materialised();
     let legacy_exact = semantic_runtime("polymeter(Array(8192).fill(silence), [silence])");
     assert_eq!(
-        legacy_exact.active_pattern().expect("legacy exact").steps(),
+        legacy_exact.active_pattern().expect("legacy exact").steps,
         Some(Fraction::int(8_192))
     );
     assert_eq!(rustel_core::stepwise_entries_materialised(), 8_193);
@@ -466,10 +466,7 @@ fn legacy_polymeter_zero_target_contains_errors_from_emitting_lanes() {
     for source in ["polymeter([])", "polymeter([], [])"] {
         let runtime = semantic_runtime(source);
         assert_eq!(
-            runtime
-                .active_pattern()
-                .expect("empty legacy stack")
-                .steps(),
+            runtime.active_pattern().expect("empty legacy stack").steps,
             None
         );
         assert!(
@@ -483,10 +480,7 @@ fn legacy_polymeter_zero_target_contains_errors_from_emitting_lanes() {
 
     let silent = semantic_runtime("polymeter([], [silence])");
     assert_eq!(
-        silent
-            .active_pattern()
-            .expect("zero-target silence")
-            .steps(),
+        silent.active_pattern().expect("zero-target silence").steps,
         Some(Fraction::ONE)
     );
     assert!(
@@ -504,7 +498,7 @@ fn legacy_polymeter_zero_target_contains_errors_from_emitting_lanes() {
             runtime
                 .active_pattern()
                 .expect("live zero-target lane")
-                .steps(),
+                .steps,
             Some(Fraction::ONE)
         );
         let direct = runtime

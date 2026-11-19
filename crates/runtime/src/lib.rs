@@ -160,7 +160,6 @@ pub use render::{
     write_silent_wav,
 };
 pub use rustel_audio::TakeoverCut;
-pub use rustel_jsruntime::forget_mini_literals;
 pub use samples::{
     BUILTIN_SOURCES, DEFAULT_VIDEO_FILE_BYTES, LOCAL_FILES, MAX_VIDEO_FILE_BYTES,
     SCORE_SAMPLE_CACHE_MAX_BYTES, SCORE_SAMPLE_CACHE_MAX_ENTRIES,
@@ -171,8 +170,8 @@ pub use samples::{
 pub use score_import::{ScoreImportAccess, import_origin};
 pub use session::{
     DEFAULT_HORIZON, EvaluateSource, PLUGIN_DIAGNOSTIC, PREVIEW_DOCUMENT, PREVIEW_ONSET_ID_FLAG,
-    RuntimeError, SAMPLE_AWAITED_DIAGNOSTIC, SAMPLE_LOADING_DIAGNOSTIC, ScoreEngine, Session,
-    SessionConfig, SessionDiagnostic, VOICE_NOTICE_DIAGNOSTIC, WindowSound,
+    RuntimeError, SAMPLE_AWAITED_DIAGNOSTIC, SAMPLE_LOADING_DIAGNOSTIC, Session, SessionConfig,
+    SessionDiagnostic, VOICE_NOTICE_DIAGNOSTIC, WindowSound,
 };
 
 #[cfg(feature = "device-audio")]

@@ -6946,7 +6946,6 @@ mod tests {
             loading: None,
             sample_memory: Default::default(),
             script_heap_bytes: 0,
-            score_engine: None,
             audio_memory: None,
         };
         let first_wall = Instant::now();
@@ -6997,7 +6996,6 @@ mod tests {
             loading: None,
             sample_memory: Default::default(),
             script_heap_bytes: 0,
-            score_engine: None,
             audio_memory: None,
         };
         let cutover_wall = first_wall + std::time::Duration::from_secs(10);

@@ -20,13 +20,11 @@ impl Session {
         // A move of a score with no link takes no lock of the chains.
         #[cfg(feature = "vst")]
         if moved
+            && self.slider_links.load(std::sync::atomic::Ordering::Relaxed)
             && self.plugins_live()
             && !self.transport.is_stopped()
-            && self
-                .slider_links()
-                .load(std::sync::atomic::Ordering::Relaxed)
         {
-            crate::vst::slider_moved(self.chains(), id, value, self.generation());
+            crate::vst::slider_moved(&self.chains, id, value, self.generation());
         }
         Ok(moved)
     }
@@ -204,11 +202,18 @@ impl Session {
         Ok(Some((generation_before, generation_after)))
     }
 
-    /// Install the score surface, once. A score the native tier evaluates
-    /// needs none, so score evaluation installs it only when JavaScript
-    /// runs. See `JsRuntime::ensure_surface`.
     pub(super) fn ensure_bindings(&mut self) -> Result<(), RuntimeError> {
-        self.js.ensure_surface().map_err(RuntimeError::Js)
+        if self.bindings_ready {
+            return Ok(());
+        }
+        self.js
+            .install_semantic_bindings()
+            .map_err(RuntimeError::Js)?;
+        // `s` is not an alias of `m`. The mini pattern is the argument to the
+        // `s` control, so `s("bd sd")` produces `{s: "bd"}` control objects,
+        // not bare `"bd"` values.
+        self.bindings_ready = true;
+        Ok(())
     }
 
     /// Install an explicit Rust `Pattern` as the active graph (no JS).
@@ -287,11 +292,8 @@ impl Session {
         if result.is_ok() {
             self.lanes.install_pattern();
             let live = self.plugins_live();
-            // The commit of a score writes its lanes to the chains, so the
-            // chains are made here.
-            let chains = &PluginChains::made_in(&self.plugin_chains).chains;
-            crate::vst::score_changed(chains, &self.lanes, None, live);
-            crate::vst::forget_lanes_away(chains, &mut self.lanes);
+            crate::vst::score_changed(&self.chains, &self.lanes, None, live);
+            crate::vst::forget_lanes_away(&self.chains, &mut self.lanes);
             #[cfg(feature = "device-audio")]
             self.plugin_ahead.restart();
         }
@@ -333,7 +335,7 @@ impl Session {
         };
         debug_assert_eq!(generation, expected_generation);
         if restart_transport {
-            self.js.clear_midi_keys();
+            self.js.midi_input_bus().clear_keys();
             self.transport.start();
         } else if !self.transport.is_stopped() {
             // Same boundary as the JavaScript path: a pattern installed over
@@ -341,7 +343,9 @@ impl Session {
             // pinned key backlog, and must still hear the presses it never
             // placed or whose pins the takeover drops. See the note in
             // `commit_evaluated_score`.
-            self.js.retire_midi_key_backlog(key_takeover_cycle);
+            self.js
+                .midi_input_bus()
+                .retire_key_backlog(key_takeover_cycle);
         }
         // A direct Rust Pattern has no textual score the live watchdog can
         // reconstruct. Keep the previous audible snapshot until this

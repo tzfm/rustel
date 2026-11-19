@@ -1918,8 +1918,6 @@ pub(super) fn play_live(
                 "status": "started",
                 "watch": reload,
                 "stream_id": device.stream_id(),
-                "engine": score_engine_name(session),
-                "script_line": script_line(session),
                 "generation": session.generation(),
                 "source_revision": live_source_revision,
                 "path": path.display().to_string(),
@@ -3119,9 +3117,6 @@ pub(super) fn play_live(
                         None
                     };
                     let device_report = live_device_report_value(device.report());
-                    // The session evaluated the score that a reload installed.
-                    let installed_score = event.status == ReloadStatus::Installed
-                        && matches!(event.target, WatchTarget::Score(_));
                     output.event(
                         LiveDetail::Essential,
                         serde_json::json!({
@@ -3136,8 +3131,6 @@ pub(super) fn play_live(
                                     ReloadStatus::Installed => "installed",
                                     ReloadStatus::Rejected => "rejected",
                                 },
-                                "engine": installed_score.then(|| score_engine_name(session)).flatten(),
-                                "script_line": installed_score.then(|| script_line(session)).flatten(),
                                 "generation_before": event.generation_before,
                                 "generation_after": event.generation_after,
                                 "source_revision": reload_source_revision,
@@ -3419,24 +3412,5 @@ pub(super) fn play(
         ))
     } else {
         session.play(duration)
-    }
-}
-
-/// What evaluated the score in play, as a live event names it: `native`
-/// for a score that needs no JavaScript, `script` for one that the script
-/// engine runs. `None` before the first score.
-fn score_engine_name(session: &Session) -> Option<&'static str> {
-    session.score_engine().map(|engine| match engine {
-        rustel_runtime::ScoreEngine::Native => "native",
-        rustel_runtime::ScoreEngine::Script { .. } => "script",
-    })
-}
-
-/// The line of the score in play that needs the script engine, when the
-/// session knows it.
-fn script_line(session: &Session) -> Option<usize> {
-    match session.score_engine()? {
-        rustel_runtime::ScoreEngine::Script { line } => line,
-        rustel_runtime::ScoreEngine::Native => None,
     }
 }

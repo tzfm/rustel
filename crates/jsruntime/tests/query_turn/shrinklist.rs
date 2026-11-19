@@ -432,7 +432,7 @@ fn retained_zero_width_shrinklist_entry_keeps_its_source_sidecar_alive() {
         runtime
             .active_pattern()
             .expect("zero-width shrinklist terminal")
-            .steps(),
+            .steps,
         Some(Fraction::ZERO)
     );
     assert!(

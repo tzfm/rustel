@@ -348,7 +348,7 @@ mod tests {
     fn extension_nodes_preserve_child_purity_and_callback_ownership() {
         let filled = fill_pattern(&rustel_core::js_query(41));
         assert!(filled.purity().impure);
-        assert_eq!(filled.purity().reachable(), [41]);
+        assert_eq!(filled.purity().reachable, vec![41]);
         assert!(!filled.purity().opaque);
     }
 

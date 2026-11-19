@@ -193,7 +193,7 @@ pub(super) fn register(r: &mut Registry) {
                     || matches!(args.get(index), Some(Value::F64(value)) if *value != 0.0)
             };
             let port = match args.get(3) {
-                Some(Value::Str(name)) => name.to_string(),
+                Some(Value::Str(name)) => name.clone(),
                 _ => "default".to_string(),
             };
             c::serial(&pat, baud, truthy(1), truthy(2), &port)

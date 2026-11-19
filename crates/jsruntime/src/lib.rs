@@ -36,7 +36,7 @@ use rquickjs::{
 };
 use rustel_core::{BindArg, BindResult, CallbackHost, CallbackId, Hap, Pattern, State, Value};
 use rustel_fraction::Fraction;
-use std::cell::{Cell, OnceCell, RefCell};
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::rc::Rc;
 
@@ -69,7 +69,6 @@ pub use runtime::*;
 /// Published so a checker can refuse it in the same words rather than
 /// inventing its own.
 pub use surface::effects::{MIDI_INPUT_SCOPE_POLICY, TEMPO_SCOPE_POLICY};
-pub use surface::patterns::forget_mini_literals;
 use surface::*;
 use thread_state::*;
 use value::*;
@@ -262,7 +261,7 @@ mod ownership_cap_tests {
                 .call((results,))
                 .map_err(|error: rquickjs::Error| error.to_string())?;
 
-            let frame = BridgeFrame::new(Rc::clone(runtime.callback_ids()));
+            let frame = BridgeFrame::new(runtime.ids.clone());
             let _scope = BridgeScope::push(&frame);
             let callback_id = frame.next_id();
             frame

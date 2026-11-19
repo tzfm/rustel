@@ -92,15 +92,6 @@ use soundfonts::load_font;
 #[cfg(test)]
 use soundfonts::{decode_font, fold_number_arithmetic};
 
-/// Tests that change the sample ceiling of the process take turns, so one
-/// does not read a ceiling that another test set.
-#[cfg(test)]
-pub(crate) fn ceiling_test_turn() -> std::sync::MutexGuard<'static, ()> {
-    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    TURN.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// How many sample-loader threads fetch at once. Enough to saturate a
 /// typical link on bulk cache jobs without hammering the CDN; a live note
 /// still jumps the queue and starts on the next free worker.

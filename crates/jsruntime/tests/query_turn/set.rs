@@ -471,7 +471,7 @@ fn raw_set_retains_values_prunes_transients_and_keeps_nested_accounting() {
         "captured JavaScript value lost its query owner"
     );
     assert_eq!(
-        owned.active_pattern().expect("raw set owned graph").steps(),
+        owned.active_pattern().expect("raw set owned graph").steps,
         Some(Fraction::int(5))
     );
     for _ in 0..3 {

@@ -75,18 +75,11 @@ impl Session {
         {
             if self.plugins_live() {
                 self.report_plugin_lines(crate::vst::take_errors());
-                if let Some(plugins) = self.plugin_chains.get() {
-                    let lines = crate::vst::take_output_lines(&plugins.chains);
-                    self.report_plugin_lines(lines);
-                }
+                self.report_plugin_lines(crate::vst::take_output_lines(&self.chains));
             }
-            // A session with no chains has no problem to report.
-            if let Some(plugins) = self.plugin_chains.get() {
-                let lines = crate::vst::take_problems(&plugins.chains);
-                self.report_plugin_lines(lines);
-            }
+            self.report_plugin_lines(crate::vst::take_problems(&self.chains));
         }
-        for message in self.csound_take_errors() {
+        for message in self.csound.take_errors() {
             let record = serde_json::json!({ "csound_failed": { "message": &message } });
             self.report_plugin_line(message, record);
         }

@@ -50,7 +50,7 @@ fn public_swing_preserves_scalar_steps_and_keeps_zero_no_step_and_patterned_boun
     for (label, source, expected_steps, expected_haps) in cases {
         let runtime = semantic_runtime(source);
         let pattern = runtime.active_pattern().expect("active public swing");
-        assert_eq!(pattern.steps(), expected_steps, "{label}: steps");
+        assert_eq!(pattern.steps, expected_steps, "{label}: steps");
         assert!(pattern.is_pure(), "{label}: native graph lost purity");
         assert!(
             !runtime.active_needs_host(),
@@ -414,7 +414,7 @@ fn raw_swing_preserves_selected_ownership_and_existing_resource_accounting() {
     );
     assert_eq!(native.get_number("rawSwingTagLoss"), Some(1.0));
     let native_pattern = native.active_pattern().expect("active raw swing");
-    assert_eq!(native_pattern.steps(), Some(Fraction::int(8)));
+    assert_eq!(native_pattern.steps, Some(Fraction::int(8)));
     assert!(native_pattern.is_pure(), "raw swing lost native purity");
     assert!(
         native_pattern.as_pure().is_none(),
