@@ -13,6 +13,7 @@
 - A score that asks for thousands of voices a second keeps its audio thread inside its deadline: retiring voices fade in proportion to the cull rate, one block starts at most one polyphony cap of voices, and a saturated intake refuses a note before ferrying it. The set thins out instead of crackling and dropping out; ordinary music keeps its full quarter-second fades.
 - The knobs column moves a plain number live while the set plays, as a slider does: the number of an audio control such as `lpf(4000)`, or of a function such as `pg(0.8)`, `fast(2)`, an `FX` stage's `soft(4.5)`, or a plugin option such as `vsti("Diva", { output: 0.111 })`. It needs no update, and edits not yet evaluated stay out of the sound. A plugin key turned on goes in as an update of its own. A rail that waits for an update is muted, dashed and marked "not live".
 - Hold Shift or Alt while you drag any slider for a fine drag, a tenth as far. f in the knobs column or the expanded slider locks it on.
+- Fixed: an update that starts on a rest and cannot play any of its notes no longer silences the set. The last good score keeps playing.
 
 ## v0.1.7
 

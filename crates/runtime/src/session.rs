@@ -94,10 +94,15 @@ enum ReplacementLookAhead {
     /// keeps playing. Publishing now would latch silence if the fetch
     /// never completes.
     Loading(String),
-    /// An invalid control waits ahead, which refuses the whole
-    /// replacement as the same voice in the first window would.
-    InvalidControl(String),
-    /// Nothing renders and nothing is coming.
+    /// An invalid control waits ahead. After a refused first window it
+    /// refuses the whole replacement, as the same voice in the first
+    /// window would. After an empty first window it refuses only when
+    /// nothing else renders (`rendered` is false).
+    InvalidControl { message: String, rendered: bool },
+    /// Onsets wait ahead, and every one of them is refused: the last
+    /// refusal says why.
+    Refused(String),
+    /// No onset ahead, or the query gave no answer.
     Nothing,
 }
 

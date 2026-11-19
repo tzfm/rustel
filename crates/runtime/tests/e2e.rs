@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use rustel_audio::DspDispatch;
 use rustel_fraction::Fraction;
 use rustel_runtime::{
-    AccelerationPreference, ScoreSampleAccess, Session, SessionConfig, score_sample_cache_dir,
+    AccelerationPreference, RuntimeError, ScoreSampleAccess, Session, SessionConfig,
+    score_sample_cache_dir,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -235,7 +236,19 @@ fn hex(digest: impl AsRef<[u8]>) -> String {
 enum Outcome {
     Measured(Box<Measured>, Duration),
     SamplesUnavailable(String),
+    /// A time or size limit refused the work. In the parallel pass this can
+    /// be host load, so `measure_all` measures the case again alone.
+    OverLimit(String),
     Failed(String),
+}
+
+/// Keeps a limit refusal apart from other failures.
+fn refused(step: &str, error: RuntimeError) -> Outcome {
+    let why = format!("{step}: {error}");
+    match error {
+        RuntimeError::ResourceLimit(_) => Outcome::OverLimit(why),
+        _ => Outcome::Failed(why),
+    }
 }
 
 /// The policy a musician runs under: `rustel` allows the built-in sources
@@ -261,12 +274,12 @@ fn measure(case: &Case, dispatch: DspDispatch) -> Outcome {
         return Outcome::Failed(format!("samples: {e}"));
     }
     if let Err(e) = session.evaluate(&case.source) {
-        return Outcome::Failed(format!("evaluate: {e}"));
+        return refused("evaluate", e);
     }
 
     let haps = match session.query(Fraction::new(0, 1), Fraction::new(QUERY_CYCLES, 1)) {
         Ok(haps) => haps,
-        Err(e) => return Outcome::Failed(format!("query: {e}")),
+        Err(e) => return refused("query", e),
     };
     let mut hasher = Sha256::new();
     let mut ctx = 0usize;
@@ -279,7 +292,7 @@ fn measure(case: &Case, dispatch: DspDispatch) -> Outcome {
 
     let pcm = match session.render_pcm(case.duration) {
         Ok(pcm) => pcm,
-        Err(e) => return Outcome::Failed(format!("render: {e}")),
+        Err(e) => return refused("render", e),
     };
     if channels == 0 || pcm.len() % channels != 0 {
         return Outcome::Failed(format!(
@@ -361,9 +374,7 @@ fn measure_all(cases: &[Case], dispatch: DspDispatch) -> Vec<Outcome> {
         let handles: Vec<_> = (0..workers)
             .map(|worker| {
                 let next = &next;
-                std::thread::Builder::new()
-                    .name(format!("e2e-{worker}"))
-                    .stack_size(64 * 1024 * 1024)
+                corpus_thread(format!("e2e-{worker}"))
                     .spawn_scoped(scope, move || {
                         let mut mine = Vec::new();
                         loop {
@@ -382,7 +393,38 @@ fn measure_all(cases: &[Case], dispatch: DspDispatch) -> Vec<Outcome> {
             .collect()
     });
     indexed.sort_by_key(|(index, _)| *index);
-    indexed.into_iter().map(|(_, outcome)| outcome).collect()
+    indexed
+        .into_iter()
+        .map(|(index, outcome)| match outcome {
+            Outcome::OverLimit(why) => measure_alone(&cases[index], dispatch, &why),
+            outcome => outcome,
+        })
+        .collect()
+}
+
+/// The 64 MiB stack is what the CLI and the studio give a Session's thread.
+fn corpus_thread(name: String) -> std::thread::Builder {
+    std::thread::Builder::new()
+        .name(name)
+        .stack_size(64 * 1024 * 1024)
+}
+
+/// Measures a case that hit a limit under parallel load again, with no
+/// other case running. A score that is over the limit on its own fails.
+#[allow(clippy::print_stderr, reason = "the test log names each retried score")]
+fn measure_alone(case: &Case, dispatch: DspDispatch, why: &str) -> Outcome {
+    eprintln!("e2e: {} measured again alone after {why}", case.name);
+    let outcome = std::thread::scope(|scope| {
+        corpus_thread("e2e-alone".into())
+            .spawn_scoped(scope, || measure(case, dispatch))
+            .expect("spawn a corpus worker")
+            .join()
+            .expect("worker panicked")
+    });
+    match outcome {
+        Outcome::OverLimit(why) => Outcome::Failed(why),
+        outcome => outcome,
+    }
 }
 
 // ------------------------------------------------------------- the goldens
@@ -683,7 +725,9 @@ fn every_score_matches_the_golden() {
                 }
             }
             Outcome::SamplesUnavailable(why) => unavailable.push(format!("{}: {why}", case.name)),
-            Outcome::Failed(why) => broken.push(format!("{}: {why}", case.name)),
+            Outcome::OverLimit(why) | Outcome::Failed(why) => {
+                broken.push(format!("{}: {why}", case.name));
+            }
         }
     }
 

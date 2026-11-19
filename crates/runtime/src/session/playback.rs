@@ -1595,17 +1595,27 @@ mod tests {
         );
     }
 
-    /// A thread that stops the transport of `session` when its next run
-    /// starts, whatever the speed of the run: the run clears the stop that
-    /// is set here, and the thread stops it as soon as it sees that.
-    fn stop_in_the_next_run(session: &Session) -> std::thread::JoinHandle<()> {
-        let handle = session.transport();
-        handle.stop();
-        std::thread::spawn(move || {
-            while handle.is_stopped() {
-                std::thread::yield_now();
+    /// Runs `run` while another thread stops `transport` every millisecond.
+    /// `play` restarts the transport, so one timed stop can land before that
+    /// restart and be lost, and a fast run can end before it.
+    fn while_stopping<T>(transport: &rustel_scheduler::Transport, run: impl FnOnce() -> T) -> T {
+        struct SetOnDrop<'a>(&'a AtomicBool);
+        impl Drop for SetOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            handle.stop();
+        }
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    transport.stop();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+            // A panic in `run` still ends the stopper, so the scope joins.
+            let _done = SetOnDrop(&done);
+            run()
         })
     }
 
@@ -1613,7 +1623,7 @@ mod tests {
     fn stopping_the_transport_mid_run_cancels_it() {
         // A `play` that ignores Stop also returns, so termination proves
         // nothing. Stop discards queued events, so a cancelled run yields
-        // fewer onsets.
+        // fewer onsets. The full run takes seconds.
         let mut session = Session::new().expect("session");
         session.evaluate(r#"s("bd*8")"#).expect("evaluate");
         let full = session.play(86_400.0).expect("play").onsets.len();
@@ -1624,11 +1634,11 @@ mod tests {
 
         let mut session = Session::new().expect("session");
         session.evaluate(r#"s("bd*8")"#).expect("evaluate");
-        let stopper = stop_in_the_next_run(&session);
         let started = std::time::Instant::now();
-        let cancelled = session.play(86_400.0).expect("play").onsets.len();
+        let cancelled = while_stopping(&session.transport(), || {
+            session.play(86_400.0).expect("play").onsets.len()
+        });
         let elapsed = started.elapsed();
-        stopper.join().expect("stopper thread");
 
         assert!(
             cancelled < full,
@@ -1650,13 +1660,13 @@ mod tests {
             }
             let mut session = Session::new().expect("session");
             session.evaluate(r#"s("bd*8")"#).expect("evaluate");
-            let stopper = stop_in_the_next_run(&session);
-            let error = if mp3 {
-                session.render(60.0, &path, RenderFormat::ScalarMp3).err()
-            } else {
-                session.render_pcm(60.0).err()
-            };
-            stopper.join().expect("stopper thread");
+            let error = while_stopping(&session.transport(), || {
+                if mp3 {
+                    session.render(60.0, &path, RenderFormat::ScalarMp3).err()
+                } else {
+                    session.render_pcm(60.0).err()
+                }
+            });
             assert!(matches!(error, Some(RuntimeError::Cancelled)), "{error:?}");
             assert!(!path.exists(), "a stopped mp3 render wrote its file");
         }
@@ -1686,21 +1696,12 @@ mod tests {
         let mut session = Session::new().expect("session");
         session.evaluate(r#"s("bd*8")"#).expect("evaluate");
         session.transport().stop();
-        // `play` restarts the transport, so stop from a handle DURING the
-        // run: as soon as the run starts the transport. A stop after a
-        // fixed time lands later in a run that takes less time.
-        let handle = session.transport();
-        let stopper = std::thread::spawn(move || {
-            let patience = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while handle.is_stopped() && std::time::Instant::now() < patience {
-                std::thread::yield_now();
-            }
-            handle.stop();
-        });
+        // `play` restarts the transport, so stop from a handle DURING the run.
         let started = std::time::Instant::now();
-        let cancelled = session.play(86_400.0).expect("play").onsets.len();
+        let cancelled = while_stopping(&session.transport(), || {
+            session.play(86_400.0).expect("play").onsets.len()
+        });
         let cancelled_elapsed = started.elapsed();
-        stopper.join().expect("stopper");
 
         assert!(
             cancelled < full,

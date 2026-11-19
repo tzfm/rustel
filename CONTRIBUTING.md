@@ -36,8 +36,7 @@ the screens it paints. The `pty` feature also checks that the product binary
 starts, resizes and quits in a real terminal. The suite must run serially, so
 it has a command of its own and the workspace test leaves it out.
 A PR that changes the studio must keep this suite passing. CI runs it only in
-the heavy tier (see "How CI runs, and why"). Run it locally, or ask a
-maintainer to dispatch Heavy CI for the PR's current commit.
+the heavy tier (see "How CI runs, and why"), when the PR is not a draft.
 
 One test in the workspace run reports as ignored: the Link wire test, which
 binds the shared multicast port on every interface. The macOS firewall asks a
@@ -272,26 +271,17 @@ source-location span count, duration and frame count exactly.
 
 ## How CI runs, and why
 
-The workflows use GitHub-hosted Linux, macOS and Windows runners. `.github/workflows/ci.yml` runs ordinary checks on every pull request and push to `main`. It checks formatting, Clippy, supported feature sets and the serial workspace tests, and runs the tests of the hand-written `unsafe` code under Miri. `.github/workflows/heavy.yml` runs the release-mode corpus in portable and automatic acceleration modes and the Studio end-to-end suite. Heavy CI runs on pushes to `main`, twice weekly for cache warming, and when a maintainer dispatches it for an exact pull request commit.
+The workflows use GitHub-hosted Linux, macOS and Windows runners. `.github/workflows/ci.yml` runs ordinary checks on every pull request and push to `main`. It checks formatting, Clippy, supported feature sets and the serial workspace tests, and runs the tests of the hand-written `unsafe` code under Miri. `.github/workflows/heavy.yml` runs the release-mode corpus in portable and automatic acceleration modes and the Studio end-to-end suite. Heavy CI runs on pushes to `main`, twice weekly for cache warming, and on every pull request that is not a draft.
 
-A pull request with only Markdown changes skips the build and test jobs, except changes to `SECURITY.md`, `docs/cli.md`, `docs/hardware.md` or `docs/studio.md`, which run the full checks. Configure the `main` ruleset to require `CI result`, as described in [release setup](docs/releasing.md#branch-and-tag-rules). This job passes when the build and test jobs pass or are skipped.
+A pull request with only Markdown changes skips the build and test jobs, except changes to `SECURITY.md`, `docs/cli.md`, `docs/hardware.md` or `docs/studio.md`, which run the full checks. Configure the `main` ruleset to require `CI result` and `Heavy result`, as described in [release setup](docs/releasing.md#branch-and-tag-rules). This job passes when the build and test jobs pass or are skipped.
 
 The CI workflows declare read-only repository tokens. Checkouts do not persist credentials, and the jobs do not receive repository secrets. No CI workflow uses a self-hosted runner.
 
-Heavy CI calls `.github/workflows/heavy-checks.yml` from the same trusted revision for both targets. PR jobs have enforced `cache-mode: read` and restore caches without saving. Main jobs have `cache-mode: write` and can refresh caches. [Cache permissions](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#controlling-cache-access-with-cache-mode) are separate from the repository token: checking out a PR during a dispatch from `main` does not give that job a PR-scoped cache. The read-only mode keeps PR code from writing caches later consumed by main jobs. The ordinary checks follow the same rule: jobs in `ci.yml` restore their caches on pull requests and save them only from pushes to `main`. A pull request's cache save is scoped to that pull request, so `main` can never reuse it. Each extra generation counts against the repository's 10 GB cache quota, and pull request saves pushed the heavy sample caches out of that quota. The warming runs then saved caches that later heavy runs could not find.
+Heavy CI calls `.github/workflows/heavy-checks.yml` for both targets. PR jobs have enforced `cache-mode: read` and restore caches without saving. Main jobs have `cache-mode: write` and can refresh caches. [Cache permissions](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#controlling-cache-access-with-cache-mode) are separate from the repository token. The read-only mode keeps PR code from writing caches later consumed by main jobs. The ordinary checks follow the same rule: jobs in `ci.yml` restore their caches on pull requests and save them only from pushes to `main`. A pull request's cache save is scoped to that pull request, so `main` can never reuse it. Each extra generation counts against the repository's 10 GB cache quota, and pull request saves pushed the heavy sample caches out of that quota. The warming runs then saved caches that later heavy runs could not find.
 
-### Running heavy checks for a pull request
+### Heavy checks for a pull request
 
-Review the proposed code and workflow changes, then record the current full head SHA:
-
-```sh
-gh pr view <number> --json headRefOid --jq .headRefOid
-gh workflow run heavy.yml --ref main -f pr_number=<number> -f sha=<full-40-character-sha>
-```
-
-The Actions page offers the same operation: choose **Heavy CI → Run workflow**, select `main`, then enter the PR number and full SHA. The workflow definition comes from `main`. Its first job checks that the PR is open, targets this repository's `main`, and still has the requested SHA. Each test job checks the SHA again after checkout, before running PR code. The run summary records the SHA. A later push changes the PR head; dispatch a new heavy run for the new SHA. A prior run does not qualify the new commit.
-
-Maintainers should dispatch heavy CI for changes to the engine, scheduler, audio rendering, corpus goldens, Studio behavior or any other release-critical path. The ordinary checks run regardless of this choice. The heavy jobs are optional PR checks, so do not make them unconditional required status checks.
+A draft PR gets the ordinary checks only. When the PR is ready for review, and on each later push, Heavy CI tests the PR's merge commit with `main`. The `Heavy result` check fails on a draft and passes only when every heavy job passes, so a PR cannot merge without a green heavy run on its current commit. To test a draft, mark it ready. To retry a failed job, re-run it from the PR's checks.
 
 ### Unsafe code and Miri
 
@@ -317,7 +307,7 @@ The ordinary check builds the default and lean product feature sets, the Studio-
 
 Sample downloads use per-platform hosted caches. The loader rechecks cached files against pinned hashes. Twice-weekly heavy runs keep corpus and Studio entries warm; a cold cache can otherwise cause simultaneous CDN fetches. `RUSTEL_SAMPLE_CACHE` is set per step because the `runner` context is unavailable in job-level `env`. `TMPDIR` is isolated per run attempt. Failing corpus and Studio goldens are uploaded as short-lived artifacts.
 
-Concurrency is per job and platform. A newer run cancels the older run for the same ref, including `main`. Heavy PR dispatches use the PR number as their concurrency key, so a newer dispatch supersedes an older one for that PR. A heavy PR run is valid only for the SHA recorded in its summary.
+Concurrency is per job and platform. A newer run cancels the older run for the same ref, including `main` and each PR.
 
 ## Performance checks
 
