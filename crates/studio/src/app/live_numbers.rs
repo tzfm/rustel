@@ -685,6 +685,25 @@ mod tests {
     const CUTOFF: &str = "$: s(\"sine\").seg(4).lpf(4000)\n";
 
     /// The texts sent to the engine since the test began, newest last.
+    /// Why a move sent nothing, for the message of a failed check.
+    fn send_state(app: &App) -> String {
+        let scene = app.scenes.current().id;
+        let live: Vec<_> = app
+            .live_numbers_now(scene)
+            .into_iter()
+            .map(|number| (number.range, live_number_range(&number.id)))
+            .collect();
+        format!(
+            "plays live {}, visual revision {}, on its way {}, connected {}, \
+             installed is the text {}, live {live:?}",
+            app.plays_live(scene),
+            app.visual_revision.is_some(),
+            app.reinstall_on_its_way(),
+            app.engine_connected,
+            app.evaluated_source.as_deref() == Some(&*app.editor().source()),
+        )
+    }
+
     fn sent(app: &App) -> Vec<Arc<str>> {
         let mut sent: Vec<_> = app.inflight.values().collect();
         sent.sort_by_key(|pending| pending.request_id);
@@ -873,7 +892,8 @@ mod tests {
                 .map(|text| text.as_ref())
                 .collect::<Vec<_>>(),
             [installed],
-            "the playing score goes again, the number live"
+            "the playing score goes again, the number live: {}",
+            send_state(&app)
         );
         land(&mut app, 3);
         let before = sent(&app).len();
@@ -938,7 +958,12 @@ mod tests {
         assert!(!app.editor().source().contains("output"), "the off stop");
         app.drag_knob(output, rail, 12);
         assert!(app.editor().source().contains("output"), "back on");
-        assert_eq!(sent(&app).len(), 1, "the playing score goes again");
+        assert_eq!(
+            sent(&app).len(),
+            1,
+            "the playing score goes again: {}",
+            send_state(&app)
+        );
         land(&mut app, 3, &[cell("output: "), cell("cutoff: ")]);
         assert!(
             !app.editor().source().contains("0.123456"),
