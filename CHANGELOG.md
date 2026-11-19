@@ -12,6 +12,7 @@
 - Fixed: an update that starts on a rest and cannot play any of its notes no longer silences the set. The last good score keeps playing.
 - Fixed: loop points outside 0 to 1, or a loopBegin after loopEnd, loop the whole sample as Web Audio does, instead of playing loud clipped noise.
 - Fixed: a slider move is written to the session tape once it settles, so a replay plays it.
+- Fixed: `up` with values that name no controls, such as `up("7 12")` or `up(7)`, keeps the controls of the events underneath instead of replacing each event.
 
 ## v0.1.7
 

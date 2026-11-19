@@ -22,14 +22,19 @@ pub(super) const REFERENCE: ReferenceEntry = ReferenceEntry {
     origin: "switch angel",
 };
 
-/// Merge only the keys carried by the right-hand value.
+/// Merge only the keys carried by the right-hand value. A value that is
+/// not an object carries no keys, so it leaves the event as it was; an
+/// event that is not an object takes the right-hand keys alone.
 pub fn merge(left: &Value, right: &Value) -> Value {
     let right = rustel_core::materialize_js_value(right);
     let left = rustel_core::materialize_js_value(left);
-    let (Value::Object(base), Value::Object(over)) = (&left, &right) else {
-        return right;
+    let Value::Object(over) = &right else {
+        return left;
     };
-    let mut merged = base.clone();
+    let mut merged = match left {
+        Value::Object(base) => base,
+        _ => Default::default(),
+    };
     for (key, value) in over.iter() {
         if matches!(value, Value::Undefined) {
             continue;
@@ -54,4 +59,44 @@ pub(super) fn install(registry: &mut Registry) {
             pattern.app_both_with(values.clone(), merge)
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object(pairs: &[(&str, Value)]) -> Value {
+        Value::object(
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), value.clone())),
+        )
+    }
+
+    /// A right-hand value that is not an object carries no keys.
+    #[test]
+    fn a_value_without_keys_leaves_the_event() {
+        let event = object(&[("note", Value::F64(48.0))]);
+        for right in [
+            Value::F64(7.0),
+            Value::Str("rev".into()),
+            Value::List(vec![Value::F64(1.0)]),
+            Value::Null,
+            Value::Undefined,
+        ] {
+            assert_eq!(merge(&event, &right), event, "{right:?}");
+        }
+        assert_eq!(merge(&Value::F64(1.0), &Value::F64(2.0)), Value::F64(1.0));
+    }
+
+    /// An event that is not an object takes the right-hand keys, without
+    /// the undefined ones.
+    #[test]
+    fn an_event_without_keys_takes_the_defined_right_hand_keys() {
+        let right = object(&[("gain", Value::F64(0.5)), ("pan", Value::Undefined)]);
+        assert_eq!(
+            merge(&Value::F64(1.0), &right),
+            object(&[("gain", Value::F64(0.5))])
+        );
+    }
 }

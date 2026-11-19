@@ -372,6 +372,27 @@ fn up_takes_the_rhythm_from_the_values_it_is_given() {
     assert_eq!(controls(r#"s("hh").up("1 ~ 0.7".as("velocity"))"#).len(), 2);
 }
 
+/// A bare value carries no control, so it leaves the controls underneath
+/// alone and only sets the rhythm, rests included.
+#[test]
+fn up_with_bare_values_keeps_every_control() {
+    let c3 = r#"gain=F64(0.2),note=Str("c3"),s=Str("sine")"#;
+    let e3 = r#"gain=F64(0.2),note=Str("e3"),s=Str("sine")"#;
+    for (values, expected) in [
+        (r#""7 12""#, vec![c3, e3]),
+        ("7", vec![c3, e3]),
+        (r#""7 ~ 12 19""#, vec![c3, e3, e3]),
+    ] {
+        assert_eq!(
+            controls(&format!(
+                r#"note("c3 e3").s("sine").gain(0.2).up({values})"#
+            )),
+            expected,
+            "up({values})"
+        );
+    }
+}
+
 #[test]
 fn up_overwrites_a_key_the_pattern_already_had() {
     assert_eq!(
