@@ -71,8 +71,24 @@ impl ManifestContext {
                 let written = source.as_str();
                 let url = match read_source(source, GITHUB_SAMPLE_MANIFEST) {
                     SampleSource::LocalFolder(rest) => {
+                        let rest = rest.trim();
+                        // A file under the root is a sample map, as a URL is.
+                        // Its entries hang off its own folder.
+                        if let Some(map) = read_score_local_map(rest, access)? {
+                            budget.check()?;
+                            return self.register_score_custom_value(
+                                &map,
+                                base,
+                                Some(&local_map_base(rest)),
+                                access,
+                                depth + 1,
+                                budget,
+                                Some(import.unwrap_or(written)),
+                                layer,
+                            );
+                        }
                         return self.register_score_local_folder(
-                            rest.trim(),
+                            rest,
                             access,
                             budget,
                             Some(written),
@@ -1184,6 +1200,59 @@ fn parse_sample_map(url: &str, bytes: &[u8]) -> Result<serde_json::Value, String
             format!("{url}: not JSON: {error}")
         }
     })
+}
+
+/// The map in the file `local:<path>` names, or `None` when that path is not
+/// a file under the root. A folder, a refused path, or no root at all is the
+/// folder reader's to answer, with its own errors.
+fn read_score_local_map(
+    path: &str,
+    access: &ScoreSampleAccess,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(root) = access.local_root.as_ref() else {
+        return Ok(None);
+    };
+    let relative = Path::new(path);
+    let relative = relative.strip_prefix(".").unwrap_or(relative);
+    if !crate::sample_server::relative_sample_path_allowed(relative) {
+        return Ok(None);
+    }
+    let target = root.path().join(relative);
+    if !target.is_file() {
+        return Ok(None);
+    }
+    let written = format!("local:{path}");
+    let (file, length) = root
+        .open_score_file(&target)
+        .map_err(|error| format!("{written}: {error}"))?;
+    if length > MAX_SCORE_SAMPLE_MAP_BYTES as u64 {
+        return Err(format!(
+            "{written}: samples() map exceeds the {MAX_SCORE_SAMPLE_MAP_BYTES} byte limit"
+        ));
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length as usize)
+        .map_err(|_| "not enough host memory for the sample map".to_owned())?;
+    // One byte past the limit tells a file that grew after the check.
+    file.take(MAX_SCORE_SAMPLE_MAP_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{written}: {error}"))?;
+    if bytes.len() > MAX_SCORE_SAMPLE_MAP_BYTES {
+        return Err(format!(
+            "{written}: samples() map exceeds the {MAX_SCORE_SAMPLE_MAP_BYTES} byte limit"
+        ));
+    }
+    parse_sample_map(&written, &bytes).map(Some)
+}
+
+/// The folder a `local:` map's entries hang off: `local:kits/q.json` gives
+/// `local:kits/`, and `local:q.json` gives `local:`.
+fn local_map_base(path: &str) -> String {
+    match path.rsplit_once('/') {
+        Some((folder, _)) => format!("local:{folder}/"),
+        None => "local:".to_owned(),
+    }
 }
 
 pub(super) fn parse_bank(entry: &serde_json::Value, base: &str) -> Option<Bank> {

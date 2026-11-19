@@ -25,6 +25,32 @@ impl ScoreSampleAccess {
         }
     }
 
+    /// Approve the file a `local:` map entry names beneath the local root,
+    /// as the file URL it is read from. A leading `/` means the root, as it
+    /// does on a sample server. The read stays confined to the root.
+    pub(super) fn approve_local(&self, path: &str) -> Result<(Arc<str>, ScoreFetchAccess), String> {
+        let root = self.local_root.as_ref().ok_or_else(|| {
+            self.note_local_refused();
+            "samples('local:') requires a host-selected local sample root (--allow-local-samples, or the Studio Permissions page)".to_owned()
+        })?;
+        let refused = || format!("local:{path} must be a file inside the permitted folder");
+        let url = Url::from_directory_path(root.path())
+            .ok()
+            .and_then(|folder| folder.join(path.trim_start_matches('/')).ok())
+            .ok_or_else(refused)?;
+        let file = url.to_file_path().map_err(|()| refused())?;
+        let relative = file.strip_prefix(root.path()).map_err(|_| refused())?;
+        if !crate::sample_server::relative_sample_path_allowed(relative) {
+            return Err(refused());
+        }
+        Ok((
+            Arc::from(url.as_str()),
+            ScoreFetchAccess::Local {
+                root: Arc::clone(root),
+            },
+        ))
+    }
+
     /// The sources this policy allows, in the order they were given.
     pub fn sources(&self) -> &[SourceRule] {
         &self.sources
@@ -725,7 +751,11 @@ fn approve_score_url(
     sources
         .try_reserve(1)
         .map_err(|_| "not enough host memory for sample sources".to_owned())?;
-    let (url, source_access) = access.approve_remote(&join_url(base, file))?;
+    let address = join_url(base, file);
+    let (url, source_access) = match address.strip_prefix("local:") {
+        Some(path) => access.approve_local(path)?,
+        None => access.approve_remote(&address)?,
+    };
     sources.push((url.clone(), source_access));
     Ok(url)
 }
