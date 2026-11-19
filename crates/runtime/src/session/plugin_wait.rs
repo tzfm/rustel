@@ -1028,7 +1028,7 @@ impl Session {
     fn restore_score_in_play(&mut self) -> Result<(), RuntimeError> {
         #[cfg(feature = "hydra")]
         {
-            self.staged_hydra = None;
+            self.staged_hydra = PendingHydra::None;
         }
         self.js
             .restore_last_good_active()

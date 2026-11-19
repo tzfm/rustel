@@ -1125,6 +1125,9 @@ pub struct TranspileOptions {
     pub block_offset: usize,
     pub registered_languages: Vec<String>,
     pub widget_methods: Vec<String>,
+    /// Whether [`VISUAL_WIDGET_METHODS`] are recognized in addition to
+    /// [`Self::widget_methods`], without cloning their static names.
+    pub default_widget_methods: bool,
     pub emit_widgets: bool,
     pub id: Option<String>,
     /// Whether ECMAScript module syntax is accepted by the output parser.
@@ -1150,6 +1153,13 @@ pub struct TranspileOptions {
     pub live_numbers: Vec<std::ops::Range<usize>>,
 }
 
+impl TranspileOptions {
+    fn has_widget_method(&self, name: &str) -> bool {
+        (self.default_widget_methods && VISUAL_WIDGET_METHODS.contains(&name))
+            || self.widget_methods.iter().any(|method| method == name)
+    }
+}
+
 impl Default for TranspileOptions {
     fn default() -> Self {
         Self {
@@ -1160,6 +1170,7 @@ impl Default for TranspileOptions {
             block_offset: 0,
             registered_languages: Vec::new(),
             widget_methods: Vec::new(),
+            default_widget_methods: false,
             emit_widgets: true,
             id: None,
             allow_module_syntax: true,
@@ -3678,10 +3689,7 @@ fn collect_widgets(
                 && painter != "markcss"
                 && painter.bytes().all(|byte| is_identifier_byte(&byte))
                 && !painter.starts_with('_')
-                && options
-                    .widget_methods
-                    .iter()
-                    .any(|method| method == painter);
+                && options.has_widget_method(painter);
             recognized.then_some((painter, painter_options))
         } else {
             None
@@ -3737,7 +3745,7 @@ fn collect_widgets(
                 label: None,
             };
             Some((record, CallSite::Slider { name_end, open }))
-        } else if member && options.widget_methods.iter().any(|method| method == name) {
+        } else if member && options.has_widget_method(name) {
             let call_start = find_member_expression_start(bytes, name_start - 1, regexes);
             let record = visual_record(
                 &widgets,

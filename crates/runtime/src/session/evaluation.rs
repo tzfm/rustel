@@ -701,6 +701,41 @@ impl Session {
         // A number the host made live becomes a cell in the transpiler's
         // output, so a text with live numbers takes the transpiler.
         let live_numbers = self.live_numbers(source);
+        // Identical pure native re-evaluation: when the source text matches
+        // the installed native score and no plugin, live-number, or recovery
+        // state differs, reuse the active native graph and its tempo directly.
+        #[cfg(feature = "vst")]
+        let same_vst_state = !self.plugins_live()
+            && self.plugin_chains.get().is_none()
+            && self.lanes.same_document();
+        #[cfg(not(feature = "vst"))]
+        let same_vst_state = true;
+        if self.score_engine == Some(ScoreEngine::Native)
+            && self.last_source.as_deref() == Some(source)
+            && live_numbers.is_empty()
+            && seed.is_none()
+            && same_vst_state
+            && !self.csound_made()
+            && !budget.is_zero()
+            && !cancellation.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some((pattern, cps, settings)) = self.js.try_reuse_identical_native_score(source)
+        {
+            #[cfg(feature = "hydra")]
+            {
+                self.staged_hydra = PendingHydra::Clear;
+            }
+            #[cfg(feature = "vst")]
+            self.keep_ran_plugins(&[]);
+            let csound = self.csound_stage(&[])?;
+            let mut effects = rustel_jsruntime::ScoreEffects::default();
+            effects.cps = cps;
+            return Ok(EvaluatedScore::JavaScript {
+                pattern,
+                effects: Box::new(effects),
+                settings,
+                csound,
+            });
+        }
         #[cfg_attr(not(feature = "vst"), allow(unused_mut))]
         let mut read = if live_numbers.is_empty() {
             rustel_score::read(source, rustel_transpiler::call_form)
@@ -723,12 +758,10 @@ impl Session {
         let read_by_place = read
             .as_mut()
             .is_some_and(|read| !read.number_lanes(&lane_numbers));
-        let mut options = TranspileOptions {
+        let options = TranspileOptions {
             // The editor lists the leaves with its own layout pass.
             list_mini_leaves: false,
-            // Lent for this evaluation, and taken back after it: a list
-            // built per evaluation costs one allocation for each name.
-            widget_methods: std::mem::take(&mut self.widget_methods),
+            default_widget_methods: true,
             #[cfg(feature = "vst")]
             lane_numbers,
             live_numbers: live_numbers
@@ -757,7 +790,6 @@ impl Session {
                 cancellation,
             ),
         };
-        self.widget_methods = std::mem::take(&mut options.widget_methods);
         if evaluated.is_ok() {
             self.score_engine = Some(if self.js.evaluated_natively() {
                 ScoreEngine::Native
@@ -810,7 +842,10 @@ impl Session {
                 // score either never mentioned Hydra or called `clearHydra()`.
                 #[cfg(feature = "hydra")]
                 {
-                    self.staged_hydra = Some(effects.hydra.take().unwrap_or_default());
+                    self.staged_hydra = match effects.hydra.take() {
+                        Some(candidate) => PendingHydra::Ready(candidate),
+                        None => PendingHydra::Clear,
+                    };
                 }
                 // Each door that evaluates a text comes here. The plugins of
                 // the calls the score ran load at the next look at the plugin
@@ -830,7 +865,7 @@ impl Session {
                     Err(error) => {
                         #[cfg(feature = "hydra")]
                         {
-                            self.staged_hydra = None;
+                            self.staged_hydra = PendingHydra::None;
                         }
                         self.js
                             .restore_last_good_active()
@@ -985,7 +1020,7 @@ impl Session {
         );
         #[cfg(feature = "hydra")]
         if probe.is_err() {
-            self.staged_hydra = None;
+            self.staged_hydra = PendingHydra::None;
         }
         probe?;
         self.commit_evaluated_score(
@@ -1031,7 +1066,7 @@ impl Session {
         self.record_producer_phase(ProducerPhase::ReplacementProbe, probe_elapsed);
         #[cfg(feature = "hydra")]
         if probe.is_err() {
-            self.staged_hydra = None;
+            self.staged_hydra = PendingHydra::None;
         }
         probe?;
         // The seam plans the plugin chains of the candidate. It runs before
@@ -1514,11 +1549,17 @@ impl Session {
         {
             self.lanes.install(source);
             let live = self.plugins_live();
-            // The commit of a score writes its lanes to the chains, so the
-            // chains are made here.
-            let chains = &PluginChains::made_in(&self.plugin_chains).chains;
-            crate::vst::score_changed(chains, &self.lanes, Some(source), live);
-            crate::vst::forget_lanes_away(chains, &mut self.lanes);
+            if let Some(plugins) = self.plugin_chains.get() {
+                crate::vst::score_changed(&plugins.chains, &self.lanes, Some(source), live);
+                crate::vst::forget_lanes_away(&plugins.chains, &mut self.lanes);
+            } else if live || self.lanes.has_plugins() {
+                let chains = &self.plugin_chains.get_or_init(PluginChains::new).chains;
+                crate::vst::score_changed(chains, &self.lanes, Some(source), live);
+                crate::vst::forget_lanes_away(chains, &mut self.lanes);
+            } else {
+                // No plugin chains exist yet, so no away lane is held by a chain.
+                self.lanes.forget_away(|_| false);
+            }
             #[cfg(feature = "device-audio")]
             self.plugin_ahead.restart();
             match plan_lead {

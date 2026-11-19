@@ -794,19 +794,25 @@ struct PluginChains {
 
 #[cfg(feature = "vst")]
 impl PluginChains {
-    /// The chains in `cell`, made at the first call. It takes the cell and
-    /// not the session, so a caller can hold the chains and borrow another
-    /// field of the session as well.
-    fn made_in(cell: &OnceCell<Self>) -> &Self {
-        cell.get_or_init(|| {
-            let chains = Arc::new(Mutex::new(crate::vst::Chains::new()));
-            let slider_links = crate::vst::slider_links(&chains);
-            Self {
-                chains,
-                slider_links,
-            }
-        })
+    fn new() -> Self {
+        let chains = Arc::new(Mutex::new(crate::vst::Chains::new()));
+        let slider_links = crate::vst::slider_links(&chains);
+        Self {
+            chains,
+            slider_links,
+        }
     }
+}
+
+/// Visuals update waiting to be committed or drained by the host window.
+/// `Clear` avoids boxing an empty candidate on every non-visual evaluation.
+#[cfg(feature = "hydra")]
+#[derive(Default)]
+enum PendingHydra {
+    #[default]
+    None,
+    Clear,
+    Ready(Box<rustel_jsruntime::HydraCandidate>),
 }
 
 /// One-process headless runtime: one QuickJS heap, one scheduler transport.
@@ -836,11 +842,11 @@ pub struct Session {
     /// has committed it. A candidate the replacement probe rejects is dropped
     /// here rather than reaching a window.
     #[cfg(feature = "hydra")]
-    staged_hydra: Option<Box<rustel_jsruntime::HydraCandidate>>,
+    staged_hydra: PendingHydra,
     /// The visuals recording of the score that is now installed, waiting for
     /// the surface that owns the window to drain it.
     #[cfg(feature = "hydra")]
-    pending_hydra: Option<Box<rustel_jsruntime::HydraCandidate>>,
+    pending_hydra: PendingHydra,
     /// Per-score diagnostic gates for bounded MIDI collection. They prevent a
     /// dense pattern from turning one refused route into producer-thread log
     /// spam while still reporting the first actionable failure.
@@ -898,9 +904,6 @@ pub struct Session {
     lanes: crate::vst::LaneTable,
     /// What evaluated the last score. See [`Self::score_engine`].
     score_engine: Option<ScoreEngine>,
-    /// The names of the widget methods, as each transpile takes them: lent
-    /// to the options of an evaluation and taken back after it.
-    widget_methods: Vec<String>,
     /// The last look of [`Self::plugins_pending`]: its time, the generation
     /// of the score, and the count.
     #[cfg(feature = "vst")]
@@ -1233,9 +1236,9 @@ impl Session {
             #[cfg(feature = "midi")]
             pending_midi: Vec::new(),
             #[cfg(feature = "hydra")]
-            staged_hydra: None,
+            staged_hydra: PendingHydra::None,
             #[cfg(feature = "hydra")]
-            pending_hydra: None,
+            pending_hydra: PendingHydra::None,
             #[cfg(feature = "midi")]
             midi_oversized_route_reported: false,
             #[cfg(feature = "midi")]
@@ -1264,10 +1267,6 @@ impl Session {
             #[cfg(feature = "vst")]
             lanes: crate::vst::LaneTable::default(),
             score_engine: None,
-            widget_methods: rustel_transpiler::VISUAL_WIDGET_METHODS
-                .iter()
-                .map(|method| (*method).to_owned())
-                .collect(),
             #[cfg(feature = "vst")]
             plugin_look: None,
             #[cfg(all(feature = "vst", feature = "device-audio"))]
@@ -1347,8 +1346,9 @@ impl Session {
     /// waiting for something to commit. Cleared into `pending_hydra` there.
     #[cfg(feature = "hydra")]
     pub(crate) fn promote_staged_hydra(&mut self) {
-        if let Some(candidate) = self.staged_hydra.take() {
-            self.pending_hydra = Some(candidate);
+        match std::mem::take(&mut self.staged_hydra) {
+            PendingHydra::None => {}
+            staged => self.pending_hydra = staged,
         }
     }
 
@@ -1356,7 +1356,9 @@ impl Session {
     /// own: close the picture, unless the evaluation already recorded one.
     #[cfg(feature = "hydra")]
     pub(crate) fn stage_hydra_close_when_unstaged(&mut self) {
-        self.staged_hydra.get_or_insert_with(Box::default);
+        if matches!(self.staged_hydra, PendingHydra::None) {
+            self.staged_hydra = PendingHydra::Clear;
+        }
     }
 
     /// The visuals program a committed score installed, if there is a new one.
@@ -1366,7 +1368,11 @@ impl Session {
     /// update whose program is empty is the instruction to close.
     #[cfg(feature = "hydra")]
     pub fn take_pending_hydra(&mut self) -> Option<Box<rustel_jsruntime::HydraCandidate>> {
-        self.pending_hydra.take()
+        match std::mem::take(&mut self.pending_hydra) {
+            PendingHydra::None => None,
+            PendingHydra::Clear => Some(Box::default()),
+            PendingHydra::Ready(candidate) => Some(candidate),
+        }
     }
 
     pub fn config(&self) -> &SessionConfig {
@@ -1387,7 +1393,18 @@ impl Session {
 
     #[cfg(feature = "vst")]
     fn plugin_chains(&self) -> &PluginChains {
-        PluginChains::made_in(&self.plugin_chains)
+        self.plugin_chains.get_or_init(|| {
+            let plugins = PluginChains::new();
+            if !self.lanes.is_empty() || self.lanes.document() != 0 {
+                crate::vst::score_changed(
+                    &plugins.chains,
+                    &self.lanes,
+                    self.last_source.as_deref(),
+                    self.plugins_live(),
+                );
+            }
+            plugins
+        })
     }
 
     /// Ends the plan of the text before, when the session has chains: a
@@ -1893,10 +1910,14 @@ impl Session {
     #[cfg(feature = "vst")]
     pub fn forget_plugin_document(&mut self, document: u64) -> bool {
         let live = self.plugins_live();
-        // The close goes through the chains, which also forget the lanes.
-        let chains = &PluginChains::made_in(&self.plugin_chains).chains;
-        let held = crate::vst::forget_document(chains, &mut self.lanes, document, live);
-        self.end_closed_plugin_document() || (held && self.transport.is_stopped())
+        if let Some(plugins) = self.plugin_chains.get() {
+            let held =
+                crate::vst::forget_document(&plugins.chains, &mut self.lanes, document, live);
+            self.end_closed_plugin_document() || (held && self.transport.is_stopped())
+        } else {
+            self.lanes.forget(document);
+            false
+        }
     }
 
     /// Ends the plugin chains of each closed document while the transport

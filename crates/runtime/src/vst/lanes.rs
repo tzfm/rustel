@@ -350,11 +350,13 @@ impl LaneTable {
                 self.rest.insert(left, rest);
             }
         }
-        let kept: HashSet<u64> = self.playing.lanes.iter().map(|lane| lane.number).collect();
-        // A lane that came back is in play again.
-        self.away.retain(|lane| !kept.contains(&lane.number));
-        let gone = before.iter().filter(|lane| !kept.contains(&lane.number));
-        self.away.extend(gone.cloned());
+        if !self.away.is_empty() || !before.is_empty() {
+            let kept: HashSet<u64> = self.playing.lanes.iter().map(|lane| lane.number).collect();
+            // A lane that came back is in play again.
+            self.away.retain(|lane| !kept.contains(&lane.number));
+            let gone = before.iter().filter(|lane| !kept.contains(&lane.number));
+            self.away.extend(gone.cloned());
+        }
         if heard && left == document {
             self.audible = Audible::Earlier {
                 document: left,
@@ -368,7 +370,7 @@ impl LaneTable {
     /// `chained` gives true for the number of a lane with a chain. A lane
     /// away comes back with its number by rules 1 to 3 of [`pair`]. A lane
     /// that comes back after this is a new lane.
-    pub(super) fn forget_away(&mut self, chained: impl Fn(u64) -> bool) {
+    pub(crate) fn forget_away(&mut self, chained: impl Fn(u64) -> bool) {
         self.away.retain(|lane| chained(lane.number));
         for rest in self.rest.values_mut() {
             rest.lanes.retain(|lane| chained(lane.number));
@@ -380,7 +382,7 @@ impl LaneTable {
     /// to rest again. A document at rest leaves rest, and the table drops
     /// its lanes and its lanes away. The document in play keeps its lanes
     /// until another document goes in play.
-    pub(super) fn forget(&mut self, document: u64) {
+    pub(crate) fn forget(&mut self, document: u64) {
         self.closed.insert(document);
         self.rest.remove(&document);
     }
@@ -406,6 +408,24 @@ impl LaneTable {
     /// The lanes of the score in play.
     pub(super) fn playing(&self) -> &ScoreLanes {
         &self.playing
+    }
+
+    /// True when any lane in play names a plugin call.
+    pub(crate) fn has_plugins(&self) -> bool {
+        self.playing
+            .lanes
+            .iter()
+            .any(|lane| !lane.plugins.is_empty())
+    }
+
+    /// True when the reading document is the document in play.
+    pub(crate) fn same_document(&self) -> bool {
+        self.reading == self.document
+    }
+
+    /// True when no lanes are in play and no documents are at rest.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.playing.lanes.is_empty() && self.away.is_empty() && self.rest.is_empty()
     }
 
     /// The document and the lanes of the score the install of the text

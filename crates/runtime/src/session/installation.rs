@@ -287,11 +287,12 @@ impl Session {
         if result.is_ok() {
             self.lanes.install_pattern();
             let live = self.plugins_live();
-            // The commit of a score writes its lanes to the chains, so the
-            // chains are made here.
-            let chains = &PluginChains::made_in(&self.plugin_chains).chains;
-            crate::vst::score_changed(chains, &self.lanes, None, live);
-            crate::vst::forget_lanes_away(chains, &mut self.lanes);
+            if let Some(plugins) = self.plugin_chains.get() {
+                crate::vst::score_changed(&plugins.chains, &self.lanes, None, live);
+                crate::vst::forget_lanes_away(&plugins.chains, &mut self.lanes);
+            } else {
+                self.lanes.forget_away(|_| false);
+            }
             #[cfg(feature = "device-audio")]
             self.plugin_ahead.restart();
         }
