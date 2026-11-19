@@ -74,7 +74,7 @@ fn timeline_root_inherits_the_receiver_runtime() {
     let receiver =
         rustel_core::pure(Value::Str("receiver".into())).with_runtime_settings(receiver_owner);
     let pattern = rustel_core::timeline(time, receiver, TimelineState::default())
-        .fmap(|_| Value::Str(format!("{:?}", rng::rng_mode())));
+        .fmap(|_| Value::Str(format!("{:?}", rng::rng_mode()).into()));
 
     ambient.with(|| {
         assert_eq!(
@@ -148,7 +148,7 @@ fn nested_wrappers_keep_the_snapshot_selected_by_the_outer_query() {
     let transform_resume = Arc::clone(&resume);
     let pause_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let transform_once = Arc::clone(&pause_once);
-    let inner = rustel_core::state_signal(|_| Value::Str(format!("{:?}", rng::rng_mode())))
+    let inner = rustel_core::state_signal(|_| Value::Str(format!("{:?}", rng::rng_mode()).into()))
         .with_runtime_settings(settings.clone());
     let exported = inner
         .with_query_time(move |time| {

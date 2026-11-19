@@ -2024,7 +2024,8 @@ mod tests {
     }
 
     /// The script engine's heap is a part of the studio no other figure
-    /// covers, and it is there as soon as a session is.
+    /// covers. It is there from the first score that needs the engine: a
+    /// studio of native scores holds none.
     #[test]
     fn script_heap_is_reported() {
         let mut engine = StudioEngine::new(StudioConfig {
@@ -2033,6 +2034,16 @@ mod tests {
         })
         .expect("engine");
 
+        engine
+            .session
+            .evaluate("s(\"kick\")")
+            .expect("a native score");
+        assert_eq!(engine.snapshot().script_heap_bytes, 0);
+        // An index into an array is JavaScript alone.
+        engine
+            .session
+            .evaluate("s(\"kick\").fast([1][0])")
+            .expect("a script score");
         assert!(engine.snapshot().script_heap_bytes > 0);
     }
 

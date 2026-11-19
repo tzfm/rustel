@@ -23,7 +23,7 @@
 
 use std::cmp::Ordering;
 use std::fmt;
-use std::num::NonZeroI128;
+use std::num::{NonZeroI128, NonZeroU16, NonZeroU32};
 use std::str::FromStr;
 
 use num_bigint::{BigInt, BigUint, Sign};
@@ -58,6 +58,10 @@ fn gcd_i128(a: i128, b: i128) -> i128 {
 
 #[inline]
 fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
+    // Terms of a machine word need no wide division.
+    if let (Ok(a), Ok(b)) = (u64::try_from(a), u64::try_from(b)) {
+        return u128::from(gcd_u64(a, b));
+    }
     while b != 0 {
         let t = a % b;
         a = b;
@@ -88,12 +92,82 @@ fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
+/// A grid of equally spaced ticks per cycle. Each residue gives the common
+/// divisor of its tick and the grid denominator, and the reduced denominator.
+#[derive(Debug)]
+pub struct TickGrid {
+    reductions: Box<[(NonZeroU16, NonZeroU16)]>,
+}
+
+impl TickGrid {
+    /// Four bytes per residue keep the grid within four KiB.
+    pub const MAX_DENOM: i64 = 1024;
+
+    /// A grid with `denom` ticks per cycle, when it fits the table.
+    pub fn new(denom: i64) -> Option<Self> {
+        if !(1..=Self::MAX_DENOM).contains(&denom) {
+            return None;
+        }
+        let denom = denom as u16;
+        let reductions = (0..denom)
+            .map(|residue| {
+                let gcd = gcd_u64(u64::from(residue), u64::from(denom)) as u16;
+                (
+                    NonZeroU16::new(gcd).expect("a positive common divisor"),
+                    NonZeroU16::new(denom / gcd).expect("a positive denominator"),
+                )
+            })
+            .collect();
+        Some(Self { reductions })
+    }
+
+    #[inline]
+    pub fn denom(&self) -> i64 {
+        self.reductions.len() as i64
+    }
+
+    /// The signed tick at `time`, when it lies on this grid and fits in a word.
+    #[inline]
+    pub fn ticks(&self, time: Fraction) -> Option<i64> {
+        let n = i64::try_from(time.numer()).ok()?;
+        let d = usize::try_from(time.denom()).ok()?;
+        if d == self.reductions.len() {
+            return Some(n);
+        }
+        let &(gcd, scale) = self.reductions.get(d)?;
+        if usize::from(gcd.get()) != d {
+            return None;
+        }
+        n.checked_mul(i64::from(scale.get()))
+    }
+
+    /// The reduced time of a signed tick. The residue of its magnitude
+    /// selects the same common divisor for both signs.
+    #[inline]
+    pub fn time(&self, ticks: i64) -> Fraction {
+        let residue = ticks.unsigned_abs() % self.reductions.len() as u64;
+        let (gcd, denominator) = self.reductions[residue as usize];
+        Fraction {
+            n: i128::from(ticks / i64::from(gcd.get())),
+            d: den(i128::from(denominator.get())),
+        }
+    }
+}
+
 /// Reduce a numerator and a positive denominator from the 64-bit path.
 #[inline]
 fn reduced_small(n: i64, d: i64) -> Fraction {
     debug_assert!(d > 0);
     if n == 0 {
         return Fraction::ZERO;
+    }
+    // A power of two takes out its common factor of two with no division.
+    if d & (d - 1) == 0 {
+        let shift = n.trailing_zeros().min(d.trailing_zeros());
+        return Fraction {
+            n: i128::from(n >> shift),
+            d: den(i128::from(d >> shift)),
+        };
     }
     let divisor = gcd_u64(n.unsigned_abs(), d as u64) as i64;
     Fraction {
@@ -128,11 +202,21 @@ fn checked_normalised(n: i128, d: i128) -> Option<Fraction> {
         return Some(Fraction::ZERO);
     }
     let negative = (n < 0) != (d < 0);
-    let mut numerator = n.unsigned_abs();
-    let mut denominator = d.unsigned_abs();
-    let divisor = gcd_u128(numerator, denominator);
-    numerator /= divisor;
-    denominator /= divisor;
+    let (numerator, denominator) = (n.unsigned_abs(), d.unsigned_abs());
+    // Terms of a machine word reduce with no wide division.
+    let (numerator, denominator) = match (u64::try_from(numerator), u64::try_from(denominator)) {
+        (Ok(numerator), Ok(denominator)) => {
+            let divisor = gcd_u64(numerator, denominator);
+            (
+                u128::from(numerator / divisor),
+                u128::from(denominator / divisor),
+            )
+        }
+        _ => {
+            let divisor = gcd_u128(numerator, denominator);
+            (numerator / divisor, denominator / divisor)
+        }
+    };
     if denominator > i128::MAX as u128 {
         return None;
     }
@@ -159,12 +243,16 @@ fn checked_normalised(n: i128, d: i128) -> Option<Fraction> {
 /// f64 comparison has the same result. This preserves the scalar state
 /// machine, including equality caused by f64 rounding, while making a run
 /// logarithmic rather than linear in the denominator limit.
-fn farey_approximation(p1: f64, limit: i128) -> (i128, i128) {
+///
+/// Each bound stays between `0/1` and `1/1`, and a move ends at most one
+/// step past `limit`, so no term is above `2 * limit`: the terms are
+/// machine words, which a float takes with no library call.
+fn farey_approximation(p1: f64, limit: i64) -> (i64, i64) {
     farey_approximation_with_runs(p1, limit).0
 }
 
-fn farey_approximation_with_runs(p1: f64, limit: i128) -> ((i128, i128), usize) {
-    fn last_true(mut low: i128, mut high: i128, predicate: impl Fn(i128) -> bool) -> i128 {
+fn farey_approximation_with_runs(p1: f64, limit: i64) -> ((i64, i64), usize) {
+    fn last_true(mut low: i64, mut high: i64, predicate: impl Fn(i64) -> bool) -> i64 {
         debug_assert!(low >= 1 && low <= high && predicate(low));
         while low < high {
             let middle = low + (high - low + 1) / 2;
@@ -177,10 +265,10 @@ fn farey_approximation_with_runs(p1: f64, limit: i128) -> ((i128, i128), usize) 
         low
     }
 
-    let (mut a, mut b, mut c, mut d) = (0i128, 1i128, 1i128, 1i128);
+    let (mut a, mut b, mut c, mut d) = (0i64, 1i64, 1i64, 1i64);
     // The loop always assigns these before returning: its first iteration
     // takes either the equality branch or a batched run.
-    let (mut n, mut den) = (0i128, 1i128);
+    let (mut n, mut den) = (0i64, 1i64);
     let mut runs = 0usize;
     while b <= limit && d <= limit {
         runs += 1;
@@ -358,6 +446,57 @@ impl Fraction {
         checked_normalised(n, d)
     }
 
+    /// The reduced cycle time of a signed tick on a uniform grid.
+    #[inline]
+    pub fn from_ticks(ticks: i128, ticks_per_cycle: NonZeroU32) -> Self {
+        let d = ticks_per_cycle.get();
+        if d.is_power_of_two()
+            && let Some(time) = Self::dyadic(ticks, d.trailing_zeros())
+        {
+            return time;
+        }
+        // Terms of 32 bits reduce with a gcd of 32 bits.
+        if let Ok(magnitude) = u32::try_from(ticks.unsigned_abs()) {
+            if magnitude == 0 {
+                return Self::ZERO;
+            }
+            let (mut a, mut b) = (magnitude, d);
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            let n = i128::from(magnitude / a);
+            return Self {
+                n: if ticks < 0 { -n } else { n },
+                d: den(i128::from(d / a)),
+            };
+        }
+        if let Ok(ticks) = i64::try_from(ticks) {
+            return reduced_small(ticks, i64::from(d));
+        }
+        Self::new(ticks, i128::from(d))
+    }
+
+    /// `n / 2^shift`, reduced by a shift of the trailing zeros of `n` with
+    /// no gcd. `None` for a `shift` above 126, whose denominator has no room.
+    #[inline]
+    pub fn dyadic(n: i128, shift: u32) -> Option<Self> {
+        if shift > 126 {
+            return None;
+        }
+        if n == 0 {
+            return Some(Self::ZERO);
+        }
+        // The one numerator whose magnitude has no room as it is.
+        if n == i128::MIN {
+            return Self::checked_new(n, 1i128 << shift);
+        }
+        let drop = n.trailing_zeros().min(shift);
+        Some(Fraction {
+            n: n >> drop,
+            d: den(1i128 << (shift - drop)),
+        })
+    }
+
     #[inline]
     pub const fn int(n: i128) -> Self {
         Fraction { n, d: den(1) }
@@ -366,7 +505,10 @@ impl Fraction {
     /// Both components as `i64` when each is below [`SMALL_LIMIT`].
     #[inline]
     fn small(self) -> Option<(i64, i64)> {
-        (self.n > -SMALL_LIMIT && self.n < SMALL_LIMIT && self.d.get() < SMALL_LIMIT)
+        // One unsigned compare of the numerator holds both of its bounds.
+        let numerator_fits =
+            self.n.wrapping_add(SMALL_LIMIT - 1) as u128 <= (SMALL_LIMIT * 2 - 2) as u128;
+        (numerator_fits && self.d.get() < SMALL_LIMIT)
             .then_some((self.n as i64, self.d.get() as i64))
     }
 
@@ -434,7 +576,7 @@ impl Fraction {
         }
 
         let mut z: i128 = 1;
-        const N: i128 = 10_000_000;
+        const N: i64 = 10_000_000;
 
         if p1 >= 1.0 {
             let exponent = (1.0 + p1.log10()).floor();
@@ -451,8 +593,11 @@ impl Fraction {
         if den == 0 {
             return None;
         }
-        let n = ck(n.checked_mul(z), "from_f64 scale");
-        Some(Fraction::new(if negative { -n } else { n }, den))
+        let n = ck(i128::from(n).checked_mul(z), "from_f64 scale");
+        Some(Fraction::new(
+            if negative { -n } else { n },
+            i128::from(den),
+        ))
     }
 
     // -- arithmetic --------------------------------------------------------
@@ -488,6 +633,10 @@ impl Fraction {
             return Some(sum);
         }
         if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
+            // The same denominator leaves smaller terms to reduce.
+            if d == od {
+                return Some(reduced_small(n + on, d));
+            }
             return Some(reduced_small(n * od + on * d, d * od));
         }
         let native = || {
@@ -517,6 +666,9 @@ impl Fraction {
             return Some(difference);
         }
         if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
+            if d == od {
+                return Some(reduced_small(n - on, d));
+            }
             return Some(reduced_small(n * od - on * d, d * od));
         }
         let native = || {
@@ -739,6 +891,34 @@ impl Fraction {
         }
     }
 
+    /// `(self / o).floor()` as a whole count, with no reduced quotient on
+    /// the 64-bit path. `None` as [`Self::checked_div`] gives it.
+    pub fn checked_div_floor(self, o: Self) -> Option<i128> {
+        match self.small_quotient(o) {
+            Some((n, d)) => Some(i128::from(n.div_euclid(d))),
+            None => Some(self.checked_div(o)?.floor().n),
+        }
+    }
+
+    /// `(self / o).ceil()` as a whole count, with no reduced quotient on
+    /// the 64-bit path. `None` as [`Self::checked_div`] gives it.
+    pub fn checked_div_ceil(self, o: Self) -> Option<i128> {
+        match self.small_quotient(o) {
+            // The floor of the negated quotient, negated: no remainder to
+            // test, and no overflow for products below 2^62.
+            Some((n, d)) => Some(-i128::from((-n).div_euclid(d))),
+            None => Some(self.checked_div(o)?.ceil().n),
+        }
+    }
+
+    /// `self / o` as a numerator and a positive denominator that are not
+    /// reduced, for a divisor above zero on the 64-bit path.
+    #[inline]
+    fn small_quotient(self, o: Self) -> Option<(i64, i64)> {
+        let ((n, d), (on, od)) = (self.small()?, o.small()?);
+        (on > 0).then_some((n * od, d * on))
+    }
+
     #[inline]
     fn mul_eq_self(self, o: Self) -> bool {
         self.n == o.n && self.d.get() == o.d.get()
@@ -859,6 +1039,10 @@ impl PartialOrd for Fraction {
 
 impl Ord for Fraction {
     fn cmp(&self, o: &Self) -> Ordering {
+        // Reduced fractions of one denominator order as their numerators do.
+        if self.d == o.d {
+            return self.n.cmp(&o.n);
+        }
         if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
             return (n * od).cmp(&(on * d));
         }
@@ -1077,7 +1261,12 @@ mod from_f64_tests {
         farey_approximation_with_runs, gcd_i128,
     };
 
-    fn scalar_farey_approximation(p1: f64, limit: i128) -> (i128, i128) {
+    const FRACTION_JS_LIMIT: i64 = 10_000_000;
+
+    /// The walk of fraction.js, one move at a time, in terms as wide as a
+    /// fraction holds.
+    fn scalar_farey_approximation(p1: f64, limit: i64) -> (i64, i64) {
+        let limit = i128::from(limit);
         let (mut a, mut b, mut c, mut d) = (0i128, 1i128, 1i128, 1i128);
         let (mut n, mut den) = (0i128, 1i128);
         while b <= limit && d <= limit {
@@ -1110,12 +1299,13 @@ mod from_f64_tests {
                 den = b;
             }
         }
-        (n, den)
+        let word = |term: i128| i64::try_from(term).expect("a term of a machine word");
+        (word(n), word(den))
     }
 
     #[test]
     fn batched_farey_walk_matches_the_scalar_state_machine() {
-        const LIMIT: i128 = 1_024;
+        const LIMIT: i64 = 1_024;
         let edge_cases = [
             f64::MIN_POSITIVE,
             f64::from_bits(1),
@@ -1149,12 +1339,19 @@ mod from_f64_tests {
                 scalar_farey_approximation(value, LIMIT),
                 "sample {index}: {value:.17}"
             );
+            // The limit of fraction.js, where the terms are the largest.
+            if index % 8 == 0 {
+                assert_eq!(
+                    farey_approximation(value, FRACTION_JS_LIMIT),
+                    scalar_farey_approximation(value, FRACTION_JS_LIMIT),
+                    "sample {index} at the limit of fraction.js: {value:.17}"
+                );
+            }
         }
     }
 
     #[test]
     fn near_zero_random_offsets_take_bounded_farey_runs() {
-        const FRACTION_JS_LIMIT: i128 = 10_000_000;
         for value in [
             0.000_000_123_456_789,
             0.000_314_159_265_358_979_3,
@@ -1597,6 +1794,81 @@ mod parse_tokeniser_tests {
 mod native_fast_path_tests {
     use super::*;
 
+    /// Reduce `n / d` with a plain gcd, as the reference for the fast paths.
+    fn reference(n: i128, d: i128) -> Fraction {
+        let divisor = gcd_i128(n, d).max(1);
+        Fraction::new(n / divisor, d / divisor)
+    }
+
+    #[test]
+    fn small_sums_differences_and_orders_match_a_plain_reduction() {
+        // Powers of two, other denominators, whole numbers, negative terms
+        // and terms at the edge of the 64-bit path.
+        let denoms = [1, 2, 3, 4, 6, 8, 12, 16, 64, 80, 1 << 30, (1 << 31) - 1];
+        let numers = [
+            -(1 << 31) + 1,
+            -(1 << 31),
+            -(1 << 30) - 3,
+            -17,
+            -8,
+            -1,
+            0,
+            1,
+            3,
+            5,
+            8,
+            24,
+            1 << 29,
+            (1 << 31) - 2,
+            (1 << 31) - 1,
+            1 << 31,
+        ];
+        let times: Vec<Fraction> = denoms
+            .iter()
+            .flat_map(|&d| numers.iter().map(move |&n| Fraction::new(n, d)))
+            .collect();
+        for &a in &times {
+            for &b in &times {
+                let (an, ad, bn, bd) = (a.numer(), a.denom(), b.numer(), b.denom());
+                assert_eq!(
+                    a + b,
+                    reference(an * bd + bn * ad, ad * bd),
+                    "{a:?} + {b:?}"
+                );
+                assert_eq!(
+                    a - b,
+                    reference(an * bd - bn * ad, ad * bd),
+                    "{a:?} - {b:?}"
+                );
+                assert_eq!(a * b, reference(an * bn, ad * bd), "{a:?} * {b:?}");
+                assert_eq!(a.cmp(&b), (an * bd).cmp(&(bn * ad)), "{a:?} cmp {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn signed_ticks_reduce_on_each_grid() {
+        for d in [1, 2, 12, 128, 257, 1 << 31, u32::MAX] {
+            let grid = NonZeroU32::new(d).unwrap();
+            let edges = [
+                i128::MIN,
+                i128::MIN + 1,
+                i128::MAX,
+                i128::from(i64::MIN),
+                i128::from(i64::MIN) + 1,
+                i128::from(i64::MAX),
+                i128::from(i64::MAX) + 1,
+            ];
+            for tick in (-260..=260).chain(edges) {
+                assert_eq!(
+                    Fraction::from_ticks(tick, grid),
+                    Fraction::new(tick, i128::from(d)),
+                    "{tick}/{d}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn adding_whole_cycles_agrees_with_exact_addition_at_the_edges() {
         let cases = [
@@ -1655,6 +1927,42 @@ mod native_fast_path_tests {
     }
 
     #[test]
+    fn the_whole_counts_around_a_quotient_agree_with_the_reduced_quotient() {
+        let terms = [
+            Fraction::ZERO,
+            Fraction::ONE,
+            Fraction::new(-1, 1),
+            Fraction::new(13, 96),
+            Fraction::new(-13, 96),
+            Fraction::new(60, 1),
+            Fraction::new(-60, 1),
+            Fraction::new(7, 3),
+            Fraction::new(-7, 3),
+            Fraction::new((1 << 31) - 1, 1),
+            Fraction::new(1, (1 << 31) - 1),
+            Fraction::new(1 << 31, 3),
+            Fraction::new(-5, 1 << 40),
+            Fraction::new(i128::MAX, 2),
+            Fraction::new(i128::MIN + 1, 1),
+        ];
+        for left in terms {
+            for right in terms {
+                let quotient = left.checked_div(right);
+                assert_eq!(
+                    left.checked_div_floor(right),
+                    quotient.map(|quotient| quotient.floor().numer()),
+                    "floor of {left:?} / {right:?}"
+                );
+                assert_eq!(
+                    left.checked_div_ceil(right),
+                    quotient.map(|quotient| quotient.ceil().numer()),
+                    "ceil of {left:?} / {right:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_64_bit_fraction_converts_as_a_128_bit_one() {
         for (n, d) in [
             (1i64, 3i64),
@@ -1673,5 +1981,62 @@ mod native_fast_path_tests {
                 "{n}/{d}"
             );
         }
+    }
+
+    #[test]
+    fn a_dyadic_fraction_is_the_reduced_one() {
+        for shift in 0..=126u32 {
+            for n in [
+                -96i128,
+                -7,
+                -1,
+                0,
+                1,
+                2,
+                3,
+                8,
+                64,
+                1 << 40,
+                i128::MAX,
+                i128::MIN + 1,
+            ] {
+                let expected = Fraction::checked_new(n, 1i128 << shift);
+                assert_eq!(Fraction::dyadic(n, shift), expected, "{n} over 2^{shift}");
+            }
+        }
+        assert_eq!(Fraction::dyadic(1, 127), None);
+    }
+
+    #[test]
+    fn ticks_have_the_same_reduced_time_as_exact_division() {
+        for denom in [1, 8, 11, 15, 96, 176, 257, TickGrid::MAX_DENOM] {
+            let grid = TickGrid::new(denom).unwrap();
+            assert_eq!(grid.denom(), denom);
+            for tick in (-2 * denom..=2 * denom).chain([i64::MIN, i64::MIN + 1, i64::MAX]) {
+                let exact = Fraction::new(i128::from(tick), i128::from(denom));
+                assert_eq!(grid.time(tick), exact, "tick {tick} of {denom}");
+                assert_eq!(grid.ticks(exact), Some(tick));
+            }
+        }
+    }
+
+    #[test]
+    fn a_grid_accepts_only_its_representable_ticks() {
+        for denom in [-1, 0, TickGrid::MAX_DENOM + 1, i64::MAX] {
+            assert!(TickGrid::new(denom).is_none());
+        }
+        let grid = TickGrid::new(24).unwrap();
+        for d in 1..=32 {
+            for n in [-13, 0, 7, i128::from(i64::MAX), i128::from(i64::MIN)] {
+                let time = Fraction::new(n, d);
+                let scaled = time * Fraction::int(24);
+                let expected = (scaled.denom() == 1)
+                    .then(|| i64::try_from(scaled.numer()).ok())
+                    .flatten();
+                assert_eq!(grid.ticks(time), expected, "{time:?}");
+            }
+        }
+        assert_eq!(grid.ticks(Fraction::int(i128::MAX)), None);
+        assert_eq!(grid.ticks(Fraction::new(1, i128::MAX)), None);
     }
 }

@@ -48,7 +48,10 @@ fn set_plugin_field(hap: &Value, call: &str, field: &Field, setting: &Value) -> 
     match field {
         Field::Name(binding) => {
             plugin.insert("name".into(), setting);
-            plugin.insert("__rustel_binding".into(), Value::Str(binding.clone()));
+            plugin.insert(
+                "__rustel_binding".into(),
+                Value::Str(binding.as_str().into()),
+            );
         }
         Field::Key(key, _) if key == "preset" => {
             plugin.insert("preset".into(), setting);
@@ -65,7 +68,7 @@ fn set_plugin_field(hap: &Value, call: &str, field: &Field, setting: &Value) -> 
                     Some(Value::Object(sliders)) => sliders.clone(),
                     _ => rustel_core::OrderedMap::new(),
                 };
-                sliders.insert(key.clone(), Value::Str(slider.clone()));
+                sliders.insert(key.clone(), Value::Str(slider.as_str().into()));
                 plugin.insert("__rustel_sliders".into(), Value::Object(sliders));
             }
         }
@@ -147,7 +150,7 @@ fn install_plugin<'js>(
                 &format!("{call} must be built in the score or one of its callbacks"),
             )
         })?;
-    let name = Value::Str(name);
+    let name = Value::Str(name.into());
     let field = Field::Name(binding);
     let mut output =
         receiver.fmap_keeping_live(move |hap| Some(set_plugin_field(hap, call, &field, &name)));
@@ -211,7 +214,7 @@ mod tests {
                     panic!("object hap");
                 };
                 let lane = match controls.get("__rustel_lane") {
-                    Some(Value::Str(lane)) => lane.clone(),
+                    Some(Value::Str(lane)) => lane.to_string(),
                     None => String::new(),
                     _ => panic!("lane tag"),
                 };
@@ -221,7 +224,7 @@ mod tests {
                         let Some(Value::Str(binding)) = plugin.get("__rustel_binding") else {
                             panic!("binding");
                         };
-                        binding.clone()
+                        binding.to_string()
                     })
                     .collect();
                 (lane, ids)

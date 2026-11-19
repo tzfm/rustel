@@ -128,6 +128,7 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
     let proto = surface.proto.clone();
     let set_canonical_polymeter_pace = surface.set_canonical_polymeter_pace.clone();
     let set_canonical_zoom = surface.set_canonical_zoom.clone();
+    let helpers = InstallHelpers::compile(&ctx)?;
     // -- prototype installation order -------------------------------
     //
     // Assignments onto `Pattern.prototype` land in a fixed order, and
@@ -148,7 +149,7 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
         if !registration.declared_in.is_extension() {
             continue;
         }
-        install_combinator(&ctx, &proto, &globals, name, registration.clone())?;
+        install_combinator(&ctx, &helpers, &proto, &globals, name, registration)?;
     }
 
     for name in registry().names() {
@@ -156,7 +157,7 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
         if registration.declared_in != rustel_core::register::DeclaredIn::PatternModule {
             continue;
         }
-        install_combinator(&ctx, &proto, &globals, name, registration.clone())?;
+        install_combinator(&ctx, &helpers, &proto, &globals, name, registration)?;
         // Raw swing, range/range2, apply/when/never/always, the stepwise
         // pairs, and canonical shrink/grow are installed later through
         // private JavaScript register() calls. Reserve their
@@ -208,10 +209,8 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
     for name in control_registry().names() {
         let spec = control_registry()
             .get(name)
-            .expect("name came from the registry")
-            .clone();
+            .expect("name came from the registry");
         let literal = LITERAL_STRING_CONTROLS.contains(&name);
-        let method_spec = spec.clone();
         let method = Function::new(
             ctx.clone(),
             hr_this_rest(move |ctx, this, args| {
@@ -225,30 +224,30 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
                 // Spelling them separately is what lets a pattern go on one
                 // of them - `limit(slider(-6, -24, 0), "hard")` - which a
                 // string glued together cannot do.
-                let argument =
-                    match control_arguments(&method_spec, args.0, rquickjs::Value::is_undefined) {
-                        ControlArguments::Positional(values) => {
-                            let mut parts = Vec::with_capacity(values.len());
-                            for value in values {
-                                let (pattern, sidecar) = reify_bridged(&ctx, &value)?;
-                                sidecars.push(sidecar);
-                                parts.push(pattern);
-                            }
-                            let pattern = apply_control_method(
-                                &method_spec,
-                                &receiver,
-                                ControlArguments::Positional(parts),
-                            );
-                            return derive_wrapper(ctx, pattern, &sidecars);
+                let argument = match control_arguments(spec, args.0, rquickjs::Value::is_undefined)
+                {
+                    ControlArguments::Positional(values) => {
+                        let mut parts = Vec::with_capacity(values.len());
+                        for value in values {
+                            let (pattern, sidecar) = reify_bridged(&ctx, &value)?;
+                            sidecars.push(sidecar);
+                            parts.push(pattern);
                         }
-                        ControlArguments::Single(argument) => argument,
-                    };
+                        let pattern = apply_control_method(
+                            spec,
+                            receiver,
+                            ControlArguments::Positional(parts),
+                        );
+                        return derive_wrapper(ctx, pattern, &sidecars);
+                    }
+                    ControlArguments::Single(argument) => argument,
+                };
                 // `if (typeof value === 'undefined') return pat.fmap(withVal);`
                 let value = if let Some(value) = argument {
                     match value.as_string().filter(|_| literal) {
                         // A code expression: keep it whole.
                         Some(text) => Some(rustel_core::pure(rustel_core::Value::Str(
-                            text.to_string()?,
+                            text.to_string()?.into(),
                         ))),
                         None => {
                             let (pattern, sidecar) = reify_bridged(&ctx, &value)?;
@@ -259,8 +258,7 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
                 } else {
                     None
                 };
-                let pattern =
-                    apply_control_method(&method_spec, &receiver, ControlArguments::Single(value));
+                let pattern = apply_control_method(spec, receiver, ControlArguments::Single(value));
                 derive_wrapper(ctx, pattern, &sidecars)
             }),
         )
@@ -275,7 +273,7 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
                 &ctx,
                 name,
                 method.into_value(),
-                BuiltinMethod::Control(spec.clone()),
+                BuiltinMethod::Control(spec),
             )
             .map_err(|error| error.to_string())?;
         }
@@ -290,7 +288,9 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
             }),
         )
         .map_err(|e| e.to_string())?;
-        globals.set(name, free).map_err(|e| e.to_string())?;
+        globals.set(name, free.clone()).map_err(|e| e.to_string())?;
+        record_builtin_global(&ctx, name, free.into_value(), BuiltinGlobal::Control)
+            .map_err(|error| error.to_string())?;
     }
 
     // -- combinators declared in the controls module (installed LAST) --
@@ -299,7 +299,7 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
         if registration.declared_in != rustel_core::register::DeclaredIn::ControlsModule {
             continue;
         }
-        install_combinator(&ctx, &proto, &globals, name, registration.clone())?;
+        install_combinator(&ctx, &helpers, &proto, &globals, name, registration)?;
     }
 
     // These are exact object aliases, not fresh
@@ -422,7 +422,7 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
             }),
         )
         .map_err(|error| error.to_string())?;
-        install_composer(&ctx, &proto, op, wrapper, default_apply)?;
+        install_composer(&ctx, &helpers, &proto, op, wrapper, default_apply)?;
     }
 
     // The named shortcuts defined on top of the matrix:
@@ -827,7 +827,14 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
             }),
         )
         .map_err(|e| e.to_string())?;
-        proto.set(name, f).map_err(|e| e.to_string())?;
+        proto.set(name, f.clone()).map_err(|e| e.to_string())?;
+        record_builtin_method(
+            &ctx,
+            name,
+            f.into_value(),
+            BuiltinMethod::Layer { keep_original },
+        )
+        .map_err(|e| e.to_string())?;
     }
 
     // -- the direct join surface ------------------------------------

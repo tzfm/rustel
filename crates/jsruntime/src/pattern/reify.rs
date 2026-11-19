@@ -475,7 +475,7 @@ fn combinator_reference_within(
     let tag: rquickjs::Object = object.get("__rustel_combinator").ok()?;
     let name: String = tag.get("name").ok()?;
     let bound: rquickjs::Array = tag.get("args").ok()?;
-    let registration = registry().get(&name)?.clone();
+    let registration = registry().get(&name)?;
     // Defence in depth: never build a transformer around an argument that
     // cannot be bridged. `reify_args` rejects these first, but
     // `superimpose`/`layer` reach this function directly.
@@ -514,7 +514,7 @@ fn combinator_reference_within(
 /// the conservative path.
 pub(crate) fn bound_registered_transformer(
     name: &str,
-    registration: rustel_core::register::Registration,
+    registration: &'static rustel_core::register::Registration,
     args: Vec<Pattern>,
 ) -> rustel_core::value::FunctionRef {
     let provable_pure = registration.preserves_purity_with(&args);

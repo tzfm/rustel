@@ -683,6 +683,8 @@ pub struct StudioSnapshot {
     pub sample_memory: SampleMemory,
     /// Bytes live on the score's script heap, as its allocator counts them.
     pub script_heap_bytes: usize,
+    /// What evaluated the last score, or `None` before the first one.
+    pub score_engine: Option<rustel_runtime::ScoreEngine>,
     /// What the audio side holds, or `None` with no stream open.
     pub audio_memory: Option<AudioMemory>,
 }
@@ -2175,6 +2177,7 @@ impl StudioEngine {
             loading: self.loading_cue(),
             sample_memory: self.sample_memory(),
             script_heap_bytes: self.session.js_heap_live(),
+            score_engine: self.session.score_engine(),
             audio_memory: self.audio_memory(),
         }
     }

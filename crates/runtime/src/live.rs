@@ -654,7 +654,7 @@ impl LiveFileProducer {
         result: &Result<LiveProducerStep, RuntimeError>,
     ) {
         session
-            .csound
+            .csound()
             .retain_queued(self.pending.iter().map(|event| &event.controls));
         let mut record = session.take_pending_producer_turn();
         record.producer_backlog_depth = u32::try_from(self.pending.len()).unwrap_or(u32::MAX);
@@ -746,8 +746,9 @@ impl LiveFileProducer {
     /// A preparation error rejects the replacement and preserves the audible score.
     /// `install` ships the plugin inserts of an accepted window to the output
     /// before its generation or events publish. A refused window installs
-    /// nothing. `install` gets only the events the backlog keeps, and must not
-    /// wait for loading or build assets.
+    /// nothing. `install` gets the window the ring will be offered, which a
+    /// full pipeline may still drop the newest events of, and must not wait
+    /// for loading or build assets.
     #[allow(
         clippy::too_many_arguments,
         reason = "preparation, insert installation, generation publication and ring delivery are separate ordered hooks"
@@ -1158,13 +1159,13 @@ impl LiveFileProducer {
             .queued_through
             .max(event.target_frame as f64 / f64::from(sample_rate));
         session
-            .csound
+            .csound()
             .admit(event, sample_rate, self.queued_through, render_frontier);
     }
 
     fn sync_panic_recovery(&mut self, session: &Session) {
-        session.csound.track_live_events();
-        self.csound = Some(session.csound.clone());
+        session.csound().track_live_events();
+        self.csound = Some(session.csound().clone());
         if self.recovery_epoch != session.recovery_epoch() {
             // A host can submit another command before its next producer
             // step. Its new replacement already discarded the old backlog.
@@ -1554,8 +1555,9 @@ impl LiveFileProducer {
     /// Prepare a shield window once before any event crosses the ring. A
     /// backpressured window keeps its reservation until it drains or is replaced.
     /// `install` ships the plugin inserts of the window to the output before its
-    /// events publish. It gets only the events the backlog keeps, and must not
-    /// wait for loading or build assets.
+    /// events publish. It gets the window the ring will be offered, which a
+    /// full pipeline may still drop the newest events of, and must not wait
+    /// for loading or build assets.
     pub fn shield_reload_with_clock_and_preparation(
         &mut self,
         session: &mut Session,
@@ -1568,7 +1570,7 @@ impl LiveFileProducer {
         push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<bool, RuntimeError> {
         self.sync_panic_recovery(session);
-        let csound = session.csound.clone();
+        let csound = session.csound().clone();
         let result =
             self.shield_reload_inner(session, schedule_now, sample_rate, prepare, install, push);
         csound.retain_queued(self.pending.iter().map(|event| &event.controls));
@@ -1661,10 +1663,8 @@ impl LiveFileProducer {
             return Err(RuntimeError::Cancelled);
         }
         let tail_started = batch.tail_started;
-        let room = MAX_PENDING_BACKLOG.saturating_sub(self.pending.len());
-        let dropped = batch.events.len().saturating_sub(room);
         let preparation_started = Instant::now();
-        install(&batch.events[..batch.events.len().min(room)]);
+        install(&batch.events);
         session.record_producer_phase(
             ProducerPhase::AssetPreparation,
             preparation_started.elapsed(),
@@ -1672,35 +1672,14 @@ impl LiveFileProducer {
         let restart_lead = session.restart_lead_frames();
         let starts = batch.events.iter();
         self.note_scheduled_through(starts.map(|event| latest_start(event, restart_lead)));
-        self.pending.extend(
-            batch
-                .events
-                .into_iter()
-                .take(room)
-                .map(QueuedAudioEvent::from),
-        );
+        // A steady window carries no receipts, so the whole batch may enter
+        // the backlog: its memory is paid for by the query, and the ring
+        // below still takes what it can hold. Only what remains after that
+        // push is a real overflow.
+        self.pending
+            .extend(batch.events.into_iter().map(QueuedAudioEvent::from));
         if !self.pending.is_empty() {
             self.pending_publication = Some(publication);
-        }
-        if dropped > 0 && !self.backlog_dropped_reported {
-            self.backlog_dropped_reported = true;
-            let message = format!(
-                "score scheduled more events than the live backlog holds; {dropped} dropped so later edits stay possible"
-            );
-            session.report_diagnostic(
-                "live-error",
-                message.clone(),
-                serde_json::json!({
-                    "live_error": {
-                        "kind": "resource-limit",
-                        "message": message,
-                        "recoverable": true,
-                    }
-                }),
-            );
-        }
-        if dropped == 0 {
-            self.backlog_dropped_reported = false;
         }
         let mut second_pushed = 0usize;
         let mut second_saturated = false;
@@ -1724,6 +1703,7 @@ impl LiveFileProducer {
                 second_saturated,
             );
         }
+        self.enforce_backlog_cap(session);
         self.query_tail_window.record(tail_started.elapsed());
         Ok(true)
     }
@@ -1815,7 +1795,8 @@ impl LiveFileProducer {
     /// A preparation error rejects the replacement and preserves the audible score.
     /// `install` ships the plugin inserts of an accepted window to the output
     /// before its cutover and events. A refused window installs nothing.
-    /// `install` gets only the events the backlog keeps, and must not wait for
+    /// `install` gets the window the ring will be offered, which a full
+    /// pipeline may still drop the newest events of, and must not wait for
     /// loading or build assets.
     #[allow(
         clippy::too_many_arguments,
@@ -2714,7 +2695,15 @@ impl LiveFileProducer {
             } else {
                 None
             };
-            let room = MAX_PENDING_BACKLOG.saturating_sub(self.pending.len());
+            let room = if confirmation.is_some() {
+                // The receipted branch below relies on the arm paths clearing
+                // the backlog first, so every offered onset fits and no
+                // ordinal is orphaned. Pin that dependency here.
+                debug_assert!(self.pending.is_empty());
+                MAX_PENDING_BACKLOG.saturating_sub(self.pending.len())
+            } else {
+                usize::MAX
+            };
             let preparation_started = Instant::now();
             install(&batch.events[..batch.events.len().min(room)]);
             session.record_producer_phase(
@@ -2773,8 +2762,12 @@ impl LiveFileProducer {
             // non-empty `can_attempt_score` is false, i.e. NO later save is
             // ever attempted. Keeping the oldest events preserves what is
             // about to sound; the excess is dropped and reported once.
-            let room = MAX_PENDING_BACKLOG.saturating_sub(self.pending.len());
-            let dropped = events.len().saturating_sub(room);
+            //
+            // A window with receipts keeps the cap before the push: every
+            // onset the offer counts must reach the device, or its ordinal is
+            // orphaned. A window without receipts may enter in full - the
+            // memory is paid for by the query - and only what the ring and
+            // the backlog together cannot hold is dropped after the push.
             let restart_lead = session.restart_lead_frames();
             let starts = events.iter();
             self.note_scheduled_through(starts.map(|event| latest_start(event, restart_lead)));
@@ -2809,25 +2802,8 @@ impl LiveFileProducer {
             if !self.pending.is_empty() {
                 self.pending_publication = Some(publication);
             }
-            if dropped > 0 && !self.backlog_dropped_reported {
-                self.backlog_dropped_reported = true;
-                let message = format!(
-                    "score scheduled more events than the live backlog holds; {dropped} dropped so later edits stay possible"
-                );
-                session.report_diagnostic(
-                    "live-error",
-                    message.clone(),
-                    serde_json::json!({
-                        "live_error": {
-                            "kind": "resource-limit",
-                            "message": message,
-                            "recoverable": true,
-                        }
-                    }),
-                );
-            }
-            if dropped == 0 {
-                self.backlog_dropped_reported = false;
+            if confirmation.is_some() {
+                self.report_backlog_drop(session, scheduled.saturating_sub(room));
             }
             let pushed_before = pushed;
             if !self.pending.is_empty() {
@@ -2849,6 +2825,9 @@ impl LiveFileProducer {
                     pushed.saturating_sub(pushed_before),
                     backpressured,
                 );
+            }
+            if confirmation.is_none() {
+                self.enforce_backlog_cap(session);
             }
             self.query_tail_window.record(tail_started.elapsed());
         }
@@ -2885,6 +2864,47 @@ fn latest_start(event: &rustel_audio::AudioEvent, restart_lead: u64) -> u64 {
 }
 
 impl LiveFileProducer {
+    /// Hold the staged backlog to [`MAX_PENDING_BACKLOG`] once the ring has
+    /// taken what it can. What still exceeds the cap after the push is a real
+    /// overflow, so the newest events go and the drop is reported once. The
+    /// cap keeps `can_attempt_score` reachable: a backlog that never drains
+    /// would refuse every later save.
+    fn enforce_backlog_cap(&mut self, session: &mut Session) {
+        let dropped = self.pending.len().saturating_sub(MAX_PENDING_BACKLOG);
+        if dropped > 0 {
+            self.pending.truncate(MAX_PENDING_BACKLOG);
+            // One oversized window grows the deque past the cap; without a
+            // shrink the producer keeps that capacity for its lifetime.
+            self.pending.shrink_to_fit();
+        }
+        self.report_backlog_drop(session, dropped);
+    }
+
+    /// Report a backlog overflow once until a turn drops nothing. `dropped`
+    /// counts the events that did not enter the staged backlog.
+    fn report_backlog_drop(&mut self, session: &mut Session, dropped: usize) {
+        if dropped > 0 && !self.backlog_dropped_reported {
+            self.backlog_dropped_reported = true;
+            let message = format!(
+                "score scheduled more events than the live backlog holds; {dropped} dropped so later edits stay possible"
+            );
+            session.report_diagnostic(
+                "live-error",
+                message.clone(),
+                serde_json::json!({
+                    "live_error": {
+                        "kind": "resource-limit",
+                        "message": message,
+                        "recoverable": true,
+                    }
+                }),
+            );
+        }
+        if dropped == 0 {
+            self.backlog_dropped_reported = false;
+        }
+    }
+
     /// Remember how far ahead the backlog now reaches: one past the latest
     /// frame a source of the events starts on, from `starts`.
     fn note_scheduled_through(&mut self, starts: impl Iterator<Item = u64>) {
@@ -3008,6 +3028,80 @@ mod tests {
             #[cfg(feature = "serial")]
             assert!(session.take_pending_serial().is_empty());
         }
+    }
+
+    #[test]
+    fn an_oversized_window_crosses_a_draining_ring_without_drops() {
+        // At the default 0.5 cps the first half-second window holds 8192
+        // onsets, twice the backlog cap.
+        let mut session = Session::new().expect("session");
+        session.set_schedule_lead(0.0);
+        session.evaluate("s(\"bd*32768\")").expect("score");
+        session.restart_transport_at(0.0);
+        let mut producer = LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+        let first = producer
+            .step_unwatched_with_clock_and_cutover_and_preparation(
+                &mut session,
+                || 0.0,
+                48_000,
+                |_events| Ok(rustel_audio::KabelPublication::default()),
+                |_| {},
+                |_, _, _| panic!("initial window does not replace a generation"),
+                |_| true,
+            )
+            .expect("initial prefill");
+        assert_eq!(first.scheduled, 8192);
+        assert_eq!(
+            first.pushed, 8192,
+            "a draining ring must take the whole window"
+        );
+        assert_eq!(first.pending, 0);
+        let steady = producer
+            .step_unwatched_with_clock(&mut session, || 0.5, 48_000, |_| true)
+            .expect("steady window");
+        assert_eq!(steady.pushed, steady.scheduled);
+        assert_eq!(steady.pending, 0);
+        assert!(
+            session
+                .take_diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.kind != "live-error"),
+            "a window the ring can drain must not be truncated"
+        );
+    }
+
+    #[test]
+    fn a_full_ring_still_caps_the_backlog_and_reports_once() {
+        let mut session = Session::new().expect("session");
+        session.set_schedule_lead(0.0);
+        session.evaluate("s(\"bd*32768\")").expect("score");
+        session.restart_transport_at(0.0);
+        let mut producer = LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+        let step = producer
+            .step_unwatched_with_clock_and_cutover_and_preparation(
+                &mut session,
+                || 0.0,
+                48_000,
+                |_events| Ok(rustel_audio::KabelPublication::default()),
+                |_| {},
+                |_, _, _| panic!("initial window does not replace a generation"),
+                |_| false,
+            )
+            .expect("initial prefill");
+        assert_eq!(step.scheduled, 8192);
+        assert_eq!(step.pushed, 0);
+        assert_eq!(step.pending, MAX_PENDING_BACKLOG);
+        assert!(step.backpressured);
+        producer
+            .step_unwatched_with_clock(&mut session, || 0.0, 48_000, |_| false)
+            .expect("steady step against the same full ring");
+        let dropped: Vec<_> = session
+            .take_diagnostics()
+            .into_iter()
+            .filter(|diagnostic| diagnostic.kind == "live-error")
+            .collect();
+        assert_eq!(dropped.len(), 1, "the overflow reports once");
+        assert!(dropped[0].message.contains("4096 dropped"));
     }
 
     #[test]

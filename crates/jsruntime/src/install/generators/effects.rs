@@ -83,7 +83,7 @@ fn stage_samples<'js>(
     ctx: &Ctx<'js>,
     args: &[rquickjs::Value<'js>],
     policy: &Cell<EffectPolicy>,
-    transaction: &RefCell<Option<ScoreEffects>>,
+    transaction: &RefCell<EffectTransaction>,
     refusal: &RefCell<Option<String>>,
 ) -> rquickjs::Result<()> {
     let map = argument(ctx, args, 0);
@@ -314,7 +314,7 @@ fn stage_preload<'js>(
     ctx: &Ctx<'js>,
     args: Vec<rquickjs::Value<'js>>,
     policy: &Cell<EffectPolicy>,
-    transaction: &RefCell<Option<ScoreEffects>>,
+    transaction: &RefCell<EffectTransaction>,
     refusal: &RefCell<Option<String>>,
 ) -> rquickjs::Result<()> {
     let outer = rquickjs::Array::new(ctx.clone())?;

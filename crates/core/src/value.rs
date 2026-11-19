@@ -8,15 +8,7 @@ Software Foundation, either version 3 of the License, or (at your option) any
 later version.
 */
 
-use std::{
-    collections::BTreeMap,
-    fmt,
-    hash::{Hash, Hasher},
-    sync::{
-        Arc, LazyLock, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{fmt, hash::Hash, sync::Arc};
 
 /// An insertion-ordered JavaScript object.
 ///
@@ -29,198 +21,754 @@ pub struct OrderedMap {
     entries: Entries,
 }
 
-/// The entries of a map. Both kinds are shared until a write, which copies
-/// them first.
+/// The entries of a map, in one allocation that holds them and no more.
+/// Both kinds are shared until a write, which copies them first.
 #[derive(Clone)]
 enum Entries {
     /// A clone is a reference count step.
-    Shared(Arc<Vec<(Key, Value)>>),
-    /// Kept for the life of the process, so a clone copies a pointer. See
-    /// [`OrderedMap::interned`].
-    Interned(&'static Vec<(Key, Value)>),
+    Shared(Arc<[(Key, Value)]>),
+    /// Shared entries a compose made of data values only, so the map holds
+    /// data until it is written again. See [`compose::compose_data_in_place`].
+    Made(Arc<[(Key, Value)]>),
+    /// No entries and no allocation: what a fresh map holds.
+    Empty,
+    /// The entries of one step of a layer, which the other steps share:
+    /// see [`Table`]. The map holds a handle of the table and the step.
+    Dressed(Arc<Table>, u32),
 }
 
-/// The entries a copy of shared entries has room for beyond its own, at
-/// least.
-const COPY_ROOM: usize = 4;
+/// What the steps of one layer share when each reads as a map: its own
+/// entries first (the head), then the entries that a set of controls
+/// gives every step (the tail). This is the map that a compose of the set
+/// onto the head makes, as long as no key is in both.
+pub(crate) struct Table {
+    /// The head of each step.
+    heads: Heads,
+    /// The entries of the set, none for a layer with no set.
+    tail: Option<Arc<[(Key, Value)]>>,
+    /// Whether a compose of data made the maps, which are then data only.
+    made: bool,
+    /// The marks of the key names of every step, see [`Table::mark`]. A key
+    /// whose mark is not here is in no step.
+    marks: u64,
+}
 
-/// The entries of every empty map, so a fresh map allocates nothing.
-static EMPTY: Vec<(Key, Value)> = Vec::new();
+/// The entries of one map, shared.
+type Shares = Arc<[(Key, Value)]>;
+
+/// The head of each step of a [`Table`].
+enum Heads {
+    /// The value of each step, each once, under one key.
+    Keyed(Key, Arc<[Value]>),
+    /// The entries of the map of each step.
+    Maps(Box<[Shares]>),
+}
+
+impl Table {
+    /// The table of `values` under `key`, with `set` after: `None` where
+    /// a map would not read the same as the compose of `set` onto the
+    /// value. That is no value or no data, a set that is no data, a key
+    /// that `set` also holds, and, with no key, a value that is no map.
+    pub(crate) fn new(
+        values: &Arc<[Value]>,
+        key: Option<Key>,
+        set: Option<&OrderedMap>,
+    ) -> Option<Self> {
+        if values.is_empty() || u32::try_from(values.len()).is_err() {
+            return None;
+        }
+        // An empty set is no set, in whatever form its map holds nothing.
+        let made = set.is_some();
+        let set = set.filter(|set| !set.is_empty());
+        if set.is_some_and(|set| !set.pairs().all(|(_, value)| value.is_data(0))) {
+            return None;
+        }
+        let tail: Option<Arc<[(Key, Value)]>> = set.and_then(|set| match &set.entries {
+            Entries::Shared(entries) | Entries::Made(entries) => Some(Arc::clone(entries)),
+            Entries::Empty => None,
+            Entries::Dressed(..) => Some(set.layout().to_shares()),
+        });
+        let held = |name: &Key| {
+            tail.as_deref()
+                .is_some_and(|tail| tail.iter().any(|(held, _)| held == name))
+        };
+        let heads = match key {
+            Some(key) => {
+                if held(&key) || !values.iter().all(|value| value.is_data(0)) {
+                    return None;
+                }
+                Heads::Keyed(key, Arc::clone(values))
+            }
+            // Without a set there is nothing to share.
+            None if set.is_none() => return None,
+            None => {
+                let mut maps = Vec::with_capacity(values.len());
+                for value in values.iter() {
+                    let Value::Object(map) = value else {
+                        return None;
+                    };
+                    let entries: Arc<[(Key, Value)]> = match &map.entries {
+                        Entries::Shared(entries) | Entries::Made(entries) => Arc::clone(entries),
+                        Entries::Empty => Arc::from([]),
+                        // The entries of a dressed map, copied once.
+                        Entries::Dressed(..) => map.layout().to_shares(),
+                    };
+                    let bare = entries.is_empty() && tail.is_none();
+                    if bare || entries.iter().any(|(name, _)| held(name)) || !value.is_data(0) {
+                        return None;
+                    }
+                    maps.push(entries);
+                }
+                Heads::Maps(maps.into())
+            }
+        };
+        let mut table = Self {
+            heads,
+            tail,
+            made,
+            marks: 0,
+        };
+        table.marks = table.marks_of_keys();
+        Some(table)
+    }
+
+    /// The mark of a key name: one of 64 bits, from the length and the
+    /// first, middle and last bytes, which is all that a lookup of a name
+    /// that most steps lack needs to rule it out. The bytes are mixed so
+    /// that the common control names do not share a bit.
+    #[inline(always)]
+    fn mark(name: &str) -> u64 {
+        let bytes = name.as_bytes();
+        let (Some(&first), Some(&last)) = (bytes.first(), bytes.last()) else {
+            return 1;
+        };
+        let middle = bytes[bytes.len() / 2];
+        let mixed = (bytes.len() as u32 & 0xff)
+            | u32::from(first) << 8
+            | u32::from(last) << 16
+            | u32::from(middle) << 24;
+        1 << (mixed.wrapping_mul(0x9E37_79B1) >> 26)
+    }
+
+    /// The marks of every key name that a step of this table holds.
+    fn marks_of_keys(&self) -> u64 {
+        let of = |entries: &[(Key, Value)]| {
+            entries
+                .iter()
+                .fold(0, |marks, (name, _)| marks | Self::mark(name))
+        };
+        let tail = self.tail.as_deref().map_or(0, of);
+        tail | match &self.heads {
+            Heads::Keyed(key, _) => Self::mark(key),
+            Heads::Maps(maps) => maps.iter().fold(0, |marks, map| marks | of(map)),
+        }
+    }
+
+    /// The value of step `index` as a map, for a step that the table holds.
+    #[inline]
+    pub(crate) fn map(self: &Arc<Self>, index: usize) -> Option<OrderedMap> {
+        let held = match &self.heads {
+            Heads::Keyed(_, values) => values.len(),
+            Heads::Maps(maps) => maps.len(),
+        };
+        // The table holds no more steps than a u32 counts.
+        (index < held).then(|| OrderedMap {
+            entries: Entries::Dressed(Arc::clone(self), index as u32),
+        })
+    }
+
+    #[inline(always)]
+    fn layout(&self, index: u32) -> Layout<'_> {
+        let tail = self.tail.as_deref().unwrap_or(&[]);
+        match &self.heads {
+            Heads::Keyed(key, values) => Layout::Keyed(key, &values[index as usize], tail),
+            Heads::Maps(maps) => Layout::Split(&maps[index as usize], tail),
+        }
+    }
+}
+
+/// The text of a key name, for the lookups that a key or a string asks.
+trait Named {
+    fn name(&self) -> &str;
+}
+
+impl Named for Key {
+    #[inline(always)]
+    fn name(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Named for str {
+    #[inline(always)]
+    fn name(&self) -> &str {
+        self
+    }
+}
+
+/// How a map lays its entries out, in the order of the map.
+#[derive(Clone, Copy)]
+enum Layout<'a> {
+    /// All the entries in one slice.
+    Plain(&'a [(Key, Value)]),
+    /// One entry of a key and its value, then a slice.
+    Keyed(&'a Key, &'a Value, &'a [(Key, Value)]),
+    /// A slice, then another.
+    Split(&'a [(Key, Value)], &'a [(Key, Value)]),
+}
+
+impl<'a> Layout<'a> {
+    #[inline]
+    fn len(self) -> usize {
+        match self {
+            Self::Plain(entries) => entries.len(),
+            Self::Keyed(_, _, tail) => 1 + tail.len(),
+            Self::Split(head, tail) => head.len() + tail.len(),
+        }
+    }
+
+    #[inline]
+    fn pairs(self) -> Pairs<'a> {
+        match self {
+            Self::Plain(entries) => Pairs::Plain(entries.iter()),
+            Self::Keyed(key, value, tail) => Pairs::Keyed(key, value, tail.iter()),
+            Self::Split(head, tail) => Pairs::Split(head.iter(), tail.iter()),
+        }
+    }
+
+    /// The entry at `index`.
+    #[inline]
+    fn at(self, index: usize) -> (&'a Key, &'a Value) {
+        let pair = |(key, value): &'a (Key, Value)| (key, value);
+        match self {
+            Self::Plain(entries) => pair(&entries[index]),
+            Self::Keyed(key, value, tail) => match index {
+                0 => (key, value),
+                _ => pair(&tail[index - 1]),
+            },
+            Self::Split(head, tail) => match index.checked_sub(head.len()) {
+                None => pair(&head[index]),
+                Some(index) => pair(&tail[index]),
+            },
+        }
+    }
+
+    /// The place of the entry of `key`.
+    #[inline(always)]
+    fn position<K: ?Sized>(self, key: &K) -> Option<usize>
+    where
+        Key: PartialEq<K>,
+    {
+        let find = |entries: &[(Key, Value)]| entries.iter().position(|(name, _)| name == key);
+        match self {
+            Self::Plain(entries) => find(entries),
+            Self::Keyed(name, _, tail) => match name == key {
+                true => Some(0),
+                false => find(tail).map(|at| at + 1),
+            },
+            Self::Split(head, tail) => find(head).or_else(|| find(tail).map(|at| at + head.len())),
+        }
+    }
+
+    #[inline(always)]
+    fn get<K: ?Sized>(self, key: &K) -> Option<&'a Value>
+    where
+        Key: PartialEq<K>,
+    {
+        let find = |entries: &'a [(Key, Value)]| {
+            entries
+                .iter()
+                .find_map(|(name, value)| (name == key).then_some(value))
+        };
+        match self {
+            Self::Plain(entries) => find(entries),
+            Self::Keyed(name, value, tail) => match name == key {
+                true => Some(value),
+                false => find(tail),
+            },
+            Self::Split(head, tail) => find(head).or_else(|| find(tail)),
+        }
+    }
+}
+
+impl Layout<'_> {
+    /// The entries in one allocation. Iterators that know their length
+    /// collect into one allocation of the exact size, with no list first.
+    fn to_shares(self) -> Shares {
+        let pair = |(key, value): &(Key, Value)| (key.clone(), value.clone());
+        match self {
+            Self::Plain(entries) => entries.iter().map(pair).collect(),
+            Self::Keyed(key, value, tail) => std::iter::once((key.clone(), value.clone()))
+                .chain(tail.iter().map(pair))
+                .collect(),
+            Self::Split(head, tail) => head.iter().chain(tail).map(pair).collect(),
+        }
+    }
+
+    /// The entries in one allocation, where the entry at `at` takes `value`,
+    /// or `value` comes last under `key` when `at` is `None`.
+    fn with(self, key: &Key, at: Option<usize>, value: Value) -> Shares {
+        let value = std::cell::Cell::new(Some(value));
+        let pair = |index: usize, name: &Key, held: &Value| match at == Some(index) {
+            true => (name.clone(), value.take().expect("the value goes in once")),
+            false => (name.clone(), held.clone()),
+        };
+        let last = at
+            .is_none()
+            .then(|| (key.clone(), value.take().expect("the value goes in once")));
+        match self {
+            Self::Plain(entries) => entries
+                .iter()
+                .enumerate()
+                .map(|(index, (name, held))| pair(index, name, held))
+                .chain(last)
+                .collect(),
+            Self::Keyed(name, held, tail) => std::iter::once(pair(0, name, held))
+                .chain(
+                    tail.iter()
+                        .enumerate()
+                        .map(|(index, (name, held))| pair(index + 1, name, held)),
+                )
+                .chain(last)
+                .collect(),
+            Self::Split(head, tail) => head
+                .iter()
+                .enumerate()
+                .map(|(index, (name, held))| pair(index, name, held))
+                .chain(
+                    tail.iter()
+                        .enumerate()
+                        .map(|(index, (name, held))| pair(head.len() + index, name, held)),
+                )
+                .chain(last)
+                .collect(),
+        }
+    }
+}
+
+/// The entries of a map, in order.
+#[derive(Clone)]
+pub enum Pairs<'a> {
+    /// The entries left in one slice.
+    Plain(std::slice::Iter<'a, (Key, Value)>),
+    /// One entry, then the entries left in a slice.
+    Keyed(&'a Key, &'a Value, std::slice::Iter<'a, (Key, Value)>),
+    /// The entries left in a slice, then those in another.
+    Split(
+        std::slice::Iter<'a, (Key, Value)>,
+        std::slice::Iter<'a, (Key, Value)>,
+    ),
+}
+
+impl<'a> Iterator for Pairs<'a> {
+    type Item = (&'a Key, &'a Value);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let (key, value) = match self {
+            Self::Plain(entries) => entries.next()?,
+            Self::Keyed(key, value, tail) => {
+                let (key, value) = (*key, *value);
+                *self = Self::Plain(tail.clone());
+                return Some((key, value));
+            }
+            Self::Split(head, tail) => head.next().or_else(|| tail.next())?,
+        };
+        Some((key, value))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = match self {
+            Self::Plain(entries) => entries.len(),
+            Self::Keyed(_, _, tail) => 1 + tail.len(),
+            Self::Split(head, tail) => head.len() + tail.len(),
+        };
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for Pairs<'_> {}
+
+/// The entries that a map held, for the map that takes their place: they
+/// move where no other map shares them, and are copied otherwise.
+enum Held<'a> {
+    Own(&'a mut [(Key, Value)]),
+    View(Layout<'a>),
+}
+
+impl Held<'_> {
+    /// Whether the held entries have an entry of `key`.
+    fn holds(&self, key: &Key) -> bool {
+        match self {
+            Self::Own(entries) => entries.iter().any(|(name, _)| name == key),
+            Self::View(layout) => layout.position(key).is_some(),
+        }
+    }
+
+    /// The entry at `index`, to hold in the new map.
+    fn take(&mut self, index: usize) -> (Key, Value) {
+        match self {
+            // A handle of the key, and the value itself.
+            Self::Own(entries) => {
+                let (key, value) = &mut entries[index];
+                (key.clone(), std::mem::replace(value, Value::Undefined))
+            }
+            Self::View(layout) => {
+                let (key, value) = layout.at(index);
+                (key.clone(), value.clone())
+            }
+        }
+    }
+}
 
 impl Default for OrderedMap {
     fn default() -> Self {
         Self {
-            entries: Entries::Interned(&EMPTY),
+            entries: Entries::Empty,
         }
     }
 }
 
 impl PartialEq for OrderedMap {
     fn eq(&self, other: &Self) -> bool {
-        self.entries() == other.entries()
+        if let (Layout::Plain(a), Layout::Plain(b)) = (self.layout(), other.layout()) {
+            return a == b;
+        }
+        self.len() == other.len()
+            && self
+                .pairs()
+                .zip(other.pairs())
+                .all(|((a_key, a), (b_key, b))| a_key == b_key && a == b)
     }
 }
 
 impl fmt::Debug for OrderedMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The list of pairs that a plain map prints as its entries.
         f.debug_struct("OrderedMap")
-            .field("entries", self.entries())
+            .field("entries", &DebugPairs(self))
             .finish()
     }
 }
 
-/// About the most bytes [`OrderedMap::interned`] keeps: each map's entries
-/// and its place in the store. Past it, maps stay shared and interning stops.
-const INTERN_BUDGET: usize = 16 << 20;
+/// The entries of a map as a list, for [`fmt::Debug`].
+struct DebugPairs<'a>(&'a OrderedMap);
 
-/// The bytes one kept map costs besides its entries: the boxed list and
-/// its slot in a shard.
-const KEPT_MAP_BYTES: usize = std::mem::size_of::<Vec<(Key, Value)>>()
-    + std::mem::size_of::<(u64, Vec<Kept>)>()
-    + std::mem::size_of::<Kept>();
-
-/// The entries of one interned map.
-type Kept = &'static Vec<(Key, Value)>;
-
-/// Interned maps by content hash, in one of 16 shards so that builders on
-/// several threads rarely wait for one another.
-type Shard = Mutex<BTreeMap<u64, Vec<Kept>>>;
-
-static INTERNED: LazyLock<[Shard; 16]> =
-    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(BTreeMap::new())));
-static INTERNED_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-/// FNV-1a: the same hash in every run, for keys that are only ever compared
-/// within this process.
-struct Fnv(u64);
-
-impl Default for Fnv {
-    fn default() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
-    }
-}
-
-impl Hasher for Fnv {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+impl fmt::Debug for DebugPairs<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.0.pairs()).finish()
     }
 }
 
 impl OrderedMap {
-    fn entries(&self) -> &Vec<(Key, Value)> {
+    #[inline(always)]
+    fn layout(&self) -> Layout<'_> {
         match &self.entries {
-            Entries::Shared(entries) => entries,
-            Entries::Interned(entries) => entries,
+            Entries::Shared(entries) | Entries::Made(entries) => Layout::Plain(entries),
+            Entries::Empty => Layout::Plain(&[]),
+            Entries::Dressed(table, index) => table.layout(*index),
         }
     }
 
-    /// The entries to write, with room for `additional` more. Entries
-    /// another map shares are copied first, once, with that room and a
-    /// little more, since a map that is written once is often written again.
-    fn entries_mut(&mut self, additional: usize) -> &mut Vec<(Key, Value)> {
-        let unique = match &mut self.entries {
-            Entries::Shared(entries) => Arc::get_mut(entries).is_some(),
-            Entries::Interned(_) => false,
+    #[inline(always)]
+    pub(crate) fn pairs(&self) -> Pairs<'_> {
+        self.layout().pairs()
+    }
+
+    /// This map with its entries in a plain map of its own, which a write
+    /// needs and a set that a dress holds does not pin a table with.
+    pub(crate) fn undressed(mut self) -> Self {
+        self.undress();
+        self
+    }
+
+    /// The entries of a dressed map copied into a plain one, which keeps
+    /// whether a compose made them of data.
+    fn undress(&mut self) {
+        if let Entries::Dressed(table, index) = &self.entries {
+            let entries = table.layout(*index).to_shares();
+            self.entries = match table.made {
+                true => Entries::Made(entries),
+                false => Entries::Shared(entries),
+            };
+        }
+    }
+
+    /// The entries to write where they are. Entries another map shares
+    /// are copied first, once.
+    pub(crate) fn entries_mut(&mut self) -> &mut [(Key, Value)] {
+        self.undress();
+        // A map a compose made of data holds that guarantee only until it is
+        // written again; the compose re-marks its own writes.
+        if let Entries::Made(entries) = &self.entries {
+            let entries = Arc::clone(entries);
+            self.entries = Entries::Shared(entries);
+        }
+        let Entries::Shared(entries) = &mut self.entries else {
+            return &mut [];
         };
-        if !unique {
-            let mut copy = Vec::with_capacity(self.len() + additional.max(COPY_ROOM));
-            copy.extend_from_slice(self.entries());
-            self.entries = Entries::Shared(Arc::new(copy));
+        if Arc::get_mut(entries).is_none() {
+            *entries = Arc::from(&entries[..]);
         }
-        match &mut self.entries {
-            Entries::Shared(entries) => {
-                let entries = Arc::make_mut(entries);
-                entries.reserve(additional);
-                entries
+        Arc::get_mut(entries).expect("entries that no other map shares")
+    }
+
+    /// A map of `entries`, each of another key.
+    fn of(entries: Arc<[(Key, Value)]>) -> Self {
+        Self {
+            entries: match entries.is_empty() {
+                true => Entries::Empty,
+                false => Entries::Shared(entries),
+            },
+        }
+    }
+
+    /// A map of `entries`, each of another key, in their order.
+    pub(crate) fn of_keys(entries: impl IntoIterator<Item = (Key, Value)>) -> Self {
+        Self::of(entries.into_iter().collect())
+    }
+
+    /// Put `count` entries in the place of the entries of this map: `entry`
+    /// gives each in turn, from the entries that the map held. One
+    /// allocation holds the new entries.
+    fn rebuild(
+        &mut self,
+        count: usize,
+        mut entry: impl FnMut(&mut Held<'_>, usize) -> (Key, Value),
+    ) {
+        let mut taken = std::mem::replace(&mut self.entries, Entries::Empty);
+        let mut held = match &mut taken {
+            Entries::Shared(entries) | Entries::Made(entries) => match Arc::get_mut(entries) {
+                Some(own) => Held::Own(own),
+                None => Held::View(Layout::Plain(entries)),
+            },
+            Entries::Empty => Held::View(Layout::Plain(&[])),
+            Entries::Dressed(table, index) => Held::View(table.layout(*index)),
+        };
+        // A range with a map says its length, so the entries are made
+        // where the new map holds them.
+        *self = Self::of((0..count).map(|index| entry(&mut held, index)).collect());
+    }
+
+    /// Add `entry`, of a key that the map does not hold, after the others.
+    /// One allocation holds the new entries: the old ones move where no
+    /// other map shares them, and are copied otherwise.
+    fn append(&mut self, entry: (Key, Value)) {
+        let held: Shares = match std::mem::replace(&mut self.entries, Entries::Empty) {
+            Entries::Shared(mut entries) | Entries::Made(mut entries) => {
+                match Arc::get_mut(&mut entries) {
+                    // A handle of the key, and the value itself.
+                    Some(own) => own
+                        .iter_mut()
+                        .map(|(key, value)| {
+                            (key.clone(), std::mem::replace(value, Value::Undefined))
+                        })
+                        .chain(std::iter::once(entry))
+                        .collect(),
+                    None => entries
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(entry))
+                        .collect(),
+                }
             }
-            Entries::Interned(_) => unreachable!("an interned map was just copied"),
+            Entries::Empty => Arc::new([entry]),
+            Entries::Dressed(table, index) => {
+                let (key, value) = entry;
+                table.layout(index).with(&key, None, value)
+            }
+        };
+        self.entries = Entries::Shared(held);
+    }
+
+    /// Each entry of `other` in this map. An entry of a key that the map
+    /// holds changes the value of that key where it is, to what `change`
+    /// makes of the value and the one of `other`. The other entries come
+    /// after, in the order of `other`.
+    pub(crate) fn merge(&mut self, other: &Self, mut change: impl FnMut(&Value, &Value) -> Value) {
+        // Nothing to add changes nothing, and a dressed map stays dressed.
+        if other.is_empty() {
+            return;
+        }
+        // A control that sets one key, which most chains do: one lookup, and
+        // one write.
+        if other.len() == 1
+            && let Some((key, value)) = other.pairs().next()
+        {
+            return self.merge_one(key, value, change);
+        }
+        let of = |key: &Key| other.layout().get(key);
+        let fresh = other
+            .pairs()
+            .filter(|(key, _)| self.position(*key).is_none())
+            .count();
+        if fresh == 0 {
+            for (key, value) in self.entries_mut() {
+                if let Some(other) = of(key) {
+                    *value = change(value, other);
+                }
+            }
+            return;
+        }
+        let held = self.len();
+        let mut more = other.pairs();
+        self.rebuild(held + fresh, |entries, index| {
+            if index < held {
+                let (key, value) = entries.take(index);
+                return match of(&key) {
+                    Some(other) => (key, change(&value, other)),
+                    None => (key, value),
+                };
+            }
+            // The next entry of `other` whose key the map did not hold.
+            let (key, value) = more
+                .find(|(key, _)| !entries.holds(key))
+                .expect("a key that the map did not hold");
+            (key.clone(), value.clone())
+        });
+    }
+
+    /// [`Self::merge`] of the one entry `key` and `other`.
+    fn merge_one(
+        &mut self,
+        key: &Key,
+        other: &Value,
+        mut change: impl FnMut(&Value, &Value) -> Value,
+    ) {
+        let at = self.position(key);
+        match (&self.entries, at) {
+            (Entries::Dressed(..), at) => {
+                // The entries of the table go to one allocation, with the
+                // changed value in its place or the new entry after them.
+                let value = match at {
+                    Some(at) => change(self.layout().at(at).1, other),
+                    None => other.clone(),
+                };
+                self.entries = Entries::Shared(self.layout().with(key, at, value));
+            }
+            (_, Some(at)) => {
+                let entries = self.entries_mut();
+                let value = change(&entries[at].1, other);
+                entries[at].1 = value;
+            }
+            (_, None) => self.append((key.clone(), other.clone())),
         }
     }
 
-    /// Room for `additional` more entries, so that adding them grows the
-    /// map at most once.
-    pub fn reserve(&mut self, additional: usize) {
-        if additional > 0 {
-            self.entries_mut(additional);
+    /// The place of the entry of `key`. A dressed map rules out a name that
+    /// no step of its table holds without a scan.
+    #[inline(always)]
+    fn position<K: ?Sized + Named>(&self, key: &K) -> Option<usize>
+    where
+        Key: PartialEq<K>,
+    {
+        match &self.entries {
+            Entries::Empty => None,
+            Entries::Shared(entries) | Entries::Made(entries) => {
+                Layout::Plain(entries).position(key)
+            }
+            Entries::Dressed(table, index) => match table.marks & Table::mark(key.name()) {
+                0 => None,
+                _ => table.layout(*index).position(key),
+            },
         }
     }
 
-    /// An equal map that every caller shares for the life of the process, so
-    /// that cloning it copies a pointer and dropping it does nothing.
-    ///
-    /// For the maps a precomputed table hands out with every hap. `None`
-    /// for a map that holds a script object, pattern, function or hap list,
-    /// or once [`INTERN_BUDGET`] is spent. Such a map stays shared.
-    pub(crate) fn interned(&self) -> Option<OrderedMap> {
-        if let Entries::Interned(_) = self.entries {
-            return Some(self.clone());
+    /// Whether the map's own storage answers for its data-ness: an empty
+    /// map holds nothing else, and a made map was made of data values only.
+    pub(crate) fn holds_only_data(&self) -> bool {
+        match &self.entries {
+            Entries::Empty | Entries::Made(_) => true,
+            Entries::Dressed(table, _) => table.made,
+            Entries::Shared(_) => false,
         }
-        let entries = self.entries();
-        // As deep as the map's own data check reads them, so that a kept map
-        // is data. See `Value::is_data`.
-        if !entries.iter().all(|(_, value)| value.is_data(1)) {
-            return None;
-        }
-        let mut hasher = Fnv::default();
-        for (key, value) in entries {
-            key.hash(&mut hasher);
-            hash_data(value, &mut hasher);
-        }
-        let hash = hasher.finish();
-        // FNV-1a mixes its high bits best. Its low bits see only the low
-        // bits of each byte, so `1.0` and `2.0` would share a shard.
-        let shard = &INTERNED[(hash >> 60) as usize];
-        let mut shard = shard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(found) = shard.get(&hash).and_then(|kept| {
-            kept.iter()
-                .copied()
-                .find(|kept| same_entries(kept, entries))
-        }) {
-            return Some(Self {
-                entries: Entries::Interned(found),
-            });
-        }
-        let bytes = entries
-            .iter()
-            .map(|(key, value)| key.len() + data_bytes(value))
-            .sum::<usize>()
-            + std::mem::size_of::<(Key, Value)>() * entries.len()
-            + KEPT_MAP_BYTES;
-        if INTERNED_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes > INTERN_BUDGET {
-            INTERNED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
-            return None;
-        }
-        let kept: Kept = Box::leak(Box::new(entries.clone()));
-        shard.entry(hash).or_default().push(kept);
-        Some(Self {
-            entries: Entries::Interned(kept),
-        })
     }
 
-    /// Whether cloning this map copies a pointer and dropping it does
-    /// nothing.
-    pub(crate) fn is_interned(&self) -> bool {
-        matches!(self.entries, Entries::Interned(_))
+    /// Whether the map's storage tells that it holds data only, with no
+    /// walk of its entries. A table also holds data only when no compose
+    /// made it: it refuses a value that is no data.
+    pub(crate) fn is_known_data(&self) -> bool {
+        matches!(self.entries, Entries::Dressed(..)) || self.holds_only_data()
+    }
+
+    /// A hash of this map's data that agrees with [`Self::same_data`].
+    pub(crate) fn data_hash(&self) -> u64 {
+        let mut hasher = WordHasher::default();
+        hash_data_entries(self.layout(), &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    }
+
+    /// Whether two maps hold the same keys and the same data, in order and
+    /// down to the bits of every number. `==` makes `0.0` equal to `-0.0`,
+    /// which divide apart, and a NaN unequal to itself.
+    pub(crate) fn same_data(&self, other: &Self) -> bool {
+        if let (Entries::Dressed(a, at), Entries::Dressed(b, to)) = (&self.entries, &other.entries)
+            && Arc::ptr_eq(a, b)
+            && at == to
+        {
+            // The same step of one table is one map.
+            return true;
+        }
+        same_entries(self.pairs(), other.pairs())
+    }
+
+    /// Whether the map holds no allocation, so a clone copies nothing.
+    pub(crate) fn owns_no_heap(&self) -> bool {
+        matches!(self.entries, Entries::Empty)
+    }
+
+    /// Mark this map, whose writes a compose of data values just finished,
+    /// as holding data only. A map another writer shares, or an empty one,
+    /// is left alone: the guarantee belongs to this compose's own unique
+    /// copy.
+    pub(crate) fn mark_made_of_data(&mut self) {
+        let current = std::mem::replace(&mut self.entries, Entries::Empty);
+        self.entries = match current {
+            Entries::Shared(entries) if Arc::strong_count(&entries) == 1 => Entries::Made(entries),
+            other => other,
+        };
     }
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn from_entries(entries: impl IntoIterator<Item = (String, Value)>) -> Self {
-        let mut out = Self::new();
-        for (key, value) in entries {
-            out.insert(key, value);
+    /// Set `key` to `value`, a data value, in this map of data: a `set` of
+    /// the map of that one entry, with no such map. The map then holds
+    /// data only.
+    pub(crate) fn set_data(&mut self, key: &Key, value: Value) {
+        if let Entries::Dressed(..) = &self.entries {
+            // One copy of the table's entries with the change in it, which
+            // is data only.
+            let entries = self.layout().with(key, self.position(key), value);
+            self.entries = Entries::Made(entries);
+            return;
         }
-        out
+        match self.position(key) {
+            Some(index) => self.entries_mut()[index].1 = value,
+            None => self.append((key.clone(), value)),
+        }
+        self.mark_made_of_data();
+    }
+
+    /// A map of one entry: the control of one value, which a graph holds
+    /// for each step.
+    pub(crate) fn of_one(key: Key, value: Value) -> Self {
+        Self {
+            entries: Entries::Shared(Arc::new([(key, value)])),
+        }
+    }
+
+    pub fn from_entries(entries: impl IntoIterator<Item = (String, Value)>) -> Self {
+        // The entries in one list first: a later entry of a key takes the
+        // place of the value of that key.
+        let mut held: Vec<(Key, Value)> = Vec::new();
+        for (key, value) in entries {
+            match held.iter_mut().find(|(name, _)| *name == *key) {
+                Some((_, current)) => *current = value,
+                None => held.push((Key::from(key), value)),
+            }
+        }
+        Self::of(held.into())
     }
 
     pub fn insert(&mut self, key: String, value: Value) -> Option<Value> {
@@ -230,26 +778,11 @@ impl OrderedMap {
     /// [`Self::insert`] of a key that another map or a control already
     /// holds, which the map then shares.
     pub fn insert_key(&mut self, key: Key, value: Value) -> Option<Value> {
-        let entries = self.entries_mut(0);
-        if let Some((_, current)) = entries.iter_mut().find(|(name, _)| *name == key) {
-            return Some(std::mem::replace(current, value));
-        }
-        entries.push((key, value));
-        None
-    }
-
-    /// `key`'s value replaced by what `make` makes of it where it is, or
-    /// `make(None)` added last when the map has no such key.
-    pub(crate) fn upsert(&mut self, key: &Key, make: impl FnOnce(Option<&Value>) -> Value) {
-        let entries = self.entries_mut(0);
-        match entries.iter().position(|(name, _)| name == key) {
-            Some(index) => {
-                let value = make(Some(&entries[index].1));
-                entries[index].1 = value;
-            }
+        match self.position(&key) {
+            Some(index) => Some(std::mem::replace(&mut self.entries_mut()[index].1, value)),
             None => {
-                let value = make(None);
-                entries.push((key.clone(), value));
+                self.append((key, value));
+                None
             }
         }
     }
@@ -259,53 +792,57 @@ impl OrderedMap {
         self.insert(entry.0, entry.1);
     }
 
+    #[inline]
     pub fn get(&self, key: &str) -> Option<&Value> {
-        self.entries()
-            .iter()
-            .find_map(|(name, value)| (name == key).then_some(value))
+        match &self.entries {
+            Entries::Empty => None,
+            Entries::Shared(entries) | Entries::Made(entries) => Layout::Plain(entries).get(key),
+            Entries::Dressed(table, index) => match table.marks & Table::mark(key) {
+                0 => None,
+                _ => table.layout(*index).get(key),
+            },
+        }
     }
 
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
-        if !self.contains_key(key) {
-            return None;
-        }
-        self.entries_mut(0)
-            .iter_mut()
-            .find_map(|(name, value)| (name == key).then_some(value))
+        let index = self.position(key)?;
+        Some(&mut self.entries_mut()[index].1)
     }
 
     pub fn remove(&mut self, key: &str) -> Option<Value> {
-        if !self.contains_key(key) {
-            return None;
-        }
-        let entries = self.entries_mut(0);
-        let index = entries.iter().position(|(name, _)| name == key)?;
-        Some(entries.remove(index).1)
+        let at = self.position(key)?;
+        let removed = std::mem::replace(&mut self.entries_mut()[at].1, Value::Undefined);
+        // The entries but the one at `at`.
+        self.rebuild(self.len() - 1, |entries, index| {
+            entries.take(index + usize::from(index >= at))
+        });
+        Some(removed)
     }
 
+    #[inline]
     pub fn contains_key(&self, key: &str) -> bool {
-        self.entries().iter().any(|(name, _)| name == key)
+        self.get(key).is_some()
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
-        self.entries().len()
+        self.layout().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries().is_empty()
+        self.len() == 0
     }
 
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
-        self.entries()
-            .iter()
-            .map(|(name, value)| (name.as_str(), value))
+        self.pairs().map(|(name, value)| (name.as_str(), value))
     }
 
     /// ECMAScript `Object.keys` order.
     pub fn js_entries(&self) -> Vec<(&str, &Value)> {
         let mut integer = Vec::new();
         let mut strings = Vec::new();
-        for (position, (key, value)) in self.entries().iter().enumerate() {
+        for (position, (key, value)) in self.pairs().enumerate() {
             if let Some(index) = array_index(key) {
                 integer.push((index, key.as_str(), value));
             } else {
@@ -323,21 +860,33 @@ impl OrderedMap {
 
 impl<'a> IntoIterator for &'a OrderedMap {
     type Item = (&'a Key, &'a Value);
-    type IntoIter =
-        std::iter::Map<std::slice::Iter<'a, (Key, Value)>, fn(&(Key, Value)) -> (&Key, &Value)>;
+    type IntoIter = Pairs<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        fn pair(entry: &(Key, Value)) -> (&Key, &Value) {
-            (&entry.0, &entry.1)
-        }
-        self.entries().iter().map(pair)
+        self.pairs()
     }
 }
 
 /// A key of an [`OrderedMap`]. Every copy of a map, and every map that a
 /// control makes, shares its key's one allocation.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Eq)]
 pub struct Key(Arc<str>);
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Self) -> bool {
+        // Maps that share a key's allocation answer by pointer; only keys
+        // from different allocations compare their text.
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+impl Hash for Key {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // By text, so equal keys hash equal whether or not they share an
+        // allocation.
+        self.0.hash(state)
+    }
+}
 
 impl Key {
     pub fn as_str(&self) -> &str {
@@ -587,6 +1136,17 @@ impl FunctionRef {
         }
     }
 
+    /// Whether this is a JavaScript callback with its compiled program: the
+    /// one function value a callback program may hold, in its registration's
+    /// function slot. The host owns the choice between the program and the
+    /// callback, in either kind.
+    pub(crate) fn carries_pattern_program(&self) -> bool {
+        matches!(
+            self.kind,
+            FunctionKind::LoweredJs { .. } | FunctionKind::JsPatternIr { .. }
+        )
+    }
+
     /// The script callback a pure view of this function may still need: a
     /// lowered callback whose program can go stale. See
     /// [`crate::Pattern::retaining_callbacks`].
@@ -597,6 +1157,53 @@ impl FunctionRef {
             }
             _ => None,
         }
+    }
+
+    /// Every script callback a wrapper owning this function must keep alive:
+    /// the fallback a lowered callback needs once its program can go stale,
+    /// the fallback a pattern-IR callback needs at every application, and -
+    /// for either kind - the same set for every function-valued argument the
+    /// program holds, which can go stale on its own while the program stands.
+    ///
+    /// A closure that captures a function value cannot show it to purity, so
+    /// [`crate::Pattern::retaining_callbacks`] is the only channel these ids
+    /// reach a wrapper's harvest through.
+    pub(crate) fn retained_callbacks(&self) -> Vec<crate::CallbackId> {
+        let mut ids = Vec::new();
+        match &self.kind {
+            FunctionKind::Js(id) => ids.push(*id),
+            FunctionKind::JsPatternIr { fallback, program } => {
+                ids.push(*fallback);
+                ids.extend(program.retained_callback_ids());
+            }
+            FunctionKind::LoweredJs { fallback, program } => {
+                if program.can_go_stale() {
+                    ids.push(*fallback);
+                }
+                ids.extend(program.retained_callback_ids());
+            }
+            FunctionKind::Native { .. } | FunctionKind::Registered { .. } => {}
+        }
+        ids
+    }
+
+    /// Whether a later application may have to differ from this one: a
+    /// lowered callback whose program can go stale must reach its script
+    /// callback again once it does, so applying it once does not stand for
+    /// applying it at every query.
+    pub(crate) fn can_go_stale(&self) -> bool {
+        self.callback_kept_by_pure_view().is_some()
+    }
+
+    /// Whether applying this once stands for applying it at every query: a
+    /// function with a native view that cannot go stale always applies the
+    /// same way, so a combinator may apply it once while it builds its
+    /// graph. A JavaScript callback, a host-bound transformer, or a lowered
+    /// callback that can go stale does not: those applications run at query
+    /// time, once per carrier hap, and a program that stops standing for its
+    /// callback must reach the callback again.
+    pub(crate) fn stands_for_every_application(&self) -> bool {
+        self.is_native() && !self.can_go_stale()
     }
 
     /// The callback id, for a JS function.
@@ -1065,7 +1672,8 @@ pub enum Value {
     Null,
     Bool(bool),
     F64(f64),
-    Str(String),
+    /// Text that each copy of the value shares.
+    Str(Arc<str>),
     List(Vec<Value>),
     Object(OrderedMap),
     /// A native Pattern nested in a JavaScript array/object value.
@@ -1094,6 +1702,131 @@ impl Clone for Value {
             shared => shared.clone_shared(),
         }
     }
+}
+
+/// Share equal maps among `values`. Values that repeat a control map then
+/// hold it once, and the sharing ends when they drop.
+pub(crate) fn share_equal_maps<'a>(values: impl IntoIterator<Item = &'a mut Value>) {
+    let mut kept: std::collections::HashMap<u64, Vec<OrderedMap>> =
+        std::collections::HashMap::new();
+    for value in values {
+        let Value::Object(map) = value else {
+            continue;
+        };
+        let same = kept.entry(map.data_hash()).or_default();
+        match same.iter().find(|other| other.same_data(map)) {
+            // Equal data, so the value reads the same map: a reference
+            // count step instead of a second copy.
+            Some(other) => *map = other.clone(),
+            None => same.push(map.clone()),
+        }
+    }
+}
+
+/// A fast hash for keys compared only within one process: one rotate,
+/// xor and multiply per word. Not resistant to chosen collisions, which
+/// cost a longer equality scan and never a wrong answer.
+#[derive(Default)]
+pub struct WordHasher(u64);
+
+impl WordHasher {
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl std::hash::Hasher for WordHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        for word in words {
+            self.add(u64::from_le_bytes(*word));
+        }
+        let mut tail = [0u8; 8];
+        tail[..rest.len()].copy_from_slice(rest);
+        self.add(u64::from_le_bytes(tail) ^ rest.len() as u64);
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.add(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+}
+
+/// Feed a map's entries to `state`, numbers by their bits.
+fn hash_data_entries(layout: Layout<'_>, state: &mut impl std::hash::Hasher) {
+    fn slice(entries: &[(Key, Value)], state: &mut impl std::hash::Hasher) {
+        for (key, value) in entries {
+            key.hash(state);
+            hash_data(value, state);
+        }
+    }
+    layout.len().hash(state);
+    match layout {
+        Layout::Plain(entries) => slice(entries, state),
+        Layout::Keyed(key, value, tail) => {
+            key.hash(state);
+            hash_data(value, state);
+            slice(tail, state);
+        }
+        Layout::Split(head, tail) => {
+            slice(head, state);
+            slice(tail, state);
+        }
+    }
+}
+
+/// Feed a data value to `state`, numbers by their bits.
+fn hash_data(value: &Value, state: &mut impl std::hash::Hasher) {
+    match value {
+        Value::Undefined => 0u8.hash(state),
+        Value::Null => 1u8.hash(state),
+        Value::Bool(value) => (2u8, value).hash(state),
+        Value::F64(value) => (3u8, value.to_bits()).hash(state),
+        Value::Str(value) => (4u8, value).hash(state),
+        Value::List(items) => {
+            (5u8, items.len()).hash(state);
+            for item in items {
+                hash_data(item, state);
+            }
+        }
+        Value::Object(object) => {
+            6u8.hash(state);
+            hash_data_entries(object.layout(), state);
+        }
+        Value::Pattern(_) | Value::JsValue(_) | Value::Function(_) | Value::Haps(_) => {
+            7u8.hash(state)
+        }
+    }
+}
+
+/// Whether two data values are the same down to the bits of every number.
+fn same_data(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
+        (Value::List(a), Value::List(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_data(a, b))
+        }
+        (Value::Object(a), Value::Object(b)) => a.same_data(b),
+        _ => a == b,
+    }
+}
+
+/// [`same_data`] for the entries of two maps, in order.
+fn same_entries(a: Pairs<'_>, b: Pairs<'_>) -> bool {
+    a.len() == b.len()
+        && a.zip(b)
+            .all(|((a_key, a), (b_key, b))| a_key == b_key && same_data(a, b))
 }
 
 impl Value {
@@ -1127,6 +1860,9 @@ fn needs_runtime_settings(value: &Value, depth: u32) -> bool {
         Value::List(values) => values
             .iter()
             .any(|value| needs_runtime_settings(value, depth.saturating_add(1))),
+        // An empty map holds nothing, and a made map was made of data
+        // values only: data binds no runtime.
+        Value::Object(values) if values.is_known_data() => false,
         Value::Object(values) => values
             .iter()
             .any(|(_, value)| needs_runtime_settings(value, depth.saturating_add(1))),
@@ -1143,71 +1879,6 @@ fn needs_runtime_settings(value: &Value, depth: u32) -> bool {
     }
 }
 
-/// A content hash of a data value that agrees with [`same_data`]: a number
-/// hashes by its bits.
-fn hash_data(value: &Value, state: &mut impl Hasher) {
-    match value {
-        Value::Undefined => 0u8.hash(state),
-        Value::Null => 1u8.hash(state),
-        Value::Bool(value) => (2u8, value).hash(state),
-        Value::F64(value) => (3u8, value.to_bits()).hash(state),
-        Value::Str(value) => (4u8, value).hash(state),
-        Value::List(items) => {
-            (5u8, items.len()).hash(state);
-            for item in items {
-                hash_data(item, state);
-            }
-        }
-        Value::Object(object) => {
-            (6u8, object.len()).hash(state);
-            for (key, value) in object.iter() {
-                key.hash(state);
-                hash_data(value, state);
-            }
-        }
-        Value::Pattern(_) | Value::JsValue(_) | Value::Function(_) | Value::Haps(_) => {
-            7u8.hash(state)
-        }
-    }
-}
-
-/// Whether two data values are the same down to the bits of every number.
-/// `==` makes `0.0` equal to `-0.0`, which divide apart, and a NaN unequal
-/// to itself, which an interned map could then never find.
-fn same_data(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
-        (Value::List(a), Value::List(b)) => {
-            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_data(a, b))
-        }
-        (Value::Object(a), Value::Object(b)) => same_entries(a.entries(), b.entries()),
-        _ => a == b,
-    }
-}
-
-/// [`same_data`] for the entries of two maps, in order.
-fn same_entries(a: &[(Key, Value)], b: &[(Key, Value)]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|((a_key, a), (b_key, b))| a_key == b_key && same_data(a, b))
-}
-
-/// About how many heap bytes a data value holds.
-fn data_bytes(value: &Value) -> usize {
-    match value {
-        Value::Str(value) => value.len(),
-        Value::List(items) => {
-            items.iter().map(data_bytes).sum::<usize>() + std::mem::size_of_val(items.as_slice())
-        }
-        Value::Object(object) => object
-            .iter()
-            .map(|(key, value)| key.len() + data_bytes(value) + std::mem::size_of::<(Key, Value)>())
-            .sum(),
-        _ => 0,
-    }
-}
-
 impl Value {
     /// Whether this is data only: no script object, pattern, function or hap
     /// list, each of which a query resolves anew.
@@ -1218,11 +1889,26 @@ impl Value {
         match self {
             Value::Undefined | Value::Null | Value::Bool(_) | Value::F64(_) | Value::Str(_) => true,
             Value::List(items) => items.iter().all(|item| item.is_data(depth + 1)),
-            // A kept map was checked as data when it was kept.
-            Value::Object(object) if depth == 0 && object.is_interned() => true,
+            // An empty map holds nothing, and a made map was made of data
+            // values only.
+            Value::Object(object) if object.is_known_data() => true,
             Value::Object(object) => object.iter().all(|(_, item)| item.is_data(depth + 1)),
             Value::Pattern(_) | Value::JsValue(_) | Value::Function(_) | Value::Haps(_) => false,
         }
+    }
+
+    /// A hash of this data value, numbers by their bits. Values that are
+    /// [the same data](Self::same_data) hash the same.
+    pub(crate) fn data_hash(&self) -> u64 {
+        let mut hasher = WordHasher::default();
+        hash_data(self, &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    }
+
+    /// Whether this data value and `other` are the same down to the bits of
+    /// every number.
+    pub(crate) fn same_data(&self, other: &Value) -> bool {
+        same_data(self, other)
     }
 
     pub fn object(entries: impl IntoIterator<Item = (String, Value)>) -> Self {
@@ -1266,7 +1952,7 @@ impl Value {
             Self::Null => "null".into(),
             Self::Bool(value) => value.to_string(),
             Self::F64(value) => js_number(*value),
-            Self::Str(value) => value.clone(),
+            Self::Str(value) => value.to_string(),
             Self::List(_) | Self::Object(_) => self.compact_json(),
             // `String(fn)` is the source text on strudel.cc; a stable identity is
             // more useful and never appears in a snapshot.
@@ -1320,6 +2006,9 @@ impl Value {
             Self::Haps(haps) => haps.0.iter().any(|hap| hap.value.has_js_function()),
             Self::JsValue(_) => true,
             Self::List(items) => items.iter().any(Value::has_js_function),
+            // An empty map holds nothing, and a made map was made of data
+            // values only. Data holds no function.
+            Self::Object(map) if map.is_known_data() => false,
             Self::Object(map) => map.iter().any(|(_, v)| v.has_js_function()),
             _ => false,
         }
@@ -1335,6 +2024,10 @@ impl Value {
             Self::JsValue(_) => true,
             Self::Haps(haps) => haps.0.iter().any(|hap| hap.value.contains_js_value()),
             Self::List(items) => items.iter().any(Value::contains_js_value),
+            // An empty map holds nothing, and a made map was made of data
+            // values only. Data holds nothing a host
+            // owns.
+            Self::Object(map) if map.is_known_data() => false,
             Self::Object(map) => map.iter().any(|(_, value)| value.contains_js_value()),
             _ => false,
         }
@@ -1356,6 +2049,11 @@ impl Value {
         settings: &crate::settings::RuntimeSettings,
         depth: u32,
     ) -> bool {
+        // Most values of a query are maps of controls that say they hold
+        // data only: such a map has nothing to attach.
+        if matches!(self, Self::Object(values) if values.is_known_data()) {
+            return true;
+        }
         if crate::cancellation_requested() || crate::query_deadline_expired() {
             return false;
         }
@@ -1387,7 +2085,7 @@ impl Value {
                 {
                     return true;
                 }
-                for (_, value) in values.entries_mut(0) {
+                for (_, value) in values.entries_mut() {
                     if !value.attach_runtime_settings(settings, depth + 1) {
                         return false;
                     }
@@ -1592,7 +2290,59 @@ fn write_json_quote(out: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{OrderedMap, Value};
+    use super::{Key, OrderedMap, Table, Value};
+    use std::sync::Arc;
+
+    /// A table makes no map where a plain compose would not read the same.
+    #[test]
+    fn a_table_refuses_what_a_compose_would_read_otherwise() {
+        let values: Arc<[Value]> = Arc::from([Value::Str("c3".into())]);
+        let key = || Some(Key::from("note"));
+        let data = OrderedMap::from_entries([("gain".to_string(), Value::F64(1.0))]);
+        let no_data = OrderedMap::from_entries([(
+            "gain".to_string(),
+            Value::Haps(super::HapList::new(Vec::new())),
+        )]);
+        assert!(Table::new(&values, key(), Some(&data)).is_some());
+        assert!(
+            Table::new(&values, key(), Some(&no_data)).is_none(),
+            "a set that is no data"
+        );
+        assert!(
+            Table::new(&values, None, None).is_none(),
+            "no key and no set"
+        );
+        assert!(
+            Table::new(&values, None, Some(&data)).is_none(),
+            "a value that is no map"
+        );
+        assert!(
+            Table::new(&Arc::from([]), key(), Some(&data)).is_none(),
+            "no values"
+        );
+    }
+
+    /// A map that reads a shared table holds no more than a plain one.
+    #[test]
+    fn a_dressed_map_is_no_larger_than_a_plain_one() {
+        assert_eq!(
+            std::mem::size_of::<OrderedMap>(),
+            std::mem::size_of::<super::Entries>()
+        );
+        assert_eq!(std::mem::size_of::<super::Entries>(), 24);
+        assert_eq!(std::mem::size_of::<Value>(), 32);
+    }
+
+    #[test]
+    fn a_later_entry_of_a_key_takes_the_place_of_its_value() {
+        let map = OrderedMap::from_entries([
+            ("s".to_string(), Value::F64(1.0)),
+            ("n".to_string(), Value::F64(2.0)),
+            ("s".to_string(), Value::F64(3.0)),
+        ]);
+        let entries: Vec<_> = map.iter().collect();
+        assert_eq!(entries, [("s", &Value::F64(3.0)), ("n", &Value::F64(2.0))]);
+    }
 
     #[test]
     fn object_keys_follow_ecmascript_order() {
@@ -1762,43 +2512,6 @@ mod tests {
         }
     }
 
-    fn map(entries: &[(&str, Value)]) -> OrderedMap {
-        OrderedMap::from_entries(
-            entries
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), value.clone())),
-        )
-    }
-
-    #[test]
-    fn an_interned_map_is_shared_and_a_change_copies_it_first() {
-        let shared = map(&[("s", Value::Str("bd".into())), ("n", Value::F64(3.0))]);
-        let interned = shared.interned().expect("a data map is interned");
-        assert!(interned.is_interned());
-        assert_eq!(interned, shared);
-        assert_eq!(format!("{interned:?}"), format!("{shared:?}"));
-        let again = shared.clone().interned().expect("a data map is interned");
-        assert!(std::ptr::eq(interned.entries(), again.entries()));
-        let mut changed = interned.clone();
-        changed.insert("n".into(), Value::F64(4.0));
-        assert!(!changed.is_interned());
-        assert_eq!(interned.get("n"), Some(&Value::F64(3.0)));
-        assert_eq!(changed.get("n"), Some(&Value::F64(4.0)));
-    }
-
-    #[test]
-    fn numbers_are_interned_by_their_bits() {
-        let nan = map(&[("n", Value::F64(f64::NAN))]);
-        let first = nan.interned().expect("a NaN map is data");
-        let second = nan.interned().expect("a NaN map is data");
-        assert!(std::ptr::eq(first.entries(), second.entries()));
-        let zero = map(&[("n", Value::F64(0.0))]).interned().expect("data");
-        let minus = map(&[("n", Value::F64(-0.0))]).interned().expect("data");
-        assert!(!std::ptr::eq(zero.entries(), minus.entries()));
-        let kept = minus.get("n").and_then(Value::as_f64).expect("a number");
-        assert_eq!(kept.to_bits(), (-0.0f64).to_bits());
-    }
-
     #[test]
     fn a_lowered_callback_is_a_native_transformer_and_a_javascript_value() {
         let program = crate::callback_ir::PatternTransformProgram::new([]).unwrap();
@@ -1809,7 +2522,7 @@ mod tests {
         assert!(value.has_js_function());
         assert!(!crate::pure(value).is_pure());
         assert!(super::is_rendered_function(&format!("{lowered:?}")));
-        assert!(format!("{lowered:?}").ends_with("(cb 9, native ir v12:0 ops)"));
+        assert!(format!("{lowered:?}").ends_with("(cb 9, native ir v13:0 ops)"));
 
         let pattern = crate::pure(Value::F64(4.0));
         let pure = crate::purity::PurePattern::assert_pure(pattern.clone());
@@ -1866,9 +2579,74 @@ mod tests {
         assert!(crate::take_query_error().is_some());
     }
 
+    /// A set that holds no entry, in the form of a map that was emptied, is
+    /// no set: the table reads as the plain map and refuses a bare step.
     #[test]
-    fn a_map_with_a_script_value_is_not_interned() {
-        let opaque = map(&[("x", Value::JsValue(super::JsValueRef::new(3, false)))]);
-        assert!(opaque.interned().is_none());
+    fn an_emptied_set_counts_as_no_set() {
+        for entries in [
+            super::Entries::Shared(Arc::from([])),
+            super::Entries::Made(Arc::from([])),
+        ] {
+            let emptied = OrderedMap { entries };
+            assert!(emptied.is_empty());
+            check_emptied(&emptied);
+        }
+    }
+
+    fn check_emptied(emptied: &OrderedMap) {
+        // A step with no entry has nothing to share.
+        let bare: Arc<[Value]> = Arc::from([Value::Object(OrderedMap::new())]);
+        assert!(Table::new(&bare, None, Some(emptied)).is_none());
+        // A named value reads as the map of its one entry.
+        let key = Key::from("note");
+        let values: Arc<[Value]> = Arc::from([Value::F64(1.0)]);
+        let table = Table::new(&values, Some(key.clone()), Some(emptied)).expect("a table");
+        let read = Arc::new(table).map(0).expect("step 0");
+        let plain = OrderedMap::of_one(key, Value::F64(1.0));
+        assert_eq!(read, plain);
+        assert_eq!(read.len(), 1);
+        assert!(!read.owns_no_heap() && !plain.owns_no_heap());
+    }
+
+    /// A lookup of a name that no step holds finds nothing, and every name
+    /// that a step holds is found, whatever its mark is.
+    #[test]
+    fn a_lookup_through_the_marks_finds_what_the_map_holds() {
+        let names = [
+            "s", "n", "note", "gain", "lpf", "lpq", "room", "delay", "distort", "pan", "orbit",
+            "release", "sound", "speed", "shape", "cutoff", "decay", "vst", "vsti", "duration",
+        ];
+        let tail: Vec<(String, Value)> = names[4..]
+            .iter()
+            .map(|name| (name.to_string(), Value::F64(2.0)))
+            .collect();
+        let set = OrderedMap::from_entries(tail);
+        let values: Arc<[Value]> = Arc::from([Value::F64(1.0)]);
+        let table = Arc::new(Table::new(&values, Some(Key::from("note")), Some(&set)).unwrap());
+        let map = table.map(0).unwrap();
+        let plain = {
+            let mut plain = OrderedMap::from_entries([("note".to_string(), Value::F64(1.0))]);
+            for (key, value) in set.iter() {
+                plain.insert(key.to_string(), value.clone());
+            }
+            plain
+        };
+        for name in names.iter().copied().chain(["x", "", "gains", "notes"]) {
+            assert_eq!(map.get(name), plain.get(name), "{name}");
+            assert_eq!(map.contains_key(name), plain.contains_key(name), "{name}");
+        }
+    }
+
+    /// A merge of no entry changes nothing, and leaves a dressed map as it is.
+    #[test]
+    fn a_merge_of_an_empty_map_leaves_the_map() {
+        let values: Arc<[Value]> = Arc::from([Value::F64(1.0)]);
+        let set = OrderedMap::from_entries([("s".to_string(), Value::Str("x".into()))]);
+        let table = Arc::new(Table::new(&values, Some(Key::from("note")), Some(&set)).unwrap());
+        let mut map = table.map(0).unwrap();
+        let before = map.clone();
+        map.merge(&OrderedMap::new(), |_, other| other.clone());
+        assert_eq!(map, before);
+        assert!(matches!(map.entries, super::Entries::Dressed(..)));
     }
 }

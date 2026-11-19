@@ -210,7 +210,7 @@ fn trace_edo_scale(value: &Value) -> Option<TraceEdoScale> {
     let interval_labels = (0..degree_indexes.len())
         .map(|degree| match labels.get(degree + 1) {
             Some(Value::Str(label)) if label.len() <= MAX_TRACE_INTERVAL_LABEL_BYTES => {
-                label.clone()
+                label.to_string()
             }
             _ => String::new(),
         })

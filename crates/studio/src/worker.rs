@@ -3110,6 +3110,7 @@ mod tests {
             loading: None,
             sample_memory: Default::default(),
             script_heap_bytes: 0,
+            score_engine: None,
             audio_memory: None,
         };
         let mut pending = VecDeque::new();

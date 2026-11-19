@@ -171,9 +171,19 @@ impl LaneTable {
     /// score in play, and a document that plays again finds its own lanes
     /// first.
     pub(crate) fn read(&mut self, source: &str) -> Vec<u64> {
+        self.read_statements(source, rustel_transpiler::lane_statements(source))
+    }
+
+    /// [`Self::read`] for a text whose lanes a reader listed: `statements`
+    /// are the lanes of `source`, or `None` for a text with no scan.
+    pub(crate) fn read_statements(
+        &mut self,
+        source: &str,
+        statements: Option<Vec<LaneStatement>>,
+    ) -> Vec<u64> {
         // The read takes the place of the candidate, with its mark.
         let adopted = std::mem::take(&mut self.adopted);
-        let Some(statements) = rustel_transpiler::lane_statements(source) else {
+        let Some(statements) = statements else {
             self.candidate = None;
             return Vec::new();
         };
@@ -501,6 +511,20 @@ fn pair(
     away: &[Lane],
     audible: &[Lane],
 ) {
+    // A score that is read again with no change: rule 1 gives each
+    // statement the lane in play at its place, with no search.
+    let same = |(statement, lane): (&LaneStatement, &Lane)| {
+        statement.label == lane.label && statement.body == lane.body
+    };
+    if statements.len() == playing.len()
+        && numbers.iter().all(Option::is_none)
+        && statements.iter().zip(playing).all(same)
+    {
+        for (number, lane) in numbers.iter_mut().zip(playing) {
+            *number = Some(lane.number);
+        }
+        return;
+    }
     // The numbers with a statement, and the numbers of the score in play.
     let mut taken: HashSet<u64> = numbers.iter().flatten().copied().collect();
     let kept: HashSet<u64> = playing.iter().map(|lane| lane.number).collect();
@@ -514,7 +538,13 @@ fn pair(
     for rule in 1..=3 {
         let heard = (rule == 1).then_some((audible, false));
         let lists = known.into_iter().chain([(away, false)]).chain(heard);
+        // A list with no lane gives no pair, and neither does a list when
+        // each statement has its lane.
+        let lists = lists.filter(|(lanes, _)| !lanes.is_empty());
         for (lanes, new_only) in lists {
+            if numbers.iter().all(Option::is_some) {
+                return;
+            }
             // The places of the lanes and of the statements with no pair
             // yet, by key.
             let mut olds: HashMap<_, Vec<usize>> = HashMap::new();

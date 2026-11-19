@@ -1164,6 +1164,21 @@ impl LiveScalarBackend {
                     event.event.target_frame = landing.saturating_sub(lead).max(floor);
                 }
             }
+            // A saturated intake has no slot for this onset, and a dense
+            // window drains thousands of them through this loop. Refuse
+            // before the duck arm and the onset copy, which a refused onset
+            // would never use: one burst window must not spend the whole
+            // callback ferrying notes that cannot sound.
+            if !event.controls.choke_only
+                && self.scalar.refuse_saturated_intake(
+                    event.confirmation,
+                    musical,
+                    event.generation,
+                )
+            {
+                report.refused += 1;
+                continue;
+            }
             // Arm the sidechain at FIRST SIGHT of the event, at schedule
             // time: the duck's 10 ms pre-hold must still be in the future so
             // the dip ramps in full. Arming only at admission (the onset's

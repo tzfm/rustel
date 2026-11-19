@@ -15,7 +15,7 @@ fn stepalt_source_and_lcm_expansions_are_preflighted_before_reification() {
         "two groups with an 8,192-cycle LCM should fill the shared bound"
     );
     assert_eq!(
-        exact.active_pattern().expect("exact stepalt").steps,
+        exact.active_pattern().expect("exact stepalt").steps(),
         Some(Fraction::int(i128::from(limit)))
     );
     assert!(query_active(&exact, Fraction::ZERO, Fraction::ZERO).is_ok());
@@ -79,7 +79,7 @@ fn stepalt_source_and_lcm_expansions_are_preflighted_before_reification() {
         source_exact
             .active_pattern()
             .expect("exact source stepalt")
-            .steps,
+            .steps(),
         Some(Fraction::ZERO)
     );
     assert_eq!(rustel_core::stepwise_entries_materialised(), 0);

@@ -6,7 +6,7 @@ impl JsRuntime {
     /// evaluations, its `instanceof`, and that it stays queryable.
     pub fn bind_global(&self, name: &str, slot: Slot, index: usize) -> Result<(), String> {
         let _settings = self.core_settings.bind();
-        self.callback_ir.gate.borrow_mut().close_global(name);
+        self.callback_ir().gate.borrow_mut().close_global(name);
         with_ctx(self, |ctx| -> Result<(), String> {
             let w = Self::wrapper_at(&ctx, slot, index)?;
             ctx.globals().set(name, w).map_err(|e| e.to_string())
@@ -67,6 +67,29 @@ impl JsRuntime {
         controls: &[(&str, f64)],
     ) -> Result<Vec<Hap>, QueryError> {
         self.sync_host_voicing_default()?;
+        let mut state = State::new(rustel_core::TimeSpan::new(begin, end));
+        for (k, v) in controls {
+            state.controls.push(((*k).to_string(), Value::F64(*v)));
+        }
+        let answer = |pattern: &Pattern| {
+            rustel_core::with_callback_host(self, || {
+                // Preserve the queryArc error boundary, then order the
+                // returned haps without discarding wholeless signals across
+                // cycles.
+                let haps = pattern
+                    .try_query_state_with_budget(&state, self.hap_budget.get())
+                    .map_err(QueryError::Limit)?;
+                Ok(rustel_core::sort_haps_for_query(haps))
+            })
+        };
+        if matches!(slot, Slot::Active) {
+            // A graph of the native tier reaches no callback of a script,
+            // so no wrapper owns its query.
+            let held = self.native_active.borrow().clone();
+            if let Some(pattern) = held {
+                return answer(&pattern);
+            }
+        }
         let (pattern, native_active) = with_ctx(self, |ctx| -> Result<_, String> {
             if matches!(slot, Slot::Active) {
                 let value: rquickjs::Value = host_active(&ctx)
@@ -89,26 +112,19 @@ impl JsRuntime {
             QueryScope::push(self, slot, index)
         }
         .map_err(QueryError::Message)?;
-        let mut state = State::new(rustel_core::TimeSpan::new(begin, end));
-        for (k, v) in controls {
-            state.controls.push(((*k).to_string(), Value::F64(*v)));
-        }
         // Query-scoped bridge frame: see `query`.
-        let frame = BridgeFrame::new(self.ids.clone());
+        let frame = BridgeFrame::new(Rc::clone(self.callback_ids()));
         let _bridge = BridgeScope::push(&frame);
-        rustel_core::with_callback_host(self, || {
-            // Preserve the queryArc error boundary, then order the returned
-            // haps without discarding wholeless signals across cycles.
-            let haps = pattern
-                .try_query_state_with_budget(&state, self.hap_budget.get())
-                .map_err(QueryError::Limit)?;
-            Ok(rustel_core::sort_haps_for_query(haps))
-        })
+        answer(&pattern)
     }
 
     /// Depth of the query stack - 0 when nothing is being queried.
     pub fn query_depth(&self) -> usize {
         let _settings = self.core_settings.bind();
+        // A runtime with no realm has no query stack.
+        if self.realm.get().is_none() {
+            return 0;
+        }
         with_ctx(self, |ctx| {
             host_stack(&ctx).map(|stack| stack.len()).unwrap_or(0)
         })
@@ -117,6 +133,10 @@ impl JsRuntime {
     /// Clear the active slot, making the current graph unreachable.
     pub fn clear_active(&self) {
         let _settings = self.core_settings.bind();
+        self.native_active.borrow_mut().take();
+        if self.realm.get().is_none() {
+            return;
+        }
         with_ctx(self, |ctx| {
             if let Ok(active) = host_active(&ctx) {
                 let _ = active.set(0, rquickjs::Value::new_null(ctx.clone()));
@@ -132,7 +152,18 @@ impl JsRuntime {
         self.keep_last_good_imports();
         // The timeline offsets of this score are the offsets in play now.
         *self.last_good_timeline.borrow_mut() = None;
-        with_ctx(self, |ctx| {
+        // A native graph in play is the last good score as it is. The realm
+        // then holds no wrapper to keep.
+        let native = self.native_active.borrow().clone();
+        *self.native_last_good.borrow_mut() = native;
+        // A runtime with no realm has no wrapper and no slider or voicing
+        // state.
+        if self.realm.get().is_none() {
+            return;
+        }
+        let replaces = self.last_good_active.borrow().is_some();
+        // The snapshot reads and writes private roots: it runs no score code.
+        with_ctx_running_no_script(self, |ctx| {
             *self.last_good_active.borrow_mut() = host_active(&ctx)
                 .ok()
                 .and_then(|active| active.get::<rquickjs::Value>(0).ok())
@@ -153,6 +184,13 @@ impl JsRuntime {
                 let _ = sets.set(2, active_registry);
             }
         });
+        // A wrapper and its own query function hold each other, so only a
+        // collection frees the wrapper that a native score replaced, and
+        // its graph with it. A native score runs no script: the script heap
+        // does not grow, and the engine does not collect of its own.
+        if replaces && self.evaluated_natively.get() {
+            self.run_gc();
+        }
     }
 
     /// Restore the last successfully installed active wrapper and its slider,
@@ -162,6 +200,13 @@ impl JsRuntime {
         let _settings = self.core_settings.bind();
         self.show_last_good_imports();
         self.restore_last_good_timeline();
+        let native = self.native_last_good.borrow().clone();
+        *self.native_active.borrow_mut() = native;
+        // A runtime with no realm has no wrapper and no slider or voicing
+        // state to restore.
+        if self.realm.get().is_none() {
+            return Ok(());
+        }
         with_ctx(self, |ctx| -> Result<(), QueryError> {
             let restored = {
                 let saved = self.last_good_active.borrow();
@@ -235,10 +280,23 @@ impl JsRuntime {
             .map(|pattern| pattern.with_runtime_settings(self.core_settings.clone()))
     }
 
+    /// The active graph as its score built it, before the export takes this
+    /// runtime's settings, for tests that compare two builds of a score.
+    #[doc(hidden)]
+    pub fn active_graph_for_test(&self) -> Option<Pattern> {
+        self.active_pattern_unwrapped()
+    }
+
     /// Whether the active slot contains a pattern wrapper, without cloning its
     /// graph.
     pub fn has_active_pattern(&self) -> bool {
         let _settings = self.core_settings.bind();
+        if self.native_active.borrow().is_some() {
+            return true;
+        }
+        if self.realm.get().is_none() {
+            return false;
+        }
         with_ctx(self, |ctx| {
             let Ok(active) = host_active(&ctx) else {
                 return false;
@@ -256,6 +314,12 @@ impl JsRuntime {
 
     pub(super) fn active_pattern_unwrapped(&self) -> Option<Pattern> {
         let _settings = self.core_settings.bind();
+        if let Some(pattern) = &*self.native_active.borrow() {
+            // The handle of the graph in play, for the caller to hold.
+            return Some(pattern.clone());
+        }
+        // A runtime with no realm holds no wrapper.
+        self.realm.get()?;
         with_ctx(self, |ctx| -> Option<Pattern> {
             let value: rquickjs::Value = host_active(&ctx).ok()?.get(0).ok()?;
             if value.is_null() || value.is_undefined() {
@@ -311,7 +375,9 @@ impl JsRuntime {
     /// Number of JS objects currently allocated - an independent check on the
     /// per-resource counters.
     pub fn js_object_count(&self) -> usize {
-        self.rt.memory_usage().obj_count as usize
+        self.realm
+            .get()
+            .map_or(0, |realm| realm.rt.memory_usage().obj_count as usize)
     }
 
     /// A callback created in a live bridge frame but not yet owned by a
@@ -528,7 +594,7 @@ impl JsRuntime {
 
     pub(super) fn record_query_error(&self, message: &str) {
         let line = format!("[query] error: {message}");
-        let mut logs = self.logs.borrow_mut();
+        let mut logs = self.logs().borrow_mut();
         if logs.last() != Some(&line) && logs.len() < MAX_BUFFERED_LOGS {
             logs.push(line);
         }

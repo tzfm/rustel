@@ -659,9 +659,12 @@ mod tests {
             app.send_csound();
             assert!(!app.csound_owed);
             app.retry_refused_update();
+            // The request waits its turn when the engine has not yet taken
+            // the switch.
             let rerun = app
                 .inflight
                 .values()
+                .chain(app.pending_evaluation.iter())
                 .find(|pending| pending.scene == scene)
                 .expect("the refused update re-ran");
             assert_eq!(rerun.editor_revision, revision);
