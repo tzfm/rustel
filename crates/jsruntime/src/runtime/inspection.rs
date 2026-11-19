@@ -6,7 +6,7 @@ impl JsRuntime {
     /// evaluations, its `instanceof`, and that it stays queryable.
     pub fn bind_global(&self, name: &str, slot: Slot, index: usize) -> Result<(), String> {
         let _settings = self.core_settings.bind();
-        self.callback_ir.gate.borrow_mut().close_global(name);
+        self.callback_ir().gate.borrow_mut().close_global(name);
         with_ctx(self, |ctx| -> Result<(), String> {
             let w = Self::wrapper_at(&ctx, slot, index)?;
             ctx.globals().set(name, w).map_err(|e| e.to_string())
@@ -113,7 +113,7 @@ impl JsRuntime {
         }
         .map_err(QueryError::Message)?;
         // Query-scoped bridge frame: see `query`.
-        let frame = BridgeFrame::new(self.ids.clone());
+        let frame = BridgeFrame::new(Rc::clone(self.callback_ids()));
         let _bridge = BridgeScope::push(&frame);
         answer(&pattern)
     }
@@ -594,7 +594,7 @@ impl JsRuntime {
 
     pub(super) fn record_query_error(&self, message: &str) {
         let line = format!("[query] error: {message}");
-        let mut logs = self.logs.borrow_mut();
+        let mut logs = self.logs().borrow_mut();
         if logs.last() != Some(&line) && logs.len() < MAX_BUFFERED_LOGS {
             logs.push(line);
         }

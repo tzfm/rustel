@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Arc;
 
 impl JsRuntime {
     /// A runtime with its script engine started.
@@ -19,25 +20,24 @@ impl JsRuntime {
     /// for [`Self::with_pointer`].
     pub fn deferred(pointer: Option<rustel_core::host_value::Pointer>) -> Self {
         Self {
-            realm: std::cell::OnceCell::new(),
+            realm: OnceCell::new(),
             core_settings: rustel_core::settings::RuntimeSettings::default(),
-            ids: std::rc::Rc::new(Cell::new(0)),
-            logs: std::rc::Rc::new(RefCell::new(Vec::new())),
+            ids: OnceCell::new(),
+            logs: OnceCell::new(),
             contained_query_errors_unlogged: Cell::new(false),
-            cycle_time: std::rc::Rc::new(Cell::new(0.0)),
-            cps: std::rc::Rc::new(Cell::new(0.5)),
+            cycle_time: Rc::new(Cell::new(0.0)),
+            cps: Rc::new(Cell::new(0.5)),
             loaded_imports: LoadedImports::default(),
             import_surface: RefCell::default(),
             timeline_state: rustel_core::TimelineState::default(),
-            midi_in_bus: std::sync::Arc::new(rustel_core::midi_in::InputBus::new()),
-            midi_in_handles: std::rc::Rc::new(RefCell::new(MidiInputHandles::default())),
+            midi_in: OnceCell::new(),
             #[cfg(feature = "hydra")]
             hydra_chains: Rc::new(RefCell::new(crate::install::HydraChains::default())),
-            effect_transaction: Rc::new(RefCell::new(None)),
+            effect_transaction: Rc::default(),
             effect_policy: Rc::new(Cell::new(EffectPolicy::NONE)),
             hap_budget: Cell::new(rustel_core::DEFAULT_HAP_BUDGET),
             query_threw: RefCell::new(None),
-            callback_ir: Rc::new(CallbackIr::new()),
+            callback_ir: OnceCell::new(),
             native_tier: Cell::new(true),
             evaluated_natively: Cell::new(false),
             bindings_installed: Cell::new(false),
@@ -120,42 +120,71 @@ impl JsRuntime {
         self.native_left.get()
     }
 
+    /// The text the memo of the last native build holds, when one kept a
+    /// text. The session that replays the same text shares this handle.
+    #[doc(hidden)]
+    pub fn native_source_text(&self) -> Option<Arc<str>> {
+        self.native_memo.borrow().source.clone()
+    }
+
+    /// The callback-IR state, made at the first use. A runtime that lowers
+    /// no callback, and whose realm never started, holds none.
+    pub(super) fn callback_ir(&self) -> &Rc<CallbackIr> {
+        self.callback_ir.get_or_init(|| Rc::new(CallbackIr::new()))
+    }
+
     /// Select callback-IR execution policy for tests and same-machine A/B.
     /// Callbacks bridged before the change keep the representation they were
     /// bridged with. See [`PatternTransformIrMode`].
     #[doc(hidden)]
     pub fn set_pattern_transform_ir_mode(&self, mode: PatternTransformIrMode) {
-        self.callback_ir.mode.set(mode);
+        self.callback_ir().mode.set(mode);
     }
 
     #[doc(hidden)]
     pub fn pattern_transform_ir_mode(&self) -> PatternTransformIrMode {
-        self.callback_ir.mode.get()
+        // A read makes no state: a runtime with none runs the default mode.
+        self.callback_ir
+            .get()
+            .map_or(PatternTransformIrMode::Auto, |ir| ir.mode.get())
     }
 
     /// Snapshot bounded producer-side callback-IR counters.
     #[doc(hidden)]
     pub fn pattern_transform_ir_stats(&self) -> PatternTransformIrStats {
-        self.callback_ir.stats.get()
+        self.callback_ir
+            .get()
+            .map_or_else(PatternTransformIrStats::default, |ir| ir.stats.get())
     }
 
     #[doc(hidden)]
     pub fn reset_pattern_transform_ir_stats(&self) {
-        self.callback_ir
-            .stats
-            .set(PatternTransformIrStats::default());
+        if let Some(ir) = self.callback_ir.get() {
+            ir.stats.set(PatternTransformIrStats::default());
+        }
+    }
+
+    /// The console buffer, made at the first writer.
+    pub(crate) fn logs(&self) -> &Rc<RefCell<Vec<String>>> {
+        self.logs.get_or_init(Rc::default)
     }
 
     pub fn take_logs(&self) -> Vec<String> {
-        std::mem::take(&mut self.logs.borrow_mut())
+        match self.logs.get() {
+            Some(logs) => mem::take(&mut logs.borrow_mut()),
+            None => Vec::new(),
+        }
     }
 
     /// Run `f`, and drop the console lines it writes: the lines of a query
     /// whose notes do not play now.
     pub fn with_logs_dropped<R>(&self, f: impl FnOnce() -> R) -> R {
-        let kept = self.logs.borrow().len();
+        // The buffer may not exist yet, and `f` may make it and write to it.
+        let kept = self.logs.get().map_or(0, |logs| logs.borrow().len());
         let result = f();
-        self.logs.borrow_mut().truncate(kept);
+        if let Some(logs) = self.logs.get() {
+            logs.borrow_mut().truncate(kept);
+        }
         result
     }
 
@@ -228,16 +257,60 @@ impl JsRuntime {
     /// Take over `bus` as this realm's MIDI input bus, with its ports and
     /// their controller values. Call it before the semantic bindings
     /// install: they open the score's ports on the bus held then.
-    pub fn adopt_midi_input_bus(&mut self, bus: std::sync::Arc<rustel_core::midi_in::InputBus>) {
-        self.midi_in_bus = bus;
+    pub fn adopt_midi_input_bus(&mut self, bus: Arc<rustel_core::midi_in::InputBus>) {
+        // The host bus replaces a bus made at a first use, and the handles
+        // stay. Call it before an opener takes the bus of the runtime.
+        let handles = self
+            .midi_in
+            .take()
+            .map_or_else(Rc::default, |midi| midi.handles);
+        self.midi_in = OnceCell::from(MidiInput { bus, handles });
+    }
+
+    /// The MIDI bus and its handle state, made when a score or the host
+    /// first asks for either.
+    fn midi(&self) -> &MidiInput {
+        self.midi_in.get_or_init(|| MidiInput {
+            // The launch-pad words of a fresh bus cost their Vec alone.
+            bus: Arc::new(rustel_core::midi_in::InputBus::new()),
+            handles: Rc::default(),
+        })
+    }
+
+    /// The handle state of this runtime's MIDI inputs.
+    pub(crate) fn midi_handles(&self) -> &Rc<RefCell<MidiInputHandles>> {
+        &self.midi().handles
+    }
+
+    /// Whether this runtime made its MIDI input bus: a hidden probe for
+    /// the rule that a score with no input makes none.
+    #[doc(hidden)]
+    pub fn midi_bus_made(&self) -> bool {
+        self.midi_in.get().is_some()
+    }
+
+    /// Clear the MIDI key ring, when a bus was made: a score that named no
+    /// input has no keys to clear.
+    pub fn clear_midi_keys(&self) {
+        if let Some(midi) = self.midi_in.get() {
+            midi.bus.clear_keys();
+        }
+    }
+
+    /// Retire the MIDI key backlog, when a bus was made: see
+    /// [`rustel_core::midi_in::InputBus::retire_key_backlog`].
+    pub fn retire_midi_key_backlog(&self, takeover_cycle: f64) {
+        if let Some(midi) = self.midi_in.get() {
+            midi.bus.retire_key_backlog(takeover_cycle);
+        }
     }
 
     /// The MIDI-input tables this runtime's scores have named.
     ///
     /// The host attaches listeners to these; evaluation only ever interns a
     /// name into them, which is why opening a device cannot stall a score.
-    pub fn midi_input_bus(&self) -> std::sync::Arc<rustel_core::midi_in::InputBus> {
-        std::sync::Arc::clone(&self.midi_in_bus)
+    pub fn midi_input_bus(&self) -> Arc<rustel_core::midi_in::InputBus> {
+        Arc::clone(&self.midi().bus)
     }
 
     /// Publish a successful score evaluation's complete MIDI-input set.
@@ -252,8 +325,17 @@ impl JsRuntime {
         generation: u64,
     ) -> Result<(), String> {
         let bindings = &effects.midi_inputs.bindings;
-        let ports: Vec<std::sync::Arc<rustel_core::midi_in::InputPort>> = {
-            let handles = self.midi_in_handles.borrow();
+        // A score that named no input, on a runtime that made no bus and no
+        // handle, commits the state a fresh bus already holds.
+        if bindings.is_empty()
+            && effects.midi_inputs.provisional_handles.is_empty()
+            && self.midi_in.get().is_none()
+        {
+            effects.midi_inputs.resolved = true;
+            return Ok(());
+        }
+        let ports: Vec<Arc<rustel_core::midi_in::InputPort>> = {
+            let handles = self.midi_handles().borrow();
             bindings
                 .iter()
                 .map(|binding| {
@@ -269,10 +351,11 @@ impl JsRuntime {
 
         // The bus validates the entire candidate before replacing either of
         // its retained generations.
-        self.midi_in_bus
+        self.midi()
+            .bus
             .commit_generation(generation, ports.clone())?;
 
-        let mut handles = self.midi_in_handles.borrow_mut();
+        let mut handles = self.midi_handles().borrow_mut();
         let active: BTreeMap<String, u64> = bindings
             .iter()
             .map(|binding| (binding.selector.clone(), binding.handle))
@@ -833,9 +916,16 @@ impl JsRuntime {
         // One allocator per runtime, shared by both wrapper families: a
         // separate counter for each would hand the same id to both, which is
         // exactly the wrong-callback invocation the identity rules prevent.
-        let id = self.ids.get();
-        self.ids.set(id + 1);
+        let ids = self.callback_ids();
+        let id = ids.get();
+        ids.set(id + 1);
         id
+    }
+
+    /// The callback id counter, made at the first evaluation or query that
+    /// bridges a callback frame.
+    pub(crate) fn callback_ids(&self) -> &Rc<Cell<CallbackId>> {
+        self.ids.get_or_init(Rc::default)
     }
 
     pub fn builder(&self) -> GraphBuilder {
@@ -1038,7 +1128,7 @@ impl JsRuntime {
         }
         let _scope = QueryScope::push_active_native(self).map_err(QueryError::Message)?;
         Ok(with_ctx(self, |_ctx| {
-            let frame = BridgeFrame::new(self.ids.clone());
+            let frame = BridgeFrame::new(Rc::clone(self.callback_ids()));
             let _bridge = BridgeScope::push(&frame);
             rustel_core::with_callback_host(self, f)
         }))
@@ -1529,7 +1619,7 @@ impl JsRuntime {
                 // new cells then. They belong to this query only, so the frame
                 // is torn down with it rather than accumulating across queries.
                 return with_ctx(self, |_ctx| {
-                    let frame = BridgeFrame::new(self.ids.clone());
+                    let frame = BridgeFrame::new(Rc::clone(self.callback_ids()));
                     let _bridge = BridgeScope::push(&frame);
                     rustel_core::with_callback_host(self, || {
                         self.query_sorted_recording_throw(&pattern, begin, end)
@@ -1545,7 +1635,7 @@ impl JsRuntime {
         })?;
         let _scope = QueryScope::push(self, slot, index)?;
         let haps = with_ctx(self, |_ctx| {
-            let frame = BridgeFrame::new(self.ids.clone());
+            let frame = BridgeFrame::new(Rc::clone(self.callback_ids()));
             let _bridge = BridgeScope::push(&frame);
             rustel_core::with_callback_host(self, || {
                 self.query_sorted_recording_throw(&pattern, begin, end)
@@ -1608,7 +1698,7 @@ impl JsRuntime {
             // The shadow owns the callbacks of its lanes.
             let _scope = WrapperQueryScope::push(&ctx, shadow)
                 .map_err(|error| QueryError::Message(error.to_string()))?;
-            let frame = BridgeFrame::new(self.ids.clone());
+            let frame = BridgeFrame::new(Rc::clone(self.callback_ids()));
             let _bridge = BridgeScope::push(&frame);
             rustel_core::with_callback_host(self, || {
                 self.query_sorted_recording_throw(&pattern, begin, end)

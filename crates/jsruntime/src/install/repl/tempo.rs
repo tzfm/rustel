@@ -19,7 +19,7 @@ struct NativeTempoSetter<'js> {
     #[qjs(skip_trace)]
     lane: bool,
     #[qjs(skip_trace)]
-    transaction: Rc<RefCell<Option<ScoreEffects>>>,
+    transaction: Rc<RefCell<EffectTransaction>>,
     #[qjs(skip_trace)]
     policy: Rc<Cell<EffectPolicy>>,
     #[qjs(skip_trace)]
@@ -325,7 +325,7 @@ pub(super) fn install<'js>(
     let get_cps = Function::new(ctx.clone(), move || {
         staged
             .borrow()
-            .as_ref()
+            .written()
             .and_then(|effects| effects.cps)
             .unwrap_or_else(|| playing.get())
     })

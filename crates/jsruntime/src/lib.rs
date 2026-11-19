@@ -36,7 +36,7 @@ use rquickjs::{
 };
 use rustel_core::{BindArg, BindResult, CallbackHost, CallbackId, Hap, Pattern, State, Value};
 use rustel_fraction::Fraction;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::rc::Rc;
 
@@ -262,7 +262,7 @@ mod ownership_cap_tests {
                 .call((results,))
                 .map_err(|error: rquickjs::Error| error.to_string())?;
 
-            let frame = BridgeFrame::new(runtime.ids.clone());
+            let frame = BridgeFrame::new(Rc::clone(runtime.callback_ids()));
             let _scope = BridgeScope::push(&frame);
             let callback_id = frame.next_id();
             frame

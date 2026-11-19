@@ -285,8 +285,7 @@ impl Session {
             fresh.plugins_live = AtomicBool::new(live);
             fresh.plugin_rate = std::mem::take(&mut self.plugin_rate);
             fresh.ran_plugin_calls = self.ran_plugin_calls;
-            fresh.chains = self.chains.clone();
-            fresh.slider_links = self.slider_links.clone();
+            fresh.plugin_chains = self.plugin_chains.clone();
             fresh.lanes = std::mem::take(&mut self.lanes);
             fresh.plugin_lead = self.plugin_lead;
             fresh.cover_lead = self.cover_lead;
@@ -579,8 +578,8 @@ mod tests {
         #[cfg(feature = "vst")]
         assert!(
             Arc::ptr_eq(
-                &session.slider_links,
-                &crate::vst::slider_links(&session.chains)
+                session.slider_links(),
+                &crate::vst::slider_links(session.chains())
             ),
             "the rebuilt session lost the slider links of its chains"
         );
@@ -1167,9 +1166,11 @@ mod tests {
     }
 
     use super::*;
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
     use crate::session::tests::*;
     #[cfg(all(feature = "vst", feature = "device-audio"))]
     use crate::test_support::past_the_cover;
+    #[cfg(feature = "device-audio")]
     use rustel_core::Value;
     #[cfg(feature = "device-audio")]
     #[test]

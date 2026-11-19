@@ -424,7 +424,7 @@ pub(super) fn install<'js>(
         .map_err(|error| error.to_string())?;
 
     let reset = Function::new(ctx.clone(), reset).map_err(|error| error.to_string())?;
-    let logs = runtime.logs.clone();
+    let logs = Rc::clone(runtime.logs());
     let deadline = runtime.deadline.clone();
     let finish = Function::new(
         ctx.clone(),

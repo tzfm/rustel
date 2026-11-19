@@ -354,9 +354,9 @@ impl Session {
                 // The lanes that do not play get the rest of the time.
                 let shadow = self.candidate_shadow(settings, from, next, deadline);
                 crate::vst::plan(
-                    &self.chains,
+                    self.chains(),
                     &self.lanes,
-                    &self.csound,
+                    self.csound(),
                     source,
                     &haps,
                     &shadow,
@@ -365,7 +365,7 @@ impl Session {
             // A score with no pattern plays no plugin. It has no plan of its
             // own, so the plan of the text before ends, as at the commit seam.
             EvaluatedScore::MiniFallback(_) => {
-                crate::vst::forget_plan(&self.chains);
+                self.forget_plugin_plan();
                 Vec::new()
             }
         };
@@ -375,7 +375,7 @@ impl Session {
         // A text the session does not hold gives each failed or faulted copy
         // of its plan one new try, as at the commit seam: see
         // `Self::plugin_seam`.
-        if held.is_none() && crate::vst::retry(&self.chains, Some(source), rate) > 0 {
+        if held.is_none() && crate::vst::retry(self.chains(), Some(source), rate) > 0 {
             lines = crate::vst::ensure(&wants, rate).1;
         }
         self.report_plugin_lines(lines);
@@ -465,7 +465,7 @@ impl Session {
     pub fn cancel_plugin_hold(&mut self) {
         self.plugin_hold = None;
         self.lanes.hold(None);
-        crate::vst::forget_plan(&self.chains);
+        self.forget_plugin_plan();
     }
 
     /// Whether an edit waits for its plugin copies. On at the start. With the
@@ -510,7 +510,7 @@ impl Session {
     fn adopt_plugin_hold(&mut self, source: &str) -> bool {
         let adopted = self.holds_edit(source) && self.lanes.adopt_read(source);
         if adopted {
-            crate::vst::adopt_plan(&self.chains, &self.lanes, source);
+            crate::vst::adopt_plan(self.chains(), &self.lanes, source);
             self.lanes.hold(Some(source));
             if let Some(hold) = self.plugin_hold.as_mut() {
                 hold.progress = Instant::now();
@@ -590,12 +590,12 @@ impl Session {
         else {
             // A text with no plan of its own ends the plan of the text
             // before, and has no lead.
-            crate::vst::forget_plan(&self.chains);
+            self.forget_plugin_plan();
             self.plan_lead = Some(0.0);
             return Ok(Some(Vec::new()));
         };
         if !self.plugins_live() || self.generation() == 0 || self.transport.is_stopped() {
-            crate::vst::forget_plan(&self.chains);
+            self.forget_plugin_plan();
             self.plan_lead = Some(0.0);
             return Ok(Some(Vec::new()));
         }
@@ -654,9 +654,9 @@ impl Session {
         let mut wants = match held.as_mut() {
             Some(held) if armed => std::mem::take(&mut held.wants),
             _ => crate::vst::plan(
-                &self.chains,
+                self.chains(),
                 &self.lanes,
-                &self.csound,
+                self.csound(),
                 source,
                 &haps,
                 &shadow,
@@ -696,9 +696,9 @@ impl Session {
             haps.extend(later);
             shadow.extend(self.candidate_shadow(settings, next, last, deadline));
             wants = crate::vst::plan(
-                &self.chains,
+                self.chains(),
                 &self.lanes,
-                &self.csound,
+                self.csound(),
                 source,
                 &haps,
                 &shadow,
@@ -714,7 +714,7 @@ impl Session {
         // of its plan one new try, behind its own copies and loads. A copy in
         // its try gives no line. The count stays the count of the look
         // before, so the edit waits for no new copy that look did not count.
-        if hold && held.is_none() && crate::vst::retry(&self.chains, Some(source), rate) > 0 {
+        if hold && held.is_none() && crate::vst::retry(self.chains(), Some(source), rate) > 0 {
             lines = look(&wants).1;
         }
         // The commit takes the lead of the plan.
@@ -922,7 +922,7 @@ impl Session {
         // callback gives an evaluation no plugin call, and its chain still
         // counts the time it plays.
         if self.plugins_live() {
-            crate::vst::tick(&self.chains, now);
+            crate::vst::tick(self.chains(), now);
         }
         // A score that a panic recovery restored looks at nothing ahead
         // until the next commit. A look of a score that panicked panics
@@ -1013,9 +1013,9 @@ impl Session {
             return;
         };
         let wants = if shadow {
-            crate::vst::wants(&self.chains, &self.lanes, &self.csound, &[], &haps)
+            crate::vst::wants(self.chains(), &self.lanes, self.csound(), &[], &haps)
         } else {
-            crate::vst::wants(&self.chains, &self.lanes, &self.csound, &haps, &[])
+            crate::vst::wants(self.chains(), &self.lanes, self.csound(), &haps, &[])
         };
         self.ensure_wants(&wants);
         // These notes play later: the cover keeps room for their lead.
@@ -1696,9 +1696,9 @@ mod tests {
         });
         let live = session.plugins_live();
         let chains = crate::vst::assign(
-            &session.chains,
+            session.chains(),
             &session.lanes,
-            &session.csound,
+            session.csound(),
             notes,
             live,
         );
@@ -1803,7 +1803,7 @@ mod tests {
         assert_eq!(plugin_chain(&session), chain);
         let insert_chains = |session: &Session| {
             let turn = rustel_audio::InsertTurn::default();
-            crate::vst::named_chains(&session.chains, turn)
+            crate::vst::named_chains(session.chains(), turn)
         };
         assert_eq!(insert_chains(&session).named, [chain]);
         assert_eq!(session.plugin_names(), [fixture]);
@@ -1847,9 +1847,9 @@ mod tests {
         let names: Vec<crate::ValueJson> =
             (1..rustel_audio::MAX_INSERT_BUSES).map(run_time).collect();
         crate::vst::assign(
-            &session.chains,
+            session.chains(),
             &session.lanes,
-            &session.csound,
+            session.csound(),
             &names,
             true,
         );
@@ -1857,9 +1857,9 @@ mod tests {
         let csound = serde_json::json!({"s": "sine", "csound": "probe", "orbit": 2});
         let window = [run_time(1), crate::ValueJson::Raw(csound)];
         crate::vst::assign(
-            &session.chains,
+            session.chains(),
             &session.lanes,
-            &session.csound,
+            session.csound(),
             &window,
             true,
         );
@@ -2535,7 +2535,7 @@ mod tests {
         copy.process(&mut [0.0; 128], &mut [0.0; 128]);
         let restarts = |session: &Session| {
             let turn = rustel_audio::InsertTurn::default();
-            crate::vst::named_chains(&session.chains, turn).restart
+            crate::vst::named_chains(session.chains(), turn).restart
         };
         let mut other = Session::new().expect("session");
         other.evaluate(&delay).expect("score");
@@ -2563,7 +2563,7 @@ mod tests {
         host.wait_idle();
         let replacements = |session: &Session| {
             let turn = rustel_audio::InsertTurn::default();
-            crate::vst::named_chains(&session.chains, turn).replace
+            crate::vst::named_chains(session.chains(), turn).replace
         };
         assert!(replacements(&other).is_empty(), "a copy of another session");
         assert_eq!(replacements(&session), [(slot, key)]);

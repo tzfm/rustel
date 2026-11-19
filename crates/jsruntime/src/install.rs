@@ -76,7 +76,7 @@ fn install_logger<'js>(
     if !current.is_undefined() {
         return Ok(());
     }
-    let sink = runtime.logs.clone();
+    let sink = Rc::clone(runtime.logs());
     let logger = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, args: rquickjs::function::Rest<rquickjs::Value<'js>>| {

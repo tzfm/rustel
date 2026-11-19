@@ -25,6 +25,23 @@ struct SnapshotData {
 }
 
 impl CsoundSnapshot {
+    /// Whether this snapshot holds what a new store holds: no source, no
+    /// url and no load.
+    pub(crate) fn is_empty(&self) -> bool {
+        *self.0 == SnapshotData::default()
+    }
+
+    /// A snapshot of one orchestra source, for the tests of the rules that
+    /// keep a snapshot.
+    #[cfg(test)]
+    pub(crate) fn of_source(source: &str) -> Self {
+        Self(Arc::new(SnapshotData {
+            sources: vec![source.to_owned()],
+            urls: BTreeSet::new(),
+            initialized: true,
+        }))
+    }
+
     /// Keep definitions from both snapshots, with newer definitions last.
     pub fn merge(&mut self, newer: &Self) -> Result<(), RuntimeError> {
         let mut merged = self.clone();
@@ -569,6 +586,7 @@ impl State {
         })
     }
 
+    #[cfg(any(feature = "device-audio", not(feature = "vst")))]
     pub(crate) fn provider(&self, wait: bool) -> Arc<InsertProvider> {
         let state = self.clone();
         Arc::new(move |key, rate, slot| {
@@ -795,6 +813,22 @@ fn control_number(value: &Value) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    /// A session that never made its store reports the default snapshot,
+    /// and the recovery keeps it: that is right only when a new store holds
+    /// the same snapshot.
+    #[test]
+    fn the_default_snapshot_is_the_snapshot_of_a_new_store() {
+        for allowed in [false, true] {
+            assert_eq!(
+                State::new(allowed).snapshot(),
+                CsoundSnapshot::default(),
+                "a new store (allowed {allowed}) holds more than the default snapshot"
+            );
+        }
+        assert!(CsoundSnapshot::default().is_empty());
+        assert!(!CsoundSnapshot::of_source("instr a\nendin").is_empty());
+    }
+
     use super::*;
 
     #[cfg(feature = "device-audio")]

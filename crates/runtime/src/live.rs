@@ -654,7 +654,7 @@ impl LiveFileProducer {
         result: &Result<LiveProducerStep, RuntimeError>,
     ) {
         session
-            .csound
+            .csound()
             .retain_queued(self.pending.iter().map(|event| &event.controls));
         let mut record = session.take_pending_producer_turn();
         record.producer_backlog_depth = u32::try_from(self.pending.len()).unwrap_or(u32::MAX);
@@ -1159,13 +1159,13 @@ impl LiveFileProducer {
             .queued_through
             .max(event.target_frame as f64 / f64::from(sample_rate));
         session
-            .csound
+            .csound()
             .admit(event, sample_rate, self.queued_through, render_frontier);
     }
 
     fn sync_panic_recovery(&mut self, session: &Session) {
-        session.csound.track_live_events();
-        self.csound = Some(session.csound.clone());
+        session.csound().track_live_events();
+        self.csound = Some(session.csound().clone());
         if self.recovery_epoch != session.recovery_epoch() {
             // A host can submit another command before its next producer
             // step. Its new replacement already discarded the old backlog.
@@ -1570,7 +1570,7 @@ impl LiveFileProducer {
         push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<bool, RuntimeError> {
         self.sync_panic_recovery(session);
-        let csound = session.csound.clone();
+        let csound = session.csound().clone();
         let result =
             self.shield_reload_inner(session, schedule_now, sample_rate, prepare, install, push);
         csound.retain_queued(self.pending.iter().map(|event| &event.controls));

@@ -506,7 +506,7 @@ impl Session {
         let (begin, end) = Self::window(from_cycle, cycles);
         let shadow = self.shadow_haps(begin, end, now + ceiling);
         let shadow = shadow.unwrap_or_default();
-        let wants = crate::vst::wants(&self.chains, &self.lanes, &self.csound, &haps, &shadow);
+        let wants = crate::vst::wants(self.chains(), &self.lanes, self.csound(), &haps, &shadow);
         let pending = if tries {
             let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
             let (mut pending, mut lines) = crate::vst::ensure(&wants, rate);
@@ -541,7 +541,7 @@ impl Session {
             return 0;
         }
         let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
-        crate::vst::returning(&self.chains, rate)
+        crate::vst::returning(self.chains(), rate)
     }
 
     /// The leads of the plugin chains of `wants` at the rate of the output,

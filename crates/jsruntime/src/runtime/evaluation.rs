@@ -211,7 +211,7 @@ impl JsRuntime {
             _borrow: std::marker::PhantomData,
         };
         let evaluation = self.with_heap_boundary(|| {
-            let alloc = self.ids.clone();
+            let alloc = Rc::clone(self.callback_ids());
             with_ctx(self, |ctx| {
                 struct PendingJobGuard {
                     runtime: *mut rquickjs::qjs::JSRuntime,
@@ -620,7 +620,7 @@ impl JsRuntime {
         let score_error = |message: String| {
             QueryError::Message(remap_reported_position(message, shim_lines, line_map))
         };
-        let alloc = self.ids.clone();
+        let alloc = Rc::clone(self.callback_ids());
         with_ctx(self, |ctx| -> Result<(), QueryError> {
             // The REPL re-injects these exact objects
             // before every score evaluation. Restore every repairable
@@ -767,7 +767,7 @@ impl JsRuntime {
                             && self
                                 .effect_transaction
                                 .borrow()
-                                .as_ref()
+                                .written()
                                 .is_some_and(|effects| !effects.csound.is_empty())
                         {
                             // Orchestra definitions commit without a sounding pattern.
@@ -961,8 +961,11 @@ impl JsRuntime {
                 }
                 // The plugin names of the calls that ran go with the effects
                 // of the score.
-                if let Some(effects) = self.effect_transaction.borrow_mut().as_mut() {
-                    effects.plugins = frame.take_plugin_names();
+                let plugins = frame.take_plugin_names();
+                if !plugins.is_empty()
+                    && let Some(effects) = self.effect_transaction.borrow_mut().effects_mut()
+                {
+                    effects.plugins = plugins;
                 }
                 // A score with a shadow stages a wrapper of its own that holds
                 // it. A value the score returned keeps no shadow: a muted lane

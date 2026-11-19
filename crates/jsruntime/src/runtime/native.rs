@@ -403,7 +403,7 @@ impl JsRuntime {
     pub(super) fn stage_native(&self, score: NativeScore) -> Result<(), QueryError> {
         if let Some(cps) = score.cps {
             let mut transaction = self.effect_transaction.borrow_mut();
-            let effects = transaction.as_mut().ok_or_else(|| {
+            let effects = transaction.effects_mut().ok_or_else(|| {
                 QueryError::Message("a native score set its tempo outside a score turn".into())
             })?;
             effects.cps = Some(cps);

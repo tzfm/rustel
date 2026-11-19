@@ -141,7 +141,7 @@ fn install_absent_visuals<'js>(
 ) -> Result<(), String> {
     const NOTICE: &str = "[hydra] this build has no visuals window; initHydra() did nothing. Rebuild with `--features hydra` for one.";
 
-    let sink = runtime.logs.clone();
+    let sink = Rc::clone(runtime.logs());
     let open = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, _args: Rest<rquickjs::Value<'js>>| {

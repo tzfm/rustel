@@ -190,7 +190,7 @@ pub(super) fn install<'js>(
             let staged = policy.get().allows(EffectPolicy::GAMEPAD)
                 && transaction
                     .borrow_mut()
-                    .as_mut()
+                    .effects_mut()
                     .map(|effects| effects.gamepad = true)
                     .is_some();
             if !staged {

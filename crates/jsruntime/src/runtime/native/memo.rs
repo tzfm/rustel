@@ -31,10 +31,12 @@
 
 use rustel_core::Pattern;
 use rustel_transpiler::{ScoreProgram, ScoreStatement, Written};
+use std::mem;
+use std::sync::Arc;
 
 /// Each name of the score that a part or a statement read, by its number
 /// among the names of its build, with the version the name had.
-type Read = Vec<(u32, u64)>;
+type Read = Box<[(u32, u64)]>;
 
 /// One kept part: where the score writes it, what it built, and what it
 /// read.
@@ -64,8 +66,10 @@ struct Name {
 /// What the last native build of a score kept.
 #[derive(Default)]
 pub(in crate::runtime) struct Memo {
-    /// The text of the score of that build.
-    source: String,
+    /// The text of the score of that build, one handle of it: the session
+    /// that keeps the text for a replay shares this handle.
+    /// None before the first build.
+    pub(in crate::runtime) source: Option<Arc<str>>,
     /// The kept parts, in the order of their places.
     parts: Vec<Part>,
     /// The names of the score, each at its number: the place of its
@@ -223,7 +227,7 @@ impl<'p> Reuse<'p> {
         }
         Self {
             source,
-            unchanged: Unchanged::of(source, &before.source),
+            unchanged: Unchanged::of(source, before.source.as_deref().unwrap_or_default()),
             taken: vec![false; before.parts.len()],
             next: before.next,
             before,
@@ -247,7 +251,7 @@ impl<'p> Reuse<'p> {
         };
         let start = written.start as usize;
         self.unchanged.holds(start, start + text.len())
-            || Some(text) == kept.text(&self.before.source)
+            || Some(text) == kept.text(self.before.source.as_deref().unwrap_or_default())
     }
 
     /// A part or a statement begins, with `frames` function calls and
@@ -398,7 +402,7 @@ impl<'p> Reuse<'p> {
     /// it is the end of the list of each part and statement that is open.
     fn versions_of(&mut self, start: usize) -> Read {
         let Some(read) = self.read.get_mut(start..).filter(|read| !read.is_empty()) else {
-            return Read::new();
+            return Read::default();
         };
         read.sort_unstable();
         let mut kept = 1;
@@ -409,12 +413,12 @@ impl<'p> Reuse<'p> {
             }
         }
         self.read.truncate(start + kept);
-        let mut versions = Read::with_capacity(kept);
+        let mut versions = Vec::with_capacity(kept);
         for at in start..start + kept {
             let number = self.read[at];
             versions.push((number, self.version(number)));
         }
-        versions
+        versions.into_boxed_slice()
     }
 
     /// The version of the name with `number`: the version of the build
@@ -455,7 +459,7 @@ impl<'p> Reuse<'p> {
     /// The memo of this build: the parts it took and the parts it made, and
     /// each name of the program.
     pub(super) fn finish(mut self) -> Memo {
-        let now = std::mem::take(&mut self.now);
+        let now = mem::take(&mut self.now);
         // Each name that a taken part or statement read is a name of this
         // build, and takes its number in it.
         let renumbered = |read: Read| -> Read {
@@ -464,8 +468,8 @@ impl<'p> Reuse<'p> {
                 .filter_map(|(was, version)| Some((number(was)?, version)))
                 .collect()
         };
-        let taken = std::mem::take(&mut self.taken);
-        let mut parts: Vec<Part> = std::mem::take(&mut self.before.parts)
+        let taken = mem::take(&mut self.taken);
+        let mut parts: Vec<Part> = mem::take(&mut self.before.parts)
             .into_iter()
             .zip(taken)
             .filter_map(|(part, taken)| taken.then_some(part))
@@ -479,7 +483,10 @@ impl<'p> Reuse<'p> {
         // of the two holds what the call builds.
         parts.sort_unstable_by_key(Part::key);
         parts.dedup_by_key(|part| part.key());
-        let mut before = std::mem::take(&mut self.before.names);
+        // The next build reads this list for every part it finds, so the
+        // room a part left when its duplicate went is not kept.
+        parts.shrink_to_fit();
+        let mut before = mem::take(&mut self.before.names);
         // A list of its own, with room for the names alone: the list of
         // the build is larger.
         let mut names: Vec<Name> = Vec::with_capacity(self.names.len());
@@ -487,8 +494,8 @@ impl<'p> Reuse<'p> {
             let kept = name.was.map(|was| {
                 let kept = &mut before[was];
                 (
-                    std::mem::take(&mut kept.text),
-                    std::mem::take(&mut kept.read),
+                    mem::take(&mut kept.text),
+                    mem::take(&mut kept.read),
                     kept.version,
                 )
             });
@@ -499,7 +506,7 @@ impl<'p> Reuse<'p> {
                 (Some((text, read, version)), None) if name.version == Some(version) => {
                     (text, renumbered(read))
                 }
-                (Some((text, ..)), None) => (text, Read::new()),
+                (Some((text, ..)), None) => (text, Read::default()),
                 (None, read) => (Box::from(name.text), read.unwrap_or_default()),
             };
             Name {
@@ -511,16 +518,19 @@ impl<'p> Reuse<'p> {
                 read,
             }
         }));
-        // The text takes the place of the text of the build before.
-        let mut source = std::mem::take(&mut self.before.source);
-        source.clear();
-        source.push_str(self.source);
+        // A re-evaluation of the same text shares the handle the build
+        // before kept, so the text lives one time. An aborted build makes
+        // no handle.
+        let source = match &self.before.source {
+            Some(kept) if **kept == *self.source => Arc::clone(kept),
+            _ => Arc::from(self.source),
+        };
         let mut by_text: Vec<u32> = (0..names.len())
             .filter_map(|number| u32::try_from(number).ok())
             .collect();
         by_text.sort_unstable_by_key(|number| &*names[*number as usize].text);
         Memo {
-            source,
+            source: Some(source),
             parts,
             names,
             by_text,

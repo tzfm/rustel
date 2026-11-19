@@ -43,7 +43,7 @@ impl Realm {
         let ctx = Context::full(&rt)?;
         let effect_policy = runtime.effect_policy.clone();
         let effect_policy_refusal = runtime.effect_policy_refusal.clone();
-        let callback_ir = runtime.callback_ir.clone();
+        let callback_ir = Rc::clone(runtime.callback_ir());
         ctx.with(|ctx| -> rquickjs::Result<()> {
             let held = rquickjs::Array::new(ctx.clone())?;
             held.as_object().set_prototype(None)?;
