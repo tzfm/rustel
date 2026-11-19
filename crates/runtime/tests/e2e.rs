@@ -411,6 +411,7 @@ fn corpus_thread(name: String) -> std::thread::Builder {
 
 /// Measures a case that hit a limit under parallel load again, with no
 /// other case running. A score that is over the limit on its own fails.
+#[allow(clippy::print_stderr, reason = "the test log names each retried score")]
 fn measure_alone(case: &Case, dispatch: DspDispatch, why: &str) -> Outcome {
     eprintln!("e2e: {} measured again alone after {why}", case.name);
     let outcome = std::thread::scope(|scope| {
