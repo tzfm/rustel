@@ -1,7 +1,7 @@
 name: CI
 
 # Fast, read-only checks on every PR and main push. Heavy corpus and Studio
-# checks live in heavy.yml.
+# checks live in heavy.yml and require an exact maintainer-selected PR SHA.
 on:
   # Branch pushes are covered by the pull_request run.
   push:
