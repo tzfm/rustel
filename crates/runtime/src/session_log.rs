@@ -118,6 +118,9 @@ pub struct SessionRecorder {
     /// returns to a scene it already played writes a reference rather than
     /// the score again.
     seen: HashMap<String, usize>,
+    /// The revision of the last source recorded as installed: what a replay
+    /// of the tape plays at its end.
+    sounding: Option<String>,
 }
 
 impl SessionRecorder {
@@ -227,6 +230,7 @@ impl SessionRecorder {
             mode,
             saves: 0,
             seen: HashMap::new(),
+            sounding: None,
         };
         // Which engine produced the tape matters for a bug report and not at
         // all for a replay, so it rides with the diagnostics rather than in
@@ -317,9 +321,18 @@ impl SessionRecorder {
             record["error"] = serde_json::Value::String(error.to_string());
         }
         self.write(&record)?;
+        if status == SaveStatus::Installed {
+            self.sounding = Some(hash.clone());
+        }
         self.seen.entry(hash).or_insert(self.saves);
         self.saves += 1;
         Ok(())
+    }
+
+    /// Whether the last source recorded as installed is `source`, so a
+    /// replay of the tape already ends on it.
+    pub fn ends_on(&self, source: &str) -> bool {
+        self.sounding.as_deref() == Some(source_revision(source).as_str())
     }
 
     /// Record a gesture that changed the sound without changing the score:
@@ -774,6 +787,28 @@ fn civil_from_unix(unix_seconds: i64) -> (i64, u32, u32, u32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    /// A tape ends on the last source recorded as installed, whether it was
+    /// written out or as a reference; a rejected save in debug mode does not
+    /// change it.
+    #[test]
+    fn a_tape_ends_on_its_last_installed_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut recorder = SessionRecorder::create(
+            directory.path().join("ends.rustel-session"),
+            SessionMode::Debug,
+            None,
+        )
+        .unwrap();
+        assert!(!recorder.ends_on("a"));
+        recorder.record_save(0.0, SaveStatus::Installed, "a", None);
+        recorder.record_save(1.0, SaveStatus::Installed, "b", None);
+        assert!(recorder.ends_on("b") && !recorder.ends_on("a"));
+        recorder.record_save(2.0, SaveStatus::Rejected, "c", Some("refused"));
+        assert!(recorder.ends_on("b"), "a rejected save does not sound");
+        recorder.record_save(3.0, SaveStatus::Installed, "a", None);
+        assert!(recorder.ends_on("a"), "a reference to an earlier save");
+    }
+
     use super::*;
 
     mod line_reads {

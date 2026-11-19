@@ -620,6 +620,9 @@ impl App {
                 span.value = value;
             }
             self.owe_slider(id, value, false);
+            // A move made before its cell existed goes on the tape once the
+            // cell plays it. A move handed to its cell armed the tape then.
+            self.slider_tape_due = Some(Instant::now() + TAPE_GESTURE_SETTLE);
         }
         self.flush_pending_sliders();
     }

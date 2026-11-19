@@ -90,7 +90,7 @@ impl App {
             // current slider targets belong in the first block too, so this
             // tape does not depend on a block in the previous tape.
             let seeded = (|| {
-                if let Some(source) = self.sounding_tape_source(false) {
+                if let Some(source) = self.sounding_tape_source() {
                     recorder.try_record_save_via(
                         0.0,
                         SaveStatus::Installed,
@@ -144,7 +144,7 @@ impl App {
         self.dirty_frame = true;
     }
 
-    fn flush_tape_gestures(&mut self) {
+    pub(super) fn flush_tape_gestures(&mut self) {
         if self.slider_tape_due.take().is_some() {
             self.record_sounding_sliders();
         }
@@ -173,7 +173,7 @@ impl App {
 
     /// The installed source, including live slider targets. Reading a tape
     /// or auditioning a snippet never becomes a fresh recording of itself.
-    pub(super) fn sounding_tape_source(&self, require_slider_change: bool) -> Option<String> {
+    pub(super) fn sounding_tape_source(&self) -> Option<String> {
         #[cfg(feature = "hydra")]
         if self.snippet_preview.is_some() {
             return None;
@@ -200,20 +200,50 @@ impl App {
                     .filter(|source| source_revision(source) == installed)
                     .cloned()
             })?;
-        let mut edits = self
+        // The slider ranges index the source of the layout they came with,
+        // so a layout of another score has nothing to say about this one.
+        let sliders = self
             .visual
             .layout()
-            .into_iter()
-            .flat_map(|layout| &layout.sliders)
+            .filter(|layout| layout.source_revision == installed)
+            .map(|layout| layout.sliders.as_slice())
+            .unwrap_or_default();
+        let mut edits = sliders
+            .iter()
             .filter_map(|slider| {
-                let current = self.sliders.iter().find(|span| span.id == slider.id)?;
-                (current.value != slider.value)
-                    .then(|| (slider.from, slider.to, slider::format_value(current.value)))
+                // The value the engine plays: the editor's, within the
+                // evaluated bounds, or the layout's when an edit since has
+                // taken the slider out of the editor.
+                let plays = self
+                    .sliders
+                    .iter()
+                    .find(|span| span.id == slider.id)
+                    .map_or(slider.value, |span| {
+                        span.value.clamp(slider.min, slider.max)
+                    });
+                // Against the number the installed source holds, not the
+                // layout's value: the engine reports a moved value in the
+                // layouts it sends after the move. A literal that is not a
+                // plain number, such as `slider(x, 0, 1)`, is written as the
+                // value it plays.
+                let holds = source
+                    .get(slider.from..slider.to)
+                    .and_then(|literal| literal.trim().parse::<f64>().ok());
+                (holds != Some(plays))
+                    .then(|| (slider.from, slider.to, slider::format_value(plays)))
             })
             .collect::<Vec<_>>();
-        if require_slider_change && edits.is_empty() {
-            return None;
-        }
+        // Sliders made by one call, as a helper that calls `slider` does,
+        // share one literal that can hold only one value: those are left
+        // as written.
+        let shared = |from: usize, to: usize| {
+            sliders
+                .iter()
+                .filter(|slider| slider.from < to && from < slider.to)
+                .count()
+                > 1
+        };
+        edits.retain(|(from, to, _)| !shared(*from, *to));
         edits.sort_by_key(|(from, _, _)| std::cmp::Reverse(*from));
         let mut text = source.to_string();
         for (from, to, literal) in edits {
@@ -296,12 +326,22 @@ impl App {
         if self.recorder.is_none() {
             return;
         }
-        let Some(text) = self.sounding_tape_source(true) else {
+        let Some(text) = self.sounding_tape_source() else {
             return;
         };
         let at = self.recorder_started.elapsed().as_secs_f64();
-        if let Some(recorder) = self.recorder.as_mut() {
-            recorder.record_save_via(at, SaveStatus::Installed, &text, None, Some("slider"));
+        // A move back to the value the tape already ends on writes nothing;
+        // a move back to the evaluated value after a recorded move does.
+        let Some(recorder) = self.recorder.as_mut() else {
+            return;
+        };
+        if recorder.ends_on(&text) {
+            return;
+        }
+        recorder.record_save_via(at, SaveStatus::Installed, &text, None, Some("slider"));
+        let path = recorder.path().to_path_buf();
+        for tab in self.replays.values_mut().filter(|tab| tab.path == path) {
+            let _ = tab.reload();
         }
     }
 
@@ -880,10 +920,10 @@ mod tests {
             // A retained but unrelated layout cannot stand in for the installed
             // score, and stopping must not seed a tape from an earlier layout.
             app.evaluated_source = Some(Arc::from("s(\"stale\")"));
-            assert!(app.sounding_tape_source(false).is_none());
+            assert!(app.sounding_tape_source().is_none());
             app.evaluated_source = Some(source);
             app.installed_revision = None;
-            assert!(app.sounding_tape_source(false).is_none());
+            assert!(app.sounding_tape_source().is_none());
         }
 
         #[test]
