@@ -525,7 +525,7 @@ struct Asked<'a> {
     /// The cycle that the walk writes.
     cycle: i64,
     /// The cycles of the pattern that one cycle of the walk takes.
-    pace: Fraction,
+    pace: (i128, i128),
     /// Where the text writes the speeds and the slow counts above the
     /// layer, the innermost first.
     after: &'a [At],
@@ -561,8 +561,8 @@ impl Asked<'_> {
         {
             return Some(time);
         }
-        let numer = i128::from(at).checked_mul(self.pace.numer())?;
-        let denom = i128::from(parts).checked_mul(self.pace.denom())?;
+        let numer = i128::from(at).checked_mul(self.pace.0)?;
+        let denom = i128::from(parts).checked_mul(self.pace.1)?;
         let time = Fraction::checked_new(numer, denom)?;
         self.last = Some(((at, parts), time));
         Some(time)
@@ -642,24 +642,65 @@ fn common_turns(left: i64, right: i64) -> Option<i64> {
 enum Kind {
     Rest,
     /// The place of a value among the values, and where the text writes
-    /// it.
-    Atom(u32, At),
-    /// Two steps or more, one after the other.
-    Sequence(Steps),
+    /// it: the offset of its begin and its length. A word is far shorter
+    /// than the range of the length.
+    Atom {
+        value: u32,
+        begin: u32,
+        len: u16,
+    },
+    /// Two steps or more of the weight one, one after the other: their ids
+    /// among the ids, which need no weights.
+    EqualSequence(Among),
+    /// Two steps or more, one after the other, of any weights: their parts
+    /// among the parts.
+    WeightedSequence(Among),
     /// The patterns of a stack, among the stacked plans.
     Stack(Among),
+    /// The patterns of a stack that come one after the other among the
+    /// plans: the first plan, and the plan after the last. They need no
+    /// list.
+    StackRun(Among),
     /// Lanes, each the sequence of its steps at one unit of weight a
     /// cycle, among the lanes.
     Alternation(Among),
-    /// The pattern at a whole rate, where the text writes the rate, and
-    /// whether the pattern has one layer at most. A walk writes no layers
-    /// at a speed: they answer one after the other.
-    Faster(Id, u32, At, bool),
+    /// The pattern at a whole rate, where the text writes the rate among
+    /// the sites, and whether the pattern has one layer at most. A walk
+    /// writes no layers at a speed: they answer one after the other.
+    Faster(Id, u32, u16, bool),
     /// The pattern, a whole count of times as slow, and where the text
-    /// writes the count.
-    Slower(Id, u32, At),
+    /// writes the count among the sites.
+    Slower(Id, u32, u16),
     /// Each cycle of the pattern, a whole count of times in the cycle.
     Repeated(Id, u32),
+}
+
+impl Kind {
+    /// The atom of the value at `value`, which the text writes at `at`.
+    /// `None` for a word longer than the range of a length.
+    fn atom(value: u32, at: At) -> Option<Self> {
+        let len = u16::try_from(at.1.checked_sub(at.0)?).ok()?;
+        Some(Self::Atom {
+            value,
+            begin: at.0,
+            len,
+        })
+    }
+
+    /// Whether the steps of a sequence kind have the weight one.
+    fn is_equal(self) -> bool {
+        matches!(self, Self::EqualSequence(_))
+    }
+
+    /// Whether the patterns of a stack kind are a run of plans.
+    fn is_run(self) -> bool {
+        matches!(self, Self::StackRun(_))
+    }
+}
+
+/// Where the atom that begins at `begin` and is `len` long is written.
+fn written(begin: u32, len: u16) -> At {
+    (begin, begin + u32::from(len))
 }
 
 /// Where a plan is among the [`Plans`] of its text.
@@ -690,25 +731,31 @@ impl Among {
     }
 }
 
-/// The steps of a sequence, among the parts: each with the units of weight
-/// that it fills, of `total` units.
+/// The steps of a sequence: each fills units of weight. Steps that all have
+/// the weight one are plain ids among the ids, which need no weights. The
+/// steps of other weights are among the parts.
 #[derive(Clone, Copy)]
 struct Steps {
     parts: Among,
-    total: u32,
+    /// Whether each step has the weight one: the steps are then in one
+    /// layer. Steps of other weights are a layer each, as they answer.
+    equal: bool,
 }
 
 impl Steps {
-    /// Whether each step has the weight one: the steps are then in one
-    /// layer. Steps of other weights are a layer each, as they answer.
-    fn are_equal(&self) -> bool {
-        self.parts.range().len() == self.total as usize
+    fn len(self) -> usize {
+        self.parts.range().len()
     }
 }
 
-/// One step of a sequence: its plan, and the units of weight that it
+/// One step of a sequence that has steps of other weights: its plan, and
+/// the unit after its last unit of weight. Its first unit is the one after
+/// the last of the step before it.
+type Part = (Id, u32);
+
+/// One step as a walk reads it: its plan, and the units of weight that it
 /// fills, from the first to the one after the last.
-type Part = (Id, (u32, u32));
+type Step = (Id, (u32, u32));
 
 /// What the planner knows of a construct while it plans the constructs
 /// around it.
@@ -729,10 +776,69 @@ struct Facts {
 /// What a walk of each cycle writes as one layer.
 #[derive(Clone, Copy)]
 enum Root {
-    /// A plan, in a window of the cycle.
-    Plan(Id, Window),
+    /// A plan, in the window of the cycle from the unit `from` to the unit
+    /// `to` of `of` units.
+    Plan {
+        plan: Id,
+        from: u32,
+        to: u32,
+        of: u32,
+    },
     /// The steps of a sequence, over the cycle.
     Steps(Steps),
+}
+
+impl Root {
+    /// The window of the cycle that the root writes.
+    fn window(self) -> Window {
+        match self {
+            Self::Plan { from, to, of, .. } => Window {
+                begin: i64::from(from),
+                end: i64::from(to),
+                parts: i64::from(of),
+            },
+            Self::Steps(_) => Window::CYCLE,
+        }
+    }
+}
+
+/// A count of cycles as a fraction of whole numbers, in the range of a
+/// product of a few counts: a lane, a speed or a slow count each take a
+/// factor of it.
+#[derive(Clone, Copy)]
+struct Pace {
+    numer: u32,
+    denom: u32,
+}
+
+impl Pace {
+    const ONE: Self = Self { numer: 1, denom: 1 };
+
+    /// This pace times `numer / denom`, in lowest terms. `None` for a zero,
+    /// and outside the range of the whole numbers.
+    fn times(self, numer: u32, denom: u32) -> Option<Self> {
+        if numer == 0 || denom == 0 {
+            return None;
+        }
+        let numer = u64::from(self.numer) * u64::from(numer);
+        let denom = u64::from(self.denom) * u64::from(denom);
+        let (mut divisor, mut rest) = (numer, denom);
+        while rest != 0 {
+            (divisor, rest) = (rest, divisor % rest);
+        }
+        Some(Self {
+            numer: u32::try_from(numer / divisor).ok()?,
+            denom: u32::try_from(denom / divisor).ok()?,
+        })
+    }
+
+    fn terms(self) -> (i128, i128) {
+        (i128::from(self.numer), i128::from(self.denom))
+    }
+
+    fn fraction(self) -> Option<Fraction> {
+        Fraction::checked_new(i128::from(self.numer), i128::from(self.denom))
+    }
 }
 
 /// One layer of the rhythm of a plan.
@@ -743,25 +849,28 @@ struct LayerPlan {
     /// The cycles of the pattern that one cycle of the walk takes. A lane
     /// of an alternation, a speed and a slow count each scale it for the
     /// layers under them.
-    pace: Fraction,
+    pace: Pace,
     /// Where the text writes the speeds and the slow counts above the
-    /// layer, the innermost first.
-    after: Vec<At>,
+    /// layer, the innermost first. An empty list holds no room.
+    after: Box<[At]>,
 }
 
 impl LayerPlan {
-    fn of(root: Root, turns: i64) -> Self {
+    /// The layer of `root`, under the speeds and slow counts of `above`,
+    /// the outermost first.
+    fn of(root: Root, turns: i64, above: &[At]) -> Self {
         Self {
             root,
             turns,
-            pace: Fraction::ONE,
-            after: Vec::new(),
+            pace: Pace::ONE,
+            // One list for the layer, the innermost first.
+            after: above.iter().rev().copied().collect(),
         }
     }
 
     /// The cycles of the pattern after which the layer repeats.
     fn period(&self) -> Option<Fraction> {
-        Fraction::int(i128::from(self.turns)).checked_mul(self.pace)
+        Fraction::int(i128::from(self.turns)).checked_mul(self.pace.fraction()?)
     }
 
     /// Whether the layer holds a list of its `count` steps.
@@ -804,8 +913,14 @@ struct Plans {
     /// What the planner knows of each construct. A pattern that reads its
     /// steps from the plans keeps none of it.
     facts: Vec<Facts>,
-    /// The steps of each sequence and of each lane, one after the other.
+    /// The steps of each sequence and of each lane with steps of other
+    /// weights than one, one after the other.
     parts: Vec<Part>,
+    /// The steps of each sequence and of each lane of steps of the weight
+    /// one, one after the other.
+    ids: Vec<Id>,
+    /// Where the text writes each speed and each slow count.
+    sites: Vec<At>,
     /// The patterns of each stack.
     stacked: Vec<Id>,
     /// The lanes of each alternation.
@@ -831,8 +946,42 @@ impl Plans {
         Some(Id(id))
     }
 
-    fn parts(&self, steps: Steps) -> &[Part] {
-        &self.parts[steps.parts.range()]
+    /// The `at`th step of `steps`.
+    fn step(&self, steps: Steps, at: usize) -> Step {
+        let first = steps.parts.0 as usize;
+        if steps.equal {
+            // The steps are few enough for the range of the units.
+            let unit = at as u32;
+            return (self.ids[first + at], (unit, unit + 1));
+        }
+        let (plan, to) = self.parts[first + at];
+        let from = match at {
+            0 => 0,
+            _ => self.parts[first + at - 1].1,
+        };
+        (plan, (from, to))
+    }
+
+    /// The steps of `steps`, in the order of time.
+    fn each(&self, steps: Steps) -> impl Iterator<Item = Step> + '_ {
+        (0..steps.len()).map(move |at| self.step(steps, at))
+    }
+
+    /// The units of weight of `steps`.
+    fn total(&self, steps: Steps) -> u32 {
+        // Steps with no step are equal: the others end at their last part.
+        debug_assert!(steps.equal || steps.len() > 0);
+        match (steps.equal, steps.len()) {
+            (true, len) => len as u32,
+            (false, len) => self.parts[steps.parts.0 as usize + len - 1].1,
+        }
+    }
+
+    /// The place of the site `at` among the sites.
+    fn site(&mut self, at: At) -> Option<u16> {
+        let place = u16::try_from(self.sites.len()).ok()?;
+        self.sites.push(at);
+        Some(place)
     }
 
     /// The steps of a sequence, each with its weight. `None` for a step
@@ -850,22 +999,51 @@ impl Plans {
         let mut total = 0u32;
         for step in steps {
             let (plan, weight) = step?;
-            let from = total;
+            // A weight of zero would make the count of steps the total.
+            debug_assert!(weight > 0);
             total = total.checked_add(weight)?;
-            self.parts.push((plan, (from, total)));
+            self.parts.push((plan, total));
         }
+        let equal = total as usize == self.parts.len() - first;
+        if !equal {
+            return Some(Steps {
+                parts: Among::from(first, self.parts.len())?,
+                equal,
+            });
+        }
+        // Steps of the weight one need no weights.
+        let first_id = self.ids.len();
+        self.ids
+            .extend(self.parts.drain(first..).map(|(plan, _)| plan));
         Some(Steps {
-            parts: Among::from(first, self.parts.len())?,
-            total,
+            parts: Among::from(first_id, self.ids.len())?,
+            equal,
         })
     }
 
     /// The plan of the sequence of `steps`, which reports their weights as
     /// its step count. One step is the sequence, at any weight.
     fn sequence(&mut self, steps: Steps) -> Option<Id> {
-        let total = i64::from(steps.total);
-        let id = match *self.parts(steps) {
-            [(plan, _)] => plan,
+        let total = i64::from(self.total(steps));
+        let id = match steps.len() {
+            1 => {
+                let plan = self.step(steps, 0).0;
+                // The list of one step is no more than its plan. It leaves
+                // no room when it is the last made.
+                let first = steps.parts.0 as usize;
+                let list_len = match steps.equal {
+                    true => self.ids.len(),
+                    false => self.parts.len(),
+                };
+                debug_assert_eq!(steps.parts.1 as usize, list_len);
+                if steps.parts.1 as usize == list_len {
+                    match steps.equal {
+                        true => self.ids.truncate(first),
+                        false => self.parts.truncate(first),
+                    }
+                }
+                plan
+            }
             _ => {
                 let facts = Facts {
                     turns: self.turns(steps)?,
@@ -873,7 +1051,13 @@ impl Plans {
                     layers: self.layers(steps),
                     word: false,
                 };
-                self.add(Kind::Sequence(steps), facts)?
+                self.add(
+                    match steps.equal {
+                        true => Kind::EqualSequence(steps.parts),
+                        false => Kind::WeightedSequence(steps.parts),
+                    },
+                    facts,
+                )?
             }
         };
         let facts = &mut self.facts[id.0 as usize];
@@ -900,8 +1084,34 @@ impl Plans {
             layers,
             word: false,
         };
+        let listed = &self.stacked[first..];
+        // The members of a stack often come one after the other among the
+        // plans, as words do: they need no list.
+        let run = !listed.is_empty() && listed.windows(2).all(|pair| pair[1].0 == pair[0].0 + 1);
+        if run {
+            let (begin, end) = (
+                listed[0].0 as usize,
+                listed[listed.len() - 1].0 as usize + 1,
+            );
+            self.stacked.truncate(first);
+            return self.add(Kind::StackRun(Among::from(begin, end)?), facts);
+        }
         let patterns = Among::from(first, self.stacked.len())?;
         self.add(Kind::Stack(patterns), facts)
+    }
+
+    /// The patterns of a stack, in the order of time.
+    fn stacked(&self, patterns: Among, run: bool) -> impl Iterator<Item = Id> + '_ {
+        patterns.range().map(move |at| self.stacked_at(at, run))
+    }
+
+    /// The pattern at `at` among the patterns of a stack.
+    fn stacked_at(&self, at: usize, run: bool) -> Id {
+        match run {
+            // The plans are fewer than the range of an id.
+            true => Id(at as u32),
+            false => self.stacked[at],
+        }
     }
 
     /// The plan of lanes that each take one step a cycle. `None` for a
@@ -917,13 +1127,14 @@ impl Plans {
             if sounding == 0 {
                 continue;
             }
-            let own = self.turns(lane)?.checked_mul(i64::from(lane.total))?;
+            let own = self.turns(lane)?.checked_mul(i64::from(self.total(lane)))?;
             turns = common_turns(turns, own)?;
             layers = layers.checked_add(sounding)?;
             // A step of a weight above one fills as many cycles, but for
             // a `!` of the weight, which fills each with one of its own.
-            let fills = |(plan, (from, to)): &Part| self.lane_step(*plan, to - from).is_some();
-            self.long |= !self.parts(lane).iter().all(fills);
+            let fills = |(plan, (from, to)): Step| self.lane_step(plan, to - from).is_some();
+            let steps_fill = self.each(lane).all(fills);
+            self.long |= !steps_fill;
             self.lanes.push(lane);
         }
         let facts = Facts {
@@ -940,11 +1151,11 @@ impl Plans {
     /// text writes it. `None` for a factor that is no whole number of one
     /// or more as one atom.
     fn whole_factor(&self, values: &[Value], factor: Id) -> Option<(u32, At)> {
-        let Kind::Atom(value, at) = self.kind(factor) else {
+        let Kind::Atom { value, begin, len } = self.kind(factor) else {
             return None;
         };
         let count = crate::fraction_site_value(values.get(value as usize)?)?;
-        Some((whole_count(count)?, at))
+        Some((whole_count(count)?, written(begin, len)))
     }
 
     /// The plan of `pattern` at the speed that `factor` writes.
@@ -958,7 +1169,8 @@ impl Plans {
             word: false,
             ..under
         };
-        self.add(Kind::Faster(pattern, rate, at, under.layers <= 1), facts)
+        let speed = self.site(at)?;
+        self.add(Kind::Faster(pattern, rate, speed, under.layers <= 1), facts)
     }
 
     /// The plan of `pattern`, as many times as slow as `factor` writes.
@@ -971,7 +1183,8 @@ impl Plans {
             ..under
         };
         self.long = true;
-        self.add(Kind::Slower(pattern, times, at), facts)
+        let speed = self.site(at)?;
+        self.add(Kind::Slower(pattern, times, speed), facts)
     }
 
     /// The plan of each cycle of `pattern`, `amount` times in the cycle.
@@ -993,7 +1206,7 @@ impl Plans {
     /// a rest, and anything in brackets.
     fn tail(&mut self, values: &mut Vec<Value>, chain: Id, last: Id, at: At) -> Option<Id> {
         let word = |plan: Id| match (self.kind(plan), self.facts(plan).word) {
-            (Kind::Atom(value, _), true) => Some(value as usize),
+            (Kind::Atom { value, .. }, true) => Some(value as usize),
             _ => None,
         };
         let (words, last) = (word(chain)?, word(last)?);
@@ -1008,29 +1221,28 @@ impl Plans {
         };
         let held = u32::try_from(values.len()).ok()?;
         values.push(Value::List(list));
-        self.kinds[chain.0 as usize] = Kind::Atom(held, at);
+        self.kinds[chain.0 as usize] = Kind::atom(held, at)?;
         Some(chain)
     }
 
     /// The common multiple of the periods of `steps`.
     fn turns(&self, steps: Steps) -> Option<i64> {
-        let turns = |turns, (plan, _): &Part| common_turns(turns, self.facts(*plan).turns);
-        self.parts(steps).iter().try_fold(1, turns)
+        let turns = |turns, (plan, _): Step| common_turns(turns, self.facts(plan).turns);
+        self.each(steps).try_fold(1, turns)
     }
 
     /// How many layers the sequence of `steps` has: those of its one
     /// step, one layer for steps of the weight one, and a layer for each
     /// step that holds a value otherwise.
     fn layers(&self, steps: Steps) -> u32 {
-        let parts = self.parts(steps);
-        let sounding = parts
-            .iter()
+        let sounding = self
+            .each(steps)
             .filter(|(plan, _)| self.facts(*plan).layers > 0);
         // The steps of a text are far fewer than the range holds.
         let sounding = sounding.count() as u32;
-        match parts {
-            [(plan, _)] => self.facts(*plan).layers,
-            _ if steps.are_equal() => sounding.min(1),
+        match steps.len() {
+            1 => self.facts(self.step(steps, 0).0).layers,
+            _ if steps.equal => sounding.min(1),
             _ => sounding,
         }
     }
@@ -1062,19 +1274,25 @@ impl Plans {
     ) -> Option<()> {
         match self.kind(id) {
             Kind::Rest => Some(()),
-            Kind::Atom(value, at) => asked.step(window, value, at, speeds),
-            Kind::Sequence(steps) => self.walk_steps(steps, cycle, window, speeds, asked),
-            Kind::Stack(patterns) => self.stacked[patterns.range()]
-                .iter()
-                .try_for_each(|pattern| self.walk(*pattern, cycle, window, speeds, asked)),
+            Kind::Atom { value, begin, len } => {
+                asked.step(window, value, written(begin, len), speeds)
+            }
+            kind @ (Kind::EqualSequence(parts) | Kind::WeightedSequence(parts)) => {
+                let equal = kind.is_equal();
+                self.walk_steps(Steps { parts, equal }, cycle, window, speeds, asked)
+            }
+            kind @ (Kind::Stack(patterns) | Kind::StackRun(patterns)) => self
+                .stacked(patterns, kind.is_run())
+                .try_for_each(|pattern| self.walk(pattern, cycle, window, speeds, asked)),
             Kind::Alternation(lanes) => self.lanes[lanes.range()]
                 .iter()
                 .try_for_each(|lane| self.walk_lane(*lane, cycle, window, speeds, asked)),
-            Kind::Faster(pattern, rate, at, one_layer) => {
+            Kind::Faster(pattern, rate, speed, one_layer) => {
                 if rate > 1 && !one_layer {
                     return None;
                 }
                 let rate = i64::from(rate);
+                let at = self.sites[speed as usize];
                 let speeds = Speeds { at, above: speeds };
                 let first = cycle.checked_mul(rate)?;
                 for part in first_part(window, rate, asked)?..rate {
@@ -1113,21 +1331,44 @@ impl Plans {
         speeds: Option<&Speeds<'_>>,
         asked: &mut Asked<'_>,
     ) -> Option<()> {
-        let parts = match self.parts(steps) {
-            [(plan, _)] => return self.walk(*plan, cycle, window, speeds, asked),
-            parts => parts,
-        };
-        let total = i64::from(steps.total);
-        let part = |(from, to): (u32, u32)| window.parts((i64::from(from), i64::from(to)), total);
+        let part =
+            |from: u32, to: u32, total: i64| window.parts((i64::from(from), i64::from(to)), total);
         // The steps are in the order of time: those before the first
-        // step that the span meets are passed with no walk of them.
-        let past = |(_, units): &Part| part(*units).is_some_and(|window| asked.is_past(window));
-        for (plan, units) in &parts[parts.partition_point(past)..] {
-            let window = part(*units)?;
+        // step that the span meets are passed with no walk of them. A step
+        // is past when its end is, so the passed steps need no start.
+        let is_past =
+            |to: u32, total: i64| part(0, to, total).is_some_and(|window| asked.is_past(window));
+        let range = steps.parts.range();
+        if steps.equal {
+            let ids = &self.ids[range];
+            if let [plan] = ids {
+                return self.walk(*plan, cycle, window, speeds, asked);
+            }
+            // The steps are few enough for the range of the units.
+            let total = ids.len() as i64;
+            let first = passed(ids.len(), |at| is_past(at as u32 + 1, total));
+            for (at, plan) in ids.iter().enumerate().skip(first) {
+                let window = part(at as u32, at as u32 + 1, total)?;
+                if asked.is_ahead(window) {
+                    break;
+                }
+                self.walk(*plan, cycle, window, speeds, asked)?;
+            }
+            return Some(());
+        }
+        let parts = &self.parts[range];
+        // The steps of a list of more than one step end at their last part.
+        let total = i64::from(parts.last()?.1);
+        let first = parts.partition_point(|(_, to)| is_past(*to, total));
+        // The start of a step is the end of the step before it.
+        let mut from = first.checked_sub(1).map_or(0, |before| parts[before].1);
+        for (plan, to) in &parts[first..] {
+            let window = part(from, *to, total)?;
             if asked.is_ahead(window) {
                 break;
             }
             self.walk(*plan, cycle, window, speeds, asked)?;
+            from = *to;
         }
         Some(())
     }
@@ -1144,16 +1385,25 @@ impl Plans {
         speeds: Option<&Speeds<'_>>,
         asked: &mut Asked<'_>,
     ) -> Option<()> {
-        if steps.total == 0 {
-            return Some(());
+        let range = steps.parts.range();
+        if steps.equal {
+            let ids = &self.ids[range];
+            if ids.is_empty() {
+                return Some(());
+            }
+            // Each step fills one cycle: the turn of the cycle names it.
+            let total = ids.len() as i64;
+            let (turn, unit) = (cycle.div_euclid(total), cycle.rem_euclid(total));
+            return self.walk(ids[unit as usize], turn, window, speeds, asked);
         }
-        let total = i64::from(steps.total);
+        let parts = &self.parts[range];
+        let total = i64::from(parts.last()?.1);
         let (turn, unit) = (cycle.div_euclid(total), cycle.rem_euclid(total));
-        let parts = self.parts(steps);
-        let at = parts.partition_point(|(_, (_, to))| i64::from(*to) <= unit);
-        let (plan, (from, to)) = parts.get(at)?;
+        let at = parts.partition_point(|(_, to)| i64::from(*to) <= unit);
+        let (plan, to) = *parts.get(at)?;
+        let from = at.checked_sub(1).map_or(0, |before| parts[before].1);
         self.walk(
-            self.lane_step(*plan, to - from)?,
+            self.lane_step(plan, to - from)?,
             turn,
             window,
             speeds,
@@ -1164,21 +1414,21 @@ impl Plans {
     /// [`Self::walk`] for what a layer writes.
     fn walk_root(&self, root: Root, cycle: i64, asked: &mut Asked<'_>) -> Option<()> {
         match root {
-            Root::Plan(id, window) => self.walk(id, cycle, window, None, asked),
+            Root::Plan { plan, .. } => self.walk(plan, cycle, root.window(), None, asked),
             Root::Steps(steps) => self.walk_steps(steps, cycle, Window::CYCLE, None, asked),
         }
     }
 
     /// The layers of the rhythm of the construct at `id`, after those of
     /// `out`. A construct with no value has no layer.
-    fn layers_onto(&self, id: Id, out: &mut Vec<LayerPlan>) -> Option<()> {
+    fn layers_onto(&self, id: Id, out: &mut Vec<LayerPlan>, above: &mut Vec<At>) -> Option<()> {
         let small = |period: &Fraction| {
             period.numer() <= MAX_PERIOD_TERM && period.denom() <= MAX_PERIOD_TERM
         };
-        // The layers from `from` on, `factor` times as slow.
-        let slower = |layers: &mut [LayerPlan], factor: Fraction| {
+        // The layers from `from` on, `numer / denom` times as slow.
+        let slower = |layers: &mut [LayerPlan], numer: u32, denom: u32| {
             layers.iter_mut().try_for_each(|layer| {
-                layer.pace = layer.pace.checked_mul(factor)?;
+                layer.pace = layer.pace.times(numer, denom)?;
                 layer.period().filter(small).map(drop)
             })
         };
@@ -1188,35 +1438,42 @@ impl Plans {
         }
         match self.kind(id) {
             Kind::Rest => Some(()),
-            Kind::Sequence(steps) => self.layers_of_steps(steps, out),
-            Kind::Stack(patterns) => self.stacked[patterns.range()]
-                .iter()
-                .try_for_each(|pattern| self.layers_onto(*pattern, out)),
+            kind @ (Kind::EqualSequence(parts) | Kind::WeightedSequence(parts)) => {
+                let equal = kind.is_equal();
+                self.layers_of_steps(Steps { parts, equal }, out, above)
+            }
+            kind @ (Kind::Stack(patterns) | Kind::StackRun(patterns)) => self
+                .stacked(patterns, kind.is_run())
+                .try_for_each(|pattern| self.layers_onto(pattern, out, above)),
             Kind::Alternation(lanes) => self.lanes[lanes.range()].iter().try_for_each(|lane| {
                 let from = out.len();
-                self.layers_of_steps(*lane, out)?;
-                slower(&mut out[from..], Fraction::int(i128::from(lane.total)))
+                self.layers_of_steps(*lane, out, above)?;
+                slower(&mut out[from..], self.total(*lane), 1)
             }),
-            kind @ (Kind::Faster(pattern, count, at, _) | Kind::Slower(pattern, count, at)) => {
+            kind @ (Kind::Faster(pattern, count, speed, _)
+            | Kind::Slower(pattern, count, speed)) => {
                 let from = out.len();
-                self.layers_onto(pattern, out)?;
-                let count = Fraction::int(i128::from(count));
+                // The place of the factor comes after those of a value.
+                above.push(self.sites[speed as usize]);
+                self.layers_onto(pattern, out, above)?;
+                above.pop();
                 // A speed divides the period of each layer, and a slow
                 // count multiplies it.
-                let longer = match kind {
-                    Kind::Faster(..) => Fraction::ONE.checked_div(count)?,
-                    _ => count,
+                let (numer, denom) = match kind {
+                    Kind::Faster(..) => (1, count),
+                    _ => (count, 1),
                 };
-                slower(&mut out[from..], longer)?;
-                // The place of the factor comes after those of a value.
-                for layer in &mut out[from..] {
-                    layer.after.push(at);
-                }
-                Some(())
+                slower(&mut out[from..], numer, denom)
             }
             // An atom, and a repeat: one layer of each cycle.
-            Kind::Atom(..) | Kind::Repeated(..) => {
-                out.push(LayerPlan::of(Root::Plan(id, Window::CYCLE), facts.turns));
+            Kind::Atom { .. } | Kind::Repeated(..) => {
+                let root = Root::Plan {
+                    plan: id,
+                    from: 0,
+                    to: 1,
+                    of: 1,
+                };
+                out.push(LayerPlan::of(root, facts.turns, above));
                 Some(())
             }
         }
@@ -1225,22 +1482,27 @@ impl Plans {
     /// The layers of the sequence of `steps`, after those of `out`: those
     /// of its one step, one layer for steps of the weight one, and a layer
     /// for each step otherwise.
-    fn layers_of_steps(&self, steps: Steps, out: &mut Vec<LayerPlan>) -> Option<()> {
+    fn layers_of_steps(
+        &self,
+        steps: Steps,
+        out: &mut Vec<LayerPlan>,
+        above: &mut Vec<At>,
+    ) -> Option<()> {
         if self.layers(steps) == 0 {
             return Some(());
         }
-        match self.parts(steps) {
-            [(plan, _)] => self.layers_onto(*plan, out),
-            _ if steps.are_equal() => {
-                out.push(LayerPlan::of(Root::Steps(steps), self.turns(steps)?));
+        match steps.len() {
+            1 => self.layers_onto(self.step(steps, 0).0, out, above),
+            _ if steps.equal => {
+                out.push(LayerPlan::of(Root::Steps(steps), self.turns(steps)?, above));
                 Some(())
             }
-            parts => parts.iter().try_for_each(|(plan, (from, to))| {
-                let units = (i64::from(*from), i64::from(*to));
-                let window = Window::CYCLE.parts(units, i64::from(steps.total))?;
-                let facts = self.facts(*plan);
+            _ => self.each(steps).try_for_each(|(plan, (from, to))| {
+                let facts = self.facts(plan);
                 if facts.layers > 0 {
-                    out.push(LayerPlan::of(Root::Plan(*plan, window), facts.turns));
+                    let of = self.total(steps);
+                    let root = Root::Plan { plan, from, to, of };
+                    out.push(LayerPlan::of(root, facts.turns, above));
                 }
                 Some(())
             }),
@@ -1252,7 +1514,7 @@ impl Plans {
     /// and for more steps than a layer holds.
     fn reads(&self, layer: &LayerPlan) -> Option<usize> {
         let count = match layer.root {
-            Root::Plan(id, window) => self.survey(id, layer.turns, window.parts)?.count,
+            Root::Plan { plan, of, .. } => self.survey(plan, layer.turns, i64::from(of))?.count,
             Root::Steps(steps) => self.survey_steps(steps, layer.turns, 1)?,
         };
         usize::try_from(count).ok().filter(|_| count <= MOST_STEPS)
@@ -1271,18 +1533,25 @@ impl Plans {
                 count: 0,
                 fills: true,
             },
-            Kind::Atom(..) => Survey {
+            Kind::Atom { .. } => Survey {
                 count: cycles,
                 fills: true,
             },
-            Kind::Sequence(steps) => Survey {
-                count: self.survey_steps(steps, cycles, parts)?,
+            kind @ (Kind::EqualSequence(list) | Kind::WeightedSequence(list)) => Survey {
+                count: self.survey_steps(
+                    Steps {
+                        parts: list,
+                        equal: kind.is_equal(),
+                    },
+                    cycles,
+                    parts,
+                )?,
                 fills: false,
             },
-            Kind::Stack(patterns) => {
-                let patterns = self.stacked[patterns.range()].iter();
+            kind @ (Kind::Stack(patterns) | Kind::StackRun(patterns)) => {
+                let patterns = self.stacked(patterns, kind.is_run());
                 Survey {
-                    count: together(patterns.map(|pattern| self.survey(*pattern, cycles, parts)))?,
+                    count: together(patterns.map(|pattern| self.survey(pattern, cycles, parts)))?,
                     fills: true,
                 }
             }
@@ -1324,14 +1593,13 @@ impl Plans {
     /// How many steps `cycles` cycles of the sequence of `steps` hold. See
     /// [`Self::survey`]: a sequence is in order when each step is.
     fn survey_steps(&self, steps: Steps, cycles: i64, parts: i64) -> Option<i64> {
-        let list = self.parts(steps);
-        let parts = match list.len() {
+        let parts = match steps.len() {
             1 => parts,
-            _ => parts.checked_mul(i64::from(steps.total))?,
+            _ => parts.checked_mul(i64::from(self.total(steps)))?,
         };
-        sum(list
-            .iter()
-            .map(|(plan, _)| Some(self.survey(*plan, cycles, parts)?.count)))
+        sum(self
+            .each(steps)
+            .map(|(plan, _)| Some(self.survey(plan, cycles, parts)?.count)))
     }
 
     /// [`Self::survey`] for the lane of `steps`.
@@ -1340,14 +1608,14 @@ impl Plans {
             count: 0,
             fills: true,
         };
-        let total = i64::from(steps.total);
+        let total = i64::from(self.total(steps));
         // The cycles hold each step of the lane a whole count of times.
         if cycles % total != 0 {
             return None;
         }
-        for (plan, (from, to)) in self.parts(steps) {
+        for (plan, (from, to)) in self.each(steps) {
             let weight = to - from;
-            let step = self.survey(self.lane_step(*plan, weight)?, cycles / total, parts)?;
+            let step = self.survey(self.lane_step(plan, weight)?, cycles / total, parts)?;
             // Each cycle of the step writes the same cycle of its plan.
             let count = step.count.checked_mul(i64::from(weight))?;
             lane = Survey {
@@ -1366,18 +1634,25 @@ impl Plans {
     fn localize(&mut self, id: Id, local: &mut [u32], held: &mut Vec<u32>) {
         match self.kind(id) {
             Kind::Rest => {}
-            Kind::Atom(value, at) => {
+            Kind::Atom { value, begin, len } => {
                 let place = &mut local[value as usize];
                 if *place == 0 {
                     held.push(value);
                     *place = held.len() as u32;
                 }
-                self.kinds[id.0 as usize] = Kind::Atom(*place - 1, at);
+                self.kinds[id.0 as usize] = Kind::Atom {
+                    value: *place - 1,
+                    begin,
+                    len,
+                };
             }
-            Kind::Sequence(steps) => self.localize_steps(steps, local, held),
-            Kind::Stack(patterns) => {
-                for pattern in patterns.range() {
-                    self.localize(self.stacked[pattern], local, held);
+            kind @ (Kind::EqualSequence(parts) | Kind::WeightedSequence(parts)) => {
+                let equal = kind.is_equal();
+                self.localize_steps(Steps { parts, equal }, local, held)
+            }
+            kind @ (Kind::Stack(patterns) | Kind::StackRun(patterns)) => {
+                for at in patterns.range() {
+                    self.localize(self.stacked_at(at, kind.is_run()), local, held);
                 }
             }
             Kind::Alternation(lanes) => {
@@ -1393,8 +1668,8 @@ impl Plans {
 
     /// [`Self::localize`] for each step of `steps`.
     fn localize_steps(&mut self, steps: Steps, local: &mut [u32], held: &mut Vec<u32>) {
-        for part in steps.parts.range() {
-            self.localize(self.parts[part].0, local, held);
+        for at in 0..steps.len() {
+            self.localize(self.step(steps, at).0, local, held);
         }
     }
 
@@ -1409,7 +1684,7 @@ impl Plans {
         local.resize(values.len(), 0);
         let mut held = Vec::new();
         match layer.root {
-            Root::Plan(id, _) => self.localize(id, local, &mut held),
+            Root::Plan { plan, .. } => self.localize(plan, local, &mut held),
             Root::Steps(steps) => self.localize_steps(steps, local, &mut held),
         }
         // The next layer holds none of these values yet.
@@ -1429,7 +1704,7 @@ impl Plans {
     fn read(
         &self,
         layer: &LayerPlan,
-        pace: Fraction,
+        pace: (i128, i128),
         begin: Fraction,
         end: Fraction,
         each: &mut dyn FnMut(SourceStep),
@@ -1440,8 +1715,8 @@ impl Plans {
         // The span in cycles of the walk: each bound over the pace, as a
         // whole number over a whole number, with no fraction made.
         let walked = |time: Fraction| {
-            let numer = time.numer().checked_mul(pace.denom())?;
-            let denom = time.denom().checked_mul(pace.numer())?;
+            let numer = time.numer().checked_mul(pace.1)?;
+            let denom = time.denom().checked_mul(pace.0)?;
             (numer.abs() <= MOST_SPAN_TERM && denom <= MOST_SPAN_TERM).then_some((numer, denom))
         };
         let (from, to) = (walked(begin)?, walked(end)?);
@@ -1470,8 +1745,8 @@ impl Plans {
             asked.cycle = i64::try_from(cycle).ok()?;
             // A step of a sequence with weights sounds in its own window
             // of the cycle only.
-            if let Root::Plan(_, window) = root
-                && (asked.is_past(*window) || asked.is_ahead(*window))
+            if let Root::Plan { .. } = root
+                && (asked.is_past(root.window()) || asked.is_ahead(root.window()))
             {
                 continue;
             }
@@ -1490,7 +1765,7 @@ impl Plans {
     ) -> Option<Vec<SequenceStep>> {
         let mut steps = Vec::with_capacity(count);
         // One cycle of the walk is one of the equal shares of the period.
-        let share = Fraction::checked_new(1, i128::from(layer.turns))?;
+        let share = (1, i128::from(layer.turns));
         self.read(layer, share, Fraction::ZERO, Fraction::ONE, &mut |step| {
             // A handle of the value, for the step.
             let value = values[step.value as usize].clone();
@@ -1505,6 +1780,10 @@ impl Plans {
     fn for_walks(mut self) -> Self {
         self.kinds.shrink_to_fit();
         self.parts.shrink_to_fit();
+        self.ids.shrink_to_fit();
+        self.sites.shrink_to_fit();
+        self.stacked.shrink_to_fit();
+        self.lanes.shrink_to_fit();
         Self {
             facts: Vec::new(),
             ..self
@@ -1517,13 +1796,13 @@ impl Plans {
 struct PlanLayer {
     plans: Arc<Plans>,
     layer: LayerPlan,
-    /// How many steps a period holds.
-    count: usize,
+    /// How many steps a period holds, at most the most steps of a layer.
+    count: u32,
 }
 
 impl StepSource for PlanLayer {
     fn count(&self) -> usize {
-        self.count
+        self.count as usize
     }
 
     fn steps(
@@ -1533,7 +1812,7 @@ impl StepSource for PlanLayer {
         each: &mut dyn FnMut(SourceStep),
     ) -> Option<()> {
         self.plans
-            .read(&self.layer, self.layer.pace, begin, end, each)
+            .read(&self.layer, self.layer.pace.terms(), begin, end, each)
     }
 }
 
@@ -1563,6 +1842,8 @@ impl Room {
             kinds,
             facts,
             parts,
+            ids,
+            sites,
             stacked,
             lanes,
             long: _,
@@ -1571,6 +1852,8 @@ impl Room {
             kinds.capacity(),
             facts.capacity(),
             parts.capacity(),
+            ids.capacity(),
+            sites.capacity(),
             stacked.capacity(),
             lanes.capacity(),
             self.values.capacity(),
@@ -1588,6 +1871,8 @@ impl Room {
             kinds,
             facts,
             parts,
+            ids,
+            sites,
             stacked,
             lanes,
             long,
@@ -1599,6 +1884,9 @@ impl Room {
         facts.reserve(words);
         parts.clear();
         parts.reserve(words);
+        ids.clear();
+        ids.reserve(words);
+        sites.clear();
         stacked.clear();
         lanes.clear();
         *long = false;
@@ -1646,7 +1934,7 @@ impl<'r> Planned<'r> {
     fn layers(&self) -> Option<Vec<(LayerPlan, usize)>> {
         let plans = &self.room.plans;
         let mut layers = Vec::new();
-        plans.layers_onto(self.root, &mut layers)?;
+        plans.layers_onto(self.root, &mut layers, &mut Vec::new())?;
         let counted = layers.into_iter().map(|layer| {
             let count = plans.reads(&layer)?;
             Some((layer, count))
@@ -1670,9 +1958,10 @@ impl<'r> Planned<'r> {
     pub(crate) fn pattern(self) -> Option<Pattern> {
         let steps = self.steps();
         let layers = match self.room.plans.kind(self.root) {
-            Kind::Atom(value, at) => {
+            Kind::Atom { value, begin, len } => {
                 let value = self.room.values.swap_remove(value as usize);
-                return Some(constant(value, vec![place(at)]).with_steps(steps));
+                let at = place(written(begin, len));
+                return Some(constant(value, vec![at]).with_steps(steps));
             }
             _ => self.layers()?,
         };
@@ -1705,12 +1994,26 @@ impl<'r> Planned<'r> {
                     // A handle of the plans, for each layer.
                     plans: Arc::clone(kept.as_ref()?),
                     layer,
-                    count,
+                    count: u32::try_from(count).ok()?,
                 }),
             }))
         });
         Some(sequence_of(given.collect::<Option<_>>()?)?.with_steps(steps))
     }
+}
+
+/// The count of the first `len` steps that `is_past` is true of, which are
+/// the steps before the first that is not: `is_past` is false after them.
+fn passed(len: usize, is_past: impl Fn(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0, len);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match is_past(middle) {
+            true => low = middle + 1,
+            false => high = middle,
+        }
+    }
+    low
 }
 
 /// The first of the `count` equal parts of `window` that does not end
@@ -1833,13 +2136,13 @@ impl<'a> Build<'a> for Planner<'a, '_> {
             "-" | "~" => Kind::Rest,
             _ => {
                 let at = written_at(self.src, self.offset, &span)?;
-                Kind::Atom(self.value(word, span.end)?, at)
+                Kind::atom(self.value(word, span.end)?, at)?
             }
         };
         let facts = Facts {
             turns: 1,
             steps: 1,
-            layers: u32::from(matches!(kind, Kind::Atom(..))),
+            layers: u32::from(matches!(kind, Kind::Atom { .. })),
             word: true,
         };
         self.room.plans.add(kind, facts)
@@ -1943,6 +2246,133 @@ fn lcm(left: i128, right: i128) -> Option<i128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plan_holds_few_bytes() {
+        use std::mem::size_of;
+        assert!(size_of::<Kind>() <= 12);
+        assert!(size_of::<Part>() <= 8);
+        assert!(size_of::<Root>() <= 20);
+        assert!(size_of::<Pace>() <= 8);
+        assert!(size_of::<LayerPlan>() <= 56);
+        assert!(size_of::<PlanLayer>() <= 72);
+    }
+
+    fn plans_of(text: &str, room: &mut Room) -> Plans {
+        assert!(Planned::read(text, 0, room).unwrap().is_some());
+        std::mem::take(&mut room.plans)
+    }
+
+    /// Steps of the weight one are plain ids with no weights.
+    #[test]
+    fn equal_steps_keep_ids_and_no_parts() {
+        let plans = plans_of("<a b c d e>", &mut Room::default());
+        assert!(plans.parts.is_empty());
+        // The five steps of the lane, and no list for an atom alone.
+        assert_eq!(plans.ids.len(), 5);
+    }
+
+    /// Steps of other weights keep the end of each, and read the start of a
+    /// step from the end of the step before it.
+    #[test]
+    fn weighted_steps_read_their_units_from_their_ends() {
+        let plans = plans_of("<a@3 b c@2>", &mut Room::default());
+        assert!(plans.ids.is_empty());
+        let lane = plans.lanes[0];
+        assert!(!lane.equal);
+        assert_eq!(plans.total(lane), 6);
+        let units: Vec<_> = plans.each(lane).map(|(_, units)| units).collect();
+        assert_eq!(units, [(0, 3), (3, 4), (4, 6)]);
+        assert_eq!(passed(3, |at| plans.step(lane, at).1.1 <= 3), 1);
+    }
+
+    /// A list that a pattern keeps has no spare room.
+    #[test]
+    fn kept_plans_hold_no_spare_room() {
+        let mut room = Room::default();
+        let text = "<[a,b,c] [d,e,f]@2 g h i j k l>*2";
+        let kept = plans_of(text, &mut room).for_walks();
+        assert!(kept.facts.is_empty());
+        assert_eq!(kept.kinds.capacity(), kept.kinds.len());
+        assert_eq!(kept.parts.capacity(), kept.parts.len());
+        assert_eq!(kept.ids.capacity(), kept.ids.len());
+        assert_eq!(kept.sites.capacity(), kept.sites.len());
+        assert_eq!(kept.stacked.capacity(), kept.stacked.len());
+        assert_eq!(kept.lanes.capacity(), kept.lanes.len());
+    }
+
+    /// A stack of words keeps no list of its members, and a stack of other
+    /// constructs does.
+    #[test]
+    fn a_stack_of_words_keeps_no_list() {
+        let plans = plans_of("<[a,b,c] [d,e,f]>", &mut Room::default());
+        assert!(plans.stacked.is_empty());
+        let plans = plans_of("<[a,b c] [d,e]>", &mut Room::default());
+        assert_eq!(plans.stacked.len(), 2);
+        let run = |plans: &Plans, id: usize| match plans.kinds[id] {
+            Kind::StackRun(patterns) => plans.stacked(patterns, true).map(|id| id.0).collect(),
+            _ => Vec::new(),
+        };
+        let plans = plans_of("[a,b,c]", &mut Room::default());
+        assert_eq!(run(&plans, 3), [0, 1, 2]);
+    }
+
+    /// A sequence of one step is its step: it keeps no list.
+    #[test]
+    fn a_sequence_of_one_step_keeps_no_list() {
+        let plans = plans_of("[[a]] b", &mut Room::default());
+        assert_eq!(plans.ids.len(), 2);
+        assert!(plans.parts.is_empty());
+    }
+
+    #[test]
+    fn a_pace_stays_exact_and_in_lowest_terms() {
+        let pace = Pace::ONE.times(6, 1).unwrap().times(1, 4).unwrap();
+        assert_eq!((pace.numer, pace.denom), (3, 2));
+        assert!(Pace::ONE.times(u32::MAX, 1).unwrap().times(2, 1).is_none());
+        assert!(
+            Pace::ONE
+                .times(1 << 20, 1)
+                .unwrap()
+                .times(1, 1 << 20)
+                .is_some_and(|pace| pace.terms() == (1, 1))
+        );
+    }
+
+    /// The places of the speeds above a layer come innermost first, one
+    /// list for the layer.
+    #[test]
+    fn a_layer_lists_the_places_of_its_speeds_innermost_first() {
+        let mut room = Room::default();
+        let planned = Planned::read("<a b c d e>*2/3", 0, &mut room)
+            .unwrap()
+            .unwrap();
+        let layers = planned.layers().unwrap();
+        let after = &layers[0].0.after;
+        assert_eq!(after.len(), 2);
+        assert!(after[0].0 < after[1].0);
+    }
+
+    #[test]
+    fn a_pace_refuses_a_zero() {
+        assert!(Pace::ONE.times(0, 1).is_none());
+        assert!(Pace::ONE.times(1, 0).is_none());
+        assert!(Pace::ONE.times(0, 0).is_none());
+    }
+
+    /// A layer under no speed keeps no list of places.
+    #[test]
+    fn a_layer_under_no_speed_has_an_empty_after() {
+        let mut room = Room::default();
+        let planned = Planned::read("<a b c d e>", 0, &mut room).unwrap().unwrap();
+        let layers = planned.layers().unwrap();
+        assert!(layers[0].0.after.is_empty());
+        let planned = Planned::read("<a b c d e>*2", 0, &mut room)
+            .unwrap()
+            .unwrap();
+        let layers = planned.layers().unwrap();
+        assert_eq!(layers[0].0.after.len(), 1);
+    }
 
     /// A word that a text writes again has the value that it made the
     /// first time: a text of many words holds one value for each word.
