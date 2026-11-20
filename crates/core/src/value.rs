@@ -30,6 +30,7 @@ const MAX_PATCHES: usize = 8;
 /// 6 bits hold `Table::mark_bit`. Saves 14 bytes per entry vs `(Key, Value)`.
 pub(crate) trait BuiltinEntries: Send + Sync {
     fn parts(&self) -> (&[u16], &[Value]);
+    fn parts_mut(&mut self) -> (&[u16], &mut [Value]);
 }
 
 struct BuiltinMap<const N: usize> {
@@ -42,23 +43,25 @@ impl<const N: usize> BuiltinEntries for BuiltinMap<N> {
     fn parts(&self) -> (&[u16], &[Value]) {
         (&self.keys, &self.values)
     }
+
+    #[inline(always)]
+    fn parts_mut(&mut self) -> (&[u16], &mut [Value]) {
+        (&self.keys, &mut self.values)
+    }
 }
 
-const MAX_BUILTIN_MAP_LEN: usize = 12;
+const MAX_BUILTIN_MAP_LEN: usize = 24;
 
 /// Pack `count` `(packed_key, value)` pairs from stack buffers into an exact-sized
-/// `Arc<BuiltinMap<N>>` (`1 <= count <= 12`).
-fn make_builtin_arc(
-    count: usize,
-    keys: &[u16; MAX_BUILTIN_MAP_LEN],
-    values: &mut [Value; MAX_BUILTIN_MAP_LEN],
-) -> Arc<dyn BuiltinEntries> {
+/// `Arc<BuiltinMap<N>>` (`1 <= count <= 24`).
+fn make_builtin_arc(count: usize, keys: &[u16], values: &mut [Value]) -> Arc<dyn BuiltinEntries> {
     macro_rules! build {
         ($($n:literal),+) => {
             match count {
                 $(
                     $n => {
-                        let k = std::array::from_fn::<u16, $n, _>(|i| keys[i]);
+                        let mut k = [0u16; $n];
+                        k.copy_from_slice(&keys[..$n]);
                         let v = std::array::from_fn::<Value, $n, _>(|i| {
                             std::mem::replace(&mut values[i], Value::Undefined)
                         });
@@ -69,55 +72,71 @@ fn make_builtin_arc(
             }
         };
     }
-    build!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+    build!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    )
+}
+
+/// Build `Entries` from `count` `(Key, Value)` items using a stack buffer of
+/// size `CAP`, packing into `Entries::Builtin` when every key is a canonical
+/// built-in control name.
+fn pack_entries_capped<const CAP: usize>(
+    count: usize,
+    mut next: impl FnMut(usize) -> (Key, Value),
+    made: bool,
+) -> Entries {
+    let mut keys = [0u16; CAP];
+    let mut values = [const { Value::Undefined }; CAP];
+    let mut fallback: Option<Vec<(Key, Value)>> = None;
+    for i in 0..count {
+        let (key, value) = next(i);
+        if let Some(vec) = &mut fallback {
+            vec.push((key, value));
+            continue;
+        }
+        let packed = crate::controls::pack_builtin_key_str(key.as_str());
+        if packed != 0 {
+            keys[i] = packed;
+            values[i] = value;
+        } else {
+            let mut vec = Vec::with_capacity(count);
+            for j in 0..i {
+                let id = keys[j] & 0x03ff;
+                let k = crate::controls::builtin_key_ref_by_id(id)
+                    .expect("packed builtin id")
+                    .clone();
+                let v = std::mem::replace(&mut values[j], Value::Undefined);
+                vec.push((k, v));
+            }
+            vec.push((key, value));
+            fallback = Some(vec);
+        }
+    }
+    match fallback {
+        None => Entries::Builtin(make_builtin_arc(count, &keys, &mut values), made),
+        Some(vec) => {
+            let shares: Shares = vec.into();
+            if made {
+                Entries::Made(shares)
+            } else {
+                Entries::Shared(shares)
+            }
+        }
+    }
 }
 
 /// Build `Entries` from `count` `(Key, Value)` items, packing into
-/// `Entries::Builtin` when `1 <= count <= 12` and every key is a canonical
+/// `Entries::Builtin` when `1 <= count <= 24` and every key is a canonical
 /// built-in control name.
-fn pack_entries(count: usize, mut next: impl FnMut(usize) -> (Key, Value), made: bool) -> Entries {
+fn pack_entries(count: usize, next: impl FnMut(usize) -> (Key, Value), made: bool) -> Entries {
     if count == 0 {
         return Entries::Empty;
     }
+    if count <= 8 {
+        return pack_entries_capped::<8>(count, next, made);
+    }
     if count <= MAX_BUILTIN_MAP_LEN {
-        let mut keys = [0u16; MAX_BUILTIN_MAP_LEN];
-        let mut values: [Value; MAX_BUILTIN_MAP_LEN] = std::array::from_fn(|_| Value::Undefined);
-        let mut fallback: Option<Vec<(Key, Value)>> = None;
-        for i in 0..count {
-            let (key, value) = next(i);
-            if let Some(vec) = &mut fallback {
-                vec.push((key, value));
-                continue;
-            }
-            let packed = crate::controls::pack_builtin_key_str(key.as_str());
-            if packed != 0 {
-                keys[i] = packed;
-                values[i] = value;
-            } else {
-                let mut vec = Vec::with_capacity(count);
-                for j in 0..i {
-                    let id = keys[j] & 0x03ff;
-                    let k = crate::controls::builtin_key_ref_by_id(id)
-                        .expect("packed builtin id")
-                        .clone();
-                    let v = std::mem::replace(&mut values[j], Value::Undefined);
-                    vec.push((k, v));
-                }
-                vec.push((key, value));
-                fallback = Some(vec);
-            }
-        }
-        return match fallback {
-            None => Entries::Builtin(make_builtin_arc(count, &keys, &mut values), made),
-            Some(vec) => {
-                let shares: Shares = vec.into();
-                if made {
-                    Entries::Made(shares)
-                } else {
-                    Entries::Shared(shares)
-                }
-            }
-        };
+        return pack_entries_capped::<MAX_BUILTIN_MAP_LEN>(count, next, made);
     }
     let shares: Shares = (0..count).map(next).collect();
     if made {
@@ -232,7 +251,11 @@ impl<'a> Slice<'a> {
     pub(crate) fn iter(self) -> SliceIter<'a> {
         match self {
             Self::Plain(entries) => SliceIter::Plain(entries.iter()),
-            Self::Builtin(keys, values) => SliceIter::Builtin(keys.iter(), values.iter()),
+            Self::Builtin(keys, values) => SliceIter::Builtin(
+                keys.iter(),
+                values.iter(),
+                crate::controls::builtin_key_slice(),
+            ),
         }
     }
 
@@ -279,7 +302,11 @@ impl<'a> Slice<'a> {
 #[derive(Clone)]
 pub(crate) enum SliceIter<'a> {
     Plain(std::slice::Iter<'a, (Key, Value)>),
-    Builtin(std::slice::Iter<'a, u16>, std::slice::Iter<'a, Value>),
+    Builtin(
+        std::slice::Iter<'a, u16>,
+        std::slice::Iter<'a, Value>,
+        &'static [Key],
+    ),
 }
 
 impl<'a> Iterator for SliceIter<'a> {
@@ -289,11 +316,10 @@ impl<'a> Iterator for SliceIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Plain(iter) => iter.next().map(|(k, v)| (k, v)),
-            Self::Builtin(keys, values) => {
+            Self::Builtin(keys, values, key_table) => {
                 let (&packed, value) = (keys.next()?, values.next()?);
-                let key = crate::controls::builtin_key_ref_by_id(packed & 0x03ff)
-                    .expect("packed builtin id");
-                Some((key, value))
+                let index = usize::from((packed & 0x03ff) - 1);
+                Some((&key_table[index], value))
             }
         }
     }
@@ -302,7 +328,7 @@ impl<'a> Iterator for SliceIter<'a> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let len = match self {
             Self::Plain(iter) => iter.len(),
-            Self::Builtin(keys, _) => keys.len(),
+            Self::Builtin(keys, _, _) => keys.len(),
         };
         (len, Some(len))
     }
@@ -1027,16 +1053,18 @@ impl Table {
 
     /// Bit position (`0..63`) of a key name's bloom mark.
     #[inline(always)]
-    pub(crate) fn mark_bit(name: &str) -> u8 {
+    pub(crate) const fn mark_bit(name: &str) -> u8 {
         let bytes = name.as_bytes();
-        let (Some(&first), Some(&last)) = (bytes.first(), bytes.last()) else {
+        if bytes.is_empty() {
             return 0;
-        };
+        }
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
         let middle = bytes[bytes.len() / 2];
         let mixed = (bytes.len() as u32 & 0xff)
-            | u32::from(first) << 8
-            | u32::from(last) << 16
-            | u32::from(middle) << 24;
+            | ((first as u32) << 8)
+            | ((last as u32) << 16)
+            | ((middle as u32) << 24);
         ((mixed.wrapping_mul(0x9E37_79B1) >> 26) % 63) as u8
     }
 
@@ -1646,14 +1674,19 @@ impl OrderedMap {
         Arc::get_mut(entries).expect("entries that no other map shares")
     }
 
-    /// Replace entry at `at` with `value`, keeping `Entries::Builtin` compact.
+    /// Replace entry at `at` with `value`, keeping `Entries::Builtin` compact
+    /// and mutating in place when uniquely owned.
     fn replace_at(&mut self, at: usize, value: Value, made: bool) {
-        if let Entries::Builtin(b, _) = &self.entries {
+        if let Entries::Builtin(b, is_made) = &mut self.entries {
+            if let Some(own) = Arc::get_mut(b) {
+                own.parts_mut().1[at] = value;
+                *is_made = made;
+                return;
+            }
             let (keys_slice, vals_slice) = b.parts();
             let count = keys_slice.len();
             let mut keys = [0u16; MAX_BUILTIN_MAP_LEN];
-            let mut values: [Value; MAX_BUILTIN_MAP_LEN] =
-                std::array::from_fn(|_| Value::Undefined);
+            let mut values = [const { Value::Undefined }; MAX_BUILTIN_MAP_LEN];
             keys[..count].copy_from_slice(keys_slice);
             let mut slot = Some(value);
             for (i, v) in vals_slice.iter().enumerate() {
@@ -1799,8 +1832,7 @@ impl OrderedMap {
             let packed = crate::controls::pack_builtin_key_str(entry.0.as_str());
             if count < MAX_BUILTIN_MAP_LEN && packed != 0 {
                 let mut keys = [0u16; MAX_BUILTIN_MAP_LEN];
-                let mut values: [Value; MAX_BUILTIN_MAP_LEN] =
-                    std::array::from_fn(|_| Value::Undefined);
+                let mut values = [const { Value::Undefined }; MAX_BUILTIN_MAP_LEN];
                 keys[..count].copy_from_slice(keys_slice);
                 keys[count] = packed;
                 for (i, v) in vals_slice.iter().enumerate() {
@@ -1910,13 +1942,29 @@ impl OrderedMap {
             .pairs()
             .filter(|(key, _)| self.position(*key).is_none())
             .count();
-        if fresh == 0 && !matches!(self.entries, Entries::Builtin(..)) {
-            for (key, value) in self.entries_mut() {
-                if let Some(other) = of(key) {
-                    *value = change(value, other);
+        if fresh == 0 {
+            if let Entries::Builtin(b, is_made) = &mut self.entries {
+                if let Some(own) = Arc::get_mut(b) {
+                    let other_layout = other.layout();
+                    let (keys, values) = own.parts_mut();
+                    for (&packed, value) in keys.iter().zip(values.iter_mut()) {
+                        if let Some(name) = crate::controls::builtin_name_str_by_id(packed & 0x03ff)
+                            && let Some(other_val) = other_layout.get(name)
+                        {
+                            *value = change(value, other_val);
+                        }
+                    }
+                    *is_made = false;
+                    return;
                 }
+            } else {
+                for (key, value) in self.entries_mut() {
+                    if let Some(other) = of(key) {
+                        *value = change(value, other);
+                    }
+                }
+                return;
             }
-            return;
         }
         let held = self.len();
         let mut more = other.pairs();
@@ -2005,13 +2053,29 @@ impl OrderedMap {
             .pairs()
             .filter(|(key, _)| self.position(*key).is_none())
             .count();
-        if fresh == 0 && !matches!(self.entries, Entries::Builtin(..)) {
-            for (key, value) in self.entries_mut() {
-                if let Some(other) = of(key) {
-                    *value = change(value, other);
+        if fresh == 0 {
+            if let Entries::Builtin(b, is_made) = &mut self.entries {
+                if let Some(own) = Arc::get_mut(b) {
+                    let other_layout = other.layout();
+                    let (keys, values) = own.parts_mut();
+                    for (&packed, value) in keys.iter().zip(values.iter_mut()) {
+                        if let Some(name) = crate::controls::builtin_name_str_by_id(packed & 0x03ff)
+                            && let Some(other_val) = other_layout.get(name)
+                        {
+                            *value = change(value, other_val);
+                        }
+                    }
+                    *is_made = false;
+                    return;
                 }
+            } else {
+                for (key, value) in self.entries_mut() {
+                    if let Some(other) = of(key) {
+                        *value = change(value, other);
+                    }
+                }
+                return;
             }
-            return;
         }
         let held = self.len();
         let mut more = other.pairs();
@@ -2175,6 +2239,14 @@ impl OrderedMap {
             }
             (Entries::SeqLayer(a, at, ai), Entries::SeqLayer(b, to, bi))
                 if Arc::ptr_eq(a, b) && at == to && ai == bi =>
+            {
+                return true;
+            }
+            (Entries::Builtin(a, _), Entries::Builtin(b, _)) if Arc::ptr_eq(a, b) => {
+                return true;
+            }
+            (Entries::Shared(a) | Entries::Made(a), Entries::Shared(b) | Entries::Made(b))
+                if Arc::ptr_eq(a, b) =>
             {
                 return true;
             }
@@ -2543,6 +2615,37 @@ impl OrderedMap {
                     }
                     append_indices[append_len] = i;
                     append_len += 1;
+                }
+                if append_len == 0 {
+                    match &mut self.entries {
+                        Entries::Builtin(b, is_made) => {
+                            if let Some(own) = Arc::get_mut(b) {
+                                let (keys, values) = own.parts_mut();
+                                for (key, num) in patches {
+                                    let packed =
+                                        crate::controls::pack_builtin_key_str(key.as_str());
+                                    if let Some(at) = keys.iter().position(|&k| k == packed) {
+                                        values[at] = Value::F64(*num);
+                                    }
+                                }
+                                *is_made = true;
+                                return;
+                            }
+                        }
+                        Entries::Shared(entries) | Entries::Made(entries) => {
+                            if let Some(own) = Arc::get_mut(entries) {
+                                for (key, num) in patches {
+                                    if let Some((_, val)) = own.iter_mut().find(|(k, _)| k == *key)
+                                    {
+                                        *val = Value::F64(*num);
+                                    }
+                                }
+                                self.mark_made_of_data();
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 let mut taken = std::mem::replace(&mut self.entries, Entries::Empty);
                 let mut held = match &mut taken {

@@ -653,19 +653,67 @@ pub(crate) fn builtin_name_str_by_id(id: u16) -> Option<&'static str> {
         .and_then(|c| c.names.first().copied())
 }
 
+const PACKED_TABLE_LEN: usize = 1024;
+
+#[inline(always)]
+const fn control_name_hash(bytes: &[u8]) -> usize {
+    let mut h: u32 = 0x811c_9dc5;
+    let mut i = 0;
+    while i < bytes.len() {
+        h ^= bytes[i] as u32;
+        h = h.wrapping_mul(0x0100_0193);
+        i += 1;
+    }
+    h as usize
+}
+
+/// Compile-time open-addressed lookup table from canonical built-in control
+/// name to packed `u16` (`id | (mark_bit << 10)`). Zero runtime initialization
+/// and zero `BTreeMap` traversal.
+static PACKED_KEY_TABLE: [(&str, u16); PACKED_TABLE_LEN] = {
+    let mut table = [("", 0u16); PACKED_TABLE_LEN];
+    let controls = crate::controls_generated::CONTROL_NAMES;
+    let mut i = 0;
+    while i < controls.len() {
+        let names = controls[i].names;
+        if !names.is_empty() {
+            let name = names[0];
+            let id = (i + 1) as u16;
+            let bit = crate::value::Table::mark_bit(name);
+            let packed = id | ((bit as u16) << 10);
+            let mut slot = control_name_hash(name.as_bytes()) & (PACKED_TABLE_LEN - 1);
+            while table[slot].1 != 0 {
+                slot = (slot + 1) & (PACKED_TABLE_LEN - 1);
+            }
+            table[slot] = (name, packed);
+        }
+        i += 1;
+    }
+    table
+};
+
 /// Pack a built-in canonical key name into a non-zero `u16`: low 10 bits hold
 /// the 1-based control id (`1..1024`) and high 6 bits hold `Table::mark_bit`.
 /// Returns `0` for non-built-in or alias names.
 #[inline]
 pub(crate) fn pack_builtin_key_str(name: &str) -> u16 {
-    let Some(spec) = default_control_registry().get(name) else {
-        return 0;
-    };
-    if spec.id == 0 || spec.id >= 1024 || spec.names.first().map(|s| &**s) != Some(name) {
-        return 0;
+    let mut slot = control_name_hash(name.as_bytes()) & (PACKED_TABLE_LEN - 1);
+    loop {
+        let (slot_name, packed) = PACKED_KEY_TABLE[slot];
+        if packed == 0 {
+            return 0;
+        }
+        if slot_name == name {
+            return packed;
+        }
+        slot = (slot + 1) & (PACKED_TABLE_LEN - 1);
     }
-    let bit = crate::value::Table::mark_bit(name);
-    spec.id | (u16::from(bit) << 10)
+}
+
+/// Built-in canonical [`Key`] table for 1-based registry ids (`id - 1`).
+#[inline]
+pub(crate) fn builtin_key_slice() -> &'static [Key] {
+    &default_control_registry().keys
 }
 
 /// Built-in canonical [`Key`] reference for a non-zero 1-based registry id.

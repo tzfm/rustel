@@ -442,6 +442,7 @@ impl StepWave {
 /// Compact storage for arithmetic ops on a wave: identity, single op, or
 /// `.range(lo, hi)` (`mul` then `add`) stay inline with zero heap allocation,
 /// while deeper chains (such as `.rangex`) spill to a boxed slice.
+#[derive(Clone)]
 enum WaveMath {
     None,
     One(crate::compose::ComposeOp, f64),
@@ -463,6 +464,51 @@ impl WaveMath {
         }
     }
 
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::None, Self::None) => true,
+            (Self::One(ao, av), Self::One(bo, bv)) => ao == bo && av.to_bits() == bv.to_bits(),
+            (Self::MulAdd { mul: am, add: aa }, Self::MulAdd { mul: bm, add: ba }) => {
+                am.to_bits() == bm.to_bits() && aa.to_bits() == ba.to_bits()
+            }
+            (Self::Boxed(a), Self::Boxed(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|((ao, av), (bo, bv))| ao == bo && av.to_bits() == bv.to_bits())
+            }
+            _ => false,
+        }
+    }
+
+    fn apply_to_pattern(&self, pattern: Pattern) -> Pattern {
+        let apply_ops = |pattern: Pattern, ops: &[(crate::compose::ComposeOp, f64)]| {
+            pattern.met_numbers(ops).unwrap_or_else(|| {
+                let mut current = pattern;
+                for &(op, number) in ops {
+                    current = current.app_left_by(
+                        crate::pure(Value::F64(number)),
+                        Combine::Composed(op),
+                        op.lookup_flow(),
+                    );
+                }
+                current
+            })
+        };
+        match self {
+            Self::None => pattern,
+            Self::One(op, value) => apply_ops(pattern, &[(*op, *value)]),
+            Self::MulAdd { mul, add } => apply_ops(
+                pattern,
+                &[
+                    (crate::compose::ComposeOp::Mul, *mul),
+                    (crate::compose::ComposeOp::Add, *add),
+                ],
+            ),
+            Self::Boxed(ops) => apply_ops(pattern, ops),
+        }
+    }
+
     #[inline]
     fn apply(&self, mut number: f64) -> Option<f64> {
         match self {
@@ -481,6 +527,7 @@ impl WaveMath {
 
 /// Compact storage for up to [`Wave::MOST_TIMES`] time changes and their
 /// cycle-cutting bitmask: 0 or 1 time change stays inline in 16 bytes.
+#[derive(Clone)]
 enum WaveTimes {
     None,
     One(WaveTime, u8),
@@ -494,6 +541,10 @@ impl WaveTimes {
             1 => Self::One(times[0], cut_mask),
             _ => Self::Many(Box::new((times, len, cut_mask))),
         }
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
     }
 
     #[inline]
@@ -518,6 +569,7 @@ impl WaveTimes {
 /// of the query, or a time that keeps a cycle of the query in one cycle,
 /// for most waves. Any other number is under changes of time that
 /// `cut_mask` records, and each part is read in its time.
+#[derive(Clone)]
 pub(crate) struct Wave {
     /// The arithmetic, the innermost first: each op with its number.
     math: WaveMath,
@@ -530,7 +582,7 @@ const _: () = assert!(std::mem::size_of::<Wave>() <= 48);
 
 /// One change of time over a [`Wave`]. Factors and shifts are bounded below
 /// 2^16 by [`Wave::plain`], so 32-bit components are lossless and compact.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum WaveTime {
     /// `fast(factor)`: what lies inside is asked at `t * (n / d)`.
     Fast(i32, std::num::NonZeroU32),
@@ -590,26 +642,77 @@ impl Wave {
 
     /// `pattern` as a wave, when it is one.
     pub(crate) fn of(pattern: &Pattern) -> Option<Self> {
-        Self::read_in(pattern, None)
+        Self::read_in(pattern, None, false).map(|(wave, _)| wave)
+    }
+
+    /// `pattern` as a self-contained inline wave with no bound runtime settings
+    /// and a lossless `to_control_pattern` reconstruction (`math_inside` records
+    /// whether all arithmetic sits inside or outside the time changes).
+    pub(crate) fn of_inline(pattern: &Pattern) -> Option<(Self, bool)> {
+        let (wave, math_inside) = Self::read_in(pattern, None, true)?;
+        let (_, cut_mask) = wave.times.parts();
+        if cut_mask != 0 {
+            return None;
+        }
+        Some((wave, math_inside?))
+    }
+
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        std::ptr::fn_addr_eq(self.body, other.body)
+            && self.math.same(&other.math)
+            && self.times.same(&other.times)
+    }
+
+    /// Rebuild the exact `Node::ControlMap` pattern that this inline wave
+    /// collapsed from, used only on the rare fallback path (non-object haps,
+    /// multi-cycle parts, >48-bit rationals, or `cut_mask` boundaries).
+    pub(crate) fn to_control_pattern(&self, key_id: u16, math_inside: bool) -> Pattern {
+        let apply_times = |mut pat: Pattern| {
+            let (times, _) = self.times.parts();
+            for change in times.iter().rev() {
+                match *change {
+                    WaveTime::Fast(n, d) => {
+                        pat = pat.fast(Fraction::from_ticks(i128::from(n), d));
+                    }
+                    WaveTime::Late(n, d) => {
+                        pat = pat.late(Fraction::from_ticks(i128::from(n), d));
+                    }
+                }
+            }
+            pat
+        };
+        let pat = crate::signal_static(self.body);
+        let pat = if math_inside {
+            apply_times(self.math.apply_to_pattern(pat))
+        } else {
+            self.math.apply_to_pattern(apply_times(pat))
+        };
+        Pattern::of(Node::ControlMap(pat, key_id, false))
     }
 
     /// `pattern` as a wave read in steps, as a `segment` of one is, with
     /// the count of its steps a cycle.
     fn of_steps(pattern: &Pattern) -> Option<(Self, u32)> {
         let mut steps = None;
-        let wave = Self::read_in(pattern, Some(&mut steps))?;
+        let (wave, _) = Self::read_in(pattern, Some(&mut steps), false)?;
         Some((wave, u32::try_from(steps?).ok()?))
     }
 
-    fn read_in(pattern: &Pattern, steps: Option<&mut Option<i128>>) -> Option<Self> {
+    fn read_in(
+        pattern: &Pattern,
+        steps: Option<&mut Option<i128>>,
+        strict_runtime: bool,
+    ) -> Option<(Self, Option<bool>)> {
         let mut times = [WaveTime::IDENTITY; Self::MOST_TIMES];
         let mut times_len = 0u8;
         let mut inline_math = [(crate::compose::ComposeOp::Add, 0.0); 4];
         let mut inline_len = 0u8;
         let mut spilled_math: Option<Vec<(crate::compose::ComposeOp, f64)>> = None;
         let mut cut_mask = 0u8;
+        let mut math_depth: Option<Option<u8>> = None;
         let body = Self::read(
             pattern,
+            strict_runtime,
             &mut |time| {
                 let idx = usize::from(times_len);
                 if idx < Self::MOST_TIMES {
@@ -617,7 +720,13 @@ impl Wave {
                 }
                 times_len = times_len.saturating_add(1);
             },
-            &mut |op, number, cut| {
+            &mut |op, number, depth, cut| {
+                let depth_u8 = depth as u8;
+                math_depth = match math_depth {
+                    None => Some(Some(depth_u8)),
+                    Some(Some(prev)) if prev == depth_u8 => Some(Some(prev)),
+                    _ => Some(None),
+                };
                 if let Some(vec) = &mut spilled_math {
                     vec.push((op, number));
                 } else if usize::from(inline_len) < inline_math.len() {
@@ -648,11 +757,20 @@ impl Wave {
                 WaveMath::from_ops(&inline_math[..usize::from(inline_len)])
             }
         };
-        Some(Self {
-            math,
-            times: WaveTimes::from_raw(times, times_len, cut_mask),
-            body,
-        })
+        let math_inside = match math_depth {
+            None => Some(true),
+            Some(Some(d)) if d == times_len => Some(true),
+            Some(Some(0)) => Some(false),
+            _ => None,
+        };
+        Some((
+            Self {
+                math,
+                times: WaveTimes::from_raw(times, times_len, cut_mask),
+                body,
+            },
+            math_inside,
+        ))
     }
 
     /// The body of `pattern`, when it is a wave: each change of time goes
@@ -661,15 +779,20 @@ impl Wave {
     /// query, `number` also takes the count of the changes of time over it.
     fn read(
         mut pattern: &Pattern,
+        strict_runtime: bool,
         time: &mut dyn FnMut(WaveTime),
-        number: &mut dyn FnMut(crate::compose::ComposeOp, f64, Option<usize>),
+        number: &mut dyn FnMut(crate::compose::ComposeOp, f64, usize, Option<usize>),
         mut steps: Option<&mut Option<i128>>,
     ) -> Option<crate::NumberSignal> {
         let mut times = 0;
         // Whether a cycle of the query lies in one cycle of the time here.
         let mut cycles_kept = true;
         loop {
-            if !pattern.tables_may_answer() {
+            if strict_runtime {
+                if pattern.has_runtime_settings() || !pattern.is_cacheable() {
+                    return None;
+                }
+            } else if !pattern.tables_may_answer() {
                 return None;
             }
             pattern = match pattern.node_kind() {
@@ -688,7 +811,13 @@ impl Wave {
                 {
                     *steps = Some(count);
                     let mut timed = false;
-                    let body = Self::read(functions, &mut |_| timed = true, number, None)?;
+                    let body = Self::read(
+                        functions,
+                        strict_runtime,
+                        &mut |_| timed = true,
+                        number,
+                        None,
+                    )?;
                     return (!timed).then_some(body);
                 }
                 Node::Fast(node) if node.1 > Fraction::ZERO => {
@@ -722,7 +851,7 @@ impl Wave {
                     for meeting in node.1.iter().rev() {
                         let (op, other) = meeting.number()?;
                         op.of_numbers(0.0, 0.0)?;
-                        number(op, other, (!cycles_kept).then_some(times));
+                        number(op, other, times, (!cycles_kept).then_some(times));
                     }
                     &node.0
                 }
@@ -740,10 +869,17 @@ impl Wave {
                     };
                     // An op of arithmetic makes a number of two numbers.
                     op.of_numbers(0.0, 0.0)?;
-                    if !values.tables_may_answer() {
+                    if strict_runtime {
+                        if values.has_runtime_settings()
+                            || !values.is_cacheable()
+                            || values.pure_loc_raw().is_some()
+                        {
+                            return None;
+                        }
+                    } else if !values.tables_may_answer() {
                         return None;
                     }
-                    number(*op, *other, (!cycles_kept).then_some(times));
+                    number(*op, *other, times, (!cycles_kept).then_some(times));
                     functions
                 }
                 _ => return None,
@@ -840,5 +976,5 @@ impl Wave {
 /// of its haps then holds one number under that name, and nothing more.
 pub(crate) fn wave_name(values: &Pattern) -> Option<crate::Key> {
     let (inner, key) = ValueSignal::named_key(values)?;
-    Wave::read(inner, &mut |_| (), &mut |_, _, _| (), None).map(|_| key)
+    Wave::read(inner, false, &mut |_| (), &mut |_, _, _, _| (), None).map(|_| key)
 }

@@ -4633,48 +4633,10 @@ impl PickLookup {
         }
     }
 
-    /// This lookup with what `change` makes of each pattern. `None` when
-    /// `change` makes none of one of them.
-    fn try_map(&self, mut change: impl FnMut(&Pattern) -> Option<Pattern>) -> Option<Self> {
-        Some(match self {
-            Self::Array {
-                enumerable_len,
-                length,
-                entries,
-            } => Self::Array {
-                enumerable_len: *enumerable_len,
-                length: *length,
-                entries: entries
-                    .iter()
-                    .map(|(index, pattern)| Some((*index, change(pattern)?)))
-                    .collect::<Option<_>>()?,
-            },
-            Self::Object {
-                enumerable_len,
-                entries,
-            } => Self::Object {
-                enumerable_len: *enumerable_len,
-                entries: entries
-                    .iter()
-                    .map(|(key, pattern)| Some((key.clone(), change(pattern)?)))
-                    .collect::<Option<_>>()?,
-            },
-        })
-    }
-
     fn patterns(&self) -> Box<dyn Iterator<Item = &Pattern> + '_> {
         match self {
             Self::Array { entries, .. } => Box::new(entries.iter().map(|(_, pattern)| pattern)),
             Self::Object { entries, .. } => Box::new(entries.iter().map(|(_, pattern)| pattern)),
-        }
-    }
-
-    fn patterns_mut(&mut self) -> Box<dyn Iterator<Item = &mut Pattern> + '_> {
-        match self {
-            Self::Array { entries, .. } => Box::new(entries.iter_mut().map(|(_, pattern)| pattern)),
-            Self::Object { entries, .. } => {
-                Box::new(entries.iter_mut().map(|(_, pattern)| pattern))
-            }
         }
     }
 
@@ -4760,6 +4722,212 @@ impl PickLookup {
             enumerable_len,
             entries,
         })
+    }
+}
+
+/// Compact exact-sized lookup stored inside [`PickNode`]: dense `0..n` arrays
+/// drop the index column and spare `Vec` capacity.
+#[derive(Clone)]
+pub(crate) enum CompactPickLookup {
+    Dense(Box<[Pattern]>),
+    Array {
+        enumerable_len: usize,
+        length: usize,
+        entries: Box<[(usize, Pattern)]>,
+    },
+    Object {
+        enumerable_len: usize,
+        entries: Box<[(Box<str>, Pattern)]>,
+    },
+}
+
+impl CompactPickLookup {
+    fn from_lookup(lookup: PickLookup) -> Self {
+        match lookup {
+            PickLookup::Array {
+                enumerable_len,
+                length,
+                entries,
+            } => {
+                let dense = enumerable_len == entries.len()
+                    && length == entries.len()
+                    && entries.iter().enumerate().all(|(i, (idx, _))| i == *idx);
+                if dense {
+                    Self::Dense(entries.into_iter().map(|(_, p)| p).collect())
+                } else {
+                    Self::Array {
+                        enumerable_len,
+                        length,
+                        entries: entries.into_boxed_slice(),
+                    }
+                }
+            }
+            PickLookup::Object {
+                enumerable_len,
+                entries,
+            } => Self::Object {
+                enumerable_len,
+                entries: entries
+                    .into_iter()
+                    .map(|(k, p)| (k.into_boxed_str(), p))
+                    .collect(),
+            },
+        }
+    }
+
+    fn try_map(&self, mut change: impl FnMut(&Pattern) -> Option<Pattern>) -> Option<Self> {
+        Some(match self {
+            Self::Dense(patterns) => Self::Dense(
+                patterns
+                    .iter()
+                    .map(&mut change)
+                    .collect::<Option<Vec<_>>>()?
+                    .into_boxed_slice(),
+            ),
+            Self::Array {
+                enumerable_len,
+                length,
+                entries,
+            } => Self::Array {
+                enumerable_len: *enumerable_len,
+                length: *length,
+                entries: entries
+                    .iter()
+                    .map(|(index, pattern)| Some((*index, change(pattern)?)))
+                    .collect::<Option<Vec<_>>>()?
+                    .into_boxed_slice(),
+            },
+            Self::Object {
+                enumerable_len,
+                entries,
+            } => Self::Object {
+                enumerable_len: *enumerable_len,
+                entries: entries
+                    .iter()
+                    .map(|(key, pattern)| Some((key.clone(), change(pattern)?)))
+                    .collect::<Option<Vec<_>>>()?
+                    .into_boxed_slice(),
+            },
+        })
+    }
+
+    fn patterns(&self) -> Box<dyn Iterator<Item = &Pattern> + '_> {
+        match self {
+            Self::Dense(patterns) => Box::new(patterns.iter()),
+            Self::Array { entries, .. } => Box::new(entries.iter().map(|(_, pattern)| pattern)),
+            Self::Object { entries, .. } => Box::new(entries.iter().map(|(_, pattern)| pattern)),
+        }
+    }
+
+    fn patterns_mut(&mut self) -> Box<dyn Iterator<Item = &mut Pattern> + '_> {
+        match self {
+            Self::Dense(patterns) => Box::new(patterns.iter_mut()),
+            Self::Array { entries, .. } => Box::new(entries.iter_mut().map(|(_, pattern)| pattern)),
+            Self::Object { entries, .. } => {
+                Box::new(entries.iter_mut().map(|(_, pattern)| pattern))
+            }
+        }
+    }
+
+    fn drain_into(&mut self, out: &mut Vec<Pattern>) {
+        match self {
+            Self::Dense(patterns) => {
+                out.extend(std::mem::take(patterns).into_vec());
+            }
+            Self::Array { entries, .. } => {
+                out.extend(
+                    std::mem::take(entries)
+                        .into_vec()
+                        .into_iter()
+                        .map(|(_, p)| p),
+                );
+            }
+            Self::Object { entries, .. } => {
+                out.extend(
+                    std::mem::take(entries)
+                        .into_vec()
+                        .into_iter()
+                        .map(|(_, p)| p),
+                );
+            }
+        }
+    }
+
+    fn select(&self, value: &Value, index_mode: PickIndexMode) -> Option<&Pattern> {
+        let materialized;
+        let value = if matches!(value, Value::JsValue(_)) {
+            materialized = materialize_js_value(value);
+            &materialized
+        } else {
+            value
+        };
+        match self {
+            Self::Dense(patterns) => {
+                let len = patterns.len();
+                let index = pick_array_index(value, len, len, index_mode)?;
+                patterns.get(index)
+            }
+            Self::Array {
+                enumerable_len,
+                length,
+                entries,
+            } => {
+                let index = pick_array_index(value, *enumerable_len, *length, index_mode)?;
+                entries
+                    .iter()
+                    .find_map(|(candidate, pattern)| (*candidate == index).then_some(pattern))
+            }
+            Self::Object { entries, .. } => {
+                if let Value::Str(key) = value {
+                    return entries.iter().find_map(|(candidate, pattern)| {
+                        (&**candidate == key.as_str()).then_some(pattern)
+                    });
+                }
+                let key = pick_property_key(value);
+                entries.iter().find_map(|(candidate, pattern)| {
+                    (&**candidate == key.as_str()).then_some(pattern)
+                })
+            }
+        }
+    }
+}
+
+#[inline]
+fn pick_array_index(
+    value: &Value,
+    enumerable_len: usize,
+    length: usize,
+    index_mode: PickIndexMode,
+) -> Option<usize> {
+    let rounded = crate::util::js_round(pick_js_number(value));
+    let numeric = match index_mode {
+        PickIndexMode::Clamp if rounded.is_nan() => f64::NAN,
+        PickIndexMode::Clamp => rounded.max(0.0).min(length.saturating_sub(1) as f64),
+        PickIndexMode::Remainder => rounded % enumerable_len as f64,
+        PickIndexMode::Modulo => {
+            let len = enumerable_len as f64;
+            ((rounded % len) + len) % len
+        }
+    };
+    if !numeric.is_finite() || numeric < 0.0 || numeric > usize::MAX as f64 {
+        return None;
+    }
+    Some(numeric as usize)
+}
+
+#[derive(Clone, Copy)]
+enum LookupRef<'a> {
+    Full(&'a PickLookup),
+    Compact(&'a CompactPickLookup),
+}
+
+impl<'a> LookupRef<'a> {
+    #[inline]
+    fn select(self, value: &Value, index_mode: PickIndexMode) -> Option<&'a Pattern> {
+        match self {
+            Self::Full(lookup) => lookup.select(value, index_mode),
+            Self::Compact(lookup) => lookup.select(value, index_mode),
+        }
     }
 }
 
@@ -5288,7 +5456,7 @@ fn pick_where_it_is(outer: &Hap, inner: &mut Hap, whole: Option<TimeSpan>, part:
 fn query_pick(
     thread: &QueryThread,
     selector: &Pattern,
-    lookup: &PickLookup,
+    lookup: LookupRef<'_>,
     index_mode: PickIndexMode,
     mode: JoinMode,
     state: &State,
@@ -5322,7 +5490,7 @@ fn query_pick(
 fn pick_of(
     thread: &QueryThread,
     outer: &Hap,
-    lookup: &PickLookup,
+    lookup: LookupRef<'_>,
     index_mode: PickIndexMode,
     mode: JoinMode,
     state: &State,
@@ -5512,7 +5680,7 @@ fn query_patternified_pick(
                 query_pick(
                     thread,
                     selector,
-                    lookup_hap.lookup.as_ref(),
+                    LookupRef::Full(lookup_hap.lookup.as_ref()),
                     index_mode,
                     mode,
                     &state.set_span(lookup_hap.hap.part),
@@ -5782,10 +5950,10 @@ enum Node {
         mode: JoinMode,
     },
     Degrade(Box<(Pattern, f64, u32)>),
-    Stack(Vec<Pattern>),
-    SlowCat(Vec<Pattern>),
+    Stack(Box<[Pattern]>),
+    SlowCat(Box<[Pattern]>),
     /// `slowcatPrime` - cycle-skipping concatenation used by `every`/`lastOf`.
-    SlowCatPrime(Vec<Pattern>),
+    SlowCatPrime(Box<[Pattern]>),
     /// `innerJoin` over a pattern-of-patterns produced by a native function.
     InnerJoin(Box<(Pattern, ToPatternFn)>),
     SplitQueries(Pattern),
@@ -5802,6 +5970,10 @@ enum Node {
     /// keeping the FUNCTION side's whole. This is the fold `register()` uses
     /// when a leading argument is itself a pattern.
     AppLeft(Box<AppLeftNode>),
+    /// Collapsed `appLeft(..., ControlMap(wave, key_id, false), Set, Set)`:
+    /// stores the compiled [`fused::Wave`] inline with zero `OnceLock` and
+    /// drops the temporary wave graph immediately.
+    AppWave(Box<AppWaveNode>),
     /// A pattern whose every hap meets constants in turn: what `.gain(0.8)`,
     /// `sine.range(200, 2000)` and `.add(7)` give of a pattern that is no
     /// sequence. One node for the run, where each constant was an `appLeft`
@@ -5875,10 +6047,20 @@ struct UiVisualNode {
 /// Boxed payload of [`Node::Pick`].
 struct PickNode {
     selector: Pattern,
-    lookup: PickLookup,
+    lookup: CompactPickLookup,
     index_mode: PickIndexMode,
     mode: JoinMode,
 }
+
+/// Boxed payload of [`Node::AppWave`].
+pub(crate) struct AppWaveNode {
+    pub(crate) inner: Pattern,
+    pub(crate) wave: fused::Wave,
+    pub(crate) key_id: u16,
+    pub(crate) math_inside: bool,
+}
+
+const _: () = assert!(std::mem::size_of::<AppWaveNode>() <= 80);
 
 /// Boxed payload of [`Node::Constants`].
 pub(crate) struct ConstantsNode(pub(crate) Pattern, pub(crate) Box<[RunMeeting]>);
@@ -7262,15 +7444,16 @@ fn inherited_runtime_settings_source(node: &Node) -> Option<&Pattern> {
             .then_some(&pair.1)
             .or_else(|| pair.0.has_runtime_settings().then_some(&pair.0)),
         Node::AppLeft(pair) => pair.runtime_settings_source(),
+        Node::AppWave(app) => app.inner.has_runtime_settings().then_some(&app.inner),
         Node::AppRight(node) | Node::AppBoth(node) => node.runtime_settings_source(),
         Node::Arp(pair)
         | Node::ArpWithPattern(pair)
         | Node::PickPatternified { patterns: pair, .. } => pair.runtime_settings_source(),
         Node::PurePickLookup(boxed) => from_patterns(boxed.1.patterns()),
-        Node::ChooseCycles(patterns, _)
-        | Node::Stack(patterns)
-        | Node::SlowCat(patterns)
-        | Node::SlowCatPrime(patterns) => from_patterns(patterns),
+        Node::ChooseCycles(patterns, _) => from_patterns(patterns),
+        Node::Stack(patterns) | Node::SlowCat(patterns) | Node::SlowCatPrime(patterns) => {
+            from_patterns(patterns)
+        }
         Node::WChoose(choice) => choice
             .chooser
             .has_runtime_settings()
@@ -7816,13 +7999,12 @@ impl Pattern {
     }
 
     /// Fast in-place path for a chain of 1..=8 wave or single-step `StepWave`
-    /// `AppLeft` nodes (`.lpf(sine...).pan(rand)`): walks the wave spine,
-    /// queries the base directly into `out`, caches chord samples, and applies
-    /// all numeric patches in a single `OrderedMap` allocation.
+    /// `AppWave`/`AppLeft` nodes (`.lpf(sine...).pan(rand)`): walks the wave
+    /// spine, queries the base directly into `out`, caches chord samples, and
+    /// applies all numeric patches in a single `OrderedMap` allocation.
     fn try_query_wave_chain_onto(
         &self,
         thread: &QueryThread,
-        outer: ValueSide<'_>,
         state: &State,
         out: &mut Vec<Hap>,
     ) -> bool {
@@ -7841,44 +8023,50 @@ impl Pattern {
                 }
             }
         }
-        fn wave_of<'a>(side: ValueSide<'a>, state: &State) -> Option<QuickWave<'a>> {
-            if !matches!(side.apply, Combine::Composed(compose::ComposeOp::Set))
-                || side.flow != LookupFlow::Set
-                || !side.values.tables_may_answer()
-            {
-                return None;
+        fn wave_of_node<'a>(node: &'a Node, state: &State) -> Option<(QuickWave<'a>, &'a Pattern)> {
+            match node {
+                Node::AppWave(app) => {
+                    let key = controls::builtin_key_ref_by_id(app.key_id)?;
+                    Some((QuickWave::Wave(key, &app.wave), &app.inner))
+                }
+                Node::AppLeft(_) => {
+                    let side = ValueSide::of(node)?;
+                    if !matches!(side.apply, Combine::Composed(compose::ComposeOp::Set))
+                        || side.flow != LookupFlow::Set
+                        || !side.values.tables_may_answer()
+                    {
+                        return None;
+                    }
+                    let ReadValues::Signal(signal) = side.reading.of(side.values, state)? else {
+                        return None;
+                    };
+                    if let Some((key, wave)) = signal.wave() {
+                        return Some((QuickWave::Wave(key, wave), side.functions));
+                    }
+                    signal
+                        .step_wave()
+                        .filter(|step| step.covers_span(state.span))
+                        .map(|step| (QuickWave::Step(step), side.functions))
+                }
+                _ => None,
             }
-            let Some(ReadValues::Signal(signal)) = side.reading.of(side.values, state) else {
-                return None;
-            };
-            if let Some((key, wave)) = signal.wave() {
-                return Some(QuickWave::Wave(key, wave));
-            }
-            signal
-                .step_wave()
-                .filter(|step| step.covers_span(state.span))
-                .map(QuickWave::Step)
         }
-        let Some(first) = wave_of(outer, state) else {
+        let Some((first, mut base)) = wave_of_node(self.node_kind(), state) else {
             return false;
         };
         let mut waves: [Option<QuickWave<'_>>; MAX_WAVES] = [None; MAX_WAVES];
         waves[0] = Some(first);
         let mut count = 1usize;
-        let mut base = outer.functions;
         while count < MAX_WAVES {
             if base.has_runtime_settings() || base.is_volatile() {
                 break;
             }
-            let Some(inner_side) = ValueSide::of(base.node_kind()) else {
-                break;
-            };
-            let Some(pair) = wave_of(inner_side, state) else {
+            let Some((pair, next_base)) = wave_of_node(base.node_kind(), state) else {
                 break;
             };
             waves[count] = Some(pair);
             count += 1;
-            base = inner_side.functions;
+            base = next_base;
         }
         if base.is_volatile() {
             return false;
@@ -8512,6 +8700,42 @@ impl Pattern {
                 }
             }
 
+            Node::AppWave(app) => {
+                if self.try_query_wave_chain_onto(thread, state, out) {
+                    return;
+                }
+                // Rare fallback for non-object haps, multi-cycle parts, >48-bit
+                // rationals, or cut_mask boundaries: rebuild exact wave pattern.
+                let values = app.wave.to_control_pattern(app.key_id, app.math_inside);
+                let reading = ValueReading::default();
+                let apply = Combine::Composed(compose::ComposeOp::Set);
+                let side = ValueSide {
+                    functions: &app.inner,
+                    values: &values,
+                    reading: &reading,
+                    apply: &apply,
+                    flow: LookupFlow::Set,
+                };
+                with_list(|functions| {
+                    side.functions
+                        .answer_onto(thread, state, table::Order::Graph, functions);
+                    if functions.is_empty() {
+                        return;
+                    }
+                    if side.met_in_one_query(functions, state, out) {
+                        return;
+                    }
+                    let from = out.len();
+                    let mut meetings = Meetings::default();
+                    out.reserve(functions.len());
+                    for hf in functions.drain(..) {
+                        if !side.meet_on(thread, hf, &mut meetings, state, from, out) {
+                            break;
+                        }
+                    }
+                });
+            }
+
             // Function haps drive: values are queried over each function
             // hap's wholeOrPart, and the function side's whole wins.
             node @ Node::AppLeft(..) => {
@@ -8520,7 +8744,7 @@ impl Pattern {
                 // (`.lpf(sine...).pan(rand)`): queries the base directly into
                 // `out`, caches chord samples, and applies all patches in one
                 // `OrderedMap` allocation with no `with_list` scratch copy.
-                if self.try_query_wave_chain_onto(thread, side, state, out) {
+                if self.try_query_wave_chain_onto(thread, state, out) {
                     return;
                 }
                 // Fast in-place path for a degrade gate: filters `out` directly.
@@ -8619,7 +8843,7 @@ impl Pattern {
             Node::Pick(pick) => query_pick(
                 thread,
                 &pick.selector,
-                &pick.lookup,
+                LookupRef::Compact(&pick.lookup),
                 pick.index_mode,
                 pick.mode,
                 state,
@@ -8802,6 +9026,7 @@ impl Pattern {
             | Node::Stack(_)
             | Node::AddContext(..)
             | Node::AppLeft(..)
+            | Node::AppWave(..)
             | Node::AppRight(..)
             | Node::Pick(..)
             | Node::SlowCat(_)
@@ -10406,6 +10631,24 @@ impl Pattern {
         if let Some(met) = self.met_constant(&other, &combine, lookup_flow) {
             return met.with_steps(steps);
         }
+        if !sequence::builds_each_node()
+            && !self.is_volatile()
+            && matches!(combine, Combine::Composed(compose::ComposeOp::Set))
+            && lookup_flow == LookupFlow::Set
+            && !other.has_runtime_settings()
+            && other.is_cacheable()
+            && let Node::ControlMap(inner, key_id, false) = other.node_kind()
+            && *key_id != 0
+            && let Some((wave, math_inside)) = fused::Wave::of_inline(inner)
+        {
+            return Pattern::of(Node::AppWave(Box::new(AppWaveNode {
+                inner: self.clone(),
+                wave,
+                key_id: *key_id,
+                math_inside,
+            })))
+            .with_steps(steps);
+        }
         Pattern::of(Node::AppLeft(Box::new(AppLeftNode(
             self.clone(),
             other,
@@ -10490,7 +10733,11 @@ impl Pattern {
     fn meets_each_control(&self) -> bool {
         let takes = matches!(
             self.node_kind(),
-            Node::AppLeft(..) | Node::Constants(..) | Node::Stack(_) | Node::FilterValues(..)
+            Node::AppLeft(..)
+                | Node::AppWave(..)
+                | Node::Constants(..)
+                | Node::Stack(_)
+                | Node::FilterValues(..)
         );
         !takes && self.meets_constants()
     }
@@ -10681,6 +10928,9 @@ impl Pattern {
                 // haps now.
                 pair.2.forget_functions();
             }
+            Node::AppWave(app) if waves > 0 => {
+                app.inner.write(waves - 1, control, context, apart);
+            }
             Node::Sequence(layers) => sequence::set_here(layers, control, context),
             Node::Constants(node) => {
                 let last = node.1.last_mut().expect("a run of one meeting or more");
@@ -10815,16 +11065,25 @@ impl Pattern {
         // The names of the waves, the outermost first.
         let mut names: Vec<Key> = Vec::new();
         let mut under = self;
-        while let Node::AppLeft(pair) = under.node_kind()
-            && let AppLeftNode(
-                functions,
-                values,
-                _,
-                Combine::Composed(compose::ComposeOp::Set),
-                LookupFlow::Set,
-            ) = &**pair
-            && let Some(name) = table::wave_name(values)
-        {
+        loop {
+            let (functions, name) = match under.node_kind() {
+                Node::AppWave(app) => {
+                    let Some(key) = controls::builtin_key_ref_by_id(app.key_id) else {
+                        break;
+                    };
+                    (&app.inner, key.clone())
+                }
+                Node::AppLeft(pair)
+                    if matches!(pair.3, Combine::Composed(compose::ComposeOp::Set))
+                        && pair.4 == LookupFlow::Set =>
+                {
+                    let Some(name) = table::wave_name(&pair.1) else {
+                        break;
+                    };
+                    (&pair.0, name)
+                }
+                _ => break,
+            };
             // The application keeps the runtime that its handle binds, as
             // a function call gives one. A function side that binds
             // another runtime answers under that one.
@@ -10869,6 +11128,12 @@ impl Pattern {
                     pair.3.clone(),
                     pair.4,
                 ))),
+                Node::AppWave(app) => Node::AppWave(Box::new(AppWaveNode {
+                    inner: app.inner.clone(),
+                    wave: app.wave.clone(),
+                    key_id: app.key_id,
+                    math_inside: app.math_inside,
+                })),
                 // A handle of the pattern under the run, and a copy of the run.
                 Node::Constants(node) => {
                     Node::Constants(Box::new(ConstantsNode(node.0.clone(), node.1.clone())))
@@ -11673,6 +11938,7 @@ impl Pattern {
             {
                 table::wave_name(&pair.1).is_some() && pair.0.takes_constants()
             }
+            Node::AppWave(app) => app.inner.takes_constants(),
             _ => false,
         }
     }
@@ -11880,7 +12146,7 @@ impl Pattern {
         let whole_cycles =
             whole_cycles && matches!(picked.mode, JoinMode::Reset | JoinMode::Restart);
         let selector = sequence::selecting(&picked.selector, locations, whole_cycles)?;
-        Some(pick(
+        Some(pick_compact(
             selector,
             picked.lookup.try_map(change)?,
             picked.index_mode,
@@ -12629,6 +12895,7 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
             take_child(&mut pair.0, out);
             take_child(&mut pair.1, out);
         }
+        Node::AppWave(app) => take_child(&mut app.inner, out),
         Node::AppRight(node) | Node::AppBoth(node) => {
             take_child(&mut node.0, out);
             take_child(&mut node.1, out);
@@ -12645,10 +12912,10 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
             take_child(&mut pair.0, out);
             take_child(&mut pair.1, out);
         }
-        Node::ChooseCycles(patterns, _)
-        | Node::Stack(patterns)
-        | Node::SlowCat(patterns)
-        | Node::SlowCatPrime(patterns) => out.extend(std::mem::take(patterns)),
+        Node::ChooseCycles(patterns, _) => out.extend(std::mem::take(patterns)),
+        Node::Stack(patterns) | Node::SlowCat(patterns) | Node::SlowCatPrime(patterns) => {
+            out.extend(std::mem::take(patterns).into_vec())
+        }
         Node::PatternOfHap(bind) => {
             take_child(&mut bind.0, out);
             out.extend(std::mem::take(&mut bind.1));
@@ -12666,7 +12933,7 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         Node::PurePickLookup(boxed) => drain_lookup(&mut boxed.1, out),
         Node::Pick(pick) => {
             take_child(&mut pick.selector, out);
-            drain_lookup(&mut pick.lookup, out);
+            pick.lookup.drain_into(out);
         }
     }
 }
@@ -12810,6 +13077,7 @@ fn span_read(node: &Node) -> purity::SpanRead {
         // The side that gives the structure is cut by the query. The other
         // side is asked over the whole of each hap, whatever the query.
         Node::AppLeft(pair) => of(&pair.0),
+        Node::AppWave(app) => of(&app.inner),
         Node::AppRight(pair) => of(&pair.1),
         Node::AppBoth(pair) => of(&pair.0).max(of(&pair.1)),
         // Each hap of the selector asks its pattern over the hap's part, or
@@ -12971,6 +13239,7 @@ fn compute_purity(node: &Node) -> purity::Purity {
                 .chain(pick.lookup.patterns().map(Pattern::purity)),
         ),
         Node::AppLeft(pair) => Purity::merge([pair.0.purity(), pair.1.purity()]),
+        Node::AppWave(app) => app.inner.purity(),
         Node::AppRight(node) | Node::AppBoth(node) => {
             Purity::merge([node.0.purity(), node.1.purity()])
         }
@@ -13407,6 +13676,24 @@ pub fn wchoose(pairs: Vec<(Pattern, Pattern)>, cycles: bool) -> Pattern {
     })))
 }
 
+fn pick_compact(
+    selector: Pattern,
+    lookup: CompactPickLookup,
+    index_mode: PickIndexMode,
+    mode: JoinMode,
+) -> Pattern {
+    let steps = (mode == JoinMode::Outer)
+        .then_some(selector.steps())
+        .flatten();
+    Pattern::of(Node::Pick(Box::new(PickNode {
+        selector,
+        lookup,
+        index_mode,
+        mode,
+    })))
+    .with_steps(steps)
+}
+
 /// The shared `_pick` core plus its selected join.
 pub fn pick(
     selector: Pattern,
@@ -13419,16 +13706,12 @@ pub fn pick(
         // join. Every join drops `_steps`, including on an empty pattern.
         silence().with_steps(None)
     } else {
-        let steps = (mode == JoinMode::Outer)
-            .then_some(selector.steps())
-            .flatten();
-        Pattern::of(Node::Pick(Box::new(PickNode {
+        pick_compact(
             selector,
-            lookup,
+            CompactPickLookup::from_lookup(lookup),
             index_mode,
             mode,
-        })))
-        .with_steps(steps)
+        )
     }
 }
 
@@ -13571,14 +13854,14 @@ pub fn stack(pats: Vec<Pattern>) -> Pattern {
     if let Some(stacked) = sequence::stacked(&pats) {
         return stacked.with_steps(steps);
     }
-    Pattern::of(Node::Stack(pats)).with_steps(steps)
+    Pattern::of(Node::Stack(pats.into_boxed_slice())).with_steps(steps)
 }
 
 fn slowcat_with_steps(mut pats: Vec<Pattern>, steps: Option<Fraction>) -> Pattern {
     if pats.len() == 1 {
         return pats.pop().expect("one slowcat input");
     }
-    Pattern::of(Node::SlowCat(pats))
+    Pattern::of(Node::SlowCat(pats.into_boxed_slice()))
         .split_queries()
         .with_steps(steps)
 }
@@ -13691,7 +13974,7 @@ pub fn slowcat_prime(pats: Vec<Pattern>) -> Pattern {
     if pats.is_empty() {
         return silence();
     }
-    Pattern::of(Node::SlowCatPrime(pats)).split_queries()
+    Pattern::of(Node::SlowCatPrime(pats.into_boxed_slice())).split_queries()
 }
 
 /// All patterns squeezed into one cycle.
@@ -15423,10 +15706,12 @@ mod value_signal_tests {
         let runtimes = [runtime(RngMode::Precise), runtime(RngMode::Legacy)];
         for settings in &runtimes {
             let set = of(settings, chain);
-            let Node::AppLeft(pair, ..) = set.node_kind() else {
-                panic!("the application of the wave is the last one");
+            let inner = match set.node_kind() {
+                Node::AppLeft(pair, ..) => &pair.0,
+                Node::AppWave(app) => &app.inner,
+                _ => panic!("the application of the wave is the last one"),
             };
-            assert!(matches!(pair.0.node_kind(), Node::Sequence(_)));
+            assert!(matches!(inner.node_kind(), Node::Sequence(_)));
             for (begin, end) in spans() {
                 assert_eq!(
                     answers(&set, begin, end),
@@ -15592,12 +15877,16 @@ mod value_signal_tests {
     fn constants_after_a_wave_are_set_under_its_application() {
         let (_, values) = chains_with_waves().swap_remove(0);
         let set = chain(&steps_of_other_names(), &values);
-        let Node::AppLeft(pair) = set.node_kind() else {
-            panic!("the application of the wave is the last one");
+        let inner = match set.node_kind() {
+            Node::AppLeft(pair) => {
+                assert!(matches!(pair.3, Combine::Composed(ComposeOp::Set)));
+                &pair.0
+            }
+            Node::AppWave(app) => &app.inner,
+            _ => panic!("the application of the wave is the last one"),
         };
-        assert!(matches!(pair.3, Combine::Composed(ComposeOp::Set)));
         assert!(
-            matches!(pair.0.node_kind(), Node::Sequence(_)),
+            matches!(inner.node_kind(), Node::Sequence(_)),
             "the steps hold each constant"
         );
     }
@@ -16061,8 +16350,10 @@ mod restart_tests {
                 stack(vec![
                     in_turn(300).split_queries(),
                     in_turn(340),
-                    Pattern::of(Node::SlowCatPrime(vec![in_turn(360), steps(370, 3)]))
-                        .split_queries(),
+                    Pattern::of(Node::SlowCatPrime(
+                        vec![in_turn(360), steps(370, 3)].into_boxed_slice(),
+                    ))
+                    .split_queries(),
                     steps(380, 2),
                 ])
                 .cpm(Fraction::int(35)),

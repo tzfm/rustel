@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use crate::{Node, Pattern, PickLookup, Value};
+use crate::{CompactPickLookup, Node, Pattern, PickLookup, Value};
 
 /// The most node pairs one comparison visits.
 const MAX_COMPARED_NODES: usize = 1 << 20;
@@ -123,6 +123,58 @@ fn same_lookup<'g>(
                 entries: left_entries,
             },
             PickLookup::Object {
+                enumerable_len: right_enumerable,
+                entries: right_entries,
+            },
+        ) => {
+            left_enumerable == right_enumerable
+                && left_entries.len() == right_entries.len()
+                && left_entries.iter().zip(right_entries).all(
+                    |((left_key, left), (right_key, right))| {
+                        pending.push((left, right));
+                        left_key == right_key
+                    },
+                )
+        }
+        _ => false,
+    }
+}
+
+fn same_compact_lookup<'g>(
+    left: &'g CompactPickLookup,
+    right: &'g CompactPickLookup,
+    pending: &mut Vec<(&'g Pattern, &'g Pattern)>,
+) -> bool {
+    match (left, right) {
+        (CompactPickLookup::Dense(a), CompactPickLookup::Dense(b)) => same_children(a, b, pending),
+        (
+            CompactPickLookup::Array {
+                enumerable_len: left_enumerable,
+                length: left_length,
+                entries: left_entries,
+            },
+            CompactPickLookup::Array {
+                enumerable_len: right_enumerable,
+                length: right_length,
+                entries: right_entries,
+            },
+        ) => {
+            left_enumerable == right_enumerable
+                && left_length == right_length
+                && left_entries.len() == right_entries.len()
+                && left_entries.iter().zip(right_entries).all(
+                    |((left_index, left), (right_index, right))| {
+                        pending.push((left, right));
+                        left_index == right_index
+                    },
+                )
+        }
+        (
+            CompactPickLookup::Object {
+                enumerable_len: left_enumerable,
+                entries: left_entries,
+            },
+            CompactPickLookup::Object {
                 enumerable_len: right_enumerable,
                 entries: right_entries,
             },
@@ -355,7 +407,7 @@ fn same_node<'g>(
                 pending.push((&a.selector, &b.selector));
                 a.index_mode == b.index_mode
                     && a.mode == b.mode
-                    && same_lookup(&a.lookup, &b.lookup, pending)
+                    && same_compact_lookup(&a.lookup, &b.lookup, pending)
             }
             _ => false,
         },
@@ -425,6 +477,16 @@ fn same_node<'g>(
             Node::AppLeft(b) if a.4 == b.4 => {
                 pending.push((&a.1, &b.1));
                 child!(&a.0, &b.0)
+            }
+            _ => false,
+        },
+        Node::AppWave(a) => match right {
+            Node::AppWave(b)
+                if a.key_id == b.key_id
+                    && a.math_inside == b.math_inside
+                    && a.wave.same(&b.wave) =>
+            {
+                child!(&a.inner, &b.inner)
             }
             _ => false,
         },
