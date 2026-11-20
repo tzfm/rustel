@@ -9,6 +9,16 @@ enum Field {
     Key(String),
 }
 
+/// The text to speak. A number, as mini-notation reads `"42"`, is spoken
+/// as its digits, so `talkit("42")` says forty two.
+fn spoken_text(text: Value) -> Value {
+    match text {
+        // `+ 0.0` turns -0 into 0, as JavaScript prints it.
+        Value::F64(number) if number.is_finite() => Value::Str((number + 0.0).to_string()),
+        other => other,
+    }
+}
+
 /// Sets one field of the speech object of a hap:
 /// `talkit: { text: "hello", pitch: 120 }`.
 fn set_speech_field(hap: &Value, field: &Field, setting: &Value) -> Value {
@@ -26,7 +36,10 @@ fn set_speech_field(hap: &Value, field: &Field, setting: &Value) -> Value {
     };
     match field {
         Field::Text => {
-            speech.insert("text".into(), setting);
+            speech.insert("text".into(), spoken_text(setting));
+        }
+        Field::Key(key) if key == "text" => {
+            speech.insert("text".into(), spoken_text(setting));
         }
         Field::Key(key) => {
             speech.insert(key.clone(), setting);
@@ -63,7 +76,10 @@ pub(super) fn speech_free<'js>(
     // per cycle, and `talkit("my name is")` one event per word.
     let mut output = text.fmap_keeping_live(|value| {
         let mut speech = rustel_core::OrderedMap::new();
-        speech.insert("text".into(), rustel_core::materialize_js_value(value));
+        speech.insert(
+            "text".into(),
+            spoken_text(rustel_core::materialize_js_value(value)),
+        );
         Some(Value::object([("talkit".into(), Value::Object(speech))]))
     });
     if let Some(config) = args.0.get(1).and_then(rquickjs::Value::as_object) {
@@ -269,6 +285,21 @@ mod tests {
                     .is_some_and(|name| name == "bd" || name == "hh")
             );
         }
+    }
+
+    #[test]
+    fn numbers_are_spoken_as_their_digits() {
+        let runtime = runtime();
+        let haps = spoken(&runtime, r#"$: talkit("42")"#);
+        assert_eq!(text_of(&haps[0]), "42");
+        let haps = spoken(&runtime, r#"$: talkit(["4 0.5 7"])"#);
+        let words: Vec<String> = haps.iter().map(text_of).collect();
+        assert_eq!(words, ["4", "0.5", "7"]);
+        let haps = spoken(&runtime, r#"$: s("bd").talkit("12")"#);
+        assert_eq!(text_of(&haps[0]), "12");
+        let haps = spoken(&runtime, r#"$: talkit("hi", { text: 7 })"#);
+        assert_eq!(text_of(&haps[0]), "7");
+        assert_eq!(spoken_text(Value::F64(-0.0)), Value::Str("0".into()));
     }
 
     #[test]
