@@ -2789,7 +2789,14 @@ fn run_command(
                 );
             }
             let score_cps = session.config().cps;
-            let (duration, whole_cycles) = length.on_a_cycle(score_cps);
+            let (mut duration, whole_cycles) = length.on_a_cycle(score_cps);
+            // A tempo lane can change the tempo on the way, so a bounce of
+            // cycles ends at its last cycle. Its length here is only a first
+            // guess, which the render checks against the cap once it knows.
+            if let RenderLength::Cycles(cycles) = length {
+                session.set_render_cycles(Some(cycles));
+                duration = duration.min(MAX_DURATION_SECS);
+            }
             let duration = parse_positive_seconds("duration", duration)?;
             if until_silence {
                 if !silence_floor.is_finite() || silence_floor > 0.0 {
@@ -2834,6 +2841,13 @@ fn run_command(
                     );
                 } else {
                     let seconds = report.duration_secs;
+                    // A bounce of cycles says the count asked: a tempo lane
+                    // can make a cycle last more or less than the session
+                    // tempo says. A silence stop can end it early.
+                    let cycles = match length {
+                        RenderLength::Cycles(cycles) if !until_silence => cycles,
+                        _ => seconds * score_cps,
+                    };
                     let format_text = match format {
                         RenderCliFormat::ScalarWav => "16-bit stereo WAV",
                         RenderCliFormat::ScalarF32 => "32-bit float stereo WAV",
@@ -2847,7 +2861,7 @@ fn run_command(
                         style::green(on, "wrote"),
                         style::bold(on, &report.path),
                         seconds,
-                        format_cycles(seconds * score_cps),
+                        format_cycles(cycles),
                         if whole_cycles { "" } else { " (as asked)" },
                         format_text,
                         report.sample_rate,
