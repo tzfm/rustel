@@ -23,13 +23,14 @@ pub struct OrderedMap {
 
 /// Maximum inline patch slots carried by a [`Patched`] overlay before
 /// materialising a flat slice.
-const MAX_PATCHES: usize = 6;
+const MAX_PATCHES: usize = 8;
 
 /// Up to [`MAX_PATCHES`] key/value overrides or additions over a shared
 /// dressed [`Table`] row, avoiding flattening `Table::tail` on dynamic
 /// control chains. The row index lives alongside the `Arc<Patched>` in
 /// [`Entries::Patched`] so chord notes from the same uniform-key table can
 /// share one overlay allocation.
+#[derive(Clone)]
 pub(crate) struct Patched {
     base: Arc<Table>,
     base_len: u16,
@@ -257,17 +258,19 @@ impl Patched {
     }
 }
 
-/// Reusable per-timestamp overlay cache for chord haps sharing one uniform-key
-/// [`Table`] during a fused wave chain query.
+/// Reusable per-timestamp or per-run overlay cache for chord haps sharing one
+/// uniform-key [`Table`] or [`Patched`] overlay.
 #[derive(Default)]
 pub(crate) struct SharedWaveCache {
-    cached: Option<Arc<Patched>>,
+    dressed: Option<Arc<Patched>>,
+    patched: Option<(Arc<Patched>, Arc<Patched>)>,
 }
 
 impl SharedWaveCache {
     #[inline]
     pub(crate) fn clear(&mut self) {
-        self.cached = None;
+        self.dressed = None;
+        self.patched = None;
     }
 }
 
@@ -285,7 +288,7 @@ enum Entries {
     /// The entries of one step of a layer, which the other steps share:
     /// see [`Table`]. The map holds a handle of the table and the step.
     Dressed(Arc<Table>, u32),
-    /// A small overlay of 1..=4 entries over a dressed [`Table`] row.
+    /// A small overlay of up to [`MAX_PATCHES`] entries over a dressed [`Table`] row.
     Patched(Arc<Patched>, u32),
 }
 
@@ -1234,6 +1237,27 @@ impl OrderedMap {
         }
     }
 
+    /// The shared flat entries when this map is already undressed and non-empty.
+    #[inline]
+    pub(crate) fn as_shares(&self) -> Option<&Arc<[(Key, Value)]>> {
+        match &self.entries {
+            Entries::Shared(entries) | Entries::Made(entries) => Some(entries),
+            _ => None,
+        }
+    }
+
+    /// Reconstruct a data-only map from undressed shared entries.
+    #[inline]
+    pub(crate) fn from_made_shares(entries: Arc<[(Key, Value)]>) -> Self {
+        Self {
+            entries: if entries.is_empty() {
+                Entries::Empty
+            } else {
+                Entries::Made(entries)
+            },
+        }
+    }
+
     /// A map of `entries`, each of another key, in their order.
     pub(crate) fn of_keys(entries: impl IntoIterator<Item = (Key, Value)>) -> Self {
         Self::of(entries.into_iter().collect())
@@ -1582,35 +1606,140 @@ impl OrderedMap {
     }
 
     /// Set several numeric data controls, reusing one [`Patched`] allocation
-    /// across chord haps that share a uniform-key [`Table`] at the same sample.
+    /// across chord haps that share a uniform-key [`Table`] or [`Patched`]
+    /// overlay at the same sample.
     pub(crate) fn set_data_many_cached(
         &mut self,
         patches: &[(&Key, f64)],
         cache: &mut SharedWaveCache,
     ) {
-        if !patches.is_empty()
-            && patches.len() <= MAX_PATCHES
-            && let Entries::Dressed(table, row) = &self.entries
-            && table.has_uniform_keys()
-        {
-            let row = *row;
-            if let Some(cached) = &cache.cached
-                && Arc::ptr_eq(&cached.base, table)
-            {
-                self.entries = Entries::Patched(Arc::clone(cached), row);
-                return;
-            }
-            if let Some(mut patched) = Patched::empty(Arc::clone(table), row, true) {
-                for (key, num) in patches {
-                    let _ = patched.try_set(row, key, Value::F64(*num), true);
+        if !patches.is_empty() && patches.len() <= MAX_PATCHES {
+            match &mut self.entries {
+                Entries::Dressed(table, row) if table.has_uniform_keys() => {
+                    let row = *row;
+                    if let Some(cached) = &cache.dressed
+                        && Arc::ptr_eq(&cached.base, table)
+                    {
+                        self.entries = Entries::Patched(Arc::clone(cached), row);
+                        return;
+                    }
+                    if let Some(mut patched) = Patched::empty(Arc::clone(table), row, true) {
+                        for (key, num) in patches {
+                            let _ = patched.try_set(row, key, Value::F64(*num), true);
+                        }
+                        let arc = Arc::new(patched);
+                        cache.dressed = Some(Arc::clone(&arc));
+                        self.entries = Entries::Patched(arc, row);
+                        return;
+                    }
                 }
-                let arc = Arc::new(patched);
-                cache.cached = Some(Arc::clone(&arc));
-                self.entries = Entries::Patched(arc, row);
-                return;
+                Entries::Patched(prev, row)
+                    if prev.base.has_uniform_keys() && Arc::strong_count(prev) > 1 =>
+                {
+                    let row = *row;
+                    if let Some((cached_prev, cached_out)) = &cache.patched
+                        && Arc::ptr_eq(cached_prev, prev)
+                    {
+                        self.entries = Entries::Patched(Arc::clone(cached_out), row);
+                        return;
+                    }
+                    let mut extra = 0usize;
+                    for (i, (key, _)) in patches.iter().enumerate() {
+                        if !prev.has_patch_for(key)
+                            && !patches[..i].iter().any(|(other, _)| other == key)
+                        {
+                            extra += 1;
+                        }
+                    }
+                    if usize::from(prev.len) + extra <= MAX_PATCHES {
+                        let mut next = (**prev).clone();
+                        for (key, num) in patches {
+                            let _ = next.try_set(row, key, Value::F64(*num), true);
+                        }
+                        next.made = true;
+                        let arc = Arc::new(next);
+                        cache.patched = Some((Arc::clone(prev), Arc::clone(&arc)));
+                        self.entries = Entries::Patched(arc, row);
+                        return;
+                    }
+                }
+                _ => {}
             }
         }
         self.set_data_many(patches);
+    }
+
+    /// Merge all entries of `other` onto `self` with overwrite (`ComposeOp::Set`)
+    /// semantics on data maps, reusing one [`Patched`] allocation across chord
+    /// haps that share a uniform-key [`Table`] or [`Patched`] overlay.
+    pub(crate) fn merge_set_data_cached(&mut self, other: &Self, cache: &mut SharedWaveCache) {
+        if other.is_empty() {
+            return;
+        }
+        let other_len = other.len();
+        if other_len <= MAX_PATCHES {
+            match &mut self.entries {
+                Entries::Dressed(table, row) if table.has_uniform_keys() => {
+                    let row = *row;
+                    if let Some(cached) = &cache.dressed
+                        && Arc::ptr_eq(&cached.base, table)
+                    {
+                        self.entries = Entries::Patched(Arc::clone(cached), row);
+                        return;
+                    }
+                    if let Some(mut patched) = Patched::empty(Arc::clone(table), row, true) {
+                        for (key, value) in other.pairs() {
+                            let ok = patched.try_set(row, key, value.clone(), true).is_ok();
+                            debug_assert!(ok);
+                        }
+                        let arc = Arc::new(patched);
+                        cache.dressed = Some(Arc::clone(&arc));
+                        self.entries = Entries::Patched(arc, row);
+                        return;
+                    }
+                }
+                Entries::Patched(prev, row) if prev.base.has_uniform_keys() => {
+                    let row = *row;
+                    if Arc::strong_count(prev) > 1 {
+                        if let Some((cached_prev, cached_out)) = &cache.patched
+                            && Arc::ptr_eq(cached_prev, prev)
+                        {
+                            self.entries = Entries::Patched(Arc::clone(cached_out), row);
+                            return;
+                        }
+                        let extra = other
+                            .pairs()
+                            .filter(|(k, _)| !prev.has_patch_for(k))
+                            .count();
+                        if usize::from(prev.len) + extra <= MAX_PATCHES {
+                            let mut next = (**prev).clone();
+                            for (key, value) in other.pairs() {
+                                let ok = next.try_set(row, key, value.clone(), true).is_ok();
+                                debug_assert!(ok);
+                            }
+                            next.made = true;
+                            let arc = Arc::new(next);
+                            cache.patched = Some((Arc::clone(prev), Arc::clone(&arc)));
+                            self.entries = Entries::Patched(arc, row);
+                            return;
+                        }
+                    } else if let Some(own) = Arc::get_mut(prev) {
+                        let extra = other.pairs().filter(|(k, _)| !own.has_patch_for(k)).count();
+                        if usize::from(own.len) + extra <= MAX_PATCHES {
+                            for (key, value) in other.pairs() {
+                                let ok = own.try_set(row, key, value.clone(), true).is_ok();
+                                debug_assert!(ok);
+                            }
+                            own.made = true;
+                            return;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.merge(other, |_, value| value.clone());
+        self.mark_made_of_data();
     }
 
     /// Set several numeric data controls in one pass, allocating at most once.

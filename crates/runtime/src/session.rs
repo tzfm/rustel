@@ -824,7 +824,7 @@ pub struct Session {
     recovery_epoch: u64,
     recovery_generation: u64,
     recovered_source: Option<Arc<str>>,
-    recovery_prebakes: Arc<Vec<recovery::RecoveryPrebake>>,
+    recovery_prebakes: Option<Arc<Vec<recovery::RecoveryPrebake>>>,
     #[cfg(any(test, feature = "test-support"))]
     injected_panic: std::cell::Cell<Option<SessionPanicPoint>>,
     /// Serial intents from the last scheduling pass, awaiting the live loop.
@@ -1228,7 +1228,7 @@ impl Session {
             recovery_epoch: 0,
             recovery_generation: 0,
             recovered_source: None,
-            recovery_prebakes: Arc::default(),
+            recovery_prebakes: None,
             #[cfg(any(test, feature = "test-support"))]
             injected_panic: std::cell::Cell::new(None),
             #[cfg(feature = "serial")]

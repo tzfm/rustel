@@ -305,6 +305,10 @@ fn same_node<'g>(
             Node::MapHapsOwned(b, _, other) if spans == other => child!(a, b),
             _ => false,
         },
+        Node::UiVisual(a, slot, _) => match right {
+            Node::UiVisual(b, other, _) if slot == other => child!(a, b),
+            _ => false,
+        },
         Node::MapHapsWithState(a, _) => match right {
             Node::MapHapsWithState(b, _) => child!(a, b),
             _ => false,

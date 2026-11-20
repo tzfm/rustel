@@ -253,7 +253,7 @@ impl Session {
 
     fn retain_recovery_prebake(&mut self, source: &str, error: Option<Arc<str>>) {
         // Keep completed mutations before an ordinary throw. Limits are not replayed.
-        let prebakes = Arc::make_mut(&mut self.recovery_prebakes);
+        let prebakes = Arc::make_mut(self.recovery_prebakes.get_or_insert_with(Arc::default));
         prebakes.retain(|earlier| &*earlier.source != source);
         prebakes.push(recovery::RecoveryPrebake {
             source: Arc::from(source),

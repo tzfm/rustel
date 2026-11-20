@@ -494,6 +494,11 @@ impl<'p> Reuse<'p> {
                 break;
             }
         }
+        // A single-expression score with no bindings has nothing to reuse on
+        // an edit, while an identical re-evaluation hits `source` directly.
+        if self.names.is_empty() && parts.len() == 1 {
+            parts.clear();
+        }
         // The next build reads this list for every part it finds, so the
         // room a part left when its duplicate went is not kept.
         parts.shrink_to_fit();

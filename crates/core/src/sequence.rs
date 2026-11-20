@@ -579,6 +579,108 @@ struct Cut {
     end: u32,
 }
 
+/// Compact 6-byte cut step when index and whole ticks fit in `u16`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SmallCut {
+    index: u16,
+    begin: u16,
+    end: u16,
+}
+
+impl SmallCut {
+    #[inline]
+    fn from_wide(cut: Cut) -> Option<Self> {
+        Some(Self {
+            index: u16::try_from(cut.index).ok()?,
+            begin: u16::try_from(cut.begin).ok()?,
+            end: u16::try_from(cut.end).ok()?,
+        })
+    }
+
+    #[inline]
+    fn to_wide(self) -> Cut {
+        Cut {
+            index: u32::from(self.index),
+            begin: u32::from(self.begin),
+            end: u32::from(self.end),
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<SmallCut>() == 6);
+
+#[derive(Clone, Copy)]
+enum CutsSlice<'a> {
+    Small(&'a [SmallCut]),
+    Wide(&'a [Cut]),
+}
+
+impl<'a> CutsSlice<'a> {
+    const EMPTY: Self = Self::Small(&[]);
+
+    #[inline]
+    fn len(self) -> usize {
+        match self {
+            Self::Small(s) => s.len(),
+            Self::Wide(w) => w.len(),
+        }
+    }
+
+    #[inline]
+    fn get(self, at: usize) -> Option<Cut> {
+        match self {
+            Self::Small(s) => s.get(at).copied().map(SmallCut::to_wide),
+            Self::Wide(w) => w.get(at).copied(),
+        }
+    }
+
+    #[inline]
+    fn starting_at(self, first: usize) -> Self {
+        match self {
+            Self::Small(s) => {
+                let at = s.partition_point(|cut| usize::from(cut.index) < first);
+                Self::Small(&s[at..])
+            }
+            Self::Wide(w) => {
+                let at = w.partition_point(|cut| (cut.index as usize) < first);
+                Self::Wide(&w[at..])
+            }
+        }
+    }
+
+    #[inline]
+    fn split_first_at(&mut self, index: usize) -> Option<Cut> {
+        match self {
+            Self::Small(s) => {
+                let (&cut, rest) = s.split_first()?;
+                if usize::from(cut.index) == index {
+                    *s = rest;
+                    Some(cut.to_wide())
+                } else {
+                    None
+                }
+            }
+            Self::Wide(w) => {
+                let (&cut, rest) = w.split_first()?;
+                if cut.index as usize == index {
+                    *w = rest;
+                    Some(cut)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn same(self, other: Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        (0..self.len()).all(|i| self.get(i) == other.get(i))
+    }
+}
+
 /// The steps of a layer on an integer grid of `1 / ticks` cycles, kept
 /// as ticks, when each time of them fits in 32 bits.
 struct Grid {
@@ -598,14 +700,65 @@ struct Grid {
 const _: () = assert!(std::mem::size_of::<SmallGridStep>() == 8);
 const _: () = assert!(std::mem::size_of::<Grid>() <= 48);
 
-/// Rare cuts and wide locations kept out of [`Spare`] so packed-only grids pay
-/// only 24 bytes for their side header instead of 48.
 #[derive(Clone)]
-struct SpareRare {
-    /// The cut steps, in the order of their places.
+struct SpareRareFull {
     cuts: Box<[Cut]>,
-    /// Locations whose ranges do not fit [`PackedLoc`].
     wide: Box<[Locations]>,
+}
+
+/// Rare cuts and wide locations kept compact behind one 24-byte enum so
+/// cuts-only grids avoid a wide-locations slice header and pack cuts into 6 B.
+#[derive(Clone)]
+enum SpareRare {
+    SmallCuts(Box<[SmallCut]>),
+    WideCuts(Box<[Cut]>),
+    WideOnly(Box<[Locations]>),
+    Full(Box<SpareRareFull>),
+}
+
+const _: () = assert!(std::mem::size_of::<SpareRare>() == 24);
+
+impl SpareRare {
+    fn from_parts(cuts: Vec<Cut>, wide: Box<[Locations]>) -> Self {
+        if wide.is_empty() {
+            if let Some(small) = cuts
+                .iter()
+                .copied()
+                .map(SmallCut::from_wide)
+                .collect::<Option<Box<[SmallCut]>>>()
+            {
+                Self::SmallCuts(small)
+            } else {
+                Self::WideCuts(cuts.into_boxed_slice())
+            }
+        } else if cuts.is_empty() {
+            Self::WideOnly(wide)
+        } else {
+            Self::Full(Box::new(SpareRareFull {
+                cuts: cuts.into_boxed_slice(),
+                wide,
+            }))
+        }
+    }
+
+    #[inline]
+    fn cuts(&self) -> CutsSlice<'_> {
+        match self {
+            Self::SmallCuts(s) => CutsSlice::Small(s),
+            Self::WideCuts(w) => CutsSlice::Wide(w),
+            Self::WideOnly(_) => CutsSlice::EMPTY,
+            Self::Full(full) => CutsSlice::Wide(&full.cuts),
+        }
+    }
+
+    #[inline]
+    fn wide(&self) -> &[Locations] {
+        match self {
+            Self::SmallCuts(_) | Self::WideCuts(_) => &[],
+            Self::WideOnly(w) => w,
+            Self::Full(full) => &full.wide,
+        }
+    }
 }
 
 /// The cuts and the spare locations of a [`Grid`].
@@ -764,13 +917,11 @@ impl Grid {
         // The grid fits, so any wide locations move with no copy.
         let side = (!cuts.is_empty() || !packed_runs.is_empty() || !wide.is_empty()).then(|| {
             let rare = (!cuts.is_empty() || !wide.is_empty()).then(|| {
-                Box::new(SpareRare {
-                    cuts: cuts.into(),
-                    wide: wide
-                        .iter()
-                        .map(|index| std::mem::take(&mut raws[*index].locations))
-                        .collect(),
-                })
+                let wide_locs: Box<[Locations]> = wide
+                    .iter()
+                    .map(|index| std::mem::take(&mut raws[*index].locations))
+                    .collect();
+                Box::new(SpareRare::from_parts(cuts, wide_locs))
             });
             Box::new(Spare {
                 packed: packed_runs.into(),
@@ -843,13 +994,11 @@ impl Grid {
         }
         let side = (!packed_runs.is_empty() || !wide.is_empty()).then(|| {
             let rare = (!wide.is_empty()).then(|| {
-                Box::new(SpareRare {
-                    cuts: Box::new([]),
-                    wide: wide
-                        .iter()
-                        .map(|index| std::mem::take(&mut source_steps[*index].locations))
-                        .collect(),
-                })
+                let wide_locs: Box<[Locations]> = wide
+                    .iter()
+                    .map(|index| std::mem::take(&mut source_steps[*index].locations))
+                    .collect();
+                Box::new(SpareRare::WideOnly(wide_locs))
             });
             Box::new(Spare {
                 packed: packed_runs.into(),
@@ -912,18 +1061,17 @@ impl Grid {
         Some((floor, floor + i64::from(rest != 0)))
     }
 
-    fn cuts(&self) -> &[Cut] {
+    fn cuts(&self) -> CutsSlice<'_> {
         self.side
             .as_ref()
             .and_then(|side| side.rare.as_deref())
-            .map_or(&[], |rare| &rare.cuts)
+            .map_or(CutsSlice::EMPTY, SpareRare::cuts)
     }
 
     /// The cut of step `index`.
-    fn cut(&self, index: usize) -> Option<&Cut> {
-        let cuts = self.cuts();
-        let at = cuts.partition_point(|cut| (cut.index as usize) < index);
-        cuts.get(at).filter(|cut| cut.index as usize == index)
+    fn cut(&self, index: usize) -> Option<Cut> {
+        let mut cuts = self.cuts().starting_at(index);
+        cuts.split_first_at(index)
     }
 
     fn part(&self, index: usize) -> TimeSpan {
@@ -961,7 +1109,7 @@ impl Grid {
                 .as_ref()
                 .and_then(|side| side.rare.as_deref())
                 .expect("a wide location has a rare side");
-            return rare.wide[(packed & PackedLoc::INDEX_MASK) as usize].clone();
+            return rare.wide()[(packed & PackedLoc::INDEX_MASK) as usize].clone();
         }
         let base = self.base & !Self::SMALL;
         if packed & PackedLoc::SPARE != 0 {
@@ -1010,12 +1158,12 @@ impl Grid {
         // A tick is inside the period when `tick / ticks <= n / d`.
         let bound = period.numer().checked_mul(i128::from(self.ticks.get()))?;
         let inside = |tick: u32| Some(i128::from(tick).checked_mul(period.denom())? <= bound);
-        let mut cuts = self.cuts().iter().peekable();
+        let mut cuts = self.cuts();
         let len = self.steps.len();
         let mut prev: Option<(u32, u32)> = None;
         for index in 0..len {
             let (part_begin, part_end) = self.steps.times_of(index);
-            let cut = cuts.next_if(|cut| cut.index as usize == index);
+            let cut = cuts.split_first_at(index);
             let (begin, end) = cut.map_or((part_begin, part_end), |c| (c.begin, c.end));
             let shaped = begin <= part_begin && part_begin < part_end && part_end <= end;
             if !shaped || !inside(end)? {
@@ -1034,7 +1182,7 @@ impl Grid {
     /// Whether the steps of both are at the same ticks and cut alike.
     fn same_times(&self, other: &Self) -> bool {
         self.ticks == other.ticks
-            && self.cuts() == other.cuts()
+            && self.cuts().same(other.cuts())
             && self.steps.len() == other.steps.len()
             && (0..self.steps.len())
                 .all(|index| self.steps.times_of(index) == other.steps.times_of(index))
@@ -1089,7 +1237,9 @@ impl Grid {
                 }
             }
             if g1 > 1 {
-                for cut in self.cuts() {
+                let cuts = self.cuts();
+                for i in 0..cuts.len() {
+                    let cut = cuts.get(i).expect("cut in bounds");
                     g1 = gcd(g1, u64::from(cut.begin));
                     g1 = gcd(g1, u64::from(cut.end));
                     if g1 == 1 {
@@ -1123,15 +1273,16 @@ impl Grid {
                     let rare = match &spare.rare {
                         None => None,
                         Some(rare) => {
-                            let mut cuts = rare.cuts.clone();
-                            for cut in &mut cuts {
+                            let cuts_view = rare.cuts();
+                            let mut cuts = Vec::with_capacity(cuts_view.len());
+                            for i in 0..cuts_view.len() {
+                                let mut cut = cuts_view.get(i).expect("cut in bounds");
                                 cut.begin = rescale(cut.begin)?;
                                 cut.end = rescale(cut.end)?;
+                                cuts.push(cut);
                             }
-                            Some(Box::new(SpareRare {
-                                cuts,
-                                wide: rare.wide.clone(),
-                            }))
+                            let wide: Box<[Locations]> = rare.wide().to_vec().into_boxed_slice();
+                            Some(Box::new(SpareRare::from_parts(cuts, wide)))
                         }
                     };
                     Some(Box::new(Spare {
@@ -1347,7 +1498,7 @@ fn unpack_dress_loc(packed: u32) -> (usize, usize) {
 }
 
 /// Rare tail fields of [`Dress`]: spilled leading locations, trailing locations,
-/// and context keys.
+/// context keys, and non-map or empty-map set values.
 #[derive(Clone, Default)]
 struct DressTail {
     /// Leading locations when more than two ranges or a wide range are present.
@@ -1357,6 +1508,8 @@ struct DressTail {
     /// The keys of the context of each hap, as a map of the haps set them:
     /// the scale that `scale` names, for one.
     keys: ContextKeys,
+    /// Rare non-object or empty-object `Dress::set` value.
+    set_other: Option<Value>,
 }
 
 /// What the folds on a layer give each hap of it, beyond its step. The
@@ -1367,25 +1520,25 @@ struct Dress {
     /// value reads as the map that [`crate::controls::named_value`] makes
     /// of it. See [`Layer::named`].
     named: Option<Arc<[Arc<str>]>>,
-    /// A control map that each value takes when it is read, after its
-    /// name: the union of the constants that a chain of controls set, the
-    /// last one last. See [`Layer::set`].
-    set: Option<Value>,
+    /// Undressed non-empty control map entries set on each value when read.
+    /// Rare empty-map or non-object set values live in `tail.set_other`.
+    set_map: Option<Arc<[(crate::Key, Value)]>>,
     /// Up to two compact leading locations packed inline; `[0, 0]` when empty
     /// or spilled into `tail.before`.
     before_packed: [u32; 2],
-    /// Rare spilled leading locations, trailing locations, and context keys.
+    /// Rare spilled leading locations, trailing locations, context keys, and
+    /// non-map set values.
     tail: Option<Box<DressTail>>,
 }
 
-const _: () = assert!(size_of::<Dress>() <= 56);
+const _: () = assert!(size_of::<Dress>() == 48);
 
 static EMPTY_LOCATIONS: Locations = Locations::new();
 
 /// The dress of a layer that no fold dressed.
 static BARE: Dress = Dress {
     named: None,
-    set: None,
+    set_map: None,
     before_packed: [0, 0],
     tail: None,
 };
@@ -1499,9 +1652,83 @@ impl Dress {
 
     fn prune_tail(&mut self) {
         if self.tail.as_deref().is_some_and(|tail| {
-            tail.before.is_empty() && tail.after.is_empty() && tail.keys.is_empty()
+            tail.before.is_empty()
+                && tail.after.is_empty()
+                && tail.keys.is_empty()
+                && tail.set_other.is_none()
         }) {
             self.tail = None;
+        }
+    }
+
+    #[inline]
+    fn has_set(&self) -> bool {
+        self.set_map.is_some()
+            || self
+                .tail
+                .as_deref()
+                .is_some_and(|tail| tail.set_other.is_some())
+    }
+
+    fn clear_set(&mut self) {
+        self.set_map = None;
+        if let Some(tail) = &mut self.tail {
+            tail.set_other = None;
+            self.prune_tail();
+        }
+    }
+
+    fn assign_set(&mut self, value: Option<Value>) {
+        self.set_map = None;
+        match value {
+            None => {
+                if let Some(tail) = &mut self.tail {
+                    tail.set_other = None;
+                    self.prune_tail();
+                }
+            }
+            Some(Value::Object(map)) => {
+                let map = map.undressed();
+                if let Some(shares) = map.as_shares() {
+                    self.set_map = Some(Arc::clone(shares));
+                    if let Some(tail) = &mut self.tail {
+                        tail.set_other = None;
+                        self.prune_tail();
+                    }
+                } else {
+                    self.tail.get_or_insert_with(Default::default).set_other =
+                        Some(Value::Object(map));
+                }
+            }
+            Some(other) => {
+                self.tail.get_or_insert_with(Default::default).set_other = Some(other);
+            }
+        }
+    }
+
+    fn set_value(&self) -> Option<Value> {
+        if let Some(shares) = &self.set_map {
+            Some(Value::Object(crate::value::OrderedMap::from_made_shares(
+                Arc::clone(shares),
+            )))
+        } else {
+            self.tail.as_deref().and_then(|tail| tail.set_other.clone())
+        }
+    }
+
+    fn compose_set_into(&self, target: &mut Value) {
+        if let Some(shares) = &self.set_map {
+            let other = crate::value::OrderedMap::from_made_shares(Arc::clone(shares));
+            if let Value::Object(map) = target
+                && !union_drops(&other)
+            {
+                map.merge(&other, |_, value| value.clone());
+                map.mark_made_of_data();
+                return;
+            }
+            compose_data_in_place(ComposeOp::Set, target, &Value::Object(other));
+        } else if let Some(other) = self.tail.as_deref().and_then(|t| t.set_other.as_ref()) {
+            compose_data_in_place(ComposeOp::Set, target, other);
         }
     }
 
@@ -1511,6 +1738,16 @@ impl Dress {
         }
         self.tail.get_or_insert_with(Default::default).keys = keys;
         self.prune_tail();
+    }
+
+    fn add_ui_visual_slot(&mut self, slot: u8) {
+        if slot >= 64 {
+            return;
+        }
+        self.tail
+            .get_or_insert_with(Default::default)
+            .keys
+            .add_ui_visual_slot(slot);
     }
 
     fn clear_after(&mut self) {
@@ -1543,23 +1780,43 @@ impl Dress {
     fn set_here(&mut self, control: &Value, context: Locations) {
         // The value side's locations come first.
         self.prepend_before(context);
-        match &mut self.set {
-            Some(set) => compose_data_in_place(ComposeOp::Set, set, control),
-            // A handle of the map of the control, which holds its own
-            // entries: a map that reads a table would pin that table.
-            None => {
-                self.set = Some(match control {
-                    Value::Object(map) => Value::Object(map.clone().undressed()),
-                    other => other.clone(),
-                })
+        if let Some(shares) = self.set_map.take() {
+            let mut map = crate::value::OrderedMap::from_made_shares(shares);
+            if let Value::Object(other) = control
+                && !union_drops(other)
+            {
+                map.merge(other, |_, value| value.clone());
+                map.mark_made_of_data();
+                if let Some(new_shares) = map.as_shares() {
+                    self.set_map = Some(Arc::clone(new_shares));
+                } else {
+                    self.tail.get_or_insert_with(Default::default).set_other =
+                        Some(Value::Object(map));
+                }
+                return;
             }
+            let mut value = Value::Object(map);
+            compose_data_in_place(ComposeOp::Set, &mut value, control);
+            self.assign_set(Some(value));
+            return;
         }
+        if let Some(set_other) = self
+            .tail
+            .as_deref_mut()
+            .and_then(|tail| tail.set_other.take())
+        {
+            let mut value = set_other;
+            compose_data_in_place(ComposeOp::Set, &mut value, control);
+            self.assign_set(Some(value));
+            return;
+        }
+        self.assign_set(Some(control.clone()));
     }
 
     /// Whether the dress gives a hap nothing.
     fn is_bare(&self) -> bool {
         self.named.is_none()
-            && self.set.is_none()
+            && !self.has_set()
             && self.before_is_empty()
             && self.keys().is_empty()
             && self.after().is_empty()
@@ -1584,8 +1841,8 @@ impl Dress {
     /// Whether two dresses give each hap the same, with set controls that
     /// `same_value` holds to be the same.
     fn same(&self, other: &Self, same_value: impl Fn(&Value, &Value) -> bool) -> bool {
-        let same_set = match (&self.set, &other.set) {
-            (Some(a), Some(b)) => same_value(a, b),
+        let same_set = match (self.set_value(), other.set_value()) {
+            (Some(a), Some(b)) => same_value(&a, &b),
             (None, None) => true,
             _ => false,
         };
@@ -1993,7 +2250,7 @@ impl Layer {
         self.values = values;
         self.change_dress(|dress| {
             dress.named = None;
-            dress.set = None;
+            dress.clear_set();
         });
         self.values_read = OnceLock::new();
         self
@@ -2061,7 +2318,7 @@ impl Layer {
     /// Whether [`Self::named`] names the values of this layer: it holds no
     /// name and no control yet.
     fn takes_name(&self) -> bool {
-        self.dress().named.is_none() && self.dress().set.is_none()
+        self.dress().named.is_none() && !self.dress().has_set()
     }
 
     /// This layer where each value takes the keys of the one value of
@@ -2111,7 +2368,7 @@ impl Layer {
             .dress()
             .named
             .as_ref()
-            .filter(|_| self.dress().set.is_none())?;
+            .filter(|_| !self.dress().has_set())?;
         let [name] = &names[..] else {
             return None;
         };
@@ -2268,7 +2525,7 @@ impl Layer {
     }
 
     fn reader_and_contexts<'a>(&'a self, dress: &Dress) -> (Values<'a>, Option<&'a [Locations]>) {
-        let needs_values = dress.named.is_some() || dress.set.is_some();
+        let needs_values = dress.named.is_some() || dress.has_set();
         let needs_contexts = Self::spills_contexts(dress);
         if !needs_values && !needs_contexts {
             return (Values::Held(&self.values), None);
@@ -2294,11 +2551,12 @@ impl Layer {
     /// The values as `dress` makes them: one table that their maps read
     /// where that gives the same maps, else each value made on its own.
     fn read_values(&self, dress: &Dress) -> Arc<Table> {
-        let needs_values = dress.named.is_some() || dress.set.is_some();
+        let needs_values = dress.named.is_some() || dress.has_set();
         let core = if !needs_values {
             LayerCachedValues::Held
         } else {
-            let set = match &dress.set {
+            let set_owned = dress.set_value();
+            let set = match &set_owned {
                 None => Some(None),
                 Some(Value::Object(set)) if !union_drops(set) => Some(Some(set)),
                 Some(_) => None,
@@ -2325,9 +2583,7 @@ impl Layer {
                                 Some(names) => crate::controls::named_value(names, value.clone()),
                                 None => value.clone(),
                             };
-                            if let Some(set) = &dress.set {
-                                compose_data_in_place(ComposeOp::Set, &mut value, set);
-                            }
+                            dress.compose_set_into(&mut value);
                             value
                         })
                         .collect(),
@@ -2575,12 +2831,8 @@ impl Layer {
         }
         out.reserve(met);
         // The cuts are in the order of the steps: one search finds the first.
-        let cuts = grid.cuts();
-        let mut cuts = if cuts.is_empty() {
-            cuts
-        } else {
-            &cuts[cuts.partition_point(|cut| (cut.index as usize) < first)..]
-        };
+        let mut cuts = grid.cuts().starting_at(first);
+        let has_cuts = cuts.len() != 0;
         // A turn that begins on a whole cycle moves a tick by whole cycles of
         // ticks, so a time is made one time, reduced, from its tick.
         let offset = turn
@@ -2620,12 +2872,13 @@ impl Layer {
                 }
             };
             let visible = TimeSpan::new(at(step_begin)?, at(step_end)?);
-            let whole = match cuts.split_first() {
-                Some((cut, rest)) if cut.index as usize == index => {
-                    cuts = rest;
-                    TimeSpan::new(at(cut.begin)?, at(cut.end)?)
+            let whole = if has_cuts {
+                match cuts.split_first_at(index) {
+                    Some(cut) => TimeSpan::new(at(cut.begin)?, at(cut.end)?),
+                    None => visible,
                 }
-                _ => visible,
+            } else {
+                visible
             };
             let part_begin = if i64::from(step_begin) <= begin_low {
                 span.begin
@@ -3442,6 +3695,40 @@ fn revalued(
 /// `pure` keeps its own node, which says that it is one.
 pub(crate) fn located(pattern: &Pattern, locations: &[(usize, usize)]) -> Option<Pattern> {
     let layers = redressed(folded(pattern)?, |dress| dress.extend_after(locations));
+    Some(node_of_sound(layers))
+}
+
+/// Set UI visual `slot` on `layers` of an owned `Node::Sequence` in place when
+/// unshared, avoiding `Layer` and `NodeCell` cloning.
+pub(crate) fn with_ui_visual_slot_in_place(layers: &mut Arc<[Layer]>, slot: u8) -> bool {
+    let Some(slice) = Arc::get_mut(layers) else {
+        return false;
+    };
+    let mut last: Option<(*const Dress, Arc<Dress>)> = None;
+    for layer in slice {
+        if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
+            dress.add_ui_visual_slot(slot);
+            continue;
+        }
+        let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
+        let dress = match &last {
+            Some((seen, dress)) if *seen == from => Arc::clone(dress),
+            _ => {
+                let mut dress = layer.dress().clone();
+                dress.add_ui_visual_slot(slot);
+                let dress = Arc::new(dress);
+                last = Some((from, Arc::clone(&dress)));
+                dress
+            }
+        };
+        layer.dress = Some(dress);
+    }
+    true
+}
+
+/// `pattern` with UI visual `slot` folded into its sequence layers.
+pub(crate) fn with_ui_visual_slot(pattern: &Pattern, slot: u8) -> Option<Pattern> {
+    let layers = redressed(folded(pattern)?, |dress| dress.add_ui_visual_slot(slot));
     Some(node_of_sound(layers))
 }
 
@@ -5547,7 +5834,7 @@ mod tests {
         let mut layer = Layer::new(frac((1, 1)), raws, values.into());
         layer.change_dress(|dress| {
             dress.named = names.map(|names| names.iter().map(|name| Arc::from(*name)).collect());
-            dress.set = set;
+            dress.assign_set(set);
         });
         layer
     }
@@ -5564,9 +5851,7 @@ mod tests {
                     Some(names) => crate::controls::named_value(names, value.clone()),
                     None => value.clone(),
                 };
-                if let Some(set) = &dress.set {
-                    compose_data_in_place(ComposeOp::Set, &mut value, set);
-                }
+                dress.compose_set_into(&mut value);
                 value
             })
             .collect()

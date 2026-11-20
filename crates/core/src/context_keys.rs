@@ -16,7 +16,36 @@ later version.
 
 use crate::{PickLookup, Value};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+static UI_VISUAL_MASK_CACHE: [OnceLock<Arc<Keys>>; 64] = [const { OnceLock::new() }; 64];
+static UI_VISUAL_SINGLE_CACHE: [OnceLock<Arc<Keys>>; 64] = [const { OnceLock::new() }; 64];
+
+fn cached_ui_visual_mask(mask: u64) -> Option<Arc<Keys>> {
+    if mask == 0 {
+        return None;
+    }
+    if mask < 64 {
+        let cell = &UI_VISUAL_MASK_CACHE[mask as usize];
+        return Some(Arc::clone(cell.get_or_init(|| {
+            Arc::new(Keys {
+                ui_visuals: mask,
+                ..Keys::default()
+            })
+        })));
+    }
+    if mask.is_power_of_two() {
+        let slot = mask.trailing_zeros() as usize;
+        let cell = &UI_VISUAL_SINGLE_CACHE[slot];
+        return Some(Arc::clone(cell.get_or_init(|| {
+            Arc::new(Keys {
+                ui_visuals: mask,
+                ..Keys::default()
+            })
+        })));
+    }
+    None
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ContextKeys(Option<Arc<Keys>>);
@@ -121,6 +150,99 @@ impl ContextKeys {
     /// The keys to change, copied first when another hap shares them.
     pub(crate) fn edit(&mut self) -> &mut Keys {
         Arc::make_mut(self.0.get_or_insert_with(Default::default))
+    }
+
+    /// Set visual slot bit `slot` on these keys, using static cached `Arc<Keys>`
+    /// entries when no other context keys are present.
+    #[inline]
+    pub(crate) fn add_ui_visual_slot(&mut self, slot: u8) {
+        if slot >= 64 {
+            return;
+        }
+        let bit = 1_u64 << slot;
+        match &self.0 {
+            None => {
+                if let Some(cached) = cached_ui_visual_mask(bit) {
+                    self.0 = Some(cached);
+                    return;
+                }
+            }
+            Some(arc) => {
+                if arc.ui_visuals & bit != 0 {
+                    return;
+                }
+                if arc.is_ui_visuals_only()
+                    && let Some(cached) = cached_ui_visual_mask(arc.ui_visuals | bit)
+                {
+                    self.0 = Some(cached);
+                    return;
+                }
+            }
+        }
+        self.edit().ui_visuals |= bit;
+    }
+
+    /// Like [`Self::add_ui_visual_slot`], additionally checking a persistent
+    /// node-level `OnceLock` cache first and a per-query local cache second so
+    /// haps sharing non-visual keys (such as a layer's `scale` context) allocate
+    /// once across the lifetime of the graph instead of once per query.
+    #[inline]
+    pub(crate) fn add_ui_visual_slot_cached(
+        &mut self,
+        slot: u8,
+        once: &std::sync::OnceLock<Box<(Arc<Keys>, Arc<Keys>)>>,
+        local: &mut Option<(Arc<Keys>, Arc<Keys>)>,
+    ) {
+        if slot >= 64 {
+            return;
+        }
+        let bit = 1_u64 << slot;
+        match &self.0 {
+            None => {
+                if let Some(cached) = cached_ui_visual_mask(bit) {
+                    self.0 = Some(cached);
+                    return;
+                }
+            }
+            Some(arc) => {
+                if arc.ui_visuals & bit != 0 {
+                    return;
+                }
+                if arc.is_ui_visuals_only()
+                    && let Some(cached) = cached_ui_visual_mask(arc.ui_visuals | bit)
+                {
+                    self.0 = Some(cached);
+                    return;
+                }
+                if let Some(pair) = once.get() {
+                    if Arc::ptr_eq(arc, &pair.0) {
+                        self.0 = Some(Arc::clone(&pair.1));
+                        return;
+                    }
+                    if let Some((cached_in, cached_out)) = local
+                        && Arc::ptr_eq(arc, cached_in)
+                    {
+                        self.0 = Some(Arc::clone(cached_out));
+                        return;
+                    }
+                    let input = Arc::clone(arc);
+                    let mut next = (**arc).clone();
+                    next.ui_visuals |= bit;
+                    let output = Arc::new(next);
+                    *local = Some((input, Arc::clone(&output)));
+                    self.0 = Some(output);
+                    return;
+                }
+                let input = Arc::clone(arc);
+                let mut next = (**arc).clone();
+                next.ui_visuals |= bit;
+                let output = Arc::new(next);
+                let _ = once.set(Box::new((input, Arc::clone(&output))));
+                self.0 = Some(output);
+                return;
+            }
+        }
+        self.edit().ui_visuals |= bit;
     }
 
     /// Drop the backing allocation when every field is cleared.
@@ -277,6 +399,18 @@ impl Keys {
         self.live_controls == [0; 4]
             && self.slider_binding == 0
             && self.ui_visuals == 0
+            && self.pick_lookup.is_none()
+    }
+
+    #[inline]
+    fn is_ui_visuals_only(&self) -> bool {
+        self.scale.is_none()
+            && self.edo_size.is_none()
+            && self.scale_definition.is_none()
+            && self.tags.is_none()
+            && self.log_line.is_none()
+            && self.live_controls == [0; 4]
+            && self.slider_binding == 0
             && self.pick_lookup.is_none()
     }
 

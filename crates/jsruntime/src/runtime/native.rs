@@ -1141,7 +1141,7 @@ impl<'p> Turn<'p> {
             _ => return None,
         };
         Some(Native::Pattern(match slot {
-            Some(slot) => pattern.with_ui_visual_slot(slot),
+            Some(slot) => pattern.with_ui_visual_slot_owned(slot),
             None => pattern,
         }))
     }

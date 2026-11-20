@@ -29,7 +29,7 @@ later version.
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use crate::value::{OrderedMap, Value};
+use crate::value::{OrderedMap, SharedStr, Value};
 
 const PINNED_DICTS: &str = include_str!("../assets/voicing-dicts.json");
 const PINNED_REGISTRY: &str = include_str!("../assets/voicing-registry.json");
@@ -290,19 +290,48 @@ fn tokenize_chord(chord: &str) -> Option<(&str, &str)> {
 
 /// The name of a MIDI note, with flats: `60` is `C4`. A voicing names the
 /// same notes at each query, so each note of the MIDI range is named one
-/// time.
-fn midi2note(midi: i64) -> std::sync::Arc<str> {
-    fn name(midi: i64) -> std::sync::Arc<str> {
+/// time and kept inline in `SharedStr` (zero refcount bumps).
+fn midi2note_shared(midi: i64) -> SharedStr {
+    fn name(midi: i64) -> SharedStr {
         let oct = midi.div_euclid(12) - 1;
         let pc = FLATS[midi.rem_euclid(12) as usize];
+        let mut buf = [0u8; 16];
+        let pc_bytes = pc.as_bytes();
+        let mut len = pc_bytes.len();
+        buf[..len].copy_from_slice(pc_bytes);
+        // Format `oct` directly into stack buffer for common octave range.
+        if (-99..=999).contains(&oct) {
+            let mut n = oct;
+            if n < 0 {
+                buf[len] = b'-';
+                len += 1;
+                n = -n;
+            }
+            let start = len;
+            loop {
+                buf[len] = b'0' + (n % 10) as u8;
+                len += 1;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            buf[start..len].reverse();
+            let text = std::str::from_utf8(&buf[..len]).expect("ASCII note name");
+            return SharedStr::from(text);
+        }
         format!("{pc}{oct}").into()
     }
-    static NAMES: std::sync::LazyLock<Box<[std::sync::Arc<str>]>> =
-        std::sync::LazyLock::new(|| (0..128).map(name).collect());
+    static NAMES: std::sync::LazyLock<[SharedStr; 128]> =
+        std::sync::LazyLock::new(|| std::array::from_fn(|i| name(i as i64)));
     match usize::try_from(midi).ok().and_then(|at| NAMES.get(at)) {
-        Some(name) => std::sync::Arc::clone(name),
+        Some(note) => note.clone(),
         None => name(midi),
     }
+}
+
+fn midi2note(midi: i64) -> std::sync::Arc<str> {
+    midi2note_shared(midi).to_arc()
 }
 
 fn value_str(value: Option<&Value>) -> Option<&str> {
@@ -371,22 +400,17 @@ fn anchor_midi(value: Option<&Value>) -> Option<f64> {
     }
 }
 
-/// The notes of one voicing for a hap value, or None for strudel.cc's caught
-/// throw (unknown chord → logger + silence).
-pub fn render_voicing(map: &OrderedMap) -> Option<Vec<Value>> {
+/// Resolve the voicing for `map`, invoking `emit` with the resulting note
+/// values (or single selected MIDI number when `n` is set) without intermediate
+/// heap vectors in the common case (<= 16 notes).
+fn resolve_voicing<R>(map: &OrderedMap, emit: impl FnOnce(&[Value]) -> R) -> Option<R> {
     let chord = value_str(map.get("chord"))?;
-    // A dictionary is a registry NAME or a custom `{symbol: [voicings]}`
-    // object (`.dict({'': ['0 4 7', …]})`); strudel.cc uses objects directly.
     let custom;
     let user;
     let live_cell;
     let live_guard;
-    // Materialize before the match. A `.dict('name')` argument crosses the JS
-    // boundary as a JsValue that holds a string. Without this step the raw
-    // variant takes the object arm, where a string returns None, and every
-    // named dictionary, built-in ones included, renders zero haps with no
-    // error.
     let materialized;
+    let default_name;
     let selector = match map.get("dictionary") {
         Some(value @ Value::JsValue(_)) => {
             materialized = crate::materialize_js_value(value);
@@ -395,18 +419,13 @@ pub fn render_voicing(map: &OrderedMap) -> Option<Vec<Value>> {
         other => other,
     };
     let dictionary: &HashMap<String, Vec<Vec<f64>>> = match selector {
-        Some(Value::Str(name)) => {
-            // A score's own `addVoicings` registration wins over a pinned
-            // name, exactly as strudel.cc's `Object.assign(voicingRegistry, …)`
-            // lets a user shadow a built-in.
-            match crate::settings::user_voicing_dict(name) {
-                Some(dict) => {
-                    user = dict;
-                    &user
-                }
-                None => dictionaries().dicts.get(&**name)?,
+        Some(Value::Str(name)) => match crate::settings::user_voicing_dict(name) {
+            Some(dict) => {
+                user = dict;
+                &user
             }
-        }
+            None => dictionaries().dicts.get(&**name)?,
+        },
         Some(Value::Object(object)) => {
             custom = parse_custom_dictionary(object)?;
             &custom
@@ -419,21 +438,22 @@ pub fn render_voicing(map: &OrderedMap) -> Option<Vec<Value>> {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 live_guard.as_ref()?
             } else {
-                let name = crate::settings::default_voicings()
-                    .unwrap_or_else(|| dictionaries().pinned_default.clone());
-                match crate::settings::user_voicing_dict(&name) {
+                let name: &str = match crate::settings::default_voicings() {
+                    Some(name) => {
+                        default_name = name;
+                        &default_name
+                    }
+                    None => &dictionaries().pinned_default,
+                };
+                match crate::settings::user_voicing_dict(name) {
                     Some(dict) => {
                         user = dict;
                         &user
                     }
-                    None => dictionaries().dicts.get(&name)?,
+                    None => dictionaries().dicts.get(name)?,
                 }
             }
         }
-        // JavaScript's destructuring default selects the global dictionary
-        // only for missing/undefined. Explicit null and other non-dictionary
-        // values reach the custom-dictionary path on strudel.cc, throw, and are
-        // caught by `voicing()` as silence.
         Some(_) => return None,
     };
 
@@ -455,9 +475,6 @@ pub fn render_voicing(map: &OrderedMap) -> Option<Vec<Value>> {
     let offset = control_number(map, "offset", 0.0);
     let octaves = control_number(map, "octaves", 1.0);
 
-    // strudel.cc has six explicit modes. Calling an absent modeTarget
-    // throws and the public wrapper turns that into silence, so an unknown
-    // spelling must not silently inherit `below`.
     let (target_first, mult, force_first, duck) = match mode {
         "below" => (false, 1.0f64, false, false),
         "duck" => (false, 1.0, false, true),
@@ -472,7 +489,6 @@ pub fn render_voicing(map: &OrderedMap) -> Option<Vec<Value>> {
     if voicings.is_empty() {
         return None;
     }
-    // `modeTarget`: below/duck use the last step; every other mode the first.
     let target_of = |voicing: &Vec<f64>| -> Option<f64> {
         if target_first {
             voicing.first().copied()
@@ -483,7 +499,7 @@ pub fn render_voicing(map: &OrderedMap) -> Option<Vec<Value>> {
 
     let mut min_distance: Option<f64> = None;
     let mut best_index = 0usize;
-    let mut chroma_diffs = Vec::with_capacity(voicings.len());
+    let mut best_chroma_diff = 0.0f64;
     for (index, voicing) in voicings.iter().enumerate() {
         let target_step = target_of(voicing)?;
         let raw = (anchor_chroma - target_step - root_chroma as f64) * mult;
@@ -491,8 +507,8 @@ pub fn render_voicing(map: &OrderedMap) -> Option<Vec<Value>> {
         if min_distance.is_none_or(|current| distance < current) {
             min_distance = Some(distance);
             best_index = index;
+            best_chroma_diff = distance * mult;
         }
-        chroma_diffs.push(distance * mult);
     }
     if force_first {
         best_index = 0;
@@ -510,38 +526,86 @@ pub fn render_voicing(map: &OrderedMap) -> Option<Vec<Value>> {
     let selected_index = selected_index as usize;
     let voicing = &voicings[selected_index];
     let target_step = target_of(voicing)?;
-    let anchor_midi_value = anchor - chroma_diffs[selected_index] + oct_diff;
-
-    let voicing_midi: Vec<f64> = voicing
-        .iter()
-        .map(|step| anchor_midi_value - target_step + *step)
-        .collect();
-
-    let mut notes: Vec<Value> = Vec::with_capacity(voicing_midi.len());
-    let mut selected_midis = Vec::with_capacity(voicing_midi.len());
-    for midi in &voicing_midi {
-        if duck && *midi == anchor {
-            continue;
-        }
-        let midi = exact_i64(*midi)?;
-        selected_midis.push(midi);
-        notes.push(Value::Str(midi2note(midi).into()));
-    }
+    let selected_chroma_diff = if selected_index == best_index && !force_first {
+        best_chroma_diff
+    } else {
+        let raw = (anchor_chroma - target_step - root_chroma as f64) * mult;
+        crate::util::modulo_f64(raw, 12.0) * mult
+    };
+    let anchor_midi_value = anchor - selected_chroma_diff + oct_diff;
 
     if let Some(n) = defined_control(map, "n").map(crate::pick_js_number) {
-        // `scaleStep(notes, n, octaves)` over midi numbers → ONE number.
+        // `scaleStep(notes, n, octaves)` over midi numbers -> ONE number.
+        const STACK: usize = 16;
+        let mut stack_midis = [0i64; STACK];
+        let mut heap_midis = Vec::new();
+        let mut count = 0usize;
+        for step in voicing {
+            let midi_f = anchor_midi_value - target_step + *step;
+            if duck && midi_f == anchor {
+                continue;
+            }
+            let midi = exact_i64(midi_f)?;
+            if heap_midis.is_empty() && count < STACK {
+                stack_midis[count] = midi;
+            } else {
+                if heap_midis.is_empty() {
+                    heap_midis.reserve(voicing.len());
+                    heap_midis.extend_from_slice(&stack_midis[..count]);
+                }
+                heap_midis.push(midi);
+            }
+            count += 1;
+        }
+        let selected_midis: &[i64] = if heap_midis.is_empty() {
+            &stack_midis[..count]
+        } else {
+            &heap_midis
+        };
         if selected_midis.is_empty() {
-            return Some(vec![Value::F64(f64::NAN)]);
+            return Some(emit(&[Value::F64(f64::NAN)]));
         }
         let len = selected_midis.len() as f64;
         let index = crate::util::modulo_f64(n, len);
         let Some(index) = exact_i64(index).and_then(|index| usize::try_from(index).ok()) else {
-            return Some(vec![Value::F64(f64::NAN)]);
+            return Some(emit(&[Value::F64(f64::NAN)]));
         };
         let oct_offset = (n / len).floor() * octaves * 12.0;
-        return Some(vec![Value::F64(selected_midis[index] as f64 + oct_offset)]);
+        let single = [Value::F64(selected_midis[index] as f64 + oct_offset)];
+        return Some(emit(&single));
     }
-    Some(notes)
+
+    const STACK: usize = 16;
+    if voicing.len() <= STACK {
+        let mut notes: [Value; STACK] = [const { Value::Undefined }; STACK];
+        let mut count = 0usize;
+        for step in voicing {
+            let midi_f = anchor_midi_value - target_step + *step;
+            if duck && midi_f == anchor {
+                continue;
+            }
+            let midi = exact_i64(midi_f)?;
+            notes[count] = Value::Str(midi2note_shared(midi));
+            count += 1;
+        }
+        return Some(emit(&notes[..count]));
+    }
+    let mut notes: Vec<Value> = Vec::with_capacity(voicing.len());
+    for step in voicing {
+        let midi_f = anchor_midi_value - target_step + *step;
+        if duck && midi_f == anchor {
+            continue;
+        }
+        let midi = exact_i64(midi_f)?;
+        notes.push(Value::Str(midi2note_shared(midi)));
+    }
+    Some(emit(&notes))
+}
+
+/// The notes of one voicing for a hap value, or None for strudel.cc's caught
+/// throw (unknown chord → logger + silence).
+pub fn render_voicing(map: &OrderedMap) -> Option<Vec<Value>> {
+    resolve_voicing(map, |notes| notes.to_vec())
 }
 
 pub const MAX_USER_VOICING_JSON_BYTES: usize = 256 * 1024;
@@ -1026,68 +1090,82 @@ fn voicing_hap(hap: &crate::Hap) -> Vec<crate::Hap> {
         }
         _ => return Vec::new(),
     };
-    let Some(notes) = render_voicing(map) else {
-        // Upstream: caught throw → `[voicing]: unknown chord` + silence.
-        return Vec::new();
-    };
-    const VOICING_CONTROLS: [&str; 7] = [
-        "dictionary",
-        "chord",
-        "anchor",
-        "offset",
-        "mode",
-        "n",
-        "octaves",
-    ];
-    // Each note is first, then each control that the voicing does not
-    // read. A note that the chord holds takes the place of each note.
-    let own_note = map.get("note");
-    if notes.is_empty() {
-        return Vec::new();
-    }
-    let tail_entries: Vec<(crate::Key, Value)> = map
-        .into_iter()
-        .filter(|(key, _)| key.as_str() != "note" && !VOICING_CONTROLS.contains(&key.as_str()))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    if notes.len() > 1 {
-        let note_values: std::sync::Arc<[Value]> = match own_note {
-            Some(own) => std::iter::repeat_n(own.clone(), notes.len()).collect(),
-            None => notes.iter().cloned().collect(),
-        };
-        let tail_map =
-            (!tail_entries.is_empty()).then(|| OrderedMap::of_keys(tail_entries.clone()));
-        if let Some(table) = crate::value::Table::new(
-            &note_values,
-            Some(crate::combinators::NOTE.clone()),
-            tail_map.as_ref(),
-        ) {
-            let table = std::sync::Arc::new(table);
-            let mut template = hap.clone();
-            template.value = Value::Undefined;
-            return (0..notes.len())
-                .map(|index| {
-                    let mut out = template.clone();
-                    out.value = Value::Object(table.map(index).expect("note index in table"));
-                    out
-                })
-                .collect();
+    resolve_voicing(map, |notes| {
+        const VOICING_CONTROLS: [&str; 7] = [
+            "dictionary",
+            "chord",
+            "anchor",
+            "offset",
+            "mode",
+            "n",
+            "octaves",
+        ];
+        // Each note is first, then each control that the voicing does not
+        // read. A note that the chord holds takes the place of each note.
+        let own_note = map.get("note");
+        if notes.is_empty() {
+            return Vec::new();
         }
-    }
-    notes
-        .into_iter()
-        .map(|note| {
-            let note = (
-                crate::combinators::NOTE.clone(),
-                own_note.cloned().unwrap_or(note),
-            );
-            let mut out = hap.clone();
-            out.value = Value::Object(OrderedMap::of_keys(
-                std::iter::once(note).chain(tail_entries.iter().cloned()),
-            ));
-            out
-        })
-        .collect()
+        let has_tail = map
+            .into_iter()
+            .any(|(key, _)| key.as_str() != "note" && !VOICING_CONTROLS.contains(&key.as_str()));
+        if notes.len() > 1 {
+            let note_values: std::sync::Arc<[Value]> = match own_note {
+                Some(own) => std::iter::repeat_n(own.clone(), notes.len()).collect(),
+                None => notes.iter().cloned().collect(),
+            };
+            let tail_map = has_tail.then(|| {
+                OrderedMap::of_keys(
+                    map.into_iter()
+                        .filter(|(key, _)| {
+                            key.as_str() != "note" && !VOICING_CONTROLS.contains(&key.as_str())
+                        })
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                )
+            });
+            if let Some(table) = crate::value::Table::new(
+                &note_values,
+                Some(crate::combinators::NOTE.clone()),
+                tail_map.as_ref(),
+            ) {
+                let table = std::sync::Arc::new(table);
+                let mut template = hap.clone();
+                template.value = Value::Undefined;
+                return (0..notes.len())
+                    .map(|index| {
+                        let mut out = template.clone();
+                        out.value = Value::Object(table.map(index).expect("note index in table"));
+                        out
+                    })
+                    .collect();
+            }
+        }
+        let tail_entries: Vec<(crate::Key, Value)> = if has_tail {
+            map.into_iter()
+                .filter(|(key, _)| {
+                    key.as_str() != "note" && !VOICING_CONTROLS.contains(&key.as_str())
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        notes
+            .iter()
+            .map(|note| {
+                let note = (
+                    crate::combinators::NOTE.clone(),
+                    own_note.cloned().unwrap_or_else(|| note.clone()),
+                );
+                let mut out = hap.clone();
+                out.value = Value::Object(OrderedMap::of_keys(
+                    std::iter::once(note).chain(tail_entries.iter().cloned()),
+                ));
+                out
+            })
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Every chord symbol a dictionary knows, sorted by name.

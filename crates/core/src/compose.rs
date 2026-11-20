@@ -387,10 +387,27 @@ fn union_into(op: ComposeOp, out: &mut OrderedMap, b: &OrderedMap) {
 /// map is marked as holding data only, and the next compose of it does not
 /// walk its entries to learn that again.
 pub(crate) fn compose_data_in_place(op: ComposeOp, a: &mut Value, b: &Value) {
+    compose_data_in_place_cached(op, a, b, None);
+}
+
+/// [`compose_data_in_place`] with an optional shared overlay cache for chord
+/// haps meeting the same constant control map.
+pub(crate) fn compose_data_in_place_cached(
+    op: ComposeOp,
+    a: &mut Value,
+    b: &Value,
+    cache: Option<&mut crate::value::SharedWaveCache>,
+) {
     debug_assert!(a.is_data(0) && b.is_data(0));
     if let (Value::Object(map), Value::Object(other)) = (&mut *a, b)
         && !union_drops(other)
     {
+        if op == ComposeOp::Set
+            && let Some(cache) = cache
+        {
+            map.merge_set_data_cached(other, cache);
+            return;
+        }
         union_into(op, map, other);
         map.mark_made_of_data();
         return;

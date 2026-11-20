@@ -73,7 +73,7 @@ struct RecoveryCheckpoint {
     /// [`Session::set_plugin_document`].
     #[cfg(feature = "vst")]
     document: u64,
-    prebakes: Arc<Vec<RecoveryPrebake>>,
+    prebakes: Option<Arc<Vec<RecoveryPrebake>>>,
     csound: crate::CsoundSnapshot,
     settings: RuntimeSettings,
     cps: f64,
@@ -341,7 +341,7 @@ impl Session {
         let replay_started = Instant::now();
         let replay = catch_unwind(AssertUnwindSafe(|| -> Result<(), RuntimeError> {
             let mut replayed_voicings = None;
-            for prebake in checkpoint.prebakes.iter() {
+            for prebake in checkpoint.prebakes.as_deref().into_iter().flatten() {
                 self.evaluate_prebake_guarded(
                     &prebake.source,
                     PREBAKE_CPU_BUDGET,
@@ -412,7 +412,7 @@ impl Session {
         //   Ok(true)                  Ok(false)              Ok(false)
         let mut fallback = checkpoint;
         if fallback.source.take().is_none() {
-            fallback.prebakes = Arc::default();
+            fallback.prebakes = None;
             fallback.csound = crate::CsoundSnapshot::default();
         }
         self.rebuild_after_panic(now, fallback)?;
@@ -846,7 +846,7 @@ mod tests {
                 .evaluate_prebake("globalThis.recoveryNote = 48;")
                 .expect("setup");
         }
-        assert_eq!(session.recovery_prebakes.len(), 1);
+        assert_eq!(session.recovery_prebakes.as_deref().map_or(0, Vec::len), 1);
     }
 
     #[test]
@@ -1001,7 +1001,7 @@ mod tests {
             .expect_err("query panics");
         assert_eq!(session.active_source(), Some(source));
         assert_eq!(session.js.get_number("recoveryNote").unwrap(), 48.0);
-        assert_eq!(session.recovery_prebakes.len(), 1);
+        assert_eq!(session.recovery_prebakes.as_deref().map_or(0, Vec::len), 1);
         assert!(
             !session
                 .query(Fraction::ZERO, Fraction::ONE)
@@ -1021,7 +1021,12 @@ mod tests {
             session.evaluate_prebake_cancellable("globalThis.cancelledSetup = 1;", &cancelled),
             Err(RuntimeError::Cancelled)
         ));
-        assert!(session.recovery_prebakes.is_empty());
+        assert!(
+            session
+                .recovery_prebakes
+                .as_deref()
+                .is_none_or(Vec::is_empty)
+        );
         session.inject_panic_for_test(SessionPanicPoint::Query);
         session
             .schedule_through(0.0, 0.5)
@@ -1125,7 +1130,12 @@ mod tests {
             .expect_err("query panics");
         assert!(error.to_string().contains("fresh Session ready"), "{error}");
         assert_eq!(session.active_source(), None);
-        assert!(session.recovery_prebakes.is_empty());
+        assert!(
+            session
+                .recovery_prebakes
+                .as_deref()
+                .is_none_or(Vec::is_empty)
+        );
         session
             .js
             .eval("if ('unapplied' in globalThis) throw new Error('unexpected setup effect');")
@@ -1160,7 +1170,12 @@ mod tests {
             .expect_err("host panic is caught");
         assert!(error.to_string().contains("fresh Session ready"), "{error}");
         assert_eq!(session.active_source(), None);
-        assert!(session.recovery_prebakes.is_empty());
+        assert!(
+            session
+                .recovery_prebakes
+                .as_deref()
+                .is_none_or(Vec::is_empty)
+        );
         assert_eq!(session.csound_snapshot(), crate::CsoundSnapshot::default());
         session.reload_at(GOOD, false, 0.5).expect("next edit");
     }

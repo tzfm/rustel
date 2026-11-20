@@ -604,9 +604,7 @@ impl Hap {
     }
 
     pub fn with_ui_visual_slot(mut self, slot: u8) -> Self {
-        if slot < 64 {
-            self.keys.edit().ui_visuals |= 1_u64 << slot;
-        }
+        self.keys.add_ui_visual_slot(slot);
         self
     }
 
@@ -1121,26 +1119,72 @@ fn unpack_span_read(flags: u8) -> purity::SpanRead {
     }
 }
 
+/// Ultra-rare handle-level metadata kept behind one `Box` so [`PatternExtras`]
+/// stays 32 bytes.
+#[derive(Clone, Default)]
+struct PatternExtrasRare {
+    large_steps: Option<Fraction>,
+    pure_loc: Option<(u32, u32)>,
+}
+
 /// Rare handle-level metadata kept out-of-line so [`Pattern`] stays 24 bytes.
 #[derive(Clone, Default)]
 struct PatternExtras {
-    large_steps: Option<Fraction>,
-    pure_loc: Option<(u32, u32)>,
     runtime_settings: Option<settings::RuntimeSettings>,
-    extra_flags: u8,
     reachable: Option<Arc<Vec<CallbackId>>>,
+    rare: Option<Box<PatternExtrasRare>>,
+    extra_flags: u8,
 }
+
+const _: () = assert!(size_of::<PatternExtras>() <= 32);
 
 impl PatternExtras {
     /// True when this extras record carries only `runtime_settings`, so
     /// ancestor nodes with no reachable JS callbacks can share its `Arc`.
     #[inline]
     fn is_plain_runtime_settings(&self) -> bool {
-        self.large_steps.is_none()
-            && self.pure_loc.is_none()
+        self.rare.is_none()
             && self.runtime_settings.is_some()
             && self.extra_flags == 0
             && self.reachable.is_none()
+    }
+
+    #[inline]
+    fn large_steps(&self) -> Option<Fraction> {
+        self.rare.as_deref().and_then(|r| r.large_steps)
+    }
+
+    #[inline]
+    fn pure_loc(&self) -> Option<(u32, u32)> {
+        self.rare.as_deref().and_then(|r| r.pure_loc)
+    }
+
+    fn set_large_steps(&mut self, steps: Option<Fraction>) {
+        match steps {
+            Some(steps) => self.rare.get_or_insert_with(Default::default).large_steps = Some(steps),
+            None => {
+                if let Some(rare) = self.rare.as_deref_mut() {
+                    rare.large_steps = None;
+                    if rare.pure_loc.is_none() {
+                        self.rare = None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_pure_loc(&mut self, loc: Option<(u32, u32)>) {
+        match loc {
+            Some(loc) => self.rare.get_or_insert_with(Default::default).pure_loc = Some(loc),
+            None => {
+                if let Some(rare) = self.rare.as_deref_mut() {
+                    rare.pure_loc = None;
+                    if rare.large_steps.is_none() {
+                        self.rare = None;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -4670,6 +4714,11 @@ impl PickLookup {
                     .find_map(|(candidate, pattern)| (*candidate == index).then_some(pattern))
             }
             Self::Object { entries, .. } => {
+                if let Value::Str(key) = value {
+                    return entries.iter().find_map(|(candidate, pattern)| {
+                        (candidate == key.as_str()).then_some(pattern)
+                    });
+                }
                 let key = pick_property_key(value);
                 entries
                     .iter()
@@ -4933,6 +4982,7 @@ impl Meeting {
         part: TimeSpan,
         apply: &Combine,
         flow: LookupFlow,
+        cache: Option<&mut value::SharedWaveCache>,
     ) -> bool {
         let Some(op) = apply.in_place_op() else {
             return false;
@@ -4973,7 +5023,7 @@ impl Meeting {
                 hf.set_live_bindings(live_controls, slider_binding);
             }
         }
-        compose::compose_data_in_place(op, &mut hf.value, value);
+        compose::compose_data_in_place_cached(op, &mut hf.value, value, cache);
         hf.part = part;
         if !context.is_empty() {
             let mut merged = context.clone();
@@ -5728,6 +5778,11 @@ enum Node {
     /// A native per-hap map that takes ownership of the incoming hap, so a
     /// value or context change does not clone them.
     MapHapsOwned(Pattern, OwnedHapMapFn, SpanUse),
+    UiVisual(
+        Pattern,
+        u8,
+        std::sync::OnceLock<Box<(Arc<context_keys::Keys>, Arc<context_keys::Keys>)>>,
+    ),
     MapHapsWithState(Pattern, StateHapMapFn),
     /// One hap expands to N haps sharing its span - `voicing()`'s
     /// `stack(...notes).note().set(rest)` + outerJoin collapses to exactly
@@ -5927,8 +5982,9 @@ enum ReadValues {
     /// to the piece. In a box, so that a signal's reading is not as large.
     Constant(Box<Hap>),
     /// The side is a signal, as `.lpf(sine.range(200, 2000))` gives, which
-    /// answers as a table samples it.
-    Signal(Box<table::ValueSignal>),
+    /// answers as a table samples it. Stored inline inside `Box<Reading>` to
+    /// avoid a second heap allocation and indirection.
+    Signal(table::ValueSignal),
 }
 
 impl ValueReading {
@@ -5953,9 +6009,7 @@ impl ValueReading {
         let settings = settings::current_state_id();
         let found = match values.constant_cycle(state) {
             Some(hap) => Some(ReadValues::Constant(Box::new(hap))),
-            None => {
-                table::ValueSignal::of(values).map(|signal| ReadValues::Signal(Box::new(signal)))
-            }
+            None => table::ValueSignal::of(values).map(ReadValues::Signal),
         };
         if unsettled() {
             return None;
@@ -6775,6 +6829,8 @@ fn query_run(
         }
     }) {
         let mut stopped = false;
+        let use_cache = out.len() - from > 1;
+        let mut caches: [value::SharedWaveCache; 4] = Default::default();
         retain_from(out, from, |hf| {
             if stopped {
                 return false;
@@ -6783,8 +6839,13 @@ fn query_run(
             let Some(part) = hf.part.intersection(&met) else {
                 return false;
             };
-            for meeting in meetings {
+            for (m_idx, meeting) in meetings.iter().enumerate() {
                 let (apply, flow) = (&meeting.apply, meeting.flow);
+                let cache = if use_cache {
+                    caches.get_mut(m_idx)
+                } else {
+                    None
+                };
                 if Meeting::in_place_constant(
                     hf,
                     &meeting.value,
@@ -6792,6 +6853,7 @@ fn query_run(
                     part,
                     apply,
                     flow,
+                    cache,
                 ) {
                     continue;
                 }
@@ -6845,6 +6907,7 @@ fn query_run(
                     part,
                     apply,
                     flow,
+                    None,
                 ) {
                     continue;
                 }
@@ -6888,9 +6951,8 @@ impl Pattern {
             Node::AddContext(pattern, _)
             | Node::FmapNative(pattern, _)
             | Node::MapHapsNative(pattern, _, SpanUse::Ignores)
-            | Node::MapHapsOwned(pattern, _, SpanUse::Ignores) => {
-                pattern.constant_levels()?.checked_add(1)
-            }
+            | Node::MapHapsOwned(pattern, _, SpanUse::Ignores)
+            | Node::UiVisual(pattern, _, _) => pattern.constant_levels()?.checked_add(1),
             _ => None,
         }
     }
@@ -6966,6 +7028,7 @@ fn inherited_runtime_settings_source(node: &Node) -> Option<&Pattern> {
         | Node::SortHapsByPart(pattern)
         | Node::MapHapsNative(pattern, _, _)
         | Node::MapHapsOwned(pattern, _, _)
+        | Node::UiVisual(pattern, _, _)
         | Node::MapHapsWithState(pattern, _)
         | Node::ExpandHapsNative(pattern, _, _)
         | Node::Collect(pattern)
@@ -7137,8 +7200,8 @@ impl Pattern {
         if self.step_denom != 0 {
             return true;
         }
-        let a = self.extras.as_deref().and_then(|e| e.large_steps);
-        let b = other.extras.as_deref().and_then(|e| e.large_steps);
+        let a = self.extras.as_deref().and_then(PatternExtras::large_steps);
+        let b = other.extras.as_deref().and_then(PatternExtras::large_steps);
         a == b
     }
 
@@ -7280,7 +7343,7 @@ impl Pattern {
                 i128::from(self.step_denom),
             ))
         } else {
-            self.extras.as_deref().and_then(|e| e.large_steps)
+            self.extras.as_deref().and_then(PatternExtras::large_steps)
         }
     }
 
@@ -7292,9 +7355,9 @@ impl Pattern {
                 if self
                     .extras
                     .as_deref()
-                    .is_some_and(|e| e.large_steps.is_some())
+                    .is_some_and(|e| e.large_steps().is_some())
                 {
-                    self.extras_mut().large_steps = None;
+                    self.extras_mut().set_large_steps(None);
                 }
             }
             Some(steps) => {
@@ -7306,15 +7369,15 @@ impl Pattern {
                         if self
                             .extras
                             .as_deref()
-                            .is_some_and(|e| e.large_steps.is_some())
+                            .is_some_and(|e| e.large_steps().is_some())
                         {
-                            self.extras_mut().large_steps = None;
+                            self.extras_mut().set_large_steps(None);
                         }
                     }
                     _ => {
                         self.step_numer = 0;
                         self.step_denom = 0;
-                        self.extras_mut().large_steps = Some(steps);
+                        self.extras_mut().set_large_steps(Some(steps));
                     }
                 }
             }
@@ -7327,14 +7390,14 @@ impl Pattern {
     pub fn with_steps_of(mut self, other: &Self) -> Self {
         self.step_numer = other.step_numer;
         self.step_denom = other.step_denom;
-        let large = other.extras.as_deref().and_then(|e| e.large_steps);
+        let large = other.extras.as_deref().and_then(PatternExtras::large_steps);
         if large.is_some()
             || self
                 .extras
                 .as_deref()
-                .is_some_and(|e| e.large_steps.is_some())
+                .is_some_and(|e| e.large_steps().is_some())
         {
-            self.extras_mut().large_steps = large;
+            self.extras_mut().set_large_steps(large);
         }
         self
     }
@@ -8457,6 +8520,15 @@ impl Pattern {
                 map_from(out, from, |hap| map(hap));
             }
 
+            Node::UiVisual(pat, slot, cache) => {
+                let from = out.len();
+                pat.answer_onto(thread, state, table::Order::Graph, out);
+                let mut local = None;
+                for hap in &mut out[from..] {
+                    hap.keys.add_ui_visual_slot_cached(*slot, cache, &mut local);
+                }
+            }
+
             // One constituent per cycle. `offset` keeps constituent cycles
             // contiguous: the fourth cycle of a three-pattern slowcat is the
             // SECOND cycle of the first pattern, not the fourth. The wrapping
@@ -8511,6 +8583,7 @@ impl Pattern {
             | Node::Signal(..)
             | Node::MapHapsNative(..)
             | Node::MapHapsOwned(..)
+            | Node::UiVisual(..)
             | Node::Constants(..) => {
                 let mut haps = Vec::new();
                 QUERY_THREAD.with(|thread| self.query_node_onto(thread, state, &mut haps));
@@ -9883,19 +9956,19 @@ impl Pattern {
     pub fn pure_loc(&self) -> Option<(usize, usize)> {
         self.extras
             .as_deref()
-            .and_then(|e| e.pure_loc)
+            .and_then(PatternExtras::pure_loc)
             .map(|(begin, end)| (begin as usize, end as usize))
     }
 
     fn pure_loc_raw(&self) -> Option<(u32, u32)> {
-        self.extras.as_deref().and_then(|e| e.pure_loc)
+        self.extras.as_deref().and_then(PatternExtras::pure_loc)
     }
 
     pub fn with_pure_loc(mut self, loc: (usize, usize)) -> Self {
         // A span of a score, which is far shorter than the count of `u32`.
         let loc = u32::try_from(loc.0).ok().zip(u32::try_from(loc.1).ok());
         if loc.is_some() || self.pure_loc_raw().is_some() {
-            self.extras_mut().pure_loc = loc;
+            self.extras_mut().set_pure_loc(loc);
         }
         self
     }
@@ -9909,30 +9982,38 @@ impl Pattern {
         let locs = Arc::new(locs);
         let mut pattern = Pattern::of(Node::AddContext(self.clone(), locs)).with_steps_of(self);
         if let Some(loc) = self.pure_loc_raw() {
-            pattern.extras_mut().pure_loc = Some(loc);
+            pattern.extras_mut().set_pure_loc(Some(loc));
         }
         pattern
     }
 
     pub fn with_ui_visual_slot(&self, slot: u8) -> Self {
-        // One closure object per slot: the same visual built again is the
-        // same payload, so its subtree carries its answers across
-        // evaluations. See [`interned_closure`].
-        static POOL: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<u8, OwnedHapMapFn>>,
-        > = std::sync::OnceLock::new();
-        let interned = interned_closure(POOL.get_or_init(Default::default), slot, || {
-            // The map takes each hap as it is, with no copy of it.
-            let mapped: OwnedHapMapFn =
-                Arc::new(move |hap: Hap| Some(hap.with_ui_visual_slot(slot)));
-            mapped
-        });
-        let mut pattern = Pattern::of(Node::MapHapsOwned(self.clone(), interned, SpanUse::Ignores))
-            .with_steps_of(self);
+        if let Some(folded) = sequence::with_ui_visual_slot(self, slot) {
+            return folded.with_steps_of(self);
+        }
+        let mut pattern = Pattern::of(Node::UiVisual(
+            self.clone(),
+            slot,
+            std::sync::OnceLock::new(),
+        ))
+        .with_steps_of(self);
         if let Some(loc) = self.pure_loc_raw() {
-            pattern.extras_mut().pure_loc = Some(loc);
+            pattern.extras_mut().set_pure_loc(Some(loc));
         }
         pattern
+    }
+
+    /// Owned variant of [`Self::with_ui_visual_slot`] that updates an unshared
+    /// `Node::Sequence` in place without cloning layers or `NodeCell`.
+    pub fn with_ui_visual_slot_owned(mut self, slot: u8) -> Self {
+        if self.extras.is_none()
+            && let Some(cell) = Arc::get_mut(&mut self.node)
+            && let Node::Sequence(layers) = &mut cell.kind
+            && sequence::with_ui_visual_slot_in_place(layers, slot)
+        {
+            return self;
+        }
+        self.with_ui_visual_slot(slot)
     }
 
     /// Collect this pattern's values into a one-element `Value::List`, the seed
@@ -12119,6 +12200,7 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         | Node::SortHapsByPart(pattern)
         | Node::MapHapsNative(pattern, _, _)
         | Node::MapHapsOwned(pattern, _, _)
+        | Node::UiVisual(pattern, _, _)
         | Node::MapHapsWithState(pattern, _)
         | Node::ExpandHapsNative(pattern, _, _)
         | Node::Collect(pattern)
@@ -12311,6 +12393,7 @@ fn span_read(node: &Node) -> purity::SpanRead {
         | Node::FilterValues(pattern, _)
         | Node::MapHapsNative(pattern, _, SpanUse::Ignores)
         | Node::MapHapsOwned(pattern, _, SpanUse::Ignores)
+        | Node::UiVisual(pattern, _, _)
         | Node::ExpandHapsNative(pattern, _, SpanUse::Ignores)
         // A hap is kept or dropped by the begin of its whole.
         | Node::Degrade(pattern, ..) => of(pattern),
@@ -12427,6 +12510,7 @@ fn compute_purity(node: &Node) -> purity::Purity {
         | Node::SortHapsByPart(p)
         | Node::MapHapsNative(p, _, _)
         | Node::MapHapsOwned(p, _, _)
+        | Node::UiVisual(p, _, _)
         | Node::MapHapsWithState(p, _)
         | Node::ExpandHapsNative(p, _, _)
         | Node::Collect(p)
