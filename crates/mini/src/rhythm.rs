@@ -4,8 +4,8 @@
 use crate::{Build, ParseError, Postfix, Span};
 use rustel_core::{
     Locations, Pattern, SequenceBuilder, SequenceLayer, SequenceStep, SourceStep, SourcedLayer,
-    StepSource, Value, pure, sequence, sequence_of_indexed_slice, sequence_of_sourced,
-    sequence_of_ticks, silence,
+    StepSource, TickCut, TickStep, Value, pure, sequence, sequence_of_cut_ticks,
+    sequence_of_indexed_slice, sequence_of_sourced, sequence_of_ticks, silence,
 };
 use rustel_fraction::Fraction;
 use std::ops::Range;
@@ -2294,6 +2294,9 @@ impl<'r> Planned<'r> {
         if let Some(pattern) = self.try_tick_pattern(steps) {
             return Some(pattern);
         }
+        if let Some(pattern) = self.try_cut_tick_pattern(steps) {
+            return Some(pattern);
+        }
         let Room {
             plans,
             values,
@@ -2486,6 +2489,553 @@ impl<'r> Planned<'r> {
             }
         }
         Some(builder.finish()?.with_steps(steps))
+    }
+
+    /// Direct integer-tick fast path for single-layer equal sequences holding
+    /// alternations, whole speeds (`*N`), and whole slow counts (`/N`) — plus
+    /// top-level `/N` and `*N` of an atom or single-lane equal alternation.
+    fn try_cut_tick_pattern(&mut self, steps: Option<Fraction>) -> Option<Pattern> {
+        let Room {
+            plans,
+            values,
+            local_buf,
+            held_buf,
+            ..
+        } = &mut *self.room;
+        #[derive(Clone, Copy)]
+        enum FlatSlot {
+            Rest,
+            Atom {
+                value: u16,
+                begin: u32,
+                len: u16,
+                extra: (u32, u16),
+            },
+            Alt {
+                ids: Among,
+                extra: (u32, u16),
+            },
+            SlowAtom {
+                value: u16,
+                begin: u32,
+                len: u16,
+                times: u32,
+                extra: (u32, u16),
+            },
+            SlowAlt {
+                ids: Among,
+                times: u32,
+                extra: (u32, u16),
+            },
+            FastAtom {
+                value: u16,
+                begin: u32,
+                len: u16,
+                rate: u32,
+                extra: (u32, u16),
+            },
+            FastAlt {
+                ids: Among,
+                rate: u32,
+                extra: (u32, u16),
+            },
+        }
+        let extra_of = |plans: &Plans, site_idx: u16| -> Option<(u32, u16)> {
+            let (b, e) = plans.sites[site_idx as usize];
+            let len = e.checked_sub(b)?;
+            if len == 0 || len >= 255 {
+                return None;
+            }
+            Some((b, len as u16))
+        };
+        let flat_alt_ids = |plans: &Plans, id: Id| -> Option<Among> {
+            let Kind::Alternation(lanes) = plans.kind(id) else {
+                return None;
+            };
+            let [lane] = plans.lanes[lanes.range()] else {
+                return None;
+            };
+            if !lane.equal || lane.parts.range().is_empty() {
+                return None;
+            }
+            for &child in &plans.ids[lane.parts.range()] {
+                match plans.kind(child) {
+                    Kind::Rest => {}
+                    Kind::Atom { value, len, .. } => {
+                        if u16::try_from(value).is_err() || len >= 255 {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            Some(lane.parts)
+        };
+        let classify = |plans: &Plans, id: Id| -> Option<FlatSlot> {
+            match plans.kind(id) {
+                Kind::Rest => Some(FlatSlot::Rest),
+                Kind::Atom { value, begin, len } => {
+                    if len >= 255 {
+                        return None;
+                    }
+                    Some(FlatSlot::Atom {
+                        value: u16::try_from(value).ok()?,
+                        begin,
+                        len,
+                        extra: (0, 0),
+                    })
+                }
+                Kind::Alternation(_) => Some(FlatSlot::Alt {
+                    ids: flat_alt_ids(plans, id)?,
+                    extra: (0, 0),
+                }),
+                Kind::Slower(inner, times, speed) if (1..=64).contains(&times) => {
+                    let extra = extra_of(plans, speed)?;
+                    match plans.kind(inner) {
+                        Kind::Rest => Some(FlatSlot::Rest),
+                        Kind::Atom { value, begin, len } if len > 0 && len < 255 => {
+                            Some(FlatSlot::SlowAtom {
+                                value: u16::try_from(value).ok()?,
+                                begin,
+                                len,
+                                times,
+                                extra,
+                            })
+                        }
+                        Kind::Alternation(_) => Some(FlatSlot::SlowAlt {
+                            ids: flat_alt_ids(plans, inner)?,
+                            times,
+                            extra,
+                        }),
+                        _ => None,
+                    }
+                }
+                Kind::Faster(inner, rate, speed, true) if (1..=16).contains(&rate) => {
+                    let extra = extra_of(plans, speed)?;
+                    match plans.kind(inner) {
+                        Kind::Rest => Some(FlatSlot::Rest),
+                        Kind::Atom { value, begin, len } if len > 0 && len < 255 => {
+                            Some(FlatSlot::FastAtom {
+                                value: u16::try_from(value).ok()?,
+                                begin,
+                                len,
+                                rate,
+                                extra,
+                            })
+                        }
+                        Kind::Alternation(_) => Some(FlatSlot::FastAlt {
+                            ids: flat_alt_ids(plans, inner)?,
+                            rate,
+                            extra,
+                        }),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        let mut raw_steps = [TickStep {
+            part_begin: 0,
+            part_end: 0,
+            value: 0,
+            loc0_begin: 0,
+            loc0_len: 0,
+            loc1_begin: 0,
+            loc1_len: 0,
+        }; 128];
+        let mut cuts = [TickCut {
+            index: 0,
+            whole_begin: 0,
+            whole_end: 0,
+        }; 128];
+        let mut step_len = 0usize;
+        let mut cut_len = 0usize;
+        let mut in_cycles = true;
+        let (period, ticks) = match plans.kind(self.root) {
+            Kind::Slower(..) | Kind::Faster(..) => {
+                let slot = classify(plans, self.root)?;
+                match slot {
+                    FlatSlot::Rest => return Some(silence().with_steps(steps)),
+                    FlatSlot::SlowAtom {
+                        value,
+                        begin,
+                        len,
+                        times,
+                        extra,
+                    } => {
+                        if times > u32::from(u16::MAX) {
+                            return None;
+                        }
+                        in_cycles = times == 1;
+                        raw_steps[0] = TickStep {
+                            part_begin: 0,
+                            part_end: times as u16,
+                            value,
+                            loc0_begin: begin,
+                            loc0_len: len,
+                            loc1_begin: extra.0,
+                            loc1_len: extra.1,
+                        };
+                        step_len = 1;
+                        let period = if times == 1 {
+                            Fraction::ONE
+                        } else {
+                            Fraction::int(i128::from(times))
+                        };
+                        (period, 1u32)
+                    }
+                    FlatSlot::SlowAlt { ids, times, extra } => {
+                        let slice = &plans.ids[ids.range()];
+                        let p = slice.len() as u32;
+                        let period_int = p.checked_mul(times)?;
+                        if period_int > u32::from(u16::MAX) || slice.len() > raw_steps.len() {
+                            return None;
+                        }
+                        in_cycles = times == 1;
+                        for (i, &child) in slice.iter().enumerate() {
+                            if let Kind::Atom { value, begin, len } = plans.kind(child) {
+                                if len == 0 {
+                                    return None;
+                                }
+                                let b = (i as u32) * times;
+                                raw_steps[step_len] = TickStep {
+                                    part_begin: b as u16,
+                                    part_end: (b + times) as u16,
+                                    value: value as u16,
+                                    loc0_begin: begin,
+                                    loc0_len: len,
+                                    loc1_begin: extra.0,
+                                    loc1_len: extra.1,
+                                };
+                                step_len += 1;
+                            }
+                        }
+                        let period = if period_int == 1 {
+                            Fraction::ONE
+                        } else {
+                            Fraction::int(i128::from(period_int))
+                        };
+                        (period, 1u32)
+                    }
+                    FlatSlot::FastAtom {
+                        value,
+                        begin,
+                        len,
+                        rate,
+                        extra,
+                    } => {
+                        // One step over period `1 / rate` fits `CompactGrid::OneStep`
+                        // with zero heap grid allocation.
+                        raw_steps[0] = TickStep {
+                            part_begin: 0,
+                            part_end: 1,
+                            value,
+                            loc0_begin: begin,
+                            loc0_len: len,
+                            loc1_begin: extra.0,
+                            loc1_len: extra.1,
+                        };
+                        step_len = 1;
+                        (Fraction::checked_new(1, i128::from(rate))?, rate)
+                    }
+                    FlatSlot::FastAlt { ids, rate, extra } => {
+                        let slice = &plans.ids[ids.range()];
+                        let p = slice.len() as u32;
+                        if slice.len() > raw_steps.len() {
+                            return None;
+                        }
+                        for (i, &child) in slice.iter().enumerate() {
+                            if let Kind::Atom { value, begin, len } = plans.kind(child) {
+                                if len == 0 {
+                                    return None;
+                                }
+                                raw_steps[step_len] = TickStep {
+                                    part_begin: i as u16,
+                                    part_end: (i + 1) as u16,
+                                    value: value as u16,
+                                    loc0_begin: begin,
+                                    loc0_len: len,
+                                    loc1_begin: extra.0,
+                                    loc1_len: extra.1,
+                                };
+                                step_len += 1;
+                            }
+                        }
+                        (
+                            Fraction::checked_new(i128::from(p), i128::from(rate))?,
+                            rate,
+                        )
+                    }
+                    _ => return None,
+                }
+            }
+            Kind::EqualSequence(parts) => {
+                let ids = &plans.ids[parts.range()];
+                let k = ids.len();
+                if !(2..=16).contains(&k) {
+                    return None;
+                }
+                let mut slots = [FlatSlot::Rest; 16];
+                let mut period_cycles = 1u32;
+                let mut sub_ticks = 1u32;
+                for (j, &child) in ids.iter().enumerate() {
+                    let slot = classify(plans, child)?;
+                    slots[j] = slot;
+                    match slot {
+                        FlatSlot::Rest | FlatSlot::Atom { .. } => {}
+                        FlatSlot::Alt { ids, .. } => {
+                            period_cycles = lcm_u32(period_cycles, ids.range().len() as u32)?;
+                        }
+                        FlatSlot::SlowAtom { times, .. } => {
+                            period_cycles = lcm_u32(period_cycles, times)?;
+                        }
+                        FlatSlot::SlowAlt { ids, times, .. } => {
+                            let p = (ids.range().len() as u32).checked_mul(times)?;
+                            period_cycles = lcm_u32(period_cycles, p)?;
+                        }
+                        FlatSlot::FastAtom { rate, .. } => {
+                            sub_ticks = lcm_u32(sub_ticks, rate)?;
+                        }
+                        FlatSlot::FastAlt { ids, rate, .. } => {
+                            let p = ids.range().len() as u32;
+                            period_cycles = lcm_u32(period_cycles, p / gcd_u32(p, rate))?;
+                            sub_ticks = lcm_u32(sub_ticks, rate)?;
+                        }
+                    }
+                    if period_cycles > 64 || sub_ticks > 16 {
+                        return None;
+                    }
+                }
+                let ticks = (k as u32).checked_mul(sub_ticks)?;
+                if u64::from(period_cycles) * u64::from(ticks) > u64::from(u16::MAX) {
+                    return None;
+                }
+                for t in 0..period_cycles {
+                    let cycle_base = t * ticks;
+                    for (j, &slot) in slots[..k].iter().enumerate() {
+                        let slot_start = cycle_base + (j as u32) * sub_ticks;
+                        match slot {
+                            FlatSlot::Rest => {}
+                            FlatSlot::Atom {
+                                value,
+                                begin,
+                                len,
+                                extra,
+                            } => {
+                                if step_len >= raw_steps.len() {
+                                    return None;
+                                }
+                                raw_steps[step_len] = TickStep {
+                                    part_begin: slot_start as u16,
+                                    part_end: (slot_start + sub_ticks) as u16,
+                                    value,
+                                    loc0_begin: begin,
+                                    loc0_len: len,
+                                    loc1_begin: extra.0,
+                                    loc1_len: extra.1,
+                                };
+                                step_len += 1;
+                            }
+                            FlatSlot::Alt { ids, extra } => {
+                                let slice = &plans.ids[ids.range()];
+                                let child = slice[(t as usize) % slice.len()];
+                                if let Kind::Atom { value, begin, len } = plans.kind(child) {
+                                    if step_len >= raw_steps.len() {
+                                        return None;
+                                    }
+                                    raw_steps[step_len] = TickStep {
+                                        part_begin: slot_start as u16,
+                                        part_end: (slot_start + sub_ticks) as u16,
+                                        value: value as u16,
+                                        loc0_begin: begin,
+                                        loc0_len: len,
+                                        loc1_begin: extra.0,
+                                        loc1_len: extra.1,
+                                    };
+                                    step_len += 1;
+                                }
+                            }
+                            FlatSlot::SlowAtom {
+                                value,
+                                begin,
+                                len,
+                                times,
+                                extra,
+                            } => {
+                                if step_len >= raw_steps.len() {
+                                    return None;
+                                }
+                                let rem = t % times;
+                                if times > 1 {
+                                    let wb = i64::from(slot_start)
+                                        - i64::from(rem) * i64::from(sub_ticks);
+                                    let we = i64::from(slot_start)
+                                        + i64::from(times - rem) * i64::from(sub_ticks);
+                                    let wb = u16::try_from(wb).ok()?;
+                                    let we = u16::try_from(we).ok()?;
+                                    cuts[cut_len] = TickCut {
+                                        index: step_len as u16,
+                                        whole_begin: wb,
+                                        whole_end: we,
+                                    };
+                                    cut_len += 1;
+                                }
+                                raw_steps[step_len] = TickStep {
+                                    part_begin: slot_start as u16,
+                                    part_end: (slot_start + sub_ticks) as u16,
+                                    value,
+                                    loc0_begin: begin,
+                                    loc0_len: len,
+                                    loc1_begin: extra.0,
+                                    loc1_len: extra.1,
+                                };
+                                step_len += 1;
+                            }
+                            FlatSlot::SlowAlt { ids, times, extra } => {
+                                let slice = &plans.ids[ids.range()];
+                                let inner_cycle = (t / times) as usize;
+                                let rem = t % times;
+                                let child = slice[inner_cycle % slice.len()];
+                                if let Kind::Atom { value, begin, len } = plans.kind(child) {
+                                    if len == 0 || step_len >= raw_steps.len() {
+                                        return None;
+                                    }
+                                    if times > 1 {
+                                        let wb = i64::from(slot_start)
+                                            - i64::from(rem) * i64::from(sub_ticks);
+                                        let we = i64::from(slot_start)
+                                            + i64::from(times - rem) * i64::from(sub_ticks);
+                                        let wb = u16::try_from(wb).ok()?;
+                                        let we = u16::try_from(we).ok()?;
+                                        cuts[cut_len] = TickCut {
+                                            index: step_len as u16,
+                                            whole_begin: wb,
+                                            whole_end: we,
+                                        };
+                                        cut_len += 1;
+                                    }
+                                    raw_steps[step_len] = TickStep {
+                                        part_begin: slot_start as u16,
+                                        part_end: (slot_start + sub_ticks) as u16,
+                                        value: value as u16,
+                                        loc0_begin: begin,
+                                        loc0_len: len,
+                                        loc1_begin: extra.0,
+                                        loc1_len: extra.1,
+                                    };
+                                    step_len += 1;
+                                }
+                            }
+                            FlatSlot::FastAtom {
+                                value,
+                                begin,
+                                len,
+                                rate,
+                                extra,
+                            } => {
+                                let w = sub_ticks / rate;
+                                for r in 0..rate {
+                                    if step_len >= raw_steps.len() {
+                                        return None;
+                                    }
+                                    let pb = slot_start + r * w;
+                                    raw_steps[step_len] = TickStep {
+                                        part_begin: pb as u16,
+                                        part_end: (pb + w) as u16,
+                                        value,
+                                        loc0_begin: begin,
+                                        loc0_len: len,
+                                        loc1_begin: extra.0,
+                                        loc1_len: extra.1,
+                                    };
+                                    step_len += 1;
+                                }
+                            }
+                            FlatSlot::FastAlt { ids, rate, extra } => {
+                                let slice = &plans.ids[ids.range()];
+                                let w = sub_ticks / rate;
+                                for r in 0..rate {
+                                    let child = slice[((t * rate + r) as usize) % slice.len()];
+                                    if let Kind::Atom { value, begin, len } = plans.kind(child) {
+                                        if len == 0 || step_len >= raw_steps.len() {
+                                            return None;
+                                        }
+                                        let pb = slot_start + r * w;
+                                        raw_steps[step_len] = TickStep {
+                                            part_begin: pb as u16,
+                                            part_end: (pb + w) as u16,
+                                            value: value as u16,
+                                            loc0_begin: begin,
+                                            loc0_len: len,
+                                            loc1_begin: extra.0,
+                                            loc1_len: extra.1,
+                                        };
+                                        step_len += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let period = if period_cycles == 1 {
+                    Fraction::ONE
+                } else {
+                    Fraction::int(i128::from(period_cycles))
+                };
+                (period, ticks)
+            }
+            _ => return None,
+        };
+        if step_len == 0 {
+            return Some(silence().with_steps(steps));
+        }
+        // Validate location bounds up front before moving values out of `Room`.
+        let mut min_begin = u32::MAX;
+        let mut max_begin = 0u32;
+        for step in &raw_steps[..step_len] {
+            if step.loc0_len > 0 {
+                min_begin = min_begin.min(step.loc0_begin);
+                max_begin = max_begin.max(step.loc0_begin);
+            }
+            if step.loc1_len > 0 {
+                min_begin = min_begin.min(step.loc1_begin);
+                max_begin = max_begin.max(step.loc1_begin);
+            }
+        }
+        let base = if min_begin == u32::MAX { 0 } else { min_begin };
+        if base >= (1 << 31) || (min_begin != u32::MAX && max_begin - base >= (1 << 22)) {
+            return None;
+        }
+        if local_buf.len() < values.len() {
+            local_buf.resize(values.len(), 0);
+        }
+        held_buf.clear();
+        for step in &mut raw_steps[..step_len] {
+            let global_idx = usize::from(step.value);
+            let slot = &mut local_buf[global_idx];
+            if *slot == 0 {
+                held_buf.push(global_idx as u32);
+                *slot = held_buf.len() as u32;
+            }
+            step.value = (*slot - 1) as u16;
+        }
+        let layer_values: Arc<[Value]> = held_buf
+            .iter()
+            .map(|&idx| {
+                local_buf[idx as usize] = 0;
+                std::mem::replace(&mut values[idx as usize], Value::Undefined)
+            })
+            .collect();
+        let ticks = std::num::NonZeroU32::new(ticks)?;
+        sequence_of_cut_ticks(
+            period,
+            ticks,
+            layer_values,
+            in_cycles,
+            &raw_steps[..step_len],
+            &cuts[..cut_len],
+        )
+        .map(|pattern| pattern.with_steps(steps))
     }
 }
 

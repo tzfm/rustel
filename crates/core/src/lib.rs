@@ -51,8 +51,8 @@ pub use locations::Locations;
 use rustel_fraction::Fraction;
 pub use sequence::{
     GivenLayer, IndexedLayer, SequenceBuilder, SequenceLayer, SequenceStep, SourceStep,
-    SourcedLayer, StepSource, sequence, sequence_of, sequence_of_indexed_slice,
-    sequence_of_sourced, sequence_of_ticks,
+    SourcedLayer, StepSource, TickCut, TickStep, sequence, sequence_of, sequence_of_cut_ticks,
+    sequence_of_indexed_slice, sequence_of_sourced, sequence_of_ticks,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -13482,7 +13482,7 @@ impl Pattern {
     /// stacking up to 8 wave controls into one node without building
     /// intermediate signal or control patterns.
     pub(crate) fn apply_inline_wave(
-        self,
+        mut self,
         key_id: u16,
         wave: fused::Wave,
         steps_per_cycle: u32,
@@ -13498,20 +13498,38 @@ impl Pattern {
             key_id,
             math_inside,
         };
-        if let Node::AppWave(existing) = self.node_kind()
-            && !self.has_runtime_settings()
-            && self.pure_loc_raw().is_none()
-            && self.keeps_runtime_over(&existing.inner)
-            && existing.waves.len() < 8
-        {
-            let mut combined = Vec::with_capacity(existing.waves.len() + 1);
-            combined.extend(existing.waves.iter().cloned());
-            combined.push(item);
-            return Pattern::of(Node::AppWave(Box::new(AppWaveNode {
-                inner: existing.inner.clone(),
-                waves: AppWaves::Many(combined.into_boxed_slice()),
-            })))
-            .with_steps(steps);
+        let can_append = matches!(
+            self.node_kind(),
+            Node::AppWave(existing)
+                if !self.has_runtime_settings()
+                    && self.pure_loc_raw().is_none()
+                    && self.keeps_runtime_over(&existing.inner)
+                    && existing.waves.len() < 8
+        );
+        if can_append {
+            if let Some(cell) = Arc::get_mut(&mut self.node)
+                && let Node::AppWave(existing) = &mut cell.kind
+            {
+                let mut combined = Vec::with_capacity(existing.waves.len() + 1);
+                let prev = std::mem::replace(&mut existing.waves, AppWaves::Many(Box::new([])));
+                match prev {
+                    AppWaves::One(one) => combined.push(one),
+                    AppWaves::Many(many) => combined.extend(many.into_vec()),
+                }
+                combined.push(item);
+                existing.waves = AppWaves::Many(combined.into_boxed_slice());
+                return self.with_steps(steps);
+            }
+            if let Node::AppWave(existing) = self.node_kind() {
+                let mut combined = Vec::with_capacity(existing.waves.len() + 1);
+                combined.extend(existing.waves.iter().cloned());
+                combined.push(item);
+                return Pattern::of(Node::AppWave(Box::new(AppWaveNode {
+                    inner: existing.inner.clone(),
+                    waves: AppWaves::Many(combined.into_boxed_slice()),
+                })))
+                .with_steps(steps);
+            }
         }
         Pattern::of(Node::AppWave(Box::new(AppWaveNode {
             inner: self,
@@ -14487,50 +14505,6 @@ impl Pattern {
         self.query_arc_outcome_in(state, budget, table::Order::Sorted)
     }
 
-    fn initial_short_room(&self) -> usize {
-        fn has_dense_shape(mut cur: &Node, depth: u8) -> bool {
-            for _ in 0..8 {
-                match cur {
-                    Node::UiVisual(node) => cur = node.inner.node_kind(),
-                    Node::AppWave(app) => cur = app.inner.node_kind(),
-                    Node::AppLeft(pair) => cur = pair.0.node_kind(),
-                    Node::AddContext(boxed) => cur = boxed.0.node_kind(),
-                    Node::SplitQueries(cell, _) => cur = &cell.kind,
-                    Node::SplitQueriesBoxed(pat) => cur = pat.node_kind(),
-                    Node::Constants(node) => cur = node.0.node_kind(),
-                    Node::Fast(node) => cur = node.0.node_kind(),
-                    Node::Shift(node) => cur = node.0.node_kind(),
-                    Node::ShiftSmall(cell, ..) => cur = &cell.kind,
-                    Node::ControlMap(cell, ..) => cur = &cell.kind,
-                    Node::ControlMapBoxed(boxed) => cur = boxed.0.node_kind(),
-                    Node::MapHapsNative(boxed) => cur = boxed.0.node_kind(),
-                    Node::MapHapsOwned(boxed) => cur = boxed.0.node_kind(),
-                    Node::Cpm(boxed) => cur = boxed.0.node_kind(),
-                    Node::WithRandSeed(boxed) => cur = boxed.0.node_kind(),
-                    Node::Timeline(..) => return true,
-                    Node::SlowCat(pats) if pats.len() >= 2 => return true,
-                    Node::SlowCatPure(cells) if cells.len() >= 2 => return true,
-                    Node::Stack(pats) => {
-                        return pats.len() >= 4
-                            || (depth == 0
-                                && pats.iter().any(|p| has_dense_shape(p.node_kind(), 1)));
-                    }
-                    Node::StackPure(cells) => {
-                        return cells.len() >= 4
-                            || (depth == 0 && cells.iter().any(|c| has_dense_shape(&c.kind, 1)));
-                    }
-                    _ => return false,
-                }
-            }
-            false
-        }
-        if has_dense_shape(self.node_kind(), 0) {
-            32
-        } else {
-            20
-        }
-    }
-
     fn query_arc_outcome_in(
         &self,
         state: &State,
@@ -14553,7 +14527,7 @@ impl Pattern {
         let query = || {
             with_hap_budget(budget, || {
                 let raw_query_attaches_metadata = QUERY_DEPTH.with(|depth| depth.get() == 0);
-                // Short windows start at 20 (3,840 B <= 4 KiB slab) and adapt
+                // Short windows start at 20 (3,840 B <= 4 KiB page) and adapt
                 // up to 64 per root pattern once denser windows are observed,
                 // avoiding repeated `Vec<Hap>` reallocs without slowing tiny
                 // scores or retaining memory on the pattern.
@@ -14563,15 +14537,13 @@ impl Pattern {
                 }
                 let is_short = state.span.end - state.span.begin <= Fraction::ONE;
                 let root_ptr = Arc::as_ptr(&self.node) as usize;
-                let mut base_room = 20usize;
                 let room = if is_short {
                     SHORT_QUERY_HINT.with(|hint| {
                         let (ptr, cap) = hint.get();
                         if ptr == root_ptr {
                             usize::from(cap)
                         } else {
-                            base_room = self.initial_short_room();
-                            base_room
+                            20
                         }
                     })
                 } else {
@@ -14588,8 +14560,7 @@ impl Pattern {
                         48u16
                     } else {
                         64u16
-                    }
-                    .max(base_room as u16);
+                    };
                     SHORT_QUERY_HINT.with(|hint| {
                         let (ptr, cap) = hint.get();
                         let next = if ptr == root_ptr {

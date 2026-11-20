@@ -77,6 +77,7 @@ struct Chain {
 }
 
 /// One call of a control with one argument, as the score writes it.
+#[derive(Clone, Copy)]
 struct ControlCall<'p> {
     spec: &'static ControlSpec,
     method: &'p str,
@@ -562,14 +563,20 @@ impl<'p> Turn<'p> {
                 receiver,
                 method,
                 arguments,
-                ..
+                written,
             } => {
-                let (calls, under) = self.control_calls(names, expression);
-                if !calls.is_empty() {
-                    return self.control_chain(names, calls, under, runtime);
-                }
-                self.spare.calls.push(calls);
                 let arguments = self.held.row(*arguments);
+                if let [first_arg] = arguments
+                    && let Some(BuiltinMethod::Control(first_spec)) = builtin_method(names, method)
+                {
+                    let first = ControlCall {
+                        spec: first_spec,
+                        method,
+                        argument: first_arg,
+                        written: *written,
+                    };
+                    return self.control_chain_from(names, first, self.held.at(*receiver), runtime);
+                }
                 match self.receiver(names, self.held.at(*receiver), method, runtime)? {
                     Native::Pattern(receiver) => {
                         self.method(names, receiver, method, arguments, runtime)?
@@ -860,17 +867,20 @@ impl<'p> Turn<'p> {
         }
     }
 
-    /// The calls of controls with one argument that end at `expression`,
-    /// the last one first, and the receiver of the first one.
-    fn control_calls(
+    /// Collect a chain of control calls starting from `first` and apply them,
+    /// keeping chains of up to 12 calls entirely on the stack.
+    fn control_chain_from(
         &mut self,
         names: &Names<'_, '_>,
-        expression: &'p ScoreExpr<'p>,
-    ) -> (Vec<ControlCall<'p>>, &'p ScoreExpr<'p>) {
-        // The expressions live as long as the program, not as this turn.
+        first: ControlCall<'p>,
+        mut under: &'p ScoreExpr<'p>,
+        runtime: &JsRuntime,
+    ) -> Option<Native<'p>> {
+        const INLINE: usize = 12;
         let held = self.held;
-        let mut calls = self.spare.calls.pop().unwrap_or_default();
-        let mut under = expression;
+        let mut inline = [first; INLINE];
+        let mut len = 1usize;
+        let mut spilled: Option<Vec<ControlCall<'p>>> = None;
         while let ScoreExpr::Method {
             receiver,
             method,
@@ -880,24 +890,91 @@ impl<'p> Turn<'p> {
             && let [argument] = held.row(*arguments)
             && let Some(BuiltinMethod::Control(spec)) = builtin_method(names, method)
         {
-            calls.push(ControlCall {
+            let call = ControlCall {
                 spec,
                 method,
                 argument,
                 written: *written,
-            });
+            };
+            if let Some(vec) = &mut spilled {
+                vec.push(call);
+            } else if len < INLINE {
+                inline[len] = call;
+                len += 1;
+            } else {
+                let mut vec = self.spare.calls.pop().unwrap_or_default();
+                vec.extend_from_slice(&inline);
+                vec.push(call);
+                spilled = Some(vec);
+            }
             under = held.at(*receiver);
         }
-        (calls, under)
+        if let Some(mut calls) = spilled {
+            let made = self.control_chain_slice(names, &calls, under, runtime);
+            calls.clear();
+            self.spare.calls.push(calls);
+            made
+        } else {
+            self.control_chain_slice(names, &inline[..len], under, runtime)
+        }
+    }
+
+    fn eval_control_arg(
+        &mut self,
+        names: &Names<'_, '_>,
+        call: &ControlCall<'p>,
+        runtime: &JsRuntime,
+    ) -> Option<ChainArgument> {
+        Some(match call.argument {
+            ScoreExpr::Number(number) => ChainArgument::Number(*number),
+            ScoreExpr::String(text) => ChainArgument::Constant(
+                rustel_core::Value::Str(text.as_ref().into()),
+                rustel_core::Locations::new(),
+            ),
+            ScoreExpr::Call {
+                callee, arguments, ..
+            } if *callee == MINI_CALLEE
+                && names.mini()
+                && matches!(self.resolve(MINI_CALLEE), Resolved::Host)
+                && let [ScoreExpr::String(source), ScoreExpr::Number(offset)] =
+                    self.held.row(*arguments)
+                && offset.fract() == 0.0
+                && offset.is_finite()
+                && let Ok(at) = usize::try_from(*offset as i64)
+                && let Some((value, locations)) = rustel_mini::word_constant_value(source, at) =>
+            {
+                self.steps += 1;
+                if self.steps > MAX_STEPS {
+                    return None;
+                }
+                ChainArgument::Constant(value, locations)
+            }
+            argument => {
+                if let Some(wave) = self.try_eval_wave_expr(names, argument) {
+                    wave
+                } else {
+                    match self.pattern_argument(names, argument, runtime) {
+                        Some(value) => ChainArgument::Pattern(value),
+                        None => {
+                            if self.left.is_none() && call.written.len > 0 {
+                                self.left =
+                                    Some(call.written.start.saturating_add(call.written.len - 1));
+                            }
+                            return None;
+                        }
+                    }
+                }
+            }
+        })
     }
 
     /// The pattern of a chain of control calls on `receiver`: each call as
     /// [`Self::method`] makes it, with the constants in a row set in one
     /// step. See [`rustel_core::controls::apply_chain`].
-    fn control_chain(
+    fn control_chain_slice(
         &mut self,
         names: &Names<'_, '_>,
-        mut calls: Vec<ControlCall<'p>>,
+        calls: &[ControlCall<'p>],
         receiver: &'p ScoreExpr,
         runtime: &JsRuntime,
     ) -> Option<Native<'p>> {
@@ -906,12 +983,6 @@ impl<'p> Turn<'p> {
         if self.steps > MAX_STEPS {
             return None;
         }
-        // A call that is left to JavaScript is where the native tier stops.
-        let leave = |turn: &mut Self, call: &ControlCall<'p>| {
-            if turn.left.is_none() && call.written.len > 0 {
-                turn.left = Some(call.written.start.saturating_add(call.written.len - 1));
-            }
-        };
         // A pattern, or the parameter of an arrow that is being compiled.
         enum Receiver {
             Pattern(Pattern),
@@ -921,51 +992,44 @@ impl<'p> Turn<'p> {
             Some(Native::Pattern(pattern)) => Receiver::Pattern(pattern),
             Some(Native::Chain(parameter)) => Receiver::Parameter(parameter),
             _ => {
-                leave(self, calls.last()?);
+                if let Some(call) = calls.last()
+                    && self.left.is_none()
+                    && call.written.len > 0
+                {
+                    self.left = Some(call.written.start.saturating_add(call.written.len - 1));
+                }
                 return None;
             }
         };
+        const INLINE_CHAIN: usize = 12;
+        if calls.len() <= INLINE_CHAIN {
+            let dummy = calls[0].spec;
+            let mut chain: [ChainCall; INLINE_CHAIN] =
+                std::array::from_fn(|_| (dummy, ChainArgument::Number(0.0)));
+            let mut len = 0usize;
+            for call in calls.iter().rev() {
+                let argument = self.eval_control_arg(names, call, runtime)?;
+                chain[len] = (call.spec, argument);
+                len += 1;
+            }
+            return Some(match receiver {
+                Receiver::Pattern(pattern) => Native::Pattern(
+                    rustel_core::controls::apply_chain_owned(pattern, &mut chain[..len]),
+                ),
+                Receiver::Parameter(mut parameter) => {
+                    let name = calls.last()?.method;
+                    let step =
+                        rustel_core::controls::chain_transformer(name, chain.into_iter().take(len));
+                    parameter
+                        .steps
+                        .push(PatternTransformInstruction::Apply(step));
+                    Native::Chain(parameter)
+                }
+            });
+        }
         let mut chain = self.spare.chains.pop().unwrap_or_default();
         for call in calls.iter().rev() {
-            let argument = match call.argument {
-                ScoreExpr::Number(number) => ChainArgument::Number(*number),
-                ScoreExpr::String(text) => ChainArgument::Constant(
-                    rustel_core::Value::Str(text.as_ref().into()),
-                    rustel_core::Locations::new(),
-                ),
-                ScoreExpr::Call {
-                    callee, arguments, ..
-                } if *callee == MINI_CALLEE
-                    && names.mini()
-                    && matches!(self.resolve(MINI_CALLEE), Resolved::Host)
-                    && let [ScoreExpr::String(source), ScoreExpr::Number(offset)] =
-                        self.held.row(*arguments)
-                    && offset.fract() == 0.0
-                    && offset.is_finite()
-                    && let Ok(at) = usize::try_from(*offset as i64)
-                    && let Some((value, locations)) =
-                        rustel_mini::word_constant_value(source, at) =>
-                {
-                    self.steps += 1;
-                    if self.steps > MAX_STEPS {
-                        return None;
-                    }
-                    ChainArgument::Constant(value, locations)
-                }
-                argument => {
-                    if let Some(wave) = self.try_eval_wave_expr(names, argument) {
-                        wave
-                    } else {
-                        match self.pattern_argument(names, argument, runtime) {
-                            Some(value) => ChainArgument::Pattern(value),
-                            None => {
-                                leave(self, call);
-                                return None;
-                            }
-                        }
-                    }
-                }
-            };
+            let argument = self.eval_control_arg(names, call, runtime)?;
             chain.push((call.spec, argument));
         }
         let made = match receiver {
@@ -983,9 +1047,7 @@ impl<'p> Turn<'p> {
                 Native::Chain(parameter)
             }
         };
-        calls.clear();
         chain.clear();
-        self.spare.calls.push(calls);
         self.spare.chains.push(chain);
         Some(made)
     }

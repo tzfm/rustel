@@ -1928,6 +1928,24 @@ impl<'a> GridView<'a> {
     }
 
     #[inline]
+    fn inline_loc_raw(self, index: usize) -> Option<Option<(u32, u16)>> {
+        let packed = self.steps.get(index).loc.0;
+        if packed == 0 {
+            return Some(None);
+        }
+        if packed & PackedLoc::SPARE != 0 {
+            return None;
+        }
+        let base = self.base & !Grid::SMALL;
+        let begin = base + (packed >> PackedLoc::LENGTH_BITS);
+        let length = ((packed & PackedLoc::LENGTH_MASK) - 1) as u16;
+        if length == 0 {
+            return None;
+        }
+        Some(Some((begin, length)))
+    }
+
+    #[inline]
     fn locations(self, index: usize) -> Locations {
         let packed = self.steps.get(index).loc.0;
         if packed == 0 {
@@ -4827,6 +4845,9 @@ impl Layer {
             });
             return Some((met, pairs));
         }
+        if let Some(fast) = self.met_grids(values, side, &keys) {
+            return Some(fast);
+        }
         // Both layers repeat in the least period that holds a whole count
         // of turns of each.
         let own_period = self.period();
@@ -4968,6 +4989,179 @@ impl Layer {
         }
         build
     }
+
+    /// Integer-tick fast path for [`Self::met`] when both layers are uncut
+    /// integer-period [`Grid`]s carrying at most one inline location per step
+    /// and no extra dress locations to fold in.
+    fn met_grids(
+        &self,
+        values: &Layer,
+        side: Side,
+        keys: &ContextKeys,
+    ) -> Option<(Layer, Vec<(u32, u32)>)> {
+        if self.dress().before_len() != 0
+            || values.dress().before_len() != 0
+            || !values.dress().after().is_empty()
+            || (side == Side::Values && !self.dress().after().is_empty())
+        {
+            return None;
+        }
+        let own_period = self.period();
+        let values_period = values.period();
+        if own_period.denom() != 1 || values_period.denom() != 1 {
+            return None;
+        }
+        let p1 = u32::try_from(own_period.numer()).ok()?;
+        let p2 = u32::try_from(values_period.numer()).ok()?;
+        let gcd = |mut a: u32, mut b: u32| -> u32 {
+            while b != 0 {
+                let r = a % b;
+                a = b;
+                b = r;
+            }
+            a
+        };
+        let period_int = (p1 / gcd(p1, p2)).checked_mul(p2)?;
+        if period_int == 0 || period_int > 64 {
+            return None;
+        }
+        let turns = period_int / p1;
+        self.listing()
+            .with_grid_view(|own| {
+                if own.rare.is_some() {
+                    return None;
+                }
+                values.listing().with_grid_view(|other| {
+                    if other.rare.is_some() {
+                        return None;
+                    }
+                    let t1 = own.ticks.get();
+                    let t2 = other.ticks.get();
+                    let ticks = (t1 / gcd(t1, t2)).checked_mul(t2)?;
+                    if u64::from(period_int) * u64::from(ticks) > u64::from(u16::MAX) {
+                        return None;
+                    }
+                    let scale1 = ticks / t1;
+                    let scale2 = ticks / t2;
+                    let p1_ticks = p1 * ticks;
+                    let p2_ticks = p2 * ticks;
+                    let other_len = other.steps.len();
+                    let mut tick_steps = SmallCopyBuf::<TickStep, 32>::new(TickStep {
+                        part_begin: 0,
+                        part_end: 0,
+                        value: 0,
+                        loc0_begin: 0,
+                        loc0_len: 0,
+                        loc1_begin: 0,
+                        loc1_len: 0,
+                    });
+                    let mut tick_cuts = SmallCopyBuf::<TickCut, 16>::new(TickCut {
+                        index: 0,
+                        whole_begin: 0,
+                        whole_end: 0,
+                    });
+                    let mut pairs: Vec<(u32, u32)> = Vec::new();
+                    let mut in_cycles = true;
+                    for turn in 0..turns {
+                        let start1 = turn * p1_ticks;
+                        for i in 0..own.steps.len() {
+                            let own_step = own.steps.get(i);
+                            let own_b = start1 + own_step.part_begin * scale1;
+                            let own_e = start1 + own_step.part_end * scale1;
+                            let own_loc = own.inline_loc_raw(i)?;
+                            let first_at = own_b / p2_ticks;
+                            let last_at = (own_e - 1) / p2_ticks;
+                            for at in first_at..=last_at {
+                                let start2 = at * p2_ticks;
+                                let rel_b = own_b.saturating_sub(start2);
+                                let rel_e = own_e - start2;
+                                let mut j = 0usize;
+                                while j < other_len {
+                                    let (_, oe) = other.steps.times_of(j);
+                                    if oe * scale2 > rel_b {
+                                        break;
+                                    }
+                                    j += 1;
+                                }
+                                while j < other_len {
+                                    let other_step = other.steps.get(j);
+                                    let jb = other_step.part_begin * scale2;
+                                    if jb >= rel_e {
+                                        break;
+                                    }
+                                    let je = other_step.part_end * scale2;
+                                    let piece_b = own_b.max(start2 + jb);
+                                    let piece_e = own_e.min(start2 + je);
+                                    if tick_steps.len() >= MAX_FOLDED_STEPS {
+                                        return None;
+                                    }
+                                    let other_loc = other.inline_loc_raw(j)?;
+                                    let pair = (own_step.value, other_step.value);
+                                    let pair_idx =
+                                        match pairs.iter().position(|known| *known == pair) {
+                                            Some(idx) => idx,
+                                            None => {
+                                                pairs.push(pair);
+                                                pairs.len() - 1
+                                            }
+                                        };
+                                    let value = u16::try_from(pair_idx).ok()?;
+                                    let (first_loc, second_loc) = match side {
+                                        Side::Functions => (other_loc, own_loc),
+                                        Side::Values => (own_loc, other_loc),
+                                    };
+                                    let (loc0, loc1) = match (first_loc, second_loc) {
+                                        (Some(a), Some(b)) => (a, b),
+                                        (Some(a), None) | (None, Some(a)) => (a, (0, 0)),
+                                        (None, None) => ((0, 0), (0, 0)),
+                                    };
+                                    if piece_b / ticks != (piece_e - 1) / ticks {
+                                        in_cycles = false;
+                                    }
+                                    let step_idx = u16::try_from(tick_steps.len()).ok()?;
+                                    if piece_b != own_b || piece_e != own_e {
+                                        tick_cuts.push(TickCut {
+                                            index: step_idx,
+                                            whole_begin: own_b as u16,
+                                            whole_end: own_e as u16,
+                                        });
+                                    }
+                                    tick_steps.push(TickStep {
+                                        part_begin: piece_b as u16,
+                                        part_end: piece_e as u16,
+                                        value,
+                                        loc0_begin: loc0.0,
+                                        loc0_len: loc0.1,
+                                        loc1_begin: loc1.0,
+                                        loc1_len: loc1.1,
+                                    });
+                                    j += 1;
+                                }
+                            }
+                        }
+                    }
+                    let period = if period_int == 1 {
+                        Fraction::ONE
+                    } else {
+                        Fraction::int(i128::from(period_int))
+                    };
+                    let listing = listing_of_cut_ticks(
+                        NonZeroU32::new(ticks)?,
+                        tick_steps.as_slice(),
+                        tick_cuts.as_slice(),
+                    )?;
+                    let mut met = self.clone();
+                    met.set_in_cycles(in_cycles);
+                    met.set_period_and_steps(period, Steps::Listed(listing));
+                    met.change_dress(|dress| {
+                        dress.set_keys(keys.clone());
+                    });
+                    met.is_in_order().then_some((met, pairs))
+                })
+            })
+            .flatten()
+            .flatten()
+    }
 }
 
 /// Whether the part of each of `places` lies in one cycle, in every turn of
@@ -5090,6 +5284,156 @@ fn layer_of_ticks(
         rare,
     );
     Some(Layer::holding(
+        period,
+        Steps::Listed(listing),
+        in_cycles,
+        values,
+    ))
+}
+
+/// Compact raw tick step carrying up to two source ranges (`loc1_len == 0`
+/// means a single range and `loc0_len == 0` means no location).
+#[derive(Clone, Copy)]
+pub struct TickStep {
+    pub part_begin: u16,
+    pub part_end: u16,
+    pub value: u16,
+    pub loc0_begin: u32,
+    pub loc0_len: u16,
+    pub loc1_begin: u32,
+    pub loc1_len: u16,
+}
+
+/// Cut step whose `whole` differs from its `part`, in integer grid ticks.
+#[derive(Clone, Copy)]
+pub struct TickCut {
+    pub index: u16,
+    pub whole_begin: u16,
+    pub whole_end: u16,
+}
+
+fn listing_of_cut_ticks(
+    ticks: NonZeroU32,
+    raw_steps: &[TickStep],
+    cuts: &[TickCut],
+) -> Option<Listing> {
+    let mut base = u32::MAX;
+    for step in raw_steps {
+        if step.loc0_len > 0 {
+            base = base.min(step.loc0_begin);
+        }
+        if step.loc1_len > 0 {
+            base = base.min(step.loc1_begin);
+        }
+    }
+    let base = if base == u32::MAX { 0 } else { base };
+    if base & Grid::SMALL != 0 {
+        return None;
+    }
+    let mut packed_runs = SmallCopyBuf::<u32, 32>::new(0);
+    let steps = GridSteps::build(raw_steps.len(), |index| {
+        let step = raw_steps[index];
+        let loc = if step.loc0_len == 0 && step.loc1_len == 0 {
+            PackedLoc(0)
+        } else if step.loc1_len == 0 {
+            PackedLoc::range_raw(base, step.loc0_begin, u32::from(step.loc0_len))?
+        } else {
+            let w0 = PackedLoc::range_raw(base, step.loc0_begin, u32::from(step.loc0_len))?.0;
+            let w1 = PackedLoc::range_raw(base, step.loc1_begin, u32::from(step.loc1_len))?.0
+                | PackedLoc::SPARE;
+            let existing = packed_runs.as_slice();
+            let mut found = None;
+            let mut pos = 0;
+            while pos + 2 <= existing.len() {
+                if existing[pos] == w0 && existing[pos + 1] == w1 {
+                    found = Some(pos);
+                    break;
+                }
+                pos += 2;
+            }
+            let start = match found {
+                Some(pos) => pos,
+                None => {
+                    let start = packed_runs.len();
+                    if start >= PackedLoc::WIDE as usize {
+                        return None;
+                    }
+                    packed_runs.push(w0);
+                    packed_runs.push(w1);
+                    start
+                }
+            };
+            PackedLoc(PackedLoc::SPARE | start as u32)
+        };
+        Some(GridStep {
+            part_begin: u32::from(step.part_begin),
+            part_end: u32::from(step.part_end),
+            value: u32::from(step.value),
+            loc,
+        })
+    })?;
+    let mut cuts_buf = SmallCopyBuf::<Cut, 16>::new(Cut {
+        index: 0,
+        begin: 0,
+        end: 0,
+    });
+    for c in cuts {
+        cuts_buf.push(Cut {
+            index: u32::from(c.index),
+            begin: u32::from(c.whole_begin),
+            end: u32::from(c.whole_end),
+        });
+    }
+    let (steps, rare) = match steps {
+        GridSteps::Wide(wide_steps) => (
+            GridSteps::Small(Box::from([])),
+            Some(Box::new(SpareRare::from_parts(
+                cuts_buf.as_slice(),
+                Box::from([]),
+                wide_steps,
+            ))),
+        ),
+        other if !cuts_buf.is_empty() => (
+            other,
+            Some(Box::new(SpareRare::from_parts(
+                cuts_buf.as_slice(),
+                Box::from([]),
+                Box::from([]),
+            ))),
+        ),
+        other => (other, None),
+    };
+    let packed = if packed_runs.is_empty() {
+        PackedRunsInput::None
+    } else if rare.is_none()
+        && let Some(small) = try_pack_runs_u16(packed_runs.as_slice())
+    {
+        PackedRunsInput::Small(small)
+    } else {
+        PackedRunsInput::Wide(packed_runs.into_boxed_slice())
+    };
+    Some(Listing::from_parts(
+        ticks,
+        base | Grid::SMALL,
+        steps,
+        packed,
+        rare,
+    ))
+}
+
+pub fn sequence_of_cut_ticks(
+    period: Fraction,
+    ticks: NonZeroU32,
+    values: Arc<[Value]>,
+    in_cycles: bool,
+    raw_steps: &[TickStep],
+    cuts: &[TickCut],
+) -> Option<Pattern> {
+    if raw_steps.is_empty() {
+        return Some(silence());
+    }
+    let listing = listing_of_cut_ticks(ticks, raw_steps, cuts)?;
+    node_of_one(Layer::holding(
         period,
         Steps::Listed(listing),
         in_cycles,
