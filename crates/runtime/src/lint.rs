@@ -506,19 +506,19 @@ fn lint_with_scan(
                 // The LFO shapes the voice refuses by name: a word that is not
                 // one of them silences the voice when it plays, so it is an
                 // error now. A number picks a shape by its index.
-                "wtshape" | "warpshape" | "lpshape" | "hpshape" | "bpshape" if numeric => None,
+                "wtshape" | "warpshape" | "lpshape" | "hpshape" | "bpshape"
+                    if numeric && !word.contains(':') =>
+                {
+                    None
+                }
                 "wtshape" | "warpshape" | "lpshape" | "hpshape" | "bpshape" => {
-                    let names = rustel_core::reference::reference_choices(callee, "shape")
-                        .map(|set| {
-                            set.choices
-                                .iter()
-                                .map(|choice| choice.value)
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    (head != "tri" && !names.contains(&head)).then(|| {
+                    // A `name:x` is a pair, which no voice reads as a shape.
+                    let set = rustel_core::reference::reference_choices(callee, "shape")
+                        .filter(|set| !set.choices.is_empty())?;
+                    let names: Vec<&str> = set.choices.iter().map(|choice| choice.value).collect();
+                    (word.contains(':') || (head != "tri" && !names.contains(&head))).then(|| {
                         format!(
-                            "unknown {callee} \"{head}\" - one of {}, or a number",
+                            "unknown {callee} \"{word}\" - one of {}, or a number",
                             names.join(", ")
                         )
                     })
@@ -4048,7 +4048,12 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
                 "{control}"
             );
         }
-        assert!(check("$: s(\"wt_digital\").wtshape(\"<tri sine 2 square>\")").is_empty());
+        for control in ["wtshape", "warpshape", "lpshape", "hpshape", "bpshape"] {
+            let score = format!("$: s(\"bd\").{control}(\"<tri sine 2 square>\")");
+            assert!(check(&score).is_empty(), "{control}");
+        }
+        // A pair is no shape.
+        assert_eq!(check("$: s(\"bd\").wtshape(\"sine:square\")").len(), 1);
         // Tremolo falls back to its default shape: not this check's to refuse.
         assert!(check("$: s(\"bd\").tremoloshape(\"bogus\")").is_empty());
     }
