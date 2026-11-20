@@ -718,6 +718,19 @@ impl SampleLibrary {
         })
     }
 
+    /// The lowest and highest MIDI notes of the font `n` picks, once it
+    /// has loaded.
+    pub(super) fn soundfont_range(&self, fonts: &[Arc<str>], n: f64) -> Option<(f64, f64)> {
+        let font = fonts.get(sound_index(n, fonts.len()))?;
+        let table = self.shared.fonts.read().expect("font table");
+        let Some(FontState::Ready(zones)) = table.get(font) else {
+            return None;
+        };
+        let low = zones.iter().map(|zone| zone.key_lo).reduce(f64::min)?;
+        let high = zones.iter().map(|zone| zone.key_hi).reduce(f64::max)?;
+        Some((low, high))
+    }
+
     /// Font-zone lookup for gm_* names: variant by `n`, zone by midi range,
     /// exactly `registerSoundfonts`/`findZone`.
     pub(super) fn resolve_soundfont(

@@ -17,6 +17,8 @@
 - Fixed: the events pane uses the theme's palette so monochrome themes stay monochrome. In Vim mode, `ip` and `ap` select paragraphs, `.` repeats the last change, and Ctrl+[ steps to the previous scene from Normal mode.
 - Fixed: `up` with values that name no controls, such as `up("7 12")` or `up(7)`, keeps the controls of the events underneath instead of replacing each event.
 - `rustel check` and `rustel query` take `--prebake setup.js`, so a score calling a prebake's helpers checks clean.
+- Fixed: a General MIDI note outside its font's range says which notes the font plays instead of "failed to load", and Studio no longer counts such a font as a failed sound.
+- Fixed: `talkit("42")` speaks the number instead of a silent refused voice.
 
 ## v0.1.7
 
