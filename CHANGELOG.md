@@ -4,6 +4,7 @@
 
 - A sample source can be a repository page such as `https://github.com/user/repo`. It reads as `github:user/repo`, and a web page or a missing map says what to write instead.
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
+- Fixed: leaving a Link session or letting go of an incoming MIDI clock plays the score's own tempo again, instead of the bent tempo the follow left until the next update.
 - The reference search also finds entries by extension name, description, tags, parameters and examples, and by words spread across them. These matches come after the usual matches, under more matches.
 - The theme picker shows its Ctrl+N new, Ctrl+E edit and Ctrl+D delete keys.
 - Fixed: the theme editor opened from the theme picker shows on top of the reference.
@@ -22,6 +23,7 @@
 - Fixed: `talkit("42")` speaks the number instead of a silent refused voice.
 - Fixed: a KabelSalat signal past the range of a sample is silent on both channels, as the docs say, instead of full-scale noise on one.
 - Fixed: a scene can call a name from a script that another scene of the set imports, as the docs say, instead of the check refusing it as unknown.
+- Fixed: one sample source in Settings that will not read fails only its own row; the other remote sources still load.
 
 ## v0.1.7
 
