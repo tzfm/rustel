@@ -202,12 +202,23 @@ impl StudioEngine {
         self.clock_locked = false;
         self.clock_external_cps = None;
         self.update_pattern_tempo();
-        if released && port.is_none() {
-            self.return_to_score_tempo();
-        }
         if let Some(port) = port {
-            self.clock_in = Some(ClockIn::open(port)?);
-            self.update_pattern_tempo();
+            match ClockIn::open(port) {
+                Ok(clock) => {
+                    self.clock_in = Some(clock);
+                    self.update_pattern_tempo();
+                }
+                // A switch to a port that will not open leaves no clock:
+                // the score's tempo, as a release does.
+                Err(error) => {
+                    if released {
+                        self.return_to_score_tempo();
+                    }
+                    return Err(error);
+                }
+            }
+        } else if released {
+            self.return_to_score_tempo();
         }
         Ok(())
     }
