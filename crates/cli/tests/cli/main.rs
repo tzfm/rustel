@@ -9618,6 +9618,7 @@ fn check_and_query_take_a_prebake() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!out.status.success());
     assert!(stdout.contains("the prebake failed"), "{stdout}");
+}
 
 /// A KabelSalat signal past the range of a sample is silent on both
 /// channels, as a nonfinite one is, never full-scale noise on one.
