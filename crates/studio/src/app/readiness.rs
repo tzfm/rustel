@@ -782,7 +782,8 @@ impl App {
             // the name is missing when it runs.
             context.setup_has_dynamic_names |= self.scenes.scenes().iter().any(|other| {
                 let source = other.editor.source();
-                other.is_score()
+                other.id != scene.id
+                    && other.is_score()
                     && source.contains("import")
                     && !rustel_transpiler::script_imports(&source).is_empty()
             });
