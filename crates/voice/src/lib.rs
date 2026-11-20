@@ -1126,6 +1126,38 @@ mod tests {
         );
     }
 
+    /// A bank named by digits plays: mini-notation reads `s("808")` as a
+    /// number, and the sound is looked up by its spelling, as on strudel.cc.
+    #[test]
+    fn a_bank_named_by_digits_plays() {
+        struct Digits;
+        impl SampleLookup for Digits {
+            fn resolve(&self, s: &str, _n: f64, _midi: f64) -> SampleResolution {
+                BundledOnly.resolve(if s == "808" { "bd" } else { s }, 0.0, 36.0)
+            }
+        }
+        let event = resolve_voice_with_samples(
+            &serde_json::json!({ "s": 808 }),
+            0,
+            0.5,
+            0.0,
+            48_000,
+            0.5,
+            &Digits,
+        )
+        .expect("808 plays");
+        assert!(event.sample.is_some());
+        assert_eq!(js_number_spelling(&serde_json::Number::from(808)), "808");
+        assert_eq!(
+            js_number_spelling(&serde_json::Number::from_f64(0.5).unwrap()),
+            "0.5"
+        );
+        assert_eq!(
+            js_number_spelling(&serde_json::Number::from_f64(-0.0).unwrap()),
+            "0"
+        );
+    }
+
     #[test]
     fn one_is_a_constant_signal_unless_a_sample_has_the_name() {
         struct HasOne;
@@ -2657,6 +2689,19 @@ fn resolve_voice_at(
             other => other.to_string(),
         }));
     }
+    // Mini-notation reads `s("808")` as the number 808. strudel.cc looks the
+    // sound up by it as an object key, where a number is its own spelling,
+    // so a bank named by digits plays: name it the same way here.
+    let spelled;
+    let value = match value.get("s") {
+        Some(serde_json::Value::Number(number)) => {
+            let mut renamed = value.clone();
+            renamed["s"] = serde_json::Value::String(js_number_spelling(number));
+            spelled = renamed;
+            &spelled
+        }
+        _ => value,
+    };
     let mut plays_plugin = false;
     let mut plays_csound = false;
     let (frequency, gain, controls, sample, wavetable, synth) = match value {
@@ -3604,6 +3649,17 @@ fn banked_source_name(object: &serde_json::Map<String, serde_json::Value>) -> Op
             .flatten()
             .unwrap_or_else(|| name.to_owned()),
     )
+}
+
+/// A number as JavaScript prints it, the way it names an object key: a
+/// whole number has no fraction, `808` not `808.0`.
+fn js_number_spelling(number: &serde_json::Number) -> String {
+    match number.as_f64() {
+        // The shortest spelling that reads back, without a `.0` and with
+        // -0 as 0, as JavaScript prints a number in its usual range.
+        Some(value) => (value + 0.0).to_string(),
+        None => number.to_string(),
+    }
 }
 
 /// `wt_`-named sounds route to the wavetable oscillator.

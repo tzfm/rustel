@@ -22,6 +22,7 @@
 - Fixed: with Vim editor keys on, text a remote client types arrives in order, as the docs say, instead of each character going in before the last.
 - Fixed: the events pane uses the theme's palette so monochrome themes stay monochrome. In Vim mode, `ip` and `ap` select paragraphs, `.` repeats the last change, and Ctrl+[ steps to the previous scene from Normal mode.
 - Fixed: `up` with values that name no controls, such as `up("7 12")` or `up(7)`, keeps the controls of the events underneath instead of replacing each event.
+- Fixed: a sample bank named by digits, such as the docs' own `samples('local:808')`, plays with `s("808")` instead of refusing every note.
 - Fixed: a visuals dock moved from a side to the top or bottom starts at the band's own size, so it no longer vanishes beside the mixer; a dock with no room says the keys go to the score.
 - Fixed: a General MIDI note outside its font's range says which notes the font plays instead of "failed to load", and Studio no longer counts such a font as a failed sound.
 - Fixed: `talkit("42")` speaks the number instead of a silent refused voice.
