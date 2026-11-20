@@ -15,6 +15,36 @@ fn distort_pattern(pattern: Pattern, args: Pattern, algorithm: &'static str) -> 
         .apply(&pattern, Some(args))
 }
 
+/// A distortion of `pattern`: the first argument is the amount (or an
+/// `amount:volume` pair), and a second argument - the documented `volume` -
+/// sets `distortvol` on each event afterwards, as `.distortvol()` would, so
+/// a signal there is sampled per event.
+fn distort_with<'js>(
+    ctx: &Ctx<'js>,
+    pattern: Pattern,
+    args: &rquickjs::function::Rest<rquickjs::Value<'js>>,
+    algorithm: &'static str,
+    sidecars: &mut Vec<Sidecar<'js>>,
+) -> rquickjs::Result<Pattern> {
+    let first = args
+        .0
+        .first()
+        .cloned()
+        .unwrap_or_else(|| rquickjs::Value::new_undefined(ctx.clone()));
+    let (amount, sidecar) = reify_bridged(ctx, &first)?;
+    sidecars.push(sidecar);
+    let distorted = distort_pattern(pattern, amount, algorithm);
+    let Some(volume) = args.0.get(1).filter(|value| !value.is_undefined()) else {
+        return Ok(distorted);
+    };
+    let (volume, sidecar) = reify_bridged(ctx, volume)?;
+    sidecars.push(sidecar);
+    Ok(control_registry()
+        .get("distortvol")
+        .expect("distortvol control")
+        .apply(&distorted, Some(volume)))
+}
+
 pub(super) fn distort_method<'js>(
     ctx: Ctx<'js>,
     this: rquickjs::function::This<rquickjs::Class<'js, NativePatternWrapper<'js>>>,
@@ -25,14 +55,8 @@ pub(super) fn distort_method<'js>(
         let wrapper = this.0.borrow();
         (wrapper.pattern.clone(), vec![Sidecar::of(&wrapper)])
     };
-    let value = args
-        .0
-        .first()
-        .cloned()
-        .unwrap_or_else(|| rquickjs::Value::new_undefined(ctx.clone()));
-    let (args, sidecar) = reify_bridged(&ctx, &value)?;
-    sidecars.push(sidecar);
-    derive_wrapper(ctx, distort_pattern(receiver, args, algorithm), &sidecars)
+    let distorted = distort_with(&ctx, receiver, &args, algorithm, &mut sidecars)?;
+    derive_wrapper(ctx, distorted, &sidecars)
 }
 
 pub(super) fn distort_free<'js>(
@@ -40,14 +64,10 @@ pub(super) fn distort_free<'js>(
     args: rquickjs::function::Rest<rquickjs::Value<'js>>,
     algorithm: &'static str,
 ) -> NativeResult<'js> {
-    let value = args
-        .0
-        .first()
-        .cloned()
-        .unwrap_or_else(|| rquickjs::Value::new_undefined(ctx.clone()));
-    let (args, sidecar) = reify_bridged(&ctx, &value)?;
     let receiver = rustel_core::pure(Value::object(std::iter::empty()));
-    derive_wrapper(ctx, distort_pattern(receiver, args, algorithm), &[sidecar])
+    let mut sidecars = Vec::new();
+    let distorted = distort_with(&ctx, receiver, &args, algorithm, &mut sidecars)?;
+    derive_wrapper(ctx, distorted, &sidecars)
 }
 
 pub(super) fn span_signal(kind: &str) -> Pattern {

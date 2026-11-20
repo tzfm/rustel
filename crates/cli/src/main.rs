@@ -1225,6 +1225,10 @@ enum Command {
     Check {
         #[command(flatten)]
         input: SourceInput,
+        /// Evaluate setup JavaScript before the score, as `play` does, so
+        /// the names it defines are known.
+        #[arg(long, value_name = "FILE")]
+        prebake: Option<PathBuf>,
         /// Do not load the sample library; sound names are then not judged.
         #[arg(long)]
         no_samples: bool,
@@ -1240,6 +1244,9 @@ enum Command {
     Query {
         #[command(flatten)]
         input: SourceInput,
+        /// Evaluate setup JavaScript before the score, as `play` does.
+        #[arg(long, value_name = "FILE")]
+        prebake: Option<PathBuf>,
         /// Cycle begin (rational string like 0/1, or decimal).
         #[arg(long, default_value = "0")]
         begin: String,
@@ -1511,6 +1518,27 @@ fn with_sample_access(
         config.score_osc_access = osc_access;
     }
     Ok(config)
+}
+
+/// Evaluate a `--prebake` file before a score is checked or queried, and
+/// give the names it defines to the lint.
+fn load_prebake(
+    session: &mut Session,
+    prebake: Option<&std::path::Path>,
+) -> Result<rustel_runtime::lint::LintContext, RuntimeError> {
+    let Some(path) = prebake else {
+        return Ok(rustel_runtime::lint::LintContext::default());
+    };
+    let source = read_bounded_file(path, "prebake")?;
+    // A sample import in the prebake reports through the command's own
+    // channel, as one in the score does.
+    if !rustel_runtime::sounds::samples_imports(&source).is_empty() {
+        session.set_direct_diagnostic_logging(false);
+    }
+    session.evaluate_prebake_cancellable(&source, &EVALUATION_CANCELLED)?;
+    Ok(rustel_runtime::lint::LintContext::from_setup_sources([
+        source.as_str(),
+    ]))
 }
 
 /// Score and optional prebake loaded before live playback.
@@ -2371,6 +2399,7 @@ fn run_command(
         ),
         Command::Check {
             input,
+            prebake,
             no_samples,
             json,
         } => {
@@ -2397,12 +2426,25 @@ fn run_command(
             // that fails to resolve only at evaluation, or a score that
             // throws. The dry evaluation in `check_score` catches those,
             // with the mini-notation compatibility fallback disabled.
-            let mut check = rustel_runtime::score_check::check_score(
+            // A prebake that fails is a finding of the check, reported in
+            // its list and its JSON, not an error before them.
+            let (context, prebake_error) = match load_prebake(&mut session, prebake.as_deref()) {
+                Ok(context) => (context, None),
+                Err(error) => (rustel_runtime::lint::LintContext::default(), Some(error)),
+            };
+            let mut check = rustel_runtime::score_check::check_score_with(
                 &source,
                 library.as_deref(),
                 &mut session,
                 &EVALUATION_CANCELLED,
+                &context,
             );
+            if let Some(error) = prebake_error {
+                check.eval_error = Some(rustel_runtime::score_check::EvalError {
+                    message: format!("the prebake failed: {error}"),
+                    line: None,
+                });
+            }
             let failures = sample_import_failures(&source, &mut session);
             check.diagnostics.extend(failures.placed);
             if !failures.unplaced.is_empty() {
@@ -2522,6 +2564,7 @@ fn run_command(
         }
         Command::Query {
             input,
+            prebake,
             begin,
             end,
             json,
@@ -2535,8 +2578,11 @@ fn run_command(
             if !rustel_runtime::sounds::samples_imports(&source).is_empty() {
                 session.set_direct_diagnostic_logging(false);
             }
+            let context = load_prebake(&mut session, prebake.as_deref())?;
             // Check sound names only in `check`, which has the sample library.
-            if let Some(reason) = rustel_runtime::lint::rejection(&source, false, None) {
+            if let Some(reason) =
+                rustel_runtime::lint::rejection_with(&source, false, None, &context)
+            {
                 return Err(RuntimeError::Js(reason));
             }
             // Unlike every other command's `load_source`, a query refuses the

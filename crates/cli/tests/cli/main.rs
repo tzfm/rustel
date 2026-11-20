@@ -9588,6 +9588,40 @@ fn a_replay_save_that_never_reached_the_score_is_reported_not_announced() {
     }
 }
 
+/// `check` and `query` run a prebake first, as `play` does, so a score that
+/// calls one of its helpers is clean and lists its events.
+#[test]
+fn check_and_query_take_a_prebake() {
+    let prebake = scratch("prebake-helpers.js");
+    std::fs::write(
+        &prebake,
+        "globalThis.wide = p => p.room(.25).pan(\"<.3 -.3>\");",
+    )
+    .expect("prebake");
+    let prebake = prebake.to_str().expect("utf-8 path");
+    let score = r#"wide(note("c3 e3 g3").s("sine"))"#;
+    let checked = ok_stdout(&["check", "--no-samples", "--prebake", prebake, "-e", score]);
+    assert!(checked.contains("no issues found"), "{checked}");
+    let queried = ok_stdout(&["query", "--prebake", prebake, "-e", score, "--plain"]);
+    assert!(queried.contains("3 events"), "{queried}");
+    assert!(queried.contains("room:0.25"), "{queried}");
+    // A prebake that throws is one of the check's findings, in its JSON.
+    let broken = scratch("prebake-throws.js");
+    std::fs::write(&broken, "throw new Error('bad setup')").expect("prebake");
+    let out = run(&[
+        "check",
+        "--json",
+        "--no-samples",
+        "--prebake",
+        broken.to_str().expect("utf-8 path"),
+        "-e",
+        score,
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success());
+    assert!(stdout.contains("the prebake failed"), "{stdout}");
+}
+
 /// A KabelSalat signal past the range of a sample is silent on both
 /// channels, as a nonfinite one is, never full-scale noise on one.
 #[test]
@@ -9620,4 +9654,42 @@ fn a_kabelsalat_overflow_is_silent_on_both_channels() {
             .count();
         assert_eq!(loud, 0, "{expression}: {loud} samples are not silent");
     }
+}
+
+/// The documented second argument of a distortion is its volume: it reaches
+/// the event as `distortvol`, patterned too, and the one-argument form keeps
+/// volume 1.
+#[test]
+fn a_distortion_takes_its_volume_as_a_second_argument() {
+    let volumes = |score: &str| -> Vec<f64> {
+        let out = ok_stdout(&["query", "-e", score, "--end", "2", "-j"]);
+        let report: serde_json::Value = serde_json::from_str(&out).expect("query report");
+        report["haps"]
+            .as_array()
+            .expect("haps")
+            .iter()
+            .map(|hap| hap["value"]["distortvol"].as_f64().expect("distortvol"))
+            .collect()
+    };
+    assert_eq!(
+        volumes(r#"note("c2").s("triangle").asym(.5, .3)"#),
+        [0.3, 0.3]
+    );
+    assert_eq!(
+        volumes(r#"note("c2").s("triangle").diode(2, "<.5 .25>")"#),
+        [0.5, 0.25]
+    );
+    assert_eq!(volumes(r#"note("c2").s("triangle").fold(.5)"#), [1.0, 1.0]);
+    assert_eq!(
+        volumes(r#"note("c2").s("triangle").asym(".9:.5")"#),
+        [0.5, 0.5]
+    );
+    // A signal is read at each note, and the second argument wins over a pair.
+    let sawed = volumes(r#"note("c2*4").s("triangle").asym(.5, saw.range(.2, .6))"#);
+    assert_eq!(sawed.len(), 8);
+    assert!(sawed[0] < sawed[1] && sawed[1] < sawed[2], "{sawed:?}");
+    assert_eq!(
+        volumes(r#"note("c2").s("triangle").asym(".9:.5", .3)"#),
+        [0.3, 0.3]
+    );
 }
