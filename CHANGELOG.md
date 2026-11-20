@@ -33,6 +33,7 @@
 
 ## v0.1.7
 
+- Fixed: talkit speaks C7, the top of its documented range, which was refused a hair above the range's limit in whole hertz.
 - Release archives and installers include signed build provenance for independent verification with GitHub CLI.
 - A video file plays as a sample: `mp4`, `m4v`, `mov`, `mkv` and `webm` play their audio track.
 - `_video()` and `video()` draw a video sample's picture in sync with its sound. H.264, HEVC, AV1, VP9, VP8 and Motion JPEG decode natively.

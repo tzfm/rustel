@@ -9763,3 +9763,28 @@ fn a_distortion_takes_its_volume_as_a_second_argument() {
         [0.3, 0.3]
     );
 }
+
+/// talkit speaks the whole documented range, C1 to C7: C7 is a hair above
+/// the range's top in whole hertz and still speaks; C8 is refused.
+#[test]
+fn talkit_speaks_up_to_c7() {
+    for (note, speaks) in [("c7", true), ("c1", true), ("c8", false)] {
+        let path = scratch("talkit-range.wav");
+        let out = run(&[
+            "export",
+            "-e",
+            &format!("$: note(\"{note}\").talkit(\"la\")"),
+            "--cycles",
+            "1",
+            "-o",
+            path.to_str().expect("utf-8 path"),
+        ]);
+        let _ = std::fs::remove_file(&path);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            !stderr.contains("voice_refused"),
+            speaks,
+            "{note}: {stderr}"
+        );
+    }
+}
