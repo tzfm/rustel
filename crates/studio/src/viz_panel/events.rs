@@ -4,11 +4,11 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     widgets::Widget,
 };
 
-use super::super::theme::{Theme, hsv, rgb_parts, wash};
+use super::super::theme::{Theme, wash};
 use super::super::visuals::VisualState;
 
 /// The events as they are queued to sound, newest at the bottom, each a
@@ -179,7 +179,7 @@ impl Widget for EventsView<'_> {
                 .color
                 .as_deref()
                 .and_then(super::super::theme::parse_color)
-                .unwrap_or_else(|| label_colour(head.as_str(), theme));
+                .unwrap_or_else(|| theme.label_colour(head.as_str()));
             let sounding = event.target_time <= now
                 && now < event.target_time + event.duration_seconds.max(0.05);
             let style = if sounding {
@@ -198,22 +198,6 @@ impl Widget for EventsView<'_> {
             buffer.set_stringn(area.x, y, text, width, *style);
         }
     }
-}
-
-/// A steady colour for a sound's name, so `bd` is always the same one.
-fn label_colour(name: &str, theme: &Theme) -> Color {
-    let hash = name.bytes().fold(0u32, |hash, byte| {
-        hash.wrapping_mul(31).wrapping_add(u32::from(byte))
-    });
-    let hue = (hash % 360) as f32;
-    let (r, g, b) = rgb_parts(hsv(hue, 0.7, 0.95));
-    let (tr, tg, tb) = rgb_parts(theme.foreground);
-    // Toward the theme's foreground a little, so it reads on the surface.
-    Color::Rgb(
-        ((u16::from(r) * 3 + u16::from(tr)) / 4) as u8,
-        ((u16::from(g) * 3 + u16::from(tg)) / 4) as u8,
-        ((u16::from(b) * 3 + u16::from(tb)) / 4) as u8,
-    )
 }
 
 #[cfg(test)]
@@ -376,5 +360,167 @@ mod tests {
         assert_eq!(trim_number("0.250000"), ".25");
         assert_eq!(trim_number("-0.5"), "-.5");
         assert_eq!(trim_number("bd"), "bd");
+    }
+
+    #[test]
+    fn events_pane_keeps_a_monochrome_theme_monochrome() {
+        use ratatui::style::Color;
+        use rustel_runtime::ui_events::UiEventBatch;
+
+        #[cfg(feature = "themes")]
+        let mono = Theme::built_in("mono").expect("bundled mono theme");
+        #[cfg(not(feature = "themes"))]
+        let mono = {
+            let mut theme = Theme::default();
+            theme.background = Color::Rgb(0, 0, 0);
+            theme.foreground = Color::Rgb(255, 255, 255);
+            theme.accent = Color::Rgb(255, 255, 255);
+            theme.ok = Color::Rgb(255, 255, 255);
+            theme.event = Color::Rgb(255, 255, 255);
+            theme.syntax.text = Color::Rgb(255, 255, 255);
+            theme.syntax.string = Color::Rgb(224, 224, 224);
+            theme.syntax.number = Color::Rgb(255, 255, 255);
+            theme.syntax.punctuation = Color::Rgb(176, 176, 176);
+            theme.syntax.keyword = None;
+            theme.syntax.function = None;
+            theme
+        };
+
+        let envelope = rustel_runtime::ui_events::visual_layout("$: s(\"bd sd\")", 1).unwrap();
+        let revision = envelope.ui_layout.source_revision.clone();
+        // Cover past, sounding, and upcoming events across several sound names.
+        let mut past = event_with("s:bd");
+        past.onset_id = 1;
+        past.target_time = -1.0;
+        let mut sounding = event_with("s:sd");
+        sounding.onset_id = 2;
+        sounding.target_time = 0.0;
+        let mut upcoming = event_with("s:hh");
+        upcoming.onset_id = 3;
+        upcoming.target_time = 0.1;
+        let mut explicit = event_with("s:cp");
+        explicit.onset_id = 4;
+        explicit.generation = 2;
+        explicit.target_time = 0.0;
+        explicit.color = Some("red".to_owned());
+
+        let mut state = VisualState::default();
+        state.install_layout(envelope);
+        state.start();
+        assert!(
+            state.install_batch(
+                UiEventBatch::new(
+                    0.0,
+                    0.0,
+                    1.0,
+                    1,
+                    revision,
+                    vec![past, sounding, upcoming],
+                    0
+                )
+                .unwrap()
+            )
+        );
+        state.stop();
+
+        let area = Rect::new(0, 0, 16, 4);
+        let mut buffer = Buffer::empty(area);
+        EventsView {
+            state: &state,
+            theme: &mono,
+        }
+        .render(area, &mut buffer);
+
+        let painted: Vec<_> = buffer
+            .content
+            .iter()
+            .filter(|cell| !cell.symbol().trim().is_empty())
+            .collect();
+        assert!(!painted.is_empty());
+        for cell in painted {
+            match cell.fg {
+                Color::Rgb(r, g, b) => {
+                    assert_eq!(
+                        (r, g, b),
+                        (r, r, r),
+                        "mono events cell {:?} had chromatic fg {:?}",
+                        cell.symbol(),
+                        cell.fg
+                    );
+                }
+                other => panic!("unexpected non-RGB fg on mono theme: {other:?}"),
+            }
+        }
+
+        // An explicit `.color(...)` in the score still applies.
+        let envelope =
+            rustel_runtime::ui_events::visual_layout("$: s(\"cp\").color(\"red\")", 2).unwrap();
+        let revision = envelope.ui_layout.source_revision.clone();
+        let mut state = VisualState::default();
+        state.install_layout(envelope);
+        state.start();
+        assert!(state.install_batch(
+            UiEventBatch::new(0.0, 0.0, 1.0, 2, revision, vec![explicit], 0).unwrap()
+        ));
+        state.stop();
+        let mut buffer = Buffer::empty(area);
+        EventsView {
+            state: &state,
+            theme: &mono,
+        }
+        .render(area, &mut buffer);
+        let red = crate::theme::parse_color("red").expect("named red");
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "c" && cell.fg == red),
+            "explicit event color should remain honoured"
+        );
+    }
+
+    #[cfg(feature = "themes")]
+    #[test]
+    fn events_pane_keeps_terminal_theme_on_terminal_palette() {
+        use ratatui::style::Color;
+        use rustel_runtime::ui_events::UiEventBatch;
+
+        let terminal = Theme::built_in("terminal").expect("bundled terminal theme");
+        let envelope = rustel_runtime::ui_events::visual_layout("$: s(\"bd sd\")", 1).unwrap();
+        let revision = envelope.ui_layout.source_revision.clone();
+        let mut bd = event_with("s:bd");
+        bd.onset_id = 1;
+        let mut sd = event_with("s:sd");
+        sd.onset_id = 2;
+        let mut state = VisualState::default();
+        state.install_layout(envelope);
+        state.start();
+        assert!(state.install_batch(
+            UiEventBatch::new(0.0, 0.0, 1.0, 1, revision, vec![bd, sd], 0).unwrap()
+        ));
+        state.stop();
+
+        let area = Rect::new(0, 0, 16, 4);
+        let mut buffer = Buffer::empty(area);
+        EventsView {
+            state: &state,
+            theme: &terminal,
+        }
+        .render(area, &mut buffer);
+
+        let painted: Vec<_> = buffer
+            .content
+            .iter()
+            .filter(|cell| !cell.symbol().trim().is_empty())
+            .collect();
+        assert!(!painted.is_empty());
+        for cell in painted {
+            assert!(
+                !matches!(cell.fg, Color::Rgb(_, _, _)),
+                "terminal theme invented truecolour fg {:?} for {:?}",
+                cell.fg,
+                cell.symbol()
+            );
+        }
     }
 }

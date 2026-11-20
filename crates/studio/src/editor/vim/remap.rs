@@ -173,7 +173,8 @@ impl Editor {
             return true;
         }
         if key.modifiers == KeyModifiers::CONTROL
-            && (matches!(key.code, KeyCode::Char('r' | '['))
+            && (key.code == KeyCode::Char('r')
+                || (key.code == KeyCode::Char('[') && self.vim_needs_escape())
                 || (matches!(key.code, KeyCode::Char('c' | 'C')) && self.vim.mode == Mode::Insert))
         {
             return true;

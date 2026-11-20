@@ -3,7 +3,10 @@ use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{ByteOffset, Editor, EditorError, HistoryMoment, Mode, Selection, line_ending_len};
+use super::repeat::RepeatableAction;
+use super::{
+    ByteOffset, Editor, EditorError, HistoryMoment, Mode, Operator, Selection, line_ending_len,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TextObjectKind {
@@ -19,19 +22,45 @@ impl Editor {
         moment: HistoryMoment,
     ) -> Result<(), EditorError> {
         let before = self.vim.pending.operator.and_then(|(_, count)| count);
-        let count = self
-            .vim_take_count()
-            .saturating_mul(before.map_or(1, NonZeroUsize::get));
-        let range = self.vim_text_object_range(kind, character, count)?;
+        let after = self.vim.pending.count.take();
+        let explicit_count = match (before, after) {
+            (Some(before), Some(after)) => Some(before.saturating_mul(after).get()),
+            (before, after) => before.or(after).map(NonZeroUsize::get),
+        };
+        let count = explicit_count.unwrap_or(1);
         let operator = self.vim.pending.operator.map(|(operator, _)| operator);
         self.vim_cancel_pending();
-        let Some(range) = range else {
+        if let Some(operator) = operator {
+            let changed =
+                self.vim_execute_operator_text_object(operator, kind, character, count, moment)?;
+            if changed {
+                self.vim_record_change(
+                    RepeatableAction::OperatorTextObject {
+                        operator,
+                        kind,
+                        character,
+                    },
+                    explicit_count,
+                );
+            }
+            return Ok(());
+        }
+        let Some((range, linewise)) = self.vim_text_object_range(kind, character, count)? else {
             self.vim.message = Some("Text object not found");
             return Ok(());
         };
-        if let Some(operator) = operator {
-            let start = range.start;
-            self.vim_apply_operator(operator, range, false, true, start, moment)?;
+        if linewise {
+            let last_offset = if range.end > range.start {
+                self.document
+                    .previous_grapheme_boundary(range.end)?
+                    .max(range.start)
+            } else {
+                range.start
+            };
+            let head = self
+                .document
+                .line_start(self.document.line_of(last_offset)?);
+            self.vim_select_visual(range.start, head, true)?;
         } else {
             let head = if range.is_empty() {
                 range.start
@@ -49,12 +78,34 @@ impl Editor {
         Ok(())
     }
 
+    pub(super) fn vim_execute_operator_text_object(
+        &mut self,
+        operator: Operator,
+        kind: TextObjectKind,
+        character: char,
+        count: usize,
+        moment: HistoryMoment,
+    ) -> Result<bool, EditorError> {
+        let Some((range, linewise)) = self.vim_text_object_range(kind, character, count)? else {
+            self.vim.message = Some("Text object not found");
+            return Ok(false);
+        };
+        let start = range.start;
+        self.vim_apply_operator(operator, range, linewise, !linewise, start, moment)
+    }
+
     fn vim_text_object_range(
         &self,
         kind: TextObjectKind,
         character: char,
         count: usize,
-    ) -> Result<Option<Range<ByteOffset>>, EditorError> {
+    ) -> Result<Option<(Range<ByteOffset>, bool)>, EditorError> {
+        if character == 'p' {
+            let Some((first, last)) = self.vim_paragraph_lines(kind, count)? else {
+                return Ok(None);
+            };
+            return Ok(Some((self.vim_line_range(first, last), true)));
+        }
         let head = self.vim_head();
         let pair = match character {
             '(' | ')' | 'b' => Some((b'(', b')')),
@@ -101,7 +152,115 @@ impl Editor {
         {
             return Ok(None);
         }
-        Ok(Some(range))
+        Ok(Some((range, false)))
+    }
+
+    /// Inclusive line range `(first, last)` for `ip` and `ap`.
+    fn vim_paragraph_lines(
+        &self,
+        kind: TextObjectKind,
+        count: usize,
+    ) -> Result<Option<(usize, usize)>, EditorError> {
+        let last_line = self.vim_last_line();
+        let line = self.document.line_of(self.vim_head())?;
+        if line > last_line {
+            return Ok(None);
+        }
+        let is_blank = |row: usize| {
+            self.document
+                .line_content(row)
+                .chars()
+                .all(|character| matches!(character, ' ' | '\t'))
+        };
+
+        let (visual_start, start_line) = match self.vim.mode {
+            Mode::Visual {
+                anchor,
+                head,
+                linewise,
+            } if linewise || anchor != head => {
+                let first = self.document.line_of(anchor.min(head))?;
+                let end = self.document.line_of(anchor.max(head))?.min(last_line);
+                if end < last_line && is_blank(end) != is_blank(end + 1) {
+                    (Some(first), end + 1)
+                } else {
+                    (None, line)
+                }
+            }
+            _ => (None, line),
+        };
+
+        let start_blank = is_blank(start_line);
+        let mut first = start_line;
+        while first > 0 && is_blank(first - 1) == start_blank {
+            first -= 1;
+        }
+        let mut end = start_line;
+        while end < last_line && is_blank(end + 1) == start_blank {
+            end += 1;
+        }
+
+        match kind {
+            TextObjectKind::Inner => {
+                let mut current_blank = start_blank;
+                for _ in 1..count {
+                    if end >= last_line {
+                        break;
+                    }
+                    current_blank = !current_blank;
+                    end += 1;
+                    while end < last_line && is_blank(end + 1) == current_blank {
+                        end += 1;
+                    }
+                }
+            }
+            TextObjectKind::Around => {
+                if start_blank {
+                    for step in 0..count {
+                        if step > 0 {
+                            if end >= last_line {
+                                break;
+                            }
+                            end += 1;
+                            while end < last_line && is_blank(end + 1) {
+                                end += 1;
+                            }
+                        }
+                        if end < last_line && !is_blank(end + 1) {
+                            end += 1;
+                            while end < last_line && !is_blank(end + 1) {
+                                end += 1;
+                            }
+                        }
+                    }
+                } else {
+                    for step in 0..count {
+                        if step > 0 {
+                            if end >= last_line {
+                                break;
+                            }
+                            end += 1;
+                            while end < last_line && !is_blank(end + 1) {
+                                end += 1;
+                            }
+                        }
+                        if end < last_line && is_blank(end + 1) {
+                            end += 1;
+                            while end < last_line && is_blank(end + 1) {
+                                end += 1;
+                            }
+                        } else if step == 0 && visual_start.is_none() {
+                            while first > 0 && is_blank(first - 1) {
+                                first -= 1;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let first = visual_start.map_or(first, |start| start.min(first));
+        Ok(Some((first, end)))
     }
 }
 

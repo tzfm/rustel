@@ -250,6 +250,16 @@ fn degrade_by_with_uses_chooser_values_and_a_strict_threshold() {
         [Value::Str("a".into()), Value::Str("b".into())]
     );
     assert!(!runtime.active_needs_host());
+    // A segmented signal holds one chooser value per segment, for every
+    // event in it.
+    assert_eq!(
+        values(
+            &runtime,
+            "reify('a b c d e f g h').degradeByWith(saw.segment(4), 0.5)"
+        ),
+        [Value::Str("g".into()), Value::Str("h".into())]
+    );
+    assert!(!runtime.active_needs_host());
 }
 
 #[test]
