@@ -4142,8 +4142,8 @@ fn speech_note_pitch(
     let midi = ((midi + 12.0 * octave) * 100.0).round() / 100.0;
     let hz = midi_to_hz(midi)? as f32;
     let range = rustel_talkit::params::NOTE_PITCH;
-    // The range is written in whole hertz: C7 is 2093.0045 Hz and C1
-    // 32.7032. A note within a cent of either end is that end, so the
+    // The range is written in whole hertz, and C7 is 2093.0045 Hz, a hair
+    // above its top. A note within a cent of either end is that end, so the
     // documented C1 to C7 all speak.
     let cent = 2f32.powf(1.0 / 1200.0);
     let hz = if hz > *range.end() && hz <= range.end() * cent {
