@@ -29,7 +29,7 @@
 //! argument held here alone, which costs the memory of its node and saves
 //! the build of it at the next edit of the list.
 
-use rustel_core::Pattern;
+use rustel_core::{Pattern, PatternHandleMeta, PatternNodeRef, PatternSharedExtras};
 use rustel_transpiler::{ScoreProgram, ScoreStatement, Written};
 use std::mem;
 use std::sync::Arc;
@@ -76,39 +76,62 @@ fn unpack_slots(slots: u16) -> u32 {
     }
 }
 
-/// One kept part: where the score writes it, what it built, and what it
-/// read. Packs into 32 bytes for scores up to 64 KiB; widget slot indices live
-/// in [`Memo::part_slots`] only when the score contains widgets.
+/// One kept part: where the score writes it, its compact 8-byte graph node
+/// handle, inline small `_steps` + node flags, and what it read. Packs into
+/// 24 bytes for scores up to 64 KiB; rare wide `_steps` or `PatternExtras`
+/// spill to sparse [`Memo::part_meta`], and widget slots to [`Memo::part_slots`].
 struct Part {
-    pattern: Pattern,
+    node: PatternNodeRef,
     start: u16,
     len: u16,
     read_start: u16,
     read_len_flags: u16,
+    step_numer: i16,
+    step_denom: u16,
+    flags: u8,
+    meta_kind: u8,
 }
 
-const _: () = assert!(std::mem::size_of::<Part>() <= 32);
+const _: () = assert!(std::mem::size_of::<Part>() == 24);
+
+struct MadePart {
+    part: Part,
+    meta: Option<PatternHandleMeta>,
+    slot: u16,
+}
 
 impl Part {
     #[inline]
-    fn from_written(written: Written, pattern: Pattern, read: ReadSpan) -> Option<(Self, u16)> {
+    fn from_written(
+        written: Written,
+        pattern: Pattern,
+        read: ReadSpan,
+        shared_extras: &mut Option<PatternSharedExtras>,
+    ) -> Option<MadePart> {
         let start = u16::try_from(written.start).ok()?;
         let len = u16::try_from(written.len).ok()?;
-        let slots = pack_slots(written.slots)?;
+        let slot = pack_slots(written.slots)?;
         if read.len > LEN_MASK {
             return None;
         }
         let read_len_flags = read.len | if written.mini { MINI_FLAG } else { 0 };
-        Some((
-            Self {
-                pattern,
+        let (node, flags, step_numer, step_denom, meta_kind, meta) =
+            pattern.split_compact(shared_extras);
+        Some(MadePart {
+            part: Self {
+                node,
                 start,
                 len,
                 read_start: read.start,
                 read_len_flags,
+                step_numer,
+                step_denom,
+                flags,
+                meta_kind,
             },
-            slots,
-        ))
+            meta,
+            slot,
+        })
     }
 
     #[inline]
@@ -177,6 +200,12 @@ pub(in crate::runtime) struct Memo {
     pub(in crate::runtime) source: Option<Arc<str>>,
     /// The kept parts, in the order of their places.
     parts: Box<[Part]>,
+    /// Sparse `(part_index, meta)` for parts whose handles carry wide `_steps`
+    /// or non-shared `PatternExtras`; empty for ordinary native scores.
+    part_meta: Box<[(u16, PatternHandleMeta)]>,
+    /// Shared plain `runtime_settings` handle reused across parts that carry
+    /// the session's own runtime settings without per-part `part_meta` entries.
+    shared_extras: Option<PatternSharedExtras>,
     /// Parallel widget slot indices for [`Self::parts`]; empty when no part
     /// carries a widget slot.
     part_slots: Box<[u16]>,
@@ -194,6 +223,30 @@ pub(in crate::runtime) struct Memo {
 }
 
 impl Memo {
+    pub(in crate::runtime) fn remap_nodes(&mut self, f: &mut dyn FnMut(&mut PatternNodeRef)) {
+        for part in self.parts.iter_mut() {
+            f(&mut part.node);
+        }
+    }
+
+    #[inline]
+    fn part_pattern(&self, index: usize) -> Pattern {
+        let part = &self.parts[index];
+        let meta = u16::try_from(index)
+            .ok()
+            .and_then(|idx| self.part_meta.binary_search_by_key(&idx, |(i, _)| *i).ok())
+            .map(|at| &self.part_meta[at].1);
+        Pattern::from_compact(
+            &part.node,
+            part.flags,
+            part.step_numer,
+            part.step_denom,
+            part.meta_kind,
+            self.shared_extras.as_ref(),
+            meta,
+        )
+    }
+
     #[inline]
     fn part_slot(&self, index: usize) -> u16 {
         self.part_slots.get(index).copied().unwrap_or(NO_SLOTS)
@@ -325,8 +378,10 @@ pub(super) struct Reuse<'p> {
     unchanged: Unchanged,
     /// Whether this build took each part of `before`, or a part around it.
     taken: Vec<bool>,
-    /// The parts that this build evaluated and keeps, paired with their widget slot.
-    made: Vec<(Part, u16)>,
+    /// The parts that this build evaluated and keeps, paired with their metadata.
+    made: Vec<MadePart>,
+    /// Shared plain `runtime_settings` extras handle across parts in this build.
+    shared_extras: Option<PatternSharedExtras>,
     /// Flat pool of `(name_number, version)` pairs recorded during this build.
     made_reads: Vec<(u16, u16)>,
     /// The names of the program, each at its number.
@@ -373,6 +428,7 @@ impl<'p> Reuse<'p> {
                 now[was] = Some(number);
             }
         }
+        let shared_extras = before.shared_extras.clone();
         Self {
             source,
             unchanged: Unchanged::of(source, before.source.as_deref().unwrap_or_default()),
@@ -380,6 +436,7 @@ impl<'p> Reuse<'p> {
             next: before.next,
             before,
             made: Vec::new(),
+            shared_extras,
             made_reads: Vec::new(),
             names,
             now,
@@ -498,7 +555,7 @@ impl<'p> Reuse<'p> {
             .count();
         self.taken[at..at + inside].fill(true);
         // A handle of the kept pattern.
-        Some(self.before.parts[at].pattern.clone())
+        Some(self.before.part_pattern(at))
     }
 
     /// Keep `pattern`, which the build made of the call at `written` and
@@ -510,7 +567,9 @@ impl<'p> Reuse<'p> {
         let Some(read) = self.versions_of(closed.read) else {
             return;
         };
-        let Some(entry) = Part::from_written(written, pattern.clone(), read) else {
+        let Some(entry) =
+            Part::from_written(written, pattern.clone(), read, &mut self.shared_extras)
+        else {
             return;
         };
         self.made.push(entry);
@@ -530,7 +589,7 @@ impl<'p> Reuse<'p> {
     pub(super) fn release(&mut self, mark: usize) {
         let mut at = mark;
         while at < self.made.len() {
-            if self.made[at].0.pattern.is_held_elsewhere() {
+            if self.made[at].part.node.strong_count() > 1 {
                 at += 1;
             } else {
                 // The order of the parts is made when the build ends.
@@ -629,30 +688,54 @@ impl<'p> Reuse<'p> {
         let now = mem::take(&mut self.now);
         let taken = mem::take(&mut self.taken);
         let before_slots = mem::take(&mut self.before.part_slots);
-        let mut entries: Vec<(Part, u16, bool)> = mem::take(&mut self.before.parts)
+        let before_meta = mem::take(&mut self.before.part_meta);
+        let mut meta_iter = before_meta.into_vec().into_iter().peekable();
+        let mut entries: Vec<(MadePart, bool)> = mem::take(&mut self.before.parts)
             .into_vec()
             .into_iter()
             .enumerate()
             .zip(taken)
             .filter_map(|((i, part), taken)| {
+                let meta = match meta_iter.peek() {
+                    Some((idx, _)) if usize::from(*idx) == i => {
+                        meta_iter.next().map(|(_, meta)| meta)
+                    }
+                    _ => None,
+                };
+                if !taken {
+                    return None;
+                }
                 let slot = before_slots.get(i).copied().unwrap_or(NO_SLOTS);
-                taken.then_some((part, slot, true))
+                Some((MadePart { part, meta, slot }, true))
             })
-            .chain(
-                mem::take(&mut self.made)
-                    .into_iter()
-                    .map(|(part, slot)| (part, slot, false)),
-            )
+            .chain(mem::take(&mut self.made).into_iter().map(|m| (m, false)))
             .collect();
         // A part that the build evaluated two times is kept one time: each
         // of the two holds what the call builds.
-        entries.sort_unstable_by_key(|(part, _, _)| part.key());
-        entries.dedup_by_key(|(part, _, _)| part.key());
+        entries.sort_unstable_by_key(|(entry, _)| entry.part.key());
+        entries.dedup_by_key(|(entry, _)| entry.part.key());
         // Drop parts not shared with the live graph (such as folded
-        // sub-expressions). Repeating to a fixpoint releases dead chains too.
+        // sub-expressions). Counting duplicate handles inside `entries` itself
+        // catches dead pairs that only keep each other alive, and repeating to
+        // a fixpoint releases dead parent-child chains too.
         loop {
             let before = entries.len();
-            entries.retain(|(part, _, _)| part.pattern.is_held_elsewhere());
+            if before <= 1 {
+                entries.retain(|(entry, _)| entry.part.node.strong_count() > 1);
+                break;
+            }
+            let mut ids: Vec<usize> = entries
+                .iter()
+                .map(|(entry, _)| entry.part.node.identity())
+                .collect();
+            ids.sort_unstable();
+            entries.retain(|(entry, _)| {
+                let id = entry.part.node.identity();
+                let lo = ids.partition_point(|&x| x < id);
+                let hi = ids.partition_point(|&x| x <= id);
+                let inside = hi - lo;
+                entry.part.node.strong_count() > inside
+            });
             if entries.len() == before {
                 break;
             }
@@ -673,6 +756,8 @@ impl<'p> Reuse<'p> {
             return Memo {
                 source: Some(source),
                 parts: Box::new([]),
+                part_meta: Box::new([]),
+                shared_extras: None,
                 part_slots: Box::new([]),
                 names: Box::new([]),
                 reads: Box::new([]),
@@ -722,25 +807,32 @@ impl<'p> Reuse<'p> {
                 }
             }
         };
-        let has_part_slots = entries.iter().any(|(_, slot, _)| *slot != NO_SLOTS);
+        let has_part_slots = entries.iter().any(|(entry, _)| entry.slot != NO_SLOTS);
         let mut part_slots: Vec<u16> = if has_part_slots {
             Vec::with_capacity(entries.len())
         } else {
             Vec::new()
         };
+        let mut part_meta: Vec<(u16, PatternHandleMeta)> = Vec::new();
         let parts: Box<[Part]> = entries
             .into_iter()
-            .map(|(mut part, slot, from_before)| {
+            .enumerate()
+            .map(|(idx, (mut entry, from_before))| {
                 let next_read = if from_before {
-                    push_renumbered(&mut reads, part.read())
+                    push_renumbered(&mut reads, entry.part.read())
                 } else {
-                    push_made(&mut reads, part.read())
+                    push_made(&mut reads, entry.part.read())
                 };
-                part.set_read(next_read);
-                if has_part_slots {
-                    part_slots.push(slot);
+                entry.part.set_read(next_read);
+                if let Some(meta) = entry.meta
+                    && let Ok(idx_u16) = u16::try_from(idx)
+                {
+                    part_meta.push((idx_u16, meta));
                 }
-                part
+                if has_part_slots {
+                    part_slots.push(entry.slot);
+                }
+                entry.part
             })
             .collect();
         let before_names = mem::take(&mut self.before.names);
@@ -796,9 +888,14 @@ impl<'p> Reuse<'p> {
             let len = usize::from(name.text_len_flags & LEN_MASK);
             source_str.get(start..start + len).unwrap_or("")
         });
+        let has_shared = parts
+            .iter()
+            .any(|p| p.meta_kind == rustel_core::COMPACT_META_SHARED_EXTRAS);
         Memo {
             source: Some(source),
             parts,
+            part_meta: part_meta.into_boxed_slice(),
+            shared_extras: if has_shared { self.shared_extras } else { None },
             part_slots: part_slots.into_boxed_slice(),
             names: names.into_boxed_slice(),
             reads: reads.into_boxed_slice(),

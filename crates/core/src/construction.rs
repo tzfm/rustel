@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use crate::{CompactPickLookup, Node, Pattern, PickLookup, Value};
+use crate::{CompactPickLookup, Node, NodeCell, Pattern, PickLookup, Value};
 
 /// The most node pairs one comparison visits.
 const MAX_COMPARED_NODES: usize = 1 << 20;
@@ -38,21 +38,48 @@ impl Pattern {
         Arc::strong_count(&self.node) > 1
     }
 
+    /// Reference count of the underlying node cell.
+    #[doc(hidden)]
+    pub fn node_strong_count(&self) -> usize {
+        Arc::strong_count(&self.node)
+    }
+
+    /// Address identity of the underlying node cell, for deduplicating handles
+    /// within one evaluation pass.
+    #[doc(hidden)]
+    pub fn node_identity(&self) -> usize {
+        Arc::as_ptr(&self.node) as usize
+    }
+
     pub fn same_construction(&self, other: &Pattern) -> bool {
         let mut pending = vec![(self, other)];
+        let mut plain: Vec<(&NodeCell, u8, &NodeCell, u8)> = Vec::new();
         let mut budget = MAX_COMPARED_NODES;
-        while let Some((left, right)) = pending.pop() {
-            if !same_handles(left, right) {
-                return false;
-            }
-            if Arc::ptr_eq(&left.node, &right.node) {
-                continue;
-            }
+        loop {
+            let (left_kind, right_kind) = if let Some((left, right)) = pending.pop() {
+                if !same_handles(left, right) {
+                    return false;
+                }
+                if Arc::ptr_eq(&left.node, &right.node) {
+                    continue;
+                }
+                (&left.node.kind, &right.node.kind)
+            } else if let Some((left, lf, right, rf)) = plain.pop() {
+                if lf != rf {
+                    return false;
+                }
+                if std::ptr::eq(left, right) {
+                    continue;
+                }
+                (&left.kind, &right.kind)
+            } else {
+                break;
+            };
             let Some(rest) = budget.checked_sub(1) else {
                 return false;
             };
             budget = rest;
-            if !same_node(&left.node.kind, &right.node.kind, &mut pending) {
+            if !same_node(left_kind, right_kind, &mut pending, &mut plain) {
                 return false;
             }
         }
@@ -200,10 +227,17 @@ fn same_node<'g>(
     left: &'g Node,
     right: &'g Node,
     pending: &mut Vec<(&'g Pattern, &'g Pattern)>,
+    plain: &mut Vec<(&'g NodeCell, u8, &'g NodeCell, u8)>,
 ) -> bool {
     macro_rules! child {
         ($left:expr, $right:expr) => {{
             pending.push(($left, $right));
+            true
+        }};
+    }
+    macro_rules! plain_child {
+        ($left:expr, $lf:expr, $right:expr, $rf:expr) => {{
+            plain.push(($left, *$lf, $right, *$rf));
             true
         }};
     }
@@ -232,11 +266,11 @@ fn same_node<'g>(
             Node::Fast(b) if a.1 == b.1 && a.2 == b.2 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::FastSmall(a_pat, a_n, a_d, a_slow) => match right {
-            Node::FastSmall(b_pat, b_n, b_d, b_slow)
+        Node::FastSmall(a_cell, a_f, a_n, a_d, a_slow) => match right {
+            Node::FastSmall(b_cell, b_f, b_n, b_d, b_slow)
                 if a_n == b_n && a_d == b_d && a_slow == b_slow =>
             {
-                child!(a_pat, b_pat)
+                plain_child!(a_cell, a_f, b_cell, b_f)
             }
             _ => false,
         },
@@ -244,11 +278,11 @@ fn same_node<'g>(
             Node::Shift(b) if a.1 == b.1 && a.2 == b.2 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::ShiftSmall(a_pat, a_n, a_d, a_early) => match right {
-            Node::ShiftSmall(b_pat, b_n, b_d, b_early)
+        Node::ShiftSmall(a_cell, a_f, a_n, a_d, a_early) => match right {
+            Node::ShiftSmall(b_cell, b_f, b_n, b_d, b_early)
                 if a_n == b_n && a_d == b_d && a_early == b_early =>
             {
-                child!(a_pat, b_pat)
+                plain_child!(a_cell, a_f, b_cell, b_f)
             }
             _ => false,
         },
@@ -343,12 +377,16 @@ fn same_node<'g>(
             Node::SortHapsByPart(b) => child!(a, b),
             _ => false,
         },
-        Node::ControlMap(a, id, unnamed) => match right {
-            Node::ControlMap(b, other_id, other_unnamed)
+        Node::ControlMap(a, af, id, unnamed) => match right {
+            Node::ControlMap(b, bf, other_id, other_unnamed)
                 if id == other_id && unnamed == other_unnamed =>
             {
-                child!(a, b)
+                plain_child!(a, af, b, bf)
             }
+            _ => false,
+        },
+        Node::ControlMapBoxed(a) => match right {
+            Node::ControlMapBoxed(b) if a.1 == b.1 && a.2 == b.2 => child!(&a.0, &b.0),
             _ => false,
         },
         Node::MapHapsNative(a) => match right {
@@ -388,8 +426,8 @@ fn same_node<'g>(
             _ => false,
         },
         Node::Signal(_) => matches!(right, Node::Signal(_)),
-        Node::ChooseCycles(a, seed) => match right {
-            Node::ChooseCycles(b, other) => seed == other && same_children(a, b, pending),
+        Node::ChooseCycles(a) => match right {
+            Node::ChooseCycles(b) => a.1 == b.1 && same_children(&a.0, &b.0, pending),
             _ => false,
         },
         Node::WChoose(a) => match right {
@@ -437,20 +475,60 @@ fn same_node<'g>(
             Node::Stack(b) => same_children(a, b, pending),
             _ => false,
         },
+        Node::StackPure(a) => match right {
+            Node::StackPure(b) => {
+                if a.len() != b.len() {
+                    return false;
+                }
+                for (l, r) in a.iter().zip(b.iter()) {
+                    plain.push((l, 0, r, 0));
+                }
+                true
+            }
+            _ => false,
+        },
         Node::SlowCat(a) => match right {
             Node::SlowCat(b) => same_children(a, b, pending),
+            _ => false,
+        },
+        Node::SlowCatPure(a) => match right {
+            Node::SlowCatPure(b) => {
+                if a.len() != b.len() {
+                    return false;
+                }
+                for (l, r) in a.iter().zip(b.iter()) {
+                    plain.push((l, 0, r, 0));
+                }
+                true
+            }
             _ => false,
         },
         Node::SlowCatPrime(a) => match right {
             Node::SlowCatPrime(b) => same_children(a, b, pending),
             _ => false,
         },
+        Node::SlowCatPrimePure(a) => match right {
+            Node::SlowCatPrimePure(b) => {
+                if a.len() != b.len() {
+                    return false;
+                }
+                for (l, r) in a.iter().zip(b.iter()) {
+                    plain.push((l, 0, r, 0));
+                }
+                true
+            }
+            _ => false,
+        },
         Node::InnerJoin(a) => match right {
             Node::InnerJoin(b) => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::SplitQueries(a) => match right {
-            Node::SplitQueries(b) => child!(a, b),
+        Node::SplitQueries(a, af) => match right {
+            Node::SplitQueries(b, bf) => plain_child!(a, af, b, bf),
+            _ => false,
+        },
+        Node::SplitQueriesBoxed(a) => match right {
+            Node::SplitQueriesBoxed(b) => child!(a, b),
             _ => false,
         },
         Node::FastGap(a) => match right {
@@ -482,9 +560,12 @@ fn same_node<'g>(
         },
         Node::AppWave(a) => match right {
             Node::AppWave(b)
-                if a.key_id == b.key_id
-                    && a.math_inside == b.math_inside
-                    && a.wave.same(&b.wave) =>
+                if a.waves.len() == b.waves.len()
+                    && a.waves.iter().zip(b.waves.iter()).all(|(x, y)| {
+                        x.key_id == y.key_id
+                            && x.math_inside == y.math_inside
+                            && x.wave.same(&y.wave)
+                    }) =>
             {
                 child!(&a.inner, &b.inner)
             }
@@ -538,8 +619,12 @@ fn same_node<'g>(
             }
             _ => false,
         },
-        Node::Join(a, mode) => match right {
-            Node::Join(b, other) if mode == other => child!(a, b),
+        Node::Join(a, af, mode) => match right {
+            Node::Join(b, bf, other) if mode == other => plain_child!(a, af, b, bf),
+            _ => false,
+        },
+        Node::JoinBoxed(a) => match right {
+            Node::JoinBoxed(b) if a.1 == b.1 => child!(&a.0, &b.0),
             _ => false,
         },
         Node::FmapJs(a) => match right {

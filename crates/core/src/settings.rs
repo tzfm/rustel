@@ -298,6 +298,11 @@ impl RuntimeSettings {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    #[inline]
+    pub(crate) fn handle_ptr(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
     /// Request this handle for the dynamic extent of `f`.
     ///
     /// A nested handle from the same runtime keeps the snapshot already

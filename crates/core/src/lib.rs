@@ -1087,8 +1087,6 @@ const FLAG_SPAN_MASK: u8 = 0b11 << 4;
 const FLAG_SPAN_NO: u8 = 0 << 4;
 const FLAG_SPAN_MADE: u8 = 1 << 4;
 const FLAG_SPAN_YES: u8 = 2 << 4;
-/// Handle-level override clearing `FLAG_IMPURE` for [`purity::PurePattern::host_built`].
-const EXTRA_FORCE_PURE: u8 = 1 << 7;
 
 fn pack_purity_flags(purity: &purity::Purity) -> u8 {
     let mut flags = 0u8;
@@ -1129,12 +1127,14 @@ struct PatternExtrasRare {
 }
 
 /// Rare handle-level metadata kept out-of-line so [`Pattern`] stays 24 bytes.
+/// Compact single-range `pure_loc` (packed via [`pack_run_loc`]) sits inline so
+/// located `pure` handles avoid a secondary `PatternExtrasRare` box allocation.
 #[derive(Clone, Default)]
-struct PatternExtras {
+pub(crate) struct PatternExtras {
     runtime_settings: Option<settings::RuntimeSettings>,
     reachable: Option<Arc<Vec<CallbackId>>>,
     rare: Option<Box<PatternExtrasRare>>,
-    extra_flags: u8,
+    pure_loc_packed: u32,
 }
 
 const _: () = assert!(size_of::<PatternExtras>() <= 32);
@@ -1143,11 +1143,30 @@ impl PatternExtras {
     /// True when this extras record carries only `runtime_settings`, so
     /// ancestor nodes with no reachable JS callbacks can share its `Arc`.
     #[inline]
-    fn is_plain_runtime_settings(&self) -> bool {
+    pub(crate) fn is_plain_runtime_settings(&self) -> bool {
         self.rare.is_none()
+            && self.pure_loc_packed == 0
             && self.runtime_settings.is_some()
-            && self.extra_flags == 0
             && self.reachable.is_none()
+    }
+
+    #[inline]
+    pub(crate) fn plain_runtime_settings_key(&self) -> Option<usize> {
+        if self.is_plain_runtime_settings() {
+            self.runtime_settings
+                .as_ref()
+                .map(settings::RuntimeSettings::handle_ptr)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.runtime_settings.is_none()
+            && self.reachable.is_none()
+            && self.rare.is_none()
+            && self.pure_loc_packed == 0
     }
 
     #[inline]
@@ -1157,6 +1176,10 @@ impl PatternExtras {
 
     #[inline]
     fn pure_loc(&self) -> Option<(u32, u32)> {
+        if self.pure_loc_packed != 0 {
+            let (b, e) = unpack_run_loc(self.pure_loc_packed);
+            return Some((b as u32, e as u32));
+        }
         self.rare.as_deref().and_then(|r| r.pure_loc)
     }
 
@@ -1176,8 +1199,22 @@ impl PatternExtras {
 
     fn set_pure_loc(&mut self, loc: Option<(u32, u32)>) {
         match loc {
-            Some(loc) => self.rare.get_or_insert_with(Default::default).pure_loc = Some(loc),
+            Some((b, e)) => {
+                if let Some(packed) = pack_run_loc((b as usize, e as usize)) {
+                    self.pure_loc_packed = packed;
+                    if let Some(rare) = self.rare.as_deref_mut() {
+                        rare.pure_loc = None;
+                        if rare.large_steps.is_none() {
+                            self.rare = None;
+                        }
+                    }
+                } else {
+                    self.pure_loc_packed = 0;
+                    self.rare.get_or_insert_with(Default::default).pure_loc = Some((b, e));
+                }
+            }
             None => {
+                self.pure_loc_packed = 0;
                 if let Some(rare) = self.rare.as_deref_mut() {
                     rare.pure_loc = None;
                     if rare.large_steps.is_none() {
@@ -1189,13 +1226,190 @@ impl PatternExtras {
     }
 }
 
+/// Bitmask for inline small `_steps` denominator in `Pattern::step_denom`
+/// (low 24 bits, up to 16,777,215; larger denominators spill to `PatternExtras`).
+const STEP_DENOM_MASK: u32 = 0x00ff_ffff;
+/// High 8 bits of `Pattern::step_denom` hold the node's packed purity/span
+/// flags so [`NodeCell`] carries zero flag/padding bytes.
+const NODE_FLAGS_SHIFT: u32 = 24;
+
+/// Compact 8-byte reference to a [`Pattern`]'s underlying graph node, used by
+/// dense caches that keep per-handle metadata only for non-plain handles.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct PatternNodeRef(pub(crate) Arc<NodeCell>);
+
+const _: () = assert!(std::mem::size_of::<PatternNodeRef>() == 8);
+
+impl PatternNodeRef {
+    #[inline]
+    pub fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+
+    #[inline]
+    pub fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+}
+
+/// Rare per-handle metadata split out of a [`Pattern`] when stored densely.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct PatternHandleMeta {
+    step_numer: i32,
+    step_denom_low: u32,
+    extras: Option<Arc<PatternExtras>>,
+}
+
+/// Shared plain `runtime_settings` extras handle stored once per dense cache
+/// (such as the native score memo) so parts sharing the session's runtime
+/// settings avoid per-part [`PatternHandleMeta`] entries.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct PatternSharedExtras(Arc<PatternExtras>);
+
+impl PatternSharedExtras {
+    #[inline]
+    fn matches(&self, other: &PatternExtras) -> bool {
+        match (&self.0.runtime_settings, &other.runtime_settings) {
+            (Some(a), Some(b)) => a.same_handle(b),
+            _ => false,
+        }
+    }
+}
+
+/// Compact metadata tag for [`Pattern::split_compact`].
+#[doc(hidden)]
+pub const COMPACT_META_STEPS: u8 = 0;
+#[doc(hidden)]
+pub const COMPACT_META_PURE_LOC: u8 = 1;
+#[doc(hidden)]
+pub const COMPACT_META_SHARED_EXTRAS: u8 = 2;
+
+impl Pattern {
+    /// Split this handle into its 8-byte node reference, 1-byte packed flags,
+    /// inline small steps `(i16, u16)` (or a 32-bit inline `pure_loc`), a 1-byte
+    /// metadata tag, and optional rare metadata when steps overflow or
+    /// non-shared `extras` are present.
+    #[doc(hidden)]
+    #[inline]
+    pub fn split_compact(
+        self,
+        shared: &mut Option<PatternSharedExtras>,
+    ) -> (PatternNodeRef, u8, i16, u16, u8, Option<PatternHandleMeta>) {
+        let flags = self.node_flags();
+        let denom_low = self.inline_step_denom();
+        if self.extras.is_none() {
+            if denom_low == 0 && self.step_numer != 0 {
+                let packed = self.step_numer as u32;
+                return (
+                    PatternNodeRef(self.node),
+                    flags,
+                    (packed & 0xffff) as u16 as i16,
+                    (packed >> 16) as u16,
+                    COMPACT_META_PURE_LOC,
+                    None,
+                );
+            }
+            if let (Ok(n), Ok(d)) = (i16::try_from(self.step_numer), u16::try_from(denom_low)) {
+                return (
+                    PatternNodeRef(self.node),
+                    flags,
+                    n,
+                    d,
+                    COMPACT_META_STEPS,
+                    None,
+                );
+            }
+        } else if let Some(ex) = &self.extras
+            && ex.is_plain_runtime_settings()
+            && let (Ok(n), Ok(d)) = (i16::try_from(self.step_numer), u16::try_from(denom_low))
+        {
+            let matched = match shared {
+                Some(existing) => existing.matches(ex),
+                None => {
+                    *shared = Some(PatternSharedExtras(Arc::clone(ex)));
+                    true
+                }
+            };
+            if matched {
+                return (
+                    PatternNodeRef(self.node),
+                    flags,
+                    n,
+                    d,
+                    COMPACT_META_SHARED_EXTRAS,
+                    None,
+                );
+            }
+        }
+        let meta = PatternHandleMeta {
+            step_numer: self.step_numer,
+            step_denom_low: denom_low,
+            extras: self.extras,
+        };
+        (
+            PatternNodeRef(self.node),
+            flags,
+            0,
+            0,
+            COMPACT_META_STEPS,
+            Some(meta),
+        )
+    }
+
+    /// Reconstruct a [`Pattern`] from [`Self::split_compact`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn from_compact(
+        node: &PatternNodeRef,
+        flags: u8,
+        step_numer: i16,
+        step_denom: u16,
+        meta_kind: u8,
+        shared: Option<&PatternSharedExtras>,
+        meta: Option<&PatternHandleMeta>,
+    ) -> Self {
+        match meta {
+            None if meta_kind == COMPACT_META_PURE_LOC => {
+                let packed = u32::from(step_numer as u16) | (u32::from(step_denom) << 16);
+                Self {
+                    node: Arc::clone(&node.0),
+                    step_numer: packed as i32,
+                    step_denom: u32::from(flags) << NODE_FLAGS_SHIFT,
+                    extras: None,
+                }
+            }
+            None if meta_kind == COMPACT_META_SHARED_EXTRAS => Self {
+                node: Arc::clone(&node.0),
+                step_numer: i32::from(step_numer),
+                step_denom: (u32::from(flags) << NODE_FLAGS_SHIFT) | u32::from(step_denom),
+                extras: shared.map(|s| Arc::clone(&s.0)),
+            },
+            None => Self {
+                node: Arc::clone(&node.0),
+                step_numer: i32::from(step_numer),
+                step_denom: (u32::from(flags) << NODE_FLAGS_SHIFT) | u32::from(step_denom),
+                extras: None,
+            },
+            Some(meta) => Self {
+                node: Arc::clone(&node.0),
+                step_numer: meta.step_numer,
+                step_denom: (u32::from(flags) << NODE_FLAGS_SHIFT) | meta.step_denom_low,
+                extras: meta.extras.clone(),
+            },
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Pattern {
     node: Arc<NodeCell>,
-    /// Packed small `_steps` metadata: when `step_denom != 0`, this handle has
-    /// `Fraction::new(step_numer, step_denom)`; when `step_denom == 0`, check
-    /// `extras.large_steps`.
+    /// Packed small `_steps` numerator; active when `(step_denom & STEP_DENOM_MASK) != 0`.
     step_numer: i32,
+    /// Low 24 bits: inline `_steps` denominator (`0` means none or `extras.large_steps`).
+    /// High 8 bits: packed purity and span-read flags for `node`.
     step_denom: u32,
     /// Rare handle-level metadata (`pure_loc`, `runtime_settings`, large
     /// `i128` step counts, handle-added volatility, or reachable JS callbacks).
@@ -1206,7 +1420,7 @@ pub struct Pattern {
 const _: () = assert!(std::mem::size_of::<Pattern>() == 24);
 // A score builds thousands of nodes, so a node's size is most of a graph's
 // memory. A variant that grows every node fails here: box its rare part.
-const _: () = assert!(std::mem::size_of::<NodeCell>() <= 40);
+const _: () = assert!(std::mem::size_of::<NodeCell>() <= 24);
 
 /// A rewrite of the pitch of each hap, as [`Pattern::pitched`] applies it.
 struct PitchRewrite {
@@ -1241,11 +1455,103 @@ impl<'a> Apart<'a> {
     }
 }
 
-/// A lock-free graph node plus its bit-packed purity flags, shared by every
-/// handle to it.
-struct NodeCell {
-    flags: u8,
-    kind: Node,
+/// A lock-free graph node shared by every handle to it. Purity flags travel in
+/// the high byte of [`Pattern::step_denom`] so `NodeCell` stays 24 bytes.
+pub(crate) struct NodeCell {
+    pub(crate) kind: Node,
+}
+
+fn purity_from_plain_flags(flags: u8) -> purity::Purity {
+    purity::Purity::from_packed(
+        flags & FLAG_IMPURE != 0,
+        flags & FLAG_OPAQUE != 0,
+        flags & FLAG_VOLATILE != 0,
+        flags & FLAG_HOST_VOICINGS != 0,
+        unpack_span_read(flags),
+        None,
+    )
+}
+
+#[inline(always)]
+pub(crate) fn plain_flags_cacheable(flags: u8) -> bool {
+    (flags & (FLAG_IMPURE | FLAG_VOLATILE)) == 0
+        && ((flags & FLAG_HOST_VOICINGS) == 0 || !settings::default_voicings_is_host_owned())
+}
+
+#[inline(always)]
+pub(crate) fn plain_pattern(node: &Arc<NodeCell>, flags: u8) -> Pattern {
+    Pattern {
+        node: Arc::clone(node),
+        step_numer: 0,
+        step_denom: u32::from(flags) << NODE_FLAGS_SHIFT,
+        extras: None,
+    }
+}
+
+/// Borrowed view of either a full [`Pattern`] handle or a plain `(NodeCell, flags)`
+/// child stored inline inside compact 24-byte [`Node`] variants.
+#[derive(Clone, Copy)]
+pub(crate) enum NodeRef<'a> {
+    Pat(&'a Pattern),
+    Plain(&'a NodeCell, u8),
+}
+
+impl<'a> NodeRef<'a> {
+    #[inline(always)]
+    pub(crate) fn kind(self) -> &'a Node {
+        match self {
+            Self::Pat(pat) => pat.node_kind(),
+            Self::Plain(cell, _) => &cell.kind,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn has_runtime_settings(self) -> bool {
+        match self {
+            Self::Pat(pat) => pat.has_runtime_settings(),
+            Self::Plain(..) => false,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_cacheable(self) -> bool {
+        match self {
+            Self::Pat(pat) => pat.is_cacheable(),
+            Self::Plain(_, flags) => plain_flags_cacheable(flags),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn tables_may_answer(self) -> bool {
+        match self {
+            Self::Pat(pat) => pat.tables_may_answer(),
+            Self::Plain(_, flags) => plain_flags_cacheable(flags),
+        }
+    }
+
+    pub(crate) fn under_structure(self) -> Option<&'a Pattern> {
+        let Node::FilterValues(boxed) = self.kind() else {
+            return None;
+        };
+        let (structured, keep) = (&boxed.0, &boxed.1);
+        let Node::AppRight(node) = structured.node_kind() else {
+            return None;
+        };
+        let AppNode(functions, structure, Combine::With(combine), LookupFlow::Left) = &**node
+        else {
+            return None;
+        };
+        let kept = KEEP_DEFINED
+            .get()
+            .is_some_and(|defined| Arc::ptr_eq(defined, keep))
+            && compose::is_keep_if(combine);
+        let keeps_structured = match self {
+            Self::Pat(pat) => pat.keeps_runtime_over(structured),
+            Self::Plain(..) => !structured.has_runtime_settings(),
+        };
+        let bound = keeps_structured && structured.keeps_runtime_over(functions);
+        (kept && sequence::is_bare(structure) && bound).then_some(functions)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2292,17 +2598,20 @@ const CONSTRUCTION_MEMO_ENTRIES: usize = 32;
 
 /// The rate of a `cpm`, in cycles each minute, and the speed change that
 /// it makes of the tempo of the scheduler.
-struct TempoRate {
-    cpm: Fraction,
+pub(crate) struct TempoRate {
+    pub(crate) cpm: Fraction,
     /// The speed change at the tempo that asked first, with the bits of
     /// that tempo. A float reads as a fraction slowly, and a session seldom
     /// changes its tempo.
     read: std::sync::OnceLock<(u64, Option<Fraction>, Option<TempoGrid>)>,
 }
 
-/// A sixteenth of a child cycle as ticks of the scheduler.
+/// A sixteenth of a child cycle as ticks of the scheduler. Borrows its
+/// reduction table from the thread-local cache so a `cpm` node holds no
+/// `TickGrid` vector on the heap.
+#[derive(Clone, Copy)]
 struct TempoGrid {
-    grid: rustel_fraction::TickGrid,
+    denom: std::num::NonZeroU32,
     cycle_ticks: i64,
 }
 
@@ -2314,8 +2623,13 @@ impl TempoGrid {
             return None;
         }
         let tick = Fraction::new(1, i128::from(Self::STEPS)).checked_div(speed)?;
+        let denom_i64 = i64::try_from(tick.denom()).ok()?;
+        if denom_i64 <= 0 || denom_i64 > rustel_fraction::TickGrid::MAX_DENOM {
+            return None;
+        }
+        let denom = std::num::NonZeroU32::new(u32::try_from(denom_i64).ok()?)?;
         Some(Self {
-            grid: rustel_fraction::TickGrid::new(i64::try_from(tick.denom()).ok()?)?,
+            denom,
             cycle_ticks: i64::try_from(tick.numer()).ok()?.checked_mul(Self::STEPS)?,
         })
     }
@@ -2328,12 +2642,15 @@ impl TempoGrid {
         }
         let n = i64::try_from(time.numer()).ok()?;
         let ticks = n.checked_mul(self.cycle_ticks >> d.trailing_zeros())?;
-        Some(self.grid.time(ticks))
+        Some(sequence::with_tick_grid(self.denom, |grid| match grid {
+            Some(grid) => grid.time(ticks),
+            None => Fraction::from_ticks(i128::from(ticks), self.denom),
+        }))
     }
 }
 
 impl TempoRate {
-    fn new(cpm: Fraction) -> Self {
+    pub(crate) fn new(cpm: Fraction) -> Self {
         Self {
             cpm,
             read: std::sync::OnceLock::new(),
@@ -2365,7 +2682,7 @@ impl TempoRate {
 /// either, so sharing cannot change what it answers. Bounded, and drained
 /// onto the destruction worklist like any other child.
 #[derive(Default)]
-struct ConstructionMemo {
+pub(crate) struct ConstructionMemo {
     entries: Mutex<Constructions>,
     /// Round-robin victim once full. The key set is a handful of argument
     /// values, so plain replacement is enough and never thrashes on it.
@@ -2882,6 +3199,29 @@ fn query_stack_onto(
         before();
         stack_child_onto(thread, out, |out| {
             pat.answer_onto(thread, state, table::Order::Graph, out);
+        });
+        let held = out.len() - from;
+        if !thread.charge(held) {
+            out.truncate(from);
+            return;
+        }
+        thread.note_accumulated(held);
+    }
+}
+
+fn query_stack_pure_onto(
+    thread: &QueryThread,
+    cells: &[Arc<NodeCell>],
+    state: &State,
+    out: &mut Vec<Hap>,
+) {
+    let from = out.len();
+    for cell in cells
+        .iter()
+        .filter(|cell| !matches!(cell.kind, Node::Silence))
+    {
+        stack_child_onto(thread, out, |out| {
+            plain_pattern(cell, 0).answer_onto(thread, state, table::Order::Graph, out);
         });
         let held = out.len() - from;
         if !thread.charge(held) {
@@ -4548,13 +4888,17 @@ impl PickLookup {
         if cancellation_requested() || query_deadline_expired() {
             return false;
         }
+        let shared = Arc::new(PatternExtras {
+            runtime_settings: Some(settings.clone()),
+            ..PatternExtras::default()
+        });
         match self {
             Self::Array { entries, .. } => {
                 for (_, pattern) in entries {
                     if cancellation_requested() || query_deadline_expired() {
                         return false;
                     }
-                    pattern.attach_runtime_settings(settings.clone());
+                    pattern.attach_runtime_settings_shared(settings, &shared);
                 }
             }
             Self::Object { entries, .. } => {
@@ -4562,7 +4906,7 @@ impl PickLookup {
                     if cancellation_requested() || query_deadline_expired() {
                         return false;
                     }
-                    pattern.attach_runtime_settings(settings.clone());
+                    pattern.attach_runtime_settings_shared(settings, &shared);
                 }
             }
         }
@@ -4738,7 +5082,7 @@ pub(crate) enum CompactPickLookup {
     },
     Object {
         enumerable_len: usize,
-        entries: Box<[(Box<str>, Pattern)]>,
+        entries: Box<[(crate::value::SharedStr, Pattern)]>,
     },
 }
 
@@ -4770,7 +5114,7 @@ impl CompactPickLookup {
                 enumerable_len,
                 entries: entries
                     .into_iter()
-                    .map(|(k, p)| (k.into_boxed_str(), p))
+                    .map(|(k, p)| (crate::value::SharedStr::from(k), p))
                     .collect(),
             },
         }
@@ -5136,6 +5480,35 @@ impl Meeting {
         part: TimeSpan,
         cache: Option<&mut value::SharedWaveCache>,
     ) -> bool {
+        let single_key = meeting.apply.single_key();
+        if single_key != 0 {
+            if hf.pick_lookup().is_some()
+                || !matches!(hf.value, Value::Object(_))
+                || !hf.value.is_data(0)
+            {
+                return false;
+            }
+            let Some(key) = controls::builtin_key_ref_by_id(single_key & 0x03ff) else {
+                return false;
+            };
+            if !hf.keys.is_empty() {
+                let hf_live = hf.live_controls();
+                let hf_binding = hf.slider_binding();
+                if hf_live != [0; 4] || hf_binding != 0 {
+                    let mut bindings = hf_live;
+                    if let Some(slot) = controls::live_slot(key.as_str()) {
+                        bindings[slot] = 0;
+                    }
+                    hf.set_live_bindings(bindings, 0);
+                }
+            }
+            if let Value::Object(map) = &mut hf.value {
+                map.set_data_single_cached(key, &meeting.value, cache);
+            }
+            hf.part = part;
+            meeting.prepend_context_to(&mut hf.context);
+            return true;
+        }
         let Some(op) = meeting.in_place_op() else {
             return false;
         };
@@ -5796,7 +6169,7 @@ const _: fn() = || {
     assert_send_sync::<Hap>();
 };
 
-enum Node {
+pub(crate) enum Node {
     Silence,
     Pure(Value),
     /// The steps of every cycle, as one node. See [`sequence`].
@@ -5830,15 +6203,17 @@ enum Node {
     /// `fast` by an exact factor: query times are multiplied by it and hap
     /// times divided by it. See [`checked_time`] for overflow.
     Fast(Box<FastNode>),
-    /// Inline small-fraction `fast`/`slow` (`slow` when `bool` is true), avoiding
-    /// an 80-byte `Box<FastNode>` allocation for ordinary rational factors.
-    FastSmall(Pattern, i16, u16, bool),
+    /// Inline small-fraction `fast`/`slow` over a plain handle (`slow` when
+    /// `bool` is true), avoiding an 80-byte `Box<FastNode>` while keeping
+    /// [`Node`] 24 bytes.
+    FastSmall(Arc<NodeCell>, u8, i16, u16, bool),
     /// `late` by an exact offset (`early` is a negative one): subtracted from
     /// query times and added to hap times. See [`checked_time`] for overflow.
     Shift(Box<ShiftNode>),
-    /// Inline small-fraction `late`/`early` (`early` when `bool` is true),
-    /// avoiding an 80-byte `Box<ShiftNode>` allocation.
-    ShiftSmall(Pattern, i16, u16, bool),
+    /// Inline small-fraction `late`/`early` over a plain handle (`early` when
+    /// `bool` is true), avoiding an 80-byte `Box<ShiftNode>` while keeping
+    /// [`Node`] 24 bytes.
+    ShiftSmall(Arc<NodeCell>, u8, i16, u16, bool),
     /// `withQuerySpan` / `withHapSpan` - begin and end mapped jointly.
     WithQuerySpan(Box<(Pattern, SpanFn)>),
     WithQuerySpanJs(Box<(Pattern, CallbackId)>),
@@ -5846,14 +6221,14 @@ enum Node {
     /// `rev` - reflect each cycle. Its own node because the reflection pivot
     /// comes from the query span's cycle, so the hap transform is not a
     /// function of the hap alone.
-    Rev(Pattern),
+    Rev(Box<Pattern>),
     /// `stepJoin` - re-slices the outer cycle on every query, so it cannot be
     /// expressed as a `Join` mode.
-    StepJoin(Pattern),
+    StepJoin(Box<Pattern>),
     /// `polyJoin` - extends each inner pattern to the outer's step count, then
     /// joins taking the outer whole. Resolved at query time so it survives
     /// wrapping.
-    PolyJoin(Pattern),
+    PolyJoin(Box<Pattern>),
     /// `arp(indices, pat)` - index into each chord.
     ///
     /// Its own node because the collect/select/unwrap pipeline's intermediate
@@ -5886,7 +6261,7 @@ enum Node {
     /// Its purity is inherited exactly: a pure inner stays pure and queryable
     /// with no host, and an impure one keeps its precise reachable set.
     /// Routing it through `PatternOfDynamic` would make it falsely opaque.
-    PurePattern(Pattern),
+    PurePattern(Box<Pattern>),
     /// A pure JavaScript array/object whose exact lookup shape travels beside
     /// its ordinary value until pick consumes it.
     PurePickLookup(Box<(Value, PickLookup)>),
@@ -5906,10 +6281,14 @@ enum Node {
     FilterHaps(Box<(Pattern, HapPredicate)>),
     FilterHapsJs(Box<(Pattern, CallbackId)>),
     FilterWhenJs(Box<(Pattern, CallbackId)>),
-    SortHapsByPart(Pattern),
-    /// Built-in control naming map by 1-based registry id, avoiding closure
-    /// boxing and pool locks on non-sequence patterns such as signals.
-    ControlMap(Pattern, u16, bool),
+    SortHapsByPart(Box<Pattern>),
+    /// Built-in control naming map by 1-based registry id over a plain handle,
+    /// avoiding closure boxing and pool locks on non-sequence patterns such as
+    /// signals while keeping [`Node`] 24 bytes.
+    ControlMap(Arc<NodeCell>, u8, u16, bool),
+    /// Boxed fallback of [`Node::ControlMap`] when the inner handle carries
+    /// `_steps` or [`PatternExtras`].
+    ControlMapBoxed(Box<(Pattern, u16, bool)>),
     /// `withHaps` with native per-hap drop: the map-then-`removeUndefineds`
     /// shape (`scale` uses it). A closure that hits a query-time throw signals
     /// through `signal_query_error` and returns `None`; the flag surfaces at
@@ -5924,20 +6303,20 @@ enum Node {
     /// `stack(...notes).note().set(rest)` + outerJoin collapses to exactly
     /// this shape natively (each note covers the source hap's whole/part).
     ExpandHapsNative(Box<(Pattern, HapExpandFn, SpanUse)>),
-    Collect(Pattern),
+    Collect(Box<Pattern>),
     /// `isobite`: the onsets in the cycle of the query, each valued by its
     /// position among them. An onset is a hap with a value not loosely 0.
-    CycleOnsetIndex(Pattern),
+    CycleOnsetIndex(Box<Pattern>),
     /// `isobite`: one hap over the cycle of the query, valued by the number
     /// of onsets in the cycle.
-    CycleOnsetCount(Pattern),
+    CycleOnsetCount(Box<Pattern>),
     /// `withSeed(() => n)`: rewrite `state.controls.randSeed`
     /// for the subtree, which every random signal reads. The registered
     /// `seed(n)` combinator is the constant form; function-valued `withSeed`
     /// is a JS surface the native scope does not expose.
     WithRandSeed(Box<(Pattern, f64)>),
     Signal(SignalFn),
-    ChooseCycles(Vec<Pattern>, u32),
+    ChooseCycles(Box<(Box<[Pattern]>, u32)>),
     /// Weighted random choice. See [`WeightedChoice`].
     WChoose(Box<WeightedChoice>),
     /// A selector pattern choosing reified entries from a JavaScript array or
@@ -5952,12 +6331,20 @@ enum Node {
     },
     Degrade(Box<(Pattern, f64, DegradeKind)>),
     Stack(Box<[Pattern]>),
+    /// Compact [`Node::Stack`] when every child has `flags == 0` and no extras:
+    /// 8 bytes per child instead of 24 bytes.
+    StackPure(Box<[Arc<NodeCell>]>),
     SlowCat(Box<[Pattern]>),
+    /// Compact [`Node::SlowCat`] when every child has `flags == 0` and no extras.
+    SlowCatPure(Box<[Arc<NodeCell>]>),
     /// `slowcatPrime` - cycle-skipping concatenation used by `every`/`lastOf`.
     SlowCatPrime(Box<[Pattern]>),
+    /// Compact [`Node::SlowCatPrime`] when every child has `flags == 0` and no extras.
+    SlowCatPrimePure(Box<[Arc<NodeCell>]>),
     /// `innerJoin` over a pattern-of-patterns produced by a native function.
     InnerJoin(Box<(Pattern, ToPatternFn)>),
-    SplitQueries(Pattern),
+    SplitQueries(Arc<NodeCell>, u8),
+    SplitQueriesBoxed(Box<Pattern>),
     /// `fastGap`: speed up, leaving a gap rather than repeating.
     FastGap(Box<(Pattern, Fraction)>),
     RepeatCycles(Box<(Pattern, Fraction)>),
@@ -6011,7 +6398,10 @@ enum Node {
     /// Tune from ratio patterns while keeping the source note's spans.
     XenPatterns(Box<(Pattern, Vec<Pattern>)>),
     /// Flatten a `PatternOf`, choosing whose whole survives.
-    Join(Pattern, JoinMode),
+    Join(Arc<NodeCell>, u8, JoinMode),
+    /// Boxed fallback of [`Node::Join`] when the inner handle carries `_steps`
+    /// or [`PatternExtras`].
+    JoinBoxed(Box<(Pattern, JoinMode)>),
     /// `fmap` with a USER callback. Holds only the opaque id.
     FmapJs(Box<(Pattern, CallbackId)>),
     /// Trusted host finalization retains unchanged native control bindings.
@@ -6048,26 +6438,53 @@ pub(crate) struct ShiftNode(
 );
 
 /// Boxed payload of [`Node::UiVisual`].
-struct UiVisualNode {
-    inner: Pattern,
-    slot: u8,
-    cache: std::sync::OnceLock<Box<(Arc<context_keys::Keys>, Arc<context_keys::Keys>)>>,
+pub(crate) struct UiVisualNode {
+    pub(crate) inner: Pattern,
+    pub(crate) slot: u8,
+    pub(crate) cache: std::sync::OnceLock<Box<(Arc<context_keys::Keys>, Arc<context_keys::Keys>)>>,
 }
 
 /// Boxed payload of [`Node::Pick`].
-struct PickNode {
-    selector: Pattern,
-    lookup: CompactPickLookup,
-    index_mode: PickIndexMode,
-    mode: JoinMode,
+pub(crate) struct PickNode {
+    pub(crate) selector: Pattern,
+    pub(crate) lookup: CompactPickLookup,
+    pub(crate) index_mode: PickIndexMode,
+    pub(crate) mode: JoinMode,
+}
+
+/// One inline wave control inside [`AppWaveNode`].
+#[derive(Clone)]
+pub(crate) struct AppWaveItem {
+    pub(crate) wave: fused::Wave,
+    pub(crate) key_id: u16,
+    pub(crate) math_inside: bool,
+}
+
+/// Compact storage for one or more consecutive inline wave controls: a single
+/// wave sits inline with no secondary allocation, while stacked wave controls
+/// (`.lpf(sine...).pan(rand)`) collapse into one [`AppWaveNode`].
+#[derive(Clone)]
+pub(crate) enum AppWaves {
+    One(AppWaveItem),
+    Many(Box<[AppWaveItem]>),
+}
+
+impl std::ops::Deref for AppWaves {
+    type Target = [AppWaveItem];
+
+    #[inline(always)]
+    fn deref(&self) -> &[AppWaveItem] {
+        match self {
+            Self::One(one) => std::slice::from_ref(one),
+            Self::Many(many) => many,
+        }
+    }
 }
 
 /// Boxed payload of [`Node::AppWave`].
 pub(crate) struct AppWaveNode {
     pub(crate) inner: Pattern,
-    pub(crate) wave: fused::Wave,
-    pub(crate) key_id: u16,
-    pub(crate) math_inside: bool,
+    pub(crate) waves: AppWaves,
 }
 
 const _: () = assert!(std::mem::size_of::<AppWaveNode>() <= 80);
@@ -6122,12 +6539,12 @@ impl std::ops::DerefMut for ConstantsMeetings {
 /// Boxed payload of [`Node::Constants`].
 pub(crate) struct ConstantsNode(pub(crate) Pattern, pub(crate) ConstantsMeetings);
 
-const _: () = assert!(std::mem::size_of::<ConstantsNode>() <= 80);
+const _: () = assert!(std::mem::size_of::<ConstantsNode>() <= 64);
 
 /// The two children of a node that has two: functions and values, a
 /// pattern and its operand, a selector and its lookup. One box for both,
 /// so the node of every other kind stays small.
-struct PatternPair(Pattern, Pattern);
+pub(crate) struct PatternPair(pub(crate) Pattern, pub(crate) Pattern);
 
 impl PatternPair {
     /// The first child that binds a runtime, if any.
@@ -6191,7 +6608,11 @@ impl AppLeftNode {
 
 /// Boxed payload of [`Node::PatternOfPureOperand`], keeping `ConstructionMemo`
 /// out of every other [`Node`] variant.
-struct OperandPureNode(Pattern, Pattern, ConstructionMemo);
+pub(crate) struct OperandPureNode(
+    pub(crate) Pattern,
+    pub(crate) Pattern,
+    pub(crate) ConstructionMemo,
+);
 
 impl OperandPureNode {
     #[inline]
@@ -6210,17 +6631,21 @@ impl OperandPureNode {
 /// `weights` are patterns, not construction-time scalars; `chooser` is `rand`
 /// for `wchoose` and `rand.segment(1)` for `wchooseCycles`. The boolean
 /// selects the final inner join (`true`) versus outer join (`false`).
-struct WeightedChoice {
-    chooser: Pattern,
-    total: Pattern,
-    cumulative: Vec<Pattern>,
-    values: Vec<Pattern>,
-    inner: bool,
+pub(crate) struct WeightedChoice {
+    pub(crate) chooser: Pattern,
+    pub(crate) total: Pattern,
+    pub(crate) cumulative: Vec<Pattern>,
+    pub(crate) values: Vec<Pattern>,
+    pub(crate) inner: bool,
 }
 
 /// The payload of a [`Node::PatternOfHap`]: the outer pattern, every graph
 /// that the bind may return, and the bind.
-struct HapBind(Pattern, Vec<Pattern>, HapToPatternFn);
+pub(crate) struct HapBind(
+    pub(crate) Pattern,
+    pub(crate) Vec<Pattern>,
+    pub(crate) HapToPatternFn,
+);
 
 /// How the value side of an `appLeft` is read with no query of its graph for
 /// each function hap, found once by the first query that meets the side.
@@ -6313,49 +6738,80 @@ fn unpack_run_loc(packed: u32) -> (usize, usize) {
 }
 
 #[derive(Clone)]
-struct RunWith {
-    apply: CombineFn,
+struct RunSpilled {
+    combine: Combine,
     flow: LookupFlow,
+    single_key: u16,
     loc0: u32,
+    more_context: Option<Locations>,
 }
 
-/// Compact 8-byte header for [`RunMeeting`] packing [`Combine`],
-/// [`LookupFlow`], and up to one inline packed source location (`loc0 != 0`).
-/// Rare opaque `Combine::With` closures are boxed into [`RunWith`] so
-/// [`RunApply`] fits in one pointer word.
+/// Compact 16-byte header for [`RunMeeting`] packing [`Combine`],
+/// [`LookupFlow`], an inline single built-in control key, and up to one inline
+/// packed source location (`loc0 != 0`). Rare `Combine::With` closures and
+/// multi-range locations spill into [`RunSpilled`] so [`RunMeeting`] stays 40
+/// bytes.
 #[derive(Clone)]
-enum RunApply {
+pub(crate) enum RunApply {
     Composed {
         op: compose::ComposeOp,
         flow: LookupFlow,
         merged: bool,
+        /// Non-zero packed built-in key when `RunMeeting::value` holds the
+        /// single control value inline without allocating a `BuiltinMap<1>`.
+        single_key: u16,
         loc0: u32,
     },
-    With(Box<RunWith>),
+    Spilled(Box<RunSpilled>),
 }
 
 const _: () = assert!(std::mem::size_of::<RunApply>() <= 16);
 
 impl RunApply {
-    fn from_parts(apply: Combine, flow: LookupFlow, loc0: u32) -> Self {
-        match apply {
-            Combine::Composed(op) => Self::Composed {
-                op,
-                flow,
-                merged: false,
-                loc0,
-            },
-            Combine::SetMerged => Self::Composed {
-                op: compose::ComposeOp::Set,
-                flow,
-                merged: true,
-                loc0,
-            },
-            Combine::With(apply) => Self::With(Box::new(RunWith {
-                apply: *apply,
-                flow,
-                loc0,
-            })),
+    fn from_parts(
+        apply: Combine,
+        flow: LookupFlow,
+        single_key: u16,
+        loc0: u32,
+        more_context: Option<Locations>,
+    ) -> Self {
+        if more_context.is_none() {
+            match apply {
+                Combine::Composed(op) => {
+                    return Self::Composed {
+                        op,
+                        flow,
+                        merged: false,
+                        single_key,
+                        loc0,
+                    };
+                }
+                Combine::SetMerged => {
+                    return Self::Composed {
+                        op: compose::ComposeOp::Set,
+                        flow,
+                        merged: true,
+                        single_key,
+                        loc0,
+                    };
+                }
+                Combine::With(_) => {}
+            }
+        }
+        Self::Spilled(Box::new(RunSpilled {
+            combine: apply,
+            flow,
+            single_key,
+            loc0,
+            more_context,
+        }))
+    }
+
+    #[inline]
+    fn single_key(&self) -> u16 {
+        match self {
+            Self::Composed { single_key, .. } => *single_key,
+            Self::Spilled(s) => s.single_key,
         }
     }
 
@@ -6363,7 +6819,7 @@ impl RunApply {
     fn flow(&self) -> LookupFlow {
         match self {
             Self::Composed { flow, .. } => *flow,
-            Self::With(w) => w.flow,
+            Self::Spilled(s) => s.flow,
         }
     }
 
@@ -6371,15 +6827,15 @@ impl RunApply {
     fn loc0(&self) -> u32 {
         match self {
             Self::Composed { loc0, .. } => *loc0,
-            Self::With(w) => w.loc0,
+            Self::Spilled(s) => s.loc0,
         }
     }
 
     #[inline]
-    fn set_loc0(&mut self, value: u32) {
+    fn more_context(&self) -> Option<&Locations> {
         match self {
-            Self::Composed { loc0, .. } => *loc0 = value,
-            Self::With(w) => w.loc0 = value,
+            Self::Composed { .. } => None,
+            Self::Spilled(s) => s.more_context.as_ref(),
         }
     }
 
@@ -6387,7 +6843,11 @@ impl RunApply {
     fn in_place_op(&self) -> Option<compose::ComposeOp> {
         match self {
             Self::Composed { op, .. } => Some(*op),
-            Self::With(_) => None,
+            Self::Spilled(s) => match &s.combine {
+                Combine::Composed(op) => Some(*op),
+                Combine::SetMerged => Some(compose::ComposeOp::Set),
+                Combine::With(_) => None,
+            },
         }
     }
 
@@ -6395,12 +6855,12 @@ impl RunApply {
         match self {
             Self::Composed { merged: true, .. } => Combine::SetMerged,
             Self::Composed { op, .. } => Combine::Composed(*op),
-            Self::With(w) => Combine::with(Arc::clone(&w.apply)),
+            Self::Spilled(s) => s.combine.clone(),
         }
     }
 
     fn same(&self, other: &Self) -> bool {
-        if self.flow() != other.flow() {
+        if self.flow() != other.flow() || self.single_key() != other.single_key() {
             return false;
         }
         match (self, other) {
@@ -6412,8 +6872,12 @@ impl RunApply {
                     op: b, merged: mb, ..
                 },
             ) => a == b && ma == mb,
-            (Self::With(a), Self::With(b)) => Arc::ptr_eq(&a.apply, &b.apply),
-            _ => false,
+            _ => match (self.combine(), other.combine()) {
+                (Combine::Composed(a), Combine::Composed(b)) => a == b,
+                (Combine::SetMerged, Combine::SetMerged) => true,
+                (Combine::With(a), Combine::With(b)) => Arc::ptr_eq(&a, &b),
+                _ => false,
+            },
         }
     }
 }
@@ -6423,14 +6887,12 @@ impl RunApply {
 /// maps of controls in a row are one meeting, which the build made of them.
 /// See [`Pattern::set_control`].
 #[derive(Clone)]
-struct RunMeeting {
-    value: Value,
-    apply: RunApply,
-    /// Spilled locations when more than one range or a wide range is present.
-    more_context: Option<Box<Locations>>,
+pub(crate) struct RunMeeting {
+    pub(crate) value: Value,
+    pub(crate) apply: RunApply,
 }
 
-const _: () = assert!(std::mem::size_of::<RunMeeting>() <= 48);
+const _: () = assert!(std::mem::size_of::<RunMeeting>() <= 40);
 
 impl RunMeeting {
     #[inline]
@@ -6459,12 +6921,12 @@ impl RunMeeting {
 
     #[inline]
     fn context_is_empty(&self) -> bool {
-        self.apply.loc0() == 0 && self.more_context.is_none()
+        self.apply.loc0() == 0 && self.apply.more_context().is_none()
     }
 
     fn context(&self) -> Locations {
-        if let Some(more) = &self.more_context {
-            (**more).clone()
+        if let Some(more) = self.apply.more_context() {
+            more.clone()
         } else if self.apply.loc0() != 0 {
             let mut out = Locations::new();
             out.push(unpack_run_loc(self.apply.loc0()));
@@ -6476,8 +6938,8 @@ impl RunMeeting {
 
     #[inline]
     fn prepend_context_to(&self, target: &mut Locations) {
-        if let Some(more) = &self.more_context {
-            let mut merged = (**more).clone();
+        if let Some(more) = self.apply.more_context() {
+            let mut merged = more.clone();
             merged.append(target);
             *target = merged;
         } else if self.apply.loc0() != 0 {
@@ -6489,14 +6951,14 @@ impl RunMeeting {
     }
 
     fn same_context(&self, other: &Self) -> bool {
-        match (&self.more_context, &other.more_context) {
+        match (self.apply.more_context(), other.apply.more_context()) {
             (None, None) => self.apply.loc0() == other.apply.loc0(),
             (Some(a), Some(b)) => a == b,
             _ => false,
         }
     }
 
-    fn pack_context(context: Locations) -> (u32, Option<Box<Locations>>) {
+    fn pack_context(context: Locations) -> (u32, Option<Locations>) {
         if context.is_empty() {
             (0, None)
         } else if context.len() == 1
@@ -6505,14 +6967,18 @@ impl RunMeeting {
         {
             (packed, None)
         } else {
-            (0, Some(Box::new(context)))
+            (0, Some(context))
         }
     }
 
     /// Materialize this constant as a cycle-zero [`Hap`] for fallback paths.
     pub(crate) fn as_hap(&self) -> Hap {
         let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
-        let mut hap = Hap::new(Some(cycle), cycle, self.value.clone());
+        let value = match self.apply.single_key() {
+            0 => self.value.clone(),
+            packed => Value::Object(OrderedMap::from_single_packed(packed, self.value.clone())),
+        };
+        let mut hap = Hap::new(Some(cycle), cycle, value);
         hap.context = self.context();
         hap
     }
@@ -6544,15 +7010,21 @@ impl RunMeeting {
     /// `appLeft` of a `pure` of the value at those places makes it: the
     /// value in every cycle, on a hap that carries nothing more.
     fn of(apply: Combine, flow: LookupFlow, mut value: Value, context: Locations) -> Self {
+        let mut single_key = 0u16;
         if let Value::Object(map) = &mut value {
             map.undress_patched();
-            map.intern_builtin();
+            if matches!(apply, Combine::Composed(compose::ComposeOp::Set))
+                && flow == LookupFlow::Set
+                && let Some((packed, inner_val)) = map.single_packed_entry()
+            {
+                single_key = packed;
+                value = inner_val.clone();
+            }
         }
         let (loc0, more_context) = Self::pack_context(context);
         Self {
             value,
-            apply: RunApply::from_parts(apply, flow, loc0),
-            more_context,
+            apply: RunApply::from_parts(apply, flow, single_key, loc0, more_context),
         }
     }
 
@@ -6561,9 +7033,12 @@ impl RunMeeting {
     /// text.
     pub(crate) fn number(&self) -> Option<(compose::ComposeOp, f64)> {
         match (&self.apply, &self.value) {
-            (RunApply::Composed { op, .. }, Value::F64(other)) if self.context_is_empty() => {
-                Some((*op, *other))
-            }
+            (
+                RunApply::Composed {
+                    op, single_key: 0, ..
+                },
+                Value::F64(other),
+            ) if self.context_is_empty() => Some((*op, *other)),
             _ => None,
         }
     }
@@ -6583,13 +7058,10 @@ impl RunMeeting {
     /// `value` alone keeps the other side as it is, so such a constant
     /// takes none.
     fn takes_sets(&self) -> bool {
-        let sets = matches!(
-            self.apply,
-            RunApply::Composed {
-                op: compose::ComposeOp::Set,
-                ..
-            }
-        );
+        let sets = self.apply.in_place_op() == Some(compose::ComposeOp::Set);
+        if self.apply.single_key() != 0 {
+            return self.flow() == LookupFlow::Set && sets;
+        }
         let controls = self.value.as_object();
         self.flow() == LookupFlow::Set
             && sets
@@ -6612,19 +7084,18 @@ impl RunMeeting {
     /// [takes](Self::takes_set_after): the constant is then the union, with
     /// the locations of the later control first.
     fn set_after(&mut self, control: &Value, mut context: Locations) {
-        if let RunApply::Composed { merged, .. } = &mut self.apply {
-            *merged = true;
+        let single_key = self.apply.single_key();
+        if single_key != 0 {
+            let val = std::mem::replace(&mut self.value, Value::Undefined);
+            self.value = Value::Object(OrderedMap::from_single_packed(single_key, val));
         }
         compose::compose_data_flat(compose::ComposeOp::Set, &mut self.value, control);
-        if let Value::Object(map) = &mut self.value {
-            map.intern_builtin();
-        }
         if !self.context_is_empty() {
             context.append(&self.context());
         }
+        let flow = self.apply.flow();
         let (new_loc0, new_more) = Self::pack_context(context);
-        self.apply.set_loc0(new_loc0);
-        self.more_context = new_more;
+        self.apply = RunApply::from_parts(Combine::SetMerged, flow, 0, new_loc0, new_more);
     }
 }
 
@@ -6759,6 +7230,12 @@ fn slowcat_cycle(pats: &[Pattern], state: &State) -> Vec<Hap> {
     haps
 }
 
+fn slowcat_cycle_pure(cells: &[Arc<NodeCell>], state: &State) -> Vec<Hap> {
+    let mut haps = Vec::new();
+    QUERY_THREAD.with(|thread| slowcat_cycle_pure_onto(thread, cells, state, &mut haps));
+    haps
+}
+
 /// [`slowcat_cycle`] after the haps of `out`: the pattern writes its haps
 /// there, and each moves to the cycle where it is.
 fn slowcat_cycle_onto(thread: &QueryThread, pats: &[Pattern], state: &State, out: &mut Vec<Hap>) {
@@ -6768,6 +7245,36 @@ fn slowcat_cycle_onto(thread: &QueryThread, pats: &[Pattern], state: &State, out
     let n = pats.len() as i128;
     let cycle = state.span.begin.sam().numer();
     let pat = &pats[cycle.rem_euclid(n) as usize];
+    slowcat_cycle_item_onto(thread, n, cycle, pat, state, out);
+}
+
+fn slowcat_cycle_pure_onto(
+    thread: &QueryThread,
+    cells: &[Arc<NodeCell>],
+    state: &State,
+    out: &mut Vec<Hap>,
+) {
+    if cells.is_empty() {
+        return;
+    }
+    let n = cells.len() as i128;
+    let cycle = state.span.begin.sam().numer();
+    let cell = &cells[cycle.rem_euclid(n) as usize];
+    if matches!(cell.kind, Node::Silence) {
+        return;
+    }
+    let pat = plain_pattern(cell, 0);
+    slowcat_cycle_item_onto(thread, n, cycle, &pat, state, out);
+}
+
+fn slowcat_cycle_item_onto(
+    thread: &QueryThread,
+    n: i128,
+    cycle: i128,
+    pat: &Pattern,
+    state: &State,
+    out: &mut Vec<Hap>,
+) {
     if pat.is_rest() {
         return;
     }
@@ -7387,7 +7894,10 @@ impl Pattern {
             // One value that fills each cycle, as a control of a `pure` is
             // once it is folded.
             Node::Sequence(layers) => sequence::constant_value(layers).map(|_| 1),
-            Node::ControlMap(pattern, _, _) => pattern.constant_levels()?.checked_add(1),
+            Node::ControlMap(cell, flags, _, _) => plain_pattern(cell, *flags)
+                .constant_levels()?
+                .checked_add(1),
+            Node::ControlMapBoxed(boxed) => boxed.0.constant_levels()?.checked_add(1),
             Node::AddContext(boxed) => boxed.0.constant_levels()?.checked_add(1),
             Node::FmapNative(boxed) => boxed.0.constant_levels()?.checked_add(1),
             Node::MapHapsNative(boxed) if boxed.2 == SpanUse::Ignores => {
@@ -7445,7 +7955,12 @@ fn inherited_runtime_settings_source(node: &Node) -> Option<&Pattern> {
         | Node::QueryError(_)
         | Node::QueryLimit(_)
         | Node::Signal(_)
-        | Node::JsQuery(_) => None,
+        | Node::JsQuery(_)
+        | Node::FastSmall(..)
+        | Node::ShiftSmall(..)
+        | Node::ControlMap(..)
+        | Node::Join(..)
+        | Node::SplitQueries(..) => None,
         Node::PatternOfPureOperand(pair, _) => pair.runtime_settings_source(),
         #[cfg(non_send_node_mutation)]
         Node::NonSendMutation(_) => None,
@@ -7454,16 +7969,13 @@ fn inherited_runtime_settings_source(node: &Node) -> Option<&Pattern> {
         | Node::PolyJoin(pattern)
         | Node::PurePattern(pattern)
         | Node::SortHapsByPart(pattern)
-        | Node::ControlMap(pattern, _, _)
         | Node::Collect(pattern)
         | Node::CycleOnsetIndex(pattern)
         | Node::CycleOnsetCount(pattern)
-        | Node::SplitQueries(pattern)
-        | Node::Join(pattern, _) => pattern.has_runtime_settings().then_some(pattern),
+        | Node::SplitQueriesBoxed(pattern) => pattern.has_runtime_settings().then_some(pattern),
+        Node::ControlMapBoxed(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::JoinBoxed(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
         Node::Fast(node) => node.0.has_runtime_settings().then_some(&node.0),
-        Node::FastSmall(pat, ..) | Node::ShiftSmall(pat, ..) => {
-            pat.has_runtime_settings().then_some(pat)
-        }
         Node::Shift(node) => node.0.has_runtime_settings().then_some(&node.0),
         Node::Constants(node) => node.0.has_runtime_settings().then_some(&node.0),
         Node::UiVisual(node) => node.inner.has_runtime_settings().then_some(&node.inner),
@@ -7513,10 +8025,11 @@ fn inherited_runtime_settings_source(node: &Node) -> Option<&Pattern> {
         | Node::ArpWithPattern(pair)
         | Node::PickPatternified { patterns: pair, .. } => pair.runtime_settings_source(),
         Node::PurePickLookup(boxed) => from_patterns(boxed.1.patterns()),
-        Node::ChooseCycles(patterns, _) => from_patterns(patterns),
+        Node::ChooseCycles(boxed) => from_patterns(&boxed.0),
         Node::Stack(patterns) | Node::SlowCat(patterns) | Node::SlowCatPrime(patterns) => {
             from_patterns(patterns)
         }
+        Node::StackPure(_) | Node::SlowCatPure(_) | Node::SlowCatPrimePure(_) => None,
         Node::WChoose(choice) => choice
             .chooser
             .has_runtime_settings()
@@ -7579,9 +8092,9 @@ impl Pattern {
         let flags = pack_purity_flags(&purity);
         let extras = inherited_extras(&node, purity.take_reachable());
         Pattern {
-            node: Arc::new(NodeCell { flags, kind: node }),
+            node: Arc::new(NodeCell { kind: node }),
             step_numer: 0,
-            step_denom: 0,
+            step_denom: u32::from(flags) << NODE_FLAGS_SHIFT,
             extras,
         }
     }
@@ -7590,12 +8103,100 @@ impl Pattern {
     /// node says, and no metadata of a handle.
     fn holding(node: Arc<NodeCell>) -> Self {
         let mut purity = compute_purity(&node.kind);
+        purity.span_read = span_read(&node.kind);
+        let flags = pack_purity_flags(&purity);
         let extras = inherited_extras(&node.kind, purity.take_reachable());
         Pattern {
             node,
             step_numer: 0,
-            step_denom: 0,
+            step_denom: u32::from(flags) << NODE_FLAGS_SHIFT,
             extras,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn node_flags(&self) -> u8 {
+        (self.step_denom >> NODE_FLAGS_SHIFT) as u8
+    }
+
+    #[inline(always)]
+    pub(crate) fn node_arc(&self) -> &Arc<NodeCell> {
+        &self.node
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_node_arc(&mut self, node: Arc<NodeCell>) {
+        self.node = node;
+    }
+
+    #[inline(always)]
+    pub(crate) fn has_internable_extras(&self) -> bool {
+        self.extras
+            .as_deref()
+            .is_none_or(PatternExtras::is_plain_runtime_settings)
+    }
+
+    #[inline(always)]
+    pub(crate) fn extras_ptr(&self) -> usize {
+        self.extras.as_ref().map_or(0, |e| Arc::as_ptr(e) as usize)
+    }
+
+    #[inline]
+    pub(crate) fn dedup_plain_extras(
+        &mut self,
+        intern: &mut dyn FnMut(usize, &Arc<PatternExtras>) -> Arc<PatternExtras>,
+    ) {
+        if let Some(ex) = &self.extras
+            && let Some(key) = ex.plain_runtime_settings_key()
+        {
+            let canon = intern(key, ex);
+            if !Arc::ptr_eq(ex, &canon) {
+                self.extras = Some(canon);
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn packed_steps(&self) -> (i32, u32) {
+        (self.step_numer, self.step_denom)
+    }
+
+    #[inline(always)]
+    fn inline_step_denom(&self) -> u32 {
+        self.step_denom & STEP_DENOM_MASK
+    }
+
+    #[inline(always)]
+    fn inline_pure_loc(&self) -> u32 {
+        if self.inline_step_denom() == 0 {
+            self.step_numer as u32
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    fn is_plain_handle(&self) -> bool {
+        self.inline_step_denom() == 0 && self.step_numer == 0 && self.extras.is_none()
+    }
+
+    #[inline]
+    fn control_map_node(inner: Pattern, id: u16, unnamed_only: bool) -> Node {
+        if inner.is_plain_handle() {
+            let flags = inner.node_flags();
+            Node::ControlMap(inner.node, flags, id, unnamed_only)
+        } else {
+            Node::ControlMapBoxed(Box::new((inner, id, unnamed_only)))
+        }
+    }
+
+    #[inline]
+    fn join_node(inner: Pattern, mode: JoinMode) -> Node {
+        if inner.is_plain_handle() {
+            let flags = inner.node_flags();
+            Node::Join(inner.node, flags, mode)
+        } else {
+            Node::JoinBoxed(Box::new((inner, mode)))
         }
     }
 
@@ -7608,15 +8209,7 @@ impl Pattern {
 
     #[inline(always)]
     fn effective_flags(&self) -> u8 {
-        let mut flags = self.node.flags;
-        if let Some(extras) = &self.extras {
-            flags |= extras.extra_flags
-                & (FLAG_IMPURE | FLAG_OPAQUE | FLAG_VOLATILE | FLAG_HOST_VOICINGS);
-            if extras.extra_flags & EXTRA_FORCE_PURE != 0 {
-                flags &= !FLAG_IMPURE;
-            }
-        }
-        flags
+        self.node_flags()
     }
 
     #[inline(always)]
@@ -7633,7 +8226,7 @@ impl Pattern {
 
     #[inline(always)]
     pub(crate) fn span_read(&self) -> purity::SpanRead {
-        unpack_span_read(self.node.flags)
+        unpack_span_read(self.node_flags())
     }
 
     #[inline(always)]
@@ -7643,11 +8236,13 @@ impl Pattern {
     }
 
     pub(crate) fn same_steps(&self, other: &Self) -> bool {
-        if self.step_denom != other.step_denom || self.step_numer != other.step_numer {
+        let a_denom = self.inline_step_denom();
+        let b_denom = other.inline_step_denom();
+        if a_denom != b_denom {
             return false;
         }
-        if self.step_denom != 0 {
-            return true;
+        if a_denom != 0 {
+            return self.step_numer == other.step_numer;
         }
         let a = self.extras.as_deref().and_then(PatternExtras::large_steps);
         let b = other.extras.as_deref().and_then(PatternExtras::large_steps);
@@ -7655,7 +8250,7 @@ impl Pattern {
     }
 
     pub(crate) fn clear_impure(&mut self) {
-        self.extras_mut().extra_flags |= EXTRA_FORCE_PURE;
+        self.step_denom &= !(u32::from(FLAG_IMPURE) << NODE_FLAGS_SHIFT);
     }
 
     fn node_kind(&self) -> &Node {
@@ -7698,7 +8293,7 @@ impl Pattern {
             flags & FLAG_OPAQUE != 0,
             flags & FLAG_VOLATILE != 0,
             flags & FLAG_HOST_VOICINGS != 0,
-            unpack_span_read(self.node.flags),
+            unpack_span_read(self.node_flags()),
             self.extras.as_deref().and_then(|e| e.reachable.clone()),
         )
     }
@@ -7734,7 +8329,7 @@ impl Pattern {
     /// This handle, declared volatile - see [`purity::Purity::volatile`].
     pub fn mark_volatile(&self) -> Self {
         let mut pattern = self.clone();
-        pattern.extras_mut().extra_flags |= FLAG_VOLATILE;
+        pattern.step_denom |= u32::from(FLAG_VOLATILE) << NODE_FLAGS_SHIFT;
         pattern
     }
 
@@ -7754,7 +8349,7 @@ impl Pattern {
     /// [`purity::Purity::host_voicings`].
     pub(crate) fn mark_host_voicings(&self) -> Self {
         let mut pattern = self.clone();
-        pattern.extras_mut().extra_flags |= FLAG_HOST_VOICINGS;
+        pattern.step_denom |= u32::from(FLAG_HOST_VOICINGS) << NODE_FLAGS_SHIFT;
         pattern
     }
 
@@ -7786,10 +8381,11 @@ impl Pattern {
 
     /// `_steps` of this pattern: how many steps one cycle of it has.
     pub fn steps(&self) -> Option<Fraction> {
-        if self.step_denom != 0 {
+        let denom = self.inline_step_denom();
+        if denom != 0 {
             Some(Fraction::new(
                 i128::from(self.step_numer),
-                i128::from(self.step_denom),
+                i128::from(denom),
             ))
         } else {
             self.extras.as_deref().and_then(PatternExtras::large_steps)
@@ -7797,10 +8393,12 @@ impl Pattern {
     }
 
     pub fn with_steps(mut self, steps: Option<Fraction>) -> Self {
+        let flags_bits = self.step_denom & !STEP_DENOM_MASK;
+        let saved_pure_loc = self.inline_pure_loc();
         match steps {
             None => {
-                self.step_numer = 0;
-                self.step_denom = 0;
+                self.step_denom = flags_bits;
+                self.step_numer = saved_pure_loc as i32;
                 if self
                     .extras
                     .as_deref()
@@ -7808,24 +8406,45 @@ impl Pattern {
                 {
                     self.extras_mut().set_large_steps(None);
                 }
+                if self.step_numer == 0
+                    && let Some(packed) = self
+                        .extras
+                        .as_deref()
+                        .map(|e| e.pure_loc_packed)
+                        .filter(|&p| p != 0)
+                {
+                    self.step_numer = packed as i32;
+                    self.extras_mut().pure_loc_packed = 0;
+                }
+                if self.extras.as_deref().is_some_and(PatternExtras::is_empty) {
+                    self.extras = None;
+                }
             }
             Some(steps) => {
-                let denom = u32::try_from(steps.denom()).ok().filter(|&d| d != 0);
+                let denom = u32::try_from(steps.denom())
+                    .ok()
+                    .filter(|&d| d != 0 && d <= STEP_DENOM_MASK);
                 match (i32::try_from(steps.numer()), denom) {
                     (Ok(numer), Some(denom)) => {
                         self.step_numer = numer;
-                        self.step_denom = denom;
+                        self.step_denom = flags_bits | denom;
+                        if saved_pure_loc != 0 {
+                            self.extras_mut().pure_loc_packed = saved_pure_loc;
+                        }
                         if self
                             .extras
                             .as_deref()
                             .is_some_and(|e| e.large_steps().is_some())
                         {
                             self.extras_mut().set_large_steps(None);
+                            if self.extras.as_deref().is_some_and(PatternExtras::is_empty) {
+                                self.extras = None;
+                            }
                         }
                     }
                     _ => {
-                        self.step_numer = 0;
-                        self.step_denom = 0;
+                        self.step_numer = saved_pure_loc as i32;
+                        self.step_denom = flags_bits;
                         self.extras_mut().set_large_steps(Some(steps));
                     }
                 }
@@ -7837,8 +8456,28 @@ impl Pattern {
     /// [`Self::with_steps`] of the steps of `other`, which the handle
     /// takes as they are held.
     pub fn with_steps_of(mut self, other: &Self) -> Self {
-        self.step_numer = other.step_numer;
-        self.step_denom = other.step_denom;
+        let saved_pure_loc = self.inline_pure_loc();
+        let other_denom = other.inline_step_denom();
+        if other_denom != 0 {
+            self.step_numer = other.step_numer;
+            self.step_denom = (self.step_denom & !STEP_DENOM_MASK) | other_denom;
+            if saved_pure_loc != 0 {
+                self.extras_mut().pure_loc_packed = saved_pure_loc;
+            }
+        } else {
+            self.step_denom &= !STEP_DENOM_MASK;
+            self.step_numer = saved_pure_loc as i32;
+            if self.step_numer == 0
+                && let Some(packed) = self
+                    .extras
+                    .as_deref()
+                    .map(|e| e.pure_loc_packed)
+                    .filter(|&p| p != 0)
+            {
+                self.step_numer = packed as i32;
+                self.extras_mut().pure_loc_packed = 0;
+            }
+        }
         let large = other.extras.as_deref().and_then(PatternExtras::large_steps);
         if large.is_some()
             || self
@@ -7847,6 +8486,9 @@ impl Pattern {
                 .is_some_and(|e| e.large_steps().is_some())
         {
             self.extras_mut().set_large_steps(large);
+        }
+        if self.extras.as_deref().is_some_and(PatternExtras::is_empty) {
+            self.extras = None;
         }
         self
     }
@@ -7864,6 +8506,18 @@ impl Pattern {
     pub(crate) fn attach_runtime_settings(&mut self, settings: settings::RuntimeSettings) {
         if !self.has_runtime_settings() {
             self.extras_mut().runtime_settings = Some(settings);
+        }
+    }
+
+    fn attach_runtime_settings_shared(
+        &mut self,
+        settings: &settings::RuntimeSettings,
+        shared: &Arc<PatternExtras>,
+    ) {
+        if self.extras.is_none() {
+            self.extras = Some(Arc::clone(shared));
+        } else if !self.has_runtime_settings() {
+            self.extras_mut().runtime_settings = Some(settings.clone());
         }
     }
 
@@ -7924,6 +8578,24 @@ impl Pattern {
                 for layer in layers.iter().filter(|layer| !layer.is_rest()) {
                     stack_child_onto(thread, out, |out| {
                         layer.query_restarted_onto(thread, shift, state, part, out);
+                    });
+                    let held = out.len() - from;
+                    if !thread.charge(held) {
+                        out.truncate(from);
+                        return;
+                    }
+                    thread.note_accumulated(held);
+                }
+            }
+            Node::StackPure(cells) if !self.has_runtime_settings() && !self.is_volatile() => {
+                let from = out.len();
+                for cell in cells
+                    .iter()
+                    .filter(|cell| !matches!(cell.kind, Node::Silence))
+                {
+                    stack_child_onto(thread, out, |out| {
+                        plain_pattern(cell, 0)
+                            .query_restarted_onto(thread, shift, state, part, out);
                     });
                     let held = out.len() - from;
                     if !thread.charge(held) {
@@ -8086,51 +8758,80 @@ impl Pattern {
                 }
             }
         }
-        fn wave_of_node<'a>(node: &'a Node, state: &State) -> Option<(QuickWave<'a>, &'a Pattern)> {
-            match node {
+        let mut waves: [Option<QuickWave<'_>>; MAX_WAVES] = [None; MAX_WAVES];
+        let mut count = 0usize;
+        let mut base = self;
+        loop {
+            if count > 0 && (base.has_runtime_settings() || base.is_volatile()) {
+                break;
+            }
+            match base.node_kind() {
                 Node::AppWave(app) => {
-                    let key = controls::builtin_key_ref_by_id(app.key_id)?;
-                    Some((QuickWave::Wave(key, &app.wave), &app.inner))
+                    let items = &*app.waves;
+                    if count + items.len() > MAX_WAVES {
+                        if count == 0 {
+                            return false;
+                        }
+                        break;
+                    }
+                    let mut ok = true;
+                    let saved = count;
+                    for item in items.iter().rev() {
+                        let Some(key) = controls::builtin_key_ref_by_id(item.key_id) else {
+                            ok = false;
+                            break;
+                        };
+                        waves[count] = Some(QuickWave::Wave(key, &item.wave));
+                        count += 1;
+                    }
+                    if !ok {
+                        count = saved;
+                        if count == 0 {
+                            return false;
+                        }
+                        break;
+                    }
+                    base = &app.inner;
                 }
                 Node::AppLeft(_) => {
-                    let side = ValueSide::of(node)?;
+                    let Some(side) = ValueSide::of(base.node_kind()) else {
+                        break;
+                    };
                     if !matches!(side.apply, Combine::Composed(compose::ComposeOp::Set))
                         || side.flow != LookupFlow::Set
                         || !side.values.tables_may_answer()
                     {
-                        return None;
+                        break;
                     }
-                    let ReadValues::Signal(signal) = side.reading.of(side.values, state)? else {
-                        return None;
+                    let Some(ReadValues::Signal(signal)) = side.reading.of(side.values, state)
+                    else {
+                        break;
                     };
-                    if let Some((key, wave)) = signal.wave() {
-                        return Some((QuickWave::Wave(key, wave), side.functions));
+                    let found = if let Some((key, wave)) = signal.wave() {
+                        Some(QuickWave::Wave(key, wave))
+                    } else {
+                        signal
+                            .step_wave()
+                            .filter(|step| step.covers_span(state.span))
+                            .map(QuickWave::Step)
+                    };
+                    let Some(found) = found else {
+                        break;
+                    };
+                    if count >= MAX_WAVES {
+                        break;
                     }
-                    signal
-                        .step_wave()
-                        .filter(|step| step.covers_span(state.span))
-                        .map(|step| (QuickWave::Step(step), side.functions))
+                    waves[count] = Some(found);
+                    count += 1;
+                    base = side.functions;
                 }
-                _ => None,
+                _ => break,
             }
         }
-        let Some((first, mut base)) = wave_of_node(self.node_kind(), state) else {
+        if count == 0 {
             return false;
-        };
-        let mut waves: [Option<QuickWave<'_>>; MAX_WAVES] = [None; MAX_WAVES];
-        waves[0] = Some(first);
-        let mut count = 1usize;
-        while count < MAX_WAVES {
-            if base.has_runtime_settings() || base.is_volatile() {
-                break;
-            }
-            let Some((pair, next_base)) = wave_of_node(base.node_kind(), state) else {
-                break;
-            };
-            waves[count] = Some(pair);
-            count += 1;
-            base = next_base;
         }
+        let first = waves[0].expect("at least one wave");
         if base.is_volatile() {
             return false;
         }
@@ -8682,20 +9383,20 @@ impl Pattern {
                     .query_faster_onto(thread, node.1, None, node.2, state, out);
             }
 
-            Node::FastSmall(pat, numer, denom, is_slow) => {
+            Node::FastSmall(cell, flags, numer, denom, is_slow) => {
                 let factor = Fraction::new(i128::from(*numer), i128::from(*denom));
                 let op = if *is_slow { "slow" } else { "fast" };
-                pat.query_faster_onto(thread, factor, None, op, state, out);
+                plain_pattern(cell, *flags).query_faster_onto(thread, factor, None, op, state, out);
             }
 
             Node::Shift(node) => {
                 node.0.query_moved_onto(thread, node.1, node.2, state, out);
             }
 
-            Node::ShiftSmall(pat, numer, denom, is_early) => {
+            Node::ShiftSmall(cell, flags, numer, denom, is_early) => {
                 let offset = Fraction::new(i128::from(*numer), i128::from(*denom));
                 let op = if *is_early { "early" } else { "late" };
-                pat.query_moved_onto(thread, offset, op, state, out);
+                plain_pattern(cell, *flags).query_moved_onto(thread, offset, op, state, out);
             }
 
             Node::Cpm(boxed) => {
@@ -8766,6 +9467,7 @@ impl Pattern {
             }
 
             Node::Stack(pats) => query_stack_onto(thread, pats, state, out, || {}),
+            Node::StackPure(cells) => query_stack_pure_onto(thread, cells, state, out),
 
             Node::AddContext(boxed) => {
                 let (pat, locs) = (&boxed.0, &boxed.1);
@@ -8790,35 +9492,19 @@ impl Pattern {
                     return;
                 }
                 // Rare fallback for non-object haps, multi-cycle parts, >48-bit
-                // rationals, or cut_mask boundaries: rebuild exact wave pattern.
-                let values = app.wave.to_control_pattern(app.key_id, app.math_inside);
-                let reading = ValueReading::default();
-                let apply = Combine::Composed(compose::ComposeOp::Set);
-                let side = ValueSide {
-                    functions: &app.inner,
-                    values: &values,
-                    reading: &reading,
-                    apply: &apply,
-                    flow: LookupFlow::Set,
-                };
-                with_list(|functions| {
-                    side.functions
-                        .answer_onto(thread, state, table::Order::Graph, functions);
-                    if functions.is_empty() {
-                        return;
-                    }
-                    if side.met_in_one_query(functions, state, out) {
-                        return;
-                    }
-                    let from = out.len();
-                    let mut meetings = Meetings::default();
-                    out.reserve(functions.len());
-                    for hf in functions.drain(..) {
-                        if !side.meet_on(thread, hf, &mut meetings, state, from, out) {
-                            break;
-                        }
-                    }
-                });
+                // rationals, or cut_mask boundaries: rebuild exact wave chain.
+                let mut current = app.inner.clone();
+                for item in app.waves.iter() {
+                    let values = item.wave.to_control_pattern(item.key_id, item.math_inside);
+                    current = Pattern::of(Node::AppLeft(Box::new(AppLeftNode(
+                        current,
+                        values,
+                        ValueReading::default(),
+                        Combine::Composed(compose::ComposeOp::Set),
+                        LookupFlow::Set,
+                    ))));
+                }
+                current.answer_onto(thread, state, table::Order::Graph, out);
             }
 
             // Function haps drive: values are queried over each function
@@ -9021,16 +9707,39 @@ impl Pattern {
                 pats[index as usize].answer_onto(thread, state, table::Order::Graph, out);
             }
 
+            Node::SlowCatPrimePure(cells) => {
+                if cells.is_empty() {
+                    return;
+                }
+                let n = cells.len() as i128;
+                let index = state.span.begin.floor().numer().rem_euclid(n);
+                let cell = &cells[index as usize];
+                if !matches!(cell.kind, Node::Silence) {
+                    plain_pattern(cell, 0).answer_onto(thread, state, table::Order::Graph, out);
+                }
+            }
+
             Node::Signal(signal) => {
                 out.push(Hap::new(None, state.span, signal(state)));
             }
 
-            Node::ControlMap(pat, id, unnamed_only) => {
+            Node::ControlMap(cell, flags, id, unnamed_only) => {
                 let from = out.len();
-                pat.answer_onto(thread, state, table::Order::Graph, out);
+                plain_pattern(cell, *flags).answer_onto(thread, state, table::Order::Graph, out);
                 if let Some(spec) = controls::builtin_spec_by_id(*id) {
                     map_from(out, from, |hap| {
                         controls::apply_control_hap(spec, *unnamed_only, hap)
+                    });
+                }
+            }
+
+            Node::ControlMapBoxed(boxed) => {
+                let (pat, id, unnamed_only) = (&boxed.0, boxed.1, boxed.2);
+                let from = out.len();
+                pat.answer_onto(thread, state, table::Order::Graph, out);
+                if let Some(spec) = controls::builtin_spec_by_id(id) {
+                    map_from(out, from, |hap| {
+                        controls::apply_control_hap(spec, unnamed_only, hap)
                     });
                 }
             }
@@ -9076,17 +9785,35 @@ impl Pattern {
             // a single constituent. A shifted time outside the native range
             // refuses as `NativeFraction { operation: "slowcat" }`.
             Node::SlowCat(pats) => slowcat_cycle_onto(thread, pats, state, out),
+            Node::SlowCatPure(cells) => slowcat_cycle_pure_onto(thread, cells, state, out),
 
             // A span in one cycle is one piece, which the pattern answers
             // where the haps of the walk are.
-            Node::SplitQueries(pat) if state.span.within_one_cycle() => match pat.node_kind() {
-                Node::SlowCat(pats) if !pat.has_runtime_settings() => {
-                    slowcat_cycle_onto(thread, pats, state, out);
-                }
+            Node::SplitQueries(cell, flags) if state.span.within_one_cycle() => match &cell.kind {
+                Node::SlowCat(pats) => slowcat_cycle_onto(thread, pats, state, out),
+                Node::SlowCatPure(cells) => slowcat_cycle_pure_onto(thread, cells, state, out),
                 _ => {
-                    pat.answer_onto(thread, state, table::Order::Graph, out);
+                    plain_pattern(cell, *flags).answer_onto(
+                        thread,
+                        state,
+                        table::Order::Graph,
+                        out,
+                    );
                 }
             },
+            Node::SplitQueriesBoxed(pat) if state.span.within_one_cycle() => {
+                match pat.node_kind() {
+                    Node::SlowCat(pats) if !pat.has_runtime_settings() => {
+                        slowcat_cycle_onto(thread, pats, state, out);
+                    }
+                    Node::SlowCatPure(cells) if !pat.has_runtime_settings() => {
+                        slowcat_cycle_pure_onto(thread, cells, state, out);
+                    }
+                    _ => {
+                        pat.answer_onto(thread, state, table::Order::Graph, out);
+                    }
+                }
+            }
 
             _ => hand_over(self.query_node(state), out),
         }
@@ -9109,13 +9836,16 @@ impl Pattern {
             | Node::FilterHaps(..)
             | Node::Degrade(..)
             | Node::Stack(_)
+            | Node::StackPure(_)
             | Node::AddContext(..)
             | Node::AppLeft(..)
             | Node::AppWave(..)
             | Node::AppRight(..)
             | Node::Pick(..)
             | Node::SlowCat(_)
+            | Node::SlowCatPure(_)
             | Node::SlowCatPrime(_)
+            | Node::SlowCatPrimePure(_)
             | Node::WithQueryTime(..)
             | Node::WithHapTime(..)
             | Node::WithQuerySpan(..)
@@ -9125,6 +9855,7 @@ impl Pattern {
             | Node::ExpandHapsNative(..)
             | Node::Signal(..)
             | Node::ControlMap(..)
+            | Node::ControlMapBoxed(..)
             | Node::MapHapsNative(..)
             | Node::MapHapsOwned(..)
             | Node::UiVisual(..)
@@ -9271,7 +10002,8 @@ impl Pattern {
             }
             Node::MidiKeys(boxed) => query_midi_keys(&boxed.0, &boxed.1, state),
 
-            Node::ChooseCycles(patterns, seed) => {
+            Node::ChooseCycles(boxed) => {
+                let (patterns, seed) = (&boxed.0, &boxed.1);
                 if patterns.is_empty() {
                     return Vec::new();
                 }
@@ -9569,7 +10301,20 @@ impl Pattern {
             // bindWhole: each inner pattern is queried over its outer hap's
             // part; the mode picks whose whole survives, and contexts
             // concatenate outer-then-inner.
-            Node::Join(inner, mode) => {
+            Node::Join(..) | Node::JoinBoxed(..) => {
+                let (plain_owned, mode);
+                let inner = match self.node_kind() {
+                    Node::Join(cell, flags, m) => {
+                        plain_owned = plain_pattern(cell, *flags);
+                        mode = m;
+                        &plain_owned
+                    }
+                    Node::JoinBoxed(boxed) => {
+                        mode = &boxed.1;
+                        &boxed.0
+                    }
+                    _ => unreachable!(),
+                };
                 // Every mode queries the pattern-of-patterns over the SAME
                 // state, so one resolution serves all of them. `resolve_for_join`
                 // is total: a receiver that is not a pattern-of at all still
@@ -10026,12 +10771,24 @@ impl Pattern {
                 Vec::new()
             }
 
-            Node::SplitQueries(pat) => {
+            Node::SplitQueries(..) | Node::SplitQueriesBoxed(..) => {
+                let plain_owned;
+                let pat = match self.node_kind() {
+                    Node::SplitQueries(cell, flags) => {
+                        plain_owned = plain_pattern(cell, *flags);
+                        &plain_owned
+                    }
+                    Node::SplitQueriesBoxed(pat) => pat,
+                    _ => unreachable!(),
+                };
                 // The split of a concatenation answers each cycle with the
                 // concatenation's own rule, in one visit. Any other handle
                 // is queried: it may bind a runtime.
                 let concatenated = match pat.node_kind() {
-                    Node::SlowCat(pats) if !pat.has_runtime_settings() => Some(pats),
+                    Node::SlowCat(pats) if !pat.has_runtime_settings() => Some(Ok(pats.as_ref())),
+                    Node::SlowCatPure(cells) if !pat.has_runtime_settings() => {
+                        Some(Err(cells.as_ref()))
+                    }
                     _ => None,
                 };
                 let pieces = state.span.span_cycles();
@@ -10047,7 +10804,8 @@ impl Pattern {
                 let branches = pieces.into_iter().map(|sub| {
                     let cycle = state.set_span(sub);
                     match concatenated {
-                        Some(pats) => slowcat_cycle(pats, &cycle),
+                        Some(Ok(pats)) => slowcat_cycle(pats, &cycle),
+                        Some(Err(cells)) => slowcat_cycle_pure(cells, &cycle),
                         None => pat.query(&cycle),
                     }
                 });
@@ -10174,7 +10932,7 @@ impl Pattern {
                                     subspan,
                                     Value::Undefined,
                                 ),
-                                inner.clone(),
+                                (**inner).clone(),
                             )
                         })
                         .collect(),
@@ -10225,7 +10983,10 @@ impl Pattern {
             // pattern-of-patterns may be wrapped in before the join. Matching
             // only the bare node made `polyJoin` return silence for anything
             // that had been `fast`ed, `early`d or split.
-            Node::SplitQueries(inner) => inner.resolve_pattern_of(state),
+            Node::SplitQueries(cell, flags) => {
+                plain_pattern(cell, *flags).resolve_pattern_of(state)
+            }
+            Node::SplitQueriesBoxed(inner) => inner.resolve_pattern_of(state),
             Node::AddContext(boxed) => boxed.0.resolve_pattern_of(state).map(|resolved| {
                 let locs = &boxed.1;
                 resolved
@@ -10290,23 +11051,24 @@ impl Pattern {
                         })
                         .collect()
                 }),
-            Node::FastSmall(pat, numer, denom, is_slow) => {
+            Node::FastSmall(cell, flags, numer, denom, is_slow) => {
                 let factor = Fraction::new(i128::from(*numer), i128::from(*denom));
                 let op = if *is_slow { "slow" } else { "fast" };
-                pat.resolve_pattern_of(
-                    &state.with_span(|sp| sp.with_time(|t| fast_query_time(t, factor, op))),
-                )
-                .map(|resolved| {
-                    resolved
-                        .into_iter()
-                        .map(|resolved| ResolvedHap {
-                            hap: resolved
-                                .hap
-                                .with_span(|sp| sp.with_time(|t| fast_hap_time(t, factor, op))),
-                            inner: resolved.inner,
-                        })
-                        .collect()
-                })
+                plain_pattern(cell, *flags)
+                    .resolve_pattern_of(
+                        &state.with_span(|sp| sp.with_time(|t| fast_query_time(t, factor, op))),
+                    )
+                    .map(|resolved| {
+                        resolved
+                            .into_iter()
+                            .map(|resolved| ResolvedHap {
+                                hap: resolved
+                                    .hap
+                                    .with_span(|sp| sp.with_time(|t| fast_hap_time(t, factor, op))),
+                                inner: resolved.inner,
+                            })
+                            .collect()
+                    })
             }
             Node::Shift(node) => node
                 .0
@@ -10324,23 +11086,24 @@ impl Pattern {
                         })
                         .collect()
                 }),
-            Node::ShiftSmall(pat, numer, denom, is_early) => {
+            Node::ShiftSmall(cell, flags, numer, denom, is_early) => {
                 let offset = Fraction::new(i128::from(*numer), i128::from(*denom));
                 let op = if *is_early { "early" } else { "late" };
-                pat.resolve_pattern_of(
-                    &state.with_span(|sp| sp.with_time(|t| shift_query_time(t, offset, op))),
-                )
-                .map(|resolved| {
-                    resolved
-                        .into_iter()
-                        .map(|resolved| ResolvedHap {
-                            hap: resolved
-                                .hap
-                                .with_span(|sp| sp.with_time(|t| shift_hap_time(t, offset, op))),
-                            inner: resolved.inner,
-                        })
-                        .collect()
-                })
+                plain_pattern(cell, *flags)
+                    .resolve_pattern_of(
+                        &state.with_span(|sp| sp.with_time(|t| shift_query_time(t, offset, op))),
+                    )
+                    .map(|resolved| {
+                        resolved
+                            .into_iter()
+                            .map(|resolved| ResolvedHap {
+                                hap: resolved.hap.with_span(|sp| {
+                                    sp.with_time(|t| shift_hap_time(t, offset, op))
+                                }),
+                                inner: resolved.inner,
+                            })
+                            .collect()
+                    })
             }
             // `stack` resolves each branch and concatenates, mirroring the
             // query's flatten. `seqPLoop` (and any join over a stacked
@@ -10354,6 +11117,12 @@ impl Pattern {
                 )
                 // A refused concatenation resolves to silence; the refusal
                 // itself travels on the query-wide channel.
+                .unwrap_or_default(),
+            ),
+            Node::StackPure(cells) => Some(
+                extend_budgeted(cells.iter().map(|cell| {
+                    query_stack_child(|| plain_pattern(cell, 0).resolve_for_join(state))
+                }))
                 .unwrap_or_default(),
             ),
             // `fastGap` on a pattern-of-patterns: the join must consume the
@@ -10546,21 +11315,66 @@ impl Pattern {
 
     /// `__pure_loc` - the source span attached to a pure value, if any.
     pub fn pure_loc(&self) -> Option<(usize, usize)> {
-        self.extras
-            .as_deref()
-            .and_then(PatternExtras::pure_loc)
+        self.pure_loc_raw()
             .map(|(begin, end)| (begin as usize, end as usize))
     }
 
     fn pure_loc_raw(&self) -> Option<(u32, u32)> {
+        let inline = self.inline_pure_loc();
+        if inline != 0 {
+            let (begin, end) = unpack_run_loc(inline);
+            return Some((begin as u32, end as u32));
+        }
         self.extras.as_deref().and_then(PatternExtras::pure_loc)
+    }
+
+    fn set_pure_loc_raw(&mut self, loc: Option<(u32, u32)>) {
+        match loc {
+            Some((begin, end)) => {
+                if self.inline_step_denom() == 0
+                    && let Some(packed) = pack_run_loc((begin as usize, end as usize))
+                {
+                    self.step_numer = packed as i32;
+                    if self
+                        .extras
+                        .as_deref()
+                        .is_some_and(|e| e.pure_loc().is_some())
+                    {
+                        self.extras_mut().set_pure_loc(None);
+                        if self.extras.as_deref().is_some_and(PatternExtras::is_empty) {
+                            self.extras = None;
+                        }
+                    }
+                } else {
+                    if self.inline_step_denom() == 0 {
+                        self.step_numer = 0;
+                    }
+                    self.extras_mut().set_pure_loc(Some((begin, end)));
+                }
+            }
+            None => {
+                if self.inline_step_denom() == 0 {
+                    self.step_numer = 0;
+                }
+                if self
+                    .extras
+                    .as_deref()
+                    .is_some_and(|e| e.pure_loc().is_some())
+                {
+                    self.extras_mut().set_pure_loc(None);
+                    if self.extras.as_deref().is_some_and(PatternExtras::is_empty) {
+                        self.extras = None;
+                    }
+                }
+            }
+        }
     }
 
     pub fn with_pure_loc(mut self, loc: (usize, usize)) -> Self {
         // A span of a score, which is far shorter than the count of `u32`.
         let loc = u32::try_from(loc.0).ok().zip(u32::try_from(loc.1).ok());
         if loc.is_some() || self.pure_loc_raw().is_some() {
-            self.extras_mut().set_pure_loc(loc);
+            self.set_pure_loc_raw(loc);
         }
         self
     }
@@ -10575,7 +11389,7 @@ impl Pattern {
         let mut pattern =
             Pattern::of(Node::AddContext(Box::new((self.clone(), locs)))).with_steps_of(self);
         if let Some(loc) = self.pure_loc_raw() {
-            pattern.extras_mut().set_pure_loc(Some(loc));
+            pattern.set_pure_loc_raw(Some(loc));
         }
         pattern
     }
@@ -10590,7 +11404,7 @@ impl Pattern {
         let mut pattern =
             Pattern::of(Node::AddContext(Box::new((self.clone(), locs)))).with_steps_of(self);
         if let Some(loc) = self.pure_loc_raw() {
-            pattern.extras_mut().set_pure_loc(Some(loc));
+            pattern.set_pure_loc_raw(Some(loc));
         }
         pattern
     }
@@ -10604,7 +11418,7 @@ impl Pattern {
         let mut pattern =
             Pattern::of(Node::AddContext(Box::new((self.clone(), locs)))).with_steps_of(self);
         if let Some(loc) = self.pure_loc_raw() {
-            pattern.extras_mut().set_pure_loc(Some(loc));
+            pattern.set_pure_loc_raw(Some(loc));
         }
         pattern
     }
@@ -10620,7 +11434,7 @@ impl Pattern {
         })))
         .with_steps_of(self);
         if let Some(loc) = self.pure_loc_raw() {
-            pattern.extras_mut().set_pure_loc(Some(loc));
+            pattern.set_pure_loc_raw(Some(loc));
         }
         pattern
     }
@@ -10722,15 +11536,40 @@ impl Pattern {
             && lookup_flow == LookupFlow::Set
             && !other.has_runtime_settings()
             && other.is_cacheable()
-            && let Node::ControlMap(inner, key_id, false) = other.node_kind()
-            && *key_id != 0
-            && let Some((wave, math_inside)) = fused::Wave::of_inline(inner)
+            && let Some((inner_ref, key_id)) = match other.node_kind() {
+                Node::ControlMap(cell, flags, key_id, false) if *key_id != 0 => {
+                    Some((NodeRef::Plain(cell, *flags), *key_id))
+                }
+                Node::ControlMapBoxed(boxed) if !boxed.2 && boxed.1 != 0 => {
+                    Some((NodeRef::Pat(&boxed.0), boxed.1))
+                }
+                _ => None,
+            }
+            && let Some((wave, math_inside)) = fused::Wave::of_inline_ref(inner_ref)
         {
+            let item = AppWaveItem {
+                wave,
+                key_id,
+                math_inside,
+            };
+            if let Node::AppWave(existing) = self.node_kind()
+                && !self.has_runtime_settings()
+                && self.pure_loc_raw().is_none()
+                && self.keeps_runtime_over(&existing.inner)
+                && existing.waves.len() < 8
+            {
+                let mut combined = Vec::with_capacity(existing.waves.len() + 1);
+                combined.extend(existing.waves.iter().cloned());
+                combined.push(item);
+                return Pattern::of(Node::AppWave(Box::new(AppWaveNode {
+                    inner: existing.inner.clone(),
+                    waves: AppWaves::Many(combined.into_boxed_slice()),
+                })))
+                .with_steps(steps);
+            }
             return Pattern::of(Node::AppWave(Box::new(AppWaveNode {
                 inner: self.clone(),
-                wave,
-                key_id: *key_id,
-                math_inside,
+                waves: AppWaves::One(item),
             })))
             .with_steps(steps);
         }
@@ -11065,6 +11904,30 @@ impl Pattern {
                     }
                 }
             }
+            Node::StackPure(cells) => {
+                let mut patterns: Vec<Pattern> =
+                    cells.iter().map(|cell| plain_pattern(cell, 0)).collect();
+                for pattern in patterns.iter_mut().filter(|pattern| !pattern.is_rest()) {
+                    if let Some((waves, under)) = pattern.taking(control) {
+                        pattern.write(waves, &under, context.clone(), apart);
+                        continue;
+                    }
+                    if pattern.meets_each_control() && control.is_data(0) {
+                        *pattern =
+                            pattern.met_row(control, context.clone(), apart.each().len() > 1);
+                        continue;
+                    }
+                    let row = Self::apart_under(control, apart.each());
+                    for (each, at) in row {
+                        pattern.set_in_turn(each, at);
+                    }
+                }
+                if can_pack_pure_cells(&patterns) {
+                    *cells = pack_pure_cells(patterns);
+                } else {
+                    cell.kind = Node::Stack(patterns.into_boxed_slice());
+                }
+            }
             // The control goes to the pattern under the structure.
             Node::FilterValues(boxed) => boxed.0.write(0, control, context, apart),
             Node::AppRight(node) => node.0.write_row(control, context, apart),
@@ -11119,6 +11982,9 @@ impl Pattern {
             Node::Stack(patterns) => patterns
                 .iter()
                 .any(|pattern| !pattern.is_rest() && pattern.takes_control(control)),
+            Node::StackPure(cells) => cells.iter().any(|cell| {
+                !matches!(cell.kind, Node::Silence) && plain_pattern(cell, 0).takes_control(control)
+            }),
             Node::FilterValues(..) => self
                 .under_structure()
                 .is_some_and(|functions| functions.takes_control(control)),
@@ -11149,14 +12015,32 @@ impl Pattern {
             .filter(|controls| !compose::union_drops(controls))?;
         // The names of the waves, the outermost first.
         let mut names: Vec<Key> = Vec::new();
+        let mut depth = 0usize;
         let mut under = self;
         loop {
-            let (functions, name) = match under.node_kind() {
+            match under.node_kind() {
                 Node::AppWave(app) => {
-                    let Some(key) = controls::builtin_key_ref_by_id(app.key_id) else {
+                    if !under.keeps_runtime_over(&app.inner) {
+                        return None;
+                    }
+                    let mut ok = true;
+                    let saved = names.len();
+                    for item in app.waves.iter().rev() {
+                        let Some(key) = controls::builtin_key_ref_by_id(item.key_id) else {
+                            ok = false;
+                            break;
+                        };
+                        if controls.contains_key(key) {
+                            return None;
+                        }
+                        names.push(key.clone());
+                    }
+                    if !ok {
+                        names.truncate(saved);
                         break;
-                    };
-                    (&app.inner, key.clone())
+                    }
+                    depth += 1;
+                    under = &app.inner;
                 }
                 Node::AppLeft(pair)
                     if matches!(pair.3, Combine::Composed(compose::ComposeOp::Set))
@@ -11165,18 +12049,15 @@ impl Pattern {
                     let Some(name) = table::wave_name(&pair.1) else {
                         break;
                     };
-                    (&pair.0, name)
+                    if controls.contains_key(&name) || !under.keeps_runtime_over(&pair.0) {
+                        return None;
+                    }
+                    names.push(name);
+                    depth += 1;
+                    under = &pair.0;
                 }
                 _ => break,
-            };
-            // The application keeps the runtime that its handle binds, as
-            // a function call gives one. A function side that binds
-            // another runtime answers under that one.
-            if controls.contains_key(&name) || !under.keeps_runtime_over(functions) {
-                return None;
             }
-            names.push(name);
-            under = functions;
         }
         if names.is_empty() || !control.is_data(0) {
             return None;
@@ -11188,7 +12069,7 @@ impl Pattern {
         }
         let mut set = Value::Object(places);
         compose::compose_data_in_place(compose::ComposeOp::Set, &mut set, control);
-        Some((names.len(), set, under))
+        Some((depth, set, under))
     }
 
     /// Whether a pick that joins by `mode` moves a picked pattern by whole
@@ -11215,9 +12096,7 @@ impl Pattern {
                 ))),
                 Node::AppWave(app) => Node::AppWave(Box::new(AppWaveNode {
                     inner: app.inner.clone(),
-                    wave: app.wave.clone(),
-                    key_id: app.key_id,
-                    math_inside: app.math_inside,
+                    waves: app.waves.clone(),
                 })),
                 // A handle of the pattern under the run, and a copy of the run.
                 Node::Constants(node) => {
@@ -11231,6 +12110,7 @@ impl Pattern {
                 })),
                 // A handle of each pattern of the stack.
                 Node::Stack(patterns) => Node::Stack(patterns.clone()),
+                Node::StackPure(cells) => Node::StackPure(cells.clone()),
                 // A handle of each side of a structure, and of its filter.
                 Node::FilterValues(boxed) => {
                     Node::FilterValues(Box::new((boxed.0.clone(), Arc::clone(&boxed.1))))
@@ -11531,29 +12411,29 @@ impl Pattern {
 
     /// `innerJoin` - the inner hap's whole survives. `register()`'s default.
     pub fn inner_join(&self) -> Self {
-        Pattern::of(Node::Join(self.clone(), JoinMode::Inner))
+        Pattern::of(Self::join_node(self.clone(), JoinMode::Inner))
     }
     /// `outerJoin` - the outer hap's whole survives.
     pub fn outer_join(&self) -> Self {
-        Pattern::of(Node::Join(self.clone(), JoinMode::Outer))
+        Pattern::of(Self::join_node(self.clone(), JoinMode::Outer))
     }
     /// `join`/`bind` - wholes intersect.
     pub fn mix_join(&self) -> Self {
-        Pattern::of(Node::Join(self.clone(), JoinMode::Mix))
+        Pattern::of(Self::join_node(self.clone(), JoinMode::Mix))
     }
     /// `squeezeJoin` - a whole cycle of each inner pattern is squeezed into the
     /// corresponding outer hap. What `ply`, `chop`, `euclid`'s squeeze variants
     /// and mini-notation's `@`-weighted replication are built from.
     pub fn squeeze_join(&self) -> Self {
-        Pattern::of(Node::Join(self.clone(), JoinMode::Squeeze))
+        Pattern::of(Self::join_node(self.clone(), JoinMode::Squeeze))
     }
     /// `resetJoin` - inner cycle start re-aligned to each outer onset.
     pub fn reset_join(&self) -> Self {
-        Pattern::of(Node::Join(self.clone(), JoinMode::Reset))
+        Pattern::of(Self::join_node(self.clone(), JoinMode::Reset))
     }
     /// `restartJoin` - inner cycle zero re-aligned to each outer onset.
     pub fn restart_join(&self) -> Self {
-        Pattern::of(Node::Join(self.clone(), JoinMode::Restart))
+        Pattern::of(Self::join_node(self.clone(), JoinMode::Restart))
     }
 
     /// `polyBind(func)` with a USER JavaScript callback: `fmap` then
@@ -11582,7 +12462,7 @@ impl Pattern {
     /// into no haps. Reproduced rather than smoothed over.
     pub fn poly_join(&self) -> Self {
         let steps = self.steps();
-        Pattern::of(Node::PolyJoin(self.clone())).with_steps(steps)
+        Pattern::of(Node::PolyJoin(Box::new(self.clone()))).with_steps(steps)
     }
 
     /// `queryArc(begin, end)` - the public pattern-query boundary.
@@ -11857,7 +12737,7 @@ impl Pattern {
 
     /// `rev` - reverse each cycle. `preserveSteps = true`, `patternify = false`.
     pub fn rev(&self) -> Self {
-        Pattern::of(Node::Rev(self.clone()))
+        Pattern::of(Node::Rev(Box::new(self.clone())))
             .split_queries()
             .with_steps_of(self)
     }
@@ -12014,6 +12894,9 @@ impl Pattern {
             Node::Stack(patterns) => patterns
                 .iter()
                 .any(|pattern| !pattern.is_rest() && pattern.takes_constants()),
+            Node::StackPure(cells) => cells.iter().any(|cell| {
+                !matches!(cell.kind, Node::Silence) && plain_pattern(cell, 0).takes_constants()
+            }),
             Node::FilterValues(..) => self.under_structure().is_some_and(Self::takes_constants),
             Node::Constants(node) => node.1.last().is_some_and(RunMeeting::takes_sets),
             // A control of a wave, which a constant goes under.
@@ -12061,7 +12944,7 @@ impl Pattern {
             return named.with_steps_of(self);
         }
         if spec.id != 0 && !sequence::holds_steps(self) {
-            return Pattern::of(Node::ControlMap(self.clone(), spec.id, unnamed_only))
+            return Pattern::of(Self::control_map_node(self.clone(), spec.id, unnamed_only))
                 .with_steps_of(self);
         }
         let map = controls::interned_control_map(spec, unnamed_only);
@@ -12069,7 +12952,7 @@ impl Pattern {
             return mapped.with_steps_of(self);
         }
         if spec.id != 0 {
-            return Pattern::of(Node::ControlMap(self.clone(), spec.id, unnamed_only))
+            return Pattern::of(Self::control_map_node(self.clone(), spec.id, unnamed_only))
                 .with_steps_of(self);
         }
         Pattern::of(Node::MapHapsOwned(Box::new((
@@ -12138,7 +13021,7 @@ impl Pattern {
     }
 
     pub fn sort_haps_by_part_pattern(&self) -> Self {
-        Pattern::of(Node::SortHapsByPart(self.clone()))
+        Pattern::of(Node::SortHapsByPart(Box::new(self.clone())))
     }
 
     /// `seed(n)` - pin the random stream for this subtree.
@@ -12424,19 +13307,19 @@ impl Pattern {
     }
 
     pub fn collect(&self) -> Self {
-        Pattern::of(Node::Collect(self.clone()))
+        Pattern::of(Node::Collect(Box::new(self.clone())))
     }
 
     /// The onsets of each cycle, valued by their position in the cycle.
     /// See [`combinators::isobite`].
     pub fn cycle_onset_indices(&self) -> Self {
-        Pattern::of(Node::CycleOnsetIndex(self.clone())).split_queries()
+        Pattern::of(Node::CycleOnsetIndex(Box::new(self.clone()))).split_queries()
     }
 
     /// One hap per cycle, valued by the number of onsets in the cycle.
     /// See [`combinators::isobite`].
     pub fn cycle_onset_count(&self) -> Self {
-        Pattern::of(Node::CycleOnsetCount(self.clone())).split_queries()
+        Pattern::of(Node::CycleOnsetCount(Box::new(self.clone()))).split_queries()
     }
 
     pub fn loop_at(&self, factor: Fraction) -> Self {
@@ -12653,7 +13536,14 @@ impl Pattern {
     }
 
     pub fn split_queries(&self) -> Self {
-        Pattern::of(Node::SplitQueries(self.clone()))
+        if self.is_plain_handle() {
+            Pattern::of(Node::SplitQueries(
+                Arc::clone(&self.node),
+                self.node_flags(),
+            ))
+        } else {
+            Pattern::of(Node::SplitQueriesBoxed(Box::new(self.clone())))
+        }
     }
 
     /// Speed up by `factor`; `_steps` is kept.
@@ -12709,10 +13599,11 @@ impl Pattern {
             "early" => Some(true),
             _ => None,
         };
-        let node = if let Some(is_early) = is_early
+        let node = if self.is_plain_handle()
+            && let Some(is_early) = is_early
             && let (Ok(n), Ok(d)) = (i16::try_from(t.numer()), u16::try_from(t.denom()))
         {
-            Node::ShiftSmall(self.clone(), n, d, is_early)
+            Node::ShiftSmall(Arc::clone(&self.node), self.node_flags(), n, d, is_early)
         } else {
             Node::Shift(Box::new(ShiftNode(self.clone(), t, operation)))
         };
@@ -12729,10 +13620,11 @@ impl Pattern {
             "slow" => Some(true),
             _ => None,
         };
-        let node = if let Some(is_slow) = is_slow
+        let node = if self.is_plain_handle()
+            && let Some(is_slow) = is_slow
             && let (Ok(n), Ok(d)) = (i16::try_from(factor.numer()), u16::try_from(factor.denom()))
         {
-            Node::FastSmall(self.clone(), n, d, is_slow)
+            Node::FastSmall(Arc::clone(&self.node), self.node_flags(), n, d, is_slow)
         } else {
             Node::Fast(Box::new(FastNode(self.clone(), factor, operation)))
         };
@@ -12820,7 +13712,7 @@ impl Pattern {
     /// Anything driven by user source wants [`Pattern::try_step_join`].
     pub fn step_join(&self) -> Self {
         self.try_step_join()
-            .unwrap_or_else(|_| Pattern::of(Node::StepJoin(self.clone())))
+            .unwrap_or_else(|_| Pattern::of(Node::StepJoin(Box::new(self.clone()))))
     }
 
     /// `stepJoin`, reporting the CONSTRUCTION-time failure.
@@ -12863,7 +13755,7 @@ impl Pattern {
                 .map_err(|value| step_join_value_error(&value))?;
             step_slices_pattern(&resolved).steps()
         };
-        Ok(Pattern::of(Node::StepJoin(self.clone())).with_steps(first_steps))
+        Ok(Pattern::of(Node::StepJoin(Box::new(self.clone()))).with_steps(first_steps))
     }
 
     /// `_focusSpan(span)` - `focus` over a `TimeSpan`. `squeezeJoin` uses this
@@ -12946,14 +13838,26 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         | Node::PolyJoin(pattern)
         | Node::PurePattern(pattern)
         | Node::SortHapsByPart(pattern)
-        | Node::ControlMap(pattern, _, _)
         | Node::Collect(pattern)
         | Node::CycleOnsetIndex(pattern)
         | Node::CycleOnsetCount(pattern)
-        | Node::SplitQueries(pattern)
-        | Node::Join(pattern, _) => take_child(pattern, out),
+        | Node::SplitQueriesBoxed(pattern) => take_child(pattern, out),
+        Node::ControlMapBoxed(boxed) => take_child(&mut boxed.0, out),
+        Node::JoinBoxed(boxed) => take_child(&mut boxed.0, out),
         Node::Fast(node) => take_child(&mut node.0, out),
-        Node::FastSmall(pat, ..) | Node::ShiftSmall(pat, ..) => take_child(pat, out),
+        Node::FastSmall(cell, flags, ..)
+        | Node::ShiftSmall(cell, flags, ..)
+        | Node::ControlMap(cell, flags, ..)
+        | Node::Join(cell, flags, ..)
+        | Node::SplitQueries(cell, flags) => {
+            let taken = std::mem::replace(cell, Arc::clone(&silence().node));
+            out.push(Pattern {
+                node: taken,
+                step_numer: 0,
+                step_denom: u32::from(*flags) << NODE_FLAGS_SHIFT,
+                extras: None,
+            });
+        }
         Node::Shift(node) => take_child(&mut node.0, out),
         Node::Constants(node) => take_child(&mut node.0, out),
         Node::UiVisual(node) => take_child(&mut node.inner, out),
@@ -13011,9 +13915,22 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
             take_child(&mut pair.0, out);
             take_child(&mut pair.1, out);
         }
-        Node::ChooseCycles(patterns, _) => out.extend(std::mem::take(patterns)),
+        Node::ChooseCycles(boxed) => out.extend(std::mem::take(&mut boxed.0).into_vec()),
         Node::Stack(patterns) | Node::SlowCat(patterns) | Node::SlowCatPrime(patterns) => {
             out.extend(std::mem::take(patterns).into_vec())
+        }
+        Node::StackPure(cells) | Node::SlowCatPure(cells) | Node::SlowCatPrimePure(cells) => {
+            out.extend(
+                std::mem::take(cells)
+                    .into_vec()
+                    .into_iter()
+                    .map(|node| Pattern {
+                        node,
+                        step_numer: 0,
+                        step_denom: 0,
+                        extras: None,
+                    }),
+            );
         }
         Node::PatternOfHap(bind) => {
             take_child(&mut bind.0, out);
@@ -13148,12 +14065,13 @@ fn span_read(node: &Node) -> purity::SpanRead {
         // A time map that keeps the order of time, and maps of each hap that
         // read no span.
         Node::Fast(node) if node.1 > Fraction::ZERO => of(&node.0),
-        Node::FastSmall(pat, numer, _, _) if *numer > 0 => of(pat),
+        Node::FastSmall(_, flags, numer, _, _) if *numer > 0 => unpack_span_read(*flags),
         // A `fast` by the tempo of the query, which the span does not say.
         Node::Cpm(boxed) if boxed.1.cpm > Fraction::ZERO => of(&boxed.0),
-        Node::ControlMap(pattern, _, _) => of(pattern),
+        Node::ControlMap(_, flags, _, _) => unpack_span_read(*flags),
+        Node::ControlMapBoxed(boxed) => of(&boxed.0),
         Node::Shift(node) => of(&node.0),
-        Node::ShiftSmall(pat, ..) => of(pat),
+        Node::ShiftSmall(_, flags, ..) => unpack_span_read(*flags),
         Node::Constants(node) => of(&node.0),
         Node::UiVisual(node) => of(&node.inner),
         Node::AddContext(boxed) => of(&boxed.0),
@@ -13165,10 +14083,19 @@ fn span_read(node: &Node) -> purity::SpanRead {
         // A hap is kept or dropped by the begin of its whole.
         Node::Degrade(boxed) => of(&boxed.0),
         Node::Stack(patterns) => most(&mut patterns.iter()),
+        Node::StackPure(_) => No,
         // One cycle at a time: the node inside is asked over each cycle's
         // piece of the span, where each of these kinds maps time in order.
-        Node::SplitQueries(inner) => match inner.node_kind() {
+        Node::SplitQueries(cell, flags) => match &cell.kind {
             Node::SlowCat(patterns) | Node::SlowCatPrime(patterns) => most(&mut patterns.iter()),
+            Node::SlowCatPure(_) | Node::SlowCatPrimePure(_) => No,
+            Node::FastGap(boxed) | Node::RepeatCycles(boxed) => of(&boxed.0),
+            Node::Rev(pattern) => of(pattern),
+            _ => unpack_span_read(*flags),
+        },
+        Node::SplitQueriesBoxed(inner) => match inner.node_kind() {
+            Node::SlowCat(patterns) | Node::SlowCatPrime(patterns) => most(&mut patterns.iter()),
+            Node::SlowCatPure(_) | Node::SlowCatPrimePure(_) => No,
             Node::FastGap(boxed) | Node::RepeatCycles(boxed) => of(&boxed.0),
             Node::Rev(pattern) => of(pattern),
             _ => of(inner),
@@ -13189,13 +14116,26 @@ fn span_read(node: &Node) -> purity::SpanRead {
         // body makes the pattern at the query, where the join reads how it
         // answers.
         Node::Join(
-            inner,
+            cell,
+            _,
             JoinMode::Inner | JoinMode::Outer | JoinMode::Mix | JoinMode::Squeeze,
-        ) => match inner.node_kind() {
+        ) => match &cell.kind {
             Node::PatternOfPureOperand(pair, ..) => of(&pair.0).max(Made),
             Node::PatternOfPure(boxed) => of(&boxed.0).max(Made),
             _ => Yes,
         },
+        Node::JoinBoxed(boxed)
+            if matches!(
+                boxed.1,
+                JoinMode::Inner | JoinMode::Outer | JoinMode::Mix | JoinMode::Squeeze
+            ) =>
+        {
+            match boxed.0.node_kind() {
+                Node::PatternOfPureOperand(pair, ..) => of(&pair.0).max(Made),
+                Node::PatternOfPure(boxed) => of(&boxed.0).max(Made),
+                _ => Yes,
+            }
+        }
         _ => Yes,
     }
 }
@@ -13266,14 +14206,18 @@ fn compute_purity(node: &Node) -> purity::Purity {
         // Exact inheritance: a known pure inner stays pure.
         | Node::PurePattern(p)
         | Node::SortHapsByPart(p)
-        | Node::ControlMap(p, _, _)
         | Node::Collect(p)
         | Node::CycleOnsetIndex(p)
         | Node::CycleOnsetCount(p)
-        | Node::SplitQueries(p)
-        | Node::Join(p, _) => p.purity(),
+        | Node::SplitQueriesBoxed(p) => p.purity(),
+        Node::ControlMapBoxed(boxed) => boxed.0.purity(),
+        Node::JoinBoxed(boxed) => boxed.0.purity(),
         Node::Fast(node) => node.0.purity(),
-        Node::FastSmall(pat, ..) | Node::ShiftSmall(pat, ..) => pat.purity(),
+        Node::FastSmall(_, flags, ..)
+        | Node::ShiftSmall(_, flags, ..)
+        | Node::ControlMap(_, flags, ..)
+        | Node::Join(_, flags, ..)
+        | Node::SplitQueries(_, flags) => purity_from_plain_flags(*flags),
         Node::Shift(node) => node.0.purity(),
         Node::Constants(node) => node.0.purity(),
         Node::UiVisual(node) => node.inner.purity(),
@@ -13326,7 +14270,8 @@ fn compute_purity(node: &Node) -> purity::Purity {
         Node::Stack(ps) | Node::SlowCat(ps) | Node::SlowCatPrime(ps) => {
             Purity::merge(ps.iter().map(Pattern::purity))
         }
-        Node::ChooseCycles(ps, _) => Purity::merge(ps.iter().map(Pattern::purity)),
+        Node::StackPure(_) | Node::SlowCatPure(_) | Node::SlowCatPrimePure(_) => Purity::pure(),
+        Node::ChooseCycles(boxed) => Purity::merge(boxed.0.iter().map(Pattern::purity)),
         Node::WChoose(choice) => Purity::merge(
             [choice.chooser.purity(), choice.total.purity()]
                 .into_iter()
@@ -13599,7 +14544,7 @@ pub fn silence() -> Pattern {
 /// `pure(pattern)` - one known inner pattern per cycle. Outer `_steps` is 1,
 /// as `pure`'s is.
 pub fn pure_pattern(inner: Pattern) -> Pattern {
-    Pattern::of(Node::PurePattern(inner)).with_steps(Some(Fraction::ONE))
+    Pattern::of(Node::PurePattern(Box::new(inner))).with_steps(Some(Fraction::ONE))
 }
 
 /// A pattern-of-patterns whose inner patterns come from a JS callback.
@@ -13736,7 +14681,10 @@ pub fn choose_cycles(patterns: Vec<Pattern>, seed: u32) -> Pattern {
     if patterns.is_empty() {
         silence()
     } else {
-        Pattern::of(Node::ChooseCycles(patterns, seed))
+        Pattern::of(Node::ChooseCycles(Box::new((
+            patterns.into_boxed_slice(),
+            seed,
+        ))))
     }
 }
 
@@ -13941,6 +14889,17 @@ fn lcm_steps(pats: &[Pattern]) -> Result<Option<Fraction>, ()> {
     Ok(Some(steps))
 }
 
+#[inline]
+fn can_pack_pure_cells(pats: &[Pattern]) -> bool {
+    pats.iter()
+        .all(|p| p.extras.is_none() && p.node_flags() == 0)
+}
+
+#[inline]
+fn pack_pure_cells(pats: Vec<Pattern>) -> Box<[Arc<NodeCell>]> {
+    pats.into_iter().map(|p| p.node).collect()
+}
+
 pub fn stack(pats: Vec<Pattern>) -> Pattern {
     let steps = match lcm_steps(&pats) {
         Ok(steps) => steps,
@@ -13953,16 +14912,24 @@ pub fn stack(pats: Vec<Pattern>) -> Pattern {
     if let Some(stacked) = sequence::stacked(&pats) {
         return stacked.with_steps(steps);
     }
-    Pattern::of(Node::Stack(pats.into_boxed_slice())).with_steps(steps)
+    let node = if can_pack_pure_cells(&pats) {
+        Node::StackPure(pack_pure_cells(pats))
+    } else {
+        Node::Stack(pats.into_boxed_slice())
+    };
+    Pattern::of(node).with_steps(steps)
 }
 
 fn slowcat_with_steps(mut pats: Vec<Pattern>, steps: Option<Fraction>) -> Pattern {
     if pats.len() == 1 {
         return pats.pop().expect("one slowcat input");
     }
-    Pattern::of(Node::SlowCat(pats.into_boxed_slice()))
-        .split_queries()
-        .with_steps(steps)
+    let node = if can_pack_pure_cells(&pats) {
+        Node::SlowCatPure(pack_pure_cells(pats))
+    } else {
+        Node::SlowCat(pats.into_boxed_slice())
+    };
+    Pattern::of(node).split_queries().with_steps(steps)
 }
 
 /// One pattern per cycle.
@@ -14073,7 +15040,12 @@ pub fn slowcat_prime(pats: Vec<Pattern>) -> Pattern {
     if pats.is_empty() {
         return silence();
     }
-    Pattern::of(Node::SlowCatPrime(pats.into_boxed_slice())).split_queries()
+    let node = if can_pack_pure_cells(&pats) {
+        Node::SlowCatPrimePure(pack_pure_cells(pats))
+    } else {
+        Node::SlowCatPrime(pats.into_boxed_slice())
+    };
+    Pattern::of(node).split_queries()
 }
 
 /// All patterns squeezed into one cycle.

@@ -29,8 +29,9 @@ const MAX_PATCHES: usize = 8;
 /// built-in control names: low 10 bits hold the 1-based control id and high
 /// 6 bits hold `Table::mark_bit`. Saves 14 bytes per entry vs `(Key, Value)`.
 pub(crate) trait BuiltinEntries: Send + Sync {
-    fn parts(&self) -> (&[u16], &[Value]);
-    fn parts_mut(&mut self) -> (&[u16], &mut [Value]);
+    fn as_slice(&self) -> Slice<'_>;
+    fn keys(&self) -> &[u16];
+    fn parts_mut(&mut self) -> Option<(&[u16], &mut [Value])>;
 }
 
 struct BuiltinMap<const N: usize> {
@@ -40,17 +41,78 @@ struct BuiltinMap<const N: usize> {
 
 impl<const N: usize> BuiltinEntries for BuiltinMap<N> {
     #[inline(always)]
-    fn parts(&self) -> (&[u16], &[Value]) {
-        (&self.keys, &self.values)
+    fn as_slice(&self) -> Slice<'_> {
+        Slice::Builtin(&self.keys, &self.values)
     }
 
     #[inline(always)]
-    fn parts_mut(&mut self) -> (&[u16], &mut [Value]) {
-        (&self.keys, &mut self.values)
+    fn keys(&self) -> &[u16] {
+        &self.keys
+    }
+
+    #[inline(always)]
+    fn parts_mut(&mut self) -> Option<(&[u16], &mut [Value])> {
+        Some((&self.keys, &mut self.values))
     }
 }
 
-const MAX_BUILTIN_MAP_LEN: usize = 24;
+/// Compact pooled storage for immutable built-in control maps whose values are
+/// shared through a score-wide `Arc<[Value]>` pool (`4` bytes per entry instead
+/// of `26` bytes).
+struct PooledBuiltinMap<const N: usize> {
+    pool: Arc<[Value]>,
+    keys: [u16; N],
+    vals: [u16; N],
+}
+
+impl<const N: usize> BuiltinEntries for PooledBuiltinMap<N> {
+    #[inline(always)]
+    fn as_slice(&self) -> Slice<'_> {
+        Slice::Pooled(&self.keys, &self.vals, &self.pool)
+    }
+
+    #[inline(always)]
+    fn keys(&self) -> &[u16] {
+        &self.keys
+    }
+
+    #[inline(always)]
+    fn parts_mut(&mut self) -> Option<(&[u16], &mut [Value])> {
+        None
+    }
+}
+
+pub(crate) const MAX_BUILTIN_MAP_LEN: usize = 24;
+
+/// Pack `keys` and `vals` referencing `pool` into an exact-sized
+/// `Arc<PooledBuiltinMap<N>>` (`1 <= keys.len() <= 24`).
+pub(crate) fn make_pooled_builtin_arc(
+    pool: Arc<[Value]>,
+    keys: &[u16],
+    vals: &[u16],
+) -> Arc<dyn BuiltinEntries> {
+    let count = keys.len();
+    debug_assert_eq!(count, vals.len());
+    macro_rules! build {
+        ($($n:literal),+) => {
+            match count {
+                $(
+                    $n => {
+                        let mut k = [0u16; $n];
+                        k.copy_from_slice(keys);
+                        let mut v = [0u16; $n];
+                        v.copy_from_slice(vals);
+                        Arc::new(PooledBuiltinMap { pool, keys: k, vals: v })
+                    }
+                )+
+                _ => unreachable!("pooled builtin map count out of range"),
+            }
+        };
+    }
+    build!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    )
+}
 
 /// Pack `count` `(packed_key, value)` pairs from stack buffers into an exact-sized
 /// `Arc<BuiltinMap<N>>` (`1 <= count <= 24`).
@@ -152,6 +214,7 @@ fn pack_entries(count: usize, next: impl FnMut(usize) -> (Key, Value), made: boo
 pub(crate) enum Slice<'a> {
     Plain(&'a [(Key, Value)]),
     Builtin(&'a [u16], &'a [Value]),
+    Pooled(&'a [u16], &'a [u16], &'a [Value]),
 }
 
 impl<'a> Slice<'a> {
@@ -161,7 +224,7 @@ impl<'a> Slice<'a> {
     pub(crate) fn len(self) -> usize {
         match self {
             Self::Plain(entries) => entries.len(),
-            Self::Builtin(keys, _) => keys.len(),
+            Self::Builtin(keys, _) | Self::Pooled(keys, _, _) => keys.len(),
         }
     }
 
@@ -181,6 +244,11 @@ impl<'a> Slice<'a> {
                 let key = crate::controls::builtin_key_ref_by_id(keys[index] & 0x03ff)
                     .expect("packed builtin id");
                 (key, &values[index])
+            }
+            Self::Pooled(keys, vals, pool) => {
+                let key = crate::controls::builtin_key_ref_by_id(keys[index] & 0x03ff)
+                    .expect("packed builtin id");
+                (key, &pool[usize::from(vals[index])])
             }
         }
     }
@@ -202,6 +270,17 @@ impl<'a> Slice<'a> {
                 }
                 None
             }
+            Self::Pooled(keys, vals, pool) => {
+                let want_bit = Table::mark_bit(key);
+                for (i, &packed) in keys.iter().enumerate() {
+                    if (packed >> 10) as u8 == want_bit
+                        && crate::controls::builtin_name_str_by_id(packed & 0x03ff) == Some(key)
+                    {
+                        return Some(&pool[usize::from(vals[i])]);
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -209,7 +288,7 @@ impl<'a> Slice<'a> {
     pub(crate) fn position_str(self, key: &str) -> Option<usize> {
         match self {
             Self::Plain(entries) => entries.iter().position(|(name, _)| name == key),
-            Self::Builtin(keys, _) => {
+            Self::Builtin(keys, _) | Self::Pooled(keys, _, _) => {
                 let want_bit = Table::mark_bit(key);
                 for (i, &packed) in keys.iter().enumerate() {
                     if (packed >> 10) as u8 == want_bit
@@ -232,7 +311,7 @@ impl<'a> Slice<'a> {
             Self::Plain(entries) => entries
                 .iter()
                 .find_map(|(name, value)| (name == key).then_some(value)),
-            Self::Builtin(..) => self.get_str(key.name()),
+            Self::Builtin(..) | Self::Pooled(..) => self.get_str(key.name()),
         }
     }
 
@@ -243,7 +322,7 @@ impl<'a> Slice<'a> {
     {
         match self {
             Self::Plain(entries) => entries.iter().position(|(name, _)| name == key),
-            Self::Builtin(..) => self.position_str(key.name()),
+            Self::Builtin(..) | Self::Pooled(..) => self.position_str(key.name()),
         }
     }
 
@@ -256,6 +335,12 @@ impl<'a> Slice<'a> {
                 values.iter(),
                 crate::controls::builtin_key_slice(),
             ),
+            Self::Pooled(keys, vals, pool) => SliceIter::Pooled(
+                keys.iter(),
+                vals.iter(),
+                pool,
+                crate::controls::builtin_key_slice(),
+            ),
         }
     }
 
@@ -265,7 +350,7 @@ impl<'a> Slice<'a> {
             Self::Plain(entries) => entries
                 .iter()
                 .fold(0u64, |marks, (name, _)| marks | Table::mark(name.as_str())),
-            Self::Builtin(keys, _) => keys
+            Self::Builtin(keys, _) | Self::Pooled(keys, _, _) => keys
                 .iter()
                 .fold(0u64, |marks, &packed| marks | (1u64 << (packed >> 10))),
         }
@@ -287,6 +372,16 @@ impl<'a> Slice<'a> {
                     (k, v.clone())
                 })
                 .collect(),
+            Self::Pooled(keys, vals, pool) => keys
+                .iter()
+                .zip(vals)
+                .map(|(&packed, &idx)| {
+                    let k = crate::controls::builtin_key_ref_by_id(packed & 0x03ff)
+                        .expect("packed builtin id")
+                        .clone();
+                    (k, pool[usize::from(idx)].clone())
+                })
+                .collect(),
         }
     }
 
@@ -295,6 +390,9 @@ impl<'a> Slice<'a> {
         match self {
             Self::Plain(entries) => entries.iter().all(|(_, v)| v.is_data(0)),
             Self::Builtin(_, values) => values.iter().all(|v| v.is_data(0)),
+            Self::Pooled(_, vals, pool) => {
+                vals.iter().all(|&idx| pool[usize::from(idx)].is_data(0))
+            }
         }
     }
 }
@@ -305,6 +403,12 @@ pub(crate) enum SliceIter<'a> {
     Builtin(
         std::slice::Iter<'a, u16>,
         std::slice::Iter<'a, Value>,
+        &'static [Key],
+    ),
+    Pooled(
+        std::slice::Iter<'a, u16>,
+        std::slice::Iter<'a, u16>,
+        &'a [Value],
         &'static [Key],
     ),
 }
@@ -321,6 +425,11 @@ impl<'a> Iterator for SliceIter<'a> {
                 let index = usize::from((packed & 0x03ff) - 1);
                 Some((&key_table[index], value))
             }
+            Self::Pooled(keys, vals, pool, key_table) => {
+                let (&packed, &val_idx) = (keys.next()?, vals.next()?);
+                let index = usize::from((packed & 0x03ff) - 1);
+                Some((&key_table[index], &pool[usize::from(val_idx)]))
+            }
         }
     }
 
@@ -328,7 +437,7 @@ impl<'a> Iterator for SliceIter<'a> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let len = match self {
             Self::Plain(iter) => iter.len(),
-            Self::Builtin(keys, _, _) => keys.len(),
+            Self::Builtin(keys, _, _) | Self::Pooled(keys, _, _, _) => keys.len(),
         };
         (len, Some(len))
     }
@@ -1572,10 +1681,7 @@ impl OrderedMap {
             Entries::Shared(entries) | Entries::Made(entries) => {
                 Layout::Plain(Slice::Plain(entries))
             }
-            Entries::Builtin(entries, _) => {
-                let (keys, values) = entries.parts();
-                Layout::Plain(Slice::Builtin(keys, values))
-            }
+            Entries::Builtin(entries, _) => Layout::Plain(entries.as_slice()),
             Entries::Empty => Layout::Plain(Slice::EMPTY),
             Entries::Dressed(table, index) => table.layout(*index),
             Entries::SeqLayer(layers, row, layer_idx) => {
@@ -1660,8 +1766,7 @@ impl OrderedMap {
                 self.entries = Entries::Shared(entries);
             }
             Entries::Builtin(entries, _) => {
-                let (keys, values) = entries.parts();
-                self.entries = Entries::Shared(Slice::Builtin(keys, values).to_shares());
+                self.entries = Entries::Shared(entries.as_slice().to_shares());
             }
             _ => {}
         }
@@ -1678,22 +1783,25 @@ impl OrderedMap {
     /// and mutating in place when uniquely owned.
     fn replace_at(&mut self, at: usize, value: Value, made: bool) {
         if let Entries::Builtin(b, is_made) = &mut self.entries {
-            if let Some(own) = Arc::get_mut(b) {
-                own.parts_mut().1[at] = value;
+            if let Some(own) = Arc::get_mut(b)
+                && let Some((_, vals_mut)) = own.parts_mut()
+            {
+                vals_mut[at] = value;
                 *is_made = made;
                 return;
             }
-            let (keys_slice, vals_slice) = b.parts();
+            let slice = b.as_slice();
+            let keys_slice = b.keys();
             let count = keys_slice.len();
             let mut keys = [0u16; MAX_BUILTIN_MAP_LEN];
             let mut values = [const { Value::Undefined }; MAX_BUILTIN_MAP_LEN];
             keys[..count].copy_from_slice(keys_slice);
             let mut slot = Some(value);
-            for (i, v) in vals_slice.iter().enumerate() {
-                values[i] = if i == at {
+            for (i, dst) in values.iter_mut().enumerate().take(count) {
+                *dst = if i == at {
                     slot.take().expect("replace_at writes once")
                 } else {
-                    v.clone()
+                    slice.at(i).1.clone()
                 };
             }
             self.entries = Entries::Builtin(make_builtin_arc(count, &keys, &mut values), made);
@@ -1720,21 +1828,60 @@ impl OrderedMap {
         match &self.entries {
             Entries::Empty => Some(Slice::EMPTY),
             Entries::Shared(entries) | Entries::Made(entries) => Some(Slice::Plain(entries)),
-            Entries::Builtin(entries, _) => {
-                let (keys, values) = entries.parts();
-                Some(Slice::Builtin(keys, values))
-            }
+            Entries::Builtin(entries, _) => Some(entries.as_slice()),
             _ => None,
         }
     }
 
-    /// Intern compact built-in entries through the active per-evaluation interner
-    /// when this map holds built-in data entries.
+    /// Replace compact built-in entries through a post-eval deduplicator,
+    /// returning `true` when the `Arc` pointer changed.
     #[inline]
-    pub(crate) fn intern_builtin(&mut self) {
+    pub(crate) fn dedup_builtin(
+        &mut self,
+        f: impl FnOnce(Arc<dyn BuiltinEntries>, bool) -> Arc<dyn BuiltinEntries>,
+    ) -> bool {
         if let Entries::Builtin(entries, made) = &mut self.entries {
-            let owned = Arc::clone(entries);
-            *entries = crate::intern::intern_builtin(owned, *made);
+            let next = f(Arc::clone(entries), *made);
+            if !Arc::ptr_eq(entries, &next) {
+                *entries = next;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The single packed `(key, value)` when this map is a 1-entry data-only
+    /// `Entries::Builtin` whose key is not `"value"`.
+    #[inline]
+    pub(crate) fn single_packed_entry(&self) -> Option<(u16, &Value)> {
+        if let Entries::Builtin(entries, made) = &self.entries {
+            let keys = entries.keys();
+            if keys.len() == 1 {
+                let val = entries.as_slice().at(0).1;
+                if *made || val.is_data(0) {
+                    let id = keys[0] & 0x03ff;
+                    if crate::controls::builtin_key_ref_by_id(id)
+                        .is_some_and(|k| k.as_str() != "value")
+                    {
+                        return Some((keys[0], val));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Reconstruct a 1-entry data-only built-in map from a packed key and value.
+    #[inline]
+    pub(crate) fn from_single_packed(packed_key: u16, value: Value) -> Self {
+        Self {
+            entries: Entries::Builtin(
+                Arc::new(BuiltinMap {
+                    keys: [packed_key],
+                    values: [value],
+                }),
+                true,
+            ),
         }
     }
 
@@ -1778,10 +1925,7 @@ impl OrderedMap {
                 Some(own) => Held::Own(own),
                 None => Held::View(Layout::Plain(Slice::Plain(entries))),
             },
-            Entries::Builtin(entries, _) => {
-                let (keys, values) = entries.parts();
-                Held::View(Layout::Plain(Slice::Builtin(keys, values)))
-            }
+            Entries::Builtin(entries, _) => Held::View(Layout::Plain(entries.as_slice())),
             Entries::Empty => Held::View(Layout::Plain(Slice::EMPTY)),
             Entries::Dressed(table, index) => Held::View(table.layout(*index)),
             Entries::SeqLayer(layers, row, layer_idx) => {
@@ -1837,16 +1981,17 @@ impl OrderedMap {
             return;
         }
         if let Entries::Builtin(b, _) = &self.entries {
-            let (keys_slice, vals_slice) = b.parts();
+            let keys_slice = b.keys();
             let count = keys_slice.len();
             let packed = crate::controls::pack_builtin_key_str(entry.0.as_str());
             if count < MAX_BUILTIN_MAP_LEN && packed != 0 {
+                let slice = b.as_slice();
                 let mut keys = [0u16; MAX_BUILTIN_MAP_LEN];
                 let mut values = [const { Value::Undefined }; MAX_BUILTIN_MAP_LEN];
                 keys[..count].copy_from_slice(keys_slice);
                 keys[count] = packed;
-                for (i, v) in vals_slice.iter().enumerate() {
-                    values[i] = v.clone();
+                for (i, dst) in values.iter_mut().enumerate().take(count) {
+                    *dst = slice.at(i).1.clone();
                 }
                 values[count] = entry.1;
                 self.entries =
@@ -1874,9 +2019,8 @@ impl OrderedMap {
                 Entries::Shared(held)
             }
             Entries::Builtin(entries, _) => {
-                let (keys, values) = entries.parts();
                 let (key, value) = entry;
-                Layout::Plain(Slice::Builtin(keys, values)).with_entries(&key, None, value, false)
+                Layout::Plain(entries.as_slice()).with_entries(&key, None, value, false)
             }
             Entries::Empty => {
                 let mut entry = Some(entry);
@@ -1954,9 +2098,10 @@ impl OrderedMap {
             .count();
         if fresh == 0 {
             if let Entries::Builtin(b, is_made) = &mut self.entries {
-                if let Some(own) = Arc::get_mut(b) {
+                if let Some(own) = Arc::get_mut(b)
+                    && let Some((keys, values)) = own.parts_mut()
+                {
                     let other_layout = other.layout();
-                    let (keys, values) = own.parts_mut();
                     for (&packed, value) in keys.iter().zip(values.iter_mut()) {
                         if let Some(name) = crate::controls::builtin_name_str_by_id(packed & 0x03ff)
                             && let Some(other_val) = other_layout.get(name)
@@ -2065,9 +2210,10 @@ impl OrderedMap {
             .count();
         if fresh == 0 {
             if let Entries::Builtin(b, is_made) = &mut self.entries {
-                if let Some(own) = Arc::get_mut(b) {
+                if let Some(own) = Arc::get_mut(b)
+                    && let Some((keys, values)) = own.parts_mut()
+                {
                     let other_layout = other.layout();
-                    let (keys, values) = own.parts_mut();
                     for (&packed, value) in keys.iter().zip(values.iter_mut()) {
                         if let Some(name) = crate::controls::builtin_name_str_by_id(packed & 0x03ff)
                             && let Some(other_val) = other_layout.get(name)
@@ -2192,10 +2338,7 @@ impl OrderedMap {
             Entries::Shared(entries) | Entries::Made(entries) => {
                 Slice::Plain(entries).position(key)
             }
-            Entries::Builtin(entries, _) => {
-                let (keys, values) = entries.parts();
-                Slice::Builtin(keys, values).position_str(key.name())
-            }
+            Entries::Builtin(entries, _) => entries.as_slice().position_str(key.name()),
             Entries::Dressed(table, index) => match table.marks() & Table::mark(key.name()) {
                 0 => None,
                 _ => table.layout(*index).position(key),
@@ -2454,6 +2597,95 @@ impl OrderedMap {
     /// Merge all entries of `other` onto `self` with overwrite (`ComposeOp::Set`)
     /// semantics on data maps, reusing one [`Patched`] allocation across chord
     /// haps that share a uniform-key [`Table`] or [`Patched`] overlay.
+    /// Fast single-key `set` into a data object, sharing a `Patched` overlay
+    /// across chord haps through `cache` when the receiver is `Dressed` or
+    /// `SeqLayer` with uniform keys.
+    pub(crate) fn set_data_single_cached(
+        &mut self,
+        key: &Key,
+        value: &Value,
+        cache: Option<&mut SharedWaveCache>,
+    ) {
+        if let Some(cache) = cache {
+            match &mut self.entries {
+                Entries::Dressed(table, row) if table.has_uniform_keys() => {
+                    let row = *row;
+                    if let Some(cached) = &cache.dressed
+                        && cached.base.matches_table(table)
+                    {
+                        self.entries = Entries::Patched(Arc::clone(cached), row);
+                        return;
+                    }
+                    if let Some(mut patched) =
+                        Patched::empty(PatchedBase::Table(Arc::clone(table)), row, true)
+                        && patched.try_set(row, key, value.clone(), true).is_ok()
+                    {
+                        let arc = Arc::new(patched);
+                        cache.dressed = Some(Arc::clone(&arc));
+                        self.entries = Entries::Patched(arc, row);
+                        return;
+                    }
+                }
+                Entries::SeqLayer(layers, row, layer_idx)
+                    if layers[usize::from(*layer_idx)].seq_has_uniform_keys() =>
+                {
+                    let row = *row;
+                    let layer_idx = *layer_idx;
+                    if let Some(cached) = &cache.dressed
+                        && cached.base.matches_seq_layer(layers, layer_idx)
+                    {
+                        self.entries = Entries::Patched(Arc::clone(cached), row);
+                        return;
+                    }
+                    if let Some(mut patched) = Patched::empty(
+                        PatchedBase::SeqLayer(Arc::clone(layers), layer_idx),
+                        row,
+                        true,
+                    ) && patched.try_set(row, key, value.clone(), true).is_ok()
+                    {
+                        let arc = Arc::new(patched);
+                        cache.dressed = Some(Arc::clone(&arc));
+                        self.entries = Entries::Patched(arc, row);
+                        return;
+                    }
+                }
+                Entries::Patched(prev, row) if prev.base.has_uniform_keys() => {
+                    let row = *row;
+                    if Arc::strong_count(prev) > 1 {
+                        if let Some((cached_prev, cached_out)) = &cache.patched
+                            && Arc::ptr_eq(cached_prev, prev)
+                        {
+                            self.entries = Entries::Patched(Arc::clone(cached_out), row);
+                            return;
+                        }
+                        let extra = usize::from(!prev.has_patch_for(key));
+                        if usize::from(prev.len) + extra <= MAX_PATCHES {
+                            let mut next = (**prev).clone();
+                            let ok = next.try_set(row, key, value.clone(), true).is_ok();
+                            debug_assert!(ok);
+                            next.made = true;
+                            let arc = Arc::new(next);
+                            cache.patched = Some((Arc::clone(prev), Arc::clone(&arc)));
+                            self.entries = Entries::Patched(arc, row);
+                            return;
+                        }
+                    } else if let Some(own) = Arc::get_mut(prev) {
+                        let extra = usize::from(!own.has_patch_for(key));
+                        if usize::from(own.len) + extra <= MAX_PATCHES {
+                            let ok = own.try_set(row, key, value.clone(), true).is_ok();
+                            debug_assert!(ok);
+                            own.made = true;
+                            return;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.set_data(key, value.clone());
+        self.mark_made_of_data();
+    }
+
     pub(crate) fn merge_set_data_cached(&mut self, other: &Self, cache: &mut SharedWaveCache) {
         if other.is_empty() {
             return;
@@ -2629,8 +2861,9 @@ impl OrderedMap {
                 if append_len == 0 {
                     match &mut self.entries {
                         Entries::Builtin(b, is_made) => {
-                            if let Some(own) = Arc::get_mut(b) {
-                                let (keys, values) = own.parts_mut();
+                            if let Some(own) = Arc::get_mut(b)
+                                && let Some((keys, values)) = own.parts_mut()
+                            {
                                 for (key, num) in patches {
                                     let packed =
                                         crate::controls::pack_builtin_key_str(key.as_str());
@@ -2665,10 +2898,7 @@ impl OrderedMap {
                             None => Held::View(Layout::Plain(Slice::Plain(entries))),
                         }
                     }
-                    Entries::Builtin(entries, _) => {
-                        let (keys, values) = entries.parts();
-                        Held::View(Layout::Plain(Slice::Builtin(keys, values)))
-                    }
+                    Entries::Builtin(entries, _) => Held::View(Layout::Plain(entries.as_slice())),
                     Entries::Empty => Held::View(Layout::Plain(Slice::EMPTY)),
                     Entries::Dressed(table, index) => Held::View(table.layout(*index)),
                     Entries::SeqLayer(layers, row, layer_idx) => {
@@ -2849,10 +3079,7 @@ impl OrderedMap {
         match &self.entries {
             Entries::Empty => None,
             Entries::Shared(entries) | Entries::Made(entries) => Slice::Plain(entries).get_str(key),
-            Entries::Builtin(entries, _) => {
-                let (keys, values) = entries.parts();
-                Slice::Builtin(keys, values).get_str(key)
-            }
+            Entries::Builtin(entries, _) => entries.as_slice().get_str(key),
             Entries::Dressed(table, index) => match table.marks() & Table::mark(key) {
                 0 => None,
                 _ => table.layout(*index).get(key),
@@ -2889,7 +3116,7 @@ impl OrderedMap {
         match &self.entries {
             Entries::Empty => 0,
             Entries::Shared(entries) | Entries::Made(entries) => entries.len(),
-            Entries::Builtin(entries, _) => entries.parts().0.len(),
+            Entries::Builtin(entries, _) => entries.keys().len(),
             Entries::Dressed(table, index) => table.layout(*index).len(),
             Entries::SeqLayer(layers, row, layer_idx) => {
                 layers[usize::from(*layer_idx)].seq_len(*row)

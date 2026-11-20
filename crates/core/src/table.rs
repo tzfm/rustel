@@ -283,44 +283,66 @@ impl Signal {
 /// Extract a stateless [`Signal`] from a pattern made of a signal under
 /// span-blind steps, speed changes, shifts, and meetings with constants.
 pub(super) fn signal_of(pattern: &Pattern) -> Option<Signal> {
+    signal_of_depth(crate::NodeRef::Pat(pattern), 0)
+}
+
+fn signal_of_ref(pattern: crate::NodeRef<'_>) -> Option<Signal> {
     signal_of_depth(pattern, 0)
 }
 
-fn signal_of_depth(pattern: &Pattern, depth: u32) -> Option<Signal> {
+fn signal_of_depth(pattern: crate::NodeRef<'_>, depth: u32) -> Option<Signal> {
     if depth >= MAX_SIGNAL_DEPTH || !pattern.tables_may_answer() {
         return None;
     }
-    let (inner, op) = match pattern.node_kind() {
+    let (inner, op) = match pattern.kind() {
         Node::Signal(signal) => {
             return Some(Signal {
                 source: signal.clone(),
                 ops: Vec::new(),
             });
         }
-        Node::FmapNative(boxed) => (&boxed.0, SignalOp::Step(Step::Map(boxed.1.clone()))),
-        Node::FilterValues(boxed) => (&boxed.0, SignalOp::Step(Step::Keep(boxed.1.clone()))),
-        Node::ControlMap(inner, id, unnamed_only) => {
-            (inner, SignalOp::Step(Step::Control(*id, *unnamed_only)))
+        Node::FmapNative(boxed) => (
+            crate::NodeRef::Pat(&boxed.0),
+            SignalOp::Step(Step::Map(boxed.1.clone())),
+        ),
+        Node::FilterValues(boxed) => (
+            crate::NodeRef::Pat(&boxed.0),
+            SignalOp::Step(Step::Keep(boxed.1.clone())),
+        ),
+        Node::ControlMap(cell, flags, id, unnamed_only) => (
+            crate::NodeRef::Plain(cell, *flags),
+            SignalOp::Step(Step::Control(*id, *unnamed_only)),
+        ),
+        Node::ControlMapBoxed(boxed) => (
+            crate::NodeRef::Pat(&boxed.0),
+            SignalOp::Step(Step::Control(boxed.1, boxed.2)),
+        ),
+        Node::MapHapsNative(boxed) if boxed.2 == SpanUse::Ignores => (
+            crate::NodeRef::Pat(&boxed.0),
+            SignalOp::Step(Step::MapHap(boxed.1.clone())),
+        ),
+        Node::MapHapsOwned(boxed) if boxed.2 == SpanUse::Ignores => (
+            crate::NodeRef::Pat(&boxed.0),
+            SignalOp::Step(Step::MapOwned(boxed.1.clone())),
+        ),
+        Node::AddContext(boxed) => (
+            crate::NodeRef::Pat(&boxed.0),
+            SignalOp::Step(Step::Locations(boxed.1.clone())),
+        ),
+        Node::Fast(node) if node.1 > Fraction::ZERO => {
+            (crate::NodeRef::Pat(&node.0), SignalOp::Fast(node.1))
         }
-        Node::MapHapsNative(boxed) if boxed.2 == SpanUse::Ignores => {
-            (&boxed.0, SignalOp::Step(Step::MapHap(boxed.1.clone())))
-        }
-        Node::MapHapsOwned(boxed) if boxed.2 == SpanUse::Ignores => {
-            (&boxed.0, SignalOp::Step(Step::MapOwned(boxed.1.clone())))
-        }
-        Node::AddContext(boxed) => (&boxed.0, SignalOp::Step(Step::Locations(boxed.1.clone()))),
-        Node::Fast(node) if node.1 > Fraction::ZERO => (&node.0, SignalOp::Fast(node.1)),
-        Node::FastSmall(pat, numer, denom, _) if *numer > 0 => (
-            pat,
+        Node::FastSmall(cell, flags, numer, denom, _) if *numer > 0 => (
+            crate::NodeRef::Plain(cell, *flags),
             SignalOp::Fast(Fraction::new(i128::from(*numer), i128::from(*denom))),
         ),
-        Node::Shift(node) => (&node.0, SignalOp::Shift(node.1)),
-        Node::ShiftSmall(pat, numer, denom, _) => (
-            pat,
+        Node::Shift(node) => (crate::NodeRef::Pat(&node.0), SignalOp::Shift(node.1)),
+        Node::ShiftSmall(cell, flags, numer, denom, _) => (
+            crate::NodeRef::Plain(cell, *flags),
             SignalOp::Shift(Fraction::new(i128::from(*numer), i128::from(*denom))),
         ),
         Node::Constants(node) => {
-            let mut signal = signal_of_depth(&node.0, depth + 1)?;
+            let mut signal = signal_of_depth(crate::NodeRef::Pat(&node.0), depth + 1)?;
             signal
                 .ops
                 .extend(node.1.iter().map(|meeting| SignalOp::Constant {
@@ -335,7 +357,7 @@ fn signal_of_depth(pattern: &Pattern, depth: u32) -> Option<Signal> {
             let crate::AppLeftNode(functions, values, _, apply, flow) = &**node;
             let hap = constant_of(values)?;
             (
-                functions,
+                crate::NodeRef::Pat(functions),
                 SignalOp::Constant {
                     hap,
                     side: Side::Value,
@@ -348,7 +370,7 @@ fn signal_of_depth(pattern: &Pattern, depth: u32) -> Option<Signal> {
             let crate::AppNode(functions, values, apply, flow) = &**node;
             let hap = constant_of(functions)?;
             (
-                values,
+                crate::NodeRef::Pat(values),
                 SignalOp::Constant {
                     hap,
                     side: Side::Function,
@@ -433,10 +455,10 @@ impl ValueSignal {
             return Some(Self::StepWave(Box::new(step_wave)));
         }
         if let Some((inner, key)) = Self::named_key(values) {
-            if let Some(wave) = Wave::of(inner) {
+            if let Some(wave) = Wave::of_ref(inner) {
                 return Some(Self::Wave { key, wave });
             }
-            if let Some(signal) = signal_of(inner) {
+            if let Some(signal) = signal_of_ref(inner) {
                 let named = Self::named(values).map(|(_, named)| named);
                 return Some(Self::Signal {
                     signal: Box::new(signal),
@@ -455,36 +477,49 @@ impl ValueSignal {
 
     /// Fast lock-free extraction of `(inner, key)` for built-in control maps,
     /// avoiding closure creation when the value side is a [`Wave`] or [`StepWave`].
-    pub(super) fn named_key(values: &Pattern) -> Option<(&Pattern, crate::Key)> {
+    pub(super) fn named_key(values: &Pattern) -> Option<(crate::NodeRef<'_>, crate::Key)> {
         if !values.tables_may_answer() {
             return None;
         }
         match values.node_kind() {
-            Node::ControlMap(inner, id, false) => {
+            Node::ControlMap(cell, flags, id, false) => {
                 let spec = crate::controls::builtin_spec_by_id(*id)?;
                 let key = spec.key();
-                (key.as_str() != "value").then_some((inner, key))
+                (key.as_str() != "value").then_some((crate::NodeRef::Plain(cell, *flags), key))
+            }
+            Node::ControlMapBoxed(boxed) if !boxed.2 => {
+                let spec = crate::controls::builtin_spec_by_id(boxed.1)?;
+                let key = spec.key();
+                (key.as_str() != "value").then_some((crate::NodeRef::Pat(&boxed.0), key))
             }
             Node::MapHapsOwned(boxed) if boxed.2 == SpanUse::Ignores => {
                 let (inner, map) = (&boxed.0, &boxed.1);
                 let key = crate::controls::named_by(map)?;
-                (key.as_str() != "value").then_some((inner, key))
+                (key.as_str() != "value").then_some((crate::NodeRef::Pat(inner), key))
             }
             _ => None,
         }
     }
 
-    pub(super) fn named(values: &Pattern) -> Option<(&Pattern, Named)> {
+    pub(super) fn named(values: &Pattern) -> Option<(crate::NodeRef<'_>, Named)> {
         if !values.tables_may_answer() {
             return None;
         }
         match values.node_kind() {
-            Node::ControlMap(inner, id, false) => {
+            Node::ControlMap(cell, flags, id, false) => {
                 let spec = crate::controls::builtin_spec_by_id(*id)?;
                 let key = spec.key();
                 (key.as_str() != "value").then(|| {
                     let map = crate::controls::interned_control_map(spec, false);
-                    (inner, Named { key, map })
+                    (crate::NodeRef::Plain(cell, *flags), Named { key, map })
+                })
+            }
+            Node::ControlMapBoxed(boxed) if !boxed.2 => {
+                let spec = crate::controls::builtin_spec_by_id(boxed.1)?;
+                let key = spec.key();
+                (key.as_str() != "value").then(|| {
+                    let map = crate::controls::interned_control_map(spec, false);
+                    (crate::NodeRef::Pat(&boxed.0), Named { key, map })
                 })
             }
             Node::MapHapsOwned(boxed) if boxed.2 == SpanUse::Ignores => {
@@ -492,7 +527,7 @@ impl ValueSignal {
                 let key = crate::controls::named_by(map)?;
                 (key.as_str() != "value").then(|| {
                     let map = OwnedHapMapFn::clone(map);
-                    (inner, Named { key, map })
+                    (crate::NodeRef::Pat(inner), Named { key, map })
                 })
             }
             _ => None,

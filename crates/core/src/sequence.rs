@@ -258,6 +258,52 @@ pub(crate) struct InlineGrid<const N: usize> {
     steps: [SmallGridStep; N],
 }
 
+/// Compact grid storage for `1..=16` steps carrying deduplicated 16-bit
+/// multi-range location runs (`offset < 1024`, `len <= 30`) without `Box<Spare>`
+/// or a separate `Box<[SmallGridStep]>`.
+pub(crate) struct InlinePackedGrid<const N: usize> {
+    ticks: NonZeroU32,
+    base: u32,
+    packed: Box<[u16]>,
+    steps: [SmallGridStep; N],
+}
+
+/// Compact grid storage for `> 16` steps carrying deduplicated 16-bit
+/// multi-range location runs without `Box<Spare>`.
+pub(crate) struct PackedSliceGrid {
+    ticks: NonZeroU32,
+    base: u32,
+    steps: Box<[SmallGridStep]>,
+    packed: Box<[u16]>,
+}
+
+const SMALL_RUN_END: u16 = 1 << 15;
+const SMALL_RUN_LEN_BITS: u16 = 5;
+const SMALL_RUN_LEN_MASK: u16 = (1 << SMALL_RUN_LEN_BITS) - 1;
+const SMALL_RUN_OFF_LIMIT: u32 = 1 << 10;
+
+fn try_pack_runs_u16(runs: &[u32]) -> Option<Box<[u16]>> {
+    if runs.is_empty() {
+        return None;
+    }
+    let mut small = SmallCopyBuf::<u16, 32>::new(0);
+    for &word in runs {
+        let entry = word & !PackedLoc::SPARE;
+        let offset = entry >> PackedLoc::LENGTH_BITS;
+        let len_plus_1 = entry & PackedLoc::LENGTH_MASK;
+        if offset >= SMALL_RUN_OFF_LIMIT || len_plus_1 > u32::from(SMALL_RUN_LEN_MASK) {
+            return None;
+        }
+        let end_bit = if (word & PackedLoc::SPARE) != 0 {
+            SMALL_RUN_END
+        } else {
+            0
+        };
+        small.push(end_bit | ((offset as u16) << SMALL_RUN_LEN_BITS) | (len_plus_1 as u16));
+    }
+    Some(small.into_boxed_slice())
+}
+
 #[derive(Clone)]
 pub(crate) enum CompactGrid {
     N1(Arc<InlineGrid<1>>),
@@ -276,6 +322,27 @@ pub(crate) enum CompactGrid {
     N14(Arc<InlineGrid<14>>),
     N15(Arc<InlineGrid<15>>),
     N16(Arc<InlineGrid<16>>),
+    P1(Arc<InlinePackedGrid<1>>),
+    P2(Arc<InlinePackedGrid<2>>),
+    P3(Arc<InlinePackedGrid<3>>),
+    P4(Arc<InlinePackedGrid<4>>),
+    P5(Arc<InlinePackedGrid<5>>),
+    P6(Arc<InlinePackedGrid<6>>),
+    P7(Arc<InlinePackedGrid<7>>),
+    P8(Arc<InlinePackedGrid<8>>),
+    P9(Arc<InlinePackedGrid<9>>),
+    P10(Arc<InlinePackedGrid<10>>),
+    P11(Arc<InlinePackedGrid<11>>),
+    P12(Arc<InlinePackedGrid<12>>),
+    P13(Arc<InlinePackedGrid<13>>),
+    P14(Arc<InlinePackedGrid<14>>),
+    P15(Arc<InlinePackedGrid<15>>),
+    P16(Arc<InlinePackedGrid<16>>),
+    PMany(Arc<PackedSliceGrid>),
+    /// Inline 1-step uncut grid packed into 12 bytes (0..=3 locations) with
+    /// zero heap allocation, living flat inside [`CompactGrid`] so [`Listing`]
+    /// and [`Steps`] stay 16 bytes.
+    OneStep([u8; 12]),
 }
 
 const MAX_INLINE_GRID_LEN: usize = 16;
@@ -313,17 +380,93 @@ impl CompactGrid {
         )
     }
 
+    fn from_packed_inline(
+        ticks: NonZeroU32,
+        base: u32,
+        steps: &[SmallGridStep],
+        packed: Box<[u16]>,
+    ) -> Self {
+        macro_rules! build {
+            ($($n:literal => $var:ident),+) => {
+                match steps.len() {
+                    $(
+                        $n => {
+                            let mut arr = [SmallGridStep {
+                                part_begin: 0,
+                                part_end: 0,
+                                value: 0,
+                                loc: 0,
+                            }; $n];
+                            arr.copy_from_slice(steps);
+                            Self::$var(Arc::new(InlinePackedGrid {
+                                ticks,
+                                base,
+                                packed,
+                                steps: arr,
+                            }))
+                        }
+                    )+
+                    _ => unreachable!("compact packed grid length out of range"),
+                }
+            };
+        }
+        build!(
+            1 => P1, 2 => P2, 3 => P3, 4 => P4,
+            5 => P5, 6 => P6, 7 => P7, 8 => P8,
+            9 => P9, 10 => P10, 11 => P11, 12 => P12,
+            13 => P13, 14 => P14, 15 => P15, 16 => P16
+        )
+    }
+
+    fn from_packed_slice(
+        ticks: NonZeroU32,
+        base: u32,
+        steps: Box<[SmallGridStep]>,
+        packed: Box<[u16]>,
+    ) -> Self {
+        Self::PMany(Arc::new(PackedSliceGrid {
+            ticks,
+            base,
+            steps,
+            packed,
+        }))
+    }
+
     #[inline(always)]
-    pub(crate) fn parts(&self) -> (NonZeroU32, u32, &[SmallGridStep]) {
+    pub(crate) fn parts(&self) -> (NonZeroU32, u32, &[SmallGridStep], Option<&[u16]>) {
         macro_rules! unpack {
-            ($($var:ident),+) => {
+            (plain: [$($n:ident),+], packed: [$($p:ident),+]) => {
                 match self {
-                    $(Self::$var(g) => (g.ticks, g.base, &g.steps[..]),)+
+                    $(Self::$n(g) => (g.ticks, g.base, &g.steps[..], None),)+
+                    $(Self::$p(g) => (g.ticks, g.base, &g.steps[..], Some(&g.packed[..])),)+
+                    Self::PMany(g) => (g.ticks, g.base, &g.steps[..], Some(&g.packed[..])),
+                    Self::OneStep(_) => unreachable!("OneStep handled before parts()"),
                 }
             };
         }
         unpack!(
-            N1, N2, N3, N4, N5, N6, N7, N8, N9, N10, N11, N12, N13, N14, N15, N16
+            plain: [N1, N2, N3, N4, N5, N6, N7, N8, N9, N10, N11, N12, N13, N14, N15, N16],
+            packed: [P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, P11, P12, P13, P14, P15, P16]
+        )
+    }
+
+    #[inline(always)]
+    pub(crate) fn ptr_hash(&self, state: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        macro_rules! hash_ptr {
+            ($($var:ident),+) => {
+                match self {
+                    $(Self::$var(g) => (Arc::as_ptr(g) as usize).hash(state),)+
+                    Self::OneStep(buf) => {
+                        0xffu8.hash(state);
+                        buf.hash(state);
+                    }
+                }
+            };
+        }
+        hash_ptr!(
+            N1, N2, N3, N4, N5, N6, N7, N8, N9, N10, N11, N12, N13, N14, N15, N16, P1, P2, P3, P4,
+            P5, P6, P7, P8, P9, P10, P11, P12, P13, P14, P15, P16, PMany
         )
     }
 
@@ -333,14 +476,32 @@ impl CompactGrid {
             ($($var:ident),+) => {
                 match (self, other) {
                     $((Self::$var(a), Self::$var(b)) => Arc::ptr_eq(a, b),)+
+                    (Self::OneStep(a), Self::OneStep(b)) => a == b,
                     _ => false,
                 }
             };
         }
         same_ptr!(
-            N1, N2, N3, N4, N5, N6, N7, N8, N9, N10, N11, N12, N13, N14, N15, N16
+            N1, N2, N3, N4, N5, N6, N7, N8, N9, N10, N11, N12, N13, N14, N15, N16, P1, P2, P3, P4,
+            P5, P6, P7, P8, P9, P10, P11, P12, P13, P14, P15, P16, PMany
         )
     }
+}
+
+/// Borrowed view over packed multi-range location runs.
+#[derive(Clone, Copy)]
+enum PackedRunsRef<'a> {
+    None,
+    Small(&'a [u16]),
+    Wide(&'a [u32]),
+}
+
+/// Owned input for [`Listing::from_parts`] avoiding an intermediate `Box<Spare>`
+/// when a grid can stay in [`CompactGrid`].
+enum PackedRunsInput {
+    None,
+    Small(Box<[u16]>),
+    Wide(Box<[u32]>),
 }
 
 /// Borrowed view over any grid representation (`OneStep`, `CompactGrid`, or `Grid`).
@@ -349,22 +510,14 @@ struct GridView<'a> {
     ticks: NonZeroU32,
     base: u32,
     steps: GridStepsRef<'a>,
-    side: Option<&'a Spare>,
+    packed: PackedRunsRef<'a>,
+    rare: Option<&'a SpareRare>,
 }
 
 #[derive(Clone)]
 enum Listing {
     Places(Arc<Listed>),
-    /// Inline 1-step uncut grid packed into 8 bytes:
-    /// - `base_ticks`: low 24 bits = `base` (< 16 MiB), bit 24 = `SMALL`, bits 25..32 = `ticks` (`1..=127`).
-    /// - `span_loc`: bits 0..8 = `begin`, bits 8..16 = `end`, bits 16..32 = `loc`.
-    ///
-    /// Zero heap allocation while keeping [`Listing`] and [`Steps`] 16 bytes.
-    OneStep {
-        base_ticks: u32,
-        span_loc: u32,
-    },
-    /// Single-allocation `1..=16` step grid with no [`Spare`] sidecar.
+    /// Inline 1-step grid or single-allocation `1..=16` / packed grid.
     CompactGrid(CompactGrid),
     Grid(Arc<Grid>),
 }
@@ -414,57 +567,181 @@ impl Listing {
         ticks: NonZeroU32,
         base: u32,
         steps: GridSteps,
-        side: Option<Box<Spare>>,
+        packed: PackedRunsInput,
+        rare: Option<Box<SpareRare>>,
     ) -> Self {
-        if side.is_none()
-            && let GridSteps::Inline(len, ref arr) = steps
-        {
-            let slice = &arr[..usize::from(len)];
-            let raw_base = base & !Grid::SMALL;
-            if slice.len() == 1
-                && slice[0].value == 0
-                && (slice[0].loc & SmallGridStep::SPARE) == 0
-                && raw_base < (1 << 24)
-                && ticks.get() <= 127
-                && slice[0].part_begin <= 255
-                && slice[0].part_end <= 255
-            {
-                let small_bit = u32::from(base & Grid::SMALL != 0) << 24;
-                let base_ticks = raw_base | small_bit | (ticks.get() << 25);
-                let span_loc = u32::from(slice[0].part_begin)
-                    | (u32::from(slice[0].part_end) << 8)
-                    | (u32::from(slice[0].loc) << 16);
-                return Self::OneStep {
-                    base_ticks,
-                    span_loc,
-                };
-            }
-            if !slice.is_empty() {
-                let compact = CompactGrid::from_parts(ticks, base, slice);
-                return Self::CompactGrid(crate::intern::intern_compact_grid(compact));
+        if rare.is_none() {
+            match packed {
+                PackedRunsInput::None => {
+                    if let GridSteps::Inline(len, ref arr) = steps {
+                        let slice = &arr[..usize::from(len)];
+                        let raw_base = base & !Grid::SMALL;
+                        if slice.len() == 1
+                            && slice[0].value == 0
+                            && (slice[0].loc & SmallGridStep::SPARE) == 0
+                            && raw_base < (1 << 24)
+                            && ticks.get() <= 127
+                            && slice[0].part_begin <= 255
+                            && slice[0].part_end <= 255
+                        {
+                            let small_bit = u32::from(base & Grid::SMALL != 0) << 24;
+                            let base_ticks = raw_base | small_bit | (ticks.get() << 25);
+                            let span_loc = u32::from(slice[0].part_begin)
+                                | (u32::from(slice[0].part_end) << 8)
+                                | (u32::from(slice[0].loc) << 16);
+                            let mut buf = [0u8; 12];
+                            buf[0..4].copy_from_slice(&base_ticks.to_ne_bytes());
+                            buf[4..8].copy_from_slice(&span_loc.to_ne_bytes());
+                            return Self::CompactGrid(CompactGrid::OneStep(buf));
+                        }
+                        if !slice.is_empty() {
+                            return Self::CompactGrid(CompactGrid::from_parts(ticks, base, slice));
+                        }
+                    }
+                    let small_steps = match steps {
+                        GridSteps::Inline(len, arr) => Box::from(&arr[..usize::from(len)]),
+                        GridSteps::Small(small) => small,
+                        GridSteps::Wide(_) => Box::from([]),
+                    };
+                    return Self::Grid(Arc::new(Grid {
+                        ticks,
+                        base,
+                        small_steps,
+                        side: None,
+                    }));
+                }
+                PackedRunsInput::Small(packed_small) => {
+                    match steps {
+                        GridSteps::Inline(len, arr) if len > 0 => {
+                            let slice = &arr[..usize::from(len)];
+                            let raw_base = base & !Grid::SMALL;
+                            if slice.len() == 1
+                                && slice[0].value == 0
+                                && slice[0].loc == SmallGridStep::SPARE
+                                && (2..=3).contains(&packed_small.len())
+                                && raw_base < (1 << 24)
+                                && ticks.get() <= 127
+                                && slice[0].part_begin <= 255
+                                && slice[0].part_end <= 255
+                            {
+                                let small_bit = u32::from(base & Grid::SMALL != 0) << 24;
+                                let base_ticks = raw_base | small_bit | (ticks.get() << 25);
+                                let span_loc = u32::from(slice[0].part_begin)
+                                    | (u32::from(slice[0].part_end) << 8)
+                                    | (u32::from(packed_small[0]) << 16);
+                                let loc2 = packed_small.get(2).copied().unwrap_or(0);
+                                let mut buf = [0u8; 12];
+                                buf[0..4].copy_from_slice(&base_ticks.to_ne_bytes());
+                                buf[4..8].copy_from_slice(&span_loc.to_ne_bytes());
+                                buf[8..12].copy_from_slice(
+                                    &(u32::from(packed_small[1]) | (u32::from(loc2) << 16))
+                                        .to_ne_bytes(),
+                                );
+                                return Self::CompactGrid(CompactGrid::OneStep(buf));
+                            }
+                            return Self::CompactGrid(CompactGrid::from_packed_inline(
+                                ticks,
+                                base,
+                                slice,
+                                packed_small,
+                            ));
+                        }
+                        GridSteps::Small(small) => {
+                            return Self::CompactGrid(CompactGrid::from_packed_slice(
+                                ticks,
+                                base,
+                                small,
+                                packed_small,
+                            ));
+                        }
+                        GridSteps::Inline(_, _) | GridSteps::Wide(_) => {
+                            // Unpack rare empty/wide case below.
+                            let wide: Box<[u32]> = packed_small
+                                .iter()
+                                .map(|&w| {
+                                    let entry = w & !SMALL_RUN_END;
+                                    let off = u32::from(entry >> SMALL_RUN_LEN_BITS);
+                                    let len_p1 = u32::from(entry & SMALL_RUN_LEN_MASK);
+                                    let end = if (w & SMALL_RUN_END) != 0 {
+                                        PackedLoc::SPARE
+                                    } else {
+                                        0
+                                    };
+                                    end | (off << PackedLoc::LENGTH_BITS) | len_p1
+                                })
+                                .collect();
+                            return Self::Grid(Arc::new(Grid {
+                                ticks,
+                                base,
+                                small_steps: Box::from([]),
+                                side: Some(Box::new(Spare {
+                                    packed: wide,
+                                    rare: None,
+                                })),
+                            }));
+                        }
+                    }
+                }
+                PackedRunsInput::Wide(packed_wide) => {
+                    let small_steps = match steps {
+                        GridSteps::Inline(len, arr) => Box::from(&arr[..usize::from(len)]),
+                        GridSteps::Small(small) => small,
+                        GridSteps::Wide(_) => Box::from([]),
+                    };
+                    return Self::Grid(Arc::new(Grid {
+                        ticks,
+                        base,
+                        small_steps,
+                        side: Some(Box::new(Spare {
+                            packed: packed_wide,
+                            rare: None,
+                        })),
+                    }));
+                }
             }
         }
+        let packed_wide = match packed {
+            PackedRunsInput::None => Box::from([]),
+            PackedRunsInput::Wide(wide) => wide,
+            PackedRunsInput::Small(small) => small
+                .iter()
+                .map(|&w| {
+                    let entry = w & !SMALL_RUN_END;
+                    let off = u32::from(entry >> SMALL_RUN_LEN_BITS);
+                    let len_p1 = u32::from(entry & SMALL_RUN_LEN_MASK);
+                    let end = if (w & SMALL_RUN_END) != 0 {
+                        PackedLoc::SPARE
+                    } else {
+                        0
+                    };
+                    end | (off << PackedLoc::LENGTH_BITS) | len_p1
+                })
+                .collect(),
+        };
         let small_steps = match steps {
             GridSteps::Inline(len, arr) => Box::from(&arr[..usize::from(len)]),
             GridSteps::Small(small) => small,
             GridSteps::Wide(_) => Box::from([]),
         };
-        Self::Grid(crate::intern::intern_grid(Arc::new(Grid {
+        Self::Grid(Arc::new(Grid {
             ticks,
             base,
             small_steps,
-            side,
-        })))
+            side: Some(Box::new(Spare {
+                packed: packed_wide,
+                rare,
+            })),
+        }))
     }
 
     #[inline]
     fn with_grid_view<R>(&self, f: impl FnOnce(GridView<'_>) -> R) -> Option<R> {
         match self {
             Self::Places(_) => None,
-            Self::OneStep {
-                base_ticks,
-                span_loc,
-            } => {
+            Self::CompactGrid(CompactGrid::OneStep(buf)) => {
+                let base_ticks = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let span_loc = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                let extra = u32::from_ne_bytes([buf[8], buf[9], buf[10], buf[11]]);
                 let raw_base = base_ticks & 0x00ff_ffff;
                 let small_bit = if (base_ticks & (1 << 24)) != 0 {
                     Grid::SMALL
@@ -472,26 +749,45 @@ impl Listing {
                     0
                 };
                 let ticks = NonZeroU32::new(base_ticks >> 25).expect("non-zero packed ticks");
+                let loc0 = (span_loc >> 16) as u16;
+                let (step_loc, packed_buf, packed_len) = if extra != 0 {
+                    let loc1 = (extra & 0xffff) as u16;
+                    let loc2 = (extra >> 16) as u16;
+                    let len = if loc2 != 0 { 3 } else { 2 };
+                    (SmallGridStep::SPARE, [loc0, loc1, loc2], len)
+                } else {
+                    (loc0, [0, 0, 0], 0)
+                };
                 let step = [SmallGridStep {
                     part_begin: (span_loc & 0xff) as u16,
                     part_end: ((span_loc >> 8) & 0xff) as u16,
                     value: 0,
-                    loc: (span_loc >> 16) as u16,
+                    loc: step_loc,
                 }];
+                let packed = if packed_len > 0 {
+                    PackedRunsRef::Small(&packed_buf[..packed_len])
+                } else {
+                    PackedRunsRef::None
+                };
                 Some(f(GridView {
                     ticks,
                     base: raw_base | small_bit,
                     steps: GridStepsRef::Small(&step),
-                    side: None,
+                    packed,
+                    rare: None,
                 }))
             }
             Self::CompactGrid(grid) => {
-                let (ticks, base, steps) = grid.parts();
+                let (ticks, base, steps, packed) = grid.parts();
                 Some(f(GridView {
                     ticks,
                     base,
                     steps: GridStepsRef::Small(steps),
-                    side: None,
+                    packed: match packed {
+                        Some(small) => PackedRunsRef::Small(small),
+                        None => PackedRunsRef::None,
+                    },
+                    rare: None,
                 }))
             }
             Self::Grid(grid) => Some(f(grid.view())),
@@ -501,7 +797,7 @@ impl Listing {
     fn len(&self) -> usize {
         match self {
             Self::Places(listed) => listed.places.len(),
-            Self::OneStep { .. } => 1,
+            Self::CompactGrid(CompactGrid::OneStep(_)) => 1,
             Self::CompactGrid(grid) => grid.parts().2.len(),
             Self::Grid(grid) => grid.steps_ref().len(),
         }
@@ -543,7 +839,7 @@ impl Listing {
     fn is_cut(&self, index: usize) -> bool {
         match self {
             Self::Places(listed) => listed.places[index].part.is_some(),
-            Self::OneStep { .. } | Self::CompactGrid(_) => false,
+            Self::CompactGrid(_) => false,
             Self::Grid(grid) => grid.view().cut(index).is_some(),
         }
     }
@@ -551,7 +847,7 @@ impl Listing {
     fn value(&self, index: usize) -> u32 {
         match self {
             Self::Places(listed) => listed.places[index].value,
-            Self::OneStep { .. } => 0,
+            Self::CompactGrid(CompactGrid::OneStep(_)) => 0,
             Self::CompactGrid(grid) => u32::from(grid.parts().2[index].value),
             Self::Grid(grid) => grid.steps_ref().get(index).value,
         }
@@ -581,7 +877,9 @@ impl Listing {
     fn small_denominators(&self) -> bool {
         match self {
             Self::Places(listed) => listed.small_denominators,
-            Self::OneStep { base_ticks, .. } => base_ticks & (1 << 24) != 0,
+            Self::CompactGrid(CompactGrid::OneStep(buf)) => {
+                u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) & (1 << 24) != 0
+            }
             Self::CompactGrid(grid) => grid.parts().1 & Grid::SMALL != 0,
             Self::Grid(grid) => grid.small_denominators(),
         }
@@ -635,11 +933,6 @@ pub(crate) struct SmallGridStep {
 }
 
 impl SmallGridStep {
-    #[inline(always)]
-    pub(crate) fn has_loc(self) -> bool {
-        self.loc != 0
-    }
-
     #[inline]
     pub(crate) fn hash_intern(&self, state: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
@@ -1077,14 +1370,6 @@ impl<T: Copy, const N: usize> SmallCopyBuf<T, N> {
     }
 
     #[inline]
-    fn truncate(&mut self, new_len: usize) {
-        match self {
-            Self::Inline { len, .. } => *len = (*len).min(new_len),
-            Self::Heap(vec) => vec.truncate(new_len),
-        }
-    }
-
-    #[inline]
     fn as_slice(&self) -> &[T] {
         match self {
             Self::Inline { len, data } => &data[..*len],
@@ -1213,26 +1498,41 @@ impl Grid {
                 PackedLoc(PackedLoc::WIDE_MASK | at)
             }
             len => {
-                let start = packed_runs.len();
-                if start <= PackedLoc::INDEX_MASK as usize {
-                    let mut all_fit = true;
-                    for i in 0..len {
-                        if let Some(range) = locations.get(i)
-                            && let Some(word) = PackedLoc::range(base, range)
-                        {
-                            packed_runs.push(word.0);
-                        } else {
-                            all_fit = false;
-                            break;
-                        }
+                let mut run = SmallCopyBuf::<u32, 8>::new(0);
+                let mut all_fit = true;
+                for i in 0..len {
+                    if let Some(range) = locations.get(i)
+                        && let Some(word) = PackedLoc::range(base, range)
+                    {
+                        run.push(word.0);
+                    } else {
+                        all_fit = false;
+                        break;
                     }
-                    if all_fit {
-                        if let Some(last) = packed_runs.last_mut() {
-                            *last |= PackedLoc::SPARE;
+                }
+                if all_fit {
+                    if let Some(last) = run.last_mut() {
+                        *last |= PackedLoc::SPARE;
+                    }
+                    let needle = run.as_slice();
+                    let existing = packed_runs.as_slice();
+                    let mut pos = 0;
+                    while pos + needle.len() <= existing.len() {
+                        if &existing[pos..pos + needle.len()] == needle {
+                            return PackedLoc(PackedLoc::SPARE | pos as u32);
+                        }
+                        while pos < existing.len() && (existing[pos] & PackedLoc::SPARE) == 0 {
+                            pos += 1;
+                        }
+                        pos += 1;
+                    }
+                    let start = existing.len();
+                    if start <= PackedLoc::INDEX_MASK as usize {
+                        for &word in needle {
+                            packed_runs.push(word);
                         }
                         return PackedLoc(PackedLoc::SPARE | start as u32);
                     }
-                    packed_runs.truncate(start);
                 }
                 let at = wide.len() as u32;
                 wide.push(index);
@@ -1337,30 +1637,28 @@ impl Grid {
             other => (other, Box::from([])),
         };
         // The grid fits, so any wide locations move with no copy.
-        let side = (!cuts.is_empty()
-            || !packed_runs.is_empty()
-            || !wide.is_empty()
-            || !wide_steps.is_empty())
-        .then(|| {
-            let rare =
-                (!cuts.is_empty() || !wide.is_empty() || !wide_steps.is_empty()).then(|| {
-                    let wide_locs: Box<[Locations]> = wide
-                        .iter()
-                        .map(|index| std::mem::take(&mut raws[*index].locations))
-                        .collect();
-                    Box::new(SpareRare::from_parts(
-                        cuts.as_slice(),
-                        wide_locs,
-                        wide_steps,
-                    ))
-                });
-            Box::new(Spare {
-                packed: packed_runs.into_boxed_slice(),
-                rare,
-            })
+        let rare = (!cuts.is_empty() || !wide.is_empty() || !wide_steps.is_empty()).then(|| {
+            let wide_locs: Box<[Locations]> = wide
+                .iter()
+                .map(|index| std::mem::take(&mut raws[*index].locations))
+                .collect();
+            Box::new(SpareRare::from_parts(
+                cuts.as_slice(),
+                wide_locs,
+                wide_steps,
+            ))
         });
+        let packed = if packed_runs.is_empty() {
+            PackedRunsInput::None
+        } else if rare.is_none()
+            && let Some(small) = try_pack_runs_u16(packed_runs.as_slice())
+        {
+            PackedRunsInput::Small(small)
+        } else {
+            PackedRunsInput::Wide(packed_runs.into_boxed_slice())
+        };
         let base = base | if small_denominators { Self::SMALL } else { 0 };
-        Some(Listing::from_parts(ticks, base, steps, side))
+        Some(Listing::from_parts(ticks, base, steps, packed, rare))
     }
 
     fn build_listing(raws: &mut [Raw]) -> Option<Listing> {
@@ -1429,39 +1727,51 @@ impl Grid {
             GridSteps::Wide(wide) => (GridSteps::Small(Box::from([])), wide),
             other => (other, Box::from([])),
         };
-        let side =
-            (!packed_runs.is_empty() || !wide.is_empty() || !wide_steps.is_empty()).then(|| {
-                let rare = (!wide.is_empty() || !wide_steps.is_empty()).then(|| {
-                    let wide_locs: Box<[Locations]> = wide
-                        .iter()
-                        .map(|index| std::mem::take(&mut source_steps[*index].locations))
-                        .collect();
-                    Box::new(SpareRare::from_parts(&[], wide_locs, wide_steps))
-                });
-                Box::new(Spare {
-                    packed: packed_runs.into_boxed_slice(),
-                    rare,
-                })
-            });
+        let rare = (!wide.is_empty() || !wide_steps.is_empty()).then(|| {
+            let wide_locs: Box<[Locations]> = wide
+                .iter()
+                .map(|index| std::mem::take(&mut source_steps[*index].locations))
+                .collect();
+            Box::new(SpareRare::from_parts(&[], wide_locs, wide_steps))
+        });
+        let packed = if packed_runs.is_empty() {
+            PackedRunsInput::None
+        } else if rare.is_none()
+            && let Some(small) = try_pack_runs_u16(packed_runs.as_slice())
+        {
+            PackedRunsInput::Small(small)
+        } else {
+            PackedRunsInput::Wide(packed_runs.into_boxed_slice())
+        };
         let base = base | if small_denominators { Self::SMALL } else { 0 };
-        Some(Listing::from_parts(ticks, base, steps, side))
+        Some(Listing::from_parts(ticks, base, steps, packed, rare))
     }
 
     #[inline(always)]
     fn view(&self) -> GridView<'_> {
+        let (packed, rare) = match self.side.as_deref() {
+            Some(side) => (
+                if side.packed.is_empty() {
+                    PackedRunsRef::None
+                } else {
+                    PackedRunsRef::Wide(&side.packed)
+                },
+                side.rare.as_deref(),
+            ),
+            None => (PackedRunsRef::None, None),
+        };
         GridView {
             ticks: self.ticks,
             base: self.base,
             steps: self.steps_ref(),
-            side: self.side.as_deref(),
+            packed,
+            rare,
         }
     }
 
     #[inline]
     pub(crate) fn can_intern(&self) -> bool {
-        self.side.is_none()
-            && (self.base & !Self::SMALL) == 0
-            && self.small_steps.iter().all(|s| s.loc == 0)
+        self.side.as_deref().is_none_or(|s| s.rare.is_none())
     }
 
     pub(crate) fn hash_intern(&self, state: &mut impl std::hash::Hasher) {
@@ -1552,9 +1862,7 @@ impl<'a> GridView<'a> {
     }
 
     fn cuts(self) -> CutsSlice<'a> {
-        self.side
-            .and_then(|side| side.rare.as_deref())
-            .map_or(CutsSlice::EMPTY, SpareRare::cuts)
+        self.rare.map_or(CutsSlice::EMPTY, SpareRare::cuts)
     }
 
     fn cut(self, index: usize) -> Option<Cut> {
@@ -1589,24 +1897,37 @@ impl<'a> GridView<'a> {
             return Locations::new();
         }
         if packed & PackedLoc::WIDE_MASK == PackedLoc::WIDE_MASK {
-            let rare = self
-                .side
-                .and_then(|side| side.rare.as_deref())
-                .expect("a wide location has a rare side");
+            let rare = self.rare.expect("a wide location has a rare side");
             return rare.wide()[(packed & PackedLoc::INDEX_MASK) as usize].clone();
         }
         let base = self.base & !Grid::SMALL;
         if packed & PackedLoc::SPARE != 0 {
-            let side = self.side.expect("a spare location has a side");
             let mut out = Locations::new();
-            for &word in &side.packed[(packed & PackedLoc::INDEX_MASK) as usize..] {
-                let entry = word & !PackedLoc::SPARE;
-                let begin = (base + (entry >> PackedLoc::LENGTH_BITS)) as usize;
-                let length = ((entry & PackedLoc::LENGTH_MASK) - 1) as usize;
-                out.push((begin, begin + length));
-                if word & PackedLoc::SPARE != 0 {
-                    break;
+            let start = (packed & PackedLoc::INDEX_MASK) as usize;
+            match self.packed {
+                PackedRunsRef::Small(runs) => {
+                    for &word in &runs[start..] {
+                        let entry = word & !SMALL_RUN_END;
+                        let begin = (base + u32::from(entry >> SMALL_RUN_LEN_BITS)) as usize;
+                        let length = usize::from((entry & SMALL_RUN_LEN_MASK) - 1);
+                        out.push((begin, begin + length));
+                        if (word & SMALL_RUN_END) != 0 {
+                            break;
+                        }
+                    }
                 }
+                PackedRunsRef::Wide(runs) => {
+                    for &word in &runs[start..] {
+                        let entry = word & !PackedLoc::SPARE;
+                        let begin = (base + (entry >> PackedLoc::LENGTH_BITS)) as usize;
+                        let length = ((entry & PackedLoc::LENGTH_MASK) - 1) as usize;
+                        out.push((begin, begin + length));
+                        if word & PackedLoc::SPARE != 0 {
+                            break;
+                        }
+                    }
+                }
+                PackedRunsRef::None => unreachable!("a spare location has packed runs"),
             }
             return out;
         }
@@ -1725,7 +2046,12 @@ impl<'a> GridView<'a> {
             return None;
         }
         let new_ticks = NonZeroU32::new(new_ticks_u32)?;
-        let (steps, side) = if mul == 1 && g1 == 1 {
+        let clone_packed = || match self.packed {
+            PackedRunsRef::None => PackedRunsInput::None,
+            PackedRunsRef::Small(runs) => PackedRunsInput::Small(Box::from(runs)),
+            PackedRunsRef::Wide(runs) => PackedRunsInput::Wide(Box::from(runs)),
+        };
+        let (steps, packed, rare) = if mul == 1 && g1 == 1 {
             let steps = match self.steps {
                 GridStepsRef::Small(steps) if steps.len() <= MAX_INLINE_GRID_LEN => {
                     let mut arr = [GridSteps::ZERO_SMALL; MAX_INLINE_GRID_LEN];
@@ -1735,10 +2061,8 @@ impl<'a> GridView<'a> {
                 GridStepsRef::Small(steps) => GridSteps::Small(Box::from(steps)),
                 GridStepsRef::Wide(_) => GridSteps::Small(Box::from([])),
             };
-            let side = self.side.and_then(|spare| {
-                (!spare.packed.is_empty() || spare.rare.is_some()).then(|| Box::new(spare.clone()))
-            });
-            (steps, side)
+            let rare = self.rare.map(|rare| Box::new(rare.clone()));
+            (steps, clone_packed(), rare)
         } else {
             let rescale = |t: u32| -> Option<u32> {
                 u32::try_from((u64::from(t) / g1).checked_mul(u64::from(mul))?).ok()
@@ -1753,17 +2077,13 @@ impl<'a> GridView<'a> {
                 GridSteps::Wide(wide) => (GridSteps::Small(Box::from([])), wide),
                 other => (other, Box::from([])),
             };
-            let packed = self
-                .side
-                .map(|s| s.packed.clone())
-                .unwrap_or_else(|| Box::from([]));
             let mut cuts = SmallCopyBuf::<Cut, 16>::new(Cut {
                 index: 0,
                 begin: 0,
                 end: 0,
             });
             let mut wide_locs: Box<[Locations]> = Box::from([]);
-            if let Some(rare) = self.side.and_then(|s| s.rare.as_deref()) {
+            if let Some(rare) = self.rare {
                 let cuts_view = rare.cuts();
                 for i in 0..cuts_view.len() {
                     let mut cut = cuts_view.get(i).expect("cut in bounds");
@@ -1781,11 +2101,9 @@ impl<'a> GridView<'a> {
                         wide_steps,
                     ))
                 });
-            let side =
-                (!packed.is_empty() || rare.is_some()).then(|| Box::new(Spare { packed, rare }));
-            (steps, side)
+            (steps, clone_packed(), rare)
         };
-        let listing = Listing::from_parts(new_ticks, self.base | Grid::SMALL, steps, side);
+        let listing = Listing::from_parts(new_ticks, self.base | Grid::SMALL, steps, packed, rare);
         let in_cycles = listing
             .with_grid_view(|view| view.in_cycles_for(new_period))
             .unwrap_or(false);
@@ -1802,7 +2120,7 @@ thread_local! {
 /// Borrow the table of reduced times for `ticks` without atomic reference
 /// counting. Power-of-two grids skip the thread-local completely.
 #[inline]
-fn with_tick_grid<R>(ticks: NonZeroU32, f: impl FnOnce(Option<&TickGrid>) -> R) -> R {
+pub(crate) fn with_tick_grid<R>(ticks: NonZeroU32, f: impl FnOnce(Option<&TickGrid>) -> R) -> R {
     if ticks.is_power_of_two() || i64::from(ticks.get()) > TickGrid::MAX_DENOM {
         return f(None);
     }
@@ -2228,29 +2546,61 @@ impl Dress {
     #[inline(always)]
     fn set_slice(&self) -> crate::value::Slice<'_> {
         match &self.set_map {
-            Some(entries) => {
-                let (keys, values) = entries.parts();
-                crate::value::Slice::Builtin(keys, values)
-            }
+            Some(entries) => entries.as_slice(),
             None => crate::value::Slice::EMPTY,
         }
     }
 
     fn set_map_builtin(&mut self, entries: Arc<dyn crate::value::BuiltinEntries>) {
-        let entries = crate::intern::intern_builtin(entries, true);
-        let (keys, values) = entries.parts();
-        self.set_marks = crate::value::Slice::Builtin(keys, values).marks();
+        self.set_marks = entries.as_slice().marks();
         self.set_map = Some(entries);
     }
 
     #[inline]
     fn into_arc(self) -> Arc<Self> {
-        crate::intern::intern_dress(Arc::new(self))
+        Arc::new(self)
     }
 
     #[inline]
     pub(crate) fn can_intern(&self) -> bool {
-        self.tail.is_none() && self.before_packed[0] == 0 && self.keys.can_intern()
+        self.tail.is_none() && self.keys.can_intern()
+    }
+
+    pub(crate) fn dedup_inner(
+        &self,
+        dedup_builtin: &mut dyn FnMut(
+            Arc<dyn crate::value::BuiltinEntries>,
+            bool,
+        ) -> Arc<dyn crate::value::BuiltinEntries>,
+        dedup_keys: &mut dyn FnMut(
+            Arc<crate::context_keys::Keys>,
+        ) -> Arc<crate::context_keys::Keys>,
+    ) -> Option<Self> {
+        let mut new_map = None;
+        if let Some(map) = &self.set_map {
+            let canon = dedup_builtin(Arc::clone(map), true);
+            if !Arc::ptr_eq(map, &canon) {
+                new_map = Some(canon);
+            }
+        }
+        let mut new_keys = None;
+        if let Some(keys) = self.keys.as_arc() {
+            let canon = dedup_keys(Arc::clone(keys));
+            if !Arc::ptr_eq(keys, &canon) {
+                new_keys = Some(ContextKeys::from_arc(canon));
+            }
+        }
+        if new_map.is_none() && new_keys.is_none() {
+            return None;
+        }
+        let mut cloned = self.clone();
+        if let Some(map) = new_map {
+            cloned.set_map = Some(map);
+        }
+        if let Some(keys) = new_keys {
+            cloned.keys = keys;
+        }
+        Some(cloned)
     }
 
     pub(crate) fn hash_intern(&self, state: &mut impl std::hash::Hasher) {
@@ -2589,7 +2939,118 @@ enum SequenceStop {
     Query,
 }
 
+/// Post-eval deduplicator hooks called by [`Layer::dedup_in`].
+pub(crate) trait LayerDeduper {
+    fn dedup_values(&mut self, values: &Arc<[Value]>) -> Arc<[Value]>;
+    fn dedup_dress(&mut self, dress: &Arc<Dress>) -> Arc<Dress>;
+    fn dedup_compact_grid(&mut self, grid: &CompactGrid) -> CompactGrid;
+    fn dedup_grid(&mut self, grid: &Arc<Grid>) -> Arc<Grid>;
+}
+
 impl Layer {
+    /// Whether this layer holds no `OnceLock` cache or `StepSource` so it can
+    /// be structurally deduplicated by canonical child pointers.
+    #[inline]
+    pub(crate) fn can_intern(&self) -> bool {
+        self.is_data()
+            && matches!(
+                &self.steps,
+                Steps::Listed(Listing::CompactGrid(_) | Listing::Grid(_))
+            )
+    }
+
+    pub(crate) fn hash_intern(&self, state: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        self.period_numer.hash(state);
+        self.period_denom_flags.hash(state);
+        self.named_id.hash(state);
+        self.direct_flags.hash(state);
+        (Arc::as_ptr(&self.values) as *const Value as usize).hash(state);
+        self.values.len().hash(state);
+        self.dress
+            .as_ref()
+            .map_or(0usize, |d| Arc::as_ptr(d) as usize)
+            .hash(state);
+        match &self.steps {
+            Steps::Listed(Listing::CompactGrid(g)) => {
+                1u8.hash(state);
+                g.ptr_hash(state);
+            }
+            Steps::Listed(Listing::Grid(g)) => {
+                2u8.hash(state);
+                (Arc::as_ptr(g) as usize).hash(state);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn eq_intern(&self, other: &Self) -> bool {
+        self.period_numer == other.period_numer
+            && self.period_denom_flags == other.period_denom_flags
+            && self.named_id == other.named_id
+            && self.direct_flags == other.direct_flags
+            && Arc::ptr_eq(&self.values, &other.values)
+            && match (&self.dress, &other.dress) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+            && match (&self.steps, &other.steps) {
+                (
+                    Steps::Listed(Listing::CompactGrid(a)),
+                    Steps::Listed(Listing::CompactGrid(b)),
+                ) => a.ptr_eq(b),
+                (Steps::Listed(Listing::Grid(a)), Steps::Listed(Listing::Grid(b))) => {
+                    Arc::ptr_eq(a, b)
+                }
+                _ => false,
+            }
+    }
+
+    /// Deduplicate this layer's `values`, `dress`, and `steps` payloads through
+    /// the post-eval deduplicator, returning `Some(new_layer)` only when at
+    /// least one handle changed.
+    pub(crate) fn dedup_in(&self, deduper: &mut impl LayerDeduper) -> Option<Self> {
+        let new_values = if self.is_data() {
+            let v = deduper.dedup_values(&self.values);
+            (!Arc::ptr_eq(&self.values, &v)).then_some(v)
+        } else {
+            None
+        };
+        let new_dress = if let Some(dress) = &self.dress {
+            let d = deduper.dedup_dress(dress);
+            (!Arc::ptr_eq(dress, &d)).then_some(d)
+        } else {
+            None
+        };
+        let new_steps = match &self.steps {
+            Steps::Listed(Listing::CompactGrid(CompactGrid::OneStep(_))) => None,
+            Steps::Listed(Listing::CompactGrid(g)) => {
+                let c = deduper.dedup_compact_grid(g);
+                (!g.ptr_eq(&c)).then_some(Steps::Listed(Listing::CompactGrid(c)))
+            }
+            Steps::Listed(Listing::Grid(g)) if g.can_intern() => {
+                let c = deduper.dedup_grid(g);
+                (!Arc::ptr_eq(g, &c)).then_some(Steps::Listed(Listing::Grid(c)))
+            }
+            _ => None,
+        };
+        if new_values.is_none() && new_dress.is_none() && new_steps.is_none() {
+            return None;
+        }
+        let mut cloned = self.clone();
+        if let Some(v) = new_values {
+            cloned.values = v;
+        }
+        if let Some(d) = new_dress {
+            cloned.dress = Some(d);
+        }
+        if let Some(s) = new_steps {
+            cloned.steps = s;
+        }
+        Some(cloned)
+    }
+
     fn new(period: Fraction, raws: Vec<Raw>, values: Arc<[Value]>) -> Self {
         let in_cycles = lie_in_spans(period, raws.iter().map(Raw::part));
         Self::of_list(period, raws, in_cycles, values)
@@ -2653,11 +3114,6 @@ impl Layer {
     /// A layer of `steps` that hold `values`, with no fold on it.
     fn holding(period: Fraction, steps: Steps, in_cycles: bool, values: Arc<[Value]>) -> Self {
         let data = values.iter().all(|value| value.is_data(0));
-        let values = if data {
-            crate::intern::intern_values(values)
-        } else {
-            values
-        };
         let maps = values.iter().all(|value| matches!(value, Value::Object(_)));
         let flags = (if in_cycles { LAYER_FLAG_IN_CYCLES } else { 0 })
             | (if data { LAYER_FLAG_DATA } else { 0 })
@@ -2750,12 +3206,12 @@ impl Layer {
                     let tail_ok = match &dress.set_map {
                         None => true,
                         Some(entries) => {
-                            let (keys, vals) = entries.parts();
-                            let tail = crate::value::Slice::Builtin(keys, vals);
+                            let keys = entries.keys();
+                            let tail = entries.as_slice();
                             let drops = keys.len() == 1
                                 && crate::controls::builtin_name_str_by_id(keys[0] & 0x03ff)
                                     == Some("value")
-                                && !matches!(vals[0], Value::Undefined);
+                                && !matches!(tail.at(0).1, Value::Undefined);
                             let disjoint = dress.set_marks & key_mark == 0
                                 || tail.position_str(key_str).is_none();
                             !drops && disjoint && tail.all_values_data()
@@ -2774,11 +3230,11 @@ impl Layer {
                     }
                 }
             } else if let Some(entries) = &dress.set_map {
-                let (keys, vals) = entries.parts();
-                let tail = crate::value::Slice::Builtin(keys, vals);
+                let keys = entries.keys();
+                let tail = entries.as_slice();
                 let drops = keys.len() == 1
                     && crate::controls::builtin_name_str_by_id(keys[0] & 0x03ff) == Some("value")
-                    && !matches!(vals[0], Value::Undefined);
+                    && !matches!(tail.at(0).1, Value::Undefined);
                 if !drops
                     && tail.all_values_data()
                     && self.values.iter().all(|value| {
@@ -2790,10 +3246,13 @@ impl Layer {
                                 dress.set_marks & Table::mark(k.as_str()) != 0
                                     && tail.position_str(k.as_str()).is_some()
                             }),
-                            crate::value::Slice::Builtin(hkeys, _) => !hkeys.iter().any(|&hk| {
-                                let hbit = hk >> 10;
-                                dress.set_marks & (1u64 << hbit) != 0 && keys.contains(&hk)
-                            }),
+                            crate::value::Slice::Builtin(hkeys, _)
+                            | crate::value::Slice::Pooled(hkeys, _, _) => {
+                                !hkeys.iter().any(|&hk| {
+                                    let hbit = hk >> 10;
+                                    dress.set_marks & (1u64 << hbit) != 0 && keys.contains(&hk)
+                                })
+                            }
                         })
                     })
                 {
@@ -2834,7 +3293,7 @@ impl Layer {
             .dress
             .as_deref()
             .and_then(|dress| dress.set_map.as_ref())
-            .map_or(0, |entries| entries.parts().0.len());
+            .map_or(0, |entries| entries.keys().len());
         if self.is_direct_keyed() {
             return 1 + tail_len;
         }
@@ -3184,11 +3643,6 @@ impl Layer {
     /// This layer with `values` in the place of its own, one for one.
     fn valued(mut self, values: Arc<[Value]>) -> Self {
         let data = values.iter().all(|value| value.is_data(0));
-        let values = if data {
-            crate::intern::intern_values(values)
-        } else {
-            values
-        };
         self.set_data(data);
         self.set_maps(values.iter().all(|value| matches!(value, Value::Object(_))));
         self.values = values;
@@ -3412,11 +3866,6 @@ impl Layer {
         };
         let mut layer = self.with(|_| {});
         let data = values.iter().all(|value| value.is_data(0));
-        let values = if data {
-            crate::intern::intern_values(values)
-        } else {
-            values
-        };
         layer.set_data(data);
         layer.set_maps(true);
         layer.values = values;
@@ -6758,10 +7207,12 @@ mod tests {
             if !lies_in_cycles(&built(&layers)) {
                 continue;
             }
-            let Node::Stack(patterns) = set.node_kind() else {
-                panic!("{name} is no stack");
+            let second_kind = match set.node_kind() {
+                Node::Stack(patterns) => patterns[1].node_kind(),
+                Node::StackPure(cells) => &cells[1].kind,
+                _ => panic!("{name} is no stack"),
             };
-            let Node::Constants(node) = patterns[1].node_kind() else {
+            let Node::Constants(node) = second_kind else {
                 panic!("the wave of {name} meets no constant");
             };
             let run = &node.1;
@@ -6840,7 +7291,10 @@ mod tests {
         // A list of haps is no data: a query reads it under the runtime.
         let haps = bound(pure(Value::Haps(crate::value::HapList::new(Vec::new()))));
         let kept = stack(vec![built(&sequences()[0].1), haps]);
-        assert!(matches!(kept.node_kind(), Node::Stack(_)));
+        assert!(matches!(
+            kept.node_kind(),
+            Node::Stack(_) | Node::StackPure(_)
+        ));
     }
 
     #[test]

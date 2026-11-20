@@ -127,7 +127,17 @@ fn same_pick_lookup(a: &Option<Arc<PickLookup>>, b: &Option<Arc<PickLookup>>) ->
 impl ContextKeys {
     /// `keys`, sharing nothing when no key is set.
     pub(crate) fn of(keys: Keys) -> Self {
-        Self((!keys.is_empty()).then(|| crate::intern::intern_context_keys(Arc::new(keys))))
+        Self((!keys.is_empty()).then(|| Arc::new(keys)))
+    }
+
+    #[inline]
+    pub(crate) fn as_arc(&self) -> Option<&Arc<Keys>> {
+        self.0.as_ref()
+    }
+
+    #[inline]
+    pub(crate) fn from_arc(keys: Arc<Keys>) -> Self {
+        Self(Some(keys))
     }
 
     #[inline]

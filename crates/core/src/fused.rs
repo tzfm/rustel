@@ -315,15 +315,18 @@ impl StepWave {
     /// enclosing `AppLeft`'s combine/flow (cached once per `ValueReading`).
     pub(crate) fn of_pattern(values: &Pattern) -> Option<Self> {
         let inner = match values.node_kind() {
-            Node::ControlMap(inner, _, false) => inner,
-            Node::MapHapsOwned(boxed) if boxed.2 == SpanUse::Ignores => &boxed.0,
+            Node::ControlMap(cell, flags, _, false) => crate::NodeRef::Plain(cell, *flags),
+            Node::ControlMapBoxed(boxed) if !boxed.2 => crate::NodeRef::Pat(&boxed.0),
+            Node::MapHapsOwned(boxed) if boxed.2 == SpanUse::Ignores => {
+                crate::NodeRef::Pat(&boxed.0)
+            }
             _ => return None,
         };
-        if !Wave::holds_segment(inner) {
+        if !Wave::holds_segment_ref(inner) {
             return None;
         }
         let (inner, key) = ValueSignal::named_key(values)?;
-        let (wave, steps) = Wave::of_steps(inner)?;
+        let (wave, steps) = Wave::of_steps_ref(inner)?;
         Some(Self { key, wave, steps })
     }
 
@@ -642,13 +645,18 @@ impl Wave {
 
     /// `pattern` as a wave, when it is one.
     pub(crate) fn of(pattern: &Pattern) -> Option<Self> {
+        Self::of_ref(crate::NodeRef::Pat(pattern))
+    }
+
+    /// `pattern` as a wave, when it is one.
+    pub(crate) fn of_ref(pattern: crate::NodeRef<'_>) -> Option<Self> {
         Self::read_in(pattern, None, false).map(|(wave, _)| wave)
     }
 
     /// `pattern` as a self-contained inline wave with no bound runtime settings
     /// and a lossless `to_control_pattern` reconstruction (`math_inside` records
     /// whether all arithmetic sits inside or outside the time changes).
-    pub(crate) fn of_inline(pattern: &Pattern) -> Option<(Self, bool)> {
+    pub(crate) fn of_inline_ref(pattern: crate::NodeRef<'_>) -> Option<(Self, bool)> {
         let (wave, math_inside) = Self::read_in(pattern, None, true)?;
         let (_, cut_mask) = wave.times.parts();
         if cut_mask != 0 {
@@ -661,6 +669,49 @@ impl Wave {
         std::ptr::fn_addr_eq(self.body, other.body)
             && self.math.same(&other.math)
             && self.times.same(&other.times)
+    }
+
+    pub(crate) fn hash_intern(&self, state: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        (self.body as usize).hash(state);
+        match &self.math {
+            WaveMath::None => 0u8.hash(state),
+            WaveMath::One(op, v) => {
+                1u8.hash(state);
+                (*op as u8).hash(state);
+                v.to_bits().hash(state);
+            }
+            WaveMath::MulAdd { mul, add } => {
+                2u8.hash(state);
+                mul.to_bits().hash(state);
+                add.to_bits().hash(state);
+            }
+            WaveMath::Boxed(ops) => {
+                3u8.hash(state);
+                ops.len().hash(state);
+                for (op, v) in ops.iter() {
+                    (*op as u8).hash(state);
+                    v.to_bits().hash(state);
+                }
+            }
+        }
+        let (times, cut_mask) = self.times.parts();
+        cut_mask.hash(state);
+        times.len().hash(state);
+        for t in times {
+            match *t {
+                WaveTime::Fast(n, d) => {
+                    0u8.hash(state);
+                    n.hash(state);
+                    d.get().hash(state);
+                }
+                WaveTime::Late(n, d) => {
+                    1u8.hash(state);
+                    n.hash(state);
+                    d.get().hash(state);
+                }
+            }
+        }
     }
 
     /// Rebuild the exact `Node::ControlMap` pattern that this inline wave
@@ -687,19 +738,19 @@ impl Wave {
         } else {
             self.math.apply_to_pattern(apply_times(pat))
         };
-        Pattern::of(Node::ControlMap(pat, key_id, false))
+        Pattern::of(Pattern::control_map_node(pat, key_id, false))
     }
 
     /// `pattern` as a wave read in steps, as a `segment` of one is, with
     /// the count of its steps a cycle.
-    fn of_steps(pattern: &Pattern) -> Option<(Self, u32)> {
+    fn of_steps_ref(pattern: crate::NodeRef<'_>) -> Option<(Self, u32)> {
         let mut steps = None;
         let (wave, _) = Self::read_in(pattern, Some(&mut steps), false)?;
         Some((wave, u32::try_from(steps?).ok()?))
     }
 
     fn read_in(
-        pattern: &Pattern,
+        pattern: crate::NodeRef<'_>,
         steps: Option<&mut Option<i128>>,
         strict_runtime: bool,
     ) -> Option<(Self, Option<bool>)> {
@@ -778,7 +829,7 @@ impl Wave {
     /// outermost first. For a number whose time may cut a cycle of the
     /// query, `number` also takes the count of the changes of time over it.
     fn read(
-        mut pattern: &Pattern,
+        mut pattern: crate::NodeRef<'_>,
         strict_runtime: bool,
         time: &mut dyn FnMut(WaveTime),
         number: &mut dyn FnMut(crate::compose::ComposeOp, f64, usize, Option<usize>),
@@ -795,7 +846,7 @@ impl Wave {
             } else if !pattern.tables_may_answer() {
                 return None;
             }
-            pattern = match pattern.node_kind() {
+            pattern = match pattern.kind() {
                 Node::Signal(signal) => {
                     return (times <= Self::MOST_TIMES)
                         .then(|| crate::number_signal(signal))
@@ -807,12 +858,12 @@ impl Wave {
                     if let Some(steps) = steps.as_deref_mut()
                         && steps.is_none()
                         && times == 0
-                        && let Some((count, functions)) = Self::segment(pattern) =>
+                        && let Some((count, functions)) = Self::segment_ref(pattern) =>
                 {
                     *steps = Some(count);
                     let mut timed = false;
                     let body = Self::read(
-                        functions,
+                        crate::NodeRef::Pat(functions),
                         strict_runtime,
                         &mut |_| timed = true,
                         number,
@@ -824,27 +875,27 @@ impl Wave {
                     cycles_kept &= node.1.numer() == 1;
                     time(WaveTime::fast(node.1)?);
                     times += 1;
-                    &node.0
+                    crate::NodeRef::Pat(&node.0)
                 }
-                Node::FastSmall(pat, numer, denom, _) if *numer > 0 => {
+                Node::FastSmall(cell, flags, numer, denom, _) if *numer > 0 => {
                     let factor = Fraction::new(i128::from(*numer), i128::from(*denom));
                     cycles_kept &= factor.numer() == 1;
                     time(WaveTime::fast(factor)?);
                     times += 1;
-                    pat
+                    crate::NodeRef::Plain(cell, *flags)
                 }
                 Node::Shift(node) => {
                     cycles_kept &= node.1.denom() == 1;
                     time(WaveTime::late(node.1)?);
                     times += 1;
-                    &node.0
+                    crate::NodeRef::Pat(&node.0)
                 }
-                Node::ShiftSmall(pat, numer, denom, _) => {
+                Node::ShiftSmall(cell, flags, numer, denom, _) => {
                     let offset = Fraction::new(i128::from(*numer), i128::from(*denom));
                     cycles_kept &= offset.denom() == 1;
                     time(WaveTime::late(offset)?);
                     times += 1;
-                    pat
+                    crate::NodeRef::Plain(cell, *flags)
                 }
                 // A run of numbers, the last application first.
                 Node::Constants(node) => {
@@ -853,7 +904,7 @@ impl Wave {
                         op.of_numbers(0.0, 0.0)?;
                         number(op, other, times, (!cycles_kept).then_some(times));
                     }
-                    &node.0
+                    crate::NodeRef::Pat(&node.0)
                 }
                 // A `pure` of a number answers the number in every cycle,
                 // on a hap that carries nothing more: no place in the
@@ -880,7 +931,7 @@ impl Wave {
                         return None;
                     }
                     number(*op, *other, times, (!cycles_kept).then_some(times));
-                    functions
+                    crate::NodeRef::Pat(functions)
                 }
                 _ => return None,
             };
@@ -889,27 +940,27 @@ impl Wave {
 
     /// Whether `pattern` is a run of numbers over a `segment`, by its kinds
     /// alone.
-    fn holds_segment(mut pattern: &Pattern) -> bool {
+    fn holds_segment_ref(mut pattern: crate::NodeRef<'_>) -> bool {
         // A `range` is a run of constants, or two applications of one.
         for _ in 0..Self::MOST_TIMES {
-            pattern = match pattern.node_kind() {
-                Node::Constants(node) => &node.0,
-                Node::AppLeft(pair) => &pair.0,
+            pattern = match pattern.kind() {
+                Node::Constants(node) => crate::NodeRef::Pat(&node.0),
+                Node::AppLeft(pair) => crate::NodeRef::Pat(&pair.0),
                 _ => break,
             };
         }
-        matches!(pattern.node_kind(), Node::FilterValues(boxed) if matches!(boxed.0.node_kind(), Node::AppRight(..)))
+        matches!(pattern.kind(), Node::FilterValues(boxed) if matches!(boxed.0.node_kind(), Node::AppRight(..)))
     }
 
     /// The count of steps and the pattern of the signal, when `pattern` is a
     /// `segment` that holds nothing but its values: a pulse with no place in
     /// the text and a value that keeps the hap of the signal.
-    fn segment(pattern: &Pattern) -> Option<(i128, &Pattern)> {
+    fn segment_ref(pattern: crate::NodeRef<'_>) -> Option<(i128, &Pattern)> {
         if is_unfused() {
             return None;
         }
         let functions = pattern.under_structure()?;
-        let Node::FilterValues(boxed) = pattern.node_kind() else {
+        let Node::FilterValues(boxed) = pattern.kind() else {
             return None;
         };
         let structured = &boxed.0;
