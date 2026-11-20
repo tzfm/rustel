@@ -104,7 +104,7 @@ fn describe(hap: &Hap) -> String {
         hap.scale_definition_context(),
         hap.tags_context(),
         hap.log_line(),
-        hap.live_controls,
+        hap.live_controls(),
         hap.ui_visuals_context(),
     )
 }

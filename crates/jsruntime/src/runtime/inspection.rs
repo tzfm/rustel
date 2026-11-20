@@ -553,7 +553,7 @@ impl JsRuntime {
             return out;
         }
         if self.bounded_evaluation_interrupted() {
-            if self.cancelled.get() {
+            if self.bridge.get().is_some_and(|b| b.cancelled.get()) {
                 // The identical AtomicBool is installed in core's
                 // `with_cancellation`, so the core boundary returns its typed
                 // Cancelled variant before considering any ordinary error.

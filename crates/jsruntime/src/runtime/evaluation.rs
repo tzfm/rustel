@@ -205,12 +205,13 @@ impl JsRuntime {
                 self.slot.set(self.previous);
             }
         }
-        self.cancelled.set(false);
-        let previous = self
+        let bridge = self.bridge();
+        bridge.cancelled.set(false);
+        let previous = bridge
             .cancel_flag
             .replace(cancellation.map(|flag| flag as *const _));
         let _cancellation_guard = CancellationGuard {
-            slot: self.cancel_flag.clone(),
+            slot: bridge.cancel_flag.clone(),
             previous,
             _borrow: std::marker::PhantomData,
         };
@@ -244,20 +245,20 @@ impl JsRuntime {
                         let interruption = || {
                             if cancellation.is_some_and(|flag| {
                                 flag.load(std::sync::atomic::Ordering::Relaxed)
-                            }) || self.cancelled.get()
+                            }) || bridge.cancelled.get()
                             {
-                                self.cancelled.set(true);
+                                bridge.cancelled.set(true);
                                 return Some(QueryError::Limit(
                                     rustel_core::QueryLimit::Cancelled,
                                 ));
                             }
                             if self.was_interrupted()
-                                || self
+                                || bridge
                                     .deadline
                                     .get()
                                     .is_some_and(|at| std::time::Instant::now() >= at)
                             {
-                                self.interrupted.set(true);
+                                bridge.interrupted.set(true);
                                 return Some(deadline_error());
                             }
                             None
@@ -779,6 +780,7 @@ impl JsRuntime {
                         if finished_value.is_undefined()
                             && stage_candidate
                             && self
+                                .bridge()
                                 .effect_transaction
                                 .borrow()
                                 .written()
@@ -965,7 +967,7 @@ impl JsRuntime {
                         "bounded score evaluation was interrupted".into(),
                     ));
                 }
-                if let Some(policy) = self.effect_policy_refusal.borrow().clone() {
+                if let Some(policy) = self.bridge().effect_policy_refusal.borrow().clone() {
                     // A nested query can be the first place an out-of-scope
                     // setter is reached, and its public query binding returns
                     // a fallback string. The operation-tree latch still
@@ -977,7 +979,8 @@ impl JsRuntime {
                 // of the score.
                 let plugins = frame.take_plugin_names();
                 if !plugins.is_empty()
-                    && let Some(effects) = self.effect_transaction.borrow_mut().effects_mut()
+                    && let Some(effects) =
+                        self.bridge().effect_transaction.borrow_mut().effects_mut()
                 {
                     effects.plugins = plugins;
                 }
@@ -1069,7 +1072,7 @@ impl JsRuntime {
     /// never reconstructed from a bare Rust Pattern.
     pub(super) fn commit_staged_score(&self, millis: u64) -> Result<(), QueryError> {
         let interrupted = || {
-            if self.cancelled.get() {
+            if self.bridge.get().is_some_and(|b| b.cancelled.get()) {
                 QueryError::Limit(rustel_core::QueryLimit::Cancelled)
             } else {
                 QueryError::Limit(rustel_core::QueryLimit::JsCpuDeadline { millis })
@@ -1135,7 +1138,7 @@ impl JsRuntime {
             }
             if heap_exhausted {
                 Err(QueryError::Limit(rustel_core::QueryLimit::HostMemory))
-            } else if self.cancelled.get() {
+            } else if self.bridge.get().is_some_and(|b| b.cancelled.get()) {
                 Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled))
             } else if self.was_interrupted() {
                 Err(QueryError::Limit(rustel_core::QueryLimit::JsCpuDeadline {
@@ -1321,10 +1324,10 @@ impl JsRuntime {
             && !cancellation.load(std::sync::atomic::Ordering::Relaxed)
         {
             tried_native = true;
-            struct PolicyGuard<'a>(&'a Cell<EffectPolicy>, EffectPolicy);
+            struct PolicyGuard<'a>(&'a JsRuntime, EffectPolicy);
             impl Drop for PolicyGuard<'_> {
                 fn drop(&mut self) {
-                    self.0.set(self.1);
+                    self.0.replace_effect_policy(self.1);
                 }
             }
             let policy = if allow_score_effects {
@@ -1332,8 +1335,7 @@ impl JsRuntime {
             } else {
                 EffectPolicy::NONE
             };
-            let _policy_guard =
-                PolicyGuard(&self.effect_policy, self.effect_policy.replace(policy));
+            let _policy_guard = PolicyGuard(self, self.replace_effect_policy(policy));
             let native = self.core_settings.with(|| {
                 let _published_owner = self.core_settings.bind();
                 self.native_score(program, Some(source))
@@ -1453,12 +1455,13 @@ impl JsRuntime {
             }
         }
 
-        self.cancelled.set(false);
-        let previous = self
+        let bridge = self.bridge();
+        bridge.cancelled.set(false);
+        let previous = bridge
             .cancel_flag
             .replace(Some(cancellation as *const std::sync::atomic::AtomicBool));
         let _cancellation_guard = CancellationGuard {
-            slot: self.cancel_flag.clone(),
+            slot: bridge.cancel_flag.clone(),
             previous,
             _borrow: std::marker::PhantomData,
         };
@@ -1508,7 +1511,7 @@ impl JsRuntime {
                         )),
                     }
                 });
-                if self.cancelled.get() {
+                if bridge.cancelled.get() {
                     Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled))
                 } else if self.was_interrupted() {
                     Err(QueryError::Limit(rustel_core::QueryLimit::JsCpuDeadline {

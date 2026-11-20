@@ -426,7 +426,7 @@ impl JsRuntime {
     /// wrapper holds it, so the stage runs no step of the realm.
     pub(super) fn stage_native(&self, score: NativeScore) -> Result<(), QueryError> {
         if let Some(cps) = score.cps {
-            let mut transaction = self.effect_transaction.borrow_mut();
+            let mut transaction = self.bridge().effect_transaction.borrow_mut();
             let effects = transaction.effects_mut().ok_or_else(|| {
                 QueryError::Message("a native score set its tempo outside a score turn".into())
             })?;
@@ -707,7 +707,7 @@ impl<'p> Turn<'p> {
                 };
                 let cps = if per_minute { value / 60.0 } else { *value };
                 if self.compiling()
-                    || !runtime.effect_policy.get().allows(EffectPolicy::TEMPO)
+                    || !runtime.effect_policy().allows(EffectPolicy::TEMPO)
                     || !cps.is_finite()
                     || cps <= 0.0
                 {

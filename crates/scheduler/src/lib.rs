@@ -2182,8 +2182,8 @@ impl Scheduler {
                 duration,
                 target_time,
                 cps: self.tempo.pattern_cps_at(whole.begin),
+                live_controls: hap.live_controls(),
                 value: hap.value,
-                live_controls: hap.live_controls,
                 ui_visuals,
                 log_line,
             });

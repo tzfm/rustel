@@ -15,9 +15,9 @@ impl InputOpener {
         Self {
             bus: runtime.midi_input_bus(),
             handles: Rc::clone(runtime.midi_handles()),
-            transaction: Rc::clone(&runtime.effect_transaction),
-            policy: Rc::clone(&runtime.effect_policy),
-            refusal: Rc::clone(&runtime.effect_policy_refusal),
+            transaction: Rc::clone(&runtime.bridge().effect_transaction),
+            policy: Rc::clone(&runtime.bridge().effect_policy),
+            refusal: Rc::clone(&runtime.bridge().effect_policy_refusal),
         }
     }
 

@@ -72,6 +72,39 @@ impl TimeSpan {
         Self { begin, end }
     }
 
+    /// Splits the span at cycle boundaries, passing each piece to `visit`
+    /// without heap allocation. Returns `false` if the span exceeds
+    /// [`MAX_QUERY_SPAN_CYCLES`] (after publishing the typed refusal).
+    pub(crate) fn for_each_cycle(&self, mut visit: impl FnMut(TimeSpan)) -> bool {
+        let mut begin = self.begin;
+        let end = self.end;
+        if begin == end {
+            visit(TimeSpan::new(begin, end));
+            return true;
+        }
+        let Some(count) = self
+            .cycle_count()
+            .filter(|count| *count <= MAX_QUERY_SPAN_CYCLES)
+        else {
+            refuse(QueryLimit::QuerySpan {
+                cycles: MAX_QUERY_SPAN_CYCLES,
+            });
+            return false;
+        };
+        let _ = count;
+        let end_sam = end.sam();
+        while end > begin {
+            if begin.sam() == end_sam {
+                visit(TimeSpan::new(begin, end));
+                break;
+            }
+            let next_begin = begin.next_sam();
+            visit(TimeSpan::new(begin, next_begin));
+            begin = next_begin;
+        }
+        true
+    }
+
     /// Splits the span at cycle boundaries.
     pub fn span_cycles(&self) -> Vec<TimeSpan> {
         let mut begin = self.begin;
@@ -382,20 +415,13 @@ pub struct Hap {
     /// Source spans, concatenated on every bind. Drives editor highlighting,
     /// so it must survive every combinator that carries context.
     pub context: Locations,
-    /// Direct live slider bindings: gain, low-pass cutoff, low-pass
-    /// resonance, then the direct FM route's index. Zero is unbound.
-    /// These are host tokens, never score values or source-location guesses.
-    pub live_controls: [u64; 4],
-    slider_binding: u64,
-    ui_visuals: u64,
-    /// Exact JavaScript lookup shape (holes, length, enumerable keys) when the
-    /// visible value alone cannot represent it. Nested Patterns also live in
-    /// `value`; this side channel is shape metadata, not their only owner.
-    pick_lookup: Option<Arc<PickLookup>>,
-    /// `scale`, `edoSize`, `scaleDefinition`, `tags` and `logLine`. A merge
-    /// keeps the extending side's key. See [`ContextKeys::merge`].
+    /// Optional per-hap metadata (`scale`, `edoSize`, `scaleDefinition`,
+    /// `tags`, `logLine`, live slider bindings, visual slots, and JS lookup
+    /// shape). Most haps carry none, so this stays a null pointer.
     keys: ContextKeys,
 }
+
+const _: () = assert!(std::mem::size_of::<Hap>() == 192);
 
 /// Read a `tags` key off a JS context object: an array of strings, anything
 /// else ignored. A score that somehow writes a non-array there loses the tag,
@@ -422,10 +448,6 @@ impl Hap {
             part,
             value,
             context: Locations::new(),
-            live_controls: [0; 4],
-            slider_binding: 0,
-            ui_visuals: 0,
-            pick_lookup: None,
             keys: ContextKeys::default(),
         }
     }
@@ -443,17 +465,65 @@ impl Hap {
             part,
             value,
             context,
-            live_controls: [0; 4],
-            slider_binding: 0,
-            ui_visuals: 0,
-            pick_lookup: None,
             keys,
         }
     }
 
     fn with_pick_lookup(mut self, lookup: Arc<PickLookup>) -> Self {
-        self.pick_lookup = Some(lookup);
+        self.keys.edit().pick_lookup = Some(lookup);
         self
+    }
+
+    /// Direct live slider bindings: gain, low-pass cutoff, low-pass resonance,
+    /// then the direct FM route's index. Zero is unbound.
+    #[inline]
+    pub fn live_controls(&self) -> [u64; 4] {
+        self.keys.get().live_controls
+    }
+
+    #[inline]
+    pub(crate) fn slider_binding(&self) -> u64 {
+        self.keys.get().slider_binding
+    }
+
+    #[inline]
+    pub(crate) fn set_live_control(&mut self, slot: usize, binding: u64) {
+        if binding == 0 && self.keys.is_empty() {
+            return;
+        }
+        self.keys.edit().live_controls[slot] = binding;
+        if binding == 0 {
+            self.keys.trim();
+        }
+    }
+
+    #[inline]
+    fn set_live_bindings(&mut self, live_controls: [u64; 4], slider_binding: u64) {
+        if live_controls == [0; 4] && slider_binding == 0 {
+            if !self.keys.is_empty() {
+                let keys = self.keys.get();
+                if keys.live_controls != [0; 4] || keys.slider_binding != 0 {
+                    let edit = self.keys.edit();
+                    edit.live_controls = [0; 4];
+                    edit.slider_binding = 0;
+                    self.keys.trim();
+                }
+            }
+            return;
+        }
+        let edit = self.keys.edit();
+        edit.live_controls = live_controls;
+        edit.slider_binding = slider_binding;
+    }
+
+    #[inline]
+    fn clear_live_bindings(&mut self) {
+        self.set_live_bindings([0; 4], 0);
+    }
+
+    #[inline]
+    fn pick_lookup_arc(&self) -> Option<Arc<PickLookup>> {
+        self.keys.get().pick_lookup.clone()
     }
 
     /// `hap.context.scale`, exactly as `.scale()` tagged it.
@@ -529,23 +599,28 @@ impl Hap {
     }
 
     pub fn ui_visuals_context(&self) -> u64 {
-        self.ui_visuals
+        self.keys.get().ui_visuals
     }
 
     pub fn with_ui_visual_slot(mut self, slot: u8) -> Self {
         if slot < 64 {
-            self.ui_visuals |= 1_u64 << slot;
+            self.keys.edit().ui_visuals |= 1_u64 << slot;
         }
         self
     }
 
     fn with_ui_visuals_context(mut self, visuals: u64) -> Self {
-        self.ui_visuals = visuals;
+        if visuals != 0 || !self.keys.is_empty() {
+            self.keys.edit().ui_visuals = visuals;
+            if visuals == 0 {
+                self.keys.trim();
+            }
+        }
         self
     }
 
     pub fn pick_lookup(&self) -> Option<&PickLookup> {
-        self.pick_lookup.as_deref()
+        self.keys.get().pick_lookup.as_deref()
     }
 
     pub fn whole_or_part(&self) -> TimeSpan {
@@ -617,10 +692,6 @@ impl Hap {
             part: f(&self.part),
             value: self.value.clone(),
             context: self.context.clone(),
-            ui_visuals: self.ui_visuals,
-            live_controls: self.live_controls,
-            slider_binding: self.slider_binding,
-            pick_lookup: self.pick_lookup.clone(),
             keys: self.keys.clone(),
         }
     }
@@ -711,35 +782,48 @@ impl Hap {
     pub fn combine_context(&self, other: &Hap) -> Hap {
         let mut context = self.context.clone();
         context.append(&other.context);
+        let keys = ContextKeys::merge_with(
+            &other.keys,
+            &self.keys,
+            self.live_controls(),
+            self.slider_binding(),
+            self.pick_lookup_arc(),
+        );
         Hap {
             whole: self.whole,
             part: self.part,
             value: self.value.clone(),
             context,
-            ui_visuals: self.ui_visuals | other.ui_visuals,
-            live_controls: self.live_controls,
-            slider_binding: self.slider_binding,
-            pick_lookup: self.pick_lookup.clone(),
-            keys: ContextKeys::merge(&other.keys, &self.keys),
+            keys,
         }
     }
 
     pub fn with_value(&self, f: impl Fn(&Value) -> Value) -> Hap {
         let value = f(&self.value);
+        let keys = if self.keys.is_empty() {
+            ContextKeys::NONE
+        } else {
+            let mut keys = self.keys.clone();
+            let k = keys.get();
+            let drop_lookup = k.pick_lookup.is_some() && value != self.value;
+            let clear_live = k.live_controls != [0; 4] || k.slider_binding != 0;
+            if drop_lookup || clear_live {
+                let edit = keys.edit();
+                if drop_lookup {
+                    edit.pick_lookup = None;
+                }
+                edit.live_controls = [0; 4];
+                edit.slider_binding = 0;
+                keys.trim();
+            }
+            keys
+        };
         Hap {
             whole: self.whole,
             part: self.part,
-            pick_lookup: self
-                .pick_lookup
-                .as_ref()
-                .filter(|_| value == self.value)
-                .cloned(),
             value,
             context: self.context.clone(),
-            live_controls: [0; 4],
-            slider_binding: 0,
-            ui_visuals: self.ui_visuals,
-            keys: self.keys.clone(),
+            keys,
         }
     }
 
@@ -753,53 +837,62 @@ impl Hap {
     /// [`Self::map_value`] without moving the hap.
     fn map_value_in_place(&mut self, f: impl FnOnce(&Value) -> Value) {
         let value = f(&self.value);
-        if self.pick_lookup.is_some() && value != self.value {
-            self.pick_lookup = None;
+        if !self.keys.is_empty() {
+            let k = self.keys.get();
+            let drop_lookup = k.pick_lookup.is_some() && value != self.value;
+            let clear_live = k.live_controls != [0; 4] || k.slider_binding != 0;
+            if drop_lookup || clear_live {
+                let edit = self.keys.edit();
+                if drop_lookup {
+                    edit.pick_lookup = None;
+                }
+                edit.live_controls = [0; 4];
+                edit.slider_binding = 0;
+                self.keys.trim();
+            }
         }
         self.value = value;
-        self.live_controls = [0; 4];
-        self.slider_binding = 0;
     }
 
     /// The owned hap with a new value and the same live control bindings.
     /// Public because a caller that interns an [`OwnedHapMapFn`] for
     /// [`Pattern::fmap_keeping_live_with`] must keep exactly these
     /// semantics.
-    pub fn into_value_keeping_live(self, value: Value) -> Hap {
-        Hap {
-            whole: self.whole,
-            part: self.part,
+    pub fn into_value_keeping_live(mut self, value: Value) -> Hap {
+        if self.keys.get().pick_lookup.is_some() {
             // The lookup shape was of the value before the change.
-            pick_lookup: None,
-            value,
-            context: self.context,
-            live_controls: self.live_controls,
-            slider_binding: self.slider_binding,
-            ui_visuals: self.ui_visuals,
-            keys: self.keys,
+            self.keys.edit().pick_lookup = None;
+            self.keys.trim();
         }
+        self.value = value;
+        self
     }
 
     fn without_live_controls(mut self) -> Self {
-        self.live_controls = [0; 4];
-        self.slider_binding = 0;
+        self.clear_live_bindings();
         self
     }
 
     /// Trusted pitch rewrites can carry named audio controls unchanged.
     /// A raw slider value still loses its identity when its pitch changes.
     fn with_pitch_live_controls(mut self, input: &Hap) -> Self {
-        self.live_controls = [0; 4];
-        self.slider_binding = 0;
-        for (index, key) in ["gain", "cutoff", "resonance", "fmi"]
-            .into_iter()
-            .enumerate()
-        {
-            if input.live_controls[index] != 0
-                && let Some(before) = input.value.get(key).and_then(Value::as_f64)
-                && self.value.get(key).and_then(Value::as_f64) == Some(before)
+        self.clear_live_bindings();
+        let input_live = input.live_controls();
+        if input_live != [0; 4] {
+            let mut kept = [0; 4];
+            for (index, key) in ["gain", "cutoff", "resonance", "fmi"]
+                .into_iter()
+                .enumerate()
             {
-                self.live_controls[index] = input.live_controls[index];
+                if input_live[index] != 0
+                    && let Some(before) = input.value.get(key).and_then(Value::as_f64)
+                    && self.value.get(key).and_then(Value::as_f64) == Some(before)
+                {
+                    kept[index] = input_live[index];
+                }
+            }
+            if kept != [0; 4] {
+                self.keys.edit().live_controls = kept;
             }
         }
         self
@@ -807,11 +900,12 @@ impl Hap {
 
     fn with_unchanged_live_controls(self, input: &Hap) -> Self {
         let mut mapped = self.with_pitch_live_controls(input);
-        if input.slider_binding != 0
+        let binding = input.slider_binding();
+        if binding != 0
             && let Some(before) = input.value.as_f64()
             && mapped.value.as_f64() == Some(before)
         {
-            mapped.slider_binding = input.slider_binding;
+            mapped.keys.edit().slider_binding = binding;
         }
         mapped
     }
@@ -903,23 +997,26 @@ fn joined_hap(outer: &Hap, inner: Hap, whole: Option<TimeSpan>) -> Hap {
     let pick_lookup = joined_pick_lookup(outer, &inner);
     let mut context = outer.context.clone();
     context.append(&inner.context);
+    let keys = ContextKeys::merge_with(
+        &inner.keys,
+        &outer.keys,
+        inner.live_controls(),
+        inner.slider_binding(),
+        pick_lookup,
+    );
     Hap {
         whole,
         part: inner.part,
-        pick_lookup,
-        keys: ContextKeys::merge(&inner.keys, &outer.keys),
         value: inner.value,
         context,
-        ui_visuals: outer.ui_visuals | inner.ui_visuals,
-        live_controls: inner.live_controls,
-        slider_binding: inner.slider_binding,
+        keys,
     }
 }
 
 fn joined_pick_lookup(outer: &Hap, inner: &Hap) -> Option<Arc<PickLookup>> {
-    inner.pick_lookup.clone().or_else(|| {
-        (outer.pick_lookup.is_some() && inner.value == outer.value)
-            .then(|| outer.pick_lookup.clone())
+    inner.pick_lookup_arc().or_else(|| {
+        (outer.keys.get().pick_lookup.is_some() && inner.value == outer.value)
+            .then(|| outer.pick_lookup_arc())
             .flatten()
     })
 }
@@ -4158,11 +4255,7 @@ fn query_weight_sequence(cumulative: &[Pattern], state: &State) -> Vec<Hap> {
                         part: inner.part,
                         value: Value::list(values),
                         context,
-                        ui_visuals: inner.ui_visuals | outer.ui_visuals,
-                        live_controls: [0; 4],
-                        slider_binding: 0,
-                        pick_lookup: None,
-                        keys: ContextKeys::merge(&inner.keys, &outer.keys),
+                        keys: ContextKeys::merge_with(&inner.keys, &outer.keys, [0; 4], 0, None),
                     },
                 ) {
                     return Vec::new();
@@ -4185,7 +4278,6 @@ struct WChooseCarrier {
     outer_whole: Option<TimeSpan>,
     part: TimeSpan,
     context: Locations,
-    ui_visuals: u64,
     keys: ContextKeys,
 }
 
@@ -4293,12 +4385,18 @@ fn query_wchoose(
                     outer_whole,
                     part,
                     context: outer_context,
-                    ui_visuals: weights_hap.ui_visuals
-                        | total_hap.ui_visuals
-                        | random_hap.ui_visuals,
-                    keys: ContextKeys::merge(
+                    keys: ContextKeys::merge_with(
                         &weights_hap.keys,
-                        &ContextKeys::merge(&total_hap.keys, &random_hap.keys),
+                        &ContextKeys::merge_with(
+                            &total_hap.keys,
+                            &random_hap.keys,
+                            [0; 4],
+                            0,
+                            None,
+                        ),
+                        [0; 4],
+                        0,
+                        None,
                     ),
                 });
             }
@@ -4331,13 +4429,9 @@ fn query_wchoose(
                         carrier.outer_whole
                     },
                     part: chosen.part,
-                    pick_lookup: chosen.pick_lookup.clone(),
                     keys: ContextKeys::merge(&chosen.keys, &carrier.keys),
                     value: chosen.value,
                     context,
-                    ui_visuals: chosen.ui_visuals | carrier.ui_visuals,
-                    live_controls: chosen.live_controls,
-                    slider_binding: chosen.slider_binding,
                 },
             ) {
                 return Vec::new();
@@ -4569,8 +4663,7 @@ impl PickLookup {
         // Object.assign order: left first, right wins.
         for source in [left, right] {
             let Some(Self::Object { entries: exact, .. }) = source
-                .pick_lookup
-                .as_deref()
+                .pick_lookup()
                 .cloned()
                 .or_else(|| Self::from_value(&source.value))
             else {
@@ -4607,8 +4700,8 @@ fn scoped_pick_lookup(mut lookup: PickLookup) -> Option<Arc<PickLookup>> {
 /// the merged member. `same_key` compares bits, so a zero of the other sign
 /// keeps the eager path.
 fn set_lookup_follows_value(value: &Value, left: &Hap, right: &Hap) -> bool {
-    if left.pick_lookup.is_some()
-        || right.pick_lookup.is_some()
+    if left.pick_lookup().is_some()
+        || right.pick_lookup().is_some()
         || value.has_js_function()
         // A string gives one lookup entry for each character.
         || matches!(left.value, Value::Str(_))
@@ -4641,12 +4734,12 @@ fn applied_pick_lookup(
 ) -> Option<Arc<PickLookup>> {
     match flow {
         LookupFlow::Left => {
-            let lookup = left.pick_lookup.as_ref()?;
-            (value == &left.value).then(|| lookup.clone())
+            let lookup = left.pick_lookup_arc()?;
+            (value == &left.value).then_some(lookup)
         }
         LookupFlow::Right => {
-            let lookup = right.pick_lookup.as_ref()?;
-            (value == &right.value).then(|| lookup.clone())
+            let lookup = right.pick_lookup_arc()?;
+            (value == &right.value).then_some(lookup)
         }
         LookupFlow::Set => {
             // A pick derives this lookup from the value. Plain data needs no
@@ -4655,23 +4748,23 @@ fn applied_pick_lookup(
                 return None;
             }
             if value == &right.value {
-                right.pick_lookup.clone()
+                right.pick_lookup_arc()
             } else {
                 PickLookup::set_object(left, right, value).or_else(|| {
                     (value == &left.value)
-                        .then(|| left.pick_lookup.clone())
+                        .then(|| left.pick_lookup_arc())
                         .flatten()
                 })
             }
         }
         LookupFlow::Infer | LookupFlow::Add | LookupFlow::LeftControls => {
-            if left.pick_lookup.is_none() && right.pick_lookup.is_none() {
+            if left.pick_lookup().is_none() && right.pick_lookup().is_none() {
                 return None;
             }
             if value == &left.value {
-                left.pick_lookup.clone()
+                left.pick_lookup_arc()
             } else if value == &right.value {
-                right.pick_lookup.clone()
+                right.pick_lookup_arc()
             } else {
                 None
             }
@@ -4681,27 +4774,31 @@ fn applied_pick_lookup(
 
 /// Provenance follows semantic ownership, never equality of sampled numbers.
 fn applied_live_controls(flow: LookupFlow, left: &Hap, right: &Hap) -> ([u64; 4], u64) {
+    if left.keys.is_empty() && right.keys.is_empty() {
+        return ([0; 4], 0);
+    }
     match flow {
-        LookupFlow::Left => (left.live_controls, left.slider_binding),
-        LookupFlow::LeftControls => (left.live_controls, 0),
-        LookupFlow::Right => (right.live_controls, right.slider_binding),
+        LookupFlow::Left => (left.live_controls(), left.slider_binding()),
+        LookupFlow::LeftControls => (left.live_controls(), 0),
+        LookupFlow::Right => (right.live_controls(), right.slider_binding()),
         LookupFlow::Set => {
             // Opaque objects can run score code when materialized. Refuse the
             // optional binding rather than inspecting them a second time.
             if matches!(left.value, Value::JsValue(_)) || matches!(right.value, Value::JsValue(_)) {
                 return ([0; 4], 0);
             }
+            let right_live = right.live_controls();
             if !matches!(
                 (&left.value, &right.value),
                 (Value::Object(_), _) | (_, Value::Object(_))
             ) {
-                return (right.live_controls, right.slider_binding);
+                return (right_live, right.slider_binding());
             }
-            let mut bindings = left.live_controls;
+            let mut bindings = left.live_controls();
             if let Value::Object(values) = &right.value {
                 for (key, _) in values {
                     if let Some(slot) = controls::live_slot(key.as_str()) {
-                        bindings[slot] = right.live_controls[slot];
+                        bindings[slot] = right_live[slot];
                     }
                 }
             }
@@ -4725,16 +4822,19 @@ fn applied_hap(
     let mut context = hv.context.clone();
     context.append(&hf.context);
     let met = Meeting::of(hf, hv, apply, flow);
+    let keys = ContextKeys::merge_with(
+        &hf.keys,
+        &hv.keys,
+        met.live_controls,
+        met.slider_binding,
+        met.pick_lookup,
+    );
     Hap {
         whole,
         part,
         value: met.value,
         context,
-        ui_visuals: hf.ui_visuals | hv.ui_visuals,
-        live_controls: met.live_controls,
-        slider_binding: met.slider_binding,
-        pick_lookup: met.pick_lookup,
-        keys: ContextKeys::merge(&hf.keys, &hv.keys),
+        keys,
     }
 }
 
@@ -4779,10 +4879,10 @@ impl Meeting {
             Self::of(&met, &constant, &set, flow).settle(&mut met);
         }
         Self {
+            pick_lookup: met.pick_lookup_arc(),
+            live_controls: met.live_controls(),
+            slider_binding: met.slider_binding(),
             value: met.value,
-            pick_lookup: met.pick_lookup,
-            live_controls: met.live_controls,
-            slider_binding: met.slider_binding,
         }
     }
 
@@ -4809,34 +4909,42 @@ impl Meeting {
         let Some(op) = apply.in_place_op() else {
             return false;
         };
-        if hf.pick_lookup.is_some() || !Self::values_meet_in_place(&hf.value, value, apply, flow) {
+        if hf.pick_lookup().is_some() || !Self::values_meet_in_place(&hf.value, value, apply, flow)
+        {
             return false;
         }
-        let (live_controls, slider_binding) = match flow {
-            LookupFlow::Left => (hf.live_controls, hf.slider_binding),
-            LookupFlow::LeftControls => (hf.live_controls, 0),
-            LookupFlow::Right | LookupFlow::Infer | LookupFlow::Add => ([0; 4], 0),
-            LookupFlow::Set => {
-                if hf.live_controls == [0; 4]
-                    || !matches!(
-                        (&hf.value, value),
-                        (Value::Object(_), _) | (_, Value::Object(_))
-                    )
-                {
-                    ([0; 4], 0)
-                } else {
-                    let mut bindings = hf.live_controls;
-                    if let Value::Object(values) = value {
-                        for (key, _) in values {
-                            if let Some(slot) = controls::live_slot(key.as_str()) {
-                                bindings[slot] = 0;
+        if !hf.keys.is_empty() {
+            let hf_live = hf.live_controls();
+            let hf_binding = hf.slider_binding();
+            if hf_live != [0; 4] || hf_binding != 0 {
+                let (live_controls, slider_binding) = match flow {
+                    LookupFlow::Left => (hf_live, hf_binding),
+                    LookupFlow::LeftControls => (hf_live, 0),
+                    LookupFlow::Right | LookupFlow::Infer | LookupFlow::Add => ([0; 4], 0),
+                    LookupFlow::Set => {
+                        if hf_live == [0; 4]
+                            || !matches!(
+                                (&hf.value, value),
+                                (Value::Object(_), _) | (_, Value::Object(_))
+                            )
+                        {
+                            ([0; 4], 0)
+                        } else {
+                            let mut bindings = hf_live;
+                            if let Value::Object(values) = value {
+                                for (key, _) in values {
+                                    if let Some(slot) = controls::live_slot(key.as_str()) {
+                                        bindings[slot] = 0;
+                                    }
+                                }
                             }
+                            (bindings, 0)
                         }
                     }
-                    (bindings, 0)
-                }
+                };
+                hf.set_live_bindings(live_controls, slider_binding);
             }
-        };
+        }
         compose::compose_data_in_place(op, &mut hf.value, value);
         hf.part = part;
         if !context.is_empty() {
@@ -4844,8 +4952,6 @@ impl Meeting {
             merged.append(&hf.context);
             hf.context = merged;
         }
-        hf.live_controls = live_controls;
-        hf.slider_binding = slider_binding;
         true
     }
 
@@ -4862,7 +4968,12 @@ impl Meeting {
         if !Self::meets_in_place(hf, hv, apply, flow) {
             return false;
         }
-        let (live_controls, slider_binding) = applied_live_controls(flow, hf, hv);
+        let has_keys = !hf.keys.is_empty() || !hv.keys.is_empty();
+        let (live_controls, slider_binding) = if has_keys {
+            applied_live_controls(flow, hf, hv)
+        } else {
+            ([0; 4], 0)
+        };
         compose::compose_data_in_place(op, &mut hf.value, &hv.value);
         hf.part = part;
         // The value side's locations come first.
@@ -4871,10 +4982,10 @@ impl Meeting {
             context.append(&hf.context);
             hf.context = context;
         }
-        hf.keys = ContextKeys::merge(&hf.keys, &hv.keys);
-        hf.ui_visuals |= hv.ui_visuals;
-        hf.live_controls = live_controls;
-        hf.slider_binding = slider_binding;
+        if has_keys {
+            hf.keys =
+                ContextKeys::merge_with(&hf.keys, &hv.keys, live_controls, slider_binding, None);
+        }
         true
     }
 
@@ -4896,11 +5007,13 @@ impl Meeting {
         let Value::F64(number) = hv.value else {
             return false;
         };
-        let driven = hv.slider_binding != 0 || hv.live_controls != [0; 4];
-        if driven
-            || hv.pick_lookup.is_some()
-            || !Self::set_number_in_place(hf, key, number, part, apply, flow)
-        {
+        if !hv.keys.is_empty() {
+            let k = hv.keys.get();
+            if k.slider_binding != 0 || k.live_controls != [0; 4] || k.pick_lookup.is_some() {
+                return false;
+            }
+        }
+        if !Self::set_number_in_place(hf, key, number, part, apply, flow) {
             return false;
         }
         // The value side's locations come first.
@@ -4912,7 +5025,6 @@ impl Meeting {
         if !hv.keys.is_empty() {
             hf.keys = ContextKeys::merge(&hf.keys, &hv.keys);
         }
-        hf.ui_visuals |= hv.ui_visuals;
         true
     }
 
@@ -4929,7 +5041,7 @@ impl Meeting {
     ) -> bool {
         let set =
             matches!(apply, Combine::Composed(compose::ComposeOp::Set)) && flow == LookupFlow::Set;
-        if !set || hf.pick_lookup.is_some() || !hf.value.is_data(0) {
+        if !set || hf.pick_lookup().is_some() || !hf.value.is_data(0) {
             return false;
         }
         let Value::Object(controls) = &mut hf.value else {
@@ -4938,18 +5050,26 @@ impl Meeting {
         controls.set_data(key, Value::F64(number));
         // The bindings of a set of the map: the control that the signal
         // sets has no slider, and the hap has none of its own.
-        if let Some(slot) = controls::live_slot(key.as_str()) {
-            hf.live_controls[slot] = 0;
+        if !hf.keys.is_empty() {
+            let k = hf.keys.get();
+            let slot = controls::live_slot(key.as_str());
+            if k.slider_binding != 0 || slot.is_some_and(|s| k.live_controls[s] != 0) {
+                let edit = hf.keys.edit();
+                if let Some(slot) = slot {
+                    edit.live_controls[slot] = 0;
+                }
+                edit.slider_binding = 0;
+                hf.keys.trim();
+            }
         }
-        hf.slider_binding = 0;
         hf.part = part;
         true
     }
 
     /// Whether [`Self::in_place`] makes the meeting of `hf` and `hv`.
     pub(crate) fn meets_in_place(hf: &Hap, hv: &Hap, apply: &Combine, flow: LookupFlow) -> bool {
-        hf.pick_lookup.is_none()
-            && hv.pick_lookup.is_none()
+        hf.pick_lookup().is_none()
+            && hv.pick_lookup().is_none()
             && Self::values_meet_in_place(&hf.value, &hv.value, apply, flow)
     }
 
@@ -4981,9 +5101,18 @@ impl Meeting {
     /// merge then keeps `hap`'s own.
     pub(crate) fn settle(self, hap: &mut Hap) {
         hap.value = self.value;
-        hap.pick_lookup = self.pick_lookup;
-        hap.live_controls = self.live_controls;
-        hap.slider_binding = self.slider_binding;
+        if hap.keys.is_empty()
+            && self.pick_lookup.is_none()
+            && self.live_controls == [0; 4]
+            && self.slider_binding == 0
+        {
+            return;
+        }
+        let edit = hap.keys.edit();
+        edit.pick_lookup = self.pick_lookup;
+        edit.live_controls = self.live_controls;
+        edit.slider_binding = self.slider_binding;
+        hap.keys.trim();
     }
 }
 
@@ -5108,7 +5237,6 @@ fn pick_where_it_is(outer: &Hap, inner: &mut Hap, whole: Option<TimeSpan>, part:
     inner.part = part;
     inner.keys = ContextKeys::merge(&inner.keys, &outer.keys);
     inner.context = context;
-    inner.ui_visuals |= outer.ui_visuals;
 }
 
 /// `_pick(...).{inner,outer,squeeze,reset,restart}Join()` out of line, so the
@@ -5237,9 +5365,14 @@ fn pick_of(
                 };
                 inner.whole = whole;
                 inner.part = part;
-                inner.keys = ContextKeys::merge(&outer.keys, &inner.keys);
+                inner.keys = ContextKeys::merge_with(
+                    &outer.keys,
+                    &inner.keys,
+                    inner.live_controls(),
+                    inner.slider_binding(),
+                    inner.pick_lookup_arc(),
+                );
                 inner.context.append(&outer.context);
-                inner.ui_visuals |= outer.ui_visuals;
                 true
             });
         }
@@ -5307,8 +5440,7 @@ fn query_patternified_pick(
     let mut lookups = Vec::new();
     for hap in lookup_pattern.query(state) {
         let lookup = hap
-            .pick_lookup
-            .clone()
+            .pick_lookup_arc()
             .or_else(|| match hap.value {
                 Value::JsValue(reference) => {
                     host_call_pick_lookup(reference.id()).and_then(scoped_pick_lookup)
@@ -5360,13 +5492,9 @@ fn query_patternified_pick(
                 Hap {
                     whole: inner.whole,
                     part: inner.part,
-                    pick_lookup: inner.pick_lookup.clone(),
                     keys: ContextKeys::merge(&inner.keys, &lookup_hap.hap.keys),
                     value: inner.value,
                     context,
-                    ui_visuals: inner.ui_visuals | lookup_hap.hap.ui_visuals,
-                    live_controls: inner.live_controls,
-                    slider_binding: inner.slider_binding,
                 },
             ) {
                 return Vec::new();
@@ -5847,11 +5975,11 @@ impl RunMeeting {
     ) -> bool {
         pieces.clear();
         let base = self.as_hap();
-        pieces.extend(hf.whole_or_part().span_cycles().into_iter().map(|piece| {
+        hf.whole_or_part().for_each_cycle(|piece| {
             let mut hap = base.clone();
             hap.move_to_piece(piece);
-            hap
-        }));
+            pieces.push(hap);
+        });
         meet_each(thread, hf, pieces, &self.apply, self.flow, 0, out)
     }
 
@@ -6037,11 +6165,11 @@ impl<'a> Meetings<'a> {
                     (std::slice::from_ref(constant), None)
                 } else {
                     values.clear();
-                    values.extend(met.span_cycles().into_iter().map(|piece| {
+                    met.for_each_cycle(|piece| {
                         let mut hap = constant.clone();
                         hap.move_to_piece(piece);
-                        hap
-                    }));
+                        values.push(hap);
+                    });
                     (values, None)
                 }
             }
@@ -6283,7 +6411,7 @@ impl<'a> ValueSide<'a> {
     ) -> Option<bool> {
         let set = matches!(self.apply, Combine::Composed(compose::ComposeOp::Set))
             && self.flow == LookupFlow::Set;
-        if !set || hf.pick_lookup.is_some() || !hf.value.is_data(0) {
+        if !set || hf.pick_lookup().is_some() || !hf.value.is_data(0) {
             return None;
         }
         let Value::Object(base_map) = &hf.value else {
@@ -6358,10 +6486,18 @@ impl<'a> ValueSide<'a> {
         let mut template = hf.clone();
         // Clear value on the template so per-step clones do not bump base_map's Arc.
         template.value = Value::Undefined;
-        if let Some(slot) = controls::live_slot(steps.key.as_str()) {
-            template.live_controls[slot] = 0;
+        if !template.keys.is_empty() {
+            let slot = controls::live_slot(steps.key.as_str());
+            let k = template.keys.get();
+            if k.slider_binding != 0 || slot.is_some_and(|s| k.live_controls[s] != 0) {
+                let edit = template.keys.edit();
+                if let Some(slot) = slot {
+                    edit.live_controls[slot] = 0;
+                }
+                edit.slider_binding = 0;
+                template.keys.trim();
+            }
         }
-        template.slider_binding = 0;
         out.reserve(count);
         let bulk_ok = thread.charge(out.len() - from + count);
         let mut begin = grid.time(grid.steps().start)?;
@@ -6443,7 +6579,7 @@ impl<'a> ValueSide<'a> {
         // A gate says whether the hap stays as it is, with no hap of its
         // own. A hap with a lookup keeps it only while its value equals
         // itself, which the meeting reads.
-        if hf.pick_lookup.is_none()
+        if hf.pick_lookup().is_none()
             && let Some(gate) = meetings.gate(self, state)
             && hf.part.within_one_cycle()
             && let Some(part) = hf.part.intersection(&met)
@@ -7403,7 +7539,7 @@ impl Pattern {
             return true;
         }
         let can_apply_all = out[from..].iter().all(|hap| {
-            hap.pick_lookup.is_none()
+            hap.pick_lookup().is_none()
                 && hap.part.within_one_cycle()
                 && hap.value.is_data(0)
                 && matches!(hap.value, Value::Object(_))
@@ -7419,6 +7555,7 @@ impl Pattern {
             return false;
         }
         let mut last_sample: Option<(TimeSpan, TimeSpan, [f64; MAX_WAVES])> = None;
+        let mut wave_cache = value::SharedWaveCache::default();
         let mut patches: [(&Key, f64); MAX_WAVES] = [(first.key(), 0.0); MAX_WAVES];
         for hap in &mut out[from..] {
             let met = hap.whole_or_part();
@@ -7432,6 +7569,7 @@ impl Pattern {
             {
                 cached_nums
             } else {
+                wave_cache.clear();
                 let mut nums = [0.0f64; MAX_WAVES];
                 for i in 0..count {
                     let num = match waves[i].expect("wave present") {
@@ -7453,14 +7591,25 @@ impl Pattern {
                     fused::note(fused::Hit::StepOne);
                 }
                 patches[i] = (item.key(), numbers[i]);
-                if let Some(slot) = live_slots[i] {
-                    hap.live_controls[slot] = 0;
+            }
+            if !hap.keys.is_empty() {
+                let k = hap.keys.get();
+                let clear_slot = live_slots[..count]
+                    .iter()
+                    .flatten()
+                    .any(|&s| k.live_controls[s] != 0);
+                if k.slider_binding != 0 || clear_slot {
+                    let edit = hap.keys.edit();
+                    for slot in live_slots[..count].iter().flatten() {
+                        edit.live_controls[*slot] = 0;
+                    }
+                    edit.slider_binding = 0;
+                    hap.keys.trim();
                 }
             }
             if let Value::Object(controls) = &mut hap.value {
-                controls.set_data_many(&patches[..count]);
+                controls.set_data_many_cached(&patches[..count], &mut wave_cache);
             }
-            hap.slider_binding = 0;
             hap.part = part;
         }
         true
@@ -7497,7 +7646,7 @@ impl Pattern {
         }
         if !out[from..]
             .iter()
-            .all(|hap| hap.pick_lookup.is_none() && hap.part.within_one_cycle())
+            .all(|hap| hap.pick_lookup().is_none() && hap.part.within_one_cycle())
         {
             out.truncate(from);
             return false;
@@ -7848,11 +7997,25 @@ impl Pattern {
         // afterwards, like the generic wrapper in `query` does, would
         // let a million haps exist first. Everything else grows by
         // combining smaller results, which the wrapper catches.
-        let spans = state.span.span_cycles();
-        if !thread.charge(spans.len()) {
+        let count = if state.span.begin == state.span.end {
+            1usize
+        } else {
+            let Some(c) = state
+                .span
+                .cycle_count()
+                .filter(|c| *c <= MAX_QUERY_SPAN_CYCLES)
+            else {
+                refuse(QueryLimit::QuerySpan {
+                    cycles: MAX_QUERY_SPAN_CYCLES,
+                });
+                return;
+            };
+            usize::try_from(c).unwrap_or_default()
+        };
+        if !thread.charge(count) {
             return;
         }
-        note_materialised(spans.len());
+        note_materialised(count);
         let lookup = match self.node_kind() {
             Node::PurePickLookup(_) => {
                 let Some(lookup) = self.as_pick_lookup().map(Arc::new) else {
@@ -7862,16 +8025,15 @@ impl Pattern {
             }
             _ => None,
         };
-        // The one node that can spend seconds in a single loop. Poll
-        // the stop signals while it builds: without this, SIGTERM
-        // during `s("bd*2000").queryArc(0, 500)` waited out the whole
-        // construction even though every recursive node would have
-        // unwound within milliseconds.
         let from = out.len();
-        out.reserve(spans.len());
-        for subspan in spans {
+        out.reserve(count);
+        let mut stopped = false;
+        state.span.for_each_cycle(|subspan| {
+            if stopped {
+                return;
+            }
             if thread.stop_requested() {
-                out.truncate(from);
+                stopped = true;
                 return;
             }
             let hap = Hap::new(Some(whole_cycle(subspan.begin)), subspan, value.clone());
@@ -7879,6 +8041,9 @@ impl Pattern {
                 Some(lookup) => out.push(hap.with_pick_lookup(Arc::clone(lookup))),
                 None => out.push(hap),
             }
+        });
+        if stopped {
+            out.truncate(from);
         }
     }
 
@@ -8340,7 +8505,7 @@ impl Pattern {
                     let carrier = group.first()?;
                     let ui_visuals = group
                         .iter()
-                        .fold(0_u64, |visuals, hap| visuals | hap.ui_visuals);
+                        .fold(0_u64, |visuals, hap| visuals | hap.ui_visuals_context());
                     // Every span in the group, not the carrier's alone: a
                     // collected chord is heard as one thing and was typed
                     // as several, and an editor lighting only the first of
@@ -8441,13 +8606,15 @@ impl Pattern {
                             Hap {
                                 whole: inner.whole, // innerJoin: (_, b) => b
                                 part: inner.part,
-                                pick_lookup: joined_pick_lookup(&outer, &inner),
-                                keys: ContextKeys::merge(&inner.keys, &outer.keys),
+                                keys: ContextKeys::merge_with(
+                                    &inner.keys,
+                                    &outer.keys,
+                                    inner.live_controls(),
+                                    inner.slider_binding(),
+                                    joined_pick_lookup(&outer, &inner),
+                                ),
                                 value: inner.value.clone(),
                                 context: ctx,
-                                ui_visuals: inner.ui_visuals | outer.ui_visuals,
-                                live_controls: inner.live_controls,
-                                slider_binding: inner.slider_binding,
                             },
                         ) {
                             return Vec::new();
@@ -8643,13 +8810,15 @@ impl Pattern {
                             Hap {
                                 whole: hap.whole,
                                 part: hap.part,
+                                keys: ContextKeys::merge_with(
+                                    &time_hap.keys,
+                                    &hap.keys,
+                                    hap.live_controls(),
+                                    hap.slider_binding(),
+                                    hap.pick_lookup_arc(),
+                                ),
                                 value: hap.value,
                                 context,
-                                ui_visuals: time_hap.ui_visuals | hap.ui_visuals,
-                                live_controls: hap.live_controls,
-                                slider_binding: hap.slider_binding,
-                                pick_lookup: hap.pick_lookup,
-                                keys: ContextKeys::merge(&time_hap.keys, &hap.keys),
                             },
                         ) {
                             return Vec::new();
@@ -8772,8 +8941,13 @@ impl Pattern {
                                     let Some(part) = inner.part.intersection(&outer.part) else {
                                         continue;
                                     };
-                                    let pick_lookup = joined_pick_lookup(&outer, &inner);
-                                    let keys = ContextKeys::merge(&outer.keys, &inner.keys);
+                                    let keys = ContextKeys::merge_with(
+                                        &outer.keys,
+                                        &inner.keys,
+                                        inner.live_controls(),
+                                        inner.slider_binding(),
+                                        joined_pick_lookup(&outer, &inner),
+                                    );
                                     let mut ctx = inner.context;
                                     ctx.append(&outer.context);
                                     if !push_budgeted(
@@ -8781,13 +8955,9 @@ impl Pattern {
                                         Hap {
                                             whole,
                                             part,
-                                            pick_lookup,
                                             keys,
                                             value: inner.value,
                                             context: ctx,
-                                            ui_visuals: outer.ui_visuals | inner.ui_visuals,
-                                            live_controls: inner.live_controls,
-                                            slider_binding: inner.slider_binding,
                                         },
                                     ) {
                                         return false;
@@ -8830,13 +9000,15 @@ impl Pattern {
                                     Hap {
                                         whole,
                                         part,
-                                        pick_lookup: joined_pick_lookup(&outer, &inner),
-                                        keys: ContextKeys::merge(&inner.keys, &outer.keys),
+                                        keys: ContextKeys::merge_with(
+                                            &inner.keys,
+                                            &outer.keys,
+                                            inner.live_controls(),
+                                            inner.slider_binding(),
+                                            joined_pick_lookup(&outer, &inner),
+                                        ),
                                         value: inner.value.clone(),
                                         context: ctx,
-                                        ui_visuals: outer.ui_visuals | inner.ui_visuals,
-                                        live_controls: inner.live_controls,
-                                        slider_binding: inner.slider_binding,
                                     },
                                 ) {
                                     return Vec::new();
@@ -8899,13 +9071,9 @@ impl Pattern {
                             Hap {
                                 whole: outer.whole,
                                 part: b.part,
-                                pick_lookup: b.pick_lookup.clone(),
                                 keys: ContextKeys::merge(&b.keys, &outer.keys),
                                 value: b.value.clone(),
                                 context: ctx,
-                                ui_visuals: b.ui_visuals | outer.ui_visuals,
-                                live_controls: b.live_controls,
-                                slider_binding: b.slider_binding,
                             },
                         ) {
                             return Vec::new();
@@ -8945,13 +9113,9 @@ impl Pattern {
                                 // `innerJoin`: the INNER (index) hap's whole.
                                 whole: index_hap.whole,
                                 part: index_hap.part,
-                                pick_lookup: picked.pick_lookup.clone(),
                                 keys: ContextKeys::merge(&picked.keys, &index_hap.keys),
                                 value: picked.value.clone(),
                                 context,
-                                ui_visuals: picked.ui_visuals | index_hap.ui_visuals,
-                                live_controls: picked.live_controls,
-                                slider_binding: picked.slider_binding,
                             },
                         ) {
                             return Vec::new();
@@ -9054,16 +9218,12 @@ impl Pattern {
                                 part: inner.part,
                                 value,
                                 context: locations,
-                                ui_visuals: inner.ui_visuals,
-                                live_controls: [0; 4],
-                                slider_binding: 0,
-                                pick_lookup: None,
                                 // `combineContext(h.value)`: each key on the
                                 // value-side context wins, and the receiving
                                 // hap keeps each key that side lacks. `.log()`
                                 // writes its formatted text under `logLine`,
                                 // which the runtime prints on the onset.
-                                keys: ContextKeys::merge(
+                                keys: ContextKeys::merge_with(
                                     &ContextKeys::of(context_keys::Keys {
                                         scale: context
                                             .and_then(|context| context.get("scale"))
@@ -9087,8 +9247,12 @@ impl Pattern {
                                                 Value::Str(text) => Some(text.to_arc()),
                                                 _ => None,
                                             }),
+                                        ..Default::default()
                                     }),
                                     &inner.keys,
+                                    [0; 4],
+                                    0,
+                                    None,
                                 ),
                             },
                         ) {
@@ -9559,12 +9723,8 @@ impl Pattern {
         Some(Hap {
             whole: new_whole,
             part: new_part,
-            pick_lookup: hap.pick_lookup.clone(),
             value: hap.value.clone(),
             context: hap.context.clone(),
-            ui_visuals: hap.ui_visuals,
-            live_controls: hap.live_controls,
-            slider_binding: hap.slider_binding,
             keys: hap.keys.clone(),
         })
     }
@@ -10687,8 +10847,7 @@ impl Pattern {
                     let materialized = hap.value.contains_js_value();
                     if materialized {
                         hap.value = materialize_js_value(&hap.value);
-                        hap.live_controls = [0; 4];
-                        hap.slider_binding = 0;
+                        hap.clear_live_bindings();
                     }
                     if let Some(settings) = &metadata_owner
                         && (materialized || !raw_query_attaches_metadata)
@@ -10910,7 +11069,9 @@ impl Pattern {
     pub fn with_slider_binding(&self, binding: u64) -> Self {
         self.map_haps_owned(move |hap| {
             let mut hap = hap.without_live_controls();
-            hap.slider_binding = binding;
+            if binding != 0 {
+                hap.keys.edit().slider_binding = binding;
+            }
             Some(hap)
         })
         .with_steps_of(self)
@@ -12692,8 +12853,7 @@ pub fn pick_f_compat(
                 || matches!(hap.value, Value::JsValue(reference) if reference.is_array())
             {
                 let Some(lookup) = hap
-                    .pick_lookup
-                    .clone()
+                    .pick_lookup_arc()
                     .or_else(|| match hap.value {
                         Value::JsValue(reference) => {
                             host_call_pick_lookup(reference.id()).and_then(scoped_pick_lookup)
@@ -13780,11 +13940,11 @@ mod constant_run_tests {
             .map(|hap| {
                 format!(
                     "{hap:?} {:?} {} {} {} {}",
-                    hap.live_controls,
-                    hap.slider_binding,
-                    hap.ui_visuals,
+                    hap.live_controls(),
+                    hap.slider_binding(),
+                    hap.ui_visuals_context(),
                     hap.keys.is_empty(),
-                    hap.pick_lookup.is_some()
+                    hap.pick_lookup().is_some()
                 )
             })
             .collect()
@@ -14458,8 +14618,7 @@ mod value_signal_tests {
         let driven = Pattern::of(Node::MapHapsOwned(
             fastcat(vec![note(3.0), note(4.0), note(5.0)]),
             Arc::new(|mut hap| {
-                hap.live_controls = [9, 8, 7, 6];
-                hap.slider_binding = 5;
+                hap.set_live_bindings([9, 8, 7, 6], 5);
                 Some(hap)
             }),
             SpanUse::Ignores,
@@ -14581,8 +14740,8 @@ mod value_signal_tests {
                             }
                             let haps = pattern.query_state(&state);
                             let bound = |hap: &Hap| {
-                                let lookup = hap.pick_lookup.is_some();
-                                format!("{hap:?} {:?} {lookup}", hap.live_controls)
+                                let lookup = hap.pick_lookup().is_some();
+                                format!("{hap:?} {:?} {lookup}", hap.live_controls())
                             };
                             haps.iter().map(bound).collect::<Vec<_>>()
                         };
@@ -15487,7 +15646,7 @@ mod restart_tests {
             pattern
                 .query_arc(begin, end)
                 .iter()
-                .map(|hap| format!("{hap:?} {:?} {:?}", hap.keys, hap.live_controls))
+                .map(|hap| format!("{hap:?} {:?} {:?}", hap.keys, hap.live_controls()))
                 .collect()
         };
         // Steps in one cycle each, a rest, a control of a rest as `n("~")`
@@ -15557,7 +15716,7 @@ mod restart_tests {
             pattern
                 .query_arc(begin, end)
                 .iter()
-                .map(|hap| format!("{hap:?} {:?} {:?}", hap.keys, hap.live_controls))
+                .map(|hap| format!("{hap:?} {:?} {:?}", hap.keys, hap.live_controls()))
                 .collect()
         };
         // Steps that fill the cycle, steps that overlap, and long steps.
@@ -15604,7 +15763,7 @@ mod restart_tests {
             pattern
                 .query_arc(begin, end)
                 .iter()
-                .map(|hap| format!("{hap:?} {:?} {:?}", hap.keys, hap.live_controls))
+                .map(|hap| format!("{hap:?} {:?} {:?}", hap.keys, hap.live_controls()))
                 .collect()
         };
         for (index, section) in discrete_sections().into_iter().enumerate() {
@@ -15654,7 +15813,7 @@ mod restart_tests {
             pattern
                 .query_arc(begin, end)
                 .iter()
-                .map(|hap| format!("{hap:?} {:?} {:?}", hap.keys, hap.live_controls))
+                .map(|hap| format!("{hap:?} {:?} {:?}", hap.keys, hap.live_controls()))
                 .collect()
         };
         let long = || note(300.0).slow(whole(3));

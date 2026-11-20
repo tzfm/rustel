@@ -425,7 +425,7 @@ pub(super) fn install<'js>(
 
     let reset = Function::new(ctx.clone(), reset).map_err(|error| error.to_string())?;
     let logs = Rc::clone(runtime.logs());
-    let deadline = runtime.deadline.clone();
+    let deadline = runtime.bridge().deadline.clone();
     let finish = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, returned: rquickjs::Value<'js>| {

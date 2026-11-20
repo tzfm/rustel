@@ -25,16 +25,17 @@ impl JsRuntime {
             ids: OnceCell::new(),
             logs: OnceCell::new(),
             contained_query_errors_unlogged: Cell::new(false),
-            cycle_time: Rc::new(Cell::new(0.0)),
-            cps: Rc::new(Cell::new(0.5)),
+            bridge: OnceCell::new(),
+            cycle_time_init: Cell::new(0.0),
+            cps_init: Cell::new(0.5),
+            heap_limit_init: Cell::new(DEFAULT_JS_MEMORY_LIMIT),
+            effect_policy_init: Cell::new(EffectPolicy::NONE),
             loaded_imports: OnceCell::new(),
             import_surface: RefCell::default(),
             timeline_state: OnceCell::new(),
             midi_in: OnceCell::new(),
             #[cfg(feature = "hydra")]
             hydra_chains: OnceCell::new(),
-            effect_transaction: Rc::default(),
-            effect_policy: Rc::new(Cell::new(EffectPolicy::NONE)),
             hap_budget: Cell::new(rustel_core::DEFAULT_HAP_BUDGET),
             query_threw: RefCell::new(None),
             callback_ir: OnceCell::new(),
@@ -42,19 +43,10 @@ impl JsRuntime {
             evaluated_natively: Cell::new(false),
             bindings_installed: Cell::new(false),
             voicings_installed: Cell::new(false),
-            // The budget is active from the start of the engine, so no
-            // allocation of the engine is ever unbounded.
-            heap: Rc::new(alloc::HeapBudget::new(DEFAULT_JS_MEMORY_LIMIT)),
-            deadline: Rc::new(Cell::new(None)),
-            interrupted: Rc::new(Cell::new(false)),
-            cancel_flag: Rc::new(Cell::new(None)),
-            cancelled: Rc::new(Cell::new(false)),
             query_turn_depth: Cell::new(0),
             effect_query_depth: Cell::new(0),
             heap_boundary_depth: Cell::new(0),
             query_limit_millis: Cell::new(None),
-            effect_policy_refusal: Rc::new(RefCell::new(None)),
-            effect_policy_owner_depth: Rc::new(Cell::new(0)),
             native_memo: RefCell::default(),
             native_left: Cell::new(None),
             native_staged: RefCell::new(None),
@@ -64,6 +56,40 @@ impl JsRuntime {
             last_good_timeline: RefCell::new(None),
             pointer,
             script_may_have_run: Cell::new(true),
+        }
+    }
+
+    /// The lazy QuickJS bridge cells, initialized on first JavaScript use.
+    pub(crate) fn bridge(&self) -> &JsBridge {
+        self.bridge.get_or_init(|| JsBridge {
+            cycle_time: Rc::new(Cell::new(self.cycle_time_init.get())),
+            cps: Rc::new(Cell::new(self.cps_init.get())),
+            effect_transaction: Rc::default(),
+            effect_policy: Rc::new(Cell::new(self.effect_policy_init.get())),
+            heap: Rc::new(alloc::HeapBudget::new(self.heap_limit_init.get())),
+            deadline: Rc::new(Cell::new(None)),
+            interrupted: Rc::new(Cell::new(false)),
+            cancel_flag: Rc::new(Cell::new(None)),
+            cancelled: Rc::new(Cell::new(false)),
+            effect_policy_refusal: Rc::new(RefCell::new(None)),
+            effect_policy_owner_depth: Rc::new(Cell::new(0)),
+        })
+    }
+
+    /// Current effect policy without initializing the QuickJS bridge.
+    pub(super) fn effect_policy(&self) -> EffectPolicy {
+        match self.bridge.get() {
+            Some(bridge) => bridge.effect_policy.get(),
+            None => self.effect_policy_init.get(),
+        }
+    }
+
+    /// Replace the effect policy without initializing the QuickJS bridge.
+    pub(super) fn replace_effect_policy(&self, policy: EffectPolicy) -> EffectPolicy {
+        let previous = self.effect_policy_init.replace(policy);
+        match self.bridge.get() {
+            Some(bridge) => bridge.effect_policy.replace(policy),
+            None => previous,
         }
     }
 
@@ -191,13 +217,19 @@ impl JsRuntime {
     /// Set the cycle that `getTime()` returns. The host calls it with the
     /// start of each scheduling window.
     pub fn set_cycle_time(&self, cycle: f64) {
-        self.cycle_time.set(cycle);
+        self.cycle_time_init.set(cycle);
+        if let Some(bridge) = self.bridge.get() {
+            bridge.cycle_time.set(cycle);
+        }
     }
 
     /// Set the tempo, in cycles per second, that `getCps()` returns. The
     /// host calls it before each evaluation and each scheduling window.
     pub fn set_cps(&self, cps: f64) {
-        self.cps.set(cps);
+        self.cps_init.set(cps);
+        if let Some(bridge) = self.bridge.get() {
+            bridge.cps.set(cps);
+        }
     }
 
     /// Run `f` without logging the query errors a stack contains. A caller
@@ -436,8 +468,9 @@ impl JsRuntime {
                 self.0.set(self.1);
             }
         }
-        let prev = self.deadline.get();
-        self.interrupted.set(false);
+        let bridge = self.bridge();
+        let prev = bridge.deadline.get();
+        bridge.interrupted.set(false);
         // A NESTED bounded run must never buy more time than the one that
         // contains it. `chop(32).slow(0.001)` re-enters queryArc ~1000× per
         // cycle from a JS callback; with a fresh budget each time the
@@ -448,8 +481,8 @@ impl JsRuntime {
             Some(outer) => (now + budget).min(outer),
             None => now + budget,
         };
-        self.deadline.set(Some(deadline));
-        let _g = Guard(self.deadline.clone(), prev);
+        bridge.deadline.set(Some(deadline));
+        let _g = Guard(bridge.deadline.clone(), prev);
         // The same deadline bounds NATIVE query recursion: QuickJS's
         // interrupt handler only fires while JavaScript runs, and a
         // pattern can spend minutes in Rust below every hap budget.
@@ -461,7 +494,9 @@ impl JsRuntime {
 
     /// Whether the last deadline-bounded run was interrupted.
     pub fn was_interrupted(&self) -> bool {
-        self.interrupted.get()
+        self.bridge
+            .get()
+            .is_some_and(|bridge| bridge.interrupted.get())
     }
 
     /// Refresh the structural reason for a bounded evaluation to stop even
@@ -470,21 +505,24 @@ impl JsRuntime {
     /// JavaScript; this exit check makes the deadline cover validation through
     /// the final active-graph publication as well.
     pub(super) fn bounded_evaluation_interrupted(&self) -> bool {
-        let cancellation_requested = self.cancel_flag.get().is_some_and(|pointer| {
+        let Some(bridge) = self.bridge.get() else {
+            return false;
+        };
+        let cancellation_requested = bridge.cancel_flag.get().is_some_and(|pointer| {
             // SAFETY: a pointer is installed only while the public bounded
             // evaluator owns the borrowed AtomicBool, under an RAII guard.
             unsafe { &*pointer }.load(std::sync::atomic::Ordering::Relaxed)
         });
         if cancellation_requested {
-            self.cancelled.set(true);
+            bridge.cancelled.set(true);
             return true;
         }
-        if self
+        if bridge
             .deadline
             .get()
             .is_some_and(|at| std::time::Instant::now() >= at)
         {
-            self.interrupted.set(true);
+            bridge.interrupted.set(true);
             return true;
         }
         false
@@ -901,13 +939,15 @@ impl JsRuntime {
     }
 
     pub(super) fn effect_policy_pending(&self) -> bool {
-        self.effect_policy_refusal.borrow().is_some()
+        self.bridge
+            .get()
+            .is_some_and(|bridge| bridge.effect_policy_refusal.borrow().is_some())
     }
 
     pub(super) fn effect_policy_message(&self) -> String {
-        self.effect_policy_refusal
-            .borrow()
-            .clone()
+        self.bridge
+            .get()
+            .and_then(|bridge| bridge.effect_policy_refusal.borrow().clone())
             .unwrap_or_else(|| "query-time host effect was refused".into())
     }
 
@@ -1188,31 +1228,35 @@ impl JsRuntime {
 
     /// The QuickJS heap ceiling currently in force, in bytes.
     pub fn memory_limit(&self) -> usize {
-        self.heap.limit()
+        match self.bridge.get() {
+            Some(bridge) => bridge.heap.limit(),
+            None => self.heap_limit_init.get(),
+        }
     }
 
     /// Bytes currently live on the QuickJS heap, as this allocator accounts
     /// them.
     pub fn heap_live(&self) -> usize {
-        self.heap.live()
+        self.bridge.get().map_or(0, |bridge| bridge.heap.live())
     }
 
     /// Lower the heap ceiling. The ceiling is monotonic: it can only go down.
-    ///
-    /// Tests use this to cause exhaustion at a small size: a test at 512 MiB
-    /// would have to allocate 512 MiB. An embedder on a small device can also
-    /// set a tighter bound than this build's default.
-    ///
-    /// The setter refuses three values:
-    ///
-    /// * **Zero.** QuickJS reads a limit of zero as unlimited, so accepting it
-    ///   would remove the ceiling.
-    /// * **Any increase.** Allowing a caller to lower the limit and then raise
-    ///   it again would violate the monotonic contract.
-    /// * **A value below the live heap.** Every later allocation would be
-    ///   denied, and the ceiling cannot be raised again.
     pub fn set_memory_limit(&self, bytes: usize) -> Result<(), String> {
-        self.heap.lower_to(bytes)
+        if let Some(bridge) = self.bridge.get() {
+            bridge.heap.lower_to(bytes)
+        } else {
+            if bytes == 0 {
+                return Err("JavaScript heap memory limit must be non-zero".into());
+            }
+            let current = self.heap_limit_init.get();
+            if bytes > current {
+                return Err(format!(
+                    "JavaScript heap memory limit cannot be raised from {current} to {bytes} bytes"
+                ));
+            }
+            self.heap_limit_init.set(bytes);
+            Ok(())
+        }
     }
 
     /// `query` with an explicit hap-count budget.
@@ -1295,10 +1339,10 @@ impl JsRuntime {
         let _effect_query = EffectQueryScope::enter(self);
         let out = if self.query_turn_depth.get() > 0
             || self.heap_boundary_depth.get() > 0
-            || self.cancel_flag.get().is_some()
+            || self.bridge().cancel_flag.get().is_some()
         {
             f()
-        } else if self.deadline.get().is_some() {
+        } else if self.bridge().deadline.get().is_some() {
             self.with_heap_boundary(f)
         } else {
             self.with_bounded_query_turn(
@@ -1377,18 +1421,19 @@ impl JsRuntime {
                 // Cleanup never executes jobs or JavaScript and is therefore
                 // safe after a deadline/cancellation interrupt and on unwind.
                 self.rt.discard_jobs();
-                self.rt.cancel_flag.set(self.previous_cancel);
+                self.rt.bridge().cancel_flag.set(self.previous_cancel);
                 self.rt.query_limit_millis.set(self.previous_millis);
                 self.rt.query_turn_depth.set(self.previous_depth);
             }
         }
 
+        let bridge = self.bridge();
         let previous_depth = self.query_turn_depth.replace(1);
         let previous_millis = self.query_limit_millis.replace(Some(millis));
-        let previous_cancel = self
+        let previous_cancel = bridge
             .cancel_flag
             .replace(Some(cancellation as *const std::sync::atomic::AtomicBool));
-        self.cancelled.set(false);
+        bridge.cancelled.set(false);
         let _turn = QueryTurnGuard {
             rt: self,
             previous_depth,
@@ -1416,7 +1461,7 @@ impl JsRuntime {
             // retain their typed reason. Let Session distinguish Stop's
             // established partial-success semantics from resource failure.
             // Direct queries have no such status value and translate below.
-            if self.cancelled.get() || self.was_interrupted() {
+            if bridge.cancelled.get() || self.was_interrupted() {
                 return out;
             }
             if heap_exhausted {
@@ -1430,7 +1475,7 @@ impl JsRuntime {
             }
             return out;
         }
-        if self.cancelled.get() {
+        if bridge.cancelled.get() {
             Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled))
         } else if self.was_interrupted() {
             Err(QueryError::Limit(rustel_core::QueryLimit::JsCpuDeadline {
@@ -1525,8 +1570,10 @@ impl JsRuntime {
                 millis: 0,
             }));
         }
-        self.cancelled.set(false);
-        self.interrupted.set(false);
+        if let Some(bridge) = self.bridge.get() {
+            bridge.cancelled.set(false);
+            bridge.interrupted.set(false);
+        }
         rustel_core::with_cancellation(cancellation, || {
             // A query of a few nodes reads no clock.
             rustel_core::with_query_budget(budget, || {

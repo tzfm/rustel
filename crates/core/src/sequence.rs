@@ -290,7 +290,7 @@ impl Listing {
     fn value(&self, index: usize) -> u32 {
         match self {
             Self::Places(listed) => listed.places[index].value,
-            Self::Grid(grid) => grid.steps[index].value,
+            Self::Grid(grid) => grid.steps.get(index).value,
         }
     }
 
@@ -354,6 +354,175 @@ struct GridStep {
     loc: PackedLoc,
 }
 
+/// Compact 8-byte step on a [`Grid`] when ticks, value index, and location fit
+/// 16 bits. Halves step-array memory for typical layers.
+#[derive(Clone, Copy)]
+struct SmallGridStep {
+    part_begin: u16,
+    part_end: u16,
+    value: u16,
+    /// `0` is no location. Bit 15 = 0: inline range `(offset << 6) | (len + 1)`
+    /// (`offset < 512`, `len < 63`). Bit 15 = 1, bit 14 = 0: spare index.
+    /// Bit 15 = 1, bit 14 = 1: wide index.
+    loc: u16,
+}
+
+impl SmallGridStep {
+    const SPARE: u16 = 1 << 15;
+    const WIDE: u16 = 1 << 14;
+    const INDEX_MASK: u16 = Self::WIDE - 1;
+    const LENGTH_BITS: u32 = 6;
+    const LENGTH_MASK: u16 = (1 << Self::LENGTH_BITS) - 1;
+    const OFFSET_LIMIT: u32 = 1 << 9;
+
+    #[inline]
+    fn from_wide(step: GridStep) -> Option<Self> {
+        let part_begin = u16::try_from(step.part_begin).ok()?;
+        let part_end = u16::try_from(step.part_end).ok()?;
+        let value = u16::try_from(step.value).ok()?;
+        let raw = step.loc.0;
+        let loc = if raw == 0 {
+            0
+        } else if raw & PackedLoc::SPARE != 0 {
+            let idx = raw & PackedLoc::INDEX_MASK;
+            if idx > u32::from(Self::INDEX_MASK) {
+                return None;
+            }
+            let wide_bit = if raw & PackedLoc::WIDE != 0 {
+                Self::WIDE
+            } else {
+                0
+            };
+            Self::SPARE | wide_bit | (idx as u16)
+        } else {
+            let offset = raw >> PackedLoc::LENGTH_BITS;
+            let len_plus_1 = raw & PackedLoc::LENGTH_MASK;
+            if offset >= Self::OFFSET_LIMIT || len_plus_1 > u32::from(Self::LENGTH_MASK) {
+                return None;
+            }
+            ((offset as u16) << Self::LENGTH_BITS) | (len_plus_1 as u16)
+        };
+        Some(Self {
+            part_begin,
+            part_end,
+            value,
+            loc,
+        })
+    }
+
+    #[inline]
+    fn to_wide(self) -> GridStep {
+        let loc = if self.loc == 0 {
+            PackedLoc(0)
+        } else if self.loc & Self::SPARE != 0 {
+            let idx = u32::from(self.loc & Self::INDEX_MASK);
+            let wide_bit = if self.loc & Self::WIDE != 0 {
+                PackedLoc::WIDE
+            } else {
+                0
+            };
+            PackedLoc(PackedLoc::SPARE | wide_bit | idx)
+        } else {
+            let offset = u32::from(self.loc >> Self::LENGTH_BITS);
+            let len_plus_1 = u32::from(self.loc & Self::LENGTH_MASK);
+            PackedLoc((offset << PackedLoc::LENGTH_BITS) | len_plus_1)
+        };
+        GridStep {
+            part_begin: u32::from(self.part_begin),
+            part_end: u32::from(self.part_end),
+            value: u32::from(self.value),
+            loc,
+        }
+    }
+}
+
+/// Steps of a [`Grid`], stored as 8-byte [`SmallGridStep`]s when every step
+/// fits and 16-byte [`GridStep`]s otherwise.
+enum GridSteps {
+    Small(Box<[SmallGridStep]>),
+    Wide(Box<[GridStep]>),
+}
+
+impl GridSteps {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Small(s) => s.len(),
+            Self::Wide(w) => w.len(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> GridStep {
+        match self {
+            Self::Small(s) => s[index].to_wide(),
+            Self::Wide(w) => w[index],
+        }
+    }
+
+    #[inline]
+    fn times_of(&self, index: usize) -> (u32, u32) {
+        match self {
+            Self::Small(s) => (u32::from(s[index].part_begin), u32::from(s[index].part_end)),
+            Self::Wide(w) => (w[index].part_begin, w[index].part_end),
+        }
+    }
+
+    #[inline]
+    fn has_no_locations(&self) -> bool {
+        match self {
+            Self::Small(s) => s.iter().all(|step| step.loc == 0),
+            Self::Wide(w) => w.iter().all(|step| step.loc.0 == 0),
+        }
+    }
+
+    /// Collect `len` steps produced by `make`, choosing compact 8-byte storage
+    /// when every step fits. Uses a stack buffer for up to 64 steps so the
+    /// common case performs a single heap allocation.
+    fn build(len: usize, mut make: impl FnMut(usize) -> Option<GridStep>) -> Option<Self> {
+        const STACK: usize = 64;
+        if len <= STACK {
+            let mut small = [SmallGridStep {
+                part_begin: 0,
+                part_end: 0,
+                value: 0,
+                loc: 0,
+            }; STACK];
+            for i in 0..len {
+                let step = make(i)?;
+                if let Some(s) = SmallGridStep::from_wide(step) {
+                    small[i] = s;
+                } else {
+                    let mut wide = Vec::with_capacity(len);
+                    wide.extend(small[..i].iter().map(|s| s.to_wide()));
+                    wide.push(step);
+                    for j in (i + 1)..len {
+                        wide.push(make(j)?);
+                    }
+                    return Some(Self::Wide(wide.into_boxed_slice()));
+                }
+            }
+            return Some(Self::Small(Box::from(&small[..len])));
+        }
+        let mut small = Vec::with_capacity(len);
+        for i in 0..len {
+            let step = make(i)?;
+            if let Some(s) = SmallGridStep::from_wide(step) {
+                small.push(s);
+            } else {
+                let mut wide = Vec::with_capacity(len);
+                wide.extend(small.into_iter().map(SmallGridStep::to_wide));
+                wide.push(step);
+                for j in (i + 1)..len {
+                    wide.push(make(j)?);
+                }
+                return Some(Self::Wide(wide.into_boxed_slice()));
+            }
+        }
+        Some(Self::Small(small.into_boxed_slice()))
+    }
+}
+
 /// The locations of a step in 4 bytes. `0` is no location. A set top bit
 /// is a place in the spare list. Otherwise one range: its begin from the
 /// base of the grid in the high 20 bits and its length plus one in the low
@@ -399,19 +568,18 @@ struct Cut {
 
 /// The steps of a layer on an integer grid of `1 / ticks` cycles, kept
 /// as ticks, when each time of them fits in 32 bits.
-#[derive(Clone)]
 struct Grid {
     /// The ticks in a cycle: the least common multiple of the denominators.
     ticks: NonZeroU32,
     /// The begin that the packed ranges count from, below 2^31. The top bit
     /// is [`Listing::small_denominators`].
     base: u32,
-    steps: Box<[GridStep]>,
+    steps: GridSteps,
     /// The reduced time of each residue, for a tick size that is no power
     /// of two: a time then takes no gcd.
     reductions: Option<Arc<TickGrid>>,
     /// What most layers have none of.
-    side: Option<Arc<Spare>>,
+    side: Option<Box<Spare>>,
 }
 
 /// The cuts and the spare locations of a [`Grid`].
@@ -540,56 +708,35 @@ impl Grid {
         let mut packed_runs = Vec::new();
         // The places of the steps whose locations do not fit packed encoding.
         let mut wide = Vec::new();
-        let mut fits = true;
-        // The steps are collected in one allocation, with no list first.
-        let steps: Box<[GridStep]> = raws
-            .iter()
-            .enumerate()
-            .map(|(index, raw)| {
-                let mut step = || {
-                    let (begin, end) = (on_grid(raw.whole.begin)?, on_grid(raw.whole.end)?);
-                    let (part_begin, part_end) = match raw.part {
-                        None => (begin, end),
-                        Some(part) => {
-                            cuts.push(Cut {
-                                index: index as u32,
-                                begin,
-                                end,
-                            });
-                            (on_grid(part.begin)?, on_grid(part.end)?)
-                        }
-                    };
-                    let loc = Self::pack_locations(
-                        base,
-                        &raw.locations,
-                        &mut packed_runs,
-                        &mut wide,
-                        index,
-                    );
-                    Some(GridStep {
-                        part_begin,
-                        part_end,
-                        value: raw.value,
-                        loc,
-                    })
-                };
-                step().unwrap_or_else(|| {
-                    fits = false;
-                    GridStep {
-                        part_begin: 0,
-                        part_end: 0,
-                        value: 0,
-                        loc: PackedLoc(0),
-                    }
-                })
+        let steps = GridSteps::build(raws.len(), |index| {
+            let raw = &raws[index];
+            let (begin, end) = (on_grid(raw.whole.begin)?, on_grid(raw.whole.end)?);
+            let (part_begin, part_end) = match raw.part {
+                None => (begin, end),
+                Some(part) => {
+                    cuts.push(Cut {
+                        index: index as u32,
+                        begin,
+                        end,
+                    });
+                    (on_grid(part.begin)?, on_grid(part.end)?)
+                }
+            };
+            let loc =
+                Self::pack_locations(base, &raw.locations, &mut packed_runs, &mut wide, index);
+            Some(GridStep {
+                part_begin,
+                part_end,
+                value: raw.value,
+                loc,
             })
-            .collect();
-        if !fits || wide.len() > PackedLoc::INDEX_MASK as usize {
+        })?;
+        if wide.len() > PackedLoc::INDEX_MASK as usize {
             return None;
         }
         // The grid fits, so any wide locations move with no copy.
         let side = (!cuts.is_empty() || !packed_runs.is_empty() || !wide.is_empty()).then(|| {
-            Arc::new(Spare {
+            Box::new(Spare {
                 cuts: cuts.into(),
                 packed: packed_runs.into(),
                 wide: wide
@@ -647,43 +794,23 @@ impl Grid {
         };
         let mut packed_runs = Vec::new();
         let mut wide = Vec::new();
-        let mut fits = true;
-        let steps: Box<[GridStep]> = source_steps
-            .iter()
-            .enumerate()
-            .map(|(index, src)| {
-                let mut step = || {
-                    let (begin, end) = (on_grid(src.begin)?, on_grid(src.end)?);
-                    let loc = Self::pack_locations(
-                        base,
-                        &src.locations,
-                        &mut packed_runs,
-                        &mut wide,
-                        index,
-                    );
-                    Some(GridStep {
-                        part_begin: begin,
-                        part_end: end,
-                        value: src.value,
-                        loc,
-                    })
-                };
-                step().unwrap_or_else(|| {
-                    fits = false;
-                    GridStep {
-                        part_begin: 0,
-                        part_end: 0,
-                        value: 0,
-                        loc: PackedLoc(0),
-                    }
-                })
+        let steps = GridSteps::build(source_steps.len(), |index| {
+            let src = &source_steps[index];
+            let (begin, end) = (on_grid(src.begin)?, on_grid(src.end)?);
+            let loc =
+                Self::pack_locations(base, &src.locations, &mut packed_runs, &mut wide, index);
+            Some(GridStep {
+                part_begin: begin,
+                part_end: end,
+                value: src.value,
+                loc,
             })
-            .collect();
-        if !fits || wide.len() > PackedLoc::INDEX_MASK as usize {
+        })?;
+        if wide.len() > PackedLoc::INDEX_MASK as usize {
             return None;
         }
         let side = (!packed_runs.is_empty() || !wide.is_empty()).then(|| {
-            Arc::new(Spare {
+            Box::new(Spare {
                 cuts: Box::new([]),
                 packed: packed_runs.into(),
                 wide: wide
@@ -760,8 +887,8 @@ impl Grid {
     }
 
     fn part(&self, index: usize) -> TimeSpan {
-        let step = &self.steps[index];
-        TimeSpan::new(self.time(step.part_begin), self.time(step.part_end))
+        let (part_begin, part_end) = self.steps.times_of(index);
+        TimeSpan::new(self.time(part_begin), self.time(part_end))
     }
 
     /// The whole of step `index`.
@@ -784,7 +911,7 @@ impl Grid {
     /// The locations of step `index`.
     #[inline]
     fn locations(&self, index: usize) -> Locations {
-        let packed = self.steps[index].loc.0;
+        let packed = self.steps.get(index).loc.0;
         if packed == 0 {
             return Locations::new();
         }
@@ -819,7 +946,12 @@ impl Grid {
         (0..self.steps.len())
             .map(|index| {
                 let (whole, part) = self.times(index);
-                Place::at(whole, part, self.steps[index].value, self.locations(index))
+                Place::at(
+                    whole,
+                    part,
+                    self.steps.get(index).value,
+                    self.locations(index),
+                )
             })
             .collect()
     }
@@ -835,18 +967,24 @@ impl Grid {
         let bound = period.numer().checked_mul(i128::from(self.ticks.get()))?;
         let inside = |tick: u32| Some(i128::from(tick).checked_mul(period.denom())? <= bound);
         let mut cuts = self.cuts().iter().peekable();
-        for (index, step) in self.steps.iter().enumerate() {
+        let len = self.steps.len();
+        let mut prev: Option<(u32, u32)> = None;
+        for index in 0..len {
+            let (part_begin, part_end) = self.steps.times_of(index);
             let cut = cuts.next_if(|cut| cut.index as usize == index);
-            let (begin, end) = cut.map_or((step.part_begin, step.part_end), |c| (c.begin, c.end));
-            let shaped =
-                begin <= step.part_begin && step.part_begin < step.part_end && step.part_end <= end;
+            let (begin, end) = cut.map_or((part_begin, part_end), |c| (c.begin, c.end));
+            let shaped = begin <= part_begin && part_begin < part_end && part_end <= end;
             if !shaped || !inside(end)? {
                 return Some(false);
             }
+            if let Some((prev_begin, prev_end)) = prev
+                && (prev_begin > part_begin || prev_end > part_end)
+            {
+                return Some(false);
+            }
+            prev = Some((part_begin, part_end));
         }
-        Some(self.steps.windows(2).all(|pair| {
-            pair[0].part_begin <= pair[1].part_begin && pair[0].part_end <= pair[1].part_end
-        }))
+        Some(true)
     }
 
     /// Whether the steps of both are at the same ticks and cut alike.
@@ -854,11 +992,8 @@ impl Grid {
         self.ticks == other.ticks
             && self.cuts() == other.cuts()
             && self.steps.len() == other.steps.len()
-            && self
-                .steps
-                .iter()
-                .zip(other.steps.iter())
-                .all(|(a, b)| (a.part_begin, a.part_end) == (b.part_begin, b.part_end))
+            && (0..self.steps.len())
+                .all(|index| self.steps.times_of(index) == other.steps.times_of(index))
     }
 }
 
@@ -2012,34 +2147,62 @@ impl Layer {
         let (begin_low, begin_high) = grid.ticks_at(turn.begin)?;
         let (_end_low, end_high) = grid.ticks_at(turn.end)?;
         let instant = span.begin == span.end;
-        let steps = &grid.steps;
-        // Fast reject spans outside the layer's step range before binary search.
-        let (Some(first_step), Some(last_step_ref)) = (steps.first(), steps.last()) else {
-            return Some(Ok(()));
+        let (first, last_step) = match &grid.steps {
+            GridSteps::Small(steps) => {
+                let (Some(first_step), Some(last_step_ref)) = (steps.first(), steps.last()) else {
+                    return Some(Ok(()));
+                };
+                if i64::from(last_step_ref.part_end) <= begin_low
+                    || (instant && i64::from(first_step.part_begin) > begin_low)
+                    || (!instant && i64::from(first_step.part_begin) >= end_high)
+                {
+                    return Some(Ok(()));
+                }
+                let begun = steps.partition_point(|step| i64::from(step.part_begin) < begin_high);
+                let first = begun
+                    - steps[..begun]
+                        .iter()
+                        .rev()
+                        .take_while(|step| i64::from(step.part_end) > begin_low)
+                        .count();
+                let last_step = begun
+                    + steps[begun..]
+                        .iter()
+                        .take_while(|step| {
+                            let begins = i64::from(step.part_begin);
+                            begins <= begin_low || (!instant && begins < end_high)
+                        })
+                        .count();
+                (first, last_step)
+            }
+            GridSteps::Wide(steps) => {
+                let (Some(first_step), Some(last_step_ref)) = (steps.first(), steps.last()) else {
+                    return Some(Ok(()));
+                };
+                if i64::from(last_step_ref.part_end) <= begin_low
+                    || (instant && i64::from(first_step.part_begin) > begin_low)
+                    || (!instant && i64::from(first_step.part_begin) >= end_high)
+                {
+                    return Some(Ok(()));
+                }
+                let begun = steps.partition_point(|step| i64::from(step.part_begin) < begin_high);
+                let first = begun
+                    - steps[..begun]
+                        .iter()
+                        .rev()
+                        .take_while(|step| i64::from(step.part_end) > begin_low)
+                        .count();
+                let last_step = begun
+                    + steps[begun..]
+                        .iter()
+                        .take_while(|step| {
+                            let begins = i64::from(step.part_begin);
+                            begins <= begin_low || (!instant && begins < end_high)
+                        })
+                        .count();
+                (first, last_step)
+            }
         };
-        if i64::from(last_step_ref.part_end) <= begin_low
-            || (instant && i64::from(first_step.part_begin) > begin_low)
-            || (!instant && i64::from(first_step.part_begin) >= end_high)
-        {
-            return Some(Ok(()));
-        }
-        // A step begins before a time when its begin is under the ceiling
-        // of the time, and at or before it when its begin is at most the
-        // floor.
-        let begun = steps.partition_point(|step| i64::from(step.part_begin) < begin_high);
-        let reach = |step: &&GridStep| i64::from(step.part_end) > begin_low;
-        let first = begun - steps[..begun].iter().rev().take_while(reach).count();
-        // The steps that the span meets are few, so a scan from the first
-        // that begins after the span's begin finds the end sooner than a
-        // search of the rest.
-        let last_step = begun
-            + steps[begun..]
-                .iter()
-                .take_while(|step| {
-                    let begins = i64::from(step.part_begin);
-                    begins <= begin_low || (!instant && begins < end_high)
-                })
-                .count();
         let met = last_step - first;
         if met == 0 {
             return Some(Ok(()));
@@ -2080,8 +2243,21 @@ impl Layer {
         };
         let maker = self.maker();
         let pushed = (first..last_step).try_for_each(|index| {
-            let step = &steps[index];
-            let visible = TimeSpan::new(at(step.part_begin)?, at(step.part_end)?);
+            let (step_begin, step_end, step_value) = match &grid.steps {
+                GridSteps::Small(steps) => {
+                    let s = steps[index];
+                    (
+                        u32::from(s.part_begin),
+                        u32::from(s.part_end),
+                        u32::from(s.value),
+                    )
+                }
+                GridSteps::Wide(steps) => {
+                    let s = steps[index];
+                    (s.part_begin, s.part_end, s.value)
+                }
+            };
+            let visible = TimeSpan::new(at(step_begin)?, at(step_end)?);
             let whole = match cuts.split_first() {
                 Some((cut, rest)) if cut.index as usize == index => {
                     cuts = rest;
@@ -2089,18 +2265,18 @@ impl Layer {
                 }
                 _ => visible,
             };
-            let part_begin = if i64::from(step.part_begin) <= begin_low {
+            let part_begin = if i64::from(step_begin) <= begin_low {
                 span.begin
             } else {
                 visible.begin
             };
-            let part_end = if i64::from(step.part_end) >= end_high {
+            let part_end = if i64::from(step_end) >= end_high {
                 span.end
             } else {
                 visible.end
             };
             let part = TimeSpan::new(part_begin, part_end);
-            out.push(maker.make(index, step.value, whole, part));
+            out.push(maker.make(index, step_value, whole, part));
             Ok(())
         });
         if pushed.is_ok() {
@@ -2750,16 +2926,13 @@ fn cycle_hap(value: Value) -> Hap {
 /// Whether `hap` holds a value and its locations and nothing more: what a
 /// step of a sequence holds.
 fn is_plain(hap: &Hap) -> bool {
-    holds_a_value_and_keys(hap) && hap.keys.is_empty()
+    hap.keys.is_empty()
 }
 
 /// Whether `hap` holds a value, its locations and the keys of its context,
 /// and nothing more: what a step holds with the keys of its layer.
 fn holds_a_value_and_keys(hap: &Hap) -> bool {
-    hap.live_controls == [0; 4]
-        && hap.slider_binding == 0
-        && hap.ui_visuals == 0
-        && hap.pick_lookup.is_none()
+    hap.keys.has_only_context_keys()
 }
 
 /// The value that `values` answers in each cycle on one hap that fills the
@@ -2898,7 +3071,7 @@ pub(crate) fn is_bare(pattern: &Pattern) -> bool {
             layer.dress().keys().is_empty()
                 && layer.dress().locates_alone()
                 && match layer.listing() {
-                    Listing::Grid(grid) => grid.steps.iter().all(|step| step.loc.0 == 0),
+                    Listing::Grid(grid) => grid.steps.has_no_locations(),
                     listing => (0..listing.len()).all(|index| listing.locations(index).is_empty()),
                 }
         })
@@ -3411,11 +3584,11 @@ mod tests {
             .map(|hap| {
                 format!(
                     "{hap:?} {:?} {} {} {:?} {}",
-                    hap.live_controls,
-                    hap.slider_binding,
-                    hap.ui_visuals,
+                    hap.live_controls(),
+                    hap.slider_binding(),
+                    hap.ui_visuals_context(),
                     hap.keys,
-                    hap.pick_lookup.is_some()
+                    hap.pick_lookup().is_some()
                 )
             })
             .collect()
@@ -5404,7 +5577,7 @@ mod tests {
         ];
         let layer = Layer::of(self::layer((1, 1), steps)).unwrap();
         let grid = grid_of(&layer);
-        assert_eq!(grid.steps[1].loc.0 & PackedLoc::SPARE, 0);
+        assert_eq!(grid.steps.get(1).loc.0 & PackedLoc::SPARE, 0);
         assert_eq!(grid.locations(1).to_vec(), [(5_000_000, 5_000_003)]);
         assert_eq!(grid.locations(0).to_vec(), [(0, 100_000)]);
     }

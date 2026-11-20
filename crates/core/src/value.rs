@@ -27,10 +27,11 @@ const MAX_PATCHES: usize = 4;
 
 /// Up to [`MAX_PATCHES`] key/value overrides or additions over a shared
 /// dressed [`Table`] row, avoiding flattening `Table::tail` on dynamic
-/// control chains.
-struct Patched {
+/// control chains. The row index lives alongside the `Arc<Patched>` in
+/// [`Entries::Patched`] so chord notes from the same uniform-key table can
+/// share one overlay allocation.
+pub(crate) struct Patched {
     base: Arc<Table>,
-    row: u32,
     base_len: u16,
     len: u8,
     appended: u8,
@@ -46,7 +47,6 @@ impl Patched {
         let marks = base.marks;
         Some(Self {
             base,
-            row,
             base_len,
             len: 0,
             appended: 0,
@@ -75,7 +75,6 @@ impl Patched {
         let has_replace = rep != u16::MAX;
         Some(Self {
             base,
-            row,
             base_len,
             len: 1,
             appended,
@@ -92,7 +91,7 @@ impl Patched {
     }
 
     #[inline(always)]
-    fn at(&self, index: usize) -> (&Key, &Value) {
+    fn at(&self, row: u32, index: usize) -> (&Key, &Value) {
         let base_len = usize::from(self.base_len);
         if index < base_len {
             if self.has_replace {
@@ -104,7 +103,7 @@ impl Patched {
                     }
                 }
             }
-            return self.base.layout(self.row).at(index);
+            return self.base.layout(row).at(index);
         }
         let mut want = index - base_len;
         for slot in &self.entries[..usize::from(self.len)] {
@@ -121,7 +120,7 @@ impl Patched {
     }
 
     #[inline(always)]
-    fn get<K: ?Sized + Named>(&self, key: &K) -> Option<&Value>
+    fn get<K: ?Sized + Named>(&self, row: u32, key: &K) -> Option<&Value>
     where
         Key: PartialEq<K>,
     {
@@ -138,11 +137,11 @@ impl Patched {
         if self.base.marks & Table::mark(key.name()) == 0 {
             return None;
         }
-        self.base.layout(self.row).get(key)
+        self.base.layout(row).get(key)
     }
 
     #[inline(always)]
-    fn position<K: ?Sized + Named>(&self, key: &K) -> Option<usize>
+    fn position<K: ?Sized + Named>(&self, row: u32, key: &K) -> Option<usize>
     where
         Key: PartialEq<K>,
     {
@@ -165,10 +164,10 @@ impl Patched {
         if self.base.marks & Table::mark(key.name()) == 0 {
             return None;
         }
-        self.base.layout(self.row).position(key)
+        self.base.layout(row).position(key)
     }
 
-    fn try_set(&mut self, key: &Key, value: Value, data_only: bool) -> Result<(), Value> {
+    fn try_set(&mut self, row: u32, key: &Key, value: Value, data_only: bool) -> Result<(), Value> {
         let len = usize::from(self.len);
         for slot in &mut self.entries[..len] {
             if let Some((k, v, _)) = slot
@@ -188,7 +187,7 @@ impl Patched {
         let replace = if self.base.marks & mark == 0 {
             u16::MAX
         } else {
-            match self.base.layout(self.row).position(key) {
+            match self.base.layout(row).position(key) {
                 Some(idx) => idx as u16,
                 None => u16::MAX,
             }
@@ -209,6 +208,7 @@ impl Patched {
 
     fn try_merge_one(
         &mut self,
+        row: u32,
         key: &Key,
         other: &Value,
         change: impl FnOnce(&Value, &Value) -> Value,
@@ -230,7 +230,7 @@ impl Patched {
         let (value, replace) = if self.base.marks & mark == 0 {
             (other.clone(), u16::MAX)
         } else {
-            let layout = self.base.layout(self.row);
+            let layout = self.base.layout(row);
             match layout.position(key) {
                 Some(idx) => (change(layout.at(idx).1, other), idx as u16),
                 None => (other.clone(), u16::MAX),
@@ -255,6 +255,20 @@ impl Patched {
     }
 }
 
+/// Reusable per-timestamp overlay cache for chord haps sharing one uniform-key
+/// [`Table`] during a fused wave chain query.
+#[derive(Default)]
+pub(crate) struct SharedWaveCache {
+    cached: Option<Arc<Patched>>,
+}
+
+impl SharedWaveCache {
+    #[inline]
+    pub(crate) fn clear(&mut self) {
+        self.cached = None;
+    }
+}
+
 /// The entries of a map, in one allocation that holds them and no more.
 /// Both kinds are shared until a write, which copies them first.
 #[derive(Clone)]
@@ -269,9 +283,8 @@ enum Entries {
     /// The entries of one step of a layer, which the other steps share:
     /// see [`Table`]. The map holds a handle of the table and the step.
     Dressed(Arc<Table>, u32),
-    /// A small mutable-when-unique overlay of 1..=4 entries over a dressed
-    /// [`Table`] row.
-    Patched(Arc<Patched>),
+    /// A small overlay of 1..=4 entries over a dressed [`Table`] row.
+    Patched(Arc<Patched>, u32),
 }
 
 /// What the steps of one layer share when each reads as a map: its own
@@ -323,6 +336,13 @@ enum Heads {
 }
 
 impl Table {
+    /// Whether every row of this table shares identical key positions, so a
+    /// [`Patched`] overlay built for one row applies unchanged to any other.
+    #[inline]
+    fn has_uniform_keys(&self) -> bool {
+        !matches!(self.heads, Heads::Maps(_))
+    }
+
     /// The table of `values` under `key`, with `set` after: `None` where
     /// a map would not read the same as the compose of `set` onto the
     /// value. That is no value or no data, a set that is no data, a key
@@ -344,7 +364,7 @@ impl Table {
         let tail: Option<Arc<[(Key, Value)]>> = set.and_then(|set| match &set.entries {
             Entries::Shared(entries) | Entries::Made(entries) => Some(Arc::clone(entries)),
             Entries::Empty => None,
-            Entries::Dressed(..) | Entries::Patched(_) => Some(set.layout().to_shares()),
+            Entries::Dressed(..) | Entries::Patched(..) => Some(set.layout().to_shares()),
         });
         let held = |name: &Key| {
             tail.as_deref()
@@ -369,7 +389,7 @@ impl Table {
                         Entries::Shared(entries) | Entries::Made(entries) => Arc::clone(entries),
                         Entries::Empty => Arc::from([]),
                         // The entries of a dressed map, copied once.
-                        Entries::Dressed(..) | Entries::Patched(_) => map.layout().to_shares(),
+                        Entries::Dressed(..) | Entries::Patched(..) => map.layout().to_shares(),
                     };
                     let bare = entries.is_empty() && tail.is_none();
                     if bare || entries.iter().any(|(name, _)| held(name)) || !value.is_data(0) {
@@ -424,7 +444,7 @@ impl Table {
         let entries: Shares = match &base.entries {
             Entries::Shared(entries) | Entries::Made(entries) => Arc::clone(entries),
             Entries::Empty => Arc::from([]),
-            Entries::Dressed(..) | Entries::Patched(_) => base.layout().to_shares(),
+            Entries::Dressed(..) | Entries::Patched(..) => base.layout().to_shares(),
         };
         let replace = entries
             .iter()
@@ -548,7 +568,7 @@ enum Layout<'a> {
     /// One leading entry, a shared middle slice, and one appended entry.
     KeyedExtra(&'a Key, &'a Value, &'a [(Key, Value)], &'a Key, &'a Value),
     /// A small overlay on top of a dressed table row.
-    Overlay(&'a Patched),
+    Overlay(&'a Patched, u32),
 }
 
 impl<'a> Layout<'a> {
@@ -560,7 +580,7 @@ impl<'a> Layout<'a> {
             Self::Split(head, tail) => head.len() + tail.len(),
             Self::Patched(base, replace, _, _) => base.len() + usize::from(replace == base.len()),
             Self::KeyedExtra(_, _, tail, _, _) => 2 + tail.len(),
-            Self::Overlay(patched) => patched.len(),
+            Self::Overlay(patched, _) => patched.len(),
         }
     }
 
@@ -578,8 +598,9 @@ impl<'a> Layout<'a> {
             Self::KeyedExtra(hk, hv, tail, ek, ev) => {
                 PairsInner::KeyedExtra(Some((hk, hv)), tail.iter(), Some((ek, ev)))
             }
-            Self::Overlay(patched) => PairsInner::Overlay {
+            Self::Overlay(patched, row) => PairsInner::Overlay {
                 patched,
+                row,
                 index: 0,
                 total: patched.len(),
             },
@@ -614,7 +635,7 @@ impl<'a> Layout<'a> {
                     (ek, ev)
                 }
             }
-            Self::Overlay(patched) => patched.at(index),
+            Self::Overlay(patched, row) => patched.at(row, index),
         }
     }
 
@@ -645,7 +666,7 @@ impl<'a> Layout<'a> {
                     find(tail).map(|at| at + 1)
                 }
             }
-            Self::Overlay(patched) => patched.position(key),
+            Self::Overlay(patched, row) => patched.position(row, key),
         }
     }
 
@@ -679,7 +700,7 @@ impl<'a> Layout<'a> {
                     find(tail)
                 }
             }
-            Self::Overlay(patched) => patched.get(key),
+            Self::Overlay(patched, row) => patched.get(row, key),
         }
     }
 }
@@ -705,9 +726,9 @@ impl Layout<'_> {
                 .chain(tail.iter().map(pair))
                 .chain(std::iter::once((ek.clone(), ev.clone())))
                 .collect(),
-            Self::Overlay(patched) => (0..patched.len())
+            Self::Overlay(patched, row) => (0..patched.len())
                 .map(|index| {
-                    let (key, value) = patched.at(index);
+                    let (key, value) = patched.at(row, index);
                     (key.clone(), value.clone())
                 })
                 .collect(),
@@ -776,9 +797,9 @@ impl Layout<'_> {
                 .chain(std::iter::once(pair(1 + tail.len(), ek, ev)))
                 .chain(last)
                 .collect(),
-            Self::Overlay(patched) => (0..patched.len())
+            Self::Overlay(patched, row) => (0..patched.len())
                 .map(|index| {
-                    let (name, held) = patched.at(index);
+                    let (name, held) = patched.at(row, index);
                     pair(index, name, held)
                 })
                 .chain(last)
@@ -817,6 +838,7 @@ enum PairsInner<'a> {
     /// Entries from a patched overlay over a dressed table row.
     Overlay {
         patched: &'a Patched,
+        row: u32,
         index: usize,
         total: usize,
     },
@@ -856,13 +878,14 @@ impl<'a> Iterator for Pairs<'a> {
             }
             PairsInner::Overlay {
                 patched,
+                row,
                 index,
                 total,
             } => {
                 if *index >= *total {
                     return None;
                 }
-                let pair = patched.at(*index);
+                let pair = patched.at(*row, *index);
                 *index += 1;
                 return Some(pair);
             }
@@ -967,7 +990,7 @@ impl OrderedMap {
             Entries::Shared(entries) | Entries::Made(entries) => Layout::Plain(entries),
             Entries::Empty => Layout::Plain(&[]),
             Entries::Dressed(table, index) => table.layout(*index),
-            Entries::Patched(patched) => Layout::Overlay(patched),
+            Entries::Patched(patched, row) => Layout::Overlay(patched, *row),
         }
     }
 
@@ -986,8 +1009,8 @@ impl OrderedMap {
     /// Copy an overlay map into a compact plain slice so long-lived graph
     /// nodes do not retain `Patched` overlays or pin source tables.
     pub(crate) fn undress_patched(&mut self) {
-        if let Entries::Patched(patched) = &self.entries {
-            let entries = Layout::Overlay(patched).to_shares();
+        if let Entries::Patched(patched, row) = &self.entries {
+            let entries = Layout::Overlay(patched, *row).to_shares();
             self.entries = match patched.made {
                 true => Entries::Made(entries),
                 false => Entries::Shared(entries),
@@ -1006,8 +1029,8 @@ impl OrderedMap {
                     false => Entries::Shared(entries),
                 };
             }
-            Entries::Patched(patched) => {
-                let entries = Layout::Overlay(patched).to_shares();
+            Entries::Patched(patched, row) => {
+                let entries = Layout::Overlay(patched, *row).to_shares();
                 self.entries = match patched.made {
                     true => Entries::Made(entries),
                     false => Entries::Shared(entries),
@@ -1067,7 +1090,7 @@ impl OrderedMap {
             },
             Entries::Empty => Held::View(Layout::Plain(&[])),
             Entries::Dressed(table, index) => Held::View(table.layout(*index)),
-            Entries::Patched(patched) => Held::View(Layout::Overlay(patched)),
+            Entries::Patched(patched, row) => Held::View(Layout::Overlay(patched, *row)),
         };
         // A range with a map says its length, so the entries are made
         // where the new map holds them.
@@ -1078,7 +1101,7 @@ impl OrderedMap {
     /// One allocation holds the new entries: the old ones move where no
     /// other map shares them, and are copied otherwise.
     fn append(&mut self, entry: (Key, Value)) {
-        if let Entries::Patched(patched) = &mut self.entries
+        if let Entries::Patched(patched, _) = &mut self.entries
             && let Some(own) = Arc::get_mut(patched)
             && usize::from(own.len) < MAX_PATCHES
         {
@@ -1102,7 +1125,7 @@ impl OrderedMap {
                 false,
             )
         {
-            self.entries = Entries::Patched(Arc::new(patched));
+            self.entries = Entries::Patched(Arc::new(patched), *index);
             return;
         }
         let held: Shares = match std::mem::replace(&mut self.entries, Entries::Empty) {
@@ -1128,9 +1151,9 @@ impl OrderedMap {
                 let (key, value) = entry;
                 table.layout(index).with(&key, None, value)
             }
-            Entries::Patched(patched) => {
+            Entries::Patched(patched, row) => {
                 let (key, value) = entry;
-                Layout::Overlay(&patched).with(&key, None, value)
+                Layout::Overlay(&patched, row).with(&key, None, value)
             }
         };
         self.entries = Entries::Shared(held);
@@ -1158,21 +1181,23 @@ impl OrderedMap {
         if other_len <= MAX_PATCHES {
             match &mut self.entries {
                 Entries::Dressed(table, row) => {
-                    if let Some(mut patched) = Patched::empty(Arc::clone(table), *row, false) {
+                    let row = *row;
+                    if let Some(mut patched) = Patched::empty(Arc::clone(table), row, false) {
                         for (key, value) in other.pairs() {
-                            let ok = patched.try_merge_one(key, value, &mut change);
+                            let ok = patched.try_merge_one(row, key, value, &mut change);
                             debug_assert!(ok);
                         }
-                        self.entries = Entries::Patched(Arc::new(patched));
+                        self.entries = Entries::Patched(Arc::new(patched), row);
                         return;
                     }
                 }
-                Entries::Patched(patched) => {
+                Entries::Patched(patched, row) => {
+                    let row = *row;
                     if let Some(own) = Arc::get_mut(patched) {
                         let extra = other.pairs().filter(|(k, _)| !own.has_patch_for(k)).count();
                         if usize::from(own.len) + extra <= MAX_PATCHES {
                             for (key, value) in other.pairs() {
-                                let ok = own.try_merge_one(key, value, &mut change);
+                                let ok = own.try_merge_one(row, key, value, &mut change);
                                 debug_assert!(ok);
                             }
                             return;
@@ -1220,35 +1245,37 @@ impl OrderedMap {
         other: &Value,
         mut change: impl FnMut(&Value, &Value) -> Value,
     ) {
-        if let Entries::Patched(patched) = &mut self.entries
+        if let Entries::Patched(patched, row) = &mut self.entries
+            && let row = *row
             && let Some(own) = Arc::get_mut(patched)
-            && own.try_merge_one(key, other, &mut change)
+            && own.try_merge_one(row, key, other, &mut change)
         {
             return;
         }
         if let Entries::Dressed(table, row) = &self.entries {
+            let row = *row;
             let at = self.position(key);
             let value = match at {
-                Some(at) => change(table.layout(*row).at(at).1, other),
+                Some(at) => change(table.layout(row).at(at).1, other),
                 None => other.clone(),
             };
             if let Some(patched) = Patched::of_one(
                 Arc::clone(table),
-                *row,
+                row,
                 key.clone(),
                 value.clone(),
                 at,
                 false,
             ) {
-                self.entries = Entries::Patched(Arc::new(patched));
+                self.entries = Entries::Patched(Arc::new(patched), row);
                 return;
             }
-            self.entries = Entries::Shared(table.layout(*row).with(key, at, value));
+            self.entries = Entries::Shared(table.layout(row).with(key, at, value));
             return;
         }
         let at = self.position(key);
         match (&self.entries, at) {
-            (Entries::Patched(_), at) => {
+            (Entries::Patched(..), at) => {
                 let value = match at {
                     Some(at) => change(self.layout().at(at).1, other),
                     None => other.clone(),
@@ -1280,7 +1307,7 @@ impl OrderedMap {
                 0 => None,
                 _ => table.layout(*index).position(key),
             },
-            Entries::Patched(patched) => patched.position(key),
+            Entries::Patched(patched, row) => patched.position(*row, key),
         }
     }
 
@@ -1290,7 +1317,7 @@ impl OrderedMap {
         match &self.entries {
             Entries::Empty | Entries::Made(_) => true,
             Entries::Dressed(table, _) => table.made,
-            Entries::Patched(patched) => patched.made,
+            Entries::Patched(patched, _) => patched.made,
             Entries::Shared(_) => false,
         }
     }
@@ -1338,11 +1365,11 @@ impl OrderedMap {
         let current = std::mem::replace(&mut self.entries, Entries::Empty);
         self.entries = match current {
             Entries::Shared(entries) if Arc::strong_count(&entries) == 1 => Entries::Made(entries),
-            Entries::Patched(mut patched) => {
+            Entries::Patched(mut patched, row) => {
                 if let Some(own) = Arc::get_mut(&mut patched) {
                     own.made = true;
                 }
-                Entries::Patched(patched)
+                Entries::Patched(patched, row)
             }
             other => other,
         };
@@ -1355,32 +1382,29 @@ impl OrderedMap {
     /// the map of that one entry, with no such map. The map then holds
     /// data only.
     pub(crate) fn set_data(&mut self, key: &Key, mut value: Value) {
-        if let Entries::Patched(patched) = &mut self.entries
+        if let Entries::Patched(patched, row) = &mut self.entries
+            && let row = *row
             && let Some(own) = Arc::get_mut(patched)
         {
-            match own.try_set(key, value, true) {
+            match own.try_set(row, key, value, true) {
                 Ok(()) => return,
                 Err(returned) => value = returned,
             }
         }
         if let Entries::Dressed(table, row) = &self.entries {
+            let row = *row;
             let at = self.position(key);
-            if let Some(patched) = Patched::of_one(
-                Arc::clone(table),
-                *row,
-                key.clone(),
-                value.clone(),
-                at,
-                true,
-            ) {
-                self.entries = Entries::Patched(Arc::new(patched));
+            if let Some(patched) =
+                Patched::of_one(Arc::clone(table), row, key.clone(), value.clone(), at, true)
+            {
+                self.entries = Entries::Patched(Arc::new(patched), row);
                 return;
             }
-            let entries = table.layout(*row).with(key, at, value);
+            let entries = table.layout(row).with(key, at, value);
             self.entries = Entries::Made(entries);
             return;
         }
-        if let Entries::Patched(_) = &self.entries {
+        if let Entries::Patched(..) = &self.entries {
             let entries = self.layout().with(key, self.position(key), value);
             self.entries = Entries::Made(entries);
             return;
@@ -1390,6 +1414,38 @@ impl OrderedMap {
             None => self.append((key.clone(), value)),
         }
         self.mark_made_of_data();
+    }
+
+    /// Set several numeric data controls, reusing one [`Patched`] allocation
+    /// across chord haps that share a uniform-key [`Table`] at the same sample.
+    pub(crate) fn set_data_many_cached(
+        &mut self,
+        patches: &[(&Key, f64)],
+        cache: &mut SharedWaveCache,
+    ) {
+        if !patches.is_empty()
+            && patches.len() <= MAX_PATCHES
+            && let Entries::Dressed(table, row) = &self.entries
+            && table.has_uniform_keys()
+        {
+            let row = *row;
+            if let Some(cached) = &cache.cached
+                && Arc::ptr_eq(&cached.base, table)
+            {
+                self.entries = Entries::Patched(Arc::clone(cached), row);
+                return;
+            }
+            if let Some(mut patched) = Patched::empty(Arc::clone(table), row, true) {
+                for (key, num) in patches {
+                    let _ = patched.try_set(row, key, Value::F64(*num), true);
+                }
+                let arc = Arc::new(patched);
+                cache.cached = Some(Arc::clone(&arc));
+                self.entries = Entries::Patched(arc, row);
+                return;
+            }
+        }
+        self.set_data_many(patches);
     }
 
     /// Set several numeric data controls in one pass, allocating at most once.
@@ -1403,16 +1459,18 @@ impl OrderedMap {
                 if patches.len() <= MAX_PATCHES {
                     match &mut self.entries {
                         Entries::Dressed(table, row) => {
-                            if let Some(mut patched) = Patched::empty(Arc::clone(table), *row, true)
+                            let row = *row;
+                            if let Some(mut patched) = Patched::empty(Arc::clone(table), row, true)
                             {
                                 for (key, num) in patches {
-                                    let _ = patched.try_set(key, Value::F64(*num), true);
+                                    let _ = patched.try_set(row, key, Value::F64(*num), true);
                                 }
-                                self.entries = Entries::Patched(Arc::new(patched));
+                                self.entries = Entries::Patched(Arc::new(patched), row);
                                 return;
                             }
                         }
-                        Entries::Patched(patched) => {
+                        Entries::Patched(patched, row) => {
+                            let row = *row;
                             if let Some(own) = Arc::get_mut(patched) {
                                 let mut extra = 0usize;
                                 for (i, (key, _)) in patches.iter().enumerate() {
@@ -1424,7 +1482,7 @@ impl OrderedMap {
                                 }
                                 if usize::from(own.len) + extra <= MAX_PATCHES {
                                     for (key, num) in patches {
-                                        let _ = own.try_set(key, Value::F64(*num), true);
+                                        let _ = own.try_set(row, key, Value::F64(*num), true);
                                     }
                                     return;
                                 }
@@ -1459,7 +1517,7 @@ impl OrderedMap {
                     }
                     Entries::Empty => Held::View(Layout::Plain(&[])),
                     Entries::Dressed(table, index) => Held::View(table.layout(*index)),
-                    Entries::Patched(patched) => Held::View(Layout::Overlay(patched)),
+                    Entries::Patched(patched, row) => Held::View(Layout::Overlay(patched, *row)),
                 };
                 let count = base_len + append_len;
                 let entries: Shares = (0..count)
@@ -1516,7 +1574,8 @@ impl OrderedMap {
     /// [`Self::insert`] of a key that another map or a control already
     /// holds, which the map then shares.
     pub fn insert_key(&mut self, key: Key, value: Value) -> Option<Value> {
-        if let Entries::Patched(patched) = &mut self.entries
+        if let Entries::Patched(patched, row) = &mut self.entries
+            && let row = *row
             && let Some(own) = Arc::get_mut(patched)
         {
             let len = usize::from(own.len);
@@ -1533,7 +1592,7 @@ impl OrderedMap {
                 let (old, replace) = if own.base.marks & mark == 0 {
                     (None, u16::MAX)
                 } else {
-                    let layout = own.base.layout(own.row);
+                    let layout = own.base.layout(row);
                     match layout.position(&key) {
                         Some(idx) => (Some(layout.at(idx).1.clone()), idx as u16),
                         None => (None, u16::MAX),
@@ -1552,20 +1611,21 @@ impl OrderedMap {
             }
         }
         if let Entries::Dressed(table, row) = &self.entries {
+            let row = *row;
             let at = self.position(&key);
-            let old = at.map(|idx| table.layout(*row).at(idx).1.clone());
+            let old = at.map(|idx| table.layout(row).at(idx).1.clone());
             if let Some(patched) = Patched::of_one(
                 Arc::clone(table),
-                *row,
+                row,
                 key.clone(),
                 value.clone(),
                 at,
                 false,
             ) {
-                self.entries = Entries::Patched(Arc::new(patched));
+                self.entries = Entries::Patched(Arc::new(patched), row);
                 return old;
             }
-            let entries = table.layout(*row).with(&key, at, value);
+            let entries = table.layout(row).with(&key, at, value);
             self.entries = Entries::Shared(entries);
             return old;
         }
@@ -1592,7 +1652,7 @@ impl OrderedMap {
                 0 => None,
                 _ => table.layout(*index).get(key),
             },
-            Entries::Patched(patched) => patched.get(key),
+            Entries::Patched(patched, row) => patched.get(*row, key),
         }
     }
 
@@ -2812,9 +2872,9 @@ fn hash_data_entries(layout: Layout<'_>, state: &mut impl std::hash::Hasher) {
             ek.hash(state);
             hash_data(ev, state);
         }
-        Layout::Overlay(patched) => {
+        Layout::Overlay(patched, row) => {
             for index in 0..patched.len() {
-                let (key, value) = patched.at(index);
+                let (key, value) = patched.at(row, index);
                 key.hash(state);
                 hash_data(value, state);
             }

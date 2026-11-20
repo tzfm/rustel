@@ -23,7 +23,8 @@ impl Realm {
         // it rejects before calling the allocator, so a refusal would never
         // reach the structural flag and would be indistinguishable from a user
         // throw once it surfaced as an exception.
-        let budget = runtime.heap.clone();
+        let bridge = runtime.bridge();
+        let budget = bridge.heap.clone();
         let rt = Runtime::new_with_alloc(alloc::BudgetedAllocator::new(budget.clone()))?;
         // QuickJS anchored its stack budget on the pointer it recorded in the
         // line above and never moves it again, so the size has to be set here,
@@ -44,8 +45,8 @@ impl Realm {
             RejectModuleLoader(loaded_imports.clone()),
         );
         let ctx = Context::full(&rt)?;
-        let effect_policy = runtime.effect_policy.clone();
-        let effect_policy_refusal = runtime.effect_policy_refusal.clone();
+        let effect_policy = bridge.effect_policy.clone();
+        let effect_policy_refusal = bridge.effect_policy_refusal.clone();
         let callback_ir = Rc::clone(runtime.callback_ir());
         ctx.with(|ctx| -> rquickjs::Result<()> {
             let held = rquickjs::Array::new(ctx.clone())?;
@@ -112,10 +113,10 @@ impl Realm {
         // queue still is unsupported: it needs an external host-I/O source,
         // not more polling.
         {
-            let d = runtime.deadline.clone();
-            let i = runtime.interrupted.clone();
-            let flag = runtime.cancel_flag.clone();
-            let c = runtime.cancelled.clone();
+            let d = bridge.deadline.clone();
+            let i = bridge.interrupted.clone();
+            let flag = bridge.cancel_flag.clone();
+            let c = bridge.cancelled.clone();
             rt.set_interrupt_handler(Some(Box::new(move || {
                 let cancellation_requested = flag.get().is_some_and(|pointer| {
                     // SAFETY: installed only for the duration of the call that

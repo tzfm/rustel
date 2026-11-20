@@ -277,6 +277,38 @@ impl Drop for MidiInputCandidate {
     }
 }
 
+/// Shared `Rc` state bridged into QuickJS closures and interrupt handlers.
+/// Allocated lazily on first JavaScript use so native-only sessions pay zero
+/// heap overhead for script-engine state.
+pub(crate) struct JsBridge {
+    /// The cycle that `getTime()` returns. See [`JsRuntime::set_cycle_time`].
+    pub(crate) cycle_time: Rc<Cell<f64>>,
+    /// The tempo that `getCps()` returns when the evaluation in progress has
+    /// set none. See [`JsRuntime::set_cps`].
+    pub(crate) cps: Rc<Cell<f64>>,
+    pub(super) effect_transaction: Rc<RefCell<EffectTransaction>>,
+    /// Which host effects the current operation permits.
+    pub(super) effect_policy: Rc<Cell<EffectPolicy>>,
+    /// Live bytes and the ceiling, shared with the allocator enforcing them.
+    pub(super) heap: Rc<alloc::HeapBudget>,
+    /// Shared with the interrupt handler. `Some(deadline)` while an evaluation
+    /// is running under a CPU budget; `None` when unbounded.
+    pub(super) deadline: Rc<Cell<Option<std::time::Instant>>>,
+    /// Set once the deadline fires, so the caller can tell an interrupted
+    /// evaluation from a normal error.
+    pub(super) interrupted: Rc<Cell<bool>>,
+    /// Atomic cancellation flag borrowed only while a bounded evaluation is
+    /// running.
+    pub(super) cancel_flag: Rc<Cell<Option<*const std::sync::atomic::AtomicBool>>>,
+    /// Distinguishes caller cancellation from expiry of the elapsed-time
+    /// interrupt deadline.
+    pub(super) cancelled: Rc<Cell<bool>>,
+    /// Structural host-policy refusal raised by any effect callback.
+    pub(super) effect_policy_refusal: Rc<RefCell<Option<String>>>,
+    /// Nesting depth of the outer operation that owns `effect_policy_refusal`.
+    pub(super) effect_policy_owner_depth: Rc<Cell<usize>>,
+}
+
 pub struct JsRuntime {
     /// The script engine, from the first use that needs it. The first field,
     /// so it goes before the state that its values hold.
@@ -286,11 +318,6 @@ pub struct JsRuntime {
     /// The single per-runtime callback id allocator, shared by
     /// `GraphBuilder::callback` and the host's bridge. Made at the first
     /// callback a runtime bridges.
-    ///
-    /// An `Rc<Cell<_>>` has no JS-reachable name. User code could reset a JS
-    /// global between two graph constructions: the second callback would
-    /// reuse the first id, `derive_wrapper` would deduplicate it, and the
-    /// wrong function would run.
     pub(super) ids: OnceCell<Rc<Cell<CallbackId>>>,
     /// Buffered console lines, made at the first writer: a runtime whose
     /// score never logs holds none.
@@ -298,37 +325,21 @@ pub struct JsRuntime {
     /// Whether a query error a stack contains stays out of `logs`; see
     /// [`JsRuntime::with_contained_query_errors_unlogged`].
     pub(super) contained_query_errors_unlogged: Cell<bool>,
-    /// The cycle that `getTime()` returns. See [`JsRuntime::set_cycle_time`].
-    pub(crate) cycle_time: std::rc::Rc<Cell<f64>>,
-    /// The tempo that `getCps()` returns when the evaluation in progress has
-    /// set none. See [`JsRuntime::set_cps`].
-    pub(crate) cps: std::rc::Rc<Cell<f64>>,
+    /// Lazy `Rc` cells shared with QuickJS closures once the script engine starts.
+    pub(crate) bridge: OnceCell<JsBridge>,
+    /// Inline seeds mirrored into [`JsBridge`] when it is first created.
+    pub(super) cycle_time_init: Cell<f64>,
+    pub(super) cps_init: Cell<f64>,
+    pub(super) heap_limit_init: Cell<usize>,
+    pub(super) effect_policy_init: Cell<EffectPolicy>,
     pub(super) loaded_imports: OnceCell<LoadedImports>,
     /// The names of score imports. See [`JsRuntime::show_imports`].
     pub(super) import_surface: RefCell<ImportSurface>,
     pub(super) timeline_state: OnceCell<rustel_core::TimelineState>,
     /// MIDI inputs this Session's scores have named, and their live values.
-    ///
-    /// Shared with the host, which attaches the platform listeners; the tables
-    /// themselves are dependency-free atomics in core, so nothing here links a
-    /// MIDI stack. JavaScript never holds one - `midin()` hands out an integer
-    /// handle and nothing else.
     pub(super) midi_in: OnceCell<MidiInput>,
-    /// Effects owned by the one Session evaluation currently in progress.
-    /// The transaction is private Rust state: JavaScript callbacks may append
-    /// only while the operation policy permits it, and every unsuccessful
-    /// exit drops the whole value rather than leaving work for a later score.
-    /// Hydra chains under construction by the score currently evaluating, and
-    /// which globals the visuals surface has borrowed. Never JavaScript-
-    /// reachable: a score that could reset the arena could make one chain's
-    /// index name another chain's shader.
     #[cfg(feature = "hydra")]
     pub(super) hydra_chains: OnceCell<std::rc::Rc<RefCell<crate::install::HydraChains>>>,
-    pub(super) effect_transaction: Rc<RefCell<EffectTransaction>>,
-    /// Which host effects the current operation permits. Setup may register
-    /// and preload samples; score evaluation may also stage tempo. Queries and
-    /// source-compatible raw evaluation temporarily permit none.
-    pub(super) effect_policy: Rc<Cell<EffectPolicy>>,
     /// Haps one query may produce. Configurable so the limit can be tested
     /// through the real host without provoking it at full scale.
     pub(super) hap_budget: Cell<u64>,
@@ -336,9 +347,7 @@ pub struct JsRuntime {
     /// window; reports consume this message through `take_query_throw`.
     pub(super) query_threw: RefCell<Option<String>>,
     /// Callback-IR selection is resolved at the owning runtime rather than in
-    /// a pattern hot loop. `Compatibility` and `DualRun` are test and
-    /// benchmark controls. Ordinary playback uses `Auto`. Made at the first
-    /// use: a realm that lowers no callback pays for none.
+    /// a pattern hot loop. Made at the first use.
     pub(super) callback_ir: OnceCell<Rc<CallbackIr>>,
     /// Whether a score the native tier proves skips JavaScript. On by
     /// default. See [`JsRuntime::set_native_tier`].
@@ -347,61 +356,18 @@ pub struct JsRuntime {
     /// native tier.
     pub(super) evaluated_natively: Cell<bool>,
     /// Whether the semantic surface and the voicing globals are installed.
-    /// A realm without them has run no score text: it evaluates natively,
-    /// and the first score, prelude or import that needs JavaScript installs
-    /// them. See [`JsRuntime::ensure_surface`].
     pub(super) bindings_installed: Cell<bool>,
     pub(super) voicings_installed: Cell<bool>,
-    /// Live bytes and the ceiling, shared with the allocator enforcing them.
-    pub(super) heap: std::rc::Rc<alloc::HeapBudget>,
-    /// Shared with the interrupt handler. `Some(deadline)` while an evaluation
-    /// is running under a CPU budget; `None` when unbounded.
-    pub(super) deadline: std::rc::Rc<Cell<Option<std::time::Instant>>>,
-    /// Set once the deadline fires, so the caller can tell an interrupted
-    /// evaluation from a normal error.
-    pub(super) interrupted: std::rc::Rc<Cell<bool>>,
-    /// Atomic cancellation flag borrowed only while a bounded evaluation is
-    /// running. The interrupt handler reads it without waiting for JavaScript
-    /// to reach a query node.
-    pub(super) cancel_flag: std::rc::Rc<Cell<Option<*const std::sync::atomic::AtomicBool>>>,
-    /// Distinguishes caller cancellation from expiry of the elapsed-time
-    /// interrupt deadline.
-    pub(super) cancelled: std::rc::Rc<Cell<bool>>,
     /// Depth of the bounded synchronous query turn currently using this
-    /// runtime. Only the outer direct query or scheduler tick owns the
-    /// deadline, cancellation pointer, heap flag and pending-job cleanup;
-    /// reentrant `queryHeld` calls inherit that exact boundary.
+    /// runtime.
     pub(super) query_turn_depth: Cell<usize>,
-    /// Depth of any host query scope, including a legacy query inheriting a
-    /// caller-installed raw deadline. Effect refusals use this to reach core's
-    /// structural channel before a scheduler can commit callback silence;
-    /// eager callbacks during graph construction remain outside it.
+    /// Depth of any host query scope.
     pub(super) effect_query_depth: Cell<usize>,
     /// Depth of the generic QuickJS heap-refusal boundary.
-    ///
-    /// Score/setup evaluation can call the opt-in `queryHeld` binding while it
-    /// already owns this flag. A nested legacy query must not clear it and
-    /// thereby launder an allocation denial caught by JavaScript.
     pub(super) heap_boundary_depth: Cell<usize>,
     /// Stable public millisecond value reported for a query-turn deadline
-    /// refusal. Kept apart from the absolute `Instant`: callbacks must publish
-    /// the typed refusal while the core query is still live, before a scheduler
-    /// can commit an interrupted query as silence.
+    /// refusal.
     pub(super) query_limit_millis: Cell<Option<u64>>,
-    /// Structural host-policy refusal raised by any effect callback.
-    ///
-    /// JavaScript is allowed to catch the exception, so outer evaluation and
-    /// query boundaries also inspect this latch before accepting an otherwise
-    /// successful result.
-    pub(super) effect_policy_refusal: std::rc::Rc<RefCell<Option<String>>>,
-    /// Nesting depth of the outer operation that owns
-    /// [`Self::effect_policy_refusal`].
-    ///
-    /// A raw/prebake/score evaluation can call `queryHeld`, and that query can
-    /// itself be where an effect refusal is first raised. The nested query
-    /// must report the policy without clearing it; only depth zero may reset
-    /// and finally consume the latch.
-    pub(super) effect_policy_owner_depth: std::rc::Rc<Cell<usize>>,
     /// What the last native build of a score kept for the next one. See
     /// [`native::Memo`].
     native_memo: RefCell<native::Memo>,
@@ -498,17 +464,18 @@ pub(super) struct EffectPolicyOwner {
 
 impl EffectPolicyOwner {
     pub(super) fn enter(runtime: &JsRuntime) -> Self {
-        let previous_depth = runtime.effect_policy_owner_depth.get();
+        let bridge = runtime.bridge();
+        let previous_depth = bridge.effect_policy_owner_depth.get();
         if previous_depth == 0 {
-            runtime.effect_policy_refusal.borrow_mut().take();
+            bridge.effect_policy_refusal.borrow_mut().take();
         }
-        let policy_pending_on_entry = runtime.effect_policy_refusal.borrow().is_some();
-        runtime
+        let policy_pending_on_entry = bridge.effect_policy_refusal.borrow().is_some();
+        bridge
             .effect_policy_owner_depth
             .set(previous_depth.saturating_add(1));
         Self {
-            depth: runtime.effect_policy_owner_depth.clone(),
-            refusal: runtime.effect_policy_refusal.clone(),
+            depth: bridge.effect_policy_owner_depth.clone(),
+            refusal: bridge.effect_policy_refusal.clone(),
             previous_depth,
             policy_pending_on_entry,
         }
@@ -605,27 +572,28 @@ pub(super) struct EffectTransactionOwner {
 
 impl EffectTransactionOwner {
     pub(super) fn enter(runtime: &JsRuntime, policy: EffectPolicy) -> Result<Self, QueryError> {
+        let bridge = runtime.bridge();
         if runtime.effect_query_depth.get() > 0 {
             let message = "JavaScript effect transactions cannot begin during a pattern query";
-            let mut refusal = runtime.effect_policy_refusal.borrow_mut();
+            let mut refusal = bridge.effect_policy_refusal.borrow_mut();
             if refusal.is_none() {
                 *refusal = Some(message.to_string());
             }
             return Err(QueryError::Policy(message.to_string()));
         }
-        if runtime.effect_transaction.borrow().is_open() {
+        if bridge.effect_transaction.borrow().is_open() {
             let message = "nested JavaScript effect transactions are not supported";
-            let mut refusal = runtime.effect_policy_refusal.borrow_mut();
+            let mut refusal = bridge.effect_policy_refusal.borrow_mut();
             if refusal.is_none() {
                 *refusal = Some(message.to_string());
             }
             return Err(QueryError::Policy(message.to_string()));
         }
-        runtime.effect_transaction.borrow_mut().begin();
-        let previous_policy = runtime.effect_policy.replace(policy);
+        bridge.effect_transaction.borrow_mut().begin();
+        let previous_policy = bridge.effect_policy.replace(policy);
         Ok(Self {
-            transaction: runtime.effect_transaction.clone(),
-            policy: runtime.effect_policy.clone(),
+            transaction: bridge.effect_transaction.clone(),
+            policy: bridge.effect_policy.clone(),
             previous_policy,
         })
     }
@@ -677,10 +645,11 @@ impl Drop for EffectQueryScope<'_> {
 
 impl EffectPolicyScope {
     pub(super) fn enter(runtime: &JsRuntime, policy: EffectPolicy) -> Self {
+        let bridge = runtime.bridge();
         Self::enter_state(
             &EffectBoundaryState {
-                policy: runtime.effect_policy.clone(),
-                refusal: runtime.effect_policy_refusal.clone(),
+                policy: bridge.effect_policy.clone(),
+                refusal: bridge.effect_policy_refusal.clone(),
             },
             policy,
         )

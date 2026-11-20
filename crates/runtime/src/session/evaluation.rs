@@ -1898,7 +1898,7 @@ impl Session {
                 };
                 let whole_begin = hap.whole_or_part().begin;
                 let onset = OnsetEventJson {
-                    live_controls: hap.live_controls,
+                    live_controls: hap.live_controls(),
                     onset_id: 0,
                     generation: self.generation().saturating_add(1),
                     whole_begin: whole_begin.show(),

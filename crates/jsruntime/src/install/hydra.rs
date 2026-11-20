@@ -1440,9 +1440,10 @@ pub(super) fn install<'js>(
         .hydra_chains
         .get_or_init(|| Rc::new(RefCell::new(crate::install::HydraChains::default())))
         .clone();
-    let transaction = runtime.effect_transaction.clone();
-    let policy = runtime.effect_policy.clone();
-    let refusal = runtime.effect_policy_refusal.clone();
+    let bridge = runtime.bridge();
+    let transaction = bridge.effect_transaction.clone();
+    let policy = bridge.effect_policy.clone();
+    let refusal = bridge.effect_policy_refusal.clone();
 
     let open = Function::new(ctx.clone(), {
         let chains = chains.clone();

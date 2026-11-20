@@ -56,13 +56,65 @@ struct Lane {
     plugins: Vec<String>,
 }
 
+/// Inline-optimized lane list: stores zero or one lane without a heap
+/// allocation, falling back to a `Vec` for multi-lane scores.
+#[derive(Clone, Default)]
+enum LaneList {
+    #[default]
+    Empty,
+    One(Lane),
+    Many(Vec<Lane>),
+}
+
+impl LaneList {
+    #[inline]
+    fn as_slice(&self) -> &[Lane] {
+        match self {
+            Self::Empty => &[],
+            Self::One(lane) => std::slice::from_ref(lane),
+            Self::Many(lanes) => lanes,
+        }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [Lane] {
+        match self {
+            Self::Empty => &mut [],
+            Self::One(lane) => std::slice::from_mut(lane),
+            Self::Many(lanes) => lanes,
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    #[inline]
+    fn into_vec(self) -> Vec<Lane> {
+        match self {
+            Self::Empty => Vec::new(),
+            Self::One(lane) => vec![lane],
+            Self::Many(lanes) => lanes,
+        }
+    }
+
+    fn from_iter_exact(mut iter: impl ExactSizeIterator<Item = Lane>) -> Self {
+        match iter.len() {
+            0 => Self::Empty,
+            1 => Self::One(iter.next().expect("exact length 1")),
+            _ => Self::Many(iter.collect()),
+        }
+    }
+}
+
 /// The lanes of one score text, as the chains of a session read them: see
 /// [`LaneTable::playing`] and [`LaneTable::read_of`].
 #[derive(Clone, Default)]
 pub(super) struct ScoreLanes {
     /// The lanes in text order. A score with no label has one lane, with
     /// the empty label.
-    lanes: Vec<Lane>,
+    lanes: LaneList,
     /// True when the label rewrite of the text wrote places: see
     /// [`LaneTable::wrote_places`].
     places: bool,
@@ -72,7 +124,7 @@ impl ScoreLanes {
     /// Each lane in text order: its number, its label, its line and the
     /// plugin name of each call in its body.
     pub(super) fn lanes(&self) -> impl Iterator<Item = (u64, &str, usize, &[String])> {
-        let lanes = self.lanes.iter();
+        let lanes = self.lanes.as_slice().iter();
         lanes.map(|lane| {
             (
                 lane.number,
@@ -224,14 +276,14 @@ impl LaneTable {
         let none: &[Lane] = &[];
         // The lanes of the document of the read come first.
         let (playing, away) = if reading == self.document {
-            (&self.playing.lanes[..], &self.away[..])
+            (self.playing.lanes.as_slice(), &self.away[..])
         } else {
             let rest = self.rest.get(&reading);
             rest.map_or((none, none), |rest| (&rest.lanes[..], &rest.away[..]))
         };
         let tried = self.candidate.as_ref();
         let tried = tried.filter(|(document, ..)| *document == reading);
-        let tried = tried.map_or(none, |(.., read)| &read.lanes);
+        let tried = tried.map_or(none, |(.., read)| read.lanes.as_slice());
         // A read that moved here from another document comes after the
         // lanes of the document: see `Self::adopt_read`.
         let (tried, moved) = if adopted {
@@ -252,7 +304,7 @@ impl LaneTable {
         // A document that is not in play shares the lanes of the score in
         // play.
         if reading != self.document {
-            let (playing, away) = (&self.playing.lanes, &self.away);
+            let (playing, away) = (self.playing.lanes.as_slice(), &self.away);
             pair(&statements, &mut paired, playing, none, away, other);
         }
         let lane = |(statement, number): (LaneStatement, Option<u64>)| Lane {
@@ -265,9 +317,12 @@ impl LaneTable {
             body: LaneBody::Owned(statement.body),
             line: statement.line,
         };
-        let lanes: Vec<Lane> = statements.into_iter().zip(paired).map(lane).collect();
+        let lanes = LaneList::from_iter_exact(statements.into_iter().zip(paired).map(lane));
         // A score with no label has no statement that carries a number.
-        let labeled = lanes.iter().filter(|lane| !lane.label.is_empty());
+        let labeled = lanes
+            .as_slice()
+            .iter()
+            .filter(|lane| !lane.label.is_empty());
         let numbers = labeled.map(|lane| lane.number).collect();
         let read = ScoreLanes {
             lanes,
@@ -353,7 +408,7 @@ impl LaneTable {
             .candidate
             .take_if(|(_, text, _)| text == source.as_ref());
         if let Some((document, _, mut read)) = read {
-            for lane in &mut read.lanes {
+            for lane in read.lanes.as_mut_slice() {
                 lane.body.share_with(source);
             }
             self.put_in_play(document, read);
@@ -380,7 +435,7 @@ impl LaneTable {
             let back = self.rest.remove(&document);
             let back = back.map(|rest| (rest.lanes, rest.away));
             let (lanes, away) = back.unwrap_or_default();
-            let played = std::mem::replace(&mut before, lanes);
+            let played = std::mem::replace(&mut before, LaneList::Many(lanes)).into_vec();
             let away = std::mem::replace(&mut self.away, away);
             if heard {
                 self.audible = Audible::Earlier {
@@ -398,17 +453,30 @@ impl LaneTable {
                 self.rest.insert(left, rest);
             }
         }
-        if !self.away.is_empty() || !before.is_empty() {
-            let kept: HashSet<u64> = self.playing.lanes.iter().map(|lane| lane.number).collect();
-            // A lane that came back is in play again.
-            self.away.retain(|lane| !kept.contains(&lane.number));
-            let gone = before.iter().filter(|lane| !kept.contains(&lane.number));
-            self.away.extend(gone.cloned());
+        let before_slice = before.as_slice();
+        if !self.away.is_empty() || !before_slice.is_empty() {
+            let playing = self.playing.lanes.as_slice();
+            if playing.len() <= 1 && self.away.is_empty() && before_slice.len() <= 1 {
+                let kept = playing.first().map(|lane| lane.number);
+                if let Some(gone) = before_slice.first()
+                    && Some(gone.number) != kept
+                {
+                    self.away.push(gone.clone());
+                }
+            } else {
+                let kept: HashSet<u64> = playing.iter().map(|lane| lane.number).collect();
+                // A lane that came back is in play again.
+                self.away.retain(|lane| !kept.contains(&lane.number));
+                let gone = before_slice
+                    .iter()
+                    .filter(|lane| !kept.contains(&lane.number));
+                self.away.extend(gone.cloned());
+            }
         }
         if heard && left == document {
             self.audible = Audible::Earlier {
                 document: left,
-                lanes: before,
+                lanes: before.into_vec(),
             };
         }
     }
@@ -462,6 +530,7 @@ impl LaneTable {
     pub(crate) fn has_plugins(&self) -> bool {
         self.playing
             .lanes
+            .as_slice()
             .iter()
             .any(|lane| !lane.plugins.is_empty())
     }
@@ -814,7 +883,7 @@ pub(super) mod tests {
         assert_eq!(lanes.read(&tried.replace("cp", "cp*2")), [0, 1]);
         // A score with no read takes no lanes of a different text.
         lanes.install("bd sd");
-        assert_eq!(lanes.playing.lanes.len(), 1);
+        assert_eq!(lanes.playing.lanes.as_slice().len(), 1);
         assert_eq!(play(&mut lanes, &tried), [0, 1]);
         // A text with no scan changes no lane when it goes in play.
         let deep = format!(
@@ -1001,7 +1070,7 @@ pub(super) mod tests {
         lanes.forget(2);
         assert!(lanes.is_closed(2) && !lanes.rest.contains_key(&2));
         lanes.forget(1);
-        assert_eq!(numbers(&lanes.playing.lanes), [0, 1, 3]);
+        assert_eq!(numbers(lanes.playing.lanes.as_slice()), [0, 1, 3]);
         assert_eq!(play_in(&mut lanes, 3, kick), [1]);
         assert!(!lanes.rest.contains_key(&1));
         lanes.install_pattern();

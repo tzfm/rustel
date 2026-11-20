@@ -351,7 +351,7 @@ impl StepWave {
     /// Asked of every function hap before the control answers any, so that
     /// a side that it cannot answer is queried once for all of them.
     pub(crate) fn takes(hf: &Hap) -> bool {
-        hf.pick_lookup.is_none()
+        hf.pick_lookup().is_none()
             && matches!(hf.value, Value::Object(_))
             && hf.value.is_data(0)
             && hf.part.begin < hf.part.end

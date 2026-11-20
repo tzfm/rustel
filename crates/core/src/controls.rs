@@ -646,14 +646,14 @@ fn control_map(spec: ControlSpec, unnamed_only: bool) -> impl Fn(Hap) -> Option<
         if already_controls {
             return Some(hap);
         }
-        let slider_binding = hap.slider_binding;
+        let slider_binding = hap.slider_binding();
         let scalar = matches!(hap.value, Value::F64(_));
         let mut mapped = hap.map_value(|value| spec.with_value(value.clone()));
         if slider_binding != 0
             && scalar
             && let Some(slot) = live_slot(spec.name())
         {
-            mapped.live_controls[slot] = slider_binding;
+            mapped.set_live_control(slot, slider_binding);
         }
         Some(mapped)
     }

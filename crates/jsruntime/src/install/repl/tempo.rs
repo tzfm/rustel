@@ -228,9 +228,9 @@ fn setter<'js>(
             silence,
             unit,
             lane,
-            transaction: runtime.effect_transaction.clone(),
-            policy: runtime.effect_policy.clone(),
-            refusal: runtime.effect_policy_refusal.clone(),
+            transaction: runtime.bridge().effect_transaction.clone(),
+            policy: runtime.bridge().effect_policy.clone(),
+            refusal: runtime.bridge().effect_policy_refusal.clone(),
         },
     )
     .map_err(|error| error.to_string())?
@@ -320,8 +320,9 @@ pub(super) fn install<'js>(
     canonical.set(6, lane).map_err(|error| error.to_string())?;
     // `getCps()` reads the tempo that `setCps` staged in this evaluation,
     // or else the tempo that plays.
-    let staged = runtime.effect_transaction.clone();
-    let playing = runtime.cps.clone();
+    let bridge = runtime.bridge();
+    let staged = bridge.effect_transaction.clone();
+    let playing = bridge.cps.clone();
     let get_cps = Function::new(ctx.clone(), move || {
         staged
             .borrow()

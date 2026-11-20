@@ -14,7 +14,8 @@ later version.
 //! Most haps carry none of them, so the keys sit behind one shared pointer
 //! that a clone copies. A change copies them first.
 
-use crate::Value;
+use crate::{PickLookup, Value};
+use std::fmt;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
@@ -25,7 +26,7 @@ impl ContextKeys {
     pub(crate) const NONE: Self = Self(None);
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Keys {
     /// `hap.context.scale`: set by `.scale()`, read by `.scaleTranspose()`.
     pub(crate) scale: Option<Arc<str>>,
@@ -46,6 +47,32 @@ pub(crate) struct Keys {
     /// it would make the pattern mean something else. The formatter runs
     /// when the hap is made. Only the printing waits for the onset.
     pub(crate) log_line: Option<Arc<str>>,
+    /// Direct live slider bindings: gain, low-pass cutoff, low-pass
+    /// resonance, then the direct FM route's index. Zero is unbound.
+    /// These are host tokens, never score values or source-location guesses.
+    pub(crate) live_controls: [u64; 4],
+    pub(crate) slider_binding: u64,
+    pub(crate) ui_visuals: u64,
+    /// Exact JavaScript lookup shape (holes, length, enumerable keys) when the
+    /// visible value alone cannot represent it. Nested Patterns also live in
+    /// `value`; this side channel is shape metadata, not their only owner.
+    pub(crate) pick_lookup: Option<Arc<PickLookup>>,
+}
+
+impl fmt::Debug for Keys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Keys")
+            .field("scale", &self.scale)
+            .field("edo_size", &self.edo_size)
+            .field("scale_definition", &self.scale_definition)
+            .field("tags", &self.tags)
+            .field("log_line", &self.log_line)
+            .field("live_controls", &self.live_controls)
+            .field("slider_binding", &self.slider_binding)
+            .field("ui_visuals", &self.ui_visuals)
+            .field("pick_lookup", &self.pick_lookup.is_some())
+            .finish()
+    }
 }
 
 static NO_KEYS: Keys = Keys {
@@ -54,24 +81,39 @@ static NO_KEYS: Keys = Keys {
     scale_definition: None,
     tags: None,
     log_line: None,
+    live_controls: [0; 4],
+    slider_binding: 0,
+    ui_visuals: 0,
+    pick_lookup: None,
 };
+
+fn same_pick_lookup(a: &Option<Arc<PickLookup>>, b: &Option<Arc<PickLookup>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
 
 impl ContextKeys {
     /// `keys`, sharing nothing when no key is set.
     pub(crate) fn of(keys: Keys) -> Self {
-        let empty = keys.scale.is_none()
-            && keys.edo_size.is_none()
-            && keys.scale_definition.is_none()
-            && keys.tags.is_none()
-            && keys.log_line.is_none();
-        Self((!empty).then(|| Arc::new(keys)))
+        Self((!keys.is_empty()).then(|| Arc::new(keys)))
     }
 
     /// Whether no key is set, so these share and own nothing.
+    #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_none()
     }
 
+    /// Whether no live binding, visual bit, or lookup shape is carried here.
+    #[inline]
+    pub(crate) fn has_only_context_keys(&self) -> bool {
+        self.0.as_deref().is_none_or(Keys::has_only_context_keys)
+    }
+
+    #[inline]
     pub(crate) fn get(&self) -> &Keys {
         self.0.as_deref().unwrap_or(&NO_KEYS)
     }
@@ -79,6 +121,14 @@ impl ContextKeys {
     /// The keys to change, copied first when another hap shares them.
     pub(crate) fn edit(&mut self) -> &mut Keys {
         Arc::make_mut(self.0.get_or_insert_with(Default::default))
+    }
+
+    /// Drop the backing allocation when every field is cleared.
+    #[inline]
+    pub(crate) fn trim(&mut self) {
+        if self.0.as_deref().is_some_and(Keys::is_empty) {
+            self.0 = None;
+        }
     }
 
     /// Whether these and `other` hold the same keys, down to the bits of a
@@ -97,20 +147,46 @@ impl ContextKeys {
                         && a.edo_size.map(f64::to_bits) == b.edo_size.map(f64::to_bits)
                         && same_definition(&a.scale_definition, &b.scale_definition)
                         && a.tags == b.tags
-                        && a.log_line == b.log_line)
+                        && a.log_line == b.log_line
+                        && a.live_controls == b.live_controls
+                        && a.slider_binding == b.slider_binding
+                        && a.ui_visuals == b.ui_visuals
+                        && same_pick_lookup(&a.pick_lookup, &b.pick_lookup))
             }
             _ => false,
         }
     }
 
-    /// Each key from `first` where it has one, else from `second`. A
-    /// context merge keeps the extending side's key, as `Option::or` does.
+    /// Each key from `first` where it has one, else from `second`. Visual bits
+    /// combine with bitwise OR, while live bindings and lookup shape follow
+    /// `first`.
+    #[inline]
     pub(crate) fn merge(first: &Self, second: &Self) -> Self {
         match (&first.0, &second.0) {
-            (_, None) => first.clone(),
-            (None, _) => second.clone(),
+            (None, None) => Self::NONE,
+            (Some(_), None) => first.clone(),
+            (None, Some(b)) => {
+                if b.has_only_context_keys()
+                    || (b.live_controls == [0; 4]
+                        && b.slider_binding == 0
+                        && b.pick_lookup.is_none())
+                {
+                    return second.clone();
+                }
+                Self::of(Keys {
+                    scale: b.scale.clone(),
+                    edo_size: b.edo_size,
+                    scale_definition: b.scale_definition.clone(),
+                    tags: b.tags.clone(),
+                    log_line: b.log_line.clone(),
+                    live_controls: [0; 4],
+                    slider_binding: 0,
+                    ui_visuals: b.ui_visuals,
+                    pick_lookup: None,
+                })
+            }
             (Some(a), Some(b)) => {
-                if a.covers(b) {
+                if a.covers_context_and_visuals(b) {
                     return first.clone();
                 }
                 Self(Some(Arc::new(Keys {
@@ -122,20 +198,96 @@ impl ContextKeys {
                         .or_else(|| b.scale_definition.clone()),
                     tags: a.tags.clone().or_else(|| b.tags.clone()),
                     log_line: a.log_line.clone().or_else(|| b.log_line.clone()),
+                    live_controls: a.live_controls,
+                    slider_binding: a.slider_binding,
+                    ui_visuals: a.ui_visuals | b.ui_visuals,
+                    pick_lookup: a.pick_lookup.clone(),
                 })))
             }
         }
     }
+
+    /// Merge context keys (`first` wins) and visual bits (OR), while setting
+    /// live bindings and lookup shape explicitly.
+    #[inline]
+    pub(crate) fn merge_with(
+        first: &Self,
+        second: &Self,
+        live_controls: [u64; 4],
+        slider_binding: u64,
+        pick_lookup: Option<Arc<PickLookup>>,
+    ) -> Self {
+        if first.0.is_none()
+            && second.0.is_none()
+            && live_controls == [0; 4]
+            && slider_binding == 0
+            && pick_lookup.is_none()
+        {
+            return Self::NONE;
+        }
+        let a = first.get();
+        let b = second.get();
+        if first.0.is_some()
+            && a.covers_context_and_visuals(b)
+            && a.live_controls == live_controls
+            && a.slider_binding == slider_binding
+            && same_pick_lookup(&a.pick_lookup, &pick_lookup)
+        {
+            return first.clone();
+        }
+        if first.0.is_none()
+            && second.0.is_some()
+            && b.live_controls == live_controls
+            && b.slider_binding == slider_binding
+            && same_pick_lookup(&b.pick_lookup, &pick_lookup)
+        {
+            return second.clone();
+        }
+        Self::of(Keys {
+            scale: a.scale.clone().or_else(|| b.scale.clone()),
+            edo_size: a.edo_size.or(b.edo_size),
+            scale_definition: a
+                .scale_definition
+                .clone()
+                .or_else(|| b.scale_definition.clone()),
+            tags: a.tags.clone().or_else(|| b.tags.clone()),
+            log_line: a.log_line.clone().or_else(|| b.log_line.clone()),
+            live_controls,
+            slider_binding,
+            ui_visuals: a.ui_visuals | b.ui_visuals,
+            pick_lookup,
+        })
+    }
 }
 
 impl Keys {
-    /// Whether every key `other` has is set here, so a merge keeps these.
-    fn covers(&self, other: &Self) -> bool {
+    fn is_empty(&self) -> bool {
+        self.scale.is_none()
+            && self.edo_size.is_none()
+            && self.scale_definition.is_none()
+            && self.tags.is_none()
+            && self.log_line.is_none()
+            && self.live_controls == [0; 4]
+            && self.slider_binding == 0
+            && self.ui_visuals == 0
+            && self.pick_lookup.is_none()
+    }
+
+    fn has_only_context_keys(&self) -> bool {
+        self.live_controls == [0; 4]
+            && self.slider_binding == 0
+            && self.ui_visuals == 0
+            && self.pick_lookup.is_none()
+    }
+
+    /// Whether every context key and visual bit `other` has is already set here.
+    fn covers_context_and_visuals(&self, other: &Self) -> bool {
         (self.scale.is_some() || other.scale.is_none())
             && (self.edo_size.is_some() || other.edo_size.is_none())
             && (self.scale_definition.is_some() || other.scale_definition.is_none())
             && (self.tags.is_some() || other.tags.is_none())
             && (self.log_line.is_some() || other.log_line.is_none())
+            && (self.ui_visuals & other.ui_visuals == other.ui_visuals)
     }
 }
 

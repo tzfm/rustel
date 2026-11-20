@@ -184,7 +184,7 @@ pub(super) fn install<'js>(
             .set(name, function)
             .map_err(|error| error.to_string())
     };
-    let cycle_time = runtime.cycle_time.clone();
+    let cycle_time = runtime.bridge().cycle_time.clone();
     install(
         "getTime",
         0,

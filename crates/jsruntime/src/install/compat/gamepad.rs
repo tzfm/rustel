@@ -178,8 +178,9 @@ pub(super) fn install<'js>(
     ctx: &Ctx<'js>,
     globals: &rquickjs::Object<'js>,
 ) -> Result<(), String> {
-    let transaction = runtime.effect_transaction.clone();
-    let policy = runtime.effect_policy.clone();
+    let bridge = runtime.bridge();
+    let transaction = bridge.effect_transaction.clone();
+    let policy = bridge.effect_policy.clone();
     let gamepad = Function::new(
         ctx.clone(),
         hr_pad(move |ctx, index| {
