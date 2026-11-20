@@ -12,6 +12,7 @@
 - Fixed: the theme editor opened from the theme picker shows on top of the reference.
 - The knobs column moves a plain number live while the set plays, as a slider does: the number of an audio control such as `lpf(4000)`, or of a function such as `pg(0.8)`, `fast(2)`, an `FX` stage's `soft(4.5)`, or a plugin option such as `vsti("Diva", { output: 0.111 })`. It needs no update, and edits not yet evaluated stay out of the sound. A plugin key turned on goes in as an update of its own. A rail that waits for an update is muted, dashed and marked "not live". A live move is written to the session tape.
 - Hold Shift or Alt while you drag any slider for a fine drag, a tenth as far. f in the knobs column or the expanded slider locks it on.
+- Fixed: the documented prebake helper `window.bpm = b => setcpm(b/4)` works after a score has run `initHydra()`, and a prebake that throws after an `await` reports its own line.
 - Fixed: the documented second argument of `asym`, `diode`, `fold` and the other distortions sets the volume, as `.asym(.5, .3)` reads.
 - Fixed: an update that starts on a rest and cannot play any of its notes no longer silences the set. The last good score keeps playing.
 - Fixed: loop points outside 0 to 1, or a loopBegin after loopEnd, loop the whole sample as Web Audio does, instead of playing loud clipped noise.
