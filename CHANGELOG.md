@@ -12,6 +12,7 @@
 - Fixed: the theme editor opened from the theme picker shows on top of the reference.
 - The knobs column moves a plain number live while the set plays, as a slider does: the number of an audio control such as `lpf(4000)`, or of a function such as `pg(0.8)`, `fast(2)`, an `FX` stage's `soft(4.5)`, or a plugin option such as `vsti("Diva", { output: 0.111 })`. It needs no update, and edits not yet evaluated stay out of the sound. A plugin key turned on goes in as an update of its own. A rail that waits for an update is muted, dashed and marked "not live". A live move is written to the session tape.
 - Hold Shift or Alt while you drag any slider for a fine drag, a tenth as far. f in the knobs column or the expanded slider locks it on.
+- Fixed: the documented prebake helper `window.bpm = b => setcpm(b/4)` works after a score has run `initHydra()`, and a prebake that throws after an `await` reports its own line.
 - Fixed: the documented second argument of `asym`, `diode`, `fold` and the other distortions sets the volume, as `.asym(.5, .3)` reads.
 - Fixed: an update that starts on a rest and cannot play any of its notes no longer silences the set. The last good score keeps playing.
 - Fixed: loop points outside 0 to 1, or a loopBegin after loopEnd, loop the whole sample as Web Audio does, instead of playing loud clipped noise.
@@ -21,9 +22,11 @@
 - Fixed: with Vim editor keys on, text a remote client types arrives in order, as the docs say, instead of each character going in before the last.
 - Fixed: the events pane uses the theme's palette so monochrome themes stay monochrome. In Vim mode, `ip` and `ap` select paragraphs, `.` repeats the last change, and Ctrl+[ steps to the previous scene from Normal mode.
 - Fixed: `up` with values that name no controls, such as `up("7 12")` or `up(7)`, keeps the controls of the events underneath instead of replacing each event.
+- Fixed: a sample bank named by digits, such as the docs' own `samples('local:808')`, plays with `s("808")` instead of refusing every note.
 - Fixed: a visuals dock moved from a side to the top or bottom starts at the band's own size, so it no longer vanishes beside the mixer; a dock with no room says the keys go to the score.
 - Fixed: a General MIDI note outside its font's range says which notes the font plays instead of "failed to load", and Studio no longer counts such a font as a failed sound.
 - Fixed: `talkit("42")` speaks the number instead of a silent refused voice.
+- Fixed: `check` and Studio's update refuse an unknown `wtshape`, `warpshape`, `lpshape`, `hpshape` or `bpshape` name, which the voice would refuse when it plays.
 - Fixed: a KabelSalat signal past the range of a sample is silent on both channels, as the docs say, instead of full-scale noise on one.
 - Fixed: a scene can call a name from a script that another scene of the set imports, as the docs say, instead of the check refusing it as unknown.
 - Fixed: one sample source in Settings that will not read fails only its own row; the other remote sources still load.
