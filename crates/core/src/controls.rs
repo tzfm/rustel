@@ -139,8 +139,19 @@ impl ControlSpec {
 
     /// [`Self::apply`] for a receiver that the caller gives away, as the
     /// next call of a chain takes the result of the call before it.
-    pub fn apply_to(&self, pattern: Pattern, value: Option<Pattern>) -> Pattern {
-        self.apply_for(pattern, value.as_ref())
+    pub fn apply_to(&self, mut pattern: Pattern, value: Option<Pattern>) -> Pattern {
+        let Some(value) = value else {
+            return self.pattern_for_unnamed(&pattern);
+        };
+        let alignment = crate::compose::default_alignment();
+        if alignment == crate::compose::Alignment::In {
+            pattern = match pattern.set_constant_control(self, &value) {
+                Ok(set) => return set,
+                Err(back) => back,
+            };
+        }
+        let named = value.map_control_owned(self, false);
+        crate::compose::compose(&pattern, &named, crate::compose::ComposeOp::Set, alignment)
     }
 
     /// [`Self::apply_to`] of a `pure` of `value`, as a score writes a
@@ -332,6 +343,25 @@ pub fn apply_chain(mut pattern: Pattern, chain: &[ChainCall<'_>]) -> Pattern {
     apply_row(pattern, &chain[row..])
 }
 
+/// Owned version of [`apply_chain`] that moves pattern arguments out of
+/// `chain`, allowing `map_control_owned` to name unshared sequences in place.
+pub fn apply_chain_owned(mut pattern: Pattern, chain: &mut [ChainCall<'_>]) -> Pattern {
+    let folds = crate::compose::default_alignment() == crate::compose::Alignment::In;
+    let mut row = 0;
+    for index in 0..chain.len() {
+        let held = folds && (row < index || pattern.takes_constants());
+        if held && chain[index].1.is_constant() {
+            continue;
+        }
+        pattern = apply_row(pattern, &chain[row..index]);
+        let spec = chain[index].0;
+        let argument = std::mem::replace(&mut chain[index].1, ChainArgument::Number(0.0));
+        pattern = apply_argument_owned(spec, pattern, argument);
+        row = index + 1;
+    }
+    apply_row(pattern, &chain[row..])
+}
+
 /// The transformer that applies `chain` to each pattern as [`apply_chain`]
 /// does, under `name`. It keeps a pure pattern pure when each pattern of
 /// the chain is pure: a control composes pure operands into a pure result.
@@ -390,9 +420,6 @@ fn set_row(pattern: Pattern, row: &[ChainCall<'_>]) -> Result<Pattern, Pattern> 
             ChainArgument::Constant(..) => {}
         }
     }
-    let Some((union, context)) = union_of(row) else {
-        return Err(pattern);
-    };
     // The control of each call, and its locations.
     let each = || {
         let apart = row.iter().filter_map(|(spec, argument)| {
@@ -401,7 +428,57 @@ fn set_row(pattern: Pattern, row: &[ChainCall<'_>]) -> Result<Pattern, Pattern> 
         });
         apart.collect()
     };
+    if let Some((keys, mut vals, len, context)) = packed_union_of(row) {
+        return pattern.with_packed_row(
+            &keys[..len],
+            &mut vals[..len],
+            context,
+            &crate::Apart::new(&each),
+        );
+    }
+    let Some((union, context)) = union_of(row) else {
+        return Err(pattern);
+    };
     pattern.with_row(&union, context, &crate::Apart::new(&each))
+}
+
+/// Fast stack-packed union for rows where every entry is a plain scalar
+/// canonical built-in control (not `"value"`) and count fits in 16 slots.
+fn packed_union_of(
+    row: &[ChainCall<'_>],
+) -> Option<([u16; 16], [Value; 16], usize, crate::Locations)> {
+    const CAP: usize = 16;
+    if row.is_empty() {
+        return None;
+    }
+    let mut keys = [0u16; CAP];
+    let mut vals = [const { Value::Undefined }; CAP];
+    let mut len = 0usize;
+    let mut context = crate::Locations::new();
+    for (spec, argument) in row {
+        if spec.id == 0 || spec.name() == "value" {
+            return None;
+        }
+        let (value, mut at) = argument.constant()?;
+        if !matches!(value, Value::F64(_) | Value::Str(_) | Value::Bool(_)) {
+            return None;
+        }
+        if !at.is_empty() {
+            at.append(&context);
+            context = at;
+        }
+        let packed = spec.id | (u16::from(crate::value::Table::mark_bit(spec.name())) << 10);
+        if let Some(pos) = keys[..len].iter().position(|&k| k == packed) {
+            vals[pos] = value;
+        } else if len < CAP {
+            keys[len] = packed;
+            vals[len] = value;
+            len += 1;
+        } else {
+            return None;
+        }
+    }
+    (len > 0).then_some((keys, vals, len, context))
 }
 
 /// The union of the controls of a row, as a `set` of each control in turn
@@ -490,10 +567,8 @@ fn apply_argument(spec: &ControlSpec, pattern: Pattern, argument: &ChainArgument
             if locations.is_empty() {
                 spec.apply_value(pattern, value.clone())
             } else {
-                let values = crate::pure(value.clone())
-                    .with_added_locations(locations)
-                    .with_steps(Some(rustel_fraction::Fraction::ONE));
-                spec.apply_for(pattern, Some(&values))
+                let values = crate::pure_locations(value.clone(), locations.clone());
+                spec.apply_to(pattern, Some(values))
             }
         }
         ChainArgument::Wave(wave, steps, math_inside) => {
@@ -510,6 +585,36 @@ fn apply_argument(spec: &ControlSpec, pattern: Pattern, argument: &ChainArgument
             }
         }
         ChainArgument::Pattern(values) => spec.apply_for(pattern, Some(values)),
+    }
+}
+
+/// Owned version of [`apply_argument`] that moves `ChainArgument::Pattern` into
+/// [`ControlSpec::apply_to`] so unshared sequences are named in place.
+fn apply_argument_owned(spec: &ControlSpec, pattern: Pattern, argument: ChainArgument) -> Pattern {
+    match argument {
+        ChainArgument::Number(number) => spec.apply_value(pattern, Value::F64(number)),
+        ChainArgument::Constant(value, locations) => {
+            if locations.is_empty() {
+                spec.apply_value(pattern, value)
+            } else {
+                let values = crate::pure_locations(value, locations);
+                spec.apply_to(pattern, Some(values))
+            }
+        }
+        ChainArgument::Wave(wave, steps, math_inside) => {
+            if crate::compose::default_alignment() == crate::compose::Alignment::In
+                && spec.id != 0
+                && !crate::sequence::builds_each_node()
+                && !pattern.is_volatile()
+                && (steps == 0 || (!crate::fused::is_unfused() && spec.name() != "value"))
+            {
+                pattern.apply_inline_wave(spec.id, wave, steps, math_inside)
+            } else {
+                let pat = wave.to_pattern(math_inside, steps);
+                spec.apply_to(pattern, Some(pat))
+            }
+        }
+        ChainArgument::Pattern(values) => spec.apply_to(pattern, Some(values)),
     }
 }
 

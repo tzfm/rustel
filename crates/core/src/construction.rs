@@ -244,6 +244,7 @@ fn same_node<'g>(
     match left {
         Node::Silence => matches!(right, Node::Silence),
         Node::Pure(a) => matches!(right, Node::Pure(b) if same_value(a, b)),
+        Node::PureAt(a) => matches!(right, Node::PureAt(b) if a.1 == b.1 && same_value(&a.0, &b.0)),
         Node::Sequence(a) => match right {
             Node::Sequence(b) => {
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| a.same(b, same_value))

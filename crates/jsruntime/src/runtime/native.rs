@@ -970,9 +970,9 @@ impl<'p> Turn<'p> {
             chain.push((call.spec, argument));
         }
         let made = match receiver {
-            Receiver::Pattern(pattern) => {
-                Native::Pattern(rustel_core::controls::apply_chain(pattern, &chain))
-            }
+            Receiver::Pattern(pattern) => Native::Pattern(
+                rustel_core::controls::apply_chain_owned(pattern, &mut chain),
+            ),
             // The arrow applies the chain to each pattern in one step, as
             // a pattern takes it here.
             Receiver::Parameter(mut parameter) => {

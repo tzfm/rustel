@@ -233,7 +233,7 @@ fn is_tiny_graph(root: &NodeCell) -> bool {
                     return false;
                 }
             }
-            Node::Silence | Node::Pure(_) | Node::Signal(_) => {}
+            Node::Silence | Node::Pure(_) | Node::PureAt(_) | Node::Signal(_) => {}
             _ => return false,
         }
     }
@@ -419,6 +419,13 @@ fn collect_and_pool_builtins(
             }
             Node::Pure(val) => {
                 if let Value::Object(map) = val
+                    && let Some(entries) = map.as_builtin()
+                {
+                    record(entries);
+                }
+            }
+            Node::PureAt(boxed) => {
+                if let Value::Object(map) = &boxed.0
                     && let Some(entries) = map.as_builtin()
                 {
                     record(entries);
@@ -1099,6 +1106,7 @@ impl Deduper {
         match kind {
             Node::Sequence(layers) => self.dedup_layers_mut(layers),
             Node::Pure(val) => self.dedup_value_mut(val),
+            Node::PureAt(boxed) => self.dedup_value_mut(&mut boxed.0),
             Node::Stack(pats) | Node::SlowCat(pats) | Node::SlowCatPrime(pats) => {
                 for pat in pats.iter_mut() {
                     self.dedup_pattern(pat);
@@ -1373,6 +1381,9 @@ impl Deduper {
                 (!Arc::ptr_eq(layers, &next)).then_some(Node::Sequence(next))
             }
             Node::Pure(val) => self.dedup_value(val).map(Node::Pure),
+            Node::PureAt(boxed) => self
+                .dedup_value(&boxed.0)
+                .map(|v| Node::PureAt(Box::new((v, boxed.1.clone())))),
             Node::Stack(pats) => self.dedup_slice(pats).map(Node::Stack),
             Node::StackPure(cells) => self.dedup_pure_cells(cells).map(Node::StackPure),
             Node::SlowCat(pats) => self.dedup_slice(pats).map(Node::SlowCat),
@@ -2316,6 +2327,7 @@ fn can_intern_node(node: &Node, flags: u8) -> bool {
         | Node::SlowCatPure(_)
         | Node::SlowCatPrimePure(_) => true,
         Node::Pure(v) => v.is_data(0),
+        Node::PureAt(b) => b.0.is_data(0),
         Node::Fast(n) => n.0.has_internable_extras(),
         Node::Shift(n) => n.0.has_internable_extras(),
         Node::Degrade(b) => b.0.has_internable_extras(),
@@ -2346,6 +2358,14 @@ impl Hash for InternedNode {
             Node::Pure(v) => {
                 2u8.hash(state);
                 hash_data(v, state);
+            }
+            Node::PureAt(b) => {
+                18u8.hash(state);
+                hash_data(&b.0, state);
+                b.1.len().hash(state);
+                for range in b.1.iter() {
+                    range.hash(state);
+                }
             }
             Node::FastSmall(cell, f, n, d, is_slow) => {
                 3u8.hash(state);
@@ -2483,6 +2503,7 @@ impl PartialEq for InternedNode {
         match (&self.0.kind, &other.0.kind) {
             (Node::Sequence(a), Node::Sequence(b)) => Arc::ptr_eq(a, b),
             (Node::Pure(a), Node::Pure(b)) => a.same_data(b),
+            (Node::PureAt(a), Node::PureAt(b)) => a.1 == b.1 && a.0.same_data(&b.0),
             (Node::FastSmall(ac, af, an, ad, as_), Node::FastSmall(bc, bf, bn, bd, bs)) => {
                 Arc::ptr_eq(ac, bc) && af == bf && an == bn && ad == bd && as_ == bs
             }

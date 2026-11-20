@@ -3085,8 +3085,7 @@ pub fn word_constant_value(src: &str, offset: usize) -> Option<(Value, rustel_co
 /// costs less to read than to keep.
 pub fn word_constant(src: &str, offset: usize) -> Option<Pattern> {
     let (value, locations) = word_constant_value(src, offset)?;
-    let at = locations.get(0)?;
-    Some(rhythm::constant(value, vec![at]).with_steps(Some(Fraction::ONE)))
+    Some(rustel_core::pure_locations(value, locations))
 }
 
 /// Fast path for flat ASCII whitespace-separated sequences of plain words and

@@ -479,9 +479,14 @@ impl Rhythm {
 
 /// One value a cycle, as `pure` answers it, at `locations`.
 pub(crate) fn constant(value: Value, locations: Vec<(usize, usize)>) -> Pattern {
-    match locations.is_empty() {
-        true => pure(value),
-        false => pure(value).with_added_context(locations),
+    match locations.len() {
+        0 => pure(value),
+        1 => rustel_core::pure_at(value, locations[0]),
+        _ => {
+            let mut locs = rustel_core::Locations::new();
+            locs.extend_from_slice(&locations);
+            rustel_core::pure_locations(value, locs)
+        }
     }
 }
 
@@ -2280,7 +2285,7 @@ impl<'r> Planned<'r> {
         if let Kind::Atom { value, begin, len } = self.room.plans.kind(self.root) {
             let value = self.room.values.swap_remove(value as usize);
             let at = place(written(begin, len));
-            return Some(constant(value, vec![at]).with_steps(steps));
+            return Some(rustel_core::pure_at(value, at).with_steps(steps));
         }
         // Fast path for flat equal sequences (`"bd hh sd hh"`) and single-lane
         // equal alternations (`"<c3 e3 g3>"`) of plain atoms and rests: build

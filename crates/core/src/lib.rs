@@ -6332,6 +6332,10 @@ const _: fn() = || {
 pub(crate) enum Node {
     Silence,
     Pure(Value),
+    /// A `pure(value)` carrying source locations directly in one node, avoiding
+    /// the extra `Node::Pure` + `Arc<[(usize, usize)]>` + `Node::AddContext`
+    /// wrapper allocations for located mini-notation constant atoms.
+    PureAt(Box<(Value, Locations)>),
     /// The steps of every cycle, as one node. See [`sequence`].
     Sequence(Arc<[sequence::Layer]>),
     /// Mutation control - never built.
@@ -8460,6 +8464,7 @@ impl Pattern {
         }
         match self.node_kind() {
             Node::Pure(value) => value.is_data(0).then_some(1),
+            Node::PureAt(boxed) => boxed.0.is_data(0).then_some(1),
             // One value that fills each cycle, as a control of a `pure` is
             // once it is folded.
             Node::Sequence(layers) => sequence::constant_value(layers).map(|_| 1),
@@ -8520,6 +8525,7 @@ fn inherited_runtime_settings_source(node: &Node) -> Option<&Pattern> {
     match node {
         Node::Silence
         | Node::Pure(_)
+        | Node::PureAt(_)
         | Node::Sequence(_)
         | Node::QueryError(_)
         | Node::QueryLimit(_)
@@ -10946,6 +10952,13 @@ impl Pattern {
             Node::Pure(value) => {
                 self.query_value_onto(thread, value, state, out);
             }
+            Node::PureAt(boxed) => {
+                let from = out.len();
+                self.query_value_onto(thread, &boxed.0, state, out);
+                for hap in &mut out[from..] {
+                    hap.context.append(&boxed.1);
+                }
+            }
             Node::PurePickLookup(boxed) => {
                 self.query_value_onto(thread, &boxed.0, state, out);
             }
@@ -11488,6 +11501,7 @@ impl Pattern {
             // A kind that writes its haps after those of a list.
             Node::Silence
             | Node::Pure(_)
+            | Node::PureAt(_)
             | Node::PurePickLookup(..)
             | Node::Sequence(_)
             | Node::Fast(..)
@@ -12942,6 +12956,7 @@ impl Pattern {
     fn as_pure_inner(&self) -> Option<Value> {
         match self.node_kind() {
             Node::Pure(v) => Some(v.clone()),
+            Node::PureAt(boxed) => Some(boxed.0.clone()),
             Node::PurePickLookup(boxed) => Some(boxed.0.clone()),
             // `withContext` preserves the pure fast-path metadata;
             // AddContext is that operation's native representation.
@@ -13057,6 +13072,31 @@ impl Pattern {
         if let Some(located) = sequence::located(self, &locs) {
             return located.with_steps_of(self);
         }
+        if !self.has_runtime_settings() {
+            match self.node_kind() {
+                Node::Pure(value) => {
+                    let mut out = Locations::new();
+                    out.extend_from_slice(&locs);
+                    let mut pattern = Pattern::of(Node::PureAt(Box::new((value.clone(), out))))
+                        .with_steps_of(self);
+                    if let Some(loc) = self.pure_loc_raw() {
+                        pattern.set_pure_loc_raw(Some(loc));
+                    }
+                    return pattern;
+                }
+                Node::PureAt(boxed) => {
+                    let mut out = boxed.1.clone();
+                    out.extend_from_slice(&locs);
+                    let mut pattern = Pattern::of(Node::PureAt(Box::new((boxed.0.clone(), out))))
+                        .with_steps_of(self);
+                    if let Some(loc) = self.pure_loc_raw() {
+                        pattern.set_pure_loc_raw(Some(loc));
+                    }
+                    return pattern;
+                }
+                _ => {}
+            }
+        }
         let locs: Arc<[(usize, usize)]> = Arc::from(locs);
         let mut pattern =
             Pattern::of(Node::AddContext(Box::new((self.clone(), locs)))).with_steps_of(self);
@@ -13072,6 +13112,31 @@ impl Pattern {
         if let Some(located) = sequence::located(self, locs) {
             return located.with_steps_of(self);
         }
+        if !self.has_runtime_settings() {
+            match self.node_kind() {
+                Node::Pure(value) => {
+                    let mut out = Locations::new();
+                    out.extend_from_slice(locs);
+                    let mut pattern = Pattern::of(Node::PureAt(Box::new((value.clone(), out))))
+                        .with_steps_of(self);
+                    if let Some(loc) = self.pure_loc_raw() {
+                        pattern.set_pure_loc_raw(Some(loc));
+                    }
+                    return pattern;
+                }
+                Node::PureAt(boxed) => {
+                    let mut out = boxed.1.clone();
+                    out.extend_from_slice(locs);
+                    let mut pattern = Pattern::of(Node::PureAt(Box::new((boxed.0.clone(), out))))
+                        .with_steps_of(self);
+                    if let Some(loc) = self.pure_loc_raw() {
+                        pattern.set_pure_loc_raw(Some(loc));
+                    }
+                    return pattern;
+                }
+                _ => {}
+            }
+        }
         let locs: Arc<[(usize, usize)]> = Arc::from(locs);
         let mut pattern =
             Pattern::of(Node::AddContext(Box::new((self.clone(), locs)))).with_steps_of(self);
@@ -13085,6 +13150,30 @@ impl Pattern {
     pub(crate) fn with_added_locations(&self, locs: &Locations) -> Self {
         if let Some(located) = locs.with_slice(|slice| sequence::located(self, slice)) {
             return located.with_steps_of(self);
+        }
+        if !self.has_runtime_settings() {
+            match self.node_kind() {
+                Node::Pure(value) => {
+                    let mut pattern =
+                        Pattern::of(Node::PureAt(Box::new((value.clone(), locs.clone()))))
+                            .with_steps_of(self);
+                    if let Some(loc) = self.pure_loc_raw() {
+                        pattern.set_pure_loc_raw(Some(loc));
+                    }
+                    return pattern;
+                }
+                Node::PureAt(boxed) => {
+                    let mut out = boxed.1.clone();
+                    out.append(locs);
+                    let mut pattern = Pattern::of(Node::PureAt(Box::new((boxed.0.clone(), out))))
+                        .with_steps_of(self);
+                    if let Some(loc) = self.pure_loc_raw() {
+                        pattern.set_pure_loc_raw(Some(loc));
+                    }
+                    return pattern;
+                }
+                _ => {}
+            }
         }
         let locs = locs.to_arc_slice();
         let mut pattern =
@@ -14675,6 +14764,35 @@ impl Pattern {
         Ok(self)
     }
 
+    /// Fast path of [`Self::with_row`] for stack-packed built-in controls:
+    /// writes directly into a foldable `Node::Sequence` without allocating a
+    /// temporary `BuiltinMap` when merging into an existing `Dress::set_map`.
+    pub(crate) fn with_packed_row(
+        mut self,
+        keys: &[u16],
+        vals: &mut [Value],
+        context: Locations,
+        apart: &Apart<'_>,
+    ) -> Result<Self, Self> {
+        if matches!(self.node_kind(), Node::Sequence(_)) && sequence::takes_plain_set(&self) {
+            let steps = self.steps();
+            let runtime = self.runtime_settings().cloned();
+            if let Some(cell) = self.own_node()
+                && let Node::Sequence(layers) = &mut cell.kind
+            {
+                sequence::set_packed_here(layers, keys, vals, context);
+                let node = Arc::clone(&self.node);
+                self = Self::holding(node).with_steps(steps);
+                if let Some(runtime) = runtime {
+                    self.attach_runtime_settings(runtime);
+                }
+                return Ok(self);
+            }
+        }
+        let union = Value::Object(OrderedMap::from_packed_builtin(keys, vals));
+        self.with_row(&union, context, apart)
+    }
+
     /// Whether a constant control may go into this pattern, by its kinds
     /// alone: the gate of a row of controls, which costs less than the
     /// controls. [`Self::takes_control`] decides for a control.
@@ -15642,6 +15760,7 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
     match node {
         Node::Silence
         | Node::Pure(_)
+        | Node::PureAt(_)
         | Node::Sequence(_)
         | Node::QueryError(_)
         | Node::QueryLimit(_)
@@ -15908,7 +16027,11 @@ fn span_read(node: &Node) -> purity::SpanRead {
     let of = |pattern: &Pattern| pattern.span_read();
     let most = |patterns: &mut dyn Iterator<Item = &Pattern>| patterns.map(of).max().unwrap_or(No);
     match node {
-        Node::Silence | Node::Pure(_) | Node::PurePickLookup(..) | Node::Sequence(_) => No,
+        Node::Silence
+        | Node::Pure(_)
+        | Node::PureAt(_)
+        | Node::PurePickLookup(..)
+        | Node::Sequence(_) => No,
         // A time map that keeps the order of time, and maps of each hap that
         // read no span.
         Node::Fast(node) if node.1 > Fraction::ZERO => of(&node.0),
@@ -16017,6 +16140,7 @@ fn compute_purity(node: &Node) -> purity::Purity {
         // Query-time errors and limits hold no callback or JavaScript, so they
         // stay queryable with no host installed.
         Node::Pure(value) => value_purity(value),
+        Node::PureAt(boxed) => value_purity(&boxed.0),
         // Data holds no callback, and the values of a score are data.
         Node::Sequence(layers) => Purity::merge(
             layers
@@ -16406,6 +16530,22 @@ pub fn pattern_of_js(outer: Pattern, id: CallbackId) -> Pattern {
 
 pub fn pure(v: Value) -> Pattern {
     Pattern::of(Node::Pure(v)).with_steps(Some(Fraction::ONE))
+}
+
+/// [`pure`] carrying pre-packed source locations in one node without an outer
+/// `Node::AddContext` wrapper.
+pub fn pure_locations(v: Value, locations: Locations) -> Pattern {
+    if locations.is_empty() {
+        return pure(v);
+    }
+    Pattern::of(Node::PureAt(Box::new((v, locations)))).with_steps(Some(Fraction::ONE))
+}
+
+/// [`pure`] carrying a single `(begin, end)` source location in one node.
+pub fn pure_at(v: Value, at: (usize, usize)) -> Pattern {
+    let mut locations = Locations::new();
+    locations.push(at);
+    Pattern::of(Node::PureAt(Box::new((v, locations)))).with_steps(Some(Fraction::ONE))
 }
 
 pub fn pure_pick_lookup(value: Value, lookup: PickLookup) -> Pattern {

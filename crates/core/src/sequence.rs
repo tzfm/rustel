@@ -2845,6 +2845,57 @@ impl Dress {
         self.assign_set(Some(Value::Object(map)));
     }
 
+    fn set_packed_here(
+        &mut self,
+        keys: &[u16],
+        vals: &[Value],
+        context: Locations,
+        shared: &mut Option<Arc<dyn crate::value::BuiltinEntries>>,
+    ) {
+        self.prepend_before(context);
+        if let Some(entries) = self.set_map.take() {
+            self.set_marks = 0;
+            match crate::value::merge_builtin_with_packed(entries, keys, vals) {
+                Ok(merged) => {
+                    self.set_map_builtin(merged);
+                    return;
+                }
+                Err(entries) => {
+                    let mut map = crate::value::OrderedMap::from_made_builtin(entries);
+                    let other_arc = shared
+                        .get_or_insert_with(|| crate::value::make_builtin_arc_cloned(keys, vals));
+                    let other = crate::value::OrderedMap::from_made_builtin(Arc::clone(other_arc));
+                    map.merge(&other, |_, value| value.clone());
+                    map.mark_made_of_data();
+                    if let Some(new_entries) = map.as_builtin() {
+                        self.set_map_builtin(Arc::clone(new_entries));
+                    } else {
+                        self.tail.get_or_insert_with(Default::default).set_other =
+                            Some(Value::Object(map));
+                    }
+                    return;
+                }
+            }
+        }
+        if let Some(set_other) = self
+            .tail
+            .as_deref_mut()
+            .and_then(|tail| tail.set_other.take())
+        {
+            let other_arc =
+                shared.get_or_insert_with(|| crate::value::make_builtin_arc_cloned(keys, vals));
+            let other = Value::Object(crate::value::OrderedMap::from_made_builtin(Arc::clone(
+                other_arc,
+            )));
+            let mut value = set_other;
+            compose_data_in_place(ComposeOp::Set, &mut value, &other);
+            self.assign_set(Some(value));
+            return;
+        }
+        let arc = shared.get_or_insert_with(|| crate::value::make_builtin_arc_cloned(keys, vals));
+        self.set_map_builtin(Arc::clone(arc));
+    }
+
     fn set_here(&mut self, control: &Value, context: Locations) {
         // The value side's locations come first.
         self.prepend_before(context);
@@ -5337,6 +5388,7 @@ pub(crate) fn is_data(pattern: &Pattern) -> bool {
     match pattern.node_kind() {
         Node::Sequence(layers) => holds_data(layers),
         Node::Pure(value) => value.is_data(0),
+        Node::PureAt(boxed) => boxed.0.is_data(0),
         Node::AddContext(boxed) => is_data(&boxed.0),
         _ => false,
     }
@@ -5467,6 +5519,7 @@ fn constant_value_of(values: &Pattern) -> Option<Cow<'_, Value>> {
     }
     match values.node_kind() {
         Node::Pure(value) if value.is_data(0) => Some(Cow::Borrowed(value)),
+        Node::PureAt(boxed) if boxed.0.is_data(0) => Some(Cow::Borrowed(&boxed.0)),
         Node::AddContext(boxed) => constant_value_of(&boxed.0),
         Node::Sequence(layers) => constant_value(layers),
         _ => None,
@@ -5476,6 +5529,7 @@ fn constant_value_of(values: &Pattern) -> Option<Cow<'_, Value>> {
 /// The locations of the hap of `values`, a [constant](constant_value_of).
 fn constant_locations(values: &Pattern) -> Locations {
     match values.node_kind() {
+        Node::PureAt(boxed) => boxed.1.clone(),
         Node::AddContext(boxed) => {
             let mut context = constant_locations(&boxed.0);
             context.extend_from_slice(&boxed.1);
@@ -5986,6 +6040,50 @@ pub(crate) fn takes_set(functions: &Pattern, control: &Value) -> bool {
                 .iter()
                 .all(|layer| layer.takes_set(control, LookupFlow::Set))
     })
+}
+
+/// Set stack-packed built-in controls `(keys, vals)` at `context` on each step
+/// of `layers`, avoiding a temporary `BuiltinMap` allocation when merging into
+/// an existing `Dress::set_map`.
+pub(crate) fn set_packed_here(
+    layers: &mut Arc<[Layer]>,
+    keys: &[u16],
+    vals: &[Value],
+    context: Locations,
+) {
+    if Arc::get_mut(layers).is_none() {
+        *layers = layers.iter().map(|layer| layer.with(|_| {})).collect();
+    }
+    let layers = Arc::get_mut(layers).expect("layers that no other sequence holds");
+    let mut shared: Option<Arc<dyn crate::value::BuiltinEntries>> = None;
+    if let [layer] = layers
+        && let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut)
+    {
+        dress.set_packed_here(keys, vals, context, &mut shared);
+        layer.refresh_direct();
+        return;
+    }
+    let mut last: Option<(*const Dress, Arc<Dress>)> = None;
+    for layer in layers {
+        if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
+            dress.set_packed_here(keys, vals, context.clone(), &mut shared);
+            layer.refresh_direct();
+            continue;
+        }
+        let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
+        let dress = match &last {
+            Some((seen, dress)) if *seen == from => Arc::clone(dress),
+            _ => {
+                let mut dress = layer.dress().clone();
+                dress.set_packed_here(keys, vals, context.clone(), &mut shared);
+                let dress = dress.into_arc();
+                last = Some((from, Arc::clone(&dress)));
+                dress
+            }
+        };
+        layer.dress = Some(dress);
+        layer.refresh_direct();
+    }
 }
 
 /// Set `control` at `context` on each step of `layers`, which

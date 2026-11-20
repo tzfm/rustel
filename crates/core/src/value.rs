@@ -141,6 +141,81 @@ fn make_builtin_arc(count: usize, keys: &[u16], values: &mut [Value]) -> Arc<dyn
     )
 }
 
+/// Pack `count` `(packed_key, value)` pairs by cloning values into an
+/// exact-sized `Arc<BuiltinMap<N>>` (`1 <= count <= 24`).
+pub(crate) fn make_builtin_arc_cloned(keys: &[u16], values: &[Value]) -> Arc<dyn BuiltinEntries> {
+    debug_assert_eq!(keys.len(), values.len());
+    let mut vals = [const { Value::Undefined }; MAX_BUILTIN_MAP_LEN];
+    for (dst, src) in vals.iter_mut().zip(values.iter()) {
+        *dst = src.clone();
+    }
+    make_builtin_arc(keys.len(), keys, &mut vals)
+}
+
+/// Merge a built-in entry map with stack-packed `(keys, values)` using
+/// overwrite (`Set`) semantics. Returns `Err(entries)` when the combined map
+/// exceeds `MAX_BUILTIN_MAP_LEN` or `entries` is pooled.
+pub(crate) fn merge_builtin_with_packed(
+    mut entries: Arc<dyn BuiltinEntries>,
+    other_keys: &[u16],
+    other_vals: &[Value],
+) -> Result<Arc<dyn BuiltinEntries>, Arc<dyn BuiltinEntries>> {
+    let (held, fresh, fresh_mask) = {
+        let Slice::Builtin(self_keys_ro, _) = entries.as_slice() else {
+            return Err(entries);
+        };
+        let mut fresh_mask = 0u32;
+        let mut fresh = 0usize;
+        for (i, &ok) in other_keys.iter().enumerate() {
+            if !self_keys_ro.contains(&ok) {
+                fresh_mask |= 1u32 << i;
+                fresh += 1;
+            }
+        }
+        (self_keys_ro.len(), fresh, fresh_mask)
+    };
+    if fresh == 0
+        && let Some(own) = Arc::get_mut(&mut entries)
+        && let Some((sk, sv)) = own.parts_mut()
+    {
+        for (&k, v) in sk.iter().zip(sv.iter_mut()) {
+            if let Some(pos) = other_keys.iter().position(|&ok| ok == k) {
+                *v = other_vals[pos].clone();
+            }
+        }
+        return Ok(entries);
+    }
+    let total = held + fresh;
+    if total == 0 || total > MAX_BUILTIN_MAP_LEN {
+        return Err(entries);
+    }
+    let mut out_keys = [0u16; MAX_BUILTIN_MAP_LEN];
+    let mut out_vals = [const { Value::Undefined }; MAX_BUILTIN_MAP_LEN];
+    {
+        let Slice::Builtin(self_keys_ro, self_vals_ro) = entries.as_slice() else {
+            return Err(entries);
+        };
+        for i in 0..held {
+            let k = self_keys_ro[i];
+            out_keys[i] = k;
+            out_vals[i] = match other_keys.iter().position(|&ok| ok == k) {
+                Some(pos) => other_vals[pos].clone(),
+                None => self_vals_ro[i].clone(),
+            };
+        }
+    }
+    let mut dst = held;
+    let mut rem = fresh_mask;
+    while rem != 0 {
+        let i = rem.trailing_zeros() as usize;
+        rem &= rem - 1;
+        out_keys[dst] = other_keys[i];
+        out_vals[dst] = other_vals[i].clone();
+        dst += 1;
+    }
+    Ok(make_builtin_arc(total, &out_keys, &mut out_vals))
+}
+
 /// Build `Entries` from `count` `(Key, Value)` items using a stack buffer of
 /// size `CAP`, packing into `Entries::Builtin` when every key is a canonical
 /// built-in control name.
@@ -314,6 +389,24 @@ impl<'a> Slice<'a> {
                 .iter()
                 .find_map(|(name, value)| (name == key).then_some(value)),
             Self::Builtin(..) | Self::Pooled(..) => self.get_str(key.name()),
+        }
+    }
+
+    #[inline(always)]
+    fn position_packed(self, packed: u16, key: &Key) -> Option<usize> {
+        match self {
+            Self::Plain(entries) => entries.iter().position(|(name, _)| name == key),
+            Self::Builtin(keys, _) | Self::Pooled(keys, _, _) => {
+                keys.iter().position(|&k| k == packed)
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn packed_key_at(self, index: usize) -> Option<u16> {
+        match self {
+            Self::Builtin(keys, _) | Self::Pooled(keys, _, _) => Some(keys[index]),
+            Self::Plain(_) => None,
         }
     }
 
@@ -649,14 +742,18 @@ impl StepPatch {
         }
         let base_layout = base.layout(row);
         let base_len = u16::try_from(base_layout.len()).ok()?;
-        let mut marks = base.marks();
+        let base_marks = base.marks();
+        let mut marks = base_marks;
         let mut key_slots: [Option<Key>; 4] = [None, None, None, None];
         let mut reps = [u16::MAX; 4];
         let mut appended = 0u8;
         for (i, &key) in keys.iter().enumerate() {
             key_slots[i] = Some(key.clone());
-            marks |= Table::mark(key);
-            if let Some(pos) = base_layout.position(key) {
+            let mark = Table::mark(key.as_str());
+            marks |= mark;
+            if base_marks & mark != 0
+                && let Some(pos) = base_layout.position(key)
+            {
                 reps[i] = u16::try_from(pos).ok()?;
             } else {
                 appended = appended.checked_add(1)?;
@@ -957,19 +1054,36 @@ impl Patched {
             tail: None,
         };
         let mut overlay_skip = 0u32;
+        let mut base_hits = [(0u8, 0u16); MAX_PATCHES];
+        let mut n_base_hits = 0usize;
         if base_marks & ov_marks != 0 {
+            let base_layout = out.base.layout(row);
             for ov_pos in 0..raw_len {
-                let (ov_key, ov_val) = ov_slice.at(ov_pos);
-                if base_marks & Table::mark(ov_key.as_str()) != 0
-                    && let Some(base_idx) = out.base.layout(row).position(ov_key)
-                {
-                    if usize::from(out.len) >= MAX_PATCHES {
-                        return None;
+                let packed = ov_slice.packed_key_at(ov_pos);
+                let mark = match packed {
+                    Some(p) => 1u64 << (p >> 10),
+                    None => Table::mark(ov_slice.at(ov_pos).0.as_str()),
+                };
+                if base_marks & mark != 0 {
+                    let (ov_key, _) = ov_slice.at(ov_pos);
+                    let found = match packed {
+                        Some(p) => base_layout.position_packed(p, ov_key),
+                        None => base_layout.position(ov_key),
+                    };
+                    if let Some(base_idx) = found {
+                        if n_base_hits >= MAX_PATCHES {
+                            return None;
+                        }
+                        base_hits[n_base_hits] = (ov_pos as u8, base_idx as u16);
+                        n_base_hits += 1;
+                        overlay_skip |= 1u32 << ov_pos;
                     }
-                    out.push_slot(ov_key.clone(), ov_val.clone(), base_idx as u16);
-                    out.has_replace = true;
-                    overlay_skip |= 1u32 << ov_pos;
                 }
+            }
+            for &(ov_pos, base_idx) in &base_hits[..n_base_hits] {
+                let (ov_key, ov_val) = ov_slice.at(usize::from(ov_pos));
+                out.push_slot(ov_key.clone(), ov_val.clone(), base_idx);
+                out.has_replace = true;
             }
         }
         out.overlay = Some(overlay);
@@ -993,47 +1107,55 @@ impl Patched {
         let ov_marks = ov_slice.marks();
         let base_marks = self.base.marks();
         let cur_len = usize::from(self.len);
-        // Pre-scan overlaps to verify slot budget before mutating `self`.
-        let mut needed = 0usize;
+        let mut overlay_skip = 0u32;
+        // Single-pass overlap check: record matching existing patch slots and
+        // new base replacements on the stack so we verify slot budget before
+        // mutating `self` without scanning `ov_slice` or `base_layout` twice.
+        let mut slot_hits = [(0u8, 0u8); MAX_PATCHES];
+        let mut n_slot_hits = 0usize;
+        let mut base_hits = [(0u8, 0u16); MAX_PATCHES];
+        let mut n_base_hits = 0usize;
         if self.marks & ov_marks != 0 {
             let base_layout = self.base.layout(row);
             for ov_pos in 0..raw_len {
+                let packed = ov_slice.packed_key_at(ov_pos);
+                let mark = match packed {
+                    Some(p) => 1u64 << (p >> 10),
+                    None => Table::mark(ov_slice.at(ov_pos).0.as_str()),
+                };
+                if self.marks & mark == 0 {
+                    continue;
+                }
                 let (ov_key, _) = ov_slice.at(ov_pos);
-                if self.marks & Table::mark(ov_key.as_str()) == 0 {
-                    continue;
-                }
-                if self.has_patch_for(ov_key) {
-                    continue;
-                }
-                if base_marks & Table::mark(ov_key.as_str()) != 0
-                    && base_layout.position(ov_key).is_some()
-                {
-                    needed += 1;
-                }
-            }
-            if cur_len + needed > MAX_PATCHES {
-                return false;
-            }
-        }
-        let mut overlay_skip = 0u32;
-        if self.marks & ov_marks != 0 {
-            for ov_pos in 0..raw_len {
-                let (ov_key, ov_val) = ov_slice.at(ov_pos);
-                if self.marks & Table::mark(ov_key.as_str()) == 0 {
-                    continue;
-                }
                 if let Some(idx) = self.find_slot(ov_key) {
-                    *self.slot_val_mut(idx) = ov_val.clone();
+                    slot_hits[n_slot_hits] = (ov_pos as u8, idx as u8);
+                    n_slot_hits += 1;
                     overlay_skip |= 1u32 << ov_pos;
                     continue;
                 }
-                if base_marks & Table::mark(ov_key.as_str()) != 0
-                    && let Some(base_idx) = self.base.layout(row).position(ov_key)
-                {
-                    self.push_slot(ov_key.clone(), ov_val.clone(), base_idx as u16);
-                    self.has_replace = true;
-                    overlay_skip |= 1u32 << ov_pos;
+                if base_marks & mark != 0 {
+                    let found = match packed {
+                        Some(p) => base_layout.position_packed(p, ov_key),
+                        None => base_layout.position(ov_key),
+                    };
+                    if let Some(base_idx) = found {
+                        if cur_len + n_base_hits >= MAX_PATCHES {
+                            return false;
+                        }
+                        base_hits[n_base_hits] = (ov_pos as u8, base_idx as u16);
+                        n_base_hits += 1;
+                        overlay_skip |= 1u32 << ov_pos;
+                    }
                 }
+            }
+            for &(ov_pos, idx) in &slot_hits[..n_slot_hits] {
+                let (_, ov_val) = ov_slice.at(usize::from(ov_pos));
+                *self.slot_val_mut(usize::from(idx)) = ov_val.clone();
+            }
+            for &(ov_pos, base_idx) in &base_hits[..n_base_hits] {
+                let (ov_key, ov_val) = ov_slice.at(usize::from(ov_pos));
+                self.push_slot(ov_key.clone(), ov_val.clone(), base_idx);
+                self.has_replace = true;
             }
         }
         let visible = raw_len - overlay_skip.count_ones() as usize;
@@ -1995,6 +2117,36 @@ impl<'a> Layout<'a> {
         }
     }
 
+    /// The place of the entry of `key` when its packed built-in key ID is known.
+    #[inline(always)]
+    fn position_packed(self, packed: u16, key: &Key) -> Option<usize> {
+        match self {
+            Self::Plain(entries) => entries.position_packed(packed, key),
+            Self::Keyed(name, _, tail) => match name == key {
+                true => Some(0),
+                false => tail.position_packed(packed, key).map(|at| at + 1),
+            },
+            Self::Split(head, tail) => head
+                .position_packed(packed, key)
+                .or_else(|| tail.position_packed(packed, key).map(|at| at + head.len())),
+            Self::Patched(base, replace, name, _) => match name == key {
+                true => Some(replace),
+                false => Slice::Plain(base).position(key),
+            },
+            Self::KeyedExtra(hk, _, tail, ek, _) => {
+                if hk == key {
+                    Some(0)
+                } else if ek == key {
+                    Some(1 + tail.len())
+                } else {
+                    tail.position_packed(packed, key).map(|at| at + 1)
+                }
+            }
+            Self::Overlay(patched, row) => patched.position(row, key),
+            Self::StepOverlay(step, step_packed) => step.position(step_packed, key),
+        }
+    }
+
     /// The place of the entry of `key`.
     #[inline(always)]
     fn position<K: ?Sized + Named>(self, key: &K) -> Option<usize>
@@ -2629,6 +2781,14 @@ impl OrderedMap {
         }
     }
 
+    /// Construct a data-only built-in map directly from packed keys and owned
+    /// values (`1 <= keys.len() <= 24`).
+    pub(crate) fn from_packed_builtin(keys: &[u16], values: &mut [Value]) -> Self {
+        Self {
+            entries: Entries::Builtin(make_builtin_arc(keys.len(), keys, values), true),
+        }
+    }
+
     /// Reconstruct a 2-entry data-only built-in map from two disjoint packed
     /// keys and values.
     #[inline]
@@ -2853,12 +3013,89 @@ impl OrderedMap {
     /// [`Self::merge`] producing flat entries directly without creating a
     /// temporary [`Patched`] overlay (for build-time folds that would
     /// otherwise immediately undress the overlay).
+    /// Fast `u16`-keyed merge when both `self` and `other` hold built-in control
+    /// entries and the combined count stays within `MAX_BUILTIN_ENTRIES` (24).
+    /// Avoids `Key` conversion, string hashing, and `Layout::position` lookups.
+    fn try_merge_builtin_pair(
+        &mut self,
+        other: &Self,
+        change: &mut impl FnMut(&Value, &Value) -> Value,
+    ) -> bool {
+        let (Entries::Builtin(self_b, self_made), Entries::Builtin(other_b, _)) =
+            (&mut self.entries, &other.entries)
+        else {
+            return false;
+        };
+        let Slice::Builtin(other_keys, other_vals) = other_b.as_slice() else {
+            return false;
+        };
+        let (held, fresh, fresh_mask) = {
+            let Slice::Builtin(self_keys_ro, _) = self_b.as_slice() else {
+                return false;
+            };
+            let mut fresh_mask = 0u32;
+            let mut fresh = 0usize;
+            for (i, &ok) in other_keys.iter().enumerate() {
+                if !self_keys_ro.contains(&ok) {
+                    fresh_mask |= 1u32 << i;
+                    fresh += 1;
+                }
+            }
+            (self_keys_ro.len(), fresh, fresh_mask)
+        };
+        if fresh == 0
+            && let Some(own) = Arc::get_mut(self_b)
+            && let Some((sk, sv)) = own.parts_mut()
+        {
+            for (&k, v) in sk.iter().zip(sv.iter_mut()) {
+                if let Some(pos) = other_keys.iter().position(|&ok| ok == k) {
+                    *v = change(v, &other_vals[pos]);
+                }
+            }
+            *self_made = false;
+            return true;
+        }
+        let total = held + fresh;
+        if total == 0 || total > MAX_BUILTIN_MAP_LEN {
+            return false;
+        }
+        let mut out_keys = [0u16; MAX_BUILTIN_MAP_LEN];
+        let mut out_vals = [const { Value::Undefined }; MAX_BUILTIN_MAP_LEN];
+        {
+            let Slice::Builtin(self_keys_ro, self_vals_ro) = self_b.as_slice() else {
+                return false;
+            };
+            for i in 0..held {
+                let k = self_keys_ro[i];
+                out_keys[i] = k;
+                out_vals[i] = match other_keys.iter().position(|&ok| ok == k) {
+                    Some(pos) => change(&self_vals_ro[i], &other_vals[pos]),
+                    None => self_vals_ro[i].clone(),
+                };
+            }
+        }
+        let mut dst = held;
+        let mut rem = fresh_mask;
+        while rem != 0 {
+            let i = rem.trailing_zeros() as usize;
+            rem &= rem - 1;
+            out_keys[dst] = other_keys[i];
+            out_vals[dst] = other_vals[i].clone();
+            dst += 1;
+        }
+        self.entries = Entries::Builtin(make_builtin_arc(total, &out_keys, &mut out_vals), false);
+        true
+    }
+
     pub(crate) fn merge_flat(
         &mut self,
         other: &Self,
         mut change: impl FnMut(&Value, &Value) -> Value,
     ) {
         if other.is_empty() {
+            return;
+        }
+        if self.try_merge_builtin_pair(other, &mut change) {
             return;
         }
         if other.len() == 1
@@ -2952,6 +3189,9 @@ impl OrderedMap {
     pub(crate) fn merge(&mut self, other: &Self, mut change: impl FnMut(&Value, &Value) -> Value) {
         // Nothing to add changes nothing, and a dressed map stays dressed.
         if other.is_empty() {
+            return;
+        }
+        if self.try_merge_builtin_pair(other, &mut change) {
             return;
         }
         // A control that sets one key, which most chains do: one lookup, and
