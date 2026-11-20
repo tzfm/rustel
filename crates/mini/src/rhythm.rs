@@ -3,8 +3,8 @@
 
 use crate::{Build, ParseError, Postfix, Span};
 use rustel_core::{
-    GivenLayer, IndexedLayer, Locations, Pattern, SequenceLayer, SequenceStep, SourceStep,
-    SourcedLayer, StepSource, Value, pure, sequence, sequence_of, silence,
+    Locations, Pattern, SequenceBuilder, SequenceLayer, SequenceStep, SourceStep, SourcedLayer,
+    StepSource, Value, pure, sequence, sequence_of_indexed_slice, sequence_of_sourced, silence,
 };
 use rustel_fraction::Fraction;
 use std::ops::Range;
@@ -1897,20 +1897,26 @@ impl Plans {
         Some(())
     }
 
-    /// The steps of `layer` in cycles with deduplicated layer-local values,
-    /// skipping intermediate `SequenceStep` and hash-dedup passes.
-    fn listed_indexed(
+    /// Populate `steps` with the steps of `layer` in cycles with deduplicated
+    /// layer-local value indices, returning the layer's value slice and reusing
+    /// caller-owned scratch buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn listed_indexed_into(
         &self,
         layer: &LayerPlan,
         period: Fraction,
         count: usize,
-        in_cycles: bool,
         values: &[Value],
         local: &mut Vec<u32>,
-    ) -> Option<IndexedLayer> {
-        local.resize(values.len(), 0);
-        let mut held: Vec<u32> = Vec::new();
-        let mut steps = Vec::with_capacity(count);
+        held: &mut Vec<u32>,
+        steps: &mut Vec<SourceStep>,
+    ) -> Option<Arc<[Value]>> {
+        if local.len() < values.len() {
+            local.resize(values.len(), 0);
+        }
+        held.clear();
+        steps.clear();
+        steps.reserve(count);
         let written = self.read(
             layer,
             layer.pace.terms(),
@@ -1927,7 +1933,7 @@ impl Plans {
                 steps.push(step);
             },
         );
-        for &global in &held {
+        for &global in held.iter() {
             local[global as usize] = 0;
         }
         written?;
@@ -1935,12 +1941,7 @@ impl Plans {
             .iter()
             .map(|&global| values[global as usize].clone())
             .collect();
-        Some(IndexedLayer {
-            period,
-            values: layer_values,
-            in_cycles,
-            steps,
-        })
+        Some(layer_values)
     }
 
     /// These plans with what a walk reads of them, and no more: a pattern
@@ -2000,9 +2001,23 @@ pub struct Room {
     /// hash of the word. A slot of zero holds no word. The slots are made
     /// when the text writes a second word.
     known: Vec<u32>,
+    /// Reusable parser open-step stack.
+    parser_steps: Vec<crate::Slice<Option<(Id, u32)>>>,
+    /// Reusable scratch buffers for layer planning and step materialisation.
+    layers_buf: Vec<LayerPlan>,
+    counted_layers_buf: Vec<(LayerPlan, usize)>,
+    above_buf: Vec<At>,
+    steps_buf: Vec<SourceStep>,
+    local_buf: Vec<u32>,
+    held_buf: Vec<u32>,
 }
 
 impl Room {
+    /// Borrow reusable value and step buffers for the flat-sequence fast path.
+    pub(crate) fn flat_buffers(&mut self) -> (&mut Vec<Value>, &mut Vec<SourceStep>) {
+        (&mut self.values, &mut self.steps_buf)
+    }
+
     /// Whether the room holds no list: a new room, or one that a reader
     /// put away.
     pub fn is_bare(&self) -> bool {
@@ -2028,6 +2043,13 @@ impl Room {
             self.values.capacity(),
             self.words.capacity(),
             self.known.capacity(),
+            self.parser_steps.capacity(),
+            self.layers_buf.capacity(),
+            self.counted_layers_buf.capacity(),
+            self.above_buf.capacity(),
+            self.steps_buf.capacity(),
+            self.local_buf.capacity(),
+            self.held_buf.capacity(),
         ]
         .iter()
         .all(|held| *held == 0)
@@ -2105,6 +2127,7 @@ impl<'r> Planned<'r> {
     /// The layers of the text, each with the count of its steps. `None`
     /// when a walk does not write each cycle of a layer whole and in the
     /// order of time. See [`Plans::reads`].
+    #[cfg(test)]
     fn layers(&self) -> Option<Vec<(LayerPlan, usize)>> {
         let plans = &self.room.plans;
         let mut layers = Vec::new();
@@ -2131,22 +2154,36 @@ impl<'r> Planned<'r> {
     /// the pattern level by level.
     pub(crate) fn pattern(self) -> Option<Pattern> {
         let steps = self.steps();
-        let layers = match self.room.plans.kind(self.root) {
-            Kind::Atom { value, begin, len } => {
-                let value = self.room.values.swap_remove(value as usize);
-                let at = place(written(begin, len));
-                return Some(constant(value, vec![at]).with_steps(steps));
-            }
-            _ => self.layers()?,
-        };
-        let Room { plans, values, .. } = self.room;
+        if let Kind::Atom { value, begin, len } = self.room.plans.kind(self.root) {
+            let value = self.room.values.swap_remove(value as usize);
+            let at = place(written(begin, len));
+            return Some(constant(value, vec![at]).with_steps(steps));
+        }
+        let Room {
+            plans,
+            values,
+            layers_buf,
+            counted_layers_buf,
+            above_buf,
+            steps_buf,
+            local_buf,
+            held_buf,
+            ..
+        } = self.room;
+        layers_buf.clear();
+        above_buf.clear();
+        plans.layers_onto(self.root, layers_buf, above_buf)?;
+        counted_layers_buf.clear();
+        for layer in layers_buf.drain(..) {
+            let count = plans.reads(&layer)?;
+            counted_layers_buf.push((layer, count));
+        }
         let in_cycles = !plans.long;
         // Each layer that reads the plans holds its own values.
-        let mut local = Vec::new();
         let mut own = Vec::new();
-        for (layer, count) in &layers {
+        for (layer, count) in counted_layers_buf.iter() {
             if !layer.is_listed(*count) {
-                own.push(plans.values_of(layer, values, &mut local));
+                own.push(plans.values_of(layer, values, local_buf));
             }
         }
         // A layer that reads the plans keeps them for as long as it
@@ -2154,26 +2191,55 @@ impl<'r> Planned<'r> {
         let kept = (!own.is_empty()).then(|| Arc::new(std::mem::take(plans).for_walks()));
         let plans = kept.as_deref().unwrap_or(plans);
         let mut own = own.into_iter();
-        let given = layers.into_iter().map(|(layer, count)| {
+        if counted_layers_buf.len() == 1 {
+            let (layer, count) = counted_layers_buf.pop()?;
+            let period = layer.period()?;
+            let pattern = if layer.is_listed(count) {
+                let layer_values = plans.listed_indexed_into(
+                    &layer, period, count, values, local_buf, held_buf, steps_buf,
+                )?;
+                let pattern =
+                    sequence_of_indexed_slice(period, layer_values, in_cycles, steps_buf)?;
+                steps_buf.clear();
+                pattern
+            } else {
+                sequence_of_sourced(SourcedLayer {
+                    period,
+                    values: own.next()?,
+                    in_cycles,
+                    steps: Arc::new(PlanLayer {
+                        plans: Arc::clone(kept.as_ref()?),
+                        layer,
+                        count: u32::try_from(count).ok()?,
+                    }),
+                })?
+            };
+            return Some(pattern.with_steps(steps));
+        }
+        let mut builder = SequenceBuilder::with_capacity(counted_layers_buf.len());
+        for (layer, count) in counted_layers_buf.drain(..) {
             let period = layer.period()?;
             if layer.is_listed(count) {
-                let indexed =
-                    plans.listed_indexed(&layer, period, count, in_cycles, values, &mut local)?;
-                return Some(GivenLayer::Indexed(indexed));
+                let layer_values = plans.listed_indexed_into(
+                    &layer, period, count, values, local_buf, held_buf, steps_buf,
+                )?;
+                builder.push_indexed_slice(period, layer_values, in_cycles, steps_buf);
+                steps_buf.clear();
+            } else {
+                builder.push_sourced(SourcedLayer {
+                    period,
+                    values: own.next()?,
+                    in_cycles,
+                    steps: Arc::new(PlanLayer {
+                        // A handle of the plans, for each layer.
+                        plans: Arc::clone(kept.as_ref()?),
+                        layer,
+                        count: u32::try_from(count).ok()?,
+                    }),
+                });
             }
-            Some(GivenLayer::Sourced(SourcedLayer {
-                period,
-                values: own.next()?,
-                in_cycles,
-                steps: Arc::new(PlanLayer {
-                    // A handle of the plans, for each layer.
-                    plans: Arc::clone(kept.as_ref()?),
-                    layer,
-                    count: u32::try_from(count).ok()?,
-                }),
-            }))
-        });
-        Some(sequence_of(given.collect::<Option<_>>()?)?.with_steps(steps))
+        }
+        Some(builder.finish()?.with_steps(steps))
     }
 }
 
@@ -2384,6 +2450,16 @@ impl<'a> Build<'a> for Planner<'a, '_> {
             }
             _ => None,
         }
+    }
+
+    fn take_steps(&mut self) -> Vec<crate::Slice<Self::Step>> {
+        let mut steps = std::mem::take(&mut self.room.parser_steps);
+        steps.clear();
+        steps
+    }
+
+    fn return_steps(&mut self, steps: Vec<crate::Slice<Self::Step>>) {
+        self.room.parser_steps = steps;
     }
 }
 

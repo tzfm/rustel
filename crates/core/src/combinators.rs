@@ -2379,40 +2379,30 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
     })
 }
 
-/// The lowest degree [`ScaleSteps`] keeps.
-const LOWEST_KEPT_DEGREE: i64 = -64;
-
-/// How many degrees [`ScaleSteps`] keeps, from [`LOWEST_KEPT_DEGREE`] up.
-const KEPT_DEGREES: usize = 128;
-
 /// The key of the note that `scale` and `voicing` set, which each map of
 /// their haps shares.
 pub(crate) static NOTE: std::sync::LazyLock<crate::Key> =
     std::sync::LazyLock::new(|| crate::Key::from("note"));
 
 /// One scale as a `scale` call site reads it: the name, the tag its haps
-/// carry, and the note of each degree asked so far.
-///
-/// [`crate::tonaljs::scale_step`] resolves the scale name, its tonic and the
-/// octave transposition on every call. A degree's note depends on nothing
-/// else, so each degree in the kept range is resolved once, on first use,
-/// and later haps read it. A degree outside the range resolves every time,
-/// as before.
+/// carry, and its pre-parsed tonic/interval coordinates for zero-allocation
+/// degree lookups.
 struct ScaleSteps {
     name: String,
     tag: std::sync::Arc<str>,
     /// The keys of a hap that held none before the scale tagged it: each
     /// such hap shares them.
     tagged: crate::context_keys::ContextKeys,
-    degrees: Box<[std::sync::OnceLock<Degree>]>,
+    resolved: Result<crate::tonaljs::ResolvedScale, String>,
 }
 
 /// The note of a degree of a scale, or why the scale gives none.
-type Degree = Result<std::sync::Arc<str>, String>;
+type Degree = Result<crate::value::SharedStr, String>;
 
 impl ScaleSteps {
     fn new(name: String) -> Self {
         let tag: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
+        let resolved = crate::tonaljs::ResolvedScale::parse(&name);
         Self {
             tagged: crate::context_keys::ContextKeys::of(crate::context_keys::Keys {
                 // A handle of the tag.
@@ -2421,26 +2411,16 @@ impl ScaleSteps {
             }),
             tag,
             name,
-            degrees: (0..KEPT_DEGREES)
-                .map(|_| std::sync::OnceLock::new())
-                .collect(),
+            resolved,
         }
     }
 
-    /// [`crate::tonaljs::scale_step`] of `step` in this scale. A kept
-    /// degree gives a handle of its note.
+    /// [`crate::tonaljs::scale_step`] of `step` in this scale. Resolves in
+    /// integer coordinate math into an inline [`crate::SharedStr`].
     fn step(&self, step: f64) -> Degree {
-        // `scale_step` rounds up first, so a step and its ceiling have one
-        // note. Only a finite ceiling inside the range is kept.
-        let degree = step.ceil();
-        let slot = (LOWEST_KEPT_DEGREE as f64..(LOWEST_KEPT_DEGREE + KEPT_DEGREES as i64) as f64)
-            .contains(&degree)
-            .then(|| (degree as i64 - LOWEST_KEPT_DEGREE) as usize);
-        match slot {
-            Some(slot) => self.degrees[slot]
-                .get_or_init(|| crate::tonaljs::scale_step(degree, &self.name).map(Into::into))
-                .clone(),
-            None => crate::tonaljs::scale_step(step, &self.name).map(Into::into),
+        match &self.resolved {
+            Ok(resolved) => resolved.step_shared(step),
+            Err(error) => Err(error.clone()),
         }
     }
 }
@@ -2554,7 +2534,7 @@ fn scale_note(steps: &ScaleSteps, note_or_step: &Value, anchor: Option<&Value>) 
             crate::tonaljs::step_in_named_scale(number, scale_name, Some(anchor_midi))
                 .map(Value::F64)
         }
-        None => steps.step(number).map(|s| Value::Str(s.into())),
+        None => steps.step(number).map(Value::Str),
     };
     // An error removes the hap.
     let stepped = stepped.ok()?;
@@ -2564,7 +2544,7 @@ fn scale_note(steps: &ScaleSteps, note_or_step: &Value, anchor: Option<&Value>) 
     // Accidental suffixes transpose the result; a numeric scale note
     // (anchor path) yields "".
     let base = match &stepped {
-        Value::Str(s) => s,
+        Value::Str(s) => s.as_str(),
         _ => "",
     };
     let transposed = crate::tonaljs::note_transpose(
@@ -2576,7 +2556,7 @@ fn scale_note(steps: &ScaleSteps, note_or_step: &Value, anchor: Option<&Value>) 
 
 #[cfg(test)]
 mod scale_steps_tests {
-    use super::{KEPT_DEGREES, LOWEST_KEPT_DEGREE, ScaleSteps, scale_hap};
+    use super::{ScaleSteps, scale_hap};
     use crate::{Hap, TimeSpan, Value};
     use rustel_fraction::Fraction;
 
@@ -2589,7 +2569,7 @@ mod scale_steps_tests {
         let mut hap = Hap::new(Some(cycle), cycle, controls);
         hap.keys.edit().log_line = Some("a line".into());
         let scaled = scale_hap(&hap, &steps).expect("a note of the scale");
-        let note = Value::Str(steps.step(2.0).expect("a degree of the scale").into());
+        let note = Value::Str(steps.step(2.0).expect("a degree of the scale"));
         // The step gives way to its note, after the other controls.
         let expected = Value::object([("s".into(), text("piano")), ("note".into(), note)]);
         assert_eq!(scaled.value, expected);
@@ -2599,10 +2579,7 @@ mod scale_steps_tests {
 
     #[test]
     fn a_kept_degree_is_the_note_scale_step_resolves() {
-        let mut steps: Vec<f64> = (LOWEST_KEPT_DEGREE - 3
-            ..LOWEST_KEPT_DEGREE + KEPT_DEGREES as i64 + 3)
-            .map(|degree| degree as f64)
-            .collect();
+        let mut steps: Vec<f64> = (-67..67).map(|degree| degree as f64).collect();
         steps.extend([
             -0.5,
             0.25,

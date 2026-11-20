@@ -862,6 +862,25 @@ impl<'p> Turn<'p> {
         for call in calls.iter().rev() {
             let argument = match call.argument {
                 ScoreExpr::Number(number) => ChainArgument::Number(*number),
+                ScoreExpr::Call {
+                    callee, arguments, ..
+                } if *callee == MINI_CALLEE
+                    && names.mini()
+                    && matches!(self.resolve(MINI_CALLEE), Resolved::Host)
+                    && let [ScoreExpr::String(source), ScoreExpr::Number(offset)] =
+                        self.held.row(*arguments)
+                    && offset.fract() == 0.0
+                    && offset.is_finite()
+                    && let Ok(at) = usize::try_from(*offset as i64)
+                    && let Some((value, locations)) =
+                        rustel_mini::word_constant_value(source, at) =>
+                {
+                    self.steps += 1;
+                    if self.steps > MAX_STEPS {
+                        return None;
+                    }
+                    ChainArgument::Constant(value, locations)
+                }
                 argument => match self.pattern_argument(names, argument, runtime) {
                     Some(value) => ChainArgument::Pattern(value),
                     None => {

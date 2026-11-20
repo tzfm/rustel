@@ -48,8 +48,9 @@ use context_keys::ContextKeys;
 pub use locations::Locations;
 use rustel_fraction::Fraction;
 pub use sequence::{
-    GivenLayer, IndexedLayer, SequenceLayer, SequenceStep, SourceStep, SourcedLayer, StepSource,
-    sequence, sequence_of,
+    GivenLayer, IndexedLayer, SequenceBuilder, SequenceLayer, SequenceStep, SourceStep,
+    SourcedLayer, StepSource, sequence, sequence_of, sequence_of_indexed_slice,
+    sequence_of_sourced,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -1130,6 +1131,19 @@ struct PatternExtras {
     reachable: Option<Arc<Vec<CallbackId>>>,
 }
 
+impl PatternExtras {
+    /// True when this extras record carries only `runtime_settings`, so
+    /// ancestor nodes with no reachable JS callbacks can share its `Arc`.
+    #[inline]
+    fn is_plain_runtime_settings(&self) -> bool {
+        self.large_steps.is_none()
+            && self.pure_loc.is_none()
+            && self.runtime_settings.is_some()
+            && self.extra_flags == 0
+            && self.reachable.is_none()
+    }
+}
+
 #[derive(Clone)]
 pub struct Pattern {
     node: Arc<NodeCell>,
@@ -2195,10 +2209,24 @@ pub struct PatternedPureMap {
 
 impl PatternedPureMap {
     fn apply(&self, value: &Value, operand: &Pattern) -> purity::PurePattern {
-        let values = register::argument_values(value, self.chain, &self.constants);
         let pure = operand
             .as_pure_pattern()
             .expect("a PatternOfPureOperand is built from a pure operand");
+        if self.chain == 1 {
+            if self.constants.is_empty() {
+                return (self.body)(std::slice::from_ref(value), pure);
+            }
+            let values: Vec<Value> = self
+                .constants
+                .iter()
+                .map(|constant| match constant {
+                    Some(c) => c.clone(),
+                    None => value.clone(),
+                })
+                .collect();
+            return (self.body)(&values, pure);
+        }
+        let values = register::argument_values(value, self.chain, &self.constants);
         (self.body)(&values, pure)
     }
 }
@@ -5809,12 +5837,16 @@ enum Node {
 struct PatternPair(Pattern, Pattern);
 
 impl PatternPair {
-    /// The runtime that the first child binds, or else the second.
-    fn runtime_settings(&self) -> Option<settings::RuntimeSettings> {
-        self.0
-            .runtime_settings()
-            .cloned()
-            .or_else(|| self.1.runtime_settings().cloned())
+    /// The first child that binds a runtime, if any.
+    #[inline]
+    fn runtime_settings_source(&self) -> Option<&Pattern> {
+        if self.0.has_runtime_settings() {
+            Some(&self.0)
+        } else if self.1.has_runtime_settings() {
+            Some(&self.1)
+        } else {
+            None
+        }
     }
 }
 
@@ -5823,11 +5855,15 @@ impl PatternPair {
 pub(crate) struct AppLeftNode(pub(crate) Pattern, pub(crate) Pattern, ValueReading);
 
 impl AppLeftNode {
-    fn runtime_settings(&self) -> Option<settings::RuntimeSettings> {
-        self.0
-            .runtime_settings()
-            .cloned()
-            .or_else(|| self.1.runtime_settings().cloned())
+    #[inline]
+    fn runtime_settings_source(&self) -> Option<&Pattern> {
+        if self.0.has_runtime_settings() {
+            Some(&self.0)
+        } else if self.1.has_runtime_settings() {
+            Some(&self.1)
+        } else {
+            None
+        }
     }
 }
 
@@ -5836,11 +5872,15 @@ impl AppLeftNode {
 struct OperandPureNode(Pattern, Pattern, ConstructionMemo);
 
 impl OperandPureNode {
-    fn runtime_settings(&self) -> Option<settings::RuntimeSettings> {
-        self.0
-            .runtime_settings()
-            .cloned()
-            .or_else(|| self.1.runtime_settings().cloned())
+    #[inline]
+    fn runtime_settings_source(&self) -> Option<&Pattern> {
+        if self.0.has_runtime_settings() {
+            Some(&self.0)
+        } else if self.1.has_runtime_settings() {
+            Some(&self.1)
+        } else {
+            None
+        }
     }
 }
 
@@ -6835,13 +6875,11 @@ impl Hap {
 /// wrapper node. Children with their own different runtime still rebind when
 /// queried; this selection governs work performed by the parent itself, such
 /// as an `fmap` callback returning a Pattern value.
-fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> {
-    fn from_patterns<'a>(
-        patterns: impl IntoIterator<Item = &'a Pattern>,
-    ) -> Option<settings::RuntimeSettings> {
+fn inherited_runtime_settings_source(node: &Node) -> Option<&Pattern> {
+    fn from_patterns<'a>(patterns: impl IntoIterator<Item = &'a Pattern>) -> Option<&'a Pattern> {
         patterns
             .into_iter()
-            .find_map(|pattern| pattern.runtime_settings().cloned())
+            .find(|pattern| pattern.has_runtime_settings())
     }
 
     match node {
@@ -6852,7 +6890,7 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
         | Node::QueryLimit(_)
         | Node::Signal(_)
         | Node::JsQuery(_) => None,
-        Node::PatternOfPureOperand(pair, _) => pair.runtime_settings(),
+        Node::PatternOfPureOperand(pair, _) => pair.runtime_settings_source(),
         #[cfg(non_send_node_mutation)]
         Node::NonSendMutation(_) => None,
         Node::WithQueryTime(pattern, _)
@@ -6897,19 +6935,21 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
         | Node::PatternOfDynamic(pattern, _)
         | Node::Join(pattern, _)
         | Node::FmapJs(pattern, _)
-        | Node::FmapJsPreservingControls(pattern, _, _) => pattern.runtime_settings().cloned(),
+        | Node::FmapJsPreservingControls(pattern, _, _) => {
+            pattern.has_runtime_settings().then_some(pattern)
+        }
         Node::Extension(extension) => from_patterns(extension.children()),
         Node::Timeline(pair, _) => pair
             .1
-            .runtime_settings()
-            .cloned()
-            .or_else(|| pair.0.runtime_settings().cloned()),
-        Node::AppLeft(pair, _, _) => pair.runtime_settings(),
+            .has_runtime_settings()
+            .then_some(&pair.1)
+            .or_else(|| pair.0.has_runtime_settings().then_some(&pair.0)),
+        Node::AppLeft(pair, _, _) => pair.runtime_settings_source(),
         Node::Arp(pair)
         | Node::ArpWithPattern(pair)
         | Node::PickPatternified { patterns: pair, .. }
         | Node::AppRight(pair, _, _)
-        | Node::AppBoth(pair, _, _) => pair.runtime_settings(),
+        | Node::AppBoth(pair, _, _) => pair.runtime_settings_source(),
         Node::PurePickLookup(boxed) => from_patterns(boxed.1.patterns()),
         Node::ChooseCycles(patterns, _)
         | Node::Stack(patterns)
@@ -6917,26 +6957,53 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
         | Node::SlowCatPrime(patterns) => from_patterns(patterns),
         Node::WChoose(choice) => choice
             .chooser
-            .runtime_settings()
-            .cloned()
-            .or_else(|| choice.total.runtime_settings().cloned())
+            .has_runtime_settings()
+            .then_some(&choice.chooser)
+            .or_else(|| choice.total.has_runtime_settings().then_some(&choice.total))
             .or_else(|| from_patterns(&choice.cumulative))
             .or_else(|| from_patterns(&choice.values)),
         Node::Pick {
             selector, lookup, ..
         } => selector
-            .runtime_settings()
-            .cloned()
+            .has_runtime_settings()
+            .then_some(selector)
             .or_else(|| from_patterns(lookup.patterns())),
         Node::PatternOfHap(bind) => bind
             .0
-            .runtime_settings()
-            .cloned()
+            .has_runtime_settings()
+            .then_some(&bind.0)
             .or_else(|| from_patterns(&bind.1)),
         Node::XenPatterns(pattern, dependencies) => pattern
-            .runtime_settings()
-            .cloned()
+            .has_runtime_settings()
+            .then_some(pattern)
             .or_else(|| from_patterns(dependencies)),
+    }
+}
+
+/// Inherit `runtime_settings` and `reachable` into an `Option<Arc<PatternExtras>>`,
+/// reusing the child's `Arc<PatternExtras>` directly when it carries only
+/// `runtime_settings` and `reachable` is empty.
+#[inline]
+fn inherited_extras(
+    node: &Node,
+    reachable: Option<Arc<Vec<CallbackId>>>,
+) -> Option<Arc<PatternExtras>> {
+    let source = inherited_runtime_settings_source(node);
+    match (source, reachable) {
+        (None, None) => None,
+        (Some(pat), None)
+            if pat
+                .extras
+                .as_deref()
+                .is_some_and(PatternExtras::is_plain_runtime_settings) =>
+        {
+            pat.extras.clone()
+        }
+        (source, reachable) => Some(Arc::new(PatternExtras {
+            runtime_settings: source.and_then(|p| p.runtime_settings().cloned()),
+            reachable,
+            ..PatternExtras::default()
+        })),
     }
 }
 
@@ -6948,17 +7015,7 @@ impl Pattern {
         let mut purity = compute_purity(&node);
         purity.span_read = span_read(&node);
         let flags = pack_purity_flags(&purity);
-        let runtime_settings = inherited_runtime_settings(&node);
-        let reachable = purity.take_reachable();
-        let extras = if runtime_settings.is_some() || reachable.is_some() {
-            Some(Arc::new(PatternExtras {
-                runtime_settings,
-                reachable,
-                ..PatternExtras::default()
-            }))
-        } else {
-            None
-        };
+        let extras = inherited_extras(&node, purity.take_reachable());
         Pattern {
             node: Arc::new(NodeCell { flags, kind: node }),
             step_numer: 0,
@@ -6971,17 +7028,7 @@ impl Pattern {
     /// node says, and no metadata of a handle.
     fn holding(node: Arc<NodeCell>) -> Self {
         let mut purity = compute_purity(&node.kind);
-        let runtime_settings = inherited_runtime_settings(&node.kind);
-        let reachable = purity.take_reachable();
-        let extras = if runtime_settings.is_some() || reachable.is_some() {
-            Some(Arc::new(PatternExtras {
-                runtime_settings,
-                reachable,
-                ..PatternExtras::default()
-            }))
-        } else {
-            None
-        };
+        let extras = inherited_extras(&node.kind, purity.take_reachable());
         Pattern {
             node,
             step_numer: 0,
@@ -9385,13 +9432,17 @@ impl Pattern {
                 let OperandPureNode(outer, operand, memo) = &**boxed;
                 let mut resolved = Vec::new();
                 let settings = settings::current_state_id();
-                for hap in outer.query(state) {
+                for mut hap in outer.query(state) {
                     let inner = memo
                         .construct(&hap.value, &settings, |value| map.apply(value, operand))
                         .pattern()
                         .clone();
                     if query_error_pending() || budget_exhausted() {
                         return Some(Vec::new());
+                    }
+                    if hap.pick_lookup().is_some() {
+                        hap.keys.edit().pick_lookup = None;
+                        hap.keys.trim();
                     }
                     resolved.push(ResolvedHap::of(hap, inner));
                 }

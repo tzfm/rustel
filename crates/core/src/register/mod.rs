@@ -461,17 +461,7 @@ impl Registration {
                 chain = args.to_vec();
             }
 
-            // Accumulate argument values positionally.
-            let mut acc: Pattern = chain[0].fmap_collect();
-            for a in &chain[1..] {
-                acc = acc.app_left_collect(a.clone());
-            }
             let n_chain = chain.len();
-
-            // The constants live in the closure, so the graph cannot show
-            // their callbacks to the wrapper that owns it. Retain them, as
-            // the fast path's pure view does: every fallback the constants
-            // may need once a program goes stale.
             let retained = constants
                 .iter()
                 .filter_map(|constant| match constant {
@@ -485,32 +475,38 @@ impl Registration {
             // not by a flag. A `Native` body applied to a pure operand is
             // provably pure, so purity can be inherited soundly; anything else
             // goes through the dynamic constructor and is impure.
-            //
-            // A body that consumes a transformer applies a function among
-            // its values. It takes the pure route when no value can be a
-            // function of the script: each function is a constant with a
-            // pure view, and each argument of the chain is data that its
-            // graph holds.
             let pure_view = !self.takes_function()
                 || (constants
                     .iter()
                     .flatten()
                     .all(|constant| admits_pure_view(function_argument, constant))
                     && chain.iter().all(crate::sequence::is_data));
+            let build_collected = || {
+                let mut acc: Pattern = chain[0].fmap_collect();
+                for a in &chain[1..] {
+                    acc = acc.app_left_collect(a.clone());
+                }
+                acc
+            };
             let inner = match (&self.func, pat.as_pure_pattern()) {
-                // Native body + pure operand: the closure's return type proves
-                // no JavaScript can appear, so purity is inherited SOUNDLY.
-                // The operand rides in the node as a compared child, so an
-                // unchanged operand carries its answers across evaluations.
-                (CombinatorFn::Native(n), Some(pure_operand)) if pure_view => acc
-                    .fmap_to_pure_pattern_with_operand(
+                // Native body + pure operand: a single dynamic argument rides
+                // directly without wrapping every hap value in a one-element
+                // `Value::List`.
+                (CombinatorFn::Native(n), Some(pure_operand)) if pure_view => {
+                    let acc = if n_chain == 1 {
+                        chain[0].clone()
+                    } else {
+                        build_collected()
+                    };
+                    acc.fmap_to_pure_pattern_with_operand(
                         &pure_operand,
                         n.pure.clone(),
                         n_chain,
                         constants,
-                    ),
+                    )
+                }
                 // Anything else is an opaque closure -> always impure.
-                _ => acc.fmap_to_pattern(move |riding: &Value| {
+                _ => build_collected().fmap_to_pattern(move |riding: &Value| {
                     let values = argument_values(riding, n_chain, &constants);
                     let pure_view = values
                         .iter()

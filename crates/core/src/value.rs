@@ -23,7 +23,7 @@ pub struct OrderedMap {
 
 /// Maximum inline patch slots carried by a [`Patched`] overlay before
 /// materialising a flat slice.
-const MAX_PATCHES: usize = 4;
+const MAX_PATCHES: usize = 6;
 
 /// Up to [`MAX_PATCHES`] key/value overrides or additions over a shared
 /// dressed [`Table`] row, avoiding flattening `Table::tail` on dynamic
@@ -53,7 +53,7 @@ impl Patched {
             has_replace: false,
             made,
             marks,
-            entries: [None, None, None, None],
+            entries: [const { None }; MAX_PATCHES],
         })
     }
 
@@ -73,6 +73,8 @@ impl Patched {
         let marks = base.marks | Table::mark(key.as_str());
         let appended = u8::from(rep == u16::MAX);
         let has_replace = rep != u16::MAX;
+        let mut entries = [const { None }; MAX_PATCHES];
+        entries[0] = Some((key, value, rep));
         Some(Self {
             base,
             base_len,
@@ -81,7 +83,7 @@ impl Patched {
             has_replace,
             made,
             marks,
-            entries: [Some((key, value, rep)), None, None, None],
+            entries,
         })
     }
 

@@ -438,6 +438,7 @@ impl SmallGridStep {
 
 /// Steps of a [`Grid`], stored as 8-byte [`SmallGridStep`]s when every step
 /// fits and 16-byte [`GridStep`]s otherwise.
+#[derive(Clone)]
 enum GridSteps {
     Small(Box<[SmallGridStep]>),
     Wide(Box<[GridStep]>),
@@ -582,7 +583,11 @@ struct Grid {
     side: Option<Box<Spare>>,
 }
 
+const _: () = assert!(std::mem::size_of::<SmallGridStep>() == 8);
+const _: () = assert!(std::mem::size_of::<Grid>() <= 48);
+
 /// The cuts and the spare locations of a [`Grid`].
+#[derive(Clone)]
 struct Spare {
     /// The cut steps, in the order of their places.
     cuts: Box<[Cut]>,
@@ -995,6 +1000,111 @@ impl Grid {
             && (0..self.steps.len())
                 .all(|index| self.steps.times_of(index) == other.steps.times_of(index))
     }
+
+    /// Whether every step's part lies inside one cycle in every turn of `period`,
+    /// checked directly in integer ticks without constructing `Fraction`s.
+    fn in_cycles_for(&self, period: Fraction) -> bool {
+        let Ok(turns) = u128::try_from(period.denom()) else {
+            return false;
+        };
+        let ticks = u128::from(self.ticks.get());
+        for i in 0..self.steps.len() {
+            let (b, e) = self.steps.times_of(i);
+            let Some(begins) = u128::from(b).checked_mul(turns) else {
+                return false;
+            };
+            let Some(ends) = u128::from(e).checked_mul(turns) else {
+                return false;
+            };
+            let Some(bound) = (begins / ticks + 1).checked_mul(ticks) else {
+                return false;
+            };
+            if ends > bound {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Rescale this grid's times by `1 / factor` directly in integer ticks,
+    /// avoiding `Vec<Raw>`, `Fraction` divisions, and location re-packing.
+    /// Returns `(new_grid, in_cycles)` when ticks stay in range.
+    fn faster(&self, factor: Fraction, new_period: Fraction) -> Option<(Self, bool)> {
+        let f_num = u32::try_from(factor.numer()).ok()?;
+        let f_den = u32::try_from(factor.denom()).ok()?;
+        if f_num == 0 || f_den == 0 {
+            return None;
+        }
+        let old_ticks = self.ticks.get();
+        let g0 = gcd(u64::from(old_ticks), u64::from(f_den)) as u32;
+        let ticks_1 = old_ticks / g0;
+        let mul = f_den / g0;
+        let mut g1 = u64::from(f_num);
+        if g1 > 1 {
+            for i in 0..self.steps.len() {
+                let (b, e) = self.steps.times_of(i);
+                g1 = gcd(g1, u64::from(b));
+                g1 = gcd(g1, u64::from(e));
+                if g1 == 1 {
+                    break;
+                }
+            }
+            if g1 > 1 {
+                for cut in self.cuts() {
+                    g1 = gcd(g1, u64::from(cut.begin));
+                    g1 = gcd(g1, u64::from(cut.end));
+                    if g1 == 1 {
+                        break;
+                    }
+                }
+            }
+        }
+        let ticks_2 = u64::from(ticks_1).checked_mul(u64::from(f_num))? / g1;
+        let new_ticks_u32 = u32::try_from(ticks_2).ok()?;
+        // Fall back to the general path if denominators could exceed i32.
+        if i32::try_from(new_ticks_u32).is_err() {
+            return None;
+        }
+        let new_ticks = NonZeroU32::new(new_ticks_u32)?;
+        let (steps, side) = if mul == 1 && g1 == 1 {
+            (self.steps.clone(), self.side.clone())
+        } else {
+            let rescale = |t: u32| -> Option<u32> {
+                u32::try_from((u64::from(t) / g1).checked_mul(u64::from(mul))?).ok()
+            };
+            let steps = GridSteps::build(self.steps.len(), |i| {
+                let mut step = self.steps.get(i);
+                step.part_begin = rescale(step.part_begin)?;
+                step.part_end = rescale(step.part_end)?;
+                Some(step)
+            })?;
+            let side = match &self.side {
+                None => None,
+                Some(spare) => {
+                    let mut cuts = spare.cuts.clone();
+                    for cut in &mut cuts {
+                        cut.begin = rescale(cut.begin)?;
+                        cut.end = rescale(cut.end)?;
+                    }
+                    Some(Box::new(Spare {
+                        cuts,
+                        packed: spare.packed.clone(),
+                        wide: spare.wide.clone(),
+                    }))
+                }
+            };
+            (steps, side)
+        };
+        let grid = Self {
+            ticks: new_ticks,
+            base: self.base | Self::SMALL,
+            steps,
+            reductions: tick_grid(new_ticks),
+            side,
+        };
+        let in_cycles = grid.in_cycles_for(new_period);
+        Some((grid, in_cycles))
+    }
 }
 
 thread_local! {
@@ -1218,9 +1328,34 @@ impl Values<'_> {
 const _: () = assert!(size_of::<Steps>() == 16);
 const _: () = assert!(size_of::<Layer>() <= 88);
 
-/// Rare tail fields of [`Dress`]: locations after each step and context keys.
+/// Pack a single `(begin, end)` range into a non-zero `u32` for [`Dress`]:
+/// `begin` in the high 20 bits and `length + 1` in the low 12 bits, leaving
+/// `0` as the empty sentinel.
+#[inline]
+fn pack_dress_loc((begin, end): (usize, usize)) -> Option<u32> {
+    const LEN_BITS: u32 = 12;
+    const MAX_LEN: u32 = (1 << LEN_BITS) - 2;
+    const MAX_BEGIN: u32 = (1 << (32 - LEN_BITS)) - 1;
+    let length = u32::try_from(end.checked_sub(begin)?).ok()?;
+    let begin = u32::try_from(begin).ok()?;
+    (begin <= MAX_BEGIN && length <= MAX_LEN).then_some((begin << LEN_BITS) | (length + 1))
+}
+
+#[inline]
+fn unpack_dress_loc(packed: u32) -> (usize, usize) {
+    const LEN_BITS: u32 = 12;
+    const LEN_MASK: u32 = (1 << LEN_BITS) - 1;
+    let begin = (packed >> LEN_BITS) as usize;
+    let length = ((packed & LEN_MASK) - 1) as usize;
+    (begin, begin + length)
+}
+
+/// Rare tail fields of [`Dress`]: spilled leading locations, trailing locations,
+/// and context keys.
 #[derive(Clone, Default)]
 struct DressTail {
+    /// Leading locations when more than two ranges or a wide range are present.
+    before: Locations,
     /// The locations of each hap after its step's own.
     after: Locations,
     /// The keys of the context of each hap, as a map of the haps set them:
@@ -1240,14 +1375,14 @@ struct Dress {
     /// name: the union of the constants that a chain of controls set, the
     /// last one last. See [`Layer::set`].
     set: Option<Value>,
-    /// The locations of each hap before its step's own: those of the
-    /// constants that the steps met, the last first.
-    before: Locations,
-    /// Rare trailing locations and context keys, boxed out of the common case.
+    /// Up to two compact leading locations packed inline; `[0, 0]` when empty
+    /// or spilled into `tail.before`.
+    before_packed: [u32; 2],
+    /// Rare spilled leading locations, trailing locations, and context keys.
     tail: Option<Box<DressTail>>,
 }
 
-const _: () = assert!(size_of::<Dress>() <= 88);
+const _: () = assert!(size_of::<Dress>() <= 56);
 
 static EMPTY_LOCATIONS: Locations = Locations::new();
 
@@ -1255,11 +1390,103 @@ static EMPTY_LOCATIONS: Locations = Locations::new();
 static BARE: Dress = Dress {
     named: None,
     set: None,
-    before: Locations::new(),
+    before_packed: [0, 0],
     tail: None,
 };
 
 impl Dress {
+    #[inline]
+    fn before_is_empty(&self) -> bool {
+        self.before_packed[0] == 0
+            && self
+                .tail
+                .as_deref()
+                .is_none_or(|tail| tail.before.is_empty())
+    }
+
+    #[inline]
+    fn before_len(&self) -> usize {
+        if self.before_packed[0] != 0 {
+            1 + usize::from(self.before_packed[1] != 0)
+        } else {
+            self.tail.as_deref().map_or(0, |tail| tail.before.len())
+        }
+    }
+
+    fn before_locations(&self) -> Locations {
+        if self.before_packed[0] != 0 {
+            let mut out = Locations::new();
+            out.push(unpack_dress_loc(self.before_packed[0]));
+            if self.before_packed[1] != 0 {
+                out.push(unpack_dress_loc(self.before_packed[1]));
+            }
+            out
+        } else {
+            self.tail
+                .as_deref()
+                .map_or_else(Locations::new, |tail| tail.before.clone())
+        }
+    }
+
+    fn prepend_before(&mut self, prefix: Locations) {
+        if prefix.is_empty() {
+            return;
+        }
+        let tail_empty = self
+            .tail
+            .as_deref()
+            .is_none_or(|tail| tail.before.is_empty());
+        if tail_empty {
+            match prefix.len() {
+                1 if self.before_packed[1] == 0 => {
+                    if let Some(range) = prefix.get(0)
+                        && let Some(p) = pack_dress_loc(range)
+                    {
+                        self.before_packed = [p, self.before_packed[0]];
+                        return;
+                    }
+                }
+                2 if self.before_packed[0] == 0 => {
+                    if let (Some(r0), Some(r1)) = (prefix.get(0), prefix.get(1))
+                        && let (Some(p0), Some(p1)) = (pack_dress_loc(r0), pack_dress_loc(r1))
+                    {
+                        self.before_packed = [p0, p1];
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut full = prefix;
+        full.append(&self.before_locations());
+        self.before_packed = [0, 0];
+        self.tail.get_or_insert_with(Default::default).before = full;
+    }
+
+    fn clear_before(&mut self) {
+        self.before_packed = [0, 0];
+        if let Some(tail) = &mut self.tail {
+            tail.before = Locations::new();
+            self.prune_tail();
+        }
+    }
+
+    fn same_before(&self, other: &Self) -> bool {
+        let a_spilled = self
+            .tail
+            .as_deref()
+            .is_some_and(|tail| !tail.before.is_empty());
+        let b_spilled = other
+            .tail
+            .as_deref()
+            .is_some_and(|tail| !tail.before.is_empty());
+        if !a_spilled && !b_spilled {
+            self.before_packed == other.before_packed
+        } else {
+            self.before_locations() == other.before_locations()
+        }
+    }
+
     #[inline]
     fn after(&self) -> &Locations {
         self.tail
@@ -1275,11 +1502,9 @@ impl Dress {
     }
 
     fn prune_tail(&mut self) {
-        if self
-            .tail
-            .as_deref()
-            .is_some_and(|tail| tail.after.is_empty() && tail.keys.is_empty())
-        {
+        if self.tail.as_deref().is_some_and(|tail| {
+            tail.before.is_empty() && tail.after.is_empty() && tail.keys.is_empty()
+        }) {
             self.tail = None;
         }
     }
@@ -1321,9 +1546,7 @@ impl Dress {
     /// this dress makes. See [`Layer::set_here`].
     fn set_here(&mut self, control: &Value, context: Locations) {
         // The value side's locations come first.
-        let mut before = context;
-        before.append(&self.before);
-        self.before = before;
+        self.prepend_before(context);
         match &mut self.set {
             Some(set) => compose_data_in_place(ComposeOp::Set, set, control),
             // A handle of the map of the control, which holds its own
@@ -1341,20 +1564,20 @@ impl Dress {
     fn is_bare(&self) -> bool {
         self.named.is_none()
             && self.set.is_none()
-            && self.before.is_empty()
+            && self.before_is_empty()
             && self.keys().is_empty()
             && self.after().is_empty()
     }
 
     /// Whether a hap of a step at `locations` holds them alone.
     fn locates_alone(&self) -> bool {
-        self.before.is_empty() && self.after().is_empty()
+        self.before_is_empty() && self.after().is_empty()
     }
 
     /// The locations of a hap of a step at `locations`: those before, the
     /// step's own, then those after.
     fn around(&self, locations: &Locations) -> Locations {
-        let mut context = self.before.clone();
+        let mut context = self.before_locations();
         context.append(locations);
         if let Some(tail) = &self.tail {
             context.append(&tail.after);
@@ -1373,7 +1596,7 @@ impl Dress {
         same_set
             && self.named == other.named
             && self.keys().same(other.keys())
-            && self.before == other.before
+            && self.same_before(other)
             && self.after() == other.after()
     }
 }
@@ -1518,33 +1741,45 @@ impl Layer {
     /// The layer of `layer`, whose steps are already in cycles with
     /// pre-deduplicated value indices.
     fn of_indexed(mut layer: IndexedLayer) -> Self {
-        let in_cycles = layer.in_cycles
+        Self::of_indexed_slice(
+            layer.period,
+            layer.values,
+            layer.in_cycles,
+            &mut layer.steps,
+        )
+    }
+
+    /// Build a layer directly from a mutable slice of uncut [`SourceStep`]s in
+    /// cycles, allowing callers to reuse their step buffer across layers.
+    fn of_indexed_slice(
+        period: Fraction,
+        values: Arc<[Value]>,
+        in_cycles: bool,
+        steps: &mut [SourceStep],
+    ) -> Self {
+        let in_cycles = in_cycles
             || lie_in_spans(
-                layer.period,
-                layer
-                    .steps
-                    .iter()
-                    .map(|step| TimeSpan::new(step.begin, step.end)),
+                period,
+                steps.iter().map(|step| TimeSpan::new(step.begin, step.end)),
             );
-        if let Some(grid) = Grid::build_indexed(&mut layer.steps) {
+        if let Some(grid) = Grid::build_indexed(steps) {
             return Self::holding(
-                layer.period,
+                period,
                 Steps::Listed(Listing::Grid(Arc::new(grid))),
                 in_cycles,
-                layer.values,
+                values,
             );
         }
-        let raws: Vec<Raw> = layer
-            .steps
-            .into_iter()
+        let raws: Vec<Raw> = steps
+            .iter_mut()
             .map(|step| Raw {
                 whole: TimeSpan::new(step.begin, step.end),
                 part: None,
                 value: step.value,
-                locations: step.locations,
+                locations: std::mem::take(&mut step.locations),
             })
             .collect();
-        Self::of_list(layer.period, raws, in_cycles, layer.values)
+        Self::of_list(period, raws, in_cycles, values)
     }
 
     /// The layer of `layer`, which reads its steps from their source.
@@ -1869,7 +2104,7 @@ impl Layer {
     /// Whether combining this layer's dress locations with a step location can
     /// spill `Locations::INLINE`, making a cached context table worthwhile.
     fn spills_contexts(dress: &Dress) -> bool {
-        dress.before.len() + dress.after().len() >= 7
+        dress.before_len() + dress.after().len() >= 7
     }
 
     /// What makes the haps of the steps of this layer, read once for a loop.
@@ -2376,11 +2611,7 @@ impl Layer {
             let met = self.with(|layer| {
                 layer.change_dress(|dress| {
                     match side {
-                        Side::Functions => {
-                            let mut before = values.context(0);
-                            before.append(&dress.before);
-                            dress.before = before;
-                        }
+                        Side::Functions => dress.prepend_before(values.context(0)),
                         Side::Values => dress.append_after(&values.context(0)),
                     }
                     dress.set_keys(keys);
@@ -2424,7 +2655,7 @@ impl Layer {
                 let (own_value, own_locations) = (own.value(index), own.locations(index));
                 // The locations of each hap of this step. Those after stay
                 // with the layer of the function side, which they end.
-                let mut around = self.dress().before.clone();
+                let mut around = self.dress().before_locations();
                 around.append(&own_locations);
                 if side == Side::Values {
                     around.append(self.dress().after());
@@ -2496,7 +2727,7 @@ impl Layer {
         // The locations of the steps are in their places now, but those
         // after the steps of the function side, which end each hap.
         met.change_dress(|dress| {
-            dress.before = Locations::new();
+            dress.clear_before();
             if side == Side::Values {
                 dress.clear_after();
             }
@@ -2571,6 +2802,69 @@ pub fn sequence_of(layers: Vec<GivenLayer>) -> Option<Pattern> {
         GivenLayer::Sourced(layer) => Some(Layer::of_source(layer)),
     });
     node(layers.collect::<Option<Vec<_>>>()?)
+}
+
+/// A single-layer [`sequence`] built directly from a reusable slice of uncut
+/// [`SourceStep`]s in cycles, avoiding intermediate `Vec<GivenLayer>` and
+/// `Vec<Layer>` allocations.
+pub fn sequence_of_indexed_slice(
+    period: Fraction,
+    values: Arc<[Value]>,
+    in_cycles: bool,
+    steps: &mut [SourceStep],
+) -> Option<Pattern> {
+    let layer = Layer::of_indexed_slice(period, values, in_cycles, steps);
+    node_of_one(layer)
+}
+
+/// A single-layer [`sequence`] built directly from one [`SourcedLayer`].
+pub fn sequence_of_sourced(layer: SourcedLayer) -> Option<Pattern> {
+    node_of_one(Layer::of_source(layer))
+}
+
+/// Incremental builder for multi-layer sequences, allowing callers to reuse a
+/// single `Vec<SourceStep>` buffer across layers.
+pub struct SequenceBuilder {
+    layers: Vec<Layer>,
+}
+
+impl SequenceBuilder {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            layers: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn push_indexed_slice(
+        &mut self,
+        period: Fraction,
+        values: Arc<[Value]>,
+        in_cycles: bool,
+        steps: &mut [SourceStep],
+    ) {
+        self.layers
+            .push(Layer::of_indexed_slice(period, values, in_cycles, steps));
+    }
+
+    pub fn push_sourced(&mut self, layer: SourcedLayer) {
+        self.layers.push(Layer::of_source(layer));
+    }
+
+    pub fn finish(self) -> Option<Pattern> {
+        node(self.layers)
+    }
+}
+
+/// The sequence node of a single layer, when it is sound.
+fn node_of_one(layer: Layer) -> Option<Pattern> {
+    if !layer.is_sound() {
+        return None;
+    }
+    if layer.count() == 0 {
+        return Some(silence());
+    }
+    let layers: Arc<[Layer]> = Arc::new([layer]);
+    Some(Pattern::of(Node::Sequence(layers)))
 }
 
 /// The sequence node of `layers`, when each is sound.
@@ -3055,11 +3349,7 @@ pub(crate) fn selecting(
     if locations.is_empty() {
         return Some(selector.clone());
     }
-    let layers = redressed(layers, |dress| {
-        let mut before = locations.clone();
-        before.append(&dress.before);
-        dress.before = before;
-    });
+    let layers = redressed(layers, |dress| dress.prepend_before(locations.clone()));
     Some(node_of_sound(layers).with_steps_of(selector))
 }
 
@@ -3304,9 +3594,22 @@ pub(crate) fn set_here(layers: &mut Arc<[Layer]>, control: &Value, context: Loca
         *layers = layers.iter().map(|layer| layer.with(|_| {})).collect();
     }
     let layers = Arc::get_mut(layers).expect("layers that no other sequence holds");
+    // Single layer with an unshared dress: mutate in place without cloning.
+    if let [layer] = layers
+        && let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut)
+    {
+        dress.set_here(control, context);
+        layer.values_read = OnceLock::new();
+        return;
+    }
     // Layers that wore one dress wear one after.
     let mut last: Option<(*const Dress, Arc<Dress>)> = None;
     for layer in layers {
+        if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
+            dress.set_here(control, context.clone());
+            layer.values_read = OnceLock::new();
+            continue;
+        }
         let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
         let dress = match &last {
             Some((seen, dress)) if *seen == from => Arc::clone(dress),
@@ -3449,6 +3752,15 @@ pub(crate) fn faster(pattern: &Pattern, factor: Fraction) -> Option<Pattern> {
             // The times of the steps are in cycles, so they change with
             // the speed.
             let listing = layer.listing();
+            if let Listing::Grid(grid) = listing
+                && let Some((new_grid, in_cycles)) = grid.faster(factor, period)
+            {
+                return Some(layer.with(|layer| {
+                    layer.in_cycles = in_cycles;
+                    layer.period = Period::from_fraction(period);
+                    layer.steps = Steps::Listed(Listing::Grid(Arc::new(new_grid)));
+                }));
+            }
             let raws = (0..listing.len())
                 .map(|index| {
                     let (whole, part) = listing.times(index);
@@ -4650,6 +4962,16 @@ mod tests {
                     let in_turn = || {
                         calls().fold(base(&layers), |pattern, (spec, value)| match value {
                             ChainArgument::Number(n) => spec.apply_value(pattern, Value::F64(n)),
+                            ChainArgument::Constant(value, locations) => {
+                                if locations.is_empty() {
+                                    spec.apply_value(pattern, value)
+                                } else {
+                                    let values = crate::pure(value)
+                                        .with_added_context(locations.to_vec())
+                                        .with_steps(Some(Fraction::ONE));
+                                    spec.apply_to(pattern, Some(values))
+                                }
+                            }
                             ChainArgument::Pattern(values) => spec.apply_to(pattern, Some(values)),
                         })
                     };

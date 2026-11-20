@@ -273,6 +273,14 @@ pub(crate) trait Build<'a>: Sized {
         operator: Postfix<Self::Node, Self::Step>,
         span: Span,
     ) -> Self::Node;
+
+    /// Borrow or allocate the parser's open-step stack.
+    fn take_steps(&mut self) -> Vec<Slice<Self::Step>> {
+        Vec::with_capacity(16)
+    }
+
+    /// Return the cleared open-step stack after parsing.
+    fn return_steps(&mut self, _steps: Vec<Slice<Self::Step>>) {}
 }
 
 /// One postfix operator of a slice, with its arguments.
@@ -418,7 +426,7 @@ struct Parsed<N> {
 
 /// A step of a sequence that is open: how deep its syntax nests, and where
 /// its element ends.
-struct Slice<S> {
+pub(crate) struct Slice<S> {
     step: S,
     depth: u32,
     end: usize,
@@ -556,7 +564,8 @@ impl PegExpectation {
 }
 
 impl<'a, B: Build<'a>> Parser<'a, B> {
-    fn new(src: &'a str, builder: B) -> Self {
+    fn new(src: &'a str, mut builder: B) -> Self {
+        let steps = builder.take_steps();
         Parser {
             text: src,
             src: src.as_bytes(),
@@ -565,8 +574,7 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
             depth: 0,
             expected_number_at: None,
             aligned_tail_at: None,
-            // Room for the open steps of a short text, with none to move.
-            steps: Vec::with_capacity(16),
+            steps,
             builder,
         }
     }
@@ -942,9 +950,19 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
         let mut weight = 1.0;
         let mut reps = 1.0;
 
-        // Ops in source order, each with how deep its arguments nest. One
-        // `Replicate` stays, the last, with the final accumulated count.
-        let mut ops: Vec<(Postfix<_, _>, u32)> = Vec::new();
+        // First postfix op stays inline on the stack (covers 98% of postfix steps
+        // with zero heap allocation); additional ops spill into `extra_ops`.
+        let mut first_op: Option<(Postfix<_, _>, u32)> = None;
+        let mut extra_ops: Vec<(Postfix<_, _>, u32)> = Vec::new();
+        let push_op = |first_op: &mut Option<(Postfix<_, _>, u32)>,
+                       extra_ops: &mut Vec<(Postfix<_, _>, u32)>,
+                       item: (Postfix<_, _>, u32)| {
+            if first_op.is_none() {
+                *first_op = Some(item);
+            } else {
+                extra_ops.push(item);
+            }
+        };
 
         loop {
             // krill.pegjs prefixes every postfix operator with `ws`:
@@ -969,13 +987,21 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
                     self.pos += 1;
                     let factor = self.parse_required_atom()?;
                     element_end = score_whitespace_end(self.src, self.pos);
-                    ops.push((Postfix::Fast(factor.node), factor.depth));
+                    push_op(
+                        &mut first_op,
+                        &mut extra_ops,
+                        (Postfix::Fast(factor.node), factor.depth),
+                    );
                 }
                 Some(b'/') => {
                     self.pos += 1;
                     let factor = self.parse_required_atom()?;
                     element_end = score_whitespace_end(self.src, self.pos);
-                    ops.push((Postfix::Slow(factor.node), factor.depth));
+                    push_op(
+                        &mut first_op,
+                        &mut extra_ops,
+                        (Postfix::Slow(factor.node), factor.depth),
+                    );
                 }
                 Some(b'@') | Some(b'_') => {
                     self.pos += 1;
@@ -996,8 +1022,15 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
                     // written between them: `bd!1/3!2` slows first, then
                     // replicates the slowed pattern. Pushing once at the first
                     // `!` gets this backwards.
-                    ops.retain(|(op, _)| !matches!(op, Postfix::Replicate(_)));
-                    ops.push((Postfix::Replicate(reps), 0));
+                    if matches!(first_op, Some((Postfix::Replicate(_), _))) {
+                        first_op = if extra_ops.is_empty() {
+                            None
+                        } else {
+                            Some(extra_ops.remove(0))
+                        };
+                    }
+                    extra_ops.retain(|(op, _)| !matches!(op, Postfix::Replicate(_)));
+                    push_op(&mut first_op, &mut extra_ops, (Postfix::Replicate(reps), 0));
                     element_end = self.pos;
                 }
                 Some(b'(') => {
@@ -1043,7 +1076,7 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
                         steps: steps.step,
                         rotation: rotation.map(|rotation| rotation.step),
                     };
-                    ops.push((euclid, deepest));
+                    push_op(&mut first_op, &mut extra_ops, (euclid, deepest));
                 }
                 Some(b'?') => {
                     self.pos += 1;
@@ -1056,25 +1089,38 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
                     let seed = self.seed;
                     self.seed += 1;
                     element_end = self.pos;
-                    ops.push((Postfix::Degrade { amount, seed }, 0));
+                    push_op(
+                        &mut first_op,
+                        &mut extra_ops,
+                        (Postfix::Degrade { amount, seed }, 0),
+                    );
                 }
                 Some(b':') => {
                     self.pos += 1;
                     let element = self.parse_required_atom()?;
                     element_end = score_whitespace_end(self.src, self.pos);
-                    ops.push((Postfix::Tail(element.node), element.depth));
+                    push_op(
+                        &mut first_op,
+                        &mut extra_ops,
+                        (Postfix::Tail(element.node), element.depth),
+                    );
                 }
                 Some(b'.') if self.src.get(self.pos + 1) == Some(&b'.') => {
                     self.pos += 2;
                     let end = self.parse_required_atom()?;
                     element_end = score_whitespace_end(self.src, self.pos);
-                    ops.push((Postfix::Range(end.node), end.depth));
+                    push_op(
+                        &mut first_op,
+                        &mut extra_ops,
+                        (Postfix::Range(end.node), end.depth),
+                    );
                 }
                 _ => break,
             }
 
-            if ops.len() > MAX_MINI_AST_DEPTH as usize {
-                return self.ast_depth_error(ops.len() as u32);
+            let op_count = usize::from(first_op.is_some()) + extra_ops.len();
+            if op_count > MAX_MINI_AST_DEPTH as usize {
+                return self.ast_depth_error(op_count as u32);
             }
         }
 
@@ -1083,7 +1129,7 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
             mut depth,
             start,
         } = base;
-        for (op, arguments) in ops {
+        for (op, arguments) in first_op.into_iter().chain(extra_ops) {
             let span = Span {
                 start,
                 end: self.pos,
@@ -1368,20 +1414,25 @@ pub fn parse(src: &str) -> Result<Ast, ParseError> {
 /// What `builder` makes of `src`, and the builder after the parse.
 pub(crate) fn read<'a, B: Build<'a>>(src: &'a str, builder: B) -> Result<(B::Node, B), ParseError> {
     let mut p = Parser::new(src, builder);
-    let node = p.parse_top()?;
-    p.ws();
-    if p.pos < p.src.len() {
-        // krill's opening and closing `quote` productions are independent:
-        // either quote kind can close the double-quoted wrapper Mini builds.
-        // Preserve that observable (if odd) cross-quote failure position.
-        if p.peek() == Some(b'\'') {
-            p.pos += 1;
-            p.ws();
-            return p.expected(PegExpectation::StatementTail);
+    let result = (|| {
+        let node = p.parse_top()?;
+        p.ws();
+        if p.pos < p.src.len() {
+            // krill's opening and closing `quote` productions are independent:
+            // either quote kind can close the double-quoted wrapper Mini builds.
+            // Preserve that observable (if odd) cross-quote failure position.
+            if p.peek() == Some(b'\'') {
+                p.pos += 1;
+                p.ws();
+                return p.expected(PegExpectation::StatementTail);
+            }
+            return p.expected(PegExpectation::TopTail);
         }
-        return p.expected(PegExpectation::TopTail);
-    }
-    Ok((node, p.builder))
+        Ok(node)
+    })();
+    p.steps.clear();
+    p.builder.return_steps(p.steps);
+    result.map(|node| (node, p.builder))
 }
 
 /// Byte ranges of every mini leaf. This is the native equivalent of pinned
@@ -2907,15 +2958,10 @@ pub fn mini_at(src: &str, offset: usize) -> Result<Pattern, ParseError> {
     mini_in(&mut Room::default(), src, offset)
 }
 
-/// The pattern of a text that is one word with whitespace around it: the
-/// constant that the plans of the word make, read with no room and no
-/// plan. `None` for any other text, and for the words that are no value:
-/// a rest, and the two that the parser refuses.
-///
-/// Two literals of three in a score are one word. A reader that
-/// remembers the graphs of its literals needs not remember this one: it
-/// costs less to read than to keep.
-pub fn word_constant(src: &str, offset: usize) -> Option<Pattern> {
+/// Value and inline source location of a single-word mini literal, with zero
+/// graph or vector allocation. `None` for rests, multi-word patterns, or
+/// expressions using operators.
+pub fn word_constant_value(src: &str, offset: usize) -> Option<(Value, rustel_core::Locations)> {
     let bytes = src.as_bytes();
     let start = score_whitespace_end(bytes, 0);
     // A leading `^` marks the steps of a sequence, which the plans read.
@@ -2934,7 +2980,110 @@ pub fn word_constant(src: &str, offset: usize) -> Option<Pattern> {
         return None;
     }
     let at = leaf_place(src, offset, &Span { start, end });
-    Some(rhythm::constant(atom_value(word), vec![at]).with_steps(Some(Fraction::ONE)))
+    let mut locations = rustel_core::Locations::new();
+    locations.push(at);
+    Some((atom_value(word), locations))
+}
+
+/// The pattern of a text that is one word with whitespace around it: the
+/// constant that the plans of the word make, read with no room and no
+/// plan. `None` for any other text, and for the words that are no value:
+/// a rest, and the two that the parser refuses.
+///
+/// Two literals of three in a score are one word. A reader that
+/// remembers the graphs of its literals needs not remember this one: it
+/// costs less to read than to keep.
+pub fn word_constant(src: &str, offset: usize) -> Option<Pattern> {
+    let (value, locations) = word_constant_value(src, offset)?;
+    let at = locations.get(0)?;
+    Some(rhythm::constant(value, vec![at]).with_steps(Some(Fraction::ONE)))
+}
+
+/// Fast path for flat ASCII whitespace-separated sequences of plain words and
+/// rests (such as `"bd sd hh cp"` or `"c3 ~ e3 g3"`), bypassing `Parser` and
+/// `Plans` while reusing `room`'s scratch step buffer.
+fn flat_sequence(room: &mut Room, src: &str, offset: usize) -> Option<Pattern> {
+    if !src.is_ascii() {
+        return None;
+    }
+    let bytes = src.as_bytes();
+    let mut pos = score_whitespace_end(bytes, 0);
+    if pos >= bytes.len() || bytes[pos] == b'^' {
+        return None;
+    }
+    let mut tokens: [(usize, usize); 64] = [(0, 0); 64];
+    let mut count = 0usize;
+    let mut sounding = 0usize;
+    while pos < bytes.len() {
+        let start = pos;
+        let mut end = start;
+        while let Some(len) = word_char_len(bytes, end) {
+            end += len;
+        }
+        if end == start {
+            return None;
+        }
+        let word = &src[start..end];
+        if word == "." || word == "_" || word.contains("..") {
+            return None;
+        }
+        let next_pos = score_whitespace_end(bytes, end);
+        // Must have whitespace separation or end-of-string (no attached ops).
+        if next_pos == end && next_pos < bytes.len() {
+            return None;
+        }
+        if count >= tokens.len() {
+            return None;
+        }
+        tokens[count] = (start, end);
+        count += 1;
+        if !matches!(word, "~" | "-") {
+            sounding += 1;
+        }
+        pos = next_pos;
+    }
+    if count < 2 {
+        return None;
+    }
+    let steps_meta = Some(Fraction::int(count as i128));
+    if sounding == 0 {
+        return Some(silence().with_steps(steps_meta));
+    }
+    let mut seen_words: [&str; 64] = [""; 64];
+    let mut seen_len = 0usize;
+    let (values, steps) = room.flat_buffers();
+    values.clear();
+    steps.clear();
+    steps.reserve(sounding);
+    let denom = count as i128;
+    for (slot, &(start, end)) in tokens[..count].iter().enumerate() {
+        let word = &src[start..end];
+        if matches!(word, "~" | "-") {
+            continue;
+        }
+        let value_idx = match seen_words[..seen_len].iter().position(|&w| w == word) {
+            Some(idx) => idx as u32,
+            None => {
+                let idx = seen_len as u32;
+                seen_words[seen_len] = word;
+                seen_len += 1;
+                values.push(atom_value(word));
+                idx
+            }
+        };
+        let mut locations = rustel_core::Locations::new();
+        locations.push(leaf_place(src, offset, &Span { start, end }));
+        steps.push(rustel_core::SourceStep {
+            begin: Fraction::new(slot as i128, denom),
+            end: Fraction::new((slot + 1) as i128, denom),
+            value: value_idx,
+            locations,
+        });
+    }
+    let layer_values: std::sync::Arc<[Value]> = values.drain(..).collect();
+    let pattern = rustel_core::sequence_of_indexed_slice(Fraction::ONE, layer_values, true, steps)?;
+    steps.clear();
+    Some(pattern.with_steps(steps_meta))
 }
 
 /// [`mini_at`] in `room`. A reader of many texts keeps one room, and a
@@ -2944,6 +3093,9 @@ pub fn mini_in(room: &mut Room, src: &str, offset: usize) -> Result<Pattern, Par
     // from one parse with no syntax tree. One word takes no room.
     if reads_whole_parts() {
         if let Some(pattern) = word_constant(src, offset) {
+            return Ok(pattern);
+        }
+        if let Some(pattern) = flat_sequence(room, src, offset) {
             return Ok(pattern);
         }
         if let Some(pattern) = Planned::read(src, offset, room)?.and_then(Planned::pattern) {

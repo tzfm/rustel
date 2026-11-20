@@ -296,16 +296,23 @@ impl LaneTable {
             Audible::Earlier { lanes, .. } => (none, &lanes[..]),
             Audible::InPlay => (none, none),
         };
-        let mut paired = vec![None; statements.len()];
-        pair(&statements, &mut paired, playing, tried, away, own);
+        let mut stack_paired = [None; 8];
+        let mut heap_paired;
+        let paired: &mut [Option<u64>] = if statements.len() <= stack_paired.len() {
+            &mut stack_paired[..statements.len()]
+        } else {
+            heap_paired = vec![None; statements.len()];
+            &mut heap_paired
+        };
+        pair(&statements, paired, playing, tried, away, own);
         if adopted {
-            pair(&statements, &mut paired, none, moved, none, none);
+            pair(&statements, paired, none, moved, none, none);
         }
         // A document that is not in play shares the lanes of the score in
         // play.
         if reading != self.document {
             let (playing, away) = (self.playing.lanes.as_slice(), &self.away);
-            pair(&statements, &mut paired, playing, none, away, other);
+            pair(&statements, paired, playing, none, away, other);
         }
         let lane = |(statement, number): (LaneStatement, Option<u64>)| Lane {
             number: number.unwrap_or_else(|| {
@@ -317,7 +324,8 @@ impl LaneTable {
             body: LaneBody::Owned(statement.body),
             line: statement.line,
         };
-        let lanes = LaneList::from_iter_exact(statements.into_iter().zip(paired).map(lane));
+        let lanes =
+            LaneList::from_iter_exact(statements.into_iter().zip(paired.iter().copied()).map(lane));
         // A score with no label has no statement that carries a number.
         let labeled = lanes
             .as_slice()
@@ -648,6 +656,10 @@ fn pair(
     away: &[Lane],
     audible: &[Lane],
 ) {
+    // Nothing to pair against on a fresh session or empty document.
+    if playing.is_empty() && tried.is_empty() && away.is_empty() && audible.is_empty() {
+        return;
+    }
     // A score that is read again with no change: rule 1 gives each
     // statement the lane in play at its place, with no search.
     let same = |(statement, lane): (&LaneStatement, &Lane)| {
@@ -659,6 +671,35 @@ fn pair(
     {
         for (number, lane) in numbers.iter_mut().zip(playing) {
             *number = Some(lane.number);
+        }
+        return;
+    }
+    // Single-statement edit against a single playing lane with no other pools:
+    // apply rules 2..=4 directly with zero heap allocations.
+    if let ([statement], [lane]) = (statements, playing)
+        && tried.is_empty()
+        && away.is_empty()
+        && audible.is_empty()
+        && numbers[0].is_none()
+    {
+        let body = lane.body.as_str();
+        let rule2 = statement.body == body;
+        let rule3 = rule_key(3, &statement.label, &statement.body)
+            .is_some_and(|key| Some(key) == rule_key(3, &lane.label, body));
+        let rule4 = || {
+            let equal = equal_ends(&statement.body, body);
+            let shorter = statement.body.len().min(body.len());
+            if shorter > 0 && 2 * equal >= shorter {
+                return true;
+            }
+            if !lane.plugins.is_empty() {
+                let names = body_plugin_names(&statement.body);
+                return names.iter().any(|name| lane.plugins.contains(name));
+            }
+            false
+        };
+        if rule2 || rule3 || rule4() {
+            numbers[0] = Some(lane.number);
         }
         return;
     }

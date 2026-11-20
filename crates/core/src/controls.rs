@@ -262,10 +262,11 @@ pub(crate) fn named_value(names: &[Arc<str>], mut value: Value) -> Value {
 }
 
 /// The argument of one control call of a chain: a number as a score writes
-/// it, or a pattern.
+/// it, a constant value with inline locations, or a pattern.
 #[derive(Clone)]
 pub enum ChainArgument {
     Number(f64),
+    Constant(Value, crate::Locations),
     Pattern(Pattern),
 }
 
@@ -274,6 +275,7 @@ impl ChainArgument {
     fn is_constant(&self) -> bool {
         match self {
             Self::Number(_) => true,
+            Self::Constant(value, _) => value.is_data(0),
             Self::Pattern(values) => crate::sequence::is_constant_value(values),
         }
     }
@@ -284,6 +286,7 @@ impl ChainArgument {
     fn constant(&self) -> Option<(Value, crate::Locations)> {
         match self {
             Self::Number(number) => Some((Value::F64(*number), crate::Locations::new())),
+            Self::Constant(value, locations) => Some((value.clone(), locations.clone())),
             Self::Pattern(values) => crate::sequence::constant_value_at(values),
         }
     }
@@ -326,7 +329,7 @@ pub fn chain_transformer(
 ) -> crate::value::FunctionRef {
     let chain: Arc<[ChainCall<'static>]> = chain.into_iter().collect();
     let pure = chain.iter().all(|(_, argument)| match argument {
-        ChainArgument::Number(_) => true,
+        ChainArgument::Number(_) | ChainArgument::Constant(..) => true,
         ChainArgument::Pattern(values) => values.is_pure(),
     });
     crate::value::FunctionRef::registered(
@@ -366,11 +369,14 @@ fn apply_row(pattern: Pattern, row: &[ChainCall<'_>]) -> Pattern {
 /// pattern back as it was, when it does not take the row so.
 fn set_row(pattern: Pattern, row: &[ChainCall<'_>]) -> Result<Pattern, Pattern> {
     if let [(spec, argument)] = row {
-        // One control, as its method sets it: a number through its method.
-        return match argument {
-            ChainArgument::Pattern(values) => pattern.set_constant_control(spec, values),
-            ChainArgument::Number(_) => Err(pattern),
-        };
+        // One control, as its method sets it: a number through its method,
+        // and a constant with locations directly through `union_of` + `with_row`.
+        match argument {
+            ChainArgument::Pattern(values) => return pattern.set_constant_control(spec, values),
+            ChainArgument::Number(_) => return Err(pattern),
+            ChainArgument::Constant(_, locations) if locations.is_empty() => return Err(pattern),
+            ChainArgument::Constant(..) => {}
+        }
     }
     let Some((union, context)) = union_of(row) else {
         return Err(pattern);
@@ -432,6 +438,16 @@ fn union_of(row: &[ChainCall<'_>]) -> Option<(Value, crate::Locations)> {
 fn apply_argument(spec: &ControlSpec, pattern: Pattern, argument: &ChainArgument) -> Pattern {
     match argument {
         ChainArgument::Number(number) => spec.apply_value(pattern, Value::F64(*number)),
+        ChainArgument::Constant(value, locations) => {
+            if locations.is_empty() {
+                spec.apply_value(pattern, value.clone())
+            } else {
+                let values = crate::pure(value.clone())
+                    .with_added_context(locations.to_vec())
+                    .with_steps(Some(rustel_fraction::Fraction::ONE));
+                spec.apply_for(pattern, Some(&values))
+            }
+        }
         ChainArgument::Pattern(values) => spec.apply_for(pattern, Some(values)),
     }
 }
