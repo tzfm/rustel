@@ -46,7 +46,7 @@ fn build<'js>(
             "KabelSalat source or input limit exceeded",
         ));
     }
-    let mut inputs = rustel_core::pure(Value::List(Vec::new()));
+    let mut inputs = rustel_core::pure(Value::list(Vec::new()));
     for argument in args.iter().skip(1) {
         let (pattern, owner) = reify_bridged(&ctx, argument)?;
         sidecars.push(owner);
@@ -65,14 +65,14 @@ fn build<'js>(
             _ => rustel_core::OrderedMap::new(),
         };
         let mut inputs = match controls.get("workletInputs").cloned() {
-            Some(Value::List(inputs)) => inputs,
+            Some(Value::List(inputs)) => *inputs,
             _ => Vec::new(),
         };
         if let Value::List(values) = rustel_core::materialize_js_value(input) {
-            inputs.extend(values);
+            inputs.extend(*values);
         }
         controls.insert("workletSrc".into(), Value::Str(source.as_str().into()));
-        controls.insert("workletInputs".into(), Value::List(inputs));
+        controls.insert("workletInputs".into(), Value::list(inputs));
         Value::Object(controls)
     });
     // Keep graph compilation on the bounded score thread, after later controls.

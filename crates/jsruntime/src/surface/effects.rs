@@ -375,7 +375,7 @@ fn materialize_js_value_within_depth<'js>(
             values.push(item);
             sidecars.append(&mut nested);
         }
-        return Ok((Value::List(values), sidecars));
+        return Ok((Value::list(values), sidecars));
     }
     if let Some(object) = value.as_object() {
         // Each property charges one element, so a child shared by several

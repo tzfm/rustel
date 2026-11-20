@@ -163,10 +163,23 @@ pub struct SourcedLayer {
     pub steps: Arc<dyn StepSource>,
 }
 
+/// One layer of [`sequence_of`] whose steps are already in cycles with
+/// pre-deduplicated value indices.
+pub struct IndexedLayer {
+    pub period: Fraction,
+    pub values: Arc<[Value]>,
+    /// Whether each step lies in one cycle, in every period. When `false`,
+    /// the layer checks its steps directly.
+    pub in_cycles: bool,
+    pub steps: Vec<SourceStep>,
+}
+
 /// A layer of a sequence, as its maker gives it.
 pub enum GivenLayer {
     /// Each step, in a list.
     Listed(SequenceLayer),
+    /// Each step, in cycles with pre-deduplicated value indices.
+    Indexed(IndexedLayer),
     /// The steps at a source, which the layer reads when a query asks.
     Sourced(SourcedLayer),
 }
@@ -350,6 +363,9 @@ struct PackedLoc(u32);
 
 impl PackedLoc {
     const SPARE: u32 = 1 << 31;
+    const WIDE: u32 = 1 << 30;
+    const WIDE_MASK: u32 = Self::SPARE | Self::WIDE;
+    const INDEX_MASK: u32 = Self::WIDE - 1;
     const LENGTH_BITS: u32 = 11;
     const LENGTH_MASK: u32 = (1 << Self::LENGTH_BITS) - 1;
     const OFFSET_LIMIT: u32 = 1 << 20;
@@ -402,12 +418,78 @@ struct Grid {
 struct Spare {
     /// The cut steps, in the order of their places.
     cuts: Box<[Cut]>,
-    /// The locations that do not pack.
-    spare: Box<[Locations]>,
+    /// Packed multi-range step locations relative to `Grid::base`. Each word
+    /// is a [`PackedLoc`] range, with `PackedLoc::SPARE` set on the last
+    /// range of a step.
+    packed: Box<[u32]>,
+    /// Locations whose ranges do not fit [`PackedLoc`].
+    wide: Box<[Locations]>,
 }
 
 impl Grid {
     const SMALL: u32 = 1 << 31;
+
+    /// Pack `locations` relative to `base`: inline for 0 or 1 fitting range,
+    /// into `packed_runs` for multi-range steps that all fit, or into `wide`.
+    fn pack_locations(
+        base: u32,
+        locations: &Locations,
+        packed_runs: &mut Vec<u32>,
+        wide: &mut Vec<usize>,
+        index: usize,
+    ) -> PackedLoc {
+        match locations.len() {
+            0 => PackedLoc(0),
+            1 => {
+                if let Some(range) = locations.get(0)
+                    && let Some(packed) = PackedLoc::range(base, range)
+                {
+                    return packed;
+                }
+                let at = wide.len() as u32;
+                wide.push(index);
+                PackedLoc(PackedLoc::WIDE_MASK | at)
+            }
+            len => {
+                let start = packed_runs.len();
+                if start <= PackedLoc::INDEX_MASK as usize {
+                    let mut all_fit = true;
+                    for i in 0..len {
+                        if let Some(range) = locations.get(i)
+                            && let Some(word) = PackedLoc::range(base, range)
+                        {
+                            packed_runs.push(word.0);
+                        } else {
+                            all_fit = false;
+                            break;
+                        }
+                    }
+                    if all_fit {
+                        if let Some(last) = packed_runs.last_mut() {
+                            *last |= PackedLoc::SPARE;
+                        }
+                        return PackedLoc(PackedLoc::SPARE | start as u32);
+                    }
+                    packed_runs.truncate(start);
+                }
+                let at = wide.len() as u32;
+                wide.push(index);
+                PackedLoc(PackedLoc::WIDE_MASK | at)
+            }
+        }
+    }
+
+    fn note_loc_base(base: &mut Option<u32>, locations: &Locations) {
+        for i in 0..locations.len() {
+            if let Some(range) = locations.get(i)
+                && PackedLoc::fits(range)
+                && let Ok(begin) = u32::try_from(range.0)
+                && begin < Self::SMALL
+            {
+                *base = Some(base.map_or(begin, |b| b.min(begin)));
+            }
+        }
+    }
 
     /// The steps of `raws` on a grid, or `None` for times that do not fit.
     /// A grid takes the locations that do not pack out of `raws`, and
@@ -437,16 +519,7 @@ impl Grid {
                     u32::try_from(ticks).ok()?;
                 }
             }
-            if let (1, Some(range)) = (raw.locations.len(), raw.locations.get(0))
-                && PackedLoc::fits(range)
-            {
-                // The top bit of the base is a flag of the grid.
-                if let Ok(begin) = u32::try_from(range.0)
-                    && begin < Self::SMALL
-                {
-                    base = Some(base.map_or(begin, |base| base.min(begin)));
-                }
-            }
+            Self::note_loc_base(&mut base, &raw.locations);
         }
         let base = base.unwrap_or(0);
         let ticks = NonZeroU32::new(u32::try_from(ticks).ok()?)?;
@@ -464,8 +537,9 @@ impl Grid {
             u32::try_from(u64::from(u32::try_from(time.numer()).ok()?) * u64::from(scale)).ok()
         };
         let mut cuts = Vec::new();
-        // The places of the steps whose locations do not pack.
-        let mut spare = Vec::new();
+        let mut packed_runs = Vec::new();
+        // The places of the steps whose locations do not fit packed encoding.
+        let mut wide = Vec::new();
         let mut fits = true;
         // The steps are collected in one allocation, with no list first.
         let steps: Box<[GridStep]> = raws
@@ -485,15 +559,13 @@ impl Grid {
                             (on_grid(part.begin)?, on_grid(part.end)?)
                         }
                     };
-                    let packed = match (raw.locations.len(), raw.locations.get(0)) {
-                        (0, _) => Some(PackedLoc(0)),
-                        (1, Some(range)) => PackedLoc::range(base, range),
-                        _ => None,
-                    };
-                    let loc = packed.unwrap_or_else(|| {
-                        spare.push(index);
-                        PackedLoc(PackedLoc::SPARE | (spare.len() - 1) as u32)
-                    });
+                    let loc = Self::pack_locations(
+                        base,
+                        &raw.locations,
+                        &mut packed_runs,
+                        &mut wide,
+                        index,
+                    );
                     Some(GridStep {
                         part_begin,
                         part_end,
@@ -512,16 +584,111 @@ impl Grid {
                 })
             })
             .collect();
-        if !fits || u32::try_from(spare.len()).ok()? >= PackedLoc::SPARE {
+        if !fits || wide.len() > PackedLoc::INDEX_MASK as usize {
             return None;
         }
-        // The grid fits, so the locations move with no copy.
-        let side = (!cuts.is_empty() || !spare.is_empty()).then(|| {
+        // The grid fits, so any wide locations move with no copy.
+        let side = (!cuts.is_empty() || !packed_runs.is_empty() || !wide.is_empty()).then(|| {
             Arc::new(Spare {
                 cuts: cuts.into(),
-                spare: spare
+                packed: packed_runs.into(),
+                wide: wide
                     .iter()
                     .map(|index| std::mem::take(&mut raws[*index].locations))
+                    .collect(),
+            })
+        });
+        let base = base | if small_denominators { Self::SMALL } else { 0 };
+        Some(Self {
+            ticks,
+            base,
+            steps,
+            reductions: tick_grid(ticks),
+            side,
+        })
+    }
+
+    /// Build a [`Grid`] directly from uncut [`SourceStep`]s in cycles without
+    /// allocating an intermediate [`Raw`] list.
+    fn build_indexed(source_steps: &mut [SourceStep]) -> Option<Self> {
+        u32::try_from(source_steps.len()).ok()?;
+        let mut ticks: u64 = 1;
+        let mut base: Option<u32> = None;
+        let mut last = 1;
+        let mut small_denominators = true;
+        for step in source_steps.iter() {
+            for time in [step.begin, step.end] {
+                if time.denom() == last {
+                    continue;
+                }
+                last = time.denom();
+                small_denominators &= i32::try_from(last).is_ok();
+                let denom = u64::from(u32::try_from(last).ok()?);
+                if !ticks.is_multiple_of(denom) {
+                    ticks = ticks / gcd(ticks, denom) * denom;
+                    u32::try_from(ticks).ok()?;
+                }
+            }
+            Self::note_loc_base(&mut base, &step.locations);
+        }
+        let base = base.unwrap_or(0);
+        let ticks = NonZeroU32::new(u32::try_from(ticks).ok()?)?;
+        let scaled = std::cell::Cell::new((1, ticks.get()));
+        let on_grid = |time: Fraction| {
+            let (denom, scale) = scaled.get();
+            let scale = if denom == time.denom() {
+                scale
+            } else {
+                let scale = ticks.get() / u32::try_from(time.denom()).ok()?;
+                scaled.set((time.denom(), scale));
+                scale
+            };
+            u32::try_from(u64::from(u32::try_from(time.numer()).ok()?) * u64::from(scale)).ok()
+        };
+        let mut packed_runs = Vec::new();
+        let mut wide = Vec::new();
+        let mut fits = true;
+        let steps: Box<[GridStep]> = source_steps
+            .iter()
+            .enumerate()
+            .map(|(index, src)| {
+                let mut step = || {
+                    let (begin, end) = (on_grid(src.begin)?, on_grid(src.end)?);
+                    let loc = Self::pack_locations(
+                        base,
+                        &src.locations,
+                        &mut packed_runs,
+                        &mut wide,
+                        index,
+                    );
+                    Some(GridStep {
+                        part_begin: begin,
+                        part_end: end,
+                        value: src.value,
+                        loc,
+                    })
+                };
+                step().unwrap_or_else(|| {
+                    fits = false;
+                    GridStep {
+                        part_begin: 0,
+                        part_end: 0,
+                        value: 0,
+                        loc: PackedLoc(0),
+                    }
+                })
+            })
+            .collect();
+        if !fits || wide.len() > PackedLoc::INDEX_MASK as usize {
+            return None;
+        }
+        let side = (!packed_runs.is_empty() || !wide.is_empty()).then(|| {
+            Arc::new(Spare {
+                cuts: Box::new([]),
+                packed: packed_runs.into(),
+                wide: wide
+                    .iter()
+                    .map(|index| std::mem::take(&mut source_steps[*index].locations))
                     .collect(),
             })
         });
@@ -621,11 +788,25 @@ impl Grid {
         if packed == 0 {
             return Locations::new();
         }
-        if packed & PackedLoc::SPARE != 0 {
-            let side = self.side.as_ref().expect("a spare location has a side");
-            return side.spare[(packed & !PackedLoc::SPARE) as usize].clone();
+        if packed & PackedLoc::WIDE_MASK == PackedLoc::WIDE_MASK {
+            let side = self.side.as_ref().expect("a wide location has a side");
+            return side.wide[(packed & PackedLoc::INDEX_MASK) as usize].clone();
         }
         let base = self.base & !Self::SMALL;
+        if packed & PackedLoc::SPARE != 0 {
+            let side = self.side.as_ref().expect("a spare location has a side");
+            let mut out = Locations::new();
+            for &word in &side.packed[(packed & PackedLoc::INDEX_MASK) as usize..] {
+                let entry = word & !PackedLoc::SPARE;
+                let begin = (base + (entry >> PackedLoc::LENGTH_BITS)) as usize;
+                let length = ((entry & PackedLoc::LENGTH_MASK) - 1) as usize;
+                out.push((begin, begin + length));
+                if word & PackedLoc::SPARE != 0 {
+                    break;
+                }
+            }
+            return out;
+        }
         let begin = base + (packed >> PackedLoc::LENGTH_BITS);
         // The length takes 11 bits, so it fits 16.
         let length = (packed & PackedLoc::LENGTH_MASK) - 1;
@@ -1197,6 +1378,38 @@ impl Layer {
     fn of_list(period: Fraction, raws: Vec<Raw>, in_cycles: bool, values: Arc<[Value]>) -> Self {
         let steps = Steps::Listed(Listing::of(raws));
         Self::holding(period, steps, in_cycles, values)
+    }
+
+    /// The layer of `layer`, whose steps are already in cycles with
+    /// pre-deduplicated value indices.
+    fn of_indexed(mut layer: IndexedLayer) -> Self {
+        let in_cycles = layer.in_cycles
+            || lie_in_spans(
+                layer.period,
+                layer
+                    .steps
+                    .iter()
+                    .map(|step| TimeSpan::new(step.begin, step.end)),
+            );
+        if let Some(grid) = Grid::build_indexed(&mut layer.steps) {
+            return Self::holding(
+                layer.period,
+                Steps::Listed(Listing::Grid(Arc::new(grid))),
+                in_cycles,
+                layer.values,
+            );
+        }
+        let raws: Vec<Raw> = layer
+            .steps
+            .into_iter()
+            .map(|step| Raw {
+                whole: TimeSpan::new(step.begin, step.end),
+                part: None,
+                value: step.value,
+                locations: step.locations,
+            })
+            .collect();
+        Self::of_list(layer.period, raws, in_cycles, layer.values)
     }
 
     /// The layer of `layer`, which reads its steps from their source.
@@ -2178,6 +2391,7 @@ pub fn sequence(layers: Vec<SequenceLayer>) -> Option<Pattern> {
 pub fn sequence_of(layers: Vec<GivenLayer>) -> Option<Pattern> {
     let layers = layers.into_iter().map(|layer| match layer {
         GivenLayer::Listed(layer) => Layer::of(layer),
+        GivenLayer::Indexed(layer) => Some(Layer::of_indexed(layer)),
         GivenLayer::Sourced(layer) => Some(Layer::of_source(layer)),
     });
     node(layers.collect::<Option<Vec<_>>>()?)
@@ -4835,14 +5049,14 @@ mod tests {
             ),
             (
                 "a list under two names",
-                vec![Value::List(vec![text("c3"), text("gm_piano")])],
+                vec![Value::list(vec![text("c3"), text("gm_piano")])],
                 Some(&["note", "s"]),
                 object(set.clone()),
                 false,
             ),
             (
                 "a list under one name",
-                vec![Value::List(vec![text("c3"), text("e3")])],
+                vec![Value::list(vec![text("c3"), text("e3")])],
                 Some(&["note"]),
                 object(set.clone()),
                 true,

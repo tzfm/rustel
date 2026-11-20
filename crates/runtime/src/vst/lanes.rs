@@ -9,13 +9,46 @@ use rustel_transpiler::LaneStatement;
 use super::*;
 use crate::PREVIEW_DOCUMENT;
 
+/// Body text of a [`Lane`]: either an owned string or a zero-copy slice of the
+/// session's shared score source text.
+#[derive(Clone)]
+enum LaneBody {
+    Owned(String),
+    Slice(std::sync::Arc<str>, usize, usize),
+}
+
+impl LaneBody {
+    #[inline]
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Owned(s) => s,
+            Self::Slice(source, start, end) => &source[*start..*end],
+        }
+    }
+
+    /// Replace an owned body copy with a slice of `source` when it appears
+    /// verbatim inside `source`.
+    fn share_with(&mut self, source: &std::sync::Arc<str>) {
+        if let Self::Owned(owned) = self {
+            let trimmed = source.trim();
+            if owned.as_str() == trimmed {
+                let start = trimmed.as_ptr() as usize - source.as_ptr() as usize;
+                *self = Self::Slice(std::sync::Arc::clone(source), start, start + trimmed.len());
+            } else if let Some(start) = source.find(owned.as_str()) {
+                let end = start + owned.len();
+                *self = Self::Slice(std::sync::Arc::clone(source), start, end);
+            }
+        }
+    }
+}
+
 /// A lane of a score: a labeled statement, or a score with no label.
 #[derive(Clone)]
 struct Lane {
     /// The number stays while an edit keeps the lane in the text.
     number: u64,
     label: String,
-    body: String,
+    body: LaneBody,
     /// The line of the label, counted from 1. With no label, the line where
     /// the body starts.
     line: usize,
@@ -229,7 +262,7 @@ impl LaneTable {
             }),
             plugins: body_plugin_names(&statement.body),
             label: statement.label,
-            body: statement.body,
+            body: LaneBody::Owned(statement.body),
             line: statement.line,
         };
         let lanes: Vec<Lane> = statements.into_iter().zip(paired).map(lane).collect();
@@ -308,6 +341,21 @@ impl LaneTable {
     pub(crate) fn install(&mut self, source: &str) {
         let read = self.candidate.take_if(|(_, text, _)| text == source);
         if let Some((document, _, read)) = read {
+            self.put_in_play(document, read);
+        }
+    }
+
+    /// Same as [`Self::install`], additionally sharing lane body strings with
+    /// the session's `Arc<str>` source text so no duplicate score text stays
+    /// allocated.
+    pub(crate) fn install_shared(&mut self, source: &std::sync::Arc<str>) {
+        let read = self
+            .candidate
+            .take_if(|(_, text, _)| text == source.as_ref());
+        if let Some((document, _, mut read)) = read {
+            for lane in &mut read.lanes {
+                lane.body.share_with(source);
+            }
             self.put_in_play(document, read);
         }
     }
@@ -534,7 +582,7 @@ fn pair(
     // A score that is read again with no change: rule 1 gives each
     // statement the lane in play at its place, with no search.
     let same = |(statement, lane): (&LaneStatement, &Lane)| {
-        statement.label == lane.label && statement.body == lane.body
+        statement.label == lane.label && statement.body == lane.body.as_str()
     };
     if statements.len() == playing.len()
         && numbers.iter().all(Option::is_none)
@@ -569,7 +617,7 @@ fn pair(
             // yet, by key.
             let mut olds: HashMap<_, Vec<usize>> = HashMap::new();
             for (place, lane) in lanes.iter().enumerate() {
-                let key = rule_key(rule, &lane.label, &lane.body);
+                let key = rule_key(rule, &lane.label, lane.body.as_str());
                 if let Some(key) = key.filter(|_| free(&taken, lane, new_only)) {
                     olds.entry(key).or_default().push(place);
                 }
@@ -615,8 +663,8 @@ fn pair(
                 .iter()
                 .filter(|name| lane.plugins.contains(name))
                 .count();
-            let equal = equal_ends(&statement.body, &lane.body);
-            let shorter = statement.body.len().min(lane.body.len());
+            let equal = equal_ends(&statement.body, lane.body.as_str());
+            let shorter = statement.body.len().min(lane.body.as_str().len());
             if shared > 0 || (shorter > 0 && 2 * equal >= shorter) {
                 let nearest = place.abs_diff(at);
                 let order = (std::cmp::Reverse(shared), std::cmp::Reverse(equal), nearest);

@@ -144,7 +144,7 @@ impl ExtensionPatternNode for TrackSectionNode {
 fn duration(pattern: &Pattern) -> Option<(Fraction, Fraction)> {
     let value = pattern.as_pure()?;
     let values = match value {
-        Value::List(values) => values,
+        Value::List(values) => *values,
         value => vec![value],
     };
     let cycles = values.first().and_then(|value| {

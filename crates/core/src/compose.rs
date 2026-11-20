@@ -631,7 +631,7 @@ fn js_strict_eq(a: &Value, b: &Value) -> bool {
         (F64(x), F64(y)) => x == y,
         (Str(x), Str(y)) => x == y,
         (List(x), List(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| js_strict_eq(p, q))
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| js_strict_eq(p, q))
         }
         (Object(x), Object(y)) => {
             x.len() == y.len()

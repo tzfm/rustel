@@ -485,9 +485,35 @@ impl<'p> Reuse<'p> {
         // of the two holds what the call builds.
         parts.sort_unstable_by_key(Part::key);
         parts.dedup_by_key(|part| part.key());
+        // Drop parts not shared with the live graph (such as folded
+        // sub-expressions). Repeating to a fixpoint releases dead chains too.
+        loop {
+            let before = parts.len();
+            parts.retain(|part| part.pattern.is_held_elsewhere());
+            if parts.len() == before {
+                break;
+            }
+        }
         // The next build reads this list for every part it finds, so the
         // room a part left when its duplicate went is not kept.
         parts.shrink_to_fit();
+        // A re-evaluation of the same text shares the handle the build
+        // before kept, so the text lives one time. An aborted build makes
+        // no handle.
+        let source = match &self.before.source {
+            Some(kept) if **kept == *self.source => Arc::clone(kept),
+            _ => Arc::from(self.source),
+        };
+        if parts.is_empty() {
+            return Memo {
+                source: Some(source),
+                parts,
+                names: Vec::new(),
+                by_text: Vec::new(),
+                next: self.next,
+                cps,
+            };
+        }
         let mut before = mem::take(&mut self.before.names);
         // A list of its own, with room for the names alone: the list of
         // the build is larger.
@@ -520,13 +546,6 @@ impl<'p> Reuse<'p> {
                 read,
             }
         }));
-        // A re-evaluation of the same text shares the handle the build
-        // before kept, so the text lives one time. An aborted build makes
-        // no handle.
-        let source = match &self.before.source {
-            Some(kept) if **kept == *self.source => Arc::clone(kept),
-            _ => Arc::from(self.source),
-        };
         let mut by_text: Vec<u32> = (0..names.len())
             .filter_map(|number| u32::try_from(number).ok())
             .collect();

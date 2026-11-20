@@ -190,7 +190,7 @@ pub fn randrun(n: usize) -> Pattern {
 pub fn rand_list_value(count: Value) -> Pattern {
     let count = count.as_f64().unwrap_or(0.0);
     if !count.is_finite() || count < 1.0 {
-        return signal(|_, _| Value::List(Vec::new()));
+        return signal(|_, _| Value::list(Vec::new()));
     }
     let count = count as u64;
     if count > crate::MAX_STEPWISE_ENTRIES {
@@ -209,7 +209,7 @@ pub fn rand_list_value(count: Value) -> Pattern {
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
         let rands = crate::rng::rands_at_time(time.to_f64(), count, seed);
-        Value::List(
+        Value::list(
             rands
                 .into_iter()
                 .map(|value| Value::F64(value.abs()))

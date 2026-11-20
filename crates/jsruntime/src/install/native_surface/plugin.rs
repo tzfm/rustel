@@ -29,7 +29,7 @@ fn set_plugin_field(hap: &Value, call: &str, field: &Field, setting: &Value) -> 
     }
     let chain = call == "vst";
     let mut effects = match controls.get(call) {
-        Some(Value::List(effects)) if chain => effects.clone(),
+        Some(Value::List(effects)) if chain => (**effects).clone(),
         _ => Vec::new(),
     };
     let held = if chain {
@@ -76,7 +76,7 @@ fn set_plugin_field(hap: &Value, call: &str, field: &Field, setting: &Value) -> 
     let plugin = Value::Object(plugin);
     let value = if chain {
         effects.push(plugin);
-        Value::List(effects)
+        Value::list(effects)
     } else {
         plugin
     };
@@ -255,7 +255,7 @@ mod tests {
     fn plugins(controls: &rustel_core::OrderedMap) -> Vec<&rustel_core::OrderedMap> {
         let mut plugins: Vec<_> = controls.get("vsti").into_iter().collect();
         if let Some(Value::List(effects)) = controls.get("vst") {
-            plugins.extend(effects);
+            plugins.extend(effects.iter());
         }
         plugins
             .into_iter()

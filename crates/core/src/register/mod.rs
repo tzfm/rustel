@@ -313,7 +313,7 @@ pub(crate) fn argument_values(
     constants: &[Option<Value>],
 ) -> Vec<Value> {
     let riding = match riding {
-        Value::List(values) => values.clone(),
+        Value::List(values) => (**values).clone(),
         single => vec![single.clone()],
     };
     debug_assert_eq!(riding.len(), chain);
@@ -1140,7 +1140,7 @@ mod numeric_string_tests {
             ("euclidRot", vec![value(3.0), value(16_385.0), value(0.0)]),
             (
                 "bjork",
-                vec![pure(Value::List(vec![
+                vec![pure(Value::list(vec![
                     Value::F64(3.0),
                     Value::F64(16_385.0),
                 ]))],
@@ -1277,7 +1277,7 @@ mod purity_rule_tests {
         assert!(sometimes.admits_pure_view(&[lowered()]));
         assert!(sometimes.admits_pure_view(&[Value::F64(0.5), lowered()]));
         assert!(!sometimes.admits_pure_view(&[Value::Function(Box::new(FunctionRef::js(1)))]));
-        assert!(!sometimes.admits_pure_view(&[Value::List(vec![lowered()])]));
+        assert!(!sometimes.admits_pure_view(&[Value::list(vec![lowered()])]));
         assert!(!fast.admits_pure_view(&[lowered()]));
         assert!(fast.admits_pure_view(&[Value::F64(2.0)]));
     }

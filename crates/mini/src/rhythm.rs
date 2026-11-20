@@ -3,8 +3,8 @@
 
 use crate::{Build, ParseError, Postfix, Span};
 use rustel_core::{
-    GivenLayer, Locations, Pattern, SequenceLayer, SequenceStep, SourceStep, SourcedLayer,
-    StepSource, Value, pure, sequence, sequence_of, silence,
+    GivenLayer, IndexedLayer, Locations, Pattern, SequenceLayer, SequenceStep, SourceStep,
+    SourcedLayer, StepSource, Value, pure, sequence, sequence_of, silence,
 };
 use rustel_fraction::Fraction;
 use std::ops::Range;
@@ -703,9 +703,137 @@ fn written(begin: u32, len: u16) -> At {
     (begin, begin + u32::from(len))
 }
 
+/// Compact 8-byte encoding of [`Kind`] stored in [`Plans::kinds`].
+#[derive(Clone, Copy)]
+struct PackedKind(u64);
+
+const _: () = assert!(std::mem::size_of::<PackedKind>() == 8);
+
+impl PackedKind {
+    const TAG_SHIFT: u32 = 60;
+    const REST: u64 = 0;
+    const ATOM: u64 = 1;
+    const EQUAL_SEQ: u64 = 2;
+    const WEIGHTED_SEQ: u64 = 3;
+    const STACK: u64 = 4;
+    const STACK_RUN: u64 = 5;
+    const ALTERNATION: u64 = 6;
+    const FASTER: u64 = 7;
+    const SLOWER: u64 = 8;
+    const REPEATED: u64 = 9;
+
+    const MASK_16: u64 = 0xffff;
+    const MASK_24: u64 = 0xff_ffff;
+    const MASK_32: u64 = 0xffff_ffff;
+
+    fn pack(kind: Kind, base_offset: u32) -> Option<Self> {
+        let word = match kind {
+            Kind::Rest => Self::REST << Self::TAG_SHIFT,
+            Kind::Atom { value, begin, len } => {
+                let value = u16::try_from(value).ok()?;
+                let rel = begin.checked_sub(base_offset)?;
+                if u64::from(rel) > Self::MASK_24 {
+                    return None;
+                }
+                (Self::ATOM << Self::TAG_SHIFT)
+                    | u64::from(value)
+                    | (u64::from(rel) << 16)
+                    | (u64::from(len) << 40)
+            }
+            Kind::EqualSequence(Among(a, b)) => {
+                (Self::EQUAL_SEQ << Self::TAG_SHIFT) | u64::from(a) | (u64::from(b) << 16)
+            }
+            Kind::WeightedSequence(Among(a, b)) => {
+                (Self::WEIGHTED_SEQ << Self::TAG_SHIFT) | u64::from(a) | (u64::from(b) << 16)
+            }
+            Kind::Stack(Among(a, b)) => {
+                (Self::STACK << Self::TAG_SHIFT) | u64::from(a) | (u64::from(b) << 16)
+            }
+            Kind::StackRun(Among(a, b)) => {
+                (Self::STACK_RUN << Self::TAG_SHIFT) | u64::from(a) | (u64::from(b) << 16)
+            }
+            Kind::Alternation(Among(a, b)) => {
+                (Self::ALTERNATION << Self::TAG_SHIFT) | u64::from(a) | (u64::from(b) << 16)
+            }
+            Kind::Faster(id, rate, site, one_layer) => {
+                if u64::from(rate) > Self::MASK_24 {
+                    return None;
+                }
+                (Self::FASTER << Self::TAG_SHIFT)
+                    | u64::from(id.0)
+                    | (u64::from(rate) << 16)
+                    | (u64::from(site) << 40)
+                    | (u64::from(one_layer) << 56)
+            }
+            Kind::Slower(id, times, site) => {
+                if u64::from(times) > Self::MASK_24 {
+                    return None;
+                }
+                (Self::SLOWER << Self::TAG_SHIFT)
+                    | u64::from(id.0)
+                    | (u64::from(times) << 16)
+                    | (u64::from(site) << 40)
+            }
+            Kind::Repeated(id, times) => {
+                (Self::REPEATED << Self::TAG_SHIFT) | u64::from(id.0) | (u64::from(times) << 16)
+            }
+        };
+        Some(Self(word))
+    }
+
+    #[inline]
+    fn unpack(self, base_offset: u32) -> Kind {
+        let w = self.0;
+        match w >> Self::TAG_SHIFT {
+            Self::REST => Kind::Rest,
+            Self::ATOM => Kind::Atom {
+                value: (w & Self::MASK_16) as u32,
+                begin: base_offset + ((w >> 16) & Self::MASK_24) as u32,
+                len: ((w >> 40) & Self::MASK_16) as u16,
+            },
+            Self::EQUAL_SEQ => Kind::EqualSequence(Among(
+                (w & Self::MASK_16) as u16,
+                ((w >> 16) & Self::MASK_16) as u16,
+            )),
+            Self::WEIGHTED_SEQ => Kind::WeightedSequence(Among(
+                (w & Self::MASK_16) as u16,
+                ((w >> 16) & Self::MASK_16) as u16,
+            )),
+            Self::STACK => Kind::Stack(Among(
+                (w & Self::MASK_16) as u16,
+                ((w >> 16) & Self::MASK_16) as u16,
+            )),
+            Self::STACK_RUN => Kind::StackRun(Among(
+                (w & Self::MASK_16) as u16,
+                ((w >> 16) & Self::MASK_16) as u16,
+            )),
+            Self::ALTERNATION => Kind::Alternation(Among(
+                (w & Self::MASK_16) as u16,
+                ((w >> 16) & Self::MASK_16) as u16,
+            )),
+            Self::FASTER => Kind::Faster(
+                Id((w & Self::MASK_16) as u16),
+                ((w >> 16) & Self::MASK_24) as u32,
+                ((w >> 40) & Self::MASK_16) as u16,
+                ((w >> 56) & 1) != 0,
+            ),
+            Self::SLOWER => Kind::Slower(
+                Id((w & Self::MASK_16) as u16),
+                ((w >> 16) & Self::MASK_24) as u32,
+                ((w >> 40) & Self::MASK_16) as u16,
+            ),
+            Self::REPEATED => Kind::Repeated(
+                Id((w & Self::MASK_16) as u16),
+                ((w >> 16) & Self::MASK_32) as u32,
+            ),
+            _ => unreachable!("invalid packed kind tag"),
+        }
+    }
+}
+
 /// Where a plan is among the [`Plans`] of its text.
 #[derive(Clone, Copy)]
-struct Id(u32);
+struct Id(u16);
 
 /// Where the text writes a word or a factor: two offsets in the score.
 type At = (u32, u32);
@@ -718,12 +846,12 @@ fn place(at: At) -> (usize, usize) {
 /// A run of one of the lists of [`Plans`]: its first entry, and the entry
 /// after its last.
 #[derive(Clone, Copy)]
-struct Among(u32, u32);
+struct Among(u16, u16);
 
 impl Among {
     /// The run from `first` to the end of a list of `len` entries.
     fn from(first: usize, len: usize) -> Option<Self> {
-        Some(Self(u32::try_from(first).ok()?, u32::try_from(len).ok()?))
+        Some(Self(u16::try_from(first).ok()?, u16::try_from(len).ok()?))
     }
 
     fn range(self) -> Range<usize> {
@@ -914,7 +1042,7 @@ struct Survey {
 /// few lists, with no list for each construct.
 #[derive(Default)]
 struct Plans {
-    kinds: Vec<Kind>,
+    kinds: Vec<PackedKind>,
     /// What the planner knows of each construct. A pattern that reads its
     /// steps from the plans keeps none of it.
     facts: Vec<Facts>,
@@ -930,14 +1058,18 @@ struct Plans {
     stacked: Vec<Id>,
     /// The lanes of each alternation.
     lanes: Vec<Steps>,
+    /// Starting score byte offset of this mini string, subtracted from packed
+    /// atom offsets so each atom fits in 8 bytes.
+    base_offset: u32,
     /// Whether a step may be longer than a cycle: a plan is a slow count,
     /// or a step of a lane fills more than one cycle.
     long: bool,
 }
 
 impl Plans {
+    #[inline]
     fn kind(&self, id: Id) -> Kind {
-        self.kinds[id.0 as usize]
+        self.kinds[id.0 as usize].unpack(self.base_offset)
     }
 
     fn facts(&self, id: Id) -> Facts {
@@ -945,8 +1077,9 @@ impl Plans {
     }
 
     fn add(&mut self, kind: Kind, facts: Facts) -> Option<Id> {
-        let id = u32::try_from(self.kinds.len()).ok()?;
-        self.kinds.push(kind);
+        let id = u16::try_from(self.kinds.len()).ok()?;
+        let packed = PackedKind::pack(kind, self.base_offset)?;
+        self.kinds.push(packed);
         self.facts.push(facts);
         Some(Id(id))
     }
@@ -1114,7 +1247,7 @@ impl Plans {
     fn stacked_at(&self, at: usize, run: bool) -> Id {
         match run {
             // The plans are fewer than the range of an id.
-            true => Id(at as u32),
+            true => Id(at as u16),
             false => self.stacked[at],
         }
     }
@@ -1222,11 +1355,11 @@ impl Plans {
                 list.push(last);
                 list
             }
-            first => vec![first, last],
+            first => Box::new(vec![first, last]),
         };
         let held = u32::try_from(values.len()).ok()?;
         values.push(Value::List(list));
-        self.kinds[chain.0 as usize] = Kind::atom(held, at)?;
+        self.kinds[chain.0 as usize] = PackedKind::pack(Kind::atom(held, at)?, self.base_offset)?;
         Some(chain)
     }
 
@@ -1645,11 +1778,15 @@ impl Plans {
                     held.push(value);
                     *place = held.len() as u32;
                 }
-                self.kinds[id.0 as usize] = Kind::Atom {
-                    value: *place - 1,
-                    begin,
-                    len,
-                };
+                self.kinds[id.0 as usize] = PackedKind::pack(
+                    Kind::Atom {
+                        value: *place - 1,
+                        begin,
+                        len,
+                    },
+                    self.base_offset,
+                )
+                .expect("localized atom value fits packed kind");
             }
             kind @ (Kind::EqualSequence(parts) | Kind::WeightedSequence(parts)) => {
                 let equal = kind.is_equal();
@@ -1760,24 +1897,50 @@ impl Plans {
         Some(())
     }
 
-    /// The steps of `layer` in a list, each as a share of its period,
-    /// with its value among `values`.
-    fn listed(
+    /// The steps of `layer` in cycles with deduplicated layer-local values,
+    /// skipping intermediate `SequenceStep` and hash-dedup passes.
+    fn listed_indexed(
         &self,
         layer: &LayerPlan,
+        period: Fraction,
         count: usize,
+        in_cycles: bool,
         values: &[Value],
-    ) -> Option<Vec<SequenceStep>> {
+        local: &mut Vec<u32>,
+    ) -> Option<IndexedLayer> {
+        local.resize(values.len(), 0);
+        let mut held: Vec<u32> = Vec::new();
         let mut steps = Vec::with_capacity(count);
-        // One cycle of the walk is one of the equal shares of the period.
-        let share = (1, i128::from(layer.turns));
-        self.read(layer, share, Fraction::ZERO, Fraction::ONE, &mut |step| {
-            // A handle of the value, for the step.
-            let value = values[step.value as usize].clone();
-            let locations = step.locations;
-            steps.push(SequenceStep::new(step.begin, step.end, value, locations));
-        })?;
-        Some(steps)
+        let written = self.read(
+            layer,
+            layer.pace.terms(),
+            Fraction::ZERO,
+            period,
+            &mut |mut step| {
+                let global = step.value as usize;
+                let place = &mut local[global];
+                if *place == 0 {
+                    held.push(step.value);
+                    *place = held.len() as u32;
+                }
+                step.value = *place - 1;
+                steps.push(step);
+            },
+        );
+        for &global in &held {
+            local[global as usize] = 0;
+        }
+        written?;
+        let layer_values: Arc<[Value]> = held
+            .iter()
+            .map(|&global| values[global as usize].clone())
+            .collect();
+        Some(IndexedLayer {
+            period,
+            values: layer_values,
+            in_cycles,
+            steps,
+        })
     }
 
     /// These plans with what a walk reads of them, and no more: a pattern
@@ -1851,6 +2014,7 @@ impl Room {
             sites,
             stacked,
             lanes,
+            base_offset: _,
             long: _,
         } = &self.plans;
         [
@@ -1871,7 +2035,7 @@ impl Room {
 
     /// Empty the room for the plans of `src`, with none to move: a word
     /// and its space are two bytes or more.
-    fn clear(&mut self, src: &str) {
+    fn clear(&mut self, src: &str, base_offset: u32) {
         let Plans {
             kinds,
             facts,
@@ -1880,6 +2044,7 @@ impl Room {
             sites,
             stacked,
             lanes,
+            base_offset: stored_base,
             long,
         } = &mut self.plans;
         let words = src.len() / 2 + 1;
@@ -1894,6 +2059,7 @@ impl Room {
         sites.clear();
         stacked.clear();
         lanes.clear();
+        *stored_base = base_offset;
         *long = false;
         self.values.clear();
         self.words.clear();
@@ -1920,7 +2086,10 @@ impl<'r> Planned<'r> {
         offset: usize,
         room: &'r mut Room,
     ) -> Result<Option<Self>, ParseError> {
-        room.clear(src);
+        let Ok(base_offset) = u32::try_from(offset) else {
+            return Ok(None);
+        };
+        room.clear(src, base_offset);
         let planner = Planner { src, offset, room };
         let (root, planner) = crate::read(src, planner)?;
         let room = planner.room;
@@ -1988,8 +2157,9 @@ impl<'r> Planned<'r> {
         let given = layers.into_iter().map(|(layer, count)| {
             let period = layer.period()?;
             if layer.is_listed(count) {
-                let steps = plans.listed(&layer, count, values)?;
-                return Some(GivenLayer::Listed(SequenceLayer { period, steps }));
+                let indexed =
+                    plans.listed_indexed(&layer, period, count, in_cycles, values, &mut local)?;
+                return Some(GivenLayer::Indexed(indexed));
             }
             Some(GivenLayer::Sourced(SourcedLayer {
                 period,
@@ -2255,7 +2425,8 @@ mod tests {
     #[test]
     fn a_plan_holds_few_bytes() {
         use std::mem::size_of;
-        assert!(size_of::<Kind>() <= 12);
+        assert!(size_of::<PackedKind>() <= 8);
+        assert!(size_of::<Id>() <= 2);
         assert!(size_of::<Part>() <= 8);
         assert!(size_of::<Root>() <= 20);
         assert!(size_of::<Pace>() <= 8);
@@ -2314,7 +2485,7 @@ mod tests {
         assert!(plans.stacked.is_empty());
         let plans = plans_of("<[a,b c] [d,e]>", &mut Room::default());
         assert_eq!(plans.stacked.len(), 2);
-        let run = |plans: &Plans, id: usize| match plans.kinds[id] {
+        let run = |plans: &Plans, id: usize| match plans.kind(Id(id as u16)) {
             Kind::StackRun(patterns) => plans.stacked(patterns, true).map(|id| id.0).collect(),
             _ => Vec::new(),
         };

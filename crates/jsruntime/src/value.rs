@@ -228,7 +228,7 @@ fn from_js_within_depth(
                 items.push(from_js_within_depth(&item, remaining, depth + 1)?);
             }
         }
-        Value::List(items)
+        Value::list(items)
     } else if let Some(object) = v.as_object() {
         // Each property charges one element, so a child shared by several
         // keys cannot multiply the walk past the budget. Arrays reached

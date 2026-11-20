@@ -48,8 +48,8 @@ use context_keys::ContextKeys;
 pub use locations::Locations;
 use rustel_fraction::Fraction;
 pub use sequence::{
-    GivenLayer, SequenceLayer, SequenceStep, SourceStep, SourcedLayer, StepSource, sequence,
-    sequence_of,
+    GivenLayer, IndexedLayer, SequenceLayer, SequenceStep, SourceStep, SourcedLayer, StepSource,
+    sequence, sequence_of,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -408,7 +408,7 @@ fn tags_from_value(value: &Value) -> Option<Arc<[Arc<str>]>> {
         .iter()
         .filter_map(|item| match item {
             // A handle of the text.
-            Value::Str(text) => Some(Arc::clone(text)),
+            Value::Str(text) => Some(text.to_arc()),
             _ => None,
         })
         .collect();
@@ -1755,7 +1755,7 @@ pub fn materialize_js_value(value: &Value) -> Value {
         // Controls can wrap a JS-owned value before the outer boundary sees
         // it (`s(pure(['bd']))` is `{s: <opaque array>}`). Recurse through the
         // native container or the inner identity would still escape the host.
-        Value::List(values) => Value::List(values.iter().map(materialize_js_value).collect()),
+        Value::List(values) => Value::list(values.iter().map(materialize_js_value).collect()),
         Value::Object(values) => Value::object(
             values
                 .iter()
@@ -2223,7 +2223,7 @@ fn same_key(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::F64(x), Value::F64(y)) => x.to_bits() == y.to_bits(),
         (Value::List(xs), Value::List(ys)) => {
-            xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| same_key(x, y))
+            xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| same_key(x, y))
         }
         (Value::Object(xs), Value::Object(ys)) => {
             xs.len() == ys.len()
@@ -4123,7 +4123,7 @@ fn query_weight_sequence(cumulative: &[Pattern], state: &State) -> Vec<Hap> {
     note_materialised(spans.len());
     let mut current: Vec<Hap> = spans
         .into_iter()
-        .map(|part| Hap::new(Some(whole_cycle(part.begin)), part, Value::List(Vec::new())))
+        .map(|part| Hap::new(Some(whole_cycle(part.begin)), part, Value::list(Vec::new())))
         .collect();
 
     for pattern in cumulative {
@@ -4147,7 +4147,7 @@ fn query_weight_sequence(cumulative: &[Pattern], state: &State) -> Vec<Hap> {
                 let mut context = outer.context.clone();
                 context.append(&inner.context);
                 let mut values = match &outer.value {
-                    Value::List(values) => values.clone(),
+                    Value::List(values) => (**values).clone(),
                     _ => Vec::new(),
                 };
                 values.push(inner.value.clone());
@@ -4156,7 +4156,7 @@ fn query_weight_sequence(cumulative: &[Pattern], state: &State) -> Vec<Hap> {
                     Hap {
                         whole,
                         part: inner.part,
-                        value: Value::List(values),
+                        value: Value::list(values),
                         context,
                         ui_visuals: inner.ui_visuals | outer.ui_visuals,
                         live_controls: [0; 4],
@@ -9020,7 +9020,7 @@ impl Pattern {
                             context.and_then(|context| context.get("locations"))
                         {
                             let mut added = Vec::new();
-                            for item in items {
+                            for item in items.iter() {
                                 let Some(location) = item.as_object() else {
                                     continue;
                                 };
@@ -9068,7 +9068,7 @@ impl Pattern {
                                         scale: context
                                             .and_then(|context| context.get("scale"))
                                             .and_then(|scale| match scale {
-                                                Value::Str(name) => Some(Arc::clone(name)),
+                                                Value::Str(name) => Some(name.to_arc()),
                                                 _ => None,
                                             }),
                                         edo_size: context
@@ -9084,7 +9084,7 @@ impl Pattern {
                                         log_line: context
                                             .and_then(|context| context.get("logLine"))
                                             .and_then(|value| match value {
-                                                Value::Str(text) => Some(Arc::clone(text)),
+                                                Value::Str(text) => Some(text.to_arc()),
                                                 _ => None,
                                             }),
                                     }),
@@ -9677,7 +9677,7 @@ impl Pattern {
     /// Collect this pattern's values into a one-element `Value::List`, the seed
     /// of `register()`'s positional-argument fold.
     pub fn fmap_collect(&self) -> Self {
-        self.fmap(|v| Value::List(vec![v.clone()]))
+        self.fmap(|v| Value::list(vec![v.clone()]))
     }
 
     /// Append the next positional argument via `appLeft`.
@@ -9690,7 +9690,7 @@ impl Pattern {
                     xs.push(v.clone());
                     Value::List(xs)
                 }
-                other => Value::List(vec![other.clone(), v.clone()]),
+                other => Value::list(vec![other.clone(), v.clone()]),
             })),
             LookupFlow::Infer,
         ))
@@ -13558,7 +13558,7 @@ mod set_lookup_tests {
             Value::F64(1.0),
             Value::Bool(true),
             Value::Str("x".into()),
-            Value::List(vec![Value::F64(-0.0)]),
+            Value::list(vec![Value::F64(-0.0)]),
         ];
         let mut values = vec![Value::Undefined, Value::Null, Value::Str("ab".into())];
         values.extend(members.iter().cloned());
@@ -15327,7 +15327,11 @@ mod restart_tests {
 
         // Five haps hold the text. The map takes the fourth and unwinds:
         // that hap drops, and the fifth is not read.
-        let held = || Hap::new(Some(span), span, Value::Str(Arc::clone(&shared)));
+        let held = || {
+            let mut hap = Hap::new(Some(span), span, Value::F64(0.0));
+            hap.keys.edit().scale = Some(Arc::clone(&shared));
+            hap
+        };
         let mut haps: Vec<Hap> = (0..5).map(|_| held()).collect();
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut taken = 0;

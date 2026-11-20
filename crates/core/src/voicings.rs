@@ -525,7 +525,7 @@ pub fn render_voicing(map: &OrderedMap) -> Option<Vec<Value>> {
         }
         let midi = exact_i64(*midi)?;
         selected_midis.push(midi);
-        notes.push(Value::Str(midi2note(midi)));
+        notes.push(Value::Str(midi2note(midi).into()));
     }
 
     if let Some(n) = defined_control(map, "n").map(crate::pick_js_number) {
@@ -648,7 +648,7 @@ fn parse_user_dictionary_json(
         let mut parsed = Vec::with_capacity(voicings.len());
         let mut legacy_voicings = Vec::with_capacity(voicings.len());
         let mut legacy_valid = true;
-        for voicing in voicings {
+        for voicing in voicings.iter() {
             match voicing {
                 serde_json::Value::String(text) => {
                     legacy_voicings.push(text.split(' ').map(ToOwned::to_owned).collect::<Vec<_>>())
@@ -779,7 +779,7 @@ fn parse_custom_dictionary(object: &OrderedMap) -> Option<HashMap<String, Vec<Ve
             continue;
         };
         let mut parsed = Vec::with_capacity(voicings.len());
-        for voicing in voicings {
+        for voicing in voicings.iter() {
             let steps: Option<Vec<f64>> = match voicing {
                 Value::Str(text) => text
                     .split_whitespace()
@@ -2540,7 +2540,7 @@ mod tests {
             "dictionary".into(),
             Value::Object(OrderedMap::from_entries([(
                 "7".into(),
-                Value::List(vec![Value::List(Vec::new())]),
+                Value::list(vec![Value::list(Vec::new())]),
             )])),
         );
         assert_eq!(render_voicing(&controls), None);
@@ -2571,7 +2571,7 @@ mod tests {
             "dictionary".into(),
             Value::Object(OrderedMap::from_entries([(
                 "7".into(),
-                Value::List(vec![Value::List(vec![Value::F64(0.0)])]),
+                Value::list(vec![Value::list(vec![Value::F64(0.0)])]),
             )])),
         );
         let Some(values) = render_voicing(&controls) else {

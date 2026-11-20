@@ -128,7 +128,7 @@ fn an_invalid_value_is_refused_as_its_json_is() {
         ),
         (map([("s", text("nosuch"))]), json!({"s": "nosuch"})),
         (
-            map([("s", text("bd")), ("bank", Value::List(Vec::new()))]),
+            map([("s", text("bd")), ("bank", Value::list(Vec::new()))]),
             json!({"s": "bd", "bank": []}),
         ),
         (text("c4"), json!("c4")),

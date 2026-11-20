@@ -2456,6 +2456,232 @@ impl PartialEq for HapList {
     }
 }
 
+/// Maximum byte length stored inline in [`SharedStr`] with zero heap allocation.
+const INLINE_STR_MAX: usize = 14;
+
+/// A compact immutable string value: up to 14 UTF-8 bytes inline in 16 bytes,
+/// spilling to a shared heap allocation for longer strings.
+#[derive(Clone)]
+pub struct SharedStr(SharedStrRepr);
+
+#[derive(Clone)]
+enum SharedStrRepr {
+    Inline {
+        len: u8,
+        bytes: [u8; INLINE_STR_MAX],
+    },
+    Heap(Arc<Box<str>>),
+}
+
+const _: () = assert!(std::mem::size_of::<SharedStr>() == 16);
+
+impl SharedStr {
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        match &self.0 {
+            SharedStrRepr::Inline { len, bytes } => {
+                // Inline bytes are always copied from valid UTF-8 `&str`.
+                std::str::from_utf8(&bytes[..usize::from(*len)]).unwrap_or("")
+            }
+            SharedStrRepr::Heap(text) => text,
+        }
+    }
+
+    #[inline]
+    pub fn to_arc(&self) -> Arc<str> {
+        Arc::from(self.as_str())
+    }
+}
+
+impl Default for SharedStr {
+    #[inline]
+    fn default() -> Self {
+        Self(SharedStrRepr::Inline {
+            len: 0,
+            bytes: [0; INLINE_STR_MAX],
+        })
+    }
+}
+
+impl std::ops::Deref for SharedStr {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for SharedStr {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::borrow::Borrow<str> for SharedStr {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq for SharedStr {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (SharedStrRepr::Heap(a), SharedStrRepr::Heap(b)) if Arc::ptr_eq(a, b) => true,
+            _ => self.as_str() == other.as_str(),
+        }
+    }
+}
+
+impl Eq for SharedStr {}
+
+impl PartialOrd for SharedStr {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SharedStr {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl Hash for SharedStr {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl PartialEq<str> for SharedStr {
+    #[inline]
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for SharedStr {
+    #[inline]
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for SharedStr {
+    #[inline]
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialEq<Arc<str>> for SharedStr {
+    #[inline]
+    fn eq(&self, other: &Arc<str>) -> bool {
+        self.as_str() == &**other
+    }
+}
+
+impl fmt::Debug for SharedStr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl fmt::Display for SharedStr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.as_str(), f)
+    }
+}
+
+impl From<&str> for SharedStr {
+    #[inline]
+    fn from(s: &str) -> Self {
+        if s.len() <= INLINE_STR_MAX {
+            let mut bytes = [0u8; INLINE_STR_MAX];
+            bytes[..s.len()].copy_from_slice(s.as_bytes());
+            Self(SharedStrRepr::Inline {
+                len: s.len() as u8,
+                bytes,
+            })
+        } else {
+            Self(SharedStrRepr::Heap(Arc::new(Box::<str>::from(s))))
+        }
+    }
+}
+
+impl From<String> for SharedStr {
+    #[inline]
+    fn from(s: String) -> Self {
+        if s.len() <= INLINE_STR_MAX {
+            Self::from(s.as_str())
+        } else {
+            Self(SharedStrRepr::Heap(Arc::new(s.into_boxed_str())))
+        }
+    }
+}
+
+impl From<Box<str>> for SharedStr {
+    #[inline]
+    fn from(s: Box<str>) -> Self {
+        if s.len() <= INLINE_STR_MAX {
+            Self::from(&*s)
+        } else {
+            Self(SharedStrRepr::Heap(Arc::new(s)))
+        }
+    }
+}
+
+impl From<Arc<str>> for SharedStr {
+    #[inline]
+    fn from(s: Arc<str>) -> Self {
+        Self::from(&*s)
+    }
+}
+
+impl From<&String> for SharedStr {
+    #[inline]
+    fn from(s: &String) -> Self {
+        Self::from(s.as_str())
+    }
+}
+
+impl From<std::borrow::Cow<'_, str>> for SharedStr {
+    #[inline]
+    fn from(s: std::borrow::Cow<'_, str>) -> Self {
+        match s {
+            std::borrow::Cow::Borrowed(b) => Self::from(b),
+            std::borrow::Cow::Owned(o) => Self::from(o),
+        }
+    }
+}
+
+impl From<SharedStr> for Arc<str> {
+    #[inline]
+    fn from(s: SharedStr) -> Self {
+        s.to_arc()
+    }
+}
+
+impl From<&SharedStr> for Arc<str> {
+    #[inline]
+    fn from(s: &SharedStr) -> Self {
+        s.to_arc()
+    }
+}
+
+impl From<SharedStr> for String {
+    #[inline]
+    fn from(s: SharedStr) -> Self {
+        s.as_str().to_owned()
+    }
+}
+
 /// A native representation of values that can cross the score's semantic
 /// boundary. Arrays and objects are recursive; object order is observable.
 #[derive(Debug, PartialEq)]
@@ -2464,9 +2690,9 @@ pub enum Value {
     Null,
     Bool(bool),
     F64(f64),
-    /// Text that each copy of the value shares.
-    Str(Arc<str>),
-    List(Vec<Value>),
+    /// Text: stored inline up to 14 bytes or shared on the heap.
+    Str(SharedStr),
+    List(Box<Vec<Value>>),
     Object(OrderedMap),
     /// A native Pattern nested in a JavaScript array/object value.
     Pattern(Box<PatternValue>),
@@ -2481,9 +2707,20 @@ pub enum Value {
     Haps(HapList),
 }
 
+const _: () = assert!(std::mem::size_of::<Value>() == 24);
+const _: () = assert!(std::mem::size_of::<Option<Value>>() == 24);
+
+impl Value {
+    /// Construct a `Value::List` from a `Vec<Value>`.
+    #[inline]
+    pub fn list(values: Vec<Value>) -> Self {
+        Self::List(Box::new(values))
+    }
+}
+
 impl Clone for Value {
-    /// A number, flag or nullish value copies in place. The others own heap
-    /// memory and clone out of line.
+    /// A number, flag, inline text or nullish value copies in place. The
+    /// others own heap memory and clone out of line.
     #[inline]
     fn clone(&self) -> Self {
         match self {
@@ -2491,6 +2728,12 @@ impl Clone for Value {
             Self::Null => Self::Null,
             Self::Bool(value) => Self::Bool(*value),
             Self::F64(value) => Self::F64(*value),
+            Self::Str(SharedStr(SharedStrRepr::Inline { len, bytes })) => {
+                Self::Str(SharedStr(SharedStrRepr::Inline {
+                    len: *len,
+                    bytes: *bytes,
+                }))
+            }
             shared => shared.clone_shared(),
         }
     }
@@ -2589,7 +2832,7 @@ fn hash_data(value: &Value, state: &mut impl std::hash::Hasher) {
         Value::Str(value) => (4u8, value).hash(state),
         Value::List(items) => {
             (5u8, items.len()).hash(state);
-            for item in items {
+            for item in items.iter() {
                 hash_data(item, state);
             }
         }
@@ -2608,7 +2851,7 @@ fn same_data(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
         (Value::List(a), Value::List(b)) => {
-            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_data(a, b))
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| same_data(a, b))
         }
         (Value::Object(a), Value::Object(b)) => a.same_data(b),
         _ => a == b,
@@ -2865,7 +3108,7 @@ impl Value {
                 {
                     return true;
                 }
-                for value in values {
+                for value in values.iter_mut() {
                     if !value.attach_runtime_settings(settings, depth + 1) {
                         return false;
                     }
@@ -3123,7 +3366,7 @@ mod tests {
             std::mem::size_of::<super::Entries>()
         );
         assert_eq!(std::mem::size_of::<super::Entries>(), 24);
-        assert_eq!(std::mem::size_of::<Value>(), 32);
+        assert_eq!(std::mem::size_of::<Value>(), 24);
     }
 
     #[test]
@@ -3165,10 +3408,10 @@ mod tests {
 
     #[test]
     fn nested_compact_format_matches_hap_show_algorithm() {
-        let value = Value::List(vec![
+        let value = Value::list(vec![
             Value::Str("c".into()),
             Value::Str("d".into()),
-            Value::List(vec![Value::Str("e".into()), Value::Str("f".into())]),
+            Value::list(vec![Value::Str("e".into()), Value::Str("f".into())]),
         ]);
         assert_eq!(value.compact_json(), "c d [e f]");
     }
@@ -3181,7 +3424,7 @@ mod tests {
         );
         assert_eq!(Value::F64(-0.0).json_stringify().as_deref(), Some("0"));
         assert_eq!(
-            Value::List(vec![Value::Undefined])
+            Value::list(vec![Value::Undefined])
                 .json_stringify()
                 .as_deref(),
             Some("[null]")
@@ -3241,7 +3484,7 @@ mod tests {
             ("after".into(), opaque(4)),
             ("last".into(), opaque(5)),
         ]);
-        let array = Value::List((1..=5).map(opaque).collect());
+        let array = Value::list((1..=5).map(opaque).collect());
         let all_omitted = Value::object([("tail".into(), opaque(3)), ("2".into(), opaque(1))]);
 
         for omitted in [

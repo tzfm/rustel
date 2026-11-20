@@ -484,7 +484,7 @@ pub fn ribbon<P: PatOps>(pat: &P, offset: Fraction, cycles: Fraction) -> P {
 /// A window outside the native fraction range refuses as
 /// `NativeFraction { operation: "bite" }`.
 pub fn bite<P: PatOps>(pat: &P, npat: &P, ipat: &P) -> P {
-    let pairs = ipat.app_left_with(npat.clone(), |i, n| Value::List(vec![i.clone(), n.clone()]));
+    let pairs = ipat.app_left_with(npat.clone(), |i, n| Value::list(vec![i.clone(), n.clone()]));
     let pat = pat.clone();
     pairs.squeeze_bind(move |v| {
         let Value::List(items) = v else {
@@ -1134,12 +1134,12 @@ pub fn euclidish<P: PatOps>(pat: &P, pulses: i32, steps: i32, by: Fraction) -> P
 
 pub fn as_controls<P: PatOps>(pat: &P, mapping: &Value) -> P {
     let mapping = match crate::materialize_js_value(mapping) {
-        Value::List(values) => values,
+        Value::List(values) => *values,
         value => vec![value],
     };
     pat.fmap(move |value| {
         let values = match crate::materialize_js_value(value) {
-            Value::List(values) => values,
+            Value::List(values) => *values,
             value => vec![value],
         };
         let entries = mapping.iter().zip(values).filter_map(|(name, value)| {
@@ -2120,7 +2120,7 @@ pub fn csound<P: PatOps>(pat: &P, instrument: &Value, midi: bool) -> P {
 /// wrapped, and missing positions are `undefined`.
 fn slots(value: &Value, n: usize) -> Vec<Value> {
     let items: Vec<Value> = match value {
-        Value::List(items) => items.clone(),
+        Value::List(items) => (**items).clone(),
         other => vec![other.clone()],
     };
     (0..n)
@@ -2554,7 +2554,7 @@ fn scale_note(steps: &ScaleSteps, note_or_step: &Value, anchor: Option<&Value>) 
             crate::tonaljs::step_in_named_scale(number, scale_name, Some(anchor_midi))
                 .map(Value::F64)
         }
-        None => steps.step(number).map(Value::Str),
+        None => steps.step(number).map(|s| Value::Str(s.into())),
     };
     // An error removes the hap.
     let stepped = stepped.ok()?;
@@ -2589,7 +2589,7 @@ mod scale_steps_tests {
         let mut hap = Hap::new(Some(cycle), cycle, controls);
         hap.keys.edit().log_line = Some("a line".into());
         let scaled = scale_hap(&hap, &steps).expect("a note of the scale");
-        let note = Value::Str(steps.step(2.0).expect("a degree of the scale"));
+        let note = Value::Str(steps.step(2.0).expect("a degree of the scale").into());
         // The step gives way to its note, after the other controls.
         let expected = Value::object([("s".into(), text("piano")), ("note".into(), note)]);
         assert_eq!(scaled.value, expected);

@@ -363,7 +363,7 @@ pub(super) fn register(r: &mut Registry) {
         crate::native_combinator!(|args, pat| {
             let name: std::sync::Arc<str> = match args.first() {
                 // A handle of the text.
-                Some(crate::Value::Str(text)) => std::sync::Arc::clone(text),
+                Some(crate::Value::Str(text)) => text.to_arc(),
                 Some(other) => std::sync::Arc::from(other.show().as_str()),
                 None => std::sync::Arc::from(""),
             };

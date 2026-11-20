@@ -286,7 +286,7 @@ fn xen_ratio(value: &Value) -> f64 {
 /// Tune each note from the intersected patterns of its scale degrees.
 pub fn xen_patterns(pat: &crate::Pattern, ratios: Vec<crate::Pattern>) -> crate::Pattern {
     if ratios.is_empty() {
-        return xen(pat, Value::List(Vec::new()));
+        return xen(pat, Value::list(Vec::new()));
     }
     crate::Pattern::of(crate::Node::XenPatterns(pat.clone(), ratios)).with_steps_of(pat)
 }
@@ -302,7 +302,7 @@ pub(crate) fn query_xen_patterns(
     }
     let scale = ratios
         .iter()
-        .fold(crate::pure(Value::List(Vec::new())), |scale, ratio| {
+        .fold(crate::pure(Value::list(Vec::new())), |scale, ratio| {
             scale.app_both_with(ratio.clone(), |values, value| {
                 let Value::List(values) = values else {
                     return Value::Undefined;
@@ -316,7 +316,7 @@ pub(crate) fn query_xen_patterns(
             let Value::List(ratios) = value else {
                 return Value::Undefined;
             };
-            Value::List(
+            Value::list(
                 ratios
                     .iter()
                     .map(|ratio| Value::F64(xen_ratio(ratio)))
@@ -950,7 +950,7 @@ pub fn edo_scale<P: PatOps>(pat: &P, arg: Value) -> P {
     // Arrays only. A string definition fails with the verbatim flat()
     // TypeError rather than inventing string parsing that never existed.
     let definition: Vec<Value> = match &arg {
-        Value::List(items) => items.clone(),
+        Value::List(items) => (**items).clone(),
         _ => {
             return query_error_pattern::<P>(|| {
                 "scaleDefinition.flat is not a function".to_string()
@@ -1061,11 +1061,11 @@ pub fn edo_scale<P: PatOps>(pat: &P, arg: Value) -> P {
             rest.insert("degree".into(), Value::F64(degree));
             rest.insert(
                 "degreeIndexes".into(),
-                Value::List(pitches.divisions.iter().map(|d| Value::F64(*d)).collect()),
+                Value::list(pitches.divisions.iter().map(|d| Value::F64(*d)).collect()),
             );
             rest.insert(
                 "intLabels".into(),
-                Value::List(
+                Value::list(
                     pitches
                         .int_labels
                         .iter()
@@ -1264,11 +1264,11 @@ mod tests {
         assert_eq!(scale[0], 220.0);
         assert!((scale[8] - 220.0 * 2f64.powf(8.0 / 31.0)).abs() < 1e-9);
         // A raw ratio list is scaled by the base too.
-        let raw = get_xen_scale(&Value::List(vec![Value::F64(1.0), Value::F64(2.0)])).unwrap();
+        let raw = get_xen_scale(&Value::list(vec![Value::F64(1.0), Value::F64(2.0)])).unwrap();
         assert_eq!(raw, vec![220.0, 440.0]);
-        let ratios = get_xen_scale(&Value::List(vec![
+        let ratios = get_xen_scale(&Value::list(vec![
             Value::Str("3:2".into()),
-            Value::List(vec![Value::F64(5.0), Value::F64(4.0)]),
+            Value::list(vec![Value::F64(5.0), Value::F64(4.0)]),
             Value::Str("bad".into()),
             Value::F64(2.0),
         ]))
@@ -1355,8 +1355,8 @@ mod tests {
         assert_eq!(js_number(&Value::Str("0x10".into())), 16.0);
         assert_eq!(js_number(&Value::Str("-7".into())), -7.0);
         assert!(js_number(&Value::Str("12ed".into())).is_nan());
-        assert_eq!(js_number(&Value::List(vec![Value::Str("5".into())])), 5.0);
-        assert!(js_number(&Value::List(vec![Value::F64(1.0), Value::F64(2.0)])).is_nan());
+        assert_eq!(js_number(&Value::list(vec![Value::Str("5".into())])), 5.0);
+        assert!(js_number(&Value::list(vec![Value::F64(1.0), Value::F64(2.0)])).is_nan());
     }
 
     /// Fractional offsets miss the table and stay NaN through the octave
@@ -1382,7 +1382,7 @@ mod tests {
         for scale in [
             Value::Str("hexany15".into()),
             Value::Str("tranh3".into()),
-            Value::List(vec![
+            Value::list(vec![
                 Value::F64(220.0),
                 Value::F64(330.0),
                 Value::F64(440.0),
@@ -1452,7 +1452,7 @@ mod tests {
             m.insert("n".into(), Value::F64(2.0));
             m
         }));
-        let arg = Value::List(vec![
+        let arg = Value::list(vec![
             Value::Str("C".into()),
             Value::Str("LLsLLLs".into()),
             Value::F64(2.0),

@@ -279,13 +279,13 @@ fn numeric_generators_keep_their_values_and_timing() {
     );
     assert_eq!(
         values(&runtime, "binaryNL(5, 4)"),
-        [Value::List(
+        [Value::list(
             [0.0, 1.0, 0.0, 1.0].into_iter().map(Value::F64).collect(),
         )]
     );
     assert_eq!(
         values(&runtime, "binaryL(5)"),
-        [Value::List(
+        [Value::list(
             [1.0, 0.0, 1.0].into_iter().map(Value::F64).collect(),
         )]
     );
@@ -558,7 +558,7 @@ fn rand_list_uses_the_same_seed_as_rand() {
     for count in ["0", "-1", "NaN", "Infinity"] {
         assert_eq!(
             values(&runtime, &format!("randL({count}).seed(42)")),
-            [Value::List(Vec::new())]
+            [Value::list(Vec::new())]
         );
     }
 }

@@ -204,7 +204,7 @@ fn pure_metadata_keeps_nested_patterns_and_functions_in_the_owner_runtime() {
 
     let nested = rustel_core::pure(Value::object([(
         "nested".into(),
-        Value::List(vec![Value::Pattern(Box::new(PatternValue::new(
+        Value::list(vec![Value::Pattern(Box::new(PatternValue::new(
             7,
             voicing_size_signal(),
         )))]),
@@ -297,7 +297,7 @@ fn explicit_scopes_own_unwrapped_pure_and_lookup_extractors() {
         Arc::new(|pattern| pattern.fmap(|_| Value::F64(settings_tuple().2 as f64))),
         Arc::new(|pattern| pattern.fmap(|_| Value::F64(settings_tuple().2 as f64))),
     );
-    let carrier = rustel_core::pure(Value::List(vec![
+    let carrier = rustel_core::pure(Value::list(vec![
         Value::Pattern(Box::new(PatternValue::new(25, voicing_size_signal()))),
         Value::Function(Box::new(function)),
     ]))
@@ -774,7 +774,7 @@ fn deeply_nested_metadata_refuses_within_the_bounded_traversal() {
     let settings = RuntimeSettings::default();
     let mut value = Value::Pattern(Box::new(PatternValue::new(19, voicing_size_signal())));
     for _ in 0..=rustel_core::MAX_PATTERN_DEPTH {
-        value = Value::List(vec![value]);
+        value = Value::list(vec![value]);
     }
     let pattern = rustel_core::pure(value).with_runtime_settings(settings);
     let state = State::new(TimeSpan::new(Fraction::ZERO, Fraction::ONE));

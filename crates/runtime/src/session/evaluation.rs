@@ -1547,7 +1547,11 @@ impl Session {
         // a first score starts with no lead.
         #[cfg(feature = "vst")]
         {
-            self.lanes.install(source);
+            if let Some(shared) = self.last_source.as_ref() {
+                self.lanes.install_shared(shared);
+            } else {
+                self.lanes.install(source);
+            }
             let live = self.plugins_live();
             if let Some(plugins) = self.plugin_chains.get() {
                 crate::vst::score_changed(&plugins.chains, &self.lanes, Some(source), live);

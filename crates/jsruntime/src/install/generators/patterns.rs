@@ -173,7 +173,7 @@ fn binary_list_value(number: &Value, bits: &Value) -> Value {
     let bits = js_to_number(bits);
     let start = bits - 1.0;
     if start.is_nan() || start < 0.0 {
-        return Value::List(Vec::new());
+        return Value::list(Vec::new());
     }
     let count = if start >= u64::MAX as f64 {
         // Past u64's range the cast saturates; the refusal reports the least count over the limit.
@@ -194,7 +194,7 @@ fn binary_list_value(number: &Value, bits: &Value) -> Value {
         let shift = js_to_int32(start - index as f64) as u32 & 31;
         values.push(Value::F64(f64::from((number >> shift) & 1)));
     }
-    Value::List(values)
+    Value::list(values)
 }
 
 fn binary_list(number: Pattern, bits: Pattern) -> Pattern {

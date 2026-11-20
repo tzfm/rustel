@@ -151,7 +151,7 @@ fn apply_modulator_value(
     }
     modulator.insert(id_key, Value::Object(entry));
     controls.insert(kind.into(), Value::Object(modulator));
-    Value::List(vec![Value::Object(controls), id])
+    Value::list(vec![Value::Object(controls), id])
 }
 
 fn install_modulator<'js>(
@@ -180,7 +180,7 @@ fn install_modulator<'js>(
     }
     let default = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mut output = receiver
-        .fmap(|value| Value::List(vec![value.clone()]))
+        .fmap(|value| Value::list(vec![value.clone()]))
         .app_left_with(id, append_pattern_value);
     for (raw_key, value) in entries {
         let key = modulator_subcontrol(kind, &raw_key);

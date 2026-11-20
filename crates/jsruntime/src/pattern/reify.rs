@@ -70,7 +70,7 @@ pub(crate) fn reify_xen_array<'js>(
         values.push(array.get::<rquickjs::Value>(index)?);
     }
     if values.iter().all(rquickjs::Value::is_number) {
-        let ratios = Value::List(values.iter().map(from_js).collect());
+        let ratios = Value::list(values.iter().map(from_js).collect());
         return Ok((rustel_core::xen::xen(receiver, ratios), Vec::new()));
     }
     let mut patterns = reserve_js_array(ctx, len)?;

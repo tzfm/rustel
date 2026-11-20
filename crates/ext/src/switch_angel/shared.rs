@@ -136,7 +136,7 @@ pub(super) fn apply_distortion(
     apply_control(
         pattern,
         "distort",
-        rustel_core::pure(Value::List(vec![
+        rustel_core::pure(Value::list(vec![
             amount,
             shape,
             Value::Str(algorithm.into()),
@@ -157,7 +157,7 @@ pub(super) fn value_as_pattern(value: &Value) -> Pattern {
 
 pub(super) fn pure_list(pattern: &Pattern) -> Option<Vec<Value>> {
     match pattern.as_pure()? {
-        Value::List(values) => Some(values),
+        Value::List(values) => Some(*values),
         _ => None,
     }
 }

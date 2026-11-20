@@ -2884,7 +2884,7 @@ pub(crate) mod tests {
     pub(super) fn default_voicing_value() -> Value {
         let mut controls = rustel_core::OrderedMap::new();
         controls.insert("chord".into(), Value::Str("C7".into()));
-        Value::List(
+        Value::list(
             rustel_core::voicings::render_voicing(&controls).expect("configured C7 voicing"),
         )
     }

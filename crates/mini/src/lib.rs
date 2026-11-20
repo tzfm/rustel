@@ -2226,7 +2226,7 @@ fn compile(ast: &Ast) -> Built {
             if let Some(values) = tail_atom_chain(pat, element)
                 && let Some(loc) = current_leaf_span(span)
             {
-                return Built::Rhythm(Rhythm::atom(Value::List(values), Some(loc)));
+                return Built::Rhythm(Rhythm::atom(Value::list(values), Some(loc)));
             }
             Built::Graph(build_validated(pat).app_left_with(
                 build_validated(element),
@@ -2236,7 +2236,7 @@ fn compile(ast: &Ast) -> Built {
                         values.push(right.clone());
                         Value::List(values)
                     }
-                    value => Value::List(vec![value.clone(), right.clone()]),
+                    value => Value::list(vec![value.clone(), right.clone()]),
                 },
             ))
         }
@@ -3611,7 +3611,7 @@ mod tests {
         }
         assert_eq!(
             haps[0].value,
-            rustel_core::Value::List(vec![
+            rustel_core::Value::list(vec![
                 rustel_core::Value::Str("bd".into()),
                 rustel_core::Value::F64(3.0)
             ])
@@ -3625,7 +3625,7 @@ mod tests {
         assert_eq!(end - begin, "a:b:c".len());
         assert_eq!(
             haps[0].value,
-            rustel_core::Value::List(vec![
+            rustel_core::Value::list(vec![
                 rustel_core::Value::Str("a".into()),
                 rustel_core::Value::Str("b".into()),
                 rustel_core::Value::Str("c".into())

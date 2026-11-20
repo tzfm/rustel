@@ -443,7 +443,7 @@ fn patternified_pick_lookup_source_charges_before_materialising_carriers() {
             entries: vec![(0, pure(Value::Str("x".into())))],
         };
         let carrier =
-            rustel_core::pure_pick_lookup(Value::List(vec![Value::Str("x".into())]), lookup);
+            rustel_core::pure_pick_lookup(Value::list(vec![Value::Str("x".into())]), lookup);
         rustel_core::pick_patternified(
             pure(Value::F64(0.0)),
             carrier,

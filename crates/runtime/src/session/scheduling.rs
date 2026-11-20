@@ -2565,7 +2565,7 @@ mod tests {
             session.set_direct_diagnostic_logging(false);
             let effect = Value::object(vec![("name".into(), Value::Str("delay".into()))]);
             let with_plugin = || {
-                let effects = Value::List(vec![effect.clone()]);
+                let effects = Value::list(vec![effect.clone()]);
                 sound_controls("sine", vec![("vst".into(), effects)])
             };
             let plugin_lines = |session: &mut Session, now: f64| -> Vec<String> {

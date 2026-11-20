@@ -246,7 +246,7 @@ pub(crate) fn named_value(names: &[Arc<str>], mut value: Value) -> Value {
         && let Value::List(values) = value
     {
         let result = bag.get_or_insert_with(OrderedMap::new);
-        for (name, value) in names.iter().zip(values) {
+        for (name, value) in names.iter().zip(*values) {
             result.insert_key(Key::from(Arc::clone(name)), value);
         }
         return Value::Object(result.clone());
@@ -712,7 +712,7 @@ mod tests {
     fn compound_control_ignores_extra_values() {
         let sound = ControlSpec::new(["s", "n", "gain"]);
         assert_eq!(
-            sound.with_value(Value::List(vec![
+            sound.with_value(Value::list(vec![
                 Value::Str("bd".into()),
                 Value::F64(2.0),
                 Value::F64(0.5),
@@ -748,7 +748,7 @@ mod tests {
     fn an_object_argument_is_named_like_any_other_value() {
         let dict = ControlSpec::new(["dict"]);
         let dictionary =
-            Value::object([("".into(), Value::List(vec![Value::Str("0 7 12 16".into())]))]);
+            Value::object([("".into(), Value::list(vec![Value::Str("0 7 12 16".into())]))]);
         assert_eq!(
             dict.with_value(dictionary.clone()),
             Value::object([("dict".into(), dictionary)])

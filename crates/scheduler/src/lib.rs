@@ -192,7 +192,7 @@ fn trace_edo_scale(value: &Value) -> Option<TraceEdoScale> {
         return None;
     }
     let mut degree_indexes = Vec::with_capacity(indexes.len());
-    for index in indexes {
+    for index in indexes.iter() {
         let Value::F64(index) = index else {
             return None;
         };
