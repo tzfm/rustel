@@ -2948,6 +2948,27 @@ pub(crate) trait LayerDeduper {
 }
 
 impl Layer {
+    #[inline]
+    pub(crate) fn for_each_unpooled_builtin(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn crate::value::BuiltinEntries>),
+    ) {
+        if let Some(dress) = &self.dress
+            && let Some(entries) = &dress.set_map
+            && matches!(entries.as_slice(), crate::value::Slice::Builtin(k, _) if k.len() >= 2)
+        {
+            f(entries);
+        }
+        for val in self.values.iter() {
+            if let Value::Object(map) = val
+                && let Some(entries) = map.as_builtin()
+                && matches!(entries.as_slice(), crate::value::Slice::Builtin(k, _) if k.len() >= 2)
+            {
+                f(entries);
+            }
+        }
+    }
+
     /// Whether this layer holds no `OnceLock` cache or `StepSource` so it can
     /// be structurally deduplicated by canonical child pointers.
     #[inline]

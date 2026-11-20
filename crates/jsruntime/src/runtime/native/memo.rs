@@ -683,8 +683,9 @@ impl<'p> Reuse<'p> {
     }
 
     /// The memo of this build: the parts it took and the parts it made, and
-    /// each name of the program.
-    pub(super) fn finish(mut self, cps: Option<f64>) -> Memo {
+    /// each name of the program, together with the already-canonical node
+    /// references reused from the prior build.
+    pub(super) fn finish(mut self, cps: Option<f64>) -> (Memo, Vec<PatternNodeRef>) {
         let now = mem::take(&mut self.now);
         let taken = mem::take(&mut self.taken);
         let before_slots = mem::take(&mut self.before.part_slots);
@@ -753,18 +754,21 @@ impl<'p> Reuse<'p> {
             _ => Arc::from(self.source),
         };
         if entries.is_empty() {
-            return Memo {
-                source: Some(source),
-                parts: Box::new([]),
-                part_meta: Box::new([]),
-                shared_extras: None,
-                part_slots: Box::new([]),
-                names: Box::new([]),
-                reads: Box::new([]),
-                by_text: Box::new([]),
-                next: self.next,
-                cps,
-            };
+            return (
+                Memo {
+                    source: Some(source),
+                    parts: Box::new([]),
+                    part_meta: Box::new([]),
+                    shared_extras: None,
+                    part_slots: Box::new([]),
+                    names: Box::new([]),
+                    reads: Box::new([]),
+                    by_text: Box::new([]),
+                    next: self.next,
+                    cps,
+                },
+                Vec::new(),
+            );
         }
         let before_reads = mem::take(&mut self.before.reads);
         let made_reads = mem::take(&mut self.made_reads);
@@ -814,11 +818,13 @@ impl<'p> Reuse<'p> {
             Vec::new()
         };
         let mut part_meta: Vec<(u16, PatternHandleMeta)> = Vec::new();
+        let mut reused_nodes: Vec<PatternNodeRef> = Vec::new();
         let parts: Box<[Part]> = entries
             .into_iter()
             .enumerate()
             .map(|(idx, (mut entry, from_before))| {
                 let next_read = if from_before {
+                    reused_nodes.push(entry.part.node.clone());
                     push_renumbered(&mut reads, entry.part.read())
                 } else {
                     push_made(&mut reads, entry.part.read())
@@ -891,18 +897,21 @@ impl<'p> Reuse<'p> {
         let has_shared = parts
             .iter()
             .any(|p| p.meta_kind == rustel_core::COMPACT_META_SHARED_EXTRAS);
-        Memo {
-            source: Some(source),
-            parts,
-            part_meta: part_meta.into_boxed_slice(),
-            shared_extras: if has_shared { self.shared_extras } else { None },
-            part_slots: part_slots.into_boxed_slice(),
-            names: names.into_boxed_slice(),
-            reads: reads.into_boxed_slice(),
-            by_text: by_text.into_boxed_slice(),
-            next: self.next,
-            cps,
-        }
+        (
+            Memo {
+                source: Some(source),
+                parts,
+                part_meta: part_meta.into_boxed_slice(),
+                shared_extras: if has_shared { self.shared_extras } else { None },
+                part_slots: part_slots.into_boxed_slice(),
+                names: names.into_boxed_slice(),
+                reads: reads.into_boxed_slice(),
+                by_text: by_text.into_boxed_slice(),
+                next: self.next,
+                cps,
+            },
+            reused_nodes,
+        )
     }
 }
 

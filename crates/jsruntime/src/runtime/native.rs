@@ -277,10 +277,14 @@ impl JsRuntime {
         match built {
             Ok((mut score, reuse)) => {
                 if let Some(reuse) = reuse {
-                    let mut memo = reuse.finish(score.cps);
-                    rustel_core::intern::dedup_score(&mut score.pattern, |remap| {
-                        memo.remap_nodes(remap);
-                    });
+                    let (mut memo, reused_nodes) = reuse.finish(score.cps);
+                    rustel_core::intern::dedup_score_with_reused(
+                        &mut score.pattern,
+                        &reused_nodes,
+                        |remap| {
+                            memo.remap_nodes(remap);
+                        },
+                    );
                     self.native_memo.replace(memo);
                 } else {
                     rustel_core::intern::dedup_score(&mut score.pattern, |_| {});

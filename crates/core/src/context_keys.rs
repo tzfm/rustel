@@ -15,8 +15,50 @@ later version.
 //! that a clone copies. A change copies them first.
 
 use crate::{PickLookup, Value};
+use std::cell::RefCell;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
+
+type MergeSlot = (Arc<Keys>, Arc<Keys>, Arc<Keys>);
+
+struct MergeCache {
+    active: bool,
+    next: usize,
+    slots: [Option<MergeSlot>; 4],
+}
+
+impl MergeCache {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            next: 0,
+            slots: [None, None, None, None],
+        }
+    }
+}
+
+thread_local! {
+    /// Per-query 4-slot cache for `ContextKeys::merge`, cleared when the
+    /// outermost query exits so zero bytes stay held between queries.
+    static MERGE_CACHE: RefCell<MergeCache> = const { RefCell::new(MergeCache::new()) };
+}
+
+#[inline]
+pub(crate) fn begin_query_merge_cache() {
+    let _ = MERGE_CACHE.try_with(|cache| {
+        cache.borrow_mut().active = true;
+    });
+}
+
+#[inline]
+pub(crate) fn end_query_merge_cache() {
+    let _ = MERGE_CACHE.try_with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.active = false;
+        cache.next = 0;
+        cache.slots = [None, None, None, None];
+    });
+}
 
 static UI_VISUAL_MASK_CACHE: [OnceLock<Arc<Keys>>; 64] = [const { OnceLock::new() }; 64];
 static UI_VISUAL_SINGLE_CACHE: [OnceLock<Arc<Keys>>; 64] = [const { OnceLock::new() }; 64];
@@ -213,7 +255,8 @@ impl ContextKeys {
         &mut self,
         slot: u8,
         once: &std::sync::OnceLock<Box<(Arc<Keys>, Arc<Keys>)>>,
-        local: &mut Option<(Arc<Keys>, Arc<Keys>)>,
+        local: &mut [Option<(Arc<Keys>, Arc<Keys>)>; 2],
+        local_next: &mut u8,
     ) {
         if slot >= 64 {
             return;
@@ -241,17 +284,19 @@ impl ContextKeys {
                         self.0 = Some(Arc::clone(&pair.1));
                         return;
                     }
-                    if let Some((cached_in, cached_out)) = local
-                        && Arc::ptr_eq(arc, cached_in)
-                    {
-                        self.0 = Some(Arc::clone(cached_out));
-                        return;
+                    for entry in local.iter().flatten() {
+                        if Arc::ptr_eq(arc, &entry.0) {
+                            self.0 = Some(Arc::clone(&entry.1));
+                            return;
+                        }
                     }
                     let input = Arc::clone(arc);
                     let mut next = (**arc).clone();
                     next.ui_visuals |= bit;
                     let output = Arc::new(next);
-                    *local = Some((input, Arc::clone(&output)));
+                    let idx = usize::from(*local_next & 1);
+                    local[idx] = Some((input, Arc::clone(&output)));
+                    *local_next = local_next.wrapping_add(1);
                     self.0 = Some(output);
                     return;
                 }
@@ -333,7 +378,36 @@ impl ContextKeys {
                 if a.covers_context_and_visuals(b) {
                     return first.clone();
                 }
-                Self(Some(Arc::new(Keys {
+                if a.is_ui_visuals_only()
+                    && b.is_ui_visuals_only()
+                    && let Some(cached) = cached_ui_visual_mask(a.ui_visuals | b.ui_visuals)
+                {
+                    return Self(Some(cached));
+                }
+                if a.is_ui_visuals_only()
+                    && b.live_controls == [0; 4]
+                    && b.slider_binding == 0
+                    && b.pick_lookup.is_none()
+                    && (b.ui_visuals & a.ui_visuals == a.ui_visuals)
+                {
+                    return second.clone();
+                }
+                let cached = MERGE_CACHE
+                    .try_with(|cache| {
+                        let cache = cache.borrow();
+                        if !cache.active {
+                            return None;
+                        }
+                        cache.slots.iter().flatten().find_map(|(ca, cb, cout)| {
+                            (Arc::ptr_eq(ca, a) && Arc::ptr_eq(cb, b)).then(|| Arc::clone(cout))
+                        })
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(hit) = cached {
+                    return Self(Some(hit));
+                }
+                let out = Arc::new(Keys {
                     scale: a.scale.clone().or_else(|| b.scale.clone()),
                     edo_size: a.edo_size.or(b.edo_size),
                     scale_definition: a
@@ -346,7 +420,16 @@ impl ContextKeys {
                     slider_binding: a.slider_binding,
                     ui_visuals: a.ui_visuals | b.ui_visuals,
                     pick_lookup: a.pick_lookup.clone(),
-                })))
+                });
+                let _ = MERGE_CACHE.try_with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    if cache.active {
+                        let slot = cache.next;
+                        cache.slots[slot] = Some((Arc::clone(a), Arc::clone(b), Arc::clone(&out)));
+                        cache.next = (slot + 1) & 3;
+                    }
+                });
+                Self(Some(out))
             }
         }
     }
@@ -370,15 +453,13 @@ impl ContextKeys {
             return Self::NONE;
         }
         let a = first.get();
-        let b = second.get();
-        if first.0.is_some()
-            && a.covers_context_and_visuals(b)
-            && a.live_controls == live_controls
+        if a.live_controls == live_controls
             && a.slider_binding == slider_binding
             && same_pick_lookup(&a.pick_lookup, &pick_lookup)
         {
-            return first.clone();
+            return Self::merge(first, second);
         }
+        let b = second.get();
         if first.0.is_none()
             && second.0.is_some()
             && b.live_controls == live_controls

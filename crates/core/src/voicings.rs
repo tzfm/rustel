@@ -250,15 +250,19 @@ pub fn sync_host_default_json(name: &str, json: Option<&str>) -> Result<(), Stri
 const FLATS: [&str; 12] = [
     "C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B",
 ];
-const PCS: [&str; 12] = [
-    "c", "db", "d", "eb", "e", "f", "gb", "g", "ab", "a", "bb", "b",
-];
-
 /// `pc2chroma` - pitch-class index plus accidentals; raw (may leave 0..11).
 fn pc2chroma(pc: &str) -> Option<i64> {
     let mut chars = pc.chars();
-    let letter = chars.next()?.to_ascii_lowercase().to_string();
-    let index = PCS.iter().position(|entry| **entry == *letter)? as i64;
+    let index = match chars.next()?.to_ascii_lowercase() {
+        'c' => 0,
+        'd' => 2,
+        'e' => 4,
+        'f' => 5,
+        'g' => 7,
+        'a' => 9,
+        'b' => 11,
+        _ => return None,
+    };
     let mut offset = 0i64;
     for accidental in chars {
         match accidental {

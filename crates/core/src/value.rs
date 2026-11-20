@@ -546,11 +546,21 @@ impl PatchedBase {
 #[derive(Clone)]
 pub(crate) struct Patched {
     base: PatchedBase,
+    /// Optional built-in map overlaid alongside `base` without materialising
+    /// a flat `BuiltinMap`. Keys that overlap `base` (or prior inline appends)
+    /// live in `entries` and are masked out in `overlay_skip`.
+    overlay: Option<Arc<dyn BuiltinEntries>>,
+    overlay_skip: u32,
     base_len: u16,
+    overlay_len: u16,
     len: u8,
     appended: u8,
     has_replace: bool,
     made: bool,
+    /// When `true`, `overlay` entries appear after `appended` entries
+    /// (`[base, appended, overlay]`) to preserve insertion order when attaching
+    /// a constant overlay onto an already-appended `Patched`.
+    overlay_after_appended: bool,
     marks: u64,
     entries: [Option<(Key, Value, u16)>; MAX_PATCHES],
 }
@@ -561,14 +571,188 @@ impl Patched {
         let marks = base.marks();
         Some(Self {
             base,
+            overlay: None,
+            overlay_skip: 0,
             base_len,
+            overlay_len: 0,
             len: 0,
             appended: 0,
             has_replace: false,
             made,
+            overlay_after_appended: false,
             marks,
             entries: [const { None }; MAX_PATCHES],
         })
+    }
+
+    #[inline(always)]
+    fn overlay_raw_index(&self, visible_idx: usize) -> usize {
+        if self.overlay_skip == 0 {
+            return visible_idx;
+        }
+        let mut rem = visible_idx;
+        let mut mask = !self.overlay_skip;
+        loop {
+            let pos = mask.trailing_zeros() as usize;
+            if rem == 0 {
+                return pos;
+            }
+            mask &= mask - 1;
+            rem -= 1;
+        }
+    }
+
+    #[inline(always)]
+    fn overlay_visible_index(&self, raw_pos: usize) -> Option<usize> {
+        if self.overlay_skip == 0 {
+            return Some(raw_pos);
+        }
+        if (self.overlay_skip >> raw_pos) & 1 != 0 {
+            return None;
+        }
+        let skipped_before = (self.overlay_skip & ((1u32 << raw_pos) - 1)).count_ones() as usize;
+        Some(raw_pos - skipped_before)
+    }
+
+    /// Build a zero-copy overlay over `base`, routing any keys that overlap
+    /// `base` into inline replacement slots so flat `BuiltinMap` materialisation
+    /// is avoided even when a large constant chain overrides a few base keys.
+    fn with_overlay(
+        base: PatchedBase,
+        row: u32,
+        overlay: Arc<dyn BuiltinEntries>,
+        made: bool,
+    ) -> Option<Self> {
+        let base_len = u16::try_from(base.len(row)).ok()?;
+        let ov_slice = overlay.as_slice();
+        let raw_len = ov_slice.len();
+        if raw_len > 32 {
+            return None;
+        }
+        let base_marks = base.marks();
+        let ov_marks = ov_slice.marks();
+        let mut entries = [const { None }; MAX_PATCHES];
+        let mut len = 0u8;
+        let mut has_replace = false;
+        let mut overlay_skip = 0u32;
+        if base_marks & ov_marks != 0 {
+            let base_layout = base.layout(row);
+            for ov_pos in 0..raw_len {
+                let (ov_key, ov_val) = ov_slice.at(ov_pos);
+                if base_marks & Table::mark(ov_key.as_str()) != 0
+                    && let Some(base_idx) = base_layout.position(ov_key)
+                {
+                    if usize::from(len) >= MAX_PATCHES {
+                        return None;
+                    }
+                    entries[usize::from(len)] =
+                        Some((ov_key.clone(), ov_val.clone(), base_idx as u16));
+                    len += 1;
+                    has_replace = true;
+                    overlay_skip |= 1u32 << ov_pos;
+                }
+            }
+        }
+        let overlay_len = u16::try_from(raw_len - overlay_skip.count_ones() as usize).ok()?;
+        Some(Self {
+            base,
+            overlay: Some(overlay),
+            overlay_skip,
+            base_len,
+            overlay_len,
+            len,
+            appended: 0,
+            has_replace,
+            made,
+            overlay_after_appended: false,
+            marks: base_marks | ov_marks,
+            entries,
+        })
+    }
+
+    /// Attach a built-in overlay onto an existing `Patched` that does not yet
+    /// carry an overlay. Returns `false` leaving `self` untouched when base
+    /// overlaps would exceed `MAX_PATCHES`.
+    fn attach_overlay(&mut self, row: u32, overlay: Arc<dyn BuiltinEntries>, made: bool) -> bool {
+        if self.overlay.is_some() {
+            return false;
+        }
+        let ov_slice = overlay.as_slice();
+        let raw_len = ov_slice.len();
+        if raw_len > 32 {
+            return false;
+        }
+        let ov_marks = ov_slice.marks();
+        let base_marks = self.base.marks();
+        let cur_len = usize::from(self.len);
+        // Pre-scan overlaps to verify slot budget before mutating `self`.
+        let mut needed = 0usize;
+        if self.marks & ov_marks != 0 {
+            let base_layout = self.base.layout(row);
+            for ov_pos in 0..raw_len {
+                let (ov_key, _) = ov_slice.at(ov_pos);
+                if self.marks & Table::mark(ov_key.as_str()) == 0 {
+                    continue;
+                }
+                if self.has_patch_for(ov_key) {
+                    continue;
+                }
+                if base_marks & Table::mark(ov_key.as_str()) != 0
+                    && base_layout.position(ov_key).is_some()
+                {
+                    needed += 1;
+                }
+            }
+            if cur_len + needed > MAX_PATCHES {
+                return false;
+            }
+        }
+        let mut overlay_skip = 0u32;
+        if self.marks & ov_marks != 0 {
+            let base_layout = self.base.layout(row);
+            for ov_pos in 0..raw_len {
+                let (ov_key, ov_val) = ov_slice.at(ov_pos);
+                if self.marks & Table::mark(ov_key.as_str()) == 0 {
+                    continue;
+                }
+                let mut updated = false;
+                for slot in &mut self.entries[..usize::from(self.len)] {
+                    if let Some((k, v, _)) = slot
+                        && k == ov_key
+                    {
+                        *v = ov_val.clone();
+                        overlay_skip |= 1u32 << ov_pos;
+                        updated = true;
+                        break;
+                    }
+                }
+                if updated {
+                    continue;
+                }
+                if base_marks & Table::mark(ov_key.as_str()) != 0
+                    && let Some(base_idx) = base_layout.position(ov_key)
+                {
+                    let idx = usize::from(self.len);
+                    self.entries[idx] = Some((ov_key.clone(), ov_val.clone(), base_idx as u16));
+                    self.len += 1;
+                    self.has_replace = true;
+                    overlay_skip |= 1u32 << ov_pos;
+                }
+            }
+        }
+        let visible = raw_len - overlay_skip.count_ones() as usize;
+        let Ok(overlay_len) = u16::try_from(visible) else {
+            return false;
+        };
+        self.overlay = Some(overlay);
+        self.overlay_skip = overlay_skip;
+        self.overlay_len = overlay_len;
+        self.overlay_after_appended = self.appended > 0;
+        self.marks |= ov_marks;
+        if !made {
+            self.made = false;
+        }
+        true
     }
 
     fn of_one(
@@ -591,11 +775,15 @@ impl Patched {
         entries[0] = Some((key, value, rep));
         Some(Self {
             base,
+            overlay: None,
+            overlay_skip: 0,
             base_len,
+            overlay_len: 0,
             len: 1,
             appended,
             has_replace,
             made,
+            overlay_after_appended: false,
             marks,
             entries,
         })
@@ -603,33 +791,70 @@ impl Patched {
 
     #[inline(always)]
     fn len(&self) -> usize {
-        usize::from(self.base_len) + usize::from(self.appended)
+        usize::from(self.base_len) + usize::from(self.overlay_len) + usize::from(self.appended)
     }
 
     #[inline(always)]
     fn at(&self, row: u32, index: usize) -> (&Key, &Value) {
         let base_len = usize::from(self.base_len);
-        if index < base_len {
-            if self.has_replace {
-                for slot in &self.entries[..usize::from(self.len)] {
-                    if let Some((k, v, rep)) = slot
-                        && usize::from(*rep) == index
-                    {
-                        return (k, v);
-                    }
-                }
-            }
-            return self.base.at(row, index);
-        }
-        let mut want = index - base_len;
-        for slot in &self.entries[..usize::from(self.len)] {
-            if let Some((k, v, rep)) = slot
-                && *rep == u16::MAX
-            {
-                if want == 0 {
+        let overlay_len = usize::from(self.overlay_len);
+        let appended = usize::from(self.appended);
+        if self.has_replace {
+            for slot in &self.entries[..usize::from(self.len)] {
+                if let Some((k, v, rep)) = slot
+                    && usize::from(*rep) == index
+                {
                     return (k, v);
                 }
-                want -= 1;
+            }
+        }
+        if index < base_len {
+            return self.base.at(row, index);
+        }
+        if !self.overlay_after_appended {
+            let fixed_len = base_len + overlay_len;
+            if index < fixed_len {
+                let raw = self.overlay_raw_index(index - base_len);
+                return self
+                    .overlay
+                    .as_deref()
+                    .expect("overlay_len > 0 implies overlay")
+                    .as_slice()
+                    .at(raw);
+            }
+            let mut want = index - fixed_len;
+            for slot in &self.entries[..usize::from(self.len)] {
+                if let Some((k, v, rep)) = slot
+                    && *rep == u16::MAX
+                {
+                    if want == 0 {
+                        return (k, v);
+                    }
+                    want -= 1;
+                }
+            }
+        } else {
+            let app_end = base_len + appended;
+            if index < app_end {
+                let mut want = index - base_len;
+                for slot in &self.entries[..usize::from(self.len)] {
+                    if let Some((k, v, rep)) = slot
+                        && *rep == u16::MAX
+                    {
+                        if want == 0 {
+                            return (k, v);
+                        }
+                        want -= 1;
+                    }
+                }
+            } else {
+                let raw = self.overlay_raw_index(index - app_end);
+                return self
+                    .overlay
+                    .as_deref()
+                    .expect("overlay_len > 0 implies overlay")
+                    .as_slice()
+                    .at(raw);
             }
         }
         unreachable!("overlay index out of bounds")
@@ -649,6 +874,11 @@ impl Patched {
             {
                 return Some(v);
             }
+        }
+        if let Some(overlay) = &self.overlay
+            && let Some(val) = overlay.as_slice().get_str(key.name())
+        {
+            return Some(val);
         }
         match &self.base {
             PatchedBase::Table(table) => {
@@ -671,11 +901,17 @@ impl Patched {
         if self.marks & Table::mark(key.name()) == 0 {
             return None;
         }
+        let base_len = usize::from(self.base_len);
+        let app_base = if self.overlay_after_appended {
+            base_len
+        } else {
+            base_len + usize::from(self.overlay_len)
+        };
         let mut append_pos = 0usize;
         for (k, _, rep) in self.entries[..usize::from(self.len)].iter().flatten() {
             if k == key {
                 return Some(if *rep == u16::MAX {
-                    usize::from(self.base_len) + append_pos
+                    app_base + append_pos
                 } else {
                     usize::from(*rep)
                 });
@@ -683,6 +919,17 @@ impl Patched {
             if *rep == u16::MAX {
                 append_pos += 1;
             }
+        }
+        if let Some(overlay) = &self.overlay
+            && let Some(raw_pos) = overlay.as_slice().position_str(key.name())
+            && let Some(vis) = self.overlay_visible_index(raw_pos)
+        {
+            let ov_base = if self.overlay_after_appended {
+                base_len + usize::from(self.appended)
+            } else {
+                base_len
+            };
+            return Some(ov_base + vis);
         }
         match &self.base {
             PatchedBase::Table(table) => {
@@ -695,6 +942,26 @@ impl Patched {
                 layers[usize::from(*layer_idx)].seq_position(row, key.name())
             }
         }
+    }
+
+    fn find_fixed_position(&self, row: u32, key: &Key, mark: u64) -> u16 {
+        if self.base.marks() & mark != 0
+            && let Some(idx) = self.base.layout(row).position(key)
+        {
+            return idx as u16;
+        }
+        if let Some(overlay) = &self.overlay
+            && let Some(raw_pos) = overlay.as_slice().position_str(key.as_str())
+            && let Some(vis) = self.overlay_visible_index(raw_pos)
+        {
+            let ov_base = if self.overlay_after_appended {
+                self.base_len + u16::from(self.appended)
+            } else {
+                self.base_len
+            };
+            return ov_base + vis as u16;
+        }
+        u16::MAX
     }
 
     fn try_set(&mut self, row: u32, key: &Key, value: Value, data_only: bool) -> Result<(), Value> {
@@ -714,14 +981,10 @@ impl Patched {
             return Err(value);
         }
         let mark = Table::mark(key.as_str());
-        let replace = if self.base.marks() & mark == 0 {
-            u16::MAX
-        } else {
-            match self.base.layout(row).position(key) {
-                Some(idx) => idx as u16,
-                None => u16::MAX,
-            }
-        };
+        let replace = self.find_fixed_position(row, key, mark);
+        if replace == u16::MAX && self.overlay_after_appended {
+            return Err(value);
+        }
         self.entries[len] = Some((key.clone(), value, replace));
         self.len += 1;
         if replace == u16::MAX {
@@ -757,14 +1020,27 @@ impl Patched {
             return false;
         }
         let mark = Table::mark(key.as_str());
-        let (value, replace) = if self.base.marks() & mark == 0 {
-            (other.clone(), u16::MAX)
+        let (value, replace) = if self.base.marks() & mark != 0
+            && let layout = self.base.layout(row)
+            && let Some(idx) = layout.position(key)
+        {
+            (change(layout.at(idx).1, other), idx as u16)
+        } else if let Some(overlay) = &self.overlay
+            && let ov = overlay.as_slice()
+            && let Some(raw_pos) = ov.position_str(key.as_str())
+            && let Some(vis) = self.overlay_visible_index(raw_pos)
+        {
+            let ov_base = if self.overlay_after_appended {
+                self.base_len + u16::from(self.appended)
+            } else {
+                self.base_len
+            };
+            (change(ov.at(raw_pos).1, other), ov_base + vis as u16)
         } else {
-            let layout = self.base.layout(row);
-            match layout.position(key) {
-                Some(idx) => (change(layout.at(idx).1, other), idx as u16),
-                None => (other.clone(), u16::MAX),
+            if self.overlay_after_appended {
+                return false;
             }
+            (other.clone(), u16::MAX)
         };
         self.entries[len] = Some((key.clone(), value, replace));
         self.len += 1;
@@ -783,21 +1059,66 @@ impl Patched {
             .iter()
             .any(|slot| slot.as_ref().is_some_and(|(k, _, _)| k == key))
     }
+
+    #[inline]
+    fn can_accept_key(&self, row: u32, key: &Key) -> bool {
+        !self.overlay_after_appended
+            || self.has_patch_for(key)
+            || self.find_fixed_position(row, key, Table::mark(key.as_str())) != u16::MAX
+    }
 }
 
-/// Reusable per-timestamp or per-run overlay cache for chord haps sharing one
-/// uniform-key [`Table`] or [`Patched`] overlay.
+/// Reusable per-timestamp or per-run overlay cache for chord/stacked haps
+/// sharing uniform-key [`Table`], `SeqLayer`, or [`Patched`] overlays.
 #[derive(Default)]
 pub(crate) struct SharedWaveCache {
-    dressed: Option<Arc<Patched>>,
-    patched: Option<(Arc<Patched>, Arc<Patched>)>,
+    dressed: [Option<Arc<Patched>>; 4],
+    dressed_next: u8,
+    patched: [Option<(Arc<Patched>, Arc<Patched>)>; 2],
+    patched_next: u8,
 }
 
 impl SharedWaveCache {
     #[inline]
-    pub(crate) fn clear(&mut self) {
-        self.dressed = None;
-        self.patched = None;
+    fn get_table(&self, table: &Arc<Table>) -> Option<&Arc<Patched>> {
+        self.dressed
+            .iter()
+            .flatten()
+            .find(|c| c.base.matches_table(table))
+    }
+
+    #[inline]
+    fn get_seq_layer(
+        &self,
+        layers: &Arc<[crate::sequence::Layer]>,
+        layer_idx: u16,
+    ) -> Option<&Arc<Patched>> {
+        self.dressed
+            .iter()
+            .flatten()
+            .find(|c| c.base.matches_seq_layer(layers, layer_idx))
+    }
+
+    #[inline]
+    fn put_dressed(&mut self, arc: Arc<Patched>) {
+        let slot = usize::from(self.dressed_next) & 3;
+        self.dressed[slot] = Some(arc);
+        self.dressed_next = self.dressed_next.wrapping_add(1);
+    }
+
+    #[inline]
+    fn get_patched(&self, prev: &Arc<Patched>) -> Option<&Arc<Patched>> {
+        self.patched
+            .iter()
+            .flatten()
+            .find_map(|(k, v)| Arc::ptr_eq(k, prev).then_some(v))
+    }
+
+    #[inline]
+    fn put_patched(&mut self, prev: Arc<Patched>, out: Arc<Patched>) {
+        let slot = usize::from(self.patched_next) & 1;
+        self.patched[slot] = Some((prev, out));
+        self.patched_next = self.patched_next.wrapping_add(1);
     }
 }
 
@@ -2191,7 +2512,10 @@ impl OrderedMap {
                     let row = *row;
                     if let Some(own) = Arc::get_mut(patched) {
                         let extra = other.pairs().filter(|(k, _)| !own.has_patch_for(k)).count();
-                        if usize::from(own.len) + extra <= MAX_PATCHES {
+                        if usize::from(own.len) + extra <= MAX_PATCHES
+                            && (!own.overlay_after_appended
+                                || other.pairs().all(|(k, _)| own.can_accept_key(row, k)))
+                        {
                             for (key, value) in other.pairs() {
                                 let ok = own.try_merge_one(row, key, value, &mut change);
                                 debug_assert!(ok);
@@ -2515,9 +2839,7 @@ impl OrderedMap {
             match &mut self.entries {
                 Entries::Dressed(table, row) if table.has_uniform_keys() => {
                     let row = *row;
-                    if let Some(cached) = &cache.dressed
-                        && cached.base.matches_table(table)
-                    {
+                    if let Some(cached) = cache.get_table(table) {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
                     }
@@ -2528,7 +2850,7 @@ impl OrderedMap {
                             let _ = patched.try_set(row, key, Value::F64(*num), true);
                         }
                         let arc = Arc::new(patched);
-                        cache.dressed = Some(Arc::clone(&arc));
+                        cache.put_dressed(Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, row);
                         return;
                     }
@@ -2538,9 +2860,7 @@ impl OrderedMap {
                 {
                     let row = *row;
                     let layer_idx = *layer_idx;
-                    if let Some(cached) = &cache.dressed
-                        && cached.base.matches_seq_layer(layers, layer_idx)
-                    {
+                    if let Some(cached) = cache.get_seq_layer(layers, layer_idx) {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
                     }
@@ -2553,7 +2873,7 @@ impl OrderedMap {
                             let _ = patched.try_set(row, key, Value::F64(*num), true);
                         }
                         let arc = Arc::new(patched);
-                        cache.dressed = Some(Arc::clone(&arc));
+                        cache.put_dressed(Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, row);
                         return;
                     }
@@ -2562,9 +2882,7 @@ impl OrderedMap {
                     if prev.base.has_uniform_keys() && Arc::strong_count(prev) > 1 =>
                 {
                     let row = *row;
-                    if let Some((cached_prev, cached_out)) = &cache.patched
-                        && Arc::ptr_eq(cached_prev, prev)
-                    {
+                    if let Some(cached_out) = cache.get_patched(prev) {
                         self.entries = Entries::Patched(Arc::clone(cached_out), row);
                         return;
                     }
@@ -2576,14 +2894,18 @@ impl OrderedMap {
                             extra += 1;
                         }
                     }
-                    if usize::from(prev.len) + extra <= MAX_PATCHES {
+                    if usize::from(prev.len) + extra <= MAX_PATCHES
+                        && (!prev.overlay_after_appended
+                            || patches.iter().all(|(k, _)| prev.can_accept_key(row, k)))
+                    {
                         let mut next = (**prev).clone();
                         for (key, num) in patches {
-                            let _ = next.try_set(row, key, Value::F64(*num), true);
+                            let ok = next.try_set(row, key, Value::F64(*num), true).is_ok();
+                            debug_assert!(ok);
                         }
                         next.made = true;
                         let arc = Arc::new(next);
-                        cache.patched = Some((Arc::clone(prev), Arc::clone(&arc)));
+                        cache.put_patched(Arc::clone(prev), Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, row);
                         return;
                     }
@@ -2610,9 +2932,7 @@ impl OrderedMap {
             match &mut self.entries {
                 Entries::Dressed(table, row) if table.has_uniform_keys() => {
                     let row = *row;
-                    if let Some(cached) = &cache.dressed
-                        && cached.base.matches_table(table)
-                    {
+                    if let Some(cached) = cache.get_table(table) {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
                     }
@@ -2621,7 +2941,7 @@ impl OrderedMap {
                         && patched.try_set(row, key, value.clone(), true).is_ok()
                     {
                         let arc = Arc::new(patched);
-                        cache.dressed = Some(Arc::clone(&arc));
+                        cache.put_dressed(Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, row);
                         return;
                     }
@@ -2631,9 +2951,7 @@ impl OrderedMap {
                 {
                     let row = *row;
                     let layer_idx = *layer_idx;
-                    if let Some(cached) = &cache.dressed
-                        && cached.base.matches_seq_layer(layers, layer_idx)
-                    {
+                    if let Some(cached) = cache.get_seq_layer(layers, layer_idx) {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
                     }
@@ -2644,7 +2962,7 @@ impl OrderedMap {
                     ) && patched.try_set(row, key, value.clone(), true).is_ok()
                     {
                         let arc = Arc::new(patched);
-                        cache.dressed = Some(Arc::clone(&arc));
+                        cache.put_dressed(Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, row);
                         return;
                     }
@@ -2652,26 +2970,28 @@ impl OrderedMap {
                 Entries::Patched(prev, row) if prev.base.has_uniform_keys() => {
                     let row = *row;
                     if Arc::strong_count(prev) > 1 {
-                        if let Some((cached_prev, cached_out)) = &cache.patched
-                            && Arc::ptr_eq(cached_prev, prev)
-                        {
+                        if let Some(cached_out) = cache.get_patched(prev) {
                             self.entries = Entries::Patched(Arc::clone(cached_out), row);
                             return;
                         }
                         let extra = usize::from(!prev.has_patch_for(key));
-                        if usize::from(prev.len) + extra <= MAX_PATCHES {
+                        if usize::from(prev.len) + extra <= MAX_PATCHES
+                            && prev.can_accept_key(row, key)
+                        {
                             let mut next = (**prev).clone();
                             let ok = next.try_set(row, key, value.clone(), true).is_ok();
                             debug_assert!(ok);
                             next.made = true;
                             let arc = Arc::new(next);
-                            cache.patched = Some((Arc::clone(prev), Arc::clone(&arc)));
+                            cache.put_patched(Arc::clone(prev), Arc::clone(&arc));
                             self.entries = Entries::Patched(arc, row);
                             return;
                         }
                     } else if let Some(own) = Arc::get_mut(prev) {
                         let extra = usize::from(!own.has_patch_for(key));
-                        if usize::from(own.len) + extra <= MAX_PATCHES {
+                        if usize::from(own.len) + extra <= MAX_PATCHES
+                            && own.can_accept_key(row, key)
+                        {
                             let ok = own.try_set(row, key, value.clone(), true).is_ok();
                             debug_assert!(ok);
                             own.made = true;
@@ -2686,17 +3006,105 @@ impl OrderedMap {
         self.mark_made_of_data();
     }
 
-    pub(crate) fn merge_set_data_cached(&mut self, other: &Self, cache: &mut SharedWaveCache) {
+    pub(crate) fn merge_set_data_cached(
+        &mut self,
+        other: &Self,
+        mut cache: Option<&mut SharedWaveCache>,
+    ) {
         if other.is_empty() {
             return;
         }
         let other_len = other.len();
+        if other_len >= 2
+            && let Some(ov_entries) = other.as_builtin()
+        {
+            match &mut self.entries {
+                Entries::Dressed(table, row) => {
+                    let row = *row;
+                    let uniform = table.has_uniform_keys();
+                    if uniform
+                        && let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_table(table)
+                    {
+                        self.entries = Entries::Patched(Arc::clone(cached), row);
+                        return;
+                    }
+                    if let Some(patched) = Patched::with_overlay(
+                        PatchedBase::Table(Arc::clone(table)),
+                        row,
+                        Arc::clone(ov_entries),
+                        true,
+                    ) {
+                        let arc = Arc::new(patched);
+                        if uniform && let Some(c) = cache.as_deref_mut() {
+                            c.put_dressed(Arc::clone(&arc));
+                        }
+                        self.entries = Entries::Patched(arc, row);
+                        return;
+                    }
+                }
+                Entries::SeqLayer(layers, row, layer_idx) => {
+                    let row = *row;
+                    let layer_idx = *layer_idx;
+                    let uniform = layers[usize::from(layer_idx)].seq_has_uniform_keys();
+                    if uniform
+                        && let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_seq_layer(layers, layer_idx)
+                    {
+                        self.entries = Entries::Patched(Arc::clone(cached), row);
+                        return;
+                    }
+                    if let Some(patched) = Patched::with_overlay(
+                        PatchedBase::SeqLayer(Arc::clone(layers), layer_idx),
+                        row,
+                        Arc::clone(ov_entries),
+                        true,
+                    ) {
+                        let arc = Arc::new(patched);
+                        if uniform && let Some(c) = cache.as_deref_mut() {
+                            c.put_dressed(Arc::clone(&arc));
+                        }
+                        self.entries = Entries::Patched(arc, row);
+                        return;
+                    }
+                }
+                Entries::Patched(prev, row) if prev.overlay.is_none() => {
+                    let row = *row;
+                    let uniform = prev.base.has_uniform_keys();
+                    if Arc::strong_count(prev) > 1 {
+                        if uniform
+                            && let Some(c) = cache.as_deref()
+                            && let Some(cached_out) = c.get_patched(prev)
+                        {
+                            self.entries = Entries::Patched(Arc::clone(cached_out), row);
+                            return;
+                        }
+                        let mut next = (**prev).clone();
+                        if next.attach_overlay(row, Arc::clone(ov_entries), true) {
+                            next.made = true;
+                            let arc = Arc::new(next);
+                            if uniform && let Some(c) = cache.as_deref_mut() {
+                                c.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                            }
+                            self.entries = Entries::Patched(arc, row);
+                            return;
+                        }
+                    } else if let Some(own) = Arc::get_mut(prev)
+                        && own.attach_overlay(row, Arc::clone(ov_entries), true)
+                    {
+                        own.made = true;
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
         if other_len <= MAX_PATCHES {
             match &mut self.entries {
                 Entries::Dressed(table, row) if table.has_uniform_keys() => {
                     let row = *row;
-                    if let Some(cached) = &cache.dressed
-                        && cached.base.matches_table(table)
+                    if let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_table(table)
                     {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
@@ -2709,7 +3117,9 @@ impl OrderedMap {
                             debug_assert!(ok);
                         }
                         let arc = Arc::new(patched);
-                        cache.dressed = Some(Arc::clone(&arc));
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.put_dressed(Arc::clone(&arc));
+                        }
                         self.entries = Entries::Patched(arc, row);
                         return;
                     }
@@ -2719,8 +3129,8 @@ impl OrderedMap {
                 {
                     let row = *row;
                     let layer_idx = *layer_idx;
-                    if let Some(cached) = &cache.dressed
-                        && cached.base.matches_seq_layer(layers, layer_idx)
+                    if let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_seq_layer(layers, layer_idx)
                     {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
@@ -2735,7 +3145,9 @@ impl OrderedMap {
                             debug_assert!(ok);
                         }
                         let arc = Arc::new(patched);
-                        cache.dressed = Some(Arc::clone(&arc));
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.put_dressed(Arc::clone(&arc));
+                        }
                         self.entries = Entries::Patched(arc, row);
                         return;
                     }
@@ -2743,8 +3155,8 @@ impl OrderedMap {
                 Entries::Patched(prev, row) if prev.base.has_uniform_keys() => {
                     let row = *row;
                     if Arc::strong_count(prev) > 1 {
-                        if let Some((cached_prev, cached_out)) = &cache.patched
-                            && Arc::ptr_eq(cached_prev, prev)
+                        if let Some(c) = cache.as_deref()
+                            && let Some(cached_out) = c.get_patched(prev)
                         {
                             self.entries = Entries::Patched(Arc::clone(cached_out), row);
                             return;
@@ -2753,7 +3165,10 @@ impl OrderedMap {
                             .pairs()
                             .filter(|(k, _)| !prev.has_patch_for(k))
                             .count();
-                        if usize::from(prev.len) + extra <= MAX_PATCHES {
+                        if usize::from(prev.len) + extra <= MAX_PATCHES
+                            && (!prev.overlay_after_appended
+                                || other.pairs().all(|(k, _)| prev.can_accept_key(row, k)))
+                        {
                             let mut next = (**prev).clone();
                             for (key, value) in other.pairs() {
                                 let ok = next.try_set(row, key, value.clone(), true).is_ok();
@@ -2761,13 +3176,18 @@ impl OrderedMap {
                             }
                             next.made = true;
                             let arc = Arc::new(next);
-                            cache.patched = Some((Arc::clone(prev), Arc::clone(&arc)));
+                            if let Some(c) = cache {
+                                c.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                            }
                             self.entries = Entries::Patched(arc, row);
                             return;
                         }
                     } else if let Some(own) = Arc::get_mut(prev) {
                         let extra = other.pairs().filter(|(k, _)| !own.has_patch_for(k)).count();
-                        if usize::from(own.len) + extra <= MAX_PATCHES {
+                        if usize::from(own.len) + extra <= MAX_PATCHES
+                            && (!own.overlay_after_appended
+                                || other.pairs().all(|(k, _)| own.can_accept_key(row, k)))
+                        {
                             for (key, value) in other.pairs() {
                                 let ok = own.try_set(row, key, value.clone(), true).is_ok();
                                 debug_assert!(ok);
@@ -2831,9 +3251,14 @@ impl OrderedMap {
                                         extra += 1;
                                     }
                                 }
-                                if usize::from(own.len) + extra <= MAX_PATCHES {
+                                if usize::from(own.len) + extra <= MAX_PATCHES
+                                    && (!own.overlay_after_appended
+                                        || patches.iter().all(|(k, _)| own.can_accept_key(row, k)))
+                                {
                                     for (key, num) in patches {
-                                        let _ = own.try_set(row, key, Value::F64(*num), true);
+                                        let ok =
+                                            own.try_set(row, key, Value::F64(*num), true).is_ok();
+                                        debug_assert!(ok);
                                     }
                                     return;
                                 }
@@ -2993,14 +3418,18 @@ impl OrderedMap {
             }
             if len < MAX_PATCHES {
                 let mark = Table::mark(key.as_str());
-                let (old, replace) = if own.base.marks() & mark == 0 {
-                    (None, u16::MAX)
+                let (old, replace) = if own.base.marks() & mark != 0
+                    && let layout = own.base.layout(row)
+                    && let Some(idx) = layout.position(&key)
+                {
+                    (Some(layout.at(idx).1.clone()), idx as u16)
+                } else if let Some(overlay) = &own.overlay
+                    && let ov = overlay.as_slice()
+                    && let Some(pos) = ov.position_str(key.as_str())
+                {
+                    (Some(ov.at(pos).1.clone()), own.base_len + pos as u16)
                 } else {
-                    let layout = own.base.layout(row);
-                    match layout.position(&key) {
-                        Some(idx) => (Some(layout.at(idx).1.clone()), idx as u16),
-                        None => (None, u16::MAX),
-                    }
+                    (None, u16::MAX)
                 };
                 own.entries[len] = Some((key, value, replace));
                 own.len += 1;

@@ -45,33 +45,295 @@ pub fn dedup_score(
     root: &mut Pattern,
     remap_extras: impl FnOnce(&mut dyn FnMut(&mut crate::PatternNodeRef)),
 ) {
+    dedup_score_with_reused(root, &[], remap_extras);
+}
+
+/// Like [`dedup_score`], pre-seeding already-canonical node references reused
+/// from a prior build so incremental edits skip re-walking unchanged subtrees.
+pub fn dedup_score_with_reused(
+    root: &mut Pattern,
+    reused: &[crate::PatternNodeRef],
+    remap_extras: impl FnOnce(&mut dyn FnMut(&mut crate::PatternNodeRef)),
+) {
     // Tiny single-leaf scores have nothing to share across tracks or layers.
     match &root.node_arc().kind {
         Node::Silence | Node::Pure(_) => return,
         Node::Sequence(layers) if layers.len() <= 1 => return,
         _ => {}
     }
-    let mut deduper = Deduper::default();
-    deduper.dedup_pattern(root);
-    if let Some(pooled) = deduper.build_pooled_builtins() {
-        let mut pass2 = Deduper {
-            pooled_builtins: pooled,
-            ..Deduper::default()
-        };
-        pass2.dedup_pattern(root);
-        for canon in deduper.visited.values_mut() {
-            let id2 = Arc::as_ptr(canon) as usize;
-            if let Some(final_canon) = pass2.visited.get(&id2) {
-                *canon = Arc::clone(final_canon);
-            }
+    let mut visited = FastMap::default();
+    if !reused.is_empty() {
+        visited.reserve(reused.len() * 2);
+        for node_ref in reused {
+            visited.insert(node_ref.identity(), Arc::clone(&node_ref.0));
         }
     }
+    let pooled_builtins = collect_and_pool_builtins(root.node_arc(), &visited);
+    let mut deduper = Deduper {
+        visited,
+        pooled_builtins,
+        ..Deduper::default()
+    };
+    deduper.dedup_pattern(root);
     let mut remap = |node_ref: &mut crate::PatternNodeRef| {
         if let Some(canon) = deduper.visited.get(&node_ref.identity()) {
             node_ref.0 = Arc::clone(canon);
         }
     };
     remap_extras(&mut remap);
+}
+
+/// Fast read-only pre-scan collecting surviving unpooled built-in maps so value
+/// pooling runs in a single pass with zero duplicate node/dress/layer rebuilds.
+#[allow(clippy::mutable_key_type)]
+fn collect_and_pool_builtins(
+    root: &Arc<NodeCell>,
+    skip_nodes: &FastMap<usize, Arc<NodeCell>>,
+) -> FastMap<usize, Arc<dyn BuiltinEntries>> {
+    let mut seen_nodes: FastSet<usize> = FastSet::default();
+    let mut seen_layers: FastSet<usize> = FastSet::default();
+    let mut seen_ptrs: FastSet<usize> = FastSet::default();
+    let mut unpooled: Vec<Arc<dyn BuiltinEntries>> = Vec::new();
+    let mut record = |entries: &Arc<dyn BuiltinEntries>| {
+        if let Slice::Builtin(keys, _) = entries.as_slice()
+            && keys.len() >= 2
+            && keys.len() <= MAX_BUILTIN_MAP_LEN
+        {
+            let ptr = Arc::as_ptr(entries) as *const () as usize;
+            if seen_ptrs.insert(ptr) {
+                unpooled.push(Arc::clone(entries));
+            }
+        }
+    };
+    let mut stack: Vec<&NodeCell> = vec![root.as_ref()];
+    while let Some(cell) = stack.pop() {
+        let id = std::ptr::from_ref(cell) as usize;
+        if skip_nodes.contains_key(&id) || !seen_nodes.insert(id) {
+            continue;
+        }
+        match &cell.kind {
+            Node::Sequence(layers) => {
+                let lid = Arc::as_ptr(layers) as *const Layer as usize;
+                if seen_layers.insert(lid) {
+                    for layer in layers.iter() {
+                        layer.for_each_unpooled_builtin(&mut record);
+                    }
+                }
+            }
+            Node::Pure(val) => {
+                if let Value::Object(map) = val
+                    && let Some(entries) = map.as_builtin()
+                {
+                    record(entries);
+                }
+            }
+            Node::Constants(node) => {
+                stack.push(node.0.node_arc().as_ref());
+                for m in node.1.iter() {
+                    if let Value::Object(map) = &m.value
+                        && let Some(entries) = map.as_builtin()
+                    {
+                        record(entries);
+                    }
+                }
+            }
+            Node::Stack(pats) | Node::SlowCat(pats) | Node::SlowCatPrime(pats) => {
+                for p in pats.iter() {
+                    stack.push(p.node_arc().as_ref());
+                }
+            }
+            Node::StackPure(cells) | Node::SlowCatPure(cells) | Node::SlowCatPrimePure(cells) => {
+                for c in cells.iter() {
+                    stack.push(c.as_ref());
+                }
+            }
+            Node::FastSmall(inner, ..)
+            | Node::ShiftSmall(inner, ..)
+            | Node::ControlMap(inner, ..)
+            | Node::SplitQueries(inner, _)
+            | Node::Join(inner, ..) => stack.push(inner.as_ref()),
+            Node::SplitQueriesBoxed(p)
+            | Node::Rev(p)
+            | Node::StepJoin(p)
+            | Node::PolyJoin(p)
+            | Node::PurePattern(p)
+            | Node::SortHapsByPart(p)
+            | Node::Collect(p)
+            | Node::CycleOnsetIndex(p)
+            | Node::CycleOnsetCount(p) => stack.push(p.node_arc().as_ref()),
+            Node::Fast(n) => stack.push(n.0.node_arc().as_ref()),
+            Node::Shift(n) => stack.push(n.0.node_arc().as_ref()),
+            Node::AppWave(app) => stack.push(app.inner.node_arc().as_ref()),
+            Node::UiVisual(node) => stack.push(node.inner.node_arc().as_ref()),
+            Node::Degrade(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::Cpm(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::AddContext(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::FilterValues(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::FilterHaps(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::MapHapsOwned(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::MapHapsNative(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::ExpandHapsNative(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::FmapNative(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::WithRandSeed(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::FastGap(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::RepeatCycles(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::LoopAt(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::ControlMapBoxed(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::JoinBoxed(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::WithQueryTime(b) | Node::WithHapTime(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::WithQuerySpan(b) | Node::WithHapSpan(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::MapHapsWithState(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::InnerJoin(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::PatternOfPure(b) => stack.push(b.0.node_arc().as_ref()),
+            Node::PatternOfPureOperand(b, _) => {
+                stack.push(b.0.node_arc().as_ref());
+                stack.push(b.1.node_arc().as_ref());
+            }
+            Node::PatternOfHap(b) => {
+                stack.push(b.0.node_arc().as_ref());
+                for p in b.1.iter() {
+                    stack.push(p.node_arc().as_ref());
+                }
+            }
+            Node::AppLeft(a) => {
+                stack.push(a.0.node_arc().as_ref());
+                stack.push(a.1.node_arc().as_ref());
+            }
+            Node::AppRight(a) | Node::AppBoth(a) => {
+                stack.push(a.0.node_arc().as_ref());
+                stack.push(a.1.node_arc().as_ref());
+            }
+            Node::Pick(pick) => {
+                stack.push(pick.selector.node_arc().as_ref());
+                for p in pick.lookup.patterns() {
+                    stack.push(p.node_arc().as_ref());
+                }
+            }
+            Node::PickPatternified { patterns, .. }
+            | Node::Arp(patterns)
+            | Node::ArpWithPattern(patterns)
+            | Node::Timeline(patterns, _) => {
+                stack.push(patterns.0.node_arc().as_ref());
+                stack.push(patterns.1.node_arc().as_ref());
+            }
+            Node::ChooseCycles(b) => {
+                for p in b.0.iter() {
+                    stack.push(p.node_arc().as_ref());
+                }
+            }
+            Node::WChoose(c) => {
+                stack.push(c.chooser.node_arc().as_ref());
+                stack.push(c.total.node_arc().as_ref());
+                for p in c.cumulative.iter().chain(c.values.iter()) {
+                    stack.push(p.node_arc().as_ref());
+                }
+            }
+            Node::XenPatterns(b) => {
+                stack.push(b.0.node_arc().as_ref());
+                for p in b.1.iter() {
+                    stack.push(p.node_arc().as_ref());
+                }
+            }
+            _ => {}
+        }
+    }
+    if unpooled.len() < 4 {
+        return FastMap::default();
+    }
+    // Deduplicate identical maps first so frequency counts reflect unique surviving maps.
+    let mut unique_set: FastSet<InternedBuiltin> = FastSet::default();
+    let mut unique_maps: Vec<Arc<dyn BuiltinEntries>> = Vec::with_capacity(unpooled.len());
+    let mut duplicates: Vec<(usize, usize)> = Vec::new();
+    for map in unpooled {
+        if !map.as_slice().all_values_data() {
+            continue;
+        }
+        let ptr = Arc::as_ptr(&map) as *const () as usize;
+        let key = InternedBuiltin(map);
+        if let Some(existing) = unique_set.get(&key) {
+            let canon_ptr = Arc::as_ptr(&existing.0) as *const () as usize;
+            duplicates.push((ptr, canon_ptr));
+        } else {
+            unique_maps.push(Arc::clone(&key.0));
+            unique_set.insert(key);
+        }
+    }
+    if unique_maps.len() < 4 {
+        return FastMap::default();
+    }
+    let mut freq: FastMap<DataValueRef<'_>, u32> = FastMap::default();
+    for map in &unique_maps {
+        if let Slice::Builtin(_, values) = map.as_slice() {
+            for val in values {
+                if val.is_data(0) {
+                    *freq.entry(DataValueRef(val)).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let mut poolable: Vec<&Arc<dyn BuiltinEntries>> = Vec::new();
+    for map in &unique_maps {
+        if let Slice::Builtin(_, values) = map.as_slice() {
+            let len = values.len();
+            let mut shared = 0usize;
+            for val in values {
+                if freq.get(&DataValueRef(val)).copied().unwrap_or(0) >= 2 {
+                    shared += 1;
+                }
+            }
+            let unique = len - shared;
+            if 22 * shared > 2 * unique + 16 {
+                poolable.push(map);
+            }
+        }
+    }
+    if poolable.len() < 2 {
+        return FastMap::default();
+    }
+    let mut pool_index: FastMap<DataValueRef<'_>, u16> = FastMap::default();
+    let mut pool_vec: Vec<Value> = Vec::new();
+    let mut old_bytes = 0usize;
+    let mut new_maps_bytes = 0usize;
+    for map in &poolable {
+        if let Slice::Builtin(_, values) = map.as_slice() {
+            let len = values.len();
+            old_bytes += 16 + ((26 * len + 7) & !7);
+            new_maps_bytes += 32 + ((4 * len + 7) & !7);
+            for val in values {
+                let key = DataValueRef(val);
+                if let std::collections::hash_map::Entry::Vacant(entry) = pool_index.entry(key) {
+                    let Ok(idx) = u16::try_from(pool_vec.len()) else {
+                        return FastMap::default();
+                    };
+                    pool_vec.push(val.clone());
+                    entry.insert(idx);
+                }
+            }
+        }
+    }
+    let new_bytes = 16 + 24 * pool_vec.len() + new_maps_bytes;
+    if new_bytes + 64 >= old_bytes {
+        return FastMap::default();
+    }
+    let pool: Arc<[Value]> = pool_vec.into();
+    let mut out: FastMap<usize, Arc<dyn BuiltinEntries>> = FastMap::default();
+    let mut vals_buf = [0u16; MAX_BUILTIN_MAP_LEN];
+    for map in poolable {
+        if let Slice::Builtin(keys, values) = map.as_slice() {
+            let len = keys.len();
+            for (i, val) in values.iter().enumerate() {
+                vals_buf[i] = pool_index[&DataValueRef(val)];
+            }
+            let pooled = make_pooled_builtin_arc(Arc::clone(&pool), keys, &vals_buf[..len]);
+            out.insert(Arc::as_ptr(map) as *const () as usize, pooled);
+        }
+    }
+    for (dup_ptr, canon_ptr) in duplicates {
+        if let Some(pooled) = out.get(&canon_ptr) {
+            out.insert(dup_ptr, Arc::clone(pooled));
+        }
+    }
+    out
 }
 
 #[derive(Default)]
@@ -112,95 +374,6 @@ impl Deduper {
         let out = Arc::clone(&key.0);
         self.builtins.insert(key);
         out
-    }
-
-    /// Pool repeated control values across surviving unpooled built-in maps into
-    /// one shared `Arc<[Value]>` whenever doing so strictly reduces retained bytes.
-    #[allow(clippy::mutable_key_type)]
-    fn build_pooled_builtins(&self) -> Option<FastMap<usize, Arc<dyn BuiltinEntries>>> {
-        if self.builtins.len() < 4 {
-            return None;
-        }
-        let unpooled: Vec<&Arc<dyn BuiltinEntries>> = self
-            .builtins
-            .iter()
-            .filter_map(|map| match map.0.as_slice() {
-                Slice::Builtin(keys, _) if keys.len() >= 2 && keys.len() <= MAX_BUILTIN_MAP_LEN => {
-                    Some(&map.0)
-                }
-                _ => None,
-            })
-            .collect();
-        if unpooled.len() < 4 {
-            return None;
-        }
-        let mut freq: FastMap<DataValueRef<'_>, u32> = FastMap::default();
-        for map in &unpooled {
-            if let Slice::Builtin(_, values) = map.as_slice() {
-                for val in values {
-                    if val.is_data(0) {
-                        *freq.entry(DataValueRef(val)).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-        let mut poolable: Vec<&Arc<dyn BuiltinEntries>> = Vec::new();
-        for map in &unpooled {
-            if let Slice::Builtin(_, values) = map.as_slice() {
-                let len = values.len();
-                let mut shared = 0usize;
-                for val in values {
-                    if freq.get(&DataValueRef(val)).copied().unwrap_or(0) >= 2 {
-                        shared += 1;
-                    }
-                }
-                let unique = len - shared;
-                if 22 * shared > 2 * unique + 16 {
-                    poolable.push(*map);
-                }
-            }
-        }
-        if poolable.len() < 2 {
-            return None;
-        }
-        let mut pool_index: FastMap<DataValueRef<'_>, u16> = FastMap::default();
-        let mut pool_vec: Vec<Value> = Vec::new();
-        let mut old_bytes = 0usize;
-        let mut new_maps_bytes = 0usize;
-        for map in &poolable {
-            if let Slice::Builtin(_, values) = map.as_slice() {
-                let len = values.len();
-                old_bytes += 16 + ((26 * len + 7) & !7);
-                new_maps_bytes += 32 + ((4 * len + 7) & !7);
-                for val in values {
-                    let key = DataValueRef(val);
-                    if let std::collections::hash_map::Entry::Vacant(entry) = pool_index.entry(key)
-                    {
-                        let idx = u16::try_from(pool_vec.len()).ok()?;
-                        pool_vec.push(val.clone());
-                        entry.insert(idx);
-                    }
-                }
-            }
-        }
-        let new_bytes = 16 + 24 * pool_vec.len() + new_maps_bytes;
-        if new_bytes + 64 >= old_bytes {
-            return None;
-        }
-        let pool: Arc<[Value]> = pool_vec.into();
-        let mut out: FastMap<usize, Arc<dyn BuiltinEntries>> = FastMap::default();
-        let mut vals_buf = [0u16; MAX_BUILTIN_MAP_LEN];
-        for map in poolable {
-            if let Slice::Builtin(keys, values) = map.as_slice() {
-                let len = keys.len();
-                for (i, val) in values.iter().enumerate() {
-                    vals_buf[i] = pool_index[&DataValueRef(val)];
-                }
-                let pooled = make_pooled_builtin_arc(Arc::clone(&pool), keys, &vals_buf[..len]);
-                out.insert(Arc::as_ptr(map) as *const () as usize, pooled);
-            }
-        }
-        Some(out)
     }
 
     fn dedup_value(&mut self, value: &Value) -> Option<Value> {
@@ -380,8 +553,37 @@ impl Deduper {
     }
 
     fn dedup_pat_child(&mut self, pat: &Pattern) -> Option<Pattern> {
+        let next_node = self.dedup_cell(pat.node_arc(), pat.node_flags());
+        let node_changed = !Arc::ptr_eq(pat.node_arc(), &next_node);
+        let extras_changed = pat.plain_runtime_settings_key().is_some_and(|key| {
+            self.plain_extras
+                .get(&key)
+                .is_some_and(|canon| pat.extras_ptr() != Arc::as_ptr(canon) as usize)
+        });
+        if !node_changed && !extras_changed {
+            // Still register this plain_extras as canonical if first seen.
+            if let Some(key) = pat.plain_runtime_settings_key()
+                && !self.plain_extras.contains_key(&key)
+            {
+                let mut tmp = pat.clone();
+                let plain_extras = &mut self.plain_extras;
+                tmp.dedup_plain_extras(&mut |k, ex| {
+                    Arc::clone(plain_extras.entry(k).or_insert_with(|| Arc::clone(ex)))
+                });
+            }
+            return None;
+        }
         let mut updated = pat.clone();
-        self.dedup_pattern(&mut updated).then_some(updated)
+        if node_changed {
+            updated.set_node_arc(next_node);
+        }
+        if extras_changed {
+            let plain_extras = &mut self.plain_extras;
+            updated.dedup_plain_extras(&mut |k, ex| {
+                Arc::clone(plain_extras.entry(k).or_insert_with(|| Arc::clone(ex)))
+            });
+        }
+        Some(updated)
     }
 
     fn dedup_slice(&mut self, pats: &[Pattern]) -> Option<Box<[Pattern]>> {

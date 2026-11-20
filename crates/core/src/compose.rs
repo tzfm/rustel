@@ -416,9 +416,7 @@ pub(crate) fn compose_data_in_place_cached(
     if let (Value::Object(map), Value::Object(other)) = (&mut *a, b)
         && !union_drops(other)
     {
-        if op == ComposeOp::Set
-            && let Some(cache) = cache
-        {
+        if op == ComposeOp::Set {
             map.merge_set_data_cached(other, cache);
             return;
         }

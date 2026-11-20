@@ -4081,6 +4081,31 @@ thread_local! {
     /// the room it grew to.
     static SPARE_LISTS: std::cell::RefCell<Vec<Vec<Hap>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Empty `ResolvedHap` buffers recycled across join queries on this thread.
+    static SPARE_RESOLVED: std::cell::RefCell<Vec<Vec<ResolvedHap>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_resolved_list() -> Vec<ResolvedHap> {
+    SPARE_RESOLVED
+        .try_with(|spare| spare.borrow_mut().pop())
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+fn put_resolved_list(mut list: Vec<ResolvedHap>) {
+    const MOST_LISTS: usize = 4;
+    const MOST_ROOM: usize = 16;
+    list.clear();
+    if list.capacity() <= MOST_ROOM {
+        let _ = SPARE_RESOLVED.try_with(|spare| {
+            let mut spare = spare.borrow_mut();
+            if spare.len() < MOST_LISTS {
+                spare.push(list);
+            }
+        });
+    }
 }
 
 /// Run `work` with an empty list, for the haps that a node reads from the
@@ -5640,6 +5665,18 @@ impl Meeting {
         apply: &Combine,
         flow: LookupFlow,
     ) -> bool {
+        Self::set_number_in_place_cached(hf, key, number, part, apply, flow, None)
+    }
+
+    pub(crate) fn set_number_in_place_cached(
+        hf: &mut Hap,
+        key: &Key,
+        number: f64,
+        part: TimeSpan,
+        apply: &Combine,
+        flow: LookupFlow,
+        cache: Option<&mut value::SharedWaveCache>,
+    ) -> bool {
         let set =
             matches!(apply, Combine::Composed(compose::ComposeOp::Set)) && flow == LookupFlow::Set;
         if !set || hf.pick_lookup().is_some() || !hf.value.is_data(0) {
@@ -5648,7 +5685,7 @@ impl Meeting {
         let Value::Object(controls) = &mut hf.value else {
             return false;
         };
-        controls.set_data(key, Value::F64(number));
+        controls.set_data_single_cached(key, &Value::F64(number), cache);
         // The bindings of a set of the map: the control that the signal
         // sets has no slider, and the hap has none of its own.
         if !hf.keys.is_empty() {
@@ -6985,25 +7022,56 @@ impl RunMeeting {
 
     /// Meet the function hap `hf` with the constant as its application
     /// does for any hap: the constant is one hap in each cycle that the
-    /// whole of `hf` covers, or its part. `pieces` holds those haps. What
-    /// the meetings make comes after the haps of `out`. `false` when the
-    /// query stops.
+    /// whole of `hf` covers, or its part. What the meetings make comes
+    /// after the haps of `out`. `false` when the query stops.
     fn meet(
         &self,
         thread: &QueryThread,
         hf: Hap,
-        pieces: &mut Vec<Hap>,
+        mut cache: Option<&mut value::SharedWaveCache>,
         out: &mut Vec<Hap>,
     ) -> bool {
-        pieces.clear();
-        let base = self.as_hap();
+        let mut fallback: Option<(Hap, Combine)> = None;
+        let mut stopped = false;
+        let mut single: Option<TimeSpan> = None;
+        let mut count = 0usize;
         hf.whole_or_part().for_each_cycle(|piece| {
-            let mut hap = base.clone();
-            hap.move_to_piece(piece);
-            pieces.push(hap);
+            if let Some(part) = hf.part.intersection(&piece) {
+                single = Some(part);
+                count += 1;
+            }
         });
-        let apply = self.combine();
-        meet_each(thread, hf, pieces, &apply, self.flow(), 0, out)
+        if count == 0 {
+            return true;
+        }
+        if count == 1 {
+            let part = single.expect("count == 1");
+            let mut hap = hf;
+            if !Meeting::in_place_run_meeting(&mut hap, self, part, cache) {
+                let constant = self.as_hap();
+                let apply = self.combine();
+                hap = applied_hap(&hap, &constant, hap.whole, part, &apply, self.flow());
+            }
+            return !thread.stop_requested() && thread.push_budgeted(out, 0, hap);
+        }
+        hf.whole_or_part().for_each_cycle(|piece| {
+            if stopped {
+                return;
+            }
+            let Some(part) = hf.part.intersection(&piece) else {
+                return;
+            };
+            let mut hap = hf.clone();
+            if !Meeting::in_place_run_meeting(&mut hap, self, part, cache.as_deref_mut()) {
+                let (constant, apply) =
+                    fallback.get_or_insert_with(|| (self.as_hap(), self.combine()));
+                hap = applied_hap(&hap, constant, hap.whole, part, apply, self.flow());
+            }
+            if thread.stop_requested() || !thread.push_budgeted(out, 0, hap) {
+                stopped = true;
+            }
+        });
+        !stopped
     }
 
     /// The meeting of the constant `value` at `context` by `apply`, as the
@@ -7124,17 +7192,79 @@ struct StepWaveCache {
 }
 
 #[derive(Default)]
+struct StepWaveCacheSet {
+    slots: [Option<StepWaveCache>; 4],
+    next: u8,
+}
+
+impl StepWaveCacheSet {
+    #[inline]
+    fn find(&mut self, part: TimeSpan) -> Option<&mut StepWaveCache> {
+        self.slots
+            .iter_mut()
+            .flatten()
+            .find(|cached| cached.part == part)
+    }
+
+    fn insert(&mut self, cache: StepWaveCache) -> &mut StepWaveCache {
+        let idx = match self.slots.iter().position(Option::is_none) {
+            Some(empty) => empty,
+            None => {
+                let idx = usize::from(self.next) & 3;
+                self.next = self.next.wrapping_add(1);
+                idx
+            }
+        };
+        self.slots[idx].insert(cache)
+    }
+
+    fn take_victim_pieces(&mut self, count: usize) -> Vec<TimeSpan> {
+        if self.slots.iter().all(Option::is_some) {
+            let idx = usize::from(self.next) & 3;
+            if let Some(mut prev) = self.slots[idx].take() {
+                prev.pieces.clear();
+                prev.pieces.reserve(count);
+                return prev.pieces;
+            }
+        }
+        Vec::with_capacity(count)
+    }
+}
+
+#[derive(Default)]
 struct Meetings<'a> {
     answering: Option<Answering<'a>>,
     /// The haps the value side answers for one function hap.
     values: Vec<Hap>,
     /// The side as the control of a segment of a wave, when it is one.
     steps: Option<&'a fused::StepWave>,
-    /// Cached step-wave evaluations and shared overlay table for the last `hf.part`.
-    step_cache: Option<StepWaveCache>,
+    /// Cached step-wave evaluations and shared overlay tables for up to 4
+    /// distinct `hf.part` spans, preventing thrashing across interleaved layers.
+    step_cache: StepWaveCacheSet,
+    /// Per-(met, part) overlay caches for chord notes meeting a wave signal.
+    wave_cache: [Option<(TimeSpan, TimeSpan, value::SharedWaveCache)>; 2],
+    wave_cache_next: u8,
 }
 
 impl<'a> Meetings<'a> {
+    fn wave_overlay_cache(&mut self, met: TimeSpan, part: TimeSpan) -> &mut value::SharedWaveCache {
+        if let Some(idx) = self
+            .wave_cache
+            .iter()
+            .position(|slot| matches!(slot, Some((m, p, _)) if *m == met && *p == part))
+        {
+            return &mut self.wave_cache[idx].as_mut().expect("found slot").2;
+        }
+        let idx = if let Some(empty) = self.wave_cache.iter().position(Option::is_none) {
+            empty
+        } else {
+            let victim = usize::from(self.wave_cache_next & 1);
+            self.wave_cache_next = self.wave_cache_next.wrapping_add(1);
+            victim
+        };
+        self.wave_cache[idx] = Some((met, part, value::SharedWaveCache::default()));
+        &mut self.wave_cache[idx].as_mut().expect("inserted slot").2
+    }
     /// The gate of `side`, when it is the gate of a degrade that this
     /// query reads: the meeting keeps the function hap as it is. See
     /// [`table::Gate`].
@@ -7470,7 +7600,7 @@ impl<'a> ValueSide<'a> {
         thread: &QueryThread,
         hf: &Hap,
         steps: &fused::StepWave,
-        step_cache: &mut Option<StepWaveCache>,
+        step_cache: &mut StepWaveCacheSet,
         state: &State,
         from: usize,
         out: &mut Vec<Hap>,
@@ -7483,10 +7613,9 @@ impl<'a> ValueSide<'a> {
         let Value::Object(base_map) = &hf.value else {
             return None;
         };
-        let cache_hit = step_cache
-            .as_ref()
-            .is_some_and(|cached| cached.part == hf.part);
-        if !cache_hit {
+        let cached = if step_cache.find(hf.part).is_some() {
+            step_cache.find(hf.part).expect("checked present")
+        } else {
             let grid = steps.grid_over(hf.part)?;
             let count = grid.len();
             if count == 0 {
@@ -7514,14 +7643,7 @@ impl<'a> ValueSide<'a> {
                 fused::note(fused::Hit::StepMany);
                 return Some(true);
             }
-            let mut pieces = match step_cache.take() {
-                Some(mut prev) => {
-                    prev.pieces.clear();
-                    prev.pieces
-                }
-                None => Vec::with_capacity(count),
-            };
-            pieces.reserve(count);
+            let mut pieces = step_cache.take_victim_pieces(count);
             let mut begin = grid.time(grid.steps().start)?;
             let values: Arc<[Value]> = if count <= 32 {
                 let mut nums = [0.0f64; 32];
@@ -7548,14 +7670,13 @@ impl<'a> ValueSide<'a> {
                 }
                 Arc::from(vals)
             };
-            *step_cache = Some(StepWaveCache {
+            step_cache.insert(StepWaveCache {
                 part: hf.part,
                 values,
                 pieces,
                 table: None,
-            });
-        }
-        let cached = step_cache.as_mut().expect("populated above");
+            })
+        };
         let count = cached.pieces.len();
         // Fast path: share one `PatchedTable` across all chord haps backed by
         // the same keyed base table or direct-keyed sequence layer.
@@ -7699,7 +7820,15 @@ impl<'a> ValueSide<'a> {
             && hf.part.within_one_cycle()
             && let Some(part) = hf.part.intersection(&met)
             && let Some(number) = wave.number(met, part, &state.controls)
-            && Meeting::set_number_in_place(&mut hf, key, number, part, self.apply, self.flow)
+            && Meeting::set_number_in_place_cached(
+                &mut hf,
+                key,
+                number,
+                part,
+                self.apply,
+                self.flow,
+                Some(meetings.wave_overlay_cache(met, part)),
+            )
         {
             return !thread.stop_requested() && thread.push_budgeted(out, from, hf);
         }
@@ -7833,41 +7962,56 @@ fn query_run(
     let answered = with_list(|haps| {
         haps.extend(out.drain(from..));
         out.reserve(haps.len());
-        let (mut made, mut next, mut pieces) = (Vec::new(), Vec::new(), Vec::new());
-        for mut hf in haps.drain(..) {
-            let met = hf.whole_or_part();
-            if !met.within_one_cycle() {
-                made.push(hf);
-                for meeting in meetings {
-                    for hf in made.drain(..) {
-                        if !meeting.meet(thread, hf, &mut pieces, &mut next) {
+        let use_cache = haps.len() > 1;
+        let mut caches: [value::SharedWaveCache; 4] = Default::default();
+        with_list(|made| {
+            with_list(|next| {
+                for mut hf in haps.drain(..) {
+                    let met = hf.whole_or_part();
+                    if !met.within_one_cycle() {
+                        made.push(hf);
+                        for (m_idx, meeting) in meetings.iter().enumerate() {
+                            let mut cache = if use_cache {
+                                caches.get_mut(m_idx)
+                            } else {
+                                None
+                            };
+                            for hf in made.drain(..) {
+                                if !meeting.meet(thread, hf, cache.as_deref_mut(), next) {
+                                    return None;
+                                }
+                            }
+                            std::mem::swap(made, next);
+                        }
+                        out.append(made);
+                        continue;
+                    }
+                    let Some(part) = hf.part.intersection(&met) else {
+                        continue;
+                    };
+                    for (m_idx, meeting) in meetings.iter().enumerate() {
+                        let cache = if use_cache {
+                            caches.get_mut(m_idx)
+                        } else {
+                            None
+                        };
+                        if Meeting::in_place_run_meeting(&mut hf, meeting, part, cache) {
+                            continue;
+                        }
+                        let constant = meeting.as_hap();
+                        let apply = meeting.combine();
+                        hf = applied_hap(&hf, &constant, hf.whole, part, &apply, meeting.flow());
+                        if thread.stop_requested() {
                             return None;
                         }
                     }
-                    std::mem::swap(&mut made, &mut next);
+                    if thread.stop_requested() || !thread.push_budgeted(out, from, hf) {
+                        return None;
+                    }
                 }
-                out.append(&mut made);
-                continue;
-            }
-            let Some(part) = hf.part.intersection(&met) else {
-                continue;
-            };
-            for meeting in meetings {
-                if Meeting::in_place_run_meeting(&mut hf, meeting, part, None) {
-                    continue;
-                }
-                let constant = meeting.as_hap();
-                let apply = meeting.combine();
-                hf = applied_hap(&hf, &constant, hf.whole, part, &apply, meeting.flow());
-                if thread.stop_requested() {
-                    return None;
-                }
-            }
-            if thread.stop_requested() || !thread.push_budgeted(out, from, hf) {
-                return None;
-            }
-        }
-        Some(())
+                Some(())
+            })
+        })
     });
     if answered.is_none() {
         out.truncate(from);
@@ -8139,6 +8283,13 @@ impl Pattern {
     #[inline(always)]
     pub(crate) fn extras_ptr(&self) -> usize {
         self.extras.as_ref().map_or(0, |e| Arc::as_ptr(e) as usize)
+    }
+
+    #[inline(always)]
+    pub(crate) fn plain_runtime_settings_key(&self) -> Option<usize> {
+        self.extras
+            .as_deref()
+            .and_then(PatternExtras::plain_runtime_settings_key)
     }
 
     #[inline]
@@ -8528,8 +8679,8 @@ impl Pattern {
     }
 
     /// The haps of this pattern, moved `shift` later, that a restart or a
-    /// reset join reads for an outer hap with `part`: the haps of the
-    /// query's span, which the join then cuts to the part.
+    /// reset join reads for an outer hap with `part`, appended to `out`: the
+    /// haps of the query's span, which the join then cuts to the part.
     ///
     /// A graph of discrete haps is asked over the part alone. The join cuts
     /// every other hap away, so the answer after the cut is the same, and
@@ -8539,14 +8690,6 @@ impl Pattern {
     /// in a query that walks: each join then says when a pattern that it
     /// made reads the span, and a table says nothing. Any other graph is
     /// asked over the span, where it reads its values.
-    fn query_restarted(&self, shift: Fraction, state: &State, part: TimeSpan) -> Vec<Hap> {
-        let mut haps = Vec::new();
-        QUERY_THREAD
-            .with(|thread| self.query_restarted_onto(thread, shift, state, part, &mut haps));
-        haps
-    }
-
-    /// [`Self::query_restarted`], with the haps after those of `out`.
     fn query_restarted_onto(
         &self,
         thread: &QueryThread,
@@ -8869,8 +9012,14 @@ impl Pattern {
             out.truncate(from);
             return false;
         }
-        let mut last_sample: Option<(TimeSpan, TimeSpan, [f64; MAX_WAVES])> = None;
-        let mut wave_cache = value::SharedWaveCache::default();
+        struct SampleSlot {
+            met: TimeSpan,
+            part: TimeSpan,
+            nums: [f64; MAX_WAVES],
+            cache: value::SharedWaveCache,
+        }
+        let mut samples: [Option<SampleSlot>; 4] = [None, None, None, None];
+        let mut sample_next = 0u8;
         let mut patches: [(&Key, f64); MAX_WAVES] = [(first.key(), 0.0); MAX_WAVES];
         for hap in &mut out[from..] {
             let met = hap.whole_or_part();
@@ -8878,13 +9027,12 @@ impl Pattern {
                 .part
                 .intersection(&met)
                 .expect("checked non-empty intersection");
-            let numbers = if let Some((cached_met, cached_part, cached_nums)) = last_sample
-                && cached_met == met
-                && cached_part == part
+            let slot_idx = if let Some(idx) = samples
+                .iter()
+                .position(|s| matches!(s, Some(slot) if slot.met == met && slot.part == part))
             {
-                cached_nums
+                idx
             } else {
-                wave_cache.clear();
                 let mut nums = [0.0f64; MAX_WAVES];
                 for i in 0..count {
                     let num = match waves[i].expect("wave present") {
@@ -8897,15 +9045,28 @@ impl Pattern {
                     };
                     nums[i] = num;
                 }
-                last_sample = Some((met, part, nums));
-                nums
+                let idx = if let Some(empty) = samples.iter().position(Option::is_none) {
+                    empty
+                } else {
+                    let victim = usize::from(sample_next & 3);
+                    sample_next = sample_next.wrapping_add(1);
+                    victim
+                };
+                samples[idx] = Some(SampleSlot {
+                    met,
+                    part,
+                    nums,
+                    cache: value::SharedWaveCache::default(),
+                });
+                idx
             };
+            let slot = samples[slot_idx].as_mut().expect("sample slot populated");
             for i in 0..count {
                 let item = waves[i].expect("wave present");
                 if matches!(item, QuickWave::Step(_)) {
                     fused::note(fused::Hit::StepOne);
                 }
-                patches[i] = (item.key(), numbers[i]);
+                patches[i] = (item.key(), slot.nums[i]);
             }
             if !hap.keys.is_empty() {
                 let k = hap.keys.get();
@@ -8923,7 +9084,7 @@ impl Pattern {
                 }
             }
             if let Value::Object(controls) = &mut hap.value {
-                controls.set_data_many_cached(&patches[..count], &mut wave_cache);
+                controls.set_data_many_cached(&patches[..count], &mut slot.cache);
             }
             hap.part = part;
         }
@@ -9023,38 +9184,43 @@ impl Pattern {
     /// begins at its time and a part that ends there read differently.
     fn asked_for_parts(&self, parts: &[TimeSpan], state: &State) -> Option<Vec<Hap>> {
         let all = TimeSpan::new(parts.first()?.begin, parts.last()?.end);
-        let haps = self.query(&state.set_span(all));
-        if haps.iter().any(|hap| hap.part.begin >= hap.part.end) {
-            return None;
-        }
-        // Each hap at each part that it meets, and whether the part is the
-        // last one, which takes the hap.
-        let mut met = Vec::with_capacity(haps.len());
-        for (index, hap) in haps.iter().enumerate() {
-            let first = parts.partition_point(|part| part.end <= hap.part.begin);
-            let after = parts.partition_point(|part| part.begin < hap.part.end);
-            met.extend((first..after).map(|part| (part, index, part + 1 == after)));
-        }
-        // Haps in the order of the parts, each in one part: the answer.
-        if met.len() == haps.len() && met.is_sorted_by_key(|(part, ..)| *part) {
-            return Some(haps);
-        }
-        // The sort keeps the order of the answer in each part.
-        met.sort_by_key(|(part, ..)| *part);
-        let mut haps: Vec<Option<Hap>> = haps.into_iter().map(Some).collect();
-        met.into_iter()
-            .map(|(part, index, last)| {
-                let hap = match last {
-                    true => haps[index].take(),
-                    false => haps[index].clone(),
-                };
-                let mut hap = hap?;
-                let part = parts[part];
-                hap.part =
-                    TimeSpan::new(hap.part.begin.max(part.begin), hap.part.end.min(part.end));
-                Some(hap)
-            })
-            .collect()
+        with_list(|haps| {
+            let asked = state.set_span(all);
+            QUERY_THREAD.with(|thread| {
+                self.answer_onto(thread, &asked, table::Order::Graph, haps);
+            });
+            if haps.iter().any(|hap| hap.part.begin >= hap.part.end) {
+                return None;
+            }
+            // Each hap at each part that it meets, and whether the part is the
+            // last one, which takes the hap.
+            let mut met = Vec::with_capacity(haps.len());
+            for (index, hap) in haps.iter().enumerate() {
+                let first = parts.partition_point(|part| part.end <= hap.part.begin);
+                let after = parts.partition_point(|part| part.begin < hap.part.end);
+                met.extend((first..after).map(|part| (part, index, part + 1 == after)));
+            }
+            // Haps in the order of the parts, each in one part: the answer.
+            if met.len() == haps.len() && met.is_sorted_by_key(|(part, ..)| *part) {
+                return Some(std::mem::take(haps));
+            }
+            // The sort keeps the order of the answer in each part.
+            met.sort_by_key(|(part, ..)| *part);
+            let mut slots: Vec<Option<Hap>> = haps.drain(..).map(Some).collect();
+            met.into_iter()
+                .map(|(part, index, last)| {
+                    let hap = match last {
+                        true => slots[index].take(),
+                        false => slots[index].clone(),
+                    };
+                    let mut hap = hap?;
+                    let part = parts[part];
+                    hap.part =
+                        TimeSpan::new(hap.part.begin.max(part.begin), hap.part.end.min(part.end));
+                    Some(hap)
+                })
+                .collect()
+        })
     }
 
     /// The haps that an `appRight` makes of this pattern of functions and
@@ -9220,11 +9386,18 @@ impl Pattern {
         struct DepthGuard<'a>(&'a QueryThread);
         impl Drop for DepthGuard<'_> {
             fn drop(&mut self) {
-                self.0.depth.set(self.0.depth.get().saturating_sub(1));
+                let next = self.0.depth.get().saturating_sub(1);
+                self.0.depth.set(next);
+                if next == 0 {
+                    context_keys::end_query_merge_cache();
+                }
             }
         }
         let depth = thread.depth.get().saturating_add(1);
         thread.depth.set(depth);
+        if depth == 1 {
+            context_keys::begin_query_merge_cache();
+        }
         let _guard = DepthGuard(thread);
         if depth > MAX_PATTERN_DEPTH {
             refuse(QueryLimit::GraphDepth {
@@ -9771,10 +9944,15 @@ impl Pattern {
                 let from = out.len();
                 node.inner
                     .answer_onto(thread, state, table::Order::Graph, out);
-                let mut local = None;
+                let mut local = [None, None];
+                let mut local_next = 0u8;
                 for hap in &mut out[from..] {
-                    hap.keys
-                        .add_ui_visual_slot_cached(node.slot, &node.cache, &mut local);
+                    hap.keys.add_ui_visual_slot_cached(
+                        node.slot,
+                        &node.cache,
+                        &mut local,
+                        &mut local_next,
+                    );
                 }
             }
 
@@ -10319,55 +10497,67 @@ impl Pattern {
                 // state, so one resolution serves all of them. `resolve_for_join`
                 // is total: a receiver that is not a pattern-of at all still
                 // produces haps, whose values simply are not patterns.
-                let resolved = inner.resolve_for_join(state);
+                let mut resolved = inner.resolve_for_join(state);
                 // The join dereferences each value as a pattern with no guard,
                 // so a non-pattern value is a `TypeError` that the `queryArc`
                 // boundary turns into no haps at all.
-                let resolved = match ResolvedHap::all_patterns(resolved) {
-                    Ok(resolved) => resolved,
-                    Err(_) => {
-                        signal_query_error(|| "x.value.query is not a function".into());
-                        return Vec::new();
-                    }
-                };
+                if resolved.iter().any(|r| r.inner.is_none()) {
+                    put_resolved_list(resolved);
+                    signal_query_error(|| "x.value.query is not a function".into());
+                    return Vec::new();
+                }
 
-                match mode {
+                let result = match mode {
                     JoinMode::Inner | JoinMode::Outer | JoinMode::Mix => {
                         let part_asked = part_is_asked();
                         let mut out = Vec::new();
-                        for (a, inner_pat) in resolved {
-                            if part_asked && refuses_part(&inner_pat) {
-                                return Vec::new();
-                            }
-                            for b in inner_pat.query(&state.set_span(a.part)) {
-                                let whole = match mode {
-                                    JoinMode::Inner => b.whole,
-                                    JoinMode::Outer => a.whole,
-                                    // `bind`'s whole_func: undefined if either
-                                    // side is analog, else `intersection_e`.
-                                    JoinMode::Mix => match (a.whole, b.whole) {
-                                        (Some(x), Some(y)) => match x.intersection(&y) {
-                                            Some(i) => Some(i),
-                                            // `intersection_e` THROWS, and the
-                                            // throw reaches `queryArc`, which
-                                            // then yields no haps at all.
-                                            None => {
-                                                signal_query_error(|| {
-                                                    "TimeSpans do not intersect".into()
-                                                });
-                                                continue;
-                                            }
+                        let ok = with_list(|inner_haps| {
+                            for ResolvedHap { hap: a, inner } in resolved.drain(..) {
+                                let inner_pat = inner.expect("checked all patterns");
+                                if part_asked && refuses_part(&inner_pat) {
+                                    return false;
+                                }
+                                inner_haps.clear();
+                                let asked = state.set_span(a.part);
+                                QUERY_THREAD.with(|thread| {
+                                    inner_pat.answer_onto(
+                                        thread,
+                                        &asked,
+                                        table::Order::Graph,
+                                        inner_haps,
+                                    );
+                                });
+                                for b in inner_haps.drain(..) {
+                                    let whole = match mode {
+                                        JoinMode::Inner => b.whole,
+                                        JoinMode::Outer => a.whole,
+                                        // `bind`'s whole_func: undefined if either
+                                        // side is analog, else `intersection_e`.
+                                        JoinMode::Mix => match (a.whole, b.whole) {
+                                            (Some(x), Some(y)) => match x.intersection(&y) {
+                                                Some(i) => Some(i),
+                                                // `intersection_e` THROWS, and the
+                                                // throw reaches `queryArc`, which
+                                                // then yields no haps at all.
+                                                None => {
+                                                    signal_query_error(|| {
+                                                        "TimeSpans do not intersect".into()
+                                                    });
+                                                    continue;
+                                                }
+                                            },
+                                            _ => None,
                                         },
-                                        _ => None,
-                                    },
-                                    _ => unreachable!("handled by the outer match"),
-                                };
-                                if !push_budgeted(&mut out, joined_hap(&a, b, whole)) {
-                                    return Vec::new();
+                                        _ => unreachable!("handled by the outer match"),
+                                    };
+                                    if !push_budgeted(&mut out, joined_hap(&a, b, whole)) {
+                                        return false;
+                                    }
                                 }
                             }
-                        }
-                        out
+                            true
+                        });
+                        if ok { out } else { Vec::new() }
                     }
 
                     // Each inner pattern is focused onto its outer hap's
@@ -10378,7 +10568,12 @@ impl Pattern {
                         let part_asked = part_is_asked();
                         let mut out = Vec::new();
                         let ok = with_list(|inner_haps| {
-                            for (outer, inner_pat) in resolved {
+                            for ResolvedHap {
+                                hap: outer,
+                                inner: inner_pat,
+                            } in resolved.drain(..)
+                            {
+                                let inner_pat = inner_pat.expect("checked all patterns");
                                 // `discreteOnly()`: analog outer haps are dropped.
                                 let Some(outer_whole) = outer.whole else {
                                     continue;
@@ -10432,10 +10627,7 @@ impl Pattern {
                             }
                             true
                         });
-                        if !ok {
-                            return Vec::new();
-                        }
-                        out
+                        if ok { out } else { Vec::new() }
                     }
 
                     // The inner pattern is queried over the whole state span,
@@ -10444,46 +10636,62 @@ impl Pattern {
                     // missing `part` filters.
                     JoinMode::Reset | JoinMode::Restart => {
                         let mut out = Vec::new();
-                        for (outer, inner_pat) in resolved {
-                            let Some(outer_whole) = outer.whole else {
-                                continue;
-                            };
-                            let shift = if *mode == JoinMode::Restart {
-                                outer_whole.begin
-                            } else {
-                                outer_whole.begin.cycle_pos()
-                            };
-                            for inner in inner_pat.query_restarted(shift, state, outer.part) {
-                                let Some(part) = inner.part.intersection(&outer.part) else {
+                        let ok = with_list(|inner_haps| {
+                            for ResolvedHap {
+                                hap: outer,
+                                inner: inner_pat,
+                            } in resolved.drain(..)
+                            {
+                                let inner_pat = inner_pat.expect("checked all patterns");
+                                let Some(outer_whole) = outer.whole else {
                                     continue;
                                 };
-                                let whole =
-                                    inner.whole.and_then(|iw| iw.intersection(&outer_whole));
-                                let mut ctx = outer.context.clone();
-                                ctx.append(&inner.context);
-                                if !push_budgeted(
-                                    &mut out,
-                                    Hap {
-                                        whole,
-                                        part,
-                                        keys: ContextKeys::merge_with(
-                                            &inner.keys,
-                                            &outer.keys,
-                                            inner.live_controls(),
-                                            inner.slider_binding(),
-                                            joined_pick_lookup(&outer, &inner),
-                                        ),
-                                        value: inner.value.clone(),
-                                        context: ctx,
-                                    },
-                                ) {
-                                    return Vec::new();
+                                let shift = if *mode == JoinMode::Restart {
+                                    outer_whole.begin
+                                } else {
+                                    outer_whole.begin.cycle_pos()
+                                };
+                                inner_haps.clear();
+                                QUERY_THREAD.with(|thread| {
+                                    inner_pat.query_restarted_onto(
+                                        thread, shift, state, outer.part, inner_haps,
+                                    );
+                                });
+                                for inner in inner_haps.drain(..) {
+                                    let Some(part) = inner.part.intersection(&outer.part) else {
+                                        continue;
+                                    };
+                                    let whole =
+                                        inner.whole.and_then(|iw| iw.intersection(&outer_whole));
+                                    let mut ctx = outer.context.clone();
+                                    ctx.append(&inner.context);
+                                    if !push_budgeted(
+                                        &mut out,
+                                        Hap {
+                                            whole,
+                                            part,
+                                            keys: ContextKeys::merge_with(
+                                                &inner.keys,
+                                                &outer.keys,
+                                                inner.live_controls(),
+                                                inner.slider_binding(),
+                                                joined_pick_lookup(&outer, &inner),
+                                            ),
+                                            value: inner.value,
+                                            context: ctx,
+                                        },
+                                    ) {
+                                        return false;
+                                    }
                                 }
                             }
-                        }
-                        out
+                            true
+                        });
+                        if ok { out } else { Vec::new() }
                     }
-                }
+                };
+                put_resolved_list(resolved);
+                result
             }
 
             // The outer pattern is queried over CYCLE ZERO after shifting, so
@@ -10847,67 +11055,103 @@ impl Pattern {
         match self.node_kind() {
             Node::PatternOfPure(boxed) => {
                 let (outer, f, memo) = &**boxed;
-                let mut resolved = Vec::new();
+                let mut resolved = take_resolved_list();
                 let settings = settings::current_state_id();
-                for hap in outer.query(state) {
-                    let inner = memo
-                        .construct(&hap.value, &settings, |value| f(value))
-                        .pattern()
-                        .clone();
-                    if query_error_pending() || budget_exhausted() {
-                        return Some(Vec::new());
+                let ok = with_list(|outer_haps| {
+                    QUERY_THREAD.with(|thread| {
+                        outer.answer_onto(thread, state, table::Order::Graph, outer_haps);
+                    });
+                    for hap in outer_haps.drain(..) {
+                        let inner = memo
+                            .construct(&hap.value, &settings, |value| f(value))
+                            .pattern()
+                            .clone();
+                        if query_error_pending() || budget_exhausted() {
+                            return false;
+                        }
+                        resolved.push(ResolvedHap::of(hap, inner));
                     }
-                    resolved.push(ResolvedHap::of(hap, inner));
+                    true
+                });
+                if !ok {
+                    resolved.clear();
                 }
                 Some(resolved)
             }
             Node::PatternOfPureOperand(boxed, map) => {
                 let OperandPureNode(outer, operand, memo) = &**boxed;
-                let mut resolved = Vec::new();
+                let mut resolved = take_resolved_list();
                 let settings = settings::current_state_id();
-                for mut hap in outer.query(state) {
-                    let inner = memo
-                        .construct(&hap.value, &settings, |value| map.apply(value, operand))
-                        .pattern()
-                        .clone();
-                    if query_error_pending() || budget_exhausted() {
-                        return Some(Vec::new());
+                let ok = with_list(|outer_haps| {
+                    QUERY_THREAD.with(|thread| {
+                        outer.answer_onto(thread, state, table::Order::Graph, outer_haps);
+                    });
+                    for mut hap in outer_haps.drain(..) {
+                        let inner = memo
+                            .construct(&hap.value, &settings, |value| map.apply(value, operand))
+                            .pattern()
+                            .clone();
+                        if query_error_pending() || budget_exhausted() {
+                            return false;
+                        }
+                        if hap.pick_lookup().is_some() {
+                            hap.keys.edit().pick_lookup = None;
+                            hap.keys.trim();
+                        }
+                        resolved.push(ResolvedHap::of(hap, inner));
                     }
-                    if hap.pick_lookup().is_some() {
-                        hap.keys.edit().pick_lookup = None;
-                        hap.keys.trim();
-                    }
-                    resolved.push(ResolvedHap::of(hap, inner));
+                    true
+                });
+                if !ok {
+                    resolved.clear();
                 }
                 Some(resolved)
             }
             Node::PatternOfDynamic(boxed) => {
                 let (outer, f) = (&boxed.0, &boxed.1);
-                let mut resolved = Vec::new();
-                for hap in outer.query(state) {
-                    let inner = f(&hap.value);
-                    // Iteration unwinds on the first throwing callback, as
-                    // Array.map would. A host callback records that throw in the
-                    // shared query-error channel and returns silence so Rust
-                    // itself stays panic-free; stop HERE or later carrier haps
-                    // would still expose user side effects before queryArc
-                    // eventually discarded the answer.
-                    if query_error_pending() || budget_exhausted() {
-                        return Some(Vec::new());
+                let mut resolved = take_resolved_list();
+                let ok = with_list(|outer_haps| {
+                    QUERY_THREAD.with(|thread| {
+                        outer.answer_onto(thread, state, table::Order::Graph, outer_haps);
+                    });
+                    for hap in outer_haps.drain(..) {
+                        let inner = f(&hap.value);
+                        // Iteration unwinds on the first throwing callback, as
+                        // Array.map would. A host callback records that throw in the
+                        // shared query-error channel and returns silence so Rust
+                        // itself stays panic-free; stop HERE or later carrier haps
+                        // would still expose user side effects before queryArc
+                        // eventually discarded the answer.
+                        if query_error_pending() || budget_exhausted() {
+                            return false;
+                        }
+                        resolved.push(ResolvedHap::of(hap, inner));
                     }
-                    resolved.push(ResolvedHap::of(hap, inner));
+                    true
+                });
+                if !ok {
+                    resolved.clear();
                 }
                 Some(resolved)
             }
             Node::PatternOfHap(bind) => {
                 let HapBind(outer, _, f) = &**bind;
-                let mut resolved = Vec::new();
-                for hap in outer.query(state) {
-                    let inner = f(&hap);
-                    if query_error_pending() || budget_exhausted() {
-                        return Some(Vec::new());
+                let mut resolved = take_resolved_list();
+                let ok = with_list(|outer_haps| {
+                    QUERY_THREAD.with(|thread| {
+                        outer.answer_onto(thread, state, table::Order::Graph, outer_haps);
+                    });
+                    for hap in outer_haps.drain(..) {
+                        let inner = f(&hap);
+                        if query_error_pending() || budget_exhausted() {
+                            return false;
+                        }
+                        resolved.push(ResolvedHap::of(hap, inner));
                     }
-                    resolved.push(ResolvedHap::of(hap, inner));
+                    true
+                });
+                if !ok {
+                    resolved.clear();
                 }
                 Some(resolved)
             }
@@ -11213,22 +11457,29 @@ impl Pattern {
     /// shape.
     fn resolve_for_join(&self, state: &State) -> Vec<ResolvedHap> {
         self.resolve_pattern_of(state).unwrap_or_else(|| {
-            self.query(state)
-                .into_iter()
-                .map(|hap| match &hap.value {
-                    // Ordinary `fmap` is representation-agnostic: a
-                    // callback may return a Pattern, store it in the hap, and
-                    // a following join must consume it. `FmapJs` materialises
-                    // that wrapper as `Value::Pattern`; treating every
-                    // fallback hap as scalar made
-                    // `p.fmap(x => pure(x)).innerJoin()` silently empty.
-                    Value::Pattern(value) => ResolvedHap {
-                        inner: Some(value.pattern().clone()),
-                        hap: hap.with_value(|_| Value::Undefined),
-                    },
-                    _ => ResolvedHap { hap, inner: None },
-                })
-                .collect()
+            let mut resolved = take_resolved_list();
+            with_list(|outer_haps| {
+                QUERY_THREAD.with(|thread| {
+                    self.answer_onto(thread, state, table::Order::Graph, outer_haps);
+                });
+                for hap in outer_haps.drain(..) {
+                    let entry = match &hap.value {
+                        // Ordinary `fmap` is representation-agnostic: a
+                        // callback may return a Pattern, store it in the hap, and
+                        // a following join must consume it. `FmapJs` materialises
+                        // that wrapper as `Value::Pattern`; treating every
+                        // fallback hap as scalar made
+                        // `p.fmap(x => pure(x)).innerJoin()` silently empty.
+                        Value::Pattern(value) => ResolvedHap {
+                            inner: Some(value.pattern().clone()),
+                            hap: hap.with_value(|_| Value::Undefined),
+                        },
+                        _ => ResolvedHap { hap, inner: None },
+                    };
+                    resolved.push(entry);
+                }
+            });
+            resolved
         })
     }
 
