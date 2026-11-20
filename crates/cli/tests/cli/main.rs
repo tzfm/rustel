@@ -9586,6 +9586,34 @@ fn a_replay_save_that_never_reached_the_score_is_reported_not_announced() {
     }
 }
 
+/// A `.dict()` name nothing registered is an error of the query, as on
+/// strudel.cc, not a lane that plays silence; a known name and a score's
+/// own `addVoicings` name still voice the chord.
+#[test]
+fn an_unknown_voicing_dictionary_is_an_error() {
+    assert_reported_failure(
+        &[
+            "query",
+            "-e",
+            r#"chord("Cm7").dict("lefthnd").anchor(70).voicing()"#,
+        ],
+        "unknown voicing dictionary \"lefthnd\"",
+    );
+    for score in [
+        r#"chord("Cm7").dict("lefthand").anchor(70).voicing()"#,
+        "addVoicings('mine', {m7: ['3m 7m']}, ['C3','C6']); chord('Cm7').dict('mine').voicing()",
+    ] {
+        let out = ok_stdout(&["query", "-e", score, "--plain"]);
+        let events: usize = out
+            .lines()
+            .rev()
+            .find_map(|line| line.split_once(" events").map(|(count, _)| count.trim()))
+            .and_then(|count| count.parse().ok())
+            .expect("an event count");
+        assert!(events > 0, "{score}: {out}");
+    }
+}
+
 /// `check` and `query` run a prebake first, as `play` does, so a score that
 /// calls one of its helpers is clean and lists its events.
 #[test]
