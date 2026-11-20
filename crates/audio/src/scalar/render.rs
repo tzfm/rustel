@@ -4737,7 +4737,15 @@ impl ScalarBackend {
                     // outputs its FIRST voice keyed; see `orbit_channels`.
                     let (bl, br) = Self::route_channels(self.orbit_channels[orbit], bl, br);
                     let gain = ducks[orbit].value_at(abs) * orbit_gains[orbit];
-                    let (ol, or) = (bl * gain, br * gain);
+                    // A voice pushed past the `f32` range is silence on both
+                    // sides of the mix, not a `NaN` on one channel and
+                    // full scale on the other.
+                    let silent_unless_finite =
+                        |sample: f32| if sample.is_finite() { sample } else { 0.0 };
+                    let (ol, or) = (
+                        silent_unless_finite(bl * gain),
+                        silent_unless_finite(br * gain),
+                    );
                     orbit_peaks[orbit] = orbit_peaks[orbit].max(ol.abs().max(or.abs()));
                     // A stems render taps every orbit here: after its delay,
                     // reverb, DJF, channel map, duck and fader, before the
