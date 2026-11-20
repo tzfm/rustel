@@ -835,16 +835,15 @@ impl SampleLibrary {
                 .refuse(generation, GlobalKind::Folder, &error);
         }
         if !packs.is_empty() {
-            let registered = self.register_global_packs(&packs, generation);
+            let (failed, queued) = self.register_global_packs(&packs, generation);
             let mut rows = self.shared.global_rows.lock().expect("global source rows");
-            match registered {
-                // Only the rows that would not read fail; the rest fetch.
-                Ok(failed) => {
-                    for (row, error) in failed {
-                        rows.fail_row(generation, row, &error);
-                    }
-                }
-                Err(error) => rows.refuse(generation, GlobalKind::Pack, &error),
+            // Only the rows that would not read fail with their own reason,
+            // first, so a refused queue does not take it from them.
+            for (row, error) in failed {
+                rows.fail_row(generation, row, &error);
+            }
+            if let Err(error) = queued {
+                rows.refuse(generation, GlobalKind::Pack, &error);
             }
         }
         self.global_source_reports()
@@ -977,13 +976,13 @@ impl SampleLibrary {
     /// A pack's `_base` can then point at a CDN, as a score's imports can.
     /// Fetch the packs of an adoption. A spec that will not read or is not
     /// permitted fails its own row, given back with the reason; the others
-    /// are fetched. `Err` is the queue's own refusal, which leaves every
-    /// pack row unfilled.
+    /// are fetched. The second part is the queue's own refusal, which leaves
+    /// every pack row still waiting unfilled.
     fn register_global_packs(
         &self,
         packs: &[(usize, String)],
         generation: u64,
-    ) -> Result<Vec<(usize, String)>, String> {
+    ) -> (Vec<(usize, String)>, Result<(), String>) {
         let mut access = self
             .shared
             .import_policy
@@ -1014,15 +1013,18 @@ impl SampleLibrary {
                 Err(error) => failed.push((*row, error)),
             }
         }
-        if !effects.is_empty() {
+        let queued = if effects.is_empty() {
+            Ok(())
+        } else {
             self.register_batch_async_into(
                 BankLayer::Global { generation },
                 effects,
                 &[],
                 ManifestAccess::Score(access),
-            )?;
-        }
-        Ok(failed)
+            )
+            .map(|_| ())
+        };
+        (failed, queued)
     }
 
     /// Forget a pack's cached list, so the next adoption asks for it again
