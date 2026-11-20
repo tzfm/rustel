@@ -825,6 +825,32 @@ mod tests {
             );
         }
 
+        /// A name from a script another scene imports stays available to every
+        /// scene, so the checker does not refuse it in a scene with no import
+        /// of its own.
+        #[test]
+        fn a_score_may_call_a_name_from_another_scenes_import() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let score = Arc::<str>::from("$: shimmer(s(\"hh\"))");
+            let revision = app.editor().revision();
+            assert!(
+                app.refuse_unclean(revision, &score),
+                "with no script anywhere this really is unknown"
+            );
+
+            app.scenes.current_mut().editor = Editor::new(
+                "await import('http://127.0.0.1:8123/scripts.js')\n$: shimmer(s(\"bd\"))",
+            )
+            .unwrap();
+            app.new_scene(false);
+            let revision = app.editor().revision();
+            assert!(
+                !app.refuse_unclean(revision, &score),
+                "the other scene's script may define it"
+            );
+        }
+
         /// A setup applying while a score sounds installs that score again, off
         /// the tape, so the music takes the new definitions.
         #[test]
