@@ -24,6 +24,8 @@ pub struct OrderedMap {
 /// Maximum inline patch slots carried by a [`Patched`] overlay before
 /// materialising a flat slice.
 const MAX_PATCHES: usize = 8;
+const INLINE_PATCHES: usize = 4;
+const TAIL_PATCHES: usize = MAX_PATCHES - INLINE_PATCHES;
 
 /// Compact `u16`-keyed storage for maps whose keys are all canonical
 /// built-in control names: low 10 bits hold the 1-based control id and high
@@ -538,6 +540,23 @@ impl PatchedBase {
     }
 }
 
+#[derive(Clone)]
+struct PatchedTail {
+    keys: [Option<Key>; TAIL_PATCHES],
+    values: [Value; TAIL_PATCHES],
+    reps: [u16; TAIL_PATCHES],
+}
+
+impl PatchedTail {
+    const fn empty() -> Self {
+        Self {
+            keys: [const { None }; TAIL_PATCHES],
+            values: [const { Value::Undefined }; TAIL_PATCHES],
+            reps: [u16::MAX; TAIL_PATCHES],
+        }
+    }
+}
+
 /// Up to [`MAX_PATCHES`] key/value overrides or additions over a shared
 /// dressed [`Table`] or sequence layer row, avoiding flattening `Table::tail`
 /// on dynamic control chains. The row index lives alongside the `Arc<Patched>`
@@ -548,8 +567,9 @@ pub(crate) struct Patched {
     base: PatchedBase,
     /// Optional built-in map overlaid alongside `base` without materialising
     /// a flat `BuiltinMap`. Keys that overlap `base` (or prior inline appends)
-    /// live in `entries` and are masked out in `overlay_skip`.
+    /// live in the patch slots and are masked out in `overlay_skip`.
     overlay: Option<Arc<dyn BuiltinEntries>>,
+    marks: u64,
     overlay_skip: u32,
     base_len: u16,
     overlay_len: u16,
@@ -561,17 +581,277 @@ pub(crate) struct Patched {
     /// (`[base, appended, overlay]`) to preserve insertion order when attaching
     /// a constant overlay onto an already-appended `Patched`.
     overlay_after_appended: bool,
+    reps: [u16; INLINE_PATCHES],
+    keys: [Option<Key>; INLINE_PATCHES],
+    values: [Value; INLINE_PATCHES],
+    tail: Option<Box<PatchedTail>>,
+}
+
+const _: () = assert!(std::mem::size_of::<Patched>() <= 256);
+
+/// Compact multi-slot numeric overlay storing up to 16 values (`n_keys * n_slots <= 16`,
+/// `1 <= n_keys <= 4`) over one uniform-key [`PatchedBase`]. Allows segmented steps
+/// (`meet_steps_small`) and multi-sample wave chains (`try_query_wave_chain_onto`) to
+/// share one allocation across all steps/samples and every chord note from the same base.
+#[derive(Clone)]
+pub(crate) struct StepPatch {
+    base: PatchedBase,
     marks: u64,
-    entries: [Option<(Key, Value, u16)>; MAX_PATCHES],
+    keys: [Option<Key>; 4],
+    reps: [u16; 4],
+    base_len: u16,
+    n_keys: u8,
+    appended: u8,
+    made: bool,
+    values: [Value; 16],
+}
+
+const _: () = assert!(std::mem::size_of::<StepPatch>() <= 512);
+
+impl StepPatch {
+    pub(crate) const MAX_KEYS: usize = 4;
+    pub(crate) const MAX_VALUES: usize = 16;
+    pub(crate) const MAX_ROW: u32 = u32::MAX >> 4;
+
+    /// Build a multi-slot numeric overlay over a uniform-key `base` with 1..=4
+    /// unique `keys`. Caller populates `0..n_slots` via [`Self::set_slot`].
+    pub(crate) fn new(base: PatchedBase, row: u32, keys: &[&Key], made: bool) -> Option<Self> {
+        let n_keys = keys.len();
+        if n_keys == 0 || n_keys > Self::MAX_KEYS || row > Self::MAX_ROW || !base.has_uniform_keys()
+        {
+            return None;
+        }
+        let base_layout = base.layout(row);
+        let base_len = u16::try_from(base_layout.len()).ok()?;
+        let mut marks = base.marks();
+        let mut key_slots: [Option<Key>; 4] = [None, None, None, None];
+        let mut reps = [u16::MAX; 4];
+        let mut appended = 0u8;
+        for (i, &key) in keys.iter().enumerate() {
+            key_slots[i] = Some(key.clone());
+            marks |= Table::mark(key);
+            if let Some(pos) = base_layout.position(key) {
+                reps[i] = u16::try_from(pos).ok()?;
+            } else {
+                appended = appended.checked_add(1)?;
+            }
+        }
+        Some(Self {
+            base,
+            marks,
+            keys: key_slots,
+            reps,
+            base_len,
+            n_keys: n_keys as u8,
+            appended,
+            made,
+            values: [const { Value::Undefined }; 16],
+        })
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_slot(&mut self, slot: usize, vals: &[f64]) {
+        let n = usize::from(self.n_keys);
+        debug_assert_eq!(vals.len(), n);
+        let offset = slot * n;
+        for (k, &v) in vals.iter().enumerate() {
+            self.values[offset + k] = Value::F64(v);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_single_slot(&mut self, slot: usize, val: f64) {
+        debug_assert_eq!(self.n_keys, 1);
+        self.values[slot] = Value::F64(val);
+    }
+
+    #[inline(always)]
+    pub(crate) fn pack(row: u32, slot: usize) -> u32 {
+        debug_assert!(row <= Self::MAX_ROW && slot < 16);
+        (row << 4) | (slot as u32)
+    }
+
+    #[inline(always)]
+    pub(crate) fn unpack(packed: u32) -> (u32, usize) {
+        (packed >> 4, (packed & 0xF) as usize)
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        usize::from(self.base_len) + usize::from(self.appended)
+    }
+
+    #[inline(always)]
+    fn at(&self, packed: u32, index: usize) -> (&Key, &Value) {
+        let (row, slot) = Self::unpack(packed);
+        let base_len = usize::from(self.base_len);
+        let n_keys = usize::from(self.n_keys);
+        let offset = slot * n_keys;
+        if index < base_len {
+            for k in 0..n_keys {
+                if usize::from(self.reps[k]) == index {
+                    return (
+                        self.keys[k].as_ref().expect("step patch key"),
+                        &self.values[offset + k],
+                    );
+                }
+            }
+            return self.base.layout(row).at(index);
+        }
+        let mut rem = index - base_len;
+        for k in 0..n_keys {
+            if self.reps[k] == u16::MAX {
+                if rem == 0 {
+                    return (
+                        self.keys[k].as_ref().expect("step patch key"),
+                        &self.values[offset + k],
+                    );
+                }
+                rem -= 1;
+            }
+        }
+        unreachable!("step patch index out of bounds")
+    }
+
+    #[inline(always)]
+    fn get<K: ?Sized + Named>(&self, packed: u32, key: &K) -> Option<&Value>
+    where
+        Key: PartialEq<K>,
+    {
+        if self.marks & Table::mark(key.name()) == 0 {
+            return None;
+        }
+        let (row, slot) = Self::unpack(packed);
+        let n_keys = usize::from(self.n_keys);
+        let offset = slot * n_keys;
+        for k in 0..n_keys {
+            if self.keys[k].as_ref().is_some_and(|name| name == key) {
+                return Some(&self.values[offset + k]);
+            }
+        }
+        self.base.layout(row).get(key)
+    }
+
+    #[inline(always)]
+    fn position<K: ?Sized + Named>(&self, packed: u32, key: &K) -> Option<usize>
+    where
+        Key: PartialEq<K>,
+    {
+        if self.marks & Table::mark(key.name()) == 0 {
+            return None;
+        }
+        let (row, _) = Self::unpack(packed);
+        let n_keys = usize::from(self.n_keys);
+        let mut appended_before = 0usize;
+        for k in 0..n_keys {
+            if self.keys[k].as_ref().is_some_and(|name| name == key) {
+                return if self.reps[k] != u16::MAX {
+                    Some(usize::from(self.reps[k]))
+                } else {
+                    Some(usize::from(self.base_len) + appended_before)
+                };
+            }
+            if self.reps[k] == u16::MAX {
+                appended_before += 1;
+            }
+        }
+        self.base.layout(row).position(key)
+    }
+
+    /// Promote one `(row, slot)` view into an owned mutable [`Patched`] so
+    /// downstream constant/wave overlays can stack without flattening `base`.
+    fn to_patched(&self, packed: u32) -> Option<(Patched, u32)> {
+        let (row, slot) = Self::unpack(packed);
+        let mut patched = Patched::empty(self.base.clone(), row, self.made)?;
+        let n_keys = usize::from(self.n_keys);
+        let offset = slot * n_keys;
+        for k in 0..n_keys {
+            let key = self.keys[k].as_ref()?;
+            let _ = patched.try_set(row, key, self.values[offset + k].clone(), true);
+        }
+        Some((patched, row))
+    }
 }
 
 impl Patched {
+    #[inline(always)]
+    fn slot_at(&self, i: usize) -> (&Key, &Value, u16) {
+        if i < INLINE_PATCHES {
+            (
+                self.keys[i].as_ref().expect("inline patch key"),
+                &self.values[i],
+                self.reps[i],
+            )
+        } else {
+            let tail = self.tail.as_deref().expect("tail patch present");
+            let j = i - INLINE_PATCHES;
+            (
+                tail.keys[j].as_ref().expect("tail patch key"),
+                &tail.values[j],
+                tail.reps[j],
+            )
+        }
+    }
+
+    #[inline(always)]
+    fn slot_val_mut(&mut self, i: usize) -> &mut Value {
+        if i < INLINE_PATCHES {
+            &mut self.values[i]
+        } else {
+            &mut self.tail.as_deref_mut().expect("tail patch present").values[i - INLINE_PATCHES]
+        }
+    }
+
+    #[inline(always)]
+    fn push_slot(&mut self, key: Key, value: Value, rep: u16) {
+        let i = usize::from(self.len);
+        if i < INLINE_PATCHES {
+            self.keys[i] = Some(key);
+            self.values[i] = value;
+            self.reps[i] = rep;
+        } else {
+            let tail = self
+                .tail
+                .get_or_insert_with(|| Box::new(PatchedTail::empty()));
+            let j = i - INLINE_PATCHES;
+            tail.keys[j] = Some(key);
+            tail.values[j] = value;
+            tail.reps[j] = rep;
+        }
+        self.len += 1;
+    }
+
+    #[inline(always)]
+    fn find_slot<K: ?Sized>(&self, key: &K) -> Option<usize>
+    where
+        Key: PartialEq<K>,
+    {
+        let len = usize::from(self.len);
+        let inline_n = len.min(INLINE_PATCHES);
+        for (i, slot) in self.keys.iter().enumerate().take(inline_n) {
+            if slot.as_ref().is_some_and(|k| k == key) {
+                return Some(i);
+            }
+        }
+        if len > INLINE_PATCHES
+            && let Some(tail) = self.tail.as_deref()
+        {
+            for (j, slot) in tail.keys.iter().enumerate().take(len - INLINE_PATCHES) {
+                if slot.as_ref().is_some_and(|k| k == key) {
+                    return Some(INLINE_PATCHES + j);
+                }
+            }
+        }
+        None
+    }
+
     fn empty(base: PatchedBase, row: u32, made: bool) -> Option<Self> {
         let base_len = u16::try_from(base.len(row)).ok()?;
         let marks = base.marks();
         Some(Self {
             base,
             overlay: None,
+            marks,
             overlay_skip: 0,
             base_len,
             overlay_len: 0,
@@ -580,8 +860,10 @@ impl Patched {
             has_replace: false,
             made,
             overlay_after_appended: false,
-            marks,
-            entries: [const { None }; MAX_PATCHES],
+            reps: [u16::MAX; INLINE_PATCHES],
+            keys: [const { None }; INLINE_PATCHES],
+            values: [const { Value::Undefined }; INLINE_PATCHES],
+            tail: None,
         })
     }
 
@@ -631,43 +913,43 @@ impl Patched {
         }
         let base_marks = base.marks();
         let ov_marks = ov_slice.marks();
-        let mut entries = [const { None }; MAX_PATCHES];
-        let mut len = 0u8;
-        let mut has_replace = false;
+        let mut out = Self {
+            base,
+            overlay: None,
+            marks: base_marks | ov_marks,
+            overlay_skip: 0,
+            base_len,
+            overlay_len: 0,
+            len: 0,
+            appended: 0,
+            has_replace: false,
+            made,
+            overlay_after_appended: false,
+            reps: [u16::MAX; INLINE_PATCHES],
+            keys: [const { None }; INLINE_PATCHES],
+            values: [const { Value::Undefined }; INLINE_PATCHES],
+            tail: None,
+        };
         let mut overlay_skip = 0u32;
         if base_marks & ov_marks != 0 {
-            let base_layout = base.layout(row);
             for ov_pos in 0..raw_len {
                 let (ov_key, ov_val) = ov_slice.at(ov_pos);
                 if base_marks & Table::mark(ov_key.as_str()) != 0
-                    && let Some(base_idx) = base_layout.position(ov_key)
+                    && let Some(base_idx) = out.base.layout(row).position(ov_key)
                 {
-                    if usize::from(len) >= MAX_PATCHES {
+                    if usize::from(out.len) >= MAX_PATCHES {
                         return None;
                     }
-                    entries[usize::from(len)] =
-                        Some((ov_key.clone(), ov_val.clone(), base_idx as u16));
-                    len += 1;
-                    has_replace = true;
+                    out.push_slot(ov_key.clone(), ov_val.clone(), base_idx as u16);
+                    out.has_replace = true;
                     overlay_skip |= 1u32 << ov_pos;
                 }
             }
         }
-        let overlay_len = u16::try_from(raw_len - overlay_skip.count_ones() as usize).ok()?;
-        Some(Self {
-            base,
-            overlay: Some(overlay),
-            overlay_skip,
-            base_len,
-            overlay_len,
-            len,
-            appended: 0,
-            has_replace,
-            made,
-            overlay_after_appended: false,
-            marks: base_marks | ov_marks,
-            entries,
-        })
+        out.overlay = Some(overlay);
+        out.overlay_skip = overlay_skip;
+        out.overlay_len = u16::try_from(raw_len - overlay_skip.count_ones() as usize).ok()?;
+        Some(out)
     }
 
     /// Attach a built-in overlay onto an existing `Patched` that does not yet
@@ -709,32 +991,20 @@ impl Patched {
         }
         let mut overlay_skip = 0u32;
         if self.marks & ov_marks != 0 {
-            let base_layout = self.base.layout(row);
             for ov_pos in 0..raw_len {
                 let (ov_key, ov_val) = ov_slice.at(ov_pos);
                 if self.marks & Table::mark(ov_key.as_str()) == 0 {
                     continue;
                 }
-                let mut updated = false;
-                for slot in &mut self.entries[..usize::from(self.len)] {
-                    if let Some((k, v, _)) = slot
-                        && k == ov_key
-                    {
-                        *v = ov_val.clone();
-                        overlay_skip |= 1u32 << ov_pos;
-                        updated = true;
-                        break;
-                    }
-                }
-                if updated {
+                if let Some(idx) = self.find_slot(ov_key) {
+                    *self.slot_val_mut(idx) = ov_val.clone();
+                    overlay_skip |= 1u32 << ov_pos;
                     continue;
                 }
                 if base_marks & Table::mark(ov_key.as_str()) != 0
-                    && let Some(base_idx) = base_layout.position(ov_key)
+                    && let Some(base_idx) = self.base.layout(row).position(ov_key)
                 {
-                    let idx = usize::from(self.len);
-                    self.entries[idx] = Some((ov_key.clone(), ov_val.clone(), base_idx as u16));
-                    self.len += 1;
+                    self.push_slot(ov_key.clone(), ov_val.clone(), base_idx as u16);
                     self.has_replace = true;
                     overlay_skip |= 1u32 << ov_pos;
                 }
@@ -771,11 +1041,16 @@ impl Patched {
         let marks = base.marks() | Table::mark(key.as_str());
         let appended = u8::from(rep == u16::MAX);
         let has_replace = rep != u16::MAX;
-        let mut entries = [const { None }; MAX_PATCHES];
-        entries[0] = Some((key, value, rep));
+        let mut keys = [const { None }; INLINE_PATCHES];
+        let mut values = [const { Value::Undefined }; INLINE_PATCHES];
+        let mut reps = [u16::MAX; INLINE_PATCHES];
+        keys[0] = Some(key);
+        values[0] = value;
+        reps[0] = rep;
         Some(Self {
             base,
             overlay: None,
+            marks,
             overlay_skip: 0,
             base_len,
             overlay_len: 0,
@@ -784,8 +1059,10 @@ impl Patched {
             has_replace,
             made,
             overlay_after_appended: false,
-            marks,
-            entries,
+            reps,
+            keys,
+            values,
+            tail: None,
         })
     }
 
@@ -799,11 +1076,11 @@ impl Patched {
         let base_len = usize::from(self.base_len);
         let overlay_len = usize::from(self.overlay_len);
         let appended = usize::from(self.appended);
+        let n = usize::from(self.len);
         if self.has_replace {
-            for slot in &self.entries[..usize::from(self.len)] {
-                if let Some((k, v, rep)) = slot
-                    && usize::from(*rep) == index
-                {
+            for i in 0..n {
+                let (k, v, rep) = self.slot_at(i);
+                if usize::from(rep) == index {
                     return (k, v);
                 }
             }
@@ -823,10 +1100,9 @@ impl Patched {
                     .at(raw);
             }
             let mut want = index - fixed_len;
-            for slot in &self.entries[..usize::from(self.len)] {
-                if let Some((k, v, rep)) = slot
-                    && *rep == u16::MAX
-                {
+            for i in 0..n {
+                let (k, v, rep) = self.slot_at(i);
+                if rep == u16::MAX {
                     if want == 0 {
                         return (k, v);
                     }
@@ -837,10 +1113,9 @@ impl Patched {
             let app_end = base_len + appended;
             if index < app_end {
                 let mut want = index - base_len;
-                for slot in &self.entries[..usize::from(self.len)] {
-                    if let Some((k, v, rep)) = slot
-                        && *rep == u16::MAX
-                    {
+                for i in 0..n {
+                    let (k, v, rep) = self.slot_at(i);
+                    if rep == u16::MAX {
                         if want == 0 {
                             return (k, v);
                         }
@@ -868,12 +1143,8 @@ impl Patched {
         if self.marks & Table::mark(key.name()) == 0 {
             return None;
         }
-        for slot in &self.entries[..usize::from(self.len)] {
-            if let Some((k, v, _)) = slot
-                && k == key
-            {
-                return Some(v);
-            }
+        if let Some(idx) = self.find_slot(key) {
+            return Some(self.slot_at(idx).1);
         }
         if let Some(overlay) = &self.overlay
             && let Some(val) = overlay.as_slice().get_str(key.name())
@@ -908,15 +1179,16 @@ impl Patched {
             base_len + usize::from(self.overlay_len)
         };
         let mut append_pos = 0usize;
-        for (k, _, rep) in self.entries[..usize::from(self.len)].iter().flatten() {
+        for i in 0..usize::from(self.len) {
+            let (k, _, rep) = self.slot_at(i);
             if k == key {
-                return Some(if *rep == u16::MAX {
+                return Some(if rep == u16::MAX {
                     app_base + append_pos
                 } else {
-                    usize::from(*rep)
+                    usize::from(rep)
                 });
             }
-            if *rep == u16::MAX {
+            if rep == u16::MAX {
                 append_pos += 1;
             }
         }
@@ -965,19 +1237,14 @@ impl Patched {
     }
 
     fn try_set(&mut self, row: u32, key: &Key, value: Value, data_only: bool) -> Result<(), Value> {
-        let len = usize::from(self.len);
-        for slot in &mut self.entries[..len] {
-            if let Some((k, v, _)) = slot
-                && k == key
-            {
-                *v = value;
-                if !data_only {
-                    self.made = false;
-                }
-                return Ok(());
+        if let Some(idx) = self.find_slot(key) {
+            *self.slot_val_mut(idx) = value;
+            if !data_only {
+                self.made = false;
             }
+            return Ok(());
         }
-        if len >= MAX_PATCHES {
+        if usize::from(self.len) >= MAX_PATCHES {
             return Err(value);
         }
         let mark = Table::mark(key.as_str());
@@ -985,8 +1252,7 @@ impl Patched {
         if replace == u16::MAX && self.overlay_after_appended {
             return Err(value);
         }
-        self.entries[len] = Some((key.clone(), value, replace));
-        self.len += 1;
+        self.push_slot(key.clone(), value, replace);
         if replace == u16::MAX {
             self.appended += 1;
         } else {
@@ -1006,17 +1272,13 @@ impl Patched {
         other: &Value,
         change: impl FnOnce(&Value, &Value) -> Value,
     ) -> bool {
-        let len = usize::from(self.len);
-        for slot in &mut self.entries[..len] {
-            if let Some((k, v, _)) = slot
-                && k == key
-            {
-                *v = change(v, other);
-                self.made = false;
-                return true;
-            }
+        if let Some(idx) = self.find_slot(key) {
+            let slot_val = self.slot_val_mut(idx);
+            *slot_val = change(slot_val, other);
+            self.made = false;
+            return true;
         }
-        if len >= MAX_PATCHES {
+        if usize::from(self.len) >= MAX_PATCHES {
             return false;
         }
         let mark = Table::mark(key.as_str());
@@ -1042,8 +1304,7 @@ impl Patched {
             }
             (other.clone(), u16::MAX)
         };
-        self.entries[len] = Some((key.clone(), value, replace));
-        self.len += 1;
+        self.push_slot(key.clone(), value, replace);
         if replace == u16::MAX {
             self.appended += 1;
         } else {
@@ -1055,9 +1316,7 @@ impl Patched {
     }
 
     fn has_patch_for(&self, key: &Key) -> bool {
-        self.entries[..usize::from(self.len)]
-            .iter()
-            .any(|slot| slot.as_ref().is_some_and(|(k, _, _)| k == key))
+        self.find_slot(key).is_some()
     }
 
     #[inline]
@@ -1074,7 +1333,7 @@ impl Patched {
 pub(crate) struct SharedWaveCache {
     dressed: [Option<Arc<Patched>>; 4],
     dressed_next: u8,
-    patched: [Option<(Arc<Patched>, Arc<Patched>)>; 2],
+    patched: [Option<(Arc<Patched>, Arc<Patched>)>; 4],
     patched_next: u8,
 }
 
@@ -1116,7 +1375,7 @@ impl SharedWaveCache {
 
     #[inline]
     fn put_patched(&mut self, prev: Arc<Patched>, out: Arc<Patched>) {
-        let slot = usize::from(self.patched_next) & 1;
+        let slot = usize::from(self.patched_next) & 3;
         self.patched[slot] = Some((prev, out));
         self.patched_next = self.patched_next.wrapping_add(1);
     }
@@ -1143,6 +1402,9 @@ enum Entries {
     SeqLayer(Arc<[crate::sequence::Layer]>, u32, u16),
     /// A small overlay of up to [`MAX_PATCHES`] entries over a dressed row.
     Patched(Arc<Patched>, u32),
+    /// A multi-slot numeric overlay sharing one allocation across up to 16
+    /// steps or wave samples over a uniform-key base: `(patch, (row << 4) | slot)`.
+    StepPatch(Arc<StepPatch>, u32),
 }
 
 const _: () = assert!(std::mem::size_of::<OrderedMap>() == 24);
@@ -1317,7 +1579,8 @@ impl Table {
             Entries::Builtin(..)
             | Entries::Dressed(..)
             | Entries::SeqLayer(..)
-            | Entries::Patched(..) => Some(set.layout().to_shares()),
+            | Entries::Patched(..)
+            | Entries::StepPatch(..) => Some(set.layout().to_shares()),
         });
         let held = |name: &Key| {
             tail.as_deref()
@@ -1345,7 +1608,8 @@ impl Table {
                         Entries::Builtin(..)
                         | Entries::Dressed(..)
                         | Entries::SeqLayer(..)
-                        | Entries::Patched(..) => map.layout().to_shares(),
+                        | Entries::Patched(..)
+                        | Entries::StepPatch(..) => map.layout().to_shares(),
                     };
                     let bare = entries.is_empty() && tail.is_none();
                     if bare || entries.iter().any(|(name, _)| held(name)) || !value.is_data(0) {
@@ -1461,7 +1725,8 @@ impl Table {
             Entries::Builtin(..)
             | Entries::Dressed(..)
             | Entries::SeqLayer(..)
-            | Entries::Patched(..) => base.layout().to_shares(),
+            | Entries::Patched(..)
+            | Entries::StepPatch(..) => base.layout().to_shares(),
         };
         let replace = entries
             .iter()
@@ -1612,6 +1877,8 @@ pub(crate) enum Layout<'a> {
     KeyedExtra(&'a Key, &'a Value, Slice<'a>, &'a Key, &'a Value),
     /// A small overlay on top of a dressed table row.
     Overlay(&'a Patched, u32),
+    /// A multi-slot numeric overlay on top of a dressed table row.
+    StepOverlay(&'a StepPatch, u32),
 }
 
 impl<'a> Layout<'a> {
@@ -1624,6 +1891,7 @@ impl<'a> Layout<'a> {
             Self::Patched(base, replace, _, _) => base.len() + usize::from(replace == base.len()),
             Self::KeyedExtra(_, _, tail, _, _) => 2 + tail.len(),
             Self::Overlay(patched, _) => patched.len(),
+            Self::StepOverlay(step, _) => step.len(),
         }
     }
 
@@ -1646,6 +1914,12 @@ impl<'a> Layout<'a> {
                 row,
                 index: 0,
                 total: patched.len(),
+            },
+            Self::StepOverlay(step, packed) => PairsInner::StepOverlay {
+                step,
+                packed,
+                index: 0,
+                total: step.len(),
             },
         };
         Pairs(inner)
@@ -1679,6 +1953,7 @@ impl<'a> Layout<'a> {
                 }
             }
             Self::Overlay(patched, row) => patched.at(row, index),
+            Self::StepOverlay(step, packed) => step.at(packed, index),
         }
     }
 
@@ -1711,6 +1986,7 @@ impl<'a> Layout<'a> {
                 }
             }
             Self::Overlay(patched, row) => patched.position(row, key),
+            Self::StepOverlay(step, packed) => step.position(packed, key),
         }
     }
 
@@ -1740,6 +2016,7 @@ impl<'a> Layout<'a> {
                 }
             }
             Self::Overlay(patched, row) => patched.get(row, key),
+            Self::StepOverlay(step, packed) => step.get(packed, key),
         }
     }
 }
@@ -1773,6 +2050,12 @@ impl Layout<'_> {
             Self::Overlay(patched, row) => (0..patched.len())
                 .map(|index| {
                     let (key, value) = patched.at(row, index);
+                    (key.clone(), value.clone())
+                })
+                .collect(),
+            Self::StepOverlay(step, packed) => (0..step.len())
+                .map(|index| {
+                    let (key, value) = step.at(packed, index);
                     (key.clone(), value.clone())
                 })
                 .collect(),
@@ -1849,6 +2132,13 @@ enum PairsInner<'a> {
         index: usize,
         total: usize,
     },
+    /// Entries from a multi-slot numeric overlay over a dressed table row.
+    StepOverlay {
+        step: &'a StepPatch,
+        packed: u32,
+        index: usize,
+        total: usize,
+    },
 }
 
 impl<'a> Iterator for Pairs<'a> {
@@ -1895,6 +2185,19 @@ impl<'a> Iterator for Pairs<'a> {
                 *index += 1;
                 Some(pair)
             }
+            PairsInner::StepOverlay {
+                step,
+                packed,
+                index,
+                total,
+            } => {
+                if *index >= *total {
+                    return None;
+                }
+                let pair = step.at(*packed, *index);
+                *index += 1;
+                Some(pair)
+            }
         }
     }
 
@@ -1909,7 +2212,8 @@ impl<'a> Iterator for Pairs<'a> {
             PairsInner::KeyedExtra(head, middle, extra) => {
                 usize::from(head.is_some()) + middle.len() + usize::from(extra.is_some())
             }
-            PairsInner::Overlay { index, total, .. } => total.saturating_sub(*index),
+            PairsInner::Overlay { index, total, .. }
+            | PairsInner::StepOverlay { index, total, .. } => total.saturating_sub(*index),
         };
         (len, Some(len))
     }
@@ -2009,6 +2313,7 @@ impl OrderedMap {
                 layers[usize::from(*layer_idx)].seq_layout(*row)
             }
             Entries::Patched(patched, row) => Layout::Overlay(patched, *row),
+            Entries::StepPatch(step, packed) => Layout::StepOverlay(step, *packed),
         }
     }
 
@@ -2039,9 +2344,64 @@ impl OrderedMap {
     /// Copy an overlay map into a compact flat representation so long-lived
     /// graph nodes do not retain `Patched` overlays or pin source tables.
     pub(crate) fn undress_patched(&mut self) {
-        if let Entries::Patched(patched, row) = &self.entries {
-            self.entries = Layout::Overlay(patched, *row).to_entries(patched.made);
+        match &self.entries {
+            Entries::Patched(patched, row) => {
+                self.entries = Layout::Overlay(patched, *row).to_entries(patched.made);
+            }
+            Entries::StepPatch(step, packed) => {
+                self.entries = Layout::StepOverlay(step, *packed).to_entries(step.made);
+            }
+            _ => {}
         }
+    }
+
+    /// If this map is backed by a uniform-key [`Table`] or direct-keyed sequence
+    /// layer, return `(base, row)` when `row <= StepPatch::MAX_ROW`.
+    #[inline]
+    pub(crate) fn uniform_step_base(&self) -> Option<(PatchedBase, u32)> {
+        match &self.entries {
+            Entries::Dressed(table, row)
+                if table.has_uniform_keys() && *row <= StepPatch::MAX_ROW =>
+            {
+                Some((PatchedBase::Table(Arc::clone(table)), *row))
+            }
+            Entries::SeqLayer(layers, row, layer_idx)
+                if layers[usize::from(*layer_idx)].seq_has_uniform_keys()
+                    && *row <= StepPatch::MAX_ROW =>
+            {
+                Some((PatchedBase::SeqLayer(Arc::clone(layers), *layer_idx), *row))
+            }
+            _ => None,
+        }
+    }
+
+    /// Check if this map shares the same uniform-key [`PatchedBase`] as `base`,
+    /// returning its `row` when `row <= StepPatch::MAX_ROW`.
+    #[inline]
+    pub(crate) fn matches_step_base(&self, base: &PatchedBase) -> Option<u32> {
+        match (&self.entries, base) {
+            (Entries::Dressed(table, row), PatchedBase::Table(other))
+                if Arc::ptr_eq(table, other) && *row <= StepPatch::MAX_ROW =>
+            {
+                Some(*row)
+            }
+            (
+                Entries::SeqLayer(layers, row, layer_idx),
+                PatchedBase::SeqLayer(other_layers, other_idx),
+            ) if *layer_idx == *other_idx
+                && Arc::ptr_eq(layers, other_layers)
+                && *row <= StepPatch::MAX_ROW =>
+            {
+                Some(*row)
+            }
+            _ => None,
+        }
+    }
+
+    /// Point this map at `(row, slot)` of a shared [`StepPatch`].
+    #[inline(always)]
+    pub(crate) fn set_step_patch(&mut self, patch: &Arc<StepPatch>, row: u32, slot: usize) {
+        self.entries = Entries::StepPatch(Arc::clone(patch), StepPatch::pack(row, slot));
     }
 
     /// If this map is backed by a dressed [`Table`] or direct-keyed sequence
@@ -2070,6 +2430,9 @@ impl OrderedMap {
             }
             Entries::Patched(patched, row) => {
                 self.entries = Layout::Overlay(patched, *row).to_entries(patched.made);
+            }
+            Entries::StepPatch(step, packed) => {
+                self.entries = Layout::StepOverlay(step, *packed).to_entries(step.made);
             }
             _ => {}
         }
@@ -2312,6 +2675,7 @@ impl OrderedMap {
                 Held::View(layers[usize::from(*layer_idx)].seq_layout(*row))
             }
             Entries::Patched(patched, row) => Held::View(Layout::Overlay(patched, *row)),
+            Entries::StepPatch(step, packed) => Held::View(Layout::StepOverlay(step, *packed)),
         };
         self.entries = pack_entries(count, |index| entry(&mut held, index), false);
     }
@@ -2327,9 +2691,7 @@ impl OrderedMap {
         {
             let (key, value) = entry;
             let mark = Table::mark(key.as_str());
-            let idx = usize::from(own.len);
-            own.entries[idx] = Some((key, value, u16::MAX));
-            own.len += 1;
+            own.push_slot(key, value, u16::MAX);
             own.appended += 1;
             own.marks |= mark;
             own.made = false;
@@ -2421,6 +2783,10 @@ impl OrderedMap {
                 let (key, value) = entry;
                 Layout::Overlay(&patched, row).with_entries(&key, None, value, false)
             }
+            Entries::StepPatch(step, packed) => {
+                let (key, value) = entry;
+                Layout::StepOverlay(&step, packed).with_entries(&key, None, value, false)
+            }
         };
     }
 
@@ -2457,7 +2823,7 @@ impl OrderedMap {
                     };
                     self.entries = layout.with_entries(key, at, value, false);
                 }
-                (Entries::Patched(..), at) => {
+                (Entries::Patched(..) | Entries::StepPatch(..), at) => {
                     let value = match at {
                         Some(at) => change(self.layout().at(at).1, value),
                         None => value.clone(),
@@ -2695,7 +3061,7 @@ impl OrderedMap {
         }
         let at = self.position(key);
         match (&self.entries, at) {
-            (Entries::Patched(..), at) => {
+            (Entries::Patched(..) | Entries::StepPatch(..), at) => {
                 let value = match at {
                     Some(at) => change(self.layout().at(at).1, other),
                     None => other.clone(),
@@ -2731,6 +3097,7 @@ impl OrderedMap {
                 layers[usize::from(*layer_idx)].seq_position(*row, key.name())
             }
             Entries::Patched(patched, row) => patched.position(*row, key),
+            Entries::StepPatch(step, packed) => step.position(*packed, key),
         }
     }
 
@@ -2745,6 +3112,7 @@ impl OrderedMap {
                 layers[usize::from(*layer_idx)].seq_is_made()
             }
             Entries::Patched(patched, _) => patched.made,
+            Entries::StepPatch(step, _) => step.made,
             Entries::Shared(_) => false,
         }
     }
@@ -2872,7 +3240,14 @@ impl OrderedMap {
                 .with_entries(key, at, value, true);
             return;
         }
-        if let Entries::Patched(..) = &self.entries {
+        if let Entries::StepPatch(step, packed) = &self.entries
+            && let Some((mut patched, row)) = step.to_patched(*packed)
+            && patched.try_set(row, key, value.clone(), true).is_ok()
+        {
+            self.entries = Entries::Patched(Arc::new(patched), row);
+            return;
+        }
+        if let Entries::Patched(..) | Entries::StepPatch(..) = &self.entries {
             self.entries = self
                 .layout()
                 .with_entries(key, self.position(key), value, true);
@@ -2938,36 +3313,56 @@ impl OrderedMap {
                         return;
                     }
                 }
-                Entries::Patched(prev, row)
-                    if prev.base.has_uniform_keys() && Arc::strong_count(prev) > 1 =>
-                {
+                Entries::Patched(prev, row) if prev.base.has_uniform_keys() => {
                     let row = *row;
-                    if let Some(cached_out) = cache.get_patched(prev) {
-                        self.entries = Entries::Patched(Arc::clone(cached_out), row);
-                        return;
-                    }
-                    let mut extra = 0usize;
-                    for (i, (key, _)) in patches.iter().enumerate() {
-                        if !prev.has_patch_for(key)
-                            && !patches[..i].iter().any(|(other, _)| other == key)
+                    if Arc::strong_count(prev) > 1 {
+                        if let Some(cached_out) = cache.get_patched(prev) {
+                            self.entries = Entries::Patched(Arc::clone(cached_out), row);
+                            return;
+                        }
+                        let mut extra = 0usize;
+                        for (i, (key, _)) in patches.iter().enumerate() {
+                            if !prev.has_patch_for(key)
+                                && !patches[..i].iter().any(|(other, _)| other == key)
+                            {
+                                extra += 1;
+                            }
+                        }
+                        if usize::from(prev.len) + extra <= MAX_PATCHES
+                            && (!prev.overlay_after_appended
+                                || patches.iter().all(|(k, _)| prev.can_accept_key(row, k)))
                         {
-                            extra += 1;
+                            let mut next = (**prev).clone();
+                            for (key, num) in patches {
+                                let ok = next.try_set(row, key, Value::F64(*num), true).is_ok();
+                                debug_assert!(ok);
+                            }
+                            next.made = true;
+                            let arc = Arc::new(next);
+                            cache.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                            self.entries = Entries::Patched(arc, row);
+                            return;
                         }
-                    }
-                    if usize::from(prev.len) + extra <= MAX_PATCHES
-                        && (!prev.overlay_after_appended
-                            || patches.iter().all(|(k, _)| prev.can_accept_key(row, k)))
-                    {
-                        let mut next = (**prev).clone();
-                        for (key, num) in patches {
-                            let ok = next.try_set(row, key, Value::F64(*num), true).is_ok();
-                            debug_assert!(ok);
+                    } else if let Some(own) = Arc::get_mut(prev) {
+                        let mut extra = 0usize;
+                        for (i, (key, _)) in patches.iter().enumerate() {
+                            if !own.has_patch_for(key)
+                                && !patches[..i].iter().any(|(other, _)| other == key)
+                            {
+                                extra += 1;
+                            }
                         }
-                        next.made = true;
-                        let arc = Arc::new(next);
-                        cache.put_patched(Arc::clone(prev), Arc::clone(&arc));
-                        self.entries = Entries::Patched(arc, row);
-                        return;
+                        if usize::from(own.len) + extra <= MAX_PATCHES
+                            && (!own.overlay_after_appended
+                                || patches.iter().all(|(k, _)| own.can_accept_key(row, k)))
+                        {
+                            for (key, num) in patches {
+                                let ok = own.try_set(row, key, Value::F64(*num), true).is_ok();
+                                debug_assert!(ok);
+                            }
+                            own.made = true;
+                            return;
+                        }
                     }
                 }
                 _ => {}
@@ -3390,6 +3785,9 @@ impl OrderedMap {
                         Held::View(layers[usize::from(*layer_idx)].seq_layout(*row))
                     }
                     Entries::Patched(patched, row) => Held::View(Layout::Overlay(patched, *row)),
+                    Entries::StepPatch(step, packed) => {
+                        Held::View(Layout::StepOverlay(step, *packed))
+                    }
                 };
                 let count = base_len + append_len;
                 self.entries = pack_entries(
@@ -3467,16 +3865,11 @@ impl OrderedMap {
             && let row = *row
             && let Some(own) = Arc::get_mut(patched)
         {
-            let len = usize::from(own.len);
-            for slot in &mut own.entries[..len] {
-                if let Some((k, v, _)) = slot
-                    && *k == key
-                {
-                    own.made = false;
-                    return Some(std::mem::replace(v, value));
-                }
+            if let Some(idx) = own.find_slot(&key) {
+                own.made = false;
+                return Some(std::mem::replace(own.slot_val_mut(idx), value));
             }
-            if len < MAX_PATCHES {
+            if usize::from(own.len) < MAX_PATCHES {
                 let mark = Table::mark(key.as_str());
                 let (old, replace) = if own.base.marks() & mark != 0
                     && let layout = own.base.layout(row)
@@ -3491,8 +3884,7 @@ impl OrderedMap {
                 } else {
                     (None, u16::MAX)
                 };
-                own.entries[len] = Some((key, value, replace));
-                own.len += 1;
+                own.push_slot(key, value, replace);
                 if replace == u16::MAX {
                     own.appended += 1;
                 } else {
@@ -3577,6 +3969,7 @@ impl OrderedMap {
                 layers[usize::from(*layer_idx)].seq_get(*row, key)
             }
             Entries::Patched(patched, row) => patched.get(*row, key),
+            Entries::StepPatch(step, packed) => step.get(*packed, key),
         }
     }
 
@@ -3611,6 +4004,7 @@ impl OrderedMap {
                 layers[usize::from(*layer_idx)].seq_len(*row)
             }
             Entries::Patched(patched, _) => patched.len(),
+            Entries::StepPatch(step, _) => step.len(),
         }
     }
 
@@ -4808,6 +5202,13 @@ fn hash_data_entries(layout: Layout<'_>, state: &mut impl std::hash::Hasher) {
         Layout::Overlay(patched, row) => {
             for index in 0..patched.len() {
                 let (key, value) = patched.at(row, index);
+                key.hash(state);
+                hash_data(value, state);
+            }
+        }
+        Layout::StepOverlay(step, packed) => {
+            for index in 0..step.len() {
+                let (key, value) = step.at(packed, index);
                 key.hash(state);
                 hash_data(value, state);
             }

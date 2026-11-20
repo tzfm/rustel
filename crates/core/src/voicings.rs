@@ -1077,8 +1077,31 @@ pub fn voicing<P: crate::ops::PatOps>(pat: &P) -> P {
 }
 
 /// The per-hap body of [`voicing`]: capture-free, everything it reads it
-/// reads from the hap or the settings.
-fn voicing_hap(hap: &crate::Hap) -> Vec<crate::Hap> {
+/// reads from the hap or the settings, appending directly onto `out`.
+fn voicing_hap(hap: &crate::Hap, out: &mut Vec<crate::Hap>) {
+    struct CachedVoicingTable {
+        chord: crate::value::SharedStr,
+        anchor_str: Option<crate::value::SharedStr>,
+        anchor_bits: u64,
+        mode: u8,
+        offset_bits: u64,
+        octaves_bits: u64,
+        table: std::sync::Arc<crate::value::Table>,
+        len: u16,
+    }
+    thread_local! {
+        static TABLE_CACHE: std::cell::RefCell<([Option<CachedVoicingTable>; 16], usize)> =
+            const { std::cell::RefCell::new(([const { None }; 16], 0)) };
+    }
+    const VOICING_CONTROLS: [&str; 7] = [
+        "dictionary",
+        "chord",
+        "anchor",
+        "offset",
+        "mode",
+        "n",
+        "octaves",
+    ];
     // A plain string value is `{chord: value}`.
     let owned;
     let map: &OrderedMap = match &hap.value {
@@ -1090,31 +1113,105 @@ fn voicing_hap(hap: &crate::Hap) -> Vec<crate::Hap> {
         Value::JsValue(_) => {
             owned = match crate::materialize_js_value(&hap.value) {
                 Value::Object(map) => map,
-                _ => return Vec::new(),
+                _ => return,
             };
             &owned
         }
-        _ => return Vec::new(),
+        _ => return,
     };
-    resolve_voicing(map, |notes| {
-        const VOICING_CONTROLS: [&str; 7] = [
-            "dictionary",
-            "chord",
-            "anchor",
-            "offset",
-            "mode",
-            "n",
-            "octaves",
-        ];
+    let own_note = map.get("note");
+    let has_tail = map
+        .into_iter()
+        .any(|(key, _)| key.as_str() != "note" && !VOICING_CONTROLS.contains(&key.as_str()));
+    // Fast cached path for plain default-dictionary voicings (`!has_tail`,
+    // no `note`/`dictionary`/`n` overrides, no custom voicing settings).
+    let cache_key = if !has_tail
+        && own_note.is_none()
+        && matches!(map.get("dictionary"), None | Some(Value::Undefined))
+        && matches!(map.get("n"), None | Some(Value::Undefined))
+        && !crate::settings::has_custom_voicing_settings()
+    {
+        let chord = match map.get("chord") {
+            Some(Value::Str(s)) => Some(s),
+            _ => None,
+        };
+        let anchor = match map.get("anchor") {
+            None | Some(Value::Undefined) => Some((None, 72.0_f64.to_bits())),
+            Some(Value::F64(n)) => Some((None, n.to_bits())),
+            Some(Value::Str(s)) => Some((Some(s), 0u64)),
+            _ => None,
+        };
+        let mode = match map.get("mode") {
+            None | Some(Value::Undefined) => Some(0u8),
+            Some(Value::Str(s)) => match s.as_str() {
+                "below" => Some(0),
+                "duck" => Some(1),
+                "above" => Some(2),
+                "root" => Some(3),
+                "oldabove" => Some(4),
+                "oldroot" => Some(5),
+                _ => None,
+            },
+            _ => None,
+        };
+        let offset = match map.get("offset") {
+            None | Some(Value::Undefined) => Some(0.0_f64.to_bits()),
+            Some(Value::F64(n)) => Some(n.to_bits()),
+            _ => None,
+        };
+        let octaves = match map.get("octaves") {
+            None | Some(Value::Undefined) => Some(1.0_f64.to_bits()),
+            Some(Value::F64(n)) => Some(n.to_bits()),
+            _ => None,
+        };
+        match (chord, anchor, mode, offset, octaves) {
+            (Some(chord), Some((anchor_str, anchor_bits)), Some(mode), Some(off), Some(oct)) => {
+                Some((chord, anchor_str, anchor_bits, mode, off, oct))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some((chord, anchor_str, anchor_bits, mode, offset_bits, octaves_bits)) = cache_key {
+        let hit = TABLE_CACHE
+            .try_with(|cell| {
+                let borrow = cell.borrow();
+                borrow.0.iter().flatten().find_map(|entry| {
+                    (entry.mode == mode
+                        && entry.offset_bits == offset_bits
+                        && entry.octaves_bits == octaves_bits
+                        && entry.anchor_bits == anchor_bits
+                        && entry.chord.as_str() == chord.as_str()
+                        && entry.anchor_str.as_deref() == anchor_str.map(|s| s.as_str()))
+                    .then(|| (std::sync::Arc::clone(&entry.table), usize::from(entry.len)))
+                })
+            })
+            .ok()
+            .flatten();
+        if let Some((table, len)) = hit {
+            let mut template = hap.clone();
+            template.value = Value::Undefined;
+            let mut template = Some(template);
+            out.reserve(len);
+            for index in 0..len {
+                let mut item = if index + 1 == len {
+                    template.take().expect("template present")
+                } else {
+                    template.as_ref().expect("template present").clone()
+                };
+                item.value = Value::Object(table.map(index).expect("note index in table"));
+                out.push(item);
+            }
+            return;
+        }
+    }
+    let _ = resolve_voicing(map, |notes| {
         // Each note is first, then each control that the voicing does not
         // read. A note that the chord holds takes the place of each note.
-        let own_note = map.get("note");
         if notes.is_empty() {
-            return Vec::new();
+            return;
         }
-        let has_tail = map
-            .into_iter()
-            .any(|(key, _)| key.as_str() != "note" && !VOICING_CONTROLS.contains(&key.as_str()));
         if notes.len() > 1 {
             let note_values: std::sync::Arc<[Value]> = match own_note {
                 Some(own) => std::iter::repeat_n(own.clone(), notes.len()).collect(),
@@ -1135,15 +1232,35 @@ fn voicing_hap(hap: &crate::Hap) -> Vec<crate::Hap> {
                 tail_map.as_ref(),
             ) {
                 let table = std::sync::Arc::new(table);
+                if let Some((chord, anchor_str, anchor_bits, mode, offset_bits, octaves_bits)) =
+                    cache_key
+                    && let Ok(len_u16) = u16::try_from(notes.len())
+                {
+                    let _ = TABLE_CACHE.try_with(|cell| {
+                        let mut borrow = cell.borrow_mut();
+                        let slot = borrow.1 & 15;
+                        borrow.1 = borrow.1.wrapping_add(1);
+                        borrow.0[slot] = Some(CachedVoicingTable {
+                            chord: chord.clone(),
+                            anchor_str: anchor_str.cloned(),
+                            anchor_bits,
+                            mode,
+                            offset_bits,
+                            octaves_bits,
+                            table: std::sync::Arc::clone(&table),
+                            len: len_u16,
+                        });
+                    });
+                }
                 let mut template = hap.clone();
                 template.value = Value::Undefined;
-                return (0..notes.len())
-                    .map(|index| {
-                        let mut out = template.clone();
-                        out.value = Value::Object(table.map(index).expect("note index in table"));
-                        out
-                    })
-                    .collect();
+                out.reserve(notes.len());
+                for index in 0..notes.len() {
+                    let mut item = template.clone();
+                    item.value = Value::Object(table.map(index).expect("note index in table"));
+                    out.push(item);
+                }
+                return;
             }
         }
         let tail_entries: Vec<(crate::Key, Value)> = if has_tail {
@@ -1156,22 +1273,19 @@ fn voicing_hap(hap: &crate::Hap) -> Vec<crate::Hap> {
         } else {
             Vec::new()
         };
-        notes
-            .iter()
-            .map(|note| {
-                let note = (
-                    crate::combinators::NOTE.clone(),
-                    own_note.cloned().unwrap_or_else(|| note.clone()),
-                );
-                let mut out = hap.clone();
-                out.value = Value::Object(OrderedMap::of_keys(
-                    std::iter::once(note).chain(tail_entries.iter().cloned()),
-                ));
-                out
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+        out.reserve(notes.len());
+        for note in notes {
+            let note = (
+                crate::combinators::NOTE.clone(),
+                own_note.cloned().unwrap_or_else(|| note.clone()),
+            );
+            let mut item = hap.clone();
+            item.value = Value::Object(OrderedMap::of_keys(
+                std::iter::once(note).chain(tail_entries.iter().cloned()),
+            ));
+            out.push(item);
+        }
+    });
 }
 
 /// Every chord symbol a dictionary knows, sorted by name.
@@ -2582,7 +2696,9 @@ mod tests {
         // Each voiced value as its entries, in their order.
         let voiced = |chord: &OrderedMap| -> Vec<Vec<(String, Value)>> {
             let hap = crate::Hap::new(Some(span), span, Value::Object(chord.clone()));
-            let values = voicing_hap(&hap).into_iter().map(|hap| hap.value);
+            let mut voiced = Vec::new();
+            voicing_hap(&hap, &mut voiced);
+            let values = voiced.into_iter().map(|hap| hap.value);
             values
                 .map(|value| match value {
                     Value::Object(map) => {

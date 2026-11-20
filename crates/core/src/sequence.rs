@@ -547,7 +547,13 @@ impl Listing {
     /// The list of `raws`: a grid when their times fit one. A list that
     /// does not fit becomes places one time, here.
     fn of(mut raws: Vec<Raw>) -> Self {
-        if let Some(listing) = Grid::build_listing(&mut raws) {
+        Self::of_vec(&mut raws)
+    }
+
+    /// Build a [`Listing`] from `raws`, draining `raws` when it falls back to
+    /// `Places` so callers can recycle the buffer.
+    fn of_vec(raws: &mut Vec<Raw>) -> Self {
+        if let Some(listing) = Grid::build_listing(raws) {
             return listing;
         }
         let small = |span: &TimeSpan| {
@@ -557,7 +563,7 @@ impl Listing {
             .iter()
             .all(|raw| small(&raw.whole) && raw.part.as_ref().is_none_or(small));
         Self::Places(Arc::new(Listed {
-            places: raws.into_iter().map(Raw::place).collect(),
+            places: raws.drain(..).map(Raw::place).collect(),
             small_denominators,
         }))
     }
@@ -2125,20 +2131,24 @@ pub(crate) fn with_tick_grid<R>(ticks: NonZeroU32, f: impl FnOnce(Option<&TickGr
         return f(None);
     }
     let denom = i64::from(ticks.get());
-    let hit = TICK_GRIDS.with_borrow(|grids| grids.iter().position(|grid| grid.denom() == denom));
-    let index = match hit {
-        Some(idx) => idx,
-        None => {
-            let Some(built) = TickGrid::new(denom) else {
-                return f(None);
-            };
-            TICK_GRIDS.with_borrow_mut(|grids| {
-                let idx = grids.len();
-                grids.push(built);
-                idx
-            })
-        }
+    let mut f = Some(f);
+    if let Some(result) = TICK_GRIDS.with_borrow(|grids| {
+        grids
+            .iter()
+            .find(|grid| grid.denom() == denom)
+            .map(|grid| f.take().expect("closure present")(Some(grid)))
+    }) {
+        return result;
+    }
+    let f = f.expect("closure not yet called");
+    let Some(built) = TickGrid::new(denom) else {
+        return f(None);
     };
+    let index = TICK_GRIDS.with_borrow_mut(|grids| {
+        let idx = grids.len();
+        grids.push(built);
+        idx
+    });
     TICK_GRIDS.with_borrow(|grids| f(Some(&grids[index])))
 }
 
@@ -2283,6 +2293,33 @@ impl Maker<'_> {
             contexts[index].clone()
         } else {
             let step_loc = self.listing.locations(index);
+            match self.loc_dress {
+                Some(dress) => dress.around(&step_loc),
+                None => step_loc,
+            }
+        };
+        Hap::of_sequence(whole, part, value, context, self.keys.clone())
+    }
+
+    /// Like [`Self::make`], reading step locations directly from an already
+    /// unpacked [`GridView`] to skip per-hap `CompactGrid` dispatch.
+    #[inline]
+    fn make_grid(
+        &self,
+        grid: GridView<'_>,
+        index: usize,
+        value: u32,
+        whole: TimeSpan,
+        part: TimeSpan,
+    ) -> Hap {
+        let value = self
+            .values
+            .get(value as usize)
+            .expect("a step holds a value of its layer");
+        let context = if let Some(contexts) = self.contexts {
+            contexts[index].clone()
+        } else {
+            let step_loc = grid.locations(index);
             match self.loc_dress {
                 Some(dress) => dress.around(&step_loc),
                 None => step_loc,
@@ -4475,7 +4512,7 @@ impl Layer {
                     visible.end
                 };
                 let part = TimeSpan::new(part_begin, part_end);
-                out.push(maker.make(index, step_value, whole, part));
+                out.push(maker.make_grid(grid, index, step_value, whole, part));
                 Ok(())
             })
         });
@@ -4602,103 +4639,130 @@ impl Layer {
                 span.end.checked_add(start)?,
             ))
         };
+        thread_local! {
+            static SPARE_RAWS: std::cell::RefCell<Vec<Raw>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
         let mut pairs: Vec<(u32, u32)> = Vec::new();
         // Room for a step that meets one value in each turn.
         let room = usize::try_from(turns).ok()?.saturating_mul(self.count());
-        let mut raws = Vec::with_capacity(room.min(MAX_FOLDED_STEPS));
+        let mut raws = SPARE_RAWS
+            .try_with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+            .unwrap_or_default();
+        raws.clear();
+        raws.reserve(room.min(MAX_FOLDED_STEPS));
         let (own, others) = (self.listing(), values.listing());
         // The parts of `values` are searched and read for each step, so a
         // grid makes their times one time.
-        let other_parts: Vec<TimeSpan> = (0..others.len()).map(|at| others.part(at)).collect();
-        for turn in 0..turns {
-            let start = own_period.checked_mul(Fraction::int(turn))?;
-            for index in 0..own.len() {
-                let (own_whole, own_part) = own.times(index);
-                let whole = moved(own_whole, start)?;
-                let part = match own_part {
-                    Some(part) => moved(part, start)?,
-                    None => whole,
-                };
-                let (own_value, own_locations) = (own.value(index), own.locations(index));
-                // The locations of each hap of this step. Those after stay
-                // with the layer of the function side, which they end.
-                let mut around = self.dress().before_locations();
-                around.append(&own_locations);
-                if side == Side::Values {
-                    around.append(self.dress().after());
-                }
-                // The turns of `values` that the part meets, in order.
-                let turns_met = part.begin.checked_div_floor(values_period)?
-                    ..part.end.checked_div_ceil(values_period)?;
-                for at in turns_met {
-                    let value_start = values_period.checked_mul(Fraction::int(at))?;
-                    // The part, from the start of the turn, and the steps
-                    // of the turn that it meets: they are in the order of
-                    // time.
-                    let (begin, end) = (
-                        part.begin.checked_sub(value_start)?,
-                        part.end.checked_sub(value_start)?,
-                    );
-                    let first = other_parts.partition_point(|part| part.end <= begin);
-                    let meeting =
-                        (first..other_parts.len()).take_while(|at| other_parts[*at].begin < end);
-                    for value_index in meeting {
-                        let value_part = moved(other_parts[value_index], value_start)?;
-                        let piece = TimeSpan::new(
-                            part.begin.max(value_part.begin),
-                            part.end.min(value_part.end),
+        let mut small_parts = [TimeSpan::new(Fraction::ZERO, Fraction::ZERO); 16];
+        let heap_parts;
+        let other_parts: &[TimeSpan] = if others.len() <= 16 {
+            for (at, slot) in small_parts[..others.len()].iter_mut().enumerate() {
+                *slot = others.part(at);
+            }
+            &small_parts[..others.len()]
+        } else {
+            heap_parts = (0..others.len())
+                .map(|at| others.part(at))
+                .collect::<Vec<_>>();
+            &heap_parts
+        };
+        let build = (|| -> Option<(Self, Vec<(u32, u32)>)> {
+            for turn in 0..turns {
+                let start = own_period.checked_mul(Fraction::int(turn))?;
+                for index in 0..own.len() {
+                    let (own_whole, own_part) = own.times(index);
+                    let whole = moved(own_whole, start)?;
+                    let part = match own_part {
+                        Some(part) => moved(part, start)?,
+                        None => whole,
+                    };
+                    let (own_value, own_locations) = (own.value(index), own.locations(index));
+                    // The locations of each hap of this step. Those after stay
+                    // with the layer of the function side, which they end.
+                    let mut around = self.dress().before_locations();
+                    around.append(&own_locations);
+                    if side == Side::Values {
+                        around.append(self.dress().after());
+                    }
+                    // The turns of `values` that the part meets, in order.
+                    let turns_met = part.begin.checked_div_floor(values_period)?
+                        ..part.end.checked_div_ceil(values_period)?;
+                    for at in turns_met {
+                        let value_start = values_period.checked_mul(Fraction::int(at))?;
+                        // The part, from the start of the turn, and the steps
+                        // of the turn that it meets: they are in the order of
+                        // time.
+                        let (begin, end) = (
+                            part.begin.checked_sub(value_start)?,
+                            part.end.checked_sub(value_start)?,
                         );
-                        if raws.len() == MAX_FOLDED_STEPS {
-                            return None;
+                        let first = other_parts.partition_point(|part| part.end <= begin);
+                        let meeting = (first..other_parts.len())
+                            .take_while(|at| other_parts[*at].begin < end);
+                        for value_index in meeting {
+                            let value_part = moved(other_parts[value_index], value_start)?;
+                            let piece = TimeSpan::new(
+                                part.begin.max(value_part.begin),
+                                part.end.min(value_part.end),
+                            );
+                            if raws.len() == MAX_FOLDED_STEPS {
+                                return None;
+                            }
+                            // The pairs are few: one for each value that a
+                            // value meets.
+                            let pair = (own_value, others.value(value_index));
+                            let value = match pairs.iter().position(|known| *known == pair) {
+                                Some(value) => value,
+                                None => {
+                                    pairs.push(pair);
+                                    pairs.len() - 1
+                                }
+                            };
+                            let value = u32::try_from(value).ok()?;
+                            // The value side's locations come first.
+                            let locations = match side {
+                                Side::Functions => {
+                                    let mut locations = values.context(value_index);
+                                    locations.append(&around);
+                                    locations
+                                }
+                                Side::Values => {
+                                    let mut locations = around.clone();
+                                    locations.append(&values.context(value_index));
+                                    locations
+                                }
+                            };
+                            raws.push(Raw {
+                                whole,
+                                part: (piece != whole).then_some(piece),
+                                value,
+                                locations,
+                            });
                         }
-                        // The pairs are few: one for each value that a
-                        // value meets.
-                        let pair = (own_value, others.value(value_index));
-                        let value = match pairs.iter().position(|known| *known == pair) {
-                            Some(value) => value,
-                            None => {
-                                pairs.push(pair);
-                                pairs.len() - 1
-                            }
-                        };
-                        let value = u32::try_from(value).ok()?;
-                        // The value side's locations come first.
-                        let locations = match side {
-                            Side::Functions => {
-                                let mut locations = values.context(value_index);
-                                locations.append(&around);
-                                locations
-                            }
-                            Side::Values => {
-                                let mut locations = around.clone();
-                                locations.append(&values.context(value_index));
-                                locations
-                            }
-                        };
-                        raws.push(Raw {
-                            whole,
-                            part: (piece != whole).then_some(piece),
-                            value,
-                            locations,
-                        });
                     }
                 }
             }
+            let in_cycles = lie_in_spans(period, raws.iter().map(Raw::part));
+            let mut met = self.clone();
+            met.set_in_cycles(in_cycles);
+            met.set_period_and_steps(period, Steps::Listed(Listing::of_vec(&mut raws)));
+            // The locations of the steps are in their places now, but those
+            // after the steps of the function side, which end each hap.
+            met.change_dress(|dress| {
+                dress.clear_before();
+                if side == Side::Values {
+                    dress.clear_after();
+                }
+                dress.set_keys(keys);
+            });
+            met.is_in_order().then_some((met, pairs))
+        })();
+        raws.clear();
+        if raws.capacity() > 0 && raws.capacity() <= 64 {
+            let _ = SPARE_RAWS.try_with(|cell| *cell.borrow_mut() = raws);
         }
-        let in_cycles = lie_in_spans(period, raws.iter().map(Raw::part));
-        let mut met = self.clone();
-        met.set_in_cycles(in_cycles);
-        met.set_period_and_steps(period, Steps::Listed(Listing::of(raws)));
-        // The locations of the steps are in their places now, but those
-        // after the steps of the function side, which end each hap.
-        met.change_dress(|dress| {
-            dress.clear_before();
-            if side == Side::Values {
-                dress.clear_after();
-            }
-            dress.set_keys(keys);
-        });
-        met.is_in_order().then_some((met, pairs))
+        build
     }
 }
 

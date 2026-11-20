@@ -920,6 +920,10 @@ impl<'p> Turn<'p> {
         for call in calls.iter().rev() {
             let argument = match call.argument {
                 ScoreExpr::Number(number) => ChainArgument::Number(*number),
+                ScoreExpr::String(text) => ChainArgument::Constant(
+                    rustel_core::Value::Str(text.as_ref().into()),
+                    rustel_core::Locations::new(),
+                ),
                 ScoreExpr::Call {
                     callee, arguments, ..
                 } if *callee == MINI_CALLEE

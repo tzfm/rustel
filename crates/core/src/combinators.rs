@@ -2335,22 +2335,32 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
         scale_arg
     };
     // The mini `:` list syntax arrives as a list: flatten, join with spaces.
-    let scale_name: Result<String, ()> = match &scale_arg {
-        Value::Str(s) => Ok(s.to_string()),
+    let mut owned_name = String::new();
+    let scale_name: Result<&str, ()> = match &scale_arg {
+        Value::Str(s) => Ok(s.as_str()),
         Value::List(items) => {
-            fn flatten(items: &[Value], out: &mut Vec<String>) {
+            fn append_flat(items: &[Value], out: &mut String) {
                 for item in items {
                     match item {
-                        // Depth-1 flattening would do; deeper elements
-                        // stringify to the same strings anyway.
-                        Value::List(inner) => flatten(inner, out),
-                        other => out.push(other.show()),
+                        Value::List(inner) => append_flat(inner, out),
+                        Value::Str(s) => {
+                            if !out.is_empty() {
+                                out.push(' ');
+                            }
+                            out.push_str(s.as_str());
+                        }
+                        other => {
+                            if !out.is_empty() {
+                                out.push(' ');
+                            }
+                            out.push_str(&other.show());
+                        }
                     }
                 }
             }
-            let mut parts = Vec::new();
-            flatten(items, &mut parts);
-            Ok(parts.join(" "))
+            owned_name.reserve(24);
+            append_flat(items, &mut owned_name);
+            Ok(owned_name.as_str())
         }
         // A non-string scale name throws; the text below is the observable message.
         _ => Err(()),
@@ -2369,8 +2379,8 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
         }
     };
     // The notes of the scale are kept with its body, one time for the name.
-    pat.map_pitch_haps_native_interned(&scale_name, || {
-        let steps = std::sync::Arc::new(ScaleSteps::new(scale_name.clone()));
+    pat.map_pitch_haps_native_interned(scale_name, || {
+        let steps = std::sync::Arc::new(ScaleSteps::new(scale_name.to_owned()));
         let tag = std::sync::Arc::clone(&steps.tag);
         // A handle of the notes, for the note of a hap and of a value.
         let kept = std::sync::Arc::clone(&steps);

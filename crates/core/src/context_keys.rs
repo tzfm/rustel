@@ -166,6 +166,9 @@ fn same_pick_lookup(a: &Option<Arc<PickLookup>>, b: &Option<Arc<PickLookup>>) ->
     }
 }
 
+/// Persistent 4-slot node-level cache mapping shared input keys to visual-tagged keys.
+pub(crate) type UiVisualCache = [std::sync::OnceLock<Box<(Arc<Keys>, Arc<Keys>)>>; 4];
+
 impl ContextKeys {
     /// `keys`, sharing nothing when no key is set.
     pub(crate) fn of(keys: Keys) -> Self {
@@ -246,15 +249,15 @@ impl ContextKeys {
         self.edit().ui_visuals |= bit;
     }
 
-    /// Like [`Self::add_ui_visual_slot`], additionally checking a persistent
-    /// node-level `OnceLock` cache first and a per-query local cache second so
-    /// haps sharing non-visual keys (such as a layer's `scale` context) allocate
-    /// once across the lifetime of the graph instead of once per query.
+    /// Like [`Self::add_ui_visual_slot`], mutating uniquely owned keys in place
+    /// and otherwise checking a 4-slot persistent node-level `OnceLock` cache
+    /// first and a per-query local cache second so haps sharing non-visual keys
+    /// across stacked layers allocate once over the lifetime of the graph.
     #[inline]
     pub(crate) fn add_ui_visual_slot_cached(
         &mut self,
         slot: u8,
-        once: &std::sync::OnceLock<Box<(Arc<Keys>, Arc<Keys>)>>,
+        once: &UiVisualCache,
         local: &mut [Option<(Arc<Keys>, Arc<Keys>)>; 2],
         local_next: &mut u8,
     ) {
@@ -262,7 +265,7 @@ impl ContextKeys {
             return;
         }
         let bit = 1_u64 << slot;
-        match &self.0 {
+        match &mut self.0 {
             None => {
                 if let Some(cached) = cached_ui_visual_mask(bit) {
                     self.0 = Some(cached);
@@ -279,32 +282,43 @@ impl ContextKeys {
                     self.0 = Some(cached);
                     return;
                 }
-                if let Some(pair) = once.get() {
-                    if Arc::ptr_eq(arc, &pair.0) {
-                        self.0 = Some(Arc::clone(&pair.1));
-                        return;
-                    }
-                    for entry in local.iter().flatten() {
-                        if Arc::ptr_eq(arc, &entry.0) {
-                            self.0 = Some(Arc::clone(&entry.1));
+                if let Some(own) = Arc::get_mut(arc) {
+                    own.ui_visuals |= bit;
+                    return;
+                }
+                let mut free_slot = None;
+                for (i, cell) in once.iter().enumerate() {
+                    if let Some(pair) = cell.get() {
+                        if Arc::ptr_eq(arc, &pair.0) {
+                            self.0 = Some(Arc::clone(&pair.1));
                             return;
                         }
+                    } else if free_slot.is_none() {
+                        free_slot = Some(i);
                     }
+                }
+                if let Some(idx) = free_slot {
                     let input = Arc::clone(arc);
                     let mut next = (**arc).clone();
                     next.ui_visuals |= bit;
                     let output = Arc::new(next);
-                    let idx = usize::from(*local_next & 1);
-                    local[idx] = Some((input, Arc::clone(&output)));
-                    *local_next = local_next.wrapping_add(1);
+                    let _ = once[idx].set(Box::new((input, Arc::clone(&output))));
                     self.0 = Some(output);
                     return;
+                }
+                for entry in local.iter().flatten() {
+                    if Arc::ptr_eq(arc, &entry.0) {
+                        self.0 = Some(Arc::clone(&entry.1));
+                        return;
+                    }
                 }
                 let input = Arc::clone(arc);
                 let mut next = (**arc).clone();
                 next.ui_visuals |= bit;
                 let output = Arc::new(next);
-                let _ = once.set(Box::new((input, Arc::clone(&output))));
+                let idx = usize::from(*local_next & 1);
+                local[idx] = Some((input, Arc::clone(&output)));
+                *local_next = local_next.wrapping_add(1);
                 self.0 = Some(output);
                 return;
             }

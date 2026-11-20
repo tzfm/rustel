@@ -155,10 +155,14 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
         self.expand_haps_native(f)
     }
     /// Internal voicing expansion for a body that captures nothing: one
-    /// closure object per body for the whole process.
+    /// closure object per body for the whole process, writing directly onto `out`.
     #[doc(hidden)]
-    fn expand_pitch_haps_native_static(&self, body: fn(&Hap) -> Vec<Hap>) -> Self {
-        self.expand_pitch_haps_native(body)
+    fn expand_pitch_haps_native_static(&self, body: fn(&Hap, &mut Vec<Hap>)) -> Self {
+        self.expand_pitch_haps_native(move |hap| {
+            let mut out = Vec::new();
+            body(hap, &mut out);
+            out
+        })
     }
     /// `tag(name)` - mark haps for a later `hasTag` filter.
     fn tag(&self, name: std::sync::Arc<str>) -> Self;
@@ -474,7 +478,7 @@ impl PatOps for Pattern {
     ) -> Self {
         Pattern::expand_pitch_haps_native(self, f)
     }
-    fn expand_pitch_haps_native_static(&self, body: fn(&Hap) -> Vec<Hap>) -> Self {
+    fn expand_pitch_haps_native_static(&self, body: fn(&Hap, &mut Vec<Hap>)) -> Self {
         Pattern::expand_pitch_haps_native_static(self, body)
     }
     fn map_control(&self, spec: &crate::controls::ControlSpec, unnamed_only: bool) -> Self {
@@ -841,7 +845,7 @@ impl PatOps for PurePattern {
     ) -> Self {
         PurePattern::assert_pure(self.pattern().expand_pitch_haps_native(f))
     }
-    fn expand_pitch_haps_native_static(&self, body: fn(&Hap) -> Vec<Hap>) -> Self {
+    fn expand_pitch_haps_native_static(&self, body: fn(&Hap, &mut Vec<Hap>)) -> Self {
         PurePattern::assert_pure(self.pattern().expand_pitch_haps_native_static(body))
     }
     fn map_control(&self, spec: &crate::controls::ControlSpec, unnamed_only: bool) -> Self {

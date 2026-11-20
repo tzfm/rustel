@@ -1373,6 +1373,85 @@ impl Plans {
         self.add(Kind::Repeated(pattern, times), facts)
     }
 
+    /// Whether every step of `plan` covers its whole cycle `[turn, turn + 1]`,
+    /// so a Euclidean mask splits it cleanly into equal steps with no cut.
+    fn covers_whole_cycle(&self, plan: Id) -> bool {
+        match self.kind(plan) {
+            Kind::Atom { .. } | Kind::Rest => true,
+            Kind::Stack(items) => self.stacked[items.range()]
+                .iter()
+                .all(|&item| self.covers_whole_cycle(item)),
+            Kind::StackRun(items) => (items.0..items.1).all(|id| self.covers_whole_cycle(Id(id))),
+            Kind::Alternation(lanes) => self.lanes[lanes.range()]
+                .iter()
+                .all(|&steps| steps.len() == 1 && self.covers_whole_cycle(self.step(steps, 0).0)),
+            Kind::Faster(inner, 1, _, _) => self.covers_whole_cycle(inner),
+            _ => false,
+        }
+    }
+
+    /// Extract a plain integer atom and its source span.
+    fn integer_atom(&self, values: &[Value], id: Id) -> Option<(i32, At)> {
+        let Kind::Atom { value, begin, len } = self.kind(id) else {
+            return None;
+        };
+        let count = crate::fraction_site_value(values.get(value as usize)?)?;
+        if count.denom() != 1 {
+            return None;
+        }
+        let n = i32::try_from(count.numer()).ok()?;
+        Some((n, written(begin, len)))
+    }
+
+    /// Euclidean rhythm `pattern(pulses, steps[, rotation])` directly in plans
+    /// when `pulses`, `steps`, `rotation` are constant integers and `pattern`
+    /// covers whole cycles.
+    fn euclid(
+        &mut self,
+        values: &[Value],
+        pattern: Id,
+        pulses: (Id, u32),
+        steps: (Id, u32),
+        rotation: Option<(Id, u32)>,
+    ) -> Option<Id> {
+        if pulses.1 != 1 || steps.1 != 1 || rotation.is_some_and(|(_, w)| w != 1) {
+            return None;
+        }
+        let (p, p_at) = self.integer_atom(values, pulses.0)?;
+        let (s, s_at) = self.integer_atom(values, steps.0)?;
+        let rot = match rotation {
+            Some((r_id, _)) => Some(self.integer_atom(values, r_id)?),
+            None => None,
+        };
+        if p < 1 || s < p || s > MAX_STEPS as i32 || !self.covers_whole_cycle(pattern) {
+            return None;
+        }
+        let r = rot.map_or(0, |(v, _)| v);
+        let mask = rustel_core::euclid::euclid_rot(p, s as usize, r as isize).ok()?;
+        let rest = self.add(
+            Kind::Rest,
+            Facts {
+                turns: 1,
+                steps: 1,
+                layers: 0,
+                word: false,
+            },
+        )?;
+        let step_list = self.steps(
+            mask.into_iter()
+                .map(|set| Some((if set != 0 { pattern } else { rest }, 1))),
+            false,
+        )?;
+        let seq = self.sequence(step_list)?;
+        let with_p = self.faster_whole(seq, 1, p_at)?;
+        let with_s = self.faster_whole(with_p, 1, s_at)?;
+        if let Some((_, r_at)) = rot {
+            self.faster_whole(with_s, 1, r_at)
+        } else {
+            Some(with_s)
+        }
+    }
+
     /// The plan of the words of `chain` and then the word `last`, with `:`
     /// between them: one value, a list of the value of each word, at `at`,
     /// where the text writes them all. `None` for a side that is no word:
@@ -2537,6 +2616,17 @@ impl<'a> Build<'a> for Planner<'a, '_> {
             Postfix::Fast(factor) => plans.faster(values, pattern?, factor?),
             Postfix::Slow(factor) => plans.slower(values, pattern?, factor?),
             Postfix::Replicate(amount) => plans.repeated(pattern?, amount),
+            Postfix::Euclid {
+                pulses,
+                steps,
+                rotation,
+            } => {
+                let rotation = match rotation {
+                    Some(r) => Some(r?),
+                    None => None,
+                };
+                plans.euclid(values, pattern?, pulses?, steps?, rotation)
+            }
             Postfix::Tail(element) => {
                 let at = written_at(self.src, self.offset, &span)?;
                 plans.tail(values, pattern?, element?, at)

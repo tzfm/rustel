@@ -1585,7 +1585,7 @@ impl Deduper {
                 Node::UiVisual(Box::new(UiVisualNode {
                     inner,
                     slot: node.slot,
-                    cache: std::sync::OnceLock::new(),
+                    cache: std::array::from_fn(|_| std::sync::OnceLock::new()),
                 }))
             }),
             Node::ControlMapBoxed(boxed) => self

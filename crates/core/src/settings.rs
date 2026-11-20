@@ -983,6 +983,15 @@ pub(crate) fn user_legacy_voicing_dict(
     })
 }
 
+pub(crate) fn has_custom_voicing_settings() -> bool {
+    with_current(|settings| {
+        settings
+            .rare
+            .as_deref()
+            .is_some_and(|r| r.default_voicings.is_some() || !r.user_voicing_dicts.is_empty())
+    })
+}
+
 pub(crate) fn default_voicings() -> Option<String> {
     with_current(|settings| {
         settings
