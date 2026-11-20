@@ -395,7 +395,18 @@ pub fn render_voicing(map: &OrderedMap) -> Option<Vec<Value>> {
                     user = dict;
                     &user
                 }
-                None => dictionaries().dicts.get(name)?,
+                // A name nothing registered is an error, as strudel.cc's
+                // lookup of an absent registry entry throws: silence would
+                // hide a misspelt `.dict()`.
+                None => match dictionaries().dicts.get(name) {
+                    Some(dict) => dict,
+                    None => {
+                        crate::signal_query_error(|| {
+                            format!("unknown voicing dictionary \"{name}\"")
+                        });
+                        return None;
+                    }
+                },
             }
         }
         Some(Value::Object(object)) => {
@@ -2327,6 +2338,19 @@ mod tests {
         assert_eq!(
             rendered_notes(&controls("D7", "B4", "oldabove")),
             ["Gb4", "C5", "D5", "Gb5", "A5"]
+        );
+    }
+
+    /// A dictionary name nothing registered renders nothing and says why.
+    #[test]
+    fn an_unknown_dictionary_is_a_query_error() {
+        let _ = crate::take_query_error();
+        let mut unknown = c7();
+        unknown.insert("dictionary".into(), Value::Str("lefthnd".into()));
+        assert_eq!(render_voicing(&unknown), None);
+        assert_eq!(
+            crate::take_query_error().as_deref(),
+            Some("unknown voicing dictionary \"lefthnd\"")
         );
     }
 
