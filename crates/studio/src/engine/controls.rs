@@ -198,15 +198,42 @@ impl StudioEngine {
 
     /// Follow MIDI clock from a port, or from none.
     pub fn set_clock_in(&mut self, port: Option<&str>) -> Result<(), String> {
-        self.clock_in = None;
+        let released = self.clock_in.take().is_some();
         self.clock_locked = false;
         self.clock_external_cps = None;
         self.update_pattern_tempo();
+        if released && port.is_none() {
+            self.return_to_score_tempo();
+        }
         if let Some(port) = port {
             self.clock_in = Some(ClockIn::open(port)?);
             self.update_pattern_tempo();
         }
         Ok(())
+    }
+
+    /// Play at the score's own tempo again once no outside clock leads:
+    /// following one bends the tempo, and nothing else would undo the bend
+    /// before the next update.
+    pub(super) fn return_to_score_tempo(&mut self) {
+        if self.link.is_some() || self.clock_in.is_some() {
+            return;
+        }
+        let cps = self.session.score_cps();
+        if (self.session.cps() - cps).abs() <= f64::EPSILON {
+            return;
+        }
+        let Some(live) = self.live.as_mut() else {
+            self.session
+                .retime(0.0, cps, self.session.cycle_at_time(0.0));
+            return;
+        };
+        let now = live.device.clock_seconds();
+        self.session
+            .retime(now, cps, self.session.cycle_at_time(now));
+        if let Ok(Some((before, after))) = self.session.requery_active_at(now) {
+            live.producer.arm_control_requery(before, after);
+        }
     }
 
     /// A pattern's `cps` control changes the tempo unless an outside clock
@@ -345,6 +372,32 @@ mod tests {
     use crate::engine::tests::*;
     mod link {
         use super::*;
+
+        /// Leaving the session plays the score's tempo again: the follow's
+        /// phase bend stays behind otherwise, a few tenths of a bpm off
+        /// until the next update.
+        #[test]
+        fn leaving_the_session_goes_back_to_the_scores_tempo() {
+            rustel_runtime::link::keep_the_session_off_the_wire();
+            let mut engine = StudioEngine::new(StudioConfig {
+                output: Some("silent".into()),
+                ..StudioConfig::default()
+            })
+            .expect("studio");
+            let score = engine.session.score_cps();
+            engine.set_link(true).expect("join");
+            // A follow bends the tempo to line up the phase.
+            engine
+                .session
+                .retime(0.0, score * 1.01, engine.session.cycle_at_time(0.0));
+            assert!((engine.session.cps() - score * 1.01).abs() < 1e-9);
+            engine.set_link(false).expect("leave");
+            assert!(
+                (engine.session.cps() - score).abs() < 1e-9,
+                "{} after leaving, the score asks {score}",
+                engine.session.cps()
+            );
+        }
 
         /// Joining founds the session where the score stands, a tempo the
         /// session already runs is not published again, and one a fresh

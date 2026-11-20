@@ -602,6 +602,12 @@ impl Session {
         self.scheduler.cps()
     }
 
+    /// The tempo the score asks for, whatever an outside clock has bent
+    /// the playing tempo to.
+    pub fn score_cps(&self) -> f64 {
+        self.score_cps
+    }
+
     /// Wall-clock time of `cycle` under the current transport anchor.
     pub fn time_at_cycle(&self, cycle: Fraction) -> f64 {
         self.scheduler.time_at_cycle(cycle)
@@ -2880,6 +2886,23 @@ mod tests {
         //! Following an outside clock ([`Session::retime`]).
 
         use super::*;
+
+        /// A steer bends the tempo that plays but not the score's own, which a
+        /// later score without a tempo of its own keeps.
+        #[test]
+        fn a_steer_leaves_the_scores_tempo_alone() {
+            let mut session = Session::new().expect("session");
+            session.evaluate(r#"setcpm(96/4); s("bd")"#).expect("score");
+            assert!((session.score_cps() - 0.4).abs() < 1e-12);
+            session.retime(1.0, 0.401, session.cycle_at_time(1.0));
+            assert!((session.cps() - 0.401).abs() < 1e-12);
+            assert!(
+                (session.score_cps() - 0.4).abs() < 1e-12,
+                "a bend is not the score's"
+            );
+            session.evaluate(r#"s("hh")"#).expect("score");
+            assert!((session.score_cps() - 0.4).abs() < 1e-12);
+        }
 
         /// A steer moves the conversion tempo with the scheduler: events scheduled
         /// after it last and are spaced one step at the steered rate, and a steer the
