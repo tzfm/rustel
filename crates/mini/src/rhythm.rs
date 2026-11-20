@@ -2038,6 +2038,10 @@ pub struct Room {
     known: Vec<u32>,
     /// Reusable parser open-step stack.
     parser_steps: Vec<crate::Slice<Option<(Id, u32)>>>,
+    /// Reusable parser open-group item stack.
+    parser_items: Vec<Option<Id>>,
+    /// Reusable parser open-alternation lane stack.
+    parser_lanes: Vec<Option<Steps>>,
     /// Reusable scratch buffers for layer planning and step materialisation.
     layers_buf: Vec<LayerPlan>,
     counted_layers_buf: Vec<(LayerPlan, usize)>,
@@ -2079,6 +2083,8 @@ impl Room {
             self.words.capacity(),
             self.known.capacity(),
             self.parser_steps.capacity(),
+            self.parser_items.capacity(),
+            self.parser_lanes.capacity(),
             self.layers_buf.capacity(),
             self.counted_layers_buf.capacity(),
             self.above_buf.capacity(),
@@ -2481,23 +2487,42 @@ impl<'a> Build<'a> for Planner<'a, '_> {
         self.room.plans.steps(steps, marked)
     }
 
-    fn alternation(&mut self, lanes: Vec<Option<Steps>>, _: Span) -> Option<Id> {
-        self.room.plans.alternation(lanes.into_iter())
+    fn alternation(
+        &mut self,
+        lanes: impl ExactSizeIterator<Item = Option<Steps>>,
+        _: Span,
+    ) -> Option<Id> {
+        self.room.plans.alternation(lanes)
     }
 
-    fn stack(&mut self, items: Vec<Option<Id>>, _: Span) -> Option<Id> {
-        self.room.plans.stack(items.into_iter())
+    fn stack(&mut self, items: impl ExactSizeIterator<Item = Option<Id>>, _: Span) -> Option<Id> {
+        self.room.plans.stack(items)
     }
 
-    fn choice(&mut self, _: Vec<Option<Id>>, _: u32, _: Span) -> Option<Id> {
+    fn choice(
+        &mut self,
+        _: impl ExactSizeIterator<Item = Option<Id>>,
+        _: u32,
+        _: Span,
+    ) -> Option<Id> {
         None
     }
 
-    fn feet(&mut self, _: Vec<Option<Id>>, _: u32, _: Span) -> Option<Id> {
+    fn feet(
+        &mut self,
+        _: impl ExactSizeIterator<Item = Option<Id>>,
+        _: u32,
+        _: Span,
+    ) -> Option<Id> {
         None
     }
 
-    fn polymeter(&mut self, _: Vec<Option<Id>>, _: Option<Option<Id>>, _: Span) -> Option<Id> {
+    fn polymeter(
+        &mut self,
+        _: impl ExactSizeIterator<Item = Option<Id>>,
+        _: Option<Option<Id>>,
+        _: Span,
+    ) -> Option<Id> {
         None
     }
 
@@ -2528,6 +2553,26 @@ impl<'a> Build<'a> for Planner<'a, '_> {
 
     fn return_steps(&mut self, steps: Vec<crate::Slice<Self::Step>>) {
         self.room.parser_steps = steps;
+    }
+
+    fn take_items(&mut self) -> Vec<Self::Node> {
+        let mut items = std::mem::take(&mut self.room.parser_items);
+        items.clear();
+        items
+    }
+
+    fn return_items(&mut self, items: Vec<Self::Node>) {
+        self.room.parser_items = items;
+    }
+
+    fn take_lanes(&mut self) -> Vec<Self::Lane> {
+        let mut lanes = std::mem::take(&mut self.room.parser_lanes);
+        lanes.clear();
+        lanes
+    }
+
+    fn return_lanes(&mut self, lanes: Vec<Self::Lane>) {
+        self.room.parser_lanes = lanes;
     }
 }
 

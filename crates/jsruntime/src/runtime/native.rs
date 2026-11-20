@@ -130,7 +130,7 @@ struct Turn<'p> {
     left: Option<u32>,
     /// The lists of the chains of control calls before, empty, with their
     /// room for the next chains: a chain inside a chain takes its own.
-    spare: (Vec<Vec<ControlCall<'p>>>, Vec<Vec<ChainCall>>),
+    spare: TurnScratch<'p>,
     /// The list of the numbers of a call before, with its room for the
     /// next call.
     numbers: Vec<Value>,
@@ -145,6 +145,14 @@ const MAX_DEPTH: usize = 128;
 
 /// The most expressions the native tier evaluates for one score.
 const MAX_STEPS: usize = 1 << 16;
+
+#[derive(Default)]
+struct TurnScratch<'p> {
+    calls: Vec<Vec<ControlCall<'p>>>,
+    chains: Vec<Vec<ChainCall>>,
+    frame_names: Vec<Vec<(&'p str, Option<Native<'p>>)>>,
+    call_values: Vec<Vec<Native<'p>>>,
+}
 
 /// The names one function call or arrow binds: its parameters, then its
 /// bindings, which hold no value until their statement runs.
@@ -164,8 +172,10 @@ impl<'p> Frame<'p> {
         function: &'p ScoreFunction,
         values: impl IntoIterator<Item = Native<'p>>,
         arrow: bool,
+        mut names: Vec<(&'p str, Option<Native<'p>>)>,
     ) -> Option<Self> {
-        let mut names = Vec::with_capacity(function.parameters.len() + function.bindings.len());
+        names.clear();
+        names.reserve(function.parameters.len() + function.bindings.len());
         let bound = function
             .parameters
             .iter()
@@ -540,7 +550,7 @@ impl<'p> Turn<'p> {
                 if !calls.is_empty() {
                     return self.control_chain(names, calls, under, runtime);
                 }
-                self.spare.0.push(calls);
+                self.spare.calls.push(calls);
                 let arguments = self.held.row(*arguments);
                 match self.receiver(names, self.held.at(*receiver), method, runtime)? {
                     Native::Pattern(receiver) => {
@@ -579,9 +589,14 @@ impl<'p> Turn<'p> {
             arrow,
             steps: Vec::new(),
         });
-        self.frames.push(Frame::of(function, [parameter], true)?);
+        let names_buf = self.spare.frame_names.pop().unwrap_or_default();
+        self.frames
+            .push(Frame::of(function, [parameter], true, names_buf)?);
         let result = self.function_body(names, function, runtime);
-        self.frames.pop();
+        if let Some(mut popped) = self.frames.pop() {
+            popped.names.clear();
+            self.spare.frame_names.push(popped.names);
+        }
         let Native::Chain(chain) = result? else {
             return None;
         };
@@ -743,16 +758,28 @@ impl<'p> Turn<'p> {
         runtime: &JsRuntime,
     ) -> Option<Native<'p>> {
         let kept = self.reuse.as_ref().map(memo::Reuse::mark);
-        let mut values = Vec::with_capacity(arguments.len());
+        let mut values = self.spare.call_values.pop().unwrap_or_default();
+        values.clear();
+        values.reserve(arguments.len());
         for argument in arguments {
-            values.push(self.part(names, argument, runtime)?);
+            let Some(val) = self.part(names, argument, runtime) else {
+                values.clear();
+                self.spare.call_values.push(values);
+                return None;
+            };
+            values.push(val);
         }
         // A missing argument is `undefined`, which the native tier does not
         // hold. An extra one is evaluated and not bound.
         if values.len() < function.parameters.len() {
+            values.clear();
+            self.spare.call_values.push(values);
             return None;
         }
-        let frame = Frame::of(function, values, false)?;
+        let names_buf = self.spare.frame_names.pop().unwrap_or_default();
+        let frame = Frame::of(function, values.drain(..), false, names_buf);
+        self.spare.call_values.push(values);
+        let frame = frame?;
         // The call reads the function, and the function what its body
         // reads.
         if let Some(reuse) = &mut self.reuse {
@@ -761,7 +788,10 @@ impl<'p> Turn<'p> {
         }
         self.frames.push(frame);
         let result = self.function_body(names, function, runtime);
-        self.frames.pop();
+        if let Some(mut popped) = self.frames.pop() {
+            popped.names.clear();
+            self.spare.frame_names.push(popped.names);
+        }
         if let Some(reuse) = &mut self.reuse {
             let read = reuse.end();
             reuse.named(number, read);
@@ -812,7 +842,7 @@ impl<'p> Turn<'p> {
     ) -> (Vec<ControlCall<'p>>, &'p ScoreExpr<'p>) {
         // The expressions live as long as the program, not as this turn.
         let held = self.held;
-        let mut calls = self.spare.0.pop().unwrap_or_default();
+        let mut calls = self.spare.calls.pop().unwrap_or_default();
         let mut under = expression;
         while let ScoreExpr::Method {
             receiver,
@@ -868,7 +898,7 @@ impl<'p> Turn<'p> {
                 return None;
             }
         };
-        let mut chain = self.spare.1.pop().unwrap_or_default();
+        let mut chain = self.spare.chains.pop().unwrap_or_default();
         for call in calls.iter().rev() {
             let argument = match call.argument {
                 ScoreExpr::Number(number) => ChainArgument::Number(*number),
@@ -918,8 +948,8 @@ impl<'p> Turn<'p> {
         };
         calls.clear();
         chain.clear();
-        self.spare.0.push(calls);
-        self.spare.1.push(chain);
+        self.spare.calls.push(calls);
+        self.spare.chains.push(chain);
         Some(made)
     }
 

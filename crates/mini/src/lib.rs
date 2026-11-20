@@ -256,13 +256,28 @@ pub(crate) trait Build<'a>: Sized {
         steps: impl ExactSizeIterator<Item = Self::Step>,
         steps_source: bool,
     ) -> Self::Lane;
-    fn alternation(&mut self, lanes: Vec<Self::Lane>, span: Span) -> Self::Node;
-    fn stack(&mut self, items: Vec<Self::Node>, span: Span) -> Self::Node;
-    fn choice(&mut self, items: Vec<Self::Node>, seed: u32, span: Span) -> Self::Node;
-    fn feet(&mut self, items: Vec<Self::Node>, seed: u32, span: Span) -> Self::Node;
+    fn alternation(
+        &mut self,
+        lanes: impl ExactSizeIterator<Item = Self::Lane>,
+        span: Span,
+    ) -> Self::Node;
+    fn stack(&mut self, items: impl ExactSizeIterator<Item = Self::Node>, span: Span)
+    -> Self::Node;
+    fn choice(
+        &mut self,
+        items: impl ExactSizeIterator<Item = Self::Node>,
+        seed: u32,
+        span: Span,
+    ) -> Self::Node;
+    fn feet(
+        &mut self,
+        items: impl ExactSizeIterator<Item = Self::Node>,
+        seed: u32,
+        span: Span,
+    ) -> Self::Node;
     fn polymeter(
         &mut self,
-        items: Vec<Self::Node>,
+        items: impl ExactSizeIterator<Item = Self::Node>,
         steps_per_cycle: Option<Self::Node>,
         span: Span,
     ) -> Self::Node;
@@ -281,6 +296,22 @@ pub(crate) trait Build<'a>: Sized {
 
     /// Return the cleared open-step stack after parsing.
     fn return_steps(&mut self, _steps: Vec<Slice<Self::Step>>) {}
+
+    /// Borrow or allocate the parser's open-group item stack.
+    fn take_items(&mut self) -> Vec<Self::Node> {
+        Vec::new()
+    }
+
+    /// Return the cleared open-group item stack after parsing.
+    fn return_items(&mut self, _items: Vec<Self::Node>) {}
+
+    /// Borrow or allocate the parser's open-alternation lane stack.
+    fn take_lanes(&mut self) -> Vec<Self::Lane> {
+        Vec::new()
+    }
+
+    /// Return the cleared open-alternation lane stack after parsing.
+    fn return_lanes(&mut self, _lanes: Vec<Self::Lane>) {}
 }
 
 /// One postfix operator of a slice, with its arguments.
@@ -347,25 +378,44 @@ impl<'a> Build<'a> for Tree {
         }
     }
 
-    fn alternation(&mut self, lanes: Vec<AltLane>, span: Span) -> Ast {
-        Ast::Alt { lanes, span }
+    fn alternation(&mut self, lanes: impl ExactSizeIterator<Item = AltLane>, span: Span) -> Ast {
+        Ast::Alt {
+            lanes: lanes.collect(),
+            span,
+        }
     }
 
-    fn stack(&mut self, items: Vec<Ast>, span: Span) -> Ast {
-        Ast::Stack { items, span }
+    fn stack(&mut self, items: impl ExactSizeIterator<Item = Ast>, span: Span) -> Ast {
+        Ast::Stack {
+            items: items.collect(),
+            span,
+        }
     }
 
-    fn choice(&mut self, items: Vec<Ast>, seed: u32, span: Span) -> Ast {
-        Ast::Choose { items, seed, span }
+    fn choice(&mut self, items: impl ExactSizeIterator<Item = Ast>, seed: u32, span: Span) -> Ast {
+        Ast::Choose {
+            items: items.collect(),
+            seed,
+            span,
+        }
     }
 
-    fn feet(&mut self, items: Vec<Ast>, seed: u32, span: Span) -> Ast {
-        Ast::Feet { items, seed, span }
+    fn feet(&mut self, items: impl ExactSizeIterator<Item = Ast>, seed: u32, span: Span) -> Ast {
+        Ast::Feet {
+            items: items.collect(),
+            seed,
+            span,
+        }
     }
 
-    fn polymeter(&mut self, items: Vec<Ast>, steps_per_cycle: Option<Ast>, span: Span) -> Ast {
+    fn polymeter(
+        &mut self,
+        items: impl ExactSizeIterator<Item = Ast>,
+        steps_per_cycle: Option<Ast>,
+        span: Span,
+    ) -> Ast {
         Ast::Polymeter {
-            items,
+            items: items.collect(),
             steps_per_cycle: steps_per_cycle.map(Box::new),
             span,
         }
@@ -452,9 +502,9 @@ struct Group<N> {
 
 enum Items<N> {
     One(N),
-    Stack(Vec<N>, Span),
-    Choice(Vec<N>, u32, Span),
-    Feet(Vec<N>, u32, Span),
+    Stack(usize, Span),
+    Choice(usize, u32, Span),
+    Feet(usize, u32, Span),
 }
 
 struct Parser<'a, B: Build<'a>> {
@@ -476,6 +526,10 @@ struct Parser<'a, B: Build<'a>> {
     /// sequence takes its steps from here when it ends, in a list of their
     /// count. No parse goes on after an error, so none tidies this list.
     steps: Vec<Slice<B::Step>>,
+    /// Open group items (`stack`, `choice`, `feet`), innermost last.
+    items: Vec<B::Node>,
+    /// Open alternation lanes (`<a, b>`), innermost last.
+    lanes: Vec<B::Lane>,
     builder: B,
 }
 
@@ -566,6 +620,8 @@ impl PegExpectation {
 impl<'a, B: Build<'a>> Parser<'a, B> {
     fn new(src: &'a str, mut builder: B) -> Self {
         let steps = builder.take_steps();
+        let items = builder.take_items();
+        let lanes = builder.take_lanes();
         Parser {
             text: src,
             src: src.as_bytes(),
@@ -575,6 +631,8 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
             expected_number_at: None,
             aligned_tail_at: None,
             steps,
+            items,
+            lanes,
             builder,
         }
     }
@@ -698,13 +756,18 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
     fn grouped(&mut self, group: Group<B::Node>) -> Parsed<B::Node> {
         let (node, depth) = match group.items {
             Items::One(node) => (node, group.deepest),
-            Items::Stack(items, span) => (self.builder.stack(items, span), group.deepest + 1),
-            Items::Choice(items, seed, span) => {
-                (self.builder.choice(items, seed, span), group.deepest + 1)
-            }
-            Items::Feet(items, seed, span) => {
-                (self.builder.feet(items, seed, span), group.deepest + 1)
-            }
+            Items::Stack(first, span) => (
+                self.builder.stack(self.items.drain(first..), span),
+                group.deepest + 1,
+            ),
+            Items::Choice(first, seed, span) => (
+                self.builder.choice(self.items.drain(first..), seed, span),
+                group.deepest + 1,
+            ),
+            Items::Feet(first, seed, span) => (
+                self.builder.feet(self.items.drain(first..), seed, span),
+                group.deepest + 1,
+            ),
         };
         Parsed {
             node,
@@ -783,9 +846,8 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
             });
         };
         let mut deepest = first.depth;
-        // Room for a chord, with no item to move.
-        let mut items = Vec::with_capacity(4);
-        items.push(first.node);
+        let first_item = self.items.len();
+        self.items.push(first.node);
         while self.peek() == Some(delimiter) {
             // Only a BARE `.` separates feet; `.4` is an atom and `..` is the
             // range postfix.
@@ -795,7 +857,7 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
             self.pos += 1;
             let next = self.parse_sequence(terminators)?;
             deepest = deepest.max(next.depth);
-            items.push(next.node);
+            self.items.push(next.node);
             self.ws();
         }
         let span = Span {
@@ -804,11 +866,11 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
         };
         self.aligned_tail_at = Some((self.pos, delimiter));
         let items = match delimiter {
-            b',' => Items::Stack(items, span),
+            b',' => Items::Stack(first_item, span),
             b'|' => {
                 let seed = self.seed;
                 self.seed += 1;
-                Items::Choice(items, seed, span)
+                Items::Choice(first_item, seed, span)
             }
             b'.' => {
                 // krill's `dot_tail` allocates a random seed even though the
@@ -816,7 +878,7 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
                 // that global seed, so omitting this increment changes music.
                 let seed = self.seed;
                 self.seed += 1;
-                Items::Feet(items, seed, span)
+                Items::Feet(first_item, seed, span)
             }
             _ => unreachable!(),
         };
@@ -1228,14 +1290,15 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
             }
             Some(b'<') => {
                 self.pos += 1;
-                let mut lanes = Vec::new();
+                let first_lane = self.lanes.len();
                 // An alternation nests as its deepest lane does.
                 let mut depth = 0;
                 loop {
                     let run = self.parse_run(b",>")?;
                     depth = depth.max(run.depth);
                     let steps = self.steps.drain(run.first..).map(|slice| slice.step);
-                    lanes.push(self.builder.lane(steps, run.steps_source));
+                    let lane = self.builder.lane(steps, run.steps_source);
+                    self.lanes.push(lane);
                     self.ws();
                     if self.peek() != Some(b',') {
                         break;
@@ -1251,7 +1314,9 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
                     end: self.pos,
                 };
                 Ok(Parsed {
-                    node: self.builder.alternation(lanes, span),
+                    node: self
+                        .builder
+                        .alternation(self.lanes.drain(first_lane..), span),
                     depth,
                     start,
                 })
@@ -1272,19 +1337,25 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
                 let deepest = steps_per_cycle
                     .as_ref()
                     .map_or(inner.deepest, |steps| inner.deepest.max(steps.depth));
-                let items = match inner.items {
-                    Items::One(node) => vec![node],
-                    Items::Stack(items, _)
-                    | Items::Choice(items, _, _)
-                    | Items::Feet(items, _, _) => items,
-                };
                 let span = Span {
                     start,
                     end: self.pos,
                 };
                 let steps_per_cycle = steps_per_cycle.map(|steps| steps.node);
+                let node = match inner.items {
+                    Items::One(node) => {
+                        self.builder
+                            .polymeter(std::iter::once(node), steps_per_cycle, span)
+                    }
+                    Items::Stack(first, _)
+                    | Items::Choice(first, _, _)
+                    | Items::Feet(first, _, _) => {
+                        self.builder
+                            .polymeter(self.items.drain(first..), steps_per_cycle, span)
+                    }
+                };
                 Ok(Parsed {
-                    node: self.builder.polymeter(items, steps_per_cycle, span),
+                    node,
                     depth: self.within(deepest + 1)?,
                     start,
                 })
@@ -1432,6 +1503,10 @@ pub(crate) fn read<'a, B: Build<'a>>(src: &'a str, builder: B) -> Result<(B::Nod
     })();
     p.steps.clear();
     p.builder.return_steps(p.steps);
+    p.items.clear();
+    p.builder.return_items(p.items);
+    p.lanes.clear();
+    p.builder.return_lanes(p.lanes);
     result.map(|node| (node, p.builder))
 }
 

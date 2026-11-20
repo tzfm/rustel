@@ -2224,7 +2224,14 @@ impl OrderedMap {
 
     /// A map of `entries`, each of another key, in their order.
     pub(crate) fn of_keys(entries: impl IntoIterator<Item = (Key, Value)>) -> Self {
-        let vec: Vec<(Key, Value)> = entries.into_iter().collect();
+        let mut iter = entries.into_iter();
+        let (lo, hi) = iter.size_hint();
+        if hi == Some(lo) {
+            return Self {
+                entries: pack_entries(lo, |_| iter.next().expect("exact len"), false),
+            };
+        }
+        let vec: Vec<(Key, Value)> = iter.collect();
         let len = vec.len();
         let mut iter = vec.into_iter();
         Self {
@@ -2263,6 +2270,7 @@ impl OrderedMap {
     fn append(&mut self, entry: (Key, Value)) {
         if let Entries::Patched(patched, _) = &mut self.entries
             && let Some(own) = Arc::get_mut(patched)
+            && !own.overlay_after_appended
             && usize::from(own.len) < MAX_PATCHES
         {
             let (key, value) = entry;

@@ -2566,6 +2566,30 @@ impl Dress {
         self.tail.is_none() && self.keys.can_intern()
     }
 
+    pub(crate) fn dedup_inner_mut(
+        &mut self,
+        dedup_builtin: &mut dyn FnMut(
+            Arc<dyn crate::value::BuiltinEntries>,
+            bool,
+        ) -> Arc<dyn crate::value::BuiltinEntries>,
+        dedup_keys: &mut dyn FnMut(
+            Arc<crate::context_keys::Keys>,
+        ) -> Arc<crate::context_keys::Keys>,
+    ) {
+        if let Some(map) = &mut self.set_map {
+            let canon = dedup_builtin(Arc::clone(map), true);
+            if !Arc::ptr_eq(map, &canon) {
+                *map = canon;
+            }
+        }
+        if let Some(keys) = self.keys.as_arc() {
+            let canon = dedup_keys(Arc::clone(keys));
+            if !Arc::ptr_eq(keys, &canon) {
+                self.keys = ContextKeys::from_arc(canon);
+            }
+        }
+    }
+
     pub(crate) fn dedup_inner(
         &self,
         dedup_builtin: &mut dyn FnMut(
@@ -2942,7 +2966,9 @@ enum SequenceStop {
 /// Post-eval deduplicator hooks called by [`Layer::dedup_in`].
 pub(crate) trait LayerDeduper {
     fn dedup_values(&mut self, values: &Arc<[Value]>) -> Arc<[Value]>;
+    fn dedup_values_mut(&mut self, values: &mut Arc<[Value]>);
     fn dedup_dress(&mut self, dress: &Arc<Dress>) -> Arc<Dress>;
+    fn dedup_dress_mut(&mut self, dress: &mut Arc<Dress>);
     fn dedup_compact_grid(&mut self, grid: &CompactGrid) -> CompactGrid;
     fn dedup_grid(&mut self, grid: &Arc<Grid>) -> Arc<Grid>;
 }
@@ -3026,6 +3052,33 @@ impl Layer {
                 }
                 _ => false,
             }
+    }
+
+    /// Deduplicate this layer's `values`, `dress`, and `steps` payloads in place
+    /// when the enclosing `Arc<[Layer]>` is uniquely owned.
+    pub(crate) fn dedup_in_mut(&mut self, deduper: &mut impl LayerDeduper) {
+        if self.is_data() {
+            deduper.dedup_values_mut(&mut self.values);
+        }
+        if let Some(dress) = &mut self.dress {
+            deduper.dedup_dress_mut(dress);
+        }
+        match &mut self.steps {
+            Steps::Listed(Listing::CompactGrid(CompactGrid::OneStep(_))) => {}
+            Steps::Listed(Listing::CompactGrid(g)) => {
+                let c = deduper.dedup_compact_grid(g);
+                if !g.ptr_eq(&c) {
+                    *g = c;
+                }
+            }
+            Steps::Listed(Listing::Grid(g)) if g.can_intern() => {
+                let c = deduper.dedup_grid(g);
+                if !Arc::ptr_eq(g, &c) {
+                    *g = c;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Deduplicate this layer's `values`, `dress`, and `steps` payloads through
@@ -3682,29 +3735,27 @@ impl Layer {
     ///
     /// A layer that names or sets its values already [takes no
     /// name](Self::takes_name).
-    fn named<'a>(
-        layers: impl IntoIterator<Item = &'a Layer>,
-        spec: &crate::controls::ControlSpec,
-    ) -> Vec<Layer> {
+    fn named_arc(layers: &[Layer], spec: &crate::controls::ControlSpec) -> Arc<[Layer]> {
         let id = if spec.id != 0 {
             spec.id
         } else {
             crate::controls::builtin_id_of_names(&spec.names)
         };
         if id != 0 {
-            let mut out = Vec::new();
-            for layer in layers {
-                let mut next = layer.clone();
-                next.named_id = id;
-                next.set_maps(true);
-                if next.dress.as_deref().is_some_and(Dress::has_custom_name) {
-                    next.change_dress(Dress::clear_custom_named);
-                } else {
-                    next.refresh_direct();
-                }
-                out.push(next);
-            }
-            return out;
+            return layers
+                .iter()
+                .map(|layer| {
+                    let mut next = layer.clone();
+                    next.named_id = id;
+                    next.set_maps(true);
+                    if next.dress.as_deref().is_some_and(Dress::has_custom_name) {
+                        next.change_dress(Dress::clear_custom_named);
+                    } else {
+                        next.refresh_direct();
+                    }
+                    next
+                })
+                .collect();
         }
         let mut layers = redressed(layers, |dress| dress.set_custom_named(&spec.names));
         for layer in &mut layers {
@@ -3712,7 +3763,7 @@ impl Layer {
             layer.set_maps(true);
             layer.refresh_direct();
         }
-        layers
+        layers.into()
     }
 
     /// Name `layers` in place when they are unshared, avoiding `Vec<Layer>`,
@@ -5351,7 +5402,7 @@ pub(crate) fn named(pattern: &Pattern, spec: &crate::controls::ControlSpec) -> O
     }
     // Each layer of a node has steps, so each one stays. The layers are
     // made where the new node holds them.
-    let named: Arc<[Layer]> = Layer::named(layers.iter(), spec).into();
+    let named = Layer::named_arc(&layers, spec);
     Some(Pattern::of(Node::Sequence(named)))
 }
 

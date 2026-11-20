@@ -5003,10 +5003,10 @@ impl PickLookup {
         }
     }
 
-    fn patterns(&self) -> Box<dyn Iterator<Item = &Pattern> + '_> {
+    fn patterns(&self) -> PickPatterns<'_> {
         match self {
-            Self::Array { entries, .. } => Box::new(entries.iter().map(|(_, pattern)| pattern)),
-            Self::Object { entries, .. } => Box::new(entries.iter().map(|(_, pattern)| pattern)),
+            Self::Array { entries, .. } => PickPatterns::Array(entries.iter()),
+            Self::Object { entries, .. } => PickPatterns::Object(entries.iter()),
         }
     }
 
@@ -5097,6 +5097,46 @@ impl PickLookup {
 
 /// Compact exact-sized lookup stored inside [`PickNode`]: dense `0..n` arrays
 /// drop the index column and spare `Vec` capacity.
+enum PickPatterns<'a> {
+    Dense(std::slice::Iter<'a, Pattern>),
+    Array(std::slice::Iter<'a, (usize, Pattern)>),
+    Object(std::slice::Iter<'a, (String, Pattern)>),
+    CompactObject(std::slice::Iter<'a, (value::SharedStr, Pattern)>),
+}
+
+impl<'a> Iterator for PickPatterns<'a> {
+    type Item = &'a Pattern;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense(it) => it.next(),
+            Self::Array(it) => it.next().map(|(_, p)| p),
+            Self::Object(it) => it.next().map(|(_, p)| p),
+            Self::CompactObject(it) => it.next().map(|(_, p)| p),
+        }
+    }
+}
+
+enum PickPatternsMut<'a> {
+    Dense(std::slice::IterMut<'a, Pattern>),
+    Array(std::slice::IterMut<'a, (usize, Pattern)>),
+    CompactObject(std::slice::IterMut<'a, (value::SharedStr, Pattern)>),
+}
+
+impl<'a> Iterator for PickPatternsMut<'a> {
+    type Item = &'a mut Pattern;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense(it) => it.next(),
+            Self::Array(it) => it.next().map(|(_, p)| p),
+            Self::CompactObject(it) => it.next().map(|(_, p)| p),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum CompactPickLookup {
     Dense(Box<[Pattern]>),
@@ -5181,21 +5221,19 @@ impl CompactPickLookup {
         })
     }
 
-    fn patterns(&self) -> Box<dyn Iterator<Item = &Pattern> + '_> {
+    fn patterns(&self) -> PickPatterns<'_> {
         match self {
-            Self::Dense(patterns) => Box::new(patterns.iter()),
-            Self::Array { entries, .. } => Box::new(entries.iter().map(|(_, pattern)| pattern)),
-            Self::Object { entries, .. } => Box::new(entries.iter().map(|(_, pattern)| pattern)),
+            Self::Dense(patterns) => PickPatterns::Dense(patterns.iter()),
+            Self::Array { entries, .. } => PickPatterns::Array(entries.iter()),
+            Self::Object { entries, .. } => PickPatterns::CompactObject(entries.iter()),
         }
     }
 
-    fn patterns_mut(&mut self) -> Box<dyn Iterator<Item = &mut Pattern> + '_> {
+    fn patterns_mut(&mut self) -> PickPatternsMut<'_> {
         match self {
-            Self::Dense(patterns) => Box::new(patterns.iter_mut()),
-            Self::Array { entries, .. } => Box::new(entries.iter_mut().map(|(_, pattern)| pattern)),
-            Self::Object { entries, .. } => {
-                Box::new(entries.iter_mut().map(|(_, pattern)| pattern))
-            }
+            Self::Dense(patterns) => PickPatternsMut::Dense(patterns.iter_mut()),
+            Self::Array { entries, .. } => PickPatternsMut::Array(entries.iter_mut()),
+            Self::Object { entries, .. } => PickPatternsMut::CompactObject(entries.iter_mut()),
         }
     }
 
@@ -8266,6 +8304,11 @@ impl Pattern {
     #[inline(always)]
     pub(crate) fn node_arc(&self) -> &Arc<NodeCell> {
         &self.node
+    }
+
+    #[inline(always)]
+    pub(crate) fn node_arc_mut(&mut self) -> &mut Arc<NodeCell> {
+        &mut self.node
     }
 
     #[inline(always)]
@@ -14205,6 +14248,13 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
     }
 }
 
+thread_local! {
+    /// Reusable empty worklists for iterative `Node::drop`, avoiding a heap
+    /// allocation per dropped temporary node during score construction.
+    static DROP_WORK: std::cell::RefCell<Vec<Vec<Pattern>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl Drop for Node {
     /// Destroy the graph iteratively.
     ///
@@ -14219,7 +14269,23 @@ impl Drop for Node {
     /// drops, so it recurses no further.
     fn drop(&mut self) {
         LIVE_NODES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        let mut pending = Vec::new();
+        if matches!(
+            self,
+            Node::Silence
+                | Node::Pure(_)
+                | Node::Sequence(_)
+                | Node::QueryError(_)
+                | Node::QueryLimit(_)
+                | Node::Signal(_)
+                | Node::JsQuery(_)
+        ) {
+            return;
+        }
+        let mut pending = DROP_WORK
+            .try_with(|pool| pool.borrow_mut().pop())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         drain_pattern_children(self, &mut pending);
         while let Some(pattern) = pending.pop() {
             // Only the last owner has a graph to take apart; anyone else is
@@ -14227,6 +14293,14 @@ impl Drop for Node {
             if let Some(mut cell) = Arc::into_inner(pattern.node) {
                 drain_pattern_children(&mut cell.kind, &mut pending);
             }
+        }
+        if pending.capacity() <= 64 {
+            let _ = DROP_WORK.try_with(|pool| {
+                let mut pool = pool.borrow_mut();
+                if pool.len() < 4 {
+                    pool.push(pending);
+                }
+            });
         }
     }
 }

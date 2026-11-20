@@ -43,9 +43,200 @@ type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<WordHasher>>;
 /// old nodes.
 pub fn dedup_score(
     root: &mut Pattern,
-    remap_extras: impl FnOnce(&mut dyn FnMut(&mut crate::PatternNodeRef)),
+    remap_extras: impl FnMut(&mut dyn FnMut(&mut crate::PatternNodeRef)),
 ) {
     dedup_score_with_reused(root, &[], remap_extras);
+}
+
+/// Stack-only check for tiny graphs (`<= 12` nodes) with nothing worthwhile to
+/// deduplicate, avoiding all hash-table allocations on small scores.
+fn is_tiny_graph(root: &NodeCell) -> bool {
+    const LIMIT: usize = 20;
+    let mut stack: [Option<&NodeCell>; 24] = [None; 24];
+    let mut top = 1usize;
+    stack[0] = Some(root);
+    let mut visited = 0usize;
+    fn push<'a>(
+        stack: &mut [Option<&'a NodeCell>; 24],
+        top: &mut usize,
+        cell: &'a NodeCell,
+    ) -> bool {
+        if *top >= stack.len() {
+            return false;
+        }
+        stack[*top] = Some(cell);
+        *top += 1;
+        true
+    }
+    while top > 0 {
+        top -= 1;
+        let cell = stack[top].expect("stack slot present");
+        visited += 1;
+        if visited > LIMIT {
+            return false;
+        }
+        match &cell.kind {
+            Node::Sequence(layers) => {
+                visited += layers.len();
+                if visited > LIMIT {
+                    return false;
+                }
+            }
+            Node::Stack(pats) | Node::SlowCat(pats) | Node::SlowCatPrime(pats) => {
+                for p in pats.iter() {
+                    if !push(&mut stack, &mut top, p.node_arc()) {
+                        return false;
+                    }
+                }
+            }
+            Node::StackPure(cells) | Node::SlowCatPure(cells) | Node::SlowCatPrimePure(cells) => {
+                for c in cells.iter() {
+                    if !push(&mut stack, &mut top, c) {
+                        return false;
+                    }
+                }
+            }
+            Node::FastSmall(inner, ..)
+            | Node::ShiftSmall(inner, ..)
+            | Node::ControlMap(inner, ..)
+            | Node::SplitQueries(inner, _)
+            | Node::Join(inner, ..) => {
+                if !push(&mut stack, &mut top, inner) {
+                    return false;
+                }
+            }
+            Node::Constants(node) => {
+                if !push(&mut stack, &mut top, node.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::AppWave(app) => {
+                if !push(&mut stack, &mut top, app.inner.node_arc()) {
+                    return false;
+                }
+            }
+            Node::UiVisual(node) => {
+                if !push(&mut stack, &mut top, node.inner.node_arc()) {
+                    return false;
+                }
+            }
+            Node::Fast(node) => {
+                if !push(&mut stack, &mut top, node.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::Shift(node) => {
+                if !push(&mut stack, &mut top, node.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::SplitQueriesBoxed(p)
+            | Node::Rev(p)
+            | Node::StepJoin(p)
+            | Node::PolyJoin(p)
+            | Node::PurePattern(p)
+            | Node::SortHapsByPart(p)
+            | Node::Collect(p)
+            | Node::CycleOnsetIndex(p)
+            | Node::CycleOnsetCount(p) => {
+                if !push(&mut stack, &mut top, p.node_arc()) {
+                    return false;
+                }
+            }
+            Node::AppLeft(app) => {
+                if !push(&mut stack, &mut top, app.0.node_arc())
+                    || !push(&mut stack, &mut top, app.1.node_arc())
+                {
+                    return false;
+                }
+            }
+            Node::AppRight(app) | Node::AppBoth(app) => {
+                if !push(&mut stack, &mut top, app.0.node_arc())
+                    || !push(&mut stack, &mut top, app.1.node_arc())
+                {
+                    return false;
+                }
+            }
+            Node::Degrade(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::Cpm(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::ControlMapBoxed(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::JoinBoxed(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::AddContext(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::FilterValues(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::FilterHaps(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::MapHapsOwned(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::MapHapsNative(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::ExpandHapsNative(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::FmapNative(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::WithRandSeed(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::FastGap(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::RepeatCycles(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::LoopAt(b) => {
+                if !push(&mut stack, &mut top, b.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::Silence | Node::Pure(_) | Node::Signal(_) => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Like [`dedup_score`], pre-seeding already-canonical node references reused
@@ -53,13 +244,11 @@ pub fn dedup_score(
 pub fn dedup_score_with_reused(
     root: &mut Pattern,
     reused: &[crate::PatternNodeRef],
-    remap_extras: impl FnOnce(&mut dyn FnMut(&mut crate::PatternNodeRef)),
+    mut remap_extras: impl FnMut(&mut dyn FnMut(&mut crate::PatternNodeRef)),
 ) {
-    // Tiny single-leaf scores have nothing to share across tracks or layers.
-    match &root.node_arc().kind {
-        Node::Silence | Node::Pure(_) => return,
-        Node::Sequence(layers) if layers.len() <= 1 => return,
-        _ => {}
+    // Tiny single-track scores have nothing to share across tracks or layers.
+    if is_tiny_graph(root.node_arc()) {
+        return;
     }
     let mut visited = FastMap::default();
     if !reused.is_empty() {
@@ -68,16 +257,36 @@ pub fn dedup_score_with_reused(
             visited.insert(node_ref.identity(), Arc::clone(&node_ref.0));
         }
     }
-    let pooled_builtins = collect_and_pool_builtins(root.node_arc(), &visited);
+    let (pooled_builtins, seen_nodes) = collect_and_pool_builtins(root.node_arc(), &visited);
+    // Temporarily detach extra handles (such as memo parts) that point to
+    // newly-built nodes reachable from `root` so their refcount drops to 1 and
+    // `Arc::get_mut` can deduplicate them in place without reallocating.
+    let mut detached: Vec<usize> = Vec::new();
+    let silence_arc = Arc::clone(crate::silence().node_arc());
+    remap_extras(&mut |node_ref: &mut crate::PatternNodeRef| {
+        let id = node_ref.identity();
+        if seen_nodes.contains(&id) && !visited.contains_key(&id) {
+            detached.push(id);
+            node_ref.0 = Arc::clone(&silence_arc);
+        } else {
+            detached.push(0);
+        }
+    });
     let mut deduper = Deduper {
         visited,
         pooled_builtins,
         ..Deduper::default()
     };
     deduper.dedup_pattern(root);
+    let mut idx = 0usize;
     let mut remap = |node_ref: &mut crate::PatternNodeRef| {
-        if let Some(canon) = deduper.visited.get(&node_ref.identity()) {
+        let orig = detached.get(idx).copied().unwrap_or(0);
+        idx += 1;
+        let lookup = if orig != 0 { orig } else { node_ref.identity() };
+        if let Some(canon) = deduper.visited.get(&lookup) {
             node_ref.0 = Arc::clone(canon);
+        } else {
+            debug_assert_eq!(orig, 0, "detached reachable node missing from visited");
         }
     };
     remap_extras(&mut remap);
@@ -89,7 +298,7 @@ pub fn dedup_score_with_reused(
 fn collect_and_pool_builtins(
     root: &Arc<NodeCell>,
     skip_nodes: &FastMap<usize, Arc<NodeCell>>,
-) -> FastMap<usize, Arc<dyn BuiltinEntries>> {
+) -> (FastMap<usize, Arc<dyn BuiltinEntries>>, FastSet<usize>) {
     let mut seen_nodes: FastSet<usize> = FastSet::default();
     let mut seen_layers: FastSet<usize> = FastSet::default();
     let mut seen_ptrs: FastSet<usize> = FastSet::default();
@@ -209,10 +418,7 @@ fn collect_and_pool_builtins(
                     stack.push(p.node_arc().as_ref());
                 }
             }
-            Node::PickPatternified { patterns, .. }
-            | Node::Arp(patterns)
-            | Node::ArpWithPattern(patterns)
-            | Node::Timeline(patterns, _) => {
+            Node::PickPatternified { patterns, .. } | Node::Arp(patterns) => {
                 stack.push(patterns.0.node_arc().as_ref());
                 stack.push(patterns.1.node_arc().as_ref());
             }
@@ -238,7 +444,7 @@ fn collect_and_pool_builtins(
         }
     }
     if unpooled.len() < 4 {
-        return FastMap::default();
+        return (FastMap::default(), seen_nodes);
     }
     // Deduplicate identical maps first so frequency counts reflect unique surviving maps.
     let mut unique_set: FastSet<InternedBuiltin> = FastSet::default();
@@ -259,7 +465,7 @@ fn collect_and_pool_builtins(
         }
     }
     if unique_maps.len() < 4 {
-        return FastMap::default();
+        return (FastMap::default(), seen_nodes);
     }
     let mut freq: FastMap<DataValueRef<'_>, u32> = FastMap::default();
     for map in &unique_maps {
@@ -288,7 +494,7 @@ fn collect_and_pool_builtins(
         }
     }
     if poolable.len() < 2 {
-        return FastMap::default();
+        return (FastMap::default(), seen_nodes);
     }
     let mut pool_index: FastMap<DataValueRef<'_>, u16> = FastMap::default();
     let mut pool_vec: Vec<Value> = Vec::new();
@@ -303,7 +509,7 @@ fn collect_and_pool_builtins(
                 let key = DataValueRef(val);
                 if let std::collections::hash_map::Entry::Vacant(entry) = pool_index.entry(key) {
                     let Ok(idx) = u16::try_from(pool_vec.len()) else {
-                        return FastMap::default();
+                        return (FastMap::default(), seen_nodes);
                     };
                     pool_vec.push(val.clone());
                     entry.insert(idx);
@@ -313,7 +519,7 @@ fn collect_and_pool_builtins(
     }
     let new_bytes = 16 + 24 * pool_vec.len() + new_maps_bytes;
     if new_bytes + 64 >= old_bytes {
-        return FastMap::default();
+        return (FastMap::default(), seen_nodes);
     }
     let pool: Arc<[Value]> = pool_vec.into();
     let mut out: FastMap<usize, Arc<dyn BuiltinEntries>> = FastMap::default();
@@ -333,7 +539,7 @@ fn collect_and_pool_builtins(
             out.insert(dup_ptr, Arc::clone(pooled));
         }
     }
-    out
+    (out, seen_nodes)
 }
 
 #[derive(Default)]
@@ -376,6 +582,14 @@ impl Deduper {
         out
     }
 
+    fn dedup_value_mut(&mut self, value: &mut Value) {
+        if let Value::Object(map) = value
+            && map.as_builtin().is_some()
+        {
+            map.dedup_builtin(|entries, made| self.intern_builtin(entries, made));
+        }
+    }
+
     fn dedup_value(&mut self, value: &Value) -> Option<Value> {
         if let Value::Object(map) = value
             && map.as_builtin().is_some()
@@ -386,6 +600,34 @@ impl Deduper {
             }
         }
         None
+    }
+
+    fn dedup_values_mut(&mut self, values: &mut Arc<[Value]>) {
+        if values.is_empty() {
+            return;
+        }
+        let id = Arc::as_ptr(values) as *const Value as usize;
+        if let Some(existing) = self.seen_values.get(&id) {
+            *values = Arc::clone(existing);
+            return;
+        }
+        if let Some(slice) = Arc::get_mut(values) {
+            for val in slice.iter_mut() {
+                self.dedup_value_mut(val);
+            }
+            let key = InternedValues(Arc::clone(values));
+            if let Some(existing) = self.values.get(&key) {
+                *values = Arc::clone(&existing.0);
+            } else {
+                self.values.insert(key);
+            }
+            self.seen_values.insert(id, Arc::clone(values));
+            return;
+        }
+        let next = self.dedup_values(values);
+        if !Arc::ptr_eq(values, &next) {
+            *values = next;
+        }
     }
 
     fn dedup_values(&mut self, values: &Arc<[Value]>) -> Arc<[Value]> {
@@ -417,6 +659,65 @@ impl Deduper {
         };
         self.seen_values.insert(id, Arc::clone(&canon));
         canon
+    }
+
+    fn dedup_dress_mut(&mut self, dress: &mut Arc<Dress>) {
+        let id = Arc::as_ptr(dress) as usize;
+        if let Some(existing) = self.seen_dresses.get(&id) {
+            *dress = Arc::clone(existing);
+            return;
+        }
+        if let Some(inner) = Arc::get_mut(dress) {
+            let Self {
+                builtins,
+                keys,
+                pooled_builtins,
+                ..
+            } = self;
+            let mut dedup_builtin = |entries: Arc<dyn BuiltinEntries>, known_data: bool| {
+                let ptr = Arc::as_ptr(&entries) as *const () as usize;
+                if let Some(pooled) = pooled_builtins.get(&ptr) {
+                    return Arc::clone(pooled);
+                }
+                if !known_data && !entries.as_slice().all_values_data() {
+                    return entries;
+                }
+                let key = InternedBuiltin(entries);
+                if let Some(existing) = builtins.get(&key) {
+                    return Arc::clone(&existing.0);
+                }
+                let out = Arc::clone(&key.0);
+                builtins.insert(key);
+                out
+            };
+            let mut dedup_keys = |k: Arc<Keys>| {
+                if k.scale_definition.is_some() || k.pick_lookup.is_some() {
+                    return k;
+                }
+                let key = InternedKeys(k);
+                if let Some(existing) = keys.get(&key) {
+                    return Arc::clone(&existing.0);
+                }
+                let out = Arc::clone(&key.0);
+                keys.insert(key);
+                out
+            };
+            inner.dedup_inner_mut(&mut dedup_builtin, &mut dedup_keys);
+            if dress.can_intern() {
+                let key = InternedDress(Arc::clone(dress));
+                if let Some(existing) = self.dresses.get(&key) {
+                    *dress = Arc::clone(&existing.0);
+                } else {
+                    self.dresses.insert(key);
+                }
+            }
+            self.seen_dresses.insert(id, Arc::clone(dress));
+            return;
+        }
+        let next = self.dedup_dress(dress);
+        if !Arc::ptr_eq(dress, &next) {
+            *dress = next;
+        }
     }
 
     fn dedup_dress(&mut self, dress: &Arc<Dress>) -> Arc<Dress> {
@@ -502,6 +803,33 @@ impl Deduper {
         out
     }
 
+    fn dedup_layers_mut(&mut self, layers: &mut Arc<[Layer]>) {
+        let id = Arc::as_ptr(layers) as *const Layer as usize;
+        if let Some(existing) = self.seen_layers.get(&id) {
+            *layers = Arc::clone(existing);
+            return;
+        }
+        if let Some(slice) = Arc::get_mut(layers) {
+            for layer in slice.iter_mut() {
+                layer.dedup_in_mut(self);
+            }
+            if layers.iter().all(Layer::can_intern) {
+                let key = InternedLayers(Arc::clone(layers));
+                if let Some(existing) = self.layers.get(&key) {
+                    *layers = Arc::clone(&existing.0);
+                } else {
+                    self.layers.insert(key);
+                }
+            }
+            self.seen_layers.insert(id, Arc::clone(layers));
+            return;
+        }
+        let next = self.dedup_layers(layers);
+        if !Arc::ptr_eq(layers, &next) {
+            *layers = next;
+        }
+    }
+
     fn dedup_layers(&mut self, layers: &Arc<[Layer]>) -> Arc<[Layer]> {
         let id = Arc::as_ptr(layers) as *const Layer as usize;
         if let Some(existing) = self.seen_layers.get(&id) {
@@ -544,12 +872,254 @@ impl Deduper {
             }
             Arc::clone(canon)
         });
-        let next = self.dedup_cell(pat.node_arc(), pat.node_flags());
-        if !Arc::ptr_eq(pat.node_arc(), &next) {
-            pat.set_node_arc(next);
+        let flags = pat.node_flags();
+        if self.dedup_cell_mut(pat.node_arc_mut(), flags) {
             changed = true;
         }
         changed
+    }
+
+    fn dedup_cell_mut(&mut self, cell: &mut Arc<NodeCell>, flags: u8) -> bool {
+        let id = Arc::as_ptr(cell) as usize;
+        if let Some(existing) = self.visited.get(&id) {
+            if !Arc::ptr_eq(cell, existing) {
+                *cell = Arc::clone(existing);
+                return true;
+            }
+            return false;
+        }
+        if let Some(node_cell) = Arc::get_mut(cell) {
+            self.dedup_node_in_place(&mut node_cell.kind);
+            let mut replaced = false;
+            if can_intern_node(&cell.kind, flags) {
+                let key = InternedNode(Arc::clone(cell));
+                if let Some(existing) = self.nodes.get(&key) {
+                    *cell = Arc::clone(&existing.0);
+                    replaced = true;
+                } else {
+                    self.nodes.insert(key);
+                }
+            }
+            self.visited.insert(id, Arc::clone(cell));
+            return replaced;
+        }
+        let next = self.dedup_cell(cell, flags);
+        if !Arc::ptr_eq(cell, &next) {
+            *cell = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn dedup_node_in_place(&mut self, kind: &mut Node) {
+        match kind {
+            Node::Sequence(layers) => self.dedup_layers_mut(layers),
+            Node::Pure(val) => self.dedup_value_mut(val),
+            Node::Stack(pats) | Node::SlowCat(pats) | Node::SlowCatPrime(pats) => {
+                for pat in pats.iter_mut() {
+                    self.dedup_pattern(pat);
+                }
+            }
+            Node::StackPure(cells) | Node::SlowCatPure(cells) | Node::SlowCatPrimePure(cells) => {
+                for cell in cells.iter_mut() {
+                    self.dedup_cell_mut(cell, 0);
+                }
+            }
+            Node::FastSmall(inner, f, ..)
+            | Node::ShiftSmall(inner, f, ..)
+            | Node::ControlMap(inner, f, ..)
+            | Node::SplitQueries(inner, f)
+            | Node::Join(inner, f, ..) => {
+                self.dedup_cell_mut(inner, *f);
+            }
+            Node::SplitQueriesBoxed(pat)
+            | Node::Rev(pat)
+            | Node::StepJoin(pat)
+            | Node::PolyJoin(pat)
+            | Node::PurePattern(pat)
+            | Node::SortHapsByPart(pat)
+            | Node::Collect(pat)
+            | Node::CycleOnsetIndex(pat)
+            | Node::CycleOnsetCount(pat) => {
+                self.dedup_pattern(pat);
+            }
+            Node::Fast(node) => {
+                self.dedup_pattern(&mut node.0);
+            }
+            Node::Shift(node) => {
+                self.dedup_pattern(&mut node.0);
+            }
+            Node::Degrade(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::AppWave(app) => {
+                self.dedup_pattern(&mut app.inner);
+            }
+            Node::Constants(node) => {
+                self.dedup_pattern(&mut node.0);
+                for m in node.1.iter_mut() {
+                    self.dedup_value_mut(&mut m.value);
+                }
+            }
+            Node::Pick(pick) => {
+                self.dedup_pattern(&mut pick.selector);
+                match &mut pick.lookup {
+                    CompactPickLookup::Dense(pats) => {
+                        for p in pats.iter_mut() {
+                            self.dedup_pattern(p);
+                        }
+                    }
+                    CompactPickLookup::Array { entries, .. } => {
+                        for (_, p) in entries.iter_mut() {
+                            self.dedup_pattern(p);
+                        }
+                    }
+                    CompactPickLookup::Object { entries, .. } => {
+                        for (_, p) in entries.iter_mut() {
+                            self.dedup_pattern(p);
+                        }
+                    }
+                }
+            }
+            Node::AppLeft(app) => {
+                self.dedup_pattern(&mut app.0);
+                self.dedup_pattern(&mut app.1);
+                app.2 = ValueReading::default();
+            }
+            Node::AppRight(app) | Node::AppBoth(app) => {
+                self.dedup_pattern(&mut app.0);
+                self.dedup_pattern(&mut app.1);
+            }
+            Node::Cpm(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::UiVisual(node) => {
+                self.dedup_pattern(&mut node.inner);
+            }
+            Node::ControlMapBoxed(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::JoinBoxed(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::AddContext(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::FilterValues(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::FilterHaps(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::MapHapsOwned(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::MapHapsNative(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::ExpandHapsNative(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::FmapNative(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::WithRandSeed(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::FastGap(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::RepeatCycles(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::LoopAt(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::WithQueryTime(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::WithHapTime(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::WithQuerySpan(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::WithHapSpan(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::MapHapsWithState(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::InnerJoin(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+            }
+            Node::ChooseCycles(boxed) => {
+                for p in boxed.0.iter_mut() {
+                    self.dedup_pattern(p);
+                }
+            }
+            Node::PatternOfPure(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+                boxed.2 = ConstructionMemo::default();
+            }
+            Node::PatternOfPureOperand(pair, _) => {
+                self.dedup_pattern(&mut pair.0);
+                self.dedup_pattern(&mut pair.1);
+                pair.2 = ConstructionMemo::default();
+            }
+            Node::PatternOfHap(bind) => {
+                self.dedup_pattern(&mut bind.0);
+                for p in &mut bind.1 {
+                    self.dedup_pattern(p);
+                }
+            }
+            Node::WChoose(choice) => {
+                self.dedup_pattern(&mut choice.chooser);
+                self.dedup_pattern(&mut choice.total);
+                for p in &mut choice.cumulative {
+                    self.dedup_pattern(p);
+                }
+                for p in &mut choice.values {
+                    self.dedup_pattern(p);
+                }
+            }
+            Node::Arp(pair) => {
+                self.dedup_pattern(&mut pair.0);
+                self.dedup_pattern(&mut pair.1);
+            }
+            Node::PickPatternified { patterns, .. } => {
+                self.dedup_pattern(&mut patterns.0);
+                self.dedup_pattern(&mut patterns.1);
+            }
+            Node::XenPatterns(boxed) => {
+                self.dedup_pattern(&mut boxed.0);
+                for p in &mut boxed.1 {
+                    self.dedup_pattern(p);
+                }
+            }
+            Node::Silence
+            | Node::QueryError(_)
+            | Node::QueryLimit(_)
+            | Node::Signal(_)
+            | Node::Extension(_)
+            | Node::PurePickLookup(_)
+            | Node::MidiKeys(_)
+            | Node::PatternOfDynamic(_)
+            | Node::WithQuerySpanJs(_)
+            | Node::ArpWith(_)
+            | Node::ArpWithPattern(_)
+            | Node::PatternOfJs(_)
+            | Node::FilterValuesJs(_)
+            | Node::FilterHapsJs(_)
+            | Node::FilterWhenJs(_)
+            | Node::FmapJs(_)
+            | Node::FmapJsPreservingControls(_)
+            | Node::JsQuery(_)
+            | Node::Timeline(..) => {}
+            #[cfg(non_send_node_mutation)]
+            Node::NonSendMutation(_) => {}
+        }
     }
 
     fn dedup_pat_child(&mut self, pat: &Pattern) -> Option<Pattern> {
@@ -1240,8 +1810,16 @@ impl LayerDeduper for Deduper {
         Self::dedup_values(self, values)
     }
 
+    fn dedup_values_mut(&mut self, values: &mut Arc<[Value]>) {
+        Self::dedup_values_mut(self, values);
+    }
+
     fn dedup_dress(&mut self, dress: &Arc<Dress>) -> Arc<Dress> {
         Self::dedup_dress(self, dress)
+    }
+
+    fn dedup_dress_mut(&mut self, dress: &mut Arc<Dress>) {
+        Self::dedup_dress_mut(self, dress);
     }
 
     fn dedup_compact_grid(&mut self, grid: &CompactGrid) -> CompactGrid {
