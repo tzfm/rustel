@@ -9585,3 +9585,25 @@ fn a_replay_save_that_never_reached_the_score_is_reported_not_announced() {
         let _ = std::fs::remove_file(path);
     }
 }
+
+/// A `.dict()` name nothing registered is an error of the query, as on
+/// strudel.cc, not a lane that plays silence; a known name and a score's
+/// own `addVoicings` name still voice the chord.
+#[test]
+fn an_unknown_voicing_dictionary_is_an_error() {
+    assert_reported_failure(
+        &[
+            "query",
+            "-e",
+            r#"chord("Cm7").dict("lefthnd").anchor(70).voicing()"#,
+        ],
+        "unknown voicing dictionary \"lefthnd\"",
+    );
+    for score in [
+        r#"chord("Cm7").dict("lefthand").anchor(70).voicing()"#,
+        "addVoicings('mine', {m7: ['3m 7m']}, ['C3','C6']); chord('Cm7').dict('mine').voicing()",
+    ] {
+        let out = ok_stdout(&["query", "-e", score, "--plain"]);
+        assert!(!out.contains("0 events"), "{score}: {out}");
+    }
+}
