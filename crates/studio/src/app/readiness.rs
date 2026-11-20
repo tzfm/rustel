@@ -775,6 +775,17 @@ impl App {
         if scene.is_score() {
             // Its own registrations are already read from the score itself.
             context.mode = LintMode::Score;
+            // A name from a script another score of the set imports stays
+            // available to every score once that score has played, and the
+            // checker cannot read the script: judge no name unknown, as for
+            // a score with an import of its own. The update still fails if
+            // the name is missing when it runs.
+            context.setup_has_dynamic_names |= self.scenes.scenes().iter().any(|other| {
+                let source = other.editor.source();
+                other.is_score()
+                    && source.contains("import")
+                    && !rustel_transpiler::script_imports(&source).is_empty()
+            });
         }
         context.input_channels = self.lint_input_channels();
         // What is plugged in right now, so a score naming a port that is

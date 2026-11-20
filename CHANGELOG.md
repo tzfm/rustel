@@ -17,6 +17,7 @@
 - Fixed: the events pane uses the theme's palette so monochrome themes stay monochrome. In Vim mode, `ip` and `ap` select paragraphs, `.` repeats the last change, and Ctrl+[ steps to the previous scene from Normal mode.
 - Fixed: `up` with values that name no controls, such as `up("7 12")` or `up(7)`, keeps the controls of the events underneath instead of replacing each event.
 - Fixed: `talkit("42")` speaks the number instead of a silent refused voice.
+- Fixed: a scene can call a name from a script that another scene of the set imports, as the docs say, instead of the check refusing it as unknown.
 
 ## v0.1.7
 
