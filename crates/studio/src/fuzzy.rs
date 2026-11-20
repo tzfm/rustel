@@ -122,9 +122,13 @@ pub fn name_score(query: &str, name: &str) -> Option<Score> {
     }
     // A typo: one edit per three characters typed, at least one.
     let allowed = (query_letters.len() / 3).max(1);
-    let distance = rustel_runtime::lint::edit_distance(&query_lowered, &lowered);
-    if distance <= allowed {
-        return Some(TYPO - distance as Score + brevity / 4);
+    // The edits are at least the difference in length, so a query far
+    // longer than the name skips the count, whose cost grows with both.
+    if query_letters.len().abs_diff(name_letters.len()) <= allowed {
+        let distance = rustel_runtime::lint::edit_distance(&query_lowered, &lowered);
+        if distance <= allowed {
+            return Some(TYPO - distance as Score + brevity / 4);
+        }
     }
     // Half a name is still a question: `someto` finds the `sometimes`
     // family, which no rule above reaches - nothing contains it and every
@@ -167,6 +171,14 @@ pub fn rank<'a>(query: &str, names: impl Iterator<Item = &'a str>) -> Vec<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A query much longer than every name matches none of them, typo or
+    /// not, and a near miss of the same length is still a typo.
+    #[test]
+    fn a_query_far_longer_than_the_name_is_no_typo() {
+        assert_eq!(name_score(&"b".repeat(50), "dorian"), None);
+        assert!(name_score("doriam", "dorian").is_some());
+    }
 
     /// The letters of the word, in order, with gaps: what a clumsy typist
     /// actually types.

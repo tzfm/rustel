@@ -616,6 +616,10 @@ impl SampleLookup for Lookup<'_> {
         self.samples.resolve(s, n, midi)
     }
 
+    fn note_range(&self, s: &str, n: f64) -> Option<(f64, f64)> {
+        self.samples.note_range(s, n)
+    }
+
     fn bus_names(&self) -> Option<&rustel_voice::BusNames> {
         self.samples.bus_names()
     }
@@ -654,6 +658,10 @@ pub(crate) struct ValidationLookup<'a>(pub(crate) &'a dyn SampleLookup);
 impl SampleLookup for ValidationLookup<'_> {
     fn resolve(&self, s: &str, n: f64, midi: f64) -> SampleResolution {
         self.0.resolve(s, n, midi)
+    }
+
+    fn note_range(&self, s: &str, n: f64) -> Option<(f64, f64)> {
+        self.0.note_range(s, n)
     }
 
     fn bus_names(&self) -> Option<&rustel_voice::BusNames> {

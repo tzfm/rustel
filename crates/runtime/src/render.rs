@@ -551,6 +551,10 @@ impl rustel_voice::SampleLookup for ConvertedLookup<'_> {
         self.samples.resolve(s, n, midi)
     }
 
+    fn note_range(&self, s: &str, n: f64) -> Option<(f64, f64)> {
+        self.samples.note_range(s, n)
+    }
+
     fn bus_names(&self) -> Option<&rustel_voice::BusNames> {
         self.samples.bus_names()
     }
@@ -594,6 +598,10 @@ struct PlannedLookup<'a> {
 impl rustel_voice::SampleLookup for PlannedLookup<'_> {
     fn resolve(&self, s: &str, n: f64, midi: f64) -> rustel_voice::SampleResolution {
         self.samples.resolve(s, n, midi)
+    }
+
+    fn note_range(&self, s: &str, n: f64) -> Option<(f64, f64)> {
+        self.samples.note_range(s, n)
     }
 
     fn bus_names(&self) -> Option<&rustel_voice::BusNames> {

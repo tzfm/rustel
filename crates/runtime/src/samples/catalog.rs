@@ -1531,6 +1531,9 @@ impl SampleLibrary {
         match self.resolve_with_priority(name, n, midi, LoadPriority::Bet) {
             SampleResolution::Found { .. } => SoundReadiness::Ready,
             SampleResolution::Loading => SoundReadiness::Loading,
+            // A font that loaded is ready, though it has no note at this
+            // one: `gm_clarinet` starts at midi 48.
+            SampleResolution::Failed if self.note_range(name, n).is_some() => SoundReadiness::Ready,
             SampleResolution::Failed => SoundReadiness::Failed,
             SampleResolution::Unknown => SoundReadiness::Unknown,
         }

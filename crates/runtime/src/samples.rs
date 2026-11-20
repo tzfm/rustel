@@ -2393,6 +2393,14 @@ impl SampleLookup for SampleLibrary {
     fn insert_speech(&self, request: &SpeechRequest<'_>) -> Result<SampleResolution, String> {
         speech::speak(&self.shared, request)
     }
+
+    fn note_range(&self, s: &str, n: f64) -> Option<(f64, f64)> {
+        self.look_up(s, |named| match named {
+            Named::Font(fonts) => self.soundfont_range(fonts, n),
+            Named::Bank(_) => None,
+        })
+        .flatten()
+    }
 }
 
 #[cfg(test)]
