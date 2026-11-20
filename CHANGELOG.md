@@ -3,6 +3,7 @@
 ## Unreleased
 
 - A sample source can be a repository page such as `https://github.com/user/repo`. It reads as `github:user/repo`, and a web page or a missing map says what to write instead.
+- Fixed: the documented second argument of `asym`, `diode`, `fold` and the other distortions sets the volume, as `.asym(.5, .3)` reads.
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
 - The reference search also finds entries by extension name, description, tags, parameters and examples, and by words spread across them. These matches come after the usual matches, under more matches.
 - The theme picker shows its Ctrl+N new, Ctrl+E edit and Ctrl+D delete keys.

@@ -9619,3 +9619,33 @@ fn a_kabelsalat_overflow_is_silent_on_both_channels() {
         assert_eq!(loud, 0, "{expression}: {loud} samples are not silent");
     }
 }
+
+/// The documented second argument of a distortion is its volume: it reaches
+/// the event as `distortvol`, patterned too, and the one-argument form keeps
+/// volume 1.
+#[test]
+fn a_distortion_takes_its_volume_as_a_second_argument() {
+    let volumes = |score: &str| -> Vec<f64> {
+        let out = ok_stdout(&["query", "-e", score, "--end", "2", "-j"]);
+        let report: serde_json::Value = serde_json::from_str(&out).expect("query report");
+        report["haps"]
+            .as_array()
+            .expect("haps")
+            .iter()
+            .map(|hap| hap["value"]["distortvol"].as_f64().expect("distortvol"))
+            .collect()
+    };
+    assert_eq!(
+        volumes(r#"note("c2").s("triangle").asym(.5, .3)"#),
+        [0.3, 0.3]
+    );
+    assert_eq!(
+        volumes(r#"note("c2").s("triangle").diode(2, "<.5 .25>")"#),
+        [0.5, 0.25]
+    );
+    assert_eq!(volumes(r#"note("c2").s("triangle").fold(.5)"#), [1.0, 1.0]);
+    assert_eq!(
+        volumes(r#"note("c2").s("triangle").asym(".9:.5")"#),
+        [0.5, 0.5]
+    );
+}
