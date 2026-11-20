@@ -956,6 +956,10 @@ pub struct Session {
     /// scheduler stops at the length, the reverbs and delays ring out into
     /// the tail, and a silence stop ends it when they have.
     render_tail_secs: f64,
+    /// The tempo the score asks for: the session's, or what the last
+    /// install set with `setcps`. An outside clock bends the tempo that
+    /// plays; this is where it goes back to when the clock lets go.
+    score_cps: f64,
     /// A bounce that ends at this cycle rather than at a fixed time: a
     /// tempo lane can make its cycles longer or shorter than the session
     /// tempo says.
@@ -1222,6 +1226,7 @@ impl Session {
         // The script engine starts at the first score, prelude or import
         // that needs it.
         let js = JsRuntime::deferred(config.pointer.clone());
+        let score_cps = config.cps;
         let transport = Arc::new(Transport::default());
         let scheduler = Scheduler::new(transport.clone(), config.cps, config.horizon);
         Ok(Self {
@@ -1289,6 +1294,7 @@ impl Session {
             refusals_reported: std::collections::BTreeSet::new(),
             plugin_lines_reported: std::collections::BTreeSet::new(),
             render_tail_secs: 0.0,
+            score_cps,
             render_cycles: None,
             last_gap_log: None,
             #[cfg(feature = "device-audio")]

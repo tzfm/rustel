@@ -9587,3 +9587,37 @@ fn a_replay_save_that_never_reached_the_score_is_reported_not_announced() {
         let _ = std::fs::remove_file(path);
     }
 }
+
+/// A KabelSalat signal past the range of a sample is silent on both
+/// channels, as a nonfinite one is, never full-scale noise on one.
+#[test]
+fn a_kabelsalat_overflow_is_silent_on_both_channels() {
+    for (expression, after) in [
+        ("t * 1e308 * 10", ""),
+        ("t * 1e308", ""),
+        // Within the range of a sample, then doubled past it.
+        ("2e38", ".gain(2)"),
+    ] {
+        let path = scratch("kabel-overflow.wav");
+        let score = format!("$: note(\"c3\").K(sine(sFreq).raw('{expression}').out()){after}");
+        ok_output(&[
+            "export",
+            "-e",
+            &score,
+            "--cycles",
+            "1",
+            "-o",
+            path.to_str().expect("utf-8 path"),
+        ]);
+        let wav = std::fs::read(&path).expect("wav");
+        let _ = std::fs::remove_file(&path);
+        assert!(wav.len() >= 44 + 4 * 48_000, "a cycle of stereo samples");
+        let loud = wav[44..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .filter(|sample| i16::from_le_bytes(**sample) != 0)
+            .count();
+        assert_eq!(loud, 0, "{expression}: {loud} samples are not silent");
+    }
+}

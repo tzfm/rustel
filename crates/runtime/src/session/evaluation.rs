@@ -1392,6 +1392,7 @@ impl Session {
                 debug_assert_eq!(generation, expected_generation);
                 if let Some(cps) = cps {
                     self.config.cps = cps;
+                    self.score_cps = cps;
                 }
                 // A query of the new score reads the new tempo from `getCps()`.
                 self.js.set_cps(self.scheduler.cps());
