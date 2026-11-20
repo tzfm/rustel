@@ -6,6 +6,7 @@
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
 - The reference search also finds entries by extension name, description, tags, parameters and examples, and by words spread across them. These matches come after the usual matches, under more matches.
 - The theme picker shows its Ctrl+N new, Ctrl+E edit and Ctrl+D delete keys.
+- Fixed: a `.dict()` name no dictionary has is an error, as on strudel.cc, instead of a lane that plays silence.
 - Fixed: the theme editor opened from the theme picker shows on top of the reference.
 - The knobs column moves a plain number live while the set plays, as a slider does: the number of an audio control such as `lpf(4000)`, or of a function such as `pg(0.8)`, `fast(2)`, an `FX` stage's `soft(4.5)`, or a plugin option such as `vsti("Diva", { output: 0.111 })`. It needs no update, and edits not yet evaluated stay out of the sound. A plugin key turned on goes in as an update of its own. A rail that waits for an update is muted, dashed and marked "not live". A live move is written to the session tape.
 - Hold Shift or Alt while you drag any slider for a fine drag, a tenth as far. f in the knobs column or the expanded slider locks it on.
@@ -19,8 +20,8 @@
 - Fixed: a visuals dock moved from a side to the top or bottom starts at the band's own size, so it no longer vanishes beside the mixer; a dock with no room says the keys go to the score.
 - Fixed: a General MIDI note outside its font's range says which notes the font plays instead of "failed to load", and Studio no longer counts such a font as a failed sound.
 - Fixed: `talkit("42")` speaks the number instead of a silent refused voice.
+- Fixed: a KabelSalat signal past the range of a sample is silent on both channels, as the docs say, instead of full-scale noise on one.
 - Fixed: a scene can call a name from a script that another scene of the set imports, as the docs say, instead of the check refusing it as unknown.
-- Fixed: a `.dict()` name no dictionary has is an error, as on strudel.cc, instead of a lane that plays silence.
 
 ## v0.1.7
 
