@@ -13,7 +13,8 @@ enum Field {
 /// as its digits, so `talkit("42")` says forty two.
 fn spoken_text(text: Value) -> Value {
     match text {
-        Value::F64(number) if number.is_finite() => Value::Str(number.to_string()),
+        // `+ 0.0` turns -0 into 0, as JavaScript prints it.
+        Value::F64(number) if number.is_finite() => Value::Str((number + 0.0).to_string()),
         other => other,
     }
 }
@@ -35,6 +36,9 @@ fn set_speech_field(hap: &Value, field: &Field, setting: &Value) -> Value {
     };
     match field {
         Field::Text => {
+            speech.insert("text".into(), spoken_text(setting));
+        }
+        Field::Key(key) if key == "text" => {
             speech.insert("text".into(), spoken_text(setting));
         }
         Field::Key(key) => {
@@ -293,6 +297,9 @@ mod tests {
         assert_eq!(words, ["4", "0.5", "7"]);
         let haps = spoken(&runtime, r#"$: s("bd").talkit("12")"#);
         assert_eq!(text_of(&haps[0]), "12");
+        let haps = spoken(&runtime, r#"$: talkit("hi", { text: 7 })"#);
+        assert_eq!(text_of(&haps[0]), "7");
+        assert_eq!(spoken_text(Value::F64(-0.0)), Value::Str("0".into()));
     }
 
     #[test]

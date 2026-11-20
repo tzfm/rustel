@@ -5376,9 +5376,6 @@ fn the_bounce_success_line_names_the_sample_rate_without_truncating_it() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// The command line prints recoverable notices on stderr, which a library
-/// Session does only when its host opts in. A notice that every note raises
-/// prints once, with the number of onsets.
 /// A number in a talkit text is spoken as its digits, not refused: the
 /// bounce of `talkit("42")` has sound and reports no refused voice.
 #[test]
@@ -5395,10 +5392,11 @@ fn talkit_speaks_a_number() {
         "-o",
         path.to_str().expect("UTF-8 path"),
     ]);
-    let wav = std::fs::read(&path).expect("wav");
-    let _ = std::fs::remove_file(&path);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "render failed: {stderr}");
+    let wav = std::fs::read(&path).expect("wav");
+    let _ = std::fs::remove_file(&path);
+    assert!(wav.len() > 44, "no samples in the bounce");
     assert!(!stderr.contains("voice_refused"), "{stderr}");
     // 16-bit samples after the 44-byte header: some are not silent.
     let loud = wav[44..]
@@ -5407,6 +5405,9 @@ fn talkit_speaks_a_number() {
     assert!(loud, "the bounce is silent");
 }
 
+/// The command line prints recoverable notices on stderr, which a library
+/// Session does only when its host opts in. A notice that every note raises
+/// prints once, with the number of onsets.
 #[test]
 fn render_prints_recoverable_notices_on_stderr() {
     let path = scratch("refused-voice.wav");
