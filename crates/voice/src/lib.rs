@@ -1082,6 +1082,50 @@ mod tests {
         assert!(refused.expect_err("no names").contains("bus name `move_0`"));
     }
 
+    /// A note below a loaded font's range names the range, rather than a
+    /// load that never failed.
+    #[test]
+    fn a_note_outside_a_loaded_font_names_its_range() {
+        struct Clarinet;
+        impl SampleLookup for Clarinet {
+            fn resolve(&self, _s: &str, _n: f64, _midi: f64) -> SampleResolution {
+                SampleResolution::Failed
+            }
+            fn note_range(&self, _s: &str, _n: f64) -> Option<(f64, f64)> {
+                Some((48.0, 96.0))
+            }
+        }
+        let error = resolve_voice_with_samples(
+            &serde_json::json!({ "s": "gm_clarinet", "note": 36 }),
+            0,
+            0.5,
+            0.0,
+            48_000,
+            0.5,
+            &Clarinet,
+        )
+        .expect_err("no zone at 36");
+        assert!(
+            error.contains("has no note at midi 36: it plays midi 48 to 96"),
+            "{error}"
+        );
+        // A note inside the range that falls between its zones.
+        let error = resolve_voice_with_samples(
+            &serde_json::json!({ "s": "gm_clarinet", "note": 60 }),
+            0,
+            0.5,
+            0.0,
+            48_000,
+            0.5,
+            &Clarinet,
+        )
+        .expect_err("a gap at 60");
+        assert!(
+            error.contains("has no note at midi 60: it has gaps between midi 48 and 96"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn one_is_a_constant_signal_unless_a_sample_has_the_name() {
         struct HasOne;
@@ -2303,6 +2347,12 @@ pub trait SampleLookup {
     /// Prepares a Csound score event outside the audio callback.
     fn csound(&self, _request: &CsoundRequest<'_>) -> Result<rustel_audio::InsertControls, String> {
         Err("this host has no Csound support".into())
+    }
+
+    /// The lowest and highest MIDI notes a loaded soundfont plays, for
+    /// `s` and `n`. `None` for any other sound, or a font not loaded yet.
+    fn note_range(&self, _s: &str, _n: f64) -> Option<(f64, f64)> {
+        None
     }
 }
 
@@ -4144,6 +4194,18 @@ fn sample_controls(
                 )));
             }
             SampleResolution::Failed => {
+                // A loaded font has notes only in its own range: a note
+                // outside it is not a failed load.
+                if let Some((low, high)) = samples.note_range(name, n) {
+                    let range = if (low..=high).contains(&midi) {
+                        format!("it has gaps between midi {low} and {high}")
+                    } else {
+                        format!("it plays midi {low} to {high}")
+                    };
+                    return Err(VoiceError::SampleFailed(format!(
+                        "sample \"{name}:{n}\" has no note at midi {midi}: {range}"
+                    )));
+                }
                 return Err(VoiceError::SampleFailed(format!(
                     "sample \"{name}:{n}\" failed to load"
                 )));
