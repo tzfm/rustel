@@ -358,7 +358,13 @@ impl JsRuntime {
                                     .result::<rquickjs::Value>()
                                     .expect("a rejected Promise has a result")
                                     .expect_err("a rejected Promise result is an exception");
-                                Err(QueryError::Message(describe_js_error(&ctx, error)))
+                                // The same lines as a synchronous throw: the
+                                // wrapper's two lines come off.
+                                Err(QueryError::Message(remap_reported_position(
+                                    describe_js_error(&ctx, error),
+                                    SCORE_WRAPPER_LINES,
+                                    &output.line_map,
+                                )))
                             }
                             rquickjs::promise::PromiseState::Pending => {
                                 Err(QueryError::Message(

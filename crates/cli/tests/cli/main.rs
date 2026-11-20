@@ -9588,6 +9588,50 @@ fn a_replay_save_that_never_reached_the_score_is_reported_not_announced() {
     }
 }
 
+/// The documented tempo helper `window.bpm = b => setcpm(b / 4)` is kept
+/// after `initHydra()` owns `bpm`, and a prebake that throws after an
+/// `await` names its own line.
+#[test]
+fn a_bpm_helper_survives_hydra_and_a_prebake_names_its_line() {
+    let checked = ok_stdout(&[
+        "check",
+        "--no-samples",
+        "-e",
+        "await initHydra()\nwindow.bpm = b => setcpm(b / 4)\nwindow.bpm(120)\n$: s(\"bd\")",
+    ]);
+    assert!(checked.contains("no issues found"), "{checked}");
+    // A number written after the helper is what a read gives back.
+    let checked = ok_stdout(&[
+        "check",
+        "--no-samples",
+        "-e",
+        "await initHydra()\nwindow.bpm = b => 0\nwindow.bpm = 120\nif (window.bpm !== 120) throw new Error('stale')\n$: s(\"bd\")",
+    ]);
+    assert!(checked.contains("no issues found"), "{checked}");
+
+    let prebake = scratch("prebake-throws-late.js");
+    std::fs::write(
+        &prebake,
+        "globalThis.a = 1\nawait Promise.resolve()\nthrow new Error('on line three')\n",
+    )
+    .expect("prebake");
+    let out = scratch("prebake-throws-late.wav");
+    assert_reported_failure(
+        &[
+            "export",
+            "--prebake",
+            prebake.to_str().expect("utf-8 path"),
+            "-e",
+            "s(\"bd\")",
+            "--cycles",
+            "1",
+            "-o",
+            out.to_str().expect("utf-8 path"),
+        ],
+        "on line three - line 3",
+    );
+}
+
 /// A `.dict()` name nothing registered is an error of the query, as on
 /// strudel.cc, not a lane that plays silence; a known name and a score's
 /// own `addVoicings` name still voice the chord.
