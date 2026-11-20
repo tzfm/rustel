@@ -33,6 +33,7 @@
 - Fixed: `check` and Studio's update refuse an unknown `wtshape`, `warpshape`, `lpshape`, `hpshape` or `bpshape` name, which the voice would refuse when it plays.
 - Fixed: a KabelSalat signal past the range of a sample is silent on both channels, as the docs say, instead of full-scale noise on one.
 - Fixed: a scene can call a name from a script that another scene of the set imports, as the docs say, instead of the check refusing it as unknown.
+- Fixed: `rustel check` queries the score's first cycle, so a score that evaluates but refuses when it plays, such as a Euclid step past its limit or a KabelSalat `out(16)`, fails the check as query and export do.
 - Fixed: one sample source in Settings that will not read fails only its own row; the other remote sources still load.
 
 ## v0.1.7
