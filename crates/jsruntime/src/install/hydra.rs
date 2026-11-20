@@ -263,7 +263,17 @@ fn node<'js>(
         let mut entries = Vec::with_capacity(len);
         for index in 0..len {
             let entry = array.get::<rquickjs::Value>(index)?;
-            entries.push(node(ctx, chains, &entry, depth + 1)?);
+            let recorded = node(ctx, chains, &entry, depth + 1)?;
+            // An animated array steps through numbers; anything else in it
+            // refuses the score, as docs/hydra.md says, rather than
+            // installing a picture that only warns.
+            if recorded.get("c").and_then(serde_json::Value::as_str) != Some("num") {
+                return Err(throw_type_error(
+                    ctx,
+                    "a hydra array entry must be a finite number",
+                ));
+            }
+            entries.push(recorded);
         }
         // The marks `ARRAY_UTILS` leaves. A numeric mark that is 0 or NaN
         // reads as unset, as in hydra's `getValue`.
