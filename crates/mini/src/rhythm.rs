@@ -199,6 +199,14 @@ impl Rhythm {
         let small = |period: &Fraction| {
             period.numer() <= MAX_PERIOD_TERM && period.denom() <= MAX_PERIOD_TERM
         };
+        if let [layer] = self.layers.as_mut_slice() {
+            let Some(period) = layer.period.checked_div(factor).filter(small) else {
+                return Err(self);
+            };
+            layer.period = period;
+            self.atom = false;
+            return Ok(self);
+        }
         let periods: Option<Vec<Fraction>> = self
             .layers
             .iter()
@@ -1285,20 +1293,25 @@ impl Plans {
         self.add(Kind::Alternation(lanes), facts)
     }
 
-    /// The whole count that the atom at `factor` writes, and where the
-    /// text writes it. `None` for a factor that is no whole number of one
-    /// or more as one atom.
-    fn whole_factor(&self, values: &[Value], factor: Id) -> Option<(u32, At)> {
+    /// The positive rational factor that the atom at `factor` writes, as
+    /// `(numer, denom)` and its source span.
+    fn fraction_factor(&self, values: &[Value], factor: Id) -> Option<(u32, u32, At)> {
         let Kind::Atom { value, begin, len } = self.kind(factor) else {
             return None;
         };
         let count = crate::fraction_site_value(values.get(value as usize)?)?;
-        Some((whole_count(count)?, written(begin, len)))
+        if count <= Fraction::ZERO
+            || count.numer() > MAX_PERIOD_TERM
+            || count.denom() > MAX_PERIOD_TERM
+        {
+            return None;
+        }
+        let numer = u32::try_from(count.numer()).ok()?;
+        let denom = u32::try_from(count.denom()).ok()?;
+        Some((numer, denom, written(begin, len)))
     }
 
-    /// The plan of `pattern` at the speed that `factor` writes.
-    fn faster(&mut self, values: &[Value], pattern: Id, factor: Id) -> Option<Id> {
-        let (rate, at) = self.whole_factor(values, factor)?;
+    fn faster_whole(&mut self, pattern: Id, rate: u32, at: At) -> Option<Id> {
         let under = self.facts(pattern);
         // The period of each layer, divided by the rate.
         let period = Fraction::checked_new(i128::from(under.turns), i128::from(rate))?;
@@ -1311,9 +1324,7 @@ impl Plans {
         self.add(Kind::Faster(pattern, rate, speed, under.layers <= 1), facts)
     }
 
-    /// The plan of `pattern`, as many times as slow as `factor` writes.
-    fn slower(&mut self, values: &[Value], pattern: Id, factor: Id) -> Option<Id> {
-        let (times, at) = self.whole_factor(values, factor)?;
+    fn slower_whole(&mut self, pattern: Id, times: u32, at: At) -> Option<Id> {
         let under = self.facts(pattern);
         let facts = Facts {
             turns: under.turns.checked_mul(i64::from(times))?,
@@ -1323,6 +1334,30 @@ impl Plans {
         self.long = true;
         let speed = self.site(at)?;
         self.add(Kind::Slower(pattern, times, speed), facts)
+    }
+
+    /// The plan of `pattern` at the speed that `factor` writes.
+    fn faster(&mut self, values: &[Value], pattern: Id, factor: Id) -> Option<Id> {
+        let (numer, denom, at) = self.fraction_factor(values, factor)?;
+        if denom == 1 {
+            self.faster_whole(pattern, numer, at)
+        } else if numer == 1 {
+            self.slower_whole(pattern, denom, at)
+        } else {
+            None
+        }
+    }
+
+    /// The plan of `pattern`, as many times as slow as `factor` writes.
+    fn slower(&mut self, values: &[Value], pattern: Id, factor: Id) -> Option<Id> {
+        let (numer, denom, at) = self.fraction_factor(values, factor)?;
+        if denom == 1 {
+            self.slower_whole(pattern, numer, at)
+        } else if numer == 1 {
+            self.faster_whole(pattern, denom, at)
+        } else {
+            None
+        }
     }
 
     /// The plan of each cycle of `pattern`, `amount` times in the cycle.
@@ -2069,7 +2104,7 @@ impl Room {
             base_offset: stored_base,
             long,
         } = &mut self.plans;
-        let words = src.len() / 2 + 1;
+        let words = (src.len() / 2 + 1).max(32);
         kinds.clear();
         kinds.reserve(words);
         facts.clear();
@@ -2084,7 +2119,9 @@ impl Room {
         *stored_base = base_offset;
         *long = false;
         self.values.clear();
+        self.values.reserve(16);
         self.words.clear();
+        self.words.reserve(16);
         self.known.clear();
     }
 }
@@ -2345,7 +2382,7 @@ impl<'a> Planner<'a, '_> {
         if self.room.known.is_empty() {
             // Two slots for each word that the text may hold: a word and
             // its space are two bytes or more.
-            let slots = (self.src.len() + 2).next_power_of_two();
+            let slots = (self.src.len() + 2).next_power_of_two().max(64);
             self.room.known.resize(slots, 0);
             let first = self.slot(self.word(0));
             self.room.known[first] = 1;

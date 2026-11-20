@@ -486,7 +486,7 @@ pub(crate) fn derive_pick<'js>(
             sidecars.push(Sidecar::of(&borrowed));
             let mut pattern = rustel_core::pick(selector, lookup, index_mode, join_mode);
             if let Some(loc) = borrowed.pattern.pure_loc() {
-                pattern = pattern.with_added_context(vec![loc]);
+                pattern = pattern.with_added_context_slice(&[loc]);
             }
             return derive_wrapper(ctx, pattern, &sidecars);
         }
@@ -496,7 +496,7 @@ pub(crate) fn derive_pick<'js>(
             sidecars.push(Sidecar::of(&borrowed));
             let mut pattern = rustel_core::pick(selector, lookup, index_mode, join_mode);
             if let Some(loc) = borrowed.pattern.pure_loc() {
-                pattern = pattern.with_added_context(vec![loc]);
+                pattern = pattern.with_added_context_slice(&[loc]);
             }
             return derive_wrapper(ctx, pattern, &sidecars);
         }
@@ -584,7 +584,7 @@ pub(crate) fn derive_pick_f<'js>(
         let mut functions =
             rustel_core::pick(selector, lookup, index_mode, rustel_core::JoinMode::Inner);
         if let Some(loc) = borrowed.pattern.pure_loc() {
-            functions = functions.with_added_context(vec![loc]);
+            functions = functions.with_added_context_slice(&[loc]);
         }
         functions
     } else if let Some((lookup_pattern, lookup_sidecar)) = unwrap_pattern(lookup_value) {
@@ -595,7 +595,7 @@ pub(crate) fn derive_pick_f<'js>(
             let mut functions =
                 rustel_core::pick(selector, lookup, index_mode, rustel_core::JoinMode::Inner);
             if let Some(loc) = lookup_pattern.pure_loc() {
-                functions = functions.with_added_context(vec![loc]);
+                functions = functions.with_added_context_slice(&[loc]);
             }
             functions
         } else {

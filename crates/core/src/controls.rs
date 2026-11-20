@@ -403,11 +403,40 @@ fn set_row(pattern: Pattern, row: &[ChainCall<'_>]) -> Result<Pattern, Pattern> 
 /// first. `None` when a control is no map of data that a union takes, so
 /// that the caller sets each control in turn.
 fn union_of(row: &[ChainCall<'_>]) -> Option<(Value, crate::Locations)> {
+    const INLINE_CAP: usize = 16;
     let mut context = crate::Locations::new();
-    let mut entries: Vec<(Key, Value)> = Vec::with_capacity(row.len());
-    let mut set = |key: Key, value: Value| match entries.iter_mut().find(|(name, _)| *name == key) {
-        Some((_, current)) => *current = value,
-        None => entries.push((key, value)),
+    let mut inline: [Option<(Key, Value)>; INLINE_CAP] = [const { None }; INLINE_CAP];
+    let mut inline_len = 0usize;
+    let mut spilled: Option<Vec<(Key, Value)>> = None;
+    let mut set = |key: Key, value: Value| {
+        if let Some(vec) = &mut spilled {
+            match vec.iter_mut().find(|(name, _)| *name == key) {
+                Some((_, current)) => *current = value,
+                None => vec.push((key, value)),
+            }
+            return;
+        }
+        for slot in &mut inline[..inline_len] {
+            if let Some((name, current)) = slot
+                && *name == key
+            {
+                *current = value;
+                return;
+            }
+        }
+        if inline_len < INLINE_CAP {
+            inline[inline_len] = Some((key, value));
+            inline_len += 1;
+        } else {
+            let mut vec = Vec::with_capacity(INLINE_CAP * 2);
+            for slot in &mut inline[..inline_len] {
+                if let Some(pair) = slot.take() {
+                    vec.push(pair);
+                }
+            }
+            vec.push((key, value));
+            spilled = Some(vec);
+        }
     };
     for (spec, argument) in row {
         let (value, mut at) = argument.constant()?;
@@ -434,7 +463,14 @@ fn union_of(row: &[ChainCall<'_>]) -> Option<(Value, crate::Locations)> {
             set(key.clone(), value.clone());
         }
     }
-    let mut union = OrderedMap::of_keys(entries);
+    let mut union = match spilled {
+        Some(entries) => OrderedMap::of_keys(entries),
+        None => OrderedMap::of_keys(
+            inline[..inline_len]
+                .iter_mut()
+                .map(|slot| slot.take().expect("inline entry present")),
+        ),
+    };
     union.mark_made_of_data();
     Some((Value::Object(union), context))
 }
@@ -448,7 +484,7 @@ fn apply_argument(spec: &ControlSpec, pattern: Pattern, argument: &ChainArgument
                 spec.apply_value(pattern, value.clone())
             } else {
                 let values = crate::pure(value.clone())
-                    .with_added_context(locations.to_vec())
+                    .with_added_locations(locations)
                     .with_steps(Some(rustel_fraction::Fraction::ONE));
                 spec.apply_for(pattern, Some(&values))
             }

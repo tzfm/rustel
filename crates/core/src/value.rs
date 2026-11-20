@@ -1348,6 +1348,76 @@ impl OrderedMap {
         self.entries = Entries::Shared(held);
     }
 
+    /// [`Self::merge`] producing flat `Entries::Shared` / `Entries::Made` directly
+    /// without creating a temporary [`Patched`] overlay (for build-time folds
+    /// that would otherwise immediately undress the overlay).
+    pub(crate) fn merge_flat(
+        &mut self,
+        other: &Self,
+        mut change: impl FnMut(&Value, &Value) -> Value,
+    ) {
+        if other.is_empty() {
+            return;
+        }
+        if other.len() == 1
+            && let Some((key, value)) = other.pairs().next()
+        {
+            let at = self.position(key);
+            match (&self.entries, at) {
+                (Entries::Dressed(table, row), at) => {
+                    let row = *row;
+                    let value = match at {
+                        Some(at) => change(table.layout(row).at(at).1, value),
+                        None => value.clone(),
+                    };
+                    self.entries = Entries::Shared(table.layout(row).with(key, at, value));
+                }
+                (Entries::Patched(..), at) => {
+                    let value = match at {
+                        Some(at) => change(self.layout().at(at).1, value),
+                        None => value.clone(),
+                    };
+                    self.entries = Entries::Shared(self.layout().with(key, at, value));
+                }
+                (_, Some(at)) => {
+                    let entries = self.entries_mut();
+                    let next = change(&entries[at].1, value);
+                    entries[at].1 = next;
+                }
+                (_, None) => self.append((key.clone(), value.clone())),
+            }
+            return;
+        }
+        let of = |key: &Key| other.layout().get(key);
+        let fresh = other
+            .pairs()
+            .filter(|(key, _)| self.position(*key).is_none())
+            .count();
+        if fresh == 0 {
+            for (key, value) in self.entries_mut() {
+                if let Some(other) = of(key) {
+                    *value = change(value, other);
+                }
+            }
+            return;
+        }
+        let held = self.len();
+        let mut more = other.pairs();
+        self.rebuild(held + fresh, |entries, index| {
+            if index < held {
+                let (key, value) = entries.take(index);
+                return match of(&key) {
+                    Some(other) => (key, change(&value, other)),
+                    None => (key, value),
+                };
+            }
+            let (key, value) = more
+                .find(|(key, _)| !entries.holds(key))
+                .expect("a key that the map did not hold");
+            (key.clone(), value.clone())
+        });
+    }
+
     /// Each entry of `other` in this map. An entry of a key that the map
     /// holds changes the value of that key where it is, to what `change`
     /// makes of the value and the one of `other`. The other entries come

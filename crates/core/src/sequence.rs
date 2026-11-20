@@ -718,9 +718,108 @@ enum SpareRare {
 
 const _: () = assert!(std::mem::size_of::<SpareRare>() == 24);
 
+/// Stack-backed growable buffer for small `Copy` items during grid construction,
+/// avoiding intermediate `Vec` allocations for typical mini patterns.
+enum SmallCopyBuf<T: Copy, const N: usize> {
+    Inline { len: usize, data: [T; N] },
+    Heap(Vec<T>),
+}
+
+impl<T: Copy, const N: usize> SmallCopyBuf<T, N> {
+    #[inline]
+    fn new(zero: T) -> Self {
+        Self::Inline {
+            len: 0,
+            data: [zero; N],
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len,
+            Self::Heap(vec) => vec.len(),
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    fn push(&mut self, value: T) {
+        match self {
+            Self::Inline { len, data } => {
+                if *len < N {
+                    data[*len] = value;
+                    *len += 1;
+                } else {
+                    let mut vec = Vec::with_capacity(N * 2);
+                    vec.extend_from_slice(&data[..*len]);
+                    vec.push(value);
+                    *self = Self::Heap(vec);
+                }
+            }
+            Self::Heap(vec) => vec.push(value),
+        }
+    }
+
+    #[inline]
+    fn last_mut(&mut self) -> Option<&mut T> {
+        match self {
+            Self::Inline { len, data } => (*len > 0).then(|| &mut data[*len - 1]),
+            Self::Heap(vec) => vec.last_mut(),
+        }
+    }
+
+    #[inline]
+    fn truncate(&mut self, new_len: usize) {
+        match self {
+            Self::Inline { len, .. } => *len = (*len).min(new_len),
+            Self::Heap(vec) => vec.truncate(new_len),
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[T] {
+        match self {
+            Self::Inline { len, data } => &data[..*len],
+            Self::Heap(vec) => vec.as_slice(),
+        }
+    }
+
+    fn into_boxed_slice(self) -> Box<[T]> {
+        match self {
+            Self::Inline { len, data } => Box::from(&data[..len]),
+            Self::Heap(vec) => vec.into_boxed_slice(),
+        }
+    }
+}
+
 impl SpareRare {
-    fn from_parts(cuts: Vec<Cut>, wide: Box<[Locations]>) -> Self {
+    fn from_parts(cuts: &[Cut], wide: Box<[Locations]>) -> Self {
         if wide.is_empty() {
+            if cuts.len() <= 16 {
+                let mut buf = [SmallCut {
+                    index: 0,
+                    begin: 0,
+                    end: 0,
+                }; 16];
+                let mut all_small = true;
+                for (slot, &cut) in buf[..cuts.len()].iter_mut().zip(cuts.iter()) {
+                    if let Some(small) = SmallCut::from_wide(cut) {
+                        *slot = small;
+                    } else {
+                        all_small = false;
+                        break;
+                    }
+                }
+                if all_small {
+                    return Self::SmallCuts(Box::from(&buf[..cuts.len()]));
+                }
+                return Self::WideCuts(Box::from(cuts));
+            }
             if let Some(small) = cuts
                 .iter()
                 .copied()
@@ -729,13 +828,13 @@ impl SpareRare {
             {
                 Self::SmallCuts(small)
             } else {
-                Self::WideCuts(cuts.into_boxed_slice())
+                Self::WideCuts(Box::from(cuts))
             }
         } else if cuts.is_empty() {
             Self::WideOnly(wide)
         } else {
             Self::Full(Box::new(SpareRareFull {
-                cuts: cuts.into_boxed_slice(),
+                cuts: Box::from(cuts),
                 wide,
             }))
         }
@@ -782,7 +881,7 @@ impl Grid {
     fn pack_locations(
         base: u32,
         locations: &Locations,
-        packed_runs: &mut Vec<u32>,
+        packed_runs: &mut SmallCopyBuf<u32, 32>,
         wide: &mut Vec<usize>,
         index: usize,
     ) -> PackedLoc {
@@ -884,8 +983,12 @@ impl Grid {
             };
             u32::try_from(u64::from(u32::try_from(time.numer()).ok()?) * u64::from(scale)).ok()
         };
-        let mut cuts = Vec::new();
-        let mut packed_runs = Vec::new();
+        let mut cuts = SmallCopyBuf::<Cut, 16>::new(Cut {
+            index: 0,
+            begin: 0,
+            end: 0,
+        });
+        let mut packed_runs = SmallCopyBuf::<u32, 32>::new(0);
         // The places of the steps whose locations do not fit packed encoding.
         let mut wide = Vec::new();
         let steps = GridSteps::build(raws.len(), |index| {
@@ -921,10 +1024,10 @@ impl Grid {
                     .iter()
                     .map(|index| std::mem::take(&mut raws[*index].locations))
                     .collect();
-                Box::new(SpareRare::from_parts(cuts, wide_locs))
+                Box::new(SpareRare::from_parts(cuts.as_slice(), wide_locs))
             });
             Box::new(Spare {
-                packed: packed_runs.into(),
+                packed: packed_runs.into_boxed_slice(),
                 rare,
             })
         });
@@ -975,7 +1078,7 @@ impl Grid {
             };
             u32::try_from(u64::from(u32::try_from(time.numer()).ok()?) * u64::from(scale)).ok()
         };
-        let mut packed_runs = Vec::new();
+        let mut packed_runs = SmallCopyBuf::<u32, 32>::new(0);
         let mut wide = Vec::new();
         let steps = GridSteps::build(source_steps.len(), |index| {
             let src = &source_steps[index];
@@ -1001,7 +1104,7 @@ impl Grid {
                 Box::new(SpareRare::WideOnly(wide_locs))
             });
             Box::new(Spare {
-                packed: packed_runs.into(),
+                packed: packed_runs.into_boxed_slice(),
                 rare,
             })
         });
@@ -1274,7 +1377,11 @@ impl Grid {
                         None => None,
                         Some(rare) => {
                             let cuts_view = rare.cuts();
-                            let mut cuts = Vec::with_capacity(cuts_view.len());
+                            let mut cuts = SmallCopyBuf::<Cut, 16>::new(Cut {
+                                index: 0,
+                                begin: 0,
+                                end: 0,
+                            });
                             for i in 0..cuts_view.len() {
                                 let mut cut = cuts_view.get(i).expect("cut in bounds");
                                 cut.begin = rescale(cut.begin)?;
@@ -1282,7 +1389,7 @@ impl Grid {
                                 cuts.push(cut);
                             }
                             let wide: Box<[Locations]> = rare.wide().to_vec().into_boxed_slice();
-                            Some(Box::new(SpareRare::from_parts(cuts, wide)))
+                            Some(Box::new(SpareRare::from_parts(cuts.as_slice(), wide)))
                         }
                     };
                     Some(Box::new(Spare {
@@ -1857,6 +1964,9 @@ impl Dress {
 /// One dress for the layers of `layers` that are dressed alike, as a fold
 /// that dresses each layer on its own makes them.
 fn share_dresses(layers: &mut [Layer]) {
+    if layers.len() <= 1 {
+        return;
+    }
     let mut worn: Vec<Arc<Dress>> = Vec::new();
     for layer in layers {
         let Some(dress) = &layer.dress else {
@@ -2363,7 +2473,13 @@ impl Layer {
     ///
     /// `None` for any other layer, for a value that is no number and no
     /// text, and where `note` or `map` gives none.
-    fn renoted(&self, map: &HapMapFn, note: &NoteFn) -> Option<Self> {
+    fn renoted(
+        &self,
+        map: &HapMapFn,
+        note: &NoteFn,
+        known_keys: Option<&ContextKeys>,
+        last_dress: &mut Option<(*const Dress, Arc<Dress>)>,
+    ) -> Option<Self> {
         let names = self
             .dress()
             .named
@@ -2379,18 +2495,55 @@ impl Layer {
             Value::F64(_) | Value::Str(_) => note(value),
             _ => None,
         };
-        let notes: Vec<Value> = self.values.iter().map(renoted).collect::<Option<_>>()?;
-        // The hap of the first step, as a query reads it.
-        let first = crate::controls::named_value(names, self.values.first()?.clone());
-        let mut read = cycle_hap(first);
-        read.keys = self.dress().keys().clone();
-        let keys = map(&read)?.keys;
-        let mut layer = self.with(|_| {}).valued(notes.into());
-        layer.change_dress(|dress| {
-            dress.named = Some(crate::controls::note_names());
-            dress.set_keys(keys);
-        });
+        let values: Arc<[Value]> = if self.values.len() <= 16 {
+            let mut buf: [Value; 16] = std::array::from_fn(|_| Value::Undefined);
+            let len = self.values.len();
+            for (slot, val) in buf[..len].iter_mut().zip(self.values.iter()) {
+                *slot = renoted(val)?;
+            }
+            buf[..len]
+                .iter_mut()
+                .map(|slot| std::mem::replace(slot, Value::Undefined))
+                .collect()
+        } else {
+            let notes: Vec<Value> = self.values.iter().map(renoted).collect::<Option<_>>()?;
+            notes.into()
+        };
+        let from = self.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
+        let dress = match last_dress {
+            Some((seen, dress)) if *seen == from => Arc::clone(dress),
+            _ => {
+                let keys = match known_keys {
+                    Some(added) => {
+                        if self.dress().keys().is_empty() {
+                            added.clone()
+                        } else {
+                            ContextKeys::merge(added, self.dress().keys())
+                        }
+                    }
+                    None => {
+                        let first =
+                            crate::controls::named_value(names, self.values.first()?.clone());
+                        let mut read = cycle_hap(first);
+                        read.keys = self.dress().keys().clone();
+                        map(&read)?.keys
+                    }
+                };
+                let mut next = self.dress().clone();
+                next.named = Some(crate::controls::note_names());
+                next.clear_set();
+                next.set_keys(keys);
+                let dress = Arc::new(next);
+                *last_dress = Some((from, Arc::clone(&dress)));
+                dress
+            }
+        };
+        let mut layer = self.with(|_| {});
+        layer.set_data(values.iter().all(|value| value.is_data(0)));
         layer.set_maps(true);
+        layer.values = values;
+        layer.dress = Some(dress);
+        layer.values_read = OnceLock::new();
         Some(layer)
     }
 
@@ -3850,11 +4003,23 @@ pub(crate) type NoteFn = Box<dyn Fn(&Value) -> Option<Value> + Send + Sync>;
 /// [`mapped_haps`] gives it, when the control `note` or `n` names the steps
 /// of `pattern`: `note` gives the new note of each step, and no map of
 /// controls is made. See [`Layer::renoted`].
-pub(crate) fn renoted(pattern: &Pattern, map: &HapMapFn, note: &NoteFn) -> Option<Pattern> {
+pub(crate) fn renoted(
+    pattern: &Pattern,
+    map: &HapMapFn,
+    note: &NoteFn,
+    known_keys: Option<&ContextKeys>,
+) -> Option<Pattern> {
     let layers = folded(pattern)?;
     without_query_signals(|| {
-        let renoted = layers.iter().map(|layer| layer.renoted(map, note));
-        Some(node_of_sound(renoted.collect::<Option<Vec<_>>>()?))
+        let mut last_dress = None;
+        if let [layer] = layers {
+            return node_of_one(layer.renoted(map, note, known_keys, &mut last_dress)?);
+        }
+        let mut out = Vec::with_capacity(layers.len());
+        for layer in layers {
+            out.push(layer.renoted(map, note, known_keys, &mut last_dress)?);
+        }
+        Some(node_of_sound(out))
     })
 }
 
@@ -3925,6 +4090,13 @@ fn runs_at_the_build(apply: &Combine) -> bool {
 /// What `function` and `value` make by `apply`, as the hap of a step makes
 /// it where the two meet, when they make a value and nothing more.
 fn made(function: &Value, value: &Value, apply: &Combine, flow: LookupFlow) -> Option<Value> {
+    if let Some(op) = apply.in_place_op()
+        && Meeting::values_meet_in_place(function, value, apply, flow)
+    {
+        let mut out = function.clone();
+        crate::compose::compose_data_flat(op, &mut out, value);
+        return Some(out);
+    }
     let mut hap = cycle_hap(function.clone());
     let meets = cycle_hap(value.clone());
     let part = hap.part;

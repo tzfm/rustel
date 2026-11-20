@@ -2371,11 +2371,12 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
     // The notes of the scale are kept with its body, one time for the name.
     pat.map_pitch_haps_native_interned(&scale_name, || {
         let steps = std::sync::Arc::new(ScaleSteps::new(scale_name.clone()));
+        let tag = std::sync::Arc::clone(&steps.tag);
         // A handle of the notes, for the note of a hap and of a value.
         let kept = std::sync::Arc::clone(&steps);
         let of_hap = move |hap: &crate::Hap| scale_hap(hap, &kept);
         let of_note = move |note: &Value| scale_note(&steps, note, None);
-        (of_hap, of_note)
+        (of_hap, of_note, Some(tag))
     })
 }
 

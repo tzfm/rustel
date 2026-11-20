@@ -131,7 +131,11 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     ///
     /// `make` gives the rewrite of a hap, and the note that the rewrite
     /// makes of a note or a step that a hap holds alone.
-    fn map_pitch_haps_native_interned<F, G>(&self, key: &str, make: impl FnOnce() -> (F, G)) -> Self
+    fn map_pitch_haps_native_interned<F, G>(
+        &self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<std::sync::Arc<str>>),
+    ) -> Self
     where
         F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
         G: Fn(&crate::Value) -> Option<crate::Value> + Send + Sync + 'static,
@@ -451,7 +455,11 @@ impl PatOps for Pattern {
     ) -> Self {
         Pattern::map_pitch_haps_native(self, f)
     }
-    fn map_pitch_haps_native_interned<F, G>(&self, key: &str, make: impl FnOnce() -> (F, G)) -> Self
+    fn map_pitch_haps_native_interned<F, G>(
+        &self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<std::sync::Arc<str>>),
+    ) -> Self
     where
         F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
         G: Fn(&crate::Value) -> Option<crate::Value> + Send + Sync + 'static,
@@ -810,7 +818,11 @@ impl PatOps for PurePattern {
     ) -> Self {
         PurePattern::assert_pure(self.pattern().map_pitch_haps_native(f))
     }
-    fn map_pitch_haps_native_interned<F, G>(&self, key: &str, make: impl FnOnce() -> (F, G)) -> Self
+    fn map_pitch_haps_native_interned<F, G>(
+        &self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<std::sync::Arc<str>>),
+    ) -> Self
     where
         F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
         G: Fn(&crate::Value) -> Option<crate::Value> + Send + Sync + 'static,

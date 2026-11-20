@@ -99,7 +99,7 @@ enum Step {
     Keep(ValuePredicate),
     MapHap(HapMapFn),
     MapOwned(OwnedHapMapFn),
-    Locations(Arc<Vec<(usize, usize)>>),
+    Locations(Arc<[(usize, usize)]>),
 }
 
 impl Step {

@@ -1214,6 +1214,9 @@ struct PitchRewrite {
     /// The note that the rewrite makes of a note or a step that a hap
     /// holds alone.
     note: sequence::NoteFn,
+    /// Context keys added by this rewrite (for example, `scale` tag), avoiding
+    /// a dummy hap rewrite per layer during sequence folding.
+    keys: Option<context_keys::ContextKeys>,
 }
 
 /// The controls of a row of a chain, each apart as a map of controls with
@@ -5852,7 +5855,7 @@ enum Node {
     /// intersect. Tidal's `<*>`.
     AppBoth(Box<PatternPair>, Combine, LookupFlow),
     /// Appends source locations to every hap's context.
-    AddContext(Pattern, Arc<Vec<(usize, usize)>>),
+    AddContext(Pattern, Arc<[(usize, usize)]>),
     /// A pattern whose values become patterns via a closure that is
     /// **statically proven pure by its return type** (`-> PurePattern`).
     /// The constructions this node has answered so far ride beside the
@@ -9979,7 +9982,34 @@ impl Pattern {
         if let Some(located) = sequence::located(self, &locs) {
             return located.with_steps_of(self);
         }
-        let locs = Arc::new(locs);
+        let locs: Arc<[(usize, usize)]> = Arc::from(locs);
+        let mut pattern = Pattern::of(Node::AddContext(self.clone(), locs)).with_steps_of(self);
+        if let Some(loc) = self.pure_loc_raw() {
+            pattern.extras_mut().set_pure_loc(Some(loc));
+        }
+        pattern
+    }
+
+    /// Borrowed variant of [`Self::with_added_context`] that avoids allocating
+    /// a temporary `Vec` when folded into a sequence or materialized as one `Arc`.
+    pub fn with_added_context_slice(&self, locs: &[(usize, usize)]) -> Self {
+        if let Some(located) = sequence::located(self, locs) {
+            return located.with_steps_of(self);
+        }
+        let locs: Arc<[(usize, usize)]> = Arc::from(locs);
+        let mut pattern = Pattern::of(Node::AddContext(self.clone(), locs)).with_steps_of(self);
+        if let Some(loc) = self.pure_loc_raw() {
+            pattern.extras_mut().set_pure_loc(Some(loc));
+        }
+        pattern
+    }
+
+    /// Append a [`Locations`] list without intermediate `Vec` allocation.
+    pub(crate) fn with_added_locations(&self, locs: &Locations) -> Self {
+        if let Some(located) = locs.with_slice(|slice| sequence::located(self, slice)) {
+            return located.with_steps_of(self);
+        }
+        let locs = locs.to_arc_slice();
         let mut pattern = Pattern::of(Node::AddContext(self.clone(), locs)).with_steps_of(self);
         if let Some(loc) = self.pure_loc_raw() {
             pattern.extras_mut().set_pure_loc(Some(loc));
@@ -10211,7 +10241,7 @@ impl Pattern {
         }
         let mut constant = pure(control);
         if !context.is_empty() {
-            constant = constant.with_added_context(context.to_vec());
+            constant = constant.with_added_locations(&context);
         }
         let set = Combine::Composed(compose::ComposeOp::Set);
         *self = self.app_left_by(constant, set, LookupFlow::Set);
@@ -11596,7 +11626,11 @@ impl Pattern {
     /// holds a table of its own, as a scale holds its notes, is made one
     /// time for the name. It gives the rewrite of a hap, and the note that
     /// the rewrite makes of a note or a step that a hap holds alone.
-    fn map_pitch_haps_native_interned<F, G>(&self, key: &str, make: impl FnOnce() -> (F, G)) -> Self
+    fn map_pitch_haps_native_interned<F, G>(
+        &self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<Arc<str>>),
+    ) -> Self
     where
         F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
         G: Fn(&Value) -> Option<Value> + Send + Sync + 'static,
@@ -11613,13 +11647,20 @@ impl Pattern {
             .and_then(|entries| entries.get(key).map(Arc::clone));
         let interned = held.unwrap_or_else(|| {
             interned_closure(pool, key.to_owned(), || {
-                let (of_hap, of_note) = make();
+                let (of_hap, of_note, scale_tag) = make();
                 let hap: HapMapFn = Arc::new(move |hap: &Hap| {
                     of_hap(hap).map(|mapped| mapped.with_pitch_live_controls(hap))
+                });
+                let keys = scale_tag.map(|tag| {
+                    context_keys::ContextKeys::of(context_keys::Keys {
+                        scale: Some(tag),
+                        ..Default::default()
+                    })
                 });
                 Arc::new(PitchRewrite {
                     hap,
                     note: Box::new(of_note),
+                    keys,
                 })
             })
         });
@@ -11630,7 +11671,9 @@ impl Pattern {
     /// Steps that `note` or `n` names take their new note where they are:
     /// see [`sequence::renoted`]. So does each pattern of a pick.
     fn pitched(&self, rewrite: &PitchRewrite) -> Self {
-        if let Some(renoted) = sequence::renoted(self, &rewrite.hap, &rewrite.note) {
+        if let Some(renoted) =
+            sequence::renoted(self, &rewrite.hap, &rewrite.note, rewrite.keys.as_ref())
+        {
             return renoted;
         }
         let picked = self.picked_with(&Locations::new(), false, |pattern| {
@@ -12818,7 +12861,9 @@ pub fn ref_pattern(id: CallbackId) -> Pattern {
 /// which empties the whole `queryArc`, including the haps of a sibling in
 /// the same `sequence`.
 pub fn silence() -> Pattern {
-    Pattern::of(Node::Silence).with_steps(Some(Fraction::ONE))
+    static SILENCE: std::sync::LazyLock<Pattern> =
+        std::sync::LazyLock::new(|| Pattern::of(Node::Silence).with_steps(Some(Fraction::ONE)));
+    SILENCE.clone()
 }
 
 /// `pure(pattern)` - one known inner pattern per cycle. Outer `_steps` is 1,

@@ -390,6 +390,20 @@ pub(crate) fn compose_data_in_place(op: ComposeOp, a: &mut Value, b: &Value) {
     compose_data_in_place_cached(op, a, b, None);
 }
 
+/// [`compose_data_in_place`] writing flat `Entries::Made` directly without
+/// allocating an intermediate `Patched` overlay (used by build-time folds).
+pub(crate) fn compose_data_flat(op: ComposeOp, a: &mut Value, b: &Value) {
+    debug_assert!(a.is_data(0) && b.is_data(0));
+    if let (Value::Object(map), Value::Object(other)) = (&mut *a, b)
+        && !union_drops(other)
+    {
+        map.merge_flat(other, |current, value| op.apply_scalar(current, value));
+        map.mark_made_of_data();
+        return;
+    }
+    *a = compose_op(op, a, b);
+}
+
 /// [`compose_data_in_place`] with an optional shared overlay cache for chord
 /// haps meeting the same constant control map.
 pub(crate) fn compose_data_in_place_cached(

@@ -167,6 +167,46 @@ impl Locations {
         self.iter().collect()
     }
 
+    /// Share or materialize these locations into a single `Arc<[(usize, usize)]>`.
+    pub(crate) fn to_arc_slice(&self) -> Arc<[(usize, usize)]> {
+        match &self.0 {
+            Repr::Shared(shared) => Arc::clone(shared),
+            _ => self.iter().collect(),
+        }
+    }
+
+    /// Pass these locations as a contiguous slice without heap allocation when
+    /// stored inline or already shared.
+    pub(crate) fn with_slice<R>(&self, f: impl FnOnce(&[(usize, usize)]) -> R) -> R {
+        match &self.0 {
+            Repr::Packed { len, spans } => {
+                let mut buf = [(0usize, 0usize); INLINE];
+                let count = usize::from(*len);
+                for (slot, &packed) in buf[..count].iter_mut().zip(&spans[..count]) {
+                    *slot = unpack_range(packed);
+                }
+                f(&buf[..count])
+            }
+            Repr::Inline {
+                len,
+                begins,
+                lengths,
+            } => {
+                let mut buf = [(0usize, 0usize); WIDE_INLINE];
+                let count = usize::from(*len);
+                for ((slot, &begin), &length) in buf[..count]
+                    .iter_mut()
+                    .zip(&begins[..count])
+                    .zip(&lengths[..count])
+                {
+                    *slot = wide(begin, length);
+                }
+                f(&buf[..count])
+            }
+            Repr::Shared(shared) => f(shared),
+        }
+    }
+
     pub fn clear(&mut self) {
         *self = Self::new();
     }
@@ -362,7 +402,31 @@ impl From<&[(usize, usize)]> for Locations {
 
 impl FromIterator<(usize, usize)> for Locations {
     fn from_iter<I: IntoIterator<Item = (usize, usize)>>(iter: I) -> Self {
-        Self::from(iter.into_iter().collect::<Vec<_>>())
+        let mut iter = iter.into_iter();
+        let mut spans = [0_u32; INLINE];
+        let mut len = 0_usize;
+        while let Some(range) = iter.next() {
+            if len < INLINE
+                && let Some(packed) = pack_range(range)
+            {
+                spans[len] = packed;
+                len += 1;
+                continue;
+            }
+            let mut out = Self(Repr::Packed {
+                len: len as u8,
+                spans,
+            });
+            out.push(range);
+            for rest in iter {
+                out.push(rest);
+            }
+            return out;
+        }
+        Self(Repr::Packed {
+            len: len as u8,
+            spans,
+        })
     }
 }
 
