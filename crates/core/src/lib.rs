@@ -2182,11 +2182,8 @@ pub(crate) enum Combine {
     /// [`compose::compose_op`] of this op, which a meeting can run on the
     /// structure hap's value where it is. See [`Meeting::in_place`].
     Composed(compose::ComposeOp),
-    /// A `set` of each of these maps of controls in turn: the applications
-    /// of constants in a row that one meeting of a run stands for. The
-    /// constant of the meeting is their union, which a meeting that is made
-    /// in place takes. See [`Pattern::set_control`].
-    Sets(Arc<Vec<Value>>),
+    /// Multiple constant `set` controls merged into one union map.
+    SetMerged,
     /// Any other function, boxed so [`Combine`] stays 16 bytes.
     With(Box<CombineFn>),
 }
@@ -2206,20 +2203,17 @@ impl Combine {
     fn apply(&self, function: &Value, value: &Value) -> Value {
         match self {
             Combine::Composed(op) => compose::compose_op(*op, function, value),
-            Combine::Sets(controls) => controls.iter().fold(function.clone(), |set, control| {
-                compose::compose_op(compose::ComposeOp::Set, &set, control)
-            }),
+            Combine::SetMerged => compose::compose_op(compose::ComposeOp::Set, function, value),
             Combine::With(apply) => apply(function, value),
         }
     }
 
     /// The compose op that a meeting can run on the structure hap's value
-    /// where that value is, when this function is one. A run of sets is
-    /// then one `set` of the union that its constant holds.
+    /// where that value is, when this function is one.
     fn in_place_op(&self) -> Option<compose::ComposeOp> {
         match self {
             Combine::Composed(op) => Some(*op),
-            Combine::Sets(_) => Some(compose::ComposeOp::Set),
+            Combine::SetMerged => Some(compose::ComposeOp::Set),
             Combine::With(_) => None,
         }
     }
@@ -4937,39 +4931,21 @@ pub(crate) struct Meeting {
 
 impl Meeting {
     pub(crate) fn of(hf: &Hap, hv: &Hap, apply: &Combine, flow: LookupFlow) -> Self {
-        if let Combine::Sets(controls) = apply {
-            return Self::of_sets(hf, hv, controls, flow);
-        }
         let value = apply.apply(&hf.value, &hv.value);
-        let pick_lookup = applied_pick_lookup(flow, &value, hf, hv);
+        let pick_lookup = if matches!(apply, Combine::SetMerged)
+            && flow == LookupFlow::Set
+            && hf.value.has_js_function()
+        {
+            PickLookup::set_object(hf, hv, &value)
+        } else {
+            applied_pick_lookup(flow, &value, hf, hv)
+        };
         let (live_controls, slider_binding) = applied_live_controls(flow, hf, hv);
         Self {
             value,
             pick_lookup,
             live_controls,
             slider_binding,
-        }
-    }
-
-    /// The meeting of `hf` with a run of sets: `hf` meets a constant of
-    /// each of `controls` in turn, as the applications that the run stands
-    /// for make it one by one. `hv` is the constant of the run, which gives
-    /// each constant its spans. A constant holds its control and nothing
-    /// more, so each meeting settles on the hap of the one before it.
-    fn of_sets(hf: &Hap, hv: &Hap, controls: &[Value], flow: LookupFlow) -> Self {
-        let set = Combine::Composed(compose::ComposeOp::Set);
-        // The meetings read the value, the lookup and the bindings of the
-        // hap so far, so one copy of `hf` carries them.
-        let mut met = hf.clone();
-        for control in controls {
-            let constant = Hap::new(hv.whole, hv.part, control.clone());
-            Self::of(&met, &constant, &set, flow).settle(&mut met);
-        }
-        Self {
-            pick_lookup: met.pick_lookup_arc(),
-            live_controls: met.live_controls(),
-            slider_binding: met.slider_binding(),
-            value: met.value,
         }
     }
 
@@ -5177,25 +5153,6 @@ impl Meeting {
                 && !matches!(function, Value::Str(_))
                 && !matches!(value, Value::Str(_))
                 && !value.as_object().is_some_and(compose::union_drops))
-    }
-
-    /// Turn `hap`, one side of the meeting, into the met hap. Only valid when
-    /// the other side carries no locations, visuals or context keys: the
-    /// merge then keeps `hap`'s own.
-    pub(crate) fn settle(self, hap: &mut Hap) {
-        hap.value = self.value;
-        if hap.keys.is_empty()
-            && self.pick_lookup.is_none()
-            && self.live_controls == [0; 4]
-            && self.slider_binding == 0
-        {
-            return;
-        }
-        let edit = hap.keys.edit();
-        edit.pick_lookup = self.pick_lookup;
-        edit.live_controls = self.live_controls;
-        edit.slider_binding = self.slider_binding;
-        hap.keys.trim();
     }
 }
 
@@ -5704,9 +5661,15 @@ enum Node {
     /// `fast` by an exact factor: query times are multiplied by it and hap
     /// times divided by it. See [`checked_time`] for overflow.
     Fast(Box<FastNode>),
+    /// Inline small-fraction `fast`/`slow` (`slow` when `bool` is true), avoiding
+    /// an 80-byte `Box<FastNode>` allocation for ordinary rational factors.
+    FastSmall(Pattern, i16, u16, bool),
     /// `late` by an exact offset (`early` is a negative one): subtracted from
     /// query times and added to hap times. See [`checked_time`] for overflow.
     Shift(Box<ShiftNode>),
+    /// Inline small-fraction `late`/`early` (`early` when `bool` is true),
+    /// avoiding an 80-byte `Box<ShiftNode>` allocation.
+    ShiftSmall(Pattern, i16, u16, bool),
     /// `withQuerySpan` / `withHapSpan` - begin and end mapped jointly.
     WithQuerySpan(Box<(Pattern, SpanFn)>),
     WithQuerySpanJs(Box<(Pattern, CallbackId)>),
@@ -5970,6 +5933,8 @@ pub(crate) struct AppLeftNode(
     pub(crate) LookupFlow,
 );
 
+const _: () = assert!(std::mem::size_of::<AppLeftNode>() <= 88);
+
 impl AppLeftNode {
     #[inline]
     fn runtime_settings_source(&self) -> Option<&Pattern> {
@@ -6021,11 +5986,6 @@ struct HapBind(Pattern, Vec<Pattern>, HapToPatternFn);
 #[derive(Default)]
 pub(crate) struct ValueReading {
     found: std::sync::OnceLock<Option<Box<Reading>>>,
-    /// The name that the side sets, when it is a control of a
-    /// [wave](table::Wave): what the kinds of its graph say, under any
-    /// settings. Found by the first control that is set after the
-    /// application.
-    wave: std::sync::OnceLock<Option<Key>>,
 }
 
 /// What a value side was found to be, and the settings state it was found
@@ -6082,12 +6042,6 @@ impl ValueReading {
             .map(|reading| &reading.values)
     }
 
-    /// The name that `values`, the side of this reading, sets as a control
-    /// of a wave. See [`table::wave_name`].
-    fn wave_name(&self, values: &Pattern) -> Option<&Key> {
-        self.wave.get_or_init(|| table::wave_name(values)).as_ref()
-    }
-
     /// Forget what a query read of the function side, which is another
     /// pattern now. The value side is what it was.
     fn forget_functions(&mut self) {
@@ -6117,66 +6071,74 @@ fn unpack_run_loc(packed: u32) -> (usize, usize) {
     (begin, begin + length)
 }
 
-/// Compact 16-byte header for [`RunMeeting`] packing [`Combine`],
+#[derive(Clone)]
+struct RunWith {
+    apply: CombineFn,
+    flow: LookupFlow,
+    loc0: u32,
+}
+
+/// Compact 8-byte header for [`RunMeeting`] packing [`Combine`],
 /// [`LookupFlow`], and up to one inline packed source location (`loc0 != 0`).
+/// Rare opaque `Combine::With` closures are boxed into [`RunWith`] so
+/// [`RunApply`] fits in one pointer word.
 #[derive(Clone)]
 enum RunApply {
     Composed {
         op: compose::ComposeOp,
         flow: LookupFlow,
+        merged: bool,
         loc0: u32,
     },
-    Sets {
-        controls: Arc<Vec<Value>>,
-        flow: LookupFlow,
-        loc0: u32,
-    },
-    With {
-        apply: Box<CombineFn>,
-        flow: LookupFlow,
-        loc0: u32,
-    },
+    With(Box<RunWith>),
 }
 
-const _: () = assert!(std::mem::size_of::<RunApply>() == 16);
+const _: () = assert!(std::mem::size_of::<RunApply>() <= 16);
 
 impl RunApply {
     fn from_parts(apply: Combine, flow: LookupFlow, loc0: u32) -> Self {
         match apply {
-            Combine::Composed(op) => Self::Composed { op, flow, loc0 },
-            Combine::Sets(controls) => Self::Sets {
-                controls,
+            Combine::Composed(op) => Self::Composed {
+                op,
                 flow,
+                merged: false,
                 loc0,
             },
-            Combine::With(apply) => Self::With { apply, flow, loc0 },
+            Combine::SetMerged => Self::Composed {
+                op: compose::ComposeOp::Set,
+                flow,
+                merged: true,
+                loc0,
+            },
+            Combine::With(apply) => Self::With(Box::new(RunWith {
+                apply: *apply,
+                flow,
+                loc0,
+            })),
         }
     }
 
     #[inline]
     fn flow(&self) -> LookupFlow {
         match self {
-            Self::Composed { flow, .. } | Self::Sets { flow, .. } | Self::With { flow, .. } => {
-                *flow
-            }
+            Self::Composed { flow, .. } => *flow,
+            Self::With(w) => w.flow,
         }
     }
 
     #[inline]
     fn loc0(&self) -> u32 {
         match self {
-            Self::Composed { loc0, .. } | Self::Sets { loc0, .. } | Self::With { loc0, .. } => {
-                *loc0
-            }
+            Self::Composed { loc0, .. } => *loc0,
+            Self::With(w) => w.loc0,
         }
     }
 
     #[inline]
     fn set_loc0(&mut self, value: u32) {
         match self {
-            Self::Composed { loc0, .. } | Self::Sets { loc0, .. } | Self::With { loc0, .. } => {
-                *loc0 = value;
-            }
+            Self::Composed { loc0, .. } => *loc0 = value,
+            Self::With(w) => w.loc0 = value,
         }
     }
 
@@ -6184,16 +6146,15 @@ impl RunApply {
     fn in_place_op(&self) -> Option<compose::ComposeOp> {
         match self {
             Self::Composed { op, .. } => Some(*op),
-            Self::Sets { .. } => Some(compose::ComposeOp::Set),
-            Self::With { .. } => None,
+            Self::With(_) => None,
         }
     }
 
     fn combine(&self) -> Combine {
         match self {
+            Self::Composed { merged: true, .. } => Combine::SetMerged,
             Self::Composed { op, .. } => Combine::Composed(*op),
-            Self::Sets { controls, .. } => Combine::Sets(Arc::clone(controls)),
-            Self::With { apply, .. } => Combine::With(apply.clone()),
+            Self::With(w) => Combine::with(Arc::clone(&w.apply)),
         }
     }
 
@@ -6202,11 +6163,15 @@ impl RunApply {
             return false;
         }
         match (self, other) {
-            (Self::Composed { op: a, .. }, Self::Composed { op: b, .. }) => a == b,
-            (Self::Sets { controls: a, .. }, Self::Sets { controls: b, .. }) => {
-                a.len() == b.len() && a.iter().zip(&**b).all(|(x, y)| x.same_data(y))
-            }
-            (Self::With { apply: a, .. }, Self::With { apply: b, .. }) => Arc::ptr_eq(a, b),
+            (
+                Self::Composed {
+                    op: a, merged: ma, ..
+                },
+                Self::Composed {
+                    op: b, merged: mb, ..
+                },
+            ) => a == b && ma == mb,
+            (Self::With(a), Self::With(b)) => Arc::ptr_eq(&a.apply, &b.apply),
             _ => false,
         }
     }
@@ -6235,14 +6200,6 @@ impl RunMeeting {
     #[inline]
     pub(crate) fn combine(&self) -> Combine {
         self.apply.combine()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn sets_controls(&self) -> Option<&[Value]> {
-        match &self.apply {
-            RunApply::Sets { controls, .. } => Some(controls),
-            _ => None,
-        }
     }
 
     #[inline]
@@ -6389,7 +6346,7 @@ impl RunMeeting {
             RunApply::Composed {
                 op: compose::ComposeOp::Set,
                 ..
-            } | RunApply::Sets { .. }
+            }
         );
         let controls = self.value.as_object();
         self.flow() == LookupFlow::Set
@@ -6399,8 +6356,7 @@ impl RunMeeting {
 
     /// Whether this meeting takes the `set` of the map of controls
     /// `control` after it, as one constant of the union of the two: each
-    /// hap of maps of data then meets the union as it meets the two in
-    /// turn.
+    /// hap then meets the union as it meets the two in turn.
     fn takes_set_after(&self, control: &Value) -> bool {
         let set = Combine::Composed(compose::ComposeOp::Set);
         let map = Value::Object(OrderedMap::new());
@@ -6412,33 +6368,12 @@ impl RunMeeting {
 
     /// Join the `set` of `control` at `context`, which this meeting
     /// [takes](Self::takes_set_after): the constant is then the union, with
-    /// the locations of the later control first, and the meeting holds each
-    /// control of `row`, the row of the control, apart.
-    fn set_after(
-        &mut self,
-        control: &Value,
-        mut context: Locations,
-        row: impl Iterator<Item = Value>,
-    ) {
-        let flow = self.flow();
-        let loc0 = self.apply.loc0();
-        match &mut self.apply {
-            // The run alone holds its controls, or takes a copy.
-            RunApply::Sets { controls, .. } => Arc::make_mut(controls).extend(row),
-            // A handle of the first control, which the union replaces.
-            apply => {
-                let first = std::iter::once(self.value.clone());
-                *apply = RunApply::Sets {
-                    controls: Arc::new(first.chain(row).collect()),
-                    flow,
-                    loc0,
-                };
-            }
+    /// the locations of the later control first.
+    fn set_after(&mut self, control: &Value, mut context: Locations) {
+        if let RunApply::Composed { merged, .. } = &mut self.apply {
+            *merged = true;
         }
-        compose::compose_data_in_place(compose::ComposeOp::Set, &mut self.value, control);
-        if let Value::Object(map) = &mut self.value {
-            map.undress_patched();
-        }
+        compose::compose_data_flat(compose::ComposeOp::Set, &mut self.value, control);
         if !self.context_is_empty() {
             context.append(&self.context());
         }
@@ -6468,8 +6403,8 @@ struct StepWaveCache {
     part: TimeSpan,
     values: Arc<[Value]>,
     pieces: Vec<TimeSpan>,
-    /// `(base_table, patched_table)` for the last `Heads::Keyed` base table.
-    table: Option<(Arc<value::Table>, Arc<value::Table>)>,
+    /// `(base, patched_table)` for the last keyed base table or sequence layer.
+    table: Option<(value::PatchedBase, Arc<value::Table>)>,
 }
 
 #[derive(Default)]
@@ -6871,19 +6806,19 @@ impl<'a> ValueSide<'a> {
         let cached = step_cache.as_mut().expect("populated above");
         let count = cached.pieces.len();
         // Fast path: share one `PatchedTable` across all chord haps backed by
-        // the same `Heads::Keyed` base table.
-        let shared_patched = if let Some((base_table, base_row)) = base_map.dressed_table() {
+        // the same keyed base table or direct-keyed sequence layer.
+        let shared_patched = if let Some((base_source, base_row)) = base_map.dressed_base() {
             if let Some((cached_base, cached_patched)) = &cached.table
-                && Arc::ptr_eq(cached_base, base_table)
+                && cached_base.same_source(&base_source)
             {
                 Some((Arc::clone(cached_patched), base_row))
             } else if let Some(patched) = value::Table::patched_keyed_table(
-                base_table,
+                &base_source,
                 steps.key.clone(),
                 Arc::clone(&cached.values),
             ) {
                 let patched = Arc::new(patched);
-                cached.table = Some((Arc::clone(base_table), Arc::clone(&patched)));
+                cached.table = Some((base_source, Arc::clone(&patched)));
                 Some((patched, base_row))
             } else {
                 None
@@ -7281,6 +7216,9 @@ fn inherited_runtime_settings_source(node: &Node) -> Option<&Pattern> {
         | Node::SplitQueries(pattern)
         | Node::Join(pattern, _) => pattern.has_runtime_settings().then_some(pattern),
         Node::Fast(node) => node.0.has_runtime_settings().then_some(&node.0),
+        Node::FastSmall(pat, ..) | Node::ShiftSmall(pat, ..) => {
+            pat.has_runtime_settings().then_some(pat)
+        }
         Node::Shift(node) => node.0.has_runtime_settings().then_some(&node.0),
         Node::Constants(node) => node.0.has_runtime_settings().then_some(&node.0),
         Node::UiVisual(node) => node.inner.has_runtime_settings().then_some(&node.inner),
@@ -8493,8 +8431,20 @@ impl Pattern {
                     .query_faster_onto(thread, node.1, None, node.2, state, out);
             }
 
+            Node::FastSmall(pat, numer, denom, is_slow) => {
+                let factor = Fraction::new(i128::from(*numer), i128::from(*denom));
+                let op = if *is_slow { "slow" } else { "fast" };
+                pat.query_faster_onto(thread, factor, None, op, state, out);
+            }
+
             Node::Shift(node) => {
                 node.0.query_moved_onto(thread, node.1, node.2, state, out);
+            }
+
+            Node::ShiftSmall(pat, numer, denom, is_early) => {
+                let offset = Fraction::new(i128::from(*numer), i128::from(*denom));
+                let op = if *is_early { "early" } else { "late" };
+                pat.query_moved_onto(thread, offset, op, state, out);
             }
 
             Node::Cpm(boxed) => {
@@ -8842,7 +8792,9 @@ impl Pattern {
             | Node::PurePickLookup(..)
             | Node::Sequence(_)
             | Node::Fast(..)
+            | Node::FastSmall(..)
             | Node::Shift(..)
+            | Node::ShiftSmall(..)
             | Node::Cpm(..)
             | Node::FilterValues(..)
             | Node::FilterHaps(..)
@@ -10028,6 +9980,24 @@ impl Pattern {
                         })
                         .collect()
                 }),
+            Node::FastSmall(pat, numer, denom, is_slow) => {
+                let factor = Fraction::new(i128::from(*numer), i128::from(*denom));
+                let op = if *is_slow { "slow" } else { "fast" };
+                pat.resolve_pattern_of(
+                    &state.with_span(|sp| sp.with_time(|t| fast_query_time(t, factor, op))),
+                )
+                .map(|resolved| {
+                    resolved
+                        .into_iter()
+                        .map(|resolved| ResolvedHap {
+                            hap: resolved
+                                .hap
+                                .with_span(|sp| sp.with_time(|t| fast_hap_time(t, factor, op))),
+                            inner: resolved.inner,
+                        })
+                        .collect()
+                })
+            }
             Node::Shift(node) => node
                 .0
                 .resolve_pattern_of(
@@ -10044,6 +10014,24 @@ impl Pattern {
                         })
                         .collect()
                 }),
+            Node::ShiftSmall(pat, numer, denom, is_early) => {
+                let offset = Fraction::new(i128::from(*numer), i128::from(*denom));
+                let op = if *is_early { "early" } else { "late" };
+                pat.resolve_pattern_of(
+                    &state.with_span(|sp| sp.with_time(|t| shift_query_time(t, offset, op))),
+                )
+                .map(|resolved| {
+                    resolved
+                        .into_iter()
+                        .map(|resolved| ResolvedHap {
+                            hap: resolved
+                                .hap
+                                .with_span(|sp| sp.with_time(|t| shift_hap_time(t, offset, op))),
+                            inner: resolved.inner,
+                        })
+                        .collect()
+                })
+            }
             // `stack` resolves each branch and concatenates, mirroring the
             // query's flatten. `seqPLoop` (and any join over a stacked
             // pattern-of-patterns) otherwise fell through to the plain-query
@@ -10410,7 +10398,7 @@ impl Pattern {
                 Combine::Composed(op) => self
                     .picked_applied(&other, *op, lookup_flow)
                     .or_else(|| self.set_constant(&other, *op, lookup_flow)),
-                Combine::Sets(_) | Combine::With(_) => None,
+                Combine::SetMerged | Combine::With(_) => None,
             });
         if let Some(applied) = folded {
             return applied.with_steps(steps);
@@ -10508,20 +10496,15 @@ impl Pattern {
     }
 
     /// This pattern with each hap met by the `set` of a constant of each
-    /// control of `row` in turn, as one meeting: `union` is the union of
+    /// control of a row in turn, as one meeting: `union` is the union of
     /// the row, a map of controls of data, at `context`, the locations of
     /// each control, the last one first. See [`Self::met_control`].
-    fn met_row(
-        &self,
-        union: &Value,
-        context: Locations,
-        row: impl ExactSizeIterator<Item = Value>,
-    ) -> Self {
-        let apply = match row.len() {
-            0 | 1 => Combine::Composed(compose::ComposeOp::Set),
-            _ => Combine::Sets(Arc::new(row.collect())),
+    fn met_row(&self, union: &Value, context: Locations, multi: bool) -> Self {
+        let apply = if multi {
+            Combine::SetMerged
+        } else {
+            Combine::Composed(compose::ComposeOp::Set)
         };
-        // A handle of the union, for the run to hold.
         let meeting = RunMeeting::of(apply, LookupFlow::Set, union.clone(), context);
         self.met([meeting]).with_steps(self.steps())
     }
@@ -10700,10 +10683,8 @@ impl Pattern {
             }
             Node::Sequence(layers) => sequence::set_here(layers, control, context),
             Node::Constants(node) => {
-                // The run holds each control of the row apart.
-                let row = Self::apart_under(control, apart.each()).map(|(each, _)| each);
                 let last = node.1.last_mut().expect("a run of one meeting or more");
-                last.set_after(control, context, row);
+                last.set_after(control, context);
             }
             Node::Pick(pick) => {
                 // The locations of the constant come first on each hap,
@@ -10738,12 +10719,12 @@ impl Pattern {
                     }
                     // A pattern that takes no control meets a constant of
                     // each control of the row, as it met them in the stack.
-                    let row = Self::apart_under(control, apart.each());
                     if pattern.meets_each_control() && control.is_data(0) {
-                        let row = row.map(|(each, _)| each);
-                        *pattern = pattern.met_row(control, context.clone(), row);
+                        *pattern =
+                            pattern.met_row(control, context.clone(), apart.each().len() > 1);
                         continue;
                     }
+                    let row = Self::apart_under(control, apart.each());
                     for (each, at) in row {
                         pattern.set_in_turn(each, at);
                     }
@@ -10832,22 +10813,22 @@ impl Pattern {
             .as_object()
             .filter(|controls| !compose::union_drops(controls))?;
         // The names of the waves, the outermost first.
-        let mut names: Vec<&Key> = Vec::new();
+        let mut names: Vec<Key> = Vec::new();
         let mut under = self;
         while let Node::AppLeft(pair) = under.node_kind()
             && let AppLeftNode(
                 functions,
                 values,
-                reading,
+                _,
                 Combine::Composed(compose::ComposeOp::Set),
                 LookupFlow::Set,
             ) = &**pair
-            && let Some(name) = reading.wave_name(values)
+            && let Some(name) = table::wave_name(values)
         {
             // The application keeps the runtime that its handle binds, as
             // a function call gives one. A function side that binds
             // another runtime answers under that one.
-            if controls.contains_key(name) || !under.keeps_runtime_over(functions) {
+            if controls.contains_key(&name) || !under.keeps_runtime_over(functions) {
                 return None;
             }
             names.push(name);
@@ -11690,7 +11671,7 @@ impl Pattern {
                 if matches!(pair.3, Combine::Composed(compose::ComposeOp::Set))
                     && pair.4 == LookupFlow::Set =>
             {
-                pair.2.wave_name(&pair.1).is_some() && pair.0.takes_constants()
+                table::wave_name(&pair.1).is_some() && pair.0.takes_constants()
             }
             _ => false,
         }
@@ -12358,8 +12339,19 @@ impl Pattern {
     /// steps. On overflow, record `NativeFraction` and use zero until the query
     /// boundary reports the refusal.
     fn shift_time(&self, t: Fraction, operation: &'static str) -> Self {
-        Pattern::of(Node::Shift(Box::new(ShiftNode(self.clone(), t, operation))))
-            .with_steps_of(self)
+        let is_early = match operation {
+            "late" => Some(false),
+            "early" => Some(true),
+            _ => None,
+        };
+        let node = if let Some(is_early) = is_early
+            && let (Ok(n), Ok(d)) = (i16::try_from(t.numer()), u16::try_from(t.denom()))
+        {
+            Node::ShiftSmall(self.clone(), n, d, is_early)
+        } else {
+            Node::Shift(Box::new(ShiftNode(self.clone(), t, operation)))
+        };
+        Pattern::of(node).with_steps_of(self)
     }
 
     /// The [`Node::Fast`] behind [`combinators::checked_fast`].
@@ -12367,11 +12359,19 @@ impl Pattern {
         if let Some(faster) = sequence::faster(self, factor) {
             return faster;
         }
-        Pattern::of(Node::Fast(Box::new(FastNode(
-            self.clone(),
-            factor,
-            operation,
-        ))))
+        let is_slow = match operation {
+            "fast" => Some(false),
+            "slow" => Some(true),
+            _ => None,
+        };
+        let node = if let Some(is_slow) = is_slow
+            && let (Ok(n), Ok(d)) = (i16::try_from(factor.numer()), u16::try_from(factor.denom()))
+        {
+            Node::FastSmall(self.clone(), n, d, is_slow)
+        } else {
+            Node::Fast(Box::new(FastNode(self.clone(), factor, operation)))
+        };
+        Pattern::of(node)
     }
 
     /// Speeds up like `fast`, but leaves a **gap** for the rest of the cycle
@@ -12588,6 +12588,7 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         | Node::SplitQueries(pattern)
         | Node::Join(pattern, _) => take_child(pattern, out),
         Node::Fast(node) => take_child(&mut node.0, out),
+        Node::FastSmall(pat, ..) | Node::ShiftSmall(pat, ..) => take_child(pat, out),
         Node::Shift(node) => take_child(&mut node.0, out),
         Node::Constants(node) => take_child(&mut node.0, out),
         Node::UiVisual(node) => take_child(&mut node.inner, out),
@@ -12781,10 +12782,12 @@ fn span_read(node: &Node) -> purity::SpanRead {
         // A time map that keeps the order of time, and maps of each hap that
         // read no span.
         Node::Fast(node) if node.1 > Fraction::ZERO => of(&node.0),
+        Node::FastSmall(pat, numer, _, _) if *numer > 0 => of(pat),
         // A `fast` by the tempo of the query, which the span does not say.
         Node::Cpm(boxed) if boxed.1.cpm > Fraction::ZERO => of(&boxed.0),
         Node::ControlMap(pattern, _, _) => of(pattern),
         Node::Shift(node) => of(&node.0),
+        Node::ShiftSmall(pat, ..) => of(pat),
         Node::Constants(node) => of(&node.0),
         Node::UiVisual(node) => of(&node.inner),
         Node::AddContext(boxed) => of(&boxed.0),
@@ -12903,6 +12906,7 @@ fn compute_purity(node: &Node) -> purity::Purity {
         | Node::SplitQueries(p)
         | Node::Join(p, _) => p.purity(),
         Node::Fast(node) => node.0.purity(),
+        Node::FastSmall(pat, ..) | Node::ShiftSmall(pat, ..) => pat.purity(),
         Node::Shift(node) => node.0.purity(),
         Node::Constants(node) => node.0.purity(),
         Node::UiVisual(node) => node.inner.purity(),

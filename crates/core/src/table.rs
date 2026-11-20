@@ -310,7 +310,15 @@ fn signal_of_depth(pattern: &Pattern, depth: u32) -> Option<Signal> {
         }
         Node::AddContext(boxed) => (&boxed.0, SignalOp::Step(Step::Locations(boxed.1.clone()))),
         Node::Fast(node) if node.1 > Fraction::ZERO => (&node.0, SignalOp::Fast(node.1)),
+        Node::FastSmall(pat, numer, denom, _) if *numer > 0 => (
+            pat,
+            SignalOp::Fast(Fraction::new(i128::from(*numer), i128::from(*denom))),
+        ),
         Node::Shift(node) => (&node.0, SignalOp::Shift(node.1)),
+        Node::ShiftSmall(pat, numer, denom, _) => (
+            pat,
+            SignalOp::Shift(Fraction::new(i128::from(*numer), i128::from(*denom))),
+        ),
         Node::Constants(node) => {
             let mut signal = signal_of_depth(&node.0, depth + 1)?;
             signal

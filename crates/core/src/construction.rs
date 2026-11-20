@@ -180,8 +180,24 @@ fn same_node<'g>(
             Node::Fast(b) if a.1 == b.1 && a.2 == b.2 => child!(&a.0, &b.0),
             _ => false,
         },
+        Node::FastSmall(a_pat, a_n, a_d, a_slow) => match right {
+            Node::FastSmall(b_pat, b_n, b_d, b_slow)
+                if a_n == b_n && a_d == b_d && a_slow == b_slow =>
+            {
+                child!(a_pat, b_pat)
+            }
+            _ => false,
+        },
         Node::Shift(a) => match right {
             Node::Shift(b) if a.1 == b.1 && a.2 == b.2 => child!(&a.0, &b.0),
+            _ => false,
+        },
+        Node::ShiftSmall(a_pat, a_n, a_d, a_early) => match right {
+            Node::ShiftSmall(b_pat, b_n, b_d, b_early)
+                if a_n == b_n && a_d == b_d && a_early == b_early =>
+            {
+                child!(a_pat, b_pat)
+            }
             _ => false,
         },
         Node::WithQuerySpan(a) => match right {

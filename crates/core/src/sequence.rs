@@ -191,17 +191,51 @@ enum Steps {
     Listed(Listing),
     /// The steps as their source writes them for each query.
     Source(Arc<Sourced>),
-    /// Rare fallback when a layer's period does not fit `(i32, 29-bit u32)`.
+    /// Rare fallback when a layer's period does not fit `(i16, 13-bit u16)`.
     WithPeriod(Arc<(Fraction, Steps)>),
+    /// Rare lazy cache cell for non-direct layers or spilling dress contexts.
+    Cached(Arc<(Steps, OnceLock<Arc<Table>>)>),
 }
 
 impl Steps {
     #[inline(always)]
     fn inner(&self) -> &Self {
-        match self {
-            Self::WithPeriod(pair) => &pair.1,
-            other => other,
+        let mut cur = self;
+        loop {
+            match cur {
+                Self::WithPeriod(pair) => cur = &pair.1,
+                Self::Cached(pair) => cur = &pair.0,
+                other => return other,
+            }
         }
+    }
+
+    #[inline(always)]
+    fn strip_cache(&mut self) {
+        if let Self::Cached(pair) = self {
+            *self = pair.0.clone();
+        }
+    }
+
+    #[inline(always)]
+    fn cache_cell(&self) -> Option<&OnceLock<Arc<Table>>> {
+        match self {
+            Self::Cached(pair) => Some(&pair.1),
+            _ => None,
+        }
+    }
+
+    fn ensure_fresh_cache(&mut self) {
+        if let Self::Cached(pair) = self
+            && Arc::get_mut(pair).is_some_and(|(_, cell)| cell.get().is_none())
+        {
+            return;
+        }
+        let inner = match &*self {
+            Self::Cached(pair) => pair.0.clone(),
+            other => other.clone(),
+        };
+        *self = Self::Cached(Arc::new((inner, OnceLock::new())));
     }
 }
 
@@ -261,7 +295,7 @@ impl Listing {
     fn len(&self) -> usize {
         match self {
             Self::Places(listed) => listed.places.len(),
-            Self::Grid(grid) => grid.steps.len(),
+            Self::Grid(grid) => grid.steps_ref().len(),
         }
     }
 
@@ -302,7 +336,7 @@ impl Listing {
     fn value(&self, index: usize) -> u32 {
         match self {
             Self::Places(listed) => listed.places[index].value,
-            Self::Grid(grid) => grid.steps.get(index).value,
+            Self::Grid(grid) => grid.steps_ref().get(index).value,
         }
     }
 
@@ -448,17 +482,17 @@ impl SmallGridStep {
     }
 }
 
-/// Steps of a [`Grid`], stored as 8-byte [`SmallGridStep`]s when every step
-/// fits and 16-byte [`GridStep`]s otherwise.
-#[derive(Clone)]
-enum GridSteps {
-    Small(Box<[SmallGridStep]>),
-    Wide(Box<[GridStep]>),
+/// Borrowed view of a [`Grid`]'s steps: 8-byte compact steps inline on
+/// [`Grid`], or 16-byte wide steps spilled into [`SpareRare`].
+#[derive(Clone, Copy)]
+enum GridStepsRef<'a> {
+    Small(&'a [SmallGridStep]),
+    Wide(&'a [GridStep]),
 }
 
-impl GridSteps {
+impl<'a> GridStepsRef<'a> {
     #[inline]
-    fn len(&self) -> usize {
+    fn len(self) -> usize {
         match self {
             Self::Small(s) => s.len(),
             Self::Wide(w) => w.len(),
@@ -466,7 +500,7 @@ impl GridSteps {
     }
 
     #[inline]
-    fn get(&self, index: usize) -> GridStep {
+    fn get(self, index: usize) -> GridStep {
         match self {
             Self::Small(s) => s[index].to_wide(),
             Self::Wide(w) => w[index],
@@ -474,7 +508,7 @@ impl GridSteps {
     }
 
     #[inline]
-    fn times_of(&self, index: usize) -> (u32, u32) {
+    fn times_of(self, index: usize) -> (u32, u32) {
         match self {
             Self::Small(s) => (u32::from(s[index].part_begin), u32::from(s[index].part_end)),
             Self::Wide(w) => (w[index].part_begin, w[index].part_end),
@@ -482,13 +516,22 @@ impl GridSteps {
     }
 
     #[inline]
-    fn has_no_locations(&self) -> bool {
+    fn has_no_locations(self) -> bool {
         match self {
             Self::Small(s) => s.iter().all(|step| step.loc == 0),
             Self::Wide(w) => w.iter().all(|step| step.loc.0 == 0),
         }
     }
+}
 
+/// Owned build result before storing small steps directly on [`Grid`] and
+/// spilling wide steps into [`Spare`].
+enum GridSteps {
+    Small(Box<[SmallGridStep]>),
+    Wide(Box<[GridStep]>),
+}
+
+impl GridSteps {
     /// Collect `len` steps produced by `make`, choosing compact 8-byte storage
     /// when every step fits. Uses a stack buffer for up to 64 steps so the
     /// common case performs a single heap allocation.
@@ -689,30 +732,32 @@ struct Grid {
     /// The begin that the packed ranges count from, below 2^31. The top bit
     /// is [`Listing::small_denominators`].
     base: u32,
-    steps: GridSteps,
-    /// The reduced time of each residue, for a tick size that is no power
-    /// of two: a time then takes no gcd.
-    reductions: Option<Arc<TickGrid>>,
-    /// What most layers have none of.
+    /// Compact 8-byte steps stored inline; empty when wide 16-byte steps live
+    /// in `side.rare`.
+    small_steps: Box<[SmallGridStep]>,
+    /// What most power-of-two grids have none of: non-dyadic reductions,
+    /// multi-range packed locations, cuts, wide locations, and wide steps.
     side: Option<Box<Spare>>,
 }
 
 const _: () = assert!(std::mem::size_of::<SmallGridStep>() == 8);
-const _: () = assert!(std::mem::size_of::<Grid>() <= 48);
+const _: () = assert!(std::mem::size_of::<Grid>() == 32);
 
 #[derive(Clone)]
 struct SpareRareFull {
     cuts: Box<[Cut]>,
     wide: Box<[Locations]>,
+    wide_steps: Box<[GridStep]>,
 }
 
-/// Rare cuts and wide locations kept compact behind one 24-byte enum so
-/// cuts-only grids avoid a wide-locations slice header and pack cuts into 6 B.
+/// Rare cuts, wide locations, and wide steps kept compact behind one 24-byte
+/// enum so common power-of-two grids stay 32 bytes.
 #[derive(Clone)]
 enum SpareRare {
     SmallCuts(Box<[SmallCut]>),
     WideCuts(Box<[Cut]>),
     WideOnly(Box<[Locations]>),
+    WideSteps(Box<[GridStep]>),
     Full(Box<SpareRareFull>),
 }
 
@@ -798,8 +843,8 @@ impl<T: Copy, const N: usize> SmallCopyBuf<T, N> {
 }
 
 impl SpareRare {
-    fn from_parts(cuts: &[Cut], wide: Box<[Locations]>) -> Self {
-        if wide.is_empty() {
+    fn from_parts(cuts: &[Cut], wide: Box<[Locations]>, wide_steps: Box<[GridStep]>) -> Self {
+        if wide.is_empty() && wide_steps.is_empty() {
             if cuts.len() <= 16 {
                 let mut buf = [SmallCut {
                     index: 0,
@@ -830,12 +875,15 @@ impl SpareRare {
             } else {
                 Self::WideCuts(Box::from(cuts))
             }
-        } else if cuts.is_empty() {
+        } else if cuts.is_empty() && wide_steps.is_empty() {
             Self::WideOnly(wide)
+        } else if cuts.is_empty() && wide.is_empty() {
+            Self::WideSteps(wide_steps)
         } else {
             Self::Full(Box::new(SpareRareFull {
                 cuts: Box::from(cuts),
                 wide,
+                wide_steps,
             }))
         }
     }
@@ -845,7 +893,7 @@ impl SpareRare {
         match self {
             Self::SmallCuts(s) => CutsSlice::Small(s),
             Self::WideCuts(w) => CutsSlice::Wide(w),
-            Self::WideOnly(_) => CutsSlice::EMPTY,
+            Self::WideOnly(_) | Self::WideSteps(_) => CutsSlice::EMPTY,
             Self::Full(full) => CutsSlice::Wide(&full.cuts),
         }
     }
@@ -853,25 +901,37 @@ impl SpareRare {
     #[inline]
     fn wide(&self) -> &[Locations] {
         match self {
-            Self::SmallCuts(_) | Self::WideCuts(_) => &[],
+            Self::SmallCuts(_) | Self::WideCuts(_) | Self::WideSteps(_) => &[],
             Self::WideOnly(w) => w,
             Self::Full(full) => &full.wide,
         }
     }
+
+    #[inline]
+    fn wide_steps(&self) -> Option<&[GridStep]> {
+        match self {
+            Self::WideSteps(steps) => Some(steps),
+            Self::Full(full) if !full.wide_steps.is_empty() => Some(&full.wide_steps),
+            _ => None,
+        }
+    }
 }
 
-/// The cuts and the spare locations of a [`Grid`].
+/// The non-dyadic reductions, cuts, wide steps, and spare locations of a [`Grid`].
 #[derive(Clone)]
 struct Spare {
     /// Packed multi-range step locations relative to `Grid::base`. Each word
     /// is a [`PackedLoc`] range, with `PackedLoc::SPARE` set on the last
     /// range of a step.
     packed: Box<[u32]>,
-    /// Rare cuts and wide locations, allocated only when present.
+    /// The reduced time of each residue, for a tick size that is no power of
+    /// two: a time then takes no gcd.
+    reductions: Option<Arc<TickGrid>>,
+    /// Rare cuts, wide locations, and wide steps, allocated only when present.
     rare: Option<Box<SpareRare>>,
 }
 
-const _: () = assert!(std::mem::size_of::<Spare>() == 24);
+const _: () = assert!(std::mem::size_of::<Spare>() == 32);
 
 impl Grid {
     const SMALL: u32 = 1 << 31;
@@ -1017,17 +1077,33 @@ impl Grid {
         if wide.len() > PackedLoc::INDEX_MASK as usize {
             return None;
         }
+        let (small_steps, wide_steps) = match steps {
+            GridSteps::Small(small) => (small, Box::from([])),
+            GridSteps::Wide(wide) => (Box::from([]), wide),
+        };
+        let reductions = tick_grid(ticks);
         // The grid fits, so any wide locations move with no copy.
-        let side = (!cuts.is_empty() || !packed_runs.is_empty() || !wide.is_empty()).then(|| {
-            let rare = (!cuts.is_empty() || !wide.is_empty()).then(|| {
-                let wide_locs: Box<[Locations]> = wide
-                    .iter()
-                    .map(|index| std::mem::take(&mut raws[*index].locations))
-                    .collect();
-                Box::new(SpareRare::from_parts(cuts.as_slice(), wide_locs))
-            });
+        let side = (!cuts.is_empty()
+            || !packed_runs.is_empty()
+            || !wide.is_empty()
+            || !wide_steps.is_empty()
+            || reductions.is_some())
+        .then(|| {
+            let rare =
+                (!cuts.is_empty() || !wide.is_empty() || !wide_steps.is_empty()).then(|| {
+                    let wide_locs: Box<[Locations]> = wide
+                        .iter()
+                        .map(|index| std::mem::take(&mut raws[*index].locations))
+                        .collect();
+                    Box::new(SpareRare::from_parts(
+                        cuts.as_slice(),
+                        wide_locs,
+                        wide_steps,
+                    ))
+                });
             Box::new(Spare {
                 packed: packed_runs.into_boxed_slice(),
+                reductions,
                 rare,
             })
         });
@@ -1035,8 +1111,7 @@ impl Grid {
         Some(Self {
             ticks,
             base,
-            steps,
-            reductions: tick_grid(ticks),
+            small_steps,
             side,
         })
     }
@@ -1095,16 +1170,26 @@ impl Grid {
         if wide.len() > PackedLoc::INDEX_MASK as usize {
             return None;
         }
-        let side = (!packed_runs.is_empty() || !wide.is_empty()).then(|| {
-            let rare = (!wide.is_empty()).then(|| {
+        let (small_steps, wide_steps) = match steps {
+            GridSteps::Small(small) => (small, Box::from([])),
+            GridSteps::Wide(wide) => (Box::from([]), wide),
+        };
+        let reductions = tick_grid(ticks);
+        let side = (!packed_runs.is_empty()
+            || !wide.is_empty()
+            || !wide_steps.is_empty()
+            || reductions.is_some())
+        .then(|| {
+            let rare = (!wide.is_empty() || !wide_steps.is_empty()).then(|| {
                 let wide_locs: Box<[Locations]> = wide
                     .iter()
                     .map(|index| std::mem::take(&mut source_steps[*index].locations))
                     .collect();
-                Box::new(SpareRare::WideOnly(wide_locs))
+                Box::new(SpareRare::from_parts(&[], wide_locs, wide_steps))
             });
             Box::new(Spare {
                 packed: packed_runs.into_boxed_slice(),
+                reductions,
                 rare,
             })
         });
@@ -1112,10 +1197,23 @@ impl Grid {
         Some(Self {
             ticks,
             base,
-            steps,
-            reductions: tick_grid(ticks),
+            small_steps,
             side,
         })
+    }
+
+    #[inline(always)]
+    fn steps_ref(&self) -> GridStepsRef<'_> {
+        if let Some(wide) = self
+            .side
+            .as_deref()
+            .and_then(|side| side.rare.as_deref())
+            .and_then(SpareRare::wide_steps)
+        {
+            GridStepsRef::Wide(wide)
+        } else {
+            GridStepsRef::Small(&self.small_steps)
+        }
     }
 
     fn small_denominators(&self) -> bool {
@@ -1135,7 +1233,7 @@ impl Grid {
     /// [`Self::made`] of ticks that fit 64 bits, which a query has.
     #[inline]
     fn made_small(&self, ticks: i64) -> Fraction {
-        match &self.reductions {
+        match self.side.as_deref().and_then(|s| s.reductions.as_ref()) {
             Some(reductions) => reductions.time(ticks),
             None => Fraction::from_ticks(i128::from(ticks), self.ticks),
         }
@@ -1178,7 +1276,7 @@ impl Grid {
     }
 
     fn part(&self, index: usize) -> TimeSpan {
-        let (part_begin, part_end) = self.steps.times_of(index);
+        let (part_begin, part_end) = self.steps_ref().times_of(index);
         TimeSpan::new(self.time(part_begin), self.time(part_end))
     }
 
@@ -1202,7 +1300,7 @@ impl Grid {
     /// The locations of step `index`.
     #[inline]
     fn locations(&self, index: usize) -> Locations {
-        let packed = self.steps.get(index).loc.0;
+        let packed = self.steps_ref().get(index).loc.0;
         if packed == 0 {
             return Locations::new();
         }
@@ -1238,15 +1336,11 @@ impl Grid {
     /// The places of the steps, for the rare query that leaves the range
     /// of ticks.
     fn places(&self) -> Vec<Place> {
-        (0..self.steps.len())
+        let steps = self.steps_ref();
+        (0..steps.len())
             .map(|index| {
                 let (whole, part) = self.times(index);
-                Place::at(
-                    whole,
-                    part,
-                    self.steps.get(index).value,
-                    self.locations(index),
-                )
+                Place::at(whole, part, steps.get(index).value, self.locations(index))
             })
             .collect()
     }
@@ -1262,10 +1356,11 @@ impl Grid {
         let bound = period.numer().checked_mul(i128::from(self.ticks.get()))?;
         let inside = |tick: u32| Some(i128::from(tick).checked_mul(period.denom())? <= bound);
         let mut cuts = self.cuts();
-        let len = self.steps.len();
+        let steps = self.steps_ref();
+        let len = steps.len();
         let mut prev: Option<(u32, u32)> = None;
         for index in 0..len {
-            let (part_begin, part_end) = self.steps.times_of(index);
+            let (part_begin, part_end) = steps.times_of(index);
             let cut = cuts.split_first_at(index);
             let (begin, end) = cut.map_or((part_begin, part_end), |c| (c.begin, c.end));
             let shaped = begin <= part_begin && part_begin < part_end && part_end <= end;
@@ -1286,9 +1381,9 @@ impl Grid {
     fn same_times(&self, other: &Self) -> bool {
         self.ticks == other.ticks
             && self.cuts().same(other.cuts())
-            && self.steps.len() == other.steps.len()
-            && (0..self.steps.len())
-                .all(|index| self.steps.times_of(index) == other.steps.times_of(index))
+            && self.steps_ref().len() == other.steps_ref().len()
+            && (0..self.steps_ref().len())
+                .all(|index| self.steps_ref().times_of(index) == other.steps_ref().times_of(index))
     }
 
     /// Whether every step's part lies inside one cycle in every turn of `period`,
@@ -1298,8 +1393,9 @@ impl Grid {
             return false;
         };
         let ticks = u128::from(self.ticks.get());
-        for i in 0..self.steps.len() {
-            let (b, e) = self.steps.times_of(i);
+        let steps = self.steps_ref();
+        for i in 0..steps.len() {
+            let (b, e) = steps.times_of(i);
             let Some(begins) = u128::from(b).checked_mul(turns) else {
                 return false;
             };
@@ -1331,8 +1427,9 @@ impl Grid {
         let mul = f_den / g0;
         let mut g1 = u64::from(f_num);
         if g1 > 1 {
-            for i in 0..self.steps.len() {
-                let (b, e) = self.steps.times_of(i);
+            let steps = self.steps_ref();
+            for i in 0..steps.len() {
+                let (b, e) = steps.times_of(i);
                 g1 = gcd(g1, u64::from(b));
                 g1 = gcd(g1, u64::from(e));
                 if g1 == 1 {
@@ -1358,53 +1455,86 @@ impl Grid {
             return None;
         }
         let new_ticks = NonZeroU32::new(new_ticks_u32)?;
-        let (steps, side) = if mul == 1 && g1 == 1 {
-            (self.steps.clone(), self.side.clone())
+        let steps_ref = self.steps_ref();
+        let (small_steps, side) = if mul == 1 && g1 == 1 {
+            let reductions = tick_grid(new_ticks);
+            let side = match (&self.side, reductions) {
+                (None, None) => None,
+                (Some(spare), reductions) => {
+                    if spare.packed.is_empty() && spare.rare.is_none() && reductions.is_none() {
+                        None
+                    } else {
+                        Some(Box::new(Spare {
+                            packed: spare.packed.clone(),
+                            reductions,
+                            rare: spare.rare.clone(),
+                        }))
+                    }
+                }
+                (None, Some(reductions)) => Some(Box::new(Spare {
+                    packed: Box::from([]),
+                    reductions: Some(reductions),
+                    rare: None,
+                })),
+            };
+            (self.small_steps.clone(), side)
         } else {
             let rescale = |t: u32| -> Option<u32> {
                 u32::try_from((u64::from(t) / g1).checked_mul(u64::from(mul))?).ok()
             };
-            let steps = GridSteps::build(self.steps.len(), |i| {
-                let mut step = self.steps.get(i);
+            let steps = GridSteps::build(steps_ref.len(), |i| {
+                let mut step = steps_ref.get(i);
                 step.part_begin = rescale(step.part_begin)?;
                 step.part_end = rescale(step.part_end)?;
                 Some(step)
             })?;
-            let side = match &self.side {
-                None => None,
-                Some(spare) => {
-                    let rare = match &spare.rare {
-                        None => None,
-                        Some(rare) => {
-                            let cuts_view = rare.cuts();
-                            let mut cuts = SmallCopyBuf::<Cut, 16>::new(Cut {
-                                index: 0,
-                                begin: 0,
-                                end: 0,
-                            });
-                            for i in 0..cuts_view.len() {
-                                let mut cut = cuts_view.get(i).expect("cut in bounds");
-                                cut.begin = rescale(cut.begin)?;
-                                cut.end = rescale(cut.end)?;
-                                cuts.push(cut);
-                            }
-                            let wide: Box<[Locations]> = rare.wide().to_vec().into_boxed_slice();
-                            Some(Box::new(SpareRare::from_parts(cuts.as_slice(), wide)))
-                        }
-                    };
-                    Some(Box::new(Spare {
-                        packed: spare.packed.clone(),
-                        rare,
-                    }))
-                }
+            let (small_steps, wide_steps) = match steps {
+                GridSteps::Small(small) => (small, Box::from([])),
+                GridSteps::Wide(wide) => (Box::from([]), wide),
             };
-            (steps, side)
+            let reductions = tick_grid(new_ticks);
+            let packed = self
+                .side
+                .as_deref()
+                .map(|s| s.packed.clone())
+                .unwrap_or_else(|| Box::from([]));
+            let mut cuts = SmallCopyBuf::<Cut, 16>::new(Cut {
+                index: 0,
+                begin: 0,
+                end: 0,
+            });
+            let mut wide_locs: Box<[Locations]> = Box::from([]);
+            if let Some(rare) = self.side.as_deref().and_then(|s| s.rare.as_deref()) {
+                let cuts_view = rare.cuts();
+                for i in 0..cuts_view.len() {
+                    let mut cut = cuts_view.get(i).expect("cut in bounds");
+                    cut.begin = rescale(cut.begin)?;
+                    cut.end = rescale(cut.end)?;
+                    cuts.push(cut);
+                }
+                wide_locs = rare.wide().to_vec().into_boxed_slice();
+            }
+            let rare =
+                (!cuts.is_empty() || !wide_locs.is_empty() || !wide_steps.is_empty()).then(|| {
+                    Box::new(SpareRare::from_parts(
+                        cuts.as_slice(),
+                        wide_locs,
+                        wide_steps,
+                    ))
+                });
+            let side = (!packed.is_empty() || reductions.is_some() || rare.is_some()).then(|| {
+                Box::new(Spare {
+                    packed,
+                    reductions,
+                    rare,
+                })
+            });
+            (small_steps, side)
         };
         let grid = Self {
             ticks: new_ticks,
             base: self.base | Self::SMALL,
-            steps,
-            reductions: tick_grid(new_ticks),
+            small_steps,
             side,
         };
         let in_cycles = grid.in_cycles_for(new_period);
@@ -1492,12 +1622,22 @@ impl Place {
     }
 }
 
-/// Low 29 bits of [`Layer::period_denom_flags`] hold the small period denominator
-/// (`0` signals a rare large `i128` period stored inside `Steps::WithPeriod`).
-const LAYER_DENOM_MASK: u32 = (1 << 29) - 1;
-const LAYER_FLAG_IN_CYCLES: u32 = 1 << 29;
-const LAYER_FLAG_DATA: u32 = 1 << 30;
-const LAYER_FLAG_MAPS: u32 = 1 << 31;
+/// Low 13 bits of [`Layer::period_denom_flags`] hold the small period denominator
+/// (`0` signals a rare large period stored inside `Steps::WithPeriod`).
+const LAYER_DENOM_MASK: u16 = (1 << 13) - 1;
+const LAYER_FLAG_IN_CYCLES: u16 = 1 << 13;
+const LAYER_FLAG_DATA: u16 = 1 << 14;
+const LAYER_FLAG_MAPS: u16 = 1 << 15;
+
+/// Direct-read flags when a layer answers map reads straight from its inline
+/// `named_id`, `values`, and `dress.set_map` without allocating a `Table`.
+/// Bits 3..9 store the 6-bit bloom mark bit of `named_id` for zero-lookup
+/// bloom filtering in `seq_get` and `seq_position`.
+const LAYER_DIRECT_KEYED: u16 = 1 << 0;
+const LAYER_DIRECT_SPLIT: u16 = 1 << 1;
+const LAYER_DIRECT_MADE: u16 = 1 << 2;
+const LAYER_MARK_BIT_SHIFT: u32 = 3;
+const LAYER_MARK_BIT_MASK: u16 = 0x3f;
 
 /// One layer of a sequence node: the places of its steps, and each value
 /// of them once. Each hap holds a plain value and its locations: a fold
@@ -1509,16 +1649,19 @@ pub(crate) struct Layer {
     /// The value of each step, each once, before the name and the controls
     /// that the dress gives it.
     values: Arc<[Value]>,
-    /// The values as the dress makes them, made at the first read.
-    values_read: OnceLock<Arc<Table>>,
     /// What the folds on the layer give each hap. `None` for a layer that
-    /// no fold dressed. See [`Dress`].
+    /// no fold dressed (or only carries a built-in `named_id`). See [`Dress`].
     dress: Option<Arc<Dress>>,
     /// Numerator of a small rational period (when `period_denom_flags & LAYER_DENOM_MASK != 0`).
-    period_numer: i32,
-    /// Low 29 bits: period denominator (`0` means large period in `Steps::WithPeriod`).
+    period_numer: i16,
+    /// Low 13 bits: period denominator (`0` means large period in `Steps::WithPeriod`).
     /// Top 3 bits: `in_cycles`, `data`, and `maps` flags.
-    period_denom_flags: u32,
+    period_denom_flags: u16,
+    /// Built-in 1-based control id naming each value when read, or `0` when
+    /// unnamed or named by a custom control in `dress.tail.custom_named`.
+    named_id: u16,
+    /// Precomputed direct-keyed read flags (`LAYER_DIRECT_*`).
+    direct_flags: u16,
 }
 
 /// The values of a layer as its dress makes them.
@@ -1528,6 +1671,10 @@ enum Values<'a> {
     Held(&'a [Value]),
     /// The maps that read a table.
     Table(&'a Arc<Table>),
+    /// Direct maps backed by a direct-keyed layer in `Arc<[Layer]>`, with no `Table`.
+    SeqLayer(&'a Arc<[Layer]>, u16),
+    /// Direct-keyed layer read without an owning `Arc<[Layer]>` (build folds / tests).
+    DirectKeyed(&'a Layer),
 }
 
 /// What makes the haps of the steps of a layer: the list, the values as the
@@ -1575,12 +1722,28 @@ impl Values<'_> {
         match self {
             Self::Held(values) => values.get(index).cloned(),
             Self::Table(table) => table.map(index).map(Value::Object),
+            Self::SeqLayer(layers, layer_idx) => {
+                let layer = &layers[usize::from(*layer_idx)];
+                (index < layer.values.len()).then(|| {
+                    Value::Object(crate::OrderedMap::from_seq_layer(
+                        layers,
+                        *layer_idx,
+                        index as u32,
+                    ))
+                })
+            }
+            Self::DirectKeyed(layer) => (index < layer.values.len()).then(|| {
+                Value::Object(crate::OrderedMap::from_layout(
+                    layer.seq_layout(index as u32),
+                    layer.seq_is_made(),
+                ))
+            }),
         }
     }
 }
 // A layer is cloned by each fold: its steps stay behind a handle.
 const _: () = assert!(size_of::<Steps>() == 16);
-const _: () = assert!(size_of::<Layer>() == 64);
+const _: () = assert!(size_of::<Layer>() == 48);
 
 /// Pack a single `(begin, end)` range into a non-zero `u32` for [`Dress`]:
 /// `begin` in the high 20 bits and `length + 1` in the low 12 bits, leaving
@@ -1622,9 +1785,12 @@ struct DressTail {
 /// layers that a fold dresses alike share one: see [`redressed`].
 #[derive(Clone, Default)]
 struct Dress {
-    /// Undressed non-empty control map entries set on each value when read.
-    /// Rare empty-map or non-object set values live in `tail.set_other`.
-    set_map: Option<Arc<[(crate::Key, Value)]>>,
+    /// Undressed non-empty built-in control map entries set on each value when
+    /// read. Rare custom-key, >12-key, empty-map, or non-object set values live
+    /// in `tail.set_other`.
+    set_map: Option<Arc<dyn crate::value::BuiltinEntries>>,
+    /// Precomputed 63-bit key bloom marks for `set_map`.
+    set_marks: u64,
     /// The keys of the context of each hap (for example, `scale` or visual
     /// slots), kept inline so scaled and visualized layers avoid `DressTail`.
     keys: ContextKeys,
@@ -1632,11 +1798,8 @@ struct Dress {
     /// or spilled into `tail.before`.
     before_packed: [u32; 2],
     /// Rare spilled leading locations, trailing locations, custom names, and
-    /// non-map set values.
+    /// non-builtin or non-map set values.
     tail: Option<Box<DressTail>>,
-    /// Built-in 1-based control id naming each value when read, or `0` when
-    /// unnamed or named by a custom control in `tail.custom_named`.
-    named_id: u16,
 }
 
 const _: () = assert!(size_of::<Dress>() == 48);
@@ -1646,10 +1809,10 @@ static EMPTY_LOCATIONS: Locations = Locations::new();
 /// The dress of a layer that no fold dressed.
 static BARE: Dress = Dress {
     set_map: None,
+    set_marks: 0,
     keys: ContextKeys::NONE,
     before_packed: [0, 0],
     tail: None,
-    named_id: 0,
 };
 
 impl Dress {
@@ -1758,42 +1921,24 @@ impl Dress {
     }
 
     #[inline]
-    fn has_name(&self) -> bool {
-        self.named_id != 0
-            || self
-                .tail
-                .as_deref()
-                .is_some_and(|tail| tail.custom_named.is_some())
+    fn has_custom_name(&self) -> bool {
+        self.tail
+            .as_deref()
+            .is_some_and(|tail| tail.custom_named.is_some())
     }
 
     #[inline]
-    fn named(&self) -> Option<&[Arc<str>]> {
-        if self.named_id != 0 {
-            crate::controls::builtin_names_by_id(self.named_id).map(|names| &**names)
-        } else {
-            self.tail
-                .as_deref()
-                .and_then(|tail| tail.custom_named.as_deref())
-        }
+    fn custom_named(&self) -> Option<&[Arc<str>]> {
+        self.tail
+            .as_deref()
+            .and_then(|tail| tail.custom_named.as_deref())
     }
 
-    fn set_named(&mut self, id: u16, names: &Arc<[Arc<str>]>) {
-        if id != 0 {
-            self.named_id = id;
-            if let Some(tail) = &mut self.tail
-                && tail.custom_named.is_some()
-            {
-                tail.custom_named = None;
-                self.prune_tail();
-            }
-        } else {
-            self.named_id = 0;
-            self.tail.get_or_insert_with(Default::default).custom_named = Some(Arc::clone(names));
-        }
+    fn set_custom_named(&mut self, names: &Arc<[Arc<str>]>) {
+        self.tail.get_or_insert_with(Default::default).custom_named = Some(Arc::clone(names));
     }
 
-    fn clear_named(&mut self) {
-        self.named_id = 0;
+    fn clear_custom_named(&mut self) {
         if let Some(tail) = &mut self.tail
             && tail.custom_named.is_some()
         {
@@ -1822,8 +1967,26 @@ impl Dress {
                 .is_some_and(|tail| tail.set_other.is_some())
     }
 
+    #[inline(always)]
+    fn set_slice(&self) -> crate::value::Slice<'_> {
+        match &self.set_map {
+            Some(entries) => {
+                let (keys, values) = entries.parts();
+                crate::value::Slice::Builtin(keys, values)
+            }
+            None => crate::value::Slice::EMPTY,
+        }
+    }
+
+    fn set_map_builtin(&mut self, entries: Arc<dyn crate::value::BuiltinEntries>) {
+        let (keys, values) = entries.parts();
+        self.set_marks = crate::value::Slice::Builtin(keys, values).marks();
+        self.set_map = Some(entries);
+    }
+
     fn clear_set(&mut self) {
         self.set_map = None;
+        self.set_marks = 0;
         if let Some(tail) = &mut self.tail {
             tail.set_other = None;
             self.prune_tail();
@@ -1832,6 +1995,7 @@ impl Dress {
 
     fn assign_set(&mut self, value: Option<Value>) {
         self.set_map = None;
+        self.set_marks = 0;
         match value {
             None => {
                 if let Some(tail) = &mut self.tail {
@@ -1841,8 +2005,8 @@ impl Dress {
             }
             Some(Value::Object(map)) => {
                 let map = map.undressed();
-                if let Some(shares) = map.as_shares() {
-                    self.set_map = Some(Arc::clone(shares));
+                if let Some(entries) = map.as_builtin() {
+                    self.set_map_builtin(Arc::clone(entries));
                     if let Some(tail) = &mut self.tail {
                         tail.set_other = None;
                         self.prune_tail();
@@ -1859,9 +2023,9 @@ impl Dress {
     }
 
     fn set_value(&self) -> Option<Value> {
-        if let Some(shares) = &self.set_map {
-            Some(Value::Object(crate::value::OrderedMap::from_made_shares(
-                Arc::clone(shares),
+        if let Some(entries) = &self.set_map {
+            Some(Value::Object(crate::value::OrderedMap::from_made_builtin(
+                Arc::clone(entries),
             )))
         } else {
             self.tail.as_deref().and_then(|tail| tail.set_other.clone())
@@ -1869,8 +2033,8 @@ impl Dress {
     }
 
     fn compose_set_into(&self, target: &mut Value) {
-        if let Some(shares) = &self.set_map {
-            let other = crate::value::OrderedMap::from_made_shares(Arc::clone(shares));
+        if let Some(entries) = &self.set_map {
+            let other = crate::value::OrderedMap::from_made_builtin(Arc::clone(entries));
             if let Value::Object(map) = target
                 && !union_drops(&other)
             {
@@ -1925,15 +2089,16 @@ impl Dress {
     fn set_here(&mut self, control: &Value, context: Locations) {
         // The value side's locations come first.
         self.prepend_before(context);
-        if let Some(shares) = self.set_map.take() {
-            let mut map = crate::value::OrderedMap::from_made_shares(shares);
+        if let Some(entries) = self.set_map.take() {
+            self.set_marks = 0;
+            let mut map = crate::value::OrderedMap::from_made_builtin(entries);
             if let Value::Object(other) = control
                 && !union_drops(other)
             {
                 map.merge(other, |_, value| value.clone());
                 map.mark_made_of_data();
-                if let Some(new_shares) = map.as_shares() {
-                    self.set_map = Some(Arc::clone(new_shares));
+                if let Some(new_entries) = map.as_builtin() {
+                    self.set_map_builtin(Arc::clone(new_entries));
                 } else {
                     self.tail.get_or_insert_with(Default::default).set_other =
                         Some(Value::Object(map));
@@ -1960,7 +2125,7 @@ impl Dress {
 
     /// Whether the dress gives a hap nothing.
     fn is_bare(&self) -> bool {
-        !self.has_name()
+        !self.has_custom_name()
             && !self.has_set()
             && self.before_is_empty()
             && self.keys.is_empty()
@@ -1991,12 +2156,8 @@ impl Dress {
             (None, None) => true,
             _ => false,
         };
-        let same_named = match (self.named_id, other.named_id) {
-            (a, b) if a != 0 && b != 0 => a == b,
-            _ => self.named() == other.named(),
-        };
         same_set
-            && same_named
+            && self.custom_named() == other.custom_named()
             && self.keys.same(&other.keys)
             && self.same_before(other)
             && self.after() == other.after()
@@ -2047,7 +2208,10 @@ fn redressed<'a>(
                     dress
                 }
             };
-            layer.with(|layer| layer.dress = dress)
+            layer.with(|layer| {
+                layer.dress = dress;
+                layer.refresh_direct();
+            })
         })
         .collect()
 }
@@ -2208,16 +2372,17 @@ impl Layer {
         Self {
             steps,
             values,
-            values_read: OnceLock::new(),
             dress: None,
             period_numer,
             period_denom_flags: denom | flags,
+            named_id: 0,
+            direct_flags: 0,
         }
     }
 
     #[inline]
-    fn pack_period(period: Fraction, steps: Steps) -> (i32, u32, Steps) {
-        if let (Ok(n), Ok(d)) = (i32::try_from(period.numer()), u32::try_from(period.denom()))
+    fn pack_period(period: Fraction, steps: Steps) -> (i16, u16, Steps) {
+        if let (Ok(n), Ok(d)) = (i16::try_from(period.numer()), u16::try_from(period.denom()))
             && d != 0
             && d <= LAYER_DENOM_MASK
         {
@@ -2225,6 +2390,321 @@ impl Layer {
         } else {
             (0, 0, Steps::WithPeriod(Arc::new((period, steps))))
         }
+    }
+
+    #[inline(always)]
+    fn is_direct(&self) -> bool {
+        self.direct_flags & (LAYER_DIRECT_KEYED | LAYER_DIRECT_SPLIT) != 0
+    }
+
+    #[inline(always)]
+    fn is_direct_keyed(&self) -> bool {
+        self.direct_flags & LAYER_DIRECT_KEYED != 0
+    }
+
+    #[inline(always)]
+    fn seq_named_mark(&self) -> u64 {
+        1u64 << ((self.direct_flags >> LAYER_MARK_BIT_SHIFT) & LAYER_MARK_BIT_MASK)
+    }
+
+    #[inline(always)]
+    fn has_name(&self) -> bool {
+        self.named_id != 0 || self.dress.as_deref().is_some_and(Dress::has_custom_name)
+    }
+
+    #[inline]
+    fn named_names(&self) -> Option<&[Arc<str>]> {
+        if self.named_id != 0 {
+            crate::controls::builtin_names_by_id(self.named_id).map(|names| &**names)
+        } else {
+            self.dress.as_deref().and_then(Dress::custom_named)
+        }
+    }
+
+    /// Recompute direct-read flags and attach or strip the rare lazy
+    /// `Steps::Cached` cell whenever `steps`, `values`, `named_id`, or `dress`
+    /// changes.
+    fn refresh_direct(&mut self) {
+        let dress = self.dress();
+        let needs_values = self.has_name() || dress.has_set();
+        let spills = Self::spills_contexts(dress);
+        if !needs_values && !spills {
+            self.direct_flags = 0;
+            self.steps.strip_cache();
+            return;
+        }
+        if !spills
+            && !self.values.is_empty()
+            && u32::try_from(self.values.len()).is_ok()
+            && self.is_data()
+            && dress
+                .tail
+                .as_deref()
+                .is_none_or(|t| t.set_other.is_none() && t.custom_named.is_none())
+        {
+            if self.named_id != 0 {
+                if let (Some(names), Some(key_str)) = (
+                    crate::controls::builtin_names_by_id(self.named_id),
+                    crate::controls::builtin_name_str_by_id(self.named_id),
+                ) && self
+                    .values
+                    .iter()
+                    .all(|value| crate::controls::names_as_one_entry(names, value))
+                {
+                    let mark_bit = crate::controls::builtin_mark_bit_by_id(self.named_id);
+                    let key_mark = 1u64 << mark_bit;
+                    let tail_ok = match &dress.set_map {
+                        None => true,
+                        Some(entries) => {
+                            let (keys, vals) = entries.parts();
+                            let tail = crate::value::Slice::Builtin(keys, vals);
+                            let drops = keys.len() == 1
+                                && crate::controls::builtin_name_str_by_id(keys[0] & 0x03ff)
+                                    == Some("value")
+                                && !matches!(vals[0], Value::Undefined);
+                            let disjoint = dress.set_marks & key_mark == 0
+                                || tail.position_str(key_str).is_none();
+                            !drops && disjoint && tail.all_values_data()
+                        }
+                    };
+                    if tail_ok {
+                        self.direct_flags = LAYER_DIRECT_KEYED
+                            | if dress.set_map.is_some() {
+                                LAYER_DIRECT_MADE
+                            } else {
+                                0
+                            }
+                            | (u16::from(mark_bit) << LAYER_MARK_BIT_SHIFT);
+                        self.steps.strip_cache();
+                        return;
+                    }
+                }
+            } else if let Some(entries) = &dress.set_map {
+                let (keys, vals) = entries.parts();
+                let tail = crate::value::Slice::Builtin(keys, vals);
+                let drops = keys.len() == 1
+                    && crate::controls::builtin_name_str_by_id(keys[0] & 0x03ff) == Some("value")
+                    && !matches!(vals[0], Value::Undefined);
+                if !drops
+                    && tail.all_values_data()
+                    && self.values.iter().all(|value| {
+                        let Value::Object(map) = value else {
+                            return false;
+                        };
+                        map.as_flat_slice().is_some_and(|head| match head {
+                            crate::value::Slice::Plain(pairs) => !pairs.iter().any(|(k, _)| {
+                                dress.set_marks & Table::mark(k.as_str()) != 0
+                                    && tail.position_str(k.as_str()).is_some()
+                            }),
+                            crate::value::Slice::Builtin(hkeys, _) => !hkeys.iter().any(|&hk| {
+                                let hbit = hk >> 10;
+                                dress.set_marks & (1u64 << hbit) != 0 && keys.contains(&hk)
+                            }),
+                        })
+                    })
+                {
+                    self.direct_flags = LAYER_DIRECT_SPLIT | LAYER_DIRECT_MADE;
+                    self.steps.strip_cache();
+                    return;
+                }
+            }
+        }
+        self.direct_flags = 0;
+        self.steps.ensure_fresh_cache();
+    }
+
+    #[inline(always)]
+    pub(crate) fn seq_layout(&self, row: u32) -> crate::value::Layout<'_> {
+        let tail = self
+            .dress
+            .as_deref()
+            .map_or(crate::value::Slice::EMPTY, Dress::set_slice);
+        if self.is_direct_keyed() {
+            let key = crate::controls::builtin_key_ref_by_id(self.named_id)
+                .expect("direct-keyed layer has built-in control id");
+            return crate::value::Layout::Keyed(key, &self.values[row as usize], tail);
+        }
+        debug_assert!(self.direct_flags & LAYER_DIRECT_SPLIT != 0);
+        let Value::Object(map) = &self.values[row as usize] else {
+            unreachable!("direct-split layer holds object values");
+        };
+        let head = map
+            .as_flat_slice()
+            .expect("direct-split layer holds flat maps");
+        crate::value::Layout::Split(head, tail)
+    }
+
+    #[inline(always)]
+    pub(crate) fn seq_len(&self, row: u32) -> usize {
+        let tail_len = self
+            .dress
+            .as_deref()
+            .and_then(|dress| dress.set_map.as_ref())
+            .map_or(0, |entries| entries.parts().0.len());
+        if self.is_direct_keyed() {
+            return 1 + tail_len;
+        }
+        debug_assert!(self.direct_flags & LAYER_DIRECT_SPLIT != 0);
+        let Value::Object(map) = &self.values[row as usize] else {
+            unreachable!("direct-split layer holds object values");
+        };
+        map.as_flat_slice()
+            .expect("direct-split layer holds flat maps")
+            .len()
+            + tail_len
+    }
+
+    #[inline(always)]
+    pub(crate) fn seq_at(&self, row: u32, index: usize) -> (&crate::Key, &Value) {
+        let tail = self
+            .dress
+            .as_deref()
+            .map_or(crate::value::Slice::EMPTY, Dress::set_slice);
+        if self.is_direct_keyed() {
+            if index == 0 {
+                let key = crate::controls::builtin_key_ref_by_id(self.named_id)
+                    .expect("direct-keyed layer has built-in control id");
+                return (key, &self.values[row as usize]);
+            }
+            return tail.at(index - 1);
+        }
+        debug_assert!(self.direct_flags & LAYER_DIRECT_SPLIT != 0);
+        let Value::Object(map) = &self.values[row as usize] else {
+            unreachable!("direct-split layer holds object values");
+        };
+        let head = map
+            .as_flat_slice()
+            .expect("direct-split layer holds flat maps");
+        match index.checked_sub(head.len()) {
+            None => head.at(index),
+            Some(at) => tail.at(at),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn seq_marks(&self) -> u64 {
+        if self.is_direct_keyed() {
+            return self.seq_named_mark()
+                | self.dress.as_deref().map_or(0, |dress| dress.set_marks);
+        }
+        debug_assert!(self.direct_flags & LAYER_DIRECT_SPLIT != 0);
+        !0u64 >> 1
+    }
+
+    #[inline(always)]
+    pub(crate) fn seq_get(&self, row: u32, key: &str) -> Option<&Value> {
+        let want_bit = Table::mark_bit(key);
+        let want = 1u64 << want_bit;
+        if self.is_direct_keyed() {
+            let named_mark = self.seq_named_mark();
+            let (tail, tail_marks) = match self.dress.as_deref() {
+                Some(dress) => (dress.set_slice(), dress.set_marks),
+                None => (crate::value::Slice::EMPTY, 0),
+            };
+            if (named_mark | tail_marks) & want == 0 {
+                return None;
+            }
+            if named_mark == want
+                && crate::controls::builtin_name_str_by_id(self.named_id) == Some(key)
+            {
+                return Some(&self.values[row as usize]);
+            }
+            if tail_marks & want != 0 {
+                return tail.get_str(key);
+            }
+            return None;
+        }
+        debug_assert!(self.direct_flags & LAYER_DIRECT_SPLIT != 0);
+        let Value::Object(map) = &self.values[row as usize] else {
+            unreachable!("direct-split layer holds object values");
+        };
+        let head = map
+            .as_flat_slice()
+            .expect("direct-split layer holds flat maps");
+        if let Some(found) = head.get_str(key) {
+            return Some(found);
+        }
+        if let Some(dress) = self.dress.as_deref()
+            && dress.set_marks & want != 0
+        {
+            return dress.set_slice().get_str(key);
+        }
+        None
+    }
+
+    #[inline(always)]
+    pub(crate) fn seq_position(&self, row: u32, key: &str) -> Option<usize> {
+        let want_bit = Table::mark_bit(key);
+        let want = 1u64 << want_bit;
+        if self.is_direct_keyed() {
+            let named_mark = self.seq_named_mark();
+            let (tail, tail_marks) = match self.dress.as_deref() {
+                Some(dress) => (dress.set_slice(), dress.set_marks),
+                None => (crate::value::Slice::EMPTY, 0),
+            };
+            if (named_mark | tail_marks) & want == 0 {
+                return None;
+            }
+            if named_mark == want
+                && crate::controls::builtin_name_str_by_id(self.named_id) == Some(key)
+            {
+                return Some(0);
+            }
+            if tail_marks & want != 0 {
+                return tail.position_str(key).map(|at| at + 1);
+            }
+            return None;
+        }
+        debug_assert!(self.direct_flags & LAYER_DIRECT_SPLIT != 0);
+        let Value::Object(map) = &self.values[row as usize] else {
+            unreachable!("direct-split layer holds object values");
+        };
+        let head = map
+            .as_flat_slice()
+            .expect("direct-split layer holds flat maps");
+        if let Some(at) = head.position_str(key) {
+            return Some(at);
+        }
+        if let Some(dress) = self.dress.as_deref()
+            && dress.set_marks & want != 0
+        {
+            return dress
+                .set_slice()
+                .position_str(key)
+                .map(|at| head.len() + at);
+        }
+        None
+    }
+
+    #[inline(always)]
+    pub(crate) fn seq_has_uniform_keys(&self) -> bool {
+        self.is_direct_keyed()
+    }
+
+    #[inline(always)]
+    pub(crate) fn seq_is_made(&self) -> bool {
+        self.direct_flags & LAYER_DIRECT_MADE != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn seq_keyed_parts(&self) -> Option<crate::value::KeyedParts<'_>> {
+        if !self.is_direct_keyed() {
+            return None;
+        }
+        let key = crate::controls::builtin_key_ref_by_id(self.named_id)?;
+        let tail = self
+            .dress
+            .as_deref()
+            .map_or(crate::value::Slice::EMPTY, Dress::set_slice);
+        Some((key, &self.values, tail))
+    }
+
+    #[inline]
+    pub(crate) fn seq_tail_arc(&self) -> Option<Arc<[(crate::Key, Value)]>> {
+        self.dress.as_deref().and_then(|dress| {
+            let slice = dress.set_slice();
+            (!slice.is_empty()).then(|| slice.to_shares())
+        })
     }
 
     #[inline(always)]
@@ -2271,6 +2751,7 @@ impl Layer {
         self.period_numer = numer;
         self.period_denom_flags = denom | flags;
         self.steps = steps;
+        self.refresh_direct();
     }
 
     #[inline]
@@ -2281,6 +2762,7 @@ impl Layer {
             let period = self.period();
             self.steps = Steps::WithPeriod(Arc::new((period, steps)));
         }
+        self.refresh_direct();
     }
 
     #[inline]
@@ -2290,10 +2772,15 @@ impl Layer {
             Fraction::int(i128::from(self.period_numer))
         } else if denom != 0 {
             Fraction::new(i128::from(self.period_numer), i128::from(denom))
-        } else if let Steps::WithPeriod(pair) = &self.steps {
-            pair.0
         } else {
-            unreachable!("zero period denom requires Steps::WithPeriod")
+            let mut cur = &self.steps;
+            loop {
+                match cur {
+                    Steps::WithPeriod(pair) => return pair.0,
+                    Steps::Cached(pair) => cur = &pair.0,
+                    _ => unreachable!("zero period denom requires Steps::WithPeriod"),
+                }
+            }
         }
     }
 
@@ -2320,6 +2807,7 @@ impl Layer {
         };
         change(&mut dress);
         self.dress = (!dress.is_bare()).then(|| Arc::new(dress));
+        self.refresh_direct();
     }
 
     /// The list of the steps. A layer of a source makes it at the first
@@ -2343,7 +2831,9 @@ impl Layer {
                 debug_assert!(written.is_some(), "a source reads its period");
                 Listing::of(raws)
             }),
-            Steps::WithPeriod(_) => unreachable!("inner unwraps WithPeriod"),
+            Steps::WithPeriod(_) | Steps::Cached(_) => {
+                unreachable!("inner unwraps WithPeriod and Cached")
+            }
         }
     }
 
@@ -2352,7 +2842,9 @@ impl Layer {
         match self.steps.inner() {
             Steps::Listed(listing) => Some(listing),
             Steps::Source(sourced) => sourced.read.get(),
-            Steps::WithPeriod(_) => unreachable!("inner unwraps WithPeriod"),
+            Steps::WithPeriod(_) | Steps::Cached(_) => {
+                unreachable!("inner unwraps WithPeriod and Cached")
+            }
         }
     }
 
@@ -2400,11 +2892,11 @@ impl Layer {
         self.set_data(values.iter().all(|value| value.is_data(0)));
         self.set_maps(values.iter().all(|value| matches!(value, Value::Object(_))));
         self.values = values;
+        self.named_id = 0;
         self.change_dress(|dress| {
-            dress.clear_named();
+            dress.clear_custom_named();
             dress.clear_set();
         });
-        self.values_read = OnceLock::new();
         self
     }
 
@@ -2424,9 +2916,26 @@ impl Layer {
         } else {
             crate::controls::builtin_id_of_names(&spec.names)
         };
-        let mut layers = redressed(layers, |dress| dress.set_named(id, &spec.names));
+        if id != 0 {
+            let mut out = Vec::new();
+            for layer in layers {
+                let mut next = layer.clone();
+                next.named_id = id;
+                next.set_maps(true);
+                if next.dress.as_deref().is_some_and(Dress::has_custom_name) {
+                    next.change_dress(Dress::clear_custom_named);
+                } else {
+                    next.refresh_direct();
+                }
+                out.push(next);
+            }
+            return out;
+        }
+        let mut layers = redressed(layers, |dress| dress.set_custom_named(&spec.names));
         for layer in &mut layers {
+            layer.named_id = 0;
             layer.set_maps(true);
+            layer.refresh_direct();
         }
         layers
     }
@@ -2439,24 +2948,36 @@ impl Layer {
         } else {
             crate::controls::builtin_id_of_names(&spec.names)
         };
-        if let [layer] = layers {
-            if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
-                dress.set_named(id, &spec.names);
-            } else {
-                let mut dress = layer.dress().clone();
-                dress.set_named(id, &spec.names);
-                layer.dress = Some(Arc::new(dress));
+        if id != 0 {
+            for layer in layers {
+                layer.named_id = id;
+                layer.set_maps(true);
+                if layer.dress.as_deref().is_some_and(Dress::has_custom_name) {
+                    layer.change_dress(Dress::clear_custom_named);
+                } else {
+                    layer.refresh_direct();
+                }
             }
+            return;
+        }
+        if let [layer] = layers {
+            layer.named_id = 0;
             layer.set_maps(true);
-            layer.values_read = OnceLock::new();
+            if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
+                dress.set_custom_named(&spec.names);
+                layer.refresh_direct();
+            } else {
+                layer.change_dress(|dress| dress.set_custom_named(&spec.names));
+            }
             return;
         }
         let mut last: Option<(*const Dress, Arc<Dress>)> = None;
         for layer in layers {
+            layer.named_id = 0;
+            layer.set_maps(true);
             if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
-                dress.set_named(id, &spec.names);
-                layer.set_maps(true);
-                layer.values_read = OnceLock::new();
+                dress.set_custom_named(&spec.names);
+                layer.refresh_direct();
                 continue;
             }
             let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
@@ -2464,22 +2985,21 @@ impl Layer {
                 Some((seen, dress)) if *seen == from => Arc::clone(dress),
                 _ => {
                     let mut dress = layer.dress().clone();
-                    dress.set_named(id, &spec.names);
+                    dress.set_custom_named(&spec.names);
                     let dress = Arc::new(dress);
                     last = Some((from, Arc::clone(&dress)));
                     dress
                 }
             };
             layer.dress = Some(dress);
-            layer.set_maps(true);
-            layer.values_read = OnceLock::new();
+            layer.refresh_direct();
         }
     }
 
     /// Whether [`Self::named`] names the values of this layer: it holds no
     /// name and no control yet.
     fn takes_name(&self) -> bool {
-        !self.dress().has_name() && !self.dress().has_set()
+        !self.has_name() && !self.dress().has_set()
     }
 
     /// This layer where each value takes the keys of the one value of
@@ -2529,9 +3049,9 @@ impl Layer {
         map: &HapMapFn,
         note: &NoteFn,
         known_keys: Option<&ContextKeys>,
-        last_dress: &mut Option<(*const Dress, Arc<Dress>)>,
+        last_dress: &mut Option<(*const Dress, Option<Arc<Dress>>)>,
     ) -> Option<Self> {
-        let names = self.dress().named().filter(|_| !self.dress().has_set())?;
+        let names = self.named_names().filter(|_| !self.dress().has_set())?;
         let [name] = names else {
             return None;
         };
@@ -2556,9 +3076,10 @@ impl Layer {
             let notes: Vec<Value> = self.values.iter().map(renoted).collect::<Option<_>>()?;
             notes.into()
         };
+        let note_id = crate::controls::note_control_id();
         let from = self.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
         let dress = match last_dress {
-            Some((seen, dress)) if *seen == from => Arc::clone(dress),
+            Some((seen, dress)) if *seen == from => dress.clone(),
             _ => {
                 let keys = match known_keys {
                     Some(added) => {
@@ -2577,22 +3098,15 @@ impl Layer {
                     }
                 };
                 let mut next = self.dress().clone();
-                let note_id = crate::controls::note_control_id();
                 if note_id != 0 {
-                    next.named_id = note_id;
-                    if let Some(tail) = &mut next.tail
-                        && tail.custom_named.is_some()
-                    {
-                        tail.custom_named = None;
-                        next.prune_tail();
-                    }
+                    next.clear_custom_named();
                 } else {
-                    next.set_named(0, &crate::controls::note_names());
+                    next.set_custom_named(&crate::controls::note_names());
                 }
                 next.clear_set();
                 next.set_keys(keys);
-                let dress = Arc::new(next);
-                *last_dress = Some((from, Arc::clone(&dress)));
+                let dress = (!next.is_bare()).then(|| Arc::new(next));
+                *last_dress = Some((from, dress.clone()));
                 dress
             }
         };
@@ -2600,8 +3114,9 @@ impl Layer {
         layer.set_data(values.iter().all(|value| value.is_data(0)));
         layer.set_maps(true);
         layer.values = values;
-        layer.dress = Some(dress);
-        layer.values_read = OnceLock::new();
+        layer.named_id = note_id;
+        layer.dress = dress;
+        layer.refresh_direct();
         Some(layer)
     }
 
@@ -2625,7 +3140,6 @@ impl Layer {
     /// makes each value one time, at the first read.
     pub(crate) fn set_here(&mut self, control: &Value, context: Locations) {
         self.change_dress(|dress| Dress::set_here(dress, control, context));
-        self.values_read = OnceLock::new();
     }
 
     /// Whether each value is data only.
@@ -2706,9 +3220,9 @@ impl Layer {
     }
 
     /// What makes the haps of the steps of this layer, read once for a loop.
-    fn maker(&self) -> Maker<'_> {
+    fn maker<'a>(&'a self, owner: Option<(&'a Arc<[Layer]>, u16)>) -> Maker<'a> {
         let dress = self.dress();
-        let (values, contexts) = self.reader_and_contexts(dress);
+        let (values, contexts) = self.reader_and_contexts(dress, owner);
         Maker {
             listing: self.listing(),
             values,
@@ -2721,7 +3235,7 @@ impl Layer {
     /// The values of the steps, each once, with the name of their control
     /// and the controls that a chain of constants set.
     pub(crate) fn value(&self, index: usize) -> Option<Value> {
-        self.reader().get(index)
+        self.reader(None).get(index)
     }
 
     /// The values as the steps hold them, before the dress. The dress
@@ -2731,18 +3245,26 @@ impl Layer {
     }
 
     /// The values as the dress makes them, read once for a loop of steps.
-    fn reader(&self) -> Values<'_> {
-        self.reader_and_contexts(self.dress()).0
+    fn reader<'a>(&'a self, owner: Option<(&'a Arc<[Layer]>, u16)>) -> Values<'a> {
+        self.reader_and_contexts(self.dress(), owner).0
     }
 
-    fn reader_and_contexts<'a>(&'a self, dress: &Dress) -> (Values<'a>, Option<&'a [Locations]>) {
-        let needs_values = dress.has_name() || dress.has_set();
-        let needs_contexts = Self::spills_contexts(dress);
-        if !needs_values && !needs_contexts {
-            return (Values::Held(&self.values), None);
+    fn reader_and_contexts<'a>(
+        &'a self,
+        dress: &Dress,
+        owner: Option<(&'a Arc<[Layer]>, u16)>,
+    ) -> (Values<'a>, Option<&'a [Locations]>) {
+        if self.is_direct() {
+            let values = match owner {
+                Some((layers, layer_idx)) => Values::SeqLayer(layers, layer_idx),
+                None => Values::DirectKeyed(self),
+            };
+            return (values, None);
         }
-        let (view, contexts) = self
-            .values_read
+        let Some(cache) = self.steps.cache_cell() else {
+            return (Values::Held(&self.values), None);
+        };
+        let (view, contexts) = cache
             .get_or_init(|| self.read_values(dress))
             .as_layer_read();
         let values = match view {
@@ -2755,14 +3277,14 @@ impl Layer {
 
     /// [`Self::value`] of each step.
     pub(crate) fn each_value(&self) -> impl Iterator<Item = Value> + '_ {
-        let values = self.reader();
+        let values = self.reader(None);
         (0..self.values.len()).filter_map(move |index| values.get(index))
     }
 
     /// The values as `dress` makes them: one table that their maps read
     /// where that gives the same maps, else each value made on its own.
     fn read_values(&self, dress: &Dress) -> Arc<Table> {
-        let needs_values = dress.has_name() || dress.has_set();
+        let needs_values = self.has_name() || dress.has_set();
         let core = if !needs_values {
             LayerCachedValues::Held
         } else {
@@ -2772,7 +3294,7 @@ impl Layer {
                 Some(Value::Object(set)) if !union_drops(set) => Some(Some(set)),
                 Some(_) => None,
             };
-            let named = dress.named();
+            let named = self.named_names();
             let key = match named {
                 Some(names) => self
                     .values
@@ -2823,8 +3345,14 @@ impl Layer {
     /// layers hold them: the same values with the same name and the same
     /// controls set are the same, and no value is made to know it.
     pub(crate) fn same(&self, other: &Self, same_value: impl Fn(&Value, &Value) -> bool) -> bool {
+        let same_named = self.named_id == other.named_id
+            && (self.named_id != 0 || self.dress().custom_named() == other.dress().custom_named());
+        if !same_named {
+            return false;
+        }
         let same_dress = match (&self.dress, &other.dress) {
             (Some(a), Some(b)) if Arc::ptr_eq(a, b) => true,
+            (None, None) => true,
             _ => self.dress().same(other.dress(), &same_value),
         };
         if !same_dress || !self.same_period(other) {
@@ -2889,6 +3417,7 @@ impl Layer {
     fn push(
         &self,
         thread: &QueryThread,
+        owner: Option<(&Arc<[Layer]>, u16)>,
         turn: &Turn,
         span: TimeSpan,
         others: usize,
@@ -2896,7 +3425,8 @@ impl Layer {
     ) -> Result<(), SequenceStop> {
         if let Some(source) = self.source() {
             let held = out.len();
-            if let Some(pushed) = self.push_written(thread, source, turn, span, others, out) {
+            if let Some(pushed) = self.push_written(thread, owner, source, turn, span, others, out)
+            {
                 return pushed;
             }
             // The list of the steps answers a span that the source does
@@ -2907,7 +3437,7 @@ impl Layer {
         let places = match self.listing() {
             Listing::Places(listed) => &*listed.places,
             Listing::Grid(grid) => {
-                if let Some(pushed) = self.push_grid(thread, grid, turn, span, others, out) {
+                if let Some(pushed) = self.push_grid(thread, owner, grid, turn, span, others, out) {
                     return pushed;
                 }
                 // A turn past the range of ticks asks the places.
@@ -2948,7 +3478,7 @@ impl Layer {
             return Err(SequenceStop::Query);
         }
         out.reserve(met);
-        let maker = self.maker();
+        let maker = self.maker(owner);
         for (index, place) in places.iter().enumerate().skip(first).take(met) {
             let whole = TimeSpan::new(turn.moved(place.whole.begin)?, turn.moved(place.whole.end)?);
             let visible = match &place.part {
@@ -2965,9 +3495,11 @@ impl Layer {
     /// Push the haps of this layer in `turn`, as [`Self::push`] does, from
     /// the steps on a grid. The search compares ticks, and a time is made
     /// only for a hap. `None` for a turn that leaves the range of ticks.
+    #[allow(clippy::too_many_arguments)]
     fn push_grid(
         &self,
         thread: &QueryThread,
+        owner: Option<(&Arc<[Layer]>, u16)>,
         grid: &Grid,
         turn: &Turn,
         span: TimeSpan,
@@ -2977,8 +3509,9 @@ impl Layer {
         let (begin_low, begin_high) = grid.ticks_at(turn.begin)?;
         let (_end_low, end_high) = grid.ticks_at(turn.end)?;
         let instant = span.begin == span.end;
-        let (first, last_step) = match &grid.steps {
-            GridSteps::Small(steps) => {
+        let grid_steps = grid.steps_ref();
+        let (first, last_step) = match grid_steps {
+            GridStepsRef::Small(steps) => {
                 let (Some(first_step), Some(last_step_ref)) = (steps.first(), steps.last()) else {
                     return Some(Ok(()));
                 };
@@ -3005,7 +3538,7 @@ impl Layer {
                         .count();
                 (first, last_step)
             }
-            GridSteps::Wide(steps) => {
+            GridStepsRef::Wide(steps) => {
                 let (Some(first_step), Some(last_step_ref)) = (steps.first(), steps.last()) else {
                     return Some(Ok(()));
                 };
@@ -3067,10 +3600,10 @@ impl Layer {
             last = Some((tick, time));
             Ok(time)
         };
-        let maker = self.maker();
+        let maker = self.maker(owner);
         let pushed = (first..last_step).try_for_each(|index| {
-            let (step_begin, step_end, step_value) = match &grid.steps {
-                GridSteps::Small(steps) => {
+            let (step_begin, step_end, step_value) = match grid_steps {
+                GridStepsRef::Small(steps) => {
                     let s = steps[index];
                     (
                         u32::from(s.part_begin),
@@ -3078,7 +3611,7 @@ impl Layer {
                         u32::from(s.value),
                     )
                 }
-                GridSteps::Wide(steps) => {
+                GridStepsRef::Wide(steps) => {
                     let s = steps[index];
                     (s.part_begin, s.part_end, s.value)
                 }
@@ -3115,9 +3648,11 @@ impl Layer {
     /// Push the haps of the steps that `source` writes in `turn` of the
     /// period, for a query of `span`. `None` for a span that the source
     /// does not read.
+    #[allow(clippy::too_many_arguments)]
     fn push_written(
         &self,
         thread: &QueryThread,
+        owner: Option<(&Arc<[Layer]>, u16)>,
         source: &dyn StepSource,
         turn: &Turn,
         span: TimeSpan,
@@ -3138,7 +3673,7 @@ impl Layer {
             };
             let whole = TimeSpan::new(begin, end);
             let part = TimeSpan::new(begin.max(span.begin), end.min(span.end));
-            let values = values.get_or_insert_with(|| self.reader());
+            let values = values.get_or_insert_with(|| self.reader(owner));
             let value = values
                 .get(step.value as usize)
                 .expect("a step holds a value of its layer");
@@ -3600,6 +4135,8 @@ impl Turns {
 /// in turn, as a stack of them answers.
 fn query_layers(
     thread: &QueryThread,
+    owner: &Arc<[Layer]>,
+    offset: usize,
     layers: &[Layer],
     span: TimeSpan,
     from: usize,
@@ -3611,18 +4148,20 @@ fn query_layers(
     let mut turns = Turns::of(first.period(), span)?;
     if turns.indices.end.checked_sub(turns.indices.start) == Some(1) {
         let turn = turns.turn(turns.indices.start)?;
-        for layer in layers {
-            layer.push(thread, turn, span, from, out)?;
+        for (i, layer) in layers.iter().enumerate() {
+            let layer_ref = u16::try_from(offset + i).ok().map(|idx| (owner, idx));
+            layer.push(thread, layer_ref, turn, span, from, out)?;
         }
         return Ok(());
     }
-    for layer in layers {
+    for (i, layer) in layers.iter().enumerate() {
+        let layer_ref = u16::try_from(offset + i).ok().map(|idx| (owner, idx));
         for index in turns.indices.clone() {
             // The query of the node asked before the first turn.
             if index != turns.indices.start && thread.stop_requested() {
                 return Err(SequenceStop::Query);
             }
-            layer.push(thread, turns.turn(index)?, span, from, out)?;
+            layer.push(thread, layer_ref, turns.turn(index)?, span, from, out)?;
         }
     }
     Ok(())
@@ -3632,7 +4171,7 @@ fn query_layers(
 /// [`sequence`].
 pub(crate) fn query_sequence_onto(
     thread: &QueryThread,
-    layers: &[Layer],
+    layers: &Arc<[Layer]>,
     state: &State,
     out: &mut Vec<Hap>,
 ) {
@@ -3650,8 +4189,9 @@ pub(crate) fn query_sequence_onto(
         out.reserve(steps.min(MOST_ROOM));
     }
     let from = out.len();
-    for layers in layers.chunk_by(Layer::same_period) {
-        match query_layers(thread, layers, span, from, out) {
+    let mut offset = 0usize;
+    for chunk in layers.chunk_by(Layer::same_period) {
+        match query_layers(thread, layers, offset, chunk, span, from, out) {
             Ok(()) => {}
             Err(stop) => {
                 if matches!(stop, SequenceStop::Range) {
@@ -3663,6 +4203,7 @@ pub(crate) fn query_sequence_onto(
                 return;
             }
         }
+        offset += chunk.len();
     }
     let added = out.len() - from;
     if added > 0 {
@@ -3985,7 +4526,7 @@ pub(crate) fn is_bare(pattern: &Pattern) -> bool {
             layer.dress().keys().is_empty()
                 && layer.dress().locates_alone()
                 && match layer.listing() {
-                    Listing::Grid(grid) => grid.steps.has_no_locations(),
+                    Listing::Grid(grid) => grid.steps_ref().has_no_locations(),
                     listing => (0..listing.len()).all(|index| listing.locations(index).is_empty()),
                 }
         })
@@ -4144,7 +4685,7 @@ pub(crate) fn mapped_haps(pattern: &Pattern, map: &HapMapFn) -> Option<Pattern> 
 /// op, a function of its two values and nothing more.
 fn runs_at_the_build(apply: &Combine) -> bool {
     match apply {
-        Combine::Composed(_) | Combine::Sets(_) => true,
+        Combine::Composed(_) | Combine::SetMerged => true,
         Combine::With(closure) => is_op_closure(closure),
     }
 }
@@ -4258,7 +4799,7 @@ pub(crate) fn set_here(layers: &mut Arc<[Layer]>, control: &Value, context: Loca
         && let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut)
     {
         dress.set_here(control, context);
-        layer.values_read = OnceLock::new();
+        layer.refresh_direct();
         return;
     }
     // Layers that wore one dress wear one after.
@@ -4266,7 +4807,7 @@ pub(crate) fn set_here(layers: &mut Arc<[Layer]>, control: &Value, context: Loca
     for layer in layers {
         if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
             dress.set_here(control, context.clone());
-            layer.values_read = OnceLock::new();
+            layer.refresh_direct();
             continue;
         }
         let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
@@ -4282,7 +4823,7 @@ pub(crate) fn set_here(layers: &mut Arc<[Layer]>, control: &Value, context: Loca
             }
         };
         layer.dress = Some(dress);
-        layer.values_read = OnceLock::new();
+        layer.refresh_direct();
     }
 }
 
@@ -5406,15 +5947,6 @@ mod tests {
         assert_eq!(layers[0].held_values().len(), 3);
     }
 
-    /// The controls that the last meeting of `pattern` holds apart, when
-    /// `pattern` is a run of constants that ends with sets in a row.
-    fn sets_of(pattern: &Pattern) -> Option<&[Value]> {
-        let Node::Constants(node) = pattern.node_kind() else {
-            return None;
-        };
-        node.1.last()?.sets_controls()
-    }
-
     /// Sets of constant controls in a row on a pattern that is no sequence
     /// are one meeting of one node, and it answers as the applications one
     /// by one:
@@ -5476,7 +6008,6 @@ mod tests {
                 };
                 let (under, run) = (&node.0, &node.1);
                 assert_eq!(run.len(), 1, "{name}");
-                assert_eq!(sets_of(&joined).map(<[Value]>::len), Some(4), "{name}");
                 assert!(!matches!(under.node_kind(), Node::Constants(..)), "{name}");
                 assert_same_answers(&name, &joined, &unfolded(|| chain(base(&layers))));
                 // A row on a stack is one such meeting on the pattern of
@@ -5603,8 +6134,10 @@ mod tests {
                 .map(|(spec, call)| (spec, call.1))
                 .collect();
             let set = apply_chain(run(&layers), &calls);
-            let held = sets_of(&set).map(<[Value]>::len);
-            assert_eq!(held, Some(1 + row().len()), "{name}");
+            let Node::Constants(set_node) = set.node_kind() else {
+                panic!("{name} is no run of constants");
+            };
+            assert_eq!(set_node.1.len(), 1, "{name}");
             for (base_name, base) in bases {
                 for (chain_name, chain) in chains {
                     let name = format!("{chain_name} on {base_name} of {name}");
@@ -5880,7 +6413,6 @@ mod tests {
                         control.apply(&pattern, Some(located_value(0.5)))
                     })
                 };
-                assert!(sets_of(&chain()).is_none(), "{name}");
                 assert_same_answers(&name, &chain(), &unfolded(chain));
             }
         }
@@ -5917,7 +6449,6 @@ mod tests {
             };
             let run = &node.1;
             assert_eq!(run.len(), 1, "{name}");
-            assert!(sets_of(&patterns[1]).is_none(), "{name}");
         }
     }
 
@@ -5941,7 +6472,6 @@ mod tests {
             };
             let run = &node.1;
             assert_eq!(run.len(), 2, "{name}");
-            assert!(sets_of(&set).is_none(), "{name}");
             assert_same_answers(name, &set, &unfolded(chain));
         }
     }
@@ -6066,16 +6596,25 @@ mod tests {
             })
             .collect();
         let mut layer = Layer::new(frac((1, 1)), raws, values.into());
-        layer.change_dress(|dress| {
-            if let Some(names) = names {
-                let names: Arc<[Arc<str>]> = names.iter().map(|name| Arc::from(*name)).collect();
-                let id = crate::controls::builtin_id_of_names(&names);
-                dress.set_named(id, &names);
-            } else {
-                dress.clear_named();
-            }
-            dress.assign_set(set);
-        });
+        if let Some(names) = names {
+            let names: Arc<[Arc<str>]> = names.iter().map(|name| Arc::from(*name)).collect();
+            let id = crate::controls::builtin_id_of_names(&names);
+            layer.named_id = id;
+            layer.change_dress(|dress| {
+                if id == 0 {
+                    dress.set_custom_named(&names);
+                } else {
+                    dress.clear_custom_named();
+                }
+                dress.assign_set(set);
+            });
+        } else {
+            layer.named_id = 0;
+            layer.change_dress(|dress| {
+                dress.clear_custom_named();
+                dress.assign_set(set);
+            });
+        }
         layer
     }
 
@@ -6083,7 +6622,7 @@ mod tests {
     /// each value before the steps shared a table.
     fn made_plain(layer: &Layer) -> Vec<Value> {
         let dress = layer.dress();
-        let named = dress.named();
+        let named = layer.named_names();
         layer
             .values
             .iter()
@@ -6252,17 +6791,23 @@ mod tests {
         ];
         for (what, values, names, set, shared) in cases {
             let layer = dressed_layer(values, names, set);
-            let plain = made_plain(&layer);
+            let owner: Arc<[Layer]> = Arc::new([layer]);
+            let layer = &owner[0];
+            let plain = made_plain(layer);
             assert_eq!(layer.each_value().count(), plain.len(), "{what}: count");
             assert!(layer.value(plain.len()).is_none(), "{what}: past the end");
-            let read = layer.values_read.get().expect("the layer read its values");
-            assert_eq!(
-                matches!(read.as_layer_read(), (LayerReadView::Shared(_), None)),
-                shared,
-                "{what}: the form"
-            );
+            let is_shared = layer.is_direct()
+                || layer
+                    .steps
+                    .cache_cell()
+                    .and_then(OnceLock::get)
+                    .is_some_and(|read| {
+                        matches!(read.as_layer_read(), (LayerReadView::Shared(_), None))
+                    });
+            assert_eq!(is_shared, shared, "{what}: the form");
+            let reader = layer.reader(Some((&owner, 0)));
             for (index, plain) in plain.iter().enumerate() {
-                let Some(Value::Object(shared)) = layer.value(index) else {
+                let Some(Value::Object(shared)) = reader.get(index) else {
                     panic!("{what}: step {index} is no map");
                 };
                 let Value::Object(plain) = plain else {
@@ -6373,8 +6918,13 @@ mod tests {
                 _ => Some(&["n"]),
             };
             let layer = dressed_layer(values, names, Some(set));
-            assert!(matches!(layer.reader(), Values::Table(_)));
-            for (shared, plain) in layer.each_value().zip(made_plain(&layer)) {
+            let owner: Arc<[Layer]> = Arc::new([layer]);
+            let layer = &owner[0];
+            assert!(matches!(
+                layer.reader(Some((&owner, 0))),
+                Values::Table(_) | Values::SeqLayer(_, _)
+            ));
+            for (shared, plain) in layer.each_value().zip(made_plain(layer)) {
                 let (Value::Object(shared), Value::Object(plain)) = (shared, plain) else {
                     panic!("a step is no map");
                 };
@@ -6419,10 +6969,11 @@ mod tests {
 
     fn haps_of(layer: &Layer, span: (Fraction, Fraction)) -> Vec<String> {
         let mut out = Vec::new();
+        let owner: Arc<[Layer]> = Arc::new([layer.clone()]);
         crate::QUERY_THREAD.with(|thread| {
             query_sequence_onto(
                 thread,
-                std::slice::from_ref(layer),
+                &owner,
                 &State::new(TimeSpan::new(span.0, span.1)),
                 &mut out,
             );
@@ -6568,7 +7119,7 @@ mod tests {
         ];
         let layer = Layer::of(self::layer((1, 1), steps)).unwrap();
         let grid = grid_of(&layer);
-        assert_eq!(grid.steps.get(1).loc.0 & PackedLoc::SPARE, 0);
+        assert_eq!(grid.steps_ref().get(1).loc.0 & PackedLoc::SPARE, 0);
         assert_eq!(grid.locations(1).to_vec(), [(5_000_000, 5_000_003)]);
         assert_eq!(grid.locations(0).to_vec(), [(0, 100_000)]);
     }

@@ -536,6 +536,8 @@ pub fn set_value(left: &Value, right: &Value) -> Value {
 #[derive(Clone, Debug, Default)]
 pub struct ControlRegistry {
     specs: Vec<ControlSpec>,
+    keys: Vec<Key>,
+    mark_bits: Vec<u8>,
     aliases: BTreeMap<Arc<str>, usize>,
 }
 
@@ -551,6 +553,8 @@ impl ControlRegistry {
     ) {
         let spec = ControlSpec::new(names);
         let index = self.specs.len();
+        let key = spec.key();
+        let mark_bit = crate::value::Table::mark_bit(key.as_str());
         // Only `names[0]` becomes an accessor. The SECONDARY positional names
         // of a compound control are output keys, not entry points - `s` writes
         // `n` and `gain`, but `pat.n(…)` is the separately registered `n`
@@ -564,6 +568,8 @@ impl ControlRegistry {
             self.aliases.insert(alias.into(), index);
         }
         self.specs.push(spec);
+        self.keys.push(key);
+        self.mark_bits.push(mark_bit);
     }
 
     pub fn get(&self, name: &str) -> Option<&ControlSpec> {
@@ -628,11 +634,58 @@ pub fn default_control_registry() -> &'static ControlRegistry {
     &REGISTRY
 }
 
+const _: () = assert!(crate::controls_generated::CONTROL_NAMES.len() < 1024);
+
 /// Built-in [`ControlSpec`] for a non-zero 1-based registry id.
 #[inline]
 pub(crate) fn builtin_spec_by_id(id: u16) -> Option<&'static ControlSpec> {
     let index = usize::from(id.checked_sub(1)?);
     default_control_registry().specs.get(index)
+}
+
+/// Built-in canonical control name `&'static str` for a non-zero 1-based id,
+/// reading the compile-time catalog table directly with zero `LazyLock` overhead.
+#[inline(always)]
+pub(crate) fn builtin_name_str_by_id(id: u16) -> Option<&'static str> {
+    let index = usize::from(id.checked_sub(1)?);
+    crate::controls_generated::CONTROL_NAMES
+        .get(index)
+        .and_then(|c| c.names.first().copied())
+}
+
+/// Pack a built-in canonical key name into a non-zero `u16`: low 10 bits hold
+/// the 1-based control id (`1..1024`) and high 6 bits hold `Table::mark_bit`.
+/// Returns `0` for non-built-in or alias names.
+#[inline]
+pub(crate) fn pack_builtin_key_str(name: &str) -> u16 {
+    let Some(spec) = default_control_registry().get(name) else {
+        return 0;
+    };
+    if spec.id == 0 || spec.id >= 1024 || spec.names.first().map(|s| &**s) != Some(name) {
+        return 0;
+    }
+    let bit = crate::value::Table::mark_bit(name);
+    spec.id | (u16::from(bit) << 10)
+}
+
+/// Built-in canonical [`Key`] reference for a non-zero 1-based registry id.
+#[inline]
+pub(crate) fn builtin_key_ref_by_id(id: u16) -> Option<&'static Key> {
+    let index = usize::from(id.checked_sub(1)?);
+    default_control_registry().keys.get(index)
+}
+
+/// Precomputed key bloom bit index (`0..63`) for a non-zero 1-based registry id.
+#[inline]
+pub(crate) fn builtin_mark_bit_by_id(id: u16) -> u8 {
+    let Some(index) = id.checked_sub(1).map(usize::from) else {
+        return 0;
+    };
+    default_control_registry()
+        .mark_bits
+        .get(index)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Built-in control names for a non-zero 1-based registry id.

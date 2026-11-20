@@ -697,11 +697,25 @@ impl Wave {
                     times += 1;
                     &node.0
                 }
+                Node::FastSmall(pat, numer, denom, _) if *numer > 0 => {
+                    let factor = Fraction::new(i128::from(*numer), i128::from(*denom));
+                    cycles_kept &= factor.numer() == 1;
+                    time(WaveTime::fast(factor)?);
+                    times += 1;
+                    pat
+                }
                 Node::Shift(node) => {
                     cycles_kept &= node.1.denom() == 1;
                     time(WaveTime::late(node.1)?);
                     times += 1;
                     &node.0
+                }
+                Node::ShiftSmall(pat, numer, denom, _) => {
+                    let offset = Fraction::new(i128::from(*numer), i128::from(*denom));
+                    cycles_kept &= offset.denom() == 1;
+                    time(WaveTime::late(offset)?);
+                    times += 1;
+                    pat
                 }
                 // A run of numbers, the last application first.
                 Node::Constants(node) => {
