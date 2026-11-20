@@ -9595,7 +9595,15 @@ fn a_bpm_helper_survives_hydra_and_a_prebake_names_its_line() {
         "check",
         "--no-samples",
         "-e",
-        "await initHydra()\nwindow.bpm = b => setcpm(b / 4)\n$: s(\"bd\")",
+        "await initHydra()\nwindow.bpm = b => setcpm(b / 4)\nwindow.bpm(120)\n$: s(\"bd\")",
+    ]);
+    assert!(checked.contains("no issues found"), "{checked}");
+    // A number written after the helper is what a read gives back.
+    let checked = ok_stdout(&[
+        "check",
+        "--no-samples",
+        "-e",
+        "await initHydra()\nwindow.bpm = b => 0\nwindow.bpm = 120\nif (window.bpm !== 120) throw new Error('stale')\n$: s(\"bd\")",
     ]);
     assert!(checked.contains("no issues found"), "{checked}");
 

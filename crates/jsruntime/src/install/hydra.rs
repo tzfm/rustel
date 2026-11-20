@@ -1286,6 +1286,9 @@ fn install_setting<'js>(
             .ok_or_else(|| {
                 throw_type_error(&ctx, &format!("Hydra's {name} takes a finite number"))
             })?;
+        // A read gives back the last write, a number after a helper too.
+        let assigned: rquickjs::Object = state(&ctx)?.get(ASSIGNED)?;
+        assigned.set(name, value)?;
         push_statement(
             &ctx,
             &transaction,
