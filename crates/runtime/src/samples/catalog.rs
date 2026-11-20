@@ -834,14 +834,18 @@ impl SampleLibrary {
                 .expect("global source rows")
                 .refuse(generation, GlobalKind::Folder, &error);
         }
-        if !packs.is_empty()
-            && let Err(error) = self.register_global_packs(&packs, generation)
-        {
-            self.shared
-                .global_rows
-                .lock()
-                .expect("global source rows")
-                .refuse(generation, GlobalKind::Pack, &error);
+        if !packs.is_empty() {
+            let registered = self.register_global_packs(&packs, generation);
+            let mut rows = self.shared.global_rows.lock().expect("global source rows");
+            match registered {
+                // Only the rows that would not read fail; the rest fetch.
+                Ok(failed) => {
+                    for (row, error) in failed {
+                        rows.fail_row(generation, row, &error);
+                    }
+                }
+                Err(error) => rows.refuse(generation, GlobalKind::Pack, &error),
+            }
         }
         self.global_source_reports()
     }
@@ -971,11 +975,15 @@ impl SampleLibrary {
     /// `--allow-sample-origin` for a score from another author. Each pack's
     /// origin is allowed, in addition to the sources a score gets.
     /// A pack's `_base` can then point at a CDN, as a score's imports can.
+    /// Fetch the packs of an adoption. A spec that will not read or is not
+    /// permitted fails its own row, given back with the reason; the others
+    /// are fetched. `Err` is the queue's own refusal, which leaves every
+    /// pack row unfilled.
     fn register_global_packs(
         &self,
         packs: &[(usize, String)],
         generation: u64,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<(usize, String)>, String> {
         let mut access = self
             .shared
             .import_policy
@@ -988,27 +996,33 @@ impl SampleLibrary {
                 access
             });
         let mut effects = Vec::with_capacity(packs.len());
-        for (_, spec) in packs {
-            let SampleSource::Url(url) = read_source(spec, "") else {
-                return Err(format!("{spec}: not a URL source"));
-            };
-            let origin = Url::parse(&url)
-                .map_err(|error| format!("{spec}: invalid sample source: {error}"))?
-                .origin()
-                .ascii_serialization();
-            access.permit_source(&origin)?;
-            effects.push((
-                serde_json::to_string(spec).map_err(|error| error.to_string())?,
-                None,
-            ));
+        let mut failed = Vec::new();
+        for (row, spec) in packs {
+            let checked = (|| {
+                let SampleSource::Url(url) = read_source(spec, "") else {
+                    return Err(format!("{spec}: not a URL source"));
+                };
+                let origin = Url::parse(&url)
+                    .map_err(|error| format!("{spec}: invalid sample source: {error}"))?
+                    .origin()
+                    .ascii_serialization();
+                access.permit_source(&origin)?;
+                serde_json::to_string(spec).map_err(|error| error.to_string())
+            })();
+            match checked {
+                Ok(effect) => effects.push((effect, None)),
+                Err(error) => failed.push((*row, error)),
+            }
         }
-        self.register_batch_async_into(
-            BankLayer::Global { generation },
-            effects,
-            &[],
-            ManifestAccess::Score(access),
-        )
-        .map(|_| ())
+        if !effects.is_empty() {
+            self.register_batch_async_into(
+                BankLayer::Global { generation },
+                effects,
+                &[],
+                ManifestAccess::Score(access),
+            )?;
+        }
+        Ok(failed)
     }
 
     /// Forget a pack's cached list, so the next adoption asks for it again
@@ -2594,6 +2608,58 @@ mod tests {
         assert_eq!(grant(kept), after.approve_remote(kept).unwrap().1);
         let pack = grant(&format!("{origin}/p.wav"));
         assert!(matches!(pack, ScoreFetchAccess::Remote { .. }), "{pack:?}");
+    }
+
+    /// One spec that will not read fails its own row: the pack beside it
+    /// still loads and keeps its count.
+    #[test]
+    fn one_bad_source_fails_only_its_own_row() {
+        use crate::samples::manifest_worker_tests::drain_request;
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind server");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let body = format!(r#"{{"_base":"{origin}/","pack":"p.wav"}}"#);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut stream = drain_request(stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write response");
+        });
+        let library = SampleLibrary::empty();
+        let good = format!("{origin}/one-bad-{}.json", std::process::id());
+        let reports = library.adopt_global_sources_settled(&[
+            GlobalSource {
+                spec: good.clone(),
+                enabled: true,
+            },
+            GlobalSource {
+                spec: "zzz".into(),
+                enabled: true,
+            },
+        ]);
+        // The server is not joined: a fetch that never comes would hang it.
+        drop(server);
+        assert!(library.knows("pack"), "{reports:?}");
+        let state = |spec: &str| {
+            reports
+                .iter()
+                .find(|report| report.spec == spec)
+                .map(|report| report.state.clone())
+                .expect("a row")
+        };
+        assert!(
+            matches!(state(&good), GlobalSourceState::Ready { banks: 1 }),
+            "{reports:?}"
+        );
+        assert!(
+            matches!(state("zzz"), GlobalSourceState::Failed(ref why) if why.starts_with("zzz:")),
+            "{reports:?}"
+        );
     }
 
     /// A registration that was on its way under the policy before a source
