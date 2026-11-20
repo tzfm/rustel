@@ -279,8 +279,9 @@ in a prebake shares all its names with every score in the set.
 The script runs in the score sandbox, with the limits of a prebake. A helper
 that needs a browser page does not work. [KabelSalat graphs](kabelsalat.md)
 run through `K` or `worklet`; graph node names are local to the graph. Studio does not
-check a score with an import for unknown function names: the script defines
-names Studio does not read before the script runs. See
+check a score with an import, or a score in a set where another scene has
+one, for unknown function names: the script defines names Studio does not read
+before the script runs. See
 [Script imports](../SECURITY.md#script-imports) for the security rules.
 
 ### Samples and media
