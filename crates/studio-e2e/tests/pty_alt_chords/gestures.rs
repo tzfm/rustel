@@ -114,9 +114,19 @@ fn sgr_drag_replaces_only_the_selected_source() {
         screen.contains("DRAG_TOKEN")
     });
     let (x, y) = position(&screen, "DRAG_TOKEN");
+    // The other gestures follow a key round trip. Do one here too: a
+    // Windows console can drop a gesture sent as the first input.
+    terminal.write(b"\x1b[F"); // End moves the caret past "after".
+    wait_for_screen(&terminal, REPAINT_BUDGET, "caret at line end", |screen| {
+        screen.contains(" 1,27 ")
+    });
+    let end = x + "DRAG_TOKEN".len();
     mouse(&mut terminal, 0, x, y, false);
-    mouse(&mut terminal, 32, x + "DRAG_TOKEN".len(), y, false);
-    mouse(&mut terminal, 0, x + "DRAG_TOKEN".len(), y, true);
+    mouse(&mut terminal, 32, end, y, false);
+    mouse(&mut terminal, 0, end, y, true);
+    wait_for_screen(&terminal, REPAINT_BUDGET, "caret at drag end", |screen| {
+        screen.contains(&format!(" 1,{} ", end - 4))
+    });
     terminal.write(b"replacement\x13"); // Ctrl+S saves the resulting selection edit.
     wait_for_saved(
         &terminal,
