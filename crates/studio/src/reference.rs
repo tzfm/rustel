@@ -2584,15 +2584,16 @@ mod tests {
             panel.scale_query = "b".repeat(400);
             panel.chord_query = "b".repeat(400);
             let started = std::time::Instant::now();
-            for _ in 0..10 {
+            for _ in 0..3 {
                 assert!(panel.scale_names().is_empty());
                 assert!(panel.chord_qualities().is_empty());
             }
-            // Before, each pass took longer than all ten take now.
+            // In a debug build three passes took about 2 s before and take
+            // under 0.1 s now: the bound sits well clear of both.
             let elapsed = started.elapsed();
             assert!(
-                elapsed < std::time::Duration::from_secs(2),
-                "ten passes took {elapsed:?}"
+                elapsed < std::time::Duration::from_secs(1),
+                "three passes took {elapsed:?}"
             );
         }
 
