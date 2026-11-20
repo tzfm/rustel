@@ -33,8 +33,16 @@ impl KabelState {
         };
         let out = self.graph.process([f64::from(input); 2], gate, self.time);
         self.time += 1.0 / sample_rate;
-        (out[0] as f32, out[1] as f32)
+        (silent_unless_finite(out[0]), silent_unless_finite(out[1]))
     }
+}
+
+/// A graph sample as the engine's `f32`. The graph already silences what is
+/// not finite in `f64`, but a value past `f32::MAX` becomes infinite here,
+/// and that is silenced too.
+fn silent_unless_finite(sample: f64) -> f32 {
+    let sample = sample as f32;
+    if sample.is_finite() { sample } else { 0.0 }
 }
 
 /// Whether a pooled graph can run `program` at `sample_rate`. A graph keeps
@@ -453,6 +461,14 @@ impl ScalarBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A value past the `f32` range is silent, as a nonfinite one is.
+    #[test]
+    fn a_sample_past_the_f32_range_is_silent() {
+        assert_eq!(silent_unless_finite(1e308), 0.0);
+        assert_eq!(silent_unless_finite(-1e308), 0.0);
+        assert_eq!(silent_unless_finite(0.5), 0.5);
+    }
     mod kabel_capacity_tests {
         use super::*;
 
