@@ -25,6 +25,7 @@ impl super::StudioEngine {
             self.link = None;
             self.link_playing_sent = None;
             self.update_pattern_tempo();
+            self.return_to_score_tempo();
             return Ok(());
         }
         if self.clock_in.is_some() {
