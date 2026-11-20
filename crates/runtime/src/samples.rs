@@ -697,6 +697,17 @@ impl GlobalRows {
         }
     }
 
+    /// One row of this adoption would not read: it says why, and the others
+    /// go on.
+    fn fail_row(&mut self, generation: u64, row: usize, why: &str) {
+        if generation != self.generation {
+            return;
+        }
+        for slot in self.slots.iter_mut().filter(|slot| slot.row == row) {
+            slot.stage = RowStage::Failed(why.to_owned());
+        }
+    }
+
     /// A local file is gone. No row names it any more, and a walk that
     /// lists a folder at this moment lists it again.
     fn file_deleted(&mut self, url: &str) {
