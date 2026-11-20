@@ -9586,6 +9586,34 @@ fn a_replay_save_that_never_reached_the_score_is_reported_not_announced() {
     }
 }
 
+/// A `.dict()` name nothing registered is an error of the query, as on
+/// strudel.cc, not a lane that plays silence; a known name and a score's
+/// own `addVoicings` name still voice the chord.
+#[test]
+fn an_unknown_voicing_dictionary_is_an_error() {
+    assert_reported_failure(
+        &[
+            "query",
+            "-e",
+            r#"chord("Cm7").dict("lefthnd").anchor(70).voicing()"#,
+        ],
+        "unknown voicing dictionary \"lefthnd\"",
+    );
+    for score in [
+        r#"chord("Cm7").dict("lefthand").anchor(70).voicing()"#,
+        "addVoicings('mine', {m7: ['3m 7m']}, ['C3','C6']); chord('Cm7').dict('mine').voicing()",
+    ] {
+        let out = ok_stdout(&["query", "-e", score, "--plain"]);
+        let events: usize = out
+            .lines()
+            .rev()
+            .find_map(|line| line.split_once(" events").map(|(count, _)| count.trim()))
+            .and_then(|count| count.parse().ok())
+            .expect("an event count");
+        assert!(events > 0, "{score}: {out}");
+    }
+}
+
 /// `check` and `query` run a prebake first, as `play` does, so a score that
 /// calls one of its helpers is clean and lists its events.
 #[test]
@@ -9652,4 +9680,42 @@ fn a_kabelsalat_overflow_is_silent_on_both_channels() {
             .count();
         assert_eq!(loud, 0, "{expression}: {loud} samples are not silent");
     }
+}
+
+/// The documented second argument of a distortion is its volume: it reaches
+/// the event as `distortvol`, patterned too, and the one-argument form keeps
+/// volume 1.
+#[test]
+fn a_distortion_takes_its_volume_as_a_second_argument() {
+    let volumes = |score: &str| -> Vec<f64> {
+        let out = ok_stdout(&["query", "-e", score, "--end", "2", "-j"]);
+        let report: serde_json::Value = serde_json::from_str(&out).expect("query report");
+        report["haps"]
+            .as_array()
+            .expect("haps")
+            .iter()
+            .map(|hap| hap["value"]["distortvol"].as_f64().expect("distortvol"))
+            .collect()
+    };
+    assert_eq!(
+        volumes(r#"note("c2").s("triangle").asym(.5, .3)"#),
+        [0.3, 0.3]
+    );
+    assert_eq!(
+        volumes(r#"note("c2").s("triangle").diode(2, "<.5 .25>")"#),
+        [0.5, 0.25]
+    );
+    assert_eq!(volumes(r#"note("c2").s("triangle").fold(.5)"#), [1.0, 1.0]);
+    assert_eq!(
+        volumes(r#"note("c2").s("triangle").asym(".9:.5")"#),
+        [0.5, 0.5]
+    );
+    // A signal is read at each note, and the second argument wins over a pair.
+    let sawed = volumes(r#"note("c2*4").s("triangle").asym(.5, saw.range(.2, .6))"#);
+    assert_eq!(sawed.len(), 8);
+    assert!(sawed[0] < sawed[1] && sawed[1] < sawed[2], "{sawed:?}");
+    assert_eq!(
+        volumes(r#"note("c2").s("triangle").asym(".9:.5", .3)"#),
+        [0.3, 0.3]
+    );
 }
