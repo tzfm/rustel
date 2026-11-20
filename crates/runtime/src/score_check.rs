@@ -67,6 +67,24 @@ pub fn check_score(
     session: &mut Session,
     cancellation: &AtomicBool,
 ) -> ScoreCheck {
+    check_score_with(
+        source,
+        library,
+        session,
+        cancellation,
+        &lint::LintContext::default(),
+    )
+}
+
+/// [`check_score`] after a setup: `context` holds the names the setup
+/// defined, which the session has already evaluated.
+pub fn check_score_with(
+    source: &str,
+    library: Option<&SampleLibrary>,
+    session: &mut Session,
+    cancellation: &AtomicBool,
+    context: &lint::LintContext,
+) -> ScoreCheck {
     let mut eval_error = session
         .evaluate_no_fallback_cancellable(source, cancellation)
         .err()
@@ -92,7 +110,7 @@ pub fn check_score(
     }
     // Evaluation queues imports under the session's existing sample grants.
     // The linter judges only the sources the loader has finished publishing.
-    let diagnostics = lint::lint(source, false, library);
+    let diagnostics = lint::lint_with(source, false, library, context);
     if eval_error.is_none() && cancellation.load(Ordering::Relaxed) {
         eval_error = Some(EvalError {
             message: RuntimeError::Cancelled.to_string(),

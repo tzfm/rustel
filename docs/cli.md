@@ -127,6 +127,8 @@ rustel bench song.strudel
 `query` prints pattern events; JSON uses exact fractions. Query errors and
 refused sample imports return a failure status. A score must end on a pattern
 or collect patterns with `$:`. A definition-only `register(...)` is valid setup.
+`--prebake setup.js` runs a setup before the score in both, as for `play`, so
+a helper it defines is not reported as an unknown function.
 
 `validate`, `bench`, and `trace` provide validation, timing, and scheduling
 reports. Use their `--help` for options. `trace` gives no sound without
