@@ -114,8 +114,14 @@ impl App {
                 .current_mut()
                 .editor
                 .dispatch(command, moment, &mut *self.clipboard);
+        // A client's keys use normal editing even with Vim on: Normal mode's
+        // caret rule would step back onto each character a client types at
+        // the end of a line, and the next would go in before it.
+        let remote = self.remote_key_event;
         let outcome = outcome.and_then(|effects| {
-            self.scenes.current_mut().editor.normalize_after_input()?;
+            if !remote {
+                self.scenes.current_mut().editor.normalize_after_input()?;
+            }
             Ok(effects)
         });
         match outcome {
@@ -520,6 +526,34 @@ mod tests {
                 app.theme.caret_shape(CaretShape::BlinkingBlock),
                 "Default keeps the theme's shape"
             );
+        }
+
+        /// A client's keys use normal editing with Vim on: what it types at the
+        /// end of a line arrives in order, as with Default editing.
+        #[test]
+        fn a_client_types_in_order_with_vim_on() {
+            use crate::app::tests::support::plain_app;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ab\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            // At the end of the line, where Normal's caret rule steps back.
+            app.editor_mut()
+                .set_selection(crate::editor::Selection::caret(crate::editor::ByteOffset(
+                    2,
+                )))
+                .expect("caret");
+            for character in "/qq $: s".chars() {
+                app.remote_key_event = true;
+                let outcome = app.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                )));
+                app.remote_key_event = false;
+                outcome.expect("a client key");
+            }
+            let source = app.editor().source();
+            assert_eq!(source.lines().next(), Some("ab/qq $: s"), "{source}");
         }
 
         /// A rendered control is one block: the caret warps over it instead of

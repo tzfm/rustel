@@ -15,6 +15,7 @@
 - Fixed: a slider move is written to the session tape once it settles, so a replay plays it.
 - `samples('local:kits/q.json')` reads a sample map file in the granted folder, as a URL does. Its entries are relative to the file's folder and stay inside the grant.
 - Fixed: an export of N cycles with a `cps` pattern lane lasts N cycles at the tempo the lane sets, in `rustel export --cycles` and the Studio export sheet.
+- Fixed: with Vim editor keys on, text a remote client types arrives in order, as the docs say, instead of each character going in before the last.
 - Fixed: the events pane uses the theme's palette so monochrome themes stay monochrome. In Vim mode, `ip` and `ap` select paragraphs, `.` repeats the last change, and Ctrl+[ steps to the previous scene from Normal mode.
 - Fixed: `up` with values that name no controls, such as `up("7 12")` or `up(7)`, keeps the controls of the events underneath instead of replacing each event.
 - Fixed: a visuals dock moved from a side to the top or bottom starts at the band's own size, so it no longer vanishes beside the mixer; a dock with no room says the keys go to the score.
