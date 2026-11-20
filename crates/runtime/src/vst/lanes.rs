@@ -14,7 +14,7 @@ use crate::PREVIEW_DOCUMENT;
 #[derive(Clone)]
 enum LaneBody {
     Owned(String),
-    Slice(std::sync::Arc<str>, usize, usize),
+    Slice(std::sync::Arc<str>, u32, u32),
 }
 
 impl LaneBody {
@@ -22,7 +22,7 @@ impl LaneBody {
     fn as_str(&self) -> &str {
         match self {
             Self::Owned(s) => s,
-            Self::Slice(source, start, end) => &source[*start..*end],
+            Self::Slice(source, start, end) => &source[*start as usize..*end as usize],
         }
     }
 
@@ -33,10 +33,15 @@ impl LaneBody {
             let trimmed = source.trim();
             if owned.as_str() == trimmed {
                 let start = trimmed.as_ptr() as usize - source.as_ptr() as usize;
-                *self = Self::Slice(std::sync::Arc::clone(source), start, start + trimmed.len());
+                let end = start + trimmed.len();
+                if let (Ok(s), Ok(e)) = (u32::try_from(start), u32::try_from(end)) {
+                    *self = Self::Slice(std::sync::Arc::clone(source), s, e);
+                }
             } else if let Some(start) = source.find(owned.as_str()) {
                 let end = start + owned.len();
-                *self = Self::Slice(std::sync::Arc::clone(source), start, end);
+                if let (Ok(s), Ok(e)) = (u32::try_from(start), u32::try_from(end)) {
+                    *self = Self::Slice(std::sync::Arc::clone(source), s, e);
+                }
             }
         }
     }
@@ -47,13 +52,13 @@ impl LaneBody {
 struct Lane {
     /// The number stays while an edit keeps the lane in the text.
     number: u64,
-    label: String,
+    label: rustel_core::value::SharedStr,
     body: LaneBody,
     /// The line of the label, counted from 1. With no label, the line where
     /// the body starts.
-    line: usize,
+    line: u32,
     /// The plugin name of each call in the body: see [`body_plugin_names`].
-    plugins: Vec<String>,
+    plugins: Box<[String]>,
 }
 
 /// Inline-optimized lane list: stores zero or one lane without a heap
@@ -129,7 +134,7 @@ impl ScoreLanes {
             (
                 lane.number,
                 lane.label.as_str(),
-                lane.line,
+                lane.line as usize,
                 &lane.plugins[..],
             )
         })
@@ -319,10 +324,10 @@ impl LaneTable {
                 self.next += 1;
                 self.next - 1
             }),
-            plugins: body_plugin_names(&statement.body),
-            label: statement.label,
+            plugins: body_plugin_names(&statement.body).into_boxed_slice(),
+            label: rustel_core::value::SharedStr::from(statement.label),
             body: LaneBody::Owned(statement.body),
-            line: statement.line,
+            line: u32::try_from(statement.line).unwrap_or(u32::MAX),
         };
         let lanes =
             LaneList::from_iter_exact(statements.into_iter().zip(paired.iter().copied()).map(lane));
@@ -663,7 +668,7 @@ fn pair(
     // A score that is read again with no change: rule 1 gives each
     // statement the lane in play at its place, with no search.
     let same = |(statement, lane): (&LaneStatement, &Lane)| {
-        statement.label == lane.label && statement.body == lane.body.as_str()
+        statement.label == lane.label.as_str() && statement.body == lane.body.as_str()
     };
     if statements.len() == playing.len()
         && numbers.iter().all(Option::is_none)
@@ -685,7 +690,7 @@ fn pair(
         let body = lane.body.as_str();
         let rule2 = statement.body == body;
         let rule3 = rule_key(3, &statement.label, &statement.body)
-            .is_some_and(|key| Some(key) == rule_key(3, &lane.label, body));
+            .is_some_and(|key| Some(key) == rule_key(3, lane.label.as_str(), body));
         let rule4 = || {
             let equal = equal_ends(&statement.body, body);
             let shorter = statement.body.len().min(body.len());
@@ -727,7 +732,7 @@ fn pair(
             // yet, by key.
             let mut olds: HashMap<_, Vec<usize>> = HashMap::new();
             for (place, lane) in lanes.iter().enumerate() {
-                let key = rule_key(rule, &lane.label, lane.body.as_str());
+                let key = rule_key(rule, lane.label.as_str(), lane.body.as_str());
                 if let Some(key) = key.filter(|_| free(&taken, lane, new_only)) {
                     olds.entry(key).or_default().push(place);
                 }

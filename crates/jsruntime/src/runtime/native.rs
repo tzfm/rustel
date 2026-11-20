@@ -134,6 +134,13 @@ struct Turn<'p> {
     /// The list of the numbers of a call before, with its room for the
     /// next call.
     numbers: Vec<Value>,
+    /// Per-evaluation cache of parsed mini-notation literals evaluated inside
+    /// function or arrow bodies, dropped when the build ends.
+    mini_cache: std::collections::HashMap<
+        (usize, usize, i64),
+        Pattern,
+        std::hash::BuildHasherDefault<rustel_core::WordHasher>,
+    >,
 }
 
 /// One control call of a chain, as [`rustel_core::controls::apply_chain`]
@@ -359,6 +366,7 @@ impl JsRuntime {
             left: None,
             spare: Default::default(),
             numbers: Vec::new(),
+            mini_cache: Default::default(),
         };
         match self.build_statements(program, names, &mut turn) {
             Some(score) => Ok((score, turn.reuse)),
@@ -700,7 +708,17 @@ impl<'p> Turn<'p> {
             if !names.mini() || offset.fract() != 0.0 || !offset.is_finite() {
                 return None;
             }
-            return crate::surface::parse_mini_in_room(source, *offset as i64)
+            let offset = *offset as i64;
+            if !self.frames.is_empty() {
+                let key = (source.as_ptr() as usize, source.len(), offset);
+                if let Some(cached) = self.mini_cache.get(&key) {
+                    return Some(Native::Pattern(cached.clone()));
+                }
+                let pat = crate::surface::parse_mini_in_room(source, offset).ok()?;
+                self.mini_cache.insert(key, pat.clone());
+                return Some(Native::Pattern(pat));
+            }
+            return crate::surface::parse_mini_in_room(source, offset)
                 .ok()
                 .map(Native::Pattern);
         }

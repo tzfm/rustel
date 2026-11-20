@@ -17,6 +17,7 @@ later version.
 //! `Arc<Dress>`, `CompactGrid`, `Arc<Grid>`, `Arc<[Layer]>`, and pure
 //! `Arc<NodeCell>` subgraphs across tracks and sections.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::Arc;
@@ -257,24 +258,35 @@ pub fn dedup_score_with_reused(
             visited.insert(node_ref.identity(), Arc::clone(&node_ref.0));
         }
     }
-    let (pooled_builtins, seen_nodes) = collect_and_pool_builtins(root.node_arc(), &visited);
+    let (pooled_builtins, seen_nodes, builtins_pre_deduped) =
+        collect_and_pool_builtins(root.node_arc(), &visited);
     // Temporarily detach extra handles (such as memo parts) that point to
     // newly-built nodes reachable from `root` so their refcount drops to 1 and
     // `Arc::get_mut` can deduplicate them in place without reallocating.
     let mut detached: Vec<usize> = Vec::new();
+    let mut detached_ids: FastSet<usize> = FastSet::default();
     let silence_arc = Arc::clone(crate::silence().node_arc());
     remap_extras(&mut |node_ref: &mut crate::PatternNodeRef| {
         let id = node_ref.identity();
         if seen_nodes.contains(&id) && !visited.contains_key(&id) {
             detached.push(id);
+            detached_ids.insert(id);
             node_ref.0 = Arc::clone(&silence_arc);
         } else {
             detached.push(0);
         }
     });
+    let cap = seen_nodes.len();
     let mut deduper = Deduper {
         visited,
+        detached_ids,
         pooled_builtins,
+        builtins_pre_deduped,
+        values: FastMap::with_capacity_and_hasher(cap / 2, Default::default()),
+        dresses: FastMap::with_capacity_and_hasher(cap / 2, Default::default()),
+        compact_grids: FastMap::with_capacity_and_hasher(cap / 2, Default::default()),
+        layers: FastMap::with_capacity_and_hasher(cap / 2, Default::default()),
+        nodes: FastMap::with_capacity_and_hasher(cap, Default::default()),
         ..Deduper::default()
     };
     deduper.dedup_pattern(root);
@@ -298,11 +310,15 @@ pub fn dedup_score_with_reused(
 fn collect_and_pool_builtins(
     root: &Arc<NodeCell>,
     skip_nodes: &FastMap<usize, Arc<NodeCell>>,
-) -> (FastMap<usize, Arc<dyn BuiltinEntries>>, FastSet<usize>) {
-    let mut seen_nodes: FastSet<usize> = FastSet::default();
-    let mut seen_layers: FastSet<usize> = FastSet::default();
-    let mut seen_ptrs: FastSet<usize> = FastSet::default();
-    let mut unpooled: Vec<Arc<dyn BuiltinEntries>> = Vec::new();
+) -> (
+    FastMap<usize, Arc<dyn BuiltinEntries>>,
+    FastSet<usize>,
+    bool,
+) {
+    let mut seen_nodes: FastSet<usize> = FastSet::with_capacity_and_hasher(64, Default::default());
+    let mut seen_layers: FastSet<usize> = FastSet::with_capacity_and_hasher(32, Default::default());
+    let mut seen_ptrs: FastSet<usize> = FastSet::with_capacity_and_hasher(64, Default::default());
+    let mut unpooled: Vec<Arc<dyn BuiltinEntries>> = Vec::with_capacity(64);
     let mut record = |entries: &Arc<dyn BuiltinEntries>| {
         if let Slice::Builtin(keys, _) = entries.as_slice()
             && keys.len() >= 2
@@ -314,7 +330,8 @@ fn collect_and_pool_builtins(
             }
         }
     };
-    let mut stack: Vec<&NodeCell> = vec![root.as_ref()];
+    let mut stack: Vec<&NodeCell> = Vec::with_capacity(32);
+    stack.push(root.as_ref());
     while let Some(cell) = stack.pop() {
         let id = std::ptr::from_ref(cell) as usize;
         if skip_nodes.contains_key(&id) || !seen_nodes.insert(id) {
@@ -444,120 +461,161 @@ fn collect_and_pool_builtins(
         }
     }
     if unpooled.len() < 4 {
-        return (FastMap::default(), seen_nodes);
+        return (FastMap::default(), seen_nodes, false);
     }
-    // Deduplicate identical maps first so frequency counts reflect unique surviving maps.
-    let mut unique_set: FastSet<InternedBuiltin> = FastSet::default();
+    // Deduplicate identical maps once so frequency counts reflect unique
+    // surviving maps and `Deduper` does not re-hash `len >= 2` built-in maps.
+    let mut unique_set: FastMap<InternedBuiltin, ()> =
+        FastMap::with_capacity_and_hasher(unpooled.len(), Default::default());
     let mut unique_maps: Vec<Arc<dyn BuiltinEntries>> = Vec::with_capacity(unpooled.len());
-    let mut duplicates: Vec<(usize, usize)> = Vec::new();
+    let mut duplicates: Vec<(usize, Arc<dyn BuiltinEntries>)> = Vec::new();
     for map in unpooled {
         if !map.as_slice().all_values_data() {
             continue;
         }
         let ptr = Arc::as_ptr(&map) as *const () as usize;
-        let key = InternedBuiltin(map);
-        if let Some(existing) = unique_set.get(&key) {
-            let canon_ptr = Arc::as_ptr(&existing.0) as *const () as usize;
-            duplicates.push((ptr, canon_ptr));
-        } else {
-            unique_maps.push(Arc::clone(&key.0));
-            unique_set.insert(key);
-        }
-    }
-    if unique_maps.len() < 4 {
-        return (FastMap::default(), seen_nodes);
-    }
-    let mut freq: FastMap<DataValueRef<'_>, u32> = FastMap::default();
-    for map in &unique_maps {
-        if let Slice::Builtin(_, values) = map.as_slice() {
-            for val in values {
-                if val.is_data(0) {
-                    *freq.entry(DataValueRef(val)).or_insert(0) += 1;
-                }
+        match unique_set.entry(InternedBuiltin(map)) {
+            Entry::Occupied(entry) => {
+                duplicates.push((ptr, Arc::clone(&entry.key().0)));
+            }
+            Entry::Vacant(entry) => {
+                unique_maps.push(Arc::clone(&entry.key().0));
+                entry.insert(());
             }
         }
     }
-    let mut poolable: Vec<&Arc<dyn BuiltinEntries>> = Vec::new();
-    for map in &unique_maps {
-        if let Slice::Builtin(_, values) = map.as_slice() {
-            let len = values.len();
+    let mut out: FastMap<usize, Arc<dyn BuiltinEntries>> =
+        FastMap::with_capacity_and_hasher(duplicates.len() + unique_maps.len(), Default::default());
+    if unique_maps.len() >= 4 {
+        // Hash each distinct data value once into dense ids, then use flat
+        // array lookups for frequency counting, poolability, and packing.
+        let mut val_ids: FastMap<DataValueRef<'_>, u32> =
+            FastMap::with_capacity_and_hasher(unique_maps.len() * 2, Default::default());
+        let mut counts: Vec<u32> = Vec::with_capacity(unique_maps.len() * 2);
+        let mut distinct_vals: Vec<&Value> = Vec::with_capacity(unique_maps.len() * 2);
+        let mut map_val_ids: Vec<u32> = Vec::with_capacity(unique_maps.len() * 4);
+        let mut map_spans: Vec<(u32, u16)> = Vec::with_capacity(unique_maps.len());
+        for map in &unique_maps {
+            let start = map_val_ids.len() as u32;
+            if let Slice::Builtin(_, values) = map.as_slice() {
+                for val in values {
+                    let id = match val_ids.entry(DataValueRef(val)) {
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            let id = *entry.get();
+                            counts[id as usize] += 1;
+                            id
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let id = counts.len() as u32;
+                            counts.push(1);
+                            distinct_vals.push(val);
+                            entry.insert(id);
+                            id
+                        }
+                    };
+                    map_val_ids.push(id);
+                }
+                map_spans.push((start, values.len() as u16));
+            } else {
+                map_spans.push((start, 0));
+            }
+        }
+        let mut poolable_idx: Vec<usize> = Vec::with_capacity(unique_maps.len());
+        for (idx, &(start, len)) in map_spans.iter().enumerate() {
+            let len = usize::from(len);
+            if len == 0 {
+                continue;
+            }
+            let vids = &map_val_ids[start as usize..start as usize + len];
             let mut shared = 0usize;
-            for val in values {
-                if freq.get(&DataValueRef(val)).copied().unwrap_or(0) >= 2 {
+            for &vid in vids {
+                if counts[vid as usize] >= 2 {
                     shared += 1;
                 }
             }
             let unique = len - shared;
             if 22 * shared > 2 * unique + 16 {
-                poolable.push(map);
+                poolable_idx.push(idx);
             }
         }
-    }
-    if poolable.len() < 2 {
-        return (FastMap::default(), seen_nodes);
-    }
-    let mut pool_index: FastMap<DataValueRef<'_>, u16> = FastMap::default();
-    let mut pool_vec: Vec<Value> = Vec::new();
-    let mut old_bytes = 0usize;
-    let mut new_maps_bytes = 0usize;
-    for map in &poolable {
-        if let Slice::Builtin(_, values) = map.as_slice() {
-            let len = values.len();
-            old_bytes += 16 + ((26 * len + 7) & !7);
-            new_maps_bytes += 32 + ((4 * len + 7) & !7);
-            for val in values {
-                let key = DataValueRef(val);
-                if let std::collections::hash_map::Entry::Vacant(entry) = pool_index.entry(key) {
-                    let Ok(idx) = u16::try_from(pool_vec.len()) else {
-                        return (FastMap::default(), seen_nodes);
-                    };
-                    pool_vec.push(val.clone());
-                    entry.insert(idx);
+        if poolable_idx.len() >= 2 {
+            let mut remap: Vec<u16> = vec![u16::MAX; counts.len()];
+            let mut pool_vec: Vec<Value> = Vec::with_capacity(counts.len());
+            let mut old_bytes = 0usize;
+            let mut new_maps_bytes = 0usize;
+            let mut overflow = false;
+            'assign: for &idx in &poolable_idx {
+                let (start, len) = map_spans[idx];
+                let len = usize::from(len);
+                old_bytes += 16 + ((26 * len + 7) & !7);
+                new_maps_bytes += 32 + ((4 * len + 7) & !7);
+                for &vid in &map_val_ids[start as usize..start as usize + len] {
+                    if remap[vid as usize] == u16::MAX {
+                        let Ok(pidx) = u16::try_from(pool_vec.len()) else {
+                            overflow = true;
+                            break 'assign;
+                        };
+                        if pidx == u16::MAX {
+                            overflow = true;
+                            break 'assign;
+                        }
+                        remap[vid as usize] = pidx;
+                        pool_vec.push(distinct_vals[vid as usize].clone());
+                    }
+                }
+            }
+            let new_bytes = 16 + 24 * pool_vec.len() + new_maps_bytes;
+            if !overflow && new_bytes + 64 < old_bytes {
+                let pool: Arc<[Value]> = pool_vec.into();
+                let mut vals_buf = [0u16; MAX_BUILTIN_MAP_LEN];
+                for &idx in &poolable_idx {
+                    let map = &unique_maps[idx];
+                    if let Slice::Builtin(keys, _) = map.as_slice() {
+                        let (start, len) = map_spans[idx];
+                        let len = usize::from(len);
+                        for (i, &vid) in map_val_ids[start as usize..start as usize + len]
+                            .iter()
+                            .enumerate()
+                        {
+                            vals_buf[i] = remap[vid as usize];
+                        }
+                        let pooled =
+                            make_pooled_builtin_arc(Arc::clone(&pool), keys, &vals_buf[..len]);
+                        out.insert(Arc::as_ptr(map) as *const () as usize, pooled);
+                    }
                 }
             }
         }
     }
-    let new_bytes = 16 + 24 * pool_vec.len() + new_maps_bytes;
-    if new_bytes + 64 >= old_bytes {
-        return (FastMap::default(), seen_nodes);
-    }
-    let pool: Arc<[Value]> = pool_vec.into();
-    let mut out: FastMap<usize, Arc<dyn BuiltinEntries>> = FastMap::default();
-    let mut vals_buf = [0u16; MAX_BUILTIN_MAP_LEN];
-    for map in poolable {
-        if let Slice::Builtin(keys, values) = map.as_slice() {
-            let len = keys.len();
-            for (i, val) in values.iter().enumerate() {
-                vals_buf[i] = pool_index[&DataValueRef(val)];
-            }
-            let pooled = make_pooled_builtin_arc(Arc::clone(&pool), keys, &vals_buf[..len]);
-            out.insert(Arc::as_ptr(map) as *const () as usize, pooled);
-        }
-    }
-    for (dup_ptr, canon_ptr) in duplicates {
+    for (dup_ptr, canon) in duplicates {
+        let canon_ptr = Arc::as_ptr(&canon) as *const () as usize;
         if let Some(pooled) = out.get(&canon_ptr) {
             out.insert(dup_ptr, Arc::clone(pooled));
+        } else {
+            out.insert(dup_ptr, canon);
         }
     }
-    (out, seen_nodes)
+    (out, seen_nodes, true)
 }
 
 #[derive(Default)]
 struct Deduper {
     visited: FastMap<usize, Arc<NodeCell>>,
+    detached_ids: FastSet<usize>,
     seen_values: FastMap<usize, Arc<[Value]>>,
     seen_dresses: FastMap<usize, Arc<Dress>>,
     seen_layers: FastMap<usize, Arc<[Layer]>>,
     plain_extras: FastMap<usize, Arc<PatternExtras>>,
     pooled_builtins: FastMap<usize, Arc<dyn BuiltinEntries>>,
-    builtins: FastSet<InternedBuiltin>,
-    keys: FastSet<InternedKeys>,
-    values: FastSet<InternedValues>,
-    dresses: FastSet<InternedDress>,
-    compact_grids: FastSet<InternedCompactGrid>,
-    grids: FastSet<InternedGrid>,
-    layers: FastSet<InternedLayers>,
-    nodes: FastSet<InternedNode>,
+    builtins_pre_deduped: bool,
+    builtins: FastMap<InternedBuiltin, ()>,
+    keys: FastMap<InternedKeys, ()>,
+    values: FastMap<InternedValues, ()>,
+    dresses: FastMap<InternedDress, ()>,
+    compact_grids: FastMap<InternedCompactGrid, ()>,
+    grids: FastMap<InternedGrid, ()>,
+    layers: FastMap<InternedLayers, ()>,
+    nodes: FastMap<InternedNode, ()>,
 }
 
 impl Deduper {
@@ -570,16 +628,22 @@ impl Deduper {
         if let Some(pooled) = self.pooled_builtins.get(&ptr) {
             return Arc::clone(pooled);
         }
+        if self.builtins_pre_deduped
+            && matches!(entries.as_slice(), Slice::Builtin(k, _) if k.len() >= 2 && k.len() <= MAX_BUILTIN_MAP_LEN)
+        {
+            return entries;
+        }
         if !known_data && !entries.as_slice().all_values_data() {
             return entries;
         }
-        let key = InternedBuiltin(entries);
-        if let Some(existing) = self.builtins.get(&key) {
-            return Arc::clone(&existing.0);
+        match self.builtins.entry(InternedBuiltin(entries)) {
+            Entry::Occupied(entry) => Arc::clone(&entry.key().0),
+            Entry::Vacant(entry) => {
+                let out = Arc::clone(&entry.key().0);
+                entry.insert(());
+                out
+            }
         }
-        let out = Arc::clone(&key.0);
-        self.builtins.insert(key);
-        out
     }
 
     fn dedup_value_mut(&mut self, value: &mut Value) {
@@ -606,22 +670,16 @@ impl Deduper {
         if values.is_empty() {
             return;
         }
-        let id = Arc::as_ptr(values) as *const Value as usize;
-        if let Some(existing) = self.seen_values.get(&id) {
-            *values = Arc::clone(existing);
-            return;
-        }
         if let Some(slice) = Arc::get_mut(values) {
             for val in slice.iter_mut() {
                 self.dedup_value_mut(val);
             }
-            let key = InternedValues(Arc::clone(values));
-            if let Some(existing) = self.values.get(&key) {
-                *values = Arc::clone(&existing.0);
-            } else {
-                self.values.insert(key);
+            match self.values.entry(InternedValues(Arc::clone(values))) {
+                Entry::Occupied(entry) => *values = Arc::clone(&entry.key().0),
+                Entry::Vacant(entry) => {
+                    entry.insert(());
+                }
             }
-            self.seen_values.insert(id, Arc::clone(values));
             return;
         }
         let next = self.dedup_values(values);
@@ -649,69 +707,72 @@ impl Deduper {
             Some(vec) => vec.into(),
             None => Arc::clone(values),
         };
-        let key = InternedValues(candidate);
-        let canon = if let Some(existing) = self.values.get(&key) {
-            Arc::clone(&existing.0)
-        } else {
-            let out = Arc::clone(&key.0);
-            self.values.insert(key);
-            out
+        let canon = match self.values.entry(InternedValues(candidate)) {
+            Entry::Occupied(entry) => Arc::clone(&entry.key().0),
+            Entry::Vacant(entry) => {
+                let out = Arc::clone(&entry.key().0);
+                entry.insert(());
+                out
+            }
         };
         self.seen_values.insert(id, Arc::clone(&canon));
         canon
     }
 
     fn dedup_dress_mut(&mut self, dress: &mut Arc<Dress>) {
-        let id = Arc::as_ptr(dress) as usize;
-        if let Some(existing) = self.seen_dresses.get(&id) {
-            *dress = Arc::clone(existing);
-            return;
-        }
         if let Some(inner) = Arc::get_mut(dress) {
             let Self {
                 builtins,
                 keys,
                 pooled_builtins,
+                builtins_pre_deduped,
                 ..
             } = self;
+            let pre = *builtins_pre_deduped;
             let mut dedup_builtin = |entries: Arc<dyn BuiltinEntries>, known_data: bool| {
                 let ptr = Arc::as_ptr(&entries) as *const () as usize;
                 if let Some(pooled) = pooled_builtins.get(&ptr) {
                     return Arc::clone(pooled);
                 }
+                if pre
+                    && matches!(entries.as_slice(), Slice::Builtin(k, _) if k.len() >= 2 && k.len() <= MAX_BUILTIN_MAP_LEN)
+                {
+                    return entries;
+                }
                 if !known_data && !entries.as_slice().all_values_data() {
                     return entries;
                 }
-                let key = InternedBuiltin(entries);
-                if let Some(existing) = builtins.get(&key) {
-                    return Arc::clone(&existing.0);
+                match builtins.entry(InternedBuiltin(entries)) {
+                    Entry::Occupied(entry) => Arc::clone(&entry.key().0),
+                    Entry::Vacant(entry) => {
+                        let out = Arc::clone(&entry.key().0);
+                        entry.insert(());
+                        out
+                    }
                 }
-                let out = Arc::clone(&key.0);
-                builtins.insert(key);
-                out
             };
             let mut dedup_keys = |k: Arc<Keys>| {
                 if k.scale_definition.is_some() || k.pick_lookup.is_some() {
                     return k;
                 }
-                let key = InternedKeys(k);
-                if let Some(existing) = keys.get(&key) {
-                    return Arc::clone(&existing.0);
+                match keys.entry(InternedKeys(k)) {
+                    Entry::Occupied(entry) => Arc::clone(&entry.key().0),
+                    Entry::Vacant(entry) => {
+                        let out = Arc::clone(&entry.key().0);
+                        entry.insert(());
+                        out
+                    }
                 }
-                let out = Arc::clone(&key.0);
-                keys.insert(key);
-                out
             };
             inner.dedup_inner_mut(&mut dedup_builtin, &mut dedup_keys);
             if dress.can_intern() {
-                let key = InternedDress(Arc::clone(dress));
-                if let Some(existing) = self.dresses.get(&key) {
-                    *dress = Arc::clone(&existing.0);
-                } else {
-                    self.dresses.insert(key);
+                match self.dresses.entry(InternedDress(Arc::clone(dress))) {
+                    Entry::Occupied(entry) => *dress = Arc::clone(&entry.key().0),
+                    Entry::Vacant(entry) => {
+                        entry.insert(());
+                    }
                 }
             }
-            self.seen_dresses.insert(id, Arc::clone(dress));
             return;
         }
         let next = self.dedup_dress(dress);
@@ -727,13 +788,13 @@ impl Deduper {
         }
         let candidate = self.dedup_dress_inner(dress);
         let canon = if candidate.can_intern() {
-            let key = InternedDress(candidate);
-            if let Some(existing) = self.dresses.get(&key) {
-                Arc::clone(&existing.0)
-            } else {
-                let out = Arc::clone(&key.0);
-                self.dresses.insert(key);
-                out
+            match self.dresses.entry(InternedDress(candidate)) {
+                Entry::Occupied(entry) => Arc::clone(&entry.key().0),
+                Entry::Vacant(entry) => {
+                    let out = Arc::clone(&entry.key().0);
+                    entry.insert(());
+                    out
+                }
             }
         } else {
             candidate
@@ -747,35 +808,44 @@ impl Deduper {
             builtins,
             keys,
             pooled_builtins,
+            builtins_pre_deduped,
             ..
         } = self;
+        let pre = *builtins_pre_deduped;
         let mut dedup_builtin = |entries: Arc<dyn BuiltinEntries>, known_data: bool| {
             let ptr = Arc::as_ptr(&entries) as *const () as usize;
             if let Some(pooled) = pooled_builtins.get(&ptr) {
                 return Arc::clone(pooled);
             }
+            if pre
+                && matches!(entries.as_slice(), Slice::Builtin(k, _) if k.len() >= 2 && k.len() <= MAX_BUILTIN_MAP_LEN)
+            {
+                return entries;
+            }
             if !known_data && !entries.as_slice().all_values_data() {
                 return entries;
             }
-            let key = InternedBuiltin(entries);
-            if let Some(existing) = builtins.get(&key) {
-                return Arc::clone(&existing.0);
+            match builtins.entry(InternedBuiltin(entries)) {
+                Entry::Occupied(entry) => Arc::clone(&entry.key().0),
+                Entry::Vacant(entry) => {
+                    let out = Arc::clone(&entry.key().0);
+                    entry.insert(());
+                    out
+                }
             }
-            let out = Arc::clone(&key.0);
-            builtins.insert(key);
-            out
         };
         let mut dedup_keys = |k: Arc<Keys>| {
             if k.scale_definition.is_some() || k.pick_lookup.is_some() {
                 return k;
             }
-            let key = InternedKeys(k);
-            if let Some(existing) = keys.get(&key) {
-                return Arc::clone(&existing.0);
+            match keys.entry(InternedKeys(k)) {
+                Entry::Occupied(entry) => Arc::clone(&entry.key().0),
+                Entry::Vacant(entry) => {
+                    let out = Arc::clone(&entry.key().0);
+                    entry.insert(());
+                    out
+                }
             }
-            let out = Arc::clone(&key.0);
-            keys.insert(key);
-            out
         };
         match dress.dedup_inner(&mut dedup_builtin, &mut dedup_keys) {
             Some(updated) => Arc::new(updated),
@@ -784,44 +854,66 @@ impl Deduper {
     }
 
     fn dedup_compact_grid(&mut self, grid: &CompactGrid) -> CompactGrid {
-        let key = InternedCompactGrid(grid.clone());
-        if let Some(existing) = self.compact_grids.get(&key) {
-            return existing.0.clone();
+        match self.compact_grids.entry(InternedCompactGrid(grid.clone())) {
+            Entry::Occupied(entry) => entry.key().0.clone(),
+            Entry::Vacant(entry) => {
+                let out = entry.key().0.clone();
+                entry.insert(());
+                out
+            }
         }
-        let out = key.0.clone();
-        self.compact_grids.insert(key);
-        out
+    }
+
+    fn dedup_compact_grid_mut(&mut self, grid: &mut CompactGrid) {
+        match self.compact_grids.entry(InternedCompactGrid(grid.clone())) {
+            Entry::Occupied(entry) => {
+                if !grid.ptr_eq(&entry.key().0) {
+                    *grid = entry.key().0.clone();
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(());
+            }
+        }
     }
 
     fn dedup_grid(&mut self, grid: &Arc<Grid>) -> Arc<Grid> {
-        let key = InternedGrid(Arc::clone(grid));
-        if let Some(existing) = self.grids.get(&key) {
-            return Arc::clone(&existing.0);
+        match self.grids.entry(InternedGrid(Arc::clone(grid))) {
+            Entry::Occupied(entry) => Arc::clone(&entry.key().0),
+            Entry::Vacant(entry) => {
+                let out = Arc::clone(&entry.key().0);
+                entry.insert(());
+                out
+            }
         }
-        let out = Arc::clone(&key.0);
-        self.grids.insert(key);
-        out
+    }
+
+    fn dedup_grid_mut(&mut self, grid: &mut Arc<Grid>) {
+        match self.grids.entry(InternedGrid(Arc::clone(grid))) {
+            Entry::Occupied(entry) => {
+                if !Arc::ptr_eq(grid, &entry.key().0) {
+                    *grid = Arc::clone(&entry.key().0);
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(());
+            }
+        }
     }
 
     fn dedup_layers_mut(&mut self, layers: &mut Arc<[Layer]>) {
-        let id = Arc::as_ptr(layers) as *const Layer as usize;
-        if let Some(existing) = self.seen_layers.get(&id) {
-            *layers = Arc::clone(existing);
-            return;
-        }
         if let Some(slice) = Arc::get_mut(layers) {
             for layer in slice.iter_mut() {
                 layer.dedup_in_mut(self);
             }
             if layers.iter().all(Layer::can_intern) {
-                let key = InternedLayers(Arc::clone(layers));
-                if let Some(existing) = self.layers.get(&key) {
-                    *layers = Arc::clone(&existing.0);
-                } else {
-                    self.layers.insert(key);
+                match self.layers.entry(InternedLayers(Arc::clone(layers))) {
+                    Entry::Occupied(entry) => *layers = Arc::clone(&entry.key().0),
+                    Entry::Vacant(entry) => {
+                        entry.insert(());
+                    }
                 }
             }
-            self.seen_layers.insert(id, Arc::clone(layers));
             return;
         }
         let next = self.dedup_layers(layers);
@@ -847,13 +939,13 @@ impl Deduper {
             None => Arc::clone(layers),
         };
         let canon = if candidate.iter().all(Layer::can_intern) {
-            let key = InternedLayers(candidate);
-            if let Some(existing) = self.layers.get(&key) {
-                Arc::clone(&existing.0)
-            } else {
-                let out = Arc::clone(&key.0);
-                self.layers.insert(key);
-                out
+            match self.layers.entry(InternedLayers(candidate)) {
+                Entry::Occupied(entry) => Arc::clone(&entry.key().0),
+                Entry::Vacant(entry) => {
+                    let out = Arc::clone(&entry.key().0);
+                    entry.insert(());
+                    out
+                }
             }
         } else {
             candidate
@@ -881,27 +973,31 @@ impl Deduper {
 
     fn dedup_cell_mut(&mut self, cell: &mut Arc<NodeCell>, flags: u8) -> bool {
         let id = Arc::as_ptr(cell) as usize;
+        if let Some(node_cell) = Arc::get_mut(cell) {
+            self.dedup_node_in_place(&mut node_cell.kind);
+            let mut replaced = false;
+            if can_intern_node(&cell.kind, flags) {
+                match self.nodes.entry(InternedNode(Arc::clone(cell))) {
+                    Entry::Occupied(entry) => {
+                        *cell = Arc::clone(&entry.key().0);
+                        replaced = true;
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(());
+                    }
+                }
+            }
+            if self.detached_ids.contains(&id) {
+                self.visited.insert(id, Arc::clone(cell));
+            }
+            return replaced;
+        }
         if let Some(existing) = self.visited.get(&id) {
             if !Arc::ptr_eq(cell, existing) {
                 *cell = Arc::clone(existing);
                 return true;
             }
             return false;
-        }
-        if let Some(node_cell) = Arc::get_mut(cell) {
-            self.dedup_node_in_place(&mut node_cell.kind);
-            let mut replaced = false;
-            if can_intern_node(&cell.kind, flags) {
-                let key = InternedNode(Arc::clone(cell));
-                if let Some(existing) = self.nodes.get(&key) {
-                    *cell = Arc::clone(&existing.0);
-                    replaced = true;
-                } else {
-                    self.nodes.insert(key);
-                }
-            }
-            self.visited.insert(id, Arc::clone(cell));
-            return replaced;
         }
         let next = self.dedup_cell(cell, flags);
         if !Arc::ptr_eq(cell, &next) {
@@ -1789,13 +1885,13 @@ impl Deduper {
             None => Arc::clone(cell),
         };
         let canon = if can_intern_node(&candidate.kind, flags) {
-            let key = InternedNode(candidate);
-            if let Some(existing) = self.nodes.get(&key) {
-                Arc::clone(&existing.0)
-            } else {
-                let out = Arc::clone(&key.0);
-                self.nodes.insert(key);
-                out
+            match self.nodes.entry(InternedNode(candidate)) {
+                Entry::Occupied(entry) => Arc::clone(&entry.key().0),
+                Entry::Vacant(entry) => {
+                    let out = Arc::clone(&entry.key().0);
+                    entry.insert(());
+                    out
+                }
             }
         } else {
             candidate
@@ -1826,8 +1922,16 @@ impl LayerDeduper for Deduper {
         Self::dedup_compact_grid(self, grid)
     }
 
+    fn dedup_compact_grid_mut(&mut self, grid: &mut CompactGrid) {
+        Self::dedup_compact_grid_mut(self, grid);
+    }
+
     fn dedup_grid(&mut self, grid: &Arc<Grid>) -> Arc<Grid> {
         Self::dedup_grid(self, grid)
+    }
+
+    fn dedup_grid_mut(&mut self, grid: &mut Arc<Grid>) {
+        Self::dedup_grid_mut(self, grid);
     }
 }
 
@@ -1835,11 +1939,33 @@ impl LayerDeduper for Deduper {
 
 struct InternedValues(Arc<[Value]>);
 
+#[inline]
+fn hash_interned_value(v: &Value, state: &mut impl Hasher) {
+    if let Value::Object(map) = v
+        && let Some(entries) = map.as_builtin()
+    {
+        0x55u8.hash(state);
+        (Arc::as_ptr(entries) as *const () as usize).hash(state);
+        return;
+    }
+    hash_data(v, state);
+}
+
+#[inline]
+fn same_interned_value(a: &Value, b: &Value) -> bool {
+    if let (Value::Object(am), Value::Object(bm)) = (a, b)
+        && let (Some(ae), Some(be)) = (am.as_builtin(), bm.as_builtin())
+    {
+        return Arc::ptr_eq(ae, be);
+    }
+    a.same_data(b)
+}
+
 impl Hash for InternedValues {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.len().hash(state);
         for v in self.0.iter() {
-            hash_data(v, state);
+            hash_interned_value(v, state);
         }
     }
 }
@@ -1852,7 +1978,7 @@ impl PartialEq for InternedValues {
                     .0
                     .iter()
                     .zip(other.0.iter())
-                    .all(|(a, b)| a.same_data(b)))
+                    .all(|(a, b)| same_interned_value(a, b)))
     }
 }
 
@@ -1880,11 +2006,25 @@ struct InternedBuiltin(Arc<dyn BuiltinEntries>);
 
 impl Hash for InternedBuiltin {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let keys = self.0.keys();
-        let slice = self.0.as_slice();
-        keys.hash(state);
-        for i in 0..keys.len() {
-            hash_data(slice.at(i).1, state);
+        match self.0.as_slice() {
+            Slice::Builtin(keys, values) => {
+                keys.hash(state);
+                for v in values {
+                    hash_data(v, state);
+                }
+            }
+            Slice::Pooled(keys, indices, pool) => {
+                keys.hash(state);
+                for &idx in indices {
+                    hash_data(&pool[usize::from(idx)], state);
+                }
+            }
+            Slice::Plain(pairs) => {
+                pairs.len().hash(state);
+                for (_, v) in pairs {
+                    hash_data(v, state);
+                }
+            }
         }
     }
 }
@@ -1894,14 +2034,28 @@ impl PartialEq for InternedBuiltin {
         if Arc::ptr_eq(&self.0, &other.0) {
             return true;
         }
-        let ak = self.0.keys();
-        let bk = other.0.keys();
-        if ak != bk {
-            return false;
+        match (self.0.as_slice(), other.0.as_slice()) {
+            (Slice::Builtin(ak, av), Slice::Builtin(bk, bv)) => {
+                ak == bk && av.iter().zip(bv.iter()).all(|(a, b)| a.same_data(b))
+            }
+            (Slice::Pooled(ak, ai, ap), Slice::Pooled(bk, bi, bp)) => {
+                ak == bk
+                    && ai
+                        .iter()
+                        .zip(bi.iter())
+                        .all(|(&a, &b)| ap[usize::from(a)].same_data(&bp[usize::from(b)]))
+            }
+            _ => {
+                let ak = self.0.keys();
+                let bk = other.0.keys();
+                if ak != bk {
+                    return false;
+                }
+                let a_slice = self.0.as_slice();
+                let b_slice = other.0.as_slice();
+                (0..ak.len()).all(|i| a_slice.at(i).1.same_data(b_slice.at(i).1))
+            }
         }
-        let a_slice = self.0.as_slice();
-        let b_slice = other.0.as_slice();
-        (0..ak.len()).all(|i| a_slice.at(i).1.same_data(b_slice.at(i).1))
     }
 }
 
@@ -2224,6 +2378,7 @@ impl Hash for InternedNode {
                 app.waves.len().hash(state);
                 for item in app.waves.iter() {
                     item.key_id.hash(state);
+                    item.steps.hash(state);
                     item.math_inside.hash(state);
                     item.wave.hash_intern(state);
                 }
@@ -2310,6 +2465,7 @@ impl PartialEq for InternedNode {
                     && a.waves.len() == b.waves.len()
                     && a.waves.iter().zip(b.waves.iter()).all(|(x, y)| {
                         x.key_id == y.key_id
+                            && x.steps == y.steps
                             && x.math_inside == y.math_inside
                             && x.wave.same(&y.wave)
                     })

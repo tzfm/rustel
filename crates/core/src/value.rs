@@ -2206,6 +2206,58 @@ impl OrderedMap {
         }
     }
 
+    /// Reconstruct a 2-entry data-only built-in map from two disjoint packed
+    /// keys and values.
+    #[inline]
+    pub(crate) fn from_two_packed(k0: u16, v0: Value, k1: u16, v1: Value) -> Self {
+        Self {
+            entries: Entries::Builtin(
+                Arc::new(BuiltinMap {
+                    keys: [k0, k1],
+                    values: [v0, v1],
+                }),
+                true,
+            ),
+        }
+    }
+
+    /// Reconstruct a data-only built-in map from `k0: v0`, a built-in `tail`
+    /// slice, and `k1: v1` (all keys disjoint, total length `<= MAX_BUILTIN_MAP_LEN`).
+    pub(crate) fn from_keyed_tail_and_packed(
+        k0: u16,
+        v0: Value,
+        tail: Slice<'_>,
+        k1: u16,
+        v1: Value,
+    ) -> Self {
+        let tail_len = tail.len();
+        let count = tail_len + 2;
+        let mut keys = [0u16; MAX_BUILTIN_MAP_LEN];
+        let mut values = [const { Value::Undefined }; MAX_BUILTIN_MAP_LEN];
+        keys[0] = k0;
+        values[0] = v0;
+        match tail {
+            Slice::Builtin(tkeys, tvals) => {
+                keys[1..1 + tail_len].copy_from_slice(tkeys);
+                for (dst, src) in values[1..1 + tail_len].iter_mut().zip(tvals.iter()) {
+                    *dst = src.clone();
+                }
+            }
+            Slice::Pooled(tkeys, tvals, pool) => {
+                keys[1..1 + tail_len].copy_from_slice(tkeys);
+                for (dst, &idx) in values[1..1 + tail_len].iter_mut().zip(tvals.iter()) {
+                    *dst = pool[usize::from(idx)].clone();
+                }
+            }
+            Slice::Plain(_) => unreachable!("expected built-in tail slice"),
+        }
+        keys[1 + tail_len] = k1;
+        values[1 + tail_len] = v1;
+        Self {
+            entries: Entries::Builtin(make_builtin_arc(count, &keys, &mut values), true),
+        }
+    }
+
     /// Reconstruct a data-only map from compact built-in entries.
     #[inline]
     pub(crate) fn from_made_builtin(entries: Arc<dyn BuiltinEntries>) -> Self {

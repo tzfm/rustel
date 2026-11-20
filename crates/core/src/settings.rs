@@ -40,12 +40,8 @@ impl Default for RuntimeSettingsInner {
     }
 }
 
-#[derive(Debug, Default)]
-struct SettingsState {
-    /// A score override; absent means the host chooses its default.
-    max_polyphony: Option<usize>,
-    rng_mode: u8,
-    default_join: u8,
+#[derive(Clone, Debug, Default)]
+struct SettingsRare {
     default_voicings: Option<VoicingDefault>,
     /// MIDI control maps a score registered with `midimaps`/`defaultmidimap`.
     /// The map under the name "default" is what `defaultmidimap` sets and what
@@ -59,11 +55,34 @@ struct SettingsState {
     /// alone. Entries are `Arc` so a query can hold one without cloning the
     /// whole table.
     user_voicing_dicts: HashMap<String, Arc<UserVoicingDictionaries>>,
+}
+
+#[derive(Debug, Default)]
+struct SettingsState {
+    /// A score override; absent means the host chooses its default.
+    max_polyphony: Option<usize>,
+    rng_mode: u8,
+    default_join: u8,
+    rare: Option<Box<SettingsRare>>,
     /// `voicings()` needs only the parsed MIDI of its last emitted note across
     /// queries. `None` is fresh/reset history; an empty or unparseable result
     /// stores `Some(0)`. The cell is shared by snapshots from the same runtime,
     /// but a fresh runtime receives a fresh cell.
     legacy_voicing_top_note: Arc<Mutex<Option<i64>>>,
+}
+
+impl SettingsState {
+    #[inline]
+    fn rare_mut(&mut self) -> &mut SettingsRare {
+        self.rare.get_or_insert_with(Box::default)
+    }
+
+    #[inline]
+    fn default_voicings(&self) -> Option<&VoicingDefault> {
+        self.rare
+            .as_deref()
+            .and_then(|r| r.default_voicings.as_ref())
+    }
 }
 
 /// The selected default voicing dictionary. A query that names no dictionary
@@ -244,50 +263,53 @@ impl RuntimeSettings {
         charge.arc::<RuntimeSettingsInner>()?;
         charge.arc::<SettingsState>()?;
 
-        match &state.default_voicings {
-            Some(VoicingDefault::Registry(name)) => charge.string(name)?,
-            Some(VoicingDefault::Host { token, .. }) => {
-                charge.string(token)?;
-                charge.arc::<VoicingDictionaryLeaseInner>()?;
-                charge.arc::<std::sync::atomic::AtomicBool>()?;
-                charge.arc::<std::sync::atomic::AtomicBool>()?;
-                charge.arc::<RwLock<Option<VoicingDict>>>()?;
+        if let Some(rare) = state.rare.as_deref() {
+            charge.add(std::mem::size_of::<SettingsRare>())?;
+            match &rare.default_voicings {
+                Some(VoicingDefault::Registry(name)) => charge.string(name)?,
+                Some(VoicingDefault::Host { token, .. }) => {
+                    charge.string(token)?;
+                    charge.arc::<VoicingDictionaryLeaseInner>()?;
+                    charge.arc::<std::sync::atomic::AtomicBool>()?;
+                    charge.arc::<std::sync::atomic::AtomicBool>()?;
+                    charge.arc::<RwLock<Option<VoicingDict>>>()?;
+                }
+                Some(VoicingDefault::Recovered { token, .. }) => {
+                    charge.string(token)?;
+                    charge.arc::<RwLock<Option<VoicingDict>>>()?;
+                }
+                None => {}
             }
-            Some(VoicingDefault::Recovered { token, .. }) => {
-                charge.string(token)?;
-                charge.arc::<RwLock<Option<VoicingDict>>>()?;
-            }
-            None => {}
-        }
 
-        charge.map(&state.midi_maps)?;
-        for (name, entries) in &state.midi_maps {
-            charge.string(name)?;
-            charge.arc::<HashMap<String, crate::midimap::MidiMapEntry>>()?;
-            charge.map(entries)?;
-            for (key, entry) in entries.iter() {
-                charge.string(key)?;
-                charge.string(&entry.control)?;
-            }
-        }
-
-        charge.map(&state.user_voicing_dicts)?;
-        for (name, dictionaries) in &state.user_voicing_dicts {
-            charge.string(name)?;
-            charge.arc::<UserVoicingDictionaries>()?;
-            charge.arc::<VoicingDict>()?;
-            charge.voicing_dict(&dictionaries.semantic)?;
-            charge.arc::<crate::voicings::LegacyVoicingDict>()?;
-            let (dictionary, range) = dictionaries.legacy.retention_parts();
-            charge.map(dictionary)?;
-            for (symbol, voicings) in dictionary {
-                charge.string(symbol)?;
-                charge.vector(voicings)?;
-                for voicing in voicings {
-                    charge.strings(voicing)?;
+            charge.map(&rare.midi_maps)?;
+            for (name, entries) in &rare.midi_maps {
+                charge.string(name)?;
+                charge.arc::<HashMap<String, crate::midimap::MidiMapEntry>>()?;
+                charge.map(entries)?;
+                for (key, entry) in entries.iter() {
+                    charge.string(key)?;
+                    charge.string(&entry.control)?;
                 }
             }
-            charge.vector(range)?;
+
+            charge.map(&rare.user_voicing_dicts)?;
+            for (name, dictionaries) in &rare.user_voicing_dicts {
+                charge.string(name)?;
+                charge.arc::<UserVoicingDictionaries>()?;
+                charge.arc::<VoicingDict>()?;
+                charge.voicing_dict(&dictionaries.semantic)?;
+                charge.arc::<crate::voicings::LegacyVoicingDict>()?;
+                let (dictionary, range) = dictionaries.legacy.retention_parts();
+                charge.map(dictionary)?;
+                for (symbol, voicings) in dictionary {
+                    charge.string(symbol)?;
+                    charge.vector(voicings)?;
+                    for voicing in voicings {
+                        charge.strings(voicing)?;
+                    }
+                }
+                charge.vector(range)?;
+            }
         }
 
         charge.arc::<Mutex<Option<i64>>>()?;
@@ -428,7 +450,7 @@ impl RuntimeSettings {
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(VoicingDefault::Host { lease, .. }) = &state.default_voicings else {
+        let Some(VoicingDefault::Host { lease, .. }) = state.default_voicings() else {
             return None;
         };
         Some(VoicingDictionaryIdentity(Arc::downgrade(&lease._inner)))
@@ -442,9 +464,17 @@ impl RuntimeSettings {
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .default_voicings
-            .clone();
-        self.with(|| update_current(|state| state.default_voicings = selection));
+            .default_voicings()
+            .cloned();
+        self.with(|| {
+            update_current(|state| {
+                if let Some(sel) = selection {
+                    state.rare_mut().default_voicings = Some(sel);
+                } else if let Some(rare) = state.rare.as_deref_mut() {
+                    rare.default_voicings = None;
+                }
+            });
+        });
     }
 
     /// Copy native settings into a fresh realm after a producer panic.
@@ -458,10 +488,13 @@ impl RuntimeSettings {
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let default_voicings = source
-            .default_voicings
-            .as_ref()
-            .map(VoicingDefault::recovered);
+        let rare = source.rare.as_deref().map(|r| {
+            Box::new(SettingsRare {
+                default_voicings: r.default_voicings.as_ref().map(VoicingDefault::recovered),
+                midi_maps: r.midi_maps.clone(),
+                user_voicing_dicts: r.user_voicing_dicts.clone(),
+            })
+        });
         let top_note = *source
             .legacy_voicing_top_note
             .lock()
@@ -470,9 +503,7 @@ impl RuntimeSettings {
             max_polyphony: source.max_polyphony,
             rng_mode: source.rng_mode,
             default_join: source.default_join,
-            default_voicings,
-            midi_maps: source.midi_maps.clone(),
-            user_voicing_dicts: source.user_voicing_dicts.clone(),
+            rare,
             legacy_voicing_top_note: Arc::new(Mutex::new(top_note)),
         };
         Self {
@@ -782,9 +813,7 @@ fn update_current<R>(f: impl FnOnce(&mut SettingsState) -> R) -> R {
             max_polyphony: source.max_polyphony,
             rng_mode: source.rng_mode,
             default_join: source.default_join,
-            default_voicings: source.default_voicings.clone(),
-            midi_maps: source.midi_maps.clone(),
-            user_voicing_dicts: source.user_voicing_dicts.clone(),
+            rare: source.rare.clone(),
             legacy_voicing_top_note: Arc::clone(&source.legacy_voicing_top_note),
         };
         let result = f(&mut next);
@@ -850,13 +879,17 @@ pub(crate) fn default_join() -> u8 {
 
 pub(crate) fn set_default_voicings(name: Option<String>) {
     update_current(|settings| {
-        settings.default_voicings = name.map(VoicingDefault::Registry);
+        if let Some(name) = name {
+            settings.rare_mut().default_voicings = Some(VoicingDefault::Registry(name));
+        } else if let Some(rare) = settings.rare.as_deref_mut() {
+            rare.default_voicings = None;
+        }
     });
 }
 
 pub(crate) fn set_default_voicings_with_lease(token: String, lease: VoicingDictionaryLease) {
     update_current(|settings| {
-        settings.default_voicings = Some(VoicingDefault::Host {
+        settings.rare_mut().default_voicings = Some(VoicingDefault::Host {
             token,
             lease,
             view: Arc::new(RwLock::new(None)),
@@ -868,12 +901,12 @@ pub(crate) fn register_midi_maps(
     maps: Vec<(String, Arc<HashMap<String, crate::midimap::MidiMapEntry>>)>,
 ) -> Result<(), String> {
     update_current(|settings| {
+        let rare = settings.rare_mut();
         let new_names = maps
             .iter()
-            .filter(|(name, _)| !settings.midi_maps.contains_key(name))
+            .filter(|(name, _)| !rare.midi_maps.contains_key(name))
             .count();
-        if settings.midi_maps.len().saturating_add(new_names)
-            > crate::midimap::MAX_REGISTERED_MIDI_MAPS
+        if rare.midi_maps.len().saturating_add(new_names) > crate::midimap::MAX_REGISTERED_MIDI_MAPS
         {
             return Err(format!(
                 "midimaps: at most {} named maps may be registered in one runtime",
@@ -881,18 +914,30 @@ pub(crate) fn register_midi_maps(
             ));
         }
         for (name, entries) in maps {
-            settings.midi_maps.insert(name, entries);
+            rare.midi_maps.insert(name, entries);
         }
         Ok(())
     })
 }
 
 pub(crate) fn midi_map(name: &str) -> Option<Arc<HashMap<String, crate::midimap::MidiMapEntry>>> {
-    with_current(|settings| settings.midi_maps.get(name).map(Arc::clone))
+    with_current(|settings| {
+        settings
+            .rare
+            .as_deref()
+            .and_then(|r| r.midi_maps.get(name))
+            .map(Arc::clone)
+    })
 }
 
 pub(crate) fn midi_maps() -> HashMap<String, Arc<HashMap<String, crate::midimap::MidiMapEntry>>> {
-    with_current(|settings| settings.midi_maps.clone())
+    with_current(|settings| {
+        settings
+            .rare
+            .as_deref()
+            .map(|r| r.midi_maps.clone())
+            .unwrap_or_default()
+    })
 }
 
 pub(crate) fn register_voicing_dict(
@@ -901,17 +946,16 @@ pub(crate) fn register_voicing_dict(
     legacy: Arc<crate::voicings::LegacyVoicingDict>,
 ) -> Result<(), String> {
     update_current(|settings| {
-        if !settings.user_voicing_dicts.contains_key(&name)
-            && settings.user_voicing_dicts.len()
-                >= crate::voicings::MAX_REGISTERED_USER_VOICING_DICTS
+        let rare = settings.rare_mut();
+        if !rare.user_voicing_dicts.contains_key(&name)
+            && rare.user_voicing_dicts.len() >= crate::voicings::MAX_REGISTERED_USER_VOICING_DICTS
         {
             return Err(format!(
                 "addVoicings: at most {} dictionaries may be registered in one runtime",
                 crate::voicings::MAX_REGISTERED_USER_VOICING_DICTS
             ));
         }
-        settings
-            .user_voicing_dicts
+        rare.user_voicing_dicts
             .insert(name, Arc::new(UserVoicingDictionaries { semantic, legacy }));
         Ok(())
     })
@@ -920,8 +964,9 @@ pub(crate) fn register_voicing_dict(
 pub(crate) fn user_voicing_dict(name: &str) -> Option<Arc<VoicingDict>> {
     with_current(|settings| {
         settings
-            .user_voicing_dicts
-            .get(name)
+            .rare
+            .as_deref()
+            .and_then(|r| r.user_voicing_dicts.get(name))
             .map(|entry| Arc::clone(&entry.semantic))
     })
 }
@@ -931,8 +976,9 @@ pub(crate) fn user_legacy_voicing_dict(
 ) -> Option<Arc<crate::voicings::LegacyVoicingDict>> {
     with_current(|settings| {
         settings
-            .user_voicing_dicts
-            .get(name)
+            .rare
+            .as_deref()
+            .and_then(|r| r.user_voicing_dicts.get(name))
             .map(|entry| Arc::clone(&entry.legacy))
     })
 }
@@ -940,21 +986,24 @@ pub(crate) fn user_legacy_voicing_dict(
 pub(crate) fn default_voicings() -> Option<String> {
     with_current(|settings| {
         settings
-            .default_voicings
-            .as_ref()
+            .default_voicings()
             .map(|selection| selection.name().to_owned())
     })
 }
 
 pub(crate) fn default_voicings_is_host_owned() -> bool {
-    with_current(|settings| matches!(settings.default_voicings, Some(VoicingDefault::Host { .. })))
+    with_current(|settings| {
+        matches!(
+            settings.default_voicings(),
+            Some(VoicingDefault::Host { .. })
+        )
+    })
 }
 
 pub(crate) fn default_host_voicing_dict() -> Option<Arc<RwLock<Option<VoicingDict>>>> {
     with_current(|settings| {
         settings
-            .default_voicings
-            .as_ref()
+            .default_voicings()
             .and_then(VoicingDefault::view)
             .map(Arc::clone)
     })
@@ -963,8 +1012,7 @@ pub(crate) fn default_host_voicing_dict() -> Option<Arc<RwLock<Option<VoicingDic
 pub(crate) fn sync_host_voicing_dict(name: &str, dict: Option<VoicingDict>) -> bool {
     let cell = with_current(|settings| {
         settings
-            .default_voicings
-            .as_ref()
+            .default_voicings()
             .filter(|selection| selection.name() == name)
             .and_then(VoicingDefault::view)
             .map(Arc::clone)
@@ -1106,8 +1154,9 @@ mod recovery_tests {
                     .state
                     .read()
                     .unwrap()
-                    .user_voicing_dicts
-                    .contains_key("native")
+                    .rare
+                    .as_deref()
+                    .is_some_and(|r| r.user_voicing_dicts.contains_key("native"))
             );
             assert_eq!(
                 recovered_dict.read().unwrap().as_ref().unwrap()["M"],
@@ -1203,7 +1252,7 @@ mod tests {
         let after = settings.retained_snapshot_bytes(64 * 1024).unwrap();
         assert!(after > before);
         let state = settings.inner.state.read().unwrap();
-        let dictionaries = &state.user_voicing_dicts["native"];
+        let dictionaries = &state.rare.as_deref().unwrap().user_voicing_dicts["native"];
         let mut semantic = NativeRetention::new(64 * 1024);
         semantic.voicing_dict(&dictionaries.semantic).unwrap();
         assert!(after > before + semantic.bytes);
@@ -1345,8 +1394,7 @@ mod tests {
         {
             let state = settings.inner.state.read().unwrap();
             let cell = state
-                .default_voicings
-                .as_ref()
+                .default_voicings()
                 .and_then(VoicingDefault::view)
                 .unwrap();
             let _view = cell.write().unwrap();

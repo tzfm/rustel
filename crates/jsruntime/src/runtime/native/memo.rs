@@ -719,26 +719,71 @@ impl<'p> Reuse<'p> {
         // sub-expressions). Counting duplicate handles inside `entries` itself
         // catches dead pairs that only keep each other alive, and repeating to
         // a fixpoint releases dead parent-child chains too.
-        loop {
-            let before = entries.len();
-            if before <= 1 {
-                entries.retain(|(entry, _)| entry.part.node.strong_count() > 1);
-                break;
-            }
-            let mut ids: Vec<usize> = entries
-                .iter()
-                .map(|(entry, _)| entry.part.node.identity())
-                .collect();
-            ids.sort_unstable();
+        //
+        // Tiny binding-free scores keep their few folded sub-expressions so an
+        // incremental edit still reuses the unchanged arguments of a stack or
+        // control chain.
+        let keep_tiny_parts =
+            self.names.is_empty() && self.source.len() <= 1024 && entries.len() <= 16;
+        if keep_tiny_parts {
+            let trimmed = self.source.trim();
+            let trimmed_start = trimmed.as_ptr() as usize - self.source.as_ptr() as usize;
+            let trimmed_len = trimmed.len();
+            // Drop the root expression covering the whole trimmed score (an
+            // identical re-eval hits `source` directly and any edit invalidates
+            // it) and unshared tiny sub-literals cheaper to rebuild than hold.
             entries.retain(|(entry, _)| {
-                let id = entry.part.node.identity();
-                let lo = ids.partition_point(|&x| x < id);
-                let hi = ids.partition_point(|&x| x <= id);
-                let inside = hi - lo;
-                entry.part.node.strong_count() > inside
+                let start = usize::from(entry.part.start);
+                let len = usize::from(entry.part.len);
+                let is_root = start == trimmed_start && len == trimmed_len;
+                if is_root {
+                    return false;
+                }
+                !(len <= 10 && entry.part.node.strong_count() == 1)
             });
-            if entries.len() == before {
-                break;
+            // Bound unshared folded parts proportionally to score length so
+            // short scores stay compact while keeping enough sub-expressions
+            // for fast incremental edits.
+            let max_tiny_unshared = (self.source.len() / 100).clamp(3, 8);
+            while entries
+                .iter()
+                .filter(|(entry, _)| entry.part.node.strong_count() == 1)
+                .count()
+                > max_tiny_unshared
+            {
+                if let Some((drop_idx, _)) = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (entry, _))| entry.part.node.strong_count() == 1)
+                    .min_by_key(|(_, (entry, _))| entry.part.len)
+                {
+                    entries.remove(drop_idx);
+                } else {
+                    break;
+                }
+            }
+        } else {
+            loop {
+                let before = entries.len();
+                if before <= 1 {
+                    entries.retain(|(entry, _)| entry.part.node.strong_count() > 1);
+                    break;
+                }
+                let mut ids: Vec<usize> = entries
+                    .iter()
+                    .map(|(entry, _)| entry.part.node.identity())
+                    .collect();
+                ids.sort_unstable();
+                entries.retain(|(entry, _)| {
+                    let id = entry.part.node.identity();
+                    let lo = ids.partition_point(|&x| x < id);
+                    let hi = ids.partition_point(|&x| x <= id);
+                    let inside = hi - lo;
+                    entry.part.node.strong_count() > inside
+                });
+                if entries.len() == before {
+                    break;
+                }
             }
         }
         // A single-expression score with no bindings has nothing to reuse on

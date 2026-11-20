@@ -2970,7 +2970,9 @@ pub(crate) trait LayerDeduper {
     fn dedup_dress(&mut self, dress: &Arc<Dress>) -> Arc<Dress>;
     fn dedup_dress_mut(&mut self, dress: &mut Arc<Dress>);
     fn dedup_compact_grid(&mut self, grid: &CompactGrid) -> CompactGrid;
+    fn dedup_compact_grid_mut(&mut self, grid: &mut CompactGrid);
     fn dedup_grid(&mut self, grid: &Arc<Grid>) -> Arc<Grid>;
+    fn dedup_grid_mut(&mut self, grid: &mut Arc<Grid>);
 }
 
 impl Layer {
@@ -3066,16 +3068,10 @@ impl Layer {
         match &mut self.steps {
             Steps::Listed(Listing::CompactGrid(CompactGrid::OneStep(_))) => {}
             Steps::Listed(Listing::CompactGrid(g)) => {
-                let c = deduper.dedup_compact_grid(g);
-                if !g.ptr_eq(&c) {
-                    *g = c;
-                }
+                deduper.dedup_compact_grid_mut(g);
             }
             Steps::Listed(Listing::Grid(g)) if g.can_intern() => {
-                let c = deduper.dedup_grid(g);
-                if !Arc::ptr_eq(g, &c) {
-                    *g = c;
-                }
+                deduper.dedup_grid_mut(g);
             }
             _ => {}
         }
@@ -3229,6 +3225,12 @@ impl Layer {
     #[inline(always)]
     fn seq_named_mark(&self) -> u64 {
         1u64 << ((self.direct_flags >> LAYER_MARK_BIT_SHIFT) & LAYER_MARK_BIT_MASK)
+    }
+
+    #[inline(always)]
+    fn seq_packed_key(&self) -> u16 {
+        let mark_bit = (self.direct_flags >> LAYER_MARK_BIT_SHIFT) & LAYER_MARK_BIT_MASK;
+        self.named_id | (mark_bit << 10)
     }
 
     #[inline(always)]
@@ -5594,14 +5596,68 @@ pub(crate) fn applied(
                     return Some(set);
                 }
                 let (met, pairs) = layer.met(values, Side::Functions)?;
+                // Fast path: two direct-keyed built-in layers combined by Set
+                // build each exact-sized BuiltinMap directly without temporary
+                // 1-key maps or intermediate Vec<Value>.
+                if apply.in_place_op() == Some(crate::compose::ComposeOp::Set)
+                    && flow == LookupFlow::Set
+                    && layer.is_direct_keyed()
+                    && values.is_direct_keyed()
+                    && values.dress.as_deref().is_none_or(|d| d.set_map.is_none())
+                    && layer.named_id != values.named_id
+                    && crate::controls::builtin_name_str_by_id(values.named_id) != Some("value")
+                {
+                    let k0 = layer.seq_packed_key();
+                    let k1 = values.seq_packed_key();
+                    let tail = layer.dress.as_deref().and_then(|d| d.set_map.as_ref());
+                    match tail {
+                        None => {
+                            let met_values: Arc<[Value]> = pairs
+                                .into_iter()
+                                .map(|(f, v)| {
+                                    Value::Object(crate::OrderedMap::from_two_packed(
+                                        k0,
+                                        layer.values[f as usize].clone(),
+                                        k1,
+                                        values.values[v as usize].clone(),
+                                    ))
+                                })
+                                .collect();
+                            return Some(met.valued(met_values));
+                        }
+                        Some(entries)
+                            if !entries.keys().contains(&k1)
+                                && entries.keys().len() + 2
+                                    <= crate::value::MAX_BUILTIN_MAP_LEN =>
+                        {
+                            let tail_slice = entries.as_slice();
+                            let met_values: Arc<[Value]> = pairs
+                                .into_iter()
+                                .map(|(f, v)| {
+                                    Value::Object(crate::OrderedMap::from_keyed_tail_and_packed(
+                                        k0,
+                                        layer.values[f as usize].clone(),
+                                        tail_slice,
+                                        k1,
+                                        values.values[v as usize].clone(),
+                                    ))
+                                })
+                                .collect();
+                            return Some(met.valued(met_values));
+                        }
+                        Some(_) => {}
+                    }
+                }
                 // What each pair of values makes, with no location: the
                 // locations of both sides are those of the steps.
+                let fn_reader = layer.reader(None);
+                let val_reader = values.reader(None);
                 let values = pairs
                     .into_iter()
                     .map(|(function, value)| {
                         made(
-                            &layer.value(function as usize)?,
-                            &values.value(value as usize)?,
+                            &fn_reader.get(function as usize)?,
+                            &val_reader.get(value as usize)?,
                             apply,
                             flow,
                         )

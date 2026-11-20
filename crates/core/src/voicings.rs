@@ -220,7 +220,9 @@ pub fn reset_default_voicings() {
 /// Restore voicing dictionary state for the current runtime.
 pub fn reset_voicings() {
     crate::settings::reset_legacy_voicing_top_note();
-    crate::settings::set_default_voicings(Some(dictionaries().pinned_default.clone()));
+    if crate::settings::default_voicings().is_some() {
+        crate::settings::set_default_voicings(None);
+    }
 }
 
 /// Return the currently selected registry name or host-private dictionary key.
