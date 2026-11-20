@@ -3655,8 +3655,9 @@ fn banked_source_name(object: &serde_json::Map<String, serde_json::Value>) -> Op
 /// whole number has no fraction, `808` not `808.0`.
 fn js_number_spelling(number: &serde_json::Number) -> String {
     match number.as_f64() {
-        Some(value) if value.fract() == 0.0 && value.abs() < 1e21 => format!("{:.0}", value + 0.0),
-        Some(value) => value.to_string(),
+        // The shortest spelling that reads back, without a `.0` and with
+        // -0 as 0, as JavaScript prints a number in its usual range.
+        Some(value) => (value + 0.0).to_string(),
         None => number.to_string(),
     }
 }
