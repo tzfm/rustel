@@ -586,20 +586,36 @@ impl<'s, F: Fn(&str) -> CallForm> Reader<'s, F> {
     /// a word that names an arrow: [`Self::sum_or_arrow`] says so.
     fn arrow(&mut self) -> Option<Option<Parsed<'s>>> {
         let mark = self.mark();
-        let parameters = match self.peek() {
-            b'(' => self.parameters(),
-            _ => self.bound_name().map(|name| vec![name]),
+        let mut inline = [""; 8];
+        let mut spilled: Option<Vec<&'s str>> = None;
+        let mut count = 0usize;
+        let ok = match self.peek() {
+            b'(' => self.parameters_into(&mut inline, &mut count, &mut spilled),
+            _ => match self.bound_name() {
+                Some(name) => {
+                    inline[0] = name;
+                    count = 1;
+                    true
+                }
+                None => false,
+            },
         };
         // JavaScript takes no line end before the `=>`.
-        let arrow =
-            self.bytes[self.at..].starts_with(b"=>") && !self.gap.line && !self.gap.comment_line;
-        let Some(parameters) = parameters.filter(|_| arrow) else {
+        let arrow = ok
+            && self.bytes[self.at..].starts_with(b"=>")
+            && !self.gap.line
+            && !self.gap.comment_line;
+        if !arrow {
             self.reset(mark);
             return Some(None);
+        }
+        let parameters: &[&'s str] = match &spilled {
+            Some(vec) => vec.as_slice(),
+            None => &inline[..count],
         };
         self.take(2)?;
         let (bindings, result, height) = match self.peek() {
-            b'{' => self.block(&parameters)?,
+            b'{' => self.block(parameters)?,
             _ => {
                 let result = self.expression()?;
                 (Vec::new(), result.expr, result.height)
@@ -607,7 +623,7 @@ impl<'s, F: Fn(&str) -> CallForm> Reader<'s, F> {
         };
         Some(Some(Parsed {
             expr: ScoreExpr::Arrow(Box::new(ScoreFunction {
-                parameters: borrowed(&parameters),
+                parameters: borrowed(parameters),
                 bindings,
                 result,
             })),
@@ -628,21 +644,58 @@ impl<'s, F: Fn(&str) -> CallForm> Reader<'s, F> {
 
     /// `(first, second)`: names, each one time.
     fn parameters(&mut self) -> Option<Vec<&'s str>> {
-        self.open(b'(')?;
-        let mut parameters = Vec::new();
+        let mut inline = [""; 8];
+        let mut spilled = None;
+        let mut count = 0usize;
+        if !self.parameters_into(&mut inline, &mut count, &mut spilled) {
+            return None;
+        }
+        Some(spilled.unwrap_or_else(|| inline[..count].to_vec()))
+    }
+
+    /// `(first, second)`: names, each one time, into `inline` (spilling to
+    /// `spilled` past 8 parameters) so parenthesized non-arrows and typical
+    /// arrows allocate nothing.
+    fn parameters_into(
+        &mut self,
+        inline: &mut [&'s str; 8],
+        count: &mut usize,
+        spilled: &mut Option<Vec<&'s str>>,
+    ) -> bool {
+        if self.open(b'(').is_none() {
+            return false;
+        }
         while self.peek() != b')' {
-            let name = self.bound_name()?;
-            if parameters.contains(&name) {
-                return None;
+            let Some(name) = self.bound_name() else {
+                return false;
+            };
+            if let Some(vec) = spilled {
+                if vec.contains(&name) {
+                    return false;
+                }
+                vec.push(name);
+            } else {
+                if inline[..*count].contains(&name) {
+                    return false;
+                }
+                if *count < inline.len() {
+                    inline[*count] = name;
+                    *count += 1;
+                } else {
+                    let mut vec = Vec::with_capacity(16);
+                    vec.extend_from_slice(&inline[..*count]);
+                    vec.push(name);
+                    *spilled = Some(vec);
+                }
             }
-            parameters.push(name);
             if self.peek() != b',' {
                 break;
             }
-            self.take(1)?;
+            if self.take(1).is_none() {
+                return false;
+            }
         }
-        self.close(b')')?;
-        Some(parameters)
+        self.close(b')').is_some()
     }
 
     /// `{ const name = value }` and one `return`: the bindings, the result

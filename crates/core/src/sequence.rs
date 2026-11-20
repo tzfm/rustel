@@ -1860,10 +1860,10 @@ impl<'a> GridView<'a> {
         self.made_small(i64::from(ticks))
     }
 
+    #[inline]
     fn ticks_at(self, time: Fraction) -> Option<(i64, i64)> {
-        let scaled = i64::try_from(time.numer())
-            .ok()?
-            .checked_mul(i64::from(self.ticks.get()))?;
+        let ticks = i64::from(self.ticks.get());
+        let scaled = i64::try_from(time.numer()).ok()?.checked_mul(ticks)?;
         let denom = i64::try_from(time.denom()).ok()?;
         if denom == 1 {
             return Some((scaled, scaled));
@@ -4601,7 +4601,11 @@ impl Layer {
         }
         out.reserve(met);
         // The cuts are in the order of the steps: one search finds the first.
-        let mut cuts = grid.cuts().starting_at(first);
+        let mut cuts = if grid.rare.is_some() {
+            grid.cuts().starting_at(first)
+        } else {
+            CutsSlice::EMPTY
+        };
         let has_cuts = cuts.len() != 0;
         // A turn that begins on a whole cycle moves a tick by whole cycles of
         // ticks, so a time is made one time, reduced, from its tick.
@@ -4609,10 +4613,14 @@ impl Layer {
             .whole_cycles
             .and_then(|cycles| i64::try_from(cycles).ok())
             .and_then(|cycles| cycles.checked_mul(i64::from(grid.ticks.get())));
-        let pushed = with_tick_grid(grid.ticks, |reductions| {
+        let mut emit_range = |reductions: Option<&TickGrid>, cuts: &mut CutsSlice<'_>| {
             // The tick of the time made last, and the time: the end of a step is
             // the begin of the next, which most steps are.
             let mut last: Option<(u32, Fraction)> = None;
+            let ticks_pow2 = grid
+                .ticks
+                .is_power_of_two()
+                .then(|| grid.ticks.trailing_zeros());
             let mut at = |tick: u32| -> Result<Fraction, SequenceStop> {
                 if let Some((made, time)) = last
                     && made == tick
@@ -4620,7 +4628,15 @@ impl Layer {
                     return Ok(time);
                 }
                 let time = match offset.and_then(|offset| offset.checked_add(i64::from(tick))) {
-                    Some(ticks) => grid.made_small_with(ticks, reductions),
+                    Some(ticks) => {
+                        if let Some(shift) = ticks_pow2
+                            && let Some(dyadic) = Fraction::dyadic_i64(ticks, shift)
+                        {
+                            dyadic
+                        } else {
+                            grid.made_small_with(ticks, reductions)
+                        }
+                    }
                     None => turn.moved(grid.made_small_with(i64::from(tick), reductions))?,
                 };
                 last = Some((tick, time));
@@ -4675,7 +4691,12 @@ impl Layer {
                 out.push(maker.make_grid(grid, index, step_value, whole, part));
                 Ok(())
             })
-        });
+        };
+        let pushed = if grid.ticks.is_power_of_two() {
+            emit_range(None, &mut cuts)
+        } else {
+            with_tick_grid(grid.ticks, |reductions| emit_range(reductions, &mut cuts))
+        };
         if pushed.is_ok() {
             thread.note_accumulated(out.len() - others);
         }
@@ -5282,7 +5303,76 @@ fn query_layers(
     let Some(first) = layers.first() else {
         return Ok(());
     };
-    let mut turns = Turns::of(first.period(), span)?;
+    let period = first.period();
+    // Direct single-turn fast path for whole-cycle periods without building
+    // `Turns` or copying `Option<Turn>` on the stack.
+    if period.denom() == 1 && period.numer() > 0 && span.begin < span.end {
+        let p = period.numer();
+        let first_cycle = span.begin.floor_int();
+        let turn_idx = if p == 1 {
+            first_cycle
+        } else if p & (p - 1) == 0 {
+            first_cycle >> p.trailing_zeros()
+        } else {
+            first_cycle.div_euclid(p)
+        };
+        if let Some(next_turn) = turn_idx.checked_add(1)
+            && let Some(next_start) = next_turn.checked_mul(p)
+        {
+            let fits = if span.end.denom() == 1 {
+                span.end.numer() <= next_start
+            } else {
+                span.end.floor_int() < next_start
+            };
+            if fits {
+                let start_cycles = if p == 1 {
+                    turn_idx
+                } else {
+                    turn_idx.checked_mul(p).ok_or(SequenceStop::Range)?
+                };
+                let (begin, end) = if p == 1 {
+                    let b = span.begin.cycle_pos();
+                    let e = if span.end.denom() == 1 {
+                        Fraction::ONE
+                    } else {
+                        span.end.cycle_pos()
+                    };
+                    (b, e)
+                } else if let Some(back) = start_cycles.checked_neg() {
+                    (
+                        span.begin
+                            .checked_add_int(back)
+                            .ok_or(SequenceStop::Range)?,
+                        span.end.checked_add_int(back).ok_or(SequenceStop::Range)?,
+                    )
+                } else {
+                    let start_frac = Fraction::int(start_cycles);
+                    (
+                        span.begin
+                            .checked_sub(start_frac)
+                            .ok_or(SequenceStop::Range)?,
+                        span.end
+                            .checked_sub(start_frac)
+                            .ok_or(SequenceStop::Range)?,
+                    )
+                };
+                let turn = Turn {
+                    index: turn_idx,
+                    start: Fraction::int(start_cycles),
+                    whole_cycles: Some(start_cycles),
+                    begin,
+                    end,
+                    keys: std::cell::Cell::new(None),
+                };
+                for (i, layer) in layers.iter().enumerate() {
+                    let layer_ref = u16::try_from(offset + i).ok().map(|idx| (owner, idx));
+                    layer.push(thread, layer_ref, &turn, span, from, out)?;
+                }
+                return Ok(());
+            }
+        }
+    }
+    let mut turns = Turns::of(period, span)?;
     if turns.indices.end.checked_sub(turns.indices.start) == Some(1) {
         let turn = turns.turn(turns.indices.start)?;
         for (i, layer) in layers.iter().enumerate() {

@@ -4143,7 +4143,9 @@ pub(crate) fn retain_from(out: &mut Vec<Hap>, from: usize, mut keep: impl FnMut(
     let mut kept = from;
     for at in from..out.len() {
         if keep(&mut out[at]) {
-            out.swap(kept, at);
+            if kept != at {
+                out.swap(kept, at);
+            }
             kept += 1;
         }
     }
@@ -9219,20 +9221,42 @@ impl Pattern {
             self.answer_onto(thread, state, table::Order::Graph, out);
             return;
         }
-        let asked =
-            state.with_span(|span| span.with_time(|t| fast_query_time(t, factor, operation)));
+        let mul_pow2 = (factor.denom() == 1
+            && factor.numer() > 0
+            && (factor.numer() as u128).is_power_of_two())
+        .then(|| (factor.numer() as u128).trailing_zeros());
+        let div_pow2 = (factor.numer() == 1 && (factor.denom() as u128).is_power_of_two())
+            .then(|| (factor.denom() as u128).trailing_zeros());
+        let asked = if let Some(shift) = mul_pow2 {
+            state.with_span(|span| {
+                span.with_time(|t| {
+                    t.checked_mul_pow2(shift)
+                        .unwrap_or_else(|| fast_query_time(t, factor, operation))
+                })
+            })
+        } else if let Some(shift) = div_pow2 {
+            state.with_span(|span| {
+                span.with_time(|t| {
+                    t.checked_div_pow2(shift)
+                        .unwrap_or_else(|| fast_query_time(t, factor, operation))
+                })
+            })
+        } else {
+            state.with_span(|span| span.with_time(|t| fast_query_time(t, factor, operation)))
+        };
         let edges = (!thread.stop_requested() && factor != Fraction::ZERO)
             .then_some((state.span.begin, state.span.end));
         let from = out.len();
         self.answer_onto(thread, &asked, table::Order::Graph, out);
-        if factor.denom() == 1 && factor.numer() > 0 && (factor.numer() as u128).is_power_of_two() {
-            let shift = (factor.numer() as u128).trailing_zeros();
+        if out.len() == from {
+            return;
+        }
+        if let Some(shift) = mul_pow2 {
             Hap::map_times(&mut out[from..], asked.span, edges, |t| {
                 t.checked_div_pow2(shift)
                     .unwrap_or_else(|| fast_hap_time(t, factor, operation))
             });
-        } else if factor.numer() == 1 && (factor.denom() as u128).is_power_of_two() {
-            let shift = (factor.denom() as u128).trailing_zeros();
+        } else if let Some(shift) = div_pow2 {
             Hap::map_times(&mut out[from..], asked.span, edges, |t| {
                 t.checked_mul_pow2(shift)
                     .unwrap_or_else(|| fast_hap_time(t, factor, operation))
@@ -9259,12 +9283,21 @@ impl Pattern {
             self.answer_onto(thread, state, table::Order::Graph, out);
             return;
         }
-        let asked = state.with_span(|span| span.with_time(|t| shift_query_time(t, by, operation)));
+        let whole_by = (by.denom() == 1).then(|| by.numer());
+        let asked = if let Some(neg) = whole_by.and_then(i128::checked_neg) {
+            state.with_span(|span| {
+                span.with_time(|t| checked_time(t.checked_add_int(neg), operation))
+            })
+        } else {
+            state.with_span(|span| span.with_time(|t| shift_query_time(t, by, operation)))
+        };
         let edges = (!thread.stop_requested()).then_some((state.span.begin, state.span.end));
         let from = out.len();
         self.answer_onto(thread, &asked, table::Order::Graph, out);
-        if by.denom() == 1 {
-            let whole = by.numer();
+        if out.len() == from {
+            return;
+        }
+        if let Some(whole) = whole_by {
             Hap::map_times(&mut out[from..], asked.span, edges, |t| {
                 checked_time(t.checked_add_int(whole), operation)
             });
