@@ -2179,11 +2179,42 @@ impl<'r> Planned<'r> {
             counted_layers_buf.push((layer, count));
         }
         let in_cycles = !plans.long;
+        // Materializing all layers as compact `SmallGridStep` grids is both
+        // smaller and faster to query whenever the grids fit within the
+        // retained footprint of `Plans` + `PlanLayer` + `Sourced`.
+        let all_fit_grid = counted_layers_buf
+            .iter()
+            .all(|(_, count)| *count <= MAX_STEPS);
+        let force_listed = all_fit_grid && {
+            let mut sourced_layers = 0usize;
+            let mut sourced_grid_bytes = 0usize;
+            for (layer, count) in counted_layers_buf.iter() {
+                if !layer.is_listed(*count) {
+                    sourced_layers += 1;
+                    sourced_grid_bytes += *count * 8 + 64;
+                }
+            }
+            if sourced_layers == 0 {
+                false
+            } else {
+                let plan_bytes = 192
+                    + plans.kinds.len() * 8
+                    + plans.ids.len() * 2
+                    + plans.parts.len() * 8
+                    + plans.sites.len() * 8
+                    + plans.stacked.len() * 2
+                    + plans.lanes.len() * 8
+                    + sourced_layers * 136;
+                sourced_grid_bytes <= plan_bytes + 64
+            }
+        };
         // Each layer that reads the plans holds its own values.
         let mut own = Vec::new();
-        for (layer, count) in counted_layers_buf.iter() {
-            if !layer.is_listed(*count) {
-                own.push(plans.values_of(layer, values, local_buf));
+        if !force_listed {
+            for (layer, count) in counted_layers_buf.iter() {
+                if !layer.is_listed(*count) {
+                    own.push(plans.values_of(layer, values, local_buf));
+                }
             }
         }
         // A layer that reads the plans keeps them for as long as it
@@ -2194,7 +2225,7 @@ impl<'r> Planned<'r> {
         if counted_layers_buf.len() == 1 {
             let (layer, count) = counted_layers_buf.pop()?;
             let period = layer.period()?;
-            let pattern = if layer.is_listed(count) {
+            let pattern = if force_listed || layer.is_listed(count) {
                 let layer_values = plans.listed_indexed_into(
                     &layer, period, count, values, local_buf, held_buf, steps_buf,
                 )?;
@@ -2219,7 +2250,7 @@ impl<'r> Planned<'r> {
         let mut builder = SequenceBuilder::with_capacity(counted_layers_buf.len());
         for (layer, count) in counted_layers_buf.drain(..) {
             let period = layer.period()?;
-            if layer.is_listed(count) {
+            if force_listed || layer.is_listed(count) {
                 let layer_values = plans.listed_indexed_into(
                     &layer, period, count, values, local_buf, held_buf, steps_buf,
                 )?;

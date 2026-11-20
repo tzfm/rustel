@@ -6132,6 +6132,17 @@ enum Answering<'a> {
 
 /// What one query keeps from function hap to function hap while a
 /// [`ValueSide`] meets them.
+/// Cached per-span step-wave values, cut pieces, and shared patched table so
+/// chord haps sharing `hf.part` and a `Heads::Keyed` base table do zero extra
+/// allocations or grid time divisions.
+struct StepWaveCache {
+    part: TimeSpan,
+    values: Arc<[Value]>,
+    pieces: Vec<TimeSpan>,
+    /// `(base_table, patched_table)` for the last `Heads::Keyed` base table.
+    table: Option<(Arc<value::Table>, Arc<value::Table>)>,
+}
+
 #[derive(Default)]
 struct Meetings<'a> {
     answering: Option<Answering<'a>>,
@@ -6139,9 +6150,8 @@ struct Meetings<'a> {
     values: Vec<Hap>,
     /// The side as the control of a segment of a wave, when it is one.
     steps: Option<&'a fused::StepWave>,
-    /// Last evaluated multi-step segment `(part, grid, values)` reused across
-    /// chord haps that share the exact same `hf.part`.
-    step_cache: Option<(TimeSpan, fused::StepGrid, Arc<[Value]>)>,
+    /// Cached step-wave evaluations and shared overlay table for the last `hf.part`.
+    step_cache: Option<StepWaveCache>,
 }
 
 impl<'a> Meetings<'a> {
@@ -6444,7 +6454,7 @@ impl<'a> ValueSide<'a> {
         thread: &QueryThread,
         hf: &Hap,
         steps: &fused::StepWave,
-        step_cache: &mut Option<(TimeSpan, fused::StepGrid, Arc<[Value]>)>,
+        step_cache: &mut Option<StepWaveCache>,
         state: &State,
         from: usize,
         out: &mut Vec<Hap>,
@@ -6457,72 +6467,110 @@ impl<'a> ValueSide<'a> {
         let Value::Object(base_map) = &hf.value else {
             return None;
         };
-        let (grid, cached_values) = if let Some((cached_part, cached_grid, cached_vals)) =
-            step_cache.as_ref()
-            && *cached_part == hf.part
-        {
-            (*cached_grid, Some(Arc::clone(cached_vals)))
-        } else {
-            (steps.grid_over(hf.part)?, None)
-        };
-        let count = grid.len();
-        if count == 0 {
-            return Some(true);
-        }
-        if thread.stop_requested() {
-            return Some(false);
-        }
-        // Single-step shortcut avoids allocating a shared Table.
-        if count == 1 {
-            let k = grid.steps().start;
-            let begin = grid.time(k)?;
-            let end = grid.time(k + 1)?;
-            let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
-            let number = steps.value_at(begin, &state.controls)?;
-            let mut hap = hf.clone();
-            if !Meeting::set_number_in_place(
-                &mut hap, &steps.key, number, piece, self.apply, self.flow,
-            ) {
-                return None;
+        let cache_hit = step_cache
+            .as_ref()
+            .is_some_and(|cached| cached.part == hf.part);
+        if !cache_hit {
+            let grid = steps.grid_over(hf.part)?;
+            let count = grid.len();
+            if count == 0 {
+                return Some(true);
             }
-            if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
+            if thread.stop_requested() {
                 return Some(false);
             }
-            fused::note(fused::Hit::StepMany);
-            return Some(true);
-        }
-        // Multi-step overlay: evaluate step values once per distinct `hf.part`
-        // (sharing across chord notes) and share one `value::Table::patched`
-        // across all emitted haps.
-        let values: Arc<[Value]> = match cached_values {
-            Some(values) => values,
-            None => {
-                let arc: Arc<[Value]> = if count <= 32 {
-                    let mut nums = [0.0f64; 32];
-                    for (slot, k) in nums[..count].iter_mut().zip(grid.steps()) {
-                        if thread.stop_requested() {
-                            return Some(false);
-                        }
-                        let begin = grid.time(k)?;
-                        *slot = steps.value_at(begin, &state.controls)?;
-                    }
-                    nums[..count].iter().map(|&n| Value::F64(n)).collect()
-                } else {
-                    let mut vals = Vec::with_capacity(count);
-                    for k in grid.steps() {
-                        if thread.stop_requested() {
-                            return Some(false);
-                        }
-                        let begin = grid.time(k)?;
-                        vals.push(Value::F64(steps.value_at(begin, &state.controls)?));
-                    }
-                    Arc::from(vals)
-                };
-                *step_cache = Some((hf.part, grid, Arc::clone(&arc)));
-                arc
+            // Single-step shortcut avoids allocating a shared Table or cache.
+            if count == 1 {
+                let k = grid.steps().start;
+                let begin = grid.time(k)?;
+                let end = grid.time(k + 1)?;
+                let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
+                let number = steps.value_at(begin, &state.controls)?;
+                let mut hap = hf.clone();
+                if !Meeting::set_number_in_place(
+                    &mut hap, &steps.key, number, piece, self.apply, self.flow,
+                ) {
+                    return None;
+                }
+                if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
+                    return Some(false);
+                }
+                fused::note(fused::Hit::StepMany);
+                return Some(true);
             }
+            let mut pieces = match step_cache.take() {
+                Some(mut prev) => {
+                    prev.pieces.clear();
+                    prev.pieces
+                }
+                None => Vec::with_capacity(count),
+            };
+            pieces.reserve(count);
+            let mut begin = grid.time(grid.steps().start)?;
+            let values: Arc<[Value]> = if count <= 32 {
+                let mut nums = [0.0f64; 32];
+                for (slot, k) in nums[..count].iter_mut().zip(grid.steps()) {
+                    if thread.stop_requested() {
+                        return Some(false);
+                    }
+                    let end = grid.time(k + 1)?;
+                    pieces.push(grid.cut(k, TimeSpan::new(begin, end), hf.part));
+                    *slot = steps.value_at(begin, &state.controls)?;
+                    begin = end;
+                }
+                nums[..count].iter().map(|&n| Value::F64(n)).collect()
+            } else {
+                let mut vals = Vec::with_capacity(count);
+                for k in grid.steps() {
+                    if thread.stop_requested() {
+                        return Some(false);
+                    }
+                    let end = grid.time(k + 1)?;
+                    pieces.push(grid.cut(k, TimeSpan::new(begin, end), hf.part));
+                    vals.push(Value::F64(steps.value_at(begin, &state.controls)?));
+                    begin = end;
+                }
+                Arc::from(vals)
+            };
+            *step_cache = Some(StepWaveCache {
+                part: hf.part,
+                values,
+                pieces,
+                table: None,
+            });
+        }
+        let cached = step_cache.as_mut().expect("populated above");
+        let count = cached.pieces.len();
+        // Fast path: share one `PatchedTable` across all chord haps backed by
+        // the same `Heads::Keyed` base table.
+        let shared_patched = if let Some((base_table, base_row)) = base_map.dressed_table() {
+            if let Some((cached_base, cached_patched)) = &cached.table
+                && Arc::ptr_eq(cached_base, base_table)
+            {
+                Some((Arc::clone(cached_patched), base_row))
+            } else if let Some(patched) = value::Table::patched_keyed_table(
+                base_table,
+                steps.key.clone(),
+                Arc::clone(&cached.values),
+            ) {
+                let patched = Arc::new(patched);
+                cached.table = Some((Arc::clone(base_table), Arc::clone(&patched)));
+                Some((patched, base_row))
+            } else {
+                None
+            }
+        } else {
+            None
         };
-        let table = Arc::new(value::Table::patched(base_map, steps.key.clone(), values)?);
+        let fallback_table = if shared_patched.is_none() {
+            Some(Arc::new(value::Table::patched(
+                base_map,
+                steps.key.clone(),
+                Arc::clone(&cached.values),
+            )?))
+        } else {
+            None
+        };
         let mut template = hf.clone();
         // Clear value on the template so per-step clones do not bump base_map's Arc.
         template.value = Value::Undefined;
@@ -6540,12 +6588,14 @@ impl<'a> ValueSide<'a> {
         }
         out.reserve(count);
         let bulk_ok = thread.charge(out.len() - from + count);
-        let mut begin = grid.time(grid.steps().start)?;
-        for (index, k) in grid.steps().enumerate() {
-            let end = grid.time(k + 1)?;
-            let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
-            begin = end;
-            let map = table.map(index)?;
+        for (index, &piece) in cached.pieces.iter().enumerate() {
+            let map = match &shared_patched {
+                Some((table, base_row)) => table.map_packed(*base_row, index),
+                None => fallback_table
+                    .as_ref()
+                    .expect("fallback table")
+                    .map(index)?,
+            };
             let mut hap = template.clone();
             hap.value = Value::Object(map);
             hap.part = piece;
@@ -11245,6 +11295,26 @@ impl Pattern {
             return mapped.with_steps_of(self);
         }
         Pattern::of(Node::MapHapsOwned(self.clone(), map, SpanUse::Ignores)).with_steps_of(self)
+    }
+
+    /// Owned version of [`Self::map_control`] that names an unshared
+    /// `Node::Sequence` in place, avoiding `Vec<Layer>`, `Arc<[Layer]>`, and
+    /// `Arc<NodeCell>` allocations on `s("...")` and `note("...")`.
+    pub(crate) fn map_control_owned(
+        mut self,
+        spec: &controls::ControlSpec,
+        unnamed_only: bool,
+    ) -> Self {
+        if !unnamed_only
+            && sequence::folds(&self)
+            && matches!(self.node_kind(), Node::Sequence(_))
+            && let Some(cell) = Arc::get_mut(&mut self.node)
+            && let Node::Sequence(layers) = &mut cell.kind
+            && sequence::named_in_place(layers, &spec.names)
+        {
+            return self;
+        }
+        self.map_control(spec, unnamed_only)
     }
 
     pub fn filter_values(

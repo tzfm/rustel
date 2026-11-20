@@ -686,7 +686,7 @@ impl<'p> Turn<'p> {
                     return None;
                 };
                 let value = self.pattern_argument(names, argument, runtime)?;
-                Some(Native::Pattern(spec.standalone(&value)))
+                Some(Native::Pattern(spec.standalone_owned(value)))
             }
             BuiltinGlobal::List(kind) => {
                 let mut patterns = Vec::with_capacity(arguments.len());

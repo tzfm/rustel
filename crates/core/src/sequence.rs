@@ -18,7 +18,7 @@
 
 use crate::compose::{ComposeOp, compose_data_in_place, is_op_closure, union_drops};
 use crate::context_keys::ContextKeys;
-use crate::value::Table;
+use crate::value::{LayerCachedValues, LayerReadView, Table};
 use crate::{
     Combine, Hap, HapMapFn, Locations, LookupFlow, MAX_QUERY_SPAN_CYCLES, Meeting, Node,
     OwnedHapMapFn, Pattern, QueryLimit, QueryThread, State, TimeSpan, Value, ValuePredicate,
@@ -191,6 +191,18 @@ enum Steps {
     Listed(Listing),
     /// The steps as their source writes them for each query.
     Source(Arc<Sourced>),
+    /// Rare fallback when a layer's period does not fit `(i32, 29-bit u32)`.
+    WithPeriod(Arc<(Fraction, Steps)>),
+}
+
+impl Steps {
+    #[inline(always)]
+    fn inner(&self) -> &Self {
+        match self {
+            Self::WithPeriod(pair) => &pair.1,
+            other => other,
+        }
+    }
 }
 
 /// The source of the steps of a layer, and their list when a fold read
@@ -586,18 +598,28 @@ struct Grid {
 const _: () = assert!(std::mem::size_of::<SmallGridStep>() == 8);
 const _: () = assert!(std::mem::size_of::<Grid>() <= 48);
 
+/// Rare cuts and wide locations kept out of [`Spare`] so packed-only grids pay
+/// only 24 bytes for their side header instead of 48.
+#[derive(Clone)]
+struct SpareRare {
+    /// The cut steps, in the order of their places.
+    cuts: Box<[Cut]>,
+    /// Locations whose ranges do not fit [`PackedLoc`].
+    wide: Box<[Locations]>,
+}
+
 /// The cuts and the spare locations of a [`Grid`].
 #[derive(Clone)]
 struct Spare {
-    /// The cut steps, in the order of their places.
-    cuts: Box<[Cut]>,
     /// Packed multi-range step locations relative to `Grid::base`. Each word
     /// is a [`PackedLoc`] range, with `PackedLoc::SPARE` set on the last
     /// range of a step.
     packed: Box<[u32]>,
-    /// Locations whose ranges do not fit [`PackedLoc`].
-    wide: Box<[Locations]>,
+    /// Rare cuts and wide locations, allocated only when present.
+    rare: Option<Box<SpareRare>>,
 }
+
+const _: () = assert!(std::mem::size_of::<Spare>() == 24);
 
 impl Grid {
     const SMALL: u32 = 1 << 31;
@@ -741,13 +763,18 @@ impl Grid {
         }
         // The grid fits, so any wide locations move with no copy.
         let side = (!cuts.is_empty() || !packed_runs.is_empty() || !wide.is_empty()).then(|| {
+            let rare = (!cuts.is_empty() || !wide.is_empty()).then(|| {
+                Box::new(SpareRare {
+                    cuts: cuts.into(),
+                    wide: wide
+                        .iter()
+                        .map(|index| std::mem::take(&mut raws[*index].locations))
+                        .collect(),
+                })
+            });
             Box::new(Spare {
-                cuts: cuts.into(),
                 packed: packed_runs.into(),
-                wide: wide
-                    .iter()
-                    .map(|index| std::mem::take(&mut raws[*index].locations))
-                    .collect(),
+                rare,
             })
         });
         let base = base | if small_denominators { Self::SMALL } else { 0 };
@@ -815,13 +842,18 @@ impl Grid {
             return None;
         }
         let side = (!packed_runs.is_empty() || !wide.is_empty()).then(|| {
+            let rare = (!wide.is_empty()).then(|| {
+                Box::new(SpareRare {
+                    cuts: Box::new([]),
+                    wide: wide
+                        .iter()
+                        .map(|index| std::mem::take(&mut source_steps[*index].locations))
+                        .collect(),
+                })
+            });
             Box::new(Spare {
-                cuts: Box::new([]),
                 packed: packed_runs.into(),
-                wide: wide
-                    .iter()
-                    .map(|index| std::mem::take(&mut source_steps[*index].locations))
-                    .collect(),
+                rare,
             })
         });
         let base = base | if small_denominators { Self::SMALL } else { 0 };
@@ -881,7 +913,10 @@ impl Grid {
     }
 
     fn cuts(&self) -> &[Cut] {
-        self.side.as_ref().map_or(&[], |side| &side.cuts)
+        self.side
+            .as_ref()
+            .and_then(|side| side.rare.as_deref())
+            .map_or(&[], |rare| &rare.cuts)
     }
 
     /// The cut of step `index`.
@@ -921,8 +956,12 @@ impl Grid {
             return Locations::new();
         }
         if packed & PackedLoc::WIDE_MASK == PackedLoc::WIDE_MASK {
-            let side = self.side.as_ref().expect("a wide location has a side");
-            return side.wide[(packed & PackedLoc::INDEX_MASK) as usize].clone();
+            let rare = self
+                .side
+                .as_ref()
+                .and_then(|side| side.rare.as_deref())
+                .expect("a wide location has a rare side");
+            return rare.wide[(packed & PackedLoc::INDEX_MASK) as usize].clone();
         }
         let base = self.base & !Self::SMALL;
         if packed & PackedLoc::SPARE != 0 {
@@ -1081,15 +1120,23 @@ impl Grid {
             let side = match &self.side {
                 None => None,
                 Some(spare) => {
-                    let mut cuts = spare.cuts.clone();
-                    for cut in &mut cuts {
-                        cut.begin = rescale(cut.begin)?;
-                        cut.end = rescale(cut.end)?;
-                    }
+                    let rare = match &spare.rare {
+                        None => None,
+                        Some(rare) => {
+                            let mut cuts = rare.cuts.clone();
+                            for cut in &mut cuts {
+                                cut.begin = rescale(cut.begin)?;
+                                cut.end = rescale(cut.end)?;
+                            }
+                            Some(Box::new(SpareRare {
+                                cuts,
+                                wide: rare.wide.clone(),
+                            }))
+                        }
+                    };
                     Some(Box::new(Spare {
-                        cuts,
                         packed: spare.packed.clone(),
-                        wide: spare.wide.clone(),
+                        rare,
                     }))
                 }
             };
@@ -1187,84 +1234,33 @@ impl Place {
     }
 }
 
-/// Compact period storage: fits the common small rational inline in 16 bytes.
-#[derive(Clone, PartialEq, Eq)]
-enum Period {
-    Small(i32, NonZeroU32),
-    Large(Arc<Fraction>),
-}
-
-impl Period {
-    #[inline]
-    fn from_fraction(period: Fraction) -> Self {
-        if let (Ok(n), Ok(d)) = (i32::try_from(period.numer()), u32::try_from(period.denom()))
-            && let Some(d) = NonZeroU32::new(d)
-        {
-            Self::Small(n, d)
-        } else {
-            Self::Large(Arc::new(period))
-        }
-    }
-
-    #[inline]
-    fn get(&self) -> Fraction {
-        match self {
-            Self::Small(n, d) if d.get() == 1 => Fraction::int(i128::from(*n)),
-            Self::Small(n, d) => Fraction::new(i128::from(*n), i128::from(d.get())),
-            Self::Large(period) => **period,
-        }
-    }
-}
+/// Low 29 bits of [`Layer::period_denom_flags`] hold the small period denominator
+/// (`0` signals a rare large `i128` period stored inside `Steps::WithPeriod`).
+const LAYER_DENOM_MASK: u32 = (1 << 29) - 1;
+const LAYER_FLAG_IN_CYCLES: u32 = 1 << 29;
+const LAYER_FLAG_DATA: u32 = 1 << 30;
+const LAYER_FLAG_MAPS: u32 = 1 << 31;
 
 /// One layer of a sequence node: the places of its steps, and each value
 /// of them once. Each hap holds a plain value and its locations: a fold
 /// that would give a hap more keeps its own node.
 #[derive(Clone)]
 pub(crate) struct Layer {
-    period: Period,
     /// Shared by each layer that a fold makes of the same steps.
     steps: Steps,
     /// The value of each step, each once, before the name and the controls
     /// that the dress gives it.
     values: Arc<[Value]>,
+    /// The values as the dress makes them, made at the first read.
+    values_read: OnceLock<Arc<Table>>,
     /// What the folds on the layer give each hap. `None` for a layer that
     /// no fold dressed. See [`Dress`].
     dress: Option<Arc<Dress>>,
-    /// The values as the dress makes them, made at the first read.
-    values_read: OnceLock<Read>,
-    /// Whether each value is data only: a hap of the layer then holds
-    /// nothing that a query resolves or binds to a runtime.
-    data: bool,
-    /// Whether each value is a map of controls.
-    maps: bool,
-    /// Whether the part of each step lies in one cycle, in every period: a
-    /// constant, which is another hap in each cycle, then cuts no step.
-    in_cycles: bool,
-}
-
-/// The values of a layer as its dress makes them.
-#[derive(Clone)]
-enum Read {
-    /// Each value made as a map of its own.
-    Made(Box<Arc<[Value]>>),
-    /// Each value a map that reads the entries of a table the steps share.
-    Shared(Arc<Table>),
-    /// Values plus cached per-step contexts when the dress holds enough
-    /// locations that combining per hap would spill `Locations::INLINE`.
-    WithContexts(Box<ReadWithContexts>),
-}
-
-#[derive(Clone)]
-enum ReadValues {
-    Held,
-    Made(Arc<[Value]>),
-    Shared(Arc<Table>),
-}
-
-#[derive(Clone)]
-struct ReadWithContexts {
-    values: ReadValues,
-    contexts: Box<[Locations]>,
+    /// Numerator of a small rational period (when `period_denom_flags & LAYER_DENOM_MASK != 0`).
+    period_numer: i32,
+    /// Low 29 bits: period denominator (`0` means large period in `Steps::WithPeriod`).
+    /// Top 3 bits: `in_cycles`, `data`, and `maps` flags.
+    period_denom_flags: u32,
 }
 
 /// The values of a layer as its dress makes them.
@@ -1326,7 +1322,7 @@ impl Values<'_> {
 }
 // A layer is cloned by each fold: its steps stay behind a handle.
 const _: () = assert!(size_of::<Steps>() == 16);
-const _: () = assert!(size_of::<Layer>() <= 88);
+const _: () = assert!(size_of::<Layer>() == 64);
 
 /// Pack a single `(begin, end)` range into a non-zero `u32` for [`Dress`]:
 /// `begin` in the high 20 bits and `length + 1` in the low 12 bits, leaving
@@ -1794,21 +1790,112 @@ impl Layer {
 
     /// A layer of `steps` that hold `values`, with no fold on it.
     fn holding(period: Fraction, steps: Steps, in_cycles: bool, values: Arc<[Value]>) -> Self {
+        let data = values.iter().all(|value| value.is_data(0));
+        let maps = values.iter().all(|value| matches!(value, Value::Object(_)));
+        let flags = (if in_cycles { LAYER_FLAG_IN_CYCLES } else { 0 })
+            | (if data { LAYER_FLAG_DATA } else { 0 })
+            | (if maps { LAYER_FLAG_MAPS } else { 0 });
+        let (period_numer, denom, steps) = Self::pack_period(period, steps);
         Self {
-            in_cycles,
-            period: Period::from_fraction(period),
             steps,
-            data: values.iter().all(|value| value.is_data(0)),
-            maps: values.iter().all(|value| matches!(value, Value::Object(_))),
             values,
-            dress: None,
             values_read: OnceLock::new(),
+            dress: None,
+            period_numer,
+            period_denom_flags: denom | flags,
+        }
+    }
+
+    #[inline]
+    fn pack_period(period: Fraction, steps: Steps) -> (i32, u32, Steps) {
+        if let (Ok(n), Ok(d)) = (i32::try_from(period.numer()), u32::try_from(period.denom()))
+            && d != 0
+            && d <= LAYER_DENOM_MASK
+        {
+            (n, d, steps)
+        } else {
+            (0, 0, Steps::WithPeriod(Arc::new((period, steps))))
+        }
+    }
+
+    #[inline(always)]
+    fn in_cycles(&self) -> bool {
+        self.period_denom_flags & LAYER_FLAG_IN_CYCLES != 0
+    }
+
+    #[inline(always)]
+    fn set_in_cycles(&mut self, value: bool) {
+        if value {
+            self.period_denom_flags |= LAYER_FLAG_IN_CYCLES;
+        } else {
+            self.period_denom_flags &= !LAYER_FLAG_IN_CYCLES;
+        }
+    }
+
+    #[inline(always)]
+    fn maps(&self) -> bool {
+        self.period_denom_flags & LAYER_FLAG_MAPS != 0
+    }
+
+    #[inline(always)]
+    fn set_maps(&mut self, value: bool) {
+        if value {
+            self.period_denom_flags |= LAYER_FLAG_MAPS;
+        } else {
+            self.period_denom_flags &= !LAYER_FLAG_MAPS;
+        }
+    }
+
+    #[inline(always)]
+    fn set_data(&mut self, value: bool) {
+        if value {
+            self.period_denom_flags |= LAYER_FLAG_DATA;
+        } else {
+            self.period_denom_flags &= !LAYER_FLAG_DATA;
+        }
+    }
+
+    #[inline]
+    fn set_period_and_steps(&mut self, period: Fraction, steps: Steps) {
+        let flags = self.period_denom_flags & !LAYER_DENOM_MASK;
+        let (numer, denom, steps) = Self::pack_period(period, steps);
+        self.period_numer = numer;
+        self.period_denom_flags = denom | flags;
+        self.steps = steps;
+    }
+
+    #[inline]
+    fn set_steps(&mut self, steps: Steps) {
+        if self.period_denom_flags & LAYER_DENOM_MASK != 0 {
+            self.steps = steps;
+        } else {
+            let period = self.period();
+            self.steps = Steps::WithPeriod(Arc::new((period, steps)));
         }
     }
 
     #[inline]
     fn period(&self) -> Fraction {
-        self.period.get()
+        let denom = self.period_denom_flags & LAYER_DENOM_MASK;
+        if denom == 1 {
+            Fraction::int(i128::from(self.period_numer))
+        } else if denom != 0 {
+            Fraction::new(i128::from(self.period_numer), i128::from(denom))
+        } else if let Steps::WithPeriod(pair) = &self.steps {
+            pair.0
+        } else {
+            unreachable!("zero period denom requires Steps::WithPeriod")
+        }
+    }
+
+    #[inline]
+    fn same_period(&self, other: &Self) -> bool {
+        let a_denom = self.period_denom_flags & LAYER_DENOM_MASK;
+        let b_denom = other.period_denom_flags & LAYER_DENOM_MASK;
+        if a_denom != b_denom || self.period_numer != other.period_numer {
+            return false;
+        }
+        a_denom != 0 || self.period() == other.period()
     }
 
     /// What the folds on this layer give each hap of it.
@@ -1830,7 +1917,7 @@ impl Layer {
     /// call: a fold that moves or cuts steps reads it here, and a query
     /// does not.
     fn listing(&self) -> &Listing {
-        match &self.steps {
+        match self.steps.inner() {
             Steps::Listed(listing) => listing,
             Steps::Source(sourced) => sourced.read.get_or_init(|| {
                 let mut raws = Vec::with_capacity(sourced.steps.count());
@@ -1847,20 +1934,22 @@ impl Layer {
                 debug_assert!(written.is_some(), "a source reads its period");
                 Listing::of(raws)
             }),
+            Steps::WithPeriod(_) => unreachable!("inner unwraps WithPeriod"),
         }
     }
 
     /// The list of the steps, when it is made. A read of it makes none.
     fn listed(&self) -> Option<&Listing> {
-        match &self.steps {
+        match self.steps.inner() {
             Steps::Listed(listing) => Some(listing),
             Steps::Source(sourced) => sourced.read.get(),
+            Steps::WithPeriod(_) => unreachable!("inner unwraps WithPeriod"),
         }
     }
 
     /// The source of the steps, when no fold made their list.
     fn source(&self) -> Option<&dyn StepSource> {
-        match &self.steps {
+        match self.steps.inner() {
             Steps::Source(sourced) if sourced.read.get().is_none() => Some(&*sourced.steps),
             _ => None,
         }
@@ -1899,8 +1988,8 @@ impl Layer {
 
     /// This layer with `values` in the place of its own, one for one.
     fn valued(mut self, values: Arc<[Value]>) -> Self {
-        self.data = values.iter().all(|value| value.is_data(0));
-        self.maps = values.iter().all(|value| matches!(value, Value::Object(_)));
+        self.set_data(values.iter().all(|value| value.is_data(0)));
+        self.set_maps(values.iter().all(|value| matches!(value, Value::Object(_))));
         self.values = values;
         self.change_dress(|dress| {
             dress.named = None;
@@ -1924,9 +2013,49 @@ impl Layer {
         // A handle of the names, which the control holds.
         let mut layers = redressed(layers, |dress| dress.named = Some(Arc::clone(names)));
         for layer in &mut layers {
-            layer.maps = true;
+            layer.set_maps(true);
         }
         layers
+    }
+
+    /// Name `layers` in place when they are unshared, avoiding `Vec<Layer>`,
+    /// `Arc<[Layer]>`, and `Arc<NodeCell>` churn on `s("...")` / `note("...")`.
+    fn named_in_place(layers: &mut [Layer], names: &Arc<[Arc<str>]>) {
+        if let [layer] = layers {
+            if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
+                dress.named = Some(Arc::clone(names));
+            } else {
+                let mut dress = layer.dress().clone();
+                dress.named = Some(Arc::clone(names));
+                layer.dress = Some(Arc::new(dress));
+            }
+            layer.set_maps(true);
+            layer.values_read = OnceLock::new();
+            return;
+        }
+        let mut last: Option<(*const Dress, Arc<Dress>)> = None;
+        for layer in layers {
+            if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
+                dress.named = Some(Arc::clone(names));
+                layer.set_maps(true);
+                layer.values_read = OnceLock::new();
+                continue;
+            }
+            let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
+            let dress = match &last {
+                Some((seen, dress)) if *seen == from => Arc::clone(dress),
+                _ => {
+                    let mut dress = layer.dress().clone();
+                    dress.named = Some(Arc::clone(names));
+                    let dress = Arc::new(dress);
+                    last = Some((from, Arc::clone(&dress)));
+                    dress
+                }
+            };
+            layer.dress = Some(dress);
+            layer.set_maps(true);
+            layer.values_read = OnceLock::new();
+        }
     }
 
     /// Whether [`Self::named`] names the values of this layer: it holds no
@@ -2004,7 +2133,7 @@ impl Layer {
             dress.named = Some(crate::controls::note_names());
             dress.set_keys(keys);
         });
-        layer.maps = true;
+        layer.set_maps(true);
         Some(layer)
     }
 
@@ -2014,9 +2143,9 @@ impl Layer {
     fn takes_set(&self, control: &Value, flow: LookupFlow) -> bool {
         let set = Combine::Composed(ComposeOp::Set);
         let map = Value::Object(crate::OrderedMap::new());
-        self.in_cycles
-            && self.maps
-            && self.data
+        self.in_cycles()
+            && self.maps()
+            && self.is_data()
             && !self.values.is_empty()
             && matches!(control, Value::Object(_))
             && Meeting::values_meet_in_place(&map, control, &set, flow)
@@ -2032,8 +2161,9 @@ impl Layer {
     }
 
     /// Whether each value is data only.
+    #[inline(always)]
     pub(crate) fn is_data(&self) -> bool {
-        self.data
+        self.period_denom_flags & LAYER_FLAG_DATA != 0
     }
 
     /// This layer with other places, values or locations.
@@ -2143,18 +2273,16 @@ impl Layer {
         if !needs_values && !needs_contexts {
             return (Values::Held(&self.values), None);
         }
-        match self.values_read.get_or_init(|| self.read_values(dress)) {
-            Read::Made(values) => (Values::Held(values), None),
-            Read::Shared(table) => (Values::Table(table), None),
-            Read::WithContexts(cached) => {
-                let values = match &cached.values {
-                    ReadValues::Held => Values::Held(&self.values),
-                    ReadValues::Made(values) => Values::Held(values),
-                    ReadValues::Shared(table) => Values::Table(table),
-                };
-                (values, Some(&cached.contexts))
-            }
-        }
+        let (view, contexts) = self
+            .values_read
+            .get_or_init(|| self.read_values(dress))
+            .as_layer_read();
+        let values = match view {
+            LayerReadView::Held => Values::Held(&self.values),
+            LayerReadView::Made(values) => Values::Held(values),
+            LayerReadView::Shared(table) => Values::Table(table),
+        };
+        (values, contexts)
     }
 
     /// [`Self::value`] of each step.
@@ -2165,10 +2293,10 @@ impl Layer {
 
     /// The values as `dress` makes them: one table that their maps read
     /// where that gives the same maps, else each value made on its own.
-    fn read_values(&self, dress: &Dress) -> Read {
+    fn read_values(&self, dress: &Dress) -> Arc<Table> {
         let needs_values = dress.named.is_some() || dress.set.is_some();
         let core = if !needs_values {
-            ReadValues::Held
+            LayerCachedValues::Held
         } else {
             let set = match &dress.set {
                 None => Some(None),
@@ -2186,9 +2314,9 @@ impl Layer {
             if let (Some(set), Some(key)) = (set, key)
                 && let Some(table) = Table::new(&self.values, key, set)
             {
-                ReadValues::Shared(Arc::new(table))
+                LayerCachedValues::Shared(Arc::new(table))
             } else {
-                ReadValues::Made(
+                LayerCachedValues::Made(
                     self.values
                         .iter()
                         .map(|value| {
@@ -2211,15 +2339,14 @@ impl Layer {
             let contexts: Box<[Locations]> = (0..listing.len())
                 .map(|index| dress.around(&listing.locations(index)))
                 .collect();
-            return Read::WithContexts(Box::new(ReadWithContexts {
-                values: core,
-                contexts,
-            }));
+            return Arc::new(Table::layer_with_contexts(core, contexts));
         }
         match core {
-            ReadValues::Made(values) => Read::Made(Box::new(values)),
-            ReadValues::Shared(table) => Read::Shared(table),
-            ReadValues::Held => unreachable!("ReadValues::Held only built with spilling contexts"),
+            LayerCachedValues::Made(values) => Arc::new(Table::layer_made(values)),
+            LayerCachedValues::Shared(table) => table,
+            LayerCachedValues::Held => {
+                unreachable!("LayerCachedValues::Held only built with spilling contexts")
+            }
         }
     }
 
@@ -2232,10 +2359,10 @@ impl Layer {
             (Some(a), Some(b)) if Arc::ptr_eq(a, b) => true,
             _ => self.dress().same(other.dress(), &same_value),
         };
-        if !same_dress || self.period != other.period {
+        if !same_dress || !self.same_period(other) {
             return false;
         }
-        let (own, others) = match (&self.steps, &other.steps) {
+        let (own, others) = match (self.steps.inner(), other.steps.inner()) {
             (Steps::Listed(own), Steps::Listed(others)) => (own, others),
             (Steps::Source(own), Steps::Source(others)) => {
                 // Two layers of one source hold the same steps, whatever was
@@ -2604,7 +2731,7 @@ impl Layer {
         // A step that lies in one cycle meets a value that fills the cycle
         // over the whole part: the places stay, and the locations of the
         // value go beside those of each step.
-        if self.in_cycles && values.fills_each_cycle() {
+        if self.in_cycles() && values.fills_each_cycle() {
             let pairs = (0..u32::try_from(self.values.len()).ok()?)
                 .map(|value| (value, 0))
                 .collect();
@@ -2718,12 +2845,10 @@ impl Layer {
                 }
             }
         }
-        let mut met = Layer {
-            in_cycles: lie_in_spans(period, raws.iter().map(Raw::part)),
-            period: Period::from_fraction(period),
-            steps: Steps::Listed(Listing::of(raws)),
-            ..self.clone()
-        };
+        let in_cycles = lie_in_spans(period, raws.iter().map(Raw::part));
+        let mut met = self.clone();
+        met.set_in_cycles(in_cycles);
+        met.set_period_and_steps(period, Steps::Listed(Listing::of(raws)));
         // The locations of the steps are in their places now, but those
         // after the steps of the function side, which end each hap.
         met.change_dress(|dress| {
@@ -3060,7 +3185,7 @@ pub(crate) fn query_sequence_onto(
         out.reserve(steps.min(MOST_ROOM));
     }
     let from = out.len();
-    for layers in layers.chunk_by(|a, b| a.period == b.period) {
+    for layers in layers.chunk_by(Layer::same_period) {
         match query_layers(thread, layers, span, from, out) {
             Ok(()) => {}
             Err(stop) => {
@@ -3373,7 +3498,7 @@ pub(crate) fn is_bare(pattern: &Pattern) -> bool {
 /// hap of it.
 pub(crate) fn lies_in_cycles(pattern: &Pattern) -> bool {
     match folded(pattern) {
-        Some(layers) => layers.iter().all(|layer| layer.in_cycles),
+        Some(layers) => layers.iter().all(Layer::in_cycles),
         None => pattern.is_rest() && folds(pattern),
     }
 }
@@ -3398,6 +3523,19 @@ pub(crate) fn named(pattern: &Pattern, names: &Arc<[Arc<str>]>) -> Option<Patter
     // made where the new node holds them.
     let named: Arc<[Layer]> = Layer::named(layers.iter(), names).into();
     Some(Pattern::of(Node::Sequence(named)))
+}
+
+/// Try to name `layers` of an owned `Node::Sequence` in place when unshared.
+/// Returns `true` if `layers` were updated in place.
+pub(crate) fn named_in_place(layers: &mut Arc<[Layer]>, names: &Arc<[Arc<str>]>) -> bool {
+    if !layers.iter().all(Layer::takes_name) {
+        return false;
+    }
+    let Some(slice) = Arc::get_mut(layers) else {
+        return false;
+    };
+    Layer::named_in_place(slice, names);
+    true
 }
 
 /// `pattern` with each hap changed by `map`, a map that reads no span and
@@ -3708,8 +3846,8 @@ pub(crate) fn filtered(pattern: &Pattern, keep: &ValuePredicate) -> Option<Patte
                     .map(|index| listing.raw(index))
                     .collect();
                 layer.with(|layer| {
-                    layer.in_cycles = lie_in_spans(layer.period(), raws.iter().map(Raw::part));
-                    layer.steps = Steps::Listed(Listing::of(raws));
+                    layer.set_in_cycles(lie_in_spans(layer.period(), raws.iter().map(Raw::part)));
+                    layer.set_steps(Steps::Listed(Listing::of(raws)));
                 })
             })
             .collect();
@@ -3756,9 +3894,11 @@ pub(crate) fn faster(pattern: &Pattern, factor: Fraction) -> Option<Pattern> {
                 && let Some((new_grid, in_cycles)) = grid.faster(factor, period)
             {
                 return Some(layer.with(|layer| {
-                    layer.in_cycles = in_cycles;
-                    layer.period = Period::from_fraction(period);
-                    layer.steps = Steps::Listed(Listing::Grid(Arc::new(new_grid)));
+                    layer.set_in_cycles(in_cycles);
+                    layer.set_period_and_steps(
+                        period,
+                        Steps::Listed(Listing::Grid(Arc::new(new_grid))),
+                    );
                 }));
             }
             let raws = (0..listing.len())
@@ -3777,9 +3917,8 @@ pub(crate) fn faster(pattern: &Pattern, factor: Fraction) -> Option<Pattern> {
                 })
                 .collect::<Option<Vec<_>>>()?;
             Some(layer.with(|layer| {
-                layer.in_cycles = lie_in_spans(period, raws.iter().map(Raw::part));
-                layer.period = Period::from_fraction(period);
-                layer.steps = Steps::Listed(Listing::of(raws));
+                layer.set_in_cycles(lie_in_spans(period, raws.iter().map(Raw::part)));
+                layer.set_period_and_steps(period, Steps::Listed(Listing::of(raws)));
             }))
         })
         .collect::<Option<Vec<_>>>()?;
@@ -3801,7 +3940,7 @@ pub(crate) fn plied(pattern: &Pattern, count: usize) -> Option<Pattern> {
         .map(|layer| {
             let steps = layer.listing();
             let listed = steps.len().checked_mul(count)?;
-            if !layer.data || listed > MAX_FOLDED_STEPS {
+            if !layer.is_data() || listed > MAX_FOLDED_STEPS {
                 return None;
             }
             let mut raws = Vec::with_capacity(listed);
@@ -3835,8 +3974,8 @@ pub(crate) fn plied(pattern: &Pattern, count: usize) -> Option<Pattern> {
                 }
             }
             Some(layer.with(|layer| {
-                layer.in_cycles = lie_in_spans(layer.period(), raws.iter().map(Raw::part));
-                layer.steps = Steps::Listed(Listing::of(raws));
+                layer.set_in_cycles(lie_in_spans(layer.period(), raws.iter().map(Raw::part)));
+                layer.set_steps(Steps::Listed(Listing::of(raws)));
             }))
         })
         .collect::<Option<Vec<_>>>()?;
@@ -5591,7 +5730,11 @@ mod tests {
             assert_eq!(layer.each_value().count(), plain.len(), "{what}: count");
             assert!(layer.value(plain.len()).is_none(), "{what}: past the end");
             let read = layer.values_read.get().expect("the layer read its values");
-            assert_eq!(matches!(read, Read::Shared(_)), shared, "{what}: the form");
+            assert_eq!(
+                matches!(read.as_layer_read(), (LayerReadView::Shared(_), None)),
+                shared,
+                "{what}: the form"
+            );
             for (index, plain) in plain.iter().enumerate() {
                 let Some(Value::Object(shared)) = layer.value(index) else {
                     panic!("{what}: step {index} is no map");
@@ -5767,10 +5910,10 @@ mod tests {
     fn as_places(layer: &Layer) -> Layer {
         let places: Box<[Place]> = layer.places().into();
         layer.with(|layer| {
-            layer.steps = Steps::Listed(Listing::Places(Arc::new(Listed {
+            layer.set_steps(Steps::Listed(Listing::Places(Arc::new(Listed {
                 places,
                 small_denominators: true,
-            })));
+            }))));
         })
     }
 

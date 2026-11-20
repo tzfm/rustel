@@ -2,7 +2,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
+
+static NEXT_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn next_runtime_identity() -> u64 {
+    NEXT_RUNTIME_IDENTITY.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Mutable module settings for one native rustel runtime.
 ///
@@ -12,16 +19,25 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 pub struct RuntimeSettings {
     inner: Arc<RuntimeSettingsInner>,
 }
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RuntimeSettingsInner {
     /// Snapshots used by nested graphs keep this identity while owning a
     /// detached publication slot. Re-entering the same runtime during one
     /// operation therefore reuses the already selected state.
-    identity: Arc<()>,
+    identity: u64,
     /// All clones share this publication slot. A bound operation pins the
     /// selected state identity once, so replacement is atomic across the
     /// complete operation rather than field-by-field in its middle.
     state: RwLock<Arc<SettingsState>>,
+}
+
+impl Default for RuntimeSettingsInner {
+    fn default() -> Self {
+        Self {
+            identity: next_runtime_identity(),
+            state: RwLock::default(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -226,7 +242,6 @@ impl RuntimeSettings {
         let mut charge = NativeRetention::new(limit);
         charge.add(std::mem::size_of::<Self>())?;
         charge.arc::<RuntimeSettingsInner>()?;
-        charge.arc::<()>()?;
         charge.arc::<SettingsState>()?;
 
         match &state.default_voicings {
@@ -305,7 +320,7 @@ impl RuntimeSettings {
                 .borrow()
                 .iter()
                 .rev()
-                .find(|bound| Arc::ptr_eq(&bound.owner.identity, &self.inner.identity))
+                .find(|bound| bound.owner.identity == self.inner.identity)
                 .map(|bound| (Arc::clone(&bound.owner), Arc::clone(&bound.selected)))
         });
         let (owner, selected) = inherited.unwrap_or_else(|| {
@@ -363,7 +378,7 @@ impl RuntimeSettings {
         let selected = current_state();
         Self {
             inner: Arc::new(RuntimeSettingsInner {
-                identity: Arc::new(()),
+                identity: next_runtime_identity(),
                 state: RwLock::new(selected),
             }),
         }
@@ -394,7 +409,7 @@ impl RuntimeSettings {
             .clone();
         Self {
             inner: Arc::new(RuntimeSettingsInner {
-                identity: Arc::clone(&self.inner.identity),
+                identity: self.inner.identity,
                 state: RwLock::new(selected),
             }),
         }
@@ -457,7 +472,7 @@ impl RuntimeSettings {
         };
         Self {
             inner: Arc::new(RuntimeSettingsInner {
-                identity: Arc::new(()),
+                identity: next_runtime_identity(),
                 state: RwLock::new(Arc::new(state)),
             }),
         }
@@ -627,19 +642,17 @@ impl Drop for RuntimeSettingsScope {
     }
 }
 
-fn current_binding() -> (Arc<()>, Arc<SettingsState>) {
+fn current_binding() -> (u64, Arc<SettingsState>) {
     CURRENT
         .with(|current| {
-            current.borrow().last().map(|bound| {
-                (
-                    Arc::clone(&bound.owner.identity),
-                    Arc::clone(&bound.selected),
-                )
-            })
+            current
+                .borrow()
+                .last()
+                .map(|bound| (bound.owner.identity, Arc::clone(&bound.selected)))
         })
         .unwrap_or_else(|| {
             (
-                Arc::clone(&FALLBACK.inner.identity),
+                FALLBACK.inner.identity,
                 FALLBACK
                     .inner
                     .state
@@ -1057,10 +1070,7 @@ mod recovery_tests {
             .host_voicing_identity()
             .expect("host dictionary identity");
         let recovered = settings.recovery_snapshot();
-        assert!(!Arc::ptr_eq(
-            &settings.inner.identity,
-            &recovered.inner.identity
-        ));
+        assert_ne!(settings.inner.identity, recovered.inner.identity);
         let original_dict = settings.with(default_host_voicing_dict).unwrap();
         let recovered_dict = recovered.with(default_host_voicing_dict).unwrap();
         assert!(!Arc::ptr_eq(&original_dict, &recovered_dict));

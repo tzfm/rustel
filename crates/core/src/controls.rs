@@ -185,6 +185,11 @@ impl ControlSpec {
     pub fn standalone(&self, value: &Pattern) -> Pattern {
         self.pattern(value)
     }
+
+    /// Owned free-function form: names an unshared sequence in place.
+    pub fn standalone_owned(&self, value: Pattern) -> Pattern {
+        value.map_control_owned(self, false)
+    }
 }
 
 /// The names of the control `note`, which a rewrite of pitch names each

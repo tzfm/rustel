@@ -44,7 +44,7 @@ pub(crate) struct Patched {
 impl Patched {
     fn empty(base: Arc<Table>, row: u32, made: bool) -> Option<Self> {
         let base_len = u16::try_from(base.layout(row).len()).ok()?;
-        let marks = base.marks;
+        let marks = base.marks();
         Some(Self {
             base,
             base_len,
@@ -70,7 +70,7 @@ impl Patched {
             Some(at) => u16::try_from(at).ok()?,
             None => u16::MAX,
         };
-        let marks = base.marks | Table::mark(key.as_str());
+        let marks = base.marks() | Table::mark(key.as_str());
         let appended = u8::from(rep == u16::MAX);
         let has_replace = rep != u16::MAX;
         let mut entries = [const { None }; MAX_PATCHES];
@@ -136,7 +136,7 @@ impl Patched {
                 return Some(v);
             }
         }
-        if self.base.marks & Table::mark(key.name()) == 0 {
+        if self.base.marks() & Table::mark(key.name()) == 0 {
             return None;
         }
         self.base.layout(row).get(key)
@@ -163,7 +163,7 @@ impl Patched {
                 append_pos += 1;
             }
         }
-        if self.base.marks & Table::mark(key.name()) == 0 {
+        if self.base.marks() & Table::mark(key.name()) == 0 {
             return None;
         }
         self.base.layout(row).position(key)
@@ -186,7 +186,7 @@ impl Patched {
             return Err(value);
         }
         let mark = Table::mark(key.as_str());
-        let replace = if self.base.marks & mark == 0 {
+        let replace = if self.base.marks() & mark == 0 {
             u16::MAX
         } else {
             match self.base.layout(row).position(key) {
@@ -229,7 +229,7 @@ impl Patched {
             return false;
         }
         let mark = Table::mark(key.as_str());
-        let (value, replace) = if self.base.marks & mark == 0 {
+        let (value, replace) = if self.base.marks() & mark == 0 {
             (other.clone(), u16::MAX)
         } else {
             let layout = self.base.layout(row);
@@ -294,16 +294,15 @@ enum Entries {
 /// gives every step (the tail). This is the map that a compose of the set
 /// onto the head makes, as long as no key is in both.
 pub(crate) struct Table {
-    /// The head of each step.
+    /// The head of each step. Two variants allow Rust to niche-optimize into 32 B.
     heads: Heads,
     /// The entries of the set, none for a layer with no set.
     tail: Option<Arc<[(Key, Value)]>>,
-    /// Whether a compose of data made the maps, which are then data only.
-    made: bool,
-    /// The marks of the key names of every step, see [`Table::mark`]. A key
-    /// whose mark is not here is in no step.
-    marks: u64,
+    /// Low 63 bits hold key presence marks; bit 63 is `MADE_BIT` (compose of data).
+    marks_and_made: u64,
 }
+
+const _: () = assert!(std::mem::size_of::<Table>() == 56);
 
 /// The entries of one map, shared.
 type Shares = Arc<[(Key, Value)]>;
@@ -322,27 +321,118 @@ struct PatchedKeyedHeads {
     values: Arc<[Value]>,
 }
 
-/// The head of each step of a [`Table`].
-enum Heads {
-    /// The value of each step, each once, under one key.
-    Keyed(Key, Arc<[Value]>),
+struct PatchedTableHeads {
+    base: Arc<Table>,
+    key: Key,
+    values: Arc<[Value]>,
+}
+
+/// Rare head layouts kept behind one `Box` so [`Heads`] has two variants and
+/// niche-optimizes to 32 bytes.
+enum OtherHeads {
     /// The entries of the map of each step.
     Maps(Box<[Shares]>),
     /// One shared base map with one key replaced at `replace` (or appended
     /// when `replace == base.len()`) per step.
-    Patched(Box<PatchedHeads>),
+    Patched(PatchedHeads),
     /// A dressed `Keyed` step `(head_key, head_value)` plus shared `Table::tail`
-    /// with one appended `(key, values[index])` per step, avoiding flattening
-    /// the dressed base into a fresh `Arc<[(Key, Value)]>`.
-    PatchedKeyed(Box<PatchedKeyedHeads>),
+    /// with one appended `(key, values[index])` per step.
+    PatchedKeyed(PatchedKeyedHeads),
+    /// Shared across chord notes from one `Heads::Keyed` base table: row index
+    /// packs `(base_row << 16) | step_index`.
+    PatchedTable(PatchedTableHeads),
+    /// Non-table layer values stored inside `Layer::values_read` so `OnceLock`
+    /// stays 16 bytes.
+    LayerMade(Arc<[Value]>),
+    /// Layer read cache with pre-combined spilling contexts.
+    LayerWithContexts {
+        values: LayerCachedValues,
+        contexts: Box<[crate::Locations]>,
+    },
+}
+
+pub(crate) enum LayerCachedValues {
+    Held,
+    Made(Arc<[Value]>),
+    Shared(Arc<Table>),
+}
+
+/// Decoded view of a `Layer::values_read` entry.
+pub(crate) enum LayerReadView<'a> {
+    Held,
+    Made(&'a [Value]),
+    Shared(&'a Arc<Table>),
+}
+
+/// The head of each step of a [`Table`].
+enum Heads {
+    /// The value of each step, each once, under one key.
+    Keyed(Key, Arc<[Value]>),
+    /// Rare layouts behind one `Box`.
+    Other(Box<OtherHeads>),
 }
 
 impl Table {
+    const MADE_BIT: u64 = 1u64 << 63;
+
+    #[inline(always)]
+    fn marks(&self) -> u64 {
+        self.marks_and_made & !Self::MADE_BIT
+    }
+
+    #[inline(always)]
+    fn is_made(&self) -> bool {
+        self.marks_and_made & Self::MADE_BIT != 0
+    }
+
+    /// Wrap non-table precomputed layer values inside a `Table` cell for `Layer`.
+    pub(crate) fn layer_made(values: Arc<[Value]>) -> Self {
+        Self {
+            heads: Heads::Other(Box::new(OtherHeads::LayerMade(values))),
+            tail: None,
+            marks_and_made: 0,
+        }
+    }
+
+    /// Wrap layer values plus pre-combined spilling contexts for `Layer`.
+    pub(crate) fn layer_with_contexts(
+        values: LayerCachedValues,
+        contexts: Box<[crate::Locations]>,
+    ) -> Self {
+        Self {
+            heads: Heads::Other(Box::new(OtherHeads::LayerWithContexts { values, contexts })),
+            tail: None,
+            marks_and_made: 0,
+        }
+    }
+
+    /// Decode a `Layer::values_read` cell into its values view and optional contexts.
+    #[inline]
+    pub(crate) fn as_layer_read(
+        self: &Arc<Self>,
+    ) -> (LayerReadView<'_>, Option<&[crate::Locations]>) {
+        match &self.heads {
+            Heads::Other(other) => match &**other {
+                OtherHeads::LayerMade(values) => (LayerReadView::Made(values), None),
+                OtherHeads::LayerWithContexts { values, contexts } => {
+                    let view = match values {
+                        LayerCachedValues::Held => LayerReadView::Held,
+                        LayerCachedValues::Made(vals) => LayerReadView::Made(vals),
+                        LayerCachedValues::Shared(table) => LayerReadView::Shared(table),
+                    };
+                    (view, Some(contexts))
+                }
+                _ => (LayerReadView::Shared(self), None),
+            },
+            Heads::Keyed(_, _) => (LayerReadView::Shared(self), None),
+        }
+    }
+
     /// Whether every row of this table shares identical key positions, so a
     /// [`Patched`] overlay built for one row applies unchanged to any other.
     #[inline]
     fn has_uniform_keys(&self) -> bool {
-        !matches!(self.heads, Heads::Maps(_))
+        !matches!(&self.heads, Heads::Other(o) if matches!(&**o, OtherHeads::Maps(_)))
     }
 
     /// The table of `values` under `key`, with `set` after: `None` where
@@ -399,17 +489,62 @@ impl Table {
                     }
                     maps.push(entries);
                 }
-                Heads::Maps(maps.into())
+                Heads::Other(Box::new(OtherHeads::Maps(maps.into())))
             }
         };
         let mut table = Self {
             heads,
             tail,
-            made,
-            marks: 0,
+            marks_and_made: 0,
         };
-        table.marks = table.marks_of_keys();
+        table.marks_and_made = table.marks_of_keys() | if made { Self::MADE_BIT } else { 0 };
         Some(table)
+    }
+
+    /// Build a single `Table` that appends `(key, values[step_idx])` onto any
+    /// row of a `Heads::Keyed` `base_table`, allowing all chord notes sharing
+    /// `base_table` to reuse one allocation.
+    pub(crate) fn patched_keyed_table(
+        base_table: &Arc<Table>,
+        key: Key,
+        values: Arc<[Value]>,
+    ) -> Option<Self> {
+        if values.is_empty() || values.len() > 0xffff {
+            return None;
+        }
+        let Heads::Keyed(head_key, head_values) = &base_table.heads else {
+            return None;
+        };
+        if head_values.len() > 0xffff || head_key == &key {
+            return None;
+        }
+        let mark = Self::mark(&key);
+        if base_table.marks() & mark != 0
+            && base_table
+                .tail
+                .as_deref()
+                .is_some_and(|tail| tail.iter().any(|(name, _)| name == &key))
+        {
+            return None;
+        }
+        let marks = base_table.marks() | mark;
+        Some(Self {
+            heads: Heads::Other(Box::new(OtherHeads::PatchedTable(PatchedTableHeads {
+                base: Arc::clone(base_table),
+                key,
+                values,
+            }))),
+            tail: None,
+            marks_and_made: marks | Self::MADE_BIT,
+        })
+    }
+
+    /// Map view for a `(base_row, step_idx)` pair on a `patched_keyed_table`.
+    #[inline]
+    pub(crate) fn map_packed(self: &Arc<Self>, base_row: u32, step_idx: usize) -> OrderedMap {
+        OrderedMap {
+            entries: Entries::Dressed(Arc::clone(self), (base_row << 16) | (step_idx as u32)),
+        }
     }
 
     /// A table of data maps sharing `base`, each setting `key` to one of
@@ -424,23 +559,22 @@ impl Table {
         if let Entries::Dressed(base_table, base_idx) = &base.entries
             && let Heads::Keyed(head_key, head_values) = &base_table.heads
             && head_key != &key
-            && (base_table.marks & Self::mark(&key) == 0
+            && (base_table.marks() & Self::mark(&key) == 0
                 || base_table
                     .tail
                     .as_deref()
                     .is_none_or(|tail| !tail.iter().any(|(name, _)| name == &key)))
         {
-            let marks = base_table.marks | Self::mark(&key);
+            let marks = base_table.marks() | Self::mark(&key);
             return Some(Self {
-                heads: Heads::PatchedKeyed(Box::new(PatchedKeyedHeads {
+                heads: Heads::Other(Box::new(OtherHeads::PatchedKeyed(PatchedKeyedHeads {
                     head_key: head_key.clone(),
                     head_value: head_values[*base_idx as usize].clone(),
                     key,
                     values,
-                })),
+                }))),
                 tail: base_table.tail.clone(),
-                made: true,
-                marks,
+                marks_and_made: marks | Self::MADE_BIT,
             });
         }
         let entries: Shares = match &base.entries {
@@ -453,24 +587,22 @@ impl Table {
             .position(|(name, _)| name == &key)
             .unwrap_or(entries.len());
         let mut table = Self {
-            heads: Heads::Patched(Box::new(PatchedHeads {
+            heads: Heads::Other(Box::new(OtherHeads::Patched(PatchedHeads {
                 base: entries,
                 key,
                 replace,
                 values,
-            })),
+            }))),
             tail: None,
-            made: true,
-            marks: 0,
+            marks_and_made: 0,
         };
-        table.marks = table.marks_of_keys();
+        table.marks_and_made = table.marks_of_keys() | Self::MADE_BIT;
         Some(table)
     }
 
-    /// The mark of a key name: one of 64 bits, from the length and the
-    /// first, middle and last bytes, which is all that a lookup of a name
-    /// that most steps lack needs to rule it out. The bytes are mixed so
-    /// that the common control names do not share a bit.
+    /// The mark of a key name: one of 63 bits (leaving bit 63 for `MADE_BIT`),
+    /// from the length and the first, middle and last bytes, which is all that
+    /// a lookup of a name that most steps lack needs to rule it out.
     #[inline(always)]
     fn mark(name: &str) -> u64 {
         let bytes = name.as_bytes();
@@ -482,7 +614,7 @@ impl Table {
             | u32::from(first) << 8
             | u32::from(last) << 16
             | u32::from(middle) << 24;
-        1 << (mixed.wrapping_mul(0x9E37_79B1) >> 26)
+        1u64 << ((mixed.wrapping_mul(0x9E37_79B1) >> 26) % 63)
     }
 
     /// The marks of every key name that a step of this table holds.
@@ -495,9 +627,13 @@ impl Table {
         let tail = self.tail.as_deref().map_or(0, of);
         tail | match &self.heads {
             Heads::Keyed(key, _) => Self::mark(key),
-            Heads::Maps(maps) => maps.iter().fold(0, |marks, map| marks | of(map)),
-            Heads::Patched(p) => of(&p.base) | Self::mark(&p.key),
-            Heads::PatchedKeyed(p) => Self::mark(&p.head_key) | Self::mark(&p.key),
+            Heads::Other(other) => match &**other {
+                OtherHeads::Maps(maps) => maps.iter().fold(0, |marks, map| marks | of(map)),
+                OtherHeads::Patched(p) => of(&p.base) | Self::mark(&p.key),
+                OtherHeads::PatchedKeyed(p) => Self::mark(&p.head_key) | Self::mark(&p.key),
+                OtherHeads::PatchedTable(p) => p.base.marks() | Self::mark(&p.key),
+                OtherHeads::LayerMade(_) | OtherHeads::LayerWithContexts { .. } => 0,
+            },
         }
     }
 
@@ -506,9 +642,13 @@ impl Table {
     pub(crate) fn map(self: &Arc<Self>, index: usize) -> Option<OrderedMap> {
         let held = match &self.heads {
             Heads::Keyed(_, values) => values.len(),
-            Heads::Maps(maps) => maps.len(),
-            Heads::Patched(p) => p.values.len(),
-            Heads::PatchedKeyed(p) => p.values.len(),
+            Heads::Other(other) => match &**other {
+                OtherHeads::Maps(maps) => maps.len(),
+                OtherHeads::Patched(p) => p.values.len(),
+                OtherHeads::PatchedKeyed(p) => p.values.len(),
+                OtherHeads::PatchedTable(p) => p.values.len(),
+                OtherHeads::LayerMade(_) | OtherHeads::LayerWithContexts { .. } => return None,
+            },
         };
         // The table holds no more steps than a u32 counts.
         (index < held).then(|| OrderedMap {
@@ -521,17 +661,31 @@ impl Table {
         let tail = self.tail.as_deref().unwrap_or(&[]);
         match &self.heads {
             Heads::Keyed(key, values) => Layout::Keyed(key, &values[index as usize], tail),
-            Heads::Maps(maps) => Layout::Split(&maps[index as usize], tail),
-            Heads::Patched(p) => {
-                Layout::Patched(&p.base, p.replace, &p.key, &p.values[index as usize])
-            }
-            Heads::PatchedKeyed(p) => Layout::KeyedExtra(
-                &p.head_key,
-                &p.head_value,
-                tail,
-                &p.key,
-                &p.values[index as usize],
-            ),
+            Heads::Other(other) => match &**other {
+                OtherHeads::Maps(maps) => Layout::Split(&maps[index as usize], tail),
+                OtherHeads::Patched(p) => {
+                    Layout::Patched(&p.base, p.replace, &p.key, &p.values[index as usize])
+                }
+                OtherHeads::PatchedKeyed(p) => Layout::KeyedExtra(
+                    &p.head_key,
+                    &p.head_value,
+                    tail,
+                    &p.key,
+                    &p.values[index as usize],
+                ),
+                OtherHeads::PatchedTable(p) => {
+                    let base_row = (index >> 16) as usize;
+                    let step_idx = (index & 0xffff) as usize;
+                    let Heads::Keyed(hk, hvals) = &p.base.heads else {
+                        unreachable!("PatchedTable wraps Heads::Keyed");
+                    };
+                    let base_tail = p.base.tail.as_deref().unwrap_or(&[]);
+                    Layout::KeyedExtra(hk, &hvals[base_row], base_tail, &p.key, &p.values[step_idx])
+                }
+                OtherHeads::LayerMade(_) | OtherHeads::LayerWithContexts { .. } => {
+                    unreachable!("layer-internal cache cannot be read as OrderedMap")
+                }
+            },
         }
     }
 }
@@ -1020,13 +1174,22 @@ impl OrderedMap {
         }
     }
 
+    /// If this map is backed by a dressed [`Table`], return `(table, row)`.
+    #[inline]
+    pub(crate) fn dressed_table(&self) -> Option<(&Arc<Table>, u32)> {
+        match &self.entries {
+            Entries::Dressed(table, row) => Some((table, *row)),
+            _ => None,
+        }
+    }
+
     /// The entries of a dressed map copied into a plain one, which keeps
     /// whether a compose made them of data.
     fn undress(&mut self) {
         match &self.entries {
             Entries::Dressed(table, index) => {
                 let entries = table.layout(*index).to_shares();
-                self.entries = match table.made {
+                self.entries = match table.is_made() {
                     true => Entries::Made(entries),
                     false => Entries::Shared(entries),
                 };
@@ -1305,7 +1468,7 @@ impl OrderedMap {
             Entries::Shared(entries) | Entries::Made(entries) => {
                 Layout::Plain(entries).position(key)
             }
-            Entries::Dressed(table, index) => match table.marks & Table::mark(key.name()) {
+            Entries::Dressed(table, index) => match table.marks() & Table::mark(key.name()) {
                 0 => None,
                 _ => table.layout(*index).position(key),
             },
@@ -1318,7 +1481,7 @@ impl OrderedMap {
     pub(crate) fn holds_only_data(&self) -> bool {
         match &self.entries {
             Entries::Empty | Entries::Made(_) => true,
-            Entries::Dressed(table, _) => table.made,
+            Entries::Dressed(table, _) => table.is_made(),
             Entries::Patched(patched, _) => patched.made,
             Entries::Shared(_) => false,
         }
@@ -1591,7 +1754,7 @@ impl OrderedMap {
             }
             if len < MAX_PATCHES {
                 let mark = Table::mark(key.as_str());
-                let (old, replace) = if own.base.marks & mark == 0 {
+                let (old, replace) = if own.base.marks() & mark == 0 {
                     (None, u16::MAX)
                 } else {
                     let layout = own.base.layout(row);
@@ -1650,7 +1813,7 @@ impl OrderedMap {
         match &self.entries {
             Entries::Empty => None,
             Entries::Shared(entries) | Entries::Made(entries) => Layout::Plain(entries).get(key),
-            Entries::Dressed(table, index) => match table.marks & Table::mark(key) {
+            Entries::Dressed(table, index) => match table.marks() & Table::mark(key) {
                 0 => None,
                 _ => table.layout(*index).get(key),
             },
