@@ -550,12 +550,13 @@ impl App {
         if hidden_focus {
             // The keys go to the score from here: say so, or a status
             // still naming the panel's keys would send them there.
-            if let Focus::Panel(PanelKind::Viz) = self.focus {
-                self.status = format!(
-                    "visuals {} has no room on screen - the keys go to the score",
-                    self.viz_focus + 1
-                );
-            }
+            let panel = match self.focus {
+                Focus::Panel(PanelKind::Viz) => format!("visuals {}", self.viz_focus + 1),
+                Focus::Panel(PanelKind::Set) => "the set panel".to_owned(),
+                Focus::Panel(PanelKind::Log) => "the log".to_owned(),
+                _ => "the knobs".to_owned(),
+            };
+            self.status = format!("{panel} has no room on screen - the keys go to the score");
             self.focus = Focus::Editor;
         }
         let set_name = self.scenes.name();
