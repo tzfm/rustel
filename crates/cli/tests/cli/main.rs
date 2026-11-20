@@ -9735,8 +9735,10 @@ fn an_unreadable_scale_is_reported_when_its_notes_drop() {
         "-o",
         path.to_str().expect("utf-8 path"),
     ]);
-    let _ = std::fs::remove_file(&path);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(path.exists(), "the take is written");
+    let _ = std::fs::remove_file(&path);
     assert!(stderr.contains("query_threw"), "{stderr}");
     assert!(stderr.contains("Scale name raga is incomplete"), "{stderr}");
 }
