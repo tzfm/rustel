@@ -482,6 +482,16 @@ impl App {
                 unblocked = true;
             }
         }
+        // The check refuses an update without a footer error of these
+        // owners - an unknown sound from a source not allowed yet - and a
+        // refused voice arrives under another owner. Whatever refused the
+        // update in front of the player, a new permission may lift it: the
+        // re-run reads the buffer again, and only if it is still the one
+        // refused.
+        let current = self.scenes.current();
+        unblocked |= self.update_failure.is_some_and(|(scene, revision)| {
+            current.id == scene && current.is_score() && current.editor.revision() == revision
+        });
         if unblocked {
             self.refused_update_owed = true;
         }
@@ -619,6 +629,29 @@ mod tests {
             assert!(!app.csound_allowed);
             assert!(app.note_csound_refusal(&refusal()).is_some());
             assert_eq!(csound(&app), Some(PermissionRow::Csound { allowed: false }));
+        }
+
+        /// A sample source allowed after the check refused the update - an
+        /// unknown sound, with no footer error naming the source - re-runs
+        /// that update too, as the docs promise.
+        #[test]
+        fn allowing_a_source_reruns_an_update_the_check_refused() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let scene = app.scenes.current().id;
+            let revision = app.editor().revision();
+            app.update_failure = Some((scene, revision));
+            app.allow_source("http://localhost:5432");
+            assert!(app.refused_update_owed, "the re-run is owed");
+            assert!(app.status.contains("updating the score"), "{}", app.status);
+
+            // An edit since the refusal is the next update's to run.
+            let mut app = app_over(directory.path());
+            app.update_failure = Some((app.scenes.current().id, app.editor().revision()));
+            app.dispatch_editor(crate::editor::Command::InsertText("x".into()))
+                .expect("an edit");
+            app.allow_source("http://localhost:5433");
+            assert!(!app.refused_update_owed);
         }
 
         /// Enter on the switch after a refusal re-runs the refused update by
