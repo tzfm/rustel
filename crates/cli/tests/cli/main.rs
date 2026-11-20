@@ -9604,6 +9604,12 @@ fn an_unknown_voicing_dictionary_is_an_error() {
         "addVoicings('mine', {m7: ['3m 7m']}, ['C3','C6']); chord('Cm7').dict('mine').voicing()",
     ] {
         let out = ok_stdout(&["query", "-e", score, "--plain"]);
-        assert!(!out.contains("0 events"), "{score}: {out}");
+        let events: usize = out
+            .lines()
+            .rev()
+            .find_map(|line| line.split_once(" events").map(|(count, _)| count.trim()))
+            .and_then(|count| count.parse().ok())
+            .expect("an event count");
+        assert!(events > 0, "{score}: {out}");
     }
 }
