@@ -166,8 +166,8 @@ fn same_pick_lookup(a: &Option<Arc<PickLookup>>, b: &Option<Arc<PickLookup>>) ->
     }
 }
 
-/// Persistent 8-slot node-level cache mapping shared input keys to visual-tagged keys.
-pub(crate) type UiVisualCache = [std::sync::OnceLock<Box<(Arc<Keys>, Arc<Keys>)>>; 8];
+/// Persistent 4-slot node-level cache mapping shared input keys to visual-tagged keys.
+pub(crate) type UiVisualCache = [std::sync::OnceLock<(Arc<Keys>, Arc<Keys>)>; 4];
 
 impl ContextKeys {
     /// `keys`, sharing nothing when no key is set.
@@ -302,7 +302,7 @@ impl ContextKeys {
                     let mut next = (**arc).clone();
                     next.ui_visuals |= bit;
                     let output = Arc::new(next);
-                    let _ = once[idx].set(Box::new((input, Arc::clone(&output))));
+                    let _ = once[idx].set((input, Arc::clone(&output)));
                     self.0 = Some(output);
                     return;
                 }

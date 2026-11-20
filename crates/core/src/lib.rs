@@ -4195,7 +4195,10 @@ pub(crate) fn with_list<R>(work: impl FnOnce(&mut Vec<Hap>) -> R) -> R {
     const MOST_ROOM: usize = 64;
     // The lists are gone when the thread ends.
     let spare = SPARE_LISTS.try_with(|spare| spare.borrow_mut().pop());
-    let mut list = spare.ok().flatten().unwrap_or_default();
+    let mut list = spare
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| Vec::with_capacity(8));
     let result = work(&mut list);
     list.clear();
     if list.capacity() > 0 && list.capacity() <= MOST_ROOM {
@@ -8340,6 +8343,37 @@ fn query_run(
     if out.len() == from || thread.stop_requested() {
         return;
     }
+    // Single-hap fast path: avoid stack-initializing `SharedWaveCache` arrays
+    // and running the `retain_from` closure when a voice emits one hap.
+    if out.len() - from == 1 {
+        let hf = &mut out[from];
+        let met = hf.whole_or_part();
+        match hf.part.intersection(&met) {
+            None => {
+                out.truncate(from);
+                return;
+            }
+            Some(part) if part.within_one_cycle() => {
+                for meeting in meetings {
+                    if Meeting::in_place_run_meeting(hf, meeting, part, None) {
+                        continue;
+                    }
+                    let constant = meeting.as_hap();
+                    let apply = meeting.combine();
+                    *hf = applied_hap(hf, &constant, hf.whole, part, &apply, meeting.flow());
+                    if thread.stop_requested() {
+                        out.truncate(from);
+                        return;
+                    }
+                }
+                if thread.stop_requested() {
+                    out.truncate(from);
+                }
+                return;
+            }
+            Some(_) => {}
+        }
+    }
     // Fast in-place path when every hap's active intersection lies within a
     // single cycle (true for all sub-cycle windows even when `whole` spans
     // multiple cycles): zero scratch buffer, zero Hap moves.
@@ -8351,7 +8385,36 @@ fn query_run(
         }
     }) {
         let mut stopped = false;
-        let use_cache = out.len() - from > 1;
+        if let [meeting] = meetings {
+            let mut cache = value::SharedWaveCache::default();
+            retain_from(out, from, |hf| {
+                if stopped {
+                    return false;
+                }
+                let met = hf.whole_or_part();
+                let Some(part) = hf.part.intersection(&met) else {
+                    return false;
+                };
+                if !Meeting::in_place_run_meeting(hf, meeting, part, Some(&mut cache)) {
+                    let constant = meeting.as_hap();
+                    let apply = meeting.combine();
+                    *hf = applied_hap(hf, &constant, hf.whole, part, &apply, meeting.flow());
+                    if thread.stop_requested() {
+                        stopped = true;
+                        return false;
+                    }
+                }
+                if thread.stop_requested() {
+                    stopped = true;
+                    return false;
+                }
+                true
+            });
+            if stopped {
+                out.truncate(from);
+            }
+            return;
+        }
         let mut caches: [value::SharedWaveCache; 4] = Default::default();
         retain_from(out, from, |hf| {
             if stopped {
@@ -8362,12 +8425,7 @@ fn query_run(
                 return false;
             };
             for (m_idx, meeting) in meetings.iter().enumerate() {
-                let cache = if use_cache {
-                    caches.get_mut(m_idx)
-                } else {
-                    None
-                };
-                if Meeting::in_place_run_meeting(hf, meeting, part, cache) {
+                if Meeting::in_place_run_meeting(hf, meeting, part, caches.get_mut(m_idx)) {
                     continue;
                 }
                 let constant = meeting.as_hap();
@@ -8487,14 +8545,68 @@ impl Pattern {
         }
     }
 
+    /// Direct cycle-zero constant extraction for common constant graphs,
+    /// avoiding a full query pass and `Vec<Hap>` allocation on first visit.
+    fn try_constant_cycle_direct(&self, cycle: TimeSpan) -> Option<Hap> {
+        if self.has_runtime_settings() || self.is_volatile() {
+            return None;
+        }
+        match self.node_kind() {
+            Node::Pure(value) if value.is_data(0) => {
+                Some(Hap::new(Some(cycle), cycle, value.clone()))
+            }
+            Node::PureAt(boxed) if boxed.0.is_data(0) => Some(Hap {
+                whole: Some(cycle),
+                part: cycle,
+                value: boxed.0.clone(),
+                context: boxed.1.clone(),
+                keys: ContextKeys::default(),
+            }),
+            Node::Sequence(_) => {
+                let (value, context) = sequence::constant_value_at(self)?;
+                Some(Hap {
+                    whole: Some(cycle),
+                    part: cycle,
+                    value,
+                    context,
+                    keys: ContextKeys::default(),
+                })
+            }
+            Node::AddContext(boxed) => {
+                let mut hap = boxed.0.try_constant_cycle_direct(cycle)?;
+                hap.context.extend_from_slice(&boxed.1);
+                Some(hap)
+            }
+            Node::ControlMap(cell, flags, id, unnamed_only) => {
+                let hap = plain_pattern(cell, *flags).try_constant_cycle_direct(cycle)?;
+                let spec = controls::builtin_spec_by_id(*id)?;
+                controls::apply_control_hap(spec, *unnamed_only, hap)
+            }
+            Node::ControlMapBoxed(boxed) => {
+                let hap = boxed.0.try_constant_cycle_direct(cycle)?;
+                let spec = controls::builtin_spec_by_id(boxed.1)?;
+                controls::apply_control_hap(spec, boxed.2, hap)
+            }
+            Node::UiVisual(node) => {
+                let mut hap = node.inner.try_constant_cycle_direct(cycle)?;
+                hap.keys.add_ui_visual_slot(node.slot);
+                Some(hap)
+            }
+            _ => None,
+        }
+    }
+
     /// The hap this pattern answers for cycle zero, when the pattern
     /// [is constant per cycle](Self::is_constant_per_cycle) and its graph
     /// answers so. No node of such a graph reads the controls of `state`.
     fn constant_cycle(&self, state: &State) -> Option<Hap> {
+        let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
+        if let Some(hap) = self.try_constant_cycle_direct(cycle) {
+            return Some(hap);
+        }
         if !self.is_constant_per_cycle() {
             return None;
         }
-        let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
         let mut haps = self.query(&state.set_span(cycle));
         match (haps.pop(), haps.is_empty()) {
             (Some(hap), true) if hap.whole == Some(cycle) && hap.part == cycle => Some(hap),
@@ -14375,6 +14487,50 @@ impl Pattern {
         self.query_arc_outcome_in(state, budget, table::Order::Sorted)
     }
 
+    fn initial_short_room(&self) -> usize {
+        fn has_dense_shape(mut cur: &Node, depth: u8) -> bool {
+            for _ in 0..8 {
+                match cur {
+                    Node::UiVisual(node) => cur = node.inner.node_kind(),
+                    Node::AppWave(app) => cur = app.inner.node_kind(),
+                    Node::AppLeft(pair) => cur = pair.0.node_kind(),
+                    Node::AddContext(boxed) => cur = boxed.0.node_kind(),
+                    Node::SplitQueries(cell, _) => cur = &cell.kind,
+                    Node::SplitQueriesBoxed(pat) => cur = pat.node_kind(),
+                    Node::Constants(node) => cur = node.0.node_kind(),
+                    Node::Fast(node) => cur = node.0.node_kind(),
+                    Node::Shift(node) => cur = node.0.node_kind(),
+                    Node::ShiftSmall(cell, ..) => cur = &cell.kind,
+                    Node::ControlMap(cell, ..) => cur = &cell.kind,
+                    Node::ControlMapBoxed(boxed) => cur = boxed.0.node_kind(),
+                    Node::MapHapsNative(boxed) => cur = boxed.0.node_kind(),
+                    Node::MapHapsOwned(boxed) => cur = boxed.0.node_kind(),
+                    Node::Cpm(boxed) => cur = boxed.0.node_kind(),
+                    Node::WithRandSeed(boxed) => cur = boxed.0.node_kind(),
+                    Node::Timeline(..) => return true,
+                    Node::SlowCat(pats) if pats.len() >= 2 => return true,
+                    Node::SlowCatPure(cells) if cells.len() >= 2 => return true,
+                    Node::Stack(pats) => {
+                        return pats.len() >= 4
+                            || (depth == 0
+                                && pats.iter().any(|p| has_dense_shape(p.node_kind(), 1)));
+                    }
+                    Node::StackPure(cells) => {
+                        return cells.len() >= 4
+                            || (depth == 0 && cells.iter().any(|c| has_dense_shape(&c.kind, 1)));
+                    }
+                    _ => return false,
+                }
+            }
+            false
+        }
+        if has_dense_shape(self.node_kind(), 0) {
+            32
+        } else {
+            20
+        }
+    }
+
     fn query_arc_outcome_in(
         &self,
         state: &State,
@@ -14407,13 +14563,15 @@ impl Pattern {
                 }
                 let is_short = state.span.end - state.span.begin <= Fraction::ONE;
                 let root_ptr = Arc::as_ptr(&self.node) as usize;
+                let mut base_room = 20usize;
                 let room = if is_short {
                     SHORT_QUERY_HINT.with(|hint| {
                         let (ptr, cap) = hint.get();
                         if ptr == root_ptr {
                             usize::from(cap)
                         } else {
-                            20
+                            base_room = self.initial_short_room();
+                            base_room
                         }
                     })
                 } else {
@@ -14430,7 +14588,8 @@ impl Pattern {
                         48u16
                     } else {
                         64u16
-                    };
+                    }
+                    .max(base_room as u16);
                     SHORT_QUERY_HINT.with(|hint| {
                         let (ptr, cap) = hint.get();
                         let next = if ptr == root_ptr {

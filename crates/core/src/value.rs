@@ -1481,21 +1481,33 @@ impl Patched {
 
 /// Reusable per-timestamp or per-run overlay cache for chord/stacked haps
 /// sharing uniform-key [`Table`], `SeqLayer`, or [`Patched`] overlays.
+type PatchedCacheEntry = (Arc<Patched>, u32, Arc<Patched>);
+type StepPatchCacheEntry = (Arc<StepPatch>, u32, Arc<Patched>);
+
 #[derive(Default)]
 pub(crate) struct SharedWaveCache {
-    dressed: [Option<Arc<Patched>>; 4],
+    dressed: [Option<(u32, Arc<Patched>)>; 4],
     dressed_next: u8,
-    patched: [Option<(Arc<Patched>, Arc<Patched>)>; 4],
+    patched: [Option<PatchedCacheEntry>; 4],
     patched_next: u8,
+    step_patched: [Option<StepPatchCacheEntry>; 2],
+    step_patched_next: u8,
 }
 
 impl SharedWaveCache {
+    const ANY_ROW: u32 = u32::MAX;
+
     #[inline]
-    fn get_table(&self, table: &Arc<Table>) -> Option<&Arc<Patched>> {
+    fn row_tag(uniform: bool, row: u32) -> u32 {
+        if uniform { Self::ANY_ROW } else { row }
+    }
+
+    #[inline]
+    fn get_table(&self, table: &Arc<Table>, row_tag: u32) -> Option<&Arc<Patched>> {
         self.dressed
             .iter()
             .flatten()
-            .find(|c| c.base.matches_table(table))
+            .find_map(|(tag, c)| (*tag == row_tag && c.base.matches_table(table)).then_some(c))
     }
 
     #[inline]
@@ -1503,41 +1515,55 @@ impl SharedWaveCache {
         &self,
         layers: &Arc<[crate::sequence::Layer]>,
         layer_idx: u16,
+        row_tag: u32,
     ) -> Option<&Arc<Patched>> {
-        self.dressed
-            .iter()
-            .flatten()
-            .find(|c| c.base.matches_seq_layer(layers, layer_idx))
+        self.dressed.iter().flatten().find_map(|(tag, c)| {
+            (*tag == row_tag && c.base.matches_seq_layer(layers, layer_idx)).then_some(c)
+        })
     }
 
     #[inline]
     fn get_builtin(&self, entries: &Arc<dyn BuiltinEntries>) -> Option<&Arc<Patched>> {
-        self.dressed
-            .iter()
-            .flatten()
-            .find(|c| c.base.matches_builtin(entries))
+        self.dressed.iter().flatten().find_map(|(tag, c)| {
+            (*tag == Self::ANY_ROW && c.base.matches_builtin(entries)).then_some(c)
+        })
     }
 
     #[inline]
-    fn put_dressed(&mut self, arc: Arc<Patched>) {
+    fn put_dressed(&mut self, row_tag: u32, arc: Arc<Patched>) {
         let slot = usize::from(self.dressed_next) & 3;
-        self.dressed[slot] = Some(arc);
+        self.dressed[slot] = Some((row_tag, arc));
         self.dressed_next = self.dressed_next.wrapping_add(1);
     }
 
     #[inline]
-    fn get_patched(&self, prev: &Arc<Patched>) -> Option<&Arc<Patched>> {
+    fn get_patched(&self, prev: &Arc<Patched>, row_tag: u32) -> Option<&Arc<Patched>> {
         self.patched
             .iter()
             .flatten()
-            .find_map(|(k, v)| Arc::ptr_eq(k, prev).then_some(v))
+            .find_map(|(k, tag, v)| (*tag == row_tag && Arc::ptr_eq(k, prev)).then_some(v))
     }
 
     #[inline]
-    fn put_patched(&mut self, prev: Arc<Patched>, out: Arc<Patched>) {
+    fn put_patched(&mut self, prev: Arc<Patched>, row_tag: u32, out: Arc<Patched>) {
         let slot = usize::from(self.patched_next) & 3;
-        self.patched[slot] = Some((prev, out));
+        self.patched[slot] = Some((prev, row_tag, out));
         self.patched_next = self.patched_next.wrapping_add(1);
+    }
+
+    #[inline]
+    fn get_step_patch(&self, sp: &Arc<StepPatch>, slot_key: u32) -> Option<&Arc<Patched>> {
+        self.step_patched
+            .iter()
+            .flatten()
+            .find_map(|(k, tag, v)| (*tag == slot_key && Arc::ptr_eq(k, sp)).then_some(v))
+    }
+
+    #[inline]
+    fn put_step_patch(&mut self, sp: Arc<StepPatch>, slot_key: u32, out: Arc<Patched>) {
+        let slot = usize::from(self.step_patched_next) & 1;
+        self.step_patched[slot] = Some((sp, slot_key, out));
+        self.step_patched_next = self.step_patched_next.wrapping_add(1);
     }
 }
 
@@ -3564,13 +3590,6 @@ impl OrderedMap {
                 .with_entries(key, at, value, true);
             return;
         }
-        if let Entries::StepPatch(step, packed) = &self.entries
-            && let Some((mut patched, row)) = step.to_patched(*packed)
-            && patched.try_set(row, key, value.clone(), true).is_ok()
-        {
-            self.entries = Entries::Patched(Arc::new(patched), row);
-            return;
-        }
         if let Entries::Patched(..) | Entries::StepPatch(..) = &self.entries {
             self.entries = self
                 .layout()
@@ -3587,7 +3606,7 @@ impl OrderedMap {
     }
 
     /// Set several numeric data controls, reusing one [`Patched`] allocation
-    /// across chord haps that share a uniform-key [`Table`] or [`Patched`]
+    /// across chord haps that share a [`Table`], [`Patched`], or [`StepPatch`]
     /// overlay at the same sample.
     pub(crate) fn set_data_many_cached(
         &mut self,
@@ -3596,9 +3615,10 @@ impl OrderedMap {
     ) {
         if !patches.is_empty() && patches.len() <= MAX_PATCHES {
             match &mut self.entries {
-                Entries::Dressed(table, row) if table.has_uniform_keys() => {
+                Entries::Dressed(table, row) => {
                     let row = *row;
-                    if let Some(cached) = cache.get_table(table) {
+                    let tag = SharedWaveCache::row_tag(table.has_uniform_keys(), row);
+                    if let Some(cached) = cache.get_table(table, tag) {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
                     }
@@ -3609,17 +3629,19 @@ impl OrderedMap {
                             let _ = patched.try_set(row, key, Value::F64(*num), true);
                         }
                         let arc = Arc::new(patched);
-                        cache.put_dressed(Arc::clone(&arc));
+                        cache.put_dressed(tag, Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, row);
                         return;
                     }
                 }
-                Entries::SeqLayer(layers, row, layer_idx)
-                    if layers[usize::from(*layer_idx)].seq_has_uniform_keys() =>
-                {
+                Entries::SeqLayer(layers, row, layer_idx) => {
                     let row = *row;
                     let layer_idx = *layer_idx;
-                    if let Some(cached) = cache.get_seq_layer(layers, layer_idx) {
+                    let tag = SharedWaveCache::row_tag(
+                        layers[usize::from(layer_idx)].seq_has_uniform_keys(),
+                        row,
+                    );
+                    if let Some(cached) = cache.get_seq_layer(layers, layer_idx, tag) {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
                     }
@@ -3632,15 +3654,16 @@ impl OrderedMap {
                             let _ = patched.try_set(row, key, Value::F64(*num), true);
                         }
                         let arc = Arc::new(patched);
-                        cache.put_dressed(Arc::clone(&arc));
+                        cache.put_dressed(tag, Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, row);
                         return;
                     }
                 }
-                Entries::Patched(prev, row) if prev.base.has_uniform_keys() => {
+                Entries::Patched(prev, row) => {
                     let row = *row;
+                    let tag = SharedWaveCache::row_tag(prev.base.has_uniform_keys(), row);
                     if Arc::strong_count(prev) > 1 {
-                        if let Some(cached_out) = cache.get_patched(prev) {
+                        if let Some(cached_out) = cache.get_patched(prev, tag) {
                             self.entries = Entries::Patched(Arc::clone(cached_out), row);
                             return;
                         }
@@ -3663,7 +3686,7 @@ impl OrderedMap {
                             }
                             next.made = true;
                             let arc = Arc::new(next);
-                            cache.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                            cache.put_patched(Arc::clone(prev), tag, Arc::clone(&arc));
                             self.entries = Entries::Patched(arc, row);
                             return;
                         }
@@ -3696,7 +3719,7 @@ impl OrderedMap {
                             let _ = wrapped.try_set(row, key, Value::F64(*num), true);
                         }
                         let arc = Arc::new(wrapped);
-                        cache.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                        cache.put_patched(Arc::clone(prev), tag, Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, row);
                         return;
                     }
@@ -3713,7 +3736,7 @@ impl OrderedMap {
                             let _ = patched.try_set(0, key, Value::F64(*num), true);
                         }
                         let arc = Arc::new(patched);
-                        cache.put_dressed(Arc::clone(&arc));
+                        cache.put_dressed(SharedWaveCache::ANY_ROW, Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, 0);
                         return;
                     }
@@ -3724,12 +3747,8 @@ impl OrderedMap {
         self.set_data_many(patches);
     }
 
-    /// Merge all entries of `other` onto `self` with overwrite (`ComposeOp::Set`)
-    /// semantics on data maps, reusing one [`Patched`] allocation across chord
-    /// haps that share a uniform-key [`Table`] or [`Patched`] overlay.
     /// Fast single-key `set` into a data object, sharing a `Patched` overlay
-    /// across chord haps through `cache` when the receiver is `Dressed` or
-    /// `SeqLayer` with uniform keys.
+    /// across chord haps through `cache`.
     pub(crate) fn set_data_single_cached(
         &mut self,
         key: &Key,
@@ -3738,9 +3757,10 @@ impl OrderedMap {
     ) {
         if let Some(cache) = cache {
             match &mut self.entries {
-                Entries::Dressed(table, row) if table.has_uniform_keys() => {
+                Entries::Dressed(table, row) => {
                     let row = *row;
-                    if let Some(cached) = cache.get_table(table) {
+                    let tag = SharedWaveCache::row_tag(table.has_uniform_keys(), row);
+                    if let Some(cached) = cache.get_table(table, tag) {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
                     }
@@ -3749,17 +3769,19 @@ impl OrderedMap {
                         && patched.try_set(row, key, value.clone(), true).is_ok()
                     {
                         let arc = Arc::new(patched);
-                        cache.put_dressed(Arc::clone(&arc));
+                        cache.put_dressed(tag, Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, row);
                         return;
                     }
                 }
-                Entries::SeqLayer(layers, row, layer_idx)
-                    if layers[usize::from(*layer_idx)].seq_has_uniform_keys() =>
-                {
+                Entries::SeqLayer(layers, row, layer_idx) => {
                     let row = *row;
                     let layer_idx = *layer_idx;
-                    if let Some(cached) = cache.get_seq_layer(layers, layer_idx) {
+                    let tag = SharedWaveCache::row_tag(
+                        layers[usize::from(layer_idx)].seq_has_uniform_keys(),
+                        row,
+                    );
+                    if let Some(cached) = cache.get_seq_layer(layers, layer_idx, tag) {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
                     }
@@ -3770,15 +3792,16 @@ impl OrderedMap {
                     ) && patched.try_set(row, key, value.clone(), true).is_ok()
                     {
                         let arc = Arc::new(patched);
-                        cache.put_dressed(Arc::clone(&arc));
+                        cache.put_dressed(tag, Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, row);
                         return;
                     }
                 }
-                Entries::Patched(prev, row) if prev.base.has_uniform_keys() => {
+                Entries::Patched(prev, row) => {
                     let row = *row;
+                    let tag = SharedWaveCache::row_tag(prev.base.has_uniform_keys(), row);
                     if Arc::strong_count(prev) > 1 {
-                        if let Some(cached_out) = cache.get_patched(prev) {
+                        if let Some(cached_out) = cache.get_patched(prev, tag) {
                             self.entries = Entries::Patched(Arc::clone(cached_out), row);
                             return;
                         }
@@ -3791,7 +3814,7 @@ impl OrderedMap {
                             debug_assert!(ok);
                             next.made = true;
                             let arc = Arc::new(next);
-                            cache.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                            cache.put_patched(Arc::clone(prev), tag, Arc::clone(&arc));
                             self.entries = Entries::Patched(arc, row);
                             return;
                         }
@@ -3812,8 +3835,29 @@ impl OrderedMap {
                     {
                         let _ = wrapped.try_set(row, key, value.clone(), true);
                         let arc = Arc::new(wrapped);
-                        cache.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                        cache.put_patched(Arc::clone(prev), tag, Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, row);
+                        return;
+                    }
+                }
+                Entries::StepPatch(sp, packed) => {
+                    let packed = *packed;
+                    let (row, slot) = StepPatch::unpack(packed);
+                    let slot_key = if sp.base.has_uniform_keys() {
+                        slot as u32
+                    } else {
+                        packed
+                    };
+                    if let Some(cached) = cache.get_step_patch(sp, slot_key) {
+                        self.entries = Entries::Patched(Arc::clone(cached), row);
+                        return;
+                    }
+                    if let Some((mut patched, p_row)) = sp.to_patched(packed)
+                        && patched.try_set(p_row, key, value.clone(), true).is_ok()
+                    {
+                        let arc = Arc::new(patched);
+                        cache.put_step_patch(Arc::clone(sp), slot_key, Arc::clone(&arc));
+                        self.entries = Entries::Patched(arc, p_row);
                         return;
                     }
                 }
@@ -3827,7 +3871,7 @@ impl OrderedMap {
                         && patched.try_set(0, key, value.clone(), true).is_ok()
                     {
                         let arc = Arc::new(patched);
-                        cache.put_dressed(Arc::clone(&arc));
+                        cache.put_dressed(SharedWaveCache::ANY_ROW, Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, 0);
                         return;
                     }
@@ -3854,10 +3898,9 @@ impl OrderedMap {
             match &mut self.entries {
                 Entries::Dressed(table, row) => {
                     let row = *row;
-                    let uniform = table.has_uniform_keys();
-                    if uniform
-                        && let Some(c) = cache.as_deref()
-                        && let Some(cached) = c.get_table(table)
+                    let tag = SharedWaveCache::row_tag(table.has_uniform_keys(), row);
+                    if let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_table(table, tag)
                     {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
@@ -3869,8 +3912,8 @@ impl OrderedMap {
                         true,
                     ) {
                         let arc = Arc::new(patched);
-                        if uniform && let Some(c) = cache.as_deref_mut() {
-                            c.put_dressed(Arc::clone(&arc));
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.put_dressed(tag, Arc::clone(&arc));
                         }
                         self.entries = Entries::Patched(arc, row);
                         return;
@@ -3879,10 +3922,12 @@ impl OrderedMap {
                 Entries::SeqLayer(layers, row, layer_idx) => {
                     let row = *row;
                     let layer_idx = *layer_idx;
-                    let uniform = layers[usize::from(layer_idx)].seq_has_uniform_keys();
-                    if uniform
-                        && let Some(c) = cache.as_deref()
-                        && let Some(cached) = c.get_seq_layer(layers, layer_idx)
+                    let tag = SharedWaveCache::row_tag(
+                        layers[usize::from(layer_idx)].seq_has_uniform_keys(),
+                        row,
+                    );
+                    if let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_seq_layer(layers, layer_idx, tag)
                     {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
@@ -3894,8 +3939,8 @@ impl OrderedMap {
                         true,
                     ) {
                         let arc = Arc::new(patched);
-                        if uniform && let Some(c) = cache.as_deref_mut() {
-                            c.put_dressed(Arc::clone(&arc));
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.put_dressed(tag, Arc::clone(&arc));
                         }
                         self.entries = Entries::Patched(arc, row);
                         return;
@@ -3903,12 +3948,11 @@ impl OrderedMap {
                 }
                 Entries::Patched(prev, row) => {
                     let row = *row;
-                    let uniform = prev.base.has_uniform_keys();
+                    let tag = SharedWaveCache::row_tag(prev.base.has_uniform_keys(), row);
                     if prev.overlay.is_none() {
                         if Arc::strong_count(prev) > 1 {
-                            if uniform
-                                && let Some(c) = cache.as_deref()
-                                && let Some(cached_out) = c.get_patched(prev)
+                            if let Some(c) = cache.as_deref()
+                                && let Some(cached_out) = c.get_patched(prev, tag)
                             {
                                 self.entries = Entries::Patched(Arc::clone(cached_out), row);
                                 return;
@@ -3917,8 +3961,8 @@ impl OrderedMap {
                             if next.attach_overlay(row, Arc::clone(ov_entries), true) {
                                 next.made = true;
                                 let arc = Arc::new(next);
-                                if uniform && let Some(c) = cache.as_deref_mut() {
-                                    c.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                                if let Some(c) = cache.as_deref_mut() {
+                                    c.put_patched(Arc::clone(prev), tag, Arc::clone(&arc));
                                 }
                                 self.entries = Entries::Patched(arc, row);
                                 return;
@@ -3931,9 +3975,8 @@ impl OrderedMap {
                         }
                     }
                     if !matches!(prev.base, PatchedBase::Patched(_)) {
-                        if uniform
-                            && let Some(c) = cache.as_deref()
-                            && let Some(cached_out) = c.get_patched(prev)
+                        if let Some(c) = cache.as_deref()
+                            && let Some(cached_out) = c.get_patched(prev, tag)
                         {
                             self.entries = Entries::Patched(Arc::clone(cached_out), row);
                             return;
@@ -3945,8 +3988,8 @@ impl OrderedMap {
                             true,
                         ) {
                             let arc = Arc::new(patched);
-                            if uniform && let Some(c) = cache.as_deref_mut() {
-                                c.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                            if let Some(c) = cache.as_deref_mut() {
+                                c.put_patched(Arc::clone(prev), tag, Arc::clone(&arc));
                             }
                             self.entries = Entries::Patched(arc, row);
                             return;
@@ -3968,18 +4011,35 @@ impl OrderedMap {
                     ) {
                         let arc = Arc::new(patched);
                         if let Some(c) = cache.as_deref_mut() {
-                            c.put_dressed(Arc::clone(&arc));
+                            c.put_dressed(SharedWaveCache::ANY_ROW, Arc::clone(&arc));
                         }
                         self.entries = Entries::Patched(arc, 0);
                         return;
                     }
                 }
                 Entries::StepPatch(sp, packed) => {
-                    if let Some((mut patched, row)) = sp.to_patched(*packed)
-                        && patched.attach_overlay(row, Arc::clone(ov_entries), true)
+                    let packed = *packed;
+                    let (row, slot) = StepPatch::unpack(packed);
+                    let slot_key = if sp.base.has_uniform_keys() {
+                        slot as u32
+                    } else {
+                        packed
+                    };
+                    if let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_step_patch(sp, slot_key)
+                    {
+                        self.entries = Entries::Patched(Arc::clone(cached), row);
+                        return;
+                    }
+                    if let Some((mut patched, p_row)) = sp.to_patched(packed)
+                        && patched.attach_overlay(p_row, Arc::clone(ov_entries), true)
                     {
                         patched.made = true;
-                        self.entries = Entries::Patched(Arc::new(patched), row);
+                        let arc = Arc::new(patched);
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.put_step_patch(Arc::clone(sp), slot_key, Arc::clone(&arc));
+                        }
+                        self.entries = Entries::Patched(arc, p_row);
                         return;
                     }
                 }
@@ -3988,10 +4048,11 @@ impl OrderedMap {
         }
         if other_len <= MAX_PATCHES {
             match &mut self.entries {
-                Entries::Dressed(table, row) if table.has_uniform_keys() => {
+                Entries::Dressed(table, row) => {
                     let row = *row;
+                    let tag = SharedWaveCache::row_tag(table.has_uniform_keys(), row);
                     if let Some(c) = cache.as_deref()
-                        && let Some(cached) = c.get_table(table)
+                        && let Some(cached) = c.get_table(table, tag)
                     {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
@@ -4005,19 +4066,21 @@ impl OrderedMap {
                         }
                         let arc = Arc::new(patched);
                         if let Some(c) = cache.as_deref_mut() {
-                            c.put_dressed(Arc::clone(&arc));
+                            c.put_dressed(tag, Arc::clone(&arc));
                         }
                         self.entries = Entries::Patched(arc, row);
                         return;
                     }
                 }
-                Entries::SeqLayer(layers, row, layer_idx)
-                    if layers[usize::from(*layer_idx)].seq_has_uniform_keys() =>
-                {
+                Entries::SeqLayer(layers, row, layer_idx) => {
                     let row = *row;
                     let layer_idx = *layer_idx;
+                    let tag = SharedWaveCache::row_tag(
+                        layers[usize::from(layer_idx)].seq_has_uniform_keys(),
+                        row,
+                    );
                     if let Some(c) = cache.as_deref()
-                        && let Some(cached) = c.get_seq_layer(layers, layer_idx)
+                        && let Some(cached) = c.get_seq_layer(layers, layer_idx, tag)
                     {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
@@ -4033,17 +4096,18 @@ impl OrderedMap {
                         }
                         let arc = Arc::new(patched);
                         if let Some(c) = cache.as_deref_mut() {
-                            c.put_dressed(Arc::clone(&arc));
+                            c.put_dressed(tag, Arc::clone(&arc));
                         }
                         self.entries = Entries::Patched(arc, row);
                         return;
                     }
                 }
-                Entries::Patched(prev, row) if prev.base.has_uniform_keys() => {
+                Entries::Patched(prev, row) => {
                     let row = *row;
+                    let tag = SharedWaveCache::row_tag(prev.base.has_uniform_keys(), row);
                     if Arc::strong_count(prev) > 1 {
                         if let Some(c) = cache.as_deref()
-                            && let Some(cached_out) = c.get_patched(prev)
+                            && let Some(cached_out) = c.get_patched(prev, tag)
                         {
                             self.entries = Entries::Patched(Arc::clone(cached_out), row);
                             return;
@@ -4064,7 +4128,7 @@ impl OrderedMap {
                             next.made = true;
                             let arc = Arc::new(next);
                             if let Some(c) = cache {
-                                c.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                                c.put_patched(Arc::clone(prev), tag, Arc::clone(&arc));
                             }
                             self.entries = Entries::Patched(arc, row);
                             return;
@@ -4091,10 +4155,8 @@ impl OrderedMap {
                             let _ = wrapped.try_set(row, key, value.clone(), true);
                         }
                         let arc = Arc::new(wrapped);
-                        if prev.base.has_uniform_keys()
-                            && let Some(c) = cache
-                        {
-                            c.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                        if let Some(c) = cache {
+                            c.put_patched(Arc::clone(prev), tag, Arc::clone(&arc));
                         }
                         self.entries = Entries::Patched(arc, row);
                         return;
