@@ -262,18 +262,20 @@ impl JsRuntime {
         // realm keeps no part, and the parts of a build before it are of no
         // use to a later one.
         let kept = self.native_memo.take();
-        let built = if self.bindings_installed.get() {
-            with_ctx(self, |ctx| {
-                if prove_surface_intrinsics(&ctx) && !gain_curve_set(&ctx) {
-                    self.build_native(program, &Names::Realm(&ctx), None)
-                } else {
-                    Err(None)
-                }
-            })
-        } else {
-            let reuse = source.map(|source| memo::Reuse::new(source, kept, program));
-            self.build_native(program, &Names::Listed(ListedNames), reuse)
-        };
+        let built = rustel_core::intern::with_eval_interner(|| {
+            if self.bindings_installed.get() {
+                with_ctx(self, |ctx| {
+                    if prove_surface_intrinsics(&ctx) && !gain_curve_set(&ctx) {
+                        self.build_native(program, &Names::Realm(&ctx), None)
+                    } else {
+                        Err(None)
+                    }
+                })
+            } else {
+                let reuse = source.map(|source| memo::Reuse::new(source, kept, program));
+                self.build_native(program, &Names::Listed(ListedNames), reuse)
+            }
+        });
         match built {
             Ok((score, reuse)) => {
                 if let Some(reuse) = reuse {

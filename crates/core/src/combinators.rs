@@ -1941,12 +1941,12 @@ pub(crate) fn degrade_by_with_value<P: PatOps>(pat: &P, chooser: &Value, x: f64)
 
 /// [`degrade_by_with`] over `rand`.
 pub fn degrade_by<P: PatOps>(pat: &P, x: f64) -> P {
-    degrade_by_with(pat, &pure_signal::<P>(crate::signal::rand()), x)
+    pat.degrade_by_rand(x, false)
 }
 
 /// [`degrade_by_with`] over `1 - rand`: the exact complement of [`degrade_by`].
 pub fn undegrade_by<P: PatOps>(pat: &P, x: f64) -> P {
-    degrade_by_with(pat, &pure_signal::<P>(crate::signal::rand_inverted()), x)
+    pat.degrade_by_rand(x, true)
 }
 
 /// Applies `f` to roughly `x` of the events. The halves are complementary:

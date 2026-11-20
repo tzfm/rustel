@@ -175,6 +175,8 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     fn onsets_only(&self) -> Self;
     fn remove_undefineds(&self) -> Self;
     fn degrade_by_seeded(&self, amount: f64, seed: u32) -> Self;
+    #[doc(hidden)]
+    fn degrade_by_rand(&self, amount: f64, inverted: bool) -> Self;
 
     // -- application -------------------------------------------------------
     fn app_left_with(
@@ -514,6 +516,10 @@ impl PatOps for Pattern {
     }
     fn degrade_by_seeded(&self, amount: f64, seed: u32) -> Self {
         Pattern::degrade_by_seeded(self, amount, seed)
+    }
+
+    fn degrade_by_rand(&self, amount: f64, inverted: bool) -> Self {
+        Pattern::degrade_by_rand(self, amount, inverted)
     }
 
     fn app_left_with(
@@ -882,6 +888,10 @@ impl PatOps for PurePattern {
     }
     fn degrade_by_seeded(&self, amount: f64, seed: u32) -> Self {
         PurePattern::assert_pure(self.pattern().degrade_by_seeded(amount, seed))
+    }
+
+    fn degrade_by_rand(&self, amount: f64, inverted: bool) -> Self {
+        PurePattern::assert_pure(self.pattern().degrade_by_rand(amount, inverted))
     }
 
     fn app_left_with(

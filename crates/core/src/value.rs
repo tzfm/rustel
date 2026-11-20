@@ -1728,6 +1728,16 @@ impl OrderedMap {
         }
     }
 
+    /// Intern compact built-in entries through the active per-evaluation interner
+    /// when this map holds built-in data entries.
+    #[inline]
+    pub(crate) fn intern_builtin(&mut self) {
+        if let Entries::Builtin(entries, made) = &mut self.entries {
+            let owned = Arc::clone(entries);
+            *entries = crate::intern::intern_builtin(owned, *made);
+        }
+    }
+
     /// Reconstruct a data-only map from compact built-in entries.
     #[inline]
     pub(crate) fn from_made_builtin(entries: Arc<dyn BuiltinEntries>) -> Self {
@@ -4090,7 +4100,7 @@ fn hash_data_entries(layout: Layout<'_>, state: &mut impl std::hash::Hasher) {
 }
 
 /// Feed a data value to `state`, numbers by their bits.
-fn hash_data(value: &Value, state: &mut impl std::hash::Hasher) {
+pub(crate) fn hash_data(value: &Value, state: &mut impl std::hash::Hasher) {
     match value {
         Value::Undefined => 0u8.hash(state),
         Value::Null => 1u8.hash(state),

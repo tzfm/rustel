@@ -248,11 +248,128 @@ struct Sourced {
 
 /// The steps of a layer in a list: on a grid when their times fit one,
 /// otherwise each at its place.
+/// Single-allocation grid storage for `1..=16` compact 8-byte steps with no
+/// [`Spare`] sidecar. Uses thin `Arc` pointers so [`Listing`] and [`Steps`]
+/// stay 16 bytes via enum niche folding, saving 24 bytes and one allocation
+/// per grid.
+pub(crate) struct InlineGrid<const N: usize> {
+    ticks: NonZeroU32,
+    base: u32,
+    steps: [SmallGridStep; N],
+}
+
+#[derive(Clone)]
+pub(crate) enum CompactGrid {
+    N1(Arc<InlineGrid<1>>),
+    N2(Arc<InlineGrid<2>>),
+    N3(Arc<InlineGrid<3>>),
+    N4(Arc<InlineGrid<4>>),
+    N5(Arc<InlineGrid<5>>),
+    N6(Arc<InlineGrid<6>>),
+    N7(Arc<InlineGrid<7>>),
+    N8(Arc<InlineGrid<8>>),
+    N9(Arc<InlineGrid<9>>),
+    N10(Arc<InlineGrid<10>>),
+    N11(Arc<InlineGrid<11>>),
+    N12(Arc<InlineGrid<12>>),
+    N13(Arc<InlineGrid<13>>),
+    N14(Arc<InlineGrid<14>>),
+    N15(Arc<InlineGrid<15>>),
+    N16(Arc<InlineGrid<16>>),
+}
+
+const MAX_INLINE_GRID_LEN: usize = 16;
+
+impl CompactGrid {
+    fn from_parts(ticks: NonZeroU32, base: u32, steps: &[SmallGridStep]) -> Self {
+        macro_rules! build {
+            ($($n:literal => $var:ident),+) => {
+                match steps.len() {
+                    $(
+                        $n => {
+                            let mut arr = [SmallGridStep {
+                                part_begin: 0,
+                                part_end: 0,
+                                value: 0,
+                                loc: 0,
+                            }; $n];
+                            arr.copy_from_slice(steps);
+                            Self::$var(Arc::new(InlineGrid {
+                                ticks,
+                                base,
+                                steps: arr,
+                            }))
+                        }
+                    )+
+                    _ => unreachable!("compact grid length out of range"),
+                }
+            };
+        }
+        build!(
+            1 => N1, 2 => N2, 3 => N3, 4 => N4,
+            5 => N5, 6 => N6, 7 => N7, 8 => N8,
+            9 => N9, 10 => N10, 11 => N11, 12 => N12,
+            13 => N13, 14 => N14, 15 => N15, 16 => N16
+        )
+    }
+
+    #[inline(always)]
+    pub(crate) fn parts(&self) -> (NonZeroU32, u32, &[SmallGridStep]) {
+        macro_rules! unpack {
+            ($($var:ident),+) => {
+                match self {
+                    $(Self::$var(g) => (g.ticks, g.base, &g.steps[..]),)+
+                }
+            };
+        }
+        unpack!(
+            N1, N2, N3, N4, N5, N6, N7, N8, N9, N10, N11, N12, N13, N14, N15, N16
+        )
+    }
+
+    #[inline(always)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        macro_rules! same_ptr {
+            ($($var:ident),+) => {
+                match (self, other) {
+                    $((Self::$var(a), Self::$var(b)) => Arc::ptr_eq(a, b),)+
+                    _ => false,
+                }
+            };
+        }
+        same_ptr!(
+            N1, N2, N3, N4, N5, N6, N7, N8, N9, N10, N11, N12, N13, N14, N15, N16
+        )
+    }
+}
+
+/// Borrowed view over any grid representation (`OneStep`, `CompactGrid`, or `Grid`).
+#[derive(Clone, Copy)]
+struct GridView<'a> {
+    ticks: NonZeroU32,
+    base: u32,
+    steps: GridStepsRef<'a>,
+    side: Option<&'a Spare>,
+}
+
 #[derive(Clone)]
 enum Listing {
     Places(Arc<Listed>),
+    /// Inline 1-step uncut grid packed into 8 bytes:
+    /// - `base_ticks`: low 24 bits = `base` (< 16 MiB), bit 24 = `SMALL`, bits 25..32 = `ticks` (`1..=127`).
+    /// - `span_loc`: bits 0..8 = `begin`, bits 8..16 = `end`, bits 16..32 = `loc`.
+    ///
+    /// Zero heap allocation while keeping [`Listing`] and [`Steps`] 16 bytes.
+    OneStep {
+        base_ticks: u32,
+        span_loc: u32,
+    },
+    /// Single-allocation `1..=16` step grid with no [`Spare`] sidecar.
+    CompactGrid(CompactGrid),
     Grid(Arc<Grid>),
 }
+
+const _: () = assert!(std::mem::size_of::<Listing>() == 16);
 
 /// A step as a maker gives it, before the layer keeps it in a list.
 struct Raw {
@@ -277,8 +394,8 @@ impl Listing {
     /// The list of `raws`: a grid when their times fit one. A list that
     /// does not fit becomes places one time, here.
     fn of(mut raws: Vec<Raw>) -> Self {
-        if let Some(grid) = Grid::build(&mut raws) {
-            return Self::Grid(Arc::new(grid));
+        if let Some(listing) = Grid::build_listing(&mut raws) {
+            return listing;
         }
         let small = |span: &TimeSpan| {
             i32::try_from(span.begin.denom()).is_ok() && i32::try_from(span.end.denom()).is_ok()
@@ -292,9 +409,100 @@ impl Listing {
         }))
     }
 
+    #[inline]
+    fn from_parts(
+        ticks: NonZeroU32,
+        base: u32,
+        steps: GridSteps,
+        side: Option<Box<Spare>>,
+    ) -> Self {
+        if side.is_none()
+            && let GridSteps::Inline(len, ref arr) = steps
+        {
+            let slice = &arr[..usize::from(len)];
+            let raw_base = base & !Grid::SMALL;
+            if slice.len() == 1
+                && slice[0].value == 0
+                && (slice[0].loc & SmallGridStep::SPARE) == 0
+                && raw_base < (1 << 24)
+                && ticks.get() <= 127
+                && slice[0].part_begin <= 255
+                && slice[0].part_end <= 255
+            {
+                let small_bit = u32::from(base & Grid::SMALL != 0) << 24;
+                let base_ticks = raw_base | small_bit | (ticks.get() << 25);
+                let span_loc = u32::from(slice[0].part_begin)
+                    | (u32::from(slice[0].part_end) << 8)
+                    | (u32::from(slice[0].loc) << 16);
+                return Self::OneStep {
+                    base_ticks,
+                    span_loc,
+                };
+            }
+            if !slice.is_empty() {
+                let compact = CompactGrid::from_parts(ticks, base, slice);
+                return Self::CompactGrid(crate::intern::intern_compact_grid(compact));
+            }
+        }
+        let small_steps = match steps {
+            GridSteps::Inline(len, arr) => Box::from(&arr[..usize::from(len)]),
+            GridSteps::Small(small) => small,
+            GridSteps::Wide(_) => Box::from([]),
+        };
+        Self::Grid(crate::intern::intern_grid(Arc::new(Grid {
+            ticks,
+            base,
+            small_steps,
+            side,
+        })))
+    }
+
+    #[inline]
+    fn with_grid_view<R>(&self, f: impl FnOnce(GridView<'_>) -> R) -> Option<R> {
+        match self {
+            Self::Places(_) => None,
+            Self::OneStep {
+                base_ticks,
+                span_loc,
+            } => {
+                let raw_base = base_ticks & 0x00ff_ffff;
+                let small_bit = if (base_ticks & (1 << 24)) != 0 {
+                    Grid::SMALL
+                } else {
+                    0
+                };
+                let ticks = NonZeroU32::new(base_ticks >> 25).expect("non-zero packed ticks");
+                let step = [SmallGridStep {
+                    part_begin: (span_loc & 0xff) as u16,
+                    part_end: ((span_loc >> 8) & 0xff) as u16,
+                    value: 0,
+                    loc: (span_loc >> 16) as u16,
+                }];
+                Some(f(GridView {
+                    ticks,
+                    base: raw_base | small_bit,
+                    steps: GridStepsRef::Small(&step),
+                    side: None,
+                }))
+            }
+            Self::CompactGrid(grid) => {
+                let (ticks, base, steps) = grid.parts();
+                Some(f(GridView {
+                    ticks,
+                    base,
+                    steps: GridStepsRef::Small(steps),
+                    side: None,
+                }))
+            }
+            Self::Grid(grid) => Some(f(grid.view())),
+        }
+    }
+
     fn len(&self) -> usize {
         match self {
             Self::Places(listed) => listed.places.len(),
+            Self::OneStep { .. } => 1,
+            Self::CompactGrid(grid) => grid.parts().2.len(),
             Self::Grid(grid) => grid.steps_ref().len(),
         }
     }
@@ -302,14 +510,18 @@ impl Listing {
     fn part(&self, index: usize) -> TimeSpan {
         match self {
             Self::Places(listed) => listed.places[index].part(),
-            Self::Grid(grid) => grid.part(index),
+            _ => self
+                .with_grid_view(|view| view.part(index))
+                .expect("grid listing"),
         }
     }
 
     fn whole(&self, index: usize) -> TimeSpan {
         match self {
             Self::Places(listed) => listed.places[index].whole,
-            Self::Grid(grid) => grid.whole(index),
+            _ => self
+                .with_grid_view(|view| view.whole(index))
+                .expect("grid listing"),
         }
     }
 
@@ -321,7 +533,9 @@ impl Listing {
                 let place = &listed.places[index];
                 (place.whole, place.part.as_ref().map(|part| **part))
             }
-            Self::Grid(grid) => grid.times(index),
+            _ => self
+                .with_grid_view(|view| view.times(index))
+                .expect("grid listing"),
         }
     }
 
@@ -329,13 +543,16 @@ impl Listing {
     fn is_cut(&self, index: usize) -> bool {
         match self {
             Self::Places(listed) => listed.places[index].part.is_some(),
-            Self::Grid(grid) => grid.cut(index).is_some(),
+            Self::OneStep { .. } | Self::CompactGrid(_) => false,
+            Self::Grid(grid) => grid.view().cut(index).is_some(),
         }
     }
 
     fn value(&self, index: usize) -> u32 {
         match self {
             Self::Places(listed) => listed.places[index].value,
+            Self::OneStep { .. } => 0,
+            Self::CompactGrid(grid) => u32::from(grid.parts().2[index].value),
             Self::Grid(grid) => grid.steps_ref().get(index).value,
         }
     }
@@ -343,7 +560,9 @@ impl Listing {
     fn locations(&self, index: usize) -> Locations {
         match self {
             Self::Places(listed) => listed.places[index].locations.clone(),
-            Self::Grid(grid) => grid.locations(index),
+            _ => self
+                .with_grid_view(|view| view.locations(index))
+                .expect("grid listing"),
         }
     }
 
@@ -362,6 +581,8 @@ impl Listing {
     fn small_denominators(&self) -> bool {
         match self {
             Self::Places(listed) => listed.small_denominators,
+            Self::OneStep { base_ticks, .. } => base_ticks & (1 << 24) != 0,
+            Self::CompactGrid(grid) => grid.parts().1 & Grid::SMALL != 0,
             Self::Grid(grid) => grid.small_denominators(),
         }
     }
@@ -402,8 +623,8 @@ struct GridStep {
 
 /// Compact 8-byte step on a [`Grid`] when ticks, value index, and location fit
 /// 16 bits. Halves step-array memory for typical layers.
-#[derive(Clone, Copy)]
-struct SmallGridStep {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SmallGridStep {
     part_begin: u16,
     part_end: u16,
     value: u16,
@@ -414,6 +635,20 @@ struct SmallGridStep {
 }
 
 impl SmallGridStep {
+    #[inline(always)]
+    pub(crate) fn has_loc(self) -> bool {
+        self.loc != 0
+    }
+
+    #[inline]
+    pub(crate) fn hash_intern(&self, state: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        let packed = u64::from(self.part_begin)
+            | (u64::from(self.part_end) << 16)
+            | (u64::from(self.value) << 32)
+            | (u64::from(self.loc) << 48);
+        packed.hash(state);
+    }
     const SPARE: u16 = 1 << 15;
     const WIDE: u16 = 1 << 14;
     const INDEX_MASK: u16 = Self::WIDE - 1;
@@ -524,26 +759,49 @@ impl<'a> GridStepsRef<'a> {
     }
 }
 
-/// Owned build result before storing small steps directly on [`Grid`] and
-/// spilling wide steps into [`Spare`].
+/// Owned build result before storing small steps directly on [`Listing`] /
+/// [`Grid`] and spilling wide steps into [`Spare`].
 enum GridSteps {
+    /// Up to [`MAX_INLINE_GRID_LEN`] compact steps kept on the stack so
+    /// `OneStep` and `CompactGrid` avoid an intermediate `Box` allocation.
+    Inline(u8, [SmallGridStep; MAX_INLINE_GRID_LEN]),
     Small(Box<[SmallGridStep]>),
     Wide(Box<[GridStep]>),
 }
 
 impl GridSteps {
+    const ZERO_SMALL: SmallGridStep = SmallGridStep {
+        part_begin: 0,
+        part_end: 0,
+        value: 0,
+        loc: 0,
+    };
+
     /// Collect `len` steps produced by `make`, choosing compact 8-byte storage
     /// when every step fits. Uses a stack buffer for up to 64 steps so the
-    /// common case performs a single heap allocation.
+    /// common case performs zero intermediate heap allocations.
     fn build(len: usize, mut make: impl FnMut(usize) -> Option<GridStep>) -> Option<Self> {
         const STACK: usize = 64;
+        if len <= MAX_INLINE_GRID_LEN {
+            let mut small = [Self::ZERO_SMALL; MAX_INLINE_GRID_LEN];
+            for i in 0..len {
+                let step = make(i)?;
+                if let Some(s) = SmallGridStep::from_wide(step) {
+                    small[i] = s;
+                } else {
+                    let mut wide = Vec::with_capacity(len);
+                    wide.extend(small[..i].iter().map(|s| s.to_wide()));
+                    wide.push(step);
+                    for j in (i + 1)..len {
+                        wide.push(make(j)?);
+                    }
+                    return Some(Self::Wide(wide.into_boxed_slice()));
+                }
+            }
+            return Some(Self::Inline(len as u8, small));
+        }
         if len <= STACK {
-            let mut small = [SmallGridStep {
-                part_begin: 0,
-                part_end: 0,
-                value: 0,
-                loc: 0,
-            }; STACK];
+            let mut small = [Self::ZERO_SMALL; STACK];
             for i in 0..len {
                 let step = make(i)?;
                 if let Some(s) = SmallGridStep::from_wide(step) {
@@ -726,7 +984,7 @@ impl<'a> CutsSlice<'a> {
 
 /// The steps of a layer on an integer grid of `1 / ticks` cycles, kept
 /// as ticks, when each time of them fits in 32 bits.
-struct Grid {
+pub(crate) struct Grid {
     /// The ticks in a cycle: the least common multiple of the denominators.
     ticks: NonZeroU32,
     /// The begin that the packed ranges count from, below 2^31. The top bit
@@ -735,8 +993,8 @@ struct Grid {
     /// Compact 8-byte steps stored inline; empty when wide 16-byte steps live
     /// in `side.rare`.
     small_steps: Box<[SmallGridStep]>,
-    /// What most power-of-two grids have none of: non-dyadic reductions,
-    /// multi-range packed locations, cuts, wide locations, and wide steps.
+    /// What most grids have none of: multi-range packed locations, cuts, wide
+    /// locations, and wide steps.
     side: Option<Box<Spare>>,
 }
 
@@ -917,21 +1175,18 @@ impl SpareRare {
     }
 }
 
-/// The non-dyadic reductions, cuts, wide steps, and spare locations of a [`Grid`].
+/// Cuts, wide steps, and spare locations of a [`Grid`].
 #[derive(Clone)]
 struct Spare {
     /// Packed multi-range step locations relative to `Grid::base`. Each word
     /// is a [`PackedLoc`] range, with `PackedLoc::SPARE` set on the last
     /// range of a step.
     packed: Box<[u32]>,
-    /// The reduced time of each residue, for a tick size that is no power of
-    /// two: a time then takes no gcd.
-    reductions: Option<Arc<TickGrid>>,
     /// Rare cuts, wide locations, and wide steps, allocated only when present.
     rare: Option<Box<SpareRare>>,
 }
 
-const _: () = assert!(std::mem::size_of::<Spare>() == 32);
+const _: () = assert!(std::mem::size_of::<Spare>() == 24);
 
 impl Grid {
     const SMALL: u32 = 1 << 31;
@@ -1001,7 +1256,7 @@ impl Grid {
     /// The steps of `raws` on a grid, or `None` for times that do not fit.
     /// A grid takes the locations that do not pack out of `raws`, and
     /// nothing else.
-    fn build(raws: &mut [Raw]) -> Option<Self> {
+    fn build(raws: &mut [Raw]) -> Option<Listing> {
         u32::try_from(raws.len()).ok()?;
         // The tick size, and the least begin of a range that packs.
         let mut ticks: u64 = 1;
@@ -1077,17 +1332,15 @@ impl Grid {
         if wide.len() > PackedLoc::INDEX_MASK as usize {
             return None;
         }
-        let (small_steps, wide_steps) = match steps {
-            GridSteps::Small(small) => (small, Box::from([])),
-            GridSteps::Wide(wide) => (Box::from([]), wide),
+        let (steps, wide_steps) = match steps {
+            GridSteps::Wide(wide) => (GridSteps::Small(Box::from([])), wide),
+            other => (other, Box::from([])),
         };
-        let reductions = tick_grid(ticks);
         // The grid fits, so any wide locations move with no copy.
         let side = (!cuts.is_empty()
             || !packed_runs.is_empty()
             || !wide.is_empty()
-            || !wide_steps.is_empty()
-            || reductions.is_some())
+            || !wide_steps.is_empty())
         .then(|| {
             let rare =
                 (!cuts.is_empty() || !wide.is_empty() || !wide_steps.is_empty()).then(|| {
@@ -1103,22 +1356,24 @@ impl Grid {
                 });
             Box::new(Spare {
                 packed: packed_runs.into_boxed_slice(),
-                reductions,
                 rare,
             })
         });
         let base = base | if small_denominators { Self::SMALL } else { 0 };
-        Some(Self {
-            ticks,
-            base,
-            small_steps,
-            side,
-        })
+        Some(Listing::from_parts(ticks, base, steps, side))
     }
 
-    /// Build a [`Grid`] directly from uncut [`SourceStep`]s in cycles without
+    fn build_listing(raws: &mut [Raw]) -> Option<Listing> {
+        Self::build(raws)
+    }
+
+    fn build_indexed_listing(source_steps: &mut [SourceStep]) -> Option<Listing> {
+        Self::build_indexed(source_steps)
+    }
+
+    /// Build a [`Listing`] directly from uncut [`SourceStep`]s in cycles without
     /// allocating an intermediate [`Raw`] list.
-    fn build_indexed(source_steps: &mut [SourceStep]) -> Option<Self> {
+    fn build_indexed(source_steps: &mut [SourceStep]) -> Option<Listing> {
         u32::try_from(source_steps.len()).ok()?;
         let mut ticks: u64 = 1;
         let mut base: Option<u32> = None;
@@ -1170,36 +1425,67 @@ impl Grid {
         if wide.len() > PackedLoc::INDEX_MASK as usize {
             return None;
         }
-        let (small_steps, wide_steps) = match steps {
-            GridSteps::Small(small) => (small, Box::from([])),
-            GridSteps::Wide(wide) => (Box::from([]), wide),
+        let (steps, wide_steps) = match steps {
+            GridSteps::Wide(wide) => (GridSteps::Small(Box::from([])), wide),
+            other => (other, Box::from([])),
         };
-        let reductions = tick_grid(ticks);
-        let side = (!packed_runs.is_empty()
-            || !wide.is_empty()
-            || !wide_steps.is_empty()
-            || reductions.is_some())
-        .then(|| {
-            let rare = (!wide.is_empty() || !wide_steps.is_empty()).then(|| {
-                let wide_locs: Box<[Locations]> = wide
-                    .iter()
-                    .map(|index| std::mem::take(&mut source_steps[*index].locations))
-                    .collect();
-                Box::new(SpareRare::from_parts(&[], wide_locs, wide_steps))
+        let side =
+            (!packed_runs.is_empty() || !wide.is_empty() || !wide_steps.is_empty()).then(|| {
+                let rare = (!wide.is_empty() || !wide_steps.is_empty()).then(|| {
+                    let wide_locs: Box<[Locations]> = wide
+                        .iter()
+                        .map(|index| std::mem::take(&mut source_steps[*index].locations))
+                        .collect();
+                    Box::new(SpareRare::from_parts(&[], wide_locs, wide_steps))
+                });
+                Box::new(Spare {
+                    packed: packed_runs.into_boxed_slice(),
+                    rare,
+                })
             });
-            Box::new(Spare {
-                packed: packed_runs.into_boxed_slice(),
-                reductions,
-                rare,
-            })
-        });
         let base = base | if small_denominators { Self::SMALL } else { 0 };
-        Some(Self {
-            ticks,
-            base,
-            small_steps,
-            side,
-        })
+        Some(Listing::from_parts(ticks, base, steps, side))
+    }
+
+    #[inline(always)]
+    fn view(&self) -> GridView<'_> {
+        GridView {
+            ticks: self.ticks,
+            base: self.base,
+            steps: self.steps_ref(),
+            side: self.side.as_deref(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn can_intern(&self) -> bool {
+        self.side.is_none()
+            && (self.base & !Self::SMALL) == 0
+            && self.small_steps.iter().all(|s| s.loc == 0)
+    }
+
+    pub(crate) fn hash_intern(&self, state: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        self.ticks.get().hash(state);
+        self.base.hash(state);
+        self.small_steps.len().hash(state);
+        for step in self.small_steps.iter() {
+            step.hash_intern(state);
+        }
+        if let Some(spare) = &self.side {
+            spare.packed.hash(state);
+        }
+    }
+
+    pub(crate) fn eq_intern(&self, other: &Self) -> bool {
+        self.ticks == other.ticks
+            && self.base == other.base
+            && self.small_steps == other.small_steps
+            && match (&self.side, &other.side) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.rare.is_none() && b.rare.is_none() && a.packed == b.packed,
+                _ => false,
+            }
     }
 
     #[inline(always)]
@@ -1219,33 +1505,38 @@ impl Grid {
     fn small_denominators(&self) -> bool {
         self.base & Self::SMALL != 0
     }
+}
 
-    /// `ticks` as a time in cycles, reduced.
+impl<'a> GridView<'a> {
     #[inline]
     #[cfg(test)]
-    fn made(&self, ticks: i128) -> Fraction {
+    fn made(self, ticks: i128) -> Fraction {
         match i64::try_from(ticks) {
             Ok(ticks) => self.made_small(ticks),
             Err(_) => Fraction::from_ticks(ticks, self.ticks),
         }
     }
 
-    /// [`Self::made`] of ticks that fit 64 bits, which a query has.
     #[inline]
-    fn made_small(&self, ticks: i64) -> Fraction {
-        match self.side.as_deref().and_then(|s| s.reductions.as_ref()) {
+    fn made_small(self, ticks: i64) -> Fraction {
+        with_tick_grid(self.ticks, |reductions| {
+            self.made_small_with(ticks, reductions)
+        })
+    }
+
+    #[inline]
+    fn made_small_with(self, ticks: i64, reductions: Option<&TickGrid>) -> Fraction {
+        match reductions {
             Some(reductions) => reductions.time(ticks),
             None => Fraction::from_ticks(i128::from(ticks), self.ticks),
         }
     }
 
-    /// `ticks` as a time in cycles.
-    fn time(&self, ticks: u32) -> Fraction {
+    fn time(self, ticks: u32) -> Fraction {
         self.made_small(i64::from(ticks))
     }
 
-    /// The floor and the ceiling of `time` in ticks. `None` past 64 bits.
-    fn ticks_at(&self, time: Fraction) -> Option<(i64, i64)> {
+    fn ticks_at(self, time: Fraction) -> Option<(i64, i64)> {
         let scaled = i64::try_from(time.numer())
             .ok()?
             .checked_mul(i64::from(self.ticks.get()))?;
@@ -1253,40 +1544,34 @@ impl Grid {
         if denom == 1 {
             return Some((scaled, scaled));
         }
-        // A time on a power of two, which most spans are, shifts.
         let (floor, rest) = match denom & (denom - 1) == 0 {
             true => (scaled >> denom.trailing_zeros(), scaled & (denom - 1)),
             false => (scaled.div_euclid(denom), scaled.rem_euclid(denom)),
         };
-        // A floor under the largest tick has room for one more.
         Some((floor, floor + i64::from(rest != 0)))
     }
 
-    fn cuts(&self) -> CutsSlice<'_> {
+    fn cuts(self) -> CutsSlice<'a> {
         self.side
-            .as_ref()
             .and_then(|side| side.rare.as_deref())
             .map_or(CutsSlice::EMPTY, SpareRare::cuts)
     }
 
-    /// The cut of step `index`.
-    fn cut(&self, index: usize) -> Option<Cut> {
+    fn cut(self, index: usize) -> Option<Cut> {
         let mut cuts = self.cuts().starting_at(index);
         cuts.split_first_at(index)
     }
 
-    fn part(&self, index: usize) -> TimeSpan {
-        let (part_begin, part_end) = self.steps_ref().times_of(index);
+    fn part(self, index: usize) -> TimeSpan {
+        let (part_begin, part_end) = self.steps.times_of(index);
         TimeSpan::new(self.time(part_begin), self.time(part_end))
     }
 
-    /// The whole of step `index`.
-    fn whole(&self, index: usize) -> TimeSpan {
+    fn whole(self, index: usize) -> TimeSpan {
         self.times(index).0
     }
 
-    /// The whole of step `index`, and its part when it is cut.
-    fn times(&self, index: usize) -> (TimeSpan, Option<TimeSpan>) {
+    fn times(self, index: usize) -> (TimeSpan, Option<TimeSpan>) {
         let part = self.part(index);
         match self.cut(index) {
             Some(cut) => (
@@ -1297,24 +1582,22 @@ impl Grid {
         }
     }
 
-    /// The locations of step `index`.
     #[inline]
-    fn locations(&self, index: usize) -> Locations {
-        let packed = self.steps_ref().get(index).loc.0;
+    fn locations(self, index: usize) -> Locations {
+        let packed = self.steps.get(index).loc.0;
         if packed == 0 {
             return Locations::new();
         }
         if packed & PackedLoc::WIDE_MASK == PackedLoc::WIDE_MASK {
             let rare = self
                 .side
-                .as_ref()
                 .and_then(|side| side.rare.as_deref())
                 .expect("a wide location has a rare side");
             return rare.wide()[(packed & PackedLoc::INDEX_MASK) as usize].clone();
         }
-        let base = self.base & !Self::SMALL;
+        let base = self.base & !Grid::SMALL;
         if packed & PackedLoc::SPARE != 0 {
-            let side = self.side.as_ref().expect("a spare location has a side");
+            let side = self.side.expect("a spare location has a side");
             let mut out = Locations::new();
             for &word in &side.packed[(packed & PackedLoc::INDEX_MASK) as usize..] {
                 let entry = word & !PackedLoc::SPARE;
@@ -1328,39 +1611,35 @@ impl Grid {
             return out;
         }
         let begin = base + (packed >> PackedLoc::LENGTH_BITS);
-        // The length takes 11 bits, so it fits 16.
         let length = (packed & PackedLoc::LENGTH_MASK) - 1;
         Locations::one(begin, length as u16)
     }
 
-    /// The places of the steps, for the rare query that leaves the range
-    /// of ticks.
-    fn places(&self) -> Vec<Place> {
-        let steps = self.steps_ref();
-        (0..steps.len())
+    fn places(self) -> Vec<Place> {
+        (0..self.steps.len())
             .map(|index| {
                 let (whole, part) = self.times(index);
-                Place::at(whole, part, steps.get(index).value, self.locations(index))
+                Place::at(
+                    whole,
+                    part,
+                    self.steps.get(index).value,
+                    self.locations(index),
+                )
             })
             .collect()
     }
 
-    /// Whether the steps are in the order of their haps in a period of
-    /// `period` cycles, as [`Layer::is_in_order`] says, compared as ticks.
-    /// `None` for a period whose ticks do not fit.
-    fn in_order(&self, period: Fraction) -> Option<bool> {
+    fn in_order(self, period: Fraction) -> Option<bool> {
         if period <= Fraction::ZERO {
             return Some(false);
         }
-        // A tick is inside the period when `tick / ticks <= n / d`.
         let bound = period.numer().checked_mul(i128::from(self.ticks.get()))?;
         let inside = |tick: u32| Some(i128::from(tick).checked_mul(period.denom())? <= bound);
         let mut cuts = self.cuts();
-        let steps = self.steps_ref();
-        let len = steps.len();
+        let len = self.steps.len();
         let mut prev: Option<(u32, u32)> = None;
         for index in 0..len {
-            let (part_begin, part_end) = steps.times_of(index);
+            let (part_begin, part_end) = self.steps.times_of(index);
             let cut = cuts.split_first_at(index);
             let (begin, end) = cut.map_or((part_begin, part_end), |c| (c.begin, c.end));
             let shaped = begin <= part_begin && part_begin < part_end && part_end <= end;
@@ -1377,25 +1656,21 @@ impl Grid {
         Some(true)
     }
 
-    /// Whether the steps of both are at the same ticks and cut alike.
-    fn same_times(&self, other: &Self) -> bool {
+    fn same_times(self, other: Self) -> bool {
         self.ticks == other.ticks
             && self.cuts().same(other.cuts())
-            && self.steps_ref().len() == other.steps_ref().len()
-            && (0..self.steps_ref().len())
-                .all(|index| self.steps_ref().times_of(index) == other.steps_ref().times_of(index))
+            && self.steps.len() == other.steps.len()
+            && (0..self.steps.len())
+                .all(|index| self.steps.times_of(index) == other.steps.times_of(index))
     }
 
-    /// Whether every step's part lies inside one cycle in every turn of `period`,
-    /// checked directly in integer ticks without constructing `Fraction`s.
-    fn in_cycles_for(&self, period: Fraction) -> bool {
+    fn in_cycles_for(self, period: Fraction) -> bool {
         let Ok(turns) = u128::try_from(period.denom()) else {
             return false;
         };
         let ticks = u128::from(self.ticks.get());
-        let steps = self.steps_ref();
-        for i in 0..steps.len() {
-            let (b, e) = steps.times_of(i);
+        for i in 0..self.steps.len() {
+            let (b, e) = self.steps.times_of(i);
             let Some(begins) = u128::from(b).checked_mul(turns) else {
                 return false;
             };
@@ -1412,10 +1687,7 @@ impl Grid {
         true
     }
 
-    /// Rescale this grid's times by `1 / factor` directly in integer ticks,
-    /// avoiding `Vec<Raw>`, `Fraction` divisions, and location re-packing.
-    /// Returns `(new_grid, in_cycles)` when ticks stay in range.
-    fn faster(&self, factor: Fraction, new_period: Fraction) -> Option<(Self, bool)> {
+    fn faster(self, factor: Fraction, new_period: Fraction) -> Option<(Listing, bool)> {
         let f_num = u32::try_from(factor.numer()).ok()?;
         let f_den = u32::try_from(factor.denom()).ok()?;
         if f_num == 0 || f_den == 0 {
@@ -1427,9 +1699,8 @@ impl Grid {
         let mul = f_den / g0;
         let mut g1 = u64::from(f_num);
         if g1 > 1 {
-            let steps = self.steps_ref();
-            for i in 0..steps.len() {
-                let (b, e) = steps.times_of(i);
+            for i in 0..self.steps.len() {
+                let (b, e) = self.steps.times_of(i);
                 g1 = gcd(g1, u64::from(b));
                 g1 = gcd(g1, u64::from(e));
                 if g1 == 1 {
@@ -1450,52 +1721,40 @@ impl Grid {
         }
         let ticks_2 = u64::from(ticks_1).checked_mul(u64::from(f_num))? / g1;
         let new_ticks_u32 = u32::try_from(ticks_2).ok()?;
-        // Fall back to the general path if denominators could exceed i32.
         if i32::try_from(new_ticks_u32).is_err() {
             return None;
         }
         let new_ticks = NonZeroU32::new(new_ticks_u32)?;
-        let steps_ref = self.steps_ref();
-        let (small_steps, side) = if mul == 1 && g1 == 1 {
-            let reductions = tick_grid(new_ticks);
-            let side = match (&self.side, reductions) {
-                (None, None) => None,
-                (Some(spare), reductions) => {
-                    if spare.packed.is_empty() && spare.rare.is_none() && reductions.is_none() {
-                        None
-                    } else {
-                        Some(Box::new(Spare {
-                            packed: spare.packed.clone(),
-                            reductions,
-                            rare: spare.rare.clone(),
-                        }))
-                    }
+        let (steps, side) = if mul == 1 && g1 == 1 {
+            let steps = match self.steps {
+                GridStepsRef::Small(steps) if steps.len() <= MAX_INLINE_GRID_LEN => {
+                    let mut arr = [GridSteps::ZERO_SMALL; MAX_INLINE_GRID_LEN];
+                    arr[..steps.len()].copy_from_slice(steps);
+                    GridSteps::Inline(steps.len() as u8, arr)
                 }
-                (None, Some(reductions)) => Some(Box::new(Spare {
-                    packed: Box::from([]),
-                    reductions: Some(reductions),
-                    rare: None,
-                })),
+                GridStepsRef::Small(steps) => GridSteps::Small(Box::from(steps)),
+                GridStepsRef::Wide(_) => GridSteps::Small(Box::from([])),
             };
-            (self.small_steps.clone(), side)
+            let side = self.side.and_then(|spare| {
+                (!spare.packed.is_empty() || spare.rare.is_some()).then(|| Box::new(spare.clone()))
+            });
+            (steps, side)
         } else {
             let rescale = |t: u32| -> Option<u32> {
                 u32::try_from((u64::from(t) / g1).checked_mul(u64::from(mul))?).ok()
             };
-            let steps = GridSteps::build(steps_ref.len(), |i| {
-                let mut step = steps_ref.get(i);
+            let steps = GridSteps::build(self.steps.len(), |i| {
+                let mut step = self.steps.get(i);
                 step.part_begin = rescale(step.part_begin)?;
                 step.part_end = rescale(step.part_end)?;
                 Some(step)
             })?;
-            let (small_steps, wide_steps) = match steps {
-                GridSteps::Small(small) => (small, Box::from([])),
-                GridSteps::Wide(wide) => (Box::from([]), wide),
+            let (steps, wide_steps) = match steps {
+                GridSteps::Wide(wide) => (GridSteps::Small(Box::from([])), wide),
+                other => (other, Box::from([])),
             };
-            let reductions = tick_grid(new_ticks);
             let packed = self
                 .side
-                .as_deref()
                 .map(|s| s.packed.clone())
                 .unwrap_or_else(|| Box::from([]));
             let mut cuts = SmallCopyBuf::<Cut, 16>::new(Cut {
@@ -1504,7 +1763,7 @@ impl Grid {
                 end: 0,
             });
             let mut wide_locs: Box<[Locations]> = Box::from([]);
-            if let Some(rare) = self.side.as_deref().and_then(|s| s.rare.as_deref()) {
+            if let Some(rare) = self.side.and_then(|s| s.rare.as_deref()) {
                 let cuts_view = rare.cuts();
                 for i in 0..cuts_view.len() {
                     let mut cut = cuts_view.get(i).expect("cut in bounds");
@@ -1522,48 +1781,47 @@ impl Grid {
                         wide_steps,
                     ))
                 });
-            let side = (!packed.is_empty() || reductions.is_some() || rare.is_some()).then(|| {
-                Box::new(Spare {
-                    packed,
-                    reductions,
-                    rare,
-                })
-            });
-            (small_steps, side)
+            let side =
+                (!packed.is_empty() || rare.is_some()).then(|| Box::new(Spare { packed, rare }));
+            (steps, side)
         };
-        let grid = Self {
-            ticks: new_ticks,
-            base: self.base | Self::SMALL,
-            small_steps,
-            side,
-        };
-        let in_cycles = grid.in_cycles_for(new_period);
-        Some((grid, in_cycles))
+        let listing = Listing::from_parts(new_ticks, self.base | Grid::SMALL, steps, side);
+        let in_cycles = listing
+            .with_grid_view(|view| view.in_cycles_for(new_period))
+            .unwrap_or(false);
+        Some((listing, in_cycles))
     }
 }
 
 thread_local! {
     /// The tables of reduced times that this thread made, by tick size: the
     /// layers of one tick size share one.
-    static TICK_GRIDS: std::cell::RefCell<Vec<Arc<TickGrid>>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TICK_GRIDS: std::cell::RefCell<Vec<TickGrid>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The table of reduced times for `ticks` in a cycle, when no shift reduces
-/// a time and the table is small.
-fn tick_grid(ticks: NonZeroU32) -> Option<Arc<TickGrid>> {
+/// Borrow the table of reduced times for `ticks` without atomic reference
+/// counting. Power-of-two grids skip the thread-local completely.
+#[inline]
+fn with_tick_grid<R>(ticks: NonZeroU32, f: impl FnOnce(Option<&TickGrid>) -> R) -> R {
     if ticks.is_power_of_two() || i64::from(ticks.get()) > TickGrid::MAX_DENOM {
-        return None;
+        return f(None);
     }
-    TICK_GRIDS.with_borrow_mut(|grids| {
-        let known = grids
-            .iter()
-            .find(|grid| grid.denom() == i64::from(ticks.get()));
-        known.cloned().or_else(|| {
-            let grid = Arc::new(TickGrid::new(i64::from(ticks.get()))?);
-            grids.push(Arc::clone(&grid));
-            Some(grid)
-        })
-    })
+    let denom = i64::from(ticks.get());
+    let hit = TICK_GRIDS.with_borrow(|grids| grids.iter().position(|grid| grid.denom() == denom));
+    let index = match hit {
+        Some(idx) => idx,
+        None => {
+            let Some(built) = TickGrid::new(denom) else {
+                return f(None);
+            };
+            TICK_GRIDS.with_borrow_mut(|grids| {
+                let idx = grids.len();
+                grids.push(built);
+                idx
+            })
+        }
+    };
+    TICK_GRIDS.with_borrow(|grids| f(Some(&grids[index])))
 }
 
 /// The greatest common divisor of two numbers above zero.
@@ -1784,7 +2042,7 @@ struct DressTail {
 /// What the folds on a layer give each hap of it, beyond its step. The
 /// layers that a fold dresses alike share one: see [`redressed`].
 #[derive(Clone, Default)]
-struct Dress {
+pub(crate) struct Dress {
     /// Undressed non-empty built-in control map entries set on each value when
     /// read. Rare custom-key, >12-key, empty-map, or non-object set values live
     /// in `tail.set_other`.
@@ -1979,9 +2237,45 @@ impl Dress {
     }
 
     fn set_map_builtin(&mut self, entries: Arc<dyn crate::value::BuiltinEntries>) {
+        let entries = crate::intern::intern_builtin(entries, true);
         let (keys, values) = entries.parts();
         self.set_marks = crate::value::Slice::Builtin(keys, values).marks();
         self.set_map = Some(entries);
+    }
+
+    #[inline]
+    fn into_arc(self) -> Arc<Self> {
+        crate::intern::intern_dress(Arc::new(self))
+    }
+
+    #[inline]
+    pub(crate) fn can_intern(&self) -> bool {
+        self.tail.is_none() && self.before_packed[0] == 0 && self.keys.can_intern()
+    }
+
+    pub(crate) fn hash_intern(&self, state: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        let map_ptr = self
+            .set_map
+            .as_ref()
+            .map_or(0usize, |m| Arc::as_ptr(m) as *const () as usize);
+        map_ptr.hash(state);
+        self.set_marks.hash(state);
+        self.keys.arc_ptr().hash(state);
+        self.before_packed.hash(state);
+    }
+
+    pub(crate) fn eq_intern(&self, other: &Self) -> bool {
+        self.tail.is_none()
+            && other.tail.is_none()
+            && self.set_marks == other.set_marks
+            && self.before_packed == other.before_packed
+            && self.keys.arc_ptr() == other.keys.arc_ptr()
+            && match (&self.set_map, &other.set_map) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
     }
 
     fn clear_set(&mut self) {
@@ -2203,7 +2497,7 @@ fn redressed<'a>(
                 _ => {
                     let mut dress = layer.dress().clone();
                     change(&mut dress);
-                    let dress = (!dress.is_bare()).then(|| Arc::new(dress));
+                    let dress = (!dress.is_bare()).then(|| dress.into_arc());
                     last = Some((from, dress.clone()));
                     dress
                 }
@@ -2331,13 +2625,8 @@ impl Layer {
                 period,
                 steps.iter().map(|step| TimeSpan::new(step.begin, step.end)),
             );
-        if let Some(grid) = Grid::build_indexed(steps) {
-            return Self::holding(
-                period,
-                Steps::Listed(Listing::Grid(Arc::new(grid))),
-                in_cycles,
-                values,
-            );
+        if let Some(listing) = Grid::build_indexed_listing(steps) {
+            return Self::holding(period, Steps::Listed(listing), in_cycles, values);
         }
         let raws: Vec<Raw> = steps
             .iter_mut()
@@ -2364,6 +2653,11 @@ impl Layer {
     /// A layer of `steps` that hold `values`, with no fold on it.
     fn holding(period: Fraction, steps: Steps, in_cycles: bool, values: Arc<[Value]>) -> Self {
         let data = values.iter().all(|value| value.is_data(0));
+        let values = if data {
+            crate::intern::intern_values(values)
+        } else {
+            values
+        };
         let maps = values.iter().all(|value| matches!(value, Value::Object(_)));
         let flags = (if in_cycles { LAYER_FLAG_IN_CYCLES } else { 0 })
             | (if data { LAYER_FLAG_DATA } else { 0 })
@@ -2806,7 +3100,7 @@ impl Layer {
             None => Dress::default(),
         };
         change(&mut dress);
-        self.dress = (!dress.is_bare()).then(|| Arc::new(dress));
+        self.dress = (!dress.is_bare()).then(|| dress.into_arc());
         self.refresh_direct();
     }
 
@@ -2889,7 +3183,13 @@ impl Layer {
 
     /// This layer with `values` in the place of its own, one for one.
     fn valued(mut self, values: Arc<[Value]>) -> Self {
-        self.set_data(values.iter().all(|value| value.is_data(0)));
+        let data = values.iter().all(|value| value.is_data(0));
+        let values = if data {
+            crate::intern::intern_values(values)
+        } else {
+            values
+        };
+        self.set_data(data);
         self.set_maps(values.iter().all(|value| matches!(value, Value::Object(_))));
         self.values = values;
         self.named_id = 0;
@@ -2986,7 +3286,7 @@ impl Layer {
                 _ => {
                     let mut dress = layer.dress().clone();
                     dress.set_custom_named(&spec.names);
-                    let dress = Arc::new(dress);
+                    let dress = dress.into_arc();
                     last = Some((from, Arc::clone(&dress)));
                     dress
                 }
@@ -3105,13 +3405,19 @@ impl Layer {
                 }
                 next.clear_set();
                 next.set_keys(keys);
-                let dress = (!next.is_bare()).then(|| Arc::new(next));
+                let dress = (!next.is_bare()).then(|| next.into_arc());
                 *last_dress = Some((from, dress.clone()));
                 dress
             }
         };
         let mut layer = self.with(|_| {});
-        layer.set_data(values.iter().all(|value| value.is_data(0)));
+        let data = values.iter().all(|value| value.is_data(0));
+        let values = if data {
+            crate::intern::intern_values(values)
+        } else {
+            values
+        };
+        layer.set_data(data);
         layer.set_maps(true);
         layer.values = values;
         layer.named_id = note_id;
@@ -3176,9 +3482,7 @@ impl Layer {
             return period > Fraction::ZERO;
         }
         let listing = self.listing();
-        if let Listing::Grid(grid) = listing
-            && let Some(in_order) = grid.in_order(period)
-        {
+        if let Some(Some(in_order)) = listing.with_grid_view(|grid| grid.in_order(period)) {
             return in_order;
         }
         let inside = |index: usize| {
@@ -3399,10 +3703,9 @@ impl Layer {
                 }
         };
         // Steps at the same ticks compare with no time made.
-        let same_times = match (own, others) {
-            (Listing::Grid(a), Listing::Grid(b)) => a.same_times(b),
-            _ => false,
-        };
+        let same_times = own
+            .with_grid_view(|a| others.with_grid_view(|b| a.same_times(b)).unwrap_or(false))
+            .unwrap_or(false);
         own.len() == others.len()
             && (0..own.len()).all(|index| {
                 (same_times
@@ -3436,13 +3739,25 @@ impl Layer {
         let owned;
         let places = match self.listing() {
             Listing::Places(listed) => &*listed.places,
-            Listing::Grid(grid) => {
-                if let Some(pushed) = self.push_grid(thread, owner, grid, turn, span, others, out) {
-                    return pushed;
+            listing => {
+                match listing
+                    .with_grid_view(|grid| {
+                        if let Some(pushed) =
+                            self.push_grid(thread, owner, grid, turn, span, others, out)
+                        {
+                            Ok(pushed)
+                        } else {
+                            Err(grid.places())
+                        }
+                    })
+                    .expect("grid listing")
+                {
+                    Ok(pushed) => return pushed,
+                    Err(places) => {
+                        owned = places;
+                        &owned[..]
+                    }
                 }
-                // A turn past the range of ticks asks the places.
-                owned = grid.places();
-                &owned[..]
             }
         };
         let instant = span.begin == span.end;
@@ -3500,7 +3815,7 @@ impl Layer {
         &self,
         thread: &QueryThread,
         owner: Option<(&Arc<[Layer]>, u16)>,
-        grid: &Grid,
+        grid: GridView<'_>,
         turn: &Turn,
         span: TimeSpan,
         others: usize,
@@ -3509,7 +3824,7 @@ impl Layer {
         let (begin_low, begin_high) = grid.ticks_at(turn.begin)?;
         let (_end_low, end_high) = grid.ticks_at(turn.end)?;
         let instant = span.begin == span.end;
-        let grid_steps = grid.steps_ref();
+        let grid_steps = grid.steps;
         let (first, last_step) = match grid_steps {
             GridStepsRef::Small(steps) => {
                 let (Some(first_step), Some(last_step_ref)) = (steps.first(), steps.last()) else {
@@ -3584,60 +3899,62 @@ impl Layer {
             .whole_cycles
             .and_then(|cycles| i64::try_from(cycles).ok())
             .and_then(|cycles| cycles.checked_mul(i64::from(grid.ticks.get())));
-        // The tick of the time made last, and the time: the end of a step is
-        // the begin of the next, which most steps are.
-        let mut last: Option<(u32, Fraction)> = None;
-        let mut at = |tick: u32| -> Result<Fraction, SequenceStop> {
-            if let Some((made, time)) = last
-                && made == tick
-            {
-                return Ok(time);
-            }
-            let time = match offset.and_then(|offset| offset.checked_add(i64::from(tick))) {
-                Some(ticks) => grid.made_small(ticks),
-                None => turn.moved(grid.time(tick))?,
-            };
-            last = Some((tick, time));
-            Ok(time)
-        };
-        let maker = self.maker(owner);
-        let pushed = (first..last_step).try_for_each(|index| {
-            let (step_begin, step_end, step_value) = match grid_steps {
-                GridStepsRef::Small(steps) => {
-                    let s = steps[index];
-                    (
-                        u32::from(s.part_begin),
-                        u32::from(s.part_end),
-                        u32::from(s.value),
-                    )
+        let pushed = with_tick_grid(grid.ticks, |reductions| {
+            // The tick of the time made last, and the time: the end of a step is
+            // the begin of the next, which most steps are.
+            let mut last: Option<(u32, Fraction)> = None;
+            let mut at = |tick: u32| -> Result<Fraction, SequenceStop> {
+                if let Some((made, time)) = last
+                    && made == tick
+                {
+                    return Ok(time);
                 }
-                GridStepsRef::Wide(steps) => {
-                    let s = steps[index];
-                    (s.part_begin, s.part_end, s.value)
-                }
+                let time = match offset.and_then(|offset| offset.checked_add(i64::from(tick))) {
+                    Some(ticks) => grid.made_small_with(ticks, reductions),
+                    None => turn.moved(grid.made_small_with(i64::from(tick), reductions))?,
+                };
+                last = Some((tick, time));
+                Ok(time)
             };
-            let visible = TimeSpan::new(at(step_begin)?, at(step_end)?);
-            let whole = if has_cuts {
-                match cuts.split_first_at(index) {
-                    Some(cut) => TimeSpan::new(at(cut.begin)?, at(cut.end)?),
-                    None => visible,
-                }
-            } else {
-                visible
-            };
-            let part_begin = if i64::from(step_begin) <= begin_low {
-                span.begin
-            } else {
-                visible.begin
-            };
-            let part_end = if i64::from(step_end) >= end_high {
-                span.end
-            } else {
-                visible.end
-            };
-            let part = TimeSpan::new(part_begin, part_end);
-            out.push(maker.make(index, step_value, whole, part));
-            Ok(())
+            let maker = self.maker(owner);
+            (first..last_step).try_for_each(|index| {
+                let (step_begin, step_end, step_value) = match grid_steps {
+                    GridStepsRef::Small(steps) => {
+                        let s = steps[index];
+                        (
+                            u32::from(s.part_begin),
+                            u32::from(s.part_end),
+                            u32::from(s.value),
+                        )
+                    }
+                    GridStepsRef::Wide(steps) => {
+                        let s = steps[index];
+                        (s.part_begin, s.part_end, s.value)
+                    }
+                };
+                let visible = TimeSpan::new(at(step_begin)?, at(step_end)?);
+                let whole = if has_cuts {
+                    match cuts.split_first_at(index) {
+                        Some(cut) => TimeSpan::new(at(cut.begin)?, at(cut.end)?),
+                        None => visible,
+                    }
+                } else {
+                    visible
+                };
+                let part_begin = if i64::from(step_begin) <= begin_low {
+                    span.begin
+                } else {
+                    visible.begin
+                };
+                let part_end = if i64::from(step_end) >= end_high {
+                    span.end
+                } else {
+                    visible.end
+                };
+                let part = TimeSpan::new(part_begin, part_end);
+                out.push(maker.make(index, step_value, whole, part));
+                Ok(())
+            })
         });
         if pushed.is_ok() {
             thread.note_accumulated(out.len() - others);
@@ -4469,7 +4786,7 @@ pub(crate) fn with_ui_visual_slot_in_place(layers: &mut Arc<[Layer]>, slot: u8) 
             _ => {
                 let mut dress = layer.dress().clone();
                 dress.add_ui_visual_slot(slot);
-                let dress = Arc::new(dress);
+                let dress = dress.into_arc();
                 last = Some((from, Arc::clone(&dress)));
                 dress
             }
@@ -4525,10 +4842,13 @@ pub(crate) fn is_bare(pattern: &Pattern) -> bool {
         layers.iter().all(|layer| {
             layer.dress().keys().is_empty()
                 && layer.dress().locates_alone()
-                && match layer.listing() {
-                    Listing::Grid(grid) => grid.steps_ref().has_no_locations(),
-                    listing => (0..listing.len()).all(|index| listing.locations(index).is_empty()),
-                }
+                && layer
+                    .listing()
+                    .with_grid_view(|grid| grid.steps.has_no_locations())
+                    .unwrap_or_else(|| {
+                        let listing = layer.listing();
+                        (0..listing.len()).all(|index| listing.locations(index).is_empty())
+                    })
         })
     })
 }
@@ -4817,7 +5137,7 @@ pub(crate) fn set_here(layers: &mut Arc<[Layer]>, control: &Value, context: Loca
                 let mut dress = layer.dress().clone();
                 // The locations of the control, for each layer.
                 dress.set_here(control, context.clone());
-                let dress = Arc::new(dress);
+                let dress = dress.into_arc();
                 last = Some((from, Arc::clone(&dress)));
                 dress
             }
@@ -4952,15 +5272,12 @@ pub(crate) fn faster(pattern: &Pattern, factor: Fraction) -> Option<Pattern> {
             // The times of the steps are in cycles, so they change with
             // the speed.
             let listing = layer.listing();
-            if let Listing::Grid(grid) = listing
-                && let Some((new_grid, in_cycles)) = grid.faster(factor, period)
+            if let Some(Some((new_listing, in_cycles))) =
+                listing.with_grid_view(|grid| grid.faster(factor, period))
             {
                 return Some(layer.with(|layer| {
                     layer.set_in_cycles(in_cycles);
-                    layer.set_period_and_steps(
-                        period,
-                        Steps::Listed(Listing::Grid(Arc::new(new_grid))),
-                    );
+                    layer.set_period_and_steps(period, Steps::Listed(new_listing));
                 }));
             }
             let raws = (0..listing.len())
@@ -6994,11 +7311,15 @@ mod tests {
         })
     }
 
-    fn grid_of(layer: &Layer) -> &Grid {
-        match layer.listing() {
-            Listing::Grid(grid) => grid,
-            Listing::Places(_) => panic!("the steps are not on a grid"),
-        }
+    fn with_grid_of<R>(layer: &Layer, f: impl FnOnce(GridView<'_>) -> R) -> R {
+        layer
+            .listing()
+            .with_grid_view(f)
+            .expect("the steps are not on a grid")
+    }
+
+    fn assert_on_grid(layer: &Layer) {
+        with_grid_of(layer, |_| ());
     }
 
     /// The grid of a layer answers as its places do, over spans that are
@@ -7011,7 +7332,7 @@ mod tests {
             for cells in [1, 2, 3, 4, 5, 8, 12] {
                 for variant in 0..6 {
                     let grid = Layer::of(grid_layer(period, cells, variant)).unwrap();
-                    grid_of(&grid);
+                    assert_on_grid(&grid);
                     let places = as_places(&grid);
                     for begin in -40..40i128 {
                         for width in [0, 1, 3, 7, 24] {
@@ -7064,12 +7385,13 @@ mod tests {
     #[test]
     fn a_grid_is_as_fine_as_its_denominators() {
         let layer = Layer::of(grid_layer((1, 1), 4, 0)).unwrap();
-        let grid = grid_of(&layer);
-        assert_eq!(grid.ticks.get(), 4);
-        assert_eq!(grid.time(0), Fraction::ZERO);
-        assert_eq!(grid.time(0).denom(), 1);
+        with_grid_of(&layer, |grid| {
+            assert_eq!(grid.ticks.get(), 4);
+            assert_eq!(grid.time(0), Fraction::ZERO);
+            assert_eq!(grid.time(0).denom(), 1);
+        });
         let layer = Layer::of(grid_layer((1, 3), 4, 0)).unwrap();
-        assert_eq!(grid_of(&layer).ticks.get(), 12);
+        with_grid_of(&layer, |grid| assert_eq!(grid.ticks.get(), 12));
     }
 
     /// A layer whose times do not fit 32 bits of ticks keeps its places,
@@ -7118,10 +7440,11 @@ mod tests {
             SequenceStep::new(frac((1, 2)), Fraction::ONE, Value::F64(1.0), short),
         ];
         let layer = Layer::of(self::layer((1, 1), steps)).unwrap();
-        let grid = grid_of(&layer);
-        assert_eq!(grid.steps_ref().get(1).loc.0 & PackedLoc::SPARE, 0);
-        assert_eq!(grid.locations(1).to_vec(), [(5_000_000, 5_000_003)]);
-        assert_eq!(grid.locations(0).to_vec(), [(0, 100_000)]);
+        with_grid_of(&layer, |grid| {
+            assert_eq!(grid.steps.get(1).loc.0 & PackedLoc::SPARE, 0);
+            assert_eq!(grid.locations(1).to_vec(), [(5_000_000, 5_000_003)]);
+            assert_eq!(grid.locations(0).to_vec(), [(0, 100_000)]);
+        });
     }
 
     /// `same` leaves a source that nobody read unread, and answers the same
@@ -7209,7 +7532,7 @@ mod tests {
         for period in [(1, 1), (1, 2), (3, 2)] {
             for steps in &cases {
                 let grid = Layer::of(layer(period, steps.clone())).unwrap();
-                grid_of(&grid);
+                assert_on_grid(&grid);
                 assert_eq!(
                     grid.is_in_order(),
                     as_places(&grid).is_in_order(),
@@ -7234,15 +7557,16 @@ mod tests {
                 )
             };
             let layer = Layer::of(layer((1, 1), vec![step(ticks)])).unwrap();
-            let grid = grid_of(&layer);
-            assert_eq!(grid.ticks.get() as i128, ticks);
-            for tick in (-5000..5000).chain([i128::from(i64::MAX), i128::from(i64::MIN)]) {
-                assert_eq!(
-                    grid.made(tick),
-                    Fraction::new(tick, ticks),
-                    "{tick}/{ticks}"
-                );
-            }
+            with_grid_of(&layer, |grid| {
+                assert_eq!(grid.ticks.get() as i128, ticks);
+                for tick in (-5000..5000).chain([i128::from(i64::MAX), i128::from(i64::MIN)]) {
+                    assert_eq!(
+                        grid.made(tick),
+                        Fraction::new(tick, ticks),
+                        "{tick}/{ticks}"
+                    );
+                }
+            });
         }
     }
 
@@ -7251,17 +7575,18 @@ mod tests {
     #[test]
     fn a_time_has_its_floor_and_ceiling_in_ticks() {
         let layer = Layer::of(grid_layer((1, 1), 12, 0)).unwrap();
-        let grid = grid_of(&layer);
-        for denom in [1, 2, 3, 5, 7, 8, 12, 16, 24, 1 << 20] {
-            for numer in -300..300 {
-                let time = Fraction::new(numer, denom);
-                let exact = time * Fraction::int(12);
-                let (floor, ceil) = grid.ticks_at(time).unwrap();
-                assert_eq!(Fraction::int(i128::from(floor)), exact.floor(), "{time:?}");
-                assert_eq!(Fraction::int(i128::from(ceil)), exact.ceil(), "{time:?}");
+        with_grid_of(&layer, |grid| {
+            for denom in [1, 2, 3, 5, 7, 8, 12, 16, 24, 1 << 20] {
+                for numer in -300..300 {
+                    let time = Fraction::new(numer, denom);
+                    let exact = time * Fraction::int(12);
+                    let (floor, ceil) = grid.ticks_at(time).unwrap();
+                    assert_eq!(Fraction::int(i128::from(floor)), exact.floor(), "{time:?}");
+                    assert_eq!(Fraction::int(i128::from(ceil)), exact.ceil(), "{time:?}");
+                }
             }
-        }
-        assert!(grid.ticks_at(Fraction::int(i128::MAX / 2)).is_none());
+            assert!(grid.ticks_at(Fraction::int(i128::MAX / 2)).is_none());
+        });
     }
 
     /// A source that holds one step in each period.

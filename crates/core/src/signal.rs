@@ -94,6 +94,7 @@ pub fn rand() -> Pattern {
 
 /// One less [`rand`]: the coin of `undegradeBy`, which passes what the coin
 /// of `degradeBy` holds back.
+#[cfg(test)]
 pub(crate) fn rand_inverted() -> Pattern {
     signal_static(|time, controls| {
         let seed = controls

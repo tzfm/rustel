@@ -24,6 +24,7 @@ pub mod euclid;
 pub mod extension_node;
 pub mod fdlibm;
 pub mod host_value;
+pub mod intern;
 pub mod ops;
 pub mod purity;
 pub mod reference;
@@ -5949,7 +5950,7 @@ enum Node {
         index_mode: PickIndexMode,
         mode: JoinMode,
     },
-    Degrade(Box<(Pattern, f64, u32)>),
+    Degrade(Box<(Pattern, f64, DegradeKind)>),
     Stack(Box<[Pattern]>),
     SlowCat(Box<[Pattern]>),
     /// `slowcatPrime` - cycle-skipping concatenation used by `every`/`lastOf`.
@@ -6023,6 +6024,15 @@ enum Node {
 type AddContextNode = (Pattern, Arc<[(usize, usize)]>);
 type FmapJsControlsNode = (Pattern, CallbackId, Option<fn(&Value) -> bool>);
 
+/// Mode of [`Node::Degrade`]: seeded offset (`degradeBySeeded`), standard
+/// `rand` (`degradeBy`), or complementary `1 - rand` (`undegradeBy`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DegradeKind {
+    Seeded(u32),
+    Rand,
+    RandInverted,
+}
+
 /// Boxed payload of [`Node::Fast`].
 pub(crate) struct FastNode(
     pub(crate) Pattern,
@@ -6062,8 +6072,57 @@ pub(crate) struct AppWaveNode {
 
 const _: () = assert!(std::mem::size_of::<AppWaveNode>() <= 80);
 
+/// Compact storage for one or more [`RunMeeting`]s in [`ConstantsNode`]: a
+/// single meeting (the common case) sits inline with no secondary slice allocation.
+#[derive(Clone)]
+pub(crate) enum ConstantsMeetings {
+    One(RunMeeting),
+    Many(Box<[RunMeeting]>),
+}
+
+impl ConstantsMeetings {
+    fn from_iter(iter: impl IntoIterator<Item = RunMeeting>) -> Self {
+        let mut iter = iter.into_iter();
+        let Some(first) = iter.next() else {
+            return Self::Many(Box::new([]));
+        };
+        let Some(second) = iter.next() else {
+            return Self::One(first);
+        };
+        let mut vec = Vec::with_capacity(2 + iter.size_hint().0);
+        vec.push(first);
+        vec.push(second);
+        vec.extend(iter);
+        Self::Many(vec.into_boxed_slice())
+    }
+}
+
+impl std::ops::Deref for ConstantsMeetings {
+    type Target = [RunMeeting];
+
+    #[inline(always)]
+    fn deref(&self) -> &[RunMeeting] {
+        match self {
+            Self::One(one) => std::slice::from_ref(one),
+            Self::Many(many) => many,
+        }
+    }
+}
+
+impl std::ops::DerefMut for ConstantsMeetings {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [RunMeeting] {
+        match self {
+            Self::One(one) => std::slice::from_mut(one),
+            Self::Many(many) => many,
+        }
+    }
+}
+
 /// Boxed payload of [`Node::Constants`].
-pub(crate) struct ConstantsNode(pub(crate) Pattern, pub(crate) Box<[RunMeeting]>);
+pub(crate) struct ConstantsNode(pub(crate) Pattern, pub(crate) ConstantsMeetings);
+
+const _: () = assert!(std::mem::size_of::<ConstantsNode>() <= 80);
 
 /// The two children of a node that has two: functions and values, a
 /// pattern and its operand, a selector and its lookup. One box for both,
@@ -6487,6 +6546,7 @@ impl RunMeeting {
     fn of(apply: Combine, flow: LookupFlow, mut value: Value, context: Locations) -> Self {
         if let Value::Object(map) = &mut value {
             map.undress_patched();
+            map.intern_builtin();
         }
         let (loc0, more_context) = Self::pack_context(context);
         Self {
@@ -6556,6 +6616,9 @@ impl RunMeeting {
             *merged = true;
         }
         compose::compose_data_flat(compose::ComposeOp::Set, &mut self.value, control);
+        if let Value::Object(map) = &mut self.value {
+            map.intern_builtin();
+        }
         if !self.context_is_empty() {
             context.append(&self.context());
         }
@@ -8666,7 +8729,7 @@ impl Pattern {
             }
 
             Node::Degrade(boxed) => {
-                let (pattern, amount, seed) = (&boxed.0, boxed.1, boxed.2);
+                let (pattern, amount, kind) = (&boxed.0, boxed.1, boxed.2);
                 let random_seed = state
                     .controls
                     .get("randSeed")
@@ -8674,10 +8737,32 @@ impl Pattern {
                     .unwrap_or(0.0);
                 let from = out.len();
                 pattern.answer_onto(thread, state, table::Order::Graph, out);
-                retain_from(out, from, |hap| {
-                    let time = hap.whole_or_part().begin.to_f64() + 0.0003 * f64::from(seed);
-                    rng::rand_at_time(time, random_seed) > amount
-                });
+                match kind {
+                    DegradeKind::Seeded(seed) => {
+                        retain_from(out, from, |hap| {
+                            let time =
+                                hap.whole_or_part().begin.to_f64() + 0.0003 * f64::from(seed);
+                            rng::rand_at_time(time, random_seed) > amount
+                        });
+                    }
+                    DegradeKind::Rand | DegradeKind::RandInverted => {
+                        let inverted = kind == DegradeKind::RandInverted;
+                        retain_from(out, from, |hap| {
+                            let met = hap.whole_or_part();
+                            let Some(part) = hap.part.intersection(&met) else {
+                                return false;
+                            };
+                            let r = rng::rand_at_time(met.begin.to_f64(), random_seed);
+                            let coin = if inverted { 1.0 - r } else { r };
+                            if coin > amount {
+                                hap.part = part;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    }
+                }
             }
 
             Node::Stack(pats) => query_stack_onto(thread, pats, state, out, || {}),
@@ -10781,12 +10866,12 @@ impl Pattern {
     /// takes the runtime of the pattern under it, so a receiver that binds
     /// another one stays a pattern of its own.
     fn met(&self, meetings: impl IntoIterator<Item = RunMeeting>) -> Self {
-        let (base, meetings): (_, Box<[RunMeeting]>) = match self.node_kind() {
+        let (base, meetings) = match self.node_kind() {
             Node::Constants(node) if self.same_runtime_owner(&node.0) => (
                 node.0.clone(),
-                node.1.iter().cloned().chain(meetings).collect(),
+                ConstantsMeetings::from_iter(node.1.iter().cloned().chain(meetings)),
             ),
-            _ => (self.clone(), meetings.into_iter().collect()),
+            _ => (self.clone(), ConstantsMeetings::from_iter(meetings)),
         };
         Pattern::of(Node::Constants(Box::new(ConstantsNode(base, meetings))))
     }
@@ -12513,7 +12598,21 @@ impl Pattern {
     }
 
     pub fn degrade_by_seeded(&self, amount: f64, seed: u32) -> Self {
-        Pattern::of(Node::Degrade(Box::new((self.clone(), amount, seed)))).with_steps_of(self)
+        Pattern::of(Node::Degrade(Box::new((
+            self.clone(),
+            amount,
+            DegradeKind::Seeded(seed),
+        ))))
+        .with_steps_of(self)
+    }
+
+    pub(crate) fn degrade_by_rand(&self, amount: f64, inverted: bool) -> Self {
+        let kind = if inverted {
+            DegradeKind::RandInverted
+        } else {
+            DegradeKind::Rand
+        };
+        Pattern::of(Node::Degrade(Box::new((self.clone(), amount, kind)))).with_steps_of(self)
     }
 
     pub fn repeat_cycles(&self, count: Fraction) -> Self {
