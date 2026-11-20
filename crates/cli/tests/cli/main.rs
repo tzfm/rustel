@@ -5400,8 +5400,10 @@ fn talkit_speaks_a_number() {
     assert!(!stderr.contains("voice_refused"), "{stderr}");
     // 16-bit samples after the 44-byte header: some are not silent.
     let loud = wav[44..]
-        .chunks_exact(2)
-        .any(|sample| i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs() > 100);
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .any(|sample| i16::from_le_bytes(*sample).unsigned_abs() > 100);
     assert!(loud, "the bounce is silent");
 }
 
