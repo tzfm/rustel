@@ -9648,4 +9648,12 @@ fn a_distortion_takes_its_volume_as_a_second_argument() {
         volumes(r#"note("c2").s("triangle").asym(".9:.5")"#),
         [0.5, 0.5]
     );
+    // A signal is read at each note, and the second argument wins over a pair.
+    let sawed = volumes(r#"note("c2*4").s("triangle").asym(.5, saw.range(.2, .6))"#);
+    assert_eq!(sawed.len(), 8);
+    assert!(sawed[0] < sawed[1] && sawed[1] < sawed[2], "{sawed:?}");
+    assert_eq!(
+        volumes(r#"note("c2").s("triangle").asym(".9:.5", .3)"#),
+        [0.3, 0.3]
+    );
 }
