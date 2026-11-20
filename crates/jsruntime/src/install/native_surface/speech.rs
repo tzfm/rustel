@@ -14,7 +14,7 @@ enum Field {
 fn spoken_text(text: Value) -> Value {
     match text {
         // `+ 0.0` turns -0 into 0, as JavaScript prints it.
-        Value::F64(number) if number.is_finite() => Value::Str((number + 0.0).to_string()),
+        Value::F64(number) if number.is_finite() => Value::Str((number + 0.0).to_string().into()),
         other => other,
     }
 }
