@@ -23,6 +23,9 @@ pub struct ControlSpec {
     /// canonical control name and method name. Each copy of the spec, and
     /// each sequence that the control names, shares the one list.
     pub names: Arc<[Arc<str>]>,
+    /// One-based index in [`default_control_registry`], or `0` for a custom
+    /// control created outside the built-in registry.
+    pub(crate) id: u16,
     /// The map of this control over the haps of a pattern, for each value
     /// and for unnamed values alone. Each is the interned map of the names,
     /// kept at its first use, so a later call takes no lock. A copy of the
@@ -58,6 +61,7 @@ impl ControlSpec {
     pub fn new(names: impl IntoIterator<Item = impl Into<Arc<str>>>) -> Self {
         Self {
             names: names.into_iter().map(Into::into).collect(),
+            id: 0,
             maps: Default::default(),
         }
     }
@@ -73,7 +77,7 @@ impl ControlSpec {
 
     /// The canonical name as a map key, which every map this control makes
     /// shares.
-    fn key(&self) -> Key {
+    pub(crate) fn key(&self) -> Key {
         key_of(&self.names)
     }
 
@@ -612,10 +616,51 @@ pub fn default_control_registry() -> &'static ControlRegistry {
                 control.names.iter().copied(),
                 control.aliases.iter().copied(),
             );
+            let index = registry.specs.len();
+            if let Some(id) = u16::try_from(index).ok().filter(|&n| n != 0)
+                && let Some(spec) = registry.specs.last_mut()
+            {
+                spec.id = id;
+            }
         }
         registry
     });
     &REGISTRY
+}
+
+/// Built-in [`ControlSpec`] for a non-zero 1-based registry id.
+#[inline]
+pub(crate) fn builtin_spec_by_id(id: u16) -> Option<&'static ControlSpec> {
+    let index = usize::from(id.checked_sub(1)?);
+    default_control_registry().specs.get(index)
+}
+
+/// Built-in control names for a non-zero 1-based registry id.
+#[inline]
+pub(crate) fn builtin_names_by_id(id: u16) -> Option<&'static Arc<[Arc<str>]>> {
+    builtin_spec_by_id(id).map(|spec| &spec.names)
+}
+
+/// Built-in 1-based control id matching `names`, or `0` for custom controls.
+pub(crate) fn builtin_id_of_names(names: &[Arc<str>]) -> u16 {
+    let Some(first) = names.first() else {
+        return 0;
+    };
+    default_control_registry()
+        .get(first)
+        .filter(|spec| spec.names.as_ref() == names)
+        .map_or(0, |spec| spec.id)
+}
+
+/// Cached 1-based control id for `"note"`.
+#[inline]
+pub(crate) fn note_control_id() -> u16 {
+    static ID: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        default_control_registry()
+            .get("note")
+            .map_or(0, |spec| spec.id)
+    })
 }
 
 /// The per-hap maps of the control applications, interned by what each
@@ -688,32 +733,35 @@ pub(crate) fn live_slot(name: &str) -> Option<usize> {
     }
 }
 
+/// Apply a control's naming map directly to one hap without closure indirection.
+pub(crate) fn apply_control_hap(spec: &ControlSpec, unnamed_only: bool, hap: Hap) -> Option<Hap> {
+    let already_controls = unnamed_only
+        && match &hap.value {
+            Value::Object(object) => !object.contains_key("value"),
+            Value::JsValue(reference) if !reference.is_array() => matches!(
+                crate::materialize_js_value(&hap.value),
+                Value::Object(object) if !object.contains_key("value")
+            ),
+            _ => false,
+        };
+    if already_controls {
+        return Some(hap);
+    }
+    let slider_binding = hap.slider_binding();
+    let scalar = matches!(hap.value, Value::F64(_));
+    let mut mapped = hap.map_value(|value| spec.with_value(value.clone()));
+    if slider_binding != 0
+        && scalar
+        && let Some(slot) = live_slot(spec.name())
+    {
+        mapped.set_live_control(slot, slider_binding);
+    }
+    Some(mapped)
+}
+
 /// The body of one interned control map. See [`interned_control_map`].
 fn control_map(spec: ControlSpec, unnamed_only: bool) -> impl Fn(Hap) -> Option<Hap> + Send + Sync {
-    move |hap| {
-        let already_controls = unnamed_only
-            && match &hap.value {
-                Value::Object(object) => !object.contains_key("value"),
-                Value::JsValue(reference) if !reference.is_array() => matches!(
-                    crate::materialize_js_value(&hap.value),
-                    Value::Object(object) if !object.contains_key("value")
-                ),
-                _ => false,
-            };
-        if already_controls {
-            return Some(hap);
-        }
-        let slider_binding = hap.slider_binding();
-        let scalar = matches!(hap.value, Value::F64(_));
-        let mut mapped = hap.map_value(|value| spec.with_value(value.clone()));
-        if slider_binding != 0
-            && scalar
-            && let Some(slot) = live_slot(spec.name())
-        {
-            mapped.set_live_control(slot, slider_binding);
-        }
-        Some(mapped)
-    }
+    move |hap| apply_control_hap(&spec, unnamed_only, hap)
 }
 
 #[cfg(test)]

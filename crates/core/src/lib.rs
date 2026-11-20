@@ -1205,7 +1205,7 @@ pub struct Pattern {
 const _: () = assert!(std::mem::size_of::<Pattern>() == 24);
 // A score builds thousands of nodes, so a node's size is most of a graph's
 // memory. A variant that grows every node fails here: box its rare part.
-const _: () = assert!(std::mem::size_of::<NodeCell>() <= 64);
+const _: () = assert!(std::mem::size_of::<NodeCell>() <= 40);
 
 /// A rewrite of the pitch of each hap, as [`Pattern::pitched`] applies it.
 struct PitchRewrite {
@@ -2187,15 +2187,22 @@ pub(crate) enum Combine {
     /// constant of the meeting is their union, which a meeting that is made
     /// in place takes. See [`Pattern::set_control`].
     Sets(Arc<Vec<Value>>),
-    /// Any other function.
-    With(CombineFn),
+    /// Any other function, boxed so [`Combine`] stays 16 bytes.
+    With(Box<CombineFn>),
 }
+
+const _: () = assert!(std::mem::size_of::<Combine>() == 16);
 
 /// A function that makes one value of a function value and an argument
 /// value.
 pub(crate) type CombineFn = Arc<dyn Fn(&Value, &Value) -> Value + Send + Sync>;
 
 impl Combine {
+    #[inline]
+    pub(crate) fn with(combine: CombineFn) -> Self {
+        Self::With(Box::new(combine))
+    }
+
     fn apply(&self, function: &Value, value: &Value) -> Value {
         match self {
             Combine::Composed(op) => compose::compose_op(*op, function, value),
@@ -4976,21 +4983,20 @@ impl Meeting {
     /// controls. A `set` of maps of controls is a union that keeps the keys
     /// in order and takes the later value of a repeated key, so the union
     /// of the controls first, then with the hap, is the same map.
-    /// [`Self::in_place`] against a plain constant `(value, context)` that
-    /// carries no bindings, keys, visuals, or pick lookup.
-    fn in_place_constant(
+    /// [`Self::in_place`] against a plain [`RunMeeting`] constant that carries
+    /// no bindings, keys, visuals, or pick lookup.
+    fn in_place_run_meeting(
         hf: &mut Hap,
-        value: &Value,
-        context: &Locations,
+        meeting: &RunMeeting,
         part: TimeSpan,
-        apply: &Combine,
-        flow: LookupFlow,
         cache: Option<&mut value::SharedWaveCache>,
     ) -> bool {
-        let Some(op) = apply.in_place_op() else {
+        let Some(op) = meeting.in_place_op() else {
             return false;
         };
-        if hf.pick_lookup().is_some() || !Self::values_meet_in_place(&hf.value, value, apply, flow)
+        let flow = meeting.flow();
+        if hf.pick_lookup().is_some()
+            || !meeting.values_meet_in_place(&hf.value, &meeting.value, flow)
         {
             return false;
         }
@@ -5005,14 +5011,14 @@ impl Meeting {
                     LookupFlow::Set => {
                         if hf_live == [0; 4]
                             || !matches!(
-                                (&hf.value, value),
+                                (&hf.value, &meeting.value),
                                 (Value::Object(_), _) | (_, Value::Object(_))
                             )
                         {
                             ([0; 4], 0)
                         } else {
                             let mut bindings = hf_live;
-                            if let Value::Object(values) = value {
+                            if let Value::Object(values) = &meeting.value {
                                 for (key, _) in values {
                                     if let Some(slot) = controls::live_slot(key.as_str()) {
                                         bindings[slot] = 0;
@@ -5026,13 +5032,9 @@ impl Meeting {
                 hf.set_live_bindings(live_controls, slider_binding);
             }
         }
-        compose::compose_data_in_place_cached(op, &mut hf.value, value, cache);
+        compose::compose_data_in_place_cached(op, &mut hf.value, &meeting.value, cache);
         hf.part = part;
-        if !context.is_empty() {
-            let mut merged = context.clone();
-            merged.append(&hf.context);
-            hf.context = merged;
-        }
+        meeting.prepend_context_to(&mut hf.context);
         true
     }
 
@@ -5697,18 +5699,18 @@ enum Node {
     QueryLimit(Box<QueryLimit>),
     /// Query-time transform of the query span, then of the resulting hap spans.
     /// `fast`/`slow` are expressed with these two.
-    WithQueryTime(Pattern, TimeFn),
-    WithHapTime(Pattern, TimeFn),
+    WithQueryTime(Box<(Pattern, TimeFn)>),
+    WithHapTime(Box<(Pattern, TimeFn)>),
     /// `fast` by an exact factor: query times are multiplied by it and hap
     /// times divided by it. See [`checked_time`] for overflow.
-    Fast(Pattern, Box<Fraction>, &'static str),
+    Fast(Box<FastNode>),
     /// `late` by an exact offset (`early` is a negative one): subtracted from
     /// query times and added to hap times. See [`checked_time`] for overflow.
-    Shift(Pattern, Box<Fraction>, &'static str),
+    Shift(Box<ShiftNode>),
     /// `withQuerySpan` / `withHapSpan` - begin and end mapped jointly.
-    WithQuerySpan(Pattern, SpanFn),
-    WithQuerySpanJs(Pattern, CallbackId),
-    WithHapSpan(Pattern, SpanFn),
+    WithQuerySpan(Box<(Pattern, SpanFn)>),
+    WithQuerySpanJs(Box<(Pattern, CallbackId)>),
+    WithHapSpan(Box<(Pattern, SpanFn)>),
     /// `rev` - reflect each cycle. Its own node because the reflection pivot
     /// comes from the query span's cycle, so the hap transform is not a
     /// function of the hap alone.
@@ -5738,7 +5740,7 @@ enum Node {
     ///
     /// The callback id is opaque to L1. `Hap[]` and the callback's JavaScript
     /// values exist only at the L2 boundary; the returned pattern is native.
-    ArpWith(Pattern, CallbackId),
+    ArpWith(Box<(Pattern, CallbackId)>),
     /// The general `register()` path for `arpWith`: the callback itself is a
     /// pattern (for example `.arpWith(f, g)` sequences two functions). Each
     /// callback-valued hap selects one ordinary [`Node::ArpWith`] over its
@@ -5762,35 +5764,34 @@ enum Node {
     /// Holds only the opaque id. Always impure and opaque: the callback may
     /// return a graph whose own callbacks cannot be enumerated statically, so
     /// `gc_mark` must retain conservatively.
-    PatternOfJs(Pattern, CallbackId),
+    PatternOfJs(Box<(Pattern, CallbackId)>),
     /// Native value transform.
-    FmapNative(Pattern, ValueFn),
-    FilterValues(Pattern, ValuePredicate),
-    FilterValuesJs(Pattern, CallbackId),
+    FmapNative(Box<(Pattern, ValueFn)>),
+    FilterValues(Box<(Pattern, ValuePredicate)>),
+    FilterValuesJs(Box<(Pattern, CallbackId)>),
     /// `filterHaps` - the predicate sees the whole hap. `discreteOnly` and
     /// `onsetsOnly` are the instances the joins need.
-    FilterHaps(Pattern, HapPredicate),
-    FilterHapsJs(Pattern, CallbackId),
-    FilterWhenJs(Pattern, CallbackId),
+    FilterHaps(Box<(Pattern, HapPredicate)>),
+    FilterHapsJs(Box<(Pattern, CallbackId)>),
+    FilterWhenJs(Box<(Pattern, CallbackId)>),
     SortHapsByPart(Pattern),
+    /// Built-in control naming map by 1-based registry id, avoiding closure
+    /// boxing and pool locks on non-sequence patterns such as signals.
+    ControlMap(Pattern, u16, bool),
     /// `withHaps` with native per-hap drop: the map-then-`removeUndefineds`
     /// shape (`scale` uses it). A closure that hits a query-time throw signals
     /// through `signal_query_error` and returns `None`; the flag surfaces at
     /// the query boundary like every other query-time error.
-    MapHapsNative(Pattern, HapMapFn, SpanUse),
+    MapHapsNative(Box<(Pattern, HapMapFn, SpanUse)>),
     /// A native per-hap map that takes ownership of the incoming hap, so a
     /// value or context change does not clone them.
-    MapHapsOwned(Pattern, OwnedHapMapFn, SpanUse),
-    UiVisual(
-        Pattern,
-        u8,
-        std::sync::OnceLock<Box<(Arc<context_keys::Keys>, Arc<context_keys::Keys>)>>,
-    ),
-    MapHapsWithState(Pattern, StateHapMapFn),
+    MapHapsOwned(Box<(Pattern, OwnedHapMapFn, SpanUse)>),
+    UiVisual(Box<UiVisualNode>),
+    MapHapsWithState(Box<(Pattern, StateHapMapFn)>),
     /// One hap expands to N haps sharing its span - `voicing()`'s
     /// `stack(...notes).note().set(rest)` + outerJoin collapses to exactly
     /// this shape natively (each note covers the source hap's whole/part).
-    ExpandHapsNative(Pattern, HapExpandFn, SpanUse),
+    ExpandHapsNative(Box<(Pattern, HapExpandFn, SpanUse)>),
     Collect(Pattern),
     /// `isobite`: the onsets in the cycle of the query, each valued by its
     /// position among them. An onset is a hap with a value not loosely 0.
@@ -5802,19 +5803,14 @@ enum Node {
     /// for the subtree, which every random signal reads. The registered
     /// `seed(n)` combinator is the constant form; function-valued `withSeed`
     /// is a JS surface the native scope does not expose.
-    WithRandSeed(Pattern, f64),
+    WithRandSeed(Box<(Pattern, f64)>),
     Signal(SignalFn),
     ChooseCycles(Vec<Pattern>, u32),
     /// Weighted random choice. See [`WeightedChoice`].
     WChoose(Box<WeightedChoice>),
     /// A selector pattern choosing reified entries from a JavaScript array or
     /// object, followed by the requested join.
-    Pick {
-        selector: Pattern,
-        lookup: Box<PickLookup>,
-        index_mode: PickIndexMode,
-        mode: JoinMode,
-    },
+    Pick(Box<PickNode>),
     /// A [`Node::Pick`] whose lookup is a pattern: the selector, then the
     /// lookup.
     PickPatternified {
@@ -5822,45 +5818,45 @@ enum Node {
         index_mode: PickIndexMode,
         mode: JoinMode,
     },
-    Degrade(Pattern, f64, u32),
+    Degrade(Box<(Pattern, f64, u32)>),
     Stack(Vec<Pattern>),
     SlowCat(Vec<Pattern>),
     /// `slowcatPrime` - cycle-skipping concatenation used by `every`/`lastOf`.
     SlowCatPrime(Vec<Pattern>),
     /// `innerJoin` over a pattern-of-patterns produced by a native function.
-    InnerJoin(Pattern, ToPatternFn),
+    InnerJoin(Box<(Pattern, ToPatternFn)>),
     SplitQueries(Pattern),
     /// `fastGap`: speed up, leaving a gap rather than repeating.
-    FastGap(Pattern, Box<Fraction>),
-    RepeatCycles(Pattern, Box<Fraction>),
-    LoopAt(Pattern, Box<Fraction>),
+    FastGap(Box<(Pattern, Fraction)>),
+    RepeatCycles(Box<(Pattern, Fraction)>),
+    LoopAt(Box<(Pattern, Fraction)>),
     /// Run this pattern at an absolute cycles-per-minute rate. Unlike a
     /// plain `fast(cpm / 60)`, this divides by the scheduler's `_cps`, so
     /// `.cpm(30)` means the same thing when the session default is 0.5 CPS.
-    Cpm(Pattern, Box<TempoRate>),
-    MidiKeys(Pattern, Arc<midi_in::InputPort>),
+    Cpm(Box<(Pattern, TempoRate)>),
+    MidiKeys(Box<(Pattern, Arc<midi_in::InputPort>)>),
     /// `appLeft`: a pattern of functions applied to a pattern of values,
     /// keeping the FUNCTION side's whole. This is the fold `register()` uses
     /// when a leading argument is itself a pattern.
-    AppLeft(Box<AppLeftNode>, Combine, LookupFlow),
+    AppLeft(Box<AppLeftNode>),
     /// A pattern whose every hap meets constants in turn: what `.gain(0.8)`,
     /// `sine.range(200, 2000)` and `.add(7)` give of a pattern that is no
     /// sequence. One node for the run, where each constant was an `appLeft`
     /// and a pattern of the constant, to find at the first query. The
     /// meetings are in the order of the applications.
-    Constants(Pattern, Arc<[RunMeeting]>),
+    Constants(Box<ConstantsNode>),
     /// `appRight`: keeps the VALUE side's whole and structure.
-    AppRight(Box<PatternPair>, Combine, LookupFlow),
+    AppRight(Box<AppNode>),
     /// `appBoth`: both sides are queried over the SAME span and the wholes
     /// intersect. Tidal's `<*>`.
-    AppBoth(Box<PatternPair>, Combine, LookupFlow),
+    AppBoth(Box<AppNode>),
     /// Appends source locations to every hap's context.
-    AddContext(Pattern, Arc<[(usize, usize)]>),
+    AddContext(Box<AddContextNode>),
     /// A pattern whose values become patterns via a closure that is
     /// **statically proven pure by its return type** (`-> PurePattern`).
     /// The constructions this node has answered so far ride beside the
     /// closure; see [`ConstructionMemo`].
-    PatternOfPure(Pattern, Box<(ToPurePatternFn, ConstructionMemo)>),
+    PatternOfPure(Box<(Pattern, ToPurePatternFn, ConstructionMemo)>),
     /// [`PatternOfPure`] for a registered combinator body that also reads a
     /// pattern operand. The operand rides in the node as a compared child,
     /// not inside the closure as a hidden capture, so a rebuild whose
@@ -5871,23 +5867,58 @@ enum Node {
     /// A pattern whose values become patterns via an **opaque** closure. The
     /// closure may materialise anything, including JavaScript, so this is
     /// always classified impure with an incomplete reachable set.
-    PatternOfDynamic(Pattern, ToPatternFn),
+    PatternOfDynamic(Box<(Pattern, ToPatternFn)>),
     /// Native metadata-aware bind. The closure receives the complete outer
     /// hap, including exact lookup shape, while `dependencies` makes every
     /// graph it may return explicit to purity/ownership analysis.
     PatternOfHap(Box<HapBind>),
     /// Tune from ratio patterns while keeping the source note's spans.
-    XenPatterns(Pattern, Vec<Pattern>),
+    XenPatterns(Box<(Pattern, Vec<Pattern>)>),
     /// Flatten a `PatternOf`, choosing whose whole survives.
     Join(Pattern, JoinMode),
     /// `fmap` with a USER callback. Holds only the opaque id.
-    FmapJs(Pattern, CallbackId),
+    FmapJs(Box<(Pattern, CallbackId)>),
     /// Trusted host finalization retains unchanged native control bindings.
-    FmapJsPreservingControls(Pattern, CallbackId, Option<fn(&Value) -> bool>),
+    FmapJsPreservingControls(Box<FmapJsControlsNode>),
     /// A user-authored `new Pattern(state => …)`. Holds only the opaque id.
     JsQuery(CallbackId),
     Timeline(Box<PatternPair>, TimelineState),
 }
+
+type AddContextNode = (Pattern, Arc<[(usize, usize)]>);
+type FmapJsControlsNode = (Pattern, CallbackId, Option<fn(&Value) -> bool>);
+
+/// Boxed payload of [`Node::Fast`].
+pub(crate) struct FastNode(
+    pub(crate) Pattern,
+    pub(crate) Fraction,
+    pub(crate) &'static str,
+);
+
+/// Boxed payload of [`Node::Shift`].
+pub(crate) struct ShiftNode(
+    pub(crate) Pattern,
+    pub(crate) Fraction,
+    pub(crate) &'static str,
+);
+
+/// Boxed payload of [`Node::UiVisual`].
+struct UiVisualNode {
+    inner: Pattern,
+    slot: u8,
+    cache: std::sync::OnceLock<Box<(Arc<context_keys::Keys>, Arc<context_keys::Keys>)>>,
+}
+
+/// Boxed payload of [`Node::Pick`].
+struct PickNode {
+    selector: Pattern,
+    lookup: PickLookup,
+    index_mode: PickIndexMode,
+    mode: JoinMode,
+}
+
+/// Boxed payload of [`Node::Constants`].
+pub(crate) struct ConstantsNode(pub(crate) Pattern, pub(crate) Box<[RunMeeting]>);
 
 /// The two children of a node that has two: functions and values, a
 /// pattern and its operand, a selector and its lookup. One box for both,
@@ -5908,9 +5939,36 @@ impl PatternPair {
     }
 }
 
-/// Boxed payload of [`Node::AppLeft`], keeping `ValueReading` out of every
-/// other [`Node`] variant.
-pub(crate) struct AppLeftNode(pub(crate) Pattern, pub(crate) Pattern, ValueReading);
+/// Boxed payload of [`Node::AppRight`] and [`Node::AppBoth`].
+pub(crate) struct AppNode(
+    pub(crate) Pattern,
+    pub(crate) Pattern,
+    pub(crate) Combine,
+    pub(crate) LookupFlow,
+);
+
+impl AppNode {
+    #[inline]
+    fn runtime_settings_source(&self) -> Option<&Pattern> {
+        if self.0.has_runtime_settings() {
+            Some(&self.0)
+        } else if self.1.has_runtime_settings() {
+            Some(&self.1)
+        } else {
+            None
+        }
+    }
+}
+
+/// Boxed payload of [`Node::AppLeft`], keeping `ValueReading`, `Combine`, and
+/// `LookupFlow` out of every other [`Node`] variant.
+pub(crate) struct AppLeftNode(
+    pub(crate) Pattern,
+    pub(crate) Pattern,
+    ValueReading,
+    pub(crate) Combine,
+    pub(crate) LookupFlow,
+);
 
 impl AppLeftNode {
     #[inline]
@@ -6037,24 +6095,227 @@ impl ValueReading {
     }
 }
 
+/// Pack a single `(begin, end)` range into a non-zero `u32` for [`RunApply`]:
+/// `begin` in the high 20 bits and `length + 1` in the low 12 bits, leaving
+/// `0` as the empty sentinel.
+#[inline]
+fn pack_run_loc((begin, end): (usize, usize)) -> Option<u32> {
+    const LEN_BITS: u32 = 12;
+    const MAX_LEN: u32 = (1 << LEN_BITS) - 2;
+    const MAX_BEGIN: u32 = (1 << (32 - LEN_BITS)) - 1;
+    let length = u32::try_from(end.checked_sub(begin)?).ok()?;
+    let begin = u32::try_from(begin).ok()?;
+    (begin <= MAX_BEGIN && length <= MAX_LEN).then_some((begin << LEN_BITS) | (length + 1))
+}
+
+#[inline]
+fn unpack_run_loc(packed: u32) -> (usize, usize) {
+    const LEN_BITS: u32 = 12;
+    const LEN_MASK: u32 = (1 << LEN_BITS) - 1;
+    let begin = (packed >> LEN_BITS) as usize;
+    let length = ((packed & LEN_MASK) - 1) as usize;
+    (begin, begin + length)
+}
+
+/// Compact 16-byte header for [`RunMeeting`] packing [`Combine`],
+/// [`LookupFlow`], and up to one inline packed source location (`loc0 != 0`).
+#[derive(Clone)]
+enum RunApply {
+    Composed {
+        op: compose::ComposeOp,
+        flow: LookupFlow,
+        loc0: u32,
+    },
+    Sets {
+        controls: Arc<Vec<Value>>,
+        flow: LookupFlow,
+        loc0: u32,
+    },
+    With {
+        apply: Box<CombineFn>,
+        flow: LookupFlow,
+        loc0: u32,
+    },
+}
+
+const _: () = assert!(std::mem::size_of::<RunApply>() == 16);
+
+impl RunApply {
+    fn from_parts(apply: Combine, flow: LookupFlow, loc0: u32) -> Self {
+        match apply {
+            Combine::Composed(op) => Self::Composed { op, flow, loc0 },
+            Combine::Sets(controls) => Self::Sets {
+                controls,
+                flow,
+                loc0,
+            },
+            Combine::With(apply) => Self::With { apply, flow, loc0 },
+        }
+    }
+
+    #[inline]
+    fn flow(&self) -> LookupFlow {
+        match self {
+            Self::Composed { flow, .. } | Self::Sets { flow, .. } | Self::With { flow, .. } => {
+                *flow
+            }
+        }
+    }
+
+    #[inline]
+    fn loc0(&self) -> u32 {
+        match self {
+            Self::Composed { loc0, .. } | Self::Sets { loc0, .. } | Self::With { loc0, .. } => {
+                *loc0
+            }
+        }
+    }
+
+    #[inline]
+    fn set_loc0(&mut self, value: u32) {
+        match self {
+            Self::Composed { loc0, .. } | Self::Sets { loc0, .. } | Self::With { loc0, .. } => {
+                *loc0 = value;
+            }
+        }
+    }
+
+    #[inline]
+    fn in_place_op(&self) -> Option<compose::ComposeOp> {
+        match self {
+            Self::Composed { op, .. } => Some(*op),
+            Self::Sets { .. } => Some(compose::ComposeOp::Set),
+            Self::With { .. } => None,
+        }
+    }
+
+    fn combine(&self) -> Combine {
+        match self {
+            Self::Composed { op, .. } => Combine::Composed(*op),
+            Self::Sets { controls, .. } => Combine::Sets(Arc::clone(controls)),
+            Self::With { apply, .. } => Combine::With(apply.clone()),
+        }
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        if self.flow() != other.flow() {
+            return false;
+        }
+        match (self, other) {
+            (Self::Composed { op: a, .. }, Self::Composed { op: b, .. }) => a == b,
+            (Self::Sets { controls: a, .. }, Self::Sets { controls: b, .. }) => {
+                a.len() == b.len() && a.iter().zip(&**b).all(|(x, y)| x.same_data(y))
+            }
+            (Self::With { apply: a, .. }, Self::With { apply: b, .. }) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
 /// One meeting of a run: the constant of one application, carrying only its
 /// value and source locations (cycle spans are synthesized on demand). Sets of
 /// maps of controls in a row are one meeting, which the build made of them.
 /// See [`Pattern::set_control`].
 #[derive(Clone)]
 struct RunMeeting {
-    apply: Combine,
-    flow: LookupFlow,
     value: Value,
-    context: Locations,
+    apply: RunApply,
+    /// Spilled locations when more than one range or a wide range is present.
+    more_context: Option<Box<Locations>>,
 }
 
+const _: () = assert!(std::mem::size_of::<RunMeeting>() <= 48);
+
 impl RunMeeting {
+    #[inline]
+    pub(crate) fn flow(&self) -> LookupFlow {
+        self.apply.flow()
+    }
+
+    #[inline]
+    pub(crate) fn combine(&self) -> Combine {
+        self.apply.combine()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sets_controls(&self) -> Option<&[Value]> {
+        match &self.apply {
+            RunApply::Sets { controls, .. } => Some(controls),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn in_place_op(&self) -> Option<compose::ComposeOp> {
+        self.apply.in_place_op()
+    }
+
+    #[inline]
+    fn values_meet_in_place(&self, function: &Value, value: &Value, flow: LookupFlow) -> bool {
+        let Some(op) = self.apply.in_place_op() else {
+            return false;
+        };
+        let compose = Combine::Composed(op);
+        Meeting::values_meet_in_place(function, value, &compose, flow)
+    }
+
+    #[inline]
+    fn context_is_empty(&self) -> bool {
+        self.apply.loc0() == 0 && self.more_context.is_none()
+    }
+
+    fn context(&self) -> Locations {
+        if let Some(more) = &self.more_context {
+            (**more).clone()
+        } else if self.apply.loc0() != 0 {
+            let mut out = Locations::new();
+            out.push(unpack_run_loc(self.apply.loc0()));
+            out
+        } else {
+            Locations::new()
+        }
+    }
+
+    #[inline]
+    fn prepend_context_to(&self, target: &mut Locations) {
+        if let Some(more) = &self.more_context {
+            let mut merged = (**more).clone();
+            merged.append(target);
+            *target = merged;
+        } else if self.apply.loc0() != 0 {
+            let mut merged = Locations::new();
+            merged.push(unpack_run_loc(self.apply.loc0()));
+            merged.append(target);
+            *target = merged;
+        }
+    }
+
+    fn same_context(&self, other: &Self) -> bool {
+        match (&self.more_context, &other.more_context) {
+            (None, None) => self.apply.loc0() == other.apply.loc0(),
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    fn pack_context(context: Locations) -> (u32, Option<Box<Locations>>) {
+        if context.is_empty() {
+            (0, None)
+        } else if context.len() == 1
+            && let Some(range) = context.get(0)
+            && let Some(packed) = pack_run_loc(range)
+        {
+            (packed, None)
+        } else {
+            (0, Some(Box::new(context)))
+        }
+    }
+
     /// Materialize this constant as a cycle-zero [`Hap`] for fallback paths.
     pub(crate) fn as_hap(&self) -> Hap {
         let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
         let mut hap = Hap::new(Some(cycle), cycle, self.value.clone());
-        hap.context = self.context.clone();
+        hap.context = self.context();
         hap
     }
 
@@ -6077,7 +6338,8 @@ impl RunMeeting {
             hap.move_to_piece(piece);
             pieces.push(hap);
         });
-        meet_each(thread, hf, pieces, &self.apply, self.flow, 0, out)
+        let apply = self.combine();
+        meet_each(thread, hf, pieces, &apply, self.flow(), 0, out)
     }
 
     /// The meeting of the constant `value` at `context` by `apply`, as the
@@ -6087,11 +6349,11 @@ impl RunMeeting {
         if let Value::Object(map) = &mut value {
             map.undress_patched();
         }
+        let (loc0, more_context) = Self::pack_context(context);
         Self {
-            apply,
-            flow,
             value,
-            context,
+            apply: RunApply::from_parts(apply, flow, loc0),
+            more_context,
         }
     }
 
@@ -6100,7 +6362,7 @@ impl RunMeeting {
     /// text.
     pub(crate) fn number(&self) -> Option<(compose::ComposeOp, f64)> {
         match (&self.apply, &self.value) {
-            (Combine::Composed(op), Value::F64(other)) if self.context.is_empty() => {
+            (RunApply::Composed { op, .. }, Value::F64(other)) if self.context_is_empty() => {
                 Some((*op, *other))
             }
             _ => None,
@@ -6113,10 +6375,7 @@ impl RunMeeting {
     pub(crate) fn same(left: &[Self], right: &[Self]) -> bool {
         left.len() == right.len()
             && left.iter().zip(right).all(|(a, b)| {
-                a.flow == b.flow
-                    && construction::same_combine(&a.apply, &b.apply)
-                    && a.value.same_data(&b.value)
-                    && a.context == b.context
+                a.apply.same(&b.apply) && a.value.same_data(&b.value) && a.same_context(b)
             })
     }
 
@@ -6127,10 +6386,13 @@ impl RunMeeting {
     fn takes_sets(&self) -> bool {
         let sets = matches!(
             self.apply,
-            Combine::Composed(compose::ComposeOp::Set) | Combine::Sets(_)
+            RunApply::Composed {
+                op: compose::ComposeOp::Set,
+                ..
+            } | RunApply::Sets { .. }
         );
         let controls = self.value.as_object();
-        self.flow == LookupFlow::Set
+        self.flow() == LookupFlow::Set
             && sets
             && controls.is_some_and(|controls| !compose::union_drops(controls))
     }
@@ -6158,21 +6420,31 @@ impl RunMeeting {
         mut context: Locations,
         row: impl Iterator<Item = Value>,
     ) {
+        let flow = self.flow();
+        let loc0 = self.apply.loc0();
         match &mut self.apply {
             // The run alone holds its controls, or takes a copy.
-            Combine::Sets(controls) => Arc::make_mut(controls).extend(row),
+            RunApply::Sets { controls, .. } => Arc::make_mut(controls).extend(row),
             // A handle of the first control, which the union replaces.
             apply => {
                 let first = std::iter::once(self.value.clone());
-                *apply = Combine::Sets(Arc::new(first.chain(row).collect()));
+                *apply = RunApply::Sets {
+                    controls: Arc::new(first.chain(row).collect()),
+                    flow,
+                    loc0,
+                };
             }
         }
         compose::compose_data_in_place(compose::ComposeOp::Set, &mut self.value, control);
         if let Value::Object(map) = &mut self.value {
             map.undress_patched();
         }
-        context.append(&self.context);
-        self.context = context;
+        if !self.context_is_empty() {
+            context.append(&self.context());
+        }
+        let (new_loc0, new_more) = Self::pack_context(context);
+        self.apply.set_loc0(new_loc0);
+        self.more_context = new_more;
     }
 }
 
@@ -6372,10 +6644,10 @@ struct ValueSide<'a> {
 impl<'a> ValueSide<'a> {
     /// The value side of `node`, when `node` is an `appLeft`.
     fn of(node: &'a Node) -> Option<Self> {
-        let Node::AppLeft(pair, apply, flow) = node else {
+        let Node::AppLeft(pair) = node else {
             return None;
         };
-        let AppLeftNode(functions, values, reading) = &**pair;
+        let AppLeftNode(functions, values, reading, apply, flow) = &**pair;
         Some(Self {
             functions,
             values,
@@ -6843,25 +7115,17 @@ fn query_run(
                 return false;
             };
             for (m_idx, meeting) in meetings.iter().enumerate() {
-                let (apply, flow) = (&meeting.apply, meeting.flow);
                 let cache = if use_cache {
                     caches.get_mut(m_idx)
                 } else {
                     None
                 };
-                if Meeting::in_place_constant(
-                    hf,
-                    &meeting.value,
-                    &meeting.context,
-                    part,
-                    apply,
-                    flow,
-                    cache,
-                ) {
+                if Meeting::in_place_run_meeting(hf, meeting, part, cache) {
                     continue;
                 }
                 let constant = meeting.as_hap();
-                *hf = applied_hap(hf, &constant, hf.whole, part, apply, flow);
+                let apply = meeting.combine();
+                *hf = applied_hap(hf, &constant, hf.whole, part, &apply, meeting.flow());
                 if thread.stop_requested() {
                     stopped = true;
                     return false;
@@ -6902,20 +7166,12 @@ fn query_run(
                 continue;
             };
             for meeting in meetings {
-                let (apply, flow) = (&meeting.apply, meeting.flow);
-                if Meeting::in_place_constant(
-                    &mut hf,
-                    &meeting.value,
-                    &meeting.context,
-                    part,
-                    apply,
-                    flow,
-                    None,
-                ) {
+                if Meeting::in_place_run_meeting(&mut hf, meeting, part, None) {
                     continue;
                 }
                 let constant = meeting.as_hap();
-                hf = applied_hap(&hf, &constant, hf.whole, part, apply, flow);
+                let apply = meeting.combine();
+                hf = applied_hap(&hf, &constant, hf.whole, part, &apply, meeting.flow());
                 if thread.stop_requested() {
                     return None;
                 }
@@ -6951,11 +7207,16 @@ impl Pattern {
             // One value that fills each cycle, as a control of a `pure` is
             // once it is folded.
             Node::Sequence(layers) => sequence::constant_value(layers).map(|_| 1),
-            Node::AddContext(pattern, _)
-            | Node::FmapNative(pattern, _)
-            | Node::MapHapsNative(pattern, _, SpanUse::Ignores)
-            | Node::MapHapsOwned(pattern, _, SpanUse::Ignores)
-            | Node::UiVisual(pattern, _, _) => pattern.constant_levels()?.checked_add(1),
+            Node::ControlMap(pattern, _, _) => pattern.constant_levels()?.checked_add(1),
+            Node::AddContext(boxed) => boxed.0.constant_levels()?.checked_add(1),
+            Node::FmapNative(boxed) => boxed.0.constant_levels()?.checked_add(1),
+            Node::MapHapsNative(boxed) if boxed.2 == SpanUse::Ignores => {
+                boxed.0.constant_levels()?.checked_add(1)
+            }
+            Node::MapHapsOwned(boxed) if boxed.2 == SpanUse::Ignores => {
+                boxed.0.constant_levels()?.checked_add(1)
+            }
+            Node::UiVisual(node) => node.inner.constant_levels()?.checked_add(1),
             _ => None,
         }
     }
@@ -7008,64 +7269,65 @@ fn inherited_runtime_settings_source(node: &Node) -> Option<&Pattern> {
         Node::PatternOfPureOperand(pair, _) => pair.runtime_settings_source(),
         #[cfg(non_send_node_mutation)]
         Node::NonSendMutation(_) => None,
-        Node::WithQueryTime(pattern, _)
-        | Node::WithHapTime(pattern, _)
-        | Node::Fast(pattern, _, _)
-        | Node::Shift(pattern, _, _)
-        | Node::WithQuerySpan(pattern, _)
-        | Node::WithQuerySpanJs(pattern, _)
-        | Node::WithHapSpan(pattern, _)
-        | Node::Rev(pattern)
+        Node::Rev(pattern)
         | Node::StepJoin(pattern)
         | Node::PolyJoin(pattern)
-        | Node::ArpWith(pattern, _)
         | Node::PurePattern(pattern)
-        | Node::PatternOfJs(pattern, _)
-        | Node::FmapNative(pattern, _)
-        | Node::Constants(pattern, _)
-        | Node::FilterValues(pattern, _)
-        | Node::FilterValuesJs(pattern, _)
-        | Node::FilterHaps(pattern, _)
-        | Node::FilterHapsJs(pattern, _)
-        | Node::FilterWhenJs(pattern, _)
         | Node::SortHapsByPart(pattern)
-        | Node::MapHapsNative(pattern, _, _)
-        | Node::MapHapsOwned(pattern, _, _)
-        | Node::UiVisual(pattern, _, _)
-        | Node::MapHapsWithState(pattern, _)
-        | Node::ExpandHapsNative(pattern, _, _)
+        | Node::ControlMap(pattern, _, _)
         | Node::Collect(pattern)
         | Node::CycleOnsetIndex(pattern)
         | Node::CycleOnsetCount(pattern)
-        | Node::WithRandSeed(pattern, _)
-        | Node::Degrade(pattern, _, _)
-        | Node::InnerJoin(pattern, _)
         | Node::SplitQueries(pattern)
-        | Node::FastGap(pattern, _)
-        | Node::RepeatCycles(pattern, _)
-        | Node::LoopAt(pattern, _)
-        | Node::Cpm(pattern, _)
-        | Node::MidiKeys(pattern, _)
-        | Node::AddContext(pattern, _)
-        | Node::PatternOfPure(pattern, _)
-        | Node::PatternOfDynamic(pattern, _)
-        | Node::Join(pattern, _)
-        | Node::FmapJs(pattern, _)
-        | Node::FmapJsPreservingControls(pattern, _, _) => {
-            pattern.has_runtime_settings().then_some(pattern)
+        | Node::Join(pattern, _) => pattern.has_runtime_settings().then_some(pattern),
+        Node::Fast(node) => node.0.has_runtime_settings().then_some(&node.0),
+        Node::Shift(node) => node.0.has_runtime_settings().then_some(&node.0),
+        Node::Constants(node) => node.0.has_runtime_settings().then_some(&node.0),
+        Node::UiVisual(node) => node.inner.has_runtime_settings().then_some(&node.inner),
+        Node::WithQueryTime(boxed) | Node::WithHapTime(boxed) => {
+            boxed.0.has_runtime_settings().then_some(&boxed.0)
         }
+        Node::WithQuerySpan(boxed) | Node::WithHapSpan(boxed) => {
+            boxed.0.has_runtime_settings().then_some(&boxed.0)
+        }
+        Node::WithQuerySpanJs(boxed)
+        | Node::ArpWith(boxed)
+        | Node::PatternOfJs(boxed)
+        | Node::FilterValuesJs(boxed)
+        | Node::FilterHapsJs(boxed)
+        | Node::FilterWhenJs(boxed)
+        | Node::FmapJs(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::FmapNative(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::FilterValues(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::FilterHaps(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::MapHapsNative(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::MapHapsOwned(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::MapHapsWithState(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::ExpandHapsNative(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::WithRandSeed(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::Degrade(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::InnerJoin(boxed) | Node::PatternOfDynamic(boxed) => {
+            boxed.0.has_runtime_settings().then_some(&boxed.0)
+        }
+        Node::FastGap(boxed) | Node::RepeatCycles(boxed) | Node::LoopAt(boxed) => {
+            boxed.0.has_runtime_settings().then_some(&boxed.0)
+        }
+        Node::Cpm(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::MidiKeys(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::AddContext(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::PatternOfPure(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
+        Node::FmapJsPreservingControls(boxed) => boxed.0.has_runtime_settings().then_some(&boxed.0),
         Node::Extension(extension) => from_patterns(extension.children()),
         Node::Timeline(pair, _) => pair
             .1
             .has_runtime_settings()
             .then_some(&pair.1)
             .or_else(|| pair.0.has_runtime_settings().then_some(&pair.0)),
-        Node::AppLeft(pair, _, _) => pair.runtime_settings_source(),
+        Node::AppLeft(pair) => pair.runtime_settings_source(),
+        Node::AppRight(node) | Node::AppBoth(node) => node.runtime_settings_source(),
         Node::Arp(pair)
         | Node::ArpWithPattern(pair)
-        | Node::PickPatternified { patterns: pair, .. }
-        | Node::AppRight(pair, _, _)
-        | Node::AppBoth(pair, _, _) => pair.runtime_settings_source(),
+        | Node::PickPatternified { patterns: pair, .. } => pair.runtime_settings_source(),
         Node::PurePickLookup(boxed) => from_patterns(boxed.1.patterns()),
         Node::ChooseCycles(patterns, _)
         | Node::Stack(patterns)
@@ -7078,21 +7340,21 @@ fn inherited_runtime_settings_source(node: &Node) -> Option<&Pattern> {
             .or_else(|| choice.total.has_runtime_settings().then_some(&choice.total))
             .or_else(|| from_patterns(&choice.cumulative))
             .or_else(|| from_patterns(&choice.values)),
-        Node::Pick {
-            selector, lookup, ..
-        } => selector
+        Node::Pick(pick) => pick
+            .selector
             .has_runtime_settings()
-            .then_some(selector)
-            .or_else(|| from_patterns(lookup.patterns())),
+            .then_some(&pick.selector)
+            .or_else(|| from_patterns(pick.lookup.patterns())),
         Node::PatternOfHap(bind) => bind
             .0
             .has_runtime_settings()
             .then_some(&bind.0)
             .or_else(|| from_patterns(&bind.1)),
-        Node::XenPatterns(pattern, dependencies) => pattern
+        Node::XenPatterns(boxed) => boxed
+            .0
             .has_runtime_settings()
-            .then_some(pattern)
-            .or_else(|| from_patterns(dependencies)),
+            .then_some(&boxed.0)
+            .or_else(|| from_patterns(&boxed.1)),
     }
 }
 
@@ -8226,15 +8488,17 @@ impl Pattern {
 
             Node::Sequence(layers) => sequence::query_sequence_onto(thread, layers, state, out),
 
-            Node::Fast(pat, factor, operation) => {
-                pat.query_faster_onto(thread, **factor, None, operation, state, out);
+            Node::Fast(node) => {
+                node.0
+                    .query_faster_onto(thread, node.1, None, node.2, state, out);
             }
 
-            Node::Shift(pat, by, operation) => {
-                pat.query_moved_onto(thread, **by, operation, state, out);
+            Node::Shift(node) => {
+                node.0.query_moved_onto(thread, node.1, node.2, state, out);
             }
 
-            Node::Cpm(pat, rate) => {
+            Node::Cpm(boxed) => {
+                let (pat, rate) = (&boxed.0, &boxed.1);
                 let scheduler_cps = state
                     .controls
                     .get("_cps")
@@ -8249,19 +8513,22 @@ impl Pattern {
                 }
             }
 
-            Node::FilterValues(pat, predicate) => {
+            Node::FilterValues(boxed) => {
+                let (pat, predicate) = (&boxed.0, &boxed.1);
                 let from = out.len();
                 pat.answer_onto(thread, state, table::Order::Graph, out);
                 retain_from(out, from, |hap| predicate(&hap.value));
             }
 
-            Node::FilterHaps(pat, predicate) => {
+            Node::FilterHaps(boxed) => {
+                let (pat, predicate) = (&boxed.0, &boxed.1);
                 let from = out.len();
                 pat.answer_onto(thread, state, table::Order::Graph, out);
                 retain_from(out, from, |hap| predicate(hap));
             }
 
-            Node::Degrade(pattern, amount, seed) => {
+            Node::Degrade(boxed) => {
+                let (pattern, amount, seed) = (&boxed.0, boxed.1, boxed.2);
                 let random_seed = state
                     .controls
                     .get("randSeed")
@@ -8270,14 +8537,15 @@ impl Pattern {
                 let from = out.len();
                 pattern.answer_onto(thread, state, table::Order::Graph, out);
                 retain_from(out, from, |hap| {
-                    let time = hap.whole_or_part().begin.to_f64() + 0.0003 * f64::from(*seed);
-                    rng::rand_at_time(time, random_seed) > *amount
+                    let time = hap.whole_or_part().begin.to_f64() + 0.0003 * f64::from(seed);
+                    rng::rand_at_time(time, random_seed) > amount
                 });
             }
 
             Node::Stack(pats) => query_stack_onto(thread, pats, state, out, || {}),
 
-            Node::AddContext(pat, locs) => {
+            Node::AddContext(boxed) => {
+                let (pat, locs) = (&boxed.0, &boxed.1);
                 let from = out.len();
                 // A located value is two nodes, and one visit answers for
                 // both. Any other handle is queried: it may bind a runtime.
@@ -8349,11 +8617,11 @@ impl Pattern {
 
             // A signal under steps of its own, read in equal steps of a
             // cycle as `segment` gives, answers in one walk of the steps.
-            Node::AppRight(pair, apply, flow) => {
-                if fused::app_right_onto(pair, apply, *flow, state, out) {
+            Node::AppRight(node) => {
+                if fused::app_right_onto(node, state, out) {
                     return;
                 }
-                let PatternPair(pat_func, pat_val) = &**pair;
+                let AppNode(pat_func, pat_val, apply, flow) = &**node;
                 with_list(|values| {
                     pat_val.answer_onto(thread, state, table::Order::Graph, values);
                     if values.is_empty() {
@@ -8398,51 +8666,46 @@ impl Pattern {
                 });
             }
 
-            Node::Pick {
-                selector,
-                lookup,
-                index_mode,
-                mode,
-            } => query_pick(
+            Node::Pick(pick) => query_pick(
                 thread,
-                selector,
-                lookup,
-                *index_mode,
-                *mode,
+                &pick.selector,
+                &pick.lookup,
+                pick.index_mode,
+                pick.mode,
                 state,
                 out,
                 &|| {},
             ),
 
-            Node::Constants(base, run) => query_run(thread, base, run, state, out),
+            Node::Constants(node) => query_run(thread, &node.0, &node.1, state, out),
 
-            Node::WithQueryTime(pat, f) => {
-                let s = state.with_span(|sp| sp.with_time(|t| f(t)));
-                pat.answer_onto(thread, &s, table::Order::Graph, out);
+            Node::WithQueryTime(boxed) => {
+                let s = state.with_span(|sp| sp.with_time(|t| (boxed.1)(t)));
+                boxed.0.answer_onto(thread, &s, table::Order::Graph, out);
             }
 
-            Node::WithHapTime(pat, f) => {
+            Node::WithHapTime(boxed) => {
                 let from = out.len();
-                pat.answer_onto(thread, state, table::Order::Graph, out);
+                boxed.0.answer_onto(thread, state, table::Order::Graph, out);
                 for hap in &mut out[from..] {
-                    hap.update_span(|sp| sp.with_time(|t| f(t)));
+                    hap.update_span(|sp| sp.with_time(|t| (boxed.1)(t)));
                 }
             }
 
-            Node::WithQuerySpan(pat, f) => {
-                pat.answer_onto(
+            Node::WithQuerySpan(boxed) => {
+                boxed.0.answer_onto(
                     thread,
-                    &state.with_span(|sp| f(sp)),
+                    &state.with_span(|sp| (boxed.1)(sp)),
                     table::Order::Graph,
                     out,
                 );
             }
 
-            Node::WithHapSpan(pat, f) => {
+            Node::WithHapSpan(boxed) => {
                 let from = out.len();
-                pat.answer_onto(thread, state, table::Order::Graph, out);
+                boxed.0.answer_onto(thread, state, table::Order::Graph, out);
                 for hap in &mut out[from..] {
-                    hap.update_span(|sp| f(sp));
+                    hap.update_span(|sp| (boxed.1)(sp));
                 }
             }
 
@@ -8466,15 +8729,16 @@ impl Pattern {
                 }
             }
 
-            Node::FmapNative(pat, f) => {
+            Node::FmapNative(boxed) => {
                 let from = out.len();
-                pat.answer_onto(thread, state, table::Order::Graph, out);
+                boxed.0.answer_onto(thread, state, table::Order::Graph, out);
                 for hap in &mut out[from..] {
-                    hap.map_value_in_place(|value| f(value));
+                    hap.map_value_in_place(|value| (boxed.1)(value));
                 }
             }
 
-            Node::ExpandHapsNative(pat, f, _) => {
+            Node::ExpandHapsNative(boxed) => {
+                let (pat, f) = (&boxed.0, &boxed.1);
                 let from = out.len();
                 with_list(|haps| {
                     pat.answer_onto(thread, state, table::Order::Graph, haps);
@@ -8502,9 +8766,20 @@ impl Pattern {
                 out.push(Hap::new(None, state.span, signal(state)));
             }
 
+            Node::ControlMap(pat, id, unnamed_only) => {
+                let from = out.len();
+                pat.answer_onto(thread, state, table::Order::Graph, out);
+                if let Some(spec) = controls::builtin_spec_by_id(*id) {
+                    map_from(out, from, |hap| {
+                        controls::apply_control_hap(spec, *unnamed_only, hap)
+                    });
+                }
+            }
+
             // A map of each hap, where the hap is. A hap that the map drops
             // leaves the list.
-            Node::MapHapsNative(pat, map, _) => {
+            Node::MapHapsNative(boxed) => {
+                let (pat, map) = (&boxed.0, &boxed.1);
                 let from = out.len();
                 pat.answer_onto(thread, state, table::Order::Graph, out);
                 let mut kept = from;
@@ -8517,18 +8792,21 @@ impl Pattern {
                 out.truncate(kept);
             }
 
-            Node::MapHapsOwned(pat, map, _) => {
+            Node::MapHapsOwned(boxed) => {
+                let (pat, map) = (&boxed.0, &boxed.1);
                 let from = out.len();
                 pat.answer_onto(thread, state, table::Order::Graph, out);
                 map_from(out, from, |hap| map(hap));
             }
 
-            Node::UiVisual(pat, slot, cache) => {
+            Node::UiVisual(node) => {
                 let from = out.len();
-                pat.answer_onto(thread, state, table::Order::Graph, out);
+                node.inner
+                    .answer_onto(thread, state, table::Order::Graph, out);
                 let mut local = None;
                 for hap in &mut out[from..] {
-                    hap.keys.add_ui_visual_slot_cached(*slot, cache, &mut local);
+                    hap.keys
+                        .add_ui_visual_slot_cached(node.slot, &node.cache, &mut local);
                 }
             }
 
@@ -8573,7 +8851,7 @@ impl Pattern {
             | Node::AddContext(..)
             | Node::AppLeft(..)
             | Node::AppRight(..)
-            | Node::Pick { .. }
+            | Node::Pick(..)
             | Node::SlowCat(_)
             | Node::SlowCatPrime(_)
             | Node::WithQueryTime(..)
@@ -8584,6 +8862,7 @@ impl Pattern {
             | Node::FmapNative(..)
             | Node::ExpandHapsNative(..)
             | Node::Signal(..)
+            | Node::ControlMap(..)
             | Node::MapHapsNative(..)
             | Node::MapHapsOwned(..)
             | Node::UiVisual(..)
@@ -8603,8 +8882,9 @@ impl Pattern {
                 Vec::new()
             }
 
-            Node::WithQuerySpanJs(pat, id) => {
-                let span = host_call_span_transform(*id, state.span);
+            Node::WithQuerySpanJs(boxed) => {
+                let (pat, id) = (&boxed.0, boxed.1);
+                let span = host_call_span_transform(id, state.span);
                 if query_error_pending() {
                     Vec::new()
                 } else {
@@ -8612,12 +8892,13 @@ impl Pattern {
                 }
             }
 
-            Node::FilterValuesJs(pat, id) => {
+            Node::FilterValuesJs(boxed) => {
+                let (pat, id) = (&boxed.0, boxed.1);
                 let mut output = Vec::new();
                 for hap in pat.query(state) {
                     // A throwing predicate CONTAINS the failure and keeps the
                     // hap (fail open): one broken filter must not stop the set.
-                    let keep = host_call_value_predicate(*id, &hap.value);
+                    let keep = host_call_value_predicate(id, &hap.value);
                     if query_error_pending() {
                         return Vec::new();
                     }
@@ -8628,12 +8909,13 @@ impl Pattern {
                 output
             }
 
-            Node::FilterHapsJs(pat, id) => {
+            Node::FilterHapsJs(boxed) => {
+                let (pat, id) = (&boxed.0, boxed.1);
                 let mut output = Vec::new();
                 for hap in pat.query(state) {
                     // A throwing predicate CONTAINS the failure and keeps the
                     // hap (fail open): one broken filter must not stop the set.
-                    let keep = host_call_hap_predicate(*id, &hap);
+                    let keep = host_call_hap_predicate(id, &hap);
                     if query_error_pending() {
                         return Vec::new();
                     }
@@ -8644,7 +8926,8 @@ impl Pattern {
                 output
             }
 
-            Node::FilterWhenJs(pat, id) => {
+            Node::FilterWhenJs(boxed) => {
+                let (pat, id) = (&boxed.0, boxed.1);
                 let mut output = Vec::new();
                 for hap in pat.query(state) {
                     let Some(whole) = hap.whole else {
@@ -8653,7 +8936,7 @@ impl Pattern {
                         });
                         return Vec::new();
                     };
-                    let keep = host_call_time_predicate(*id, whole.begin);
+                    let keep = host_call_time_predicate(id, whole.begin);
                     if query_error_pending() {
                         return Vec::new();
                     }
@@ -8666,10 +8949,11 @@ impl Pattern {
 
             Node::SortHapsByPart(pat) => sort_haps_by_part(pat.query(state)),
 
-            Node::MapHapsWithState(pat, f) => pat
+            Node::MapHapsWithState(boxed) => boxed
+                .0
                 .query(state)
                 .into_iter()
-                .filter_map(|hap| f(state, &hap))
+                .filter_map(|hap| (boxed.1)(state, &hap))
                 .collect(),
 
             Node::Collect(pat) => collect_congruent(pat.query(state))
@@ -8713,17 +8997,17 @@ impl Pattern {
             // Out of line: locals in query_node's frame multiply across the
             // recursion (see query_wchoose's note; the 64-layer fast/slow
             // control aborts otherwise).
-            Node::WithRandSeed(pat, seed) => query_with_rand_seed(pat, *seed, state),
+            Node::WithRandSeed(boxed) => query_with_rand_seed(&boxed.0, boxed.1, state),
 
-            Node::LoopAt(pat, factor) => {
+            Node::LoopAt(boxed) => {
                 let cps = state
                     .controls
                     .get("_cps")
                     .and_then(Value::as_f64)
                     .unwrap_or(0.5);
-                combinators::loop_at_cps(pat, **factor, cps).query(state)
+                combinators::loop_at_cps(&boxed.0, boxed.1, cps).query(state)
             }
-            Node::MidiKeys(lengths, port) => query_midi_keys(lengths, port, state),
+            Node::MidiKeys(boxed) => query_midi_keys(&boxed.0, &boxed.1, state),
 
             Node::ChooseCycles(patterns, seed) => {
                 if patterns.is_empty() {
@@ -8767,7 +9051,8 @@ impl Pattern {
 
             // innerBind: the inner hap's whole survives; context locations
             // concatenate.
-            Node::InnerJoin(pat, f) => {
+            Node::InnerJoin(boxed) => {
+                let (pat, f) = (&boxed.0, &boxed.1);
                 let mut out = Vec::new();
                 for outer in pat.query(state) {
                     let inner_pat = f(&outer.value);
@@ -8798,8 +9083,8 @@ impl Pattern {
             }
 
             // See `Pattern::fast_gap`.
-            Node::FastGap(pat, factor) => {
-                let factor = **factor;
+            Node::FastGap(boxed) => {
+                let (pat, factor) = (&boxed.0, boxed.1);
                 let span = state.span;
                 let cycle = span.begin.sam();
                 let one = Fraction::ONE;
@@ -8862,7 +9147,8 @@ impl Pattern {
                 }
             }
 
-            Node::RepeatCycles(pattern, count) => {
+            Node::RepeatCycles(boxed) => {
+                let (pattern, count) = (&boxed.0, boxed.1);
                 // Every shift is checked: a span at the far edge of the
                 // native range refuses rather than unwinds, as `fastGap`
                 // does.
@@ -8873,7 +9159,7 @@ impl Pattern {
                 };
                 let cycle = state.span.begin.sam();
                 let Some(delta) = cycle
-                    .checked_div(**count)
+                    .checked_div(count)
                     .and_then(|source| cycle.checked_sub(source.sam()))
                 else {
                     refuse_shift();
@@ -8909,8 +9195,8 @@ impl Pattern {
             // Both sides are queried over the same span; parts intersect, and
             // `appBoth`'s whole is `intersection_e` - undefined if either side
             // is analog.
-            Node::AppBoth(pair, apply, lookup_flow) => {
-                let PatternPair(pat_func, pat_val) = &**pair;
+            Node::AppBoth(node) => {
+                let AppNode(pat_func, pat_val, apply, lookup_flow) = &**node;
                 let funcs = pat_func.query(state);
                 let vals = pat_val.query(state);
                 let mut out = Vec::new();
@@ -8942,9 +9228,9 @@ impl Pattern {
                 out
             }
 
-            Node::FmapJs(pat, id) => map_js_haps(pat.query(state), *id, false, None),
-            Node::FmapJsPreservingControls(pat, id, predicate) => {
-                map_js_haps(pat.query(state), *id, true, *predicate)
+            Node::FmapJs(boxed) => map_js_haps(boxed.0.query(state), boxed.1, false, None),
+            Node::FmapJsPreservingControls(boxed) => {
+                map_js_haps(boxed.0.query(state), boxed.1, true, boxed.2)
             }
 
             Node::JsQuery(id) => host_call_query(*id, state),
@@ -9016,7 +9302,7 @@ impl Pattern {
                 Vec::new()
             }
 
-            Node::XenPatterns(pat, ratios) => xen::query_xen_patterns(pat, ratios, state),
+            Node::XenPatterns(boxed) => xen::query_xen_patterns(&boxed.0, &boxed.1, state),
 
             // bindWhole: each inner pattern is queried over its outer hap's
             // part; the mode picks whose whole survives, and contexts
@@ -9298,7 +9584,8 @@ impl Pattern {
                 out
             }
 
-            Node::ArpWith(pat, id) => {
+            Node::ArpWith(boxed) => {
+                let (pat, id) = (&boxed.0, &boxed.1);
                 let mut out = Vec::new();
                 for group in collect_congruent(pat.query(state)) {
                     let carrier = &group[0];
@@ -9538,8 +9825,8 @@ impl Pattern {
 
     fn resolve_pattern_of_inner(&self, state: &State) -> Option<Vec<ResolvedHap>> {
         match self.node_kind() {
-            Node::PatternOfPure(outer, boxed) => {
-                let (f, memo) = &**boxed;
+            Node::PatternOfPure(boxed) => {
+                let (outer, f, memo) = &**boxed;
                 let mut resolved = Vec::new();
                 let settings = settings::current_state_id();
                 for hap in outer.query(state) {
@@ -9574,7 +9861,8 @@ impl Pattern {
                 }
                 Some(resolved)
             }
-            Node::PatternOfDynamic(outer, f) => {
+            Node::PatternOfDynamic(boxed) => {
+                let (outer, f) = (&boxed.0, &boxed.1);
                 let mut resolved = Vec::new();
                 for hap in outer.query(state) {
                     let inner = f(&hap.value);
@@ -9640,7 +9928,8 @@ impl Pattern {
             // impossible by design, so the two cases dispatch on the outer's
             // representation, per hap. The single/double quote distinction
             // is the transpiler's.
-            Node::PatternOfJs(outer, id) => {
+            Node::PatternOfJs(boxed) => {
+                let (outer, id) = (&boxed.0, &boxed.1);
                 let mut out_haps = Vec::new();
                 match outer.resolve_pattern_of(state) {
                     Some(resolved) => {
@@ -9675,7 +9964,8 @@ impl Pattern {
             // only the bare node made `polyJoin` return silence for anything
             // that had been `fast`ed, `early`d or split.
             Node::SplitQueries(inner) => inner.resolve_pattern_of(state),
-            Node::AddContext(inner, locs) => inner.resolve_pattern_of(state).map(|resolved| {
+            Node::AddContext(boxed) => boxed.0.resolve_pattern_of(state).map(|resolved| {
+                let locs = &boxed.1;
                 resolved
                     .into_iter()
                     .map(|mut resolved| {
@@ -9684,9 +9974,9 @@ impl Pattern {
                     })
                     .collect()
             }),
-            Node::WithQueryTime(inner, f) => {
-                inner.resolve_pattern_of(&state.with_span(|sp| sp.with_time(|t| f(t))))
-            }
+            Node::WithQueryTime(boxed) => boxed
+                .0
+                .resolve_pattern_of(&state.with_span(|sp| sp.with_time(|t| (boxed.1)(t)))),
             // `rev` reflects the query span and then reflects the haps back, so
             // it cannot delegate the way the time transforms above do: the
             // same reflection applies on both sides. Without this arm,
@@ -9713,41 +10003,42 @@ impl Pattern {
                             .collect()
                     })
             }
-            Node::WithHapTime(inner, f) => inner.resolve_pattern_of(state).map(|resolved| {
+            Node::WithHapTime(boxed) => boxed.0.resolve_pattern_of(state).map(|resolved| {
                 resolved
                     .into_iter()
                     .map(|resolved| ResolvedHap {
-                        hap: resolved.hap.with_span(|sp| sp.with_time(|t| f(t))),
+                        hap: resolved.hap.with_span(|sp| sp.with_time(|t| (boxed.1)(t))),
                         inner: resolved.inner,
                     })
                     .collect()
             }),
-            Node::Fast(inner, factor, operation) => inner
+            Node::Fast(node) => node
+                .0
                 .resolve_pattern_of(
-                    &state
-                        .with_span(|sp| sp.with_time(|t| fast_query_time(t, **factor, operation))),
+                    &state.with_span(|sp| sp.with_time(|t| fast_query_time(t, node.1, node.2))),
                 )
                 .map(|resolved| {
                     resolved
                         .into_iter()
                         .map(|resolved| ResolvedHap {
-                            hap: resolved.hap.with_span(|sp| {
-                                sp.with_time(|t| fast_hap_time(t, **factor, operation))
-                            }),
+                            hap: resolved
+                                .hap
+                                .with_span(|sp| sp.with_time(|t| fast_hap_time(t, node.1, node.2))),
                             inner: resolved.inner,
                         })
                         .collect()
                 }),
-            Node::Shift(inner, by, operation) => inner
+            Node::Shift(node) => node
+                .0
                 .resolve_pattern_of(
-                    &state.with_span(|sp| sp.with_time(|t| shift_query_time(t, **by, operation))),
+                    &state.with_span(|sp| sp.with_time(|t| shift_query_time(t, node.1, node.2))),
                 )
                 .map(|resolved| {
                     resolved
                         .into_iter()
                         .map(|resolved| ResolvedHap {
                             hap: resolved.hap.with_span(|sp| {
-                                sp.with_time(|t| shift_hap_time(t, **by, operation))
+                                sp.with_time(|t| shift_hap_time(t, node.1, node.2))
                             }),
                             inner: resolved.inner,
                         })
@@ -9773,8 +10064,8 @@ impl Pattern {
             // builds - falls through to the plain-query fallback and hits the
             // pattern-valued refusal. The in/out scaling mirrors the query
             // arm exactly.
-            Node::FastGap(inner, factor) => {
-                let factor = **factor;
+            Node::FastGap(boxed) => {
+                let (inner, factor) = (&boxed.0, boxed.1);
                 let span = state.span;
                 let one = Fraction::ONE;
                 let mut resolved_haps = Vec::new();
@@ -9915,7 +10206,7 @@ impl Pattern {
             Node::PurePickLookup(boxed) => Some(boxed.0.clone()),
             // `withContext` preserves the pure fast-path metadata;
             // AddContext is that operation's native representation.
-            Node::AddContext(inner, _) => inner.as_pure_inner(),
+            Node::AddContext(boxed) => boxed.0.as_pure_inner(),
             _ => None,
         }
     }
@@ -9983,7 +10274,8 @@ impl Pattern {
             return located.with_steps_of(self);
         }
         let locs: Arc<[(usize, usize)]> = Arc::from(locs);
-        let mut pattern = Pattern::of(Node::AddContext(self.clone(), locs)).with_steps_of(self);
+        let mut pattern =
+            Pattern::of(Node::AddContext(Box::new((self.clone(), locs)))).with_steps_of(self);
         if let Some(loc) = self.pure_loc_raw() {
             pattern.extras_mut().set_pure_loc(Some(loc));
         }
@@ -9997,7 +10289,8 @@ impl Pattern {
             return located.with_steps_of(self);
         }
         let locs: Arc<[(usize, usize)]> = Arc::from(locs);
-        let mut pattern = Pattern::of(Node::AddContext(self.clone(), locs)).with_steps_of(self);
+        let mut pattern =
+            Pattern::of(Node::AddContext(Box::new((self.clone(), locs)))).with_steps_of(self);
         if let Some(loc) = self.pure_loc_raw() {
             pattern.extras_mut().set_pure_loc(Some(loc));
         }
@@ -10010,7 +10303,8 @@ impl Pattern {
             return located.with_steps_of(self);
         }
         let locs = locs.to_arc_slice();
-        let mut pattern = Pattern::of(Node::AddContext(self.clone(), locs)).with_steps_of(self);
+        let mut pattern =
+            Pattern::of(Node::AddContext(Box::new((self.clone(), locs)))).with_steps_of(self);
         if let Some(loc) = self.pure_loc_raw() {
             pattern.extras_mut().set_pure_loc(Some(loc));
         }
@@ -10021,11 +10315,11 @@ impl Pattern {
         if let Some(folded) = sequence::with_ui_visual_slot(self, slot) {
             return folded.with_steps_of(self);
         }
-        let mut pattern = Pattern::of(Node::UiVisual(
-            self.clone(),
+        let mut pattern = Pattern::of(Node::UiVisual(Box::new(UiVisualNode {
+            inner: self.clone(),
             slot,
-            std::sync::OnceLock::new(),
-        ))
+            cache: std::sync::OnceLock::new(),
+        })))
         .with_steps_of(self);
         if let Some(loc) = self.pure_loc_raw() {
             pattern.extras_mut().set_pure_loc(Some(loc));
@@ -10054,9 +10348,11 @@ impl Pattern {
 
     /// Append the next positional argument via `appLeft`.
     pub fn app_left_collect(&self, other: Pattern) -> Self {
-        Pattern::of(Node::AppLeft(
-            Box::new(AppLeftNode(self.clone(), other, ValueReading::default())),
-            Combine::With(Arc::new(|acc: &Value, v: &Value| match acc {
+        Pattern::of(Node::AppLeft(Box::new(AppLeftNode(
+            self.clone(),
+            other,
+            ValueReading::default(),
+            Combine::with(Arc::new(|acc: &Value, v: &Value| match acc {
                 Value::List(xs) => {
                     let mut xs = xs.clone();
                     xs.push(v.clone());
@@ -10065,7 +10361,7 @@ impl Pattern {
                 other => Value::list(vec![other.clone(), v.clone()]),
             })),
             LookupFlow::Infer,
-        ))
+        ))))
     }
 
     /// Apply a native curried-value equivalent with `appLeft` alignment.
@@ -10085,7 +10381,7 @@ impl Pattern {
         combine: impl Fn(&Value, &Value) -> Value + Send + Sync + 'static,
         lookup_flow: LookupFlow,
     ) -> Self {
-        self.app_left_by(other, Combine::With(Arc::new(combine)), lookup_flow)
+        self.app_left_by(other, Combine::with(Arc::new(combine)), lookup_flow)
     }
 
     /// [`Self::app_left_with_lookup`] of [`compose::compose_op`] for `op`.
@@ -10122,11 +10418,13 @@ impl Pattern {
         if let Some(met) = self.met_constant(&other, &combine, lookup_flow) {
             return met.with_steps(steps);
         }
-        Pattern::of(Node::AppLeft(
-            Box::new(AppLeftNode(self.clone(), other, ValueReading::default())),
+        Pattern::of(Node::AppLeft(Box::new(AppLeftNode(
+            self.clone(),
+            other,
+            ValueReading::default(),
             combine,
             lookup_flow,
-        ))
+        ))))
         .with_steps(steps)
     }
 
@@ -10181,7 +10479,7 @@ impl Pattern {
     fn meets_constants(&self) -> bool {
         let folds = self.is_rest()
             || sequence::holds_steps(self)
-            || matches!(self.node_kind(), Node::Pick { .. });
+            || matches!(self.node_kind(), Node::Pick(..));
         !folds && !sequence::builds_each_node()
     }
 
@@ -10253,13 +10551,14 @@ impl Pattern {
     /// takes the runtime of the pattern under it, so a receiver that binds
     /// another one stays a pattern of its own.
     fn met(&self, meetings: impl IntoIterator<Item = RunMeeting>) -> Self {
-        let (base, meetings): (_, Arc<[RunMeeting]>) = match self.node_kind() {
-            Node::Constants(base, run) if self.same_runtime_owner(base) => {
-                (base.clone(), run.iter().cloned().chain(meetings).collect())
-            }
+        let (base, meetings): (_, Box<[RunMeeting]>) = match self.node_kind() {
+            Node::Constants(node) if self.same_runtime_owner(&node.0) => (
+                node.0.clone(),
+                node.1.iter().cloned().chain(meetings).collect(),
+            ),
             _ => (self.clone(), meetings.into_iter().collect()),
         };
-        Pattern::of(Node::Constants(base, meetings))
+        Pattern::of(Node::Constants(Box::new(ConstantsNode(base, meetings))))
     }
 
     /// This pattern with the constant that `other` is set on it by
@@ -10393,33 +10692,28 @@ impl Pattern {
             return;
         };
         match &mut cell.kind {
-            Node::AppLeft(pair, ..) if waves > 0 => {
+            Node::AppLeft(pair) if waves > 0 => {
                 pair.0.write(waves - 1, control, context, apart);
                 // What a query read of the functions before is not their
                 // haps now.
                 pair.2.forget_functions();
             }
             Node::Sequence(layers) => sequence::set_here(layers, control, context),
-            Node::Constants(_, run) => {
+            Node::Constants(node) => {
                 // The run holds each control of the row apart.
                 let row = Self::apart_under(control, apart.each()).map(|(each, _)| each);
-                // The run alone holds its meetings, or takes a copy.
-                let last = Arc::make_mut(run)
-                    .last_mut()
-                    .expect("a run of one meeting or more");
+                let last = node.1.last_mut().expect("a run of one meeting or more");
                 last.set_after(control, context, row);
             }
-            Node::Pick {
-                selector,
-                lookup,
-                mode,
-                ..
-            } => {
+            Node::Pick(pick) => {
                 // The locations of the constant come first on each hap,
                 // through the selector.
-                *selector =
-                    sequence::selecting(selector, &context, Self::picks_whole_cycles(*mode))
-                        .expect("a selector that takes the locations of a control");
+                pick.selector = sequence::selecting(
+                    &pick.selector,
+                    &context,
+                    Self::picks_whole_cycles(pick.mode),
+                )
+                .expect("a selector that takes the locations of a control");
                 // The selector holds the locations of the row.
                 let bare = || {
                     let each = apart.each().iter();
@@ -10427,7 +10721,11 @@ impl Pattern {
                         .collect()
                 };
                 let apart = Apart::new(&bare);
-                for picked in lookup.patterns_mut().filter(|picked| !picked.is_rest()) {
+                for picked in pick
+                    .lookup
+                    .patterns_mut()
+                    .filter(|picked| !picked.is_rest())
+                {
                     picked.write_row(control, Locations::new(), &apart);
                 }
             }
@@ -10452,8 +10750,8 @@ impl Pattern {
                 }
             }
             // The control goes to the pattern under the structure.
-            Node::FilterValues(structured, _) => structured.write(0, control, context, apart),
-            Node::AppRight(pair, ..) => pair.0.write_row(control, context, apart),
+            Node::FilterValues(boxed) => boxed.0.write(0, control, context, apart),
+            Node::AppRight(node) => node.0.write_row(control, context, apart),
             _ => unreachable!("a node that takes a control is of a kind that `own_node` writes"),
         }
         // The handle that a constructor gives of the node, as the fold of
@@ -10473,28 +10771,26 @@ impl Pattern {
             // The last constant of a run takes the control into its map.
             // The new handle binds what the pattern under the run binds, so
             // this handle must bind the same.
-            Node::Constants(base, run) => {
-                self.same_runtime_owner(base)
-                    && run.last().is_some_and(|last| last.takes_set_after(control))
+            Node::Constants(node) => {
+                self.same_runtime_owner(&node.0)
+                    && node
+                        .1
+                        .last()
+                        .is_some_and(|last| last.takes_set_after(control))
             }
             // Each step of a picked sequence meets the constant where the
             // step is, in the picked pattern as in the pick. A squeeze
             // orders the context and the keys another way.
-            Node::Pick {
-                selector,
-                lookup,
-                mode,
-                ..
-            } => {
-                *mode != JoinMode::Squeeze
+            Node::Pick(pick) => {
+                pick.mode != JoinMode::Squeeze
                     && sequence::folds(self)
                     && sequence::selecting(
-                        selector,
+                        &pick.selector,
                         &Locations::new(),
-                        Self::picks_whole_cycles(*mode),
+                        Self::picks_whole_cycles(pick.mode),
                     )
                     .is_some()
-                    && lookup.patterns().all(|picked| {
+                    && pick.lookup.patterns().all(|picked| {
                         (picked.is_rest() && sequence::folds(picked))
                             || (sequence::lies_in_cycles(picked) && picked.takes_control(control))
                     })
@@ -10538,9 +10834,14 @@ impl Pattern {
         // The names of the waves, the outermost first.
         let mut names: Vec<&Key> = Vec::new();
         let mut under = self;
-        while let Node::AppLeft(pair, Combine::Composed(compose::ComposeOp::Set), LookupFlow::Set) =
-            under.node_kind()
-            && let AppLeftNode(functions, values, reading) = &**pair
+        while let Node::AppLeft(pair) = under.node_kind()
+            && let AppLeftNode(
+                functions,
+                values,
+                reading,
+                Combine::Composed(compose::ComposeOp::Set),
+                LookupFlow::Set,
+            ) = &**pair
             && let Some(name) = reading.wave_name(values)
         {
             // The application keeps the runtime that its handle binds, as
@@ -10580,39 +10881,35 @@ impl Pattern {
         if Arc::get_mut(&mut self.node).is_none() {
             let copy = match self.node_kind() {
                 Node::Sequence(layers) => Node::Sequence(Arc::clone(layers)),
-                Node::AppLeft(pair, apply, flow) => Node::AppLeft(
-                    Box::new(AppLeftNode(
-                        pair.0.clone(),
-                        pair.1.clone(),
-                        ValueReading::default(),
-                    )),
-                    apply.clone(),
-                    *flow,
-                ),
-                // A handle of the pattern under the run, and of the run.
-                Node::Constants(base, run) => Node::Constants(base.clone(), Arc::clone(run)),
-                Node::Pick {
-                    selector,
-                    lookup,
-                    index_mode,
-                    mode,
-                } => Node::Pick {
-                    selector: selector.clone(),
-                    lookup: lookup.clone(),
-                    index_mode: *index_mode,
-                    mode: *mode,
-                },
+                Node::AppLeft(pair) => Node::AppLeft(Box::new(AppLeftNode(
+                    pair.0.clone(),
+                    pair.1.clone(),
+                    ValueReading::default(),
+                    pair.3.clone(),
+                    pair.4,
+                ))),
+                // A handle of the pattern under the run, and a copy of the run.
+                Node::Constants(node) => {
+                    Node::Constants(Box::new(ConstantsNode(node.0.clone(), node.1.clone())))
+                }
+                Node::Pick(pick) => Node::Pick(Box::new(PickNode {
+                    selector: pick.selector.clone(),
+                    lookup: pick.lookup.clone(),
+                    index_mode: pick.index_mode,
+                    mode: pick.mode,
+                })),
                 // A handle of each pattern of the stack.
                 Node::Stack(patterns) => Node::Stack(patterns.clone()),
                 // A handle of each side of a structure, and of its filter.
-                Node::FilterValues(pattern, keep) => {
-                    Node::FilterValues(pattern.clone(), Arc::clone(keep))
+                Node::FilterValues(boxed) => {
+                    Node::FilterValues(Box::new((boxed.0.clone(), Arc::clone(&boxed.1))))
                 }
-                Node::AppRight(pair, apply, flow) => Node::AppRight(
-                    Box::new(PatternPair(pair.0.clone(), pair.1.clone())),
-                    apply.clone(),
-                    *flow,
-                ),
+                Node::AppRight(node) => Node::AppRight(Box::new(AppNode(
+                    node.0.clone(),
+                    node.1.clone(),
+                    node.2.clone(),
+                    node.3,
+                ))),
                 _ => return None,
             };
             self.node = Self::of(copy).node;
@@ -10637,7 +10934,7 @@ impl Pattern {
         combine: impl Fn(&Value, &Value) -> Value + Send + Sync + 'static,
         lookup_flow: LookupFlow,
     ) -> Self {
-        self.app_right_by(other, Combine::With(Arc::new(combine)), lookup_flow)
+        self.app_right_by(other, Combine::with(Arc::new(combine)), lookup_flow)
     }
 
     /// [`Self::app_right_with_lookup`] of [`compose::compose_op`] for `op`.
@@ -10660,8 +10957,13 @@ impl Pattern {
         if let Some(applied) = sequence::applied_out(self, &other, &combine, lookup_flow) {
             return applied.with_steps(steps);
         }
-        let pair = Box::new(PatternPair(self.clone(), other));
-        Pattern::of(Node::AppRight(pair, combine, lookup_flow)).with_steps(steps)
+        Pattern::of(Node::AppRight(Box::new(AppNode(
+            self.clone(),
+            other,
+            combine,
+            lookup_flow,
+        ))))
+        .with_steps(steps)
     }
 
     /// `appBoth` - both sides queried over the same span, wholes intersected.
@@ -10681,7 +10983,7 @@ impl Pattern {
         combine: impl Fn(&Value, &Value) -> Value + Send + Sync + 'static,
         lookup_flow: LookupFlow,
     ) -> Self {
-        self.app_both_by(other, Combine::With(Arc::new(combine)), lookup_flow)
+        self.app_both_by(other, Combine::with(Arc::new(combine)), lookup_flow)
     }
 
     /// [`Self::app_both_with_lookup`] of [`compose::compose_op`] for `op`.
@@ -10714,8 +11016,13 @@ impl Pattern {
             (Some(a), None) => Some(a),
             (None, b) => b,
         };
-        let pair = Box::new(PatternPair(self.clone(), other));
-        Pattern::of(Node::AppBoth(pair, combine, lookup_flow)).with_steps(steps)
+        Pattern::of(Node::AppBoth(Box::new(AppNode(
+            self.clone(),
+            other,
+            combine,
+            lookup_flow,
+        ))))
+        .with_steps(steps)
     }
 
     /// Map each value to a **provably pure** pattern.
@@ -10731,10 +11038,11 @@ impl Pattern {
         // `fmap` carries `_steps`; these are `fmap` with a pattern-valued
         // result, so they must too - `stepJoin` reads the outer step count.
         let steps = self.steps();
-        Pattern::of(Node::PatternOfPure(
+        Pattern::of(Node::PatternOfPure(Box::new((
             self.clone(),
-            Box::new((Arc::new(f), ConstructionMemo::default())),
-        ))
+            Arc::new(f),
+            ConstructionMemo::default(),
+        ))))
         .with_steps(steps)
     }
 
@@ -10750,10 +11058,11 @@ impl Pattern {
             let mapped: ToPurePatternFn = Arc::new(body);
             mapped
         });
-        Pattern::of(Node::PatternOfPure(
+        Pattern::of(Node::PatternOfPure(Box::new((
             self.clone(),
-            Box::new((interned, ConstructionMemo::default())),
-        ))
+            interned,
+            ConstructionMemo::default(),
+        ))))
         .with_steps(steps)
     }
 
@@ -10801,7 +11110,11 @@ impl Pattern {
     /// caller-supplied flag could carry a false-pure classification.
     pub fn fmap_to_pattern(&self, f: impl Fn(&Value) -> Pattern + Send + Sync + 'static) -> Self {
         let steps = self.steps();
-        Pattern::of(Node::PatternOfDynamic(self.clone(), Arc::new(f))).with_steps(steps)
+        Pattern::of(Node::PatternOfDynamic(Box::new((
+            self.clone(),
+            Arc::new(f),
+        ))))
+        .with_steps(steps)
     }
 
     /// Native control augmentation using `outerBind` timing. The receiver's
@@ -10848,25 +11161,30 @@ impl Pattern {
     /// expression that contains the JS-mapped pattern.
     pub fn fmap_js(&self, id: CallbackId) -> Self {
         let steps = self.steps();
-        Pattern::of(Node::FmapJs(self.clone(), id)).with_steps(steps)
+        Pattern::of(Node::FmapJs(Box::new((self.clone(), id)))).with_steps(steps)
     }
 
     /// Trusted host metadata rewrite, with the same callback ownership and
     /// query limits as `fmap_js`. This must not implement user-authored maps:
     /// those deliberately invalidate slider provenance even for equal values.
     pub fn fmap_js_preserving_controls(&self, id: CallbackId) -> Self {
-        Pattern::of(Node::FmapJsPreservingControls(self.clone(), id, None)).with_steps_of(self)
+        Pattern::of(Node::FmapJsPreservingControls(Box::new((
+            self.clone(),
+            id,
+            None,
+        ))))
+        .with_steps_of(self)
     }
 
     /// Materialize final event values, then apply a trusted metadata rewrite
     /// only where the native predicate matches. Unmatched values avoid a JS
     /// round-trip. This belongs after every user-authored transform.
     pub fn finalize_js_controls_if(&self, id: CallbackId, predicate: fn(&Value) -> bool) -> Self {
-        Pattern::of(Node::FmapJsPreservingControls(
+        Pattern::of(Node::FmapJsPreservingControls(Box::new((
             self.clone(),
             id,
             Some(predicate),
-        ))
+        ))))
         .with_steps_of(self)
     }
 
@@ -10875,7 +11193,7 @@ impl Pattern {
     #[doc(hidden)]
     pub fn without_final_controls(&self) -> &Pattern {
         match &self.node.kind {
-            Node::FmapJsPreservingControls(inner, _, Some(_)) => inner,
+            Node::FmapJsPreservingControls(boxed) if boxed.2.is_some() => &boxed.0,
             _ => self,
         }
     }
@@ -11184,26 +11502,26 @@ impl Pattern {
         &self,
         f: impl Fn(Fraction) -> Fraction + Send + Sync + 'static,
     ) -> Self {
-        Pattern::of(Node::WithQueryTime(self.clone(), Arc::new(f)))
+        Pattern::of(Node::WithQueryTime(Box::new((self.clone(), Arc::new(f)))))
     }
 
     pub fn with_hap_time(&self, f: impl Fn(Fraction) -> Fraction + Send + Sync + 'static) -> Self {
-        Pattern::of(Node::WithHapTime(self.clone(), Arc::new(f)))
+        Pattern::of(Node::WithHapTime(Box::new((self.clone(), Arc::new(f)))))
     }
 
     pub fn with_query_span(
         &self,
         f: impl Fn(&TimeSpan) -> TimeSpan + Send + Sync + 'static,
     ) -> Self {
-        Pattern::of(Node::WithQuerySpan(self.clone(), Arc::new(f)))
+        Pattern::of(Node::WithQuerySpan(Box::new((self.clone(), Arc::new(f)))))
     }
 
     pub fn with_query_span_js(&self, id: CallbackId) -> Self {
-        Pattern::of(Node::WithQuerySpanJs(self.clone(), id))
+        Pattern::of(Node::WithQuerySpanJs(Box::new((self.clone(), id))))
     }
 
     pub fn with_hap_span(&self, f: impl Fn(&TimeSpan) -> TimeSpan + Send + Sync + 'static) -> Self {
-        Pattern::of(Node::WithHapSpan(self.clone(), Arc::new(f)))
+        Pattern::of(Node::WithHapSpan(Box::new((self.clone(), Arc::new(f)))))
     }
 
     /// `rev` - reverse each cycle. `preserveSteps = true`, `patternify = false`.
@@ -11247,7 +11565,7 @@ impl Pattern {
     /// the step count it is supposed to rescale.
     pub fn fmap(&self, f: impl Fn(&Value) -> Value + Send + Sync + 'static) -> Self {
         let steps = self.steps();
-        Pattern::of(Node::FmapNative(self.clone(), Arc::new(f))).with_steps(steps)
+        Pattern::of(Node::FmapNative(Box::new((self.clone(), Arc::new(f))))).with_steps(steps)
     }
 
     /// Changes hap values and keeps the live control bindings of each hap.
@@ -11273,7 +11591,12 @@ impl Pattern {
     /// that interned one by what it reads. See [`interned_closure`].
     pub fn fmap_keeping_live_with(&self, map: OwnedHapMapFn) -> Self {
         let steps = self.steps();
-        Pattern::of(Node::MapHapsOwned(self.clone(), map, SpanUse::Ignores)).with_steps(steps)
+        Pattern::of(Node::MapHapsOwned(Box::new((
+            self.clone(),
+            map,
+            SpanUse::Ignores,
+        ))))
+        .with_steps(steps)
     }
 
     /// Host-only provenance for a native query-time slider. Arbitrary value
@@ -11353,16 +11676,20 @@ impl Pattern {
     pub(crate) fn takes_constants(&self) -> bool {
         match self.node_kind() {
             Node::Sequence(_) => true,
-            Node::Pick { lookup, .. } => lookup
+            Node::Pick(pick) => pick
+                .lookup
                 .patterns()
                 .all(|picked| picked.is_rest() || picked.takes_constants()),
             Node::Stack(patterns) => patterns
                 .iter()
                 .any(|pattern| !pattern.is_rest() && pattern.takes_constants()),
             Node::FilterValues(..) => self.under_structure().is_some_and(Self::takes_constants),
-            Node::Constants(_, run) => run.last().is_some_and(RunMeeting::takes_sets),
+            Node::Constants(node) => node.1.last().is_some_and(RunMeeting::takes_sets),
             // A control of a wave, which a constant goes under.
-            Node::AppLeft(pair, Combine::Composed(compose::ComposeOp::Set), LookupFlow::Set) => {
+            Node::AppLeft(pair)
+                if matches!(pair.3, Combine::Composed(compose::ComposeOp::Set))
+                    && pair.4 == LookupFlow::Set =>
+            {
                 pair.2.wave_name(&pair.1).is_some() && pair.0.takes_constants()
             }
             _ => false,
@@ -11398,14 +11725,27 @@ impl Pattern {
         }
         // The steps of a sequence take the name of the control when they
         // are read.
-        if !unnamed_only && let Some(named) = sequence::named(self, &spec.names) {
+        if !unnamed_only && let Some(named) = sequence::named(self, spec) {
             return named.with_steps_of(self);
+        }
+        if spec.id != 0 && !sequence::holds_steps(self) {
+            return Pattern::of(Node::ControlMap(self.clone(), spec.id, unnamed_only))
+                .with_steps_of(self);
         }
         let map = controls::interned_control_map(spec, unnamed_only);
         if let Some(mapped) = sequence::mapped(self, &map) {
             return mapped.with_steps_of(self);
         }
-        Pattern::of(Node::MapHapsOwned(self.clone(), map, SpanUse::Ignores)).with_steps_of(self)
+        if spec.id != 0 {
+            return Pattern::of(Node::ControlMap(self.clone(), spec.id, unnamed_only))
+                .with_steps_of(self);
+        }
+        Pattern::of(Node::MapHapsOwned(Box::new((
+            self.clone(),
+            map,
+            SpanUse::Ignores,
+        ))))
+        .with_steps_of(self)
     }
 
     /// Owned version of [`Self::map_control`] that names an unshared
@@ -11421,7 +11761,7 @@ impl Pattern {
             && matches!(self.node_kind(), Node::Sequence(_))
             && let Some(cell) = Arc::get_mut(&mut self.node)
             && let Node::Sequence(layers) = &mut cell.kind
-            && sequence::named_in_place(layers, &spec.names)
+            && sequence::named_in_place(layers, spec)
         {
             return self;
         }
@@ -11441,25 +11781,28 @@ impl Pattern {
         if let Some(filtered) = sequence::filtered(self, &predicate) {
             return filtered.with_steps_of(self);
         }
-        Pattern::of(Node::FilterValues(self.clone(), predicate)).with_steps_of(self)
+        Pattern::of(Node::FilterValues(Box::new((self.clone(), predicate)))).with_steps_of(self)
     }
 
     pub fn filter_values_js(&self, id: CallbackId) -> Self {
-        Pattern::of(Node::FilterValuesJs(self.clone(), id))
+        Pattern::of(Node::FilterValuesJs(Box::new((self.clone(), id))))
     }
 
     /// `filterHaps(hap_test)` - the predicate sees whole and part, not just
     /// the value. Unlike `filterValues`, `_steps` is not carried through.
     pub fn filter_haps(&self, predicate: impl Fn(&Hap) -> bool + Send + Sync + 'static) -> Self {
-        Pattern::of(Node::FilterHaps(self.clone(), Arc::new(predicate)))
+        Pattern::of(Node::FilterHaps(Box::new((
+            self.clone(),
+            Arc::new(predicate),
+        ))))
     }
 
     pub fn filter_haps_js(&self, id: CallbackId) -> Self {
-        Pattern::of(Node::FilterHapsJs(self.clone(), id))
+        Pattern::of(Node::FilterHapsJs(Box::new((self.clone(), id))))
     }
 
     pub fn filter_when_js(&self, id: CallbackId) -> Self {
-        Pattern::of(Node::FilterWhenJs(self.clone(), id))
+        Pattern::of(Node::FilterWhenJs(Box::new((self.clone(), id))))
     }
 
     pub fn sort_haps_by_part_pattern(&self) -> Self {
@@ -11468,7 +11811,7 @@ impl Pattern {
 
     /// `seed(n)` - pin the random stream for this subtree.
     pub fn with_rand_seed(&self, seed: f64) -> Self {
-        Pattern::of(Node::WithRandSeed(self.clone(), seed)).with_steps_of(self)
+        Pattern::of(Node::WithRandSeed(Box::new((self.clone(), seed)))).with_steps_of(self)
     }
 
     /// Per-hap rewrite where `None` drops the hap. Steps are preserved by the
@@ -11493,7 +11836,12 @@ impl Pattern {
                 Arc::new(move |hap: &Hap| body(hap).map(Hap::without_live_controls));
             mapped
         });
-        Pattern::of(Node::MapHapsNative(self.clone(), interned, SpanUse::Reads)).with_steps(steps)
+        Pattern::of(Node::MapHapsNative(Box::new((
+            self.clone(),
+            interned,
+            SpanUse::Reads,
+        ))))
+        .with_steps(steps)
     }
 
     fn map_haps_preserving_live(
@@ -11523,7 +11871,7 @@ impl Pattern {
                 return picked;
             }
         }
-        Pattern::of(Node::MapHapsNative(self.clone(), map, spans))
+        Pattern::of(Node::MapHapsNative(Box::new((self.clone(), map, spans))))
     }
 
     /// This pick with what `change` makes of each pattern that it picks,
@@ -11542,21 +11890,21 @@ impl Pattern {
         whole_cycles: bool,
         change: impl FnMut(&Pattern) -> Option<Pattern>,
     ) -> Option<Self> {
-        let Node::Pick {
-            selector,
-            lookup,
-            index_mode,
-            mode,
-        } = self.node_kind()
-        else {
+        let Node::Pick(picked) = self.node_kind() else {
             return None;
         };
-        if *mode == JoinMode::Squeeze || !sequence::folds(self) {
+        if picked.mode == JoinMode::Squeeze || !sequence::folds(self) {
             return None;
         }
-        let whole_cycles = whole_cycles && matches!(mode, JoinMode::Reset | JoinMode::Restart);
-        let selector = sequence::selecting(selector, locations, whole_cycles)?;
-        Some(pick(selector, lookup.try_map(change)?, *index_mode, *mode))
+        let whole_cycles =
+            whole_cycles && matches!(picked.mode, JoinMode::Reset | JoinMode::Restart);
+        let selector = sequence::selecting(&picked.selector, locations, whole_cycles)?;
+        Some(pick(
+            selector,
+            picked.lookup.try_map(change)?,
+            picked.index_mode,
+            picked.mode,
+        ))
     }
 
     /// The `appLeft` of this pick and `values` by `op`, when `values` is a
@@ -11599,11 +11947,11 @@ impl Pattern {
     /// change can move the value or context instead of cloning them. `f`
     /// keeps the spans and reads none of them.
     fn map_haps_owned(&self, f: impl Fn(Hap) -> Option<Hap> + Send + Sync + 'static) -> Self {
-        Pattern::of(Node::MapHapsOwned(
+        Pattern::of(Node::MapHapsOwned(Box::new((
             self.clone(),
             Arc::new(f),
             SpanUse::Ignores,
-        ))
+        ))))
     }
 
     /// A pitch rewrite. `f` keeps the spans and reads none of them.
@@ -11687,7 +12035,7 @@ impl Pattern {
         &self,
         f: impl Fn(&Hap) -> Vec<Hap> + Send + Sync + 'static,
     ) -> Self {
-        Pattern::of(Node::ExpandHapsNative(
+        Pattern::of(Node::ExpandHapsNative(Box::new((
             self.clone(),
             Arc::new(move |hap| {
                 f(hap)
@@ -11696,7 +12044,7 @@ impl Pattern {
                     .collect()
             }),
             SpanUse::Ignores,
-        ))
+        ))))
     }
 
     /// [`Self::expand_pitch_haps_native`] for a body that captures nothing:
@@ -11716,11 +12064,11 @@ impl Pattern {
             });
             expand
         });
-        Pattern::of(Node::ExpandHapsNative(
+        Pattern::of(Node::ExpandHapsNative(Box::new((
             self.clone(),
             interned,
             SpanUse::Ignores,
-        ))
+        ))))
         .with_steps(steps)
     }
 
@@ -11728,19 +12076,19 @@ impl Pattern {
         &self,
         f: impl Fn(&State, &Hap) -> Option<Hap> + Send + Sync + 'static,
     ) -> Self {
-        Pattern::of(Node::MapHapsWithState(
+        Pattern::of(Node::MapHapsWithState(Box::new((
             self.clone(),
             Arc::new(move |state, hap| f(state, hap).map(Hap::without_live_controls)),
-        ))
+        ))))
     }
 
     /// One hap → N haps (same classification rules as `map_haps_native`).
     pub fn expand_haps_native(&self, f: impl Fn(&Hap) -> Vec<Hap> + Send + Sync + 'static) -> Self {
-        Pattern::of(Node::ExpandHapsNative(
+        Pattern::of(Node::ExpandHapsNative(Box::new((
             self.clone(),
             Arc::new(move |hap| f(hap).into_iter().map(Hap::without_live_controls).collect()),
             SpanUse::Reads,
-        ))
+        ))))
     }
 
     pub fn collect(&self) -> Self {
@@ -11760,11 +12108,11 @@ impl Pattern {
     }
 
     pub fn loop_at(&self, factor: Fraction) -> Self {
-        Pattern::of(Node::LoopAt(self.clone(), Box::new(factor)))
+        Pattern::of(Node::LoopAt(Box::new((self.clone(), factor))))
     }
 
     pub fn cpm(&self, cpm: Fraction) -> Self {
-        Pattern::of(Node::Cpm(self.clone(), Box::new(TempoRate::new(cpm))))
+        Pattern::of(Node::Cpm(Box::new((self.clone(), TempoRate::new(cpm)))))
     }
 
     /// Sets each [`combinators::slice`] event's `speed` so its slice fills the
@@ -11887,14 +12235,17 @@ impl Pattern {
     /// of the constant. Each handle keeps its runtime: see
     /// [`Self::keeps_runtime_over`].
     fn under_structure(&self) -> Option<&Self> {
-        let Node::FilterValues(structured, keep) = self.node_kind() else {
+        let Node::FilterValues(boxed) = self.node_kind() else {
             return None;
         };
-        let Node::AppRight(pair, Combine::With(combine), LookupFlow::Left) = structured.node_kind()
+        let (structured, keep) = (&boxed.0, &boxed.1);
+        let Node::AppRight(node) = structured.node_kind() else {
+            return None;
+        };
+        let AppNode(functions, structure, Combine::With(combine), LookupFlow::Left) = &**node
         else {
             return None;
         };
-        let PatternPair(functions, structure) = &**pair;
         let kept = KEEP_DEFINED
             .get()
             .is_some_and(|defined| Arc::ptr_eq(defined, keep))
@@ -11915,14 +12266,14 @@ impl Pattern {
     }
 
     pub fn degrade_by_seeded(&self, amount: f64, seed: u32) -> Self {
-        Pattern::of(Node::Degrade(self.clone(), amount, seed)).with_steps_of(self)
+        Pattern::of(Node::Degrade(Box::new((self.clone(), amount, seed)))).with_steps_of(self)
     }
 
     pub fn repeat_cycles(&self, count: Fraction) -> Self {
         if count == Fraction::ZERO {
             return silence();
         }
-        Pattern::of(Node::RepeatCycles(self.clone(), Box::new(count)))
+        Pattern::of(Node::RepeatCycles(Box::new((self.clone(), count))))
             .split_queries()
             .with_steps_of(self)
     }
@@ -11952,7 +12303,7 @@ impl Pattern {
     }
 
     pub fn inner_join_with(&self, f: impl Fn(&Value) -> Pattern + Send + Sync + 'static) -> Self {
-        Pattern::of(Node::InnerJoin(self.clone(), Arc::new(f)))
+        Pattern::of(Node::InnerJoin(Box::new((self.clone(), Arc::new(f)))))
     }
 
     pub fn split_queries(&self) -> Self {
@@ -12007,7 +12358,8 @@ impl Pattern {
     /// steps. On overflow, record `NativeFraction` and use zero until the query
     /// boundary reports the refusal.
     fn shift_time(&self, t: Fraction, operation: &'static str) -> Self {
-        Pattern::of(Node::Shift(self.clone(), Box::new(t), operation)).with_steps_of(self)
+        Pattern::of(Node::Shift(Box::new(ShiftNode(self.clone(), t, operation))))
+            .with_steps_of(self)
     }
 
     /// The [`Node::Fast`] behind [`combinators::checked_fast`].
@@ -12015,14 +12367,18 @@ impl Pattern {
         if let Some(faster) = sequence::faster(self, factor) {
             return faster;
         }
-        Pattern::of(Node::Fast(self.clone(), Box::new(factor), operation))
+        Pattern::of(Node::Fast(Box::new(FastNode(
+            self.clone(),
+            factor,
+            operation,
+        ))))
     }
 
     /// Speeds up like `fast`, but leaves a **gap** for the rest of the cycle
     /// rather than repeating. This is what weighted sequences are built from -
     /// plain `fast` repeats and is the wrong primitive.
     pub fn fast_gap(&self, factor: Fraction) -> Self {
-        Pattern::of(Node::FastGap(self.clone(), Box::new(factor))).split_queries()
+        Pattern::of(Node::FastGap(Box::new((self.clone(), factor)))).split_queries()
     }
 
     /// `compress(b, e)` - squeeze into the `[b, e)` slot of each cycle.
@@ -12220,59 +12576,61 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         | Node::JsQuery(_) => {}
         #[cfg(non_send_node_mutation)]
         Node::NonSendMutation(_) => {}
-        Node::WithQueryTime(pattern, _)
-        | Node::WithHapTime(pattern, _)
-        | Node::Fast(pattern, _, _)
-        | Node::Shift(pattern, _, _)
-        | Node::WithQuerySpan(pattern, _)
-        | Node::WithQuerySpanJs(pattern, _)
-        | Node::WithHapSpan(pattern, _)
-        | Node::Rev(pattern)
+        Node::Rev(pattern)
         | Node::StepJoin(pattern)
         | Node::PolyJoin(pattern)
-        | Node::ArpWith(pattern, _)
         | Node::PurePattern(pattern)
-        | Node::PatternOfJs(pattern, _)
-        | Node::FmapNative(pattern, _)
-        | Node::Constants(pattern, _)
-        | Node::FilterValues(pattern, _)
-        | Node::FilterValuesJs(pattern, _)
-        | Node::FilterHaps(pattern, _)
-        | Node::FilterHapsJs(pattern, _)
-        | Node::FilterWhenJs(pattern, _)
         | Node::SortHapsByPart(pattern)
-        | Node::MapHapsNative(pattern, _, _)
-        | Node::MapHapsOwned(pattern, _, _)
-        | Node::UiVisual(pattern, _, _)
-        | Node::MapHapsWithState(pattern, _)
-        | Node::ExpandHapsNative(pattern, _, _)
+        | Node::ControlMap(pattern, _, _)
         | Node::Collect(pattern)
         | Node::CycleOnsetIndex(pattern)
         | Node::CycleOnsetCount(pattern)
-        | Node::WithRandSeed(pattern, _)
-        | Node::Degrade(pattern, _, _)
-        | Node::InnerJoin(pattern, _)
         | Node::SplitQueries(pattern)
-        | Node::FastGap(pattern, _)
-        | Node::RepeatCycles(pattern, _)
-        | Node::LoopAt(pattern, _)
-        | Node::Cpm(pattern, _)
-        | Node::MidiKeys(pattern, _)
-        | Node::AddContext(pattern, _)
-        | Node::PatternOfDynamic(pattern, _)
-        | Node::Join(pattern, _)
-        | Node::FmapJs(pattern, _)
-        | Node::FmapJsPreservingControls(pattern, _, _) => take_child(pattern, out),
+        | Node::Join(pattern, _) => take_child(pattern, out),
+        Node::Fast(node) => take_child(&mut node.0, out),
+        Node::Shift(node) => take_child(&mut node.0, out),
+        Node::Constants(node) => take_child(&mut node.0, out),
+        Node::UiVisual(node) => take_child(&mut node.inner, out),
+        Node::WithQueryTime(boxed) | Node::WithHapTime(boxed) => take_child(&mut boxed.0, out),
+        Node::WithQuerySpan(boxed) | Node::WithHapSpan(boxed) => take_child(&mut boxed.0, out),
+        Node::WithQuerySpanJs(boxed)
+        | Node::ArpWith(boxed)
+        | Node::PatternOfJs(boxed)
+        | Node::FilterValuesJs(boxed)
+        | Node::FilterHapsJs(boxed)
+        | Node::FilterWhenJs(boxed)
+        | Node::FmapJs(boxed) => take_child(&mut boxed.0, out),
+        Node::FmapNative(boxed) => take_child(&mut boxed.0, out),
+        Node::FilterValues(boxed) => take_child(&mut boxed.0, out),
+        Node::FilterHaps(boxed) => take_child(&mut boxed.0, out),
+        Node::MapHapsNative(boxed) => take_child(&mut boxed.0, out),
+        Node::MapHapsOwned(boxed) => take_child(&mut boxed.0, out),
+        Node::MapHapsWithState(boxed) => take_child(&mut boxed.0, out),
+        Node::ExpandHapsNative(boxed) => take_child(&mut boxed.0, out),
+        Node::WithRandSeed(boxed) => take_child(&mut boxed.0, out),
+        Node::Degrade(boxed) => take_child(&mut boxed.0, out),
+        Node::InnerJoin(boxed) | Node::PatternOfDynamic(boxed) => take_child(&mut boxed.0, out),
+        Node::FastGap(boxed) | Node::RepeatCycles(boxed) | Node::LoopAt(boxed) => {
+            take_child(&mut boxed.0, out)
+        }
+        Node::Cpm(boxed) => take_child(&mut boxed.0, out),
+        Node::MidiKeys(boxed) => take_child(&mut boxed.0, out),
+        Node::AddContext(boxed) => take_child(&mut boxed.0, out),
+        Node::FmapJsPreservingControls(boxed) => take_child(&mut boxed.0, out),
         // The kept constructions are children in every sense that matters
         // here: each is a graph of its own, taken apart on the same worklist.
-        Node::PatternOfPure(pattern, boxed) => {
-            take_child(pattern, out);
-            boxed.1.drain_into(out);
+        Node::PatternOfPure(boxed) => {
+            take_child(&mut boxed.0, out);
+            boxed.2.drain_into(out);
         }
         Node::Extension(extension) => extension.drain_children(out),
-        Node::AppLeft(pair, _, _) => {
+        Node::AppLeft(pair) => {
             take_child(&mut pair.0, out);
             take_child(&mut pair.1, out);
+        }
+        Node::AppRight(node) | Node::AppBoth(node) => {
+            take_child(&mut node.0, out);
+            take_child(&mut node.1, out);
         }
         Node::PatternOfPureOperand(pair, _) => {
             take_child(&mut pair.0, out);
@@ -12282,8 +12640,6 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         Node::Arp(pair)
         | Node::ArpWithPattern(pair)
         | Node::Timeline(pair, _)
-        | Node::AppRight(pair, _, _)
-        | Node::AppBoth(pair, _, _)
         | Node::PickPatternified { patterns: pair, .. } => {
             take_child(&mut pair.0, out);
             take_child(&mut pair.1, out);
@@ -12296,9 +12652,9 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
             take_child(&mut bind.0, out);
             out.extend(std::mem::take(&mut bind.1));
         }
-        Node::XenPatterns(pattern, patterns) => {
-            take_child(pattern, out);
-            out.extend(std::mem::take(patterns));
+        Node::XenPatterns(boxed) => {
+            take_child(&mut boxed.0, out);
+            out.extend(std::mem::take(&mut boxed.1));
         }
         Node::WChoose(choice) => {
             take_child(&mut choice.chooser, out);
@@ -12307,11 +12663,9 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
             out.extend(std::mem::take(&mut choice.values));
         }
         Node::PurePickLookup(boxed) => drain_lookup(&mut boxed.1, out),
-        Node::Pick {
-            selector, lookup, ..
-        } => {
-            take_child(selector, out);
-            drain_lookup(lookup, out);
+        Node::Pick(pick) => {
+            take_child(&mut pick.selector, out);
+            drain_lookup(&mut pick.lookup, out);
         }
     }
 }
@@ -12426,44 +12780,41 @@ fn span_read(node: &Node) -> purity::SpanRead {
         Node::Silence | Node::Pure(_) | Node::PurePickLookup(..) | Node::Sequence(_) => No,
         // A time map that keeps the order of time, and maps of each hap that
         // read no span.
-        Node::Fast(pattern, factor, _) if **factor > Fraction::ZERO => of(pattern),
+        Node::Fast(node) if node.1 > Fraction::ZERO => of(&node.0),
         // A `fast` by the tempo of the query, which the span does not say.
-        Node::Cpm(pattern, rate) if rate.cpm > Fraction::ZERO => of(pattern),
-        Node::Shift(pattern, ..)
-        | Node::AddContext(pattern, _)
-        | Node::FmapNative(pattern, _)
-        | Node::Constants(pattern, _)
-        | Node::FilterValues(pattern, _)
-        | Node::MapHapsNative(pattern, _, SpanUse::Ignores)
-        | Node::MapHapsOwned(pattern, _, SpanUse::Ignores)
-        | Node::UiVisual(pattern, _, _)
-        | Node::ExpandHapsNative(pattern, _, SpanUse::Ignores)
+        Node::Cpm(boxed) if boxed.1.cpm > Fraction::ZERO => of(&boxed.0),
+        Node::ControlMap(pattern, _, _) => of(pattern),
+        Node::Shift(node) => of(&node.0),
+        Node::Constants(node) => of(&node.0),
+        Node::UiVisual(node) => of(&node.inner),
+        Node::AddContext(boxed) => of(&boxed.0),
+        Node::FmapNative(boxed) => of(&boxed.0),
+        Node::FilterValues(boxed) => of(&boxed.0),
+        Node::MapHapsNative(boxed) if boxed.2 == SpanUse::Ignores => of(&boxed.0),
+        Node::MapHapsOwned(boxed) if boxed.2 == SpanUse::Ignores => of(&boxed.0),
+        Node::ExpandHapsNative(boxed) if boxed.2 == SpanUse::Ignores => of(&boxed.0),
         // A hap is kept or dropped by the begin of its whole.
-        | Node::Degrade(pattern, ..) => of(pattern),
+        Node::Degrade(boxed) => of(&boxed.0),
         Node::Stack(patterns) => most(&mut patterns.iter()),
         // One cycle at a time: the node inside is asked over each cycle's
         // piece of the span, where each of these kinds maps time in order.
         Node::SplitQueries(inner) => match inner.node_kind() {
             Node::SlowCat(patterns) | Node::SlowCatPrime(patterns) => most(&mut patterns.iter()),
-            Node::FastGap(pattern, _) | Node::RepeatCycles(pattern, _) | Node::Rev(pattern) => {
-                of(pattern)
-            }
+            Node::FastGap(boxed) | Node::RepeatCycles(boxed) => of(&boxed.0),
+            Node::Rev(pattern) => of(pattern),
             _ => of(inner),
         },
         // The side that gives the structure is cut by the query. The other
         // side is asked over the whole of each hap, whatever the query.
-        Node::AppLeft(pair, ..) => of(&pair.0),
-        Node::AppRight(pair, ..) => of(&pair.1),
-        Node::AppBoth(pair, ..) => of(&pair.0).max(of(&pair.1)),
+        Node::AppLeft(pair) => of(&pair.0),
+        Node::AppRight(pair) => of(&pair.1),
+        Node::AppBoth(pair) => of(&pair.0).max(of(&pair.1)),
         // Each hap of the selector asks its pattern over the hap's part, or
         // over the span and keeps the part: the same haps, for patterns of
         // discrete haps. A squeeze makes a pattern for each hap.
-        Node::Pick {
-            selector,
-            lookup,
-            mode,
-            ..
-        } if *mode != JoinMode::Squeeze => of(selector).max(most(&mut lookup.patterns())),
+        Node::Pick(pick) if pick.mode != JoinMode::Squeeze => {
+            of(&pick.selector).max(most(&mut pick.lookup.patterns()))
+        }
         // Each hap of the carrier asks a pattern over the hap's part. The
         // body makes the pattern at the query, where the join reads how it
         // answers.
@@ -12472,7 +12823,7 @@ fn span_read(node: &Node) -> purity::SpanRead {
             JoinMode::Inner | JoinMode::Outer | JoinMode::Mix | JoinMode::Squeeze,
         ) => match inner.node_kind() {
             Node::PatternOfPureOperand(pair, ..) => of(&pair.0).max(Made),
-            Node::PatternOfPure(carrier, ..) => of(carrier).max(Made),
+            Node::PatternOfPure(boxed) => of(&boxed.0).max(Made),
             _ => Yes,
         },
         _ => Yes,
@@ -12527,60 +12878,63 @@ fn compute_purity(node: &Node) -> purity::Purity {
         | Node::QueryLimit(_) => Purity::pure(),
 
         // Any node holding a callback id is impure and contributes it.
-        Node::FmapJs(p, id)
-        | Node::FmapJsPreservingControls(p, id, _)
-        | Node::WithQuerySpanJs(p, id)
-        | Node::FilterValuesJs(p, id)
-        | Node::FilterHapsJs(p, id)
-        | Node::FilterWhenJs(p, id) => Purity::merge([p.purity(), Purity::with_callback(*id)]),
+        Node::FmapJs(boxed)
+        | Node::WithQuerySpanJs(boxed)
+        | Node::FilterValuesJs(boxed)
+        | Node::FilterHapsJs(boxed)
+        | Node::FilterWhenJs(boxed) => {
+            Purity::merge([boxed.0.purity(), Purity::with_callback(boxed.1)])
+        }
+        Node::FmapJsPreservingControls(boxed) => {
+            Purity::merge([boxed.0.purity(), Purity::with_callback(boxed.1)])
+        }
         Node::JsQuery(id) => Purity::with_callback(*id),
 
-        Node::WithQueryTime(p, _)
-        | Node::WithHapTime(p, _)
-        | Node::Fast(p, _, _)
-        | Node::Shift(p, _, _)
-        | Node::WithQuerySpan(p, _)
-        | Node::WithHapSpan(p, _)
-        | Node::Rev(p)
+        Node::Rev(p)
         | Node::StepJoin(p)
         | Node::PolyJoin(p)
         // Exact inheritance: a known pure inner stays pure.
         | Node::PurePattern(p)
-        | Node::FmapNative(p, _)
-        | Node::Constants(p, _)
-        | Node::FilterValues(p, _)
-        | Node::FilterHaps(p, _)
         | Node::SortHapsByPart(p)
-        | Node::MapHapsNative(p, _, _)
-        | Node::MapHapsOwned(p, _, _)
-        | Node::UiVisual(p, _, _)
-        | Node::MapHapsWithState(p, _)
-        | Node::ExpandHapsNative(p, _, _)
+        | Node::ControlMap(p, _, _)
         | Node::Collect(p)
         | Node::CycleOnsetIndex(p)
         | Node::CycleOnsetCount(p)
-        | Node::WithRandSeed(p, _)
-        | Node::Degrade(p, _, _)
         | Node::SplitQueries(p)
-        | Node::FastGap(p, _)
-        | Node::RepeatCycles(p, _)
-        | Node::LoopAt(p, _)
-        | Node::Cpm(p, _)
-        | Node::AddContext(p, _)
+        | Node::Join(p, _) => p.purity(),
+        Node::Fast(node) => node.0.purity(),
+        Node::Shift(node) => node.0.purity(),
+        Node::Constants(node) => node.0.purity(),
+        Node::UiVisual(node) => node.inner.purity(),
+        Node::WithQueryTime(boxed) | Node::WithHapTime(boxed) => boxed.0.purity(),
+        Node::WithQuerySpan(boxed) | Node::WithHapSpan(boxed) => boxed.0.purity(),
+        Node::FmapNative(boxed) => boxed.0.purity(),
+        Node::FilterValues(boxed) => boxed.0.purity(),
+        Node::FilterHaps(boxed) => boxed.0.purity(),
+        Node::MapHapsNative(boxed) => boxed.0.purity(),
+        Node::MapHapsOwned(boxed) => boxed.0.purity(),
+        Node::MapHapsWithState(boxed) => boxed.0.purity(),
+        Node::ExpandHapsNative(boxed) => boxed.0.purity(),
+        Node::WithRandSeed(boxed) => boxed.0.purity(),
+        Node::Degrade(boxed) => boxed.0.purity(),
+        Node::FastGap(boxed) | Node::RepeatCycles(boxed) | Node::LoopAt(boxed) => boxed.0.purity(),
+        Node::Cpm(boxed) => boxed.0.purity(),
+        Node::AddContext(boxed) => boxed.0.purity(),
         // Sound: the closure's return type forbids JavaScript.
-        | Node::PatternOfPure(p, _)
-        | Node::Join(p, _)
-        | Node::InnerJoin(p, _) => p.purity(),
+        Node::PatternOfPure(boxed) => boxed.0.purity(),
+        Node::InnerJoin(boxed) => boxed.0.purity(),
         // Sound for the same reason; the operand was proven pure when the
         // node was built, and is re-proven by its own branch when rebuilt.
         Node::PatternOfPureOperand(pair, _) => Purity::merge([pair.0.purity(), pair.1.purity()]),
 
         // A live port answers with whatever was played since the last query.
-        Node::MidiKeys(p, _) => Purity::merge([p.purity(), Purity::volatile()]),
+        Node::MidiKeys(boxed) => Purity::merge([boxed.0.purity(), Purity::volatile()]),
 
-        Node::PatternOfJs(p, id) => {
-            Purity::merge([p.purity(), Purity::with_callback(*id), Purity::opaque()])
-        }
+        Node::PatternOfJs(boxed) => Purity::merge([
+            boxed.0.purity(),
+            Purity::with_callback(boxed.1),
+            Purity::opaque(),
+        ]),
 
         Node::Extension(extension) => {
             let children = Purity::merge(extension.children().iter().map(Pattern::purity));
@@ -12590,12 +12944,12 @@ fn compute_purity(node: &Node) -> purity::Purity {
                 children
             }
         }
-        Node::PatternOfDynamic(p, _) => Purity::merge([p.purity(), Purity::opaque()]),
+        Node::PatternOfDynamic(boxed) => Purity::merge([boxed.0.purity(), Purity::opaque()]),
         Node::PatternOfHap(bind) => {
             Purity::merge(std::iter::once(bind.0.purity()).chain(bind.1.iter().map(Pattern::purity)))
         }
-        Node::XenPatterns(outer, dependencies) => Purity::merge(
-            std::iter::once(outer.purity()).chain(dependencies.iter().map(Pattern::purity)),
+        Node::XenPatterns(boxed) => Purity::merge(
+            std::iter::once(boxed.0.purity()).chain(boxed.1.iter().map(Pattern::purity)),
         ),
 
         Node::Stack(ps) | Node::SlowCat(ps) | Node::SlowCatPrime(ps) => {
@@ -12608,15 +12962,17 @@ fn compute_purity(node: &Node) -> purity::Purity {
                 .chain(choice.cumulative.iter().map(Pattern::purity))
                 .chain(choice.values.iter().map(Pattern::purity)),
         ),
-        Node::Pick {
-            selector, lookup, ..
-        } => Purity::merge(
-            std::iter::once(selector.purity()).chain(lookup.patterns().map(Pattern::purity)),
+        Node::Pick(pick) => Purity::merge(
+            std::iter::once(pick.selector.purity())
+                .chain(pick.lookup.patterns().map(Pattern::purity)),
         ),
-        Node::AppLeft(pair, _, _) => Purity::merge([pair.0.purity(), pair.1.purity()]),
-        Node::PickPatternified { patterns: pair, .. }
-        | Node::AppRight(pair, _, _)
-        | Node::AppBoth(pair, _, _) => Purity::merge([pair.0.purity(), pair.1.purity()]),
+        Node::AppLeft(pair) => Purity::merge([pair.0.purity(), pair.1.purity()]),
+        Node::AppRight(node) | Node::AppBoth(node) => {
+            Purity::merge([node.0.purity(), node.1.purity()])
+        }
+        Node::PickPatternified { patterns: pair, .. } => {
+            Purity::merge([pair.0.purity(), pair.1.purity()])
+        }
 
         // `arp` reaches no JavaScript of its own: it is grouping plus an index
         // lookup, so it is exactly as pure as the chord and the indices are.
@@ -12625,9 +12981,11 @@ fn compute_purity(node: &Node) -> purity::Purity {
         // The return pattern is chosen by JavaScript at query time. Its
         // callback reachability cannot be enumerated statically, so this is
         // impure, names its own cell, and is opaque for ownership marking.
-        Node::ArpWith(p, id) => {
-            Purity::merge([p.purity(), Purity::with_callback(*id), Purity::opaque()])
-        }
+        Node::ArpWith(boxed) => Purity::merge([
+            boxed.0.purity(),
+            Purity::with_callback(boxed.1),
+            Purity::opaque(),
+        ]),
         Node::ArpWithPattern(pair) => {
             Purity::merge([pair.0.purity(), pair.1.purity(), Purity::opaque()])
         }
@@ -12665,7 +13023,7 @@ pub fn arp(pattern: Pattern, indices: Pattern) -> Pattern {
 /// Always impure: the callback is invoked at query time and may return a
 /// pattern that itself reaches callbacks not visible in this graph yet.
 pub fn arp_with(pattern: Pattern, callback: CallbackId) -> Pattern {
-    Pattern::of(Node::ArpWith(pattern, callback))
+    Pattern::of(Node::ArpWith(Box::new((pattern, callback))))
 }
 
 /// General registered `arpWith` path where callback functions vary in time.
@@ -12879,7 +13237,7 @@ pub fn pure_pattern(inner: Pattern) -> Pattern {
 /// would take the missing-`_steps` throw path.
 pub fn pattern_of_js(outer: Pattern, id: CallbackId) -> Pattern {
     let steps = outer.steps();
-    Pattern::of(Node::PatternOfJs(outer, id)).with_steps(steps)
+    Pattern::of(Node::PatternOfJs(Box::new((outer, id)))).with_steps(steps)
 }
 
 pub fn pure(v: Value) -> Pattern {
@@ -12946,7 +13304,7 @@ pub fn state_signal(f: impl Fn(&State) -> Value + Send + Sync + 'static) -> Patt
 }
 
 pub fn midi_keys(lengths: Pattern, port: Arc<midi_in::InputPort>) -> Pattern {
-    Pattern::of(Node::MidiKeys(lengths, port))
+    Pattern::of(Node::MidiKeys(Box::new((lengths, port))))
 }
 
 pub fn unjoin(pattern: Pattern, pieces: Pattern, function: Option<&value::FunctionRef>) -> Pattern {
@@ -13060,12 +13418,12 @@ pub fn pick(
         let steps = (mode == JoinMode::Outer)
             .then_some(selector.steps())
             .flatten();
-        Pattern::of(Node::Pick {
+        Pattern::of(Node::Pick(Box::new(PickNode {
             selector,
-            lookup: Box::new(lookup),
+            lookup,
             index_mode,
             mode,
-        })
+        })))
         .with_steps(steps)
     }
 }
@@ -14100,7 +14458,7 @@ mod constant_values_tests {
         };
         functions.app_left_by(
             pure(Value::F64(10.0)),
-            Combine::With(Arc::new(add)),
+            Combine::with(Arc::new(add)),
             LookupFlow::Infer,
         )
     }
@@ -14249,9 +14607,10 @@ mod constant_run_tests {
             chain(&crate::signal::saw(), &numbers)
         };
         let pattern = ranged(800.0);
-        let Node::Constants(base, run) = pattern.node_kind() else {
+        let Node::Constants(node) = pattern.node_kind() else {
             panic!("a range of a signal is no run of numbers");
         };
+        let (base, run) = (&node.0, &node.1);
         assert!(matches!(base.node_kind(), Node::Signal(_)));
         let numbers: Vec<(ComposeOp, f64)> = run.iter().filter_map(RunMeeting::number).collect();
         assert_eq!(numbers, [(ComposeOp::Mul, 600.0), (ComposeOp::Add, 200.0)]);
@@ -14288,9 +14647,10 @@ mod constant_run_tests {
             chain(&ranged(800.0), &[(ComposeOp::Set, gain)])
         };
         let set = quiet((3, 6));
-        let Node::Constants(base, run) = set.node_kind() else {
+        let Node::Constants(node) = set.node_kind() else {
             panic!("a control after a range is no run of constants");
         };
+        let (base, run) = (&node.0, &node.1);
         assert!(matches!(base.node_kind(), Node::Signal(_)));
         assert_eq!(run.len(), 3);
         assert!(set.same_construction(&quiet((3, 6))));
@@ -14715,18 +15075,18 @@ mod value_signal_tests {
     fn a_segment_walk_charges_each_hap_of_a_step_to_the_budget() {
         let many = range(&sine(), 0.0, 1.0).fast(whole(256));
         let segment = combinators::segment(&many, whole(64));
-        let Node::FilterValues(structured, _) = segment.node_kind() else {
+        let Node::FilterValues(boxed) = segment.node_kind() else {
             panic!("a segment is a filter of an application");
         };
-        let Node::AppRight(pair, apply, flow) = structured.node_kind() else {
+        let structured = &boxed.0;
+        let Node::AppRight(node) = structured.node_kind() else {
             panic!("a segment is an application");
         };
         let state = State::new(TimeSpan::new(whole(0), whole(1)));
         for (budget, refused) in [(100, true), (255, true), (256, false), (1000, false)] {
             let mut out = Vec::new();
-            let (_, refusal) = with_hap_budget(budget, || {
-                fused::app_right_onto(pair, apply, *flow, &state, &mut out)
-            });
+            let (_, refusal) =
+                with_hap_budget(budget, || fused::app_right_onto(node, &state, &mut out));
             assert_eq!(refusal.is_some(), refused, "a budget of {budget}");
             assert_eq!(
                 out.len(),
@@ -14865,19 +15225,19 @@ mod value_signal_tests {
     fn structures() -> Vec<(&'static str, Pattern)> {
         let note = |n: f64| pure(Value::object([("note".to_string(), Value::F64(n))]));
         // Notes that sliders drive, as a control of a slider makes them.
-        let driven = Pattern::of(Node::MapHapsOwned(
+        let driven = Pattern::of(Node::MapHapsOwned(Box::new((
             fastcat(vec![note(3.0), note(4.0), note(5.0)]),
-            Arc::new(|mut hap| {
+            Arc::new(|mut hap: Hap| {
                 hap.set_live_bindings([9, 8, 7, 6], 5);
                 Some(hap)
             }),
             SpanUse::Ignores,
-        ));
+        ))));
         // A number that equals no number, with a lookup: a meeting keeps
         // the lookup of a value that equals itself.
-        let looked_up = Pattern::of(Node::MapHapsOwned(
+        let looked_up = Pattern::of(Node::MapHapsOwned(Box::new((
             fastcat(vec![pure(Value::F64(f64::NAN)), pure(Value::F64(2.0))]),
-            Arc::new(|hap| {
+            Arc::new(|hap: Hap| {
                 let lookup = PickLookup::Array {
                     enumerable_len: 0,
                     length: 0,
@@ -14886,19 +15246,19 @@ mod value_signal_tests {
                 Some(hap.with_pick_lookup(Arc::new(lookup)))
             }),
             SpanUse::Ignores,
-        ));
+        ))));
         // Notes whose wholes begin after their parts: a meeting cuts each
         // part to the time that the whole holds too.
-        let late = Pattern::of(Node::MapHapsOwned(
+        let late = Pattern::of(Node::MapHapsOwned(Box::new((
             fastcat(vec![note(6.0), note(7.0), note(8.0)]),
-            Arc::new(|mut hap| {
+            Arc::new(|mut hap: Hap| {
                 let whole = hap.whole?;
                 let quarter = (whole.end - whole.begin) * Fraction::new(1, 4);
                 hap.whole = Some(TimeSpan::new(whole.begin + quarter, whole.end));
                 Some(hap)
             }),
             SpanUse::Reads,
-        ));
+        ))));
         vec![
             ("two notes a cycle", fastcat(vec![note(0.0), note(1.0)])),
             ("notes that sliders drive", driven),
@@ -15228,9 +15588,10 @@ mod value_signal_tests {
     fn constants_after_a_wave_are_set_under_its_application() {
         let (_, values) = chains_with_waves().swap_remove(0);
         let set = chain(&steps_of_other_names(), &values);
-        let Node::AppLeft(pair, Combine::Composed(ComposeOp::Set), ..) = set.node_kind() else {
+        let Node::AppLeft(pair) = set.node_kind() else {
             panic!("the application of the wave is the last one");
         };
+        assert!(matches!(pair.3, Combine::Composed(ComposeOp::Set)));
         assert!(
             matches!(pair.0.node_kind(), Node::Sequence(_)),
             "the steps hold each constant"

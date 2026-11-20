@@ -567,7 +567,7 @@ impl PatOps for Pattern {
         combine: crate::CombineFn,
         lookup_flow: crate::LookupFlow,
     ) -> Self {
-        Pattern::app_left_by(self, other, Combine::With(combine), lookup_flow)
+        Pattern::app_left_by(self, other, Combine::with(combine), lookup_flow)
     }
     fn app_right_interned(
         &self,
@@ -575,7 +575,7 @@ impl PatOps for Pattern {
         combine: crate::CombineFn,
         lookup_flow: crate::LookupFlow,
     ) -> Self {
-        Pattern::app_right_by(self, other, Combine::With(combine), lookup_flow)
+        Pattern::app_right_by(self, other, Combine::with(combine), lookup_flow)
     }
     fn app_both_interned(
         &self,
@@ -583,7 +583,7 @@ impl PatOps for Pattern {
         combine: crate::CombineFn,
         lookup_flow: crate::LookupFlow,
     ) -> Self {
-        Pattern::app_both_by(self, other, Combine::With(combine), lookup_flow)
+        Pattern::app_both_by(self, other, Combine::with(combine), lookup_flow)
     }
     fn met_numbers(&self, numbers: &[(crate::compose::ComposeOp, f64)]) -> Option<Self> {
         Pattern::met_numbers(self, numbers)
@@ -958,7 +958,7 @@ impl PatOps for PurePattern {
     ) -> Self {
         PurePattern::assert_pure(self.pattern().app_left_by(
             other.pattern().clone(),
-            Combine::With(combine),
+            Combine::with(combine),
             lookup_flow,
         ))
     }
@@ -970,7 +970,7 @@ impl PatOps for PurePattern {
     ) -> Self {
         PurePattern::assert_pure(self.pattern().app_right_by(
             other.pattern().clone(),
-            Combine::With(combine),
+            Combine::with(combine),
             lookup_flow,
         ))
     }
@@ -982,7 +982,7 @@ impl PatOps for PurePattern {
     ) -> Self {
         PurePattern::assert_pure(self.pattern().app_both_by(
             other.pattern().clone(),
-            Combine::With(combine),
+            Combine::with(combine),
             lookup_flow,
         ))
     }

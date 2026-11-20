@@ -288,7 +288,7 @@ pub fn xen_patterns(pat: &crate::Pattern, ratios: Vec<crate::Pattern>) -> crate:
     if ratios.is_empty() {
         return xen(pat, Value::list(Vec::new()));
     }
-    crate::Pattern::of(crate::Node::XenPatterns(pat.clone(), ratios)).with_steps_of(pat)
+    crate::Pattern::of(crate::Node::XenPatterns(Box::new((pat.clone(), ratios)))).with_steps_of(pat)
 }
 
 pub(crate) fn query_xen_patterns(

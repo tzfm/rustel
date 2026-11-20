@@ -14,8 +14,7 @@
 
 use crate::table::{HapBuffer, Signal, ValueSignal, in_one_cycle, signal_of};
 use crate::{
-    Combine, Hap, LookupFlow, Node, Pattern, PatternPair, SpanUse, State, TimeSpan, Value,
-    applied_hap,
+    Combine, Hap, LookupFlow, Node, Pattern, SpanUse, State, TimeSpan, Value, applied_hap,
 };
 use rustel_fraction::Fraction;
 
@@ -202,15 +201,9 @@ impl StepGrid {
 
 /// The haps of an `appRight` that a fused walk answers, into `out`. `false`
 /// leaves `out` as it is, for an application that the graph answers.
-pub(crate) fn app_right_onto(
-    pair: &PatternPair,
-    apply: &Combine,
-    flow: LookupFlow,
-    state: &State,
-    out: &mut Vec<Hap>,
-) -> bool {
-    let PatternPair(functions, values) = pair;
-    let Some(segment) = Segment::of(functions, values, apply, flow) else {
+pub(crate) fn app_right_onto(node: &crate::AppNode, state: &State, out: &mut Vec<Hap>) -> bool {
+    let crate::AppNode(functions, values, apply, flow) = node;
+    let Some(segment) = Segment::of(functions, values, apply, *flow) else {
         return false;
     };
     segment
@@ -321,19 +314,17 @@ impl StepWave {
     /// `values` as a control of a segment of a wave, independent of the
     /// enclosing `AppLeft`'s combine/flow (cached once per `ValueReading`).
     pub(crate) fn of_pattern(values: &Pattern) -> Option<Self> {
-        let Node::MapHapsOwned(inner, _, SpanUse::Ignores) = values.node_kind() else {
-            return None;
+        let inner = match values.node_kind() {
+            Node::ControlMap(inner, _, false) => inner,
+            Node::MapHapsOwned(boxed) if boxed.2 == SpanUse::Ignores => &boxed.0,
+            _ => return None,
         };
         if !Wave::holds_segment(inner) {
             return None;
         }
-        let (inner, named) = ValueSignal::named(values)?;
+        let (inner, key) = ValueSignal::named_key(values)?;
         let (wave, steps) = Wave::of_steps(inner)?;
-        Some(Self {
-            key: named.key,
-            wave,
-            steps,
-        })
+        Some(Self { key, wave, steps })
     }
 
     #[cfg(test)]
@@ -448,19 +439,69 @@ impl StepWave {
     }
 }
 
-/// Inline storage for up to 4 arithmetic ops on a wave (covers `range` and
-/// `rangex` with zero heap allocation), spilling to a boxed slice if deeper.
+/// Compact storage for arithmetic ops on a wave: identity, single op, or
+/// `.range(lo, hi)` (`mul` then `add`) stay inline with zero heap allocation,
+/// while deeper chains (such as `.rangex`) spill to a boxed slice.
 enum WaveMath {
-    Inline([(crate::compose::ComposeOp, f64); 4], u8),
+    None,
+    One(crate::compose::ComposeOp, f64),
+    MulAdd { mul: f64, add: f64 },
     Boxed(Box<[(crate::compose::ComposeOp, f64)]>),
 }
 
 impl WaveMath {
+    fn from_ops(ops: &[(crate::compose::ComposeOp, f64)]) -> Self {
+        use crate::compose::ComposeOp;
+        match ops {
+            [] => Self::None,
+            [(op, value)] => Self::One(*op, *value),
+            [(ComposeOp::Mul, mul), (ComposeOp::Add, add)] => Self::MulAdd {
+                mul: *mul,
+                add: *add,
+            },
+            many => Self::Boxed(many.into()),
+        }
+    }
+
     #[inline]
-    fn as_slice(&self) -> &[(crate::compose::ComposeOp, f64)] {
+    fn apply(&self, mut number: f64) -> Option<f64> {
         match self {
-            Self::Inline(ops, len) => &ops[..usize::from(*len)],
-            Self::Boxed(ops) => ops,
+            Self::None => Some(number),
+            Self::One(op, other) => op.of_numbers(number, *other),
+            Self::MulAdd { mul, add } => Some(number * *mul + *add),
+            Self::Boxed(ops) => {
+                for (op, other) in ops.iter() {
+                    number = op.of_numbers(number, *other)?;
+                }
+                Some(number)
+            }
+        }
+    }
+}
+
+/// Compact storage for up to [`Wave::MOST_TIMES`] time changes and their
+/// cycle-cutting bitmask: 0 or 1 time change stays inline in 16 bytes.
+enum WaveTimes {
+    None,
+    One(WaveTime, u8),
+    Many(Box<([WaveTime; Wave::MOST_TIMES], u8, u8)>),
+}
+
+impl WaveTimes {
+    fn from_raw(times: [WaveTime; Wave::MOST_TIMES], len: u8, cut_mask: u8) -> Self {
+        match len {
+            0 => Self::None,
+            1 => Self::One(times[0], cut_mask),
+            _ => Self::Many(Box::new((times, len, cut_mask))),
+        }
+    }
+
+    #[inline]
+    fn parts(&self) -> (&[WaveTime], u8) {
+        match self {
+            Self::None => (&[], 0),
+            Self::One(time, cut_mask) => (std::slice::from_ref(time), *cut_mask),
+            Self::Many(boxed) => (&boxed.0[..usize::from(boxed.1)], boxed.2),
         }
     }
 }
@@ -476,18 +517,16 @@ impl WaveMath {
 /// one cycle of the time of each number. The time of a number is the time
 /// of the query, or a time that keeps a cycle of the query in one cycle,
 /// for most waves. Any other number is under changes of time that
-/// [`Self::cut_mask`] records, and each part is read in its time.
+/// `cut_mask` records, and each part is read in its time.
 pub(crate) struct Wave {
-    body: crate::NumberSignal,
-    /// The changes of time, the outermost first (at most [`Self::MOST_TIMES`]).
-    times: [WaveTime; 3],
-    times_len: u8,
-    /// Bitmask of `1 << over` for each time change count `over` (1..=3) under
-    /// which a number's time may cut a cycle of the query.
-    cut_mask: u8,
     /// The arithmetic, the innermost first: each op with its number.
     math: WaveMath,
+    /// The changes of time, outermost first, plus the cycle-cutting bitmask.
+    times: WaveTimes,
+    body: crate::NumberSignal,
 }
+
+const _: () = assert!(std::mem::size_of::<Wave>() <= 48);
 
 /// One change of time over a [`Wave`]. Factors and shifts are bounded below
 /// 2^16 by [`Wave::plain`], so 32-bit components are lossless and compact.
@@ -602,19 +641,17 @@ impl Wave {
         let math = match spilled_math {
             Some(mut vec) => {
                 vec.reverse();
-                WaveMath::Boxed(vec.into())
+                WaveMath::from_ops(&vec)
             }
             None => {
                 inline_math[..usize::from(inline_len)].reverse();
-                WaveMath::Inline(inline_math, inline_len)
+                WaveMath::from_ops(&inline_math[..usize::from(inline_len)])
             }
         };
         Some(Self {
-            body,
-            times,
-            times_len,
-            cut_mask,
             math,
+            times: WaveTimes::from_raw(times, times_len, cut_mask),
+            body,
         })
     }
 
@@ -654,32 +691,36 @@ impl Wave {
                     let body = Self::read(functions, &mut |_| timed = true, number, None)?;
                     return (!timed).then_some(body);
                 }
-                Node::Fast(inner, factor, _) if **factor > Fraction::ZERO => {
-                    cycles_kept &= factor.numer() == 1;
-                    time(WaveTime::fast(**factor)?);
+                Node::Fast(node) if node.1 > Fraction::ZERO => {
+                    cycles_kept &= node.1.numer() == 1;
+                    time(WaveTime::fast(node.1)?);
                     times += 1;
-                    inner
+                    &node.0
                 }
-                Node::Shift(inner, by, _) => {
-                    cycles_kept &= by.denom() == 1;
-                    time(WaveTime::late(**by)?);
+                Node::Shift(node) => {
+                    cycles_kept &= node.1.denom() == 1;
+                    time(WaveTime::late(node.1)?);
                     times += 1;
-                    inner
+                    &node.0
                 }
                 // A run of numbers, the last application first.
-                Node::Constants(inner, run) => {
-                    for meeting in run.iter().rev() {
+                Node::Constants(node) => {
+                    for meeting in node.1.iter().rev() {
                         let (op, other) = meeting.number()?;
                         op.of_numbers(0.0, 0.0)?;
                         number(op, other, (!cycles_kept).then_some(times));
                     }
-                    inner
+                    &node.0
                 }
                 // A `pure` of a number answers the number in every cycle,
                 // on a hap that carries nothing more: no place in the
                 // text, no key, no visual and no slider.
-                Node::AppLeft(pair, Combine::Composed(op), _) => {
-                    let crate::AppLeftNode(functions, values, _) = &**pair;
+                Node::AppLeft(pair) => {
+                    let crate::AppLeftNode(functions, values, _, Combine::Composed(op), _) =
+                        &**pair
+                    else {
+                        return None;
+                    };
                     let Node::Pure(crate::Value::F64(other)) = values.node_kind() else {
                         return None;
                     };
@@ -702,12 +743,12 @@ impl Wave {
         // A `range` is a run of constants, or two applications of one.
         for _ in 0..Self::MOST_TIMES {
             pattern = match pattern.node_kind() {
-                Node::Constants(inner, _) => inner,
-                Node::AppLeft(pair, ..) => &pair.0,
+                Node::Constants(node) => &node.0,
+                Node::AppLeft(pair) => &pair.0,
                 _ => break,
             };
         }
-        matches!(pattern.node_kind(), Node::FilterValues(inner, _) if matches!(inner.node_kind(), Node::AppRight(..)))
+        matches!(pattern.node_kind(), Node::FilterValues(boxed) if matches!(boxed.0.node_kind(), Node::AppRight(..)))
     }
 
     /// The count of steps and the pattern of the signal, when `pattern` is a
@@ -718,20 +759,21 @@ impl Wave {
             return None;
         }
         let functions = pattern.under_structure()?;
-        let Node::FilterValues(structured, _) = pattern.node_kind() else {
+        let Node::FilterValues(boxed) = pattern.node_kind() else {
             return None;
         };
-        let Node::AppRight(pair, ..) = structured.node_kind() else {
+        let structured = &boxed.0;
+        let Node::AppRight(node) = structured.node_kind() else {
             return None;
         };
-        let Node::Sequence(layers) = pair.1.node_kind() else {
+        let Node::Sequence(layers) = node.1.node_kind() else {
             return None;
         };
         let (count, pulse) = crate::sequence::pulse(layers)?;
         (pulse.js_truthy()
             && structured.tables_may_answer()
-            && !pair.1.is_volatile()
-            && !pair.1.has_runtime_settings())
+            && !node.1.is_volatile()
+            && !node.1.has_runtime_settings())
         .then_some((count, functions))
     }
 
@@ -759,12 +801,12 @@ impl Wave {
         let mut time = Self::plain(met.begin, 48)?;
         // The part in the time of each number that may cut it.
         let mut inside = part;
-        let times = &self.times[..usize::from(self.times_len)];
+        let (times, cut_mask) = self.times.parts();
         for (over, change) in times.iter().enumerate() {
             time = change.inward(time)?;
-            if self.cut_mask != 0 {
+            if cut_mask != 0 {
                 inside = TimeSpan::new(change.inward(inside.begin)?, change.inward(inside.end)?);
-                if (self.cut_mask & (1u8 << (over + 1))) != 0 && !in_one_cycle(inside) {
+                if (cut_mask & (1u8 << (over + 1))) != 0 && !in_one_cycle(inside) {
                     return None;
                 }
             }
@@ -775,17 +817,14 @@ impl Wave {
     /// The number of the wave at `time`, with its arithmetic.
     #[inline]
     fn value_at(&self, time: Fraction, controls: &crate::OrderedMap) -> Option<f64> {
-        let mut number = (self.body)(time, controls);
-        for (op, other) in self.math.as_slice() {
-            number = op.of_numbers(number, *other)?;
-        }
-        Some(number)
+        let number = (self.body)(time, controls);
+        self.math.apply(number)
     }
 }
 
 /// The name that `values` sets, when it is a control of a [`Wave`]: each
 /// of its haps then holds one number under that name, and nothing more.
 pub(crate) fn wave_name(values: &Pattern) -> Option<crate::Key> {
-    let (inner, named) = ValueSignal::named(values)?;
-    Wave::read(inner, &mut |_| (), &mut |_, _, _| (), None).map(|_| named.key)
+    let (inner, key) = ValueSignal::named_key(values)?;
+    Wave::read(inner, &mut |_| (), &mut |_, _, _| (), None).map(|_| key)
 }

@@ -64,20 +64,6 @@ impl Pattern {
     pub fn adopt_tables_from(&self, _previous: &Pattern) {}
 }
 
-/// Whether two apply functions of a meeting are the same one.
-pub(crate) fn same_combine(left: &crate::Combine, right: &crate::Combine) -> bool {
-    match (left, right) {
-        (crate::Combine::Composed(left), crate::Combine::Composed(right)) => left == right,
-        // The same controls in the same order, down to the bits of each
-        // number.
-        (crate::Combine::Sets(left), crate::Combine::Sets(right)) => {
-            left.len() == right.len() && left.iter().zip(&**right).all(|(a, b)| a.same_data(b))
-        }
-        (crate::Combine::With(left), crate::Combine::With(right)) => Arc::ptr_eq(left, right),
-        _ => false,
-    }
-}
-
 /// Whether two handles carry the same metadata their nodes cannot express.
 fn same_handles(left: &Pattern, right: &Pattern) -> bool {
     left.same_steps(right)
@@ -182,40 +168,32 @@ fn same_node<'g>(
         Node::NonSendMutation(_) => false,
         Node::QueryError(a) => matches!(right, Node::QueryError(b) if a == b),
         Node::QueryLimit(a) => matches!(right, Node::QueryLimit(b) if a == b),
-        Node::WithQueryTime(a, _) => match right {
-            Node::WithQueryTime(b, _) => child!(a, b),
+        Node::WithQueryTime(a) => match right {
+            Node::WithQueryTime(b) => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::WithHapTime(a, _) => match right {
-            Node::WithHapTime(b, _) => child!(a, b),
+        Node::WithHapTime(a) => match right {
+            Node::WithHapTime(b) => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::Fast(a, factor, operation) => match right {
-            Node::Fast(b, other_factor, other_operation)
-                if factor == other_factor && operation == other_operation =>
-            {
-                child!(a, b)
-            }
+        Node::Fast(a) => match right {
+            Node::Fast(b) if a.1 == b.1 && a.2 == b.2 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::Shift(a, offset, operation) => match right {
-            Node::Shift(b, other_offset, other_operation)
-                if offset == other_offset && operation == other_operation =>
-            {
-                child!(a, b)
-            }
+        Node::Shift(a) => match right {
+            Node::Shift(b) if a.1 == b.1 && a.2 == b.2 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::WithQuerySpan(a, _) => match right {
-            Node::WithQuerySpan(b, _) => child!(a, b),
+        Node::WithQuerySpan(a) => match right {
+            Node::WithQuerySpan(b) => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::WithQuerySpanJs(a, id) => match right {
-            Node::WithQuerySpanJs(b, other) if id == other => child!(a, b),
+        Node::WithQuerySpanJs(a) => match right {
+            Node::WithQuerySpanJs(b) if a.1 == b.1 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::WithHapSpan(a, _) => match right {
-            Node::WithHapSpan(b, _) => child!(a, b),
+        Node::WithHapSpan(a) => match right {
+            Node::WithHapSpan(b) => child!(&a.0, &b.0),
             _ => false,
         },
         Node::Rev(a) => match right {
@@ -243,8 +221,8 @@ fn same_node<'g>(
             }
             _ => false,
         },
-        Node::ArpWith(a, id) => match right {
-            Node::ArpWith(b, other) if id == other => child!(a, b),
+        Node::ArpWith(a) => match right {
+            Node::ArpWith(b) if a.1 == b.1 => child!(&a.0, &b.0),
             _ => false,
         },
         Node::ArpWithPattern(a) => match right {
@@ -265,56 +243,64 @@ fn same_node<'g>(
             }
             _ => false,
         },
-        Node::PatternOfJs(a, id) => match right {
-            Node::PatternOfJs(b, other) if id == other => child!(a, b),
+        Node::PatternOfJs(a) => match right {
+            Node::PatternOfJs(b) if a.1 == b.1 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::FmapNative(a, _) => match right {
-            Node::FmapNative(b, _) => child!(a, b),
+        Node::FmapNative(a) => match right {
+            Node::FmapNative(b) => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::FilterValues(a, _) => match right {
-            Node::FilterValues(b, _) => child!(a, b),
+        Node::FilterValues(a) => match right {
+            Node::FilterValues(b) => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::FilterValuesJs(a, id) => match right {
-            Node::FilterValuesJs(b, other) if id == other => child!(a, b),
+        Node::FilterValuesJs(a) => match right {
+            Node::FilterValuesJs(b) if a.1 == b.1 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::FilterHaps(a, _) => match right {
-            Node::FilterHaps(b, _) => child!(a, b),
+        Node::FilterHaps(a) => match right {
+            Node::FilterHaps(b) => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::FilterHapsJs(a, id) => match right {
-            Node::FilterHapsJs(b, other) if id == other => child!(a, b),
+        Node::FilterHapsJs(a) => match right {
+            Node::FilterHapsJs(b) if a.1 == b.1 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::FilterWhenJs(a, id) => match right {
-            Node::FilterWhenJs(b, other) if id == other => child!(a, b),
+        Node::FilterWhenJs(a) => match right {
+            Node::FilterWhenJs(b) if a.1 == b.1 => child!(&a.0, &b.0),
             _ => false,
         },
         Node::SortHapsByPart(a) => match right {
             Node::SortHapsByPart(b) => child!(a, b),
             _ => false,
         },
-        Node::MapHapsNative(a, _, spans) => match right {
-            Node::MapHapsNative(b, _, other) if spans == other => child!(a, b),
+        Node::ControlMap(a, id, unnamed) => match right {
+            Node::ControlMap(b, other_id, other_unnamed)
+                if id == other_id && unnamed == other_unnamed =>
+            {
+                child!(a, b)
+            }
             _ => false,
         },
-        Node::MapHapsOwned(a, _, spans) => match right {
-            Node::MapHapsOwned(b, _, other) if spans == other => child!(a, b),
+        Node::MapHapsNative(a) => match right {
+            Node::MapHapsNative(b) if a.2 == b.2 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::UiVisual(a, slot, _) => match right {
-            Node::UiVisual(b, other, _) if slot == other => child!(a, b),
+        Node::MapHapsOwned(a) => match right {
+            Node::MapHapsOwned(b) if a.2 == b.2 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::MapHapsWithState(a, _) => match right {
-            Node::MapHapsWithState(b, _) => child!(a, b),
+        Node::UiVisual(a) => match right {
+            Node::UiVisual(b) if a.slot == b.slot => child!(&a.inner, &b.inner),
             _ => false,
         },
-        Node::ExpandHapsNative(a, _, spans) => match right {
-            Node::ExpandHapsNative(b, _, other) if spans == other => child!(a, b),
+        Node::MapHapsWithState(a) => match right {
+            Node::MapHapsWithState(b) => child!(&a.0, &b.0),
+            _ => false,
+        },
+        Node::ExpandHapsNative(a) => match right {
+            Node::ExpandHapsNative(b) if a.2 == b.2 => child!(&a.0, &b.0),
             _ => false,
         },
         Node::Collect(a) => match right {
@@ -329,8 +315,8 @@ fn same_node<'g>(
             Node::CycleOnsetCount(b) => child!(a, b),
             _ => false,
         },
-        Node::WithRandSeed(a, seed) => match right {
-            Node::WithRandSeed(b, other) if seed.to_bits() == other.to_bits() => child!(a, b),
+        Node::WithRandSeed(a) => match right {
+            Node::WithRandSeed(b) if a.1.to_bits() == b.1.to_bits() => child!(&a.0, &b.0),
             _ => false,
         },
         Node::Signal(_) => matches!(right, Node::Signal(_)),
@@ -348,22 +334,12 @@ fn same_node<'g>(
             }
             _ => false,
         },
-        Node::Pick {
-            selector,
-            lookup,
-            index_mode,
-            mode,
-        } => match right {
-            Node::Pick {
-                selector: other_selector,
-                lookup: other_lookup,
-                index_mode: other_index_mode,
-                mode: other_mode,
-            } => {
-                pending.push((selector, other_selector));
-                index_mode == other_index_mode
-                    && mode == other_mode
-                    && same_lookup(lookup, other_lookup, pending)
+        Node::Pick(a) => match right {
+            Node::Pick(b) => {
+                pending.push((&a.selector, &b.selector));
+                a.index_mode == b.index_mode
+                    && a.mode == b.mode
+                    && same_lookup(&a.lookup, &b.lookup, pending)
             }
             _ => false,
         },
@@ -383,11 +359,9 @@ fn same_node<'g>(
             }
             _ => false,
         },
-        Node::Degrade(a, amount, seed) => match right {
-            Node::Degrade(b, other_amount, other_seed)
-                if amount.to_bits() == other_amount.to_bits() && seed == other_seed =>
-            {
-                child!(a, b)
+        Node::Degrade(a) => match right {
+            Node::Degrade(b) if a.1.to_bits() == b.1.to_bits() && a.2 == b.2 => {
+                child!(&a.0, &b.0)
             }
             _ => false,
         },
@@ -403,73 +377,73 @@ fn same_node<'g>(
             Node::SlowCatPrime(b) => same_children(a, b, pending),
             _ => false,
         },
-        Node::InnerJoin(a, _) => match right {
-            Node::InnerJoin(b, _) => child!(a, b),
+        Node::InnerJoin(a) => match right {
+            Node::InnerJoin(b) => child!(&a.0, &b.0),
             _ => false,
         },
         Node::SplitQueries(a) => match right {
             Node::SplitQueries(b) => child!(a, b),
             _ => false,
         },
-        Node::FastGap(a, factor) => match right {
-            Node::FastGap(b, other) if factor == other => child!(a, b),
+        Node::FastGap(a) => match right {
+            Node::FastGap(b) if a.1 == b.1 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::RepeatCycles(a, count) => match right {
-            Node::RepeatCycles(b, other) if count == other => child!(a, b),
+        Node::RepeatCycles(a) => match right {
+            Node::RepeatCycles(b) if a.1 == b.1 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::LoopAt(a, factor) => match right {
-            Node::LoopAt(b, other) if factor == other => child!(a, b),
+        Node::LoopAt(a) => match right {
+            Node::LoopAt(b) if a.1 == b.1 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::Cpm(a, rate) => match right {
-            Node::Cpm(b, other) if rate.cpm == other.cpm => child!(a, b),
+        Node::Cpm(a) => match right {
+            Node::Cpm(b) if a.1.cpm == b.1.cpm => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::MidiKeys(a, port) => match right {
-            Node::MidiKeys(b, other) if Arc::ptr_eq(port, other) => child!(a, b),
+        Node::MidiKeys(a) => match right {
+            Node::MidiKeys(b) if Arc::ptr_eq(&a.1, &b.1) => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::AppLeft(a, _, flow) => match right {
-            Node::AppLeft(b, _, other_flow) if flow == other_flow => {
+        Node::AppLeft(a) => match right {
+            Node::AppLeft(b) if a.4 == b.4 => {
                 pending.push((&a.1, &b.1));
                 child!(&a.0, &b.0)
             }
             _ => false,
         },
-        Node::Constants(a, run) => match right {
-            Node::Constants(b, other) if crate::RunMeeting::same(run, other) => child!(a, b),
+        Node::Constants(a) => match right {
+            Node::Constants(b) if crate::RunMeeting::same(&a.1, &b.1) => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::AppRight(a, _, flow) => match right {
-            Node::AppRight(b, _, other_flow) if flow == other_flow => {
+        Node::AppRight(a) => match right {
+            Node::AppRight(b) if a.3 == b.3 => {
                 pending.push((&a.1, &b.1));
                 child!(&a.0, &b.0)
             }
             _ => false,
         },
-        Node::AppBoth(a, _, flow) => match right {
-            Node::AppBoth(b, _, other_flow) if flow == other_flow => {
+        Node::AppBoth(a) => match right {
+            Node::AppBoth(b) if a.3 == b.3 => {
                 pending.push((&a.1, &b.1));
                 child!(&a.0, &b.0)
             }
             _ => false,
         },
-        Node::AddContext(a, locations) => match right {
-            Node::AddContext(b, other) if locations == other => child!(a, b),
+        Node::AddContext(a) => match right {
+            Node::AddContext(b) if a.1 == b.1 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::PatternOfPure(a, _) => match right {
-            Node::PatternOfPure(b, _) => child!(a, b),
+        Node::PatternOfPure(a) => match right {
+            Node::PatternOfPure(b) => child!(&a.0, &b.0),
             _ => false,
         },
         Node::PatternOfPureOperand(a, _) => match right {
             Node::PatternOfPureOperand(b, _) => child!(&a.0, &b.0) && child!(&a.1, &b.1),
             _ => false,
         },
-        Node::PatternOfDynamic(a, _) => match right {
-            Node::PatternOfDynamic(b, _) => child!(a, b),
+        Node::PatternOfDynamic(a) => match right {
+            Node::PatternOfDynamic(b) => child!(&a.0, &b.0),
             _ => false,
         },
         Node::PatternOfHap(a) => match right {
@@ -479,10 +453,10 @@ fn same_node<'g>(
             }
             _ => false,
         },
-        Node::XenPatterns(a, ratios) => match right {
-            Node::XenPatterns(b, other) => {
-                pending.push((a, b));
-                same_children(ratios, other, pending)
+        Node::XenPatterns(a) => match right {
+            Node::XenPatterns(b) => {
+                pending.push((&a.0, &b.0));
+                same_children(&a.1, &b.1, pending)
             }
             _ => false,
         },
@@ -490,15 +464,13 @@ fn same_node<'g>(
             Node::Join(b, other) if mode == other => child!(a, b),
             _ => false,
         },
-        Node::FmapJs(a, id) => match right {
-            Node::FmapJs(b, other) if id == other => child!(a, b),
+        Node::FmapJs(a) => match right {
+            Node::FmapJs(b) if a.1 == b.1 => child!(&a.0, &b.0),
             _ => false,
         },
-        Node::FmapJsPreservingControls(a, id, preserved) => match right {
-            Node::FmapJsPreservingControls(b, other, other_preserved)
-                if id == other && preserved.is_some() == other_preserved.is_some() =>
-            {
-                child!(a, b)
+        Node::FmapJsPreservingControls(a) => match right {
+            Node::FmapJsPreservingControls(b) if a.1 == b.1 && a.2.is_some() == b.2.is_some() => {
+                child!(&a.0, &b.0)
             }
             _ => false,
         },

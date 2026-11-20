@@ -34,16 +34,34 @@ use rustel_transpiler::{ScoreProgram, ScoreStatement, Written};
 use std::mem;
 use std::sync::Arc;
 
-/// Each name of the score that a part or a statement read, by its number
-/// among the names of its build, with the version the name had.
-type Read = Box<[(u32, u64)]>;
+/// Sentinel version for an unread or out-of-range name.
+const UNREAD_VERSION: u32 = u32::MAX;
+
+/// A slice `(start, len)` into a flat pool of `(name_number, version)` pairs.
+#[derive(Clone, Copy, Default)]
+struct ReadSpan {
+    start: u32,
+    len: u16,
+}
+
+impl ReadSpan {
+    #[inline]
+    fn get(self, pool: &[(u32, u32)]) -> &[(u32, u32)] {
+        let start = self.start as usize;
+        let end = start + usize::from(self.len);
+        &pool[start..end]
+    }
+}
 
 /// One kept part: where the score writes it, what it built, and what it
 /// read.
 struct Part {
     written: Written,
     pattern: Pattern,
-    read: Read,
+    read: ReadSpan,
+    /// `true` while inside `Reuse::finish` when `read` indexes `before.reads`
+    /// rather than `made_reads`.
+    from_before: bool,
 }
 
 impl Part {
@@ -55,12 +73,13 @@ impl Part {
 }
 
 /// One name of the score: where the score writes its statement, its
-/// version, and what the statement read.
+/// version, its text span in [`Memo::name_texts`], and what the statement read.
 struct Name {
-    text: Box<str>,
     written: Written,
-    version: u64,
-    read: Read,
+    version: u32,
+    text_start: u32,
+    read: ReadSpan,
+    text_len: u16,
 }
 
 /// What the last native build of a score kept.
@@ -71,16 +90,32 @@ pub(in crate::runtime) struct Memo {
     /// None before the first build.
     pub(in crate::runtime) source: Option<Arc<str>>,
     /// The kept parts, in the order of their places.
-    parts: Vec<Part>,
+    parts: Box<[Part]>,
     /// The names of the score, each at its number: the place of its
     /// statement among the statements with a name.
-    names: Vec<Name>,
+    names: Box<[Name]>,
+    /// Concatenated texts of every name in [`Self::names`].
+    name_texts: Box<str>,
+    /// Flat pool of `(name_number, version)` pairs read by parts and names.
+    reads: Box<[(u32, u32)]>,
     /// The numbers of the names, in the order of the texts of the names.
-    by_text: Vec<u32>,
+    by_text: Box<[u32]>,
     /// The version that the next new or changed name takes.
-    next: u64,
+    next: u32,
     /// The tempo that the last native build set, if any.
     pub(in crate::runtime) cps: Option<f64>,
+}
+
+impl Memo {
+    #[inline]
+    fn name_text(&self, index: usize) -> &str {
+        let Some(name) = self.names.get(index) else {
+            return "";
+        };
+        let start = name.text_start as usize;
+        let end = start + usize::from(name.text_len);
+        self.name_texts.get(start..end).unwrap_or("")
+    }
 }
 
 /// How many bytes two texts are compared at a time.
@@ -164,9 +199,10 @@ struct Current<'p> {
     /// The number of the name among the names of the build before.
     was: Option<usize>,
     /// The version of the name, when the build asked for it.
-    version: Option<u64>,
-    /// What the statement of the name read, when the build evaluated it.
-    read: Option<Read>,
+    version: Option<u32>,
+    /// What the statement of the name read, when the build evaluated it
+    /// (indexes [`Reuse::made_reads`]).
+    read: Option<ReadSpan>,
 }
 
 /// One build's use of the memo of the build before: it takes parts from
@@ -180,6 +216,8 @@ pub(super) struct Reuse<'p> {
     taken: Vec<bool>,
     /// The parts that this build evaluated and keeps.
     made: Vec<Part>,
+    /// Flat pool of `(name_number, version)` pairs recorded during this build.
+    made_reads: Vec<(u32, u32)>,
     /// The names of the program, each at its number.
     names: Vec<Current<'p>>,
     /// The number that each name of `before` has in this build.
@@ -190,7 +228,7 @@ pub(super) struct Reuse<'p> {
     read: Vec<u32>,
     /// How many effects of the score the build ran.
     effects: u32,
-    next: u64,
+    next: u32,
 }
 
 impl<'p> Reuse<'p> {
@@ -215,12 +253,9 @@ impl<'p> Reuse<'p> {
         // The same name of the build before, found by its text.
         let mut now = vec![None; before.names.len()];
         for (number, name) in names.iter_mut().enumerate() {
-            let found = before.by_text.binary_search_by_key(&name.text, |was| {
-                before
-                    .names
-                    .get(*was as usize)
-                    .map_or("", |kept| &*kept.text)
-            });
+            let found = before
+                .by_text
+                .binary_search_by_key(&name.text, |was| before.name_text(*was as usize));
             if let (Ok(at), Ok(number)) = (found, u32::try_from(number)) {
                 let was = before.by_text[at] as usize;
                 name.was = Some(was);
@@ -234,6 +269,7 @@ impl<'p> Reuse<'p> {
             next: before.next,
             before,
             made: Vec::new(),
+            made_reads: Vec::new(),
             names,
             now,
             open: Vec::new(),
@@ -321,9 +357,10 @@ impl<'p> Reuse<'p> {
         }
         // Each name that the part read is a name of this build, with the
         // version that the part read.
-        let count = self.before.parts[at].read.len();
+        let read_span = self.before.parts[at].read;
+        let count = usize::from(read_span.len);
         for index in 0..count {
-            let (was, version) = self.before.parts[at].read[index];
+            let (was, version) = self.before.reads[read_span.start as usize + index];
             let number = self.now.get(was as usize).copied().flatten()?;
             if self.version(number) != version {
                 return None;
@@ -332,7 +369,7 @@ impl<'p> Reuse<'p> {
         // What the part read, the part or the statement around it reads.
         if !self.open.is_empty() {
             let now = &self.now;
-            let numbers = self.before.parts[at].read.iter();
+            let numbers = read_span.get(&self.before.reads).iter();
             let numbers = numbers.filter_map(|(was, _)| now.get(*was as usize).copied().flatten());
             self.read.extend(numbers);
         }
@@ -354,12 +391,15 @@ impl<'p> Reuse<'p> {
         if !closed.kept {
             return;
         }
-        let read = self.versions_of(closed.read);
+        let Some(read) = self.versions_of(closed.read) else {
+            return;
+        };
         self.made.push(Part {
             written,
             // A handle of the pattern, which the graph holds too.
             pattern: pattern.clone(),
             read,
+            from_before: false,
         });
     }
 
@@ -393,18 +433,19 @@ impl<'p> Reuse<'p> {
             .names
             .get(number as usize)
             .is_some_and(|name| name.read.is_none())
+            && let Some(read) = self.versions_of(closed.read)
         {
-            let read = self.versions_of(closed.read);
             self.names[number as usize].read = Some(read);
         }
     }
 
     /// Each name that the build read from place `start` of its list on, one
-    /// time, with its version. The list then holds each of them one time:
-    /// it is the end of the list of each part and statement that is open.
-    fn versions_of(&mut self, start: usize) -> Read {
+    /// time, with its version, appended to [`Self::made_reads`]. The list then
+    /// holds each of them one time: it is the end of the list of each part and
+    /// statement that is open.
+    fn versions_of(&mut self, start: usize) -> Option<ReadSpan> {
         let Some(read) = self.read.get_mut(start..).filter(|read| !read.is_empty()) else {
-            return Read::default();
+            return Some(ReadSpan::default());
         };
         read.sort_unstable();
         let mut kept = 1;
@@ -415,29 +456,38 @@ impl<'p> Reuse<'p> {
             }
         }
         self.read.truncate(start + kept);
-        let mut versions = Vec::with_capacity(kept);
+        let pool_start = u32::try_from(self.made_reads.len()).ok()?;
+        let pool_len = u16::try_from(kept).ok()?;
+        self.made_reads.reserve(kept);
         for at in start..start + kept {
             let number = self.read[at];
-            versions.push((number, self.version(number)));
+            let version = self.version(number);
+            self.made_reads.push((number, version));
         }
-        versions.into_boxed_slice()
+        Some(ReadSpan {
+            start: pool_start,
+            len: pool_len,
+        })
     }
 
     /// The version of the name with `number`: the version of the build
     /// before when the text of its statement is the same and each name
     /// that the statement read keeps its version, and a new one otherwise.
-    fn version(&mut self, number: u32) -> u64 {
+    fn version(&mut self, number: u32) -> u32 {
         let at = number as usize;
         // A number of no name is of no build: it has a version of its own.
         let Some(name) = self.names.get(at) else {
-            return u64::MAX;
+            return UNREAD_VERSION;
         };
         if let Some(version) = name.version {
             return version;
         }
         // A name that reads itself, through any number of names, is new.
         let new = self.next;
-        self.next += 1;
+        self.next = self.next.wrapping_add(1);
+        if self.next == UNREAD_VERSION {
+            self.next = 0;
+        }
         self.names[at].version = Some(new);
         let Some(was) = self.names[at].was else {
             return new;
@@ -447,8 +497,9 @@ impl<'p> Reuse<'p> {
             return new;
         }
         let version = kept.version;
-        for index in 0..self.before.names[was].read.len() {
-            let (read_was, read_version) = self.before.names[was].read[index];
+        let read_span = kept.read;
+        for index in 0..usize::from(read_span.len) {
+            let (read_was, read_version) = self.before.reads[read_span.start as usize + index];
             let now = self.now.get(read_was as usize).copied().flatten();
             if now.map(|number| self.version(number)) != Some(read_version) {
                 return new;
@@ -462,22 +513,16 @@ impl<'p> Reuse<'p> {
     /// each name of the program.
     pub(super) fn finish(mut self, cps: Option<f64>) -> Memo {
         let now = mem::take(&mut self.now);
-        // Each name that a taken part or statement read is a name of this
-        // build, and takes its number in it.
-        let renumbered = |read: Read| -> Read {
-            let number = |was: u32| now.get(was as usize).copied().flatten();
-            read.into_iter()
-                .filter_map(|(was, version)| Some((number(was)?, version)))
-                .collect()
-        };
         let taken = mem::take(&mut self.taken);
         let mut parts: Vec<Part> = mem::take(&mut self.before.parts)
+            .into_vec()
             .into_iter()
             .zip(taken)
-            .filter_map(|(part, taken)| taken.then_some(part))
-            .map(|part| Part {
-                read: renumbered(part.read),
-                ..part
+            .filter_map(|(mut part, taken)| {
+                taken.then(|| {
+                    part.from_before = true;
+                    part
+                })
             })
             .collect();
         parts.append(&mut self.made);
@@ -499,9 +544,6 @@ impl<'p> Reuse<'p> {
         if self.names.is_empty() && parts.len() == 1 {
             parts.clear();
         }
-        // The next build reads this list for every part it finds, so the
-        // room a part left when its duplicate went is not kept.
-        parts.shrink_to_fit();
         // A re-evaluation of the same text shares the handle the build
         // before kept, so the text lives one time. An aborted build makes
         // no handle.
@@ -512,54 +554,109 @@ impl<'p> Reuse<'p> {
         if parts.is_empty() {
             return Memo {
                 source: Some(source),
-                parts,
-                names: Vec::new(),
-                by_text: Vec::new(),
+                parts: Box::new([]),
+                names: Box::new([]),
+                name_texts: Box::from(""),
+                reads: Box::new([]),
+                by_text: Box::new([]),
                 next: self.next,
                 cps,
             };
         }
-        let mut before = mem::take(&mut self.before.names);
-        // A list of its own, with room for the names alone: the list of
-        // the build is larger.
+        let before_reads = mem::take(&mut self.before.reads);
+        let made_reads = mem::take(&mut self.made_reads);
+        let mut reads: Vec<(u32, u32)> = Vec::new();
+        let push_renumbered = |reads: &mut Vec<(u32, u32)>, span: ReadSpan| -> ReadSpan {
+            if span.len == 0 {
+                return ReadSpan::default();
+            }
+            let start = reads.len();
+            for &(was, version) in span.get(&before_reads) {
+                if let Some(number) = now.get(was as usize).copied().flatten() {
+                    reads.push((number, version));
+                }
+            }
+            let len = reads.len() - start;
+            match (u32::try_from(start), u16::try_from(len)) {
+                (Ok(start), Ok(len)) if len > 0 => ReadSpan { start, len },
+                _ => {
+                    reads.truncate(start);
+                    ReadSpan::default()
+                }
+            }
+        };
+        let push_made = |reads: &mut Vec<(u32, u32)>, span: ReadSpan| -> ReadSpan {
+            if span.len == 0 {
+                return ReadSpan::default();
+            }
+            let start = reads.len();
+            reads.extend_from_slice(span.get(&made_reads));
+            match u32::try_from(start) {
+                Ok(start) => ReadSpan {
+                    start,
+                    len: span.len,
+                },
+                Err(_) => {
+                    reads.truncate(start);
+                    ReadSpan::default()
+                }
+            }
+        };
+        for part in &mut parts {
+            part.read = if part.from_before {
+                push_renumbered(&mut reads, part.read)
+            } else {
+                push_made(&mut reads, part.read)
+            };
+            part.from_before = false;
+        }
+        let before_names = mem::take(&mut self.before.names);
+        let mut name_texts = String::new();
         let mut names: Vec<Name> = Vec::with_capacity(self.names.len());
-        names.extend(self.names.into_iter().map(|name| {
-            let kept = name.was.map(|was| {
-                let kept = &mut before[was];
-                (
-                    mem::take(&mut kept.text),
-                    mem::take(&mut kept.read),
-                    kept.version,
-                )
-            });
+        for name in self.names {
+            let kept = name
+                .was
+                .map(|was| (before_names[was].read, before_names[was].version));
             // What the statement read now, or what it read before when
             // this build took each part that called it.
-            let (text, read) = match (kept, name.read) {
-                (Some((text, ..)), Some(read)) => (text, read),
-                (Some((text, read, version)), None) if name.version == Some(version) => {
-                    (text, renumbered(read))
+            let read = match (kept, name.read) {
+                (_, Some(span)) => push_made(&mut reads, span),
+                (Some((span, version)), None) if name.version == Some(version) => {
+                    push_renumbered(&mut reads, span)
                 }
-                (Some((text, ..)), None) => (text, Read::default()),
-                (None, read) => (Box::from(name.text), read.unwrap_or_default()),
+                _ => ReadSpan::default(),
             };
-            Name {
-                text,
+            let text_start = u32::try_from(name_texts.len()).unwrap_or(0);
+            let text_len = u16::try_from(name.text.len()).unwrap_or(0);
+            if text_len as usize == name.text.len() {
+                name_texts.push_str(name.text);
+            }
+            names.push(Name {
                 written: name.written,
                 // A name that nothing read takes a version that no name
                 // has, so the next build finds it new.
-                version: name.version.unwrap_or(u64::MAX),
+                version: name.version.unwrap_or(UNREAD_VERSION),
+                text_start,
                 read,
-            }
-        }));
+                text_len,
+            });
+        }
         let mut by_text: Vec<u32> = (0..names.len())
             .filter_map(|number| u32::try_from(number).ok())
             .collect();
-        by_text.sort_unstable_by_key(|number| &*names[*number as usize].text);
+        by_text.sort_unstable_by_key(|number| {
+            let name = &names[*number as usize];
+            let start = name.text_start as usize;
+            let end = start + usize::from(name.text_len);
+            &name_texts[start..end]
+        });
         Memo {
             source: Some(source),
-            parts,
-            names,
-            by_text,
+            parts: parts.into_boxed_slice(),
+            names: names.into_boxed_slice(),
+            name_texts: name_texts.into_boxed_str(),
+            reads: reads.into_boxed_slice(),
+            by_text: by_text.into_boxed_slice(),
             next: self.next,
             cps,
         }

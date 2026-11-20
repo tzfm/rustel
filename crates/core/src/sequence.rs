@@ -1605,16 +1605,15 @@ fn unpack_dress_loc(packed: u32) -> (usize, usize) {
 }
 
 /// Rare tail fields of [`Dress`]: spilled leading locations, trailing locations,
-/// context keys, and non-map or empty-map set values.
+/// custom control names, and non-map or empty-map set values.
 #[derive(Clone, Default)]
 struct DressTail {
     /// Leading locations when more than two ranges or a wide range are present.
     before: Locations,
     /// The locations of each hap after its step's own.
     after: Locations,
-    /// The keys of the context of each hap, as a map of the haps set them:
-    /// the scale that `scale` names, for one.
-    keys: ContextKeys,
+    /// Custom (non-built-in) control names when `Dress::named_id == 0`.
+    custom_named: Option<Arc<[Arc<str>]>>,
     /// Rare non-object or empty-object `Dress::set` value.
     set_other: Option<Value>,
 }
@@ -1623,19 +1622,21 @@ struct DressTail {
 /// layers that a fold dresses alike share one: see [`redressed`].
 #[derive(Clone, Default)]
 struct Dress {
-    /// The names of the control that names each value when it is read: a
-    /// value reads as the map that [`crate::controls::named_value`] makes
-    /// of it. See [`Layer::named`].
-    named: Option<Arc<[Arc<str>]>>,
     /// Undressed non-empty control map entries set on each value when read.
     /// Rare empty-map or non-object set values live in `tail.set_other`.
     set_map: Option<Arc<[(crate::Key, Value)]>>,
+    /// The keys of the context of each hap (for example, `scale` or visual
+    /// slots), kept inline so scaled and visualized layers avoid `DressTail`.
+    keys: ContextKeys,
     /// Up to two compact leading locations packed inline; `[0, 0]` when empty
     /// or spilled into `tail.before`.
     before_packed: [u32; 2],
-    /// Rare spilled leading locations, trailing locations, context keys, and
+    /// Rare spilled leading locations, trailing locations, custom names, and
     /// non-map set values.
     tail: Option<Box<DressTail>>,
+    /// Built-in 1-based control id naming each value when read, or `0` when
+    /// unnamed or named by a custom control in `tail.custom_named`.
+    named_id: u16,
 }
 
 const _: () = assert!(size_of::<Dress>() == 48);
@@ -1644,10 +1645,11 @@ static EMPTY_LOCATIONS: Locations = Locations::new();
 
 /// The dress of a layer that no fold dressed.
 static BARE: Dress = Dress {
-    named: None,
     set_map: None,
+    keys: ContextKeys::NONE,
     before_packed: [0, 0],
     tail: None,
+    named_id: 0,
 };
 
 impl Dress {
@@ -1752,16 +1754,59 @@ impl Dress {
 
     #[inline]
     fn keys(&self) -> &ContextKeys {
-        self.tail
-            .as_deref()
-            .map_or(&ContextKeys::NONE, |tail| &tail.keys)
+        &self.keys
+    }
+
+    #[inline]
+    fn has_name(&self) -> bool {
+        self.named_id != 0
+            || self
+                .tail
+                .as_deref()
+                .is_some_and(|tail| tail.custom_named.is_some())
+    }
+
+    #[inline]
+    fn named(&self) -> Option<&[Arc<str>]> {
+        if self.named_id != 0 {
+            crate::controls::builtin_names_by_id(self.named_id).map(|names| &**names)
+        } else {
+            self.tail
+                .as_deref()
+                .and_then(|tail| tail.custom_named.as_deref())
+        }
+    }
+
+    fn set_named(&mut self, id: u16, names: &Arc<[Arc<str>]>) {
+        if id != 0 {
+            self.named_id = id;
+            if let Some(tail) = &mut self.tail
+                && tail.custom_named.is_some()
+            {
+                tail.custom_named = None;
+                self.prune_tail();
+            }
+        } else {
+            self.named_id = 0;
+            self.tail.get_or_insert_with(Default::default).custom_named = Some(Arc::clone(names));
+        }
+    }
+
+    fn clear_named(&mut self) {
+        self.named_id = 0;
+        if let Some(tail) = &mut self.tail
+            && tail.custom_named.is_some()
+        {
+            tail.custom_named = None;
+            self.prune_tail();
+        }
     }
 
     fn prune_tail(&mut self) {
         if self.tail.as_deref().is_some_and(|tail| {
             tail.before.is_empty()
                 && tail.after.is_empty()
-                && tail.keys.is_empty()
+                && tail.custom_named.is_none()
                 && tail.set_other.is_none()
         }) {
             self.tail = None;
@@ -1840,21 +1885,14 @@ impl Dress {
     }
 
     fn set_keys(&mut self, keys: ContextKeys) {
-        if keys.is_empty() && self.tail.is_none() {
-            return;
-        }
-        self.tail.get_or_insert_with(Default::default).keys = keys;
-        self.prune_tail();
+        self.keys = keys;
     }
 
     fn add_ui_visual_slot(&mut self, slot: u8) {
         if slot >= 64 {
             return;
         }
-        self.tail
-            .get_or_insert_with(Default::default)
-            .keys
-            .add_ui_visual_slot(slot);
+        self.keys.add_ui_visual_slot(slot);
     }
 
     fn clear_after(&mut self) {
@@ -1922,10 +1960,10 @@ impl Dress {
 
     /// Whether the dress gives a hap nothing.
     fn is_bare(&self) -> bool {
-        self.named.is_none()
+        !self.has_name()
             && !self.has_set()
             && self.before_is_empty()
-            && self.keys().is_empty()
+            && self.keys.is_empty()
             && self.after().is_empty()
     }
 
@@ -1953,9 +1991,13 @@ impl Dress {
             (None, None) => true,
             _ => false,
         };
+        let same_named = match (self.named_id, other.named_id) {
+            (a, b) if a != 0 && b != 0 => a == b,
+            _ => self.named() == other.named(),
+        };
         same_set
-            && self.named == other.named
-            && self.keys().same(other.keys())
+            && same_named
+            && self.keys.same(&other.keys)
             && self.same_before(other)
             && self.after() == other.after()
     }
@@ -2359,14 +2401,14 @@ impl Layer {
         self.set_maps(values.iter().all(|value| matches!(value, Value::Object(_))));
         self.values = values;
         self.change_dress(|dress| {
-            dress.named = None;
+            dress.clear_named();
             dress.clear_set();
         });
         self.values_read = OnceLock::new();
         self
     }
 
-    /// Name each value of these layers by the control of `names`, as the
+    /// Name each value of these layers by `spec`, as the
     /// map of the control over its haps gives them. No value is made now:
     /// a chain of controls after the name makes each value one time, at
     /// the first read, and a layer that no query reads makes none.
@@ -2375,10 +2417,14 @@ impl Layer {
     /// name](Self::takes_name).
     fn named<'a>(
         layers: impl IntoIterator<Item = &'a Layer>,
-        names: &Arc<[Arc<str>]>,
+        spec: &crate::controls::ControlSpec,
     ) -> Vec<Layer> {
-        // A handle of the names, which the control holds.
-        let mut layers = redressed(layers, |dress| dress.named = Some(Arc::clone(names)));
+        let id = if spec.id != 0 {
+            spec.id
+        } else {
+            crate::controls::builtin_id_of_names(&spec.names)
+        };
+        let mut layers = redressed(layers, |dress| dress.set_named(id, &spec.names));
         for layer in &mut layers {
             layer.set_maps(true);
         }
@@ -2387,13 +2433,18 @@ impl Layer {
 
     /// Name `layers` in place when they are unshared, avoiding `Vec<Layer>`,
     /// `Arc<[Layer]>`, and `Arc<NodeCell>` churn on `s("...")` / `note("...")`.
-    fn named_in_place(layers: &mut [Layer], names: &Arc<[Arc<str>]>) {
+    fn named_in_place(layers: &mut [Layer], spec: &crate::controls::ControlSpec) {
+        let id = if spec.id != 0 {
+            spec.id
+        } else {
+            crate::controls::builtin_id_of_names(&spec.names)
+        };
         if let [layer] = layers {
             if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
-                dress.named = Some(Arc::clone(names));
+                dress.set_named(id, &spec.names);
             } else {
                 let mut dress = layer.dress().clone();
-                dress.named = Some(Arc::clone(names));
+                dress.set_named(id, &spec.names);
                 layer.dress = Some(Arc::new(dress));
             }
             layer.set_maps(true);
@@ -2403,7 +2454,7 @@ impl Layer {
         let mut last: Option<(*const Dress, Arc<Dress>)> = None;
         for layer in layers {
             if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
-                dress.named = Some(Arc::clone(names));
+                dress.set_named(id, &spec.names);
                 layer.set_maps(true);
                 layer.values_read = OnceLock::new();
                 continue;
@@ -2413,7 +2464,7 @@ impl Layer {
                 Some((seen, dress)) if *seen == from => Arc::clone(dress),
                 _ => {
                     let mut dress = layer.dress().clone();
-                    dress.named = Some(Arc::clone(names));
+                    dress.set_named(id, &spec.names);
                     let dress = Arc::new(dress);
                     last = Some((from, Arc::clone(&dress)));
                     dress
@@ -2428,7 +2479,7 @@ impl Layer {
     /// Whether [`Self::named`] names the values of this layer: it holds no
     /// name and no control yet.
     fn takes_name(&self) -> bool {
-        self.dress().named.is_none() && !self.dress().has_set()
+        !self.dress().has_name() && !self.dress().has_set()
     }
 
     /// This layer where each value takes the keys of the one value of
@@ -2480,12 +2531,8 @@ impl Layer {
         known_keys: Option<&ContextKeys>,
         last_dress: &mut Option<(*const Dress, Arc<Dress>)>,
     ) -> Option<Self> {
-        let names = self
-            .dress()
-            .named
-            .as_ref()
-            .filter(|_| !self.dress().has_set())?;
-        let [name] = &names[..] else {
+        let names = self.dress().named().filter(|_| !self.dress().has_set())?;
+        let [name] = names else {
             return None;
         };
         if !matches!(&**name, "note" | "n") {
@@ -2530,7 +2577,18 @@ impl Layer {
                     }
                 };
                 let mut next = self.dress().clone();
-                next.named = Some(crate::controls::note_names());
+                let note_id = crate::controls::note_control_id();
+                if note_id != 0 {
+                    next.named_id = note_id;
+                    if let Some(tail) = &mut next.tail
+                        && tail.custom_named.is_some()
+                    {
+                        tail.custom_named = None;
+                        next.prune_tail();
+                    }
+                } else {
+                    next.set_named(0, &crate::controls::note_names());
+                }
                 next.clear_set();
                 next.set_keys(keys);
                 let dress = Arc::new(next);
@@ -2678,7 +2736,7 @@ impl Layer {
     }
 
     fn reader_and_contexts<'a>(&'a self, dress: &Dress) -> (Values<'a>, Option<&'a [Locations]>) {
-        let needs_values = dress.named.is_some() || dress.has_set();
+        let needs_values = dress.has_name() || dress.has_set();
         let needs_contexts = Self::spills_contexts(dress);
         if !needs_values && !needs_contexts {
             return (Values::Held(&self.values), None);
@@ -2704,7 +2762,7 @@ impl Layer {
     /// The values as `dress` makes them: one table that their maps read
     /// where that gives the same maps, else each value made on its own.
     fn read_values(&self, dress: &Dress) -> Arc<Table> {
-        let needs_values = dress.named.is_some() || dress.has_set();
+        let needs_values = dress.has_name() || dress.has_set();
         let core = if !needs_values {
             LayerCachedValues::Held
         } else {
@@ -2714,7 +2772,8 @@ impl Layer {
                 Some(Value::Object(set)) if !union_drops(set) => Some(Some(set)),
                 Some(_) => None,
             };
-            let key = match &dress.named {
+            let named = dress.named();
+            let key = match named {
                 Some(names) => self
                     .values
                     .iter()
@@ -2732,7 +2791,7 @@ impl Layer {
                         .iter()
                         .map(|value| {
                             // A handle of the value, or a copy of its text.
-                            let mut value = match &dress.named {
+                            let mut value = match named {
                                 Some(names) => crate::controls::named_value(names, value.clone()),
                                 None => value.clone(),
                             };
@@ -3639,7 +3698,7 @@ pub(crate) fn is_data(pattern: &Pattern) -> bool {
     match pattern.node_kind() {
         Node::Sequence(layers) => holds_data(layers),
         Node::Pure(value) => value.is_data(0),
-        Node::AddContext(inner, _) => is_data(inner),
+        Node::AddContext(boxed) => is_data(&boxed.0),
         _ => false,
     }
 }
@@ -3769,7 +3828,7 @@ fn constant_value_of(values: &Pattern) -> Option<Cow<'_, Value>> {
     }
     match values.node_kind() {
         Node::Pure(value) if value.is_data(0) => Some(Cow::Borrowed(value)),
-        Node::AddContext(inner, _) => constant_value_of(inner),
+        Node::AddContext(boxed) => constant_value_of(&boxed.0),
         Node::Sequence(layers) => constant_value(layers),
         _ => None,
     }
@@ -3778,9 +3837,9 @@ fn constant_value_of(values: &Pattern) -> Option<Cow<'_, Value>> {
 /// The locations of the hap of `values`, a [constant](constant_value_of).
 fn constant_locations(values: &Pattern) -> Locations {
     match values.node_kind() {
-        Node::AddContext(inner, locations) => {
-            let mut context = constant_locations(inner);
-            context.extend_from_slice(locations);
+        Node::AddContext(boxed) => {
+            let mut context = constant_locations(&boxed.0);
+            context.extend_from_slice(&boxed.1);
             context
         }
         Node::Sequence(layers) => layers[0].context(0),
@@ -3954,27 +4013,30 @@ pub(crate) fn constant_value_at(values: &Pattern) -> Option<(Value, Locations)> 
 /// `pattern` with each value named by the control of `names`, as
 /// [`Pattern::map_control`] names it, when `pattern` is a sequence or a
 /// constant that holds no name and no control yet. See [`Layer::named`].
-pub(crate) fn named(pattern: &Pattern, names: &Arc<[Arc<str>]>) -> Option<Pattern> {
+pub(crate) fn named(pattern: &Pattern, spec: &crate::controls::ControlSpec) -> Option<Pattern> {
     let layers = layers(pattern)?;
     if !layers.iter().all(Layer::takes_name) {
         return None;
     }
     // Each layer of a node has steps, so each one stays. The layers are
     // made where the new node holds them.
-    let named: Arc<[Layer]> = Layer::named(layers.iter(), names).into();
+    let named: Arc<[Layer]> = Layer::named(layers.iter(), spec).into();
     Some(Pattern::of(Node::Sequence(named)))
 }
 
 /// Try to name `layers` of an owned `Node::Sequence` in place when unshared.
 /// Returns `true` if `layers` were updated in place.
-pub(crate) fn named_in_place(layers: &mut Arc<[Layer]>, names: &Arc<[Arc<str>]>) -> bool {
+pub(crate) fn named_in_place(
+    layers: &mut Arc<[Layer]>,
+    spec: &crate::controls::ControlSpec,
+) -> bool {
     if !layers.iter().all(Layer::takes_name) {
         return false;
     }
     let Some(slice) = Arc::get_mut(layers) else {
         return false;
     };
-    Layer::named_in_place(slice, names);
+    Layer::named_in_place(slice, spec);
     true
 }
 
@@ -4638,8 +4700,8 @@ mod tests {
             seen.len()
         };
         let (_, layers) = sequences().swap_remove(5);
-        let names: Arc<[Arc<str>]> = Arc::from(vec![Arc::<str>::from("note")]);
-        let pattern = named(&built(&layers), &names).expect("a named sequence");
+        let spec = crate::controls::ControlSpec::new(["note"]);
+        let pattern = named(&built(&layers), &spec).expect("a named sequence");
         assert_eq!(dresses(&pattern), 1);
         let control = Value::object([("gain".to_string(), Value::F64(0.5))]);
         let set = compose(&pattern, &pure(control), ComposeOp::Set, Alignment::In);
@@ -4648,7 +4710,7 @@ mod tests {
         let located = located(&set, &[(3, 5)]).expect("a located sequence");
         assert_eq!(dresses(&located), 1);
         // Two sequences of two dresses, one after the other in a stack.
-        let other = named(&built(&sequences()[0].1), &names).expect("a named sequence");
+        let other = named(&built(&sequences()[0].1), &spec).expect("a named sequence");
         let both = stack(vec![located, other]);
         assert_eq!(dresses(&both), 2);
     }
@@ -5347,13 +5409,10 @@ mod tests {
     /// The controls that the last meeting of `pattern` holds apart, when
     /// `pattern` is a run of constants that ends with sets in a row.
     fn sets_of(pattern: &Pattern) -> Option<&[Value]> {
-        let Node::Constants(_, run) = pattern.node_kind() else {
+        let Node::Constants(node) = pattern.node_kind() else {
             return None;
         };
-        match &run.last()?.apply {
-            Combine::Sets(controls) => Some(controls),
-            _ => None,
-        }
+        node.1.last()?.sets_controls()
     }
 
     /// Sets of constant controls in a row on a pattern that is no sequence
@@ -5412,9 +5471,10 @@ mod tests {
             for (base_name, base) in bases {
                 let name = format!("{base_name} of {name}");
                 let joined = chain(base(&layers));
-                let Node::Constants(under, run) = joined.node_kind() else {
+                let Node::Constants(node) = joined.node_kind() else {
                     panic!("{name} is no run of constants");
                 };
+                let (under, run) = (&node.0, &node.1);
                 assert_eq!(run.len(), 1, "{name}");
                 assert_eq!(sets_of(&joined).map(<[Value]>::len), Some(4), "{name}");
                 assert!(!matches!(under.node_kind(), Node::Constants(..)), "{name}");
@@ -5852,9 +5912,10 @@ mod tests {
             let Node::Stack(patterns) = set.node_kind() else {
                 panic!("{name} is no stack");
             };
-            let Node::Constants(_, run) = patterns[1].node_kind() else {
+            let Node::Constants(node) = patterns[1].node_kind() else {
                 panic!("the wave of {name} meets no constant");
             };
+            let run = &node.1;
             assert_eq!(run.len(), 1, "{name}");
             assert!(sets_of(&patterns[1]).is_none(), "{name}");
         }
@@ -5875,9 +5936,10 @@ mod tests {
                 ControlSpec::new(["pan"]).apply(&set, Some(located_value(1.5)))
             };
             let set = chain();
-            let Node::Constants(_, run) = set.node_kind() else {
+            let Node::Constants(node) = set.node_kind() else {
                 panic!("{name} is no run of constants");
             };
+            let run = &node.1;
             assert_eq!(run.len(), 2, "{name}");
             assert!(sets_of(&set).is_none(), "{name}");
             assert_same_answers(name, &set, &unfolded(chain));
@@ -5902,7 +5964,7 @@ mod tests {
                 let picked = crate::pick(selector, lookup, index, join);
                 ControlSpec::new(["gain"]).apply(&picked, Some(located_value(0.5)))
             };
-            let folded = matches!(chain().node_kind(), Node::Pick { .. });
+            let folded = matches!(chain().node_kind(), Node::Pick(..));
             assert_eq!(folded, lies_in_cycles(&built(&layers)), "{name}");
             assert_same_answers(name, &chain(), &unfolded(chain));
         }
@@ -6005,7 +6067,13 @@ mod tests {
             .collect();
         let mut layer = Layer::new(frac((1, 1)), raws, values.into());
         layer.change_dress(|dress| {
-            dress.named = names.map(|names| names.iter().map(|name| Arc::from(*name)).collect());
+            if let Some(names) = names {
+                let names: Arc<[Arc<str>]> = names.iter().map(|name| Arc::from(*name)).collect();
+                let id = crate::controls::builtin_id_of_names(&names);
+                dress.set_named(id, &names);
+            } else {
+                dress.clear_named();
+            }
             dress.assign_set(set);
         });
         layer
@@ -6015,11 +6083,12 @@ mod tests {
     /// each value before the steps shared a table.
     fn made_plain(layer: &Layer) -> Vec<Value> {
         let dress = layer.dress();
+        let named = dress.named();
         layer
             .values
             .iter()
             .map(|value| {
-                let mut value = match &dress.named {
+                let mut value = match named {
                     Some(names) => crate::controls::named_value(names, value.clone()),
                     None => value.clone(),
                 };
