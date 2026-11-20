@@ -498,6 +498,71 @@ impl Fraction {
         checked_normalised(n, d)
     }
 
+    /// The reduced cycle time of a 64-bit signed tick with a power-of-two grid.
+    #[inline]
+    pub fn dyadic_i64(n: i64, shift: u32) -> Option<Self> {
+        if n == 0 {
+            return Some(Self::ZERO);
+        }
+        if shift >= 63 {
+            return Self::dyadic(i128::from(n), shift);
+        }
+        let tz = n.trailing_zeros().min(shift);
+        Some(Self {
+            n: i128::from(n >> tz),
+            d: den(1i128 << (shift - tz)),
+        })
+    }
+
+    /// Exact division by `2^shift` using bit shifts with no GCD or multiplication.
+    #[inline]
+    pub fn checked_div_pow2(self, shift: u32) -> Option<Self> {
+        if self.n == 0 || shift == 0 {
+            return Some(self);
+        }
+        let tz = self.n.trailing_zeros().min(shift);
+        let rem = shift - tz;
+        if rem == 0 {
+            return Some(Self {
+                n: self.n >> tz,
+                d: self.d,
+            });
+        }
+        if rem >= 127 || (self.d.get() as u128).leading_zeros() <= rem {
+            return None;
+        }
+        Some(Self {
+            n: self.n >> tz,
+            d: den(self.d.get() << rem),
+        })
+    }
+
+    /// Exact multiplication by `2^shift` using bit shifts with no GCD or multiplication.
+    #[inline]
+    pub fn checked_mul_pow2(self, shift: u32) -> Option<Self> {
+        if self.n == 0 || shift == 0 {
+            return Some(self);
+        }
+        let tz = self.d.trailing_zeros().min(shift);
+        let rem = shift - tz;
+        let d = self.d.get() >> tz;
+        if rem == 0 {
+            return Some(Self {
+                n: self.n,
+                d: den(d),
+            });
+        }
+        let mag = self.n.unsigned_abs();
+        if rem >= 127 || mag.leading_zeros() <= rem {
+            return None;
+        }
+        let shifted = (mag << rem) as i128;
+        Some(Self {
+            n: if self.n < 0 { -shifted } else { shifted },
+            d: den(d),
+        })
+    }
+
     /// The reduced cycle time of a signed tick on a uniform grid.
     #[inline]
     pub fn from_ticks(ticks: i128, ticks_per_cycle: NonZeroU32) -> Self {

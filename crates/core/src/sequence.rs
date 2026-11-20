@@ -1844,7 +1844,15 @@ impl<'a> GridView<'a> {
     fn made_small_with(self, ticks: i64, reductions: Option<&TickGrid>) -> Fraction {
         match reductions {
             Some(reductions) => reductions.time(ticks),
-            None => Fraction::from_ticks(i128::from(ticks), self.ticks),
+            None => {
+                let d = self.ticks.get();
+                if d.is_power_of_two()
+                    && let Some(time) = Fraction::dyadic_i64(ticks, d.trailing_zeros())
+                {
+                    return time;
+                }
+                Fraction::from_ticks(i128::from(ticks), self.ticks)
+            }
         }
     }
 
@@ -4428,7 +4436,9 @@ impl Layer {
         out: &mut Vec<Hap>,
     ) -> Option<Result<(), SequenceStop>> {
         let (begin_low, begin_high) = grid.ticks_at(turn.begin)?;
-        let (_end_low, end_high) = grid.ticks_at(turn.end)?;
+        let (end_low, end_high) = grid.ticks_at(turn.end)?;
+        let begin_exact = begin_low == begin_high;
+        let end_exact = end_low == end_high;
         let instant = span.begin == span.end;
         let grid_steps = grid.steps;
         let (first, last_step) = match grid_steps {
@@ -4538,7 +4548,17 @@ impl Layer {
                         (s.part_begin, s.part_end, s.value)
                     }
                 };
-                let visible = TimeSpan::new(at(step_begin)?, at(step_end)?);
+                let vis_begin = if begin_exact && i64::from(step_begin) == begin_low {
+                    span.begin
+                } else {
+                    at(step_begin)?
+                };
+                let vis_end = if end_exact && i64::from(step_end) == end_high {
+                    span.end
+                } else {
+                    at(step_end)?
+                };
+                let visible = TimeSpan::new(vis_begin, vis_end);
                 let whole = if has_cuts {
                     match cuts.split_first_at(index) {
                         Some(cut) => TimeSpan::new(at(cut.begin)?, at(cut.end)?),
@@ -4882,6 +4902,56 @@ pub fn sequence_of(layers: Vec<GivenLayer>) -> Option<Pattern> {
 /// A single-layer [`sequence`] built directly from a reusable slice of uncut
 /// [`SourceStep`]s in cycles, avoiding intermediate `Vec<GivenLayer>` and
 /// `Vec<Layer>` allocations.
+/// Build a single-layer sequence directly from integer tick steps
+/// `(part_begin, part_end, value_idx, loc_begin, loc_len)` without constructing
+/// intermediate `Fraction`s or `SourceStep`s. Returns `None` if any location
+/// does not fit inline packing (caller falls back to the general path).
+pub fn sequence_of_ticks(
+    period: Fraction,
+    ticks: NonZeroU32,
+    values: Arc<[Value]>,
+    in_cycles: bool,
+    raw_steps: &[(u16, u16, u16, u32, u16)],
+) -> Option<Pattern> {
+    if raw_steps.is_empty() {
+        return Some(silence());
+    }
+    let mut base = u32::MAX;
+    for &(_, _, _, loc_begin, loc_len) in raw_steps {
+        if loc_len > 0 {
+            base = base.min(loc_begin);
+        }
+    }
+    let base = if base == u32::MAX { 0 } else { base };
+    if base & Grid::SMALL != 0 {
+        return None;
+    }
+    let steps = GridSteps::build(raw_steps.len(), |index| {
+        let (part_begin, part_end, value, loc_begin, loc_len) = raw_steps[index];
+        let loc = if loc_len == 0 {
+            PackedLoc(0)
+        } else {
+            let begin = loc_begin as usize;
+            PackedLoc::range(base, (begin, begin + usize::from(loc_len)))?
+        };
+        Some(GridStep {
+            part_begin: u32::from(part_begin),
+            part_end: u32::from(part_end),
+            value: u32::from(value),
+            loc,
+        })
+    })?;
+    let listing = Listing::from_parts(
+        ticks,
+        base | Grid::SMALL,
+        steps,
+        PackedRunsInput::None,
+        None,
+    );
+    let layer = Layer::holding(period, Steps::Listed(listing), in_cycles, values);
+    node_of_one(layer)
+}
+
 pub fn sequence_of_indexed_slice(
     period: Fraction,
     values: Arc<[Value]>,
@@ -5139,21 +5209,33 @@ pub(crate) fn query_sequence_onto(
         out.reserve(steps.min(MOST_ROOM));
     }
     let from = out.len();
-    let mut offset = 0usize;
-    for chunk in layers.chunk_by(Layer::same_period) {
-        match query_layers(thread, layers, offset, chunk, span, from, out) {
-            Ok(()) => {}
-            Err(stop) => {
-                if matches!(stop, SequenceStop::Range) {
-                    refuse(QueryLimit::NativeFraction {
-                        operation: "sequence",
-                    });
-                }
-                out.truncate(from);
-                return;
+    if layers.len() == 1 {
+        if let Err(stop) = query_layers(thread, layers, 0, layers, span, from, out) {
+            if matches!(stop, SequenceStop::Range) {
+                refuse(QueryLimit::NativeFraction {
+                    operation: "sequence",
+                });
             }
+            out.truncate(from);
+            return;
         }
-        offset += chunk.len();
+    } else {
+        let mut offset = 0usize;
+        for chunk in layers.chunk_by(Layer::same_period) {
+            match query_layers(thread, layers, offset, chunk, span, from, out) {
+                Ok(()) => {}
+                Err(stop) => {
+                    if matches!(stop, SequenceStop::Range) {
+                        refuse(QueryLimit::NativeFraction {
+                            operation: "sequence",
+                        });
+                    }
+                    out.truncate(from);
+                    return;
+                }
+            }
+            offset += chunk.len();
+        }
     }
     let added = out.len() - from;
     if added > 0 {

@@ -52,7 +52,7 @@ use rustel_fraction::Fraction;
 pub use sequence::{
     GivenLayer, IndexedLayer, SequenceBuilder, SequenceLayer, SequenceStep, SourceStep,
     SourcedLayer, StepSource, sequence, sequence_of, sequence_of_indexed_slice,
-    sequence_of_sourced,
+    sequence_of_sourced, sequence_of_ticks,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -771,6 +771,10 @@ impl Hap {
                 && raw == part.begin
             {
                 mapped
+            } else if let Some((raw, mapped)) = last_we
+                && raw == part.begin
+            {
+                mapped
             } else {
                 let mapped = map(part.begin);
                 last_wb = Some((part.begin, mapped));
@@ -779,6 +783,10 @@ impl Hap {
             hap.part.end = if part.end == span.end {
                 *end.get_or_insert_with(|| map(part.end))
             } else if let Some((raw, mapped)) = last_we
+                && raw == part.end
+            {
+                mapped
+            } else if let Some((raw, mapped)) = last_wb
                 && raw == part.end
             {
                 mapped
@@ -9179,10 +9187,24 @@ impl Pattern {
             .then_some((state.span.begin, state.span.end));
         let from = out.len();
         self.answer_onto(thread, &asked, table::Order::Graph, out);
-        Hap::map_times(&mut out[from..], asked.span, edges, |t| {
-            grid.and_then(|grid| grid.time(t))
-                .unwrap_or_else(|| fast_hap_time(t, factor, operation))
-        });
+        if factor.denom() == 1 && factor.numer() > 0 && (factor.numer() as u128).is_power_of_two() {
+            let shift = (factor.numer() as u128).trailing_zeros();
+            Hap::map_times(&mut out[from..], asked.span, edges, |t| {
+                t.checked_div_pow2(shift)
+                    .unwrap_or_else(|| fast_hap_time(t, factor, operation))
+            });
+        } else if factor.numer() == 1 && (factor.denom() as u128).is_power_of_two() {
+            let shift = (factor.denom() as u128).trailing_zeros();
+            Hap::map_times(&mut out[from..], asked.span, edges, |t| {
+                t.checked_mul_pow2(shift)
+                    .unwrap_or_else(|| fast_hap_time(t, factor, operation))
+            });
+        } else {
+            Hap::map_times(&mut out[from..], asked.span, edges, |t| {
+                grid.and_then(|grid| grid.time(t))
+                    .unwrap_or_else(|| fast_hap_time(t, factor, operation))
+            });
+        }
     }
 
     /// The haps of this pattern, `by` later: what a [`Node::Shift`] over
@@ -9203,9 +9225,16 @@ impl Pattern {
         let edges = (!thread.stop_requested()).then_some((state.span.begin, state.span.end));
         let from = out.len();
         self.answer_onto(thread, &asked, table::Order::Graph, out);
-        Hap::map_times(&mut out[from..], asked.span, edges, |t| {
-            shift_hap_time(t, by, operation)
-        });
+        if by.denom() == 1 {
+            let whole = by.numer();
+            Hap::map_times(&mut out[from..], asked.span, edges, |t| {
+                checked_time(t.checked_add_int(whole), operation)
+            });
+        } else {
+            Hap::map_times(&mut out[from..], asked.span, edges, |t| {
+                shift_hap_time(t, by, operation)
+            });
+        }
     }
 
     /// Answer `self.focus_span(focus_span)` directly without constructing

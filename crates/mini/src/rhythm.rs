@@ -4,7 +4,8 @@
 use crate::{Build, ParseError, Postfix, Span};
 use rustel_core::{
     Locations, Pattern, SequenceBuilder, SequenceLayer, SequenceStep, SourceStep, SourcedLayer,
-    StepSource, Value, pure, sequence, sequence_of_indexed_slice, sequence_of_sourced, silence,
+    StepSource, Value, pure, sequence, sequence_of_indexed_slice, sequence_of_sourced,
+    sequence_of_ticks, silence,
 };
 use rustel_fraction::Fraction;
 use std::ops::Range;
@@ -2280,6 +2281,108 @@ impl<'r> Planned<'r> {
             let value = self.room.values.swap_remove(value as usize);
             let at = place(written(begin, len));
             return Some(constant(value, vec![at]).with_steps(steps));
+        }
+        // Fast path for flat equal sequences (`"bd hh sd hh"`) and single-lane
+        // equal alternations (`"<c3 e3 g3>"`) of plain atoms and rests: build
+        // the `SmallGridStep` grid directly from integer ticks with zero
+        // `Fraction` math, `survey`, `walk`, or `SourceStep` allocations.
+        let flat = match self.room.plans.kind(self.root) {
+            Kind::EqualSequence(parts) => Some((parts, true)),
+            Kind::Alternation(lanes) if lanes.range().len() == 1 => {
+                let lane = self.room.plans.lanes[lanes.range()][0];
+                lane.equal.then_some((lane.parts, false))
+            }
+            _ => None,
+        };
+        if let Some((parts, is_seq)) = flat {
+            let range = parts.range();
+            let total = range.len();
+            if (2..=64).contains(&total) {
+                let Room {
+                    plans,
+                    values,
+                    local_buf,
+                    held_buf,
+                    ..
+                } = self.room;
+                let ids = &plans.ids[range];
+                let mut raw_steps = [(0u16, 0u16, 0u16, 0u32, 0u16); 64];
+                let mut step_len = 0usize;
+                let mut all_flat = true;
+                let mut min_begin = u32::MAX;
+                let mut max_begin = 0u32;
+                let mut max_len = 0u16;
+                for (i, &id) in ids.iter().enumerate() {
+                    match plans.kind(id) {
+                        Kind::Rest => {}
+                        Kind::Atom { value, begin, len } => {
+                            if len > 0 {
+                                min_begin = min_begin.min(begin);
+                                max_begin = max_begin.max(begin);
+                                max_len = max_len.max(len);
+                            }
+                            raw_steps[step_len] =
+                                (i as u16, (i + 1) as u16, value as u16, begin, len);
+                            step_len += 1;
+                        }
+                        _ => {
+                            all_flat = false;
+                            break;
+                        }
+                    }
+                }
+                if all_flat {
+                    if step_len == 0 {
+                        return Some(silence().with_steps(steps));
+                    }
+                    let base = if min_begin == u32::MAX { 0 } else { min_begin };
+                    let locs_fit = base < (1 << 31)
+                        && (min_begin == u32::MAX || max_begin - base < (1 << 22))
+                        && max_len < 255;
+                    if locs_fit {
+                        if local_buf.len() < values.len() {
+                            local_buf.resize(values.len(), 0);
+                        }
+                        held_buf.clear();
+                        for step in &mut raw_steps[..step_len] {
+                            let global_idx = usize::from(step.2);
+                            let slot = &mut local_buf[global_idx];
+                            if *slot == 0 {
+                                held_buf.push(global_idx as u32);
+                                *slot = held_buf.len() as u32;
+                            }
+                            step.2 = (*slot - 1) as u16;
+                        }
+                        let layer_values: Arc<[Value]> = held_buf
+                            .iter()
+                            .map(|&idx| {
+                                local_buf[idx as usize] = 0;
+                                std::mem::replace(&mut values[idx as usize], Value::Undefined)
+                            })
+                            .collect();
+                        let (period, ticks) = if is_seq {
+                            (
+                                Fraction::ONE,
+                                std::num::NonZeroU32::new(total as u32).expect("total >= 2"),
+                            )
+                        } else {
+                            (
+                                Fraction::int(total as i128),
+                                std::num::NonZeroU32::new(1).expect("non-zero"),
+                            )
+                        };
+                        if let Some(pattern) = sequence_of_ticks(
+                            period,
+                            ticks,
+                            layer_values,
+                            true,
+                            &raw_steps[..step_len],
+                        ) {
+                            return Some(pattern.with_steps(steps));
+                        }
+                    }
+                }
+            }
         }
         let Room {
             plans,
