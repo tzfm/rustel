@@ -9779,12 +9779,21 @@ fn talkit_speaks_up_to_c7() {
             "-o",
             path.to_str().expect("utf-8 path"),
         ]);
-        let _ = std::fs::remove_file(&path);
         let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{note}: {stderr}");
+        let wav = std::fs::read(&path).expect("wav");
+        let _ = std::fs::remove_file(&path);
         assert_eq!(
             !stderr.contains("voice_refused"),
             speaks,
             "{note}: {stderr}"
         );
+        let sounds = wav.len() > 44
+            && wav[44..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .any(|sample| i16::from_le_bytes(*sample).unsigned_abs() > 100);
+        assert_eq!(sounds, speaks, "{note}: the take");
     }
 }
