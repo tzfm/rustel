@@ -12,6 +12,7 @@
 - Fixed: an update that starts on a rest and cannot play any of its notes no longer silences the set. The last good score keeps playing.
 - Fixed: loop points outside 0 to 1, or a loopBegin after loopEnd, loop the whole sample as Web Audio does, instead of playing loud clipped noise.
 - Fixed: a slider move is written to the session tape once it settles, so a replay plays it.
+- Fixed: the documented prebake helper `window.bpm = b => setcpm(b/4)` works after a score has run `initHydra()`, and a prebake that throws after an `await` reports its own line.
 - `samples('local:kits/q.json')` reads a sample map file in the granted folder, as a URL does. Its entries are relative to the file's folder and stay inside the grant.
 - Fixed: an export of N cycles with a `cps` pattern lane lasts N cycles at the tempo the lane sets, in `rustel export --cycles` and the Studio export sheet.
 - Fixed: the events pane uses the theme's palette so monochrome themes stay monochrome. In Vim mode, `ip` and `ap` select paragraphs, `.` repeats the last change, and Ctrl+[ steps to the previous scene from Normal mode.
@@ -19,8 +20,9 @@
 - Fixed: a visuals dock moved from a side to the top or bottom starts at the band's own size, so it no longer vanishes beside the mixer; a dock with no room says the keys go to the score.
 - Fixed: a General MIDI note outside its font's range says which notes the font plays instead of "failed to load", and Studio no longer counts such a font as a failed sound.
 - Fixed: `talkit("42")` speaks the number instead of a silent refused voice.
+- Fixed: a KabelSalat signal past the range of a sample is silent on both channels, as the docs say, instead of full-scale noise on one.
 - Fixed: a scene can call a name from a script that another scene of the set imports, as the docs say, instead of the check refusing it as unknown.
-- Fixed: the documented prebake helper `window.bpm = b => setcpm(b/4)` works after a score has run `initHydra()`, and a prebake that throws after an `await` reports its own line.
+- Fixed: one sample source in Settings that will not read fails only its own row; the other remote sources still load.
 
 ## v0.1.7
 
