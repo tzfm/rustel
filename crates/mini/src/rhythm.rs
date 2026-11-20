@@ -876,9 +876,14 @@ impl LayerPlan {
     /// Whether the layer holds a list of its `count` steps.
     fn is_listed(&self, count: usize) -> bool {
         let short = |period: Fraction| period < Fraction::int(READ_PERIOD);
-        self.period().is_some_and(short) && count <= MAX_STEPS
+        count <= SMALL_LISTED || (self.period().is_some_and(short) && count <= MAX_STEPS)
     }
 }
+
+/// Layers with at most this many steps always materialize directly as a
+/// compact grid rather than retaining `Plans` or building lazily during a
+/// window query.
+const SMALL_LISTED: usize = 8;
 
 /// The cycles of a period from which a layer keeps no list of its steps,
 /// and reads its plan at each query: a query meets few steps of a long

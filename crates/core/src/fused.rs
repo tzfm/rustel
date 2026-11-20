@@ -96,7 +96,8 @@ pub(crate) fn counting<R>(f: impl FnOnce() -> R) -> (R, Hits) {
 }
 
 /// Whether a test asks the graph to answer each segment.
-fn is_unfused() -> bool {
+#[inline]
+pub(crate) fn is_unfused() -> bool {
     #[cfg(test)]
     return UNFUSED.get();
     #[cfg(not(test))]
@@ -126,12 +127,32 @@ impl StepGrid {
         if span.begin > span.end || count < 1 {
             return None;
         }
-        let scale = Fraction::int(count);
-        let first = span.begin.checked_mul(scale)?.floor().numer();
-        let after = if span.begin == span.end {
-            first.checked_add(1)?
+        let (first, after) = if let (Ok(c), Ok(bn), Ok(bd), Ok(en), Ok(ed)) = (
+            i64::try_from(count),
+            i64::try_from(span.begin.numer()),
+            i64::try_from(span.begin.denom()),
+            i64::try_from(span.end.numer()),
+            i64::try_from(span.end.denom()),
+        ) && let Some(b_scaled) = bn.checked_mul(c)
+            && let Some(e_scaled) = en.checked_mul(c)
+            && let Some(neg_e) = e_scaled.checked_neg()
+        {
+            let first = i128::from(b_scaled.div_euclid(bd));
+            let after = if span.begin == span.end {
+                first.checked_add(1)?
+            } else {
+                -i128::from(neg_e.div_euclid(ed))
+            };
+            (first, after)
         } else {
-            span.end.checked_mul(scale)?.ceil().numer()
+            let scale = Fraction::int(count);
+            let first = span.begin.checked_mul(scale)?.floor().numer();
+            let after = if span.begin == span.end {
+                first.checked_add(1)?
+            } else {
+                span.end.checked_mul(scale)?.ceil().numer()
+            };
+            (first, after)
         };
         let reached = after.checked_sub(first)?;
         let plain = |index: i128| index.unsigned_abs() >> Self::INDEX_BITS == 0;
@@ -224,7 +245,7 @@ impl Segment {
             return None;
         };
         // A graph of discrete haps is asked over a part, not its whole.
-        if values.runtime_settings.is_some() || values.is_volatile() || functions.is_discrete() {
+        if values.has_runtime_settings() || values.is_volatile() || functions.is_discrete() {
             return None;
         }
         let (count, pulse) = crate::sequence::pulse(layers)?;
@@ -297,17 +318,9 @@ pub(crate) struct StepWave {
 }
 
 impl StepWave {
-    /// `values` as a control of a segment of a wave, when it is one and
-    /// the application sets each number in place: any other application
-    /// is the graph's, with one query of the side for all its haps.
-    pub(crate) fn of(values: &Pattern, apply: &Combine, flow: LookupFlow) -> Option<Self> {
-        let sets = matches!(apply, Combine::Composed(crate::compose::ComposeOp::Set))
-            && flow == LookupFlow::Set;
-        if !sets || is_unfused() {
-            return None;
-        }
-        // The kinds alone say that most sides are none, before the global
-        // pool of controls is read for the name.
+    /// `values` as a control of a segment of a wave, independent of the
+    /// enclosing `AppLeft`'s combine/flow (cached once per `ValueReading`).
+    pub(crate) fn of_pattern(values: &Pattern) -> Option<Self> {
         let Node::MapHapsOwned(inner, _, SpanUse::Ignores) = values.node_kind() else {
             return None;
         };
@@ -323,6 +336,16 @@ impl StepWave {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn of(values: &Pattern, apply: &Combine, flow: LookupFlow) -> Option<Self> {
+        let sets = matches!(apply, Combine::Composed(crate::compose::ComposeOp::Set))
+            && flow == LookupFlow::Set;
+        if !sets || is_unfused() {
+            return None;
+        }
+        Self::of_pattern(values)
+    }
+
     /// Whether this control answers for `hf` in place: a hap of data
     /// controls with no lookup, whose part lies in its whole and has width.
     /// Asked of every function hap before the control answers any, so that
@@ -335,10 +358,64 @@ impl StepWave {
             && hf.part.intersection(&hf.whole_or_part()) == Some(hf.part)
     }
 
+    /// Whether `span` lies entirely inside a single step of `self.steps`, so
+    /// every hap within `span` is guaranteed to take one step with no split.
+    #[inline]
+    pub(crate) fn covers_span(&self, span: TimeSpan) -> bool {
+        if span.begin >= span.end {
+            return false;
+        }
+        let steps = i64::from(self.steps);
+        if let (Ok(bn), Ok(bd), Ok(en), Ok(ed)) = (
+            i64::try_from(span.begin.numer()),
+            i64::try_from(span.begin.denom()),
+            i64::try_from(span.end.numer()),
+            i64::try_from(span.end.denom()),
+        ) && let Some(b_scaled) = bn.checked_mul(steps)
+            && let Some(e_scaled) = en.checked_mul(steps)
+        {
+            let k = b_scaled.div_euclid(bd);
+            return k
+                .checked_add(1)
+                .and_then(|next| next.checked_mul(ed))
+                .is_some_and(|bound| e_scaled <= bound);
+        }
+        false
+    }
+
     /// The number that the graph answers for a function hap cut to `part`,
     /// when `part` lies in one step. The wave is asked over that step.
+    #[inline]
     pub(crate) fn number(&self, part: TimeSpan, controls: &crate::OrderedMap) -> Option<f64> {
         if part.begin >= part.end {
+            return None;
+        }
+        let steps = i64::from(self.steps);
+        // Fast 64-bit check: `part` lies inside one step `[k/steps, (k+1)/steps]`.
+        if let (Ok(bn), Ok(bd), Ok(en), Ok(ed)) = (
+            i64::try_from(part.begin.numer()),
+            i64::try_from(part.begin.denom()),
+            i64::try_from(part.end.numer()),
+            i64::try_from(part.end.denom()),
+        ) && let Some(b_scaled) = bn.checked_mul(steps)
+            && let Some(e_scaled) = en.checked_mul(steps)
+        {
+            let k = b_scaled.div_euclid(bd);
+            if let Some(bound) = k.checked_add(1).and_then(|next| next.checked_mul(ed))
+                && e_scaled <= bound
+                && ((bn.unsigned_abs()
+                    | bd as u64
+                    | en.unsigned_abs()
+                    | ed as u64
+                    | k.unsigned_abs()
+                    | k.saturating_add(1).unsigned_abs())
+                    >> 48)
+                    == 0
+                && let Some(d) = std::num::NonZeroU32::new(self.steps)
+            {
+                let begin = Fraction::from_ticks(i128::from(k), d);
+                return self.wave.value_at(begin, controls);
+            }
             return None;
         }
         let grid = StepGrid::over(i128::from(self.steps), part)?;
@@ -350,17 +427,11 @@ impl StepWave {
         self.wave.number(step, part, controls)
     }
 
-    /// The number of each step that `part` meets, in order, with the piece
-    /// of `part` in the step, into `out`. `None` for a part of no width, for
-    /// a span that the graph refuses or whose budget it refuses, and for a
-    /// step whose number only the graph gives. A query stop ends the walk
-    /// early, and the caller reads the stop.
-    pub(crate) fn steps_over(
-        &self,
-        part: TimeSpan,
-        controls: &crate::OrderedMap,
-        out: &mut Vec<(TimeSpan, f64)>,
-    ) -> Option<()> {
+    /// Walk the steps of this wave that `part` meets, calling `each` with
+    /// `(step_part, value)` in order, with no intermediate allocation.
+    /// Returns `None` for a part of no width, a span the graph refuses or
+    /// whose budget it refuses, or a step whose number only the graph gives.
+    pub(crate) fn grid_over(&self, part: TimeSpan) -> Option<StepGrid> {
         if part.begin >= part.end {
             return None;
         }
@@ -368,18 +439,29 @@ impl StepWave {
         for time in [part.begin, part.end] {
             Wave::plain(time, 48)?;
         }
-        out.reserve(grid.len());
-        let mut begin = grid.time(grid.steps().start)?;
-        for k in grid.steps() {
-            if crate::query_stop_requested() {
-                return Some(());
-            }
-            let end = grid.time(k + 1)?;
-            let piece = TimeSpan::new(begin.max(part.begin), end.min(part.end));
-            out.push((piece, self.wave.value_at(begin, controls)?));
-            begin = end;
+        Some(grid)
+    }
+
+    #[inline]
+    pub(crate) fn value_at(&self, time: Fraction, controls: &crate::OrderedMap) -> Option<f64> {
+        self.wave.value_at(time, controls)
+    }
+}
+
+/// Inline storage for up to 4 arithmetic ops on a wave (covers `range` and
+/// `rangex` with zero heap allocation), spilling to a boxed slice if deeper.
+enum WaveMath {
+    Inline([(crate::compose::ComposeOp, f64); 4], u8),
+    Boxed(Box<[(crate::compose::ComposeOp, f64)]>),
+}
+
+impl WaveMath {
+    #[inline]
+    fn as_slice(&self) -> &[(crate::compose::ComposeOp, f64)] {
+        match self {
+            Self::Inline(ops, len) => &ops[..usize::from(*len)],
+            Self::Boxed(ops) => ops,
         }
-        Some(())
     }
 }
 
@@ -394,32 +476,70 @@ impl StepWave {
 /// one cycle of the time of each number. The time of a number is the time
 /// of the query, or a time that keeps a cycle of the query in one cycle,
 /// for most waves. Any other number is under changes of time that
-/// [`Self::cut_under`] counts, and each part is read in its time.
+/// [`Self::cut_mask`] records, and each part is read in its time.
 pub(crate) struct Wave {
     body: crate::NumberSignal,
-    /// The changes of time, the outermost first.
-    times: Box<[WaveTime]>,
+    /// The changes of time, the outermost first (at most [`Self::MOST_TIMES`]).
+    times: [WaveTime; 3],
+    times_len: u8,
+    /// Bitmask of `1 << over` for each time change count `over` (1..=3) under
+    /// which a number's time may cut a cycle of the query.
+    cut_mask: u8,
     /// The arithmetic, the innermost first: each op with its number.
-    math: Box<[(crate::compose::ComposeOp, f64)]>,
-    /// For each number whose time may cut a cycle of the query, the count
-    /// of the changes of time over it, in rising order.
-    cut_under: Box<[usize]>,
+    math: WaveMath,
 }
 
-/// One change of time over a [`Wave`].
+/// One change of time over a [`Wave`]. Factors and shifts are bounded below
+/// 2^16 by [`Wave::plain`], so 32-bit components are lossless and compact.
+#[derive(Clone, Copy)]
 enum WaveTime {
-    /// `fast(factor)`: what lies inside is asked at `t * factor`.
-    Fast(Fraction),
-    /// A shift by `by`: what lies inside is asked at `t - by`.
-    Late(Fraction),
+    /// `fast(factor)`: what lies inside is asked at `t * (n / d)`.
+    Fast(i32, std::num::NonZeroU32),
+    /// A shift by `by`: what lies inside is asked at `t - (n / d)`.
+    Late(i32, std::num::NonZeroU32),
 }
 
 impl WaveTime {
+    const ONE: std::num::NonZeroU32 = match std::num::NonZeroU32::new(1) {
+        Some(v) => v,
+        None => unreachable!(),
+    };
+    const IDENTITY: Self = Self::Late(0, Self::ONE);
+
+    fn fast(factor: Fraction) -> Option<Self> {
+        let f = Wave::plain(factor, 16)?;
+        Some(Self::Fast(
+            i32::try_from(f.numer()).ok()?,
+            std::num::NonZeroU32::new(u32::try_from(f.denom()).ok()?)?,
+        ))
+    }
+
+    fn late(by: Fraction) -> Option<Self> {
+        let f = Wave::plain(by, 16)?;
+        Some(Self::Late(
+            i32::try_from(f.numer()).ok()?,
+            std::num::NonZeroU32::new(u32::try_from(f.denom()).ok()?)?,
+        ))
+    }
+
     /// `time` as what lies inside is asked.
+    #[inline]
     fn inward(&self, time: Fraction) -> Option<Fraction> {
-        match self {
-            Self::Fast(factor) => time.checked_mul(*factor),
-            Self::Late(by) => time.checked_sub(*by),
+        match *self {
+            Self::Fast(n, d) => {
+                let factor = Fraction::from_ticks(i128::from(n), d);
+                time.checked_mul(factor)
+            }
+            Self::Late(n, d) => {
+                if n == 0 {
+                    return Some(time);
+                }
+                if d.get() == 1 {
+                    return time.checked_add_int(-i128::from(n));
+                }
+                let by = Fraction::from_ticks(i128::from(n), d);
+                time.checked_sub(by)
+            }
         }
     }
 }
@@ -443,26 +563,58 @@ impl Wave {
     }
 
     fn read_in(pattern: &Pattern, steps: Option<&mut Option<i128>>) -> Option<Self> {
-        let mut times = Vec::new();
-        let mut math = Vec::new();
-        let mut cut_under = Vec::new();
+        let mut times = [WaveTime::IDENTITY; Self::MOST_TIMES];
+        let mut times_len = 0u8;
+        let mut inline_math = [(crate::compose::ComposeOp::Add, 0.0); 4];
+        let mut inline_len = 0u8;
+        let mut spilled_math: Option<Vec<(crate::compose::ComposeOp, f64)>> = None;
+        let mut cut_mask = 0u8;
         let body = Self::read(
             pattern,
-            &mut |time| times.push(time),
+            &mut |time| {
+                let idx = usize::from(times_len);
+                if idx < Self::MOST_TIMES {
+                    times[idx] = time;
+                }
+                times_len = times_len.saturating_add(1);
+            },
             &mut |op, number, cut| {
-                math.push((op, number));
-                cut_under.extend(cut);
+                if let Some(vec) = &mut spilled_math {
+                    vec.push((op, number));
+                } else if usize::from(inline_len) < inline_math.len() {
+                    inline_math[usize::from(inline_len)] = (op, number);
+                    inline_len += 1;
+                } else {
+                    let mut vec = Vec::with_capacity(8);
+                    vec.extend_from_slice(&inline_math);
+                    vec.push((op, number));
+                    spilled_math = Some(vec);
+                }
+                if let Some(over) = cut
+                    && over < 8
+                {
+                    cut_mask |= 1u8 << over;
+                }
             },
             steps,
         )?;
         // The walk met the outermost number first.
-        math.reverse();
-        cut_under.dedup();
+        let math = match spilled_math {
+            Some(mut vec) => {
+                vec.reverse();
+                WaveMath::Boxed(vec.into())
+            }
+            None => {
+                inline_math[..usize::from(inline_len)].reverse();
+                WaveMath::Inline(inline_math, inline_len)
+            }
+        };
         Some(Self {
             body,
-            times: times.into(),
-            math: math.into(),
-            cut_under: cut_under.into(),
+            times,
+            times_len,
+            cut_mask,
+            math,
         })
     }
 
@@ -504,13 +656,13 @@ impl Wave {
                 }
                 Node::Fast(inner, factor, _) if **factor > Fraction::ZERO => {
                     cycles_kept &= factor.numer() == 1;
-                    time(WaveTime::Fast(Self::plain(**factor, 16)?));
+                    time(WaveTime::fast(**factor)?);
                     times += 1;
                     inner
                 }
                 Node::Shift(inner, by, _) => {
                     cycles_kept &= by.denom() == 1;
-                    time(WaveTime::Late(Self::plain(**by, 16)?));
+                    time(WaveTime::late(**by)?);
                     times += 1;
                     inner
                 }
@@ -526,8 +678,8 @@ impl Wave {
                 // A `pure` of a number answers the number in every cycle,
                 // on a hap that carries nothing more: no place in the
                 // text, no key, no visual and no slider.
-                Node::AppLeft(pair, Combine::Composed(op), _, _) => {
-                    let crate::PatternPair(functions, values) = &**pair;
+                Node::AppLeft(pair, Combine::Composed(op), _) => {
+                    let crate::AppLeftNode(functions, values, _) = &**pair;
                     let Node::Pure(crate::Value::F64(other)) = values.node_kind() else {
                         return None;
                     };
@@ -579,7 +731,7 @@ impl Wave {
         (pulse.js_truthy()
             && structured.tables_may_answer()
             && !pair.1.is_volatile()
-            && pair.1.runtime_settings.is_none())
+            && !pair.1.has_runtime_settings())
         .then_some((count, functions))
     }
 
@@ -606,13 +758,13 @@ impl Wave {
         }
         let mut time = Self::plain(met.begin, 48)?;
         // The part in the time of each number that may cut it.
-        let mut cut = self.cut_under.iter().copied().peekable();
         let mut inside = part;
-        for (over, change) in self.times.iter().enumerate() {
+        let times = &self.times[..usize::from(self.times_len)];
+        for (over, change) in times.iter().enumerate() {
             time = change.inward(time)?;
-            if cut.peek().is_some() {
+            if self.cut_mask != 0 {
                 inside = TimeSpan::new(change.inward(inside.begin)?, change.inward(inside.end)?);
-                if cut.next_if_eq(&(over + 1)).is_some() && !in_one_cycle(inside) {
+                if (self.cut_mask & (1u8 << (over + 1))) != 0 && !in_one_cycle(inside) {
                     return None;
                 }
             }
@@ -621,9 +773,10 @@ impl Wave {
     }
 
     /// The number of the wave at `time`, with its arithmetic.
+    #[inline]
     fn value_at(&self, time: Fraction, controls: &crate::OrderedMap) -> Option<f64> {
         let mut number = (self.body)(time, controls);
-        for (op, other) in &self.math {
+        for (op, other) in self.math.as_slice() {
             number = op.of_numbers(number, *other)?;
         }
         Some(number)

@@ -147,6 +147,29 @@ impl Purity {
         self.reachable.as_deref().map_or(&[], Vec::as_slice)
     }
 
+    pub(crate) fn take_reachable(&mut self) -> Option<Arc<Vec<CallbackId>>> {
+        self.reachable.take()
+    }
+
+    pub(crate) fn from_packed(
+        impure: bool,
+        opaque: bool,
+        volatile: bool,
+        host_voicings: bool,
+        span_read: SpanRead,
+        reachable: Option<Arc<Vec<CallbackId>>>,
+    ) -> Self {
+        Self {
+            impure,
+            reachable,
+            opaque,
+            volatile,
+            host_voicings,
+            span_read,
+            walked: false,
+        }
+    }
+
     /// Add `ids` to the callbacks that this subtree reaches.
     pub(crate) fn reach(&mut self, ids: impl IntoIterator<Item = CallbackId>) {
         let mut reached = Reached::default();
@@ -265,7 +288,7 @@ impl PurePattern {
     /// callbacks it reaches and is volatile, so no memo or table keeps it.
     pub(crate) fn host_built(pattern: crate::Pattern) -> Self {
         let mut pattern = pattern.mark_volatile();
-        pattern.purity.impure = false;
+        pattern.clear_impure();
         PurePattern(pattern)
     }
 }

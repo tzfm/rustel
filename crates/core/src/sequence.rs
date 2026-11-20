@@ -21,8 +21,8 @@ use crate::context_keys::ContextKeys;
 use crate::value::Table;
 use crate::{
     Combine, Hap, HapMapFn, Locations, LookupFlow, MAX_QUERY_SPAN_CYCLES, Meeting, Node,
-    OwnedHapMapFn, Pattern, QUERY_THREAD, QueryLimit, QueryThread, State, TimeSpan, Value,
-    ValuePredicate, applied_hap, refuse, silence, without_query_signals,
+    OwnedHapMapFn, Pattern, QueryLimit, QueryThread, State, TimeSpan, Value, ValuePredicate,
+    applied_hap, refuse, silence, without_query_signals,
 };
 use rustel_fraction::{Fraction, TickGrid};
 use std::borrow::Cow;
@@ -191,7 +191,7 @@ struct Sourced {
 /// otherwise each at its place.
 #[derive(Clone)]
 enum Listing {
-    Places(Listed),
+    Places(Arc<Listed>),
     Grid(Arc<Grid>),
 }
 
@@ -227,10 +227,10 @@ impl Listing {
         let small_denominators = raws
             .iter()
             .all(|raw| small(&raw.whole) && raw.part.as_ref().is_none_or(small));
-        Self::Places(Listed {
+        Self::Places(Arc::new(Listed {
             places: raws.into_iter().map(Raw::place).collect(),
             small_denominators,
-        })
+        }))
     }
 
     fn len(&self) -> usize {
@@ -309,9 +309,8 @@ impl Listing {
 }
 
 /// The places of one layer and whether their times fit a restart at a small offset.
-#[derive(Clone)]
 struct Listed {
-    places: Arc<[Place]>,
+    places: Box<[Place]>,
     small_denominators: bool,
 }
 
@@ -762,12 +761,41 @@ impl Place {
     }
 }
 
+/// Compact period storage: fits the common small rational inline in 16 bytes.
+#[derive(Clone, PartialEq, Eq)]
+enum Period {
+    Small(i32, NonZeroU32),
+    Large(Arc<Fraction>),
+}
+
+impl Period {
+    #[inline]
+    fn from_fraction(period: Fraction) -> Self {
+        if let (Ok(n), Ok(d)) = (i32::try_from(period.numer()), u32::try_from(period.denom()))
+            && let Some(d) = NonZeroU32::new(d)
+        {
+            Self::Small(n, d)
+        } else {
+            Self::Large(Arc::new(period))
+        }
+    }
+
+    #[inline]
+    fn get(&self) -> Fraction {
+        match self {
+            Self::Small(n, d) if d.get() == 1 => Fraction::int(i128::from(*n)),
+            Self::Small(n, d) => Fraction::new(i128::from(*n), i128::from(d.get())),
+            Self::Large(period) => **period,
+        }
+    }
+}
+
 /// One layer of a sequence node: the places of its steps, and each value
 /// of them once. Each hap holds a plain value and its locations: a fold
 /// that would give a hap more keeps its own node.
 #[derive(Clone)]
 pub(crate) struct Layer {
-    pub(crate) period: Fraction,
+    period: Period,
     /// Shared by each layer that a fold makes of the same steps.
     steps: Steps,
     /// The value of each step, each once, before the name and the controls
@@ -786,18 +814,31 @@ pub(crate) struct Layer {
     /// Whether the part of each step lies in one cycle, in every period: a
     /// constant, which is another hap in each cycle, then cuts no step.
     in_cycles: bool,
-    /// The locations of each step's hap, as one list, made at the first
-    /// query of a layer that has locations of its own.
-    contexts: OnceLock<Box<[Locations]>>,
 }
 
 /// The values of a layer as its dress makes them.
 #[derive(Clone)]
 enum Read {
     /// Each value made as a map of its own.
-    Made(Arc<[Value]>),
+    Made(Box<Arc<[Value]>>),
     /// Each value a map that reads the entries of a table the steps share.
     Shared(Arc<Table>),
+    /// Values plus cached per-step contexts when the dress holds enough
+    /// locations that combining per hap would spill `Locations::INLINE`.
+    WithContexts(Box<ReadWithContexts>),
+}
+
+#[derive(Clone)]
+enum ReadValues {
+    Held,
+    Made(Arc<[Value]>),
+    Shared(Arc<Table>),
+}
+
+#[derive(Clone)]
+struct ReadWithContexts {
+    values: ReadValues,
+    contexts: Box<[Locations]>,
 }
 
 /// The values of a layer as its dress makes them.
@@ -815,8 +856,10 @@ enum Values<'a> {
 struct Maker<'a> {
     listing: &'a Listing,
     values: Values<'a>,
-    /// See [`Layer::contexts`].
+    /// Pre-combined step contexts when the dress would spill `Locations::INLINE`.
     contexts: Option<&'a [Locations]>,
+    /// The dress when it adds locations before or after each step's own.
+    loc_dress: Option<&'a Dress>,
     keys: &'a ContextKeys,
 }
 
@@ -833,13 +876,16 @@ impl Maker<'_> {
             .values
             .get(value as usize)
             .expect("a step holds a value of its layer");
-        let mut hap = Hap::new(Some(whole), part, value);
-        hap.context = match self.contexts {
-            Some(contexts) => contexts[index].clone(),
-            None => self.listing.locations(index),
+        let context = if let Some(contexts) = self.contexts {
+            contexts[index].clone()
+        } else {
+            let step_loc = self.listing.locations(index);
+            match self.loc_dress {
+                Some(dress) => dress.around(&step_loc),
+                None => step_loc,
+            }
         };
-        hap.keys = self.keys.clone();
-        hap
+        Hap::of_sequence(whole, part, value, context, self.keys.clone())
     }
 }
 
@@ -853,7 +899,18 @@ impl Values<'_> {
     }
 }
 // A layer is cloned by each fold: its steps stay behind a handle.
-const _: () = assert!(size_of::<Layer>() <= 144);
+const _: () = assert!(size_of::<Steps>() == 16);
+const _: () = assert!(size_of::<Layer>() <= 88);
+
+/// Rare tail fields of [`Dress`]: locations after each step and context keys.
+#[derive(Clone, Default)]
+struct DressTail {
+    /// The locations of each hap after its step's own.
+    after: Locations,
+    /// The keys of the context of each hap, as a map of the haps set them:
+    /// the scale that `scale` names, for one.
+    keys: ContextKeys,
+}
 
 /// What the folds on a layer give each hap of it, beyond its step. The
 /// layers that a fold dresses alike share one: see [`redressed`].
@@ -867,26 +924,83 @@ struct Dress {
     /// name: the union of the constants that a chain of controls set, the
     /// last one last. See [`Layer::set`].
     set: Option<Value>,
-    /// The keys of the context of each hap, as a map of the haps set them:
-    /// the scale that `scale` names, for one.
-    keys: ContextKeys,
     /// The locations of each hap before its step's own: those of the
     /// constants that the steps met, the last first.
     before: Locations,
-    /// The locations of each hap after its step's own.
-    after: Locations,
+    /// Rare trailing locations and context keys, boxed out of the common case.
+    tail: Option<Box<DressTail>>,
 }
+
+const _: () = assert!(size_of::<Dress>() <= 88);
+
+static EMPTY_LOCATIONS: Locations = Locations::new();
 
 /// The dress of a layer that no fold dressed.
 static BARE: Dress = Dress {
     named: None,
     set: None,
-    keys: ContextKeys::NONE,
     before: Locations::new(),
-    after: Locations::new(),
+    tail: None,
 };
 
 impl Dress {
+    #[inline]
+    fn after(&self) -> &Locations {
+        self.tail
+            .as_deref()
+            .map_or(&EMPTY_LOCATIONS, |tail| &tail.after)
+    }
+
+    #[inline]
+    fn keys(&self) -> &ContextKeys {
+        self.tail
+            .as_deref()
+            .map_or(&ContextKeys::NONE, |tail| &tail.keys)
+    }
+
+    fn prune_tail(&mut self) {
+        if self
+            .tail
+            .as_deref()
+            .is_some_and(|tail| tail.after.is_empty() && tail.keys.is_empty())
+        {
+            self.tail = None;
+        }
+    }
+
+    fn set_keys(&mut self, keys: ContextKeys) {
+        if keys.is_empty() && self.tail.is_none() {
+            return;
+        }
+        self.tail.get_or_insert_with(Default::default).keys = keys;
+        self.prune_tail();
+    }
+
+    fn clear_after(&mut self) {
+        if let Some(tail) = &mut self.tail {
+            tail.after = Locations::new();
+            self.prune_tail();
+        }
+    }
+
+    fn append_after(&mut self, locations: &Locations) {
+        if !locations.is_empty() {
+            self.tail
+                .get_or_insert_with(Default::default)
+                .after
+                .append(locations);
+        }
+    }
+
+    fn extend_after(&mut self, locations: &[(usize, usize)]) {
+        if !locations.is_empty() {
+            self.tail
+                .get_or_insert_with(Default::default)
+                .after
+                .extend_from_slice(locations);
+        }
+    }
+
     /// Set `control`, a map of controls at `context`, on each value that
     /// this dress makes. See [`Layer::set_here`].
     fn set_here(&mut self, control: &Value, context: Locations) {
@@ -911,14 +1025,14 @@ impl Dress {
     fn is_bare(&self) -> bool {
         self.named.is_none()
             && self.set.is_none()
-            && self.keys.is_empty()
             && self.before.is_empty()
-            && self.after.is_empty()
+            && self.keys().is_empty()
+            && self.after().is_empty()
     }
 
     /// Whether a hap of a step at `locations` holds them alone.
     fn locates_alone(&self) -> bool {
-        self.before.is_empty() && self.after.is_empty()
+        self.before.is_empty() && self.after().is_empty()
     }
 
     /// The locations of a hap of a step at `locations`: those before, the
@@ -926,7 +1040,9 @@ impl Dress {
     fn around(&self, locations: &Locations) -> Locations {
         let mut context = self.before.clone();
         context.append(locations);
-        context.append(&self.after);
+        if let Some(tail) = &self.tail {
+            context.append(&tail.after);
+        }
         context
     }
 
@@ -940,9 +1056,9 @@ impl Dress {
         };
         same_set
             && self.named == other.named
-            && self.keys.same(&other.keys)
+            && self.keys().same(other.keys())
             && self.before == other.before
-            && self.after == other.after
+            && self.after() == other.after()
     }
 }
 
@@ -1097,15 +1213,19 @@ impl Layer {
     fn holding(period: Fraction, steps: Steps, in_cycles: bool, values: Arc<[Value]>) -> Self {
         Self {
             in_cycles,
-            period,
+            period: Period::from_fraction(period),
             steps,
             data: values.iter().all(|value| value.is_data(0)),
             maps: values.iter().all(|value| matches!(value, Value::Object(_))),
             values,
             dress: None,
             values_read: OnceLock::new(),
-            contexts: OnceLock::new(),
         }
+    }
+
+    #[inline]
+    fn period(&self) -> Fraction {
+        self.period.get()
     }
 
     /// What the folds on this layer give each hap of it.
@@ -1133,7 +1253,7 @@ impl Layer {
                 let mut raws = Vec::with_capacity(sourced.steps.count());
                 let written = sourced
                     .steps
-                    .steps(Fraction::ZERO, self.period, &mut |step| {
+                    .steps(Fraction::ZERO, self.period(), &mut |step| {
                         raws.push(Raw {
                             whole: TimeSpan::new(step.begin, step.end),
                             part: None,
@@ -1240,7 +1360,7 @@ impl Layer {
     /// that are not all maps of controls, another op, and a meeting that
     /// [`Meeting::in_place`] does not make.
     fn set(&self, values: &Layer, apply: &Combine, flow: LookupFlow) -> Option<Self> {
-        if !(values.fills_each_cycle() && values.dress().keys.is_empty()) {
+        if !(values.fills_each_cycle() && values.dress().keys().is_empty()) {
             return None;
         }
         self.set_constant(&values.value(0)?, || values.context(0), apply, flow)
@@ -1294,12 +1414,12 @@ impl Layer {
         // The hap of the first step, as a query reads it.
         let first = crate::controls::named_value(names, self.values.first()?.clone());
         let mut read = cycle_hap(first);
-        read.keys = self.dress().keys.clone();
+        read.keys = self.dress().keys().clone();
         let keys = map(&read)?.keys;
         let mut layer = self.with(|_| {}).valued(notes.into());
         layer.change_dress(|dress| {
             dress.named = Some(crate::controls::note_names());
-            dress.keys = keys;
+            dress.set_keys(keys);
         });
         layer.maps = true;
         Some(layer)
@@ -1326,7 +1446,6 @@ impl Layer {
     pub(crate) fn set_here(&mut self, control: &Value, context: Locations) {
         self.change_dress(|dress| Dress::set_here(dress, control, context));
         self.values_read = OnceLock::new();
-        self.contexts = OnceLock::new();
     }
 
     /// Whether each value is data only.
@@ -1334,13 +1453,9 @@ impl Layer {
         self.data
     }
 
-    /// This layer with other places, values or locations: the lists of
-    /// locations it made are not those of the new layer.
+    /// This layer with other places, values or locations.
     fn with(&self, change: impl FnOnce(&mut Self)) -> Self {
-        let mut layer = Self {
-            contexts: OnceLock::new(),
-            ..self.clone()
-        };
+        let mut layer = self.clone();
         change(&mut layer);
         layer
     }
@@ -1360,13 +1475,14 @@ impl Layer {
     /// period, begins at or after the part before it and ends at or after
     /// it, and no part is empty.
     fn is_in_order(&self) -> bool {
+        let period = self.period();
         // A source writes its steps in order.
         if self.source().is_some() {
-            return self.period > Fraction::ZERO;
+            return period > Fraction::ZERO;
         }
         let listing = self.listing();
         if let Listing::Grid(grid) = listing
-            && let Some(in_order) = grid.in_order(self.period)
+            && let Some(in_order) = grid.in_order(period)
         {
             return in_order;
         }
@@ -1376,36 +1492,24 @@ impl Layer {
                 && whole.begin <= part.begin
                 && part.begin < part.end
                 && part.end <= whole.end
-                && whole.end <= self.period
+                && whole.end <= period
         };
         let ordered = (1..listing.len()).all(|index| {
             let (a, b) = (listing.part(index - 1), listing.part(index));
             a.begin <= b.begin && a.end <= b.end
         });
-        self.period > Fraction::ZERO && (0..listing.len()).all(inside) && ordered
-    }
-
-    /// The locations of the hap of each step, when the dress adds some to
-    /// the step's own: made at the first query. `None` when each hap holds
-    /// the locations of its step.
-    fn contexts(&self) -> Option<&[Locations]> {
-        let dress = self.dress();
-        if dress.locates_alone() {
-            return None;
-        }
-        Some(self.contexts.get_or_init(|| {
-            (0..self.count())
-                .map(|index| dress.around(&self.locations_of(index)))
-                .collect()
-        }))
+        period > Fraction::ZERO && (0..listing.len()).all(inside) && ordered
     }
 
     /// The locations of the hap of step `index`: those before, the step's
     /// own, then those after.
     fn context(&self, index: usize) -> Locations {
-        match self.contexts() {
-            Some(contexts) => contexts[index].clone(),
-            None => self.locations_of(index),
+        let dress = self.dress();
+        let step_loc = self.locations_of(index);
+        if dress.locates_alone() {
+            step_loc
+        } else {
+            dress.around(&step_loc)
         }
     }
 
@@ -1414,37 +1518,23 @@ impl Layer {
         self.listing().locations(index)
     }
 
-    /// What makes the haps of the steps of this layer, read once for a loop.
-    fn maker(&self) -> Maker<'_> {
-        Maker {
-            listing: self.listing(),
-            values: self.reader(),
-            contexts: self.contexts(),
-            keys: &self.dress().keys,
-        }
+    /// Whether combining this layer's dress locations with a step location can
+    /// spill `Locations::INLINE`, making a cached context table worthwhile.
+    fn spills_contexts(dress: &Dress) -> bool {
+        dress.before.len() + dress.after().len() >= 7
     }
 
-    /// The haps of one period, as a layer with a period of one cycle
-    /// answers them for cycle zero: each time as a share of the period.
-    /// `None` for a time outside the native range.
-    pub(crate) fn period_haps(&self) -> Option<Vec<Hap>> {
-        let share = |span: TimeSpan| {
-            Some(TimeSpan::new(
-                span.begin.checked_div(self.period)?,
-                span.end.checked_div(self.period)?,
-            ))
-        };
-        let maker = self.maker();
-        let listing = maker.listing;
-        (0..listing.len())
-            .map(|index| {
-                Some(maker.hap(
-                    index,
-                    share(listing.whole(index))?,
-                    share(listing.part(index))?,
-                ))
-            })
-            .collect()
+    /// What makes the haps of the steps of this layer, read once for a loop.
+    fn maker(&self) -> Maker<'_> {
+        let dress = self.dress();
+        let (values, contexts) = self.reader_and_contexts(dress);
+        Maker {
+            listing: self.listing(),
+            values,
+            contexts,
+            loc_dress: (contexts.is_none() && !dress.locates_alone()).then_some(dress),
+            keys: dress.keys(),
+        }
     }
 
     /// The values of the steps, each once, with the name of their control
@@ -1461,13 +1551,26 @@ impl Layer {
 
     /// The values as the dress makes them, read once for a loop of steps.
     fn reader(&self) -> Values<'_> {
-        let dress = self.dress();
-        if dress.named.is_none() && dress.set.is_none() {
-            return Values::Held(&self.values);
+        self.reader_and_contexts(self.dress()).0
+    }
+
+    fn reader_and_contexts<'a>(&'a self, dress: &Dress) -> (Values<'a>, Option<&'a [Locations]>) {
+        let needs_values = dress.named.is_some() || dress.set.is_some();
+        let needs_contexts = Self::spills_contexts(dress);
+        if !needs_values && !needs_contexts {
+            return (Values::Held(&self.values), None);
         }
         match self.values_read.get_or_init(|| self.read_values(dress)) {
-            Read::Made(values) => Values::Held(values),
-            Read::Shared(table) => Values::Table(table),
+            Read::Made(values) => (Values::Held(values), None),
+            Read::Shared(table) => (Values::Table(table), None),
+            Read::WithContexts(cached) => {
+                let values = match &cached.values {
+                    ReadValues::Held => Values::Held(&self.values),
+                    ReadValues::Made(values) => Values::Held(values),
+                    ReadValues::Shared(table) => Values::Table(table),
+                };
+                (values, Some(&cached.contexts))
+            }
         }
     }
 
@@ -1480,40 +1583,61 @@ impl Layer {
     /// The values as `dress` makes them: one table that their maps read
     /// where that gives the same maps, else each value made on its own.
     fn read_values(&self, dress: &Dress) -> Read {
-        let set = match &dress.set {
-            None => Some(None),
-            Some(Value::Object(set)) if !union_drops(set) => Some(Some(set)),
-            Some(_) => None,
+        let needs_values = dress.named.is_some() || dress.set.is_some();
+        let core = if !needs_values {
+            ReadValues::Held
+        } else {
+            let set = match &dress.set {
+                None => Some(None),
+                Some(Value::Object(set)) if !union_drops(set) => Some(Some(set)),
+                Some(_) => None,
+            };
+            let key = match &dress.named {
+                Some(names) => self
+                    .values
+                    .iter()
+                    .all(|value| crate::controls::names_as_one_entry(names, value))
+                    .then(|| Some(crate::controls::key_of(names))),
+                None => Some(None),
+            };
+            if let (Some(set), Some(key)) = (set, key)
+                && let Some(table) = Table::new(&self.values, key, set)
+            {
+                ReadValues::Shared(Arc::new(table))
+            } else {
+                ReadValues::Made(
+                    self.values
+                        .iter()
+                        .map(|value| {
+                            // A handle of the value, or a copy of its text.
+                            let mut value = match &dress.named {
+                                Some(names) => crate::controls::named_value(names, value.clone()),
+                                None => value.clone(),
+                            };
+                            if let Some(set) = &dress.set {
+                                compose_data_in_place(ComposeOp::Set, &mut value, set);
+                            }
+                            value
+                        })
+                        .collect(),
+                )
+            }
         };
-        let key = match &dress.named {
-            Some(names) => self
-                .values
-                .iter()
-                .all(|value| crate::controls::names_as_one_entry(names, value))
-                .then(|| Some(crate::controls::key_of(names))),
-            None => Some(None),
-        };
-        if let (Some(set), Some(key)) = (set, key)
-            && let Some(table) = Table::new(&self.values, key, set)
-        {
-            return Read::Shared(Arc::new(table));
+        if Self::spills_contexts(dress) && self.source().is_none() {
+            let listing = self.listing();
+            let contexts: Box<[Locations]> = (0..listing.len())
+                .map(|index| dress.around(&listing.locations(index)))
+                .collect();
+            return Read::WithContexts(Box::new(ReadWithContexts {
+                values: core,
+                contexts,
+            }));
         }
-        Read::Made(
-            self.values
-                .iter()
-                .map(|value| {
-                    // A handle of the value, or a copy of its text.
-                    let mut value = match &dress.named {
-                        Some(names) => crate::controls::named_value(names, value.clone()),
-                        None => value.clone(),
-                    };
-                    if let Some(set) = &dress.set {
-                        compose_data_in_place(ComposeOp::Set, &mut value, set);
-                    }
-                    value
-                })
-                .collect(),
-        )
+        match core {
+            ReadValues::Made(values) => Read::Made(Box::new(values)),
+            ReadValues::Shared(table) => Read::Shared(table),
+            ReadValues::Held => unreachable!("ReadValues::Held only built with spilling contexts"),
+        }
     }
 
     /// Whether this layer and `other` answer the same haps, with values
@@ -1592,11 +1716,7 @@ impl Layer {
         others: usize,
         out: &mut Vec<Hap>,
     ) -> Result<(), SequenceStop> {
-        // A few steps cost less to keep than to walk at every query.
-        const KEPT_STEPS: usize = 8;
-        if let Some(source) = self.source()
-            && source.count() > KEPT_STEPS
-        {
+        if let Some(source) = self.source() {
             let held = out.len();
             if let Some(pushed) = self.push_written(thread, source, turn, span, others, out) {
                 return pushed;
@@ -1677,9 +1797,19 @@ impl Layer {
         out: &mut Vec<Hap>,
     ) -> Option<Result<(), SequenceStop>> {
         let (begin_low, begin_high) = grid.ticks_at(turn.begin)?;
-        let (_, end_high) = grid.ticks_at(turn.end)?;
+        let (_end_low, end_high) = grid.ticks_at(turn.end)?;
         let instant = span.begin == span.end;
         let steps = &grid.steps;
+        // Fast reject spans outside the layer's step range before binary search.
+        let (Some(first_step), Some(last_step_ref)) = (steps.first(), steps.last()) else {
+            return Some(Ok(()));
+        };
+        if i64::from(last_step_ref.part_end) <= begin_low
+            || (instant && i64::from(first_step.part_begin) > begin_low)
+            || (!instant && i64::from(first_step.part_begin) >= end_high)
+        {
+            return Some(Ok(()));
+        }
         // A step begins before a time when its begin is under the ceiling
         // of the time, and at or before it when its begin is at most the
         // floor.
@@ -1708,7 +1838,11 @@ impl Layer {
         out.reserve(met);
         // The cuts are in the order of the steps: one search finds the first.
         let cuts = grid.cuts();
-        let mut cuts = &cuts[cuts.partition_point(|cut| (cut.index as usize) < first)..];
+        let mut cuts = if cuts.is_empty() {
+            cuts
+        } else {
+            &cuts[cuts.partition_point(|cut| (cut.index as usize) < first)..]
+        };
         // A turn that begins on a whole cycle moves a tick by whole cycles of
         // ticks, so a time is made one time, reduced, from its tick.
         let offset = turn
@@ -1742,7 +1876,17 @@ impl Layer {
                 }
                 _ => visible,
             };
-            let part = TimeSpan::new(visible.begin.max(span.begin), visible.end.min(span.end));
+            let part_begin = if i64::from(step.part_begin) <= begin_low {
+                span.begin
+            } else {
+                visible.begin
+            };
+            let part_end = if i64::from(step.part_end) >= end_high {
+                span.end
+            } else {
+                visible.end
+            };
+            let part = TimeSpan::new(part_begin, part_end);
             out.push(maker.make(index, step.value, whole, part));
             Ok(())
         });
@@ -1765,8 +1909,8 @@ impl Layer {
         out: &mut Vec<Hap>,
     ) -> Option<Result<(), SequenceStop>> {
         let mut stop = None;
-        let values = self.reader();
         let dress = self.dress();
+        let mut values: Option<Values<'_>> = None;
         let written = source.steps(turn.begin, turn.end, &mut |step| {
             let times = turn
                 .moved(step.begin)
@@ -1778,16 +1922,21 @@ impl Layer {
             };
             let whole = TimeSpan::new(begin, end);
             let part = TimeSpan::new(begin.max(span.begin), end.min(span.end));
+            let values = values.get_or_insert_with(|| self.reader());
             let value = values
                 .get(step.value as usize)
                 .expect("a step holds a value of its layer");
-            let mut hap = Hap::new(Some(whole), part, value);
-            hap.context = match dress.locates_alone() {
+            let context = match dress.locates_alone() {
                 true => step.locations,
                 false => dress.around(&step.locations),
             };
-            hap.keys = dress.keys.clone();
-            out.push(hap);
+            out.push(Hap::of_sequence(
+                whole,
+                part,
+                value,
+                context,
+                dress.keys().clone(),
+            ));
         });
         if let Some(stop) = stop {
             return Some(Err(stop));
@@ -1805,7 +1954,7 @@ impl Layer {
     /// is.
     fn fills_each_cycle(&self) -> bool {
         let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
-        self.period == Fraction::ONE
+        self.period() == Fraction::ONE
             && self
                 .one_step()
                 .is_some_and(|(whole, cut, _)| whole == cycle && !cut)
@@ -1825,8 +1974,8 @@ impl Layer {
     /// largest term, and for steps that are then not in the order of time.
     fn met(&self, values: &Layer, side: Side) -> Option<(Layer, Vec<(u32, u32)>)> {
         let keys = match side {
-            Side::Functions => ContextKeys::merge(&self.dress().keys, &values.dress().keys),
-            Side::Values => ContextKeys::merge(&values.dress().keys, &self.dress().keys),
+            Side::Functions => ContextKeys::merge(self.dress().keys(), values.dress().keys()),
+            Side::Values => ContextKeys::merge(values.dress().keys(), self.dress().keys()),
         };
         // A step that lies in one cycle meets a value that fills the cycle
         // over the whole part: the places stay, and the locations of the
@@ -1843,21 +1992,23 @@ impl Layer {
                             before.append(&dress.before);
                             dress.before = before;
                         }
-                        Side::Values => dress.after.append(&values.context(0)),
+                        Side::Values => dress.append_after(&values.context(0)),
                     }
-                    dress.keys = keys;
+                    dress.set_keys(keys);
                 });
             });
             return Some((met, pairs));
         }
         // Both layers repeat in the least period that holds a whole count
         // of turns of each.
+        let own_period = self.period();
+        let values_period = values.period();
         let small = |term: i128| (1..=MAX_PERIOD_TERM).contains(&term);
-        let period = self.period.checked_lcm(values.period)?;
+        let period = own_period.checked_lcm(values_period)?;
         if !(small(period.numer()) && small(period.denom())) {
             return None;
         }
-        let turns = period.checked_div(self.period)?.numer();
+        let turns = period.checked_div(own_period)?.numer();
         let moved = |span: TimeSpan, start: Fraction| {
             Some(TimeSpan::new(
                 span.begin.checked_add(start)?,
@@ -1873,7 +2024,7 @@ impl Layer {
         // grid makes their times one time.
         let other_parts: Vec<TimeSpan> = (0..others.len()).map(|at| others.part(at)).collect();
         for turn in 0..turns {
-            let start = self.period.checked_mul(Fraction::int(turn))?;
+            let start = own_period.checked_mul(Fraction::int(turn))?;
             for index in 0..own.len() {
                 let (own_whole, own_part) = own.times(index);
                 let whole = moved(own_whole, start)?;
@@ -1887,13 +2038,13 @@ impl Layer {
                 let mut around = self.dress().before.clone();
                 around.append(&own_locations);
                 if side == Side::Values {
-                    around.append(&self.dress().after);
+                    around.append(self.dress().after());
                 }
                 // The turns of `values` that the part meets, in order.
-                let turns_met = part.begin.checked_div_floor(values.period)?
-                    ..part.end.checked_div_ceil(values.period)?;
+                let turns_met = part.begin.checked_div_floor(values_period)?
+                    ..part.end.checked_div_ceil(values_period)?;
                 for at in turns_met {
-                    let value_start = values.period.checked_mul(Fraction::int(at))?;
+                    let value_start = values_period.checked_mul(Fraction::int(at))?;
                     // The part, from the start of the turn, and the steps
                     // of the turn that it meets: they are in the order of
                     // time.
@@ -1949,9 +2100,8 @@ impl Layer {
         }
         let mut met = Layer {
             in_cycles: lie_in_spans(period, raws.iter().map(Raw::part)),
-            period,
+            period: Period::from_fraction(period),
             steps: Steps::Listed(Listing::of(raws)),
-            contexts: OnceLock::new(),
             ..self.clone()
         };
         // The locations of the steps are in their places now, but those
@@ -1959,9 +2109,9 @@ impl Layer {
         met.change_dress(|dress| {
             dress.before = Locations::new();
             if side == Side::Values {
-                dress.after = Locations::new();
+                dress.clear_after();
             }
-            dress.keys = keys;
+            dress.set_keys(keys);
         });
         met.is_in_order().then_some((met, pairs))
     }
@@ -2103,6 +2253,20 @@ struct Turns {
 impl Turns {
     fn of(period: Fraction, span: TimeSpan) -> Result<Self, SequenceStop> {
         let in_range = |turn: Option<i128>| turn.ok_or(SequenceStop::Range);
+        // Fast path for the common 1-cycle period over a single-cycle window.
+        if period == Fraction::ONE && span.begin < span.end {
+            let first = span.begin.floor().numer();
+            if let Some(next) = first.checked_add(1)
+                && span.end <= Fraction::int(next)
+            {
+                return Ok(Self {
+                    period,
+                    span,
+                    indices: first..next,
+                    read: None,
+                });
+            }
+        }
         // A span of no width meets the turn that holds its one time.
         let first = in_range(span.begin.checked_div_floor(period))?;
         let last = match span.begin == span.end {
@@ -2170,7 +2334,7 @@ fn query_layers(
     let Some(first) = layers.first() else {
         return Ok(());
     };
-    let mut turns = Turns::of(first.period, span)?;
+    let mut turns = Turns::of(first.period(), span)?;
     if turns.indices.end.checked_sub(turns.indices.start) == Some(1) {
         let turn = turns.turn(turns.indices.start)?;
         for layer in layers {
@@ -2192,7 +2356,12 @@ fn query_layers(
 
 /// The haps of `layers` in `state`'s span, after those of `out`. See
 /// [`sequence`].
-pub(crate) fn query_sequence_onto(layers: &[Layer], state: &State, out: &mut Vec<Hap>) {
+pub(crate) fn query_sequence_onto(
+    thread: &QueryThread,
+    layers: &[Layer],
+    state: &State,
+    out: &mut Vec<Hap>,
+) {
     /// The most room that an answer takes before its first hap.
     const MOST_ROOM: usize = 64;
     // A span of a cycle or more meets each step of most layers. A shorter
@@ -2207,23 +2376,24 @@ pub(crate) fn query_sequence_onto(layers: &[Layer], state: &State, out: &mut Vec
         out.reserve(steps.min(MOST_ROOM));
     }
     let from = out.len();
-    // The thread is reached one time for all the layers.
-    QUERY_THREAD.with(|thread| {
-        for layers in layers.chunk_by(|a, b| a.period == b.period) {
-            match query_layers(thread, layers, span, from, out) {
-                Ok(()) => {}
-                Err(stop) => {
-                    if matches!(stop, SequenceStop::Range) {
-                        refuse(QueryLimit::NativeFraction {
-                            operation: "sequence",
-                        });
-                    }
-                    out.truncate(from);
-                    return;
+    for layers in layers.chunk_by(|a, b| a.period == b.period) {
+        match query_layers(thread, layers, span, from, out) {
+            Ok(()) => {}
+            Err(stop) => {
+                if matches!(stop, SequenceStop::Range) {
+                    refuse(QueryLimit::NativeFraction {
+                        operation: "sequence",
+                    });
                 }
+                out.truncate(from);
+                return;
             }
         }
-    });
+    }
+    let added = out.len() - from;
+    if added > 0 {
+        crate::note_materialised(added);
+    }
 }
 
 /// Whether moving these layers by `by` leaves every step in place.
@@ -2235,7 +2405,7 @@ pub(crate) fn repeats_at(layers: &[Layer], by: Fraction, span: TimeSpan) -> bool
         return false;
     }
     layers.iter().all(|layer| {
-        let period = layer.period;
+        let period = layer.period();
         // An integer multiple of the reduced numerator is a whole number of periods.
         layer.listed().is_some_and(Listing::small_denominators)
             && small(period)
@@ -2265,7 +2435,7 @@ pub(crate) fn constant_value(layers: &[Layer]) -> Option<Cow<'_, Value>> {
     let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
     match layers {
         // A reader makes a hap of the value alone, so keys make no constant.
-        [layer] if layer.period == Fraction::ONE && layer.dress().keys.is_empty() => {
+        [layer] if layer.period() == Fraction::ONE && layer.dress().keys().is_empty() => {
             match layer.one_step() {
                 Some((whole, false, value)) if whole == cycle => layer
                     .value(value as usize)
@@ -2286,17 +2456,18 @@ pub(crate) fn pulse(layers: &[Layer]) -> Option<(i128, &Value)> {
     let [layer] = layers else {
         return None;
     };
-    if layer.period.numer() != 1 || !layer.dress().is_bare() {
+    let period = layer.period();
+    if period.numer() != 1 || !layer.dress().is_bare() {
         return None;
     }
-    let first = TimeSpan::new(Fraction::ZERO, layer.period);
+    let first = TimeSpan::new(Fraction::ZERO, period);
     let (whole, cut, value) = layer.one_step()?;
     if whole != first || cut || !layer.locations_of(0).is_empty() {
         return None;
     }
     // A bare dress gives each value as the step holds it.
     let value = layer.values.get(value as usize)?;
-    value.is_data(0).then_some((layer.period.denom(), value))
+    value.is_data(0).then_some((period.denom(), value))
 }
 
 #[cfg(test)]
@@ -2344,7 +2515,7 @@ pub(crate) fn folds(pattern: &Pattern) -> bool {
     // Silence and data hold none, so they answer the same under each
     // runtime.
     let reads_no_runtime = || pattern.is_rest() || is_data(pattern);
-    !pattern.is_volatile() && (pattern.runtime_settings.is_none() || reads_no_runtime())
+    !pattern.is_volatile() && (!pattern.has_runtime_settings() || reads_no_runtime())
 }
 
 /// The layers of `pattern`, when it is a sequence that a constructor folds
@@ -2464,9 +2635,7 @@ fn revalued(
 /// [`Pattern::with_added_context`] gives, when `pattern` is a sequence. A
 /// `pure` keeps its own node, which says that it is one.
 pub(crate) fn located(pattern: &Pattern, locations: &[(usize, usize)]) -> Option<Pattern> {
-    let layers = redressed(folded(pattern)?, |dress| {
-        dress.after.extend_from_slice(locations)
-    });
+    let layers = redressed(folded(pattern)?, |dress| dress.extend_after(locations));
     Some(node_of_sound(layers))
 }
 
@@ -2488,9 +2657,9 @@ pub(crate) fn selecting(
     let whole = |time: Fraction| time.denom() == 1;
     let layers = folded(selector)?;
     let plain = layers.iter().all(|layer| {
-        layer.dress().keys.is_empty()
+        layer.dress().keys().is_empty()
             && (!whole_cycles
-                || (whole(layer.period)
+                || (whole(layer.period())
                     && (0..layer.count()).all(|index| whole(layer.listing().whole(index).begin))))
     });
     if !plain {
@@ -2512,7 +2681,7 @@ pub(crate) fn selecting(
 pub(crate) fn is_bare(pattern: &Pattern) -> bool {
     folded(pattern).is_some_and(|layers| {
         layers.iter().all(|layer| {
-            layer.dress().keys.is_empty()
+            layer.dress().keys().is_empty()
                 && layer.dress().locates_alone()
                 && match layer.listing() {
                     Listing::Grid(grid) => grid.steps.iter().all(|step| step.loc.0 == 0),
@@ -2605,7 +2774,7 @@ pub(crate) fn mapped_haps(pattern: &Pattern, map: &HapMapFn) -> Option<Pattern> 
                 // One hap for each value in turn: the map reads it and
                 // makes its own.
                 let mut read = cycle_hap(Value::Undefined);
-                read.keys = layer.dress().keys.clone();
+                read.keys = layer.dress().keys().clone();
                 let values = layer
                     .each_value()
                     .map(|value| {
@@ -2622,12 +2791,18 @@ pub(crate) fn mapped_haps(pattern: &Pattern, map: &HapMapFn) -> Option<Pattern> 
                             && holds_a_value_and_keys(&hap)
                             && hap.context.is_empty()
                             && keys.same(&hap.keys))
-                        .then_some(hap.value)
+                        .then(|| {
+                            let mut value = hap.value;
+                            if let Value::Object(map) = &mut value {
+                                map.undress_patched();
+                            }
+                            value
+                        })
                     })
                     .collect::<Option<Vec<Value>>>()?;
                 let mut layer = layer.valued(values.into());
                 if let Some(keys) = keys {
-                    layer.change_dress(|dress| dress.keys = keys);
+                    layer.change_dress(|dress| dress.set_keys(keys));
                 }
                 Some(layer)
             })
@@ -2655,7 +2830,13 @@ fn made(function: &Value, value: &Value, apply: &Combine, flow: LookupFlow) -> O
     if !Meeting::in_place(&mut hap, &meets, part, apply, flow) {
         hap = applied_hap(&hap, &meets, hap.whole, part, apply, flow);
     }
-    is_plain(&hap).then_some(hap.value)
+    is_plain(&hap).then(|| {
+        let mut value = hap.value;
+        if let Value::Object(map) = &mut value {
+            map.undress_patched();
+        }
+        value
+    })
 }
 
 /// The `appLeft` of `functions` and `values` by `apply`, when `functions`
@@ -2753,7 +2934,6 @@ pub(crate) fn set_here(layers: &mut Arc<[Layer]>, control: &Value, context: Loca
         };
         layer.dress = Some(dress);
         layer.values_read = OnceLock::new();
-        layer.contexts = OnceLock::new();
     }
 }
 
@@ -2797,7 +2977,13 @@ pub(crate) fn applied_out(
                         let hf = cycle_hap(functions.value(function as usize)?);
                         let hv = cycle_hap(layer.value(value as usize)?);
                         let hap = applied_hap(&hf, &hv, hv.whole, hv.part, apply, flow);
-                        is_plain(&hap).then_some(hap.value)
+                        is_plain(&hap).then(|| {
+                            let mut value = hap.value;
+                            if let Value::Object(map) = &mut value {
+                                map.undress_patched();
+                            }
+                            value
+                        })
                     })
                     .collect::<Option<Vec<Value>>>()?;
                 Some(met.valued(values.into()))
@@ -2832,7 +3018,7 @@ pub(crate) fn filtered(pattern: &Pattern, keep: &ValuePredicate) -> Option<Patte
                     .map(|index| listing.raw(index))
                     .collect();
                 layer.with(|layer| {
-                    layer.in_cycles = lie_in_spans(layer.period, raws.iter().map(Raw::part));
+                    layer.in_cycles = lie_in_spans(layer.period(), raws.iter().map(Raw::part));
                     layer.steps = Steps::Listed(Listing::of(raws));
                 })
             })
@@ -2872,7 +3058,7 @@ pub(crate) fn faster(pattern: &Pattern, factor: Fraction) -> Option<Pattern> {
     let layers = layers
         .iter()
         .map(|layer| {
-            let period = layer.period.checked_div(factor).filter(small)?;
+            let period = layer.period().checked_div(factor).filter(small)?;
             // The times of the steps are in cycles, so they change with
             // the speed.
             let listing = layer.listing();
@@ -2893,7 +3079,7 @@ pub(crate) fn faster(pattern: &Pattern, factor: Fraction) -> Option<Pattern> {
                 .collect::<Option<Vec<_>>>()?;
             Some(layer.with(|layer| {
                 layer.in_cycles = lie_in_spans(period, raws.iter().map(Raw::part));
-                layer.period = period;
+                layer.period = Period::from_fraction(period);
                 layer.steps = Steps::Listed(Listing::of(raws));
             }))
         })
@@ -2950,7 +3136,7 @@ pub(crate) fn plied(pattern: &Pattern, count: usize) -> Option<Pattern> {
                 }
             }
             Some(layer.with(|layer| {
-                layer.in_cycles = lie_in_spans(layer.period, raws.iter().map(Raw::part));
+                layer.in_cycles = lie_in_spans(layer.period(), raws.iter().map(Raw::part));
                 layer.steps = Steps::Listed(Listing::of(raws));
             }))
         })
@@ -4855,11 +5041,14 @@ mod tests {
 
     fn haps_of(layer: &Layer, span: (Fraction, Fraction)) -> Vec<String> {
         let mut out = Vec::new();
-        query_sequence_onto(
-            std::slice::from_ref(layer),
-            &State::new(TimeSpan::new(span.0, span.1)),
-            &mut out,
-        );
+        crate::QUERY_THREAD.with(|thread| {
+            query_sequence_onto(
+                thread,
+                std::slice::from_ref(layer),
+                &State::new(TimeSpan::new(span.0, span.1)),
+                &mut out,
+            );
+        });
         out.iter()
             .map(|hap| format!("{hap:?} {:?}", hap.context.to_vec()))
             .collect()
@@ -4867,12 +5056,12 @@ mod tests {
 
     /// The same layer with its steps as places.
     fn as_places(layer: &Layer) -> Layer {
-        let places: Arc<[Place]> = layer.places().into();
+        let places: Box<[Place]> = layer.places().into();
         layer.with(|layer| {
-            layer.steps = Steps::Listed(Listing::Places(Listed {
+            layer.steps = Steps::Listed(Listing::Places(Arc::new(Listed {
                 places,
                 small_denominators: true,
-            }));
+            })));
         })
     }
 

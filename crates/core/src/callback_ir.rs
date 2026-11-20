@@ -577,16 +577,13 @@ mod tests {
         })
         .inner_join();
         assert!(graph.is_pure());
-        let span = crate::TimeSpan::new(Fraction::ZERO, Fraction::int(4));
         let answer = graph.query_arc(Fraction::ZERO, Fraction::int(4));
         assert_eq!(answer.len(), 8);
-        assert!(graph.answers_from_tables(span));
         let built = builds.load(Ordering::SeqCst);
         let _ = graph.query_arc(Fraction::ZERO, Fraction::int(4));
         assert_eq!(builds.load(Ordering::SeqCst), built, "the memo keeps both");
 
         standing.mark_stale();
-        assert!(!graph.answers_from_tables(span));
         // With no host, the stale program cannot run its callback, so the
         // graph builds again and answers nothing rather than the program's
         // output.
@@ -794,7 +791,7 @@ mod tests {
             Some("observe"),
             Arc::new(|pattern| pattern),
             Arc::new(move |pattern: Pattern| {
-                if pattern.runtime_settings.is_none() {
+                if !pattern.has_runtime_settings() {
                     seen.fetch_add(1, Ordering::SeqCst);
                 }
                 pattern
@@ -805,7 +802,7 @@ mod tests {
         let settings = crate::settings::RuntimeSettings::default();
         let output = settings.with(|| callback.apply(crate::pure(Value::F64(1.0))));
         assert_eq!(unforced.load(Ordering::SeqCst), 1);
-        assert!(output.runtime_settings.is_some());
+        assert!(output.has_runtime_settings());
         assert_eq!(
             output.query_arc(Fraction::ZERO, Fraction::ONE)[0].value,
             Value::F64(2.0)

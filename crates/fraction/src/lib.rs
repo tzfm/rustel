@@ -84,12 +84,24 @@ const SMALL_LIMIT: i128 = 1 << 31;
 
 #[inline]
 fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
-        let t = a % b;
-        a = b;
-        b = t;
+    if a == 0 {
+        return b;
     }
-    a
+    if b == 0 {
+        return a;
+    }
+    let shift = (a | b).trailing_zeros();
+    a >>= a.trailing_zeros();
+    loop {
+        b >>= b.trailing_zeros();
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        b -= a;
+        if b == 0 {
+            return a << shift;
+        }
+    }
 }
 
 /// A grid of equally spaced ticks per cycle. Each residue gives the common
@@ -170,6 +182,19 @@ fn reduced_small(n: i64, d: i64) -> Fraction {
         };
     }
     let divisor = gcd_u64(n.unsigned_abs(), d as u64) as i64;
+    if divisor == 1 {
+        return Fraction {
+            n: i128::from(n),
+            d: den(i128::from(d)),
+        };
+    }
+    if divisor & (divisor - 1) == 0 {
+        let shift = divisor.trailing_zeros();
+        return Fraction {
+            n: i128::from(n >> shift),
+            d: den(i128::from(d >> shift)),
+        };
+    }
     Fraction {
         n: i128::from(n / divisor),
         d: den(i128::from(d / divisor)),
@@ -534,6 +559,7 @@ impl Fraction {
     }
 
     /// Lossy: for interop at the audio boundary only. Never for cycle maths.
+    #[inline]
     pub fn to_f64(&self) -> f64 {
         let d = self.d.get();
         // A 64-bit integer converts with the same rounding as a 128-bit one
@@ -628,6 +654,7 @@ impl Fraction {
 
     /// Exact addition, returning `None` if the reduced result cannot fit in
     /// `i128` components.
+    #[inline]
     pub fn checked_add(self, o: Self) -> Option<Self> {
         if let Some(sum) = self.whole_sum(o, false) {
             return Some(sum);
@@ -661,6 +688,7 @@ impl Fraction {
 
     /// Checked exact subtraction; unlike `self.add(o.neg())`, this can inspect
     /// `i128::MIN` without first negating it.
+    #[inline]
     pub fn checked_sub(self, o: Self) -> Option<Self> {
         if let Some(difference) = self.whole_sum(o, true) {
             return Some(difference);
@@ -715,6 +743,7 @@ impl Fraction {
 
     /// Checked multiplication. The `i128` path cancels across the operands
     /// before either product.
+    #[inline]
     pub fn checked_mul(self, o: Self) -> Option<Self> {
         if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
             return Some(reduced_small(n * on, d * od));
@@ -731,6 +760,7 @@ impl Fraction {
     /// Checked division, with cross-cancellation on the `i128` path. `None`
     /// includes division by zero and an exact result outside the native
     /// `i128/i128` representation.
+    #[inline]
     pub fn checked_div(self, o: Self) -> Option<Self> {
         if o.n == 0 {
             return None;
@@ -868,6 +898,7 @@ impl Fraction {
 
     /// Rounds toward negative infinity: `(-1/4).floor() == -1`, so negative
     /// times map to the start of their containing cycle.
+    #[inline]
     pub fn floor(self) -> Self {
         if let Some((n, d)) = self.small() {
             return Fraction {
@@ -879,6 +910,7 @@ impl Fraction {
         Fraction { n: q, d: den(1) }
     }
 
+    #[inline]
     pub fn ceil(self) -> Self {
         let f = self.floor();
         if f.mul_eq_self(self) {
@@ -893,6 +925,7 @@ impl Fraction {
 
     /// `(self / o).floor()` as a whole count, with no reduced quotient on
     /// the 64-bit path. `None` as [`Self::checked_div`] gives it.
+    #[inline]
     pub fn checked_div_floor(self, o: Self) -> Option<i128> {
         match self.small_quotient(o) {
             Some((n, d)) => Some(i128::from(n.div_euclid(d))),
@@ -902,6 +935,7 @@ impl Fraction {
 
     /// `(self / o).ceil()` as a whole count, with no reduced quotient on
     /// the 64-bit path. `None` as [`Self::checked_div`] gives it.
+    #[inline]
     pub fn checked_div_ceil(self, o: Self) -> Option<i128> {
         match self.small_quotient(o) {
             // The floor of the negated quotient, negated: no remainder to
@@ -1032,12 +1066,14 @@ impl std::ops::Neg for Fraction {
 }
 
 impl PartialOrd for Fraction {
+    #[inline]
     fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
         Some(self.cmp(o))
     }
 }
 
 impl Ord for Fraction {
+    #[inline]
     fn cmp(&self, o: &Self) -> Ordering {
         // Reduced fractions of one denominator order as their numerators do.
         if self.d == o.d {

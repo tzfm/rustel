@@ -4068,7 +4068,7 @@ mod tests {
                 "{source} under a constant"
             );
         }
-        assert!(reading > 300, "{reading} texts read their plans");
+        assert!(reading > 200, "{reading} texts read their plans");
         assert!(listed > 500, "{listed} texts list their steps");
     }
 

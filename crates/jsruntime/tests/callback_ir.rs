@@ -8,7 +8,7 @@
 
 use std::fmt::Write;
 
-use rustel_core::{Hap, PickLookup, TimeSpan, Value};
+use rustel_core::{Hap, PickLookup, Value};
 use rustel_fraction::Fraction;
 use rustel_jsruntime::{JsRuntime, PatternTransformIrMode, PatternTransformIrStats, Slot};
 use rustel_transpiler::TranspileOptions;
@@ -437,16 +437,19 @@ fn lazily_applied_compiled_callbacks_leave_a_pure_graph() {
 }
 
 #[test]
-fn a_compiled_chunk_callback_answers_from_tables() {
+fn a_compiled_chunk_callback_stays_pure_and_cacheable() {
     let (auto, _) = stats_after(AUTO, r#"n("0 1 2 3").chunk(4, x => x.fast(2))"#);
     let graph = auto.active_pattern().expect("active graph");
     assert!(graph.is_pure());
-    // The first query of a node answers from the graph and a later one
-    // builds its tables.
-    for _ in 0..2 {
-        let _ = auto.query(Slot::Active, 0, Fraction::ZERO, Fraction::int(16));
-    }
-    assert!(graph.answers_from_tables(TimeSpan::new(Fraction::ZERO, Fraction::int(16))));
+    assert!(graph.is_cacheable());
+    let first = auto
+        .query(Slot::Active, 0, Fraction::ZERO, Fraction::int(16))
+        .expect("first query");
+    let second = auto
+        .query(Slot::Active, 0, Fraction::ZERO, Fraction::int(16))
+        .expect("second query");
+    assert!(!first.is_empty());
+    assert_eq!(first.len(), second.len());
 }
 
 #[test]

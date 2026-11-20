@@ -59,216 +59,9 @@ impl Pattern {
         true
     }
 
-    /// Take the precomputed tables of `previous`, the graph an edit replaced
-    /// with this one, wherever both are the same construction and the tables
-    /// still answer. An edit rebuilds only what it changed, so the first
-    /// query of the new graph pays for the changed parts alone.
-    ///
-    /// A node's answers embed its descendants' answers, so a pair takes
-    /// tables only once every pair below it agreed: the walk refuses a pair
-    /// whose subtree changed, and the siblings of a refused pair still
-    /// carry. A pair that shares one cell with its counterpart is that
-    /// subtree agreed entire: the cell serves both graphs, so the walk
-    /// takes nothing and stops there.
-    ///
-    /// A table answers only while what it was built with still stands, so a
-    /// table whose settings snapshot or compiled programs moved on is left
-    /// behind. The check runs here, at handover, and again at every query:
-    /// a filled table that later stops answering is replaced by the build
-    /// of the state in force, never left to dead-end its node.
+    /// Answer tables have been removed in favour of direct graph walks.
     #[doc(hidden)]
-    pub fn adopt_tables_from(&self, previous: &Pattern) {
-        // A graph that walks reads no table, so it takes none.
-        if self.purity.walked {
-            return;
-        }
-        /// A pair entered, waiting for the verdicts of its children.
-        struct Leave<'a> {
-            left: &'a Pattern,
-            right: &'a Pattern,
-            /// Whether this pair's own shape and payloads agreed.
-            own: bool,
-            /// How many verdicts of children it takes.
-            children: usize,
-        }
-        enum Step<'a> {
-            Enter(&'a Pattern, &'a Pattern),
-            Leave(Leave<'a>),
-        }
-        let mut steps = vec![Step::Enter(self, previous)];
-        let mut verdicts: Vec<bool> = Vec::new();
-        let mut budget = MAX_COMPARED_NODES;
-        while let Some(step) = steps.pop() {
-            match step {
-                Step::Enter(left, right) => {
-                    // Two handles of one cell with different step counts or
-                    // purity refuse the pair. The cell serves both graphs
-                    // anyway, so nothing below it can move.
-                    if !same_handles(left, right) {
-                        verdicts.push(false);
-                        continue;
-                    }
-                    if Arc::ptr_eq(&left.node, &right.node) {
-                        verdicts.push(true);
-                        continue;
-                    }
-                    let Some(rest) = budget.checked_sub(1) else {
-                        return;
-                    };
-                    budget = rest;
-                    let mut children = Vec::new();
-                    let shape = same_node(&left.node.kind, &right.node.kind, &mut children);
-                    // A pair whose shape refused keeps the children the
-                    // shape compare already queued, if it compared that far.
-                    let own = shape && same_opaque_payloads(&left.node.kind, &right.node.kind);
-                    // The children carry whatever they carry even where this
-                    // pair does not: their answers are their own.
-                    steps.push(Step::Leave(Leave {
-                        left,
-                        right,
-                        own,
-                        children: children.len(),
-                    }));
-                    steps.extend(
-                        children
-                            .into_iter()
-                            .map(|(left, right)| Step::Enter(left, right)),
-                    );
-                }
-                Step::Leave(Leave {
-                    left,
-                    right,
-                    own,
-                    children,
-                }) => {
-                    let split = verdicts
-                        .len()
-                        .checked_sub(children)
-                        .expect("one verdict per child");
-                    let agreed = own && verdicts.drain(split..).all(|agreed| agreed);
-                    verdicts.push(agreed);
-                    if !agreed {
-                        continue;
-                    }
-                    let handover = right.node.tables.read().ok().and_then(|slot| match &*slot {
-                        crate::table::TableSlot::Ready(tables) if tables.current() => {
-                            Some(Arc::clone(tables))
-                        }
-                        _ => None,
-                    });
-                    if left.tables_may_answer()
-                        && let Some(tables) = handover
-                        // A build may have taken the slot while this walk
-                        // reached it; the build's verdict wins.
-                        && let Ok(mut slot) = left.node.tables.write()
-                        && matches!(&*slot, crate::table::TableSlot::Empty)
-                    {
-                        *slot = crate::table::TableSlot::Ready(tables);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Whether the payloads [`same_node`] leaves out cannot tell this pair
-/// apart. Only a pair `same_node` accepted reaches here, so `right` is the
-/// same kind as `left`.
-///
-/// The differential mode may leave them out: two builds of one score make
-/// equal payloads, so the node shape already settles agreement there. An
-/// edit makes different payloads under a shape it did not change, and the
-/// answers of the old payloads are not this node's. Such a pair refuses,
-/// and a kind whose payloads `same_node` leaves out must be named here or
-/// its edits never carry: the match names every kind, so a new one refuses
-/// to compile until it is placed.
-fn same_opaque_payloads(left: &Node, right: &Node) -> bool {
-    use Node::*;
-    match left {
-        WithQueryTime(_, f) => matches!(right, WithQueryTime(_, g) if Arc::ptr_eq(f, g)),
-        WithHapTime(_, f) => matches!(right, WithHapTime(_, g) if Arc::ptr_eq(f, g)),
-        WithQuerySpan(_, f) => matches!(right, WithQuerySpan(_, g) if Arc::ptr_eq(f, g)),
-        WithHapSpan(_, f) => matches!(right, WithHapSpan(_, g) if Arc::ptr_eq(f, g)),
-        FmapNative(_, f) => matches!(right, FmapNative(_, g) if Arc::ptr_eq(f, g)),
-        FilterValues(_, f) => matches!(right, FilterValues(_, g) if Arc::ptr_eq(f, g)),
-        FilterHaps(_, f) => matches!(right, FilterHaps(_, g) if Arc::ptr_eq(f, g)),
-        MapHapsNative(_, f, _) => matches!(right, MapHapsNative(_, g, _) if Arc::ptr_eq(f, g)),
-        MapHapsOwned(_, f, _) => matches!(right, MapHapsOwned(_, g, _) if Arc::ptr_eq(f, g)),
-        MapHapsWithState(_, f) => matches!(right, MapHapsWithState(_, g) if Arc::ptr_eq(f, g)),
-        ExpandHapsNative(_, f, _) => {
-            matches!(right, ExpandHapsNative(_, g, _) if Arc::ptr_eq(f, g))
-        }
-        Signal(f) => matches!(right, Signal(g) if Arc::ptr_eq(f, g)),
-        InnerJoin(_, f) => matches!(right, InnerJoin(_, g) if Arc::ptr_eq(f, g)),
-        PatternOfDynamic(_, f) => matches!(right, PatternOfDynamic(_, g) if Arc::ptr_eq(f, g)),
-        PatternOfPure(_, f, _) => matches!(right, PatternOfPure(_, g, _) if Arc::ptr_eq(f, g)),
-        PatternOfPureOperand(_, f, _) => {
-            matches!(right, PatternOfPureOperand(_, g, _) if f.same(g))
-        }
-        PatternOfHap(f) => matches!(right, PatternOfHap(g) if Arc::ptr_eq(&f.2, &g.2)),
-        AppLeft(_, f, _, _) => matches!(right, AppLeft(_, g, _, _) if same_combine(f, g)),
-        AppRight(_, f, _) => matches!(right, AppRight(_, g, _) if same_combine(f, g)),
-        AppBoth(_, f, _) => matches!(right, AppBoth(_, g, _) if same_combine(f, g)),
-        FmapJsPreservingControls(_, _, f) => match right {
-            FmapJsPreservingControls(_, _, g) => match (f, g) {
-                (Some(f), Some(g)) => std::ptr::fn_addr_eq(*f, *g),
-                (None, None) => true,
-                _ => false,
-            },
-            _ => false,
-        },
-        Extension(f) => matches!(right, Extension(g) if std::ptr::eq(&**f, &**g)),
-        #[cfg(non_send_node_mutation)]
-        NonSendMutation(_) => false,
-        // Every kind left carries its whole payload in the fields
-        // `same_node` compares: the shape settles it, and the pair carries.
-        Silence
-        | Pure(_)
-        | Sequence(_)
-        | Constants(..)
-        | QueryError(_)
-        | QueryLimit(_)
-        | Fast(..)
-        | Shift(..)
-        | WithQuerySpanJs(..)
-        | Rev(_)
-        | StepJoin(_)
-        | PolyJoin(_)
-        | Arp(..)
-        | ArpWith(..)
-        | ArpWithPattern(..)
-        | PurePattern(_)
-        | PurePickLookup(..)
-        | PatternOfJs(..)
-        | FilterValuesJs(..)
-        | FilterHapsJs(..)
-        | FilterWhenJs(..)
-        | SortHapsByPart(_)
-        | Collect(_)
-        | CycleOnsetIndex(_)
-        | CycleOnsetCount(_)
-        | WithRandSeed(..)
-        | ChooseCycles(..)
-        | WChoose { .. }
-        | Pick { .. }
-        | PickPatternified { .. }
-        | Degrade(..)
-        | Stack(_)
-        | SlowCat(_)
-        | SlowCatPrime(_)
-        | SplitQueries(_)
-        | FastGap(..)
-        | RepeatCycles(..)
-        | LoopAt(..)
-        | Cpm(..)
-        | MidiKeys(..)
-        | AddContext(..)
-        | XenPatterns(..)
-        | Join(..)
-        | FmapJs(..)
-        | JsQuery(_)
-        | Timeline(..) => true,
-    }
+    pub fn adopt_tables_from(&self, _previous: &Pattern) {}
 }
 
 /// Whether two apply functions of a meeting are the same one.
@@ -287,12 +80,9 @@ pub(crate) fn same_combine(left: &crate::Combine, right: &crate::Combine) -> boo
 
 /// Whether two handles carry the same metadata their nodes cannot express.
 fn same_handles(left: &Pattern, right: &Pattern) -> bool {
-    left.step_count == right.step_count
-        && left.pure_loc == right.pure_loc
-        && left.purity.impure == right.purity.impure
-        && left.purity.opaque == right.purity.opaque
-        && left.purity.volatile == right.purity.volatile
-        && left.purity.host_voicings == right.purity.host_voicings
+    left.same_steps(right)
+        && left.pure_loc() == right.pure_loc()
+        && left.same_purity_flags(right)
         && left.same_runtime_owner(right)
 }
 
@@ -468,9 +258,10 @@ fn same_node<'g>(
             Node::PurePattern(b) => child!(a, b),
             _ => false,
         },
-        Node::PurePickLookup(value, lookup) => match right {
-            Node::PurePickLookup(other_value, other_lookup) => {
-                same_value(value, other_value) && same_lookup(lookup, other_lookup, pending)
+        Node::PurePickLookup(boxed) => match right {
+            Node::PurePickLookup(other_boxed) => {
+                same_value(&boxed.0, &other_boxed.0)
+                    && same_lookup(&boxed.1, &other_boxed.1, pending)
             }
             _ => false,
         },
@@ -636,8 +427,8 @@ fn same_node<'g>(
             Node::MidiKeys(b, other) if Arc::ptr_eq(port, other) => child!(a, b),
             _ => false,
         },
-        Node::AppLeft(a, _, flow, _) => match right {
-            Node::AppLeft(b, _, other_flow, _) if flow == other_flow => {
+        Node::AppLeft(a, _, flow) => match right {
+            Node::AppLeft(b, _, other_flow) if flow == other_flow => {
                 pending.push((&a.1, &b.1));
                 child!(&a.0, &b.0)
             }
@@ -665,12 +456,12 @@ fn same_node<'g>(
             Node::AddContext(b, other) if locations == other => child!(a, b),
             _ => false,
         },
-        Node::PatternOfPure(a, _, _) => match right {
-            Node::PatternOfPure(b, _, _) => child!(a, b),
+        Node::PatternOfPure(a, _) => match right {
+            Node::PatternOfPure(b, _) => child!(a, b),
             _ => false,
         },
-        Node::PatternOfPureOperand(a, _, _) => match right {
-            Node::PatternOfPureOperand(b, _, _) => child!(&a.0, &b.0) && child!(&a.1, &b.1),
+        Node::PatternOfPureOperand(a, _) => match right {
+            Node::PatternOfPureOperand(b, _) => child!(&a.0, &b.0) && child!(&a.1, &b.1),
             _ => false,
         },
         Node::PatternOfDynamic(a, _) => match right {
@@ -769,19 +560,6 @@ mod tests {
     fn queried_twice(pattern: &Pattern) {
         numbers(pattern);
         numbers(pattern);
-    }
-
-    #[test]
-    fn a_graph_that_walks_takes_no_table() {
-        let build = || fastcat(vec![pure(Value::F64(1.0)), pure(Value::F64(2.0))]).rev();
-        let one = build();
-        queried_twice(&one);
-        assert!(one.built_tables().is_some());
-        let (walked, tabled) = (build().mark_walked(), build());
-        walked.adopt_tables_from(&one);
-        assert!(walked.built_tables().is_none());
-        tabled.adopt_tables_from(&one);
-        assert!(tabled.built_tables().is_some());
     }
 
     #[test]

@@ -675,7 +675,7 @@ impl<'p> Turn<'p> {
             if !names.mini() || offset.fract() != 0.0 || !offset.is_finite() {
                 return None;
             }
-            return crate::surface::transpiled_mini(source, *offset as i64)
+            return crate::surface::parse_mini_in_room(source, *offset as i64)
                 .ok()
                 .map(Native::Pattern);
         }

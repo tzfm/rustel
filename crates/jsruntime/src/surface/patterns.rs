@@ -175,6 +175,31 @@ pub(crate) fn rest_mini_room() {
     MINI_MEMO.with(|memo| memo.borrow_mut().room = rustel_mini::Room::default());
 }
 
+/// Parse a mini-notation literal using the thread's scratch [`Room`] without
+/// retaining a duplicate graph in [`MINI_MEMO`]. Native score evaluation
+/// caches folded expressions in `native::memo::Reuse`, so keeping bare mini
+/// literals in `MINI_MEMO` would both double retained memory and prevent
+/// in-place `Arc::get_mut` folding during evaluation.
+pub(crate) fn parse_mini_in_room(source: &str, offset: i64) -> Result<Pattern, String> {
+    if let Ok(at) = usize::try_from(offset)
+        && let Some(word) = rustel_mini::word_constant(source, at)
+    {
+        return Ok(word);
+    }
+    let at = usize::try_from(offset).unwrap_or(0);
+    let pattern = MINI_MEMO
+        .with(|memo| rustel_mini::mini_in(&mut memo.borrow_mut().room, source, at))
+        .map_err(|error| error.to_string())?;
+    let pattern = if offset < 0 {
+        pattern
+            .map_haps_native(|hap| Some(hap.clone().with_context(Vec::new())))
+            .with_steps(pattern.steps())
+    } else {
+        pattern
+    };
+    Ok(pattern)
+}
+
 /// The pattern a transpiled mini-notation literal builds. `offset` is the
 /// byte offset of its opening quote in the score. A negative offset parses
 /// without source locations, for code outside the score.

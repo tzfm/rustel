@@ -20,8 +20,15 @@ later version.
 use std::fmt;
 use std::sync::Arc;
 
-/// Ranges kept in place before the list moves to the heap.
-const INLINE: usize = 5;
+/// Compact ranges kept in place before the list moves to the heap.
+const INLINE: usize = 7;
+/// Wide `(u32, u16)` ranges kept in place when a range exceeds the 20/12-bit
+/// packed layout.
+const WIDE_INLINE: usize = 5;
+
+const PACKED_LEN_BITS: u32 = 12;
+const PACKED_LEN_MASK: u32 = (1 << PACKED_LEN_BITS) - 1;
+const PACKED_BEGIN_LIMIT: u32 = 1 << (32 - PACKED_LEN_BITS);
 
 // The ranges in place take the room of the list on the heap and its tag.
 const _: () = assert!(std::mem::size_of::<Locations>() == 32);
@@ -32,17 +39,41 @@ pub struct Locations(Repr);
 
 #[derive(Clone)]
 enum Repr {
+    /// Up to 7 compact ranges, each packed as `(begin << 12) | length`
+    /// (`begin < 2^20`, `length < 2^12`), covering scores up to 1 MiB.
+    Packed {
+        len: u8,
+        spans: [u32; INLINE],
+    },
+    /// Up to 5 wide `(u32, u16)` ranges for offsets >= 1 MiB or spans >= 4 KiB.
     Inline {
         len: u8,
         /// Where each range begins.
-        begins: [u32; INLINE],
+        begins: [u32; WIDE_INLINE],
         /// How long each range is.
-        lengths: [u16; INLINE],
+        lengths: [u16; WIDE_INLINE],
     },
     Shared(Arc<[(usize, usize)]>),
 }
 
-/// `range` as a list in place holds it: its begin and its length. `None`
+/// Pack `(begin, end)` into 32 bits when `begin < 2^20` and `length < 2^12`.
+#[inline]
+fn pack_range((begin, end): (usize, usize)) -> Option<u32> {
+    let length = end.checked_sub(begin)?;
+    let begin = u32::try_from(begin).ok()?;
+    let length = u32::try_from(length).ok()?;
+    (begin < PACKED_BEGIN_LIMIT && length <= PACKED_LEN_MASK)
+        .then_some((begin << PACKED_LEN_BITS) | length)
+}
+
+#[inline]
+fn unpack_range(packed: u32) -> (usize, usize) {
+    let begin = (packed >> PACKED_LEN_BITS) as usize;
+    let length = (packed & PACKED_LEN_MASK) as usize;
+    (begin, begin + length)
+}
+
+/// `range` as a wide list in place holds it: its begin and its length. `None`
 /// for a range that takes more room.
 fn narrow((begin, end): (usize, usize)) -> Option<(u32, u16)> {
     let length = end.checked_sub(begin)?;
@@ -58,18 +89,22 @@ fn wide(begin: u32, length: u16) -> (usize, usize) {
 impl Locations {
     /// No ranges.
     pub const fn new() -> Self {
-        Self(Repr::Inline {
+        Self(Repr::Packed {
             len: 0,
-            begins: [0; INLINE],
-            lengths: [0; INLINE],
+            spans: [0; INLINE],
         })
     }
 
     /// The one range that begins at `begin` and is `length` long, with no
     /// check of the room, which one range always has.
     pub(crate) const fn one(begin: u32, length: u16) -> Self {
-        let mut begins = [0; INLINE];
-        let mut lengths = [0; INLINE];
+        if begin < PACKED_BEGIN_LIMIT && (length as u32) <= PACKED_LEN_MASK {
+            let mut spans = [0; INLINE];
+            spans[0] = (begin << PACKED_LEN_BITS) | (length as u32);
+            return Self(Repr::Packed { len: 1, spans });
+        }
+        let mut begins = [0; WIDE_INLINE];
+        let mut lengths = [0; WIDE_INLINE];
         begins[0] = begin;
         lengths[0] = length;
         Self(Repr::Inline {
@@ -80,25 +115,32 @@ impl Locations {
     }
 
     /// How many ranges there are.
+    #[inline]
     pub fn len(&self) -> usize {
         match &self.0 {
-            Repr::Inline { len, .. } => usize::from(*len),
+            Repr::Packed { len, .. } | Repr::Inline { len, .. } => usize::from(*len),
             Repr::Shared(ranges) => ranges.len(),
         }
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Whether the ranges are kept in place, owning no heap memory.
+    #[cfg(test)]
     pub(crate) fn is_inline(&self) -> bool {
-        matches!(self.0, Repr::Inline { .. })
+        matches!(self.0, Repr::Packed { .. } | Repr::Inline { .. })
     }
 
     /// The range at `index`, oldest first.
+    #[inline]
     pub fn get(&self, index: usize) -> Option<(usize, usize)> {
         match &self.0 {
+            Repr::Packed { len, spans } => {
+                (index < usize::from(*len)).then(|| unpack_range(spans[index]))
+            }
             Repr::Inline {
                 len,
                 begins,
@@ -141,28 +183,69 @@ impl Locations {
         if more.is_empty() {
             return;
         }
-        if let Repr::Inline {
-            len,
-            begins,
-            lengths,
-        } = &mut self.0
-        {
-            let start = usize::from(*len);
-            if start + more.len() <= INLINE {
-                let mut narrowed = [(0u32, 0u16); INLINE];
-                let fits = narrowed
-                    .iter_mut()
-                    .zip(more)
-                    .all(|(slot, range)| narrow(*range).map(|range| *slot = range).is_some());
-                if fits {
-                    for (at, (begin, length)) in narrowed[..more.len()].iter().enumerate() {
-                        begins[start + at] = *begin;
-                        lengths[start + at] = *length;
+        match &mut self.0 {
+            Repr::Packed { len, spans } => {
+                let start = usize::from(*len);
+                if start + more.len() <= INLINE {
+                    let mut packed = [0u32; INLINE];
+                    let fits = packed
+                        .iter_mut()
+                        .zip(more)
+                        .all(|(slot, range)| pack_range(*range).map(|v| *slot = v).is_some());
+                    if fits {
+                        spans[start..start + more.len()].copy_from_slice(&packed[..more.len()]);
+                        *len += more.len() as u8;
+                        return;
                     }
-                    *len += more.len() as u8;
-                    return;
+                }
+                if start + more.len() <= WIDE_INLINE {
+                    let mut begins = [0u32; WIDE_INLINE];
+                    let mut lengths = [0u16; WIDE_INLINE];
+                    for (at, &p) in spans[..start].iter().enumerate() {
+                        begins[at] = p >> PACKED_LEN_BITS;
+                        lengths[at] = (p & PACKED_LEN_MASK) as u16;
+                    }
+                    let fits = more.iter().enumerate().all(|(at, range)| {
+                        narrow(*range)
+                            .map(|(b, l)| {
+                                begins[start + at] = b;
+                                lengths[start + at] = l;
+                            })
+                            .is_some()
+                    });
+                    if fits {
+                        self.0 = Repr::Inline {
+                            len: (start + more.len()) as u8,
+                            begins,
+                            lengths,
+                        };
+                        return;
+                    }
                 }
             }
+            Repr::Inline {
+                len,
+                begins,
+                lengths,
+            } => {
+                let start = usize::from(*len);
+                if start + more.len() <= WIDE_INLINE {
+                    let mut narrowed = [(0u32, 0u16); WIDE_INLINE];
+                    let fits = narrowed
+                        .iter_mut()
+                        .zip(more)
+                        .all(|(slot, range)| narrow(*range).map(|range| *slot = range).is_some());
+                    if fits {
+                        for (at, (begin, length)) in narrowed[..more.len()].iter().enumerate() {
+                            begins[start + at] = *begin;
+                            lengths[start + at] = *length;
+                        }
+                        *len += more.len() as u8;
+                        return;
+                    }
+                }
+            }
+            Repr::Shared(_) => {}
         }
         let mut inline = [(0, 0); INLINE];
         let all: Arc<[(usize, usize)]> = self
@@ -178,6 +261,13 @@ impl Locations {
     /// in place.
     fn as_slice<'a>(&'a self, inline: &'a mut [(usize, usize); INLINE]) -> &'a [(usize, usize)] {
         match &self.0 {
+            Repr::Packed { len, spans } => {
+                let len = usize::from(*len);
+                for (at, slot) in inline[..len].iter_mut().enumerate() {
+                    *slot = unpack_range(spans[at]);
+                }
+                &inline[..len]
+            }
             Repr::Inline {
                 len,
                 begins,
@@ -195,17 +285,38 @@ impl Locations {
 
     /// Append every range of `other`, after this list's own.
     pub fn append(&mut self, other: &Locations) {
+        if other.is_empty() {
+            return;
+        }
+        if self.is_empty() {
+            *self = other.clone();
+            return;
+        }
         match &other.0 {
             Repr::Shared(ranges) => self.extend_from_slice(ranges),
+            Repr::Packed { len, spans } => {
+                let len = usize::from(*len);
+                if let Repr::Packed {
+                    len: own,
+                    spans: own_spans,
+                } = &mut self.0
+                {
+                    let start = usize::from(*own);
+                    if start + len <= INLINE {
+                        own_spans[start..start + len].copy_from_slice(&spans[..len]);
+                        *own += len as u8;
+                        return;
+                    }
+                }
+                let mut inline = [(0, 0); INLINE];
+                self.extend_from_slice(other.as_slice(&mut inline));
+            }
             Repr::Inline {
                 len,
                 begins,
                 lengths,
             } => {
                 let len = usize::from(*len);
-                if len == 0 {
-                    return;
-                }
                 if let Repr::Inline {
                     len: own,
                     begins: own_begins,
@@ -213,7 +324,7 @@ impl Locations {
                 } = &mut self.0
                 {
                     let start = usize::from(*own);
-                    if start + len <= INLINE {
+                    if start + len <= WIDE_INLINE {
                         own_begins[start..start + len].copy_from_slice(&begins[..len]);
                         own_lengths[start..start + len].copy_from_slice(&lengths[..len]);
                         *own += len as u8;
@@ -352,7 +463,7 @@ mod tests {
         let mut locations = Locations::new();
         for index in 0..INLINE {
             locations.push((index, index + 1));
-            assert!(matches!(locations.0, Repr::Inline { .. }));
+            assert!(locations.is_inline());
         }
         locations.push((9, 10));
         assert!(matches!(locations.0, Repr::Shared(_)));

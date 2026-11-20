@@ -1042,11 +1042,38 @@ fn voicing_hap(hap: &crate::Hap) -> Vec<crate::Hap> {
     // Each note is first, then each control that the voicing does not
     // read. A note that the chord holds takes the place of each note.
     let own_note = map.get("note");
-    let rest = || {
-        map.into_iter()
-            .filter(|(key, _)| key.as_str() != "note" && !VOICING_CONTROLS.contains(&key.as_str()))
-            .map(|(key, value)| (key.clone(), value.clone()))
-    };
+    if notes.is_empty() {
+        return Vec::new();
+    }
+    let tail_entries: Vec<(crate::Key, Value)> = map
+        .into_iter()
+        .filter(|(key, _)| key.as_str() != "note" && !VOICING_CONTROLS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if notes.len() > 1 {
+        let note_values: std::sync::Arc<[Value]> = match own_note {
+            Some(own) => std::iter::repeat_n(own.clone(), notes.len()).collect(),
+            None => notes.iter().cloned().collect(),
+        };
+        let tail_map =
+            (!tail_entries.is_empty()).then(|| OrderedMap::of_keys(tail_entries.clone()));
+        if let Some(table) = crate::value::Table::new(
+            &note_values,
+            Some(crate::combinators::NOTE.clone()),
+            tail_map.as_ref(),
+        ) {
+            let table = std::sync::Arc::new(table);
+            let mut template = hap.clone();
+            template.value = Value::Undefined;
+            return (0..notes.len())
+                .map(|index| {
+                    let mut out = template.clone();
+                    out.value = Value::Object(table.map(index).expect("note index in table"));
+                    out
+                })
+                .collect();
+        }
+    }
     notes
         .into_iter()
         .map(|note| {
@@ -1055,7 +1082,9 @@ fn voicing_hap(hap: &crate::Hap) -> Vec<crate::Hap> {
                 own_note.cloned().unwrap_or(note),
             );
             let mut out = hap.clone();
-            out.value = Value::Object(OrderedMap::of_keys(std::iter::once(note).chain(rest())));
+            out.value = Value::Object(OrderedMap::of_keys(
+                std::iter::once(note).chain(tail_entries.iter().cloned()),
+            ));
             out
         })
         .collect()
