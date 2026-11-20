@@ -1,8 +1,10 @@
 mod motion;
 pub(super) mod remap;
+pub(super) mod repeat;
 mod text_object;
 
 use motion::motion_for;
+use repeat::{InsertEntry, LastChange, NormalEdit, RepeatState, RepeatableAction, VisualEdit};
 use text_object::TextObjectKind;
 
 use std::num::NonZeroUsize;
@@ -73,7 +75,7 @@ enum Operator {
     Yank,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Motion {
     Left,
     Right,
@@ -116,8 +118,8 @@ enum Awaiting {
     G,
     /// A text object's `i` or `a` waits for the character that names it.
     TextObject(TextObjectKind),
-    /// `r` waits for its replacement character, and how many to replace.
-    Replace { count: usize },
+    /// `r` waits for its replacement character, and any explicit count.
+    Replace { count: Option<usize> },
     /// `:` reads its command line until Enter runs it.
     CommandLine { text: String },
 }
@@ -150,6 +152,8 @@ pub(super) struct VimState {
     insert_moment: HistoryMoment,
     /// The indent `o`, `O` or `cc` copied, and the revision that holds it.
     autoindent: Option<(Revision, Range<ByteOffset>)>,
+    last_change: Option<LastChange>,
+    repeat_state: RepeatState,
 }
 
 impl Editor {
@@ -345,7 +349,7 @@ impl Editor {
             Some(Awaiting::TextObject(TextObjectKind::Around)) => label.push_str(" a"),
             Some(Awaiting::Replace { count }) => {
                 label.push(' ');
-                if *count > 1 {
+                if let Some(count) = count.filter(|count| *count > 1) {
                     label.push_str(&count.to_string());
                 }
                 label.push('r');
@@ -476,8 +480,13 @@ impl Editor {
         ) {
             return Ok(false);
         }
+        // Esc always stays in Vim. Ctrl+[ escapes Insert, Visual, or a
+        // pending command, and in clean Normal mode falls through to the
+        // studio's scene shortcut.
         if key.code == KeyCode::Esc
-            || (key.code == KeyCode::Char('[') && key.modifiers == KeyModifiers::CONTROL)
+            || (key.code == KeyCode::Char('[')
+                && key.modifiers == KeyModifiers::CONTROL
+                && self.vim_needs_escape())
         {
             self.vim_escape()?;
             return Ok(true);
@@ -639,16 +648,32 @@ impl Editor {
             if let Mode::Visual { linewise, .. } = self.vim.mode {
                 let range = self.primary_selection().ordered();
                 let start = range.start;
-                self.vim_apply_operator(operator, range, linewise, false, start, moment)?;
+                let shape = self.vim_visual_shape(range.clone(), linewise)?;
+                let changed =
+                    self.vim_apply_operator(operator, range, linewise, false, start, moment)?;
+                if changed {
+                    let edit = match operator {
+                        Operator::Delete => VisualEdit::Delete,
+                        Operator::Change => VisualEdit::Change,
+                        Operator::Yank => unreachable!("yank returns false"),
+                    };
+                    self.vim_record_change(RepeatableAction::Visual { edit, shape }, None);
+                }
             } else if let Some((pending, before)) = self.vim.pending.operator.take() {
                 if pending == operator {
-                    let count = before
-                        .map_or(1, NonZeroUsize::get)
-                        .saturating_mul(self.vim_take_count());
-                    let head = self.vim_head();
-                    let line = self.document.line_of(head)?;
-                    let range = self.vim_line_range(line, line.saturating_add(count - 1));
-                    self.vim_apply_operator(operator, range, true, false, head, moment)?;
+                    let after = self.vim.pending.count.take();
+                    let explicit_count = match (before, after) {
+                        (Some(before), Some(after)) => Some(before.saturating_mul(after).get()),
+                        (before, after) => before.or(after).map(NonZeroUsize::get),
+                    };
+                    let count = explicit_count.unwrap_or(1);
+                    let changed = self.vim_execute_operator_lines(operator, count, moment)?;
+                    if changed {
+                        self.vim_record_change(
+                            RepeatableAction::OperatorLines { operator },
+                            explicit_count,
+                        );
+                    }
                 } else {
                     self.vim_cancel_pending();
                 }
@@ -661,23 +686,31 @@ impl Editor {
             self.vim_cancel_pending();
             return Ok(true);
         }
-        let count = self.vim_take_count();
+        let explicit_count = self.vim.pending.count.take().map(NonZeroUsize::get);
+        let count = explicit_count.unwrap_or(1);
         match character {
+            '.' if self.vim.mode == Mode::Normal => {
+                self.vim_repeat_last_change(explicit_count, moment)?;
+            }
             'i' | 'a' | 'I' | 'A' if self.vim.mode == Mode::Normal => {
-                let head = self.vim_head();
-                let line = self.document.line_of(head)?;
-                let range = self.document.line_content_range(line);
-                let target = match character {
-                    'a' => self.document.next_grapheme_boundary(head)?.min(range.end),
-                    'I' => self.document.indent_end(line),
-                    'A' => range.end,
-                    _ => head,
+                let entry = match character {
+                    'a' => InsertEntry::After,
+                    'I' => InsertEntry::LineStart,
+                    'A' => InsertEntry::LineEnd,
+                    _ => InsertEntry::Before,
                 };
-                self.vim_place_caret(target)?;
-                self.vim_begin_insert(moment);
+                self.vim_enter_insert(entry, moment)?;
+                self.vim_record_change(RepeatableAction::Insert(entry), explicit_count);
             }
             'o' | 'O' if self.vim.mode == Mode::Normal => {
-                self.vim_open_line(character == 'O', moment)?;
+                let above = character == 'O';
+                self.vim_open_line(above, moment)?;
+                let entry = if above {
+                    InsertEntry::OpenAbove
+                } else {
+                    InsertEntry::OpenBelow
+                };
+                self.vim_record_change(RepeatableAction::Insert(entry), explicit_count);
             }
             'v' | 'V' => self.vim_toggle_visual(character == 'V')?,
             'x' | 'X' | 'D' | 'C' | 'Y' => {
@@ -688,11 +721,11 @@ impl Editor {
                 };
                 let head = self.vim_head();
                 let line = self.document.line_of(head)?;
-                let (range, linewise) = if let Mode::Visual {
+                if let Mode::Visual {
                     anchor, linewise, ..
                 } = self.vim.mode
                 {
-                    if character == 'x' {
+                    let (range, linewise) = if character == 'x' {
                         (self.primary_selection().ordered(), linewise)
                     } else {
                         // Visual D, X, Y and C take the highlighted lines
@@ -700,47 +733,62 @@ impl Editor {
                         let first = self.document.line_of(anchor.min(head))?;
                         let last = self.document.line_of(anchor.max(head))?;
                         (self.vim_line_range(first, last), true)
+                    };
+                    let start = range.start;
+                    let shape = self.vim_visual_shape(range.clone(), linewise)?;
+                    let changed =
+                        self.vim_apply_operator(operator, range, linewise, false, start, moment)?;
+                    if changed {
+                        let edit = match operator {
+                            Operator::Delete => VisualEdit::Delete,
+                            Operator::Change => VisualEdit::Change,
+                            Operator::Yank => unreachable!("yank returns false"),
+                        };
+                        self.vim_record_change(RepeatableAction::Visual { edit, shape }, None);
                     }
                 } else if character == 'Y' {
-                    (
-                        self.vim_line_range(line, line.saturating_add(count - 1)),
-                        true,
-                    )
-                } else if character == 'x'
-                    && let Some(range) = atomic_delete_range.filter(|range| range.start == head)
-                {
-                    let line_end = self
-                        .document
-                        .line_content_range(self.document.line_of(range.end)?)
-                        .end;
-                    let tail = self.document.slice(range.end..line_end)?;
-                    let extra = tail
-                        .grapheme_indices(true)
-                        .nth(count - 1)
-                        .map_or(tail.len(), |(offset, _)| offset);
-                    (range.start..ByteOffset(range.end.0 + extra), false)
+                    let range = self.vim_line_range(line, line.saturating_add(count - 1));
+                    self.vim_apply_operator(operator, range, true, false, head, moment)?;
                 } else {
-                    let motion = match character {
-                        'X' => Motion::Left,
-                        'x' => Motion::Right,
-                        _ => Motion::LineEnd,
+                    let edit = match character {
+                        'X' => NormalEdit::DeleteBackward,
+                        'x' => NormalEdit::DeleteForward,
+                        'C' => NormalEdit::ChangeToEnd,
+                        _ => NormalEdit::DeleteToEnd,
                     };
-                    let target = self.vim_motion_target(motion, count, true)?.0;
-                    (head.min(target)..head.max(target), false)
-                };
-                // Y keeps the caret where it is, as yy does.
-                let start = if linewise && self.vim.mode == Mode::Normal {
-                    head
-                } else {
-                    range.start
-                };
-                // D and C run to an inclusive $, and x and X stay on their
-                // line, so none of them is an exclusive range.
-                self.vim_apply_operator(operator, range, linewise, false, start, moment)?;
+                    let changed =
+                        self.vim_execute_normal_edit(edit, count, atomic_delete_range, moment)?;
+                    if changed {
+                        self.vim_record_change(RepeatableAction::NormalEdit(edit), explicit_count);
+                    }
+                }
             }
-            'p' | 'P' => self.vim_put(character == 'P', count, moment)?,
+            'p' | 'P' => {
+                let before = character == 'P';
+                let visual_shape = match self.vim.mode {
+                    Mode::Visual { linewise, .. } => {
+                        Some(self.vim_visual_shape(self.primary_selection().ordered(), linewise)?)
+                    }
+                    _ => None,
+                };
+                if self.vim_put(before, count, moment)? {
+                    if let Some(shape) = visual_shape {
+                        self.vim_record_change(
+                            RepeatableAction::Visual {
+                                edit: VisualEdit::Put { before },
+                                shape,
+                            },
+                            None,
+                        );
+                    } else {
+                        self.vim_record_change(RepeatableAction::Put { before }, explicit_count);
+                    }
+                }
+            }
             'r' => {
-                self.vim.pending.awaiting = Some(Awaiting::Replace { count });
+                self.vim.pending.awaiting = Some(Awaiting::Replace {
+                    count: explicit_count,
+                });
             }
             'u' => {
                 self.vim_escape()?;
@@ -889,6 +937,9 @@ impl Editor {
 
     fn vim_escape(&mut self) -> Result<(), EditorError> {
         self.vim_drop_unused_indent()?;
+        if self.vim.mode == Mode::Insert {
+            self.vim_finish_insert_recording();
+        }
         // Esc in Normal only cancels what is pending, as Vim's does: the
         // column j and k aim for stays.
         let leaves = self.vim.mode != Mode::Normal;
@@ -1087,10 +1138,84 @@ impl Editor {
         Ok(())
     }
 
+    fn vim_execute_operator_lines(
+        &mut self,
+        operator: Operator,
+        count: usize,
+        moment: HistoryMoment,
+    ) -> Result<bool, EditorError> {
+        let head = self.vim_head();
+        let line = self.document.line_of(head)?;
+        let range = self.vim_line_range(line, line.saturating_add(count - 1));
+        self.vim_apply_operator(operator, range, true, false, head, moment)
+    }
+
+    fn vim_execute_normal_edit(
+        &mut self,
+        edit: NormalEdit,
+        count: usize,
+        atomic_delete_range: Option<Range<ByteOffset>>,
+        moment: HistoryMoment,
+    ) -> Result<bool, EditorError> {
+        let operator = match edit {
+            NormalEdit::ChangeToEnd => Operator::Change,
+            NormalEdit::DeleteForward | NormalEdit::DeleteBackward | NormalEdit::DeleteToEnd => {
+                Operator::Delete
+            }
+        };
+        let head = self.vim_head();
+        let range = if edit == NormalEdit::DeleteForward
+            && let Some(range) = atomic_delete_range.filter(|range| range.start == head)
+        {
+            let line_end = self
+                .document
+                .line_content_range(self.document.line_of(range.end)?)
+                .end;
+            let tail = self.document.slice(range.end..line_end)?;
+            let extra = tail
+                .grapheme_indices(true)
+                .nth(count - 1)
+                .map_or(tail.len(), |(offset, _)| offset);
+            range.start..ByteOffset(range.end.0 + extra)
+        } else {
+            let motion = match edit {
+                NormalEdit::DeleteBackward => Motion::Left,
+                NormalEdit::DeleteForward => Motion::Right,
+                NormalEdit::DeleteToEnd | NormalEdit::ChangeToEnd => Motion::LineEnd,
+            };
+            let target = self.vim_motion_target(motion, count, true)?.0;
+            head.min(target)..head.max(target)
+        };
+        let start = range.start;
+        // D and C run to an inclusive $, and x and X stay on their
+        // line, so none of them is an exclusive range.
+        self.vim_apply_operator(operator, range, false, false, start, moment)
+    }
+
+    fn vim_enter_insert(
+        &mut self,
+        entry: InsertEntry,
+        moment: HistoryMoment,
+    ) -> Result<(), EditorError> {
+        let head = self.vim_head();
+        let line = self.document.line_of(head)?;
+        let range = self.document.line_content_range(line);
+        let target = match entry {
+            InsertEntry::After => self.document.next_grapheme_boundary(head)?.min(range.end),
+            InsertEntry::LineStart => self.document.indent_end(line),
+            InsertEntry::LineEnd => range.end,
+            InsertEntry::Before | InsertEntry::OpenBelow | InsertEntry::OpenAbove => head,
+        };
+        self.vim_place_caret(target)?;
+        self.vim_begin_insert(moment);
+        Ok(())
+    }
+
     /// Run `operator` over `range`. A yank leaves the caret at `start`, the
     /// start of the text as Vim takes it: where a motion back ended, or the
     /// caret itself on the first line of a linewise command. An `exclusive`
-    /// range follows [`Self::vim_exclusive_range`].
+    /// range follows [`Self::vim_exclusive_range`]. Returns `true` when the
+    /// command deleted text or entered Insert for a change.
     fn vim_apply_operator(
         &mut self,
         operator: Operator,
@@ -1099,7 +1224,7 @@ impl Editor {
         exclusive: bool,
         start: ByteOffset,
         moment: HistoryMoment,
-    ) -> Result<(), EditorError> {
+    ) -> Result<bool, EditorError> {
         self.vim_cancel_pending();
         let (mut range, linewise) =
             if linewise || !exclusive || matches!(self.vim.mode, Mode::Visual { .. }) {
@@ -1119,7 +1244,8 @@ impl Editor {
             && operator != Operator::Change
         {
             self.vim_place_caret(start)?;
-            return self.vim_normalize_caret();
+            self.vim_normalize_caret()?;
+            return Ok(false);
         }
         // An empty line range comes from the drawn line past a final line
         // break, which is no Vim line: the command takes nothing and keeps
@@ -1128,15 +1254,16 @@ impl Editor {
             self.vim_place_caret(start)?;
             if operator == Operator::Change {
                 self.vim_begin_insert(moment);
-                return Ok(());
+                return Ok(true);
             }
-            return self.vim_normalize_caret();
+            self.vim_normalize_caret()?;
+            return Ok(false);
         }
         if operator == Operator::Yank {
             self.vim_fill_register(register, linewise);
             self.vim_place_caret(start)?;
             self.vim_normalize_caret()?;
-            return Ok(());
+            return Ok(false);
         }
         let mut replacement = String::new();
         let mut indent_bytes = 0;
@@ -1182,7 +1309,7 @@ impl Editor {
             }
             self.vim_normalize_caret()?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// An exclusive range that ends where a later line starts stops at the
@@ -1268,7 +1395,7 @@ impl Editor {
     /// as Vim does.
     fn vim_replace(
         &mut self,
-        count: usize,
+        explicit_count: Option<usize>,
         key: KeyEvent,
         moment: HistoryMoment,
     ) -> Result<(), EditorError> {
@@ -1287,6 +1414,18 @@ impl Editor {
             }
         };
         self.vim_cancel_pending();
+        if self.vim_replace_char(explicit_count.unwrap_or(1), character, moment)? {
+            self.vim_record_change(RepeatableAction::Replace { character }, explicit_count);
+        }
+        Ok(())
+    }
+
+    fn vim_replace_char(
+        &mut self,
+        count: usize,
+        character: char,
+        moment: HistoryMoment,
+    ) -> Result<bool, EditorError> {
         let head = self.vim_head();
         let line_end = self
             .document
@@ -1295,7 +1434,7 @@ impl Editor {
         let mut end = head;
         for _ in 0..count {
             if end >= line_end {
-                return Ok(());
+                return Ok(false);
             }
             end = self.document.next_grapheme_boundary(end)?;
         }
@@ -1308,7 +1447,7 @@ impl Editor {
             moment,
         )?;
         self.vim_normalize_caret()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Visual `r`: every selected character becomes the typed character.
@@ -1337,6 +1476,30 @@ impl Editor {
             self.vim_cancel_pending();
             return Ok(());
         }
+        let linewise = matches!(self.vim.mode, Mode::Visual { linewise: true, .. });
+        let shape = self.vim_visual_shape(range.clone(), linewise)?;
+        self.vim.mode = Mode::Normal;
+        self.vim_cancel_pending();
+        self.vim_replace_range(range, character, moment)?;
+        self.vim_record_change(
+            RepeatableAction::Visual {
+                edit: VisualEdit::Replace(character),
+                shape,
+            },
+            None,
+        );
+        Ok(())
+    }
+
+    fn vim_replace_range(
+        &mut self,
+        range: Range<ByteOffset>,
+        character: char,
+        moment: HistoryMoment,
+    ) -> Result<(), EditorError> {
+        if range.is_empty() {
+            return Ok(());
+        }
         let selected = self.document.slice(range.clone())?;
         let replacement = character.to_string();
         let text: String = selected
@@ -1346,8 +1509,6 @@ impl Editor {
                 _ => replacement.clone(),
             })
             .collect();
-        self.vim.mode = Mode::Normal;
-        self.vim_cancel_pending();
         self.apply_transaction(
             Transaction::new(EditOrigin::Typing)
                 .replace(Edit::new(range.clone(), text))
@@ -1363,9 +1524,9 @@ impl Editor {
         before: bool,
         count: usize,
         moment: HistoryMoment,
-    ) -> Result<(), EditorError> {
+    ) -> Result<bool, EditorError> {
         if self.vim.register.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let ending = self.preferred_line_ending();
         let register = normalize_paste_line_endings(&self.vim.register, &ending);
@@ -1461,7 +1622,8 @@ impl Editor {
         if let Some((register, linewise)) = replaced_register {
             self.vim_fill_register(register, linewise);
         }
-        self.vim_normalize_caret()
+        self.vim_normalize_caret()?;
+        Ok(true)
     }
 }
 
@@ -2311,5 +2473,213 @@ mod tests {
         assert_eq!(editor.vim_label().as_deref(), Some("NORMAL"));
         type_keys(&mut editor, "x");
         assert_eq!(editor.source(), "ab\n");
+    }
+
+    fn insert_text(editor: &mut Editor, text: &str) {
+        let mut clipboard = super::super::MemoryClipboard::default();
+        editor
+            .dispatch(
+                super::super::Command::InsertText(text.to_owned()),
+                HistoryMoment(0),
+                &mut clipboard,
+            )
+            .expect("insert");
+    }
+
+    /// Paragraph text objects `ip` and `ap` work linewise with `d`, `c`, `y`,
+    /// `v`, counts, blank-line blocks, and trailing/leading blank lines.
+    #[test]
+    fn paragraph_text_objects_cover_inner_and_around_paragraphs() {
+        let two = "aaa\nbbb\n\nccc\n";
+        assert_eq!(typed(two, 0, "dip").source(), "\nccc\n");
+        assert_eq!(typed(two, 4, "dip").source(), "\nccc\n");
+        assert_eq!(typed(two, 0, "dap").source(), "ccc\n");
+        let yanked = typed(two, 0, "yip");
+        assert_eq!(yanked.vim_register(), Some("aaa\nbbb\n"));
+        assert!(yanked.vim.linewise_register);
+        let yanked_around = typed(two, 0, "yap");
+        assert_eq!(yanked_around.vim_register(), Some("aaa\nbbb\n\n"));
+        assert!(yanked_around.vim.linewise_register);
+
+        // Last paragraph with no trailing blank lines includes preceding blank lines for `ap`.
+        let last = "aaa\n\nbbb\nccc\n";
+        assert_eq!(typed(last, 5, "dip").source(), "aaa\n\n");
+        assert_eq!(typed(last, 5, "dap").source(), "aaa\n");
+        // Without a trailing newline, `dap` still removes the preceding blank line cleanly.
+        assert_eq!(typed("aaa\n\nbbb\nccc", 5, "dap").source(), "aaa");
+
+        // Single paragraph without blank lines.
+        assert_eq!(typed("aaa\nbbb\n", 0, "dip").source(), "");
+        assert_eq!(typed("aaa\nbbb\n", 0, "dap").source(), "");
+
+        // Blank-line blocks (including whitespace-only blank lines).
+        let blanks = "aaa\n\n   \nbbb\n\nccc\n";
+        assert_eq!(typed(blanks, 4, "dip").source(), "aaa\nbbb\n\nccc\n");
+        assert_eq!(typed(blanks, 4, "dap").source(), "aaa\n\nccc\n");
+
+        // Counts alternate blocks for `ip` and take paragraph+blank pairs for `ap`.
+        let three = "a\n\nb\n\nc\n";
+        assert_eq!(typed(three, 0, "2dip").source(), "b\n\nc\n");
+        assert_eq!(typed(three, 0, "3dip").source(), "\nc\n");
+        assert_eq!(typed(three, 0, "2dap").source(), "c\n");
+
+        // `cip` keeps the first line's indent and enters Insert mode.
+        let changed = typed("  aaa\n  bbb\n\nccc\n", 2, "cip");
+        assert_eq!(changed.source(), "  \n\nccc\n");
+        assert!(changed.vim_is_insert());
+        assert_eq!(head(&changed), 2);
+
+        // `vip` and `vap` select linewise in Visual mode and `vipip` extends.
+        let vis = typed(two, 1, "vip");
+        assert_eq!(vis.vim_label().as_deref(), Some("V-LINE"));
+        assert_eq!(
+            vis.primary_selection().ordered(),
+            ByteOffset(0)..ByteOffset(8)
+        );
+        assert_eq!(typed(two, 1, "vipd").source(), "\nccc\n");
+        assert_eq!(typed(two, 1, "vapd").source(), "ccc\n");
+        assert_eq!(typed(two, 1, "vipipd").source(), "ccc\n");
+    }
+
+    /// Dot-repeat (`.`) replays deletes, changes, inserts, replaces, puts,
+    /// text objects, visual edits, and count overrides as a single undo step.
+    #[test]
+    fn dot_repeats_the_last_vim_change() {
+        // Motions and counts.
+        assert_eq!(typed("one two three", 0, "dw.").source(), "three");
+        assert_eq!(typed("a b c d e", 0, "2dw.").source(), "e");
+        assert_eq!(typed("a\nb\nc\nd\n", 0, "dd.").source(), "c\nd\n");
+        assert_eq!(typed("a\nb\nc\nd\ne\n", 0, "2dd.").source(), "e\n");
+        assert_eq!(typed("a\nb\nc\nd\ne\n", 0, "dd3.").source(), "e\n");
+        assert_eq!(typed("a\nb\nc\nd\ne\n", 0, "dd2..").source(), "e\n");
+        assert_eq!(typed("abcdef", 0, "x.").source(), "cdef");
+        assert_eq!(typed("abcdef", 0, "x3.").source(), "ef");
+        assert_eq!(typed("abcdef", 3, "X.").source(), "adef");
+        assert_eq!(typed("abc\ndef\n", 1, "Dj.").source(), "a\n\n");
+        assert_eq!(typed("abc\ndef\n", 1, "Djl.").source(), "a\nd\n");
+        assert_eq!(typed("abc\ndef\nghi\n", 0, "dG").source(), "");
+        let mut dg = typed("a\nb\nc\nd\n", 4, "dG");
+        assert_eq!(dg.source(), "a\nb\n");
+        type_keys(&mut dg, "ggj.");
+        assert_eq!(dg.source(), "a\n");
+
+        // Paragraph and delimiter text objects.
+        assert_eq!(typed("a\nb\n\nc\nd\n\ne\n", 0, "dap.").source(), "e\n");
+        assert_eq!(typed("a\nb\n\nc\nd\n\ne\n", 0, "dipj.").source(), "\n\ne\n");
+
+        // Replace and put.
+        assert_eq!(typed("abcd", 0, "rXl.").source(), "XXcd");
+        assert_eq!(typed("abcdef", 0, "rXl3.").source(), "XXXXef");
+        assert_eq!(typed("ab\n", 0, "yyp.").source(), "ab\nab\nab\n");
+
+        // Yank and failed commands do not overwrite the last change.
+        assert_eq!(typed("a\nb\nc\n", 0, "ddyy.").source(), "c\n");
+        assert_eq!(typed("a\nb\nc\n", 0, "dddi(.").source(), "c\n");
+
+        // Change + Insert replay and atomic single-step undo.
+        let mut cw = typed("foo bar baz", 0, "cw");
+        insert_text(&mut cw, "qux");
+        press(&mut cw, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(cw.source(), "qux bar baz");
+        type_keys(&mut cw, "w.");
+        assert_eq!(cw.source(), "qux qux baz");
+        assert!(cw.vim_is_normal());
+        type_keys(&mut cw, "u");
+        assert_eq!(
+            cw.source(),
+            "qux bar baz",
+            "one undo reverses the dot-repeat"
+        );
+
+        // `ci"` + Insert replay.
+        let mut quote = typed("s(\"bd\") s(\"sd\")", 3, "ci\"");
+        insert_text(&mut quote, "hh");
+        press(&mut quote, KeyCode::Esc, KeyModifiers::NONE);
+        quote
+            .set_selection(Selection::caret(ByteOffset(11)))
+            .expect("caret inside second string");
+        type_keys(&mut quote, ".");
+        assert_eq!(quote.source(), "s(\"hh\") s(\"hh\")");
+
+        // `A` and `o` + Insert replay.
+        let mut append = typed("s(\"bd\")\ns(\"sd\")\n", 0, "A");
+        insert_text(&mut append, ".gain(0.5)");
+        press(&mut append, KeyCode::Esc, KeyModifiers::NONE);
+        type_keys(&mut append, "j.");
+        assert_eq!(
+            append.source(),
+            "s(\"bd\").gain(0.5)\ns(\"sd\").gain(0.5)\n"
+        );
+
+        let mut open = typed("a\n", 0, "o");
+        insert_text(&mut open, "b");
+        press(&mut open, KeyCode::Esc, KeyModifiers::NONE);
+        type_keys(&mut open, ".");
+        assert_eq!(open.source(), "a\nb\nb\n");
+
+        // Visual delete and replace repeat over the same shape.
+        assert_eq!(typed("abcdef", 0, "vld.").source(), "ef");
+        assert_eq!(typed("a\nb\nc\nd\ne\n", 0, "Vjd.").source(), "e\n");
+        assert_eq!(typed("abcdef", 0, "vlrX2l.").source(), "XXXXef");
+
+        // Insert with Backspace replays the edit sequence cleanly.
+        let mut bs = typed("aa bb", 0, "i");
+        insert_text(&mut bs, "xy");
+        let mut clipboard = super::super::MemoryClipboard::default();
+        bs.dispatch(
+            super::super::Command::DeleteBackward,
+            HistoryMoment(0),
+            &mut clipboard,
+        )
+        .expect("backspace");
+        insert_text(&mut bs, "z");
+        press(&mut bs, KeyCode::Esc, KeyModifiers::NONE);
+        type_keys(&mut bs, "w.");
+        assert_eq!(bs.source(), "xzaa xzbb");
+    }
+
+    /// `Ctrl+[` leaves Insert, Visual, or a pending command, and falls through
+    /// to the studio in clean Normal mode.
+    #[test]
+    fn ctrl_left_bracket_escapes_active_modes_and_falls_through_in_normal() {
+        let ctrl_bracket = KeyEvent::new(KeyCode::Char('['), KeyModifiers::CONTROL);
+        let mut editor = typed("hello\n", 0, "");
+        assert!(!editor.claims_key(&ctrl_bracket));
+        assert!(
+            !editor
+                .vim_key(ctrl_bracket, HistoryMoment(0), None)
+                .expect("key")
+        );
+
+        // In Insert mode, Ctrl+[ escapes to Normal.
+        type_keys(&mut editor, "i");
+        assert!(editor.claims_key(&ctrl_bracket));
+        assert!(
+            editor
+                .vim_key(ctrl_bracket, HistoryMoment(0), None)
+                .expect("key")
+        );
+        assert!(editor.vim_is_normal());
+        assert!(!editor.claims_key(&ctrl_bracket));
+
+        // In Visual mode, Ctrl+[ escapes to Normal.
+        type_keys(&mut editor, "v");
+        assert!(editor.claims_key(&ctrl_bracket));
+        assert!(
+            editor
+                .vim_key(ctrl_bracket, HistoryMoment(0), None)
+                .expect("key")
+        );
+        assert!(editor.vim_is_normal());
+
+        // With a pending operator, Ctrl+[ cancels it.
+        type_keys(&mut editor, "d");
+        assert!(editor.claims_key(&ctrl_bracket));
+        assert!(
+            editor
+                .vim_key(ctrl_bracket, HistoryMoment(0), None)
+                .expect("key")
+        );
+        assert!(!editor.vim_has_pending_command());
     }
 }

@@ -3,6 +3,7 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::super::{display_column_of_offset_cached, offset_at_display_column_cached};
+use super::repeat::RepeatableAction;
 use super::{
     ByteOffset, Editor, EditorError, HistoryMoment, Mode, Motion, Operator, line_ending_len,
 };
@@ -17,73 +18,90 @@ impl Editor {
         let operator = self.vim.pending.operator.take();
         // The counts before and after an operator multiply. With neither,
         // G goes to the last line.
-        let count = match (operator.and_then(|(_, before)| before), after) {
-            (Some(before), Some(after)) => Some(before.saturating_mul(after)),
-            (before, after) => before.or(after),
+        let explicit_count = match (operator.and_then(|(_, before)| before), after) {
+            (Some(before), Some(after)) => Some(before.saturating_mul(after).get()),
+            (before, after) => before.or(after).map(std::num::NonZeroUsize::get),
         };
-        let count = match count {
-            Some(count) => count.get(),
+        let count = match explicit_count {
+            Some(count) => count,
             None if matches!(motion, Motion::LastLine) => 0,
             None => 1,
         };
         if let Some((operator, _)) = operator {
-            let head = self.vim_head();
-            let motion = if operator == Operator::Change
-                && matches!(motion, Motion::WordNext)
-                && !self.vim_grapheme_is_space(head)?
-            {
-                Motion::WordChange
-            } else {
-                motion
-            };
-            let target = self.vim_motion_target(motion, count, true)?.0;
-            // j on the last line and k on the first fail, and the
-            // operator waiting for them does nothing, as in Vim.
-            if matches!(motion, Motion::Up | Motion::Down)
-                && self.document.line_of(target)? == self.document.line_of(head)?
-            {
-                self.vim_cancel_pending();
-                self.vim.motion_blocked = true;
-                return Ok(());
+            let changed = self.vim_execute_operator_motion(operator, motion, count, moment)?;
+            if changed {
+                self.vim_record_change(
+                    RepeatableAction::OperatorMotion { operator, motion },
+                    explicit_count,
+                );
             }
-            let linewise = matches!(
-                motion,
-                Motion::Up | Motion::Down | Motion::FirstLine | Motion::LastLine
-            );
-            let range = if linewise {
-                self.vim_line_range(
-                    self.document.line_of(head.min(target))?,
-                    self.document.line_of(head.max(target))?,
-                )
-            } else {
-                let end = if matches!(motion, Motion::WordEnd | Motion::WordChange) {
-                    // An inclusive end takes the character it rests on,
-                    // never a line break. e rests on a line end only at
-                    // the end of the text.
-                    let last = head.max(target);
-                    let line_end = self
-                        .document
-                        .line_content_range(self.document.line_of(last)?)
-                        .end;
-                    self.document.next_grapheme_boundary(last)?.min(line_end)
-                } else {
-                    head.max(target)
-                };
-                head.min(target)..end
-            };
-            // $ is inclusive: d2$ ending on an empty line still takes it.
-            let exclusive = !matches!(motion, Motion::LineEnd);
-            self.vim_apply_operator(
-                operator,
-                range,
-                linewise,
-                exclusive,
-                head.min(target),
-                moment,
-            )
+            Ok(())
         } else {
             self.vim_move(motion, count)
         }
+    }
+
+    pub(super) fn vim_execute_operator_motion(
+        &mut self,
+        operator: Operator,
+        motion: Motion,
+        count: usize,
+        moment: HistoryMoment,
+    ) -> Result<bool, EditorError> {
+        let head = self.vim_head();
+        let motion = if operator == Operator::Change
+            && matches!(motion, Motion::WordNext)
+            && !self.vim_grapheme_is_space(head)?
+        {
+            Motion::WordChange
+        } else {
+            motion
+        };
+        let target = self.vim_motion_target(motion, count, true)?.0;
+        // j on the last line and k on the first fail, and the
+        // operator waiting for them does nothing, as in Vim.
+        if matches!(motion, Motion::Up | Motion::Down)
+            && self.document.line_of(target)? == self.document.line_of(head)?
+        {
+            self.vim_cancel_pending();
+            self.vim.motion_blocked = true;
+            return Ok(false);
+        }
+        let linewise = matches!(
+            motion,
+            Motion::Up | Motion::Down | Motion::FirstLine | Motion::LastLine
+        );
+        let range = if linewise {
+            self.vim_line_range(
+                self.document.line_of(head.min(target))?,
+                self.document.line_of(head.max(target))?,
+            )
+        } else {
+            let end = if matches!(motion, Motion::WordEnd | Motion::WordChange) {
+                // An inclusive end takes the character it rests on,
+                // never a line break. e rests on a line end only at
+                // the end of the text.
+                let last = head.max(target);
+                let line_end = self
+                    .document
+                    .line_content_range(self.document.line_of(last)?)
+                    .end;
+                self.document.next_grapheme_boundary(last)?.min(line_end)
+            } else {
+                head.max(target)
+            };
+            head.min(target)..end
+        };
+        // $ is inclusive: d2$ ending on an empty line still takes it.
+        let exclusive = !matches!(motion, Motion::LineEnd);
+        self.vim_apply_operator(
+            operator,
+            range,
+            linewise,
+            exclusive,
+            head.min(target),
+            moment,
+        )
     }
 
     pub(super) fn vim_move(&mut self, motion: Motion, count: usize) -> Result<(), EditorError> {
@@ -306,7 +324,7 @@ impl Editor {
 
     /// The line `count` lines below `line`, held to the last line Vim
     /// knows. It never climbs, even from the drawn line past the end.
-    fn vim_line_below(&self, line: usize, count: usize) -> usize {
+    pub(super) fn vim_line_below(&self, line: usize, count: usize) -> usize {
         line.saturating_add(count)
             .min(self.vim_last_line().max(line))
     }

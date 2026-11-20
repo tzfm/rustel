@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
@@ -1132,7 +1132,7 @@ impl Widget for LogPanelView<'_> {
             // reader picks `samples` out of a page of `engine` without
             // reading a word of it. One accent for all of them made the
             // column a wall.
-            let kind_color = kind_colour(&line.kind, theme);
+            let kind_color = theme.label_colour(&line.kind);
             let text_color = match line.level {
                 Level::Debug => theme.muted,
                 Level::Info => theme.foreground,
@@ -1211,34 +1211,6 @@ impl Widget for LogPanelView<'_> {
             Style::default().fg(theme.muted),
         );
     }
-}
-
-/// One colour a part of the studio keeps for as long as it speaks.
-///
-/// Taken from the theme rather than a fixed table, so it stays legible on
-/// a light one, and chosen by hashing the name, so a part added later
-/// needs registering nowhere and reads the same colour every session. Six
-/// slots over a dozen or so names means some of them share, which is worth
-/// it: the point is that `samples` and `engine` are visibly different down
-/// a page, not that every name is unique by colour alone - the name is
-/// right there.
-fn kind_colour(kind: &str, theme: &Theme) -> Color {
-    let palette = [
-        theme.accent,
-        theme.ok,
-        theme.syntax.string,
-        theme.syntax.number,
-        theme.syntax.keyword.unwrap_or(theme.syntax.punctuation),
-        theme.syntax.function.unwrap_or(theme.syntax.text),
-    ];
-    // FNV-1a: stable across runs and across machines, which a hasher from
-    // the standard library's default state is deliberately not.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in kind.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    palette[(hash % palette.len() as u64) as usize]
 }
 
 fn render_pressure_details(
@@ -2209,14 +2181,14 @@ mod tests {
     fn each_part_of_the_studio_keeps_its_own_colour() {
         let theme = Theme::default();
         assert_eq!(
-            kind_colour("samples", &theme),
-            kind_colour("samples", &theme),
+            theme.label_colour("samples"),
+            theme.label_colour("samples"),
             "and keeps it"
         );
         let named = ["samples", "engine", "drop", "transport", "focus", "take"];
         let colours: std::collections::BTreeSet<String> = named
             .iter()
-            .map(|kind| format!("{:?}", kind_colour(kind, &theme)))
+            .map(|kind| format!("{:?}", theme.label_colour(kind)))
             .collect();
         assert!(
             colours.len() > 1,

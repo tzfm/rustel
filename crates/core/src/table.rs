@@ -3292,6 +3292,11 @@ fn joined(
     if !matches!(mode, JoinMode::Inner | JoinMode::Outer | JoinMode::Mix) {
         return None;
     }
+    // A sampled layer's entries hold only the structure: a query makes their
+    // values. Their stored values do not name the patterns to join.
+    if carrier.layers.iter().any(|layer| layer.sampled.is_some()) {
+        return None;
+    }
     let settings = crate::settings::current_state_id();
     // The pattern each carrier value names, each built once.
     let mut named: Vec<(&crate::Value, Pattern)> = Vec::new();
@@ -5536,6 +5541,34 @@ mod tests {
             assert_twins(
                 &format!("{mode:?} pick of sampled choices by cycles"),
                 &picked_from(cycles, choices(), PickIndexMode::Clamp, mode),
+            );
+        }
+    }
+
+    /// A registered combinator joined over a segmented signal argument
+    /// answers as the graph does: the signal's stored entries are structure
+    /// only, so the join does not build its patterns from them.
+    #[test]
+    fn a_combinator_over_a_segmented_signal_answers_as_the_graph() {
+        let registry = crate::register::default_registry();
+        let degrade = registry.get("degradeByWith").expect("degradeByWith");
+        let twin = map(
+            vec![
+                seq(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+                segmented(signal_twin(crate::signal::sine), 8),
+            ],
+            |patterns| {
+                degrade.call(
+                    &[patterns[1].clone(), pure(Value::F64(0.5))],
+                    patterns[0].clone(),
+                )
+            },
+        );
+        for (begin, end) in spans() {
+            assert_eq!(
+                describe(&twin.tabled.query_arc(begin, end)),
+                describe(&twin.graph.query_arc(begin, end)),
+                "over {begin} .. {end}"
             );
         }
     }

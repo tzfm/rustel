@@ -96,8 +96,9 @@ themselves; Settings > Keybinds shows the fallback.
 With Vim editor keys on, Ctrl+Shift+Y and Edit > Find open the Vim search
 prompt. Enter searches once and closes it. `n` and `N` walk the matches.
 
-Vim changes Ctrl+R and Ctrl+[ in the score editor. See [Settings](#settings)
-for Vim controls.
+Vim changes Ctrl+R in the score editor and uses Ctrl+[ to leave Insert,
+Visual, or a pending command. In Normal mode, Ctrl+[ still switches to the
+previous scene. See [Settings](#settings) for Vim controls.
 
 In a split view, use **Ctrl+Shift+[ / Ctrl+Shift+]** to change scenes. F6 and F7
 also work. Each pane has its own caret and scroll position. A scene shows in one
@@ -1013,7 +1014,8 @@ a count replaces that many. `D` deletes to the end of the line.
 A selection made with the mouse or with Shift+arrows enters Visual. `d`,
 `c`, `y`, `x`, `X`, `D`, `C`, `Y`, `p`, and `P` act on it. Backspace or
 Delete deletes it, and `r` then a character replaces every selected
-character. Esc returns to Normal. `u` undoes an edit. Ctrl+R in Normal or Visual mode redoes it.
+character. Esc returns to Normal. `.` repeats the last change, with an optional
+count. `u` undoes an edit. Ctrl+R in Normal or Visual mode redoes it.
 `:redo` then Enter also redoes an edit. Ctrl+D and Ctrl+U move half a page
 down and up. A count moves that many lines.
 
@@ -1026,11 +1028,13 @@ in [regex](https://docs.rs/regex/latest/regex/#syntax), so `\$` finds a literal
 dollar sign and `\d+` finds digits. Backreferences and look-around are not
 supported. Zero-width matches are skipped.
 
-Text objects select or edit text between separators. `vi(` selects inside
-parentheses, and `vi"` selects inside double quotes. Use `a` instead of `i`
-to include the separators, such as `va(`. These objects also work with `d`,
-`c`, and `y`, such as `ci"` to replace a string. Supported separators are
-`()`, `[]`, `{}`, `<>`, single quotes, double quotes, and backticks.
+Text objects select or edit text between separators or across paragraphs.
+`vi(` selects inside parentheses, `vi"` selects inside double quotes, and `vip`
+selects an inner paragraph. Use `a` instead of `i` to include separators or
+surrounding blank lines, such as `va(` or `dap`. These objects also work with
+`d`, `c`, and `y`, such as `ci"` to replace a string or `dip` to delete a
+paragraph. Supported separators are `()`, `[]`, `{}`, `<>`, single quotes,
+double quotes, and backticks.
 
 Vim keys take priority while the editor has focus. Unclaimed keys keep their
 Studio action. A pending Vim command or mapping owns the next key. While Vim
