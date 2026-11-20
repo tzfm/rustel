@@ -21,6 +21,7 @@
 - Fixed: a visuals dock moved from a side to the top or bottom starts at the band's own size, so it no longer vanishes beside the mixer; a dock with no room says the keys go to the score.
 - Fixed: a General MIDI note outside its font's range says which notes the font plays instead of "failed to load", and Studio no longer counts such a font as a failed sound.
 - Fixed: `talkit("42")` speaks the number instead of a silent refused voice.
+- Fixed: `check` and Studio's update refuse an unknown `wtshape`, `warpshape`, `lpshape`, `hpshape` or `bpshape` name, which the voice would refuse when it plays.
 - Fixed: a KabelSalat signal past the range of a sample is silent on both channels, as the docs say, instead of full-scale noise on one.
 - Fixed: a scene can call a name from a script that another scene of the set imports, as the docs say, instead of the check refusing it as unknown.
 - Fixed: one sample source in Settings that will not read fails only its own row; the other remote sources still load.

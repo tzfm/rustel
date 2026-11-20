@@ -503,6 +503,26 @@ fn lint_with_scan(
                 "bank" => sounds
                     .filter(|library| !library.knows_bank(head))
                     .map(|_| format!("unknown bank \"{head}\"")),
+                // The LFO shapes the voice refuses by name: a word that is not
+                // one of them silences the voice when it plays, so it is an
+                // error now. A number picks a shape by its index.
+                "wtshape" | "warpshape" | "lpshape" | "hpshape" | "bpshape" if numeric => None,
+                "wtshape" | "warpshape" | "lpshape" | "hpshape" | "bpshape" => {
+                    let names = rustel_core::reference::reference_choices(callee, "shape")
+                        .map(|set| {
+                            set.choices
+                                .iter()
+                                .map(|choice| choice.value)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    (head != "tri" && !names.contains(&head)).then(|| {
+                        format!(
+                            "unknown {callee} \"{head}\" - one of {}, or a number",
+                            names.join(", ")
+                        )
+                    })
+                }
                 "chord" | "voicing" if registers_voicings => None,
                 // `chord("G:7b9")` is not one word to anybody: the colon is
                 // mini-notation's, and the pair it makes - `["G", "7b9"]` -
@@ -4009,6 +4029,28 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
         let bad = source.find("h3").unwrap();
         assert_eq!((diagnostics[0].from, diagnostics[0].to), (bad, bad + 2));
         assert!(check("note(\"c3 eb4 f#2 bs-1 62.5\")").is_empty());
+    }
+
+    /// An LFO shape the voice refuses by name is an error before it plays;
+    /// a known name, `tri`, a number and a pattern of them pass.
+    #[test]
+    fn an_unknown_lfo_shape_name_is_refused() {
+        let found = check("$: s(\"wt_digital\").wtshape(\"bogus\")");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].message.contains("unknown wtshape \"bogus\""),
+            "{found:?}"
+        );
+        for control in ["warpshape", "lpshape", "hpshape", "bpshape"] {
+            assert_eq!(
+                check(&format!("$: s(\"bd\").{control}(\"nope\")")).len(),
+                1,
+                "{control}"
+            );
+        }
+        assert!(check("$: s(\"wt_digital\").wtshape(\"<tri sine 2 square>\")").is_empty());
+        // Tremolo falls back to its default shape: not this check's to refuse.
+        assert!(check("$: s(\"bd\").tremoloshape(\"bogus\")").is_empty());
     }
 
     #[test]
