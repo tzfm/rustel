@@ -211,6 +211,22 @@ impl Locations {
         *self = Self::new();
     }
 
+    /// Add a `(begin, begin + length)` range directly into the packed buffer
+    /// when it fits, avoiding `usize` round-trips for grid run decoding.
+    #[inline]
+    pub(crate) fn push_narrow(&mut self, begin: u32, length: u32) {
+        if let Repr::Packed { len, spans } = &mut self.0 {
+            let idx = usize::from(*len);
+            if idx < INLINE && begin < PACKED_BEGIN_LIMIT && length <= PACKED_LEN_MASK {
+                spans[idx] = (begin << PACKED_LEN_BITS) | length;
+                *len += 1;
+                return;
+            }
+        }
+        let start = begin as usize;
+        self.extend_from_slice(&[(start, start + length as usize)]);
+    }
+
     /// Add `range` after the others. Past [`INLINE`] ranges this copies the
     /// whole list, so a caller with several ranges extends once instead.
     #[inline]

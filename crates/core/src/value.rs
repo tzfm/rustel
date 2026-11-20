@@ -539,6 +539,11 @@ impl PatchedBase {
     }
 
     #[inline(always)]
+    fn matches_builtin(&self, entries: &Arc<dyn BuiltinEntries>) -> bool {
+        matches!(self, Self::Builtin(other) if Arc::ptr_eq(other, entries))
+    }
+
+    #[inline(always)]
     fn keyed_parts(&self) -> Option<KeyedParts<'_>> {
         match self {
             Self::Table(table) => match &table.heads {
@@ -627,15 +632,6 @@ impl StepPatch {
     pub(crate) const MAX_KEYS: usize = 4;
     pub(crate) const MAX_VALUES: usize = 16;
     pub(crate) const MAX_ROW: u32 = u32::MAX >> 4;
-
-    /// Build a multi-slot numeric overlay over a uniform-key `base` with 1..=4
-    /// unique `keys`. Caller populates `0..n_slots` via [`Self::set_slot`].
-    pub(crate) fn new(base: PatchedBase, row: u32, keys: &[&Key], made: bool) -> Option<Self> {
-        if !base.has_uniform_keys() {
-            return None;
-        }
-        Self::new_for_row(base, row, keys, made)
-    }
 
     /// Build a multi-slot numeric overlay for one fixed `row` of `base` (even
     /// when `base` does not have uniform keys across rows). Callers must only
@@ -1390,6 +1386,14 @@ impl SharedWaveCache {
             .iter()
             .flatten()
             .find(|c| c.base.matches_seq_layer(layers, layer_idx))
+    }
+
+    #[inline]
+    fn get_builtin(&self, entries: &Arc<dyn BuiltinEntries>) -> Option<&Arc<Patched>> {
+        self.dressed
+            .iter()
+            .flatten()
+            .find(|c| c.base.matches_builtin(entries))
     }
 
     #[inline]
@@ -2421,15 +2425,7 @@ impl OrderedMap {
         }
     }
 
-    /// If this map is backed by a uniform-key [`PatchedBase`] with
-    /// `row <= StepPatch::MAX_ROW`, return `(base, row)`.
-    #[inline]
-    pub(crate) fn uniform_step_base(&self) -> Option<(PatchedBase, u32)> {
-        let (base, row, uniform) = self.step_base()?;
-        uniform.then_some((base, row))
-    }
-
-    /// Check if this map shares the same uniform-key [`PatchedBase`] as `base`,
+    /// Check if this map shares the same [`PatchedBase`] as `base`,
     /// returning its `row` when `row <= StepPatch::MAX_ROW`.
     #[inline]
     pub(crate) fn matches_step_base(&self, base: &PatchedBase) -> Option<u32> {
@@ -3465,6 +3461,23 @@ impl OrderedMap {
                         return;
                     }
                 }
+                Entries::Builtin(entries, _) => {
+                    if let Some(cached) = cache.get_builtin(entries) {
+                        self.entries = Entries::Patched(Arc::clone(cached), 0);
+                        return;
+                    }
+                    if let Some(mut patched) =
+                        Patched::empty(PatchedBase::Builtin(Arc::clone(entries)), 0, true)
+                    {
+                        for (key, num) in patches {
+                            let _ = patched.try_set(0, key, Value::F64(*num), true);
+                        }
+                        let arc = Arc::new(patched);
+                        cache.put_dressed(Arc::clone(&arc));
+                        self.entries = Entries::Patched(arc, 0);
+                        return;
+                    }
+                }
                 _ => {}
             }
         }
@@ -3561,6 +3574,21 @@ impl OrderedMap {
                         let arc = Arc::new(wrapped);
                         cache.put_patched(Arc::clone(prev), Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, row);
+                        return;
+                    }
+                }
+                Entries::Builtin(entries, _) => {
+                    if let Some(cached) = cache.get_builtin(entries) {
+                        self.entries = Entries::Patched(Arc::clone(cached), 0);
+                        return;
+                    }
+                    if let Some(mut patched) =
+                        Patched::empty(PatchedBase::Builtin(Arc::clone(entries)), 0, true)
+                        && patched.try_set(0, key, value.clone(), true).is_ok()
+                    {
+                        let arc = Arc::new(patched);
+                        cache.put_dressed(Arc::clone(&arc));
+                        self.entries = Entries::Patched(arc, 0);
                         return;
                     }
                 }
@@ -3683,6 +3711,27 @@ impl OrderedMap {
                             self.entries = Entries::Patched(arc, row);
                             return;
                         }
+                    }
+                }
+                Entries::Builtin(entries, _) => {
+                    if let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_builtin(entries)
+                    {
+                        self.entries = Entries::Patched(Arc::clone(cached), 0);
+                        return;
+                    }
+                    if let Some(patched) = Patched::with_overlay(
+                        PatchedBase::Builtin(Arc::clone(entries)),
+                        0,
+                        Arc::clone(ov_entries),
+                        true,
+                    ) {
+                        let arc = Arc::new(patched);
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.put_dressed(Arc::clone(&arc));
+                        }
+                        self.entries = Entries::Patched(arc, 0);
+                        return;
                     }
                 }
                 Entries::StepPatch(sp, packed) => {

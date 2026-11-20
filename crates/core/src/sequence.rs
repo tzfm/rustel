@@ -1922,9 +1922,9 @@ impl<'a> GridView<'a> {
                 PackedRunsRef::Small(runs) => {
                     for &word in &runs[start..] {
                         let entry = word & !SMALL_RUN_END;
-                        let begin = (base + u32::from(entry >> SMALL_RUN_LEN_BITS)) as usize;
-                        let length = usize::from((entry & SMALL_RUN_LEN_MASK) - 1);
-                        out.push((begin, begin + length));
+                        let begin = base + u32::from(entry >> SMALL_RUN_LEN_BITS);
+                        let length = u32::from((entry & SMALL_RUN_LEN_MASK) - 1);
+                        out.push_narrow(begin, length);
                         if (word & SMALL_RUN_END) != 0 {
                             break;
                         }
@@ -1933,9 +1933,9 @@ impl<'a> GridView<'a> {
                 PackedRunsRef::Wide(runs) => {
                     for &word in &runs[start..] {
                         let entry = word & !PackedLoc::SPARE;
-                        let begin = (base + (entry >> PackedLoc::LENGTH_BITS)) as usize;
-                        let length = ((entry & PackedLoc::LENGTH_MASK) - 1) as usize;
-                        out.push((begin, begin + length));
+                        let begin = base + (entry >> PackedLoc::LENGTH_BITS);
+                        let length = (entry & PackedLoc::LENGTH_MASK) - 1;
+                        out.push_narrow(begin, length);
                         if word & PackedLoc::SPARE != 0 {
                             break;
                         }
@@ -2310,7 +2310,7 @@ impl Maker<'_> {
         } else {
             let step_loc = self.listing.locations(index);
             match self.loc_dress {
-                Some(dress) => dress.around(&step_loc),
+                Some(dress) => dress.around_owned(step_loc),
                 None => step_loc,
             }
         };
@@ -2337,7 +2337,7 @@ impl Maker<'_> {
         } else {
             let step_loc = grid.locations(index);
             match self.loc_dress {
-                Some(dress) => dress.around(&step_loc),
+                Some(dress) => dress.around_owned(step_loc),
                 None => step_loc,
             }
         };
@@ -2898,9 +2898,26 @@ impl Dress {
 
     /// The locations of a hap of a step at `locations`: those before, the
     /// step's own, then those after.
+    #[inline]
     fn around(&self, locations: &Locations) -> Locations {
         let mut context = self.before_locations();
         context.append(locations);
+        if let Some(tail) = &self.tail {
+            context.append(&tail.after);
+        }
+        context
+    }
+
+    #[inline]
+    fn around_owned(&self, mut locations: Locations) -> Locations {
+        if self.before_is_empty() {
+            if let Some(tail) = &self.tail {
+                locations.append(&tail.after);
+            }
+            return locations;
+        }
+        let mut context = self.before_locations();
+        context.append(&locations);
         if let Some(tail) = &self.tail {
             context.append(&tail.after);
         }
@@ -4443,58 +4460,84 @@ impl Layer {
         let grid_steps = grid.steps;
         let (first, last_step) = match grid_steps {
             GridStepsRef::Small(steps) => {
-                let (Some(first_step), Some(last_step_ref)) = (steps.first(), steps.last()) else {
-                    return Some(Ok(()));
-                };
-                if i64::from(last_step_ref.part_end) <= begin_low
-                    || (instant && i64::from(first_step.part_begin) > begin_low)
-                    || (!instant && i64::from(first_step.part_begin) >= end_high)
-                {
-                    return Some(Ok(()));
+                if steps.len() == 1 {
+                    let s = steps[0];
+                    if i64::from(s.part_end) <= begin_low
+                        || (instant && i64::from(s.part_begin) > begin_low)
+                        || (!instant && i64::from(s.part_begin) >= end_high)
+                    {
+                        return Some(Ok(()));
+                    }
+                    (0, 1)
+                } else {
+                    let (Some(first_step), Some(last_step_ref)) = (steps.first(), steps.last())
+                    else {
+                        return Some(Ok(()));
+                    };
+                    if i64::from(last_step_ref.part_end) <= begin_low
+                        || (instant && i64::from(first_step.part_begin) > begin_low)
+                        || (!instant && i64::from(first_step.part_begin) >= end_high)
+                    {
+                        return Some(Ok(()));
+                    }
+                    let begun =
+                        steps.partition_point(|step| i64::from(step.part_begin) < begin_high);
+                    let first = begun
+                        - steps[..begun]
+                            .iter()
+                            .rev()
+                            .take_while(|step| i64::from(step.part_end) > begin_low)
+                            .count();
+                    let last_step = begun
+                        + steps[begun..]
+                            .iter()
+                            .take_while(|step| {
+                                let begins = i64::from(step.part_begin);
+                                begins <= begin_low || (!instant && begins < end_high)
+                            })
+                            .count();
+                    (first, last_step)
                 }
-                let begun = steps.partition_point(|step| i64::from(step.part_begin) < begin_high);
-                let first = begun
-                    - steps[..begun]
-                        .iter()
-                        .rev()
-                        .take_while(|step| i64::from(step.part_end) > begin_low)
-                        .count();
-                let last_step = begun
-                    + steps[begun..]
-                        .iter()
-                        .take_while(|step| {
-                            let begins = i64::from(step.part_begin);
-                            begins <= begin_low || (!instant && begins < end_high)
-                        })
-                        .count();
-                (first, last_step)
             }
             GridStepsRef::Wide(steps) => {
-                let (Some(first_step), Some(last_step_ref)) = (steps.first(), steps.last()) else {
-                    return Some(Ok(()));
-                };
-                if i64::from(last_step_ref.part_end) <= begin_low
-                    || (instant && i64::from(first_step.part_begin) > begin_low)
-                    || (!instant && i64::from(first_step.part_begin) >= end_high)
-                {
-                    return Some(Ok(()));
+                if steps.len() == 1 {
+                    let s = steps[0];
+                    if i64::from(s.part_end) <= begin_low
+                        || (instant && i64::from(s.part_begin) > begin_low)
+                        || (!instant && i64::from(s.part_begin) >= end_high)
+                    {
+                        return Some(Ok(()));
+                    }
+                    (0, 1)
+                } else {
+                    let (Some(first_step), Some(last_step_ref)) = (steps.first(), steps.last())
+                    else {
+                        return Some(Ok(()));
+                    };
+                    if i64::from(last_step_ref.part_end) <= begin_low
+                        || (instant && i64::from(first_step.part_begin) > begin_low)
+                        || (!instant && i64::from(first_step.part_begin) >= end_high)
+                    {
+                        return Some(Ok(()));
+                    }
+                    let begun =
+                        steps.partition_point(|step| i64::from(step.part_begin) < begin_high);
+                    let first = begun
+                        - steps[..begun]
+                            .iter()
+                            .rev()
+                            .take_while(|step| i64::from(step.part_end) > begin_low)
+                            .count();
+                    let last_step = begun
+                        + steps[begun..]
+                            .iter()
+                            .take_while(|step| {
+                                let begins = i64::from(step.part_begin);
+                                begins <= begin_low || (!instant && begins < end_high)
+                            })
+                            .count();
+                    (first, last_step)
                 }
-                let begun = steps.partition_point(|step| i64::from(step.part_begin) < begin_high);
-                let first = begun
-                    - steps[..begun]
-                        .iter()
-                        .rev()
-                        .take_while(|step| i64::from(step.part_end) > begin_low)
-                        .count();
-                let last_step = begun
-                    + steps[begun..]
-                        .iter()
-                        .take_while(|step| {
-                            let begins = i64::from(step.part_begin);
-                            begins <= begin_low || (!instant && begins < end_high)
-                        })
-                        .count();
-                (first, last_step)
             }
         };
         let met = last_step - first;
@@ -5082,18 +5125,33 @@ struct Turns {
 impl Turns {
     fn of(period: Fraction, span: TimeSpan) -> Result<Self, SequenceStop> {
         let in_range = |turn: Option<i128>| turn.ok_or(SequenceStop::Range);
-        // Fast path for the common 1-cycle period over a single-cycle window.
-        if period == Fraction::ONE && span.begin < span.end {
-            let first = span.begin.floor().numer();
+        // Fast path for any positive whole-cycle period over a single turn.
+        if period.denom() == 1 && period.numer() > 0 && span.begin < span.end {
+            let p = period.numer();
+            let first_cycle = span.begin.floor_int();
+            let first = if p == 1 {
+                first_cycle
+            } else if p & (p - 1) == 0 {
+                first_cycle >> p.trailing_zeros()
+            } else {
+                first_cycle.div_euclid(p)
+            };
             if let Some(next) = first.checked_add(1)
-                && span.end <= Fraction::int(next)
+                && let Some(next_start) = next.checked_mul(p)
             {
-                return Ok(Self {
-                    period,
-                    span,
-                    indices: first..next,
-                    read: None,
-                });
+                let fits = if span.end.denom() == 1 {
+                    span.end.numer() <= next_start
+                } else {
+                    span.end.floor_int() < next_start
+                };
+                if fits {
+                    return Ok(Self {
+                        period,
+                        span,
+                        indices: first..next,
+                        read: None,
+                    });
+                }
             }
         }
         // A span of no width meets the turn that holds its one time.
@@ -5127,11 +5185,19 @@ impl Turns {
             return Ok(self.read.as_ref().expect("a turn that was just found"));
         }
         let in_range = |time: Option<Fraction>| time.ok_or(SequenceStop::Range);
-        let start = match self.period == Fraction::ONE {
-            true => Fraction::int(index),
-            false => in_range(self.period.checked_mul(Fraction::int(index)))?,
+        let (start, whole_cycles) = if self.period.denom() == 1 {
+            let p = self.period.numer();
+            let cycles = if p == 1 {
+                index
+            } else {
+                index.checked_mul(p).ok_or(SequenceStop::Range)?
+            };
+            (Fraction::int(cycles), Some(cycles))
+        } else {
+            let start = in_range(self.period.checked_mul(Fraction::int(index)))?;
+            let whole = (start.denom() == 1).then(|| start.numer());
+            (start, whole)
         };
-        let whole_cycles = (start.denom() == 1).then(|| start.numer());
         // A time from a start of whole cycles, with no division.
         let from_start = |time: Fraction| match whole_cycles.and_then(i128::checked_neg) {
             Some(back) => time.checked_add_int(back),
@@ -5239,7 +5305,7 @@ pub(crate) fn query_sequence_onto(
     }
     let added = out.len() - from;
     if added > 0 {
-        crate::note_materialised(added);
+        thread.note_materialised(added);
     }
 }
 

@@ -377,6 +377,7 @@ impl RuntimeSettings {
                 selected,
             });
         });
+        crate::set_current_runtime_ptr(self.ptr_id());
         RuntimeSettingsScope {
             scope,
             _not_send: PhantomData,
@@ -543,6 +544,11 @@ impl RuntimeSettings {
     }
 
     /// Whether the innermost scope already requested this exact handle.
+    #[inline]
+    pub(crate) fn ptr_id(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
     pub(crate) fn is_current_requested(&self) -> bool {
         CURRENT.with(|current| {
             current
@@ -662,6 +668,7 @@ impl NativeRetention {
 
 impl Drop for RuntimeSettingsScope {
     fn drop(&mut self) {
+        let mut next_ptr = None;
         let _ = CURRENT.try_with(|current| {
             let mut current = current.borrow_mut();
             if current
@@ -669,12 +676,18 @@ impl Drop for RuntimeSettingsScope {
                 .is_some_and(|bound| bound.scope == self.scope)
             {
                 current.pop();
-                return;
-            }
-            if let Some(index) = current.iter().position(|bound| bound.scope == self.scope) {
+            } else if let Some(index) = current.iter().position(|bound| bound.scope == self.scope) {
                 current.remove(index);
             }
+            next_ptr = Some(
+                current
+                    .last()
+                    .map_or(0, |bound| Arc::as_ptr(&bound.requested) as usize),
+            );
         });
+        if let Some(ptr) = next_ptr {
+            crate::set_current_runtime_ptr(ptr);
+        }
     }
 }
 

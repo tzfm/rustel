@@ -988,30 +988,41 @@ impl Fraction {
 
     // -- rounding ----------------------------------------------------------
 
+    /// Integer floor toward negative infinity without constructing a `Fraction`.
+    #[inline]
+    pub fn floor_int(self) -> i128 {
+        let d = self.d.get();
+        if d == 1 {
+            return self.n;
+        }
+        if d & (d - 1) == 0 {
+            return self.n >> d.trailing_zeros();
+        }
+        if let Some((n, d)) = self.small() {
+            return i128::from(n.div_euclid(d));
+        }
+        self.n.div_euclid(d)
+    }
+
     /// Rounds toward negative infinity: `(-1/4).floor() == -1`, so negative
     /// times map to the start of their containing cycle.
     #[inline]
     pub fn floor(self) -> Self {
-        if let Some((n, d)) = self.small() {
-            return Fraction {
-                n: i128::from(n.div_euclid(d)),
-                d: den(1),
-            };
+        Fraction {
+            n: self.floor_int(),
+            d: den(1),
         }
-        let q = self.n.div_euclid(self.d.get());
-        Fraction { n: q, d: den(1) }
     }
 
     #[inline]
     pub fn ceil(self) -> Self {
-        let f = self.floor();
-        if f.mul_eq_self(self) {
-            f
-        } else {
-            Fraction {
-                n: f.n + 1,
-                d: den(1),
-            }
+        if self.d.get() == 1 {
+            return self;
+        }
+        // A reduced fraction with `d > 1` is never an integer.
+        Fraction {
+            n: self.floor_int() + 1,
+            d: den(1),
         }
     }
 
@@ -1020,8 +1031,9 @@ impl Fraction {
     #[inline]
     pub fn checked_div_floor(self, o: Self) -> Option<i128> {
         match self.small_quotient(o) {
+            Some((n, d)) if d & (d - 1) == 0 => Some(i128::from(n >> d.trailing_zeros())),
             Some((n, d)) => Some(i128::from(n.div_euclid(d))),
-            None => Some(self.checked_div(o)?.floor().n),
+            None => Some(self.checked_div(o)?.floor_int()),
         }
     }
 
@@ -1032,6 +1044,7 @@ impl Fraction {
         match self.small_quotient(o) {
             // The floor of the negated quotient, negated: no remainder to
             // test, and no overflow for products below 2^62.
+            Some((n, d)) if d & (d - 1) == 0 => Some(-i128::from((-n) >> d.trailing_zeros())),
             Some((n, d)) => Some(-i128::from((-n).div_euclid(d))),
             None => Some(self.checked_div(o)?.ceil().n),
         }
@@ -1045,11 +1058,6 @@ impl Fraction {
         (on > 0).then_some((n * od, d * on))
     }
 
-    #[inline]
-    fn mul_eq_self(self, o: Self) -> bool {
-        self.n == o.n && self.d.get() == o.d.get()
-    }
-
     // -- cycle vocabulary ---------------------------------------------------
 
     /// Start of the cycle containing this time.
@@ -1061,13 +1069,36 @@ impl Fraction {
     /// Start of the next cycle.
     #[inline]
     pub fn next_sam(self) -> Self {
-        self.sam().add(Fraction::ONE)
+        Fraction {
+            n: ck(self.floor_int().checked_add(1), "add"),
+            d: den(1),
+        }
     }
 
     /// Position relative to the start of this time's cycle.
     #[inline]
     pub fn cycle_pos(self) -> Self {
-        self.sub(self.sam())
+        let d = self.d.get();
+        if d == 1 {
+            return Fraction::ZERO;
+        }
+        // `n` is coprime to `d`, so `n mod d` is non-zero and coprime to `d`.
+        if d & (d - 1) == 0 {
+            return Fraction {
+                n: self.n & (d - 1),
+                d: self.d,
+            };
+        }
+        if let Some((n, d)) = self.small() {
+            return Fraction {
+                n: i128::from(n.rem_euclid(d)),
+                d: self.d,
+            };
+        }
+        Fraction {
+            n: self.n.rem_euclid(d),
+            d: self.d,
+        }
     }
 
     #[inline]

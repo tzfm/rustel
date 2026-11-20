@@ -646,6 +646,13 @@ impl WaveTime {
     fn inward(&self, time: Fraction) -> Option<Fraction> {
         match *self {
             Self::Fast(n, d) => {
+                let d_raw = d.get();
+                if n == 1 && d_raw.is_power_of_two() {
+                    return time.checked_div_pow2(d_raw.trailing_zeros());
+                }
+                if d_raw == 1 && n > 0 && (n as u32).is_power_of_two() {
+                    return time.checked_mul_pow2((n as u32).trailing_zeros());
+                }
                 let factor = Fraction::from_ticks(i128::from(n), d);
                 time.checked_mul(factor)
             }

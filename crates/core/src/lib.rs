@@ -302,7 +302,7 @@ pub fn sort_haps_for_query(haps: Vec<Hap>) -> Vec<Hap> {
 
 /// Part begin, part end, then the whole. An analog hap's missing whole
 /// sorts first.
-#[inline]
+#[inline(always)]
 fn query_order(a: &Hap, b: &Hap) -> std::cmp::Ordering {
     if a.part.begin != b.part.begin {
         return a.part.begin.cmp(&b.part.begin);
@@ -358,21 +358,7 @@ fn stable_sorted(mut haps: Vec<Hap>) -> Vec<Hap> {
         return haps;
     }
     if n <= FEW_HAPS {
-        let mut keys = [0.0f64; FEW_HAPS];
-        for (dst, hap) in keys[..n].iter_mut().zip(&haps) {
-            *dst = order_key(hap.part.begin);
-        }
-        let cmp = |a: usize, b: usize| -> std::cmp::Ordering {
-            let (ka, kb) = (keys[a], keys[b]);
-            if ka < kb {
-                std::cmp::Ordering::Less
-            } else if ka > kb {
-                std::cmp::Ordering::Greater
-            } else {
-                query_order(&haps[a], &haps[b])
-            }
-        };
-        if (1..n).all(|at| cmp(at - 1, at) != std::cmp::Ordering::Greater) {
+        if (1..n).all(|at| query_order(&haps[at - 1], &haps[at]) != std::cmp::Ordering::Greater) {
             return haps;
         }
         let mut indices = [0u8; FEW_HAPS];
@@ -381,16 +367,19 @@ fn stable_sorted(mut haps: Vec<Hap>) -> Vec<Hap> {
         }
         for i in 1..n {
             let key = indices[i];
-            let key_idx = key as usize;
+            let key_hap = &haps[key as usize];
             let mut j = i;
-            while j > 0 && cmp(indices[j - 1] as usize, key_idx) == std::cmp::Ordering::Greater {
+            while j > 0
+                && query_order(&haps[indices[j - 1] as usize], key_hap)
+                    == std::cmp::Ordering::Greater
+            {
                 indices[j] = indices[j - 1];
                 j -= 1;
             }
             indices[j] = key;
         }
         // Apply the permutation in place by following disjoint cycles so each
-        // 256-byte hap moves at most once with zero heap allocation.
+        // hap moves once per cycle step with zero heap allocation.
         for i in 0..n {
             let mut dst = i;
             let mut src = indices[dst] as usize;
@@ -444,8 +433,21 @@ pub fn whole_cycle(t: Fraction) -> TimeSpan {
 impl TimeSpan {
     /// Whether this span is not empty and ends inside the cycle it begins
     /// in, so [`TimeSpan::span_cycles`] gives it back whole.
+    #[inline]
     fn within_one_cycle(&self) -> bool {
-        self.begin < self.end && self.end <= self.begin.next_sam()
+        if !(self.begin < self.end) {
+            return false;
+        }
+        let begin_cycle = self.begin.floor_int();
+        if self.end.denom() == 1 {
+            begin_cycle
+                .checked_add(1)
+                .is_some_and(|next| self.end.numer() <= next)
+        } else {
+            // Reduced `end` with `denom > 1` is non-integer, so `end <= begin_cycle + 1`
+            // holds iff `end.floor_int() <= begin_cycle`.
+            self.end.floor_int() <= begin_cycle
+        }
     }
 }
 
@@ -3663,6 +3665,12 @@ struct QueryThread {
     /// will set it.
     cancel: std::cell::Cell<Option<*const std::sync::atomic::AtomicBool>>,
     cancel_observed: std::cell::Cell<bool>,
+    /// Haps materialised at leaves on this thread since the last reset.
+    materialised: std::cell::Cell<u64>,
+    /// Pointer identity of the top `RuntimeSettings` bound on this thread, or 0.
+    current_runtime: std::cell::Cell<usize>,
+    /// Remaining stepwise construction entries in the current top-level query.
+    stepwise_remaining: std::cell::Cell<Option<u64>>,
 }
 
 impl QueryThread {
@@ -3767,8 +3775,16 @@ impl QueryThread {
     }
 
     /// Record a vector that has just grown to `len`.
+    #[inline]
     fn note_accumulated(&self, len: usize) {
         self.peak.set(self.peak.get().max(len as u64));
+    }
+
+    /// Record `n` haps materialised at a leaf without an extra TLS lookup.
+    #[inline]
+    pub(crate) fn note_materialised(&self, n: usize) {
+        self.materialised
+            .set(self.materialised.get().saturating_add(n as u64));
     }
 
     /// [`push_budgeted_from`] on the counters of this thread: a walk that
@@ -3781,6 +3797,10 @@ impl QueryThread {
         self.note_accumulated(out.len() - from);
         true
     }
+}
+
+pub(crate) fn set_current_runtime_ptr(ptr: usize) {
+    let _ = QUERY_THREAD.try_with(|thread| thread.current_runtime.set(ptr));
 }
 
 thread_local! {
@@ -3798,6 +3818,9 @@ thread_local! {
             part_asked: std::cell::Cell::new(PartAsked::No),
             cancel: std::cell::Cell::new(None),
             cancel_observed: std::cell::Cell::new(false),
+            materialised: std::cell::Cell::new(0),
+            current_runtime: std::cell::Cell::new(0),
+            stepwise_remaining: std::cell::Cell::new(None),
         }
     };
 }
@@ -3894,17 +3917,15 @@ fn refuses_part(made: &Pattern) -> bool {
 /// Alias kept for the shrink/grow boundary.
 pub const MAX_STEPWISE_SEGMENTS: u64 = MAX_STEPWISE_ENTRIES;
 
+static STEPWISE_ENTRIES_REMAINING: QueryCell<std::cell::Cell<Option<u64>>> =
+    QueryCell(|q| &q.stepwise_remaining);
+
 thread_local! {
     /// Set when a RESOURCE limit refuses the query. Separate from
     /// `QUERY_ERROR` so the `queryArc` boundary cannot turn a refusal into a
     /// plausible silence, and typed so the caller learns which limit fired.
     static REFUSAL: std::cell::RefCell<Option<QueryLimit>> =
         const { std::cell::RefCell::new(None) };
-    /// Remaining stepwise construction entries in this top-level query.
-    /// `None` outside a query means the scalar body receives the same limit per
-    /// invocation; nested queries share the enclosing remaining balance.
-    static STEPWISE_ENTRIES_REMAINING: std::cell::Cell<Option<u64>> =
-        const { std::cell::Cell::new(None) };
     /// Entries materialised after preflight. Thread-local so parallel tests do
     /// not race.
     static STEPWISE_ENTRIES_MATERIALISED: std::cell::Cell<u64> =
@@ -4337,11 +4358,6 @@ pub(crate) fn refuse(limit: QueryLimit) {
     });
 }
 
-thread_local! {
-    /// Haps this thread has actually MATERIALISED at a leaf.
-    static HAPS_MATERIALISED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
 /// The largest hap vector that actually EXISTED since the last reset.
 ///
 /// Distinct from [`haps_materialised`], which counts leaf production, and from
@@ -4547,17 +4563,19 @@ pub(crate) fn cancellation_observed() -> bool {
 /// does not happen. Without this counter the pre-charge could be deleted
 /// and every budget test would still pass.
 pub fn haps_materialised() -> u64 {
-    HAPS_MATERIALISED.with(|c| c.get())
+    QUERY_THREAD.with(|t| t.materialised.get())
 }
 
 /// Reset the materialisation counter.
 pub fn reset_haps_materialised() {
-    HAPS_MATERIALISED.with(|c| c.set(0));
-    PEAK_CHARGE.with(|c| c.set(0));
+    QUERY_THREAD.with(|t| {
+        t.materialised.set(0);
+        t.peak.set(0);
+    });
 }
 
 fn note_materialised(n: usize) {
-    HAPS_MATERIALISED.with(|c| c.set(c.get().saturating_add(n as u64)));
+    QUERY_THREAD.with(|t| t.note_materialised(n));
 }
 
 /// Install a budget for `f`, restoring the previous one afterwards.
@@ -4566,38 +4584,48 @@ fn note_materialised(n: usize) {
 /// outer budget rather than getting a fresh one. Otherwise a pattern could
 /// evade the limit by querying in a loop.
 fn with_hap_budget<R>(budget: u64, f: impl FnOnce() -> R) -> (R, Option<QueryLimit>) {
-    let (previous, nested) = HAP_BUDGET.with(|slot| {
-        let previous = slot.get();
-        if previous.is_none() {
-            slot.set(Some(budget));
-        }
-        (previous, previous.is_some())
-    });
-    let previous_refusal = (!nested).then(|| {
-        let previous = REFUSAL.with(|f| f.borrow_mut().take());
-        set_stop_bit(STOP_REFUSED, false);
-        previous
-    });
-    let previous_stepwise = STEPWISE_ENTRIES_REMAINING.with(|slot| {
-        let previous = slot.get();
+    let (previous, nested, previous_stepwise, had_refusal) = QUERY_THREAD.with(|thread| {
+        let previous = thread.hap_budget.get();
+        let nested = previous.is_some();
+        let previous_stepwise = thread.stepwise_remaining.get();
+        let had_refusal = !nested && (thread.stop.get() & STOP_REFUSED != 0);
         if !nested {
-            slot.set(Some(MAX_STEPWISE_ENTRIES));
+            thread.hap_budget.set(Some(budget));
+            thread.stepwise_remaining.set(Some(MAX_STEPWISE_ENTRIES));
+            if had_refusal {
+                thread.set_stop_bit(STOP_REFUSED, false);
+            }
         }
-        previous
+        (previous, nested, previous_stepwise, had_refusal)
     });
+    let previous_refusal = if had_refusal {
+        REFUSAL.with(|f| f.borrow_mut().take())
+    } else {
+        None
+    };
     struct Guard {
         previous_budget: Option<u64>,
-        previous_refusal: Option<Option<QueryLimit>>,
+        previous_refusal: Option<QueryLimit>,
         previous_stepwise: Option<u64>,
         nested: bool,
     }
     impl Drop for Guard {
         fn drop(&mut self) {
-            HAP_BUDGET.with(|slot| slot.set(self.previous_budget));
-            if !self.nested {
-                STEPWISE_ENTRIES_REMAINING.with(|slot| slot.set(self.previous_stepwise));
-                let previous = self.previous_refusal.take().flatten();
-                set_stop_bit(STOP_REFUSED, previous.is_some());
+            let previous = self.previous_refusal.take();
+            let restore_refusal = !self.nested && previous.is_some();
+            let mut touch_refusal = restore_refusal;
+            QUERY_THREAD.with(|thread| {
+                thread.hap_budget.set(self.previous_budget);
+                if !self.nested {
+                    thread.stepwise_remaining.set(self.previous_stepwise);
+                    let had_inner = thread.stop.get() & STOP_REFUSED != 0;
+                    if restore_refusal || had_inner {
+                        thread.set_stop_bit(STOP_REFUSED, restore_refusal);
+                        touch_refusal = true;
+                    }
+                }
+            });
+            if touch_refusal {
                 REFUSAL.with(|slot| *slot.borrow_mut() = previous);
             }
         }
@@ -4609,7 +4637,11 @@ fn with_hap_budget<R>(budget: u64, f: impl FnOnce() -> R) -> (R, Option<QueryLim
         nested,
     };
     let out = f();
-    let refusal = REFUSAL.with(|f| f.borrow().clone());
+    let refusal = if QUERY_STOP.with(|s| s.get() & STOP_REFUSED != 0) {
+        REFUSAL.with(|f| f.borrow().clone())
+    } else {
+        None
+    };
     drop(guard);
     (out, refusal)
 }
@@ -9529,13 +9561,96 @@ impl Pattern {
             return false;
         }
         // Fast batched StepPatch path: when 1..=4 unique wave keys apply to
-        // multiple haps sharing one uniform-key base across 2+ distinct
-        // timestamps, pack up to `16 / n_unique` timestamps into one
-        // `Arc<StepPatch>` instead of one `Arc<Patched>` per timestamp.
-        let mut batched_pos = 0usize;
-        if count <= value::StepPatch::MAX_KEYS
-            && matches!(&out[from].value, Value::Object(m) if m.uniform_step_base().is_some())
-        {
+        // multiple haps sharing a base across 2+ distinct timestamps (even when
+        // bases are interleaved across voices), pack up to `16 / n_unique`
+        // timestamps per base into one `Arc<StepPatch>`.
+        //
+        // Uses compact `u8` index arrays on the stack (referencing haps in `out`)
+        // to avoid zeroing multi-KB `TimeSpan` buffers per base.
+        struct SampleSlot {
+            met: TimeSpan,
+            part: TimeSpan,
+            nums: [f64; MAX_WAVES],
+            cache: value::SharedWaveCache,
+        }
+        let apply_fallback_slice = |out: &mut [Hap], mask: Option<u64>| -> bool {
+            let mut samples: [Option<SampleSlot>; 4] = [None, None, None, None];
+            let mut sample_next = 0u8;
+            let mut patches: [(&Key, f64); MAX_WAVES] = [(first.key(), 0.0); MAX_WAVES];
+            let mut apply_one = |hap: &mut Hap| -> bool {
+                let met = hap.whole_or_part();
+                let part = hap
+                    .part
+                    .intersection(&met)
+                    .expect("checked non-empty intersection");
+                let slot_idx = if let Some(idx) = samples
+                    .iter()
+                    .position(|s| matches!(s, Some(slot) if slot.met == met && slot.part == part))
+                {
+                    idx
+                } else {
+                    let mut nums = [0.0f64; MAX_WAVES];
+                    for i in 0..count {
+                        let Some(num) =
+                            waves[i]
+                                .expect("wave present")
+                                .sample(met, part, &state.controls)
+                        else {
+                            return false;
+                        };
+                        nums[i] = num;
+                    }
+                    let idx = if let Some(empty) = samples.iter().position(Option::is_none) {
+                        empty
+                    } else {
+                        let victim = usize::from(sample_next & 3);
+                        sample_next = sample_next.wrapping_add(1);
+                        victim
+                    };
+                    samples[idx] = Some(SampleSlot {
+                        met,
+                        part,
+                        nums,
+                        cache: value::SharedWaveCache::default(),
+                    });
+                    idx
+                };
+                let slot = samples[slot_idx].as_mut().expect("sample slot populated");
+                for i in 0..count {
+                    let item = waves[i].expect("wave present");
+                    if item.is_step() {
+                        fused::note(fused::Hit::StepOne);
+                    }
+                    patches[i] = (item.key(), slot.nums[i]);
+                }
+                clear_live_keys(hap, &waves[..count]);
+                if let Value::Object(controls) = &mut hap.value {
+                    controls.set_data_many_cached(&patches[..count], &mut slot.cache);
+                }
+                hap.part = part;
+                true
+            };
+            match mask {
+                Some(mut rem) => {
+                    while rem != 0 {
+                        let j = rem.trailing_zeros() as usize;
+                        rem &= rem - 1;
+                        if !apply_one(&mut out[j]) {
+                            return false;
+                        }
+                    }
+                }
+                None => {
+                    for hap in out {
+                        if !apply_one(hap) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        };
+        if count <= value::StepPatch::MAX_KEYS {
             let mut unique_keys: [&Key; value::StepPatch::MAX_KEYS] =
                 [first.key(); value::StepPatch::MAX_KEYS];
             let mut key_slot = [0u8; value::StepPatch::MAX_KEYS];
@@ -9552,171 +9667,175 @@ impl Pattern {
             }
             let max_slots = value::StepPatch::MAX_VALUES / n_unique;
             if max_slots >= 2 {
-                let slice = &mut out[from..];
-                let total = slice.len();
-                let mut pos = 0usize;
-                while pos < total {
-                    let Some((base, first_row)) = (match &slice[pos].value {
-                        Value::Object(m) => m.uniform_step_base(),
-                        _ => None,
-                    }) else {
-                        break;
+                let total = out.len() - from;
+                let mut chunk_base = 0usize;
+                while chunk_base < total {
+                    let chunk_len = (total - chunk_base).min(64);
+                    let full_mask = if chunk_len == 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << chunk_len) - 1
                     };
-                    // Collect a chunk of contiguous haps sharing `base` with up
-                    // to `max_slots` distinct `(met, part)` timestamps.
-                    let mut slot_spans = [(
-                        TimeSpan::new(Fraction::ZERO, Fraction::ZERO),
-                        TimeSpan::new(Fraction::ZERO, Fraction::ZERO),
-                    ); 16];
-                    let mut slot_nums = [[0.0f64; value::StepPatch::MAX_KEYS]; 16];
-                    let mut n_slots = 0usize;
-                    let mut hap_rows = [0u32; 32];
-                    let mut hap_slots = [0u8; 32];
-                    let mut hap_parts = [TimeSpan::new(Fraction::ZERO, Fraction::ZERO); 32];
-                    let mut chunk_len = 0usize;
-                    while pos + chunk_len < total && chunk_len < 32 {
-                        let hap = &slice[pos + chunk_len];
-                        let row = if chunk_len == 0 {
-                            first_row
-                        } else {
-                            let Value::Object(m) = &hap.value else {
-                                break;
-                            };
-                            let Some(r) = m.matches_step_base(&base) else {
-                                break;
-                            };
-                            r
+                    let mut done_mask = 0u64;
+                    let mut skip_mask = 0u64;
+                    // Reuse sampled wave values across distinct bases in the same chunk.
+                    // Each entry stores the representative hap index in this chunk.
+                    let mut shared_hap = [0u8; 16];
+                    let mut shared_nums = [[0.0f64; value::StepPatch::MAX_KEYS]; 16];
+                    let mut n_shared = 0usize;
+                    let mut hap_idx = [0u8; 64];
+                    let mut hap_rows = [0u32; 64];
+                    let mut hap_slots = [0u8; 64];
+                    while (done_mask | skip_mask) != full_mask {
+                        let start = (!(done_mask | skip_mask)).trailing_zeros() as usize;
+                        let Some((base, first_row, uniform)) =
+                            (match &out[from + chunk_base + start].value {
+                                Value::Object(m) => m.step_base(),
+                                _ => None,
+                            })
+                        else {
+                            skip_mask |= 1u64 << start;
+                            continue;
                         };
-                        let met = hap.whole_or_part();
-                        let part = hap
-                            .part
-                            .intersection(&met)
-                            .expect("checked non-empty intersection");
-                        let s_idx = if let Some(existing) = slot_spans[..n_slots]
-                            .iter()
-                            .position(|&(m, p)| m == met && p == part)
-                        {
-                            existing
-                        } else if n_slots < max_slots {
-                            let mut vals = [0.0f64; value::StepPatch::MAX_KEYS];
-                            for i in 0..count {
-                                let Some(num) = waves[i].expect("wave present").sample(
-                                    met,
-                                    part,
-                                    &state.controls,
-                                ) else {
-                                    out.truncate(from);
-                                    return false;
+                        let mut slot_hap = [0u8; 16];
+                        let mut slot_nums = [[0.0f64; value::StepPatch::MAX_KEYS]; 16];
+                        let mut n_slots = 0usize;
+                        let mut m_len = 0usize;
+                        let handled = done_mask | skip_mask;
+                        for j in start..chunk_len {
+                            if handled & (1u64 << j) != 0 {
+                                continue;
+                            }
+                            let hap = &out[from + chunk_base + j];
+                            let row = if j == start {
+                                first_row
+                            } else {
+                                let Value::Object(m) = &hap.value else {
+                                    continue;
                                 };
-                                vals[usize::from(key_slot[i])] = num;
+                                let Some(r) = m.matches_step_base(&base) else {
+                                    continue;
+                                };
+                                if !uniform && r != first_row {
+                                    continue;
+                                }
+                                r
+                            };
+                            let met = hap.whole_or_part();
+                            let part = hap
+                                .part
+                                .intersection(&met)
+                                .expect("checked non-empty intersection");
+                            let s_idx = if let Some(existing) =
+                                slot_hap[..n_slots].iter().position(|&rep| {
+                                    let rh = &out[from + chunk_base + usize::from(rep)];
+                                    let rm = rh.whole_or_part();
+                                    rm == met && rh.part.intersection(&rm) == Some(part)
+                                }) {
+                                existing
+                            } else if n_slots < max_slots {
+                                let vals = if let Some(cached) =
+                                    shared_hap[..n_shared].iter().position(|&rep| {
+                                        let rh = &out[from + chunk_base + usize::from(rep)];
+                                        let rm = rh.whole_or_part();
+                                        rm == met && rh.part.intersection(&rm) == Some(part)
+                                    }) {
+                                    shared_nums[cached]
+                                } else {
+                                    let mut vals = [0.0f64; value::StepPatch::MAX_KEYS];
+                                    for i in 0..count {
+                                        let Some(num) = waves[i].expect("wave present").sample(
+                                            met,
+                                            part,
+                                            &state.controls,
+                                        ) else {
+                                            out.truncate(from);
+                                            return false;
+                                        };
+                                        vals[usize::from(key_slot[i])] = num;
+                                    }
+                                    if n_shared < 16 {
+                                        shared_hap[n_shared] = j as u8;
+                                        shared_nums[n_shared] = vals;
+                                        n_shared += 1;
+                                    }
+                                    vals
+                                };
+                                let idx = n_slots;
+                                slot_hap[idx] = j as u8;
+                                slot_nums[idx] = vals;
+                                n_slots += 1;
+                                idx
+                            } else {
+                                continue;
+                            };
+                            hap_idx[m_len] = j as u8;
+                            hap_rows[m_len] = row;
+                            hap_slots[m_len] = s_idx as u8;
+                            m_len += 1;
+                        }
+                        if n_slots < 2 {
+                            for &j in &hap_idx[..m_len] {
+                                skip_mask |= 1u64 << j;
                             }
-                            let idx = n_slots;
-                            slot_spans[idx] = (met, part);
-                            slot_nums[idx] = vals;
-                            n_slots += 1;
-                            idx
-                        } else {
-                            break;
+                            continue;
+                        }
+                        let Some(mut built) = value::StepPatch::new_for_row(
+                            base,
+                            first_row,
+                            &unique_keys[..n_unique],
+                            true,
+                        ) else {
+                            for &j in &hap_idx[..m_len] {
+                                skip_mask |= 1u64 << j;
+                            }
+                            continue;
                         };
-                        hap_rows[chunk_len] = row;
-                        hap_slots[chunk_len] = s_idx as u8;
-                        hap_parts[chunk_len] = part;
-                        chunk_len += 1;
-                    }
-                    if n_slots < 2 {
-                        break;
-                    }
-                    let Some(mut built) =
-                        value::StepPatch::new(base, first_row, &unique_keys[..n_unique], true)
-                    else {
-                        break;
-                    };
-                    for (s, nums) in slot_nums[..n_slots].iter().enumerate() {
-                        built.set_slot(s, &nums[..n_unique]);
-                    }
-                    let sp = Arc::new(built);
-                    for j in 0..chunk_len {
-                        let hap = &mut slice[pos + j];
-                        for wave in &waves[..count] {
-                            if wave.expect("wave present").is_step() {
-                                fused::note(fused::Hit::StepOne);
+                        for (s, nums) in slot_nums[..n_slots].iter().enumerate() {
+                            built.set_slot(s, &nums[..n_unique]);
+                        }
+                        let sp = Arc::new(built);
+                        for k in 0..m_len {
+                            let j = usize::from(hap_idx[k]);
+                            let hap = &mut out[from + chunk_base + j];
+                            for wave in &waves[..count] {
+                                if wave.expect("wave present").is_step() {
+                                    fused::note(fused::Hit::StepOne);
+                                }
                             }
+                            clear_live_keys(hap, &waves[..count]);
+                            if let Value::Object(controls) = &mut hap.value {
+                                controls.set_step_patch(
+                                    &sp,
+                                    hap_rows[k],
+                                    usize::from(hap_slots[k]),
+                                );
+                            }
+                            let met = hap.whole_or_part();
+                            hap.part = hap
+                                .part
+                                .intersection(&met)
+                                .expect("checked non-empty intersection");
+                            done_mask |= 1u64 << j;
                         }
-                        clear_live_keys(hap, &waves[..count]);
-                        if let Value::Object(controls) = &mut hap.value {
-                            controls.set_step_patch(&sp, hap_rows[j], usize::from(hap_slots[j]));
-                        }
-                        hap.part = hap_parts[j];
                     }
-                    pos += chunk_len;
-                }
-                if pos == total {
-                    return true;
-                }
-                batched_pos = pos;
-            }
-        }
-        struct SampleSlot {
-            met: TimeSpan,
-            part: TimeSpan,
-            nums: [f64; MAX_WAVES],
-            cache: value::SharedWaveCache,
-        }
-        let mut samples: [Option<SampleSlot>; 4] = [None, None, None, None];
-        let mut sample_next = 0u8;
-        let mut patches: [(&Key, f64); MAX_WAVES] = [(first.key(), 0.0); MAX_WAVES];
-        for hap in &mut out[from + batched_pos..] {
-            let met = hap.whole_or_part();
-            let part = hap
-                .part
-                .intersection(&met)
-                .expect("checked non-empty intersection");
-            let slot_idx = if let Some(idx) = samples
-                .iter()
-                .position(|s| matches!(s, Some(slot) if slot.met == met && slot.part == part))
-            {
-                idx
-            } else {
-                let mut nums = [0.0f64; MAX_WAVES];
-                for i in 0..count {
-                    let Some(num) =
-                        waves[i]
-                            .expect("wave present")
-                            .sample(met, part, &state.controls)
-                    else {
+                    if skip_mask != 0
+                        && !apply_fallback_slice(
+                            &mut out[from + chunk_base..from + chunk_base + chunk_len],
+                            Some(skip_mask),
+                        )
+                    {
                         out.truncate(from);
                         return false;
-                    };
-                    nums[i] = num;
+                    }
+                    chunk_base += chunk_len;
                 }
-                let idx = if let Some(empty) = samples.iter().position(Option::is_none) {
-                    empty
-                } else {
-                    let victim = usize::from(sample_next & 3);
-                    sample_next = sample_next.wrapping_add(1);
-                    victim
-                };
-                samples[idx] = Some(SampleSlot {
-                    met,
-                    part,
-                    nums,
-                    cache: value::SharedWaveCache::default(),
-                });
-                idx
-            };
-            let slot = samples[slot_idx].as_mut().expect("sample slot populated");
-            for i in 0..count {
-                let item = waves[i].expect("wave present");
-                if item.is_step() {
-                    fused::note(fused::Hit::StepOne);
-                }
-                patches[i] = (item.key(), slot.nums[i]);
+                return true;
             }
-            clear_live_keys(hap, &waves[..count]);
-            if let Value::Object(controls) = &mut hap.value {
-                controls.set_data_many_cached(&patches[..count], &mut slot.cache);
-            }
-            hap.part = part;
+        }
+        if !apply_fallback_slice(&mut out[from..], None) {
+            out.truncate(from);
+            return false;
         }
         true
     }
@@ -10630,17 +10749,19 @@ impl Pattern {
         }
         match self.runtime_settings() {
             Some(settings) => {
-                let crosses_runtime = !settings.is_current_requested();
-                if crosses_runtime {
+                if thread.current_runtime.get() == settings.ptr_id() {
+                    let owner = outermost.then_some(settings);
+                    self.query_with_bound_runtime(thread, state, owner, order, out)
+                } else {
                     // The child binds a runtime of its own, whose snapshot
                     // can move without the enclosing one changing.
                     note_uncacheable();
+                    let _scope = settings.bind();
+                    self.query_with_bound_runtime(thread, state, Some(settings), order, out)
                 }
-                let owner = (outermost || crosses_runtime).then_some(settings);
-                settings.with(|| self.query_with_bound_runtime(thread, state, owner, order, out))
             }
             None => {
-                let metadata_owner = if outermost {
+                let metadata_owner = if outermost && thread.current_runtime.get() != 0 {
                     settings::RuntimeSettings::current_requested()
                 } else {
                     None
@@ -14178,7 +14299,16 @@ impl Pattern {
                 };
                 let (mut haps, data_only) = self.answer_with_room(state, order, room);
                 if is_short {
-                    let needed = u16::try_from(haps.len()).unwrap_or(48).clamp(20, 48);
+                    let len = haps.len();
+                    let needed = if len <= 20 {
+                        20u16
+                    } else if len <= 32 {
+                        32u16
+                    } else if len <= 48 {
+                        48u16
+                    } else {
+                        64u16
+                    };
                     SHORT_QUERY_HINT.with(|hint| {
                         let (ptr, cap) = hint.get();
                         let next = if ptr == root_ptr {
