@@ -2574,6 +2574,28 @@ mod tests {
             );
         }
 
+        /// A search box that swallowed a line of a score finds nothing, and
+        /// finds it as fast as a short search: the cost of a filter does not
+        /// grow with the length of what was typed.
+        #[test]
+        fn a_long_search_on_the_chords_and_scales_tabs_stays_cheap() {
+            let reference = Reference::load_all();
+            let mut panel = ReferencePanel::browse(&reference);
+            panel.scale_query = "b".repeat(400);
+            panel.chord_query = "b".repeat(400);
+            let started = std::time::Instant::now();
+            for _ in 0..10 {
+                assert!(panel.scale_names().is_empty());
+                assert!(panel.chord_qualities().is_empty());
+            }
+            // Before, each pass took longer than all ten take now.
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "ten passes took {elapsed:?}"
+            );
+        }
+
         /// A written-out tonic names a row the list can select: `Gb1` is
         /// `Gb`, the octave is read and dropped, and a sharp reads as its
         /// flat spelling.
