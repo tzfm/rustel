@@ -358,7 +358,21 @@ fn stable_sorted(mut haps: Vec<Hap>) -> Vec<Hap> {
         return haps;
     }
     if n <= FEW_HAPS {
-        if (1..n).all(|at| query_order(&haps[at - 1], &haps[at]) != std::cmp::Ordering::Greater) {
+        let mut keys = [0.0f64; FEW_HAPS];
+        for (dst, hap) in keys[..n].iter_mut().zip(&haps) {
+            *dst = order_key(hap.part.begin);
+        }
+        let cmp = |a: usize, b: usize| -> std::cmp::Ordering {
+            let (ka, kb) = (keys[a], keys[b]);
+            if ka < kb {
+                std::cmp::Ordering::Less
+            } else if ka > kb {
+                std::cmp::Ordering::Greater
+            } else {
+                query_order(&haps[a], &haps[b])
+            }
+        };
+        if (1..n).all(|at| cmp(at - 1, at) != std::cmp::Ordering::Greater) {
             return haps;
         }
         let mut indices = [0u8; FEW_HAPS];
@@ -367,11 +381,9 @@ fn stable_sorted(mut haps: Vec<Hap>) -> Vec<Hap> {
         }
         for i in 1..n {
             let key = indices[i];
+            let key_idx = key as usize;
             let mut j = i;
-            while j > 0
-                && query_order(&haps[indices[j - 1] as usize], &haps[key as usize])
-                    == std::cmp::Ordering::Greater
-            {
+            while j > 0 && cmp(indices[j - 1] as usize, key_idx) == std::cmp::Ordering::Greater {
                 indices[j] = indices[j - 1];
                 j -= 1;
             }
@@ -7224,6 +7236,57 @@ impl RunMeeting {
     /// Join the `set` of `control` at `context`, which this meeting
     /// [takes](Self::takes_set_after): the constant is then the union, with
     /// the locations of the later control first.
+    fn of_single_control(packed_key: u16, value: Value) -> Self {
+        Self {
+            value,
+            apply: RunApply::from_parts(
+                Combine::Composed(compose::ComposeOp::Set),
+                LookupFlow::Set,
+                packed_key,
+                0,
+                None,
+            ),
+        }
+    }
+
+    fn set_single_after(&mut self, packed_key: u16, key: &Key, value: Value) {
+        let prev_key = self.apply.single_key();
+        if prev_key != 0 {
+            if prev_key == packed_key {
+                self.value = value;
+                return;
+            }
+            let prev_val = std::mem::replace(&mut self.value, Value::Undefined);
+            self.value = Value::Object(if packed_key != 0 {
+                OrderedMap::from_two_packed(prev_key, prev_val, packed_key, value)
+            } else {
+                let mut map = OrderedMap::from_single_packed(prev_key, prev_val);
+                map.set_data(key, value);
+                map.mark_made_of_data();
+                map
+            });
+            let flow = self.apply.flow();
+            let (loc0, more) = Self::pack_context(self.context());
+            self.apply = RunApply::from_parts(Combine::SetMerged, flow, 0, loc0, more);
+            return;
+        }
+        if let Value::Object(map) = &mut self.value {
+            map.set_data(key, value);
+            map.mark_made_of_data();
+        } else {
+            let mut single = OrderedMap::of_one(key.clone(), value);
+            single.mark_made_of_data();
+            compose::compose_data_flat(
+                compose::ComposeOp::Set,
+                &mut self.value,
+                &Value::Object(single),
+            );
+        }
+        let flow = self.apply.flow();
+        let (loc0, more) = Self::pack_context(self.context());
+        self.apply = RunApply::from_parts(Combine::SetMerged, flow, 0, loc0, more);
+    }
+
     fn set_after(&mut self, control: &Value, mut context: Locations) {
         let single_key = self.apply.single_key();
         if single_key != 0 {
@@ -14368,12 +14431,61 @@ impl Pattern {
     /// [`Self::set_constant_control`] for a `pure` of the data value
     /// `value`, with no pattern of it.
     pub(crate) fn set_control_value(
-        self,
+        mut self,
         spec: &controls::ControlSpec,
         value: &Value,
     ) -> Result<Self, Self> {
         if !value.is_data(0) {
             return Err(self);
+        }
+        // Plain scalar control on a built-in non-`"value"` key: avoid allocating
+        // a temporary 1-entry `BuiltinMap<1>` when writing into a Sequence,
+        // Constants run, or fresh single-control Constants node.
+        if matches!(value, Value::F64(_) | Value::Str(_) | Value::Bool(_)) && spec.name() != "value"
+        {
+            let packed_key = if spec.id != 0 {
+                spec.id | (u16::from(value::Table::mark_bit(spec.name())) << 10)
+            } else {
+                0
+            };
+            if matches!(self.node_kind(), Node::Sequence(_)) && sequence::takes_plain_set(&self) {
+                let steps = self.steps();
+                let runtime = self.runtime_settings().cloned();
+                if let Some(cell) = self.own_node()
+                    && let Node::Sequence(layers) = &mut cell.kind
+                {
+                    sequence::set_single_here(layers, &spec.key(), value.clone());
+                    let node = Arc::clone(&self.node);
+                    self = Self::holding(node).with_steps(steps);
+                    if let Some(runtime) = runtime {
+                        self.attach_runtime_settings(runtime);
+                    }
+                    return Ok(self);
+                }
+            } else if let Node::Constants(node) = self.node_kind()
+                && self.same_runtime_owner(&node.0)
+                && node.1.last().is_some_and(RunMeeting::takes_sets)
+            {
+                let steps = self.steps();
+                let runtime = self.runtime_settings().cloned();
+                if let Some(cell) = self.own_node()
+                    && let Node::Constants(node) = &mut cell.kind
+                    && let Some(last) = node.1.last_mut()
+                {
+                    last.set_single_after(packed_key, &spec.key(), value.clone());
+                    let node = Arc::clone(&self.node);
+                    self = Self::holding(node).with_steps(steps);
+                    if let Some(runtime) = runtime {
+                        self.attach_runtime_settings(runtime);
+                    }
+                    return Ok(self);
+                }
+            } else if packed_key != 0 && !self.takes_constants() && self.meets_constants() {
+                let steps = self.steps();
+                return Ok(self
+                    .met([RunMeeting::of_single_control(packed_key, value.clone())])
+                    .with_steps(steps));
+            }
         }
         // A handle of the value, for the control to hold.
         self.with_control(&spec.with_value(value.clone()), Locations::new())

@@ -343,7 +343,7 @@ type Found<T> = std::collections::HashMap<
 /// the asset.
 #[derive(Default)]
 struct FoundNames {
-    methods: Found<BuiltinMethod>,
+    methods: Found<Option<BuiltinMethod>>,
     globals: Found<BuiltinGlobal>,
 }
 
@@ -354,12 +354,18 @@ thread_local! {
 impl ListedNames {
     pub(crate) fn method(&self, name: &str) -> Option<BuiltinMethod> {
         if let Some(found) = FOUND_NAMES.with_borrow(|found| found.methods.get(name).copied()) {
-            return Some(found);
+            return found;
         }
-        let (name, listing) = listing("method", name)?;
-        let method = BuiltinMethod::listed(listing)?;
-        FOUND_NAMES.with_borrow_mut(|found| found.methods.insert(name, method));
-        Some(method)
+        let Some((key, listing)) = listing("method", name) else {
+            // Cache common non-method names such as lane `p` without allocating.
+            if name == "p" {
+                FOUND_NAMES.with_borrow_mut(|found| found.methods.insert("p", None));
+            }
+            return None;
+        };
+        let method = BuiltinMethod::listed(listing);
+        FOUND_NAMES.with_borrow_mut(|found| found.methods.insert(key, method));
+        method
     }
 
     pub(crate) fn global(&self, name: &str) -> Option<BuiltinGlobal> {
@@ -374,15 +380,28 @@ impl ListedNames {
     }
 
     pub(crate) fn is_signal(&self, name: &str) -> bool {
-        if let Some(found) = FOUND_NAMES.with_borrow(|found| {
-            found
-                .globals
-                .get(name)
-                .map(|g| matches!(g, BuiltinGlobal::Signal(_)))
-        }) {
-            return found;
-        }
-        matches!(listing("global", name), Some((_, "signal")))
+        static STATIC_SIGNALS: std::sync::OnceLock<
+            std::collections::HashSet<
+                &'static str,
+                std::hash::BuildHasherDefault<rustel_core::WordHasher>,
+            >,
+        > = std::sync::OnceLock::new();
+        STATIC_SIGNALS
+            .get_or_init(|| {
+                let mut set = std::collections::HashSet::with_capacity_and_hasher(
+                    32,
+                    std::hash::BuildHasherDefault::default(),
+                );
+                for line in NATIVE_INVENTORY.lines() {
+                    if let Some((("global", sym), "signal")) =
+                        inventory_entry(line.trim_end_matches('\r'))
+                    {
+                        set.insert(sym);
+                    }
+                }
+                set
+            })
+            .contains(name)
     }
 }
 

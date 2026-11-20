@@ -784,14 +784,28 @@ impl<'a, B: Build<'a>> Parser<'a, B> {
     ///                                  return (s === ".") || (s === "_") }
     ///        { return new AtomStub(chars.join("")) }
     /// ```
+    #[inline]
     fn step_run_len(&self, at: usize) -> usize {
+        let src = self.src;
+        let len = src.len();
         let mut end = at;
-        while let Some(len) = self.word_char_len(end) {
-            end += len;
+        while end < len {
+            let byte = src[end];
+            if byte < 128 {
+                if !ASCII_STEP_CHARS[usize::from(byte)] {
+                    break;
+                }
+                end += 1;
+            } else if let Some(ch_len) = word_char_len(src, end) {
+                end += ch_len;
+            } else {
+                break;
+            }
         }
         end - at
     }
 
+    #[inline(always)]
     fn word_char_len(&self, at: usize) -> Option<usize> {
         word_char_len(self.src, at)
     }
@@ -1457,10 +1471,11 @@ pub fn is_step_char(c: char) -> bool {
 
 /// How many bytes of `src` at `at` are one character of a step's word.
 /// `None` when the byte at `at` begins none.
+#[inline(always)]
 fn word_char_len(src: &[u8], at: usize) -> Option<usize> {
     let byte = *src.get(at)?;
-    if let Some(steps) = ASCII_STEP_CHARS.get(usize::from(byte)) {
-        return steps.then_some(1);
+    if byte < 128 {
+        return ASCII_STEP_CHARS[usize::from(byte)].then_some(1);
     }
     let value = std::str::from_utf8(&src[at..]).ok()?.chars().next()?;
     is_step_char(value).then(|| value.len_utf8())

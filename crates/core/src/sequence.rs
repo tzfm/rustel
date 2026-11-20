@@ -2127,10 +2127,18 @@ thread_local! {
 /// counting. Power-of-two grids skip the thread-local completely.
 #[inline]
 pub(crate) fn with_tick_grid<R>(ticks: NonZeroU32, f: impl FnOnce(Option<&TickGrid>) -> R) -> R {
-    if ticks.is_power_of_two() || i64::from(ticks.get()) > TickGrid::MAX_DENOM {
+    let raw = ticks.get();
+    if raw.is_power_of_two() || i64::from(raw) > TickGrid::MAX_DENOM {
         return f(None);
     }
-    let denom = i64::from(ticks.get());
+    if raw <= 64 {
+        static SMALL_GRIDS: [std::sync::OnceLock<TickGrid>; 65] =
+            [const { std::sync::OnceLock::new() }; 65];
+        let grid = SMALL_GRIDS[raw as usize]
+            .get_or_init(|| TickGrid::new(i64::from(raw)).expect("valid small tick grid"));
+        return f(Some(grid));
+    }
+    let denom = i64::from(raw);
     let mut f = Some(f);
     if let Some(result) = TICK_GRIDS.with_borrow(|grids| {
         grids
@@ -2791,6 +2799,44 @@ impl Dress {
 
     /// Set `control`, a map of controls at `context`, on each value that
     /// this dress makes. See [`Layer::set_here`].
+    fn set_single_here(&mut self, key: &crate::Key, value: Value) {
+        if let Some(entries) = self.set_map.take() {
+            self.set_marks = 0;
+            let mut map = crate::value::OrderedMap::from_made_builtin(entries);
+            map.set_data(key, value);
+            map.mark_made_of_data();
+            if let Some(new_entries) = map.as_builtin() {
+                self.set_map_builtin(Arc::clone(new_entries));
+            } else {
+                self.tail.get_or_insert_with(Default::default).set_other = Some(Value::Object(map));
+            }
+            return;
+        }
+        if let Some(Value::Object(map)) = self
+            .tail
+            .as_deref_mut()
+            .and_then(|tail| tail.set_other.as_mut())
+            && !crate::compose::union_drops(map)
+        {
+            map.set_data(key, value);
+            map.mark_made_of_data();
+            return;
+        }
+        let mut map = crate::value::OrderedMap::of_one(key.clone(), value);
+        map.mark_made_of_data();
+        if let Some(set_other) = self
+            .tail
+            .as_deref_mut()
+            .and_then(|tail| tail.set_other.take())
+        {
+            let mut held = set_other;
+            compose_data_in_place(ComposeOp::Set, &mut held, &Value::Object(map));
+            self.assign_set(Some(held));
+            return;
+        }
+        self.assign_set(Some(Value::Object(map)));
+    }
+
     fn set_here(&mut self, control: &Value, context: Locations) {
         // The value side's locations come first.
         self.prepend_before(context);
@@ -5737,6 +5783,53 @@ pub(crate) fn applied(
 /// Whether each step of the sequence `functions` takes the data value
 /// `control` in place by a `set` of a constant of it, as [`applied`] folds
 /// that `set`. See [`Layer::takes_set`].
+/// Whether `functions` takes a single plain non-`"value"` data control without
+/// needing a temporary `OrderedMap` wrapper.
+pub(crate) fn takes_plain_set(functions: &Pattern) -> bool {
+    folded(functions).is_some_and(|layers| {
+        holds_data(layers)
+            && layers.iter().all(|layer| {
+                layer.in_cycles() && layer.maps() && layer.is_data() && !layer.values.is_empty()
+            })
+    })
+}
+
+/// Set one plain `(key, value)` control directly on each step of `layers`.
+pub(crate) fn set_single_here(layers: &mut Arc<[Layer]>, key: &crate::Key, value: Value) {
+    if Arc::get_mut(layers).is_none() {
+        *layers = layers.iter().map(|layer| layer.with(|_| {})).collect();
+    }
+    let layers = Arc::get_mut(layers).expect("layers that no other sequence holds");
+    if let [layer] = layers
+        && let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut)
+    {
+        dress.set_single_here(key, value);
+        layer.refresh_direct();
+        return;
+    }
+    let mut last: Option<(*const Dress, Arc<Dress>)> = None;
+    for layer in layers {
+        if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
+            dress.set_single_here(key, value.clone());
+            layer.refresh_direct();
+            continue;
+        }
+        let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
+        let dress = match &last {
+            Some((seen, dress)) if *seen == from => Arc::clone(dress),
+            _ => {
+                let mut dress = layer.dress().clone();
+                dress.set_single_here(key, value.clone());
+                let dress = dress.into_arc();
+                last = Some((from, Arc::clone(&dress)));
+                dress
+            }
+        };
+        layer.dress = Some(dress);
+        layer.refresh_direct();
+    }
+}
+
 pub(crate) fn takes_set(functions: &Pattern, control: &Value) -> bool {
     folded(functions).is_some_and(|layers| {
         holds_data(layers)

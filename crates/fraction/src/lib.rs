@@ -173,6 +173,12 @@ fn reduced_small(n: i64, d: i64) -> Fraction {
     if n == 0 {
         return Fraction::ZERO;
     }
+    if d == 1 || n == 1 || n == -1 {
+        return Fraction {
+            n: i128::from(n),
+            d: den(i128::from(d)),
+        };
+    }
     // A power of two takes out its common factor of two with no division.
     if d & (d - 1) == 0 {
         let shift = n.trailing_zeros().min(d.trailing_zeros());
@@ -219,6 +225,7 @@ fn div_signed_by_u128(value: i128, divisor: u128) -> Option<i128> {
     (value == i128::MIN && divisor == i128::MIN.unsigned_abs()).then_some(-1)
 }
 
+#[inline]
 fn checked_normalised(n: i128, d: i128) -> Option<Fraction> {
     if d == 0 {
         return None;
@@ -231,11 +238,31 @@ fn checked_normalised(n: i128, d: i128) -> Option<Fraction> {
     // Terms of a machine word reduce with no wide division.
     let (numerator, denominator) = match (u64::try_from(numerator), u64::try_from(denominator)) {
         (Ok(numerator), Ok(denominator)) => {
-            let divisor = gcd_u64(numerator, denominator);
-            (
-                u128::from(numerator / divisor),
-                u128::from(denominator / divisor),
-            )
+            if denominator == 1 || numerator == 1 {
+                (u128::from(numerator), u128::from(denominator))
+            } else if denominator & (denominator - 1) == 0 {
+                let shift = numerator.trailing_zeros().min(denominator.trailing_zeros());
+                (
+                    u128::from(numerator >> shift),
+                    u128::from(denominator >> shift),
+                )
+            } else {
+                let divisor = gcd_u64(numerator, denominator);
+                if divisor == 1 {
+                    (u128::from(numerator), u128::from(denominator))
+                } else if divisor & (divisor - 1) == 0 {
+                    let shift = divisor.trailing_zeros();
+                    (
+                        u128::from(numerator >> shift),
+                        u128::from(denominator >> shift),
+                    )
+                } else {
+                    (
+                        u128::from(numerator / divisor),
+                        u128::from(denominator / divisor),
+                    )
+                }
+            }
         }
         _ => {
             let divisor = gcd_u128(numerator, denominator);

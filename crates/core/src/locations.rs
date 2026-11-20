@@ -213,7 +213,18 @@ impl Locations {
 
     /// Add `range` after the others. Past [`INLINE`] ranges this copies the
     /// whole list, so a caller with several ranges extends once instead.
+    #[inline]
     pub fn push(&mut self, range: (usize, usize)) {
+        if let Repr::Packed { len, spans } = &mut self.0 {
+            let idx = usize::from(*len);
+            if idx < INLINE
+                && let Some(packed) = pack_range(range)
+            {
+                spans[idx] = packed;
+                *len += 1;
+                return;
+            }
+        }
         self.extend_from_slice(&[range]);
     }
 
@@ -324,6 +335,7 @@ impl Locations {
     }
 
     /// Append every range of `other`, after this list's own.
+    #[inline]
     pub fn append(&mut self, other: &Locations) {
         if other.is_empty() {
             return;
@@ -332,22 +344,29 @@ impl Locations {
             *self = other.clone();
             return;
         }
+        if let (
+            Repr::Packed {
+                len: own,
+                spans: own_spans,
+            },
+            Repr::Packed { len, spans },
+        ) = (&mut self.0, &other.0)
+        {
+            let start = usize::from(*own);
+            let add = usize::from(*len);
+            if start + add <= INLINE {
+                own_spans[start..start + add].copy_from_slice(&spans[..add]);
+                *own += *len;
+                return;
+            }
+        }
+        self.append_slow(other);
+    }
+
+    fn append_slow(&mut self, other: &Locations) {
         match &other.0 {
             Repr::Shared(ranges) => self.extend_from_slice(ranges),
-            Repr::Packed { len, spans } => {
-                let len = usize::from(*len);
-                if let Repr::Packed {
-                    len: own,
-                    spans: own_spans,
-                } = &mut self.0
-                {
-                    let start = usize::from(*own);
-                    if start + len <= INLINE {
-                        own_spans[start..start + len].copy_from_slice(&spans[..len]);
-                        *own += len as u8;
-                        return;
-                    }
-                }
+            Repr::Packed { .. } => {
                 let mut inline = [(0, 0); INLINE];
                 self.extend_from_slice(other.as_slice(&mut inline));
             }
