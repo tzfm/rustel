@@ -425,13 +425,28 @@ fn resolve_voicing<R>(map: &OrderedMap, emit: impl FnOnce(&[Value]) -> R) -> Opt
         other => other,
     };
     let dictionary: &HashMap<String, Vec<Vec<f64>>> = match selector {
-        Some(Value::Str(name)) => match crate::settings::user_voicing_dict(name) {
-            Some(dict) => {
-                user = dict;
-                &user
+        Some(Value::Str(name)) => {
+            // A score's own `addVoicings` registration wins over a pinned
+            // name, letting a user shadow a built-in.
+            match crate::settings::user_voicing_dict(name) {
+                Some(dict) => {
+                    user = dict;
+                    &user
+                }
+                // A name nothing registered is an error: silence would hide a
+                // misspelt `.dict()`.
+                None => match dictionaries().dicts.get(&**name) {
+                    Some(dict) => dict,
+                    None => {
+                        let missing = name.to_string();
+                        crate::signal_query_error(move || {
+                            format!("unknown voicing dictionary \"{missing}\"")
+                        });
+                        return None;
+                    }
+                },
             }
-            None => dictionaries().dicts.get(&**name)?,
-        },
+        }
         Some(Value::Object(object)) => {
             custom = parse_custom_dictionary(object)?;
             &custom
@@ -2570,6 +2585,19 @@ mod tests {
         assert_eq!(
             rendered_notes(&controls("D7", "B4", "oldabove")),
             ["Gb4", "C5", "D5", "Gb5", "A5"]
+        );
+    }
+
+    /// A dictionary name nothing registered renders nothing and says why.
+    #[test]
+    fn an_unknown_dictionary_is_a_query_error() {
+        let _ = crate::take_query_error();
+        let mut unknown = c7();
+        unknown.insert("dictionary".into(), Value::Str("lefthnd".into()));
+        assert_eq!(render_voicing(&unknown), None);
+        assert_eq!(
+            crate::take_query_error().as_deref(),
+            Some("unknown voicing dictionary \"lefthnd\"")
         );
     }
 
