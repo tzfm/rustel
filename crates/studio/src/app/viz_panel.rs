@@ -217,6 +217,12 @@ impl App {
             return;
         };
         let edge = self.prefs.visuals[index].edge.next(true);
+        // A column's size is cells across and a band's is rows: a column
+        // made wide would arrive at the top as a band too tall to fit, so
+        // a change of kind starts again at the default size.
+        if edge.is_column() != self.prefs.visuals[index].edge.is_column() {
+            self.prefs.visuals[index].extent = None;
+        }
         self.prefs.visuals[index].edge = edge;
         self.ui_settings.viz_edges[index] = edge;
         if let Some(panel) = self.viz_docks[index].as_mut() {
@@ -970,6 +976,51 @@ mod tests {
             );
             let after: Vec<bool> = app.viz_docks.iter().map(Option::is_some).collect();
             assert_eq!(after, before, "^⇧V is nobody's chord here");
+        }
+
+        /// A column made wide and moved to the top arrives as a band of the
+        /// default height, which fits beside the mixer on a 45-row screen.
+        /// A band that still has no room hands the keys back to the score
+        /// and says so.
+        #[test]
+        fn a_dock_moved_from_a_side_to_the_top_keeps_a_place_on_screen() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            if app.mixer_panel.is_none() {
+                app.toggle_mixer_panel();
+            }
+            app.prefs.visuals[0].edge = Edge::Right;
+            app.prefs.visuals[0].extent = None;
+            app.ui_settings.viz_edges[0] = Edge::Right;
+            press(&mut app, KeyCode::F(1), KeyModifiers::SHIFT);
+            app.viz_focus = 0;
+            app.focus = Focus::Panel(PanelKind::Viz);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 45)).unwrap();
+            let mut draw = |app: &mut App| {
+                terminal
+                    .draw(|frame| app.paint_into(frame, Instant::now()).unwrap())
+                    .unwrap();
+            };
+            draw(&mut app);
+            for _ in 0..2 {
+                press(&mut app, KeyCode::Char('+'), KeyModifiers::NONE);
+            }
+            assert_eq!(app.prefs.visuals[0].extent, Some(44), "a wide column");
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+            assert_eq!(app.prefs.visuals[0].edge, Edge::Top);
+            draw(&mut app);
+            assert!(app.mixer_panel.is_some() && !app.regions.mixer.is_empty());
+            assert!(!app.regions.viz[0].is_empty(), "the band is on screen");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Viz));
+
+            // A band made taller than the room left: the keys go back to
+            // the score, and the status says so.
+            app.prefs.visuals[0].extent = Some(30);
+            draw(&mut app);
+            assert!(app.regions.viz[0].is_empty());
+            assert_eq!(app.focus, Focus::Editor);
+            assert!(app.status.contains("no room on screen"), "{}", app.status);
         }
 
         /// View ▸ Visuals 1 opens the visuals panel with the set's name in art
