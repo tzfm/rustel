@@ -43,6 +43,9 @@ use rustel_fraction::Fraction;
 pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     // -- constructors ------------------------------------------------------
     fn pat_pure(value: Value) -> Self;
+    fn pat_pulse(rate: Fraction) -> Self {
+        Self::pat_pure(Value::Bool(true)).fast(rate)
+    }
     fn pat_silence() -> Self;
     fn pat_query_error(message: std::sync::Arc<str>) -> Self;
     fn pat_query_limit(limit: crate::QueryLimit) -> Self;
@@ -314,6 +317,28 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
 impl PatOps for Pattern {
     fn pat_pure(value: Value) -> Self {
         crate::pure(value)
+    }
+    fn pat_pulse(rate: Fraction) -> Self {
+        if rate.denom() == 1
+            && !crate::sequence::builds_each_node()
+            && let Some(slot) = match rate.numer() {
+                1 => Some(0),
+                2 => Some(1),
+                4 => Some(2),
+                8 => Some(3),
+                16 => Some(4),
+                32 => Some(5),
+                64 => Some(6),
+                _ => None,
+            }
+        {
+            static PULSES: [std::sync::OnceLock<Pattern>; 7] =
+                [const { std::sync::OnceLock::new() }; 7];
+            return PULSES[slot]
+                .get_or_init(|| crate::pure(Value::Bool(true)).fast(rate))
+                .clone();
+        }
+        crate::pure(Value::Bool(true)).fast(rate)
     }
     fn pat_silence() -> Self {
         crate::silence()

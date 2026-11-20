@@ -271,11 +271,12 @@ pub(crate) fn named_value(names: &[Arc<str>], mut value: Value) -> Value {
 }
 
 /// The argument of one control call of a chain: a number as a score writes
-/// it, a constant value with inline locations, or a pattern.
+/// it, a constant value with inline locations, a validated inline wave, or a pattern.
 #[derive(Clone)]
 pub enum ChainArgument {
     Number(f64),
     Constant(Value, crate::Locations),
+    Wave(crate::fused::Wave, u32, bool),
     Pattern(Pattern),
 }
 
@@ -285,6 +286,7 @@ impl ChainArgument {
         match self {
             Self::Number(_) => true,
             Self::Constant(value, _) => value.is_data(0),
+            Self::Wave(..) => false,
             Self::Pattern(values) => crate::sequence::is_constant_value(values),
         }
     }
@@ -296,6 +298,7 @@ impl ChainArgument {
         match self {
             Self::Number(number) => Some((Value::F64(*number), crate::Locations::new())),
             Self::Constant(value, locations) => Some((value.clone(), locations.clone())),
+            Self::Wave(..) => None,
             Self::Pattern(values) => crate::sequence::constant_value_at(values),
         }
     }
@@ -338,7 +341,7 @@ pub fn chain_transformer(
 ) -> crate::value::FunctionRef {
     let chain: Arc<[ChainCall<'static>]> = chain.into_iter().collect();
     let pure = chain.iter().all(|(_, argument)| match argument {
-        ChainArgument::Number(_) | ChainArgument::Constant(..) => true,
+        ChainArgument::Number(_) | ChainArgument::Constant(..) | ChainArgument::Wave(..) => true,
         ChainArgument::Pattern(values) => values.is_pure(),
     });
     crate::value::FunctionRef::registered(
@@ -382,7 +385,7 @@ fn set_row(pattern: Pattern, row: &[ChainCall<'_>]) -> Result<Pattern, Pattern> 
         // and a constant with locations directly through `union_of` + `with_row`.
         match argument {
             ChainArgument::Pattern(values) => return pattern.set_constant_control(spec, values),
-            ChainArgument::Number(_) => return Err(pattern),
+            ChainArgument::Number(_) | ChainArgument::Wave(..) => return Err(pattern),
             ChainArgument::Constant(_, locations) if locations.is_empty() => return Err(pattern),
             ChainArgument::Constant(..) => {}
         }
@@ -491,6 +494,19 @@ fn apply_argument(spec: &ControlSpec, pattern: Pattern, argument: &ChainArgument
                     .with_added_locations(locations)
                     .with_steps(Some(rustel_fraction::Fraction::ONE));
                 spec.apply_for(pattern, Some(&values))
+            }
+        }
+        ChainArgument::Wave(wave, steps, math_inside) => {
+            if crate::compose::default_alignment() == crate::compose::Alignment::In
+                && spec.id != 0
+                && !crate::sequence::builds_each_node()
+                && !pattern.is_volatile()
+                && (*steps == 0 || (!crate::fused::is_unfused() && spec.name() != "value"))
+            {
+                pattern.apply_inline_wave(spec.id, wave.clone(), *steps, *math_inside)
+            } else {
+                let pat = wave.to_pattern(*math_inside, *steps);
+                spec.apply_for(pattern, Some(&pat))
             }
         }
         ChainArgument::Pattern(values) => spec.apply_for(pattern, Some(values)),

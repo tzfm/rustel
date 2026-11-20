@@ -327,7 +327,7 @@ pub fn press<P: PatOps>(pat: &P) -> P {
 /// Samples `pat` at `rate` events per cycle: structure from the pulse
 /// pattern, values from `pat` - what turns a continuous signal discrete.
 pub fn segment<P: PatOps>(pat: &P, rate: Fraction) -> P {
-    let pulse = P::pat_pure(Value::Bool(true)).fast(rate);
+    let pulse = P::pat_pulse(rate);
     compose(pat, &pulse, ComposeOp::KeepIf, Alignment::Out).set_steps(Some(rate))
 }
 

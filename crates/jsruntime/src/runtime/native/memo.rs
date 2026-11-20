@@ -379,7 +379,7 @@ pub(super) struct Reuse<'p> {
     /// Whether this build took each part of `before`, or a part around it.
     taken: Vec<bool>,
     /// The parts that this build evaluated and keeps, paired with their metadata.
-    made: Vec<MadePart>,
+    made: Vec<(MadePart, bool)>,
     /// Shared plain `runtime_settings` extras handle across parts in this build.
     shared_extras: Option<PatternSharedExtras>,
     /// Flat pool of `(name_number, version)` pairs recorded during this build.
@@ -572,7 +572,7 @@ impl<'p> Reuse<'p> {
         else {
             return;
         };
-        self.made.push(entry);
+        self.made.push((entry, false));
     }
 
     /// How many parts the build keeps so far: a mark for [`Self::release`].
@@ -589,7 +589,7 @@ impl<'p> Reuse<'p> {
     pub(super) fn release(&mut self, mark: usize) {
         let mut at = mark;
         while at < self.made.len() {
-            if self.made[at].part.node.strong_count() > 1 {
+            if self.made[at].0.part.node.strong_count() > 1 {
                 at += 1;
             } else {
                 // The order of the parts is made when the build ends.
@@ -691,26 +691,32 @@ impl<'p> Reuse<'p> {
         let before_slots = mem::take(&mut self.before.part_slots);
         let before_meta = mem::take(&mut self.before.part_meta);
         let mut meta_iter = before_meta.into_vec().into_iter().peekable();
-        let mut entries: Vec<(MadePart, bool)> = mem::take(&mut self.before.parts)
-            .into_vec()
-            .into_iter()
-            .enumerate()
-            .zip(taken)
-            .filter_map(|((i, part), taken)| {
-                let meta = match meta_iter.peek() {
-                    Some((idx, _)) if usize::from(*idx) == i => {
-                        meta_iter.next().map(|(_, meta)| meta)
-                    }
-                    _ => None,
-                };
-                if !taken {
-                    return None;
-                }
-                let slot = before_slots.get(i).copied().unwrap_or(NO_SLOTS);
-                Some((MadePart { part, meta, slot }, true))
-            })
-            .chain(mem::take(&mut self.made).into_iter().map(|m| (m, false)))
-            .collect();
+        let mut entries: Vec<(MadePart, bool)> = if self.before.parts.is_empty() {
+            mem::take(&mut self.made)
+        } else {
+            let mut out = mem::take(&mut self.made);
+            out.extend(
+                mem::take(&mut self.before.parts)
+                    .into_vec()
+                    .into_iter()
+                    .enumerate()
+                    .zip(taken)
+                    .filter_map(|((i, part), taken)| {
+                        let meta = match meta_iter.peek() {
+                            Some((idx, _)) if usize::from(*idx) == i => {
+                                meta_iter.next().map(|(_, meta)| meta)
+                            }
+                            _ => None,
+                        };
+                        if !taken {
+                            return None;
+                        }
+                        let slot = before_slots.get(i).copied().unwrap_or(NO_SLOTS);
+                        Some((MadePart { part, meta, slot }, true))
+                    }),
+            );
+            out
+        };
         // A part that the build evaluated two times is kept one time: each
         // of the two holds what the call builds.
         entries.sort_unstable_by_key(|(entry, _)| entry.part.key());

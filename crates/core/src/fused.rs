@@ -598,7 +598,7 @@ impl WaveTimes {
 /// for most waves. Any other number is under changes of time that
 /// `cut_mask` records, and each part is read in its time.
 #[derive(Clone)]
-pub(crate) struct Wave {
+pub struct Wave {
     /// The arithmetic, the innermost first: each op with its number.
     math: WaveMath,
     /// The changes of time, outermost first, plus the cycle-cutting bitmask.
@@ -756,10 +756,48 @@ impl Wave {
         }
     }
 
-    /// Rebuild the exact `Node::ControlMap` pattern that this inline wave
-    /// collapsed from, used only on the rare fallback path (non-object haps,
-    /// multi-cycle parts, >48-bit rationals, or `cut_mask` boundaries).
-    pub(crate) fn to_control_pattern(&self, key_id: u16, math_inside: bool, steps: u32) -> Pattern {
+    /// Construct a validated inline wave directly from its static signal body,
+    /// time transforms (outermost first: `true` for `fast`, `false` for `late`),
+    /// and arithmetic ops (innermost first), without building intermediate nodes.
+    pub fn from_inline_parts(
+        body: crate::NumberSignal,
+        times_outer_first: &[(bool, Fraction)],
+        math_inner_first: &[(crate::compose::ComposeOp, f64)],
+        math_inside: bool,
+    ) -> Option<Self> {
+        if times_outer_first.len() > Self::MOST_TIMES {
+            return None;
+        }
+        let mut times = [WaveTime::IDENTITY; Self::MOST_TIMES];
+        let mut cycles_kept = true;
+        for (idx, &(is_fast, value)) in times_outer_first.iter().enumerate() {
+            times[idx] = if is_fast {
+                if value <= Fraction::ZERO {
+                    return None;
+                }
+                cycles_kept &= value.numer() == 1;
+                WaveTime::fast(value)?
+            } else {
+                cycles_kept &= value.denom() == 1;
+                WaveTime::late(value)?
+            };
+        }
+        if !math_inner_first.is_empty() && math_inside && !cycles_kept {
+            return None;
+        }
+        for &(op, _) in math_inner_first {
+            op.of_numbers(0.0, 0.0)?;
+        }
+        Some(Self {
+            math: WaveMath::from_ops(math_inner_first),
+            times: WaveTimes::from_raw(times, times_outer_first.len() as u8, 0),
+            body,
+        })
+    }
+
+    /// Rebuild the exact signal pattern (before `ControlMap`) that this inline
+    /// wave represents.
+    pub(crate) fn to_pattern(&self, math_inside: bool, steps: u32) -> Pattern {
         let apply_times = |mut pat: Pattern| {
             let (times, _) = self.times.parts();
             for change in times.iter().rev() {
@@ -780,12 +818,22 @@ impl Wave {
         } else {
             self.math.apply_to_pattern(apply_times(pat))
         };
-        let pat = if steps > 0 {
+        if steps > 0 {
             crate::combinators::segment(&pat, Fraction::from(i128::from(steps)))
         } else {
             pat
-        };
-        Pattern::of(Pattern::control_map_node(pat, key_id, false))
+        }
+    }
+
+    /// Rebuild the exact `Node::ControlMap` pattern that this inline wave
+    /// collapsed from, used only on the rare fallback path (non-object haps,
+    /// multi-cycle parts, >48-bit rationals, or `cut_mask` boundaries).
+    pub(crate) fn to_control_pattern(&self, key_id: u16, math_inside: bool, steps: u32) -> Pattern {
+        Pattern::of(Pattern::control_map_node(
+            self.to_pattern(math_inside, steps),
+            key_id,
+            false,
+        ))
     }
 
     /// `pattern` as a wave read in steps, as a `segment` of one is, with

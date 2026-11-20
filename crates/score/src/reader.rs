@@ -236,21 +236,20 @@ impl<'s, F: Fn(&str) -> CallForm> Reader<'s, F> {
             pages: 0,
             line: 1,
             counted: 0,
-            // A score of calls holds an expression for each seven bytes,
-            // and the list takes its room in one piece.
-            held: Held::with_room(source.len() / 7 + 8),
+            // Size initial storage proportionally to score length without
+            // over-allocating on short single-expression scores.
+            held: Held::with_room((source.len() / 12 + 4).clamp(8, 256)),
             // The lists of the score nest a few calls deep, and take their
             // room here once rather than as each one closes.
-            listed: Vec::with_capacity(8),
+            listed: Vec::with_capacity(4),
         })
     }
 
     fn program(&mut self) -> Option<Read<'s>> {
-        // Most scores hold a handful of statements: the lists take their
-        // room in one piece, and a growing list copies its room each time.
-        // Scores with no label hold no lane number either.
-        let mut statements = Vec::with_capacity(8);
-        let mut lanes = Vec::with_capacity(8);
+        // Most scores hold a handful of statements: size tightly for short
+        // scores and avoid allocating `lanes` until a labeled lane appears.
+        let mut statements = Vec::with_capacity((self.source.len() / 64).clamp(1, 8));
+        let mut lanes = Vec::new();
         let mut labeled = Vec::new();
         // The names the score declares, each one time.
         let mut declared: Vec<&'s str> = Vec::new();

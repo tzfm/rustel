@@ -14,8 +14,17 @@ use crate::session::RuntimeError;
 
 /// Orchestra text retained for a fresh export session. Native instances are
 /// rebuilt at the output sample rate.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CsoundSnapshot(Arc<SnapshotData>);
+
+impl Default for CsoundSnapshot {
+    fn default() -> Self {
+        static EMPTY: std::sync::OnceLock<Arc<SnapshotData>> = std::sync::OnceLock::new();
+        Self(Arc::clone(
+            EMPTY.get_or_init(|| Arc::new(SnapshotData::default())),
+        ))
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SnapshotData {
@@ -28,7 +37,7 @@ impl CsoundSnapshot {
     /// Whether this snapshot holds what a new store holds: no source, no
     /// url and no load.
     pub(crate) fn is_empty(&self) -> bool {
-        *self.0 == SnapshotData::default()
+        self.0.sources.is_empty() && self.0.urls.is_empty() && !self.0.initialized
     }
 
     /// A snapshot of one orchestra source, for the tests of the rules that

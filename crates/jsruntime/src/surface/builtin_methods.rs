@@ -372,6 +372,18 @@ impl ListedNames {
         FOUND_NAMES.with_borrow_mut(|found| found.globals.insert(name, global.clone()));
         Some(global)
     }
+
+    pub(crate) fn is_signal(&self, name: &str) -> bool {
+        if let Some(found) = FOUND_NAMES.with_borrow(|found| {
+            found
+                .globals
+                .get(name)
+                .map(|g| matches!(g, BuiltinGlobal::Signal(_)))
+        }) {
+            return found;
+        }
+        matches!(listing("global", name), Some((_, "signal")))
+    }
 }
 
 /// The section and the name of a line of the inventory, and what the line

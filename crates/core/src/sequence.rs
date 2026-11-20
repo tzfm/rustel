@@ -7121,6 +7121,9 @@ mod tests {
                                     spec.apply_to(pattern, Some(values))
                                 }
                             }
+                            ChainArgument::Wave(wave, steps, math_inside) => {
+                                spec.apply_to(pattern, Some(wave.to_pattern(math_inside, steps)))
+                            }
                             ChainArgument::Pattern(values) => spec.apply_to(pattern, Some(values)),
                         })
                     };

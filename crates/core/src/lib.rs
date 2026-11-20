@@ -42,6 +42,7 @@ pub mod voicings;
 pub mod xen;
 
 mod fused;
+pub use fused::Wave;
 mod sequence;
 mod table;
 
@@ -7520,12 +7521,14 @@ struct ValueSide<'a> {
 /// Reusable 4-slot stack cache for small (`2..=8` steps) segmented waves so
 /// 1/8-cycle chord windows share one [`value::StepPatch`] across all steps and
 /// every chord note from the same base.
+type StepPatchCache = [Option<(value::PatchedBase, Option<u32>, Arc<value::StepPatch>)>; 4];
+
 struct SmallStepSlot {
     part: TimeSpan,
     count: u8,
     pieces: [TimeSpan; 8],
     nums: [f64; 8],
-    step_patches: [Option<(value::PatchedBase, Arc<value::StepPatch>)>; 4],
+    step_patches: StepPatchCache,
     step_next: u8,
     fallback_caches: Option<Box<[value::SharedWaveCache; 8]>>,
 }
@@ -7596,18 +7599,22 @@ fn meet_steps_small(
     out.reserve(count);
     let bulk_ok = thread.charge(out.len() - from + count);
     // Single-allocation StepPatch fast path: one `Arc<StepPatch>` covers all
-    // `count` steps AND every chord note sharing the same uniform-key base.
+    // `count` steps AND every chord note sharing the same uniform-key base
+    // (or the same `(base, row)` for non-uniform bases).
     if let Value::Object(map) = &hf.value
-        && let Some((base, row)) = map.uniform_step_base()
+        && let Some((base, row, uniform)) = map.step_base()
     {
-        let sp = if let Some((_, cached)) = slot
+        let fixed_row = (!uniform).then_some(row);
+        let sp = if let Some((_, _, cached)) = slot
             .step_patches
             .iter()
             .flatten()
-            .find(|(b, _)| b.same_source(&base))
+            .find(|(b, r, _)| b.same_source(&base) && *r == fixed_row)
         {
             Some(Arc::clone(cached))
-        } else if let Some(mut built) = value::StepPatch::new(base.clone(), row, &[key], true) {
+        } else if let Some(mut built) =
+            value::StepPatch::new_for_row(base.clone(), row, &[key], true)
+        {
             for (i, &num) in slot.nums.iter().enumerate().take(count) {
                 built.set_single_slot(i, num);
             }
@@ -7619,7 +7626,7 @@ fn meet_steps_small(
                 slot.step_next = slot.step_next.wrapping_add(1);
                 v
             };
-            slot.step_patches[idx] = Some((base, Arc::clone(&arc)));
+            slot.step_patches[idx] = Some((base, fixed_row, Arc::clone(&arc)));
             Some(arc)
         } else {
             None
@@ -9709,7 +9716,7 @@ impl Pattern {
                     count: u8,
                     pieces: [TimeSpan; 8],
                     nums: [[f64; 8]; 8],
-                    step_patches: [Option<(value::PatchedBase, Arc<value::StepPatch>)>; 4],
+                    step_patches: StepPatchCache,
                     step_next: u8,
                     fallback_caches: Option<Box<[value::SharedWaveCache; 8]>>,
                 }
@@ -9808,18 +9815,22 @@ impl Pattern {
                     if can_step_patch
                         && count * n_unique <= value::StepPatch::MAX_VALUES
                         && let Value::Object(map) = &template.value
-                        && let Some((base, row)) = map.uniform_step_base()
+                        && let Some((base, row, uniform)) = map.step_base()
                     {
-                        let sp = if let Some((_, cached)) = slot
+                        let fixed_row = (!uniform).then_some(row);
+                        let sp = if let Some((_, _, cached)) = slot
                             .step_patches
                             .iter()
                             .flatten()
-                            .find(|(b, _)| b.same_source(&base))
+                            .find(|(b, r, _)| b.same_source(&base) && *r == fixed_row)
                         {
                             Some(Arc::clone(cached))
-                        } else if let Some(mut built) =
-                            value::StepPatch::new(base.clone(), row, &unique_keys[..n_unique], true)
-                        {
+                        } else if let Some(mut built) = value::StepPatch::new_for_row(
+                            base.clone(),
+                            row,
+                            &unique_keys[..n_unique],
+                            true,
+                        ) {
                             let mut vals = [0.0f64; value::StepPatch::MAX_KEYS];
                             for (s_idx, row_nums) in slot.nums.iter().enumerate().take(count) {
                                 for w in 0..n_waves {
@@ -9837,7 +9848,7 @@ impl Pattern {
                                 slot.step_next = slot.step_next.wrapping_add(1);
                                 v
                             };
-                            slot.step_patches[idx] = Some((base, Arc::clone(&arc)));
+                            slot.step_patches[idx] = Some((base, fixed_row, Arc::clone(&arc)));
                             Some(arc)
                         } else {
                             None
@@ -10359,74 +10370,124 @@ impl Pattern {
     /// `None` for a few value haps, which their own queries serve, for
     /// wholes that leave most of the time between them free, for a graph
     /// that may read the span, and for a whole of no width.
-    fn met_in_one_query(
+    fn met_in_one_query_onto(
         &self,
         values: &[Hap],
         apply: &Combine,
         flow: LookupFlow,
+        thread: &QueryThread,
         state: &State,
-    ) -> Option<Vec<Hap>> {
+        out: &mut Vec<Hap>,
+    ) -> bool {
         /// The fewest value haps that one query of the functions repays.
         const REPAYS_FROM: usize = 4;
         if values.len() < REPAYS_FROM || !self.is_discrete() {
-            return None;
+            return false;
         }
         // This graph answers for the part of a hap as for its whole, cut.
         let asked = |hv: &Hap| hv.part;
         if values.iter().any(|hv| asked(hv).begin >= asked(hv).end) {
-            return None;
+            return false;
         }
-        let all = TimeSpan::new(
-            values.iter().map(|hv| asked(hv).begin).min()?,
-            values.iter().map(|hv| asked(hv).end).max()?,
-        );
+        let Some(min_begin) = values.iter().map(|hv| asked(hv).begin).min() else {
+            return false;
+        };
+        let Some(max_end) = values.iter().map(|hv| asked(hv).end).max() else {
+            return false;
+        };
+        let all = TimeSpan::new(min_begin, max_end);
         // The functions between the wholes are made for nothing.
         let width = |span: TimeSpan| span.end.to_f64() - span.begin.to_f64();
         let filled: f64 = values.iter().map(|hv| width(asked(hv))).sum();
         if filled * 2.0 < width(all) {
-            return None;
+            return false;
         }
-        let functions = self.query(&state.set_span(all));
-        // The functions in the order of time, and the latest end among
-        // those up to each: the haps that meet a span are then a range of
-        // them, read in the order of the answer.
-        let mut by_begin: Vec<usize> = (0..functions.len()).collect();
-        by_begin.sort_by(|a, b| functions[*a].part.begin.cmp(&functions[*b].part.begin));
-        let mut latest_end: Vec<Fraction> = Vec::with_capacity(by_begin.len());
-        for index in &by_begin {
-            let end = functions[*index].part.end;
-            latest_end.push(latest_end.last().map_or(end, |latest| end.max(*latest)));
-        }
-        let mut meeting = Vec::new();
-        let mut out = Vec::new();
-        for hv in values {
-            let span = asked(hv);
-            let first = latest_end.partition_point(|end| *end <= span.begin);
-            let after = by_begin.partition_point(|index| functions[*index].part.begin < span.end);
-            meeting.clear();
-            meeting.extend(
-                by_begin
-                    .get(first..after)
-                    .unwrap_or_default()
-                    .iter()
-                    .copied()
-                    .filter(|index| functions[*index].part.end > span.begin),
-            );
-            meeting.sort_unstable();
-            for hf in meeting.iter().map(|index| &functions[*index]) {
-                // The part of the function hap, as the query of the whole
-                // cuts it, then where the two haps meet.
-                let cut = TimeSpan::new(hf.part.begin.max(span.begin), hf.part.end.min(span.end));
-                let Some(part) = cut.intersection(&hv.part) else {
-                    continue;
+        with_list(|functions| {
+            self.answer_onto(thread, &state.set_span(all), table::Order::Graph, functions);
+            let n_funcs = functions.len();
+            // Stack fast path for <= 32 function haps: zero heap allocations for
+            // `by_begin`, `latest_end`, and `meeting`.
+            let mut small_by_begin = [0usize; 32];
+            let mut small_latest_end = [Fraction::ZERO; 32];
+            let mut small_meeting = [0usize; 32];
+            let heap_by_begin;
+            let mut heap_latest_end = Vec::new();
+            let mut heap_meeting = Vec::new();
+            let (by_begin, latest_end): (&[usize], &[Fraction]) = if n_funcs <= 32 {
+                for (i, slot) in small_by_begin[..n_funcs].iter_mut().enumerate() {
+                    *slot = i;
+                }
+                small_by_begin[..n_funcs]
+                    .sort_by(|a, b| functions[*a].part.begin.cmp(&functions[*b].part.begin));
+                let mut latest = Fraction::ZERO;
+                for (i, &index) in small_by_begin[..n_funcs].iter().enumerate() {
+                    let end = functions[index].part.end;
+                    latest = if i == 0 { end } else { end.max(latest) };
+                    small_latest_end[i] = latest;
+                }
+                (&small_by_begin[..n_funcs], &small_latest_end[..n_funcs])
+            } else {
+                let mut indices: Vec<usize> = (0..n_funcs).collect();
+                indices.sort_by(|a, b| functions[*a].part.begin.cmp(&functions[*b].part.begin));
+                heap_by_begin = indices;
+                heap_latest_end.reserve(n_funcs);
+                for &index in &heap_by_begin {
+                    let end = functions[index].part.end;
+                    heap_latest_end.push(
+                        heap_latest_end
+                            .last()
+                            .map_or(end, |latest| end.max(*latest)),
+                    );
+                }
+                (&heap_by_begin, &heap_latest_end)
+            };
+            let from = out.len();
+            out.reserve(values.len());
+            for hv in values {
+                let span = asked(hv);
+                let first = latest_end.partition_point(|end| *end <= span.begin);
+                let after =
+                    by_begin.partition_point(|index| functions[*index].part.begin < span.end);
+                let range = by_begin.get(first..after).unwrap_or_default();
+                let met_indices: &[usize] = if range.len() <= 32 {
+                    let mut m_len = 0usize;
+                    for &index in range {
+                        if functions[index].part.end > span.begin {
+                            small_meeting[m_len] = index;
+                            m_len += 1;
+                        }
+                    }
+                    small_meeting[..m_len].sort_unstable();
+                    &small_meeting[..m_len]
+                } else {
+                    heap_meeting.clear();
+                    heap_meeting.extend(
+                        range
+                            .iter()
+                            .copied()
+                            .filter(|index| functions[*index].part.end > span.begin),
+                    );
+                    heap_meeting.sort_unstable();
+                    &heap_meeting
                 };
-                let hap = applied_hap(hf, hv, hv.whole, part, apply, flow);
-                if query_stop_requested() || !push_budgeted(&mut out, hap) {
-                    return Some(Vec::new());
+                for &index in met_indices {
+                    let hf = &functions[index];
+                    // The part of the function hap, as the query of the whole
+                    // cuts it, then where the two haps meet.
+                    let cut =
+                        TimeSpan::new(hf.part.begin.max(span.begin), hf.part.end.min(span.end));
+                    let Some(part) = cut.intersection(&hv.part) else {
+                        continue;
+                    };
+                    let hap = applied_hap(hf, hv, hv.whole, part, apply, flow);
+                    if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
+                        out.truncate(from);
+                        return;
+                    }
                 }
             }
-        }
-        Some(out)
+        });
+        true
     }
 
     /// The query. Everything else is built on this.
@@ -10877,8 +10938,7 @@ impl Pattern {
                     if values.is_empty() {
                         return;
                     }
-                    if let Some(met) = pat_func.met_in_one_query(values, apply, *flow, state) {
-                        hand_over(met, out);
+                    if pat_func.met_in_one_query_onto(values, apply, *flow, thread, state, out) {
                         return;
                     }
                     let mut sampler =
@@ -12957,32 +13017,9 @@ impl Pattern {
                     None
                 }
         {
-            let item = AppWaveItem {
-                wave,
-                steps: steps_per_cycle,
-                key_id,
-                math_inside,
-            };
-            if let Node::AppWave(existing) = self.node_kind()
-                && !self.has_runtime_settings()
-                && self.pure_loc_raw().is_none()
-                && self.keeps_runtime_over(&existing.inner)
-                && existing.waves.len() < 8
-            {
-                let mut combined = Vec::with_capacity(existing.waves.len() + 1);
-                combined.extend(existing.waves.iter().cloned());
-                combined.push(item);
-                return Pattern::of(Node::AppWave(Box::new(AppWaveNode {
-                    inner: existing.inner.clone(),
-                    waves: AppWaves::Many(combined.into_boxed_slice()),
-                })))
-                .with_steps(steps);
-            }
-            return Pattern::of(Node::AppWave(Box::new(AppWaveNode {
-                inner: self.clone(),
-                waves: AppWaves::One(item),
-            })))
-            .with_steps(steps);
+            return self
+                .clone()
+                .apply_inline_wave(key_id, wave, steps_per_cycle, math_inside);
         }
         Pattern::of(Node::AppLeft(Box::new(AppLeftNode(
             self.clone(),
@@ -12991,6 +13028,48 @@ impl Pattern {
             combine,
             lookup_flow,
         ))))
+        .with_steps(steps)
+    }
+
+    /// Attach a validated inline wave directly to `self` as [`Node::AppWave`],
+    /// stacking up to 8 wave controls into one node without building
+    /// intermediate signal or control patterns.
+    pub(crate) fn apply_inline_wave(
+        self,
+        key_id: u16,
+        wave: fused::Wave,
+        steps_per_cycle: u32,
+        math_inside: bool,
+    ) -> Self {
+        if self.is_rest() && sequence::folds(&self) {
+            return self;
+        }
+        let steps = self.steps();
+        let item = AppWaveItem {
+            wave,
+            steps: steps_per_cycle,
+            key_id,
+            math_inside,
+        };
+        if let Node::AppWave(existing) = self.node_kind()
+            && !self.has_runtime_settings()
+            && self.pure_loc_raw().is_none()
+            && self.keeps_runtime_over(&existing.inner)
+            && existing.waves.len() < 8
+        {
+            let mut combined = Vec::with_capacity(existing.waves.len() + 1);
+            combined.extend(existing.waves.iter().cloned());
+            combined.push(item);
+            return Pattern::of(Node::AppWave(Box::new(AppWaveNode {
+                inner: existing.inner.clone(),
+                waves: AppWaves::Many(combined.into_boxed_slice()),
+            })))
+            .with_steps(steps);
+        }
+        Pattern::of(Node::AppWave(Box::new(AppWaveNode {
+            inner: self,
+            waves: AppWaves::One(item),
+        })))
         .with_steps(steps)
     }
 

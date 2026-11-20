@@ -457,6 +457,8 @@ pub(crate) type KeyedParts<'a> = (&'a Key, &'a [Value], Slice<'a>);
 pub(crate) enum PatchedBase {
     Table(Arc<Table>),
     SeqLayer(Arc<[crate::sequence::Layer]>, u16),
+    Builtin(Arc<dyn BuiltinEntries>),
+    Patched(Arc<Patched>),
 }
 
 impl PatchedBase {
@@ -465,6 +467,8 @@ impl PatchedBase {
         match self {
             Self::Table(table) => table.layout(row),
             Self::SeqLayer(layers, layer_idx) => layers[usize::from(*layer_idx)].seq_layout(row),
+            Self::Builtin(entries) => Layout::Plain(entries.as_slice()),
+            Self::Patched(patched) => Layout::Overlay(patched, row),
         }
     }
 
@@ -473,6 +477,8 @@ impl PatchedBase {
         match self {
             Self::Table(table) => table.layout(row).len(),
             Self::SeqLayer(layers, layer_idx) => layers[usize::from(*layer_idx)].seq_len(row),
+            Self::Builtin(entries) => entries.keys().len(),
+            Self::Patched(patched) => patched.len(),
         }
     }
 
@@ -481,6 +487,8 @@ impl PatchedBase {
         match self {
             Self::Table(table) => table.layout(row).at(index),
             Self::SeqLayer(layers, layer_idx) => layers[usize::from(*layer_idx)].seq_at(row, index),
+            Self::Builtin(entries) => entries.as_slice().at(index),
+            Self::Patched(patched) => patched.at(row, index),
         }
     }
 
@@ -489,6 +497,8 @@ impl PatchedBase {
         match self {
             Self::Table(table) => table.marks(),
             Self::SeqLayer(layers, layer_idx) => layers[usize::from(*layer_idx)].seq_marks(),
+            Self::Builtin(entries) => entries.as_slice().marks(),
+            Self::Patched(patched) => patched.marks,
         }
     }
 
@@ -499,6 +509,8 @@ impl PatchedBase {
             Self::SeqLayer(layers, layer_idx) => {
                 layers[usize::from(*layer_idx)].seq_has_uniform_keys()
             }
+            Self::Builtin(_) => true,
+            Self::Patched(patched) => patched.base.has_uniform_keys(),
         }
     }
 
@@ -507,6 +519,8 @@ impl PatchedBase {
         match (self, other) {
             (Self::Table(a), Self::Table(b)) => Arc::ptr_eq(a, b),
             (Self::SeqLayer(a, ai), Self::SeqLayer(b, bi)) => Arc::ptr_eq(a, b) && ai == bi,
+            (Self::Builtin(a), Self::Builtin(b)) => Arc::ptr_eq(a, b),
+            (Self::Patched(a), Self::Patched(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -536,6 +550,7 @@ impl PatchedBase {
                 Heads::Other(_) => None,
             },
             Self::SeqLayer(layers, layer_idx) => layers[usize::from(*layer_idx)].seq_keyed_parts(),
+            Self::Builtin(_) | Self::Patched(_) => None,
         }
     }
 }
@@ -616,9 +631,24 @@ impl StepPatch {
     /// Build a multi-slot numeric overlay over a uniform-key `base` with 1..=4
     /// unique `keys`. Caller populates `0..n_slots` via [`Self::set_slot`].
     pub(crate) fn new(base: PatchedBase, row: u32, keys: &[&Key], made: bool) -> Option<Self> {
+        if !base.has_uniform_keys() {
+            return None;
+        }
+        Self::new_for_row(base, row, keys, made)
+    }
+
+    /// Build a multi-slot numeric overlay for one fixed `row` of `base` (even
+    /// when `base` does not have uniform keys across rows). Callers must only
+    /// attach the resulting `StepPatch` to maps with that same `row` unless
+    /// `base.has_uniform_keys()` is true.
+    pub(crate) fn new_for_row(
+        base: PatchedBase,
+        row: u32,
+        keys: &[&Key],
+        made: bool,
+    ) -> Option<Self> {
         let n_keys = keys.len();
-        if n_keys == 0 || n_keys > Self::MAX_KEYS || row > Self::MAX_ROW || !base.has_uniform_keys()
-        {
+        if n_keys == 0 || n_keys > Self::MAX_KEYS || row > Self::MAX_ROW {
             return None;
         }
         let base_layout = base.layout(row);
@@ -1161,6 +1191,8 @@ impl Patched {
             PatchedBase::SeqLayer(layers, layer_idx) => {
                 layers[usize::from(*layer_idx)].seq_get(row, key.name())
             }
+            PatchedBase::Builtin(entries) => entries.as_slice().get_str(key.name()),
+            PatchedBase::Patched(patched) => patched.get(row, key),
         }
     }
 
@@ -1213,6 +1245,8 @@ impl Patched {
             PatchedBase::SeqLayer(layers, layer_idx) => {
                 layers[usize::from(*layer_idx)].seq_position(row, key.name())
             }
+            PatchedBase::Builtin(entries) => entries.as_slice().position_str(key.name()),
+            PatchedBase::Patched(patched) => patched.position(row, key),
         }
     }
 
@@ -2355,24 +2389,44 @@ impl OrderedMap {
         }
     }
 
-    /// If this map is backed by a uniform-key [`Table`] or direct-keyed sequence
-    /// layer, return `(base, row)` when `row <= StepPatch::MAX_ROW`.
+    /// If this map can back a [`StepPatch`] overlay for its own row (whether
+    /// or not all rows share uniform keys), return `(base, row, uniform)`.
     #[inline]
-    pub(crate) fn uniform_step_base(&self) -> Option<(PatchedBase, u32)> {
+    pub(crate) fn step_base(&self) -> Option<(PatchedBase, u32, bool)> {
         match &self.entries {
-            Entries::Dressed(table, row)
-                if table.has_uniform_keys() && *row <= StepPatch::MAX_ROW =>
-            {
-                Some((PatchedBase::Table(Arc::clone(table)), *row))
+            Entries::Dressed(table, row) if *row <= StepPatch::MAX_ROW => Some((
+                PatchedBase::Table(Arc::clone(table)),
+                *row,
+                table.has_uniform_keys(),
+            )),
+            Entries::SeqLayer(layers, row, layer_idx) if *row <= StepPatch::MAX_ROW => Some((
+                PatchedBase::SeqLayer(Arc::clone(layers), *layer_idx),
+                *row,
+                layers[usize::from(*layer_idx)].seq_has_uniform_keys(),
+            )),
+            Entries::Builtin(entries, _) => {
+                Some((PatchedBase::Builtin(Arc::clone(entries)), 0, true))
             }
-            Entries::SeqLayer(layers, row, layer_idx)
-                if layers[usize::from(*layer_idx)].seq_has_uniform_keys()
+            Entries::Patched(patched, row)
+                if !matches!(patched.base, PatchedBase::Patched(_))
                     && *row <= StepPatch::MAX_ROW =>
             {
-                Some((PatchedBase::SeqLayer(Arc::clone(layers), *layer_idx), *row))
+                Some((
+                    PatchedBase::Patched(Arc::clone(patched)),
+                    *row,
+                    patched.base.has_uniform_keys(),
+                ))
             }
             _ => None,
         }
+    }
+
+    /// If this map is backed by a uniform-key [`PatchedBase`] with
+    /// `row <= StepPatch::MAX_ROW`, return `(base, row)`.
+    #[inline]
+    pub(crate) fn uniform_step_base(&self) -> Option<(PatchedBase, u32)> {
+        let (base, row, uniform) = self.step_base()?;
+        uniform.then_some((base, row))
     }
 
     /// Check if this map shares the same uniform-key [`PatchedBase`] as `base`,
@@ -2391,6 +2445,16 @@ impl OrderedMap {
             ) if *layer_idx == *other_idx
                 && Arc::ptr_eq(layers, other_layers)
                 && *row <= StepPatch::MAX_ROW =>
+            {
+                Some(*row)
+            }
+            (Entries::Builtin(entries, _), PatchedBase::Builtin(other))
+                if Arc::ptr_eq(entries, other) =>
+            {
+                Some(0)
+            }
+            (Entries::Patched(patched, row), PatchedBase::Patched(other))
+                if Arc::ptr_eq(patched, other) && *row <= StepPatch::MAX_ROW =>
             {
                 Some(*row)
             }
@@ -3203,6 +3267,30 @@ impl OrderedMap {
                 Err(returned) => value = returned,
             }
         }
+        if let Entries::Patched(prev, row) = &self.entries
+            && !matches!(prev.base, PatchedBase::Patched(_))
+        {
+            let row = *row;
+            let at = self.position(key);
+            if let Some(patched) = Patched::of_one(
+                PatchedBase::Patched(Arc::clone(prev)),
+                row,
+                key.clone(),
+                value.clone(),
+                at,
+                true,
+            ) {
+                self.entries = Entries::Patched(Arc::new(patched), row);
+                return;
+            }
+        }
+        if let Entries::StepPatch(sp, packed) = &self.entries
+            && let Some((mut patched, row)) = sp.to_patched(*packed)
+            && patched.try_set(row, key, value.clone(), true).is_ok()
+        {
+            self.entries = Entries::Patched(Arc::new(patched), row);
+            return;
+        }
         if let Entries::Dressed(table, row) = &self.entries {
             let row = *row;
             let at = self.position(key);
@@ -3364,6 +3452,18 @@ impl OrderedMap {
                             return;
                         }
                     }
+                    if !matches!(prev.base, PatchedBase::Patched(_))
+                        && let Some(mut wrapped) =
+                            Patched::empty(PatchedBase::Patched(Arc::clone(prev)), row, true)
+                    {
+                        for (key, num) in patches {
+                            let _ = wrapped.try_set(row, key, Value::F64(*num), true);
+                        }
+                        let arc = Arc::new(wrapped);
+                        cache.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                        self.entries = Entries::Patched(arc, row);
+                        return;
+                    }
                 }
                 _ => {}
             }
@@ -3453,6 +3553,16 @@ impl OrderedMap {
                             return;
                         }
                     }
+                    if !matches!(prev.base, PatchedBase::Patched(_))
+                        && let Some(mut wrapped) =
+                            Patched::empty(PatchedBase::Patched(Arc::clone(prev)), row, true)
+                    {
+                        let _ = wrapped.try_set(row, key, value.clone(), true);
+                        let arc = Arc::new(wrapped);
+                        cache.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                        self.entries = Entries::Patched(arc, row);
+                        return;
+                    }
                 }
                 _ => {}
             }
@@ -3523,10 +3633,36 @@ impl OrderedMap {
                         return;
                     }
                 }
-                Entries::Patched(prev, row) if prev.overlay.is_none() => {
+                Entries::Patched(prev, row) => {
                     let row = *row;
                     let uniform = prev.base.has_uniform_keys();
-                    if Arc::strong_count(prev) > 1 {
+                    if prev.overlay.is_none() {
+                        if Arc::strong_count(prev) > 1 {
+                            if uniform
+                                && let Some(c) = cache.as_deref()
+                                && let Some(cached_out) = c.get_patched(prev)
+                            {
+                                self.entries = Entries::Patched(Arc::clone(cached_out), row);
+                                return;
+                            }
+                            let mut next = (**prev).clone();
+                            if next.attach_overlay(row, Arc::clone(ov_entries), true) {
+                                next.made = true;
+                                let arc = Arc::new(next);
+                                if uniform && let Some(c) = cache.as_deref_mut() {
+                                    c.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                                }
+                                self.entries = Entries::Patched(arc, row);
+                                return;
+                            }
+                        } else if let Some(own) = Arc::get_mut(prev)
+                            && own.attach_overlay(row, Arc::clone(ov_entries), true)
+                        {
+                            own.made = true;
+                            return;
+                        }
+                    }
+                    if !matches!(prev.base, PatchedBase::Patched(_)) {
                         if uniform
                             && let Some(c) = cache.as_deref()
                             && let Some(cached_out) = c.get_patched(prev)
@@ -3534,20 +3670,27 @@ impl OrderedMap {
                             self.entries = Entries::Patched(Arc::clone(cached_out), row);
                             return;
                         }
-                        let mut next = (**prev).clone();
-                        if next.attach_overlay(row, Arc::clone(ov_entries), true) {
-                            next.made = true;
-                            let arc = Arc::new(next);
+                        if let Some(patched) = Patched::with_overlay(
+                            PatchedBase::Patched(Arc::clone(prev)),
+                            row,
+                            Arc::clone(ov_entries),
+                            true,
+                        ) {
+                            let arc = Arc::new(patched);
                             if uniform && let Some(c) = cache.as_deref_mut() {
                                 c.put_patched(Arc::clone(prev), Arc::clone(&arc));
                             }
                             self.entries = Entries::Patched(arc, row);
                             return;
                         }
-                    } else if let Some(own) = Arc::get_mut(prev)
-                        && own.attach_overlay(row, Arc::clone(ov_entries), true)
+                    }
+                }
+                Entries::StepPatch(sp, packed) => {
+                    if let Some((mut patched, row)) = sp.to_patched(*packed)
+                        && patched.attach_overlay(row, Arc::clone(ov_entries), true)
                     {
-                        own.made = true;
+                        patched.made = true;
+                        self.entries = Entries::Patched(Arc::new(patched), row);
                         return;
                     }
                 }
@@ -3650,6 +3793,22 @@ impl OrderedMap {
                             own.made = true;
                             return;
                         }
+                    }
+                    if !matches!(prev.base, PatchedBase::Patched(_))
+                        && let Some(mut wrapped) =
+                            Patched::empty(PatchedBase::Patched(Arc::clone(prev)), row, true)
+                    {
+                        for (key, value) in other.pairs() {
+                            let _ = wrapped.try_set(row, key, value.clone(), true);
+                        }
+                        let arc = Arc::new(wrapped);
+                        if prev.base.has_uniform_keys()
+                            && let Some(c) = cache
+                        {
+                            c.put_patched(Arc::clone(prev), Arc::clone(&arc));
+                        }
+                        self.entries = Entries::Patched(arc, row);
+                        return;
                     }
                 }
                 _ => {}

@@ -242,6 +242,16 @@ impl Names<'_, '_> {
         }
     }
 
+    fn is_signal(&self, name: &str) -> bool {
+        match self {
+            Self::Realm(ctx) => matches!(
+                prove_builtin_global(ctx, name),
+                Some(BuiltinGlobal::Signal(_))
+            ),
+            Self::Listed(names) => names.is_signal(name),
+        }
+    }
+
     fn mini(&self) -> bool {
         match self {
             Self::Realm(ctx) => prove_mini_callee(ctx),
@@ -943,13 +953,19 @@ impl<'p> Turn<'p> {
                     }
                     ChainArgument::Constant(value, locations)
                 }
-                argument => match self.pattern_argument(names, argument, runtime) {
-                    Some(value) => ChainArgument::Pattern(value),
-                    None => {
-                        leave(self, call);
-                        return None;
+                argument => {
+                    if let Some(wave) = self.try_eval_wave_expr(names, argument) {
+                        wave
+                    } else {
+                        match self.pattern_argument(names, argument, runtime) {
+                            Some(value) => ChainArgument::Pattern(value),
+                            None => {
+                                leave(self, call);
+                                return None;
+                            }
+                        }
                     }
-                },
+                }
             };
             chain.push((call.spec, argument));
         }
@@ -973,6 +989,209 @@ impl<'p> Turn<'p> {
         self.spare.calls.push(calls);
         self.spare.chains.push(chain);
         Some(made)
+    }
+
+    /// Try to evaluate a control argument directly as an inline [`rustel_core::Wave`]
+    /// without constructing intermediate signal, time, math, or segment pattern nodes.
+    fn try_eval_wave_expr(
+        &mut self,
+        names: &Names<'_, '_>,
+        expr: &'p ScoreExpr<'p>,
+    ) -> Option<ChainArgument> {
+        use rustel_core::compose::{Alignment, ComposeOp, default_alignment};
+        use rustel_fraction::Fraction;
+
+        if default_alignment() != Alignment::In {
+            return None;
+        }
+        let mut times: [(bool, Fraction); 3] = [(false, Fraction::ZERO); 3];
+        let mut times_len = 0usize;
+        let mut math_outer: [(ComposeOp, f64); 8] = [(ComposeOp::Add, 0.0); 8];
+        let mut math_len = 0usize;
+        let mut steps = 0u32;
+        let mut math_depth: Option<u8> = None;
+        let mut nodes = 0usize;
+        let mut cur = expr;
+
+        while let ScoreExpr::Method {
+            receiver,
+            method,
+            arguments,
+            ..
+        } = cur
+        {
+            nodes += 1;
+            let args = self.held.row(*arguments);
+            let method_name: &str = method;
+            match method_name {
+                "seg" | "segment" => {
+                    if steps != 0 || times_len != 0 {
+                        return None;
+                    }
+                    let Some(BuiltinMethod::Registered(reg)) = builtin_method(names, method_name)
+                    else {
+                        return None;
+                    };
+                    if reg.names.first().map(|s| &**s) != Some("segment") {
+                        return None;
+                    }
+                    let [ScoreExpr::Number(n)] = args else {
+                        return None;
+                    };
+                    if !n.is_finite() || n.fract() != 0.0 || *n < 2.0 || *n > u32::MAX as f64 {
+                        return None;
+                    }
+                    steps = *n as u32;
+                }
+                "slow" | "sparsity" => {
+                    let Some(BuiltinMethod::Registered(reg)) = builtin_method(names, method_name)
+                    else {
+                        return None;
+                    };
+                    if reg.names.first().map(|s| &**s) != Some("slow") {
+                        return None;
+                    }
+                    let [ScoreExpr::Number(n)] = args else {
+                        return None;
+                    };
+                    let f = Fraction::from_f64(*n)?;
+                    if f <= Fraction::ZERO {
+                        return None;
+                    }
+                    let inv = Fraction::ONE.checked_div(f)?;
+                    if inv != Fraction::ONE {
+                        if times_len >= times.len() {
+                            return None;
+                        }
+                        times[times_len] = (true, inv);
+                        times_len += 1;
+                    }
+                }
+                "fast" | "density" => {
+                    let Some(BuiltinMethod::Registered(reg)) = builtin_method(names, method_name)
+                    else {
+                        return None;
+                    };
+                    if reg.names.first().map(|s| &**s) != Some("fast") {
+                        return None;
+                    }
+                    let [ScoreExpr::Number(n)] = args else {
+                        return None;
+                    };
+                    let f = Fraction::from_f64(*n)?;
+                    if f <= Fraction::ZERO {
+                        return None;
+                    }
+                    if f != Fraction::ONE {
+                        if times_len >= times.len() {
+                            return None;
+                        }
+                        times[times_len] = (true, f);
+                        times_len += 1;
+                    }
+                }
+                "late" | "early" => {
+                    let Some(BuiltinMethod::Registered(reg)) = builtin_method(names, method_name)
+                    else {
+                        return None;
+                    };
+                    if reg.names.first().map(|s| &**s) != Some(method_name) {
+                        return None;
+                    }
+                    let [ScoreExpr::Number(n)] = args else {
+                        return None;
+                    };
+                    let mut offset = Fraction::from_f64(*n)?;
+                    if method_name == "early" {
+                        offset = offset.checked_neg()?;
+                    }
+                    if offset != Fraction::ZERO {
+                        if times_len >= times.len() {
+                            return None;
+                        }
+                        times[times_len] = (false, offset);
+                        times_len += 1;
+                    }
+                }
+                "range" => {
+                    let Some(BuiltinMethod::Registered(reg)) = builtin_method(names, method_name)
+                    else {
+                        return None;
+                    };
+                    if reg.names.first().map(|s| &**s) != Some("range") {
+                        return None;
+                    }
+                    let [ScoreExpr::Number(min), ScoreExpr::Number(max)] = args else {
+                        return None;
+                    };
+                    if math_len + 2 > math_outer.len() {
+                        return None;
+                    }
+                    let depth = times_len as u8;
+                    match math_depth {
+                        None => math_depth = Some(depth),
+                        Some(prev) if prev == depth => {}
+                        _ => return None,
+                    }
+                    // Outer-to-inner: Add(min) wraps Mul(max - min).
+                    math_outer[math_len] = (ComposeOp::Add, *min);
+                    math_outer[math_len + 1] = (ComposeOp::Mul, *max - *min);
+                    math_len += 2;
+                }
+                "add" | "sub" | "mul" | "div" => {
+                    let Some(BuiltinMethod::Composer(op)) = builtin_method(names, method_name)
+                    else {
+                        return None;
+                    };
+                    let [ScoreExpr::Number(n)] = args else {
+                        return None;
+                    };
+                    if math_len >= math_outer.len() {
+                        return None;
+                    }
+                    let depth = times_len as u8;
+                    match math_depth {
+                        None => math_depth = Some(depth),
+                        Some(prev) if prev == depth => {}
+                        _ => return None,
+                    }
+                    math_outer[math_len] = (op, *n);
+                    math_len += 1;
+                }
+                _ => return None,
+            }
+            cur = self.held.at(*receiver);
+        }
+
+        let ScoreExpr::Name(signal_name) = cur else {
+            return None;
+        };
+        nodes += 1;
+        if !matches!(self.resolve(signal_name), Resolved::Host) {
+            return None;
+        }
+        let body = rustel_core::signal::static_signal_body(signal_name)?;
+        if !names.is_signal(signal_name) {
+            return None;
+        }
+        let math_inside = match math_depth {
+            None => true,
+            Some(d) if usize::from(d) == times_len => true,
+            Some(0) => false,
+            _ => return None,
+        };
+        math_outer[..math_len].reverse();
+        let wave = rustel_core::Wave::from_inline_parts(
+            body,
+            &times[..times_len],
+            &math_outer[..math_len],
+            math_inside,
+        )?;
+        if self.steps.saturating_add(nodes) > MAX_STEPS {
+            return None;
+        }
+        self.steps += nodes;
+        Some(ChainArgument::Wave(wave, steps, math_inside))
     }
 
     /// Evaluate `expression` where the score writes a part. The build

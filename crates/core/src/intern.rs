@@ -240,6 +240,51 @@ fn is_tiny_graph(root: &NodeCell) -> bool {
     true
 }
 
+thread_local! {
+    /// Reusable cleared deduper tables so repeated cold evals and edits avoid
+    /// allocating and freeing 14 hash maps on every call while retaining zero
+    /// `Arc` references between builds.
+    static SPARE_DEDUPER: std::cell::RefCell<Option<Deduper>> =
+        const { std::cell::RefCell::new(None) };
+    static SPARE_SCAN: std::cell::RefCell<Option<ScanScratch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[derive(Default)]
+struct ScanScratch {
+    seen_nodes: FastSet<usize>,
+    seen_layers: FastSet<usize>,
+    seen_ptrs: FastSet<usize>,
+    unpooled: Vec<Arc<dyn BuiltinEntries>>,
+    unique_set: FastMap<InternedBuiltin, ()>,
+    unique_maps: Vec<Arc<dyn BuiltinEntries>>,
+    duplicates: Vec<(usize, Arc<dyn BuiltinEntries>)>,
+    counts: Vec<u32>,
+    map_val_ids: Vec<u32>,
+    map_spans: Vec<(u32, u16)>,
+    poolable_idx: Vec<usize>,
+    remap: Vec<u16>,
+    detached: Vec<usize>,
+}
+
+impl ScanScratch {
+    fn clear(&mut self) {
+        self.seen_nodes.clear();
+        self.seen_layers.clear();
+        self.seen_ptrs.clear();
+        self.unpooled.clear();
+        self.unique_set.clear();
+        self.unique_maps.clear();
+        self.duplicates.clear();
+        self.counts.clear();
+        self.map_val_ids.clear();
+        self.map_spans.clear();
+        self.poolable_idx.clear();
+        self.remap.clear();
+        self.detached.clear();
+    }
+}
+
 /// Like [`dedup_score`], pre-seeding already-canonical node references reused
 /// from a prior build so incremental edits skip re-walking unchanged subtrees.
 pub fn dedup_score_with_reused(
@@ -251,48 +296,57 @@ pub fn dedup_score_with_reused(
     if is_tiny_graph(root.node_arc()) {
         return;
     }
-    let mut visited = FastMap::default();
+    let mut deduper = SPARE_DEDUPER
+        .try_with(|cell| cell.borrow_mut().take())
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let mut scan = SPARE_SCAN
+        .try_with(|cell| cell.borrow_mut().take())
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    deduper.clear();
+    scan.clear();
     if !reused.is_empty() {
-        visited.reserve(reused.len() * 2);
+        deduper.visited.reserve(reused.len() * 2);
         for node_ref in reused {
-            visited.insert(node_ref.identity(), Arc::clone(&node_ref.0));
+            deduper
+                .visited
+                .insert(node_ref.identity(), Arc::clone(&node_ref.0));
         }
     }
-    let (pooled_builtins, seen_nodes, builtins_pre_deduped) =
-        collect_and_pool_builtins(root.node_arc(), &visited);
+    let builtins_pre_deduped = collect_and_pool_builtins(
+        root.node_arc(),
+        &deduper.visited,
+        &mut scan,
+        &mut deduper.pooled_builtins,
+    );
+    deduper.builtins_pre_deduped = builtins_pre_deduped;
     // Temporarily detach extra handles (such as memo parts) that point to
     // newly-built nodes reachable from `root` so their refcount drops to 1 and
     // `Arc::get_mut` can deduplicate them in place without reallocating.
-    let mut detached: Vec<usize> = Vec::new();
-    let mut detached_ids: FastSet<usize> = FastSet::default();
     let silence_arc = Arc::clone(crate::silence().node_arc());
     remap_extras(&mut |node_ref: &mut crate::PatternNodeRef| {
         let id = node_ref.identity();
-        if seen_nodes.contains(&id) && !visited.contains_key(&id) {
-            detached.push(id);
-            detached_ids.insert(id);
+        if scan.seen_nodes.contains(&id) && !deduper.visited.contains_key(&id) {
+            scan.detached.push(id);
+            deduper.detached_ids.insert(id);
             node_ref.0 = Arc::clone(&silence_arc);
         } else {
-            detached.push(0);
+            scan.detached.push(0);
         }
     });
-    let cap = seen_nodes.len();
-    let mut deduper = Deduper {
-        visited,
-        detached_ids,
-        pooled_builtins,
-        builtins_pre_deduped,
-        values: FastMap::with_capacity_and_hasher(cap / 2, Default::default()),
-        dresses: FastMap::with_capacity_and_hasher(cap / 2, Default::default()),
-        compact_grids: FastMap::with_capacity_and_hasher(cap / 2, Default::default()),
-        layers: FastMap::with_capacity_and_hasher(cap / 2, Default::default()),
-        nodes: FastMap::with_capacity_and_hasher(cap, Default::default()),
-        ..Deduper::default()
-    };
+    let cap = scan.seen_nodes.len();
+    deduper.values.reserve(cap / 2);
+    deduper.dresses.reserve(cap / 2);
+    deduper.compact_grids.reserve(cap / 2);
+    deduper.layers.reserve(cap / 2);
+    deduper.nodes.reserve(cap);
     deduper.dedup_pattern(root);
     let mut idx = 0usize;
     let mut remap = |node_ref: &mut crate::PatternNodeRef| {
-        let orig = detached.get(idx).copied().unwrap_or(0);
+        let orig = scan.detached.get(idx).copied().unwrap_or(0);
         idx += 1;
         let lookup = if orig != 0 { orig } else { node_ref.identity() };
         if let Some(canon) = deduper.visited.get(&lookup) {
@@ -302,6 +356,14 @@ pub fn dedup_score_with_reused(
         }
     };
     remap_extras(&mut remap);
+    deduper.clear();
+    scan.clear();
+    if deduper.visited.capacity() <= 4096 && deduper.nodes.capacity() <= 4096 {
+        let _ = SPARE_DEDUPER.try_with(|cell| *cell.borrow_mut() = Some(deduper));
+    }
+    if scan.seen_nodes.capacity() <= 4096 && scan.unpooled.capacity() <= 4096 {
+        let _ = SPARE_SCAN.try_with(|cell| *cell.borrow_mut() = Some(scan));
+    }
 }
 
 /// Fast read-only pre-scan collecting surviving unpooled built-in maps so value
@@ -310,15 +372,24 @@ pub fn dedup_score_with_reused(
 fn collect_and_pool_builtins(
     root: &Arc<NodeCell>,
     skip_nodes: &FastMap<usize, Arc<NodeCell>>,
-) -> (
-    FastMap<usize, Arc<dyn BuiltinEntries>>,
-    FastSet<usize>,
-    bool,
-) {
-    let mut seen_nodes: FastSet<usize> = FastSet::with_capacity_and_hasher(64, Default::default());
-    let mut seen_layers: FastSet<usize> = FastSet::with_capacity_and_hasher(32, Default::default());
-    let mut seen_ptrs: FastSet<usize> = FastSet::with_capacity_and_hasher(64, Default::default());
-    let mut unpooled: Vec<Arc<dyn BuiltinEntries>> = Vec::with_capacity(64);
+    scan: &mut ScanScratch,
+    out: &mut FastMap<usize, Arc<dyn BuiltinEntries>>,
+) -> bool {
+    let ScanScratch {
+        seen_nodes,
+        seen_layers,
+        seen_ptrs,
+        unpooled,
+        unique_set,
+        unique_maps,
+        duplicates,
+        counts,
+        map_val_ids,
+        map_spans,
+        poolable_idx,
+        remap,
+        ..
+    } = scan;
     let mut record = |entries: &Arc<dyn BuiltinEntries>| {
         if let Slice::Builtin(keys, _) = entries.as_slice()
             && keys.len() >= 2
@@ -461,15 +532,13 @@ fn collect_and_pool_builtins(
         }
     }
     if unpooled.len() < 4 {
-        return (FastMap::default(), seen_nodes, false);
+        return false;
     }
     // Deduplicate identical maps once so frequency counts reflect unique
     // surviving maps and `Deduper` does not re-hash `len >= 2` built-in maps.
-    let mut unique_set: FastMap<InternedBuiltin, ()> =
-        FastMap::with_capacity_and_hasher(unpooled.len(), Default::default());
-    let mut unique_maps: Vec<Arc<dyn BuiltinEntries>> = Vec::with_capacity(unpooled.len());
-    let mut duplicates: Vec<(usize, Arc<dyn BuiltinEntries>)> = Vec::new();
-    for map in unpooled {
+    unique_set.reserve(unpooled.len());
+    unique_maps.reserve(unpooled.len());
+    for map in unpooled.drain(..) {
         if !map.as_slice().all_values_data() {
             continue;
         }
@@ -484,18 +553,17 @@ fn collect_and_pool_builtins(
             }
         }
     }
-    let mut out: FastMap<usize, Arc<dyn BuiltinEntries>> =
-        FastMap::with_capacity_and_hasher(duplicates.len() + unique_maps.len(), Default::default());
+    out.reserve(duplicates.len() + unique_maps.len());
     if unique_maps.len() >= 4 {
         // Hash each distinct data value once into dense ids, then use flat
         // array lookups for frequency counting, poolability, and packing.
         let mut val_ids: FastMap<DataValueRef<'_>, u32> =
             FastMap::with_capacity_and_hasher(unique_maps.len() * 2, Default::default());
-        let mut counts: Vec<u32> = Vec::with_capacity(unique_maps.len() * 2);
+        counts.reserve(unique_maps.len() * 2);
         let mut distinct_vals: Vec<&Value> = Vec::with_capacity(unique_maps.len() * 2);
-        let mut map_val_ids: Vec<u32> = Vec::with_capacity(unique_maps.len() * 4);
-        let mut map_spans: Vec<(u32, u16)> = Vec::with_capacity(unique_maps.len());
-        for map in &unique_maps {
+        map_val_ids.reserve(unique_maps.len() * 4);
+        map_spans.reserve(unique_maps.len());
+        for map in unique_maps.iter() {
             let start = map_val_ids.len() as u32;
             if let Slice::Builtin(_, values) = map.as_slice() {
                 for val in values {
@@ -520,7 +588,7 @@ fn collect_and_pool_builtins(
                 map_spans.push((start, 0));
             }
         }
-        let mut poolable_idx: Vec<usize> = Vec::with_capacity(unique_maps.len());
+        poolable_idx.reserve(unique_maps.len());
         for (idx, &(start, len)) in map_spans.iter().enumerate() {
             let len = usize::from(len);
             if len == 0 {
@@ -539,12 +607,12 @@ fn collect_and_pool_builtins(
             }
         }
         if poolable_idx.len() >= 2 {
-            let mut remap: Vec<u16> = vec![u16::MAX; counts.len()];
+            remap.resize(counts.len(), u16::MAX);
             let mut pool_vec: Vec<Value> = Vec::with_capacity(counts.len());
             let mut old_bytes = 0usize;
             let mut new_maps_bytes = 0usize;
             let mut overflow = false;
-            'assign: for &idx in &poolable_idx {
+            'assign: for &idx in poolable_idx.iter() {
                 let (start, len) = map_spans[idx];
                 let len = usize::from(len);
                 old_bytes += 16 + ((26 * len + 7) & !7);
@@ -568,7 +636,7 @@ fn collect_and_pool_builtins(
             if !overflow && new_bytes + 64 < old_bytes {
                 let pool: Arc<[Value]> = pool_vec.into();
                 let mut vals_buf = [0u16; MAX_BUILTIN_MAP_LEN];
-                for &idx in &poolable_idx {
+                for &idx in poolable_idx.iter() {
                     let map = &unique_maps[idx];
                     if let Slice::Builtin(keys, _) = map.as_slice() {
                         let (start, len) = map_spans[idx];
@@ -587,7 +655,7 @@ fn collect_and_pool_builtins(
             }
         }
     }
-    for (dup_ptr, canon) in duplicates {
+    for (dup_ptr, canon) in duplicates.drain(..) {
         let canon_ptr = Arc::as_ptr(&canon) as *const () as usize;
         if let Some(pooled) = out.get(&canon_ptr) {
             out.insert(dup_ptr, Arc::clone(pooled));
@@ -595,7 +663,7 @@ fn collect_and_pool_builtins(
             out.insert(dup_ptr, canon);
         }
     }
-    (out, seen_nodes, true)
+    true
 }
 
 #[derive(Default)]
@@ -619,6 +687,25 @@ struct Deduper {
 }
 
 impl Deduper {
+    fn clear(&mut self) {
+        self.visited.clear();
+        self.detached_ids.clear();
+        self.seen_values.clear();
+        self.seen_dresses.clear();
+        self.seen_layers.clear();
+        self.plain_extras.clear();
+        self.pooled_builtins.clear();
+        self.builtins_pre_deduped = false;
+        self.builtins.clear();
+        self.keys.clear();
+        self.values.clear();
+        self.dresses.clear();
+        self.compact_grids.clear();
+        self.grids.clear();
+        self.layers.clear();
+        self.nodes.clear();
+    }
+
     fn intern_builtin(
         &mut self,
         entries: Arc<dyn BuiltinEntries>,
