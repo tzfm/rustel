@@ -9630,6 +9630,40 @@ fn a_bpm_helper_survives_hydra_and_a_prebake_names_its_line() {
     );
 }
 
+/// `check` and `query` run a prebake first, as `play` does, so a score that
+/// calls one of its helpers is clean and lists its events.
+#[test]
+fn check_and_query_take_a_prebake() {
+    let prebake = scratch("prebake-helpers.js");
+    std::fs::write(
+        &prebake,
+        "globalThis.wide = p => p.room(.25).pan(\"<.3 -.3>\");",
+    )
+    .expect("prebake");
+    let prebake = prebake.to_str().expect("utf-8 path");
+    let score = r#"wide(note("c3 e3 g3").s("sine"))"#;
+    let checked = ok_stdout(&["check", "--no-samples", "--prebake", prebake, "-e", score]);
+    assert!(checked.contains("no issues found"), "{checked}");
+    let queried = ok_stdout(&["query", "--prebake", prebake, "-e", score, "--plain"]);
+    assert!(queried.contains("3 events"), "{queried}");
+    assert!(queried.contains("room:0.25"), "{queried}");
+    // A prebake that throws is one of the check's findings, in its JSON.
+    let broken = scratch("prebake-throws.js");
+    std::fs::write(&broken, "throw new Error('bad setup')").expect("prebake");
+    let out = run(&[
+        "check",
+        "--json",
+        "--no-samples",
+        "--prebake",
+        broken.to_str().expect("utf-8 path"),
+        "-e",
+        score,
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success());
+    assert!(stdout.contains("the prebake failed"), "{stdout}");
+}
+
 /// A KabelSalat signal past the range of a sample is silent on both
 /// channels, as a nonfinite one is, never full-scale noise on one.
 #[test]
