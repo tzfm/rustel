@@ -15309,13 +15309,26 @@ impl Pattern {
     /// Steps that `note` or `n` names take their new note where they are:
     /// see [`sequence::renoted`]. So does each pattern of a pick.
     fn pitched(&self, rewrite: &PitchRewrite) -> Self {
-        if let Some(renoted) =
-            sequence::renoted(self, &rewrite.hap, &rewrite.note, rewrite.keys.as_ref())
-        {
+        let mut dress_cache = sequence::RenoteDressCache::default();
+        self.pitched_cached(rewrite, &mut dress_cache)
+    }
+
+    fn pitched_cached(
+        &self,
+        rewrite: &PitchRewrite,
+        dress_cache: &mut sequence::RenoteDressCache,
+    ) -> Self {
+        if let Some(renoted) = sequence::renoted_cached(
+            self,
+            &rewrite.hap,
+            &rewrite.note,
+            rewrite.keys.as_ref(),
+            dress_cache,
+        ) {
             return renoted;
         }
         let picked = self.picked_with(&Locations::new(), false, |pattern| {
-            Some(pattern.pitched(rewrite))
+            Some(pattern.pitched_cached(rewrite, dress_cache))
         });
         // A handle of the rewrite, for the node that holds it.
         picked.unwrap_or_else(|| self.mapped_haps(Arc::clone(&rewrite.hap), SpanUse::Ignores))

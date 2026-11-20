@@ -3088,10 +3088,11 @@ pub fn word_constant(src: &str, offset: usize) -> Option<Pattern> {
     Some(rustel_core::pure_locations(value, locations))
 }
 
-/// Fast path for flat ASCII whitespace-separated sequences of plain words and
-/// rests (such as `"bd sd hh cp"` or `"c3 ~ e3 g3"`), bypassing `Parser` and
-/// `Plans` while reusing `room`'s scratch step buffer.
-fn flat_sequence(room: &mut Room, src: &str, offset: usize) -> Option<Pattern> {
+/// Fast path for flat ASCII whitespace-separated equal sequences
+/// (`"bd sd hh cp"`, `"c3 ~ e3 g3"`) and single-lane equal alternations
+/// (`"<c3 e3 g3>"`), building `SmallGridStep` grids directly on integer ticks
+/// with zero `Parser`, `Plans`, `Fraction`, or `SourceStep` allocations.
+fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
     if !src.is_ascii() {
         return None;
     }
@@ -3100,13 +3101,30 @@ fn flat_sequence(room: &mut Room, src: &str, offset: usize) -> Option<Pattern> {
     if pos >= bytes.len() || bytes[pos] == b'^' {
         return None;
     }
+    let mut limit = bytes.len();
+    while limit > pos && matches!(bytes[limit - 1], b' ' | b'\t' | b'\r' | b'\n') {
+        limit -= 1;
+    }
+    let is_alt = bytes[pos] == b'<' && limit > pos + 1 && bytes[limit - 1] == b'>';
+    if is_alt {
+        pos = score_whitespace_end(bytes, pos + 1);
+        limit -= 1;
+        while limit > pos && matches!(bytes[limit - 1], b' ' | b'\t' | b'\r' | b'\n') {
+            limit -= 1;
+        }
+        if pos >= limit || bytes[pos] == b'^' {
+            return None;
+        }
+    }
     let mut tokens: [(usize, usize); 64] = [(0, 0); 64];
     let mut count = 0usize;
     let mut sounding = 0usize;
-    while pos < bytes.len() {
+    while pos < limit {
         let start = pos;
         let mut end = start;
-        while let Some(len) = word_char_len(bytes, end) {
+        while end < limit
+            && let Some(len) = word_char_len(bytes, end)
+        {
             end += len;
         }
         if end == start {
@@ -3116,9 +3134,9 @@ fn flat_sequence(room: &mut Room, src: &str, offset: usize) -> Option<Pattern> {
         if word == "." || word == "_" || word.contains("..") {
             return None;
         }
-        let next_pos = score_whitespace_end(bytes, end);
-        // Must have whitespace separation or end-of-string (no attached ops).
-        if next_pos == end && next_pos < bytes.len() {
+        let next_pos = score_whitespace_end(bytes, end).min(limit);
+        // Must have whitespace separation or end-of-slice (no attached ops).
+        if next_pos == end && next_pos < limit {
             return None;
         }
         if count >= tokens.len() {
@@ -3134,44 +3152,76 @@ fn flat_sequence(room: &mut Room, src: &str, offset: usize) -> Option<Pattern> {
     if count < 2 {
         return None;
     }
-    let steps_meta = Some(Fraction::int(count as i128));
+    let steps_meta = if is_alt {
+        Some(Fraction::ONE)
+    } else {
+        Some(Fraction::int(count as i128))
+    };
     if sounding == 0 {
         return Some(silence().with_steps(steps_meta));
     }
     let mut seen_words: [&str; 64] = [""; 64];
     let mut seen_len = 0usize;
-    let (values, steps) = room.flat_buffers();
-    values.clear();
-    steps.clear();
-    steps.reserve(sounding);
-    let denom = count as i128;
+    let mut raw_steps = [(0u16, 0u16, 0u16, 0u32, 0u16); 64];
+    let mut step_len = 0usize;
+    let mut min_begin = u32::MAX;
+    let mut max_begin = 0u32;
+    let mut max_len = 0u16;
     for (slot, &(start, end)) in tokens[..count].iter().enumerate() {
         let word = &src[start..end];
         if matches!(word, "~" | "-") {
             continue;
         }
         let value_idx = match seen_words[..seen_len].iter().position(|&w| w == word) {
-            Some(idx) => idx as u32,
+            Some(idx) => idx as u16,
             None => {
-                let idx = seen_len as u32;
+                let idx = seen_len as u16;
                 seen_words[seen_len] = word;
                 seen_len += 1;
-                values.push(atom_value(word));
                 idx
             }
         };
-        let mut locations = rustel_core::Locations::new();
-        locations.push(leaf_place(src, offset, &Span { start, end }));
-        steps.push(rustel_core::SourceStep {
-            begin: Fraction::new(slot as i128, denom),
-            end: Fraction::new((slot + 1) as i128, denom),
-            value: value_idx,
-            locations,
-        });
+        let (loc_begin, loc_end) = leaf_place(src, offset, &Span { start, end });
+        let loc_begin = u32::try_from(loc_begin).ok()?;
+        let loc_len = u16::try_from(loc_end.checked_sub(loc_begin as usize)?).ok()?;
+        if loc_len > 0 {
+            min_begin = min_begin.min(loc_begin);
+            max_begin = max_begin.max(loc_begin);
+            max_len = max_len.max(loc_len);
+        }
+        raw_steps[step_len] = (
+            slot as u16,
+            (slot + 1) as u16,
+            value_idx,
+            loc_begin,
+            loc_len,
+        );
+        step_len += 1;
     }
-    let layer_values: std::sync::Arc<[Value]> = values.drain(..).collect();
-    let pattern = rustel_core::sequence_of_indexed_slice(Fraction::ONE, layer_values, true, steps)?;
-    steps.clear();
+    let base = if min_begin == u32::MAX { 0 } else { min_begin };
+    if base >= (1 << 31)
+        || (min_begin != u32::MAX && max_begin - base >= (1 << 22))
+        || max_len >= 255
+    {
+        return None;
+    }
+    let layer_values: std::sync::Arc<[Value]> = seen_words[..seen_len]
+        .iter()
+        .map(|&word| atom_value(word))
+        .collect();
+    let (period, ticks) = if is_alt {
+        (
+            Fraction::int(count as i128),
+            std::num::NonZeroU32::new(1).expect("non-zero"),
+        )
+    } else {
+        (
+            Fraction::ONE,
+            std::num::NonZeroU32::new(count as u32).expect("count >= 2"),
+        )
+    };
+    let pattern =
+        rustel_core::sequence_of_ticks(period, ticks, layer_values, true, &raw_steps[..step_len])?;
     Some(pattern.with_steps(steps_meta))
 }
 
@@ -3184,7 +3234,7 @@ pub fn mini_in(room: &mut Room, src: &str, offset: usize) -> Result<Pattern, Par
         if let Some(pattern) = word_constant(src, offset) {
             return Ok(pattern);
         }
-        if let Some(pattern) = flat_sequence(room, src, offset) {
+        if let Some(pattern) = flat_sequence(src, offset) {
             return Ok(pattern);
         }
         if let Some(pattern) = Planned::read(src, offset, room)?.and_then(Planned::pattern) {

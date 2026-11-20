@@ -353,13 +353,13 @@ pub fn apply_chain_owned(mut pattern: Pattern, chain: &mut [ChainCall<'_>]) -> P
         if held && chain[index].1.is_constant() {
             continue;
         }
-        pattern = apply_row(pattern, &chain[row..index]);
+        pattern = apply_row_owned(pattern, &mut chain[row..index]);
         let spec = chain[index].0;
         let argument = std::mem::replace(&mut chain[index].1, ChainArgument::Number(0.0));
         pattern = apply_argument_owned(spec, pattern, argument);
         row = index + 1;
     }
-    apply_row(pattern, &chain[row..])
+    apply_row_owned(pattern, &mut chain[row..])
 }
 
 /// The transformer that applies `chain` to each pattern as [`apply_chain`]
@@ -404,6 +404,32 @@ fn apply_row(pattern: Pattern, row: &[ChainCall<'_>]) -> Pattern {
     match set_row(cut, rest) {
         Ok(set) => set,
         Err(back) => rest.iter().fold(back, in_turn),
+    }
+}
+
+fn apply_row_owned(pattern: Pattern, row: &mut [ChainCall<'_>]) -> Pattern {
+    if row.is_empty() {
+        return pattern;
+    }
+    let back = match set_row(pattern, row) {
+        Ok(set) => return set,
+        Err(back) => back,
+    };
+    let (first, rest) = row.split_first_mut().expect("non-empty row");
+    let first_arg = std::mem::replace(&mut first.1, ChainArgument::Number(0.0));
+    let cut = apply_argument_owned(first.0, back, first_arg);
+    if rest.is_empty() {
+        return cut;
+    }
+    match set_row(cut, rest) {
+        Ok(set) => set,
+        Err(mut back) => {
+            for (spec, argument) in rest.iter_mut() {
+                let arg = std::mem::replace(argument, ChainArgument::Number(0.0));
+                back = apply_argument_owned(spec, back, arg);
+            }
+            back
+        }
     }
 }
 

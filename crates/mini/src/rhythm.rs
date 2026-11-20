@@ -2137,11 +2137,6 @@ pub struct Room {
 }
 
 impl Room {
-    /// Borrow reusable value and step buffers for the flat-sequence fast path.
-    pub(crate) fn flat_buffers(&mut self) -> (&mut Vec<Value>, &mut Vec<SourceStep>) {
-        (&mut self.values, &mut self.steps_buf)
-    }
-
     /// Whether the room holds no list: a new room, or one that a reader
     /// put away.
     pub fn is_bare(&self) -> bool {
