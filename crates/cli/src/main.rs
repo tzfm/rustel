@@ -1517,6 +1517,11 @@ fn load_prebake(
         return Ok(rustel_runtime::lint::LintContext::default());
     };
     let source = read_bounded_file(path, "prebake")?;
+    // A sample import in the prebake reports through the command's own
+    // channel, as one in the score does.
+    if !rustel_runtime::sounds::samples_imports(&source).is_empty() {
+        session.set_direct_diagnostic_logging(false);
+    }
     session.evaluate_prebake_cancellable(&source, &EVALUATION_CANCELLED)?;
     Ok(rustel_runtime::lint::LintContext::from_setup_sources([
         source.as_str(),
@@ -2408,7 +2413,12 @@ fn run_command(
             // that fails to resolve only at evaluation, or a score that
             // throws. The dry evaluation in `check_score` catches those,
             // with the mini-notation compatibility fallback disabled.
-            let context = load_prebake(&mut session, prebake.as_deref())?;
+            // A prebake that fails is a finding of the check, reported in
+            // its list and its JSON, not an error before them.
+            let (context, prebake_error) = match load_prebake(&mut session, prebake.as_deref()) {
+                Ok(context) => (context, None),
+                Err(error) => (rustel_runtime::lint::LintContext::default(), Some(error)),
+            };
             let mut check = rustel_runtime::score_check::check_score_with(
                 &source,
                 library.as_deref(),
@@ -2416,6 +2426,12 @@ fn run_command(
                 &EVALUATION_CANCELLED,
                 &context,
             );
+            if let Some(error) = prebake_error {
+                check.eval_error = Some(rustel_runtime::score_check::EvalError {
+                    message: format!("the prebake failed: {error}"),
+                    line: None,
+                });
+            }
             let failures = sample_import_failures(&source, &mut session);
             check.diagnostics.extend(failures.placed);
             if !failures.unplaced.is_empty() {

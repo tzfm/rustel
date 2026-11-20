@@ -9572,4 +9572,19 @@ fn check_and_query_take_a_prebake() {
     let queried = ok_stdout(&["query", "--prebake", prebake, "-e", score, "--plain"]);
     assert!(queried.contains("3 events"), "{queried}");
     assert!(queried.contains("room:0.25"), "{queried}");
+    // A prebake that throws is one of the check's findings, in its JSON.
+    let broken = scratch("prebake-throws.js");
+    std::fs::write(&broken, "throw new Error('bad setup')").expect("prebake");
+    let out = run(&[
+        "check",
+        "--json",
+        "--no-samples",
+        "--prebake",
+        broken.to_str().expect("utf-8 path"),
+        "-e",
+        score,
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success());
+    assert!(stdout.contains("the prebake failed"), "{stdout}");
 }
