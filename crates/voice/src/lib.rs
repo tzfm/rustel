@@ -1109,6 +1109,21 @@ mod tests {
             error.contains("has no note at midi 36: it plays midi 48 to 96"),
             "{error}"
         );
+        // A note inside the range that falls between its zones.
+        let error = resolve_voice_with_samples(
+            &serde_json::json!({ "s": "gm_clarinet", "note": 60 }),
+            0,
+            0.5,
+            0.0,
+            48_000,
+            0.5,
+            &Clarinet,
+        )
+        .expect_err("a gap at 60");
+        assert!(
+            error.contains("has no note at midi 60: it has gaps between midi 48 and 96"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -4154,59 +4169,63 @@ fn sample_controls(
         },
     };
     let n = optional_f64(object.get("n"), "n")?.unwrap_or(0.0);
-    let (id, transpose, natural_duration_secs, loop_secs, envelope_peak, soundfont) = match samples
-        .resolve(name, n, midi)
-    {
-        SampleResolution::Found {
-            id,
-            transpose,
-            duration_secs,
-            loop_secs,
-            envelope_peak,
-            soundfont,
-        } => (
-            id,
-            transpose,
-            duration_secs,
-            loop_secs,
-            envelope_peak,
-            soundfont,
-        ),
-        SampleResolution::Loading => {
-            // Never fatal: the runtime's per-voice skip-and-log drops
-            // this one onset, like a late-fetch skip.
-            return Err(VoiceError::SampleLoading(format!(
-                "sample \"{name}:{n}\" is still loading"
-            )));
-        }
-        SampleResolution::Failed => {
-            // A loaded font has notes only in its own range: a note
-            // outside it is not a failed load.
-            if let Some((low, high)) = samples.note_range(name, n) {
+    let (id, transpose, natural_duration_secs, loop_secs, envelope_peak, soundfont) =
+        match samples.resolve(name, n, midi) {
+            SampleResolution::Found {
+                id,
+                transpose,
+                duration_secs,
+                loop_secs,
+                envelope_peak,
+                soundfont,
+            } => (
+                id,
+                transpose,
+                duration_secs,
+                loop_secs,
+                envelope_peak,
+                soundfont,
+            ),
+            SampleResolution::Loading => {
+                // Never fatal: the runtime's per-voice skip-and-log drops
+                // this one onset, like a late-fetch skip.
+                return Err(VoiceError::SampleLoading(format!(
+                    "sample \"{name}:{n}\" is still loading"
+                )));
+            }
+            SampleResolution::Failed => {
+                // A loaded font has notes only in its own range: a note
+                // outside it is not a failed load.
+                if let Some((low, high)) = samples.note_range(name, n) {
+                    let range = if (low..=high).contains(&midi) {
+                        format!("it has gaps between midi {low} and {high}")
+                    } else {
+                        format!("it plays midi {low} to {high}")
+                    };
+                    return Err(VoiceError::SampleFailed(format!(
+                        "sample \"{name}:{n}\" has no note at midi {midi}: {range}"
+                    )));
+                }
                 return Err(VoiceError::SampleFailed(format!(
-                    "sample \"{name}:{n}\" has no note at midi {midi}: it plays midi {low} to {high}"
+                    "sample \"{name}:{n}\" failed to load"
                 )));
             }
-            return Err(VoiceError::SampleFailed(format!(
-                "sample \"{name}:{n}\" failed to load"
-            )));
-        }
-        // Not a sample: the oscillator path decides whether the name
-        // means anything (and refuses loudly when it does not).
-        SampleResolution::Unknown => {
-            // An explicitly banked name a dedicated synth would claim
-            // has no oscillator fallback: the score asked the bank for
-            // that sound, and the bank does not have it. A basic
-            // oscillator name keeps its oscillator, as
-            // `s('sine').bank(...)` always had.
-            if banked_name && is_dedicated_synth_sound(plain) {
-                return Err(VoiceError::UnknownSound(format!(
-                    "{name} is not loaded - that layer stays silent, the rest plays"
-                )));
+            // Not a sample: the oscillator path decides whether the name
+            // means anything (and refuses loudly when it does not).
+            SampleResolution::Unknown => {
+                // An explicitly banked name a dedicated synth would claim
+                // has no oscillator fallback: the score asked the bank for
+                // that sound, and the bank does not have it. A basic
+                // oscillator name keeps its oscillator, as
+                // `s('sine').bank(...)` always had.
+                if banked_name && is_dedicated_synth_sound(plain) {
+                    return Err(VoiceError::UnknownSound(format!(
+                        "{name} is not loaded - that layer stays silent, the rest plays"
+                    )));
+                }
+                return Ok(None);
             }
-            return Ok(None);
-        }
-    };
+        };
     // A soundfont zone plays at its note's pitch, from its start: `speed`,
     // `begin`/`end`, `unit`, `cut` and `nudge` do not reach it.
     let sampler_control = |key: &str| object.get(key).filter(|_| !soundfont);
