@@ -932,6 +932,38 @@ impl Theme {
         })
     }
 
+    /// A steady colour from this theme's palette for a name, such as an
+    /// event's sound or a log source.
+    ///
+    /// Chosen by hashing the name into the theme's own distinct foreground
+    /// slots, so monochrome, light, and terminal-palette themes keep their own
+    /// colours and contrast.
+    pub fn label_colour(&self, name: &str) -> Color {
+        let mut palette = [self.accent; 7];
+        let mut count = 0usize;
+        for colour in [
+            self.accent,
+            self.event,
+            self.ok,
+            self.syntax.string,
+            self.syntax.number,
+            self.syntax.keyword.unwrap_or(self.syntax.punctuation),
+            self.syntax.function.unwrap_or(self.syntax.text),
+        ] {
+            if !palette[..count].contains(&colour) {
+                palette[count] = colour;
+                count += 1;
+            }
+        }
+        // FNV-1a: stable across runs and across machines.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in name.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        legible_against(palette[(hash % count as u64) as usize], self.background)
+    }
+
     /// The text that reads on a filled chip: the background, where the
     /// theme owns one, and the palette's black where the terminal owns
     /// the ground. A palette keeps every accent readable on its black -
@@ -4429,6 +4461,16 @@ mod confinement_tests {
             };
             if let Some((mark_fg, mark_bg, floor)) = mark_pair {
                 check("sounding mark", mark_fg, mark_bg, floor);
+            }
+            for sample in [
+                "bd", "sd", "hh", "cp", "sawtooth", "piano", "engine", "samples",
+            ] {
+                check(
+                    &format!("label_colour({sample})"),
+                    theme.label_colour(sample),
+                    theme.background,
+                    AUDIT_UI_FLOOR,
+                );
             }
         }
 

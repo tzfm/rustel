@@ -147,12 +147,14 @@ fn dispatch_builtin(app: &mut App, key: KeyEvent) -> Result<bool, RuntimeError> 
     // Vim p puts what was copied last. The clipboard answers the key, and
     // a yank or delete writes the register there, so a copied score and a
     // yanked line take the same road.
-    if !pending
+    let syncs_put_clipboard = !pending
         && key.kind == KeyEventKind::Press
         && key.modifiers.is_empty()
-        && matches!(key.code, KeyCode::Char('p' | 'P'))
-        && app.editor().vim_accepts_put()
-    {
+        && ((matches!(key.code, KeyCode::Char('p' | 'P')) && app.editor().vim_accepts_put())
+            || (key.code == KeyCode::Char('.')
+                && app.editor().vim_is_normal()
+                && app.editor().vim_last_change_is_put()));
+    if syncs_put_clipboard {
         let register = app.editor().vim_register().map(str::to_owned);
         let clipboard = app
             .clipboard
@@ -399,5 +401,34 @@ y
         );
         typed(&mut app, "p");
         assert_eq!(app.editor().source(), "x\nx\ny\n");
+    }
+
+    /// `Ctrl+[` steps to the previous scene from Vim Normal mode on enhanced
+    /// terminals, while still leaving Insert mode without changing scenes.
+    #[test]
+    fn ctrl_left_bracket_navigates_previous_scene_in_vim_normal_mode() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = vim_app(directory.path(), "// first\n", "");
+        app.capabilities = crate::editor::KeyboardCapabilities::enhanced();
+        app.new_scene(false);
+        app.scenes.current_mut().editor = Editor::new("// second\n").expect("editor");
+        app.sync_editor_keybindings();
+        app.editor_mut()
+            .set_selection(Selection::caret(ByteOffset(0)))
+            .expect("caret");
+        app.focus = Focus::Editor;
+        assert_eq!(app.scenes.current_index(), 1);
+
+        // In Insert mode, Ctrl+[ returns to Normal and stays on the current scene.
+        typed(&mut app, "i");
+        assert!(app.editor().vim_is_insert());
+        press(&mut app, KeyCode::Char('['), KeyModifiers::CONTROL);
+        assert!(app.editor().vim_is_normal());
+        assert_eq!(app.scenes.current_index(), 1);
+
+        // In clean Normal mode, Ctrl+[ navigates to the previous scene.
+        press(&mut app, KeyCode::Char('['), KeyModifiers::CONTROL);
+        assert_eq!(app.scenes.current_index(), 0);
+        assert_eq!(app.editor().source(), "// first\n");
     }
 }

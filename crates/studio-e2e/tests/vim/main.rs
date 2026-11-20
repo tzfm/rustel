@@ -707,5 +707,34 @@ fn vim_mode_keeps_the_pointer_for_the_score() {
     assert_eq!(studio.score_pointer(), Some((29.5 / 150.0, 9.5 / 40.0)));
 }
 
+/// Paragraph text objects, dot-repeat, and Ctrl+[ previous-scene navigation in Vim Normal mode.
+#[test]
+fn vim_paragraph_objects_dot_repeat_and_ctrl_bracket_scene_step() {
+    let mut studio = hermetic_with(KeyboardCapabilities::enhanced());
+    enable_vim(&mut studio);
+    studio.set_score("// first\n");
+    studio.chord("ctrl+n");
+    studio.set_score("one\ntwo\n\nthree\nfour\n\nfive\n");
+    studio.set_caret(0);
+
+    // `dap` deletes the first paragraph and its trailing blank line; `.` repeats it.
+    studio.type_text("dap");
+    assert_eq!(studio.source(), "three\nfour\n\nfive\n");
+    studio.type_text(".");
+    assert_eq!(studio.source(), "five\n");
+
+    // `cw` + Insert + Esc then `.` repeats the full change.
+    studio.set_score("bd sd hh\n");
+    studio.set_caret(0);
+    studio.type_text("cwcp");
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.type_text("w.");
+    assert_eq!(studio.source(), "cp cp hh\n");
+
+    // `Ctrl+[` in clean Normal mode steps to the previous scene.
+    studio.press(KeyCode::Char('['), KeyModifiers::CONTROL);
+    assert_eq!(studio.source(), "// first\n");
+}
+
 mod mappings;
 mod search;
