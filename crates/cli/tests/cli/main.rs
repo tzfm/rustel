@@ -9554,3 +9554,22 @@ fn a_replay_save_that_never_reached_the_score_is_reported_not_announced() {
         let _ = std::fs::remove_file(path);
     }
 }
+
+/// `check` and `query` run a prebake first, as `play` does, so a score that
+/// calls one of its helpers is clean and lists its events.
+#[test]
+fn check_and_query_take_a_prebake() {
+    let prebake = scratch("prebake-helpers.js");
+    std::fs::write(
+        &prebake,
+        "globalThis.wide = p => p.room(.25).pan(\"<.3 -.3>\");",
+    )
+    .expect("prebake");
+    let prebake = prebake.to_str().expect("utf-8 path");
+    let score = r#"wide(note("c3 e3 g3").s("sine"))"#;
+    let checked = ok_stdout(&["check", "--no-samples", "--prebake", prebake, "-e", score]);
+    assert!(checked.contains("no issues found"), "{checked}");
+    let queried = ok_stdout(&["query", "--prebake", prebake, "-e", score, "--plain"]);
+    assert!(queried.contains("3 events"), "{queried}");
+    assert!(queried.contains("room:0.25"), "{queried}");
+}
