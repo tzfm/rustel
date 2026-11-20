@@ -20,6 +20,7 @@
 - Fixed: a General MIDI note outside its font's range says which notes the font plays instead of "failed to load", and Studio no longer counts such a font as a failed sound.
 - Fixed: `talkit("42")` speaks the number instead of a silent refused voice.
 - Fixed: a scene can call a name from a script that another scene of the set imports, as the docs say, instead of the check refusing it as unknown.
+- Fixed: the documented prebake helper `window.bpm = b => setcpm(b/4)` works after a score has run `initHydra()`, and a prebake that throws after an `await` reports its own line.
 
 ## v0.1.7
 

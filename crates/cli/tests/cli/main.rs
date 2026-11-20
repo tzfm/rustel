@@ -9585,3 +9585,39 @@ fn a_replay_save_that_never_reached_the_score_is_reported_not_announced() {
         let _ = std::fs::remove_file(path);
     }
 }
+
+/// The documented tempo helper `window.bpm = b => setcpm(b / 4)` is kept
+/// after `initHydra()` owns `bpm`, and a prebake that throws after an
+/// `await` names its own line.
+#[test]
+fn a_bpm_helper_survives_hydra_and_a_prebake_names_its_line() {
+    let checked = ok_stdout(&[
+        "check",
+        "--no-samples",
+        "-e",
+        "await initHydra()\nwindow.bpm = b => setcpm(b / 4)\n$: s(\"bd\")",
+    ]);
+    assert!(checked.contains("no issues found"), "{checked}");
+
+    let prebake = scratch("prebake-throws-late.js");
+    std::fs::write(
+        &prebake,
+        "globalThis.a = 1\nawait Promise.resolve()\nthrow new Error('on line three')\n",
+    )
+    .expect("prebake");
+    let out = scratch("prebake-throws-late.wav");
+    assert_reported_failure(
+        &[
+            "export",
+            "--prebake",
+            prebake.to_str().expect("utf-8 path"),
+            "-e",
+            "s(\"bd\")",
+            "--cycles",
+            "1",
+            "-o",
+            out.to_str().expect("utf-8 path"),
+        ],
+        "on line three - line 3",
+    );
+}

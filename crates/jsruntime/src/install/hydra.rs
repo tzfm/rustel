@@ -1268,7 +1268,12 @@ fn install_setting<'js>(
     let policy = policy.clone();
     let refusal = refusal.clone();
     let set = move |ctx: Ctx<'js>, args: Rest<rquickjs::Value<'js>>| -> rquickjs::Result<()> {
-        if matches!(name, "update" | "afterUpdate") {
+        // A function is a helper a setup wraps around the name, such as the
+        // documented `window.bpm = b => setcpm(b / 4)`: it is kept, as a
+        // write to a name the engine owns is, and the clock is not touched.
+        if matches!(name, "update" | "afterUpdate")
+            || args.0.first().is_some_and(rquickjs::Value::is_function)
+        {
             let assigned: rquickjs::Object = state(&ctx)?.get(ASSIGNED)?;
             let value = args.0.into_iter().next();
             return assigned.set(name, value.unwrap_or(rquickjs::Value::new_undefined(ctx)));
