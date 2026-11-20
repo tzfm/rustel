@@ -305,6 +305,7 @@ impl Session {
         fresh.stop_when_silent = self.stop_when_silent;
         fresh.export_limiter = self.export_limiter;
         fresh.render_tail_secs = self.render_tail_secs;
+        fresh.render_cycles = self.render_cycles;
         fresh.pending_diagnostics = std::mem::take(&mut self.pending_diagnostics);
         // The replay runs the imported scripts again, with no new fetch.
         fresh.import_sources = std::mem::take(&mut self.import_sources);

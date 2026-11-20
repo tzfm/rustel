@@ -49,7 +49,7 @@ impl Session {
     fn play_window_guarded(
         &mut self,
         start_secs: f64,
-        duration_secs: f64,
+        mut duration_secs: f64,
         query_js_budget: Duration,
         reanchor: bool,
     ) -> Result<PlayReport, RuntimeError> {
@@ -112,6 +112,16 @@ impl Session {
         let cancellation = self.transport.stopped_flag();
         let horizon = self.config.horizon;
         let step = scheduler.refill_floor_seconds();
+        // A bounce of cycles ends where the scheduler's own tempo map puts
+        // the last cycle. Each fill learns the tempo changes up to its
+        // horizon, so the end is read again after every tick, and it is
+        // exact once the fills pass it.
+        let end_cycle = self.render_cycles.filter(|_| reanchor);
+        let window_end = |scheduler: &Scheduler, fallback: f64| {
+            end_cycle.map_or(fallback, |cycle| {
+                (scheduler.time_at_cycle(cycle) - start_secs).clamp(0.0, MAX_DURATION_SECS)
+            })
+        };
 
         // The scheduler queries the graph on its own clock, outside
         // `JsRuntime::query`, so callback-bearing graphs need an explicit host
@@ -150,6 +160,7 @@ impl Session {
         let direct_diagnostic_logging = self.direct_diagnostic_logging;
         let collect = |onsets: &mut Vec<OnsetEventJson>,
                        overflowed: &mut bool,
+                       duration_secs: f64,
                        events: Vec<rustel_scheduler::Event>| {
             for event in events {
                 // The whole timeline stays in memory until this call returns.
@@ -248,7 +259,13 @@ impl Session {
                 }
                 _ => {}
             }
-            collect(&mut onsets, &mut overflowed, scheduler.drain_due(&clock));
+            duration_secs = window_end(scheduler, duration_secs);
+            collect(
+                &mut onsets,
+                &mut overflowed,
+                duration_secs,
+                scheduler.drain_due(&clock),
+            );
             if overflowed {
                 break;
             }
@@ -269,7 +286,12 @@ impl Session {
                     rustel_scheduler::TickStatus::Refused => {
                         refused = scheduler.refusal().cloned();
                     }
-                    _ => collect(&mut onsets, &mut overflowed, scheduler.drain_due(&clock)),
+                    _ => collect(
+                        &mut onsets,
+                        &mut overflowed,
+                        duration_secs,
+                        scheduler.drain_due(&clock),
+                    ),
                 }
             }
         }
@@ -747,6 +769,16 @@ impl Session {
         self.render_tail_secs = secs.max(0.0);
     }
 
+    /// End a bounce at cycle `cycles` instead of at its length in seconds.
+    /// The length passed to the render is then only the first guess: the
+    /// render runs on until the cycle, at whatever tempo a `cps` lane sets
+    /// on the way. `None` goes back to a length in seconds.
+    pub fn set_render_cycles(&mut self, cycles: Option<f64>) {
+        self.render_cycles = cycles
+            .filter(|cycles| cycles.is_finite() && *cycles > 0.0)
+            .and_then(Fraction::from_f64);
+    }
+
     /// Apply a master limiter to WAV/MP3 file exports. `None` bypasses it;
     /// score-level `.limit()` effects are independent of this setting.
     pub fn set_export_limiter(&mut self, limiter: Option<rustel_audio::RenderLimiter>) {
@@ -892,6 +924,8 @@ impl Session {
             ));
         }
         let play = self.play(duration_secs)?;
+        // A bounce of cycles knows its length only once it has played.
+        let duration_secs = play.duration_secs;
         // `--until-silence` ends the file early, so the requested duration is
         // a ceiling rather than a fact. Report what is actually on disk. The
         // scheduler stopped at the length; the audio may run on into the

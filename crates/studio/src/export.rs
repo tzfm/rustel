@@ -970,9 +970,12 @@ fn render(
         }
     }
     let duration = match settings.length {
-        // A tempo lane can change the tempo on the way, so the cycles last
-        // as long as the score makes them.
-        Length::Cycles(cycles) => session.seconds_for_cycles(cycles),
+        // A tempo lane can change the tempo on the way, so the bounce ends
+        // at its last cycle; this length is only the first guess.
+        Length::Cycles(cycles) => {
+            session.set_render_cycles(Some(cycles));
+            cycles / session.config().cps
+        }
         Length::UntilSilence {
             floor_db,
             hold_secs,

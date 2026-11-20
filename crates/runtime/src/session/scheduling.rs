@@ -607,38 +607,6 @@ impl Session {
         self.scheduler.time_at_cycle(cycle)
     }
 
-    /// Clock seconds of `cycles` from cycle zero, with the tempo changes the
-    /// score's pattern makes on the way: the length of a bounce of whole
-    /// cycles. A count no fraction holds runs at the session tempo.
-    pub fn seconds_for_cycles(&self, cycles: f64) -> f64 {
-        let at_session_tempo = cycles / self.config.cps;
-        let (Some(end), Some(pattern)) = (Fraction::from_f64(cycles), self.js.active_pattern())
-        else {
-            return at_session_tempo;
-        };
-        let js = &self.js;
-        let needs_host = js.active_needs_host();
-        let cancellation = self.transport.stopped_flag();
-        let budget = self.scheduler.query_hap_budget();
-        // Each cycle is queried as a tick queries it: in the score's runtime
-        // settings, and in a host scope of its own when callbacks need one.
-        self.scheduler.time_at_cycle_ahead(end, |state| {
-            let query = || match pattern.query_arc_outcome_with_budget(state, budget) {
-                Ok(rustel_core::QueryArcOutcome::Haps(haps)) => Some(haps),
-                _ => None,
-            };
-            js.with_runtime_settings(|| {
-                if needs_host {
-                    js.with_active_scope_cancellable(QUERY_JS_CPU_BUDGET, cancellation, query)
-                        .ok()
-                        .flatten()
-                } else {
-                    query()
-                }
-            })
-        })
-    }
-
     /// Cycle position at wall-clock `time` under the current anchor.
     pub fn cycle_at_time(&self, time: f64) -> f64 {
         self.scheduler.cycle_at_time(time)
