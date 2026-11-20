@@ -9719,3 +9719,24 @@ fn a_distortion_takes_its_volume_as_a_second_argument() {
         [0.3, 0.3]
     );
 }
+
+/// A scale name that will not read drops its notes, as on strudel.cc, and
+/// says so: the export reports why its lane is silent instead of writing
+/// silence with nothing said.
+#[test]
+fn an_unreadable_scale_is_reported_when_its_notes_drop() {
+    let path = scratch("unreadable-scale.wav");
+    let out = run(&[
+        "export",
+        "-e",
+        r#"$: n("0 2 4 7").scale("C3:kafi raga").s("sine").gain(.2)"#,
+        "--cycles",
+        "1",
+        "-o",
+        path.to_str().expect("utf-8 path"),
+    ]);
+    let _ = std::fs::remove_file(&path);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("query_threw"), "{stderr}");
+    assert!(stderr.contains("Scale name raga is incomplete"), "{stderr}");
+}
