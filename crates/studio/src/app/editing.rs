@@ -118,6 +118,7 @@ impl App {
         // caret rule would step back onto each character a client types at
         // the end of a line, and the next would go in before it.
         let remote = self.remote_key_event;
+        self.remote_caret_pending |= remote;
         let outcome = outcome.and_then(|effects| {
             if !remote {
                 self.scenes.current_mut().editor.normalize_after_input()?;
@@ -554,6 +555,15 @@ mod tests {
             }
             let source = app.editor().source();
             assert_eq!(source.lines().next(), Some("ab/qq $: s"), "{source}");
+            // The next local key acts on the last character typed, as Normal
+            // mode reads the caret.
+            app.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
+            .expect("a local x");
+            let source = app.editor().source();
+            assert_eq!(source.lines().next(), Some("ab/qq $: "), "{source}");
         }
 
         /// A rendered control is one block: the caret warps over it instead of

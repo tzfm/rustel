@@ -1096,6 +1096,9 @@ struct App {
     /// This key came from remote control. A machine sends normal keys, not
     /// Vim modes, so the score reads it with its usual editing.
     remote_key_event: bool,
+    /// A client typed last, so the caret may rest where Vim's Normal mode
+    /// would not leave it; the next local key puts it right first.
+    remote_caret_pending: bool,
     /// The value each control change last said and when it said it, keyed
     /// by number and channel, so a bound row reads the crossings of the
     /// line at 64 rather than every message: a knob swept across fires
@@ -1824,6 +1827,7 @@ impl App {
             keybinds: prefs.keybinds(),
             vim_config: crate::vim_config::VimConfig::default(),
             remote_key_event: false,
+            remote_caret_pending: false,
             midi_cc_last: HashMap::new(),
             note_pressed_at: HashMap::new(),
             mapping_lit: [None; MAPPING_SLOTS],
