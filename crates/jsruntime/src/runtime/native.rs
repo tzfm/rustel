@@ -733,8 +733,7 @@ impl<'p> Turn<'p> {
                 .map(Native::Pattern);
         }
         match names.global(callee)? {
-            BuiltinGlobal::Control => {
-                let spec = crate::pattern::control_registry().get(callee)?;
+            BuiltinGlobal::Control(spec) => {
                 let [argument] = arguments else {
                     return None;
                 };

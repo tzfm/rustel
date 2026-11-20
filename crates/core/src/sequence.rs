@@ -1161,11 +1161,19 @@ impl PackedLoc {
     }
 
     /// The range from `base`, when it fits.
+    #[inline]
     fn range(base: u32, (begin, end): (usize, usize)) -> Option<Self> {
         let offset = u32::try_from(begin).ok()?.checked_sub(base)?;
         let length = u32::try_from(end.checked_sub(begin)?).ok()?;
         (offset < Self::OFFSET_LIMIT && length < Self::LENGTH_MASK)
             .then(|| Self(offset << Self::LENGTH_BITS | (length + 1)))
+    }
+
+    #[inline]
+    fn range_raw(base: u32, begin: u32, length: u32) -> Option<Self> {
+        let offset = begin.checked_sub(base)?;
+        (offset < Self::OFFSET_LIMIT && length < Self::LENGTH_MASK)
+            .then(|| Self((offset << Self::LENGTH_BITS) | (length + 1)))
     }
 }
 
@@ -1494,6 +1502,11 @@ impl Grid {
         match locations.len() {
             0 => PackedLoc(0),
             1 => {
+                if let Some((begin, length)) = locations.single_packed_raw()
+                    && let Some(packed) = PackedLoc::range_raw(base, begin, length)
+                {
+                    return packed;
+                }
                 if let Some(range) = locations.get(0)
                     && let Some(packed) = PackedLoc::range(base, range)
                 {
@@ -1521,10 +1534,13 @@ impl Grid {
                         *last |= PackedLoc::SPARE;
                     }
                     let needle = run.as_slice();
+                    let first_word = needle[0];
                     let existing = packed_runs.as_slice();
                     let mut pos = 0;
                     while pos + needle.len() <= existing.len() {
-                        if &existing[pos..pos + needle.len()] == needle {
+                        if existing[pos] == first_word
+                            && existing[pos + 1..pos + needle.len()] == needle[1..]
+                        {
                             return PackedLoc(PackedLoc::SPARE | pos as u32);
                         }
                         while pos < existing.len() && (existing[pos] & PackedLoc::SPARE) == 0 {
@@ -1547,7 +1563,14 @@ impl Grid {
         }
     }
 
+    #[inline]
     fn note_loc_base(base: &mut Option<u32>, locations: &Locations) {
+        if let Some((begin, length)) = locations.single_packed_raw() {
+            if length < PackedLoc::LENGTH_MASK && begin < Self::SMALL {
+                *base = Some(base.map_or(begin, |least| least.min(begin)));
+            }
+            return;
+        }
         for i in 0..locations.len() {
             if let Some(range) = locations.get(i)
                 && PackedLoc::fits(range)
@@ -5021,16 +5044,13 @@ pub fn sequence_of(layers: Vec<GivenLayer>) -> Option<Pattern> {
 /// `(part_begin, part_end, value_idx, loc_begin, loc_len)` without constructing
 /// intermediate `Fraction`s or `SourceStep`s. Returns `None` if any location
 /// does not fit inline packing (caller falls back to the general path).
-pub fn sequence_of_ticks(
+fn layer_of_ticks(
     period: Fraction,
     ticks: NonZeroU32,
     values: Arc<[Value]>,
     in_cycles: bool,
     raw_steps: &[(u16, u16, u16, u32, u16)],
-) -> Option<Pattern> {
-    if raw_steps.is_empty() {
-        return Some(silence());
-    }
+) -> Option<Layer> {
     let mut base = u32::MAX;
     for &(_, _, _, loc_begin, loc_len) in raw_steps {
         if loc_len > 0 {
@@ -5046,8 +5066,7 @@ pub fn sequence_of_ticks(
         let loc = if loc_len == 0 {
             PackedLoc(0)
         } else {
-            let begin = loc_begin as usize;
-            PackedLoc::range(base, (begin, begin + usize::from(loc_len)))?
+            PackedLoc::range_raw(base, loc_begin, u32::from(loc_len))?
         };
         Some(GridStep {
             part_begin: u32::from(part_begin),
@@ -5056,15 +5075,39 @@ pub fn sequence_of_ticks(
             loc,
         })
     })?;
+    let (steps, rare) = match steps {
+        GridSteps::Wide(wide_steps) => (
+            GridSteps::Small(Box::from([])),
+            Some(Box::new(SpareRare::WideSteps(wide_steps))),
+        ),
+        other => (other, None),
+    };
     let listing = Listing::from_parts(
         ticks,
         base | Grid::SMALL,
         steps,
         PackedRunsInput::None,
-        None,
+        rare,
     );
-    let layer = Layer::holding(period, Steps::Listed(listing), in_cycles, values);
-    node_of_one(layer)
+    Some(Layer::holding(
+        period,
+        Steps::Listed(listing),
+        in_cycles,
+        values,
+    ))
+}
+
+pub fn sequence_of_ticks(
+    period: Fraction,
+    ticks: NonZeroU32,
+    values: Arc<[Value]>,
+    in_cycles: bool,
+    raw_steps: &[(u16, u16, u16, u32, u16)],
+) -> Option<Pattern> {
+    if raw_steps.is_empty() {
+        return Some(silence());
+    }
+    node_of_one(layer_of_ticks(period, ticks, values, in_cycles, raw_steps)?)
 }
 
 pub fn sequence_of_indexed_slice(
@@ -5104,6 +5147,24 @@ impl SequenceBuilder {
     ) {
         self.layers
             .push(Layer::of_indexed_slice(period, values, in_cycles, steps));
+    }
+
+    pub fn push_ticks(
+        &mut self,
+        period: Fraction,
+        ticks: NonZeroU32,
+        values: Arc<[Value]>,
+        in_cycles: bool,
+        raw_steps: &[(u16, u16, u16, u32, u16)],
+    ) -> bool {
+        if raw_steps.is_empty() {
+            return true;
+        }
+        let Some(layer) = layer_of_ticks(period, ticks, values, in_cycles, raw_steps) else {
+            return false;
+        };
+        self.layers.push(layer);
+        true
     }
 
     pub fn push_sourced(&mut self, layer: SourcedLayer) {

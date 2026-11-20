@@ -181,9 +181,9 @@ impl BuiltinMethod {
 /// A global that a score can use without JavaScript.
 #[derive(Clone)]
 pub(crate) enum BuiltinGlobal {
-    /// A free control such as `s`, applied to one value. The control
-    /// registry holds its spec under the same name.
-    Control,
+    /// A free control such as `s`, applied to one value. Carries its static
+    /// spec directly so native calls skip a second control-registry lookup.
+    Control(&'static ControlSpec),
     /// A list constructor such as `stack` or `cat`.
     List(ListKind),
     /// A tempo setter, in cycles per second or per minute.
@@ -339,69 +339,60 @@ type Found<T> = std::collections::HashMap<
     std::hash::BuildHasherDefault<rustel_core::WordHasher>,
 >;
 
-/// The names of the inventory that a thread found, by their spelling in
-/// the asset.
-#[derive(Default)]
-struct FoundNames {
-    methods: Found<Option<BuiltinMethod>>,
+/// Static lookup tables pre-populated once from [`NATIVE_INVENTORY`],
+/// avoiding per-thread `RefCell` TLS overhead and binary search on misses.
+struct StaticNames {
+    methods: Found<BuiltinMethod>,
     globals: Found<BuiltinGlobal>,
 }
 
-thread_local! {
-    static FOUND_NAMES: RefCell<FoundNames> = RefCell::default();
+fn static_names() -> &'static StaticNames {
+    static NAMES: std::sync::OnceLock<StaticNames> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut methods =
+            Found::with_capacity_and_hasher(1_400, std::hash::BuildHasherDefault::default());
+        let mut globals =
+            Found::with_capacity_and_hasher(600, std::hash::BuildHasherDefault::default());
+        for line in NATIVE_INVENTORY.lines() {
+            let Some(((section, name), listing)) = inventory_entry(line.trim_end_matches('\r'))
+            else {
+                continue;
+            };
+            match section {
+                "method" => {
+                    if let Some(method) = BuiltinMethod::listed(listing) {
+                        methods.insert(name, method);
+                    }
+                }
+                "global" => {
+                    if let Some(global) = BuiltinGlobal::listed(name, listing) {
+                        globals.insert(name, global);
+                    }
+                }
+                _ => {}
+            }
+        }
+        StaticNames { methods, globals }
+    })
 }
 
 impl ListedNames {
+    #[inline]
     pub(crate) fn method(&self, name: &str) -> Option<BuiltinMethod> {
-        if let Some(found) = FOUND_NAMES.with_borrow(|found| found.methods.get(name).copied()) {
-            return found;
-        }
-        let Some((key, listing)) = listing("method", name) else {
-            // Cache common non-method names such as lane `p` without allocating.
-            if name == "p" {
-                FOUND_NAMES.with_borrow_mut(|found| found.methods.insert("p", None));
-            }
-            return None;
-        };
-        let method = BuiltinMethod::listed(listing);
-        FOUND_NAMES.with_borrow_mut(|found| found.methods.insert(key, method));
-        method
+        static_names().methods.get(name).copied()
     }
 
+    #[inline]
     pub(crate) fn global(&self, name: &str) -> Option<BuiltinGlobal> {
-        if let Some(found) = FOUND_NAMES.with_borrow(|found| found.globals.get(name).cloned()) {
-            return Some(found);
-        }
-        let (name, listing) = listing("global", name)?;
-        let global = BuiltinGlobal::listed(name, listing)?;
-        // A signal is one shared pattern, so its handle is what both hold.
-        FOUND_NAMES.with_borrow_mut(|found| found.globals.insert(name, global.clone()));
-        Some(global)
+        static_names().globals.get(name).cloned()
     }
 
+    #[inline]
     pub(crate) fn is_signal(&self, name: &str) -> bool {
-        static STATIC_SIGNALS: std::sync::OnceLock<
-            std::collections::HashSet<
-                &'static str,
-                std::hash::BuildHasherDefault<rustel_core::WordHasher>,
-            >,
-        > = std::sync::OnceLock::new();
-        STATIC_SIGNALS
-            .get_or_init(|| {
-                let mut set = std::collections::HashSet::with_capacity_and_hasher(
-                    32,
-                    std::hash::BuildHasherDefault::default(),
-                );
-                for line in NATIVE_INVENTORY.lines() {
-                    if let Some((("global", sym), "signal")) =
-                        inventory_entry(line.trim_end_matches('\r'))
-                    {
-                        set.insert(sym);
-                    }
-                }
-                set
-            })
-            .contains(name)
+        matches!(
+            static_names().globals.get(name),
+            Some(BuiltinGlobal::Signal(_))
+        )
     }
 }
 
@@ -412,15 +403,10 @@ fn inventory_entry(line: &str) -> Option<((&str, &str), &str)> {
     Some(((words.next()?, words.next()?), words.next()?))
 }
 
-/// The name as the inventory spells it and what the inventory lists for
-/// it, for `name` in `section`.
-fn listing(section: &str, name: &str) -> Option<(&'static str, &'static str)> {
-    listing_in(NATIVE_INVENTORY, section, name)
-}
-
 /// The name as `text` spells it and what `text` lists for it, for `name`
 /// in `section`, found by a search of the lines of `text`, which are in
 /// the order of section and name.
+#[cfg(test)]
 fn listing_in<'t>(text: &'t str, section: &str, name: &str) -> Option<(&'t str, &'t str)> {
     let (mut low, mut high) = (0, text.len());
     while low < high {
@@ -480,23 +466,21 @@ impl BuiltinMethod {
             },
             ("composer", Some(op), None) => Self::Composer(ComposeOp::from_name(op)?),
             ("pick", Some(index), Some(join)) => Self::Pick {
-                index: [
-                    PickIndexMode::Clamp,
-                    PickIndexMode::Remainder,
-                    PickIndexMode::Modulo,
-                ]
-                .into_iter()
-                .find(|mode| format!("{mode:?}") == index)?,
-                join: [
-                    JoinMode::Inner,
-                    JoinMode::Outer,
-                    JoinMode::Mix,
-                    JoinMode::Squeeze,
-                    JoinMode::Reset,
-                    JoinMode::Restart,
-                ]
-                .into_iter()
-                .find(|mode| format!("{mode:?}") == join)?,
+                index: match index {
+                    "Clamp" => PickIndexMode::Clamp,
+                    "Remainder" => PickIndexMode::Remainder,
+                    "Modulo" => PickIndexMode::Modulo,
+                    _ => return None,
+                },
+                join: match join {
+                    "Inner" => JoinMode::Inner,
+                    "Outer" => JoinMode::Outer,
+                    "Mix" => JoinMode::Mix,
+                    "Squeeze" => JoinMode::Squeeze,
+                    "Reset" => JoinMode::Reset,
+                    "Restart" => JoinMode::Restart,
+                    _ => return None,
+                },
             },
             ("visual", None, None) => Self::Visual,
             ("layer", Some("over"), None) => Self::Layer {
@@ -515,7 +499,7 @@ impl BuiltinGlobal {
     #[cfg(test)]
     fn listing(&self) -> String {
         match self {
-            Self::Control => "control".into(),
+            Self::Control(_) => "control".into(),
             Self::List(kind) => format!("list {kind:?}"),
             Self::Tempo { per_minute: true } => "tempo minute".into(),
             Self::Tempo { per_minute: false } => "tempo second".into(),
@@ -527,10 +511,7 @@ impl BuiltinGlobal {
     /// tables of this build.
     fn listed(name: &str, listing: &str) -> Option<Self> {
         Some(match listing {
-            "control" => {
-                control_registry().get(name)?;
-                Self::Control
-            }
+            "control" => Self::Control(control_registry().get(name)?),
             "list Stack" => Self::List(ListKind::Stack),
             "list SlowCat" => Self::List(ListKind::SlowCat),
             "list FastCat" => Self::List(ListKind::FastCat),

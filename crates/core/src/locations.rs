@@ -134,6 +134,18 @@ impl Locations {
         matches!(self.0, Repr::Packed { .. } | Repr::Inline { .. })
     }
 
+    /// Fast `(begin, length)` extraction when stored as a single compact packed range.
+    #[inline]
+    pub(crate) fn single_packed_raw(&self) -> Option<(u32, u32)> {
+        match &self.0 {
+            Repr::Packed { len: 1, spans } => {
+                let p = spans[0];
+                Some((p >> PACKED_LEN_BITS, p & PACKED_LEN_MASK))
+            }
+            _ => None,
+        }
+    }
+
     /// The range at `index`, oldest first.
     #[inline]
     pub fn get(&self, index: usize) -> Option<(usize, usize)> {

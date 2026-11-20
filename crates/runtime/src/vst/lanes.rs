@@ -27,19 +27,57 @@ impl LaneBody {
     }
 
     /// Replace an owned body copy with a slice of `source` when it appears
-    /// verbatim inside `source`.
-    fn share_with(&mut self, source: &std::sync::Arc<str>) {
-        if let Self::Owned(owned) = self {
-            let trimmed = source.trim();
-            if owned.as_str() == trimmed {
-                let start = trimmed.as_ptr() as usize - source.as_ptr() as usize;
-                let end = start + trimmed.len();
-                if let (Ok(s), Ok(e)) = (u32::try_from(start), u32::try_from(end)) {
-                    *self = Self::Slice(std::sync::Arc::clone(source), s, e);
-                }
-            } else if let Some(start) = source.find(owned.as_str()) {
-                let end = start + owned.len();
-                if let (Ok(s), Ok(e)) = (u32::try_from(start), u32::try_from(end)) {
+    /// verbatim inside `source` at its starting line, avoiding a full-string
+    /// two-way substring scan on multi-line scores whose lane body was reformatted.
+    fn share_with(&mut self, source: &std::sync::Arc<str>, line: u32) {
+        let Self::Owned(owned) = self else {
+            return;
+        };
+        if owned.is_empty() || owned.len() > source.len() {
+            return;
+        }
+        let trimmed = source.trim();
+        if owned.as_str() == trimmed {
+            let start = trimmed.as_ptr() as usize - source.as_ptr() as usize;
+            let end = start + trimmed.len();
+            if let (Ok(s), Ok(e)) = (u32::try_from(start), u32::try_from(end)) {
+                *self = Self::Slice(std::sync::Arc::clone(source), s, e);
+            }
+            return;
+        }
+        let bytes = source.as_bytes();
+        let mut pos = 0usize;
+        let target_line = line.max(1);
+        let mut cur_line = 1u32;
+        while cur_line < target_line && pos < bytes.len() {
+            if bytes[pos] == b'\n' {
+                cur_line += 1;
+            }
+            pos += 1;
+        }
+        while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\r') {
+            pos += 1;
+        }
+        if source[pos..].starts_with(owned.as_str()) {
+            let end = pos + owned.len();
+            if let (Ok(s), Ok(e)) = (u32::try_from(pos), u32::try_from(end)) {
+                *self = Self::Slice(std::sync::Arc::clone(source), s, e);
+            }
+            return;
+        }
+        // Labeled lane (`label: body`): check immediately after the colon.
+        if let Some(colon) = bytes[pos..]
+            .iter()
+            .position(|&b| b == b':' || b == b'\n')
+            .filter(|&off| bytes[pos + off] == b':')
+        {
+            let mut after = pos + colon + 1;
+            while after < bytes.len() && matches!(bytes[after], b' ' | b'\t' | b'\r') {
+                after += 1;
+            }
+            if source[after..].starts_with(owned.as_str()) {
+                let end = after + owned.len();
+                if let (Ok(s), Ok(e)) = (u32::try_from(after), u32::try_from(end)) {
                     *self = Self::Slice(std::sync::Arc::clone(source), s, e);
                 }
             }
@@ -422,7 +460,7 @@ impl LaneTable {
             .take_if(|(_, text, _)| text == source.as_ref());
         if let Some((document, _, mut read)) = read {
             for lane in read.lanes.as_mut_slice() {
-                lane.body.share_with(source);
+                lane.body.share_with(source, lane.line);
             }
             self.put_in_play(document, read);
         }

@@ -2280,114 +2280,19 @@ impl<'r> Planned<'r> {
     /// each query. `None` when a walk does not write each cycle of a
     /// layer whole and in the order of time: the constructs then build
     /// the pattern level by level.
-    pub(crate) fn pattern(self) -> Option<Pattern> {
+    pub(crate) fn pattern(mut self) -> Option<Pattern> {
         let steps = self.steps();
         if let Kind::Atom { value, begin, len } = self.room.plans.kind(self.root) {
             let value = self.room.values.swap_remove(value as usize);
             let at = place(written(begin, len));
             return Some(rustel_core::pure_at(value, at).with_steps(steps));
         }
-        // Fast path for flat equal sequences (`"bd hh sd hh"`) and single-lane
-        // equal alternations (`"<c3 e3 g3>"`) of plain atoms and rests: build
-        // the `SmallGridStep` grid directly from integer ticks with zero
-        // `Fraction` math, `survey`, `walk`, or `SourceStep` allocations.
-        let flat = match self.room.plans.kind(self.root) {
-            Kind::EqualSequence(parts) => Some((parts, true)),
-            Kind::Alternation(lanes) if lanes.range().len() == 1 => {
-                let lane = self.room.plans.lanes[lanes.range()][0];
-                lane.equal.then_some((lane.parts, false))
-            }
-            _ => None,
-        };
-        if let Some((parts, is_seq)) = flat {
-            let range = parts.range();
-            let total = range.len();
-            if (2..=64).contains(&total) {
-                let Room {
-                    plans,
-                    values,
-                    local_buf,
-                    held_buf,
-                    ..
-                } = self.room;
-                let ids = &plans.ids[range];
-                let mut raw_steps = [(0u16, 0u16, 0u16, 0u32, 0u16); 64];
-                let mut step_len = 0usize;
-                let mut all_flat = true;
-                let mut min_begin = u32::MAX;
-                let mut max_begin = 0u32;
-                let mut max_len = 0u16;
-                for (i, &id) in ids.iter().enumerate() {
-                    match plans.kind(id) {
-                        Kind::Rest => {}
-                        Kind::Atom { value, begin, len } => {
-                            if len > 0 {
-                                min_begin = min_begin.min(begin);
-                                max_begin = max_begin.max(begin);
-                                max_len = max_len.max(len);
-                            }
-                            raw_steps[step_len] =
-                                (i as u16, (i + 1) as u16, value as u16, begin, len);
-                            step_len += 1;
-                        }
-                        _ => {
-                            all_flat = false;
-                            break;
-                        }
-                    }
-                }
-                if all_flat {
-                    if step_len == 0 {
-                        return Some(silence().with_steps(steps));
-                    }
-                    let base = if min_begin == u32::MAX { 0 } else { min_begin };
-                    let locs_fit = base < (1 << 31)
-                        && (min_begin == u32::MAX || max_begin - base < (1 << 22))
-                        && max_len < 255;
-                    if locs_fit {
-                        if local_buf.len() < values.len() {
-                            local_buf.resize(values.len(), 0);
-                        }
-                        held_buf.clear();
-                        for step in &mut raw_steps[..step_len] {
-                            let global_idx = usize::from(step.2);
-                            let slot = &mut local_buf[global_idx];
-                            if *slot == 0 {
-                                held_buf.push(global_idx as u32);
-                                *slot = held_buf.len() as u32;
-                            }
-                            step.2 = (*slot - 1) as u16;
-                        }
-                        let layer_values: Arc<[Value]> = held_buf
-                            .iter()
-                            .map(|&idx| {
-                                local_buf[idx as usize] = 0;
-                                std::mem::replace(&mut values[idx as usize], Value::Undefined)
-                            })
-                            .collect();
-                        let (period, ticks) = if is_seq {
-                            (
-                                Fraction::ONE,
-                                std::num::NonZeroU32::new(total as u32).expect("total >= 2"),
-                            )
-                        } else {
-                            (
-                                Fraction::int(total as i128),
-                                std::num::NonZeroU32::new(1).expect("non-zero"),
-                            )
-                        };
-                        if let Some(pattern) = sequence_of_ticks(
-                            period,
-                            ticks,
-                            layer_values,
-                            true,
-                            &raw_steps[..step_len],
-                        ) {
-                            return Some(pattern.with_steps(steps));
-                        }
-                    }
-                }
-            }
+        // Fast path for flat and shallow trees of atoms, rests, sequences,
+        // repeats, alternations, and stacks: build `SmallGridStep` grids
+        // directly from integer ticks with zero `Fraction` math, `survey`,
+        // `walk`, or `SourceStep` allocations.
+        if let Some(pattern) = self.try_tick_pattern(steps) {
+            return Some(pattern);
         }
         let Room {
             plans,
@@ -2502,6 +2407,502 @@ impl<'r> Planned<'r> {
         }
         Some(builder.finish()?.with_steps(steps))
     }
+
+    fn try_tick_pattern(&mut self, steps: Option<Fraction>) -> Option<Pattern> {
+        let Room {
+            plans,
+            values,
+            local_buf,
+            held_buf,
+            ..
+        } = &mut *self.room;
+        let mut specs = [TickLayerSpec {
+            source: TickLayerSource::Node(self.root),
+            total_cycles: 1,
+            ticks: 1,
+        }; 32];
+        let mut spec_len = 0usize;
+        if !collect_tick_layers(plans, self.root, &mut specs, &mut spec_len, 0) {
+            return None;
+        }
+        if spec_len == 0 {
+            return Some(silence().with_steps(steps));
+        }
+        if local_buf.len() < values.len() {
+            local_buf.resize(values.len(), 0);
+        }
+        let mut raw_steps = [(0u16, 0u16, 0u16, 0u32, 0u16); 64];
+        if spec_len == 1 {
+            let spec = specs[0];
+            let (layer_values, step_len, in_cycles) = emit_tick_layer(
+                plans,
+                spec,
+                values,
+                local_buf,
+                held_buf,
+                &mut raw_steps,
+                true,
+            );
+            let period = if spec.total_cycles == 1 {
+                Fraction::ONE
+            } else {
+                Fraction::int(i128::from(spec.total_cycles))
+            };
+            let ticks = std::num::NonZeroU32::new(spec.ticks)?;
+            return sequence_of_ticks(
+                period,
+                ticks,
+                layer_values,
+                in_cycles,
+                &raw_steps[..step_len],
+            )
+            .map(|pattern| pattern.with_steps(steps));
+        }
+        let mut builder = SequenceBuilder::with_capacity(spec_len);
+        for &spec in &specs[..spec_len] {
+            let (layer_values, step_len, in_cycles) = emit_tick_layer(
+                plans,
+                spec,
+                values,
+                local_buf,
+                held_buf,
+                &mut raw_steps,
+                false,
+            );
+            let period = if spec.total_cycles == 1 {
+                Fraction::ONE
+            } else {
+                Fraction::int(i128::from(spec.total_cycles))
+            };
+            let ticks = std::num::NonZeroU32::new(spec.ticks)?;
+            if !builder.push_ticks(
+                period,
+                ticks,
+                layer_values,
+                in_cycles,
+                &raw_steps[..step_len],
+            ) {
+                return None;
+            }
+        }
+        Some(builder.finish()?.with_steps(steps))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TickLayerSource {
+    Node(Id),
+    EqualLane(Steps),
+    WeightedStep { id: Id, from: u32, to: u32, of: u32 },
+}
+
+#[derive(Clone, Copy)]
+struct TickLayerSpec {
+    source: TickLayerSource,
+    total_cycles: u32,
+    ticks: u32,
+}
+
+#[derive(Clone, Copy)]
+struct TickCheck {
+    ticks: u32,
+    steps: usize,
+    min_begin: u32,
+    max_begin: u32,
+    max_len: u16,
+}
+
+impl TickCheck {
+    fn new() -> Self {
+        Self {
+            ticks: 1,
+            steps: 0,
+            min_begin: u32::MAX,
+            max_begin: 0,
+            max_len: 0,
+        }
+    }
+
+    fn locs_fit(&self) -> bool {
+        let base = if self.min_begin == u32::MAX {
+            0
+        } else {
+            self.min_begin
+        };
+        base < (1 << 31)
+            && (self.min_begin == u32::MAX || self.max_begin - base < (1 << 22))
+            && self.max_len < 255
+    }
+}
+
+fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+fn lcm_u32(a: u32, b: u32) -> Option<u32> {
+    (a / gcd_u32(a, b)).checked_mul(b)
+}
+
+fn check_tick_tree(
+    plans: &Plans,
+    id: Id,
+    w_num: u32,
+    w_den: u32,
+    total_cycles: u32,
+    depth: u8,
+    acc: &mut TickCheck,
+) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    match plans.kind(id) {
+        Kind::Rest => {
+            let Some(next_ticks) = lcm_u32(acc.ticks, w_den) else {
+                return false;
+            };
+            if u64::from(total_cycles) * u64::from(next_ticks) > u64::from(u16::MAX) {
+                return false;
+            }
+            acc.ticks = next_ticks;
+            true
+        }
+        Kind::Atom { value, begin, len } => {
+            if u16::try_from(value).is_err() {
+                return false;
+            }
+            acc.steps += 1;
+            if acc.steps > 64 {
+                return false;
+            }
+            let Some(next_ticks) = lcm_u32(acc.ticks, w_den) else {
+                return false;
+            };
+            if u64::from(total_cycles) * u64::from(next_ticks) > u64::from(u16::MAX) {
+                return false;
+            }
+            acc.ticks = next_ticks;
+            if len > 0 {
+                acc.min_begin = acc.min_begin.min(begin);
+                acc.max_begin = acc.max_begin.max(begin);
+                acc.max_len = acc.max_len.max(len);
+            }
+            true
+        }
+        Kind::Repeated(inner, times) => {
+            if times == 0 || times > 64 {
+                return false;
+            }
+            let g = gcd_u32(w_num, times);
+            let c_num = w_num / g;
+            let Some(c_den) = w_den.checked_mul(times / g) else {
+                return false;
+            };
+            let mut sub = TickCheck {
+                ticks: acc.ticks,
+                steps: 0,
+                min_begin: acc.min_begin,
+                max_begin: acc.max_begin,
+                max_len: acc.max_len,
+            };
+            if !check_tick_tree(
+                plans,
+                inner,
+                c_num,
+                c_den,
+                total_cycles,
+                depth + 1,
+                &mut sub,
+            ) {
+                return false;
+            }
+            let Some(added) = sub.steps.checked_mul(times as usize) else {
+                return false;
+            };
+            if acc.steps + added > 64 {
+                return false;
+            }
+            acc.steps += added;
+            acc.ticks = sub.ticks;
+            acc.min_begin = sub.min_begin;
+            acc.max_begin = sub.max_begin;
+            acc.max_len = sub.max_len;
+            true
+        }
+        Kind::EqualSequence(parts) => {
+            let steps = Steps { parts, equal: true };
+            let sub_total = plans.total(steps);
+            if sub_total == 0 {
+                return false;
+            }
+            let g2 = gcd_u32(w_num, sub_total);
+            let c_num = w_num / g2;
+            let Some(c_den) = w_den.checked_mul(sub_total / g2) else {
+                return false;
+            };
+            for &child in &plans.ids[parts.range()] {
+                if !check_tick_tree(plans, child, c_num, c_den, total_cycles, depth + 1, acc) {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn collect_tick_layers(
+    plans: &Plans,
+    id: Id,
+    out: &mut [TickLayerSpec; 32],
+    len: &mut usize,
+    depth: u8,
+) -> bool {
+    if depth > 2 {
+        return false;
+    }
+    match plans.kind(id) {
+        Kind::Rest => true,
+        Kind::Atom { .. } | Kind::Repeated(..) | Kind::EqualSequence(_) => {
+            if *len >= out.len() {
+                return false;
+            }
+            let mut acc = TickCheck::new();
+            if !check_tick_tree(plans, id, 1, 1, 1, 0, &mut acc) || !acc.locs_fit() {
+                return false;
+            }
+            if acc.steps > 0 {
+                out[*len] = TickLayerSpec {
+                    source: TickLayerSource::Node(id),
+                    total_cycles: 1,
+                    ticks: acc.ticks,
+                };
+                *len += 1;
+            }
+            true
+        }
+        Kind::WeightedSequence(parts) => {
+            let steps = Steps {
+                parts,
+                equal: false,
+            };
+            let sub_total = plans.total(steps);
+            if sub_total == 0 {
+                return false;
+            }
+            for (child, (from, to)) in plans.each(steps) {
+                if matches!(plans.kind(child), Kind::Rest) {
+                    continue;
+                }
+                if *len >= out.len() {
+                    return false;
+                }
+                let w = to - from;
+                let g_start = gcd_u32(from, sub_total);
+                let g_w = gcd_u32(w, sub_total);
+                let mut acc = TickCheck::new();
+                acc.ticks = sub_total / g_start;
+                if acc.ticks > u32::from(u16::MAX) {
+                    return false;
+                }
+                if !check_tick_tree(plans, child, w / g_w, sub_total / g_w, 1, 0, &mut acc)
+                    || !acc.locs_fit()
+                {
+                    return false;
+                }
+                if acc.steps > 0 {
+                    out[*len] = TickLayerSpec {
+                        source: TickLayerSource::WeightedStep {
+                            id: child,
+                            from,
+                            to,
+                            of: sub_total,
+                        },
+                        total_cycles: 1,
+                        ticks: acc.ticks,
+                    };
+                    *len += 1;
+                }
+            }
+            true
+        }
+        Kind::Alternation(lanes) => {
+            for &lane in &plans.lanes[lanes.range()] {
+                let total = plans.total(lane);
+                if total == 0 || total > u32::from(u16::MAX) {
+                    return false;
+                }
+                if lane.equal {
+                    if *len >= out.len() {
+                        return false;
+                    }
+                    let mut acc = TickCheck::new();
+                    for &child in &plans.ids[lane.parts.range()] {
+                        if !check_tick_tree(plans, child, 1, 1, total, 0, &mut acc) {
+                            return false;
+                        }
+                    }
+                    if !acc.locs_fit() {
+                        return false;
+                    }
+                    if acc.steps > 0 {
+                        out[*len] = TickLayerSpec {
+                            source: TickLayerSource::EqualLane(lane),
+                            total_cycles: total,
+                            ticks: acc.ticks,
+                        };
+                        *len += 1;
+                    }
+                } else {
+                    for (child, (from, to)) in plans.each(lane) {
+                        if matches!(plans.kind(child), Kind::Rest) {
+                            continue;
+                        }
+                        if *len >= out.len() {
+                            return false;
+                        }
+                        let mut acc = TickCheck::new();
+                        if !check_tick_tree(plans, child, to - from, 1, total, 0, &mut acc)
+                            || !acc.locs_fit()
+                        {
+                            return false;
+                        }
+                        if acc.steps > 0 {
+                            out[*len] = TickLayerSpec {
+                                source: TickLayerSource::WeightedStep {
+                                    id: child,
+                                    from,
+                                    to,
+                                    of: 1,
+                                },
+                                total_cycles: total,
+                                ticks: acc.ticks,
+                            };
+                            *len += 1;
+                        }
+                    }
+                }
+            }
+            true
+        }
+        kind @ (Kind::Stack(patterns) | Kind::StackRun(patterns)) => {
+            for child in plans.stacked(patterns, kind.is_run()) {
+                if !collect_tick_layers(plans, child, out, len, depth + 1) {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+struct TickEmit<'a> {
+    ticks: u32,
+    out: &'a mut [(u16, u16, u16, u32, u16); 64],
+    step_len: usize,
+    in_cycles: bool,
+}
+
+fn emit_tick_tree(
+    plans: &Plans,
+    id: Id,
+    start_tick: u32,
+    width_ticks: u32,
+    emit: &mut TickEmit<'_>,
+) {
+    match plans.kind(id) {
+        Kind::Rest => {}
+        Kind::Atom { value, begin, len } => {
+            let end_tick = start_tick + width_ticks;
+            if start_tick / emit.ticks != (end_tick - 1) / emit.ticks {
+                emit.in_cycles = false;
+            }
+            emit.out[emit.step_len] =
+                (start_tick as u16, end_tick as u16, value as u16, begin, len);
+            emit.step_len += 1;
+        }
+        Kind::Repeated(inner, times) => {
+            let sub_width = width_ticks / times;
+            for j in 0..times {
+                emit_tick_tree(plans, inner, start_tick + j * sub_width, sub_width, emit);
+            }
+        }
+        Kind::EqualSequence(parts) => {
+            let ids = &plans.ids[parts.range()];
+            let sub_width = width_ticks / (ids.len() as u32);
+            for (i, &child) in ids.iter().enumerate() {
+                emit_tick_tree(
+                    plans,
+                    child,
+                    start_tick + (i as u32) * sub_width,
+                    sub_width,
+                    emit,
+                );
+            }
+        }
+        _ => unreachable!("validated by check_tick_tree"),
+    }
+}
+
+fn emit_tick_layer(
+    plans: &Plans,
+    spec: TickLayerSpec,
+    values: &mut [Value],
+    local_buf: &mut [u32],
+    held_buf: &mut Vec<u32>,
+    raw_steps: &mut [(u16, u16, u16, u32, u16); 64],
+    take_values: bool,
+) -> (Arc<[Value]>, usize, bool) {
+    let mut emit = TickEmit {
+        ticks: spec.ticks,
+        out: raw_steps,
+        step_len: 0,
+        in_cycles: true,
+    };
+    match spec.source {
+        TickLayerSource::Node(id) => {
+            emit_tick_tree(plans, id, 0, spec.ticks, &mut emit);
+        }
+        TickLayerSource::EqualLane(lane) => {
+            for (i, &child) in plans.ids[lane.parts.range()].iter().enumerate() {
+                emit_tick_tree(plans, child, (i as u32) * spec.ticks, spec.ticks, &mut emit);
+            }
+        }
+        TickLayerSource::WeightedStep { id, from, to, of } => {
+            let start = (u64::from(from) * u64::from(spec.ticks) / u64::from(of)) as u32;
+            let width = (u64::from(to - from) * u64::from(spec.ticks) / u64::from(of)) as u32;
+            emit_tick_tree(plans, id, start, width, &mut emit);
+        }
+    }
+    let step_len = emit.step_len;
+    let in_cycles = emit.in_cycles;
+    held_buf.clear();
+    for step in &mut raw_steps[..step_len] {
+        let global_idx = usize::from(step.2);
+        let slot = &mut local_buf[global_idx];
+        if *slot == 0 {
+            held_buf.push(global_idx as u32);
+            *slot = held_buf.len() as u32;
+        }
+        step.2 = (*slot - 1) as u16;
+    }
+    let layer_values: Arc<[Value]> = held_buf
+        .iter()
+        .map(|&idx| {
+            local_buf[idx as usize] = 0;
+            if take_values {
+                std::mem::replace(&mut values[idx as usize], Value::Undefined)
+            } else {
+                values[idx as usize].clone()
+            }
+        })
+        .collect();
+    (layer_values, step_len, in_cycles)
 }
 
 /// The count of the first `len` steps that `is_past` is true of, which are
