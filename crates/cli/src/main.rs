@@ -2776,11 +2776,13 @@ fn run_command(
                 );
             }
             let score_cps = session.config().cps;
-            let (duration, whole_cycles) = length.on_a_cycle(score_cps);
+            let (mut duration, whole_cycles) = length.on_a_cycle(score_cps);
             // A tempo lane can change the tempo on the way, so a bounce of
-            // cycles ends at its last cycle, not at its length in seconds.
+            // cycles ends at its last cycle. Its length here is only a first
+            // guess, which the render checks against the cap once it knows.
             if let RenderLength::Cycles(cycles) = length {
                 session.set_render_cycles(Some(cycles));
+                duration = duration.min(MAX_DURATION_SECS);
             }
             let duration = parse_positive_seconds("duration", duration)?;
             if until_silence {
