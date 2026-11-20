@@ -458,14 +458,6 @@ impl App {
     ) -> Result<(), RuntimeError> {
         let terminal_event = self.option_panel_spelling(terminal_event);
         let terminal_event = composed_text_event(terminal_event);
-        // The first local key after a client's typing finds the caret where
-        // Normal mode keeps it, so `x` or `i` acts on the last character.
-        if self.remote_caret_pending && !self.remote_key_event {
-            self.remote_caret_pending = false;
-            if let Err(error) = self.scenes.current_mut().editor.normalize_after_input() {
-                self.set_error(ErrorOwner::Editor, error.to_string());
-            }
-        }
         // An armed quit waits for the next press, click or paste. It is
         // answered after the routing, so a surface that takes the event
         // first cannot skip the answer.
