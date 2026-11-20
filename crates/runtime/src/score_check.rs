@@ -15,6 +15,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use rustel_fraction::Fraction;
+
 use crate::lint::{self, Diagnostic, Level};
 use crate::samples::SampleLibrary;
 use crate::session::{RuntimeError, Session};
@@ -93,6 +95,22 @@ pub fn check_score_with(
             let line = extract_reported_line(&message);
             EvalError { message, line }
         });
+    // A score can evaluate and still refuse when it is queried: a chunk
+    // count or a Euclid step past its limit, or a KabelSalat graph that will
+    // not build. Query its first cycle, as the first update would, so the
+    // check reports what query and export would.
+    if eval_error.is_none() && !cancellation.load(Ordering::Relaxed) {
+        let thrown = match session.query_report(Fraction::ZERO, Fraction::ONE) {
+            Ok(report) => report
+                .query_threw
+                .map(|message| format!("the pattern threw while querying: {message}")),
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(message) = thrown {
+            let line = extract_reported_line(&message);
+            eval_error = Some(EvalError { message, line });
+        }
+    }
     if eval_error.is_none()
         && library.is_some()
         && !cancellation.load(Ordering::Relaxed)
