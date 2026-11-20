@@ -510,6 +510,33 @@ pub(super) mod tests {
             );
         }
 
+        /// A loaded font with no zone at a note is ready, and says which
+        /// notes it has; the note itself finds nothing to play.
+        #[test]
+        fn a_loaded_font_is_ready_below_its_lowest_note() {
+            let (library, _receiver) = library();
+            library.shared.fonts.write().unwrap().insert(
+                Arc::from("font0"),
+                FontState::Ready(Arc::new(vec![FontZone {
+                    key_lo: 48.0,
+                    key_hi: 96.0,
+                    base_detune: 6000.0,
+                    id: SampleId(30),
+                    duration_secs: 1.0,
+                    loop_secs: None,
+                }])),
+            );
+            assert!(matches!(
+                library.resolve("gm_test", 0.0, 36.0),
+                SampleResolution::Failed
+            ));
+            assert_eq!(library.note_range("gm_test", 0.0), Some((48.0, 96.0)));
+            assert_eq!(library.readiness("gm_test", 0.0), SoundReadiness::Ready);
+            // A font that has not loaded has no range yet.
+            assert_eq!(library.note_range("gm_test", 1.0), None);
+            assert_eq!(library.note_range("takes", 0.0), None);
+        }
+
         fn ids(values: &[u32]) -> HashSet<SampleId> {
             values.iter().copied().map(SampleId).collect()
         }
