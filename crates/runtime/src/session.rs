@@ -903,6 +903,10 @@ pub struct Session {
     /// scheduler stops at the length, the reverbs and delays ring out into
     /// the tail, and a silence stop ends it when they have.
     render_tail_secs: f64,
+    /// A bounce that ends at this cycle rather than at a fixed time: a
+    /// tempo lane can make its cycles longer or shorter than the session
+    /// tempo says.
+    render_cycles: Option<Fraction>,
     /// Rate limit for the "fell behind, resumed at the present" report: a
     /// machine that is persistently too slow would otherwise log every tick.
     /// Only the live producer can fall behind, so only that build reads it.
@@ -1240,6 +1244,7 @@ impl Session {
             refusals_reported: std::collections::BTreeSet::new(),
             plugin_lines_reported: std::collections::BTreeSet::new(),
             render_tail_secs: 0.0,
+            render_cycles: None,
             last_gap_log: None,
             #[cfg(feature = "device-audio")]
             audible_source: None,

@@ -5234,6 +5234,73 @@ fn trace_accepts_export_duration_spellings_without_rounding_seconds() {
     assert_eq!(report["duration_secs"], 2.0);
 }
 
+/// A bounce of whole cycles lasts as long as a tempo lane makes them, and
+/// says the cycle count it was asked for.
+#[test]
+fn export_cycles_follow_a_tempo_lane() {
+    for (score, expected_seconds) in [
+        (
+            "$: cps(\"<1 2>\").gain(0)\n$: note(\"c4*4\").s(\"sine\")",
+            3.0,
+        ),
+        // A score with a callback queries its tempo in a host scope.
+        (
+            "$: cps(\"<1 2>\").gain(0)\n$: note(\"c4*4\").s(\"sine\").every(2, x => x.fast(2))",
+            3.0,
+        ),
+        ("cps(1)\n$: note(\"c4*4\").s(\"sine\")", 4.0),
+        ("$: note(\"c4*4\").s(\"sine\")", 8.0),
+    ] {
+        let path = scratch("tempo-lane.json");
+        let report = ok_stdout(&[
+            "export",
+            "--json",
+            "-e",
+            score,
+            "--cycles",
+            "4",
+            "-o",
+            path.to_str().expect("utf-8 path"),
+        ]);
+        let report: serde_json::Value = serde_json::from_str(&report).expect("export report");
+        assert_eq!(report["duration_secs"], expected_seconds, "{score}");
+    }
+}
+
+/// A bounce of cycles is held to the duration cap by the length the tempo
+/// lane gives it, not by the session tempo's.
+#[test]
+fn export_cycles_are_capped_by_their_played_length() {
+    let path = scratch("tempo-cap.json");
+    let out = path.to_str().expect("utf-8 path");
+    // 10 cycles at 1/10000 cps would pass the cap; the lane plays them in 10 s.
+    let report = ok_stdout(&[
+        "export",
+        "--json",
+        "-e",
+        "cps(0.0001)\n$: cps(1).gain(0)\n$: note(\"c4\").s(\"sine\")",
+        "--cycles",
+        "10",
+        "-o",
+        out,
+    ]);
+    let report: serde_json::Value = serde_json::from_str(&report).expect("export report");
+    assert_eq!(report["duration_secs"], 10.0);
+    // The session tempo plays them in 20 s; the lane takes far past the cap.
+    assert_reported_failure(
+        &[
+            "export",
+            "-e",
+            "$: cps(0.0001).gain(0)\n$: note(\"c4\").s(\"sine\")",
+            "--cycles",
+            "10",
+            "-o",
+            out,
+        ],
+        "the cycles asked last more than",
+    );
+}
+
 #[test]
 fn trace_duration_limits_keep_the_resource_error_contract() {
     for length in ["1e12", "1e12s", "1e12m", "1e12b"] {
