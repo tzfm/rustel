@@ -106,7 +106,9 @@ pub fn check_score_with(
                 .map(|message| format!("the pattern threw while querying: {message}")),
             Err(error) => Some(error.to_string()),
         };
-        if let Some(message) = thrown {
+        // A stop that lands during the query is the check's cancellation,
+        // reported as such below, not a fault of the score.
+        if let Some(message) = thrown.filter(|_| !cancellation.load(Ordering::Relaxed)) {
             let line = extract_reported_line(&message);
             eval_error = Some(EvalError { message, line });
         }
