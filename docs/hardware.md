@@ -33,7 +33,7 @@ sudo usermod -aG audio "$USER"
 
 ## MIDI output
 
-`.midi()` adds a MIDI route and keeps the local audio route:
+`.midi()` sends a pattern to MIDI in place of local audio, as on strudel.cc:
 
 ```javascript
 $: note("c3 e3 g3 b3").midi('IAC Bus 1')
@@ -43,7 +43,12 @@ $: note("c a f e").midiport("<0 1>").midi()
 
 Either quote style works for device names. `.midi()` defaults to output 0.
 A blank selector is refused. Per-event `midiport` overrides the `.midi()`
-selector. Port errors do not stop local audio.
+selector. A pattern with only `ccn` and `ccv` sends control changes and no
+sound. To hear a pattern and send it to MIDI too, stack the two:
+
+```javascript
+$: stack(note("c3 e3"), note("c3 e3").midi())
+```
 
 Supported controls include `midichan`, `velocity`, `ccn`, `ccv`, `progNum`,
 `midibend`, `miditouch`, `midicmd`, and CC messages from `midimap`.

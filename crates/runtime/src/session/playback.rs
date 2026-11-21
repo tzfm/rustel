@@ -449,7 +449,11 @@ impl Session {
                     // The device, not the config, decides what rate this run
                     // decodes to.
                     library.set_render_rate(device.sample_rate());
-                    for onset in &report.onsets {
+                    for onset in report
+                        .onsets
+                        .iter()
+                        .filter(|onset| crate::render::plays_locally(onset))
+                    {
                         let _ = crate::render::scalar_event(
                             onset,
                             device.sample_rate(),
@@ -1276,6 +1280,7 @@ impl Session {
             rustel_voice::with_diagnostic_policy(self.direct_diagnostic_logging, || {
                 onsets
                     .iter()
+                    .filter(|onset| crate::render::plays_locally(onset))
                     .filter_map(|onset| {
                         match self.live_audio_event(onset, sample_rate, cps, lookup) {
                             Ok(event) => {

@@ -1,5 +1,11 @@
 use super::*;
 
+/// Why a hap that `.midi()` sends plays nothing: it has no MIDI message to
+/// send, and `.midi()` takes the place of local audio.
+#[cfg(feature = "device-audio")]
+const NO_MIDI_MESSAGE: &str =
+    ".midi() event has no MIDI message to send, such as a note, or ccn with ccv";
+
 impl Session {
     #[cfg(any(feature = "device-audio", test))]
     pub(crate) fn take_pending_producer_turn(&mut self) -> ProducerTurnRecord {
@@ -209,6 +215,12 @@ impl Session {
                 // does in the first window.
                 if self.sends_externally(&onset) {
                     rendered = true;
+                    continue;
+                }
+                // `.midi()` takes the place of local audio, so a hap with no
+                // MIDI message to send plays nothing.
+                if !crate::render::plays_locally(&onset) {
+                    refused = Some(NO_MIDI_MESSAGE.to_string());
                     continue;
                 }
                 match self.live_audio_event(&onset, sample_rate, cps, lookup) {
@@ -1280,6 +1292,23 @@ impl Session {
                 onsets
                     .iter()
                     .filter_map(|onset| {
+                        // `.midi()` takes the place of local audio. A hap
+                        // with no MIDI message to send plays nothing, and is
+                        // refused as a voice that cannot play is.
+                        if !crate::render::plays_locally(onset) {
+                            if self.sends_externally(onset) {
+                                dispositions.external += 1;
+                            } else {
+                                dispositions.refused += 1;
+                                last_refusal_loading = false;
+                                if refusals.last().is_none_or(|(_, seen): &(bool, String)| {
+                                    seen != NO_MIDI_MESSAGE
+                                }) {
+                                    refusals.push((false, NO_MIDI_MESSAGE.to_string()));
+                                }
+                            }
+                            return None;
+                        }
                         match self.live_audio_event(onset, sample_rate, cps, lookup) {
                             Ok(event) => {
                                 event_onsets.push(onset);
@@ -2829,6 +2858,28 @@ mod tests {
                     assert!(intents.iter().all(|intent| intent.generation == generation));
                 }
             }
+        }
+
+        /// A `ccn`/`ccv` pattern sent to MIDI queues its control changes and
+        /// no local voice: `.midi()` takes the place of local audio.
+        #[cfg(feature = "midi")]
+        #[test]
+        fn a_control_change_sent_to_midi_plays_no_local_voice() {
+            let controls = pure(Value::object(vec![
+                ("ccn".into(), Value::F64(74.0)),
+                ("ccv".into(), Value::F64(1.0)),
+                ("midiport".into(), Value::Str("test-port".into())),
+            ]))
+            .fast(4.into());
+            let (mut session, mut producer, output) = confirmed_score();
+            let events = publish_candidate(&mut session, &mut producer, &output, controls);
+            assert!(
+                events.is_empty(),
+                "a routed control change played a local voice"
+            );
+            let intents = session.take_pending_midi();
+            assert!(!intents.is_empty());
+            assert!(intents.iter().all(|intent| intent.controls.note.is_none()));
         }
 
         /// The warning is news once for a score and an input: a second window

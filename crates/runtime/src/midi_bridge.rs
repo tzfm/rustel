@@ -15,8 +15,9 @@ later version.
 //! side channel, so `midiport` can also be patterned per-hap to move a phrase
 //! between devices.
 //!
-//! Audio is unaffected: a hap can drive a synth AND a MIDI device, the same way
-//! `.midi()` in the browser layers on top of whatever the pattern already did.
+//! A hap with a `midiport` plays no local audio, as `.midi()` does on
+//! strudel.cc: see [`crate::render::plays_locally`]. To hear a pattern and
+//! send it to MIDI, stack it with its `.midi()` copy.
 
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},

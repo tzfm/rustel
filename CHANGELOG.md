@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Changed: `.midi()` sends a pattern to MIDI in place of local audio, as on strudel.cc. A `ccn`/`ccv` pattern sent to MIDI no longer plays a sound. To hear a pattern and send it to MIDI, use `stack(p, p.midi())`.
 - Fixed: a `vsti` note ends 1 ms early, as a MIDI note does, so a plugin such as TripleCheese no longer clicks where one note follows the next.
 - Vim mode: `J` and `gJ` join lines, as in Vim. The shipped `$` label jumps move from `J` and `K` to `]$` and `[$`.
 - `rustel check` and `rustel query` take `--prebake setup.js`, so a score calling a prebake's helpers checks clean.
