@@ -112,6 +112,7 @@ player.
 F1 opens keyboard help when the menu bar is hidden. Menus show available
 actions and shortcuts. Press Esc to return to the editor. To cancel the first
 Quit key, press another key. File ▸ Quit exits directly. Normal quit saves edits.
+A crash saves them too, before the crash report.
 
 ### Selecting text
 
@@ -159,6 +160,11 @@ no default shortcut. You can assign one in Settings > Keybinds. Ctrl+W closes
 the tab and saves its edits. It does not delete the file. If Studio cannot save the edits,
 the tab stays open. Closing a scene also forgets its pad assignment and rewind
 setting.
+
+Update saves the scene and plays it. Scene > Save saves the scene and keeps
+what plays. It renames the file to the score's `@title` first, as an update
+does. Save has no default shortcut. You can assign one in Settings >
+Keybinds. In Vim mode, `:w` saves, and `:wq` or `:x` saves and closes the tab.
 
 To launch a scene from a MIDI pad, select it, press Ctrl+L, and press the pad.
 Ctrl+Shift+L forgets the assignment. Connect the controller before you press
@@ -1022,7 +1028,8 @@ A selection made with the mouse or with Shift+arrows enters Visual. `d`,
 Delete deletes it, and `r` then a character replaces every selected
 character. Esc returns to Normal. `.` repeats the last change, with an optional
 count. `u` undoes an edit. Ctrl+R in Normal or Visual mode redoes it.
-`:redo` then Enter also redoes an edit. Ctrl+D and Ctrl+U move half a page
+`:redo` then Enter also redoes an edit. `:w` saves the scene without playing
+it, and `:wq` or `:x` saves it and closes the tab. Ctrl+D and Ctrl+U move half a page
 down and up. A count moves that many lines.
 
 `/` searches forward and `?` backward. Edit > Find opens `/`. Type a regular
@@ -1145,7 +1152,7 @@ The stable names for `<Action:...>` are:
   `memory`, `export`, `smart-action`, `split`, `hop-pane`
 - Editor: `undo`, `redo`, `copy`, `cut`, `paste`, `select-all`, `comment`,
   `find`, `first-error`
-- Scenes: `new-scene`, `duplicate-scene`, `record-take`, `record-sample`,
+- Scenes: `new-scene`, `duplicate-scene`, `save-scene`, `record-take`, `record-sample`,
   `rename-scene`, `close-scene`, `learn-pad`, `forget-pad`, `scene-rewind`,
   `previous-scene`, `next-scene`
 - View: `word-wrap`, `zen-mode`, `master-up`, `master-down`, `open-set`, `quit`

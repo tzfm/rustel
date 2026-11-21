@@ -66,6 +66,7 @@ pub enum MenuAction {
     NewScene,
     DuplicateScene,
     RenameScene,
+    SaveScene,
     CloseScene,
     DeleteScene,
     PreviousScene,
@@ -1515,6 +1516,13 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
                 hint(BindAction::RenameScene),
             )
             .enabled(!cx.on_prebake),
+            // ^S saves too, but it plays: this one keeps what is sounding.
+            MenuItem::action(
+                MenuAction::SaveScene,
+                "Save",
+                's',
+                hint(BindAction::SaveScene),
+            ),
             MenuItem::action(
                 MenuAction::CloseScene,
                 "Close scene",
@@ -2357,6 +2365,7 @@ mod tests {
             (BindAction::RecordTake, MenuAction::Record),
             (BindAction::RecordSample, MenuAction::RecordSample),
             (BindAction::DuplicateScene, MenuAction::DuplicateScene),
+            (BindAction::SaveScene, MenuAction::SaveScene),
             (BindAction::PreviousScene, MenuAction::PreviousScene),
             (BindAction::NextScene, MenuAction::NextScene),
             (BindAction::Jobs, MenuAction::Jobs),
@@ -2502,9 +2511,9 @@ mod tests {
             vec![
                 MenuAction::DuplicateScene,
                 MenuAction::RenameScene,
+                MenuAction::SaveScene,
                 MenuAction::CloseScene,
                 MenuAction::DeleteScene,
-                MenuAction::PreviousScene,
             ]
         );
     }

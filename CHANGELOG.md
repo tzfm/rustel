@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Scene > Save, and `:w` in Vim mode, save the scene without playing it. `:wq` and `:x` save it and close the tab.
+- A Studio crash saves unsaved edits, as quit does.
 - Changed: `.midi()` sends a pattern to MIDI in place of local audio, as on strudel.cc. A `ccn`/`ccv` pattern sent to MIDI no longer plays a sound. To hear a pattern and send it to MIDI, use `stack(p, p.midi())`.
 - Fixed: a `vsti` note ends 1 ms early, as a MIDI note does, so a plugin such as TripleCheese no longer clicks where one note follows the next.
 - Fixed: Enter on a preset or a parameter of the plugin in a `vsti("name"` call still being typed writes the options object and closes the call, instead of doing nothing.

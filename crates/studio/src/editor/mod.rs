@@ -41,7 +41,7 @@ pub use layout::{
     WrapIndex,
 };
 pub use selection::{Selection, SelectionSet};
-pub use vim::EditorKeybindings;
+pub use vim::{EditorKeybindings, VimRequest};
 
 pub(crate) use find::FindDirection;
 

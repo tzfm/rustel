@@ -49,6 +49,41 @@ impl App {
         self.persist_manifest();
     }
 
+    /// Write the focused tab without playing it: what ^S keeps, with the
+    /// sound left as it is. A score takes its name from `@title` first, as
+    /// on an update.
+    pub(super) fn save_scene(&mut self) {
+        let scene = self.scenes.current();
+        let (id, source) = (scene.id, Arc::<str>::from(scene.editor.source()));
+        if let Some(scope) = scene.prebake() {
+            // Kept, not run: the setup runs on its own ^S.
+            if self.persist_prebake(scope, &source) {
+                self.status = format!("{} saved - not run", scope.tab_name());
+            }
+        } else if scene.is_replay() {
+            if let Some(tab) = self.replays.get_mut(&id) {
+                let chosen = tab.selected;
+                if let Err(error) = tab.set_source(chosen, &source) {
+                    self.set_error(ErrorOwner::Interface, error);
+                }
+            }
+            self.save_replay_tab(id);
+        } else {
+            self.sync_name_from_title();
+            self.write_scene(id, source);
+        }
+        self.dirty_frame = true;
+    }
+
+    /// Save the edits a panic would lose, as quit saves them, valid or not.
+    /// The tabs may be half way through the change that panicked, so a
+    /// second panic here costs only this save, not the shutdown after it.
+    pub(super) fn save_after_crash(&mut self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.flush_dirty_scenes();
+        }));
+    }
+
     /// Say once where a preferences file that did not read was kept.
     pub(super) fn note_kept_prefs(&mut self) {
         let Some(kept) = crate::prefs::take_kept_aside() else {
@@ -333,6 +368,22 @@ mod tests {
 
         use crate::app::tests::support::*;
         use crate::app::*;
+
+        #[test]
+        fn a_panic_saves_the_typing_as_quit_does() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let path = app.scenes.current().path.clone();
+            type_text(&mut app, "$: s(\"bd*4\").fast(");
+            assert!(app.scenes.current().dirty);
+
+            app.save_after_crash();
+            app.save_worker.shutdown();
+            let _ = app.drain_save_completions();
+
+            let after = std::fs::read_to_string(&path).expect("the scene's file");
+            assert!(after.contains("bd*4\").fast("), "{after:?}");
+        }
 
         #[test]
         fn failed_preferences_write_stays_visible_and_retries_without_losing_changes() {

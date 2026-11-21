@@ -200,6 +200,15 @@ fn dispatch_builtin(app: &mut App, key: KeyEvent) -> Result<bool, RuntimeError> 
         app.scenes.current_mut().editor.vim_cancel_pending();
         handled = true;
     }
+    // `:w` and `:wq` are the studio's to do: the editor only reads them.
+    match app.scenes.current_mut().editor.take_vim_request() {
+        Some(crate::editor::VimRequest::Write) => app.save_scene(),
+        Some(crate::editor::VimRequest::WriteClose) => {
+            app.save_scene();
+            app.close_scene();
+        }
+        None => {}
+    }
     if !handled && let Some(command) = app.editor().vim_insert_command(key) {
         // Typing lets a clicked slider go, as it does outside Vim.
         if edits_document(&command) {
@@ -271,6 +280,45 @@ mod tests {
             };
             press(app, KeyCode::Char(character), modifiers);
         }
+    }
+
+    #[test]
+    fn colon_w_saves_under_the_title_and_plays_nothing() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let source = "// @title night drive\n$: s(\"bd\")\n";
+        let mut app = vim_app(directory.path(), source, "");
+        app.scenes.current_mut().refresh_dirty();
+        assert!(app.scenes.current().dirty);
+        let installs = app.next_request_id;
+
+        typed(&mut app, ":w");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        app.wait_for_saves();
+
+        let scene = app.scenes.current();
+        assert_eq!(scene.name(), "night drive");
+        assert_eq!(std::fs::read_to_string(&scene.path).unwrap(), source);
+        assert!(!scene.dirty);
+        assert_eq!(app.next_request_id, installs, "nothing was sent to play");
+    }
+
+    #[test]
+    fn colon_wq_saves_and_closes_the_tab() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = vim_app(directory.path(), "$: s(\"bd\")\n", "");
+        app.new_scene(false);
+        let source = "$: s(\"hh*8\")\n";
+        app.scenes.current_mut().editor = Editor::new(source).expect("editor");
+        app.sync_editor_keybindings();
+        app.scenes.current_mut().refresh_dirty();
+        let path = app.scenes.current().path.clone();
+        let scores = app.scenes.score_count();
+
+        typed(&mut app, ":wq");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.scenes.score_count(), scores - 1);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
     }
 
     /// A mapped panel action runs as its chord does where the keyboard
