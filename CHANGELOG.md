@@ -53,6 +53,7 @@
 - Each open scene keeps its plugins loaded, and a scene you close frees them.
 - Plugins stay loaded when the output device or buffer size changes, and an undo within 5 seconds reuses the previous plugin copy.
 - A plugin chain with up to 1 second of latency plays in time, also in exports, and edits reach it that much later.
+- Fixed: the slider form in quick action says on the footer why it did not write the fader, such as a min above the max, instead of an Enter that seems to do nothing.
 - A plugin that fails or sends invalid audio goes silent with one warning, and the next evaluation loads it again.
 - A Studio export names a plugin that does not load, and Ctrl+C stops `rustel export` to MP3.
 - Samples, images and videos load only from allowed sources. `--allow-sample-origin` adds a source, and Settings ▸ Permissions allows a refused folder.
