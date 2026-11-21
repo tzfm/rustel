@@ -235,20 +235,13 @@ const CONTROL: crate::reference::ReferenceEntry = crate::reference::ReferenceEnt
     name: "control",
     synonyms: &[],
     summary: "MIDI control: Sends a MIDI control change message.",
-    description: "MIDI control: Sends a MIDI control change message.",
-    params: &[
-        crate::reference::ReferenceParam {
-            name: "MIDI",
-            r#type: "number | Pattern",
-            description: "control number (0-127)",
-        },
-        crate::reference::ReferenceParam {
-            name: "MIDI",
-            r#type: "number | Pattern",
-            description: "controller value (0-127)",
-        },
-    ],
-    examples: &[],
+    description: "MIDI control: Sends a MIDI control change message.\nThe control number and the controller value go in one list, `[ccn, ccv]`; two separate numbers are refused, as on strudel.cc.",
+    params: &[crate::reference::ReferenceParam {
+        name: "[ccn, ccv]",
+        r#type: "number[] | Pattern",
+        description: "control number (0-127) and controller value (0-127)",
+    }],
+    examples: &["note(\"c3 e3\").control([74, 40])"],
     tags: &["external_io", "midi"],
     no_autocomplete: false,
     deprecated: false,
