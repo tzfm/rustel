@@ -1298,6 +1298,9 @@ struct App {
     editing_source: Option<String>,
     /// The page's sample grants changed and the engine does not have them yet.
     sample_grants_owed: bool,
+    /// The library's count of policies taken when the last grants were
+    /// sent: the grants are in force once the count moves past it.
+    sample_grants_sent_at: Option<u64>,
     /// A permit unblocked a refused update and the studio owes its re-run.
     /// It waits for the engine to hold the permission, so the re-run cannot
     /// be refused by the state it is running to use.
@@ -1891,6 +1894,7 @@ impl App {
             local_files_asked: false,
             editing_source: None,
             sample_grants_owed: false,
+            sample_grants_sent_at: None,
             refused_update_owed: false,
             evaluation_alerts: HashMap::new(),
             lint_status: None,

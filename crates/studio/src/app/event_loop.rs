@@ -258,6 +258,7 @@ impl App {
             && !self.csound_owed
             && !self.import_origins_owed
             && !self.sample_grants_owed
+            && self.sample_grants_in_force()
         {
             self.refused_update_owed = false;
             // A source the permission allowed was refused when the score
