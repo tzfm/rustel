@@ -9816,6 +9816,7 @@ fn an_unreadable_scale_is_reported_when_its_notes_drop() {
         ],
         "Scale name raga is incomplete",
     );
+    let _ = std::fs::remove_file(&path);
     // Half of the cycles read their scale: the bounce plays those, and says
     // why the others are silent.
     let out = run(&[
@@ -9830,7 +9831,15 @@ fn an_unreadable_scale_is_reported_when_its_notes_drop() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
     assert!(stderr.contains("Scale name raga is incomplete"), "{stderr}");
+    let take = std::fs::read(&path).expect("the take is written");
     let _ = std::fs::remove_file(&path);
+    let loud = take.len() > 44
+        && take[44..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .any(|sample| i16::from_le_bytes(*sample).unsigned_abs() > 100);
+    assert!(loud, "the cycles that read their scale sound");
 }
 
 /// `check` queries the score's first cycle, so a score that evaluates but
