@@ -58,15 +58,33 @@ fn scope_string_ids_are_metadata_and_cannot_be_used_as_signals() {
 
 #[test]
 fn mouse_inputs_say_they_need_live_control() {
-    for (name, kind) in [("mouseX", "mouseX"), ("mouseY", "mouseY"), ("1", "cc")] {
-        let error = Program::from_json(
-            &json!({"nodes":[
-                {"type":"n","value":name}, {"type":"cc","inputs":[0]},
-                {"type":"output","inputs":[1]}
-            ]})
-            .to_string(),
-        )
-        .unwrap_err();
+    let refusal =
+        |nodes: Value| Program::from_json(&json!({ "nodes": nodes }).to_string()).unwrap_err();
+    for name in ["mouseX", "mouseY"] {
+        let error = refusal(json!([
+            {"type":"n","value":name}, {"type":"cc","inputs":[0]},
+            {"type":"output","inputs":[1]}
+        ]));
+        assert!(
+            error.contains(&format!("'{name}' requires live control input")),
+            "{error}"
+        );
+        // Listed the other way round, the graph reads the same.
+        let error = refusal(json!([
+            {"type":"cc","inputs":[1]}, {"type":"n","value":name},
+            {"type":"output","inputs":[0]}
+        ]));
+        assert!(
+            error.contains(&format!("'{name}' requires live control input")),
+            "{error}"
+        );
+    }
+    // Another name, or another live node, is named by its node.
+    for (kind, id) in [("cc", "mouse1"), ("midifreq", "mouseX"), ("cc", "1")] {
+        let error = refusal(json!([
+            {"type":"n","value":id}, {"type":kind,"inputs":[0]},
+            {"type":"output","inputs":[1]}
+        ]));
         assert!(
             error.contains(&format!("'{kind}' requires live control input")),
             "{error}"
