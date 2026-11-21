@@ -589,8 +589,9 @@ fn stands_alone(source: &str, range: std::ops::Range<usize>) -> bool {
 /// whether the span the form writes over is still one whole call.
 ///
 /// The checks run in the order a player can act on them: a field that is
-/// not a number, a range with no travel, a call that must be fixed in the
-/// score first, and then a value outside its own range. The form corrects
+/// not a number, a range with no travel, a step at or below zero, a call
+/// that must be fixed in the score first, and then a value outside its own
+/// range. The form corrects
 /// only that last case, and it does so before anything is written: it puts
 /// the moved number in its field and the warning under it. Nothing is
 /// written on that Enter, because a write closes the form and the warning
@@ -829,7 +830,8 @@ impl App {
     ///
     /// The form stays open, with nothing written, only when there is
     /// something to read before a write: a field that is not a number, a
-    /// range with no travel, a span that is not one whole call, a score or
+    /// range with no travel, a step at or below zero, a span that is not one
+    /// whole call, a score or
     /// scene that changed under the form, a write the editor refused - and
     /// a value it had to pull into its range, which the next Enter writes.
     fn apply_slider_form(&mut self) {

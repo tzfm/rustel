@@ -1957,11 +1957,12 @@ impl App {
             self.dirty_frame = true;
             return false;
         }
-        let step = if step > 0.0 {
-            step
-        } else {
-            (max - min) / 1000.0
-        };
+        // As the check: a fader that cannot move is not one.
+        if step <= 0.0 {
+            editing.form.error = Some("step has to be above zero".into());
+            self.dirty_frame = true;
+            return false;
+        }
         editing.form.set_field(Field::Step, format_value(step));
         let Some(knob) = self
             .knobs_rows
@@ -4656,5 +4657,38 @@ mod tests {
             Some(3),
             "→ is the field's own caret, not a field walk"
         );
+    }
+
+    /// A step of zero in the value form is refused with the reason, as the
+    /// check refuses it, and the score is left as it was.
+    #[test]
+    fn the_knobs_form_refuses_a_zero_step() {
+        use super::super::tests::support::{app_over, press};
+        use crate::editor::{ByteOffset, Selection};
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut app = app_over(directory.path());
+        let score = "$: note(\"c3\").lpf(800)";
+        app.scenes.current_mut().editor = Editor::new(score).expect("score");
+        let _ = app
+            .scenes
+            .current_mut()
+            .editor
+            .set_selection(Selection::caret(ByteOffset(score.len() - 1)));
+        app.open_knobs_panel(true);
+        app.refresh_knobs(Rect::default());
+        press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        for _ in 0..12 {
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Char('0'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.editor().source(), score, "nothing is written");
+        let error = app
+            .knobs_panel
+            .as_ref()
+            .and_then(|panel| panel.editing.as_ref())
+            .and_then(|editing| editing.form.error.clone());
+        assert_eq!(error.as_deref(), Some("step has to be above zero"));
     }
 }
