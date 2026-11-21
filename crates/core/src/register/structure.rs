@@ -239,9 +239,9 @@ const CONTROL: crate::reference::ReferenceEntry = crate::reference::ReferenceEnt
     params: &[crate::reference::ReferenceParam {
         name: "[ccn, ccv]",
         r#type: "number[] | Pattern",
-        description: "control number (0-127) and controller value (0-127)",
+        description: "control number (0-127) and controller value (0 to 1, sent as 0-127)",
     }],
-    examples: &["note(\"c3 e3\").control([74, 40])"],
+    examples: &["note(\"c3 e3\").control([74, 0.4])"],
     tags: &["external_io", "midi"],
     no_autocomplete: false,
     deprecated: false,

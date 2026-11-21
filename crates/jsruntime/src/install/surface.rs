@@ -1032,7 +1032,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "inhabitmod",
         synonyms: &["pickmodSqueeze"],
         summary: "The same as `inhabit`, but if you pick a number greater than the size of the list, it wraps around, rather than sticking at the maximum value.",
-        description: "The same as `inhabit`, but if you pick a number greater than the size of the list,\nit wraps around, rather than sticking at the maximum value.\nFor example, if you pick the fifth pattern of a list of three, you'll get the\nsecond one.",
+        description: "The same as `inhabit`, but if you pick a number greater than the size of the list,\nit wraps around, rather than sticking at the maximum value.\nFor example, if you pick the fifth pattern of a list of three, you'll get the\nsecond one.\nCalled as a function, it takes the list first, as on strudel.cc: `inhabitmod([a, b], \"0 1\")`.",
         params: &[
             ReferenceParam {
                 name: "pat",
@@ -1597,7 +1597,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "pick",
         synonyms: &[],
         summary: "Picks patterns (or plain values) either from a list (by index) or a lookup table (by name).",
-        description: "Picks patterns (or plain values) either from a list (by index) or a lookup table (by name).\nSimilar to `inhabit`, but maintains the structure of the original patterns.",
+        description: "Picks patterns (or plain values) either from a list (by index) or a lookup table (by name).\nSimilar to `inhabit`, but maintains the structure of the original patterns.\nCalled as a function, it takes the list or table first, as on strudel.cc: `pick({a: x, b: y}, \"<a b>\")`. A list given second is taken the other way round.",
         params: &[
             ReferenceParam {
                 name: "pat",
@@ -1625,7 +1625,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "pickF",
         synonyms: &[],
         summary: "pickF lets you use a pattern of numbers to pick which function to apply to another pattern.",
-        description: "pickF lets you use a pattern of numbers to pick which function to apply to another pattern.",
+        description: "pickF lets you use a pattern of numbers to pick which function to apply to another pattern.\nCalled as a function, it takes the pattern last, as on strudel.cc: `pickF(\"<0 1>\", [rev, fast(2)], s(\"bd sd\"))`.",
         params: &[
             ReferenceParam {
                 name: "pat",
@@ -1680,7 +1680,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "pickmodF",
         synonyms: &[],
         summary: "The same as `pickF`, but if you pick a number greater than the size of the functions list, it wraps around, rather than sticking at the maximum value.",
-        description: "The same as `pickF`, but if you pick a number greater than the size of the functions list,\nit wraps around, rather than sticking at the maximum value.",
+        description: "The same as `pickF`, but if you pick a number greater than the size of the functions list,\nit wraps around, rather than sticking at the maximum value.\nCalled as a function, it takes the pattern last, as on strudel.cc: `pickmodF(\"<0 1>\", [rev, fast(2)], s(\"bd sd\"))`.",
         params: &[
             ReferenceParam {
                 name: "pat",
@@ -1731,7 +1731,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "pickmodReset",
         synonyms: &[],
         summary: "The same as `pickReset`, but if you pick a number greater than the size of the list, it wraps around, rather than sticking at the maximum value.",
-        description: "The same as `pickReset`, but if you pick a number greater than the size of the list,\nit wraps around, rather than sticking at the maximum value.",
+        description: "The same as `pickReset`, but if you pick a number greater than the size of the list,\nit wraps around, rather than sticking at the maximum value.\nCalled as a function, it takes the list first, as on strudel.cc: `pickmodReset([a, b], \"0 1\")`.",
         params: &[
             ReferenceParam {
                 name: "pat",
@@ -1754,7 +1754,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "pickmodRestart",
         synonyms: &[],
         summary: "The same as `pickRestart`, but if you pick a number greater than the size of the list, it wraps around, rather than sticking at the maximum value.",
-        description: "The same as `pickRestart`, but if you pick a number greater than the size of the list,\nit wraps around, rather than sticking at the maximum value.",
+        description: "The same as `pickRestart`, but if you pick a number greater than the size of the list,\nit wraps around, rather than sticking at the maximum value.\nCalled as a function, it takes the list first, as on strudel.cc: `pickmodRestart([a, b], \"0 1\")`.",
         params: &[
             ReferenceParam {
                 name: "pat",
