@@ -9797,3 +9797,28 @@ fn talkit_speaks_up_to_c7() {
         assert_eq!(sounds, speaks, "{note}: the take");
     }
 }
+
+/// `check` queries the score's first cycle, so a score that evaluates but
+/// refuses when it plays fails the check the way query and export fail.
+#[test]
+fn check_finds_what_only_the_query_refuses() {
+    for (score, said) in [
+        (r#"s("bd").euclid(3, 100000000)"#, "above the native limit"),
+        (
+            r#"note("c3 g3").K(sine(sFreq).mul(0.15).out(16))"#,
+            "output channel from 0 to 15",
+        ),
+    ] {
+        let out = run(&["check", "--no-samples", "-e", score]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{score}: {stdout}");
+        assert!(stdout.contains(said), "{score}: {stdout}");
+    }
+    let clean = ok_stdout(&[
+        "check",
+        "--no-samples",
+        "-e",
+        r#"note("c3 g3").K(sine(sFreq).mul(0.15).out(15))"#,
+    ]);
+    assert!(clean.contains("no issues found"), "{clean}");
+}
