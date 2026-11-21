@@ -5599,6 +5599,27 @@ enum SharedStrRepr {
 const _: () = assert!(std::mem::size_of::<SharedStr>() == 16);
 
 impl SharedStr {
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &[u8] {
+        match &self.0 {
+            SharedStrRepr::Inline { len, bytes } => &bytes[..usize::from(*len)],
+            SharedStrRepr::Heap(text) => text.as_bytes(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            SharedStrRepr::Inline { len, .. } => usize::from(*len),
+            SharedStrRepr::Heap(text) => text.len(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     #[inline]
     pub fn as_str(&self) -> &str {
         match &self.0 {
@@ -5650,11 +5671,11 @@ impl std::borrow::Borrow<str> for SharedStr {
 }
 
 impl PartialEq for SharedStr {
-    #[inline]
+    #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
             (SharedStrRepr::Heap(a), SharedStrRepr::Heap(b)) if Arc::ptr_eq(a, b) => true,
-            _ => self.as_str() == other.as_str(),
+            _ => self.as_bytes() == other.as_bytes(),
         }
     }
 }
@@ -5662,51 +5683,53 @@ impl PartialEq for SharedStr {
 impl Eq for SharedStr {}
 
 impl PartialOrd for SharedStr {
-    #[inline]
+    #[inline(always)]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for SharedStr {
-    #[inline]
+    #[inline(always)]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.as_str().cmp(other.as_str())
+        self.as_bytes().cmp(other.as_bytes())
     }
 }
 
 impl Hash for SharedStr {
-    #[inline]
+    #[inline(always)]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.as_str().hash(state);
+        // Matches `str::hash` (bytes followed by `0xff`) so `Borrow<str>` agrees.
+        state.write(self.as_bytes());
+        state.write_u8(0xff);
     }
 }
 
 impl PartialEq<str> for SharedStr {
-    #[inline]
+    #[inline(always)]
     fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
+        self.as_bytes() == other.as_bytes()
     }
 }
 
 impl PartialEq<&str> for SharedStr {
-    #[inline]
+    #[inline(always)]
     fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
+        self.as_bytes() == other.as_bytes()
     }
 }
 
 impl PartialEq<String> for SharedStr {
-    #[inline]
+    #[inline(always)]
     fn eq(&self, other: &String) -> bool {
-        self.as_str() == other.as_str()
+        self.as_bytes() == other.as_bytes()
     }
 }
 
 impl PartialEq<Arc<str>> for SharedStr {
-    #[inline]
+    #[inline(always)]
     fn eq(&self, other: &Arc<str>) -> bool {
-        self.as_str() == &**other
+        self.as_bytes() == other.as_bytes()
     }
 }
 
@@ -6060,18 +6083,29 @@ fn needs_runtime_settings(value: &Value, depth: u32) -> bool {
 impl Value {
     /// Whether this is data only: no script object, pattern, function or hap
     /// list, each of which a query resolves anew.
+    #[inline(always)]
     pub(crate) fn is_data(&self, depth: u32) -> bool {
+        match self {
+            Value::Undefined | Value::Null | Value::Bool(_) | Value::F64(_) | Value::Str(_) => {
+                depth <= crate::MAX_PATTERN_DEPTH
+            }
+            Value::Pattern(_) | Value::JsValue(_) | Value::Function(_) | Value::Haps(_) => false,
+            _ => self.is_data_compound(depth),
+        }
+    }
+
+    #[inline(never)]
+    fn is_data_compound(&self, depth: u32) -> bool {
         if depth > crate::MAX_PATTERN_DEPTH {
             return false;
         }
         match self {
-            Value::Undefined | Value::Null | Value::Bool(_) | Value::F64(_) | Value::Str(_) => true,
             Value::List(items) => items.iter().all(|item| item.is_data(depth + 1)),
             // An empty map holds nothing, and a made map was made of data
             // values only.
             Value::Object(object) if object.is_known_data() => true,
             Value::Object(object) => object.iter().all(|(_, item)| item.is_data(depth + 1)),
-            Value::Pattern(_) | Value::JsValue(_) | Value::Function(_) | Value::Haps(_) => false,
+            _ => false,
         }
     }
 

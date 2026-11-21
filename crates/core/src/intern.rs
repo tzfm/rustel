@@ -260,10 +260,13 @@ struct ScanScratch {
     unique_maps: Vec<Arc<dyn BuiltinEntries>>,
     duplicates: Vec<(usize, Arc<dyn BuiltinEntries>)>,
     counts: Vec<u32>,
+    distinct_pos: Vec<(u32, u16)>,
+    val_table: Vec<(u64, u32)>,
     map_val_ids: Vec<u32>,
     map_spans: Vec<(u32, u16)>,
     poolable_idx: Vec<usize>,
     remap: Vec<u16>,
+    pool_ids: Vec<u32>,
     detached: Vec<usize>,
 }
 
@@ -277,10 +280,13 @@ impl ScanScratch {
         self.unique_maps.clear();
         self.duplicates.clear();
         self.counts.clear();
+        self.distinct_pos.clear();
+        self.val_table.clear();
         self.map_val_ids.clear();
         self.map_spans.clear();
         self.poolable_idx.clear();
         self.remap.clear();
+        self.pool_ids.clear();
         self.detached.clear();
     }
 }
@@ -384,10 +390,13 @@ fn collect_and_pool_builtins(
         unique_maps,
         duplicates,
         counts,
+        distinct_pos,
+        val_table,
         map_val_ids,
         map_spans,
         poolable_idx,
         remap,
+        pool_ids,
         ..
     } = scan;
     let mut record = |entries: &Arc<dyn BuiltinEntries>| {
@@ -593,31 +602,48 @@ fn collect_and_pool_builtins(
     }
     out.reserve(duplicates.len() + unique_maps.len());
     if unique_maps.len() >= 4 {
-        // Hash each distinct data value once into dense ids, then use flat
-        // array lookups for frequency counting, poolability, and packing.
-        let mut val_ids: FastMap<DataValueRef<'_>, u32> =
-            FastMap::with_capacity_and_hasher(unique_maps.len() * 2, Default::default());
-        counts.reserve(unique_maps.len() * 2);
-        let mut distinct_vals: Vec<&Value> = Vec::with_capacity(unique_maps.len() * 2);
-        map_val_ids.reserve(unique_maps.len() * 4);
-        map_spans.reserve(unique_maps.len());
+        // Hash each distinct data value once into dense ids using reusable
+        // scratch buffers so cold evals allocate no temporary map or vecs.
+        let mut total_vals = 0usize;
         for map in unique_maps.iter() {
+            if let Slice::Builtin(_, values) = map.as_slice() {
+                total_vals += values.len();
+            }
+        }
+        let table_len = (total_vals.saturating_mul(2).max(16)).next_power_of_two();
+        let mask = table_len - 1;
+        val_table.clear();
+        val_table.resize(table_len, (0, u32::MAX));
+        counts.reserve(total_vals);
+        distinct_pos.reserve(total_vals);
+        map_val_ids.reserve(total_vals);
+        map_spans.reserve(unique_maps.len());
+        for (map_idx, map) in unique_maps.iter().enumerate() {
             let start = map_val_ids.len() as u32;
             if let Slice::Builtin(_, values) = map.as_slice() {
-                for val in values {
-                    let id = match val_ids.entry(DataValueRef(val)) {
-                        std::collections::hash_map::Entry::Occupied(entry) => {
-                            let id = *entry.get();
-                            counts[id as usize] += 1;
-                            id
-                        }
-                        std::collections::hash_map::Entry::Vacant(entry) => {
-                            let id = counts.len() as u32;
+                for (val_idx, val) in values.iter().enumerate() {
+                    let h = val.data_hash();
+                    let mut slot = (h as usize) & mask;
+                    let id = loop {
+                        let (entry_h, entry_id) = val_table[slot];
+                        if entry_id == u32::MAX {
+                            let new_id = counts.len() as u32;
+                            val_table[slot] = (h, new_id);
                             counts.push(1);
-                            distinct_vals.push(val);
-                            entry.insert(id);
-                            id
+                            distinct_pos.push((map_idx as u32, val_idx as u16));
+                            break new_id;
                         }
+                        if entry_h == h {
+                            let (dm, dv) = distinct_pos[entry_id as usize];
+                            if let Slice::Builtin(_, other_vals) =
+                                unique_maps[dm as usize].as_slice()
+                                && other_vals[usize::from(dv)].same_data(val)
+                            {
+                                counts[entry_id as usize] += 1;
+                                break entry_id;
+                            }
+                        }
+                        slot = (slot + 1) & mask;
                     };
                     map_val_ids.push(id);
                 }
@@ -646,7 +672,8 @@ fn collect_and_pool_builtins(
         }
         if poolable_idx.len() >= 2 {
             remap.resize(counts.len(), u16::MAX);
-            let mut pool_vec: Vec<Value> = Vec::with_capacity(counts.len());
+            pool_ids.clear();
+            pool_ids.reserve(counts.len());
             let mut old_bytes = 0usize;
             let mut new_maps_bytes = 0usize;
             let mut overflow = false;
@@ -657,7 +684,7 @@ fn collect_and_pool_builtins(
                 new_maps_bytes += 32 + ((4 * len + 7) & !7);
                 for &vid in &map_val_ids[start as usize..start as usize + len] {
                     if remap[vid as usize] == u16::MAX {
-                        let Ok(pidx) = u16::try_from(pool_vec.len()) else {
+                        let Ok(pidx) = u16::try_from(pool_ids.len()) else {
                             overflow = true;
                             break 'assign;
                         };
@@ -666,13 +693,23 @@ fn collect_and_pool_builtins(
                             break 'assign;
                         }
                         remap[vid as usize] = pidx;
-                        pool_vec.push(distinct_vals[vid as usize].clone());
+                        pool_ids.push(vid);
                     }
                 }
             }
-            let new_bytes = 16 + 24 * pool_vec.len() + new_maps_bytes;
+            let new_bytes = 16 + 24 * pool_ids.len() + new_maps_bytes;
             if !overflow && new_bytes + 64 < old_bytes {
-                let pool: Arc<[Value]> = pool_vec.into();
+                let pool: Arc<[Value]> = pool_ids
+                    .iter()
+                    .map(|&vid| {
+                        let (dm, dv) = distinct_pos[vid as usize];
+                        let Slice::Builtin(_, other_vals) = unique_maps[dm as usize].as_slice()
+                        else {
+                            unreachable!("pooled value comes from built-in map")
+                        };
+                        other_vals[usize::from(dv)].clone()
+                    })
+                    .collect();
                 let mut vals_buf = [0u16; MAX_BUILTIN_MAP_LEN];
                 for &idx in poolable_idx.iter() {
                     let map = &unique_maps[idx];
@@ -2112,22 +2149,6 @@ impl PartialEq for InternedValues {
 }
 
 impl Eq for InternedValues {}
-
-struct DataValueRef<'a>(&'a Value);
-
-impl Hash for DataValueRef<'_> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        hash_data(self.0, state);
-    }
-}
-
-impl PartialEq for DataValueRef<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.same_data(other.0)
-    }
-}
-
-impl Eq for DataValueRef<'_> {}
 
 // --- Arc<dyn BuiltinEntries> ---
 

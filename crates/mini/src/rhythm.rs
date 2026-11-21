@@ -3245,6 +3245,42 @@ fn check_tick_tree(
             }
             true
         }
+        kind @ (Kind::Stack(patterns) | Kind::StackRun(patterns))
+            if total_cycles > 1 || w_den > 1 =>
+        {
+            let mut any = false;
+            for child in plans.stacked(patterns, kind.is_run()) {
+                match plans.kind(child) {
+                    Kind::Rest => {}
+                    Kind::Atom { value, begin, len } => {
+                        if u16::try_from(value).is_err() {
+                            return false;
+                        }
+                        acc.steps += 1;
+                        if acc.steps > 64 {
+                            return false;
+                        }
+                        any = true;
+                        if len > 0 {
+                            acc.min_begin = acc.min_begin.min(begin);
+                            acc.max_begin = acc.max_begin.max(begin);
+                            acc.max_len = acc.max_len.max(len);
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            if any {
+                let Some(next_ticks) = lcm_u32(acc.ticks, w_den) else {
+                    return false;
+                };
+                if u64::from(total_cycles) * u64::from(next_ticks) > u64::from(u16::MAX) {
+                    return false;
+                }
+                acc.ticks = next_ticks;
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -3437,6 +3473,11 @@ fn emit_tick_tree(
                     sub_width,
                     emit,
                 );
+            }
+        }
+        kind @ (Kind::Stack(patterns) | Kind::StackRun(patterns)) => {
+            for child in plans.stacked(patterns, kind.is_run()) {
+                emit_tick_tree(plans, child, start_tick, width_ticks, emit);
             }
         }
         _ => unreachable!("validated by check_tick_tree"),
