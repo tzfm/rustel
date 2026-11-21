@@ -9845,3 +9845,26 @@ fn check_finds_what_only_the_query_refuses() {
     ]);
     assert!(clean.contains("no issues found"), "{clean}");
 }
+
+/// An animated Hydra array holds numbers only: any other entry refuses the
+/// score, as a NaN does, instead of installing a picture that only warns.
+#[test]
+fn a_hydra_array_entry_that_is_not_a_number_is_refused() {
+    for entry in [r#""x""#, "true", "null", "[1, 2]"] {
+        let score = format!("await initHydra()\nosc([10, {entry}, 30]).out()");
+        let out = run(&["check", "--no-samples", "-e", &score]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{entry}: {stdout}");
+        assert!(
+            stdout.contains("must be a finite number"),
+            "{entry}: {stdout}"
+        );
+    }
+    let clean = ok_stdout(&[
+        "check",
+        "--no-samples",
+        "-e",
+        "await initHydra()\nosc([10, 20, 30].smooth()).out()",
+    ]);
+    assert!(clean.contains("no issues found"), "{clean}");
+}
