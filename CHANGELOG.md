@@ -10,6 +10,7 @@
 - Fixed: a `.dict()` name no dictionary has is an error, as on strudel.cc, instead of a lane that plays silence.
 - The reference search also finds entries by extension name, description, tags, parameters and examples, and by words spread across them. These matches come after the usual matches, under more matches.
 - The theme picker shows its Ctrl+N new, Ctrl+E edit and Ctrl+D delete keys.
+- Fixed: an export whose every note an error dropped, such as a scale name that will not read, fails with the reason instead of writing silence; a partial drop still plays what it can.
 - Fixed: the theme editor opened from the theme picker shows on top of the reference.
 - The knobs column moves a plain number live while the set plays, as a slider does: the number of an audio control such as `lpf(4000)`, or of a function such as `pg(0.8)`, `fast(2)`, an `FX` stage's `soft(4.5)`, or a plugin option such as `vsti("Diva", { output: 0.111 })`. It needs no update, and edits not yet evaluated stay out of the sound. A plugin key turned on goes in as an update of its own. A rail that waits for an update is muted, dashed and marked "not live". A live move is written to the session tape.
 - Hold Shift or Alt while you drag any slider for a fine drag, a tenth as far. f in the knobs column or the expanded slider locks it on.
@@ -48,7 +49,6 @@
 - The reference knows the Hydra names, and a shared sketch with calls Rustel does not support still runs.
 - Picking a plugin from the reference opens its presets and closes the call.
 - Each open scene keeps its plugins loaded, and a scene you close frees them.
-- Fixed: an export whose every note an error dropped, such as a scale name that will not read, fails with the reason instead of writing silence; a partial drop still plays what it can.
 - Plugins stay loaded when the output device or buffer size changes, and an undo within 5 seconds reuses the previous plugin copy.
 - A plugin chain with up to 1 second of latency plays in time, also in exports, and edits reach it that much later.
 - A plugin that fails or sends invalid audio goes silent with one warning, and the next evaluation loads it again.
