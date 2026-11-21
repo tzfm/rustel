@@ -1322,18 +1322,66 @@ impl<'p> Turn<'p> {
         if let BuiltinMethod::Registered(registration) = &builtin
             && arguments.len() == registration.arity.saturating_sub(1)
         {
-            let mut numbers = std::mem::take(&mut self.numbers);
-            numbers.clear();
-            numbers.extend(arguments.iter().map_while(|argument| match argument {
-                ScoreExpr::Number(number) => Some(Value::F64(*number)),
-                _ => None,
-            }));
-            if numbers.len() == arguments.len() {
-                let made = registration.call_unpatternified(&numbers, receiver);
+            if arguments.len() <= 4 {
+                let mut stack_nums = [const { Value::Undefined }; 4];
+                let mut all_nums = true;
+                for (slot, argument) in stack_nums.iter_mut().zip(arguments) {
+                    if let ScoreExpr::Number(number) = argument {
+                        *slot = Value::F64(*number);
+                    } else {
+                        all_nums = false;
+                        break;
+                    }
+                }
+                if all_nums {
+                    return Some(Native::Pattern(
+                        registration.call_unpatternified(&stack_nums[..arguments.len()], receiver),
+                    ));
+                }
+            } else {
+                let mut numbers = std::mem::take(&mut self.numbers);
+                numbers.clear();
+                numbers.extend(arguments.iter().map_while(|argument| match argument {
+                    ScoreExpr::Number(number) => Some(Value::F64(*number)),
+                    _ => None,
+                }));
+                if numbers.len() == arguments.len() {
+                    let made = registration.call_unpatternified(&numbers, receiver);
+                    self.numbers = numbers;
+                    return Some(Native::Pattern(made));
+                }
                 self.numbers = numbers;
-                return Some(Native::Pattern(made));
             }
-            self.numbers = numbers;
+        }
+        if arguments.len() <= 4 {
+            let takes_transformer = match &builtin {
+                BuiltinMethod::Registered(registration) => {
+                    if arguments.len() != registration.arity.saturating_sub(1) {
+                        return None;
+                    }
+                    registration.function_argument == FunctionArgument::Transformer
+                }
+                _ => false,
+            };
+            let mut buf: [Option<Pattern>; 4] = [None, None, None, None];
+            let (last, leading) = match arguments.split_last() {
+                Some((last, leading)) => (Some(last), leading),
+                None => (None, arguments),
+            };
+            for (slot, argument) in buf.iter_mut().zip(leading) {
+                *slot = Some(self.pattern_argument(names, argument, runtime)?);
+            }
+            if let Some(last) = last {
+                buf[leading.len()] = Some(match self.evaluate(names, last, runtime)? {
+                    Native::Function(transformer) if takes_transformer => {
+                        rustel_core::pure(Value::function(transformer))
+                    }
+                    value => value.reified()?,
+                });
+            }
+            return builtin
+                .apply_small(receiver, &mut buf[..arguments.len()])
+                .map(Native::Pattern);
         }
         let (values, _) = self.method_arguments(names, &builtin, arguments, runtime)?;
         builtin.apply(receiver, values).map(Native::Pattern)

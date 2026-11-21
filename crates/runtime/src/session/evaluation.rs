@@ -749,7 +749,7 @@ impl Session {
             Some(read) => {
                 let lanes = std::mem::take(&mut read.lanes);
                 let shared = self.js.share_source_text(source);
-                self.lanes.read_statements_shared(&shared, Some(lanes))
+                self.lanes.read_read_lanes_shared(&shared, lanes)
             }
             None => self.lanes.read(source),
         };

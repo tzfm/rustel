@@ -401,7 +401,38 @@ fn collect_and_pool_builtins(
             }
         }
     };
-    let mut stack: Vec<&NodeCell> = Vec::with_capacity(32);
+    struct SmallNodeStack<'a> {
+        inline: [Option<&'a NodeCell>; 64],
+        len: usize,
+        overflow: Vec<&'a NodeCell>,
+    }
+    impl<'a> SmallNodeStack<'a> {
+        #[inline]
+        fn push(&mut self, cell: &'a NodeCell) {
+            if self.overflow.is_empty() && self.len < self.inline.len() {
+                self.inline[self.len] = Some(cell);
+                self.len += 1;
+            } else {
+                self.overflow.push(cell);
+            }
+        }
+        #[inline]
+        fn pop(&mut self) -> Option<&'a NodeCell> {
+            if let Some(cell) = self.overflow.pop() {
+                return Some(cell);
+            }
+            if self.len > 0 {
+                self.len -= 1;
+                return self.inline[self.len].take();
+            }
+            None
+        }
+    }
+    let mut stack = SmallNodeStack {
+        inline: [None; 64],
+        len: 0,
+        overflow: Vec::new(),
+    };
     stack.push(root.as_ref());
     while let Some(cell) = stack.pop() {
         let id = std::ptr::from_ref(cell) as usize;

@@ -14,8 +14,8 @@
 
 use crate::string::decode;
 use crate::{
-    Held, LaneStatement, Row, ScoreExpr, ScoreFunction, ScoreProgram, ScoreProperty,
-    ScoreStatement, Written,
+    Held, LaneBodySource, ReadLane, ReadLanes, Row, ScoreExpr, ScoreFunction, ScoreProgram,
+    ScoreProperty, ScoreStatement, Written,
 };
 use std::borrow::Cow;
 
@@ -66,7 +66,7 @@ pub struct Read<'s> {
     pub program: ScoreProgram<'s>,
     /// The lanes of the text, in the order of the text: each labeled
     /// statement with code, or the last statement of a text with no label.
-    pub lanes: Vec<LaneStatement>,
+    pub lanes: ReadLanes,
     /// The statement of each labeled lane, in the order of the text.
     labeled: Vec<usize>,
 }
@@ -249,7 +249,7 @@ impl<'s, F: Fn(&str) -> CallForm> Reader<'s, F> {
         // Most scores hold a handful of statements: size tightly for short
         // scores and avoid allocating `lanes` until a labeled lane appears.
         let mut statements = Vec::with_capacity((self.source.len() / 256).clamp(1, 8));
-        let mut lanes = Vec::new();
+        let mut lanes = ReadLanes::Empty;
         let mut labeled = Vec::new();
         // The names the score declares, each one time.
         let mut declared: Vec<&'s str> = Vec::new();
@@ -281,9 +281,11 @@ impl<'s, F: Fn(&str) -> CallForm> Reader<'s, F> {
                 if body.form == Form::Other || body.height >= MAX_NESTING {
                     return None;
                 }
-                lanes.push(LaneStatement {
-                    label: label.to_owned(),
-                    body: LaneStatement::body_of(&self.source[code..self.last]),
+                let label_start = u32::try_from(start).ok()?;
+                let label_end = u32::try_from(start + label.len()).ok()?;
+                lanes.push(ReadLane {
+                    label: (label_start, label_end),
+                    body: LaneBodySource::from_range(self.source, code, self.last),
                     line: self.line_of(start),
                 });
                 labeled.push(statements.len());
@@ -366,14 +368,14 @@ impl<'s, F: Fn(&str) -> CallForm> Reader<'s, F> {
         }
         if lanes.is_empty() {
             lanes.push(match last_code {
-                Some((start, end)) => LaneStatement {
-                    label: String::new(),
-                    body: LaneStatement::body_of(&self.source[start..end]),
+                Some((start, end)) => ReadLane {
+                    label: (0, 0),
+                    body: LaneBodySource::from_range(self.source, start, end),
                     line: self.line_of(start),
                 },
-                None => LaneStatement {
-                    label: String::new(),
-                    body: String::new(),
+                None => ReadLane {
+                    label: (0, 0),
+                    body: LaneBodySource::Slice(0, 0),
                     line: 1,
                 },
             });
@@ -1743,10 +1745,10 @@ mod tests {
 
     #[test]
     fn a_labeled_statement_reads_as_a_lane_call_and_a_lane() {
-        let read =
-            read("// drums\n$: s(\"bd\")\r\n  .fast(2) // twice\n", written).expect("a score");
+        let source = "// drums\n$: s(\"bd\")\r\n  .fast(2) // twice\n";
+        let read = read(source, written).expect("a score");
         assert_eq!(
-            read.lanes,
+            read.lanes.to_statements(source),
             [LaneStatement {
                 label: "$".into(),
                 body: "s(\"bd\")\n  .fast(2)".into(),
@@ -1758,9 +1760,10 @@ mod tests {
 
     #[test]
     fn a_text_with_no_label_is_one_lane_of_its_last_statement() {
-        let read = read("setcpm(30)\n\nnote(\"c e\") ;\n", written).expect("a score");
+        let source = "setcpm(30)\n\nnote(\"c e\") ;\n";
+        let read = read(source, written).expect("a score");
         assert_eq!(
-            read.lanes,
+            read.lanes.to_statements(source),
             [LaneStatement {
                 label: String::new(),
                 body: "note(\"c e\")".into(),
@@ -1849,19 +1852,21 @@ mod tests {
 
     #[test]
     fn a_label_with_no_code_at_the_end_of_the_text_is_no_statement() {
-        let alone = read("$:", written).expect("a score");
+        let alone_src = "$:";
+        let alone = read(alone_src, written).expect("a score");
         assert!(alone.program.statements.is_empty());
         assert_eq!(
-            alone.lanes,
+            alone.lanes.to_statements(alone_src),
             [LaneStatement {
                 label: String::new(),
                 body: String::new(),
                 line: 1,
             }]
         );
-        let with_code = read("$: s(\"bd\")\n$:", written).expect("a score");
+        let with_code_src = "$: s(\"bd\")\n$:";
+        let with_code = read(with_code_src, written).expect("a score");
         assert_eq!(
-            with_code.lanes,
+            with_code.lanes.to_statements(with_code_src),
             [LaneStatement {
                 label: "$".into(),
                 body: "s(\"bd\")".into(),

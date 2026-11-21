@@ -735,7 +735,7 @@ pub fn register_fast(reg: &mut Registry) {
             match args.first() {
                 None => pat,
                 Some(value) => match value_to_fraction(value) {
-                    Some(factor) => pat.fast(factor),
+                    Some(factor) => pat.fast_owned(factor),
                     None => PatOps::pat_silence(),
                 },
             }

@@ -313,6 +313,97 @@ impl LaneTable {
         self.read_statements_shared(&shared, statements)
     }
 
+    /// [`Self::read_statements_shared`] for zero-copy [`rustel_score::ReadLanes`]
+    /// parsed directly from `source`, turning verbatim lane bodies straight into
+    /// `LaneBody::Slice` without intermediate `String` or `Vec` allocations.
+    pub(crate) fn read_read_lanes_shared(
+        &mut self,
+        source: &std::sync::Arc<str>,
+        lanes_in: rustel_score::ReadLanes,
+    ) -> Vec<u64> {
+        let adopted = std::mem::take(&mut self.adopted);
+        let statements = lanes_in.as_slice();
+        let reading = self.reading;
+        let none: &[Lane] = &[];
+        let (playing, away) = if reading == self.document {
+            (self.playing.lanes.as_slice(), &self.away[..])
+        } else {
+            let rest = self.rest.get(&reading);
+            rest.map_or((none, none), |rest| (&rest.lanes[..], &rest.away[..]))
+        };
+        let tried = self.candidate.as_ref();
+        let tried = tried.filter(|(document, ..)| *document == reading);
+        let tried = tried.map_or(none, |(.., read)| read.lanes.as_slice());
+        let (tried, moved) = if adopted {
+            (none, tried)
+        } else {
+            (tried, none)
+        };
+        let (own, other) = match &self.audible {
+            Audible::Earlier { document, lanes } if *document == reading => (&lanes[..], none),
+            Audible::Earlier { lanes, .. } => (none, &lanes[..]),
+            Audible::InPlay => (none, none),
+        };
+        let mut stack_paired = [None; 8];
+        let mut heap_paired;
+        let paired: &mut [Option<u64>] = if statements.len() <= stack_paired.len() {
+            &mut stack_paired[..statements.len()]
+        } else {
+            heap_paired = vec![None; statements.len()];
+            &mut heap_paired
+        };
+        pair(statements, source, paired, playing, tried, away, own);
+        if adopted {
+            pair(statements, source, paired, none, moved, none, none);
+        }
+        if reading != self.document {
+            let (playing, away) = (self.playing.lanes.as_slice(), &self.away);
+            pair(statements, source, paired, playing, none, away, other);
+        }
+        let mut make_lane = |statement: rustel_score::ReadLane, number: Option<u64>| {
+            let number = number.unwrap_or_else(|| {
+                self.next += 1;
+                self.next - 1
+            });
+            let plugins = body_plugin_names(statement.body_str(source)).into_boxed_slice();
+            let label = rustel_core::value::SharedStr::from(statement.label_str(source));
+            let body = match statement.body {
+                rustel_score::LaneBodySource::Slice(s, e) => {
+                    LaneBody::Slice(std::sync::Arc::clone(source), s, e)
+                }
+                rustel_score::LaneBodySource::Owned(owned) => LaneBody::Owned(owned),
+            };
+            Lane {
+                number,
+                plugins,
+                label,
+                body,
+                line: u32::try_from(statement.line).unwrap_or(u32::MAX),
+            }
+        };
+        let lanes = match lanes_in {
+            rustel_score::ReadLanes::Empty => LaneList::Empty,
+            rustel_score::ReadLanes::One(stmt) => LaneList::One(make_lane(stmt, paired[0])),
+            rustel_score::ReadLanes::Many(stmts) => LaneList::from_iter_exact(
+                stmts
+                    .into_iter()
+                    .zip(paired.iter().copied())
+                    .map(|(s, n)| make_lane(s, n)),
+            ),
+        };
+        let labeled = lanes
+            .as_slice()
+            .iter()
+            .filter(|lane| !lane.label.is_empty());
+        let numbers = labeled.map(|lane| lane.number).collect();
+        let read = ScoreLanes {
+            lanes,
+            places: false,
+        };
+        self.candidate = Some((reading, std::sync::Arc::clone(source), read));
+        numbers
+    }
+
     /// [`Self::read_statements`] reusing a caller-owned shared `Arc<str>` for
     /// `source` so the candidate record avoids cloning the score text.
     pub(crate) fn read_statements_shared(
@@ -358,15 +449,15 @@ impl LaneTable {
             heap_paired = vec![None; statements.len()];
             &mut heap_paired
         };
-        pair(&statements, paired, playing, tried, away, own);
+        pair(&statements, source, paired, playing, tried, away, own);
         if adopted {
-            pair(&statements, paired, none, moved, none, none);
+            pair(&statements, source, paired, none, moved, none, none);
         }
         // A document that is not in play shares the lanes of the score in
         // play.
         if reading != self.document {
             let (playing, away) = (self.playing.lanes.as_slice(), &self.away);
-            pair(&statements, paired, playing, none, away, other);
+            pair(&statements, source, paired, playing, none, away, other);
         }
         let lane = |(statement, number): (LaneStatement, Option<u64>)| Lane {
             number: number.unwrap_or_else(|| {
@@ -702,10 +793,38 @@ const MAX_LANE_PAIRS: usize = 1 << 18;
 /// Rules 1 to 3 pair in text order: see [`in_order`]. In rule 4 the best
 /// pair goes first: the most plugin names in common, then the most equal
 /// bytes, then the nearest place. An edited lane then keeps its number
+trait LaneInput {
+    fn label_str<'a>(&'a self, source: &'a str) -> &'a str;
+    fn body_str<'a>(&'a self, source: &'a str) -> &'a str;
+}
+
+impl LaneInput for LaneStatement {
+    #[inline]
+    fn label_str<'a>(&'a self, _source: &'a str) -> &'a str {
+        &self.label
+    }
+    #[inline]
+    fn body_str<'a>(&'a self, _source: &'a str) -> &'a str {
+        &self.body
+    }
+}
+
+impl LaneInput for rustel_score::ReadLane {
+    #[inline]
+    fn label_str<'a>(&'a self, source: &'a str) -> &'a str {
+        self.label_str(source)
+    }
+    #[inline]
+    fn body_str<'a>(&'a self, source: &'a str) -> &'a str {
+        self.body_str(source)
+    }
+}
+
 /// when a new lane comes above it in the same edit. A statement with no
 /// pair is a new lane, and a lane with no pair left the score.
-fn pair(
-    statements: &[LaneStatement],
+fn pair<S: LaneInput>(
+    statements: &[S],
+    source: &str,
     numbers: &mut [Option<u64>],
     playing: &[Lane],
     tried: &[Lane],
@@ -718,8 +837,9 @@ fn pair(
     }
     // A score that is read again with no change: rule 1 gives each
     // statement the lane in play at its place, with no search.
-    let same = |(statement, lane): (&LaneStatement, &Lane)| {
-        statement.label == lane.label.as_str() && statement.body == lane.body.as_str()
+    let same = |(statement, lane): (&S, &Lane)| {
+        statement.label_str(source) == lane.label.as_str()
+            && statement.body_str(source) == lane.body.as_str()
     };
     if statements.len() == playing.len()
         && numbers.iter().all(Option::is_none)
@@ -739,17 +859,19 @@ fn pair(
         && numbers[0].is_none()
     {
         let body = lane.body.as_str();
-        let rule2 = statement.body == body;
-        let rule3 = rule_key(3, &statement.label, &statement.body)
+        let stmt_label = statement.label_str(source);
+        let stmt_body = statement.body_str(source);
+        let rule2 = stmt_body == body;
+        let rule3 = rule_key(3, stmt_label, stmt_body)
             .is_some_and(|key| Some(key) == rule_key(3, lane.label.as_str(), body));
         let rule4 = || {
-            let equal = equal_ends(&statement.body, body);
-            let shorter = statement.body.len().min(body.len());
+            let equal = equal_ends(stmt_body, body);
+            let shorter = stmt_body.len().min(body.len());
             if shorter > 0 && 2 * equal >= shorter {
                 return true;
             }
             if !lane.plugins.is_empty() {
-                let names = body_plugin_names(&statement.body);
+                let names = body_plugin_names(stmt_body);
                 return names.iter().any(|name| lane.plugins.contains(name));
             }
             false
@@ -790,7 +912,11 @@ fn pair(
             }
             let mut news: HashMap<_, Vec<usize>> = HashMap::new();
             for (place, statement) in statements.iter().enumerate() {
-                let key = rule_key(rule, &statement.label, &statement.body);
+                let key = rule_key(
+                    rule,
+                    statement.label_str(source),
+                    statement.body_str(source),
+                );
                 let open = numbers[place].is_none();
                 if let Some(key) = key.filter(|key| open && olds.contains_key(key)) {
                     news.entry(key).or_default().push(place);
@@ -820,8 +946,8 @@ fn pair(
     }
     let mut pairs = Vec::new();
     for at in open {
-        let statement = &statements[at];
-        let mut names = body_plugin_names(&statement.body);
+        let stmt_body = statements[at].body_str(source);
+        let mut names = body_plugin_names(stmt_body);
         // A name with more calls counts one time.
         names.dedup();
         for (place, lane) in &left {
@@ -829,8 +955,8 @@ fn pair(
                 .iter()
                 .filter(|name| lane.plugins.contains(name))
                 .count();
-            let equal = equal_ends(&statement.body, lane.body.as_str());
-            let shorter = statement.body.len().min(lane.body.as_str().len());
+            let equal = equal_ends(stmt_body, lane.body.as_str());
+            let shorter = stmt_body.len().min(lane.body.as_str().len());
             if shared > 0 || (shorter > 0 && 2 * equal >= shorter) {
                 let nearest = place.abs_diff(at);
                 let order = (std::cmp::Reverse(shared), std::cmp::Reverse(equal), nearest);

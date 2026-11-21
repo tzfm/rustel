@@ -15131,7 +15131,7 @@ impl Pattern {
         }
         // The steps of a sequence take the name of the control when they
         // are read.
-        if !unnamed_only && let Some(named) = sequence::named(self, spec) {
+        if let Some(named) = sequence::named(self, spec, unnamed_only) {
             return named.with_steps_of(self);
         }
         if spec.id != 0 && !sequence::holds_steps(self) {
@@ -15162,12 +15162,11 @@ impl Pattern {
         spec: &controls::ControlSpec,
         unnamed_only: bool,
     ) -> Self {
-        if !unnamed_only
-            && sequence::folds(&self)
+        if sequence::folds(&self)
             && matches!(self.node_kind(), Node::Sequence(_))
             && let Some(cell) = Arc::get_mut(&mut self.node)
             && let Node::Sequence(layers) = &mut cell.kind
-            && sequence::named_in_place(layers, spec)
+            && sequence::named_in_place(layers, spec, unnamed_only)
         {
             return self;
         }
@@ -15861,6 +15860,13 @@ impl Pattern {
         combinators::checked_fast(self, factor, "fast")
     }
 
+    pub(crate) fn fast_owned(self, factor: Fraction) -> Self {
+        if factor.numer() == 0 {
+            return silence();
+        }
+        self.fast_node_owned(factor, "fast")
+    }
+
     pub fn slow(&self, factor: Fraction) -> Self {
         if factor.numer() == 0 {
             return silence();
@@ -15873,6 +15879,32 @@ impl Pattern {
                 operation: "slow",
             })),
         }
+    }
+
+    pub(crate) fn slow_owned(self, factor: Fraction) -> Self {
+        if factor.numer() == 0 {
+            return silence();
+        }
+        match Fraction::ONE.checked_div(factor) {
+            Some(rate) => self.fast_node_owned(rate, "slow"),
+            None => query_limit_pattern(mark_stepwise_refusal(QueryLimit::NativeFraction {
+                operation: "slow",
+            })),
+        }
+    }
+
+    fn fast_node_owned(mut self, factor: Fraction, operation: &'static str) -> Self {
+        if factor > Fraction::ZERO
+            && sequence::folds(&self)
+            && matches!(self.node_kind(), Node::Sequence(_))
+            && let Some(cell) = Arc::get_mut(&mut self.node)
+            && let Node::Sequence(layers) = &mut cell.kind
+            && sequence::faster_in_place(layers, factor)
+        {
+            return self;
+        }
+        let steps = self.steps();
+        self.fast_node(factor, operation).with_steps(steps)
     }
 
     /// Shift later in time. `_late(t)`.

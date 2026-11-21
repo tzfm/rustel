@@ -141,7 +141,7 @@ impl ControlSpec {
     /// next call of a chain takes the result of the call before it.
     pub fn apply_to(&self, mut pattern: Pattern, value: Option<Pattern>) -> Pattern {
         let Some(value) = value else {
-            return self.pattern_for_unnamed(&pattern);
+            return pattern.map_control_owned(self, true);
         };
         let alignment = crate::compose::default_alignment();
         if alignment == crate::compose::Alignment::In {

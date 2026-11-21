@@ -14,7 +14,7 @@ mod program;
 mod reader;
 mod string;
 
-pub use lane::LaneStatement;
+pub use lane::{LaneBodySource, LaneStatement, ReadLane, ReadLanes};
 pub use program::{
     At, Held, Row, ScoreExpr, ScoreFunction, ScoreProgram, ScoreProperty, ScoreStatement, Written,
 };

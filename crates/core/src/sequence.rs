@@ -486,6 +486,106 @@ impl CompactGrid {
             P5, P6, P7, P8, P9, P10, P11, P12, P13, P14, P15, P16, PMany
         )
     }
+
+    fn parts_mut(&mut self) -> Option<(&mut NonZeroU32, &mut u32, &mut [SmallGridStep])> {
+        macro_rules! unpack_mut {
+            (plain: [$($p:ident),+], packed: [$($k:ident),+]) => {
+                match self {
+                    $(Self::$p(g) => {
+                        let g = Arc::get_mut(g)?;
+                        Some((&mut g.ticks, &mut g.base, &mut g.steps[..]))
+                    })+
+                    $(Self::$k(g) => {
+                        let g = Arc::get_mut(g)?;
+                        Some((&mut g.ticks, &mut g.base, &mut g.steps[..]))
+                    })+
+                    Self::PMany(g) => {
+                        let g = Arc::get_mut(g)?;
+                        Some((&mut g.ticks, &mut g.base, &mut g.steps[..]))
+                    }
+                    Self::OneStep(_) => None,
+                }
+            };
+        }
+        unpack_mut!(
+            plain: [N1, N2, N3, N4, N5, N6, N7, N8, N9, N10, N11, N12, N13, N14, N15, N16],
+            packed: [P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, P11, P12, P13, P14, P15, P16]
+        )
+    }
+
+    /// Rescale this grid by `factor` in place when unshared and every rescaled
+    /// tick fits the existing compact layout. Returns `Some(true)` on success,
+    /// `None` when the caller should fall back to rebuilding a new listing.
+    fn try_faster_in_place(&mut self, factor: Fraction) -> Option<()> {
+        let f_num = u32::try_from(factor.numer()).ok()?;
+        let f_den = u32::try_from(factor.denom()).ok()?;
+        if f_num == 0 || f_den == 0 {
+            return None;
+        }
+        if let Self::OneStep(buf) = self {
+            let base_ticks = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let span_loc = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            let old_ticks = base_ticks >> 25;
+            let b = span_loc & 0xff;
+            let e = (span_loc >> 8) & 0xff;
+            let g0 = gcd(u64::from(old_ticks), u64::from(f_den)) as u32;
+            let ticks_1 = old_ticks / g0;
+            let mul = f_den / g0;
+            let g1 = gcd(gcd(u64::from(f_num), u64::from(b)), u64::from(e));
+            let new_ticks_u32 =
+                u32::try_from(u64::from(ticks_1).checked_mul(u64::from(f_num))? / g1).ok()?;
+            if new_ticks_u32 == 0 || new_ticks_u32 > 127 {
+                return None;
+            }
+            let new_b = u8::try_from((u64::from(b) / g1).checked_mul(u64::from(mul))?).ok()?;
+            let new_e = u8::try_from((u64::from(e) / g1).checked_mul(u64::from(mul))?).ok()?;
+            let new_base_ticks = (base_ticks & 0x00ff_ffff) | (1 << 24) | (new_ticks_u32 << 25);
+            let new_span_loc =
+                (span_loc & 0xffff_0000) | u32::from(new_b) | (u32::from(new_e) << 8);
+            buf[0..4].copy_from_slice(&new_base_ticks.to_ne_bytes());
+            buf[4..8].copy_from_slice(&new_span_loc.to_ne_bytes());
+            return Some(());
+        }
+        let (ticks, base, steps) = self.parts_mut()?;
+        let old_ticks = ticks.get();
+        let g0 = gcd(u64::from(old_ticks), u64::from(f_den)) as u32;
+        let ticks_1 = old_ticks / g0;
+        let mul = f_den / g0;
+        let mut g1 = u64::from(f_num);
+        if g1 > 1 {
+            for step in steps.iter() {
+                g1 = gcd(g1, u64::from(step.part_begin));
+                g1 = gcd(g1, u64::from(step.part_end));
+                if g1 == 1 {
+                    break;
+                }
+            }
+        }
+        let ticks_2 = u64::from(ticks_1).checked_mul(u64::from(f_num))? / g1;
+        let new_ticks_u32 = u32::try_from(ticks_2).ok()?;
+        if i32::try_from(new_ticks_u32).is_err() {
+            return None;
+        }
+        let new_ticks = NonZeroU32::new(new_ticks_u32)?;
+        if mul != 1 || g1 != 1 {
+            let mul_u64 = u64::from(mul);
+            // Validate every rescaled tick fits `u16` before mutating.
+            for step in steps.iter() {
+                let nb = (u64::from(step.part_begin) / g1).checked_mul(mul_u64)?;
+                let ne = (u64::from(step.part_end) / g1).checked_mul(mul_u64)?;
+                if u16::try_from(nb).is_err() || u16::try_from(ne).is_err() {
+                    return None;
+                }
+            }
+            for step in steps.iter_mut() {
+                step.part_begin = ((u64::from(step.part_begin) / g1) * mul_u64) as u16;
+                step.part_end = ((u64::from(step.part_end) / g1) * mul_u64) as u16;
+            }
+        }
+        *ticks = new_ticks;
+        *base |= Grid::SMALL;
+        Some(())
+    }
 }
 
 /// Borrowed view over packed multi-range location runs.
@@ -548,6 +648,22 @@ impl Listing {
     /// does not fit becomes places one time, here.
     fn of(mut raws: Vec<Raw>) -> Self {
         Self::of_vec(&mut raws)
+    }
+
+    /// Build a [`Listing`] from a single [`Raw`] step without allocating a
+    /// `Vec<Raw>`.
+    fn of_single(mut raw: Raw) -> Self {
+        if let Some(listing) = Grid::build_listing(std::slice::from_mut(&mut raw)) {
+            return listing;
+        }
+        let small = |span: &TimeSpan| {
+            i32::try_from(span.begin.denom()).is_ok() && i32::try_from(span.end.denom()).is_ok()
+        };
+        let small_denominators = small(&raw.whole) && raw.part.as_ref().is_none_or(small);
+        Self::Places(Arc::new(Listed {
+            places: Box::from([raw.place()]),
+            small_denominators,
+        }))
     }
 
     /// Build a [`Listing`] from `raws`, draining `raws` when it falls back to
@@ -3378,6 +3494,12 @@ impl Layer {
         Self::of_list(period, raws, in_cycles, values)
     }
 
+    fn of_single(period: Fraction, raw: Raw, values: Arc<[Value]>) -> Self {
+        let in_cycles = lie_in_spans(period, std::iter::once(raw.part()));
+        let steps = Steps::Listed(Listing::of_single(raw));
+        Self::holding(period, steps, in_cycles, values)
+    }
+
     /// The layer of `raws`, which it keeps in a list.
     fn of_list(period: Fraction, raws: Vec<Raw>, in_cycles: bool, values: Arc<[Value]>) -> Self {
         let steps = Steps::Listed(Listing::of(raws));
@@ -4077,9 +4199,17 @@ impl Layer {
     }
 
     /// Whether [`Self::named`] names the values of this layer: it holds no
-    /// name and no control yet.
-    fn takes_name(&self) -> bool {
-        !self.has_name() && !self.dress().has_set()
+    /// name and no control yet. When `unnamed_only` is true, also requires
+    /// every value to be a plain non-object data value with no slider binding.
+    fn takes_name(&self, unnamed_only: bool) -> bool {
+        !self.has_name()
+            && !self.dress().has_set()
+            && (!unnamed_only
+                || (self.dress().keys().get().slider_binding == 0
+                    && self
+                        .values
+                        .iter()
+                        .all(|v| !matches!(v, Value::Object(_) | Value::JsValue(_)))))
     }
 
     /// This layer where each value takes the keys of the one value of
@@ -6295,9 +6425,34 @@ pub(crate) fn is_constant_value(values: &Pattern) -> bool {
 
 /// The layers that `pattern` answers as, when it is a sequence or a
 /// constant: a constant is one step that fills each cycle.
-fn layers(pattern: &Pattern) -> Option<std::borrow::Cow<'_, [Layer]>> {
+enum Layers<'a> {
+    Borrowed(&'a [Layer]),
+    Single([Layer; 1]),
+}
+
+impl std::ops::Deref for Layers<'_> {
+    type Target = [Layer];
+    #[inline]
+    fn deref(&self) -> &[Layer] {
+        match self {
+            Self::Borrowed(slice) => slice,
+            Self::Single(single) => single,
+        }
+    }
+}
+
+impl Layers<'_> {
+    fn into_owned(self) -> Vec<Layer> {
+        match self {
+            Self::Borrowed(slice) => slice.to_vec(),
+            Self::Single([layer]) => vec![layer],
+        }
+    }
+}
+
+fn layers(pattern: &Pattern) -> Option<Layers<'_>> {
     if let Some(layers) = folded(pattern) {
-        return Some(std::borrow::Cow::Borrowed(layers));
+        return Some(Layers::Borrowed(layers));
     }
     let hap = constant(pattern)?;
     let raw = Raw {
@@ -6306,9 +6461,9 @@ fn layers(pattern: &Pattern) -> Option<std::borrow::Cow<'_, [Layer]>> {
         value: 0,
         locations: hap.context,
     };
-    Some(std::borrow::Cow::Owned(vec![Layer::new(
+    Some(Layers::Single([Layer::of_single(
         Fraction::ONE,
-        vec![raw],
+        raw,
         Arc::new([hap.value]),
     )]))
 }
@@ -6566,14 +6721,24 @@ pub(crate) fn constant_value_at(values: &Pattern) -> Option<(Value, Locations)> 
 /// `pattern` with each value named by the control of `names`, as
 /// [`Pattern::map_control`] names it, when `pattern` is a sequence or a
 /// constant that holds no name and no control yet. See [`Layer::named`].
-pub(crate) fn named(pattern: &Pattern, spec: &crate::controls::ControlSpec) -> Option<Pattern> {
+pub(crate) fn named(
+    pattern: &Pattern,
+    spec: &crate::controls::ControlSpec,
+    unnamed_only: bool,
+) -> Option<Pattern> {
     let layers = layers(pattern)?;
-    if !layers.iter().all(Layer::takes_name) {
+    if !layers.iter().all(|layer| layer.takes_name(unnamed_only)) {
         return None;
     }
     // Each layer of a node has steps, so each one stays. The layers are
     // made where the new node holds them.
-    let named = Layer::named_arc(&layers, spec);
+    let named = match layers {
+        Layers::Single([mut layer]) => {
+            Layer::named_in_place(std::slice::from_mut(&mut layer), spec);
+            Arc::from([layer])
+        }
+        Layers::Borrowed(slice) => Layer::named_arc(slice, spec),
+    };
     Some(Pattern::of(Node::Sequence(named)))
 }
 
@@ -6582,8 +6747,9 @@ pub(crate) fn named(pattern: &Pattern, spec: &crate::controls::ControlSpec) -> O
 pub(crate) fn named_in_place(
     layers: &mut Arc<[Layer]>,
     spec: &crate::controls::ControlSpec,
+    unnamed_only: bool,
 ) -> bool {
-    if !layers.iter().all(Layer::takes_name) {
+    if !layers.iter().all(|layer| layer.takes_name(unnamed_only)) {
         return false;
     }
     let Some(slice) = Arc::get_mut(layers) else {
@@ -7303,6 +7469,154 @@ pub(crate) fn stacked(patterns: &[Pattern]) -> Option<Pattern> {
     Some(node_of_sound(stacked))
 }
 
+/// Try to rescale an owned `Node::Sequence` by `factor` in place when unshared,
+/// updating unshared `CompactGrid`s in place with zero heap allocations.
+pub(crate) fn faster_in_place(layers: &mut Arc<[Layer]>, factor: Fraction) -> bool {
+    if factor <= Fraction::ZERO {
+        return false;
+    }
+    let small =
+        |period: &Fraction| period.numer() <= MAX_PERIOD_TERM && period.denom() <= MAX_PERIOD_TERM;
+    let Some(slice) = Arc::get_mut(layers) else {
+        return false;
+    };
+    // Validate every layer's new period fits before mutating any layer.
+    for layer in slice.iter() {
+        if layer.period().checked_div(factor).filter(small).is_none() {
+            return false;
+        }
+    }
+    // Fast path: when every layer has a listed CompactGrid, try in-place first,
+    // falling back per-layer to `GridView::faster` (which never mutates until
+    // all layers are validated).
+    if slice.len() == 1 {
+        let layer = &mut slice[0];
+        let period = layer.period().checked_div(factor).expect("validated");
+        if (layer.period_denom_flags & LAYER_DENOM_MASK) != 0
+            && let Steps::Listed(Listing::CompactGrid(grid)) = &mut layer.steps
+            && grid.try_faster_in_place(factor).is_some()
+        {
+            let in_cycles = match &layer.steps {
+                Steps::Listed(listing) => listing
+                    .with_grid_view(|view| view.in_cycles_for(period))
+                    .unwrap_or(false),
+                _ => false,
+            };
+            let steps = std::mem::replace(
+                &mut layer.steps,
+                Steps::Listed(Listing::CompactGrid(CompactGrid::OneStep([0; 12]))),
+            );
+            layer.set_in_cycles(in_cycles);
+            layer.set_period_and_steps(period, steps);
+            return true;
+        }
+        let listing = layer.listing();
+        if let Some(Some((new_listing, in_cycles))) =
+            listing.with_grid_view(|grid| grid.faster(factor, period))
+        {
+            layer.set_in_cycles(in_cycles);
+            layer.set_period_and_steps(period, Steps::Listed(new_listing));
+            return true;
+        }
+        return false;
+    }
+    // Multi-layer owned sequence: ensure every layer can rescale via GridView
+    // before mutating any layer so partial mutation cannot happen.
+    let can_grid = slice.iter().all(|layer| {
+        let period = layer.period().checked_div(factor).expect("validated");
+        // Verify factor fits u32 and period fits; actual rescaling is infallible
+        // when grid.faster would succeed, so check via dry-run for non-inline or
+        // only proceed when all layers are listed CompactGrid/Grid with small ticks.
+        let _ = period;
+        matches!(
+            &layer.steps,
+            Steps::Listed(Listing::CompactGrid(_)) if (layer.period_denom_flags & LAYER_DENOM_MASK) != 0
+        )
+    });
+    if !can_grid {
+        return false;
+    }
+    // Check that every layer's ticks won't overflow `GridView::faster` before mutating.
+    let f_num = match u32::try_from(factor.numer()) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let f_den = match u32::try_from(factor.denom()) {
+        Ok(v) if v != 0 => v,
+        _ => return false,
+    };
+    let all_fit = slice.iter().all(|layer| {
+        let Steps::Listed(listing) = &layer.steps else {
+            return false;
+        };
+        listing
+            .with_grid_view(|view| {
+                let g0 = gcd(u64::from(view.ticks.get()), u64::from(f_den)) as u32;
+                let ticks_1 = view.ticks.get() / g0;
+                let mul = f_den / g0;
+                let Some(ticks_2) = u64::from(ticks_1).checked_mul(u64::from(f_num)) else {
+                    return false;
+                };
+                if u32::try_from(ticks_2)
+                    .ok()
+                    .and_then(|v| i32::try_from(v).ok())
+                    .is_none()
+                {
+                    return false;
+                }
+                if mul > 1 {
+                    for i in 0..view.steps.len() {
+                        let (b, e) = view.steps.times_of(i);
+                        if u64::from(b)
+                            .checked_mul(u64::from(mul))
+                            .and_then(|v| u32::try_from(v).ok())
+                            .is_none()
+                            || u64::from(e)
+                                .checked_mul(u64::from(mul))
+                                .and_then(|v| u32::try_from(v).ok())
+                                .is_none()
+                        {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .unwrap_or(false)
+    });
+    if !all_fit {
+        return false;
+    }
+    for layer in slice.iter_mut() {
+        let period = layer.period().checked_div(factor).expect("validated");
+        if let Steps::Listed(Listing::CompactGrid(grid)) = &mut layer.steps
+            && grid.try_faster_in_place(factor).is_some()
+        {
+            let in_cycles = match &layer.steps {
+                Steps::Listed(listing) => listing
+                    .with_grid_view(|view| view.in_cycles_for(period))
+                    .unwrap_or(false),
+                _ => false,
+            };
+            let steps = std::mem::replace(
+                &mut layer.steps,
+                Steps::Listed(Listing::CompactGrid(CompactGrid::OneStep([0; 12]))),
+            );
+            layer.set_in_cycles(in_cycles);
+            layer.set_period_and_steps(period, steps);
+            continue;
+        }
+        let listing = layer.listing();
+        let (new_listing, in_cycles) = listing
+            .with_grid_view(|grid| grid.faster(factor, period))
+            .flatten()
+            .expect("validated grid faster");
+        layer.set_in_cycles(in_cycles);
+        layer.set_period_and_steps(period, Steps::Listed(new_listing));
+    }
+    true
+}
+
 /// `pattern`, `factor` times as fast, when it is a sequence or a constant
 /// and the factor is above zero.
 pub(crate) fn faster(pattern: &Pattern, factor: Fraction) -> Option<Pattern> {
@@ -7318,41 +7632,49 @@ pub(crate) fn faster(pattern: &Pattern, factor: Fraction) -> Option<Pattern> {
             span.end.checked_div(factor)?,
         ))
     };
+    let rescale_layer = |layer: &Layer| -> Option<Layer> {
+        let period = layer.period().checked_div(factor).filter(small)?;
+        // The times of the steps are in cycles, so they change with
+        // the speed.
+        let listing = layer.listing();
+        if let Some(Some((new_listing, in_cycles))) =
+            listing.with_grid_view(|grid| grid.faster(factor, period))
+        {
+            return Some(layer.with(|layer| {
+                layer.set_in_cycles(in_cycles);
+                layer.set_period_and_steps(period, Steps::Listed(new_listing));
+            }));
+        }
+        let raws = (0..listing.len())
+            .map(|index| {
+                let (whole, part) = listing.times(index);
+                let part = match part {
+                    Some(part) => Some(faster(part)?),
+                    None => None,
+                };
+                Some(Raw {
+                    whole: faster(whole)?,
+                    part,
+                    value: listing.value(index),
+                    locations: listing.locations(index),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(layer.with(|layer| {
+            layer.set_in_cycles(lie_in_spans(period, raws.iter().map(Raw::part)));
+            layer.set_period_and_steps(period, Steps::Listed(Listing::of(raws)));
+        }))
+    };
+    if layers.len() <= 8 {
+        let mut buf: [Option<Layer>; 8] = Default::default();
+        for (slot, layer) in buf.iter_mut().zip(layers.iter()) {
+            *slot = Some(rescale_layer(layer)?);
+        }
+        return Some(node_of_sound_stack(&mut buf, layers.len()));
+    }
     let layers = layers
         .iter()
-        .map(|layer| {
-            let period = layer.period().checked_div(factor).filter(small)?;
-            // The times of the steps are in cycles, so they change with
-            // the speed.
-            let listing = layer.listing();
-            if let Some(Some((new_listing, in_cycles))) =
-                listing.with_grid_view(|grid| grid.faster(factor, period))
-            {
-                return Some(layer.with(|layer| {
-                    layer.set_in_cycles(in_cycles);
-                    layer.set_period_and_steps(period, Steps::Listed(new_listing));
-                }));
-            }
-            let raws = (0..listing.len())
-                .map(|index| {
-                    let (whole, part) = listing.times(index);
-                    let part = match part {
-                        Some(part) => Some(faster(part)?),
-                        None => None,
-                    };
-                    Some(Raw {
-                        whole: faster(whole)?,
-                        part,
-                        value: listing.value(index),
-                        locations: listing.locations(index),
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?;
-            Some(layer.with(|layer| {
-                layer.set_in_cycles(lie_in_spans(period, raws.iter().map(Raw::part)));
-                layer.set_period_and_steps(period, Steps::Listed(Listing::of(raws)));
-            }))
-        })
+        .map(rescale_layer)
         .collect::<Option<Vec<_>>>()?;
     Some(node_of_sound(layers))
 }
@@ -7612,7 +7934,7 @@ mod tests {
         };
         let (_, layers) = sequences().swap_remove(5);
         let spec = crate::controls::ControlSpec::new(["note"]);
-        let pattern = named(&built(&layers), &spec).expect("a named sequence");
+        let pattern = named(&built(&layers), &spec, false).expect("a named sequence");
         assert_eq!(dresses(&pattern), 1);
         let control = Value::object([("gain".to_string(), Value::F64(0.5))]);
         let set = compose(&pattern, &pure(control), ComposeOp::Set, Alignment::In);
@@ -7621,7 +7943,7 @@ mod tests {
         let located = located(&set, &[(3, 5)]).expect("a located sequence");
         assert_eq!(dresses(&located), 1);
         // Two sequences of two dresses, one after the other in a stack.
-        let other = named(&built(&sequences()[0].1), &spec).expect("a named sequence");
+        let other = named(&built(&sequences()[0].1), &spec, false).expect("a named sequence");
         let both = stack(vec![located, other]);
         assert_eq!(dresses(&both), 2);
     }

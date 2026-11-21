@@ -64,11 +64,23 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
 
     // -- time --------------------------------------------------------------
     fn fast(&self, factor: Fraction) -> Self;
+    fn fast_owned(self, factor: Fraction) -> Self
+    where
+        Self: Sized,
+    {
+        self.fast(factor)
+    }
     /// The speed change itself, with no zero check or step update. Only
     /// [`crate::combinators::checked_fast`] calls it.
     #[doc(hidden)]
     fn fast_node(&self, factor: Fraction, operation: &'static str) -> Self;
     fn slow(&self, factor: Fraction) -> Self;
+    fn slow_owned(self, factor: Fraction) -> Self
+    where
+        Self: Sized,
+    {
+        self.slow(factor)
+    }
     fn early(&self, t: Fraction) -> Self;
     fn late(&self, t: Fraction) -> Self;
     fn fast_gap(&self, factor: Fraction) -> Self;
@@ -394,11 +406,17 @@ impl PatOps for Pattern {
     fn fast(&self, factor: Fraction) -> Self {
         Pattern::fast(self, factor)
     }
+    fn fast_owned(self, factor: Fraction) -> Self {
+        Pattern::fast_owned(self, factor)
+    }
     fn fast_node(&self, factor: Fraction, operation: &'static str) -> Self {
         Pattern::fast_node(self, factor, operation)
     }
     fn slow(&self, factor: Fraction) -> Self {
         Pattern::slow(self, factor)
+    }
+    fn slow_owned(self, factor: Fraction) -> Self {
+        Pattern::slow_owned(self, factor)
     }
     fn early(&self, t: Fraction) -> Self {
         Pattern::early(self, t)
@@ -776,11 +794,17 @@ impl PatOps for PurePattern {
     fn fast(&self, factor: Fraction) -> Self {
         PurePattern::fast(self, factor)
     }
+    fn fast_owned(self, factor: Fraction) -> Self {
+        PurePattern::assert_pure(self.0.fast_owned(factor))
+    }
     fn fast_node(&self, factor: Fraction, operation: &'static str) -> Self {
         PurePattern::assert_pure(self.pattern().fast_node(factor, operation))
     }
     fn slow(&self, factor: Fraction) -> Self {
         PurePattern::slow(self, factor)
+    }
+    fn slow_owned(self, factor: Fraction) -> Self {
+        PurePattern::assert_pure(self.0.slow_owned(factor))
     }
     fn early(&self, t: Fraction) -> Self {
         PurePattern::early(self, t)

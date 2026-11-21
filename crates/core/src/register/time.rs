@@ -913,7 +913,7 @@ pub(super) fn register(r: &mut Registry) {
         SLOW,
         2,
         false,
-        crate::native_combinator!(|args, pat| pat.slow(arg_fraction(args, 0))),
+        crate::native_combinator!(|args, pat| pat.slow_owned(arg_fraction(args, 0))),
     );
 
     add(

@@ -289,7 +289,7 @@ impl ContextKeys {
                 let mut free_slot = None;
                 for (i, cell) in once.iter().enumerate() {
                     if let Some(pair) = cell.get() {
-                        if Arc::ptr_eq(arc, &pair.0) {
+                        if Arc::ptr_eq(arc, &pair.0) || Keys::same_values(arc, &pair.0) {
                             self.0 = Some(Arc::clone(&pair.1));
                             return;
                         }
@@ -337,25 +337,9 @@ impl ContextKeys {
     /// Whether these and `other` hold the same keys, down to the bits of a
     /// number.
     pub(crate) fn same(&self, other: &Self) -> bool {
-        let same_definition = |a: &Option<Arc<Value>>, b: &Option<Arc<Value>>| match (a, b) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b) || crate::same_key(a, b),
-            (None, None) => true,
-            _ => false,
-        };
         match (&self.0, &other.0) {
             (None, None) => true,
-            (Some(a), Some(b)) => {
-                Arc::ptr_eq(a, b)
-                    || (a.scale == b.scale
-                        && a.edo_size.map(f64::to_bits) == b.edo_size.map(f64::to_bits)
-                        && same_definition(&a.scale_definition, &b.scale_definition)
-                        && a.tags == b.tags
-                        && a.log_line == b.log_line
-                        && a.live_controls == b.live_controls
-                        && a.slider_binding == b.slider_binding
-                        && a.ui_visuals == b.ui_visuals
-                        && same_pick_lookup(&a.pick_lookup, &b.pick_lookup))
-            }
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b) || Keys::same_values(a, b),
             _ => false,
         }
     }
@@ -500,6 +484,23 @@ impl ContextKeys {
 }
 
 impl Keys {
+    fn same_values(a: &Self, b: &Self) -> bool {
+        let same_definition = |a: &Option<Arc<Value>>, b: &Option<Arc<Value>>| match (a, b) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b) || crate::same_key(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        a.ui_visuals == b.ui_visuals
+            && a.slider_binding == b.slider_binding
+            && a.live_controls == b.live_controls
+            && a.scale == b.scale
+            && a.edo_size.map(f64::to_bits) == b.edo_size.map(f64::to_bits)
+            && same_definition(&a.scale_definition, &b.scale_definition)
+            && a.tags == b.tags
+            && a.log_line == b.log_line
+            && same_pick_lookup(&a.pick_lookup, &b.pick_lookup)
+    }
+
     fn is_empty(&self) -> bool {
         self.scale.is_none()
             && self.edo_size.is_none()

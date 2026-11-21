@@ -2,6 +2,120 @@
 
 use crate::reader::hits;
 
+/// Normalized body text of a lane read directly from a score source: either a
+/// zero-copy byte range of the score source when already normalized, or an
+/// owned normalized string when line endings or trailing blanks changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaneBodySource {
+    Slice(u32, u32),
+    Owned(String),
+}
+
+impl LaneBodySource {
+    /// Build from `source[start..end]`, storing byte offsets without allocating
+    /// when the slice is already in canonical lane-body form.
+    pub fn from_range(source: &str, start: usize, end: usize) -> Self {
+        let code = &source[start..end];
+        if LaneStatement::is_a_body(code)
+            && let (Ok(s), Ok(e)) = (u32::try_from(start), u32::try_from(end))
+        {
+            Self::Slice(s, e)
+        } else {
+            Self::Owned(LaneStatement::body_of(code))
+        }
+    }
+
+    #[inline]
+    pub fn as_str<'a>(&'a self, source: &'a str) -> &'a str {
+        match self {
+            Self::Slice(start, end) => &source[*start as usize..*end as usize],
+            Self::Owned(owned) => owned.as_str(),
+        }
+    }
+}
+
+/// A lane read from a score source without allocating strings for verbatim
+/// labels or normalized bodies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadLane {
+    pub label: (u32, u32),
+    pub body: LaneBodySource,
+    pub line: usize,
+}
+
+impl ReadLane {
+    #[inline]
+    pub fn label_str<'a>(&self, source: &'a str) -> &'a str {
+        &source[self.label.0 as usize..self.label.1 as usize]
+    }
+
+    #[inline]
+    pub fn body_str<'a>(&'a self, source: &'a str) -> &'a str {
+        self.body.as_str(source)
+    }
+
+    pub fn to_statement(&self, source: &str) -> LaneStatement {
+        LaneStatement {
+            label: self.label_str(source).to_owned(),
+            body: self.body_str(source).to_owned(),
+            line: self.line,
+        }
+    }
+}
+
+/// Inline-optimized list of [`ReadLane`]s avoiding a heap `Vec` for empty and
+/// single-lane scores.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ReadLanes {
+    #[default]
+    Empty,
+    One(ReadLane),
+    Many(Vec<ReadLane>),
+}
+
+impl ReadLanes {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(_) => 1,
+            Self::Many(lanes) => lanes.len(),
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[ReadLane] {
+        match self {
+            Self::Empty => &[],
+            Self::One(lane) => std::slice::from_ref(lane),
+            Self::Many(lanes) => lanes.as_slice(),
+        }
+    }
+
+    pub fn push(&mut self, lane: ReadLane) {
+        match std::mem::take(self) {
+            Self::Empty => *self = Self::One(lane),
+            Self::One(first) => *self = Self::Many(vec![first, lane]),
+            Self::Many(mut lanes) => {
+                lanes.push(lane);
+                *self = Self::Many(lanes);
+            }
+        }
+    }
+
+    pub fn to_statements(&self, source: &str) -> Vec<LaneStatement> {
+        self.as_slice()
+            .iter()
+            .map(|lane| lane.to_statement(source))
+            .collect()
+    }
+}
+
 /// A lane of a score, as a reader of the text lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaneStatement {

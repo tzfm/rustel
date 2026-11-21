@@ -57,6 +57,103 @@ impl BuiltinMethod {
         matches!(self, Self::Composer(_))
     }
 
+    /// What `receiver.name(...arguments)` builds for up to 4 arguments without
+    /// allocating a `Vec<Pattern>` on the heap.
+    pub(crate) fn apply_small(
+        &self,
+        receiver: Pattern,
+        arguments: &mut [Option<Pattern>],
+    ) -> Option<Pattern> {
+        Some(match self {
+            Self::Registered(registration) => {
+                let expected = registration.arity.saturating_sub(1);
+                if arguments.len() != expected {
+                    if expected == 1 && !arguments.is_empty() {
+                        let pats: Vec<Pattern> =
+                            arguments.iter_mut().filter_map(Option::take).collect();
+                        let seq = sequence_patterns(pats);
+                        return Some(registration.call(std::slice::from_ref(&seq), receiver));
+                    }
+                    return None;
+                }
+                match arguments {
+                    [] => registration.call(&[], receiver),
+                    [a] => registration.call(std::slice::from_ref(a.as_ref()?), receiver),
+                    [a, b] => {
+                        let slice = [a.take()?, b.take()?];
+                        registration.call(&slice, receiver)
+                    }
+                    [a, b, c] => {
+                        let slice = [a.take()?, b.take()?, c.take()?];
+                        registration.call(&slice, receiver)
+                    }
+                    [a, b, c, d] => {
+                        let slice = [a.take()?, b.take()?, c.take()?, d.take()?];
+                        registration.call(&slice, receiver)
+                    }
+                    _ => {
+                        let pats: Vec<Pattern> =
+                            arguments.iter_mut().filter_map(Option::take).collect();
+                        registration.call(&pats, receiver)
+                    }
+                }
+            }
+            Self::Control(spec) => match arguments {
+                [] => spec.apply_to(receiver, None),
+                [first] => spec.apply_to(receiver, first.take()),
+                [first, ..] if spec.names.len() <= 1 => spec.apply_to(receiver, first.take()),
+                [a, b] => {
+                    let slice = [a.take()?, b.take()?];
+                    spec.apply_positional(&receiver, &slice)
+                }
+                [a, b, c] => {
+                    let slice = [a.take()?, b.take()?, c.take()?];
+                    spec.apply_positional(&receiver, &slice)
+                }
+                [a, b, c, d] => {
+                    let slice = [a.take()?, b.take()?, c.take()?, d.take()?];
+                    spec.apply_positional(&receiver, &slice)
+                }
+                _ => {
+                    let pats: Vec<Pattern> =
+                        arguments.iter_mut().filter_map(Option::take).collect();
+                    spec.apply_positional(&receiver, &pats)
+                }
+            },
+            Self::Shortcut { op, how } => match arguments {
+                [] => return None,
+                [other] => rustel_core::compose::compose(&receiver, other.as_ref()?, *op, *how),
+                _ => {
+                    let pats: Vec<Pattern> =
+                        arguments.iter_mut().filter_map(Option::take).collect();
+                    let other = sequence_patterns(pats);
+                    rustel_core::compose::compose(&receiver, &other, *op, *how)
+                }
+            },
+            Self::Composer(op) => match arguments {
+                [] => return None,
+                [other] => rustel_core::compose::compose(
+                    &receiver,
+                    other.as_ref()?,
+                    *op,
+                    rustel_core::compose::default_alignment(),
+                ),
+                _ => {
+                    let pats: Vec<Pattern> =
+                        arguments.iter_mut().filter_map(Option::take).collect();
+                    let other = sequence_patterns(pats);
+                    rustel_core::compose::compose(
+                        &receiver,
+                        &other,
+                        *op,
+                        rustel_core::compose::default_alignment(),
+                    )
+                }
+            },
+            Self::Pick { .. } | Self::Visual | Self::Layer { .. } => return None,
+        })
+    }
+
     /// What `receiver.name(...arguments)` builds, as the method builds it.
     /// `None` where the JavaScript method throws for these arguments, and
     /// for a method whose arguments are not patterns.
