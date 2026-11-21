@@ -71,7 +71,22 @@ pub(super) fn run_vst(
             let rows: Vec<_> = plugins
                 .iter()
                 .map(|plugin| {
-                    serde_json::json!({ "name": plugin.name, "bundle": text(&plugin.bundle) })
+                    // The status the human list shows as `off`, so a script
+                    // can tell a plugin it may load from one that failed.
+                    let mut row = serde_json::json!({
+                        "name": plugin.name,
+                        "bundle": text(&plugin.bundle),
+                        "status": match &plugin.status {
+                            Status::Found => "found",
+                            Status::Loading => "loading",
+                            Status::Ready => "ready",
+                            Status::Failed(_) => "failed",
+                        },
+                    });
+                    if let Status::Failed(reason) = &plugin.status {
+                        row["reason"] = serde_json::Value::String(reason.clone());
+                    }
+                    row
                 })
                 .collect();
             let folders: Vec<_> = vst::folders().iter().map(|path| text(path)).collect();

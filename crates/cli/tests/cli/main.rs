@@ -9811,3 +9811,34 @@ fn check_finds_what_only_the_query_refuses() {
     ]);
     assert!(clean.contains("no issues found"), "{clean}");
 }
+
+/// `rustel vst -j` says which plugins failed their scan, and why, as the
+/// readable list does with `off`: a bundle with no library for this system
+/// is listed as failed with its reason.
+#[cfg(feature = "vst")]
+#[test]
+fn the_json_plugin_list_says_which_bundles_failed() {
+    let directory = tempfile::tempdir().expect("plugin folder");
+    std::fs::create_dir_all(directory.path().join("plugins/Empty.vst3")).expect("empty bundle");
+    let out = rustel()
+        .args(["vst", "-j"])
+        .env("RUSTEL_VST3_PATH", directory.path().join("plugins"))
+        .env("RUSTEL_CONFIG_DIR", directory.path().join("config"))
+        .output()
+        .expect("the list runs");
+    assert!(out.status.success(), "{out:?}");
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json list");
+    let empty = list["plugins"]
+        .as_array()
+        .expect("plugins")
+        .iter()
+        .find(|row| row["name"] == "Empty")
+        .expect("the empty bundle is listed");
+    assert_eq!(empty["status"], "failed", "{empty}");
+    assert!(
+        empty["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "{empty}"
+    );
+}
