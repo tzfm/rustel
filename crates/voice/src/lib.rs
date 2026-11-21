@@ -1166,6 +1166,19 @@ mod tests {
             error.contains("has no note at midi 60: it has gaps between midi 48 and 96"),
             "{error}"
         );
+        // A check tells it apart from a font that failed to load.
+        let error = resolve_voice_with_samples_detailed(
+            &serde_json::json!({ "s": "gm_clarinet", "note": 36 }),
+            0,
+            0.5,
+            0.0,
+            0.0,
+            48_000,
+            0.5,
+            &Clarinet,
+        )
+        .expect_err("no zone at 36");
+        assert!(matches!(error, VoiceError::NoteOutsideFont(_)), "{error}");
     }
 
     /// A bank named by digits plays: mini-notation reads `s("808")` as a
@@ -2463,6 +2476,9 @@ pub enum VoiceError {
     SampleLoading(String),
     /// The selected sample or wavetable failed to fetch or decode.
     SampleFailed(String),
+    /// A soundfont that loaded has no zone for the note: it plays silence,
+    /// as on strudel.cc.
+    NoteOutsideFont(String),
     /// No currently loaded sample bank, wavetable or synth resolves this name.
     UnknownSound(String),
 }
@@ -2473,6 +2489,7 @@ impl VoiceError {
             Self::InvalidControl(message)
             | Self::SampleLoading(message)
             | Self::SampleFailed(message)
+            | Self::NoteOutsideFont(message)
             | Self::UnknownSound(message) => message,
         }
     }
@@ -2484,6 +2501,7 @@ impl std::fmt::Display for VoiceError {
             Self::InvalidControl(message)
             | Self::SampleLoading(message)
             | Self::SampleFailed(message)
+            | Self::NoteOutsideFont(message)
             | Self::UnknownSound(message) => message,
         };
         f.write_str(message)
@@ -4216,20 +4234,6 @@ fn non_scalar_speech_note() -> VoiceError {
     VoiceError::InvalidControl("talkit: note must be a note name or a MIDI number".into())
 }
 
-/// Why the sample of a hap's `object` would not sound, as a voice says it
-/// when the note plays: a file that failed, or a note a soundfont has no
-/// zone for. None when it would sound, is still loading, or names no
-/// sample.
-pub fn sample_failure(
-    object: &serde_json::Map<String, serde_json::Value>,
-    samples: &dyn SampleLookup,
-) -> Option<String> {
-    match sample_controls(object, samples) {
-        Err(VoiceError::SampleFailed(message)) => Some(message),
-        _ => None,
-    }
-}
-
 fn sample_controls(
     object: &serde_json::Map<String, serde_json::Value>,
     samples: &dyn SampleLookup,
@@ -4332,7 +4336,7 @@ fn sample_controls(
                     } else {
                         format!("it plays midi {low} to {high}")
                     };
-                    return Err(VoiceError::SampleFailed(format!(
+                    return Err(VoiceError::NoteOutsideFont(format!(
                         "sample \"{name}:{n}\" has no note at midi {midi}: {range}"
                     )));
                 }

@@ -20,7 +20,6 @@ use rustel_fraction::Fraction;
 use crate::lint::{self, Diagnostic, Level};
 use crate::samples::SampleLibrary;
 use crate::session::{RuntimeError, Session};
-use rustel_voice::SampleLookup;
 
 /// Where an evaluation failure happened, when the underlying message says.
 ///
@@ -100,11 +99,17 @@ pub fn check_score_with(
     // count or a Euclid step past its limit, or a KabelSalat graph that will
     // not build. Query its first cycle, as the first update would, so the
     // check reports what query and export would.
+    let mut first_cycle = None;
     if eval_error.is_none() && !cancellation.load(Ordering::Relaxed) {
         let thrown = match session.query_report(Fraction::ZERO, Fraction::ONE) {
-            Ok(report) => report
-                .query_threw
-                .map(|message| format!("the pattern threw while querying: {message}")),
+            Ok(report) => {
+                let thrown = report
+                    .query_threw
+                    .clone()
+                    .map(|message| format!("the pattern threw while querying: {message}"));
+                first_cycle = Some(report);
+                thrown
+            }
             Err(error) => Some(error.to_string()),
         };
         // A stop that lands during the query is the check's cancellation,
@@ -132,8 +137,17 @@ pub fn check_score_with(
     // Evaluation queues imports under the session's existing sample grants.
     // The linter judges only the sources the loader has finished publishing.
     let mut diagnostics = lint::lint_with(source, false, library, context);
-    if eval_error.is_none() && library.is_some() && !cancellation.load(Ordering::Relaxed) {
-        diagnostics.extend(notes_outside_their_fonts(session, cancellation));
+    if eval_error.is_none()
+        && library.is_some()
+        && !cancellation.load(Ordering::Relaxed)
+        && let Some(report) = &first_cycle
+    {
+        diagnostics.extend(notes_outside_their_fonts(
+            report,
+            session,
+            source,
+            cancellation,
+        ));
     }
     if eval_error.is_none() && cancellation.load(Ordering::Relaxed) {
         eval_error = Some(EvalError {
@@ -147,86 +161,88 @@ pub fn check_score_with(
     }
 }
 
-/// The notes of the first cycle that a `gm_*` soundfont has no zone for:
-/// they play as silence, as on strudel.cc, and the check says so with the
-/// words a render uses. The fonts the cycle names are fetched first, for
-/// at most a few seconds; a font that does not come in is not judged.
-fn notes_outside_their_fonts(session: &mut Session, cancellation: &AtomicBool) -> Vec<Diagnostic> {
-    let Ok(report) = session.query_report(Fraction::ZERO, Fraction::ONE) else {
-        return Vec::new();
-    };
+/// The notes of the first cycle that a soundfont has no zone for: they play
+/// as silence, as on strudel.cc, and the check says so with the words a
+/// render uses. Each note is resolved as a voice resolves it, so the sound
+/// is the one that plays. The fonts the cycle names are fetched first, for
+/// at most a few seconds; a font that does not come in, or a `samples()`
+/// still on its way that may name the sound, is not judged.
+fn notes_outside_their_fonts(
+    report: &crate::hap_json::QueryReport,
+    session: &Session,
+    source: &str,
+    cancellation: &AtomicBool,
+) -> Vec<Diagnostic> {
     let Some(samples) = session.sample_library() else {
         return Vec::new();
     };
-    let fonts: Vec<_> = report
+    let cps = session.config().cps;
+    let onsets: Vec<_> = report
         .haps
         .iter()
         .filter(|hap| hap.has_onset)
         .filter_map(|hap| match &hap.value {
-            crate::hap_json::ValueJson::Raw(serde_json::Value::Object(object)) => {
-                let sound = object.get("s")?.as_str()?;
-                let font = sound.starts_with("gm_") && !object.contains_key("bank");
-                font.then(|| FontNote {
-                    value: object.clone(),
-                    sound: sound.to_owned(),
-                    at: hap.context.first().copied(),
-                })
+            crate::hap_json::ValueJson::Raw(value @ serde_json::Value::Object(_)) => {
+                Some((value, hap.context.first().copied()))
             }
             _ => None,
         })
         .collect();
-    if fonts.is_empty() {
+    let resolve = |value| {
+        rustel_voice::resolve_voice_with_samples_detailed(
+            value,
+            0,
+            0.25,
+            0.0,
+            0.0,
+            48_000,
+            cps,
+            samples.as_ref(),
+        )
+    };
+    // Asking is what starts the fetch.
+    let loading = onsets.iter().fold(false, |loading, (value, _)| {
+        matches!(
+            resolve(value),
+            Err(rustel_voice::VoiceError::SampleLoading(_))
+        ) || loading
+    });
+    if loading {
+        samples.wait_until_idle_cancellable(Duration::from_secs(5), || {
+            cancellation.load(Ordering::Relaxed)
+        });
+    }
+    if samples.manifests_pending() > 0 {
         return Vec::new();
     }
-    // Asking is what starts the fetch.
-    for note in &fonts {
-        let _ = rustel_voice::sample_failure(&note.value, samples.as_ref());
-    }
-    samples.wait_until_idle_cancellable(Duration::from_secs(5), || {
-        cancellation.load(Ordering::Relaxed)
-    });
-    font_notes_missing(fonts, samples.as_ref())
-}
-
-/// A note a `gm_*` soundfont plays: the hap's value, its sound, and where
-/// the score wrote it.
-struct FontNote {
-    value: serde_json::Map<String, serde_json::Value>,
-    sound: String,
-    at: Option<(usize, usize)>,
-}
-
-/// The findings for the font notes of a cycle against `samples`: one per
-/// message, so a note heard many times is said once.
-fn font_notes_missing(fonts: Vec<FontNote>, samples: &dyn SampleLookup) -> Vec<Diagnostic> {
-    let mut said = Vec::new();
+    let mut said = std::collections::HashSet::new();
     let mut diagnostics = Vec::new();
-    for FontNote { value, sound, at } in fonts {
-        let n = value
-            .get("n")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0);
-        // A font that came in has a range; one that failed to come in is
-        // the network's, not the score's.
-        if samples.note_range(&sound, n).is_none() {
-            continue;
-        }
-        let Some(message) = rustel_voice::sample_failure(&value, samples) else {
+    for (value, at) in onsets {
+        let Err(rustel_voice::VoiceError::NoteOutsideFont(message)) = resolve(value) else {
             continue;
         };
-        if said.contains(&message) {
+        if !said.insert(message.clone()) {
             continue;
         }
         let (from, to) = at.unwrap_or((0, 0));
         diagnostics.push(Diagnostic {
             level: Level::Value,
-            message: message.clone(),
-            from,
-            to,
+            message,
+            from: char_floor(source, from),
+            to: char_floor(source, to),
         });
-        said.push(message);
     }
     diagnostics
+}
+
+/// `at`, moved back to the start of the character it falls in, and no
+/// further than the end of `source`.
+fn char_floor(source: &str, at: usize) -> usize {
+    let mut at = at.min(source.len());
+    while !source.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
 }
 
 /// Pull the line number back out of a `" - line N"` or `" - line N, column
@@ -246,59 +262,14 @@ fn extract_reported_line(message: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
-    /// A font that plays midi 48 to 84, found nowhere else.
-    struct Clarinet;
-
-    impl SampleLookup for Clarinet {
-        fn resolve(&self, _s: &str, _n: f64, midi: f64) -> rustel_voice::SampleResolution {
-            if (48.0..=84.0).contains(&midi) {
-                rustel_voice::SampleResolution::Loading
-            } else {
-                rustel_voice::SampleResolution::Failed
-            }
-        }
-
-        fn note_range(&self, s: &str, _n: f64) -> Option<(f64, f64)> {
-            (s == "gm_clarinet").then_some((48.0, 84.0))
-        }
-    }
-
-    fn font_note(sound: &str, note: &str) -> FontNote {
-        let serde_json::Value::Object(value) = serde_json::json!({ "s": sound, "note": note })
-        else {
-            unreachable!("an object")
-        };
-        FontNote {
-            value,
-            sound: sound.to_owned(),
-            at: Some((3, 9)),
-        }
-    }
-
-    /// A note a loaded font has no zone for is a finding, said once
-    /// however often it plays; a note in its range, and a font that never
-    /// came in, are not.
+    /// A position inside a character moves back to its start, so a
+    /// finding never cuts the score's text in two.
     #[test]
-    fn a_note_outside_its_font_is_a_finding() {
-        let found = font_notes_missing(
-            vec![
-                font_note("gm_clarinet", "c2"),
-                font_note("gm_clarinet", "c2"),
-                font_note("gm_clarinet", "c3"),
-                font_note("gm_recorder", "c2"),
-            ],
-            &Clarinet,
-        );
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].level, Level::Value);
-        assert_eq!((found[0].from, found[0].to), (3, 9));
-        assert!(
-            found[0]
-                .message
-                .contains("has no note at midi 36: it plays midi 48 to 84"),
-            "{}",
-            found[0].message
-        );
+    fn a_finding_starts_on_a_character() {
+        let source = "// 🎵\nnote(\"c2\")";
+        assert_eq!(char_floor(source, 4), 3);
+        assert_eq!(char_floor(source, 3), 3);
+        assert_eq!(char_floor(source, 999), source.len());
     }
 
     #[test]
