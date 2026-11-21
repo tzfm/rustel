@@ -814,7 +814,10 @@ A take records the main pair; it is not a recording of all separate outputs.
 To protect the master output, use Transport ▸ Add limiter to set. In the
 limiter's mixer strip,
 change the ceiling with arrows, use `c` to change mode, and use `b` or Enter to
-bypass it. Backspace removes it. The set remembers this limiter. The default
+bypass it. Backspace removes it. With makeup gain on, the default, the limiter
+lifts its ceiling to full scale: a lower ceiling limits harder and the master
+gets louder, never past 0 dBFS. Turn makeup off in Settings > Limiter to keep
+the master at or below the ceiling. The set remembers this limiter. The default
 limiter setting affects new or unconfigured sets. A score's `.limit(...)` is a
 separate effect.
 
@@ -1010,10 +1013,12 @@ to enter Insert mode, `d`, `c`, and `y` with a motion to delete, change, or
 copy text, and `p` or `P` to put it back. A yank or delete fills the
 register and the system clipboard, so `p` pastes the newest copy from any
 surface. `r` then a character replaces the character under the cursor, and
-a count replaces that many. `D` deletes to the end of the line.
+a count replaces that many. `J` joins the next line with one space, `gJ`
+joins it as it is, and a count joins that many lines. `D` deletes to the end
+of the line.
 `C` changes that text. `v` selects characters and `V` selects lines.
 A selection made with the mouse or with Shift+arrows enters Visual. `d`,
-`c`, `y`, `x`, `X`, `D`, `C`, `Y`, `p`, and `P` act on it. Backspace or
+`c`, `y`, `x`, `X`, `D`, `C`, `Y`, `J`, `p`, and `P` act on it. Backspace or
 Delete deletes it, and `r` then a character replaces every selected
 character. Esc returns to Normal. `.` repeats the last change, with an optional
 count. `u` undoes an edit. Ctrl+R in Normal or Visual mode redoes it.
@@ -1076,7 +1081,7 @@ The first time you enable Vim, Studio creates `~/.rustel/vimrc` if it does not
 exist. `RUSTEL_CONFIG_DIR` changes that folder. Built-in bindings remain active
 until a map line overrides them. Studio also ships default mappings beneath
 your file. Your file overrides them line for line. The shipped mappings
-include `U` update, `Q` stop, `J` and `K` for `$` labels, `M` for `_`, `jk`
+include `U` update, `Q` stop, `]$` and `[$` for `$` labels, `M` for `_`, `jk`
 to leave Insert, `gcl` and `gc` to comment, and `gf` for the Reference. The
 shipped `<Space>` chords are `V` visualizers, `O` set panel, `H` and `L`
 previous and next scene, `P` local prebake, `I` panels, and `1` and `2`
@@ -1089,7 +1094,7 @@ and keeps it when you switch between Default and Vim. The file can be a
 dedicated Vimscript file or a copy of your Vim or Neovim mappings. The file
 name and extension do not matter; Studio reads map lines from the file.
 
-For example, this file searches the score with `J` and `K`, types an
+For example, this file searches the score with `]$` and `[$`, types an
 underscore with `M`, toggles the inline visualizers with Space V, and leaves
 Insert mode with `jk`:
 
@@ -1097,8 +1102,8 @@ Insert mode with `jk`:
 nnoremap U <Action:update>
 nnoremap Q <Action:stop>
 nnoremap <Space>V <Action:visualizers>
-nnoremap J /\$<CR>
-nnoremap K ?\$<CR>
+nnoremap ]$ /\$<CR>
+nnoremap [$ ?\$<CR>
 nnoremap M i_<C-c>l
 nnoremap X hx
 inoremap jk <Esc>

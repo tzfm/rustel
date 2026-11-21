@@ -47,6 +47,9 @@ pub(super) enum RepeatableAction {
     Put {
         before: bool,
     },
+    Join {
+        spaces: bool,
+    },
     Insert(InsertEntry),
     Visual {
         edit: VisualEdit,
@@ -288,6 +291,10 @@ impl Editor {
             }
             RepeatableAction::Put { before } => {
                 self.vim_put(before, count, moment)?;
+            }
+            RepeatableAction::Join { spaces } => {
+                let first = self.document.line_of(self.vim_head())?;
+                self.vim_join_lines(first, count, spaces, moment)?;
             }
             RepeatableAction::Insert(entry) => {
                 if matches!(entry, InsertEntry::OpenBelow | InsertEntry::OpenAbove) {
