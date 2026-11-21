@@ -9586,6 +9586,50 @@ fn a_replay_save_that_never_reached_the_score_is_reported_not_announced() {
     }
 }
 
+/// The documented tempo helper `window.bpm = b => setcpm(b / 4)` is kept
+/// after `initHydra()` owns `bpm`, and a prebake that throws after an
+/// `await` names its own line.
+#[test]
+fn a_bpm_helper_survives_hydra_and_a_prebake_names_its_line() {
+    let checked = ok_stdout(&[
+        "check",
+        "--no-samples",
+        "-e",
+        "await initHydra()\nwindow.bpm = b => setcpm(b / 4)\nwindow.bpm(120)\n$: s(\"bd\")",
+    ]);
+    assert!(checked.contains("no issues found"), "{checked}");
+    // A number written after the helper is what a read gives back.
+    let checked = ok_stdout(&[
+        "check",
+        "--no-samples",
+        "-e",
+        "await initHydra()\nwindow.bpm = b => 0\nwindow.bpm = 120\nif (window.bpm !== 120) throw new Error('stale')\n$: s(\"bd\")",
+    ]);
+    assert!(checked.contains("no issues found"), "{checked}");
+
+    let prebake = scratch("prebake-throws-late.js");
+    std::fs::write(
+        &prebake,
+        "globalThis.a = 1\nawait Promise.resolve()\nthrow new Error('on line three')\n",
+    )
+    .expect("prebake");
+    let out = scratch("prebake-throws-late.wav");
+    assert_reported_failure(
+        &[
+            "export",
+            "--prebake",
+            prebake.to_str().expect("utf-8 path"),
+            "-e",
+            "s(\"bd\")",
+            "--cycles",
+            "1",
+            "-o",
+            out.to_str().expect("utf-8 path"),
+        ],
+        "on line three - line 3",
+    );
+}
+
 /// A `.dict()` name nothing registered is an error of the query, as on
 /// strudel.cc, not a lane that plays silence; a known name and a score's
 /// own `addVoicings` name still voice the chord.
@@ -9741,4 +9785,29 @@ fn an_unreadable_scale_is_reported_when_its_notes_drop() {
     let _ = std::fs::remove_file(&path);
     assert!(stderr.contains("query_threw"), "{stderr}");
     assert!(stderr.contains("Scale name raga is incomplete"), "{stderr}");
+}
+
+/// `check` queries the score's first cycle, so a score that evaluates but
+/// refuses when it plays fails the check the way query and export fail.
+#[test]
+fn check_finds_what_only_the_query_refuses() {
+    for (score, said) in [
+        (r#"s("bd").euclid(3, 100000000)"#, "above the native limit"),
+        (
+            r#"note("c3 g3").K(sine(sFreq).mul(0.15).out(16))"#,
+            "output channel from 0 to 15",
+        ),
+    ] {
+        let out = run(&["check", "--no-samples", "-e", score]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{score}: {stdout}");
+        assert!(stdout.contains(said), "{score}: {stdout}");
+    }
+    let clean = ok_stdout(&[
+        "check",
+        "--no-samples",
+        "-e",
+        r#"note("c3 g3").K(sine(sFreq).mul(0.15).out(15))"#,
+    ]);
+    assert!(clean.contains("no issues found"), "{clean}");
 }
