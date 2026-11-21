@@ -264,6 +264,18 @@ mod classification_tests {
         ));
     }
 
+    /// A limit is a ceiling at or below full scale: one above it is
+    /// refused and says why, and 0 itself plays.
+    #[test]
+    fn a_limit_above_zero_dbfs_is_refused() {
+        assert!(matches!(
+            refusal(&json!({ "s": "sine", "limit": 3 }), &BundledOnly),
+            VoiceError::InvalidControl(message) if message.contains("above the 0 dBFS ceiling")
+        ));
+        assert!(detailed(&json!({ "s": "sine", "limit": 0 }), &BundledOnly).is_ok());
+        assert!(detailed(&json!({ "s": "sine", "limit": -6 }), &BundledOnly).is_ok());
+    }
+
     #[test]
     fn fm_route_capacity_is_an_invalid_control_not_an_asset_error() {
         let mut value = json!({ "s": "sine" });
@@ -6527,6 +6539,12 @@ fn limit_controls(
     let Some(threshold_db) = optional_f64(object.get("limit"), "limit")? else {
         return Ok(None);
     };
+    // A ceiling above full scale would hold nothing back.
+    if threshold_db > 0.0 {
+        return Err(format!(
+            "limit {threshold_db} is above the 0 dBFS ceiling: a limit is at or below 0"
+        ));
+    }
     let character = match object.get("limitchar") {
         None | Some(serde_json::Value::Null) => rustel_audio::LimiterCharacter::default(),
         Some(serde_json::Value::String(name)) => rustel_audio::LimiterCharacter::parse(name)
