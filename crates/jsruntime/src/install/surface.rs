@@ -1006,7 +1006,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "inhabit",
         synonyms: &["pickSqueeze"],
         summary: "Picks patterns (or plain values) either from a list (by index) or a lookup table (by name).",
-        description: "Picks patterns (or plain values) either from a list (by index) or a lookup table (by name).\nSimilar to `pick`, but cycles are squeezed into the target ('inhabited') pattern.",
+        description: "Picks patterns (or plain values) either from a list (by index) or a lookup table (by name).\nSimilar to `pick`, but cycles are squeezed into the target ('inhabited') pattern.\nCalled as a function, it takes the list first, as on strudel.cc: `inhabit([a, b], \"0 1\")`.",
         params: &[
             ReferenceParam {
                 name: "pat",
@@ -1657,7 +1657,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "pickmod",
         synonyms: &[],
         summary: "The same as `pick`, but if you pick a number greater than the size of the list, it wraps around, rather than sticking at the maximum value.",
-        description: "The same as `pick`, but if you pick a number greater than the size of the list,\nit wraps around, rather than sticking at the maximum value.\nFor example, if you pick the fifth pattern of a list of three, you'll get the\nsecond one.",
+        description: "The same as `pick`, but if you pick a number greater than the size of the list,\nit wraps around, rather than sticking at the maximum value.\nFor example, if you pick the fifth pattern of a list of three, you'll get the\nsecond one.\nCalled as a function, it takes the list first, as on strudel.cc: `pickmod([a, b], \"0 1\")`.",
         params: &[
             ReferenceParam {
                 name: "pat",
@@ -1708,7 +1708,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "pickmodOut",
         synonyms: &[],
         summary: "The same as `pickOut`, but if you pick a number greater than the size of the list, it wraps around, rather than sticking at the maximum value.",
-        description: "The same as `pickOut`, but if you pick a number greater than the size of the list,\nit wraps around, rather than sticking at the maximum value.",
+        description: "The same as `pickOut`, but if you pick a number greater than the size of the list,\nit wraps around, rather than sticking at the maximum value.\nCalled as a function, it takes the list first, as on strudel.cc: `pickmodOut([a, b], \"0 1\")`.",
         params: &[
             ReferenceParam {
                 name: "pat",
@@ -1779,7 +1779,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "pickOut",
         synonyms: &[],
         summary: "Similar to `pick`, but it applies an outerJoin instead of an innerJoin.",
-        description: "Similar to `pick`, but it applies an outerJoin instead of an innerJoin.",
+        description: "Similar to `pick`, but it applies an outerJoin instead of an innerJoin.\nCalled as a function, it takes the list first, as on strudel.cc: `pickOut([a, b], \"0 1\")`.",
         params: &[
             ReferenceParam {
                 name: "pat",
@@ -1802,7 +1802,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "pickReset",
         synonyms: &[],
         summary: "Similar to `pick`, but the choosen pattern is reset when its index is triggered.",
-        description: "Similar to `pick`, but the choosen pattern is reset when its index is triggered.",
+        description: "Similar to `pick`, but the choosen pattern is reset when its index is triggered.\nCalled as a function, it takes the list first, as on strudel.cc: `pickReset([a, b], \"0 1\")`.",
         params: &[
             ReferenceParam {
                 name: "pat",
@@ -1825,7 +1825,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "pickRestart",
         synonyms: &[],
         summary: "Similar to `pick`, but the choosen pattern is restarted when its index is triggered.",
-        description: "Similar to `pick`, but the choosen pattern is restarted when its index is triggered.",
+        description: "Similar to `pick`, but the choosen pattern is restarted when its index is triggered.\nCalled as a function, it takes the list first, as on strudel.cc: `pickRestart([a, b], \"0 1\")`.",
         params: &[
             ReferenceParam {
                 name: "pat",
