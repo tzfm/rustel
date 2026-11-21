@@ -233,10 +233,15 @@ pub(crate) fn read_local_media(
     let relative = Path::new(path);
     let relative = relative.strip_prefix(".").unwrap_or(relative);
     if !crate::sample_server::relative_sample_path_allowed(relative) {
-        // A hidden name is its own refusal: the path may have no `..`.
-        let hidden = relative.components().any(|part| {
-            matches!(part, std::path::Component::Normal(name) if name.to_string_lossy().starts_with('.'))
-        });
+        // A hidden name is its own refusal, in a path that is otherwise
+        // plain names: a `..` or a root is refused for being one.
+        let plain = relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)));
+        let hidden = plain
+            && relative.components().any(|part| {
+                matches!(part, std::path::Component::Normal(name) if name.to_string_lossy().starts_with('.'))
+            });
         return Err(if hidden {
             format!(
                 "{label} {path:?} names a hidden entry, one that starts with `.`, which a score cannot read"
@@ -1167,7 +1172,9 @@ mod tests {
         let hidden = read_local_media(&root, "media/.hid.png", image).unwrap_err();
         assert!(hidden.contains("names a hidden entry"), "{hidden}");
         assert!(!hidden.contains("`..`"), "{hidden}");
-        let climbing = read_local_media(&root, "../x.png", image).unwrap_err();
-        assert!(climbing.contains("without `..`"), "{climbing}");
+        for climbing in ["../x.png", "../.hid.png", "/.hid.png"] {
+            let refused = read_local_media(&root, climbing, image).unwrap_err();
+            assert!(refused.contains("without `..`"), "{climbing}: {refused}");
+        }
     }
 }
