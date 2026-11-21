@@ -1798,8 +1798,9 @@ impl SampleLibrary {
         Some(crate::video::VideoPicture::Decoding)
     }
 
-    /// How many `samples("…")` maps have come in. It moves when a map
-    /// arrives, also one that came in before and was fetched again.
+    /// How many sample maps have come in, a score's or a Settings pack's. It
+    /// moves when a map arrives, also one that came in before and was
+    /// fetched again.
     pub fn maps_in(&self) -> u64 {
         self.shared.maps_in.load(Ordering::Acquire)
     }
@@ -2743,6 +2744,22 @@ mod tests {
             matches!(state("zzz"), GlobalSourceState::Failed(ref why) if why.starts_with("zzz:")),
             "{reports:?}"
         );
+    }
+
+    /// Every map that comes in moves the count a checker reads, also one
+    /// that was in before; a failure does not.
+    #[test]
+    fn a_map_that_comes_in_moves_the_count() {
+        let library = SampleLibrary::empty();
+        let before = library.maps_in();
+        library.note_samples_source_for_tests("http://kit.invalid/strudel.json");
+        library.note_samples_source_for_tests("http://kit.invalid/strudel.json");
+        assert_eq!(library.maps_in(), before + 2);
+        library.note_samples_source_state_for_tests(
+            "http://kit.invalid/other.json",
+            SourceState::Failed("gone".into()),
+        );
+        assert_eq!(library.maps_in(), before + 2);
     }
 
     /// A map that was in when its source was turned off keeps its standing

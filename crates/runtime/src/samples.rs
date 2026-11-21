@@ -1200,8 +1200,9 @@ struct Shared {
     /// Published source maps and registration status share one retention
     /// budget. Publication and eviction are atomic for loader and UI readers.
     source_tables: Mutex<SourceTables>,
-    /// How many `samples("…")` maps have come in, again or for the first
-    /// time: a checker reads the names they bring after each one.
+    /// How many sample maps have come in, a score's or a Settings pack's,
+    /// again or for the first time: a checker reads the names they bring
+    /// after each one.
     maps_in: AtomicU64,
     /// How many score policies [`SampleLibrary::withdraw_sources`] has
     /// taken, so a host can tell when one it sent is in force.
@@ -1307,10 +1308,18 @@ impl Shared {
     /// Record where `map` stands and return where it stood. A failure
     /// counts one more in a row after a failure.
     fn note_source_standing(&self, map: &str, state: SourceState) -> Option<Standing> {
-        self.source_tables
+        let ready = state == SourceState::Ready;
+        let previous = self
+            .source_tables
             .lock()
             .expect("samples source tables")
-            .note(map, state)
+            .note(map, state);
+        // Release after the map is noted, its banks published before it:
+        // a reader that sees the count move (Acquire) sees both.
+        if ready {
+            self.maps_in.fetch_add(1, Ordering::Release);
+        }
+        previous
     }
 }
 

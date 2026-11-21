@@ -837,7 +837,6 @@ impl ManifestContext {
     /// A map is in: a checker may now hold the score to the names it brought.
     fn note_source(&self, map: String) {
         self.shared.note_source_standing(&map, SourceState::Ready);
-        self.shared.maps_in.fetch_add(1, Ordering::Release);
     }
 
     /// A map could not be read: a checker may say so where it was asked for.
