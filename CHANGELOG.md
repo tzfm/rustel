@@ -48,6 +48,7 @@
 - The reference knows the Hydra names, and a shared sketch with calls Rustel does not support still runs.
 - Picking a plugin from the reference opens its presets and closes the call.
 - Each open scene keeps its plugins loaded, and a scene you close frees them.
+- Fixed: an export whose every note an error dropped, such as a scale name that will not read, fails with the reason instead of writing silence; a partial drop still plays what it can.
 - Plugins stay loaded when the output device or buffer size changes, and an undo within 5 seconds reuses the previous plugin copy.
 - A plugin chain with up to 1 second of latency plays in time, also in exports, and edits reach it that much later.
 - A plugin that fails or sends invalid audio goes silent with one warning, and the next evaluation loads it again.

@@ -9799,26 +9799,38 @@ fn talkit_speaks_up_to_c7() {
 }
 
 /// A scale name that will not read drops its notes, as on strudel.cc, and
-/// says so: the export reports why its lane is silent instead of writing
-/// silence with nothing said.
+/// says why. A bounce whose every note was dropped fails with that reason,
+/// rather than writing silence; one that keeps some notes fails open.
 #[test]
 fn an_unreadable_scale_is_reported_when_its_notes_drop() {
     let path = scratch("unreadable-scale.wav");
+    assert_reported_failure(
+        &[
+            "export",
+            "-e",
+            r#"$: n("0 2 4 7").scale("C3:kafi raga").s("sine").gain(.2)"#,
+            "--cycles",
+            "1",
+            "-o",
+            path.to_str().expect("utf-8 path"),
+        ],
+        "Scale name raga is incomplete",
+    );
+    // Half of the cycles read their scale: the bounce plays those, and says
+    // why the others are silent.
     let out = run(&[
         "export",
         "-e",
-        r#"$: n("0 2 4 7").scale("C3:kafi raga").s("sine").gain(.2)"#,
+        r#"$: n("0 2 4 7").scale("<C3:major raga>").s("sine").gain(.2)"#,
         "--cycles",
-        "1",
+        "2",
         "-o",
         path.to_str().expect("utf-8 path"),
     ]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
-    assert!(path.exists(), "the take is written");
-    let _ = std::fs::remove_file(&path);
-    assert!(stderr.contains("query_threw"), "{stderr}");
     assert!(stderr.contains("Scale name raga is incomplete"), "{stderr}");
+    let _ = std::fs::remove_file(&path);
 }
 
 /// `check` queries the score's first cycle, so a score that evaluates but

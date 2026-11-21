@@ -404,7 +404,13 @@ impl Session {
             // complete, so the diagnostic above reports it and the exit
             // status does not fail. A lane whose throw a stack contained
             // is missing from the bounce, so it does fail.
-            query_threw: thrown.or(contained_throw),
+            //
+            // A bounce whose every note a contained failure dropped is
+            // silence because of the error, not a bounce that fails open:
+            // it fails as a throw does, with the same message.
+            query_threw: thrown
+                .or(contained_throw)
+                .or_else(|| callback_failure.clone().filter(|_| onsets.is_empty())),
             duration_secs,
             cps: self.config.cps,
             generation,
