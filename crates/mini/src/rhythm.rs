@@ -2093,6 +2093,26 @@ impl Plans {
         Some(layer_values)
     }
 
+    /// Populate `steps` with the steps of `layer` in cycles keeping global
+    /// value indices directly (when all layers share one `Arc<[Value]>`).
+    fn listed_raw_into(
+        &self,
+        layer: &LayerPlan,
+        period: Fraction,
+        count: usize,
+        steps: &mut Vec<SourceStep>,
+    ) -> Option<()> {
+        steps.clear();
+        steps.reserve(count);
+        self.read(
+            layer,
+            layer.pace.terms(),
+            Fraction::ZERO,
+            period,
+            &mut |step| steps.push(step),
+        )
+    }
+
     /// These plans with what a walk reads of them, and no more: a pattern
     /// keeps them for as long as it plays.
     fn for_walks(mut self) -> Self {
@@ -2410,12 +2430,28 @@ impl<'r> Planned<'r> {
             return Some(pattern.with_steps(steps));
         }
         let mut builder = SequenceBuilder::with_capacity(counted_layers_buf.len());
+        let shared_values: Option<Arc<[Value]>> = if kept.is_none()
+            && plans.sites.is_empty()
+            && values.len() <= 64
+            && values
+                .iter()
+                .all(|v| matches!(v, Value::F64(_) | Value::Str(_) | Value::Bool(_)))
+        {
+            Some(values.drain(..).collect())
+        } else {
+            None
+        };
         for (layer, count) in counted_layers_buf.drain(..) {
             let period = layer.period()?;
             if force_listed || layer.is_listed(count) {
-                let layer_values = plans.listed_indexed_into(
-                    &layer, period, count, values, local_buf, held_buf, steps_buf,
-                )?;
+                let layer_values = if let Some(shared) = &shared_values {
+                    plans.listed_raw_into(&layer, period, count, steps_buf)?;
+                    Arc::clone(shared)
+                } else {
+                    plans.listed_indexed_into(
+                        &layer, period, count, values, local_buf, held_buf, steps_buf,
+                    )?
+                };
                 builder.push_indexed_slice(period, layer_values, in_cycles, steps_buf);
                 steps_buf.clear();
             } else {
@@ -2447,7 +2483,7 @@ impl<'r> Planned<'r> {
             source: TickLayerSource::Node(self.root),
             total_cycles: 1,
             ticks: 1,
-        }; 32];
+        }; 64];
         let mut spec_len = 0usize;
         if !collect_tick_layers(plans, self.root, &mut specs, &mut spec_len, 0) {
             return None;
@@ -2458,7 +2494,7 @@ impl<'r> Planned<'r> {
         if local_buf.len() < values.len() {
             local_buf.resize(values.len(), 0);
         }
-        let mut raw_steps = [(0u16, 0u16, 0u16, 0u32, 0u16); 64];
+        let mut raw_steps = [(0u16, 0u16, 0u16, 0u32, 0u16); 128];
         if spec_len == 1 {
             let spec = specs[0];
             let (layer_values, step_len, in_cycles) = emit_tick_layer(
@@ -2486,16 +2522,31 @@ impl<'r> Planned<'r> {
             .map(|pattern| pattern.with_steps(steps));
         }
         let mut builder = SequenceBuilder::with_capacity(spec_len);
+        let shared_values: Option<Arc<[Value]>> = if plans.sites.is_empty()
+            && values.len() <= 64
+            && values
+                .iter()
+                .all(|v| matches!(v, Value::F64(_) | Value::Str(_) | Value::Bool(_)))
+        {
+            Some(values.drain(..).collect())
+        } else {
+            None
+        };
         for &spec in &specs[..spec_len] {
-            let (layer_values, step_len, in_cycles) = emit_tick_layer(
-                plans,
-                spec,
-                values,
-                local_buf,
-                held_buf,
-                &mut raw_steps,
-                false,
-            );
+            let (layer_values, step_len, in_cycles) = if let Some(shared) = &shared_values {
+                let (step_len, in_cycles) = emit_tick_layer_shared(plans, spec, &mut raw_steps);
+                (Arc::clone(shared), step_len, in_cycles)
+            } else {
+                emit_tick_layer(
+                    plans,
+                    spec,
+                    values,
+                    local_buf,
+                    held_buf,
+                    &mut raw_steps,
+                    false,
+                )
+            };
             let period = if spec.total_cycles == 1 {
                 Fraction::ONE
             } else {
@@ -3170,7 +3221,7 @@ fn check_tick_tree(
                 return false;
             }
             acc.steps += 1;
-            if acc.steps > 64 {
+            if acc.steps > 128 {
                 return false;
             }
             let Some(next_ticks) = lcm_u32(acc.ticks, w_den) else {
@@ -3188,7 +3239,7 @@ fn check_tick_tree(
             true
         }
         Kind::Repeated(inner, times) => {
-            if times == 0 || times > 64 {
+            if times == 0 || times > 128 {
                 return false;
             }
             let g = gcd_u32(w_num, times);
@@ -3217,7 +3268,7 @@ fn check_tick_tree(
             let Some(added) = sub.steps.checked_mul(times as usize) else {
                 return false;
             };
-            if acc.steps + added > 64 {
+            if acc.steps + added > 128 {
                 return false;
             }
             acc.steps += added;
@@ -3245,6 +3296,49 @@ fn check_tick_tree(
             }
             true
         }
+        Kind::WeightedSequence(parts) if depth > 0 || w_den > 1 || total_cycles > 1 => {
+            let steps = Steps {
+                parts,
+                equal: false,
+            };
+            let sub_total = plans.total(steps);
+            if sub_total == 0 {
+                return false;
+            }
+            for (child, (from, to)) in plans.each(steps) {
+                let weight = to - from;
+                let g1 = gcd_u32(w_num, sub_total);
+                let num1 = w_num / g1;
+                let den1 = sub_total / g1;
+                let g2 = gcd_u32(weight, den1);
+                let c_num = match num1.checked_mul(weight / g2) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let c_den = match w_den.checked_mul(den1 / g2) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                // Also ensure `from` boundary divides cleanly on `acc.ticks`.
+                let g_off = gcd_u32(w_num, sub_total);
+                let off_den = sub_total / g_off;
+                let g_f = gcd_u32(from, off_den);
+                let Some(start_den) = w_den.checked_mul(off_den / g_f) else {
+                    return false;
+                };
+                let Some(next_ticks) = lcm_u32(acc.ticks, start_den) else {
+                    return false;
+                };
+                if u64::from(total_cycles) * u64::from(next_ticks) > u64::from(u16::MAX) {
+                    return false;
+                }
+                acc.ticks = next_ticks;
+                if !check_tick_tree(plans, child, c_num, c_den, total_cycles, depth + 1, acc) {
+                    return false;
+                }
+            }
+            true
+        }
         kind @ (Kind::Stack(patterns) | Kind::StackRun(patterns))
             if total_cycles > 1 || w_den > 1 =>
         {
@@ -3257,7 +3351,7 @@ fn check_tick_tree(
                             return false;
                         }
                         acc.steps += 1;
-                        if acc.steps > 64 {
+                        if acc.steps > 128 {
                             return false;
                         }
                         any = true;
@@ -3288,7 +3382,7 @@ fn check_tick_tree(
 fn collect_tick_layers(
     plans: &Plans,
     id: Id,
-    out: &mut [TickLayerSpec; 32],
+    out: &mut [TickLayerSpec; 64],
     len: &mut usize,
     depth: u8,
 ) -> bool {
@@ -3433,7 +3527,7 @@ fn collect_tick_layers(
 
 struct TickEmit<'a> {
     ticks: u32,
-    out: &'a mut [(u16, u16, u16, u32, u16); 64],
+    out: &'a mut [(u16, u16, u16, u32, u16); 128],
     step_len: usize,
     in_cycles: bool,
 }
@@ -3475,6 +3569,18 @@ fn emit_tick_tree(
                 );
             }
         }
+        Kind::WeightedSequence(parts) => {
+            let steps = Steps {
+                parts,
+                equal: false,
+            };
+            let sub_total = u64::from(plans.total(steps));
+            for (child, (from, to)) in plans.each(steps) {
+                let offset = (u64::from(from) * u64::from(width_ticks) / sub_total) as u32;
+                let sub_width = (u64::from(to - from) * u64::from(width_ticks) / sub_total) as u32;
+                emit_tick_tree(plans, child, start_tick + offset, sub_width, emit);
+            }
+        }
         kind @ (Kind::Stack(patterns) | Kind::StackRun(patterns)) => {
             for child in plans.stacked(patterns, kind.is_run()) {
                 emit_tick_tree(plans, child, start_tick, width_ticks, emit);
@@ -3484,13 +3590,42 @@ fn emit_tick_tree(
     }
 }
 
+fn emit_tick_layer_shared(
+    plans: &Plans,
+    spec: TickLayerSpec,
+    raw_steps: &mut [(u16, u16, u16, u32, u16); 128],
+) -> (usize, bool) {
+    let mut emit = TickEmit {
+        ticks: spec.ticks,
+        out: raw_steps,
+        step_len: 0,
+        in_cycles: true,
+    };
+    match spec.source {
+        TickLayerSource::Node(id) => {
+            emit_tick_tree(plans, id, 0, spec.ticks, &mut emit);
+        }
+        TickLayerSource::EqualLane(lane) => {
+            for (i, &child) in plans.ids[lane.parts.range()].iter().enumerate() {
+                emit_tick_tree(plans, child, (i as u32) * spec.ticks, spec.ticks, &mut emit);
+            }
+        }
+        TickLayerSource::WeightedStep { id, from, to, of } => {
+            let start = (u64::from(from) * u64::from(spec.ticks) / u64::from(of)) as u32;
+            let width = (u64::from(to - from) * u64::from(spec.ticks) / u64::from(of)) as u32;
+            emit_tick_tree(plans, id, start, width, &mut emit);
+        }
+    }
+    (emit.step_len, emit.in_cycles)
+}
+
 fn emit_tick_layer(
     plans: &Plans,
     spec: TickLayerSpec,
     values: &mut [Value],
     local_buf: &mut [u32],
     held_buf: &mut Vec<u32>,
-    raw_steps: &mut [(u16, u16, u16, u32, u16); 64],
+    raw_steps: &mut [(u16, u16, u16, u32, u16); 128],
     take_values: bool,
 ) -> (Arc<[Value]>, usize, bool) {
     let mut emit = TickEmit {

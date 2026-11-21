@@ -3699,13 +3699,11 @@ impl Layer {
                 .is_none_or(|t| t.set_other.is_none() && t.custom_named.is_none())
         {
             if self.named_id != 0 {
-                if let (Some(names), Some(key_str)) = (
-                    crate::controls::builtin_names_by_id(self.named_id),
-                    crate::controls::builtin_name_str_by_id(self.named_id),
-                ) && self
-                    .values
-                    .iter()
-                    .all(|value| crate::controls::names_as_one_entry(names, value))
+                if let Some(names) = crate::controls::builtin_names_by_id(self.named_id)
+                    && self
+                        .values
+                        .iter()
+                        .all(|value| crate::controls::names_as_one_entry(names, value))
                 {
                     let mark_bit = crate::controls::builtin_mark_bit_by_id(self.named_id);
                     let key_mark = 1u64 << mark_bit;
@@ -3719,7 +3717,7 @@ impl Layer {
                                     == Some("value")
                                 && !matches!(tail.at(0).1, Value::Undefined);
                             let disjoint = dress.set_marks & key_mark == 0
-                                || tail.position_str(key_str).is_none();
+                                || !keys.iter().any(|&k| (k & 0x03ff) == self.named_id);
                             !drops && disjoint && tail.all_values_data()
                         }
                     };
@@ -4324,23 +4322,35 @@ impl Layer {
         if !matches!(&**name, "note" | "n") {
             return None;
         }
-        let renoted = |value: &Value| match value {
-            Value::F64(_) | Value::Str(_) => note(value),
-            _ => None,
-        };
-        let values: Arc<[Value]> = if self.values.len() <= 16 {
-            let mut buf: [Value; 16] = std::array::from_fn(|_| Value::Undefined);
-            let len = self.values.len();
-            for (slot, val) in buf[..len].iter_mut().zip(self.values.iter()) {
-                *slot = renoted(val)?;
-            }
-            buf[..len]
-                .iter_mut()
-                .map(|slot| std::mem::replace(slot, Value::Undefined))
-                .collect()
+        let (values, data) = if let Some(cached) = dress_cache.get_values(&self.values) {
+            cached
         } else {
-            let notes: Vec<Value> = self.values.iter().map(renoted).collect::<Option<_>>()?;
-            notes.into()
+            let renoted = |value: &Value| match value {
+                Value::F64(_) | Value::Str(_) => note(value),
+                _ => None,
+            };
+            let values: Arc<[Value]> = if self.values.len() <= 16 {
+                let mut buf: [Value; 16] = std::array::from_fn(|_| Value::Undefined);
+                let len = self.values.len();
+                for (slot, val) in buf[..len].iter_mut().zip(self.values.iter()) {
+                    *slot = renoted(val)?;
+                }
+                buf[..len]
+                    .iter_mut()
+                    .map(|slot| std::mem::replace(slot, Value::Undefined))
+                    .collect()
+            } else {
+                let notes: Vec<Value> = self.values.iter().map(renoted).collect::<Option<_>>()?;
+                notes.into()
+            };
+            let data = values.iter().all(|value| value.is_data(0));
+            dress_cache.put_values(
+                Arc::as_ptr(&self.values) as *const Value,
+                self.values.len(),
+                Arc::clone(&values),
+                data,
+            );
+            (values, data)
         };
         let note_id = crate::controls::note_control_id();
         let from = self.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
@@ -4387,7 +4397,6 @@ impl Layer {
             }
         };
         let mut layer = self.with(|_| {});
-        let data = values.iter().all(|value| value.is_data(0));
         layer.set_data(data);
         layer.set_maps(true);
         layer.values = values;
@@ -6923,10 +6932,14 @@ pub(crate) type NoteFn = Box<dyn Fn(&Value) -> Option<Value> + Send + Sync>;
 /// across layers and picked branches of a single `.scale(...)` or pitch pass.
 type RenoteDressSlot = (*const Dress, Option<Arc<Dress>>);
 
+type RenoteValuesSlot = (*const Value, usize, Arc<[Value]>, bool);
+
 #[derive(Default)]
 pub(crate) struct RenoteDressCache {
     slots: [Option<RenoteDressSlot>; 4],
     next: u8,
+    values: [Option<RenoteValuesSlot>; 4],
+    next_values: u8,
 }
 
 impl RenoteDressCache {
@@ -6943,6 +6956,22 @@ impl RenoteDressCache {
         let idx = usize::from(self.next) & 3;
         self.slots[idx] = Some((from, dress));
         self.next = self.next.wrapping_add(1);
+    }
+
+    #[inline]
+    fn get_values(&self, src: &Arc<[Value]>) -> Option<(Arc<[Value]>, bool)> {
+        let ptr = Arc::as_ptr(src) as *const Value;
+        let len = src.len();
+        self.values.iter().flatten().find_map(|(p, l, vals, data)| {
+            (*p == ptr && *l == len).then(|| (Arc::clone(vals), *data))
+        })
+    }
+
+    #[inline]
+    fn put_values(&mut self, ptr: *const Value, len: usize, vals: Arc<[Value]>, data: bool) {
+        let idx = usize::from(self.next_values) & 3;
+        self.values[idx] = Some((ptr, len, vals, data));
+        self.next_values = self.next_values.wrapping_add(1);
     }
 }
 
@@ -6962,8 +6991,12 @@ pub(crate) fn renote_in_place(
     let Some(slice) = Arc::get_mut(layers) else {
         return false;
     };
+    let all_same_values = slice.len() > 1
+        && slice[1..]
+            .iter()
+            .all(|layer| Arc::ptr_eq(&layer.values, &slice[0].values));
     let mut total_values = 0usize;
-    for layer in slice.iter() {
+    for (idx, layer) in slice.iter().enumerate() {
         let Some(names) = layer.named_names().filter(|_| !layer.dress().has_set()) else {
             return false;
         };
@@ -6973,22 +7006,42 @@ pub(crate) fn renote_in_place(
         if !matches!(&**name, "note" | "n") {
             return false;
         }
-        total_values += layer.values.len();
+        if !all_same_values || idx == 0 {
+            total_values += layer.values.len();
+        }
     }
     if total_values > 64 {
         return false;
     }
     without_query_signals(|| {
         let mut staged: [Value; 64] = std::array::from_fn(|_| Value::Undefined);
-        let mut cursor = 0usize;
-        for layer in slice.iter() {
-            for val in layer.values.iter() {
-                match val {
-                    Value::F64(_) | Value::Str(_) => {
-                        staged[cursor] = note(val)?;
-                        cursor += 1;
+        let mut cached_shared: Option<(Arc<[Value]>, bool)> = None;
+        if all_same_values {
+            if let Some(hit) = dress_cache.get_values(&slice[0].values) {
+                cached_shared = Some(hit);
+            } else {
+                let mut cursor = 0usize;
+                for val in slice[0].values.iter() {
+                    match val {
+                        Value::F64(_) | Value::Str(_) => {
+                            staged[cursor] = note(val)?;
+                            cursor += 1;
+                        }
+                        _ => return None,
                     }
-                    _ => return None,
+                }
+            }
+        } else {
+            let mut cursor = 0usize;
+            for layer in slice.iter() {
+                for val in layer.values.iter() {
+                    match val {
+                        Value::F64(_) | Value::Str(_) => {
+                            staged[cursor] = note(val)?;
+                            cursor += 1;
+                        }
+                        _ => return None,
+                    }
                 }
             }
         }
@@ -7048,28 +7101,56 @@ pub(crate) fn renote_in_place(
                 extra_dresses.push(dress);
             }
         }
+        let shared_out = if all_same_values {
+            Some(match cached_shared {
+                Some(hit) => hit,
+                None => {
+                    let len = slice[0].values.len();
+                    let data = staged[..len].iter().all(|v| v.is_data(0));
+                    let built: Arc<[Value]> = staged[..len]
+                        .iter_mut()
+                        .map(|src| std::mem::replace(src, Value::Undefined))
+                        .collect();
+                    dress_cache.put_values(
+                        Arc::as_ptr(&slice[0].values) as *const Value,
+                        len,
+                        Arc::clone(&built),
+                        data,
+                    );
+                    (built, data)
+                }
+            })
+        } else {
+            None
+        };
         let mut read_at = 0usize;
         let mut extra_idx = 0usize;
         for (idx, layer) in slice.iter_mut().enumerate() {
-            let len = layer.values.len();
-            let mut data = true;
-            for v in &staged[read_at..read_at + len] {
-                if !v.is_data(0) {
-                    data = false;
-                    break;
-                }
-            }
-            if let Some(vals) = Arc::get_mut(&mut layer.values) {
-                for (dst, src) in vals.iter_mut().zip(&mut staged[read_at..read_at + len]) {
-                    *dst = std::mem::replace(src, Value::Undefined);
-                }
+            let data = if let Some((shared, data)) = &shared_out {
+                layer.values = Arc::clone(shared);
+                *data
             } else {
-                layer.values = staged[read_at..read_at + len]
-                    .iter_mut()
-                    .map(|src| std::mem::replace(src, Value::Undefined))
-                    .collect();
-            }
-            read_at += len;
+                let len = layer.values.len();
+                let mut data = true;
+                for v in &staged[read_at..read_at + len] {
+                    if !v.is_data(0) {
+                        data = false;
+                        break;
+                    }
+                }
+                if let Some(vals) = Arc::get_mut(&mut layer.values) {
+                    for (dst, src) in vals.iter_mut().zip(&mut staged[read_at..read_at + len]) {
+                        *dst = std::mem::replace(src, Value::Undefined);
+                    }
+                } else {
+                    layer.values = staged[read_at..read_at + len]
+                        .iter_mut()
+                        .map(|src| std::mem::replace(src, Value::Undefined))
+                        .collect();
+                }
+                read_at += len;
+                data
+            };
             layer.set_data(data);
             layer.set_maps(true);
             layer.named_id = note_id;
