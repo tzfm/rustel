@@ -3309,21 +3309,23 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
     };
     let mut is_alt = false;
     let mut alt_suffix = RateSuffix::None;
-    if bytes[pos] == b'<' {
-        let close = bytes[pos + 1..limit].iter().position(|&b| b == b'>')? + pos + 1;
-        let (suffix, after) = parse_rate_suffix(close + 1, limit)?;
-        if after != limit {
-            return None;
-        }
-        is_alt = true;
-        alt_suffix = suffix;
-        pos = score_whitespace_end(bytes, pos + 1);
-        limit = close;
-        while limit > pos && matches!(bytes[limit - 1], b' ' | b'\t' | b'\r' | b'\n') {
-            limit -= 1;
-        }
-        if pos >= limit || bytes[pos] == b'^' {
-            return None;
+    if bytes[pos] == b'<'
+        && let Some(rel_close) = bytes[pos + 1..limit].iter().position(|&b| b == b'>')
+    {
+        let close = rel_close + pos + 1;
+        if let Some((suffix, after)) = parse_rate_suffix(close + 1, limit)
+            && after == limit
+        {
+            is_alt = true;
+            alt_suffix = suffix;
+            pos = score_whitespace_end(bytes, pos + 1);
+            limit = close;
+            while limit > pos && matches!(bytes[limit - 1], b' ' | b'\t' | b'\r' | b'\n') {
+                limit -= 1;
+            }
+            if pos >= limit || bytes[pos] == b'^' {
+                return None;
+            }
         }
     }
     #[derive(Clone, Copy)]
@@ -3336,10 +3338,12 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
         Alt {
             first: u16,
             len: u16,
+            suffix: RateSuffix,
         },
         Group {
             first: u16,
             len: u16,
+            suffix: RateSuffix,
         },
     }
     let mut items: [FlatItem; 64] = [FlatItem::Word {
@@ -3363,9 +3367,18 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
             let close_ch = if is_group { b']' } else { b'>' };
             let close = bytes[pos + 1..limit].iter().position(|&b| b == close_ch)? + pos + 1;
             let next_after = score_whitespace_end(bytes, close + 1).min(limit);
-            if next_after == close + 1 && next_after < limit {
-                return None;
-            }
+            let (suffix, next_after) = if next_after == close + 1 && next_after < limit {
+                if is_alt {
+                    return None;
+                }
+                let (sfx, after) = parse_rate_suffix(close + 1, limit)?;
+                if is_group && matches!(sfx, RateSuffix::Slow(..)) {
+                    return None;
+                }
+                (sfx, after)
+            } else {
+                (RateSuffix::None, next_after)
+            };
             let mut inner_pos = score_whitespace_end(bytes, pos + 1);
             let mut inner_limit = close;
             while inner_limit > inner_pos
@@ -3399,16 +3412,23 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
             if inner_len == 0 || count >= items.len() {
                 return None;
             }
+            match suffix {
+                RateSuffix::None => {}
+                RateSuffix::Fast(..) => any_fast = true,
+                RateSuffix::Slow(..) => any_slow = true,
+            }
             if is_group {
                 items[count] = FlatItem::Group {
                     first: first as u16,
                     len: inner_len as u16,
+                    suffix,
                 };
                 any_group = true;
             } else {
                 items[count] = FlatItem::Alt {
                     first: first as u16,
                     len: inner_len as u16,
+                    suffix,
                 };
                 any_inner_alt = true;
             }
@@ -3598,8 +3618,8 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
         )?;
         return Some(pattern.with_steps(steps_meta));
     }
-    // `<a b ...>*N`, `<a b ...>/N`, or equal sequence with `atom*N` / `<a b ...>` slots.
-    if any_slow {
+    // `<a b ...>*N`, `<a b ...>/N`, or equal sequence with `atom*N`, `atom/N`, `<a b ...>`, or `[a b ...]`.
+    if is_alt && any_slow {
         return None;
     }
     let mut seen_words: [&str; 64] = [""; 64];
@@ -3614,6 +3634,12 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
         loc1_len: 0,
     }; 64];
     let mut step_len = 0usize;
+    let mut cuts = [rustel_core::TickCut {
+        index: 0,
+        whole_begin: 0,
+        whole_end: 0,
+    }; 64];
+    let mut cut_len = 0usize;
     let mut min_begin = u32::MAX;
     let mut max_begin = 0u32;
     let (period, ticks, in_cycles) = if is_alt && !matches!(alt_suffix, RateSuffix::None) {
@@ -3704,22 +3730,52 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
                     if matches!(&src[start..end], "~" | "-") {
                         continue;
                     }
-                    if let RateSuffix::Fast(rate, _, _) = suffix {
-                        sub_ticks = (sub_ticks / gcd_u32(sub_ticks, rate)).checked_mul(rate)?;
-                        if sub_ticks > 256 {
-                            return None;
+                    match suffix {
+                        RateSuffix::None => {}
+                        RateSuffix::Fast(rate, _, _) => {
+                            sub_ticks = (sub_ticks / gcd_u32(sub_ticks, rate)).checked_mul(rate)?;
+                            if sub_ticks > 256 {
+                                return None;
+                            }
+                        }
+                        RateSuffix::Slow(times, _, _) => {
+                            period_cycles = (period_cycles / gcd_u32(period_cycles, times))
+                                .checked_mul(times)?;
+                            if period_cycles > 64 {
+                                return None;
+                            }
                         }
                     }
                 }
-                FlatItem::Alt { len, .. } => {
+                FlatItem::Alt { len, suffix, .. } => {
                     let p = u32::from(len);
-                    period_cycles = (period_cycles / gcd_u32(period_cycles, p)).checked_mul(p)?;
-                    if period_cycles > 64 {
+                    match suffix {
+                        RateSuffix::None => {
+                            period_cycles =
+                                (period_cycles / gcd_u32(period_cycles, p)).checked_mul(p)?;
+                        }
+                        RateSuffix::Slow(times, _, _) => {
+                            let pt = p.checked_mul(times)?;
+                            period_cycles =
+                                (period_cycles / gcd_u32(period_cycles, pt)).checked_mul(pt)?;
+                        }
+                        RateSuffix::Fast(rate, _, _) => {
+                            let step_p = p / gcd_u32(p, rate);
+                            period_cycles = (period_cycles / gcd_u32(period_cycles, step_p))
+                                .checked_mul(step_p)?;
+                            sub_ticks = (sub_ticks / gcd_u32(sub_ticks, rate)).checked_mul(rate)?;
+                        }
+                    }
+                    if period_cycles > 64 || sub_ticks > 256 {
                         return None;
                     }
                 }
-                FlatItem::Group { len, .. } => {
-                    let g = u32::from(len);
+                FlatItem::Group { len, suffix, .. } => {
+                    let g = match suffix {
+                        RateSuffix::None => u32::from(len),
+                        RateSuffix::Fast(rate, _, _) => u32::from(len).checked_mul(rate)?,
+                        RateSuffix::Slow(..) => return None,
+                    };
                     sub_ticks = (sub_ticks / gcd_u32(sub_ticks, g)).checked_mul(g)?;
                     if sub_ticks > 256 {
                         return None;
@@ -3768,80 +3824,84 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
                             min_begin = min_begin.min(loc0_begin);
                             max_begin = max_begin.max(loc0_begin);
                         }
-                        let (rate, loc1_begin, loc1_len) = match suffix {
+                        match suffix {
+                            RateSuffix::None => {
+                                if step_len >= raw_steps.len() {
+                                    return None;
+                                }
+                                raw_steps[step_len] = rustel_core::TickStep {
+                                    part_begin: slot_start as u16,
+                                    part_end: (slot_start + sub_ticks) as u16,
+                                    value: value_idx,
+                                    loc0_begin,
+                                    loc0_len,
+                                    loc1_begin: 0,
+                                    loc1_len: 0,
+                                };
+                                step_len += 1;
+                            }
                             RateSuffix::Fast(rate, rs, re) => {
-                                let (b, l) = loc_of(rs, re)?;
-                                if l == 0 {
+                                let (loc1_begin, loc1_len) = loc_of(rs, re)?;
+                                if loc0_len == 0 || loc1_len == 0 {
                                     return None;
                                 }
-                                min_begin = min_begin.min(b);
-                                max_begin = max_begin.max(b);
-                                (rate, b, l)
+                                min_begin = min_begin.min(loc1_begin);
+                                max_begin = max_begin.max(loc1_begin);
+                                let w = sub_ticks / rate;
+                                for r in 0..rate {
+                                    if step_len >= raw_steps.len() {
+                                        return None;
+                                    }
+                                    let pb = slot_start + r * w;
+                                    raw_steps[step_len] = rustel_core::TickStep {
+                                        part_begin: pb as u16,
+                                        part_end: (pb + w) as u16,
+                                        value: value_idx,
+                                        loc0_begin,
+                                        loc0_len,
+                                        loc1_begin,
+                                        loc1_len,
+                                    };
+                                    step_len += 1;
+                                }
                             }
-                            RateSuffix::None => (1u32, 0u32, 0u16),
-                            RateSuffix::Slow(..) => unreachable!(),
-                        };
-                        let w = sub_ticks / rate;
-                        for r in 0..rate {
-                            if step_len >= raw_steps.len() {
-                                return None;
-                            }
-                            let pb = slot_start + r * w;
-                            raw_steps[step_len] = rustel_core::TickStep {
-                                part_begin: pb as u16,
-                                part_end: (pb + w) as u16,
-                                value: value_idx,
-                                loc0_begin,
-                                loc0_len,
-                                loc1_begin,
-                                loc1_len,
-                            };
-                            step_len += 1;
-                        }
-                    }
-                    FlatItem::Alt { first, len } => {
-                        let (start, end) =
-                            alt_words[usize::from(first) + (t as usize) % usize::from(len)];
-                        let word = &src[start..end];
-                        if matches!(word, "~" | "-") {
-                            continue;
-                        }
-                        let value_idx = match seen_words[..seen_len].iter().position(|&w| w == word)
-                        {
-                            Some(idx) => idx as u16,
-                            None => {
-                                if seen_len >= seen_words.len() {
+                            RateSuffix::Slow(times, rs, re) => {
+                                let (loc1_begin, loc1_len) = loc_of(rs, re)?;
+                                if loc0_len == 0 || loc1_len == 0 || step_len >= raw_steps.len() {
                                     return None;
                                 }
-                                let idx = seen_len as u16;
-                                seen_words[seen_len] = word;
-                                seen_len += 1;
-                                idx
+                                min_begin = min_begin.min(loc1_begin);
+                                max_begin = max_begin.max(loc1_begin);
+                                let rem = t % times;
+                                if times > 1 {
+                                    let wb = i64::from(slot_start)
+                                        - i64::from(rem) * i64::from(sub_ticks);
+                                    let we = i64::from(slot_start)
+                                        + i64::from(times - rem) * i64::from(sub_ticks);
+                                    cuts[cut_len] = rustel_core::TickCut {
+                                        index: step_len as u16,
+                                        whole_begin: u16::try_from(wb).ok()?,
+                                        whole_end: u16::try_from(we).ok()?,
+                                    };
+                                    cut_len += 1;
+                                }
+                                raw_steps[step_len] = rustel_core::TickStep {
+                                    part_begin: slot_start as u16,
+                                    part_end: (slot_start + sub_ticks) as u16,
+                                    value: value_idx,
+                                    loc0_begin,
+                                    loc0_len,
+                                    loc1_begin,
+                                    loc1_len,
+                                };
+                                step_len += 1;
                             }
-                        };
-                        let (loc0_begin, loc0_len) = loc_of(start, end)?;
-                        if loc0_len > 0 {
-                            min_begin = min_begin.min(loc0_begin);
-                            max_begin = max_begin.max(loc0_begin);
                         }
-                        if step_len >= raw_steps.len() {
-                            return None;
-                        }
-                        raw_steps[step_len] = rustel_core::TickStep {
-                            part_begin: slot_start as u16,
-                            part_end: (slot_start + sub_ticks) as u16,
-                            value: value_idx,
-                            loc0_begin,
-                            loc0_len,
-                            loc1_begin: 0,
-                            loc1_len: 0,
-                        };
-                        step_len += 1;
                     }
-                    FlatItem::Group { first, len } => {
-                        let w = sub_ticks / u32::from(len);
-                        for k in 0..usize::from(len) {
-                            let (start, end) = alt_words[usize::from(first) + k];
+                    FlatItem::Alt { first, len, suffix } => match suffix {
+                        RateSuffix::None => {
+                            let (start, end) =
+                                alt_words[usize::from(first) + (t as usize) % usize::from(len)];
                             let word = &src[start..end];
                             if matches!(word, "~" | "-") {
                                 continue;
@@ -3867,10 +3927,9 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
                             if step_len >= raw_steps.len() {
                                 return None;
                             }
-                            let pb = slot_start + (k as u32) * w;
                             raw_steps[step_len] = rustel_core::TickStep {
-                                part_begin: pb as u16,
-                                part_end: (pb + w) as u16,
+                                part_begin: slot_start as u16,
+                                part_end: (slot_start + sub_ticks) as u16,
                                 value: value_idx,
                                 loc0_begin,
                                 loc0_len,
@@ -3878,6 +3937,164 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
                                 loc1_len: 0,
                             };
                             step_len += 1;
+                        }
+                        RateSuffix::Slow(times, rs, re) => {
+                            let inner_cycle = (t / times) as usize;
+                            let rem = t % times;
+                            let (start, end) =
+                                alt_words[usize::from(first) + inner_cycle % usize::from(len)];
+                            let word = &src[start..end];
+                            if matches!(word, "~" | "-") {
+                                continue;
+                            }
+                            let value_idx =
+                                match seen_words[..seen_len].iter().position(|&w| w == word) {
+                                    Some(idx) => idx as u16,
+                                    None => {
+                                        if seen_len >= seen_words.len() {
+                                            return None;
+                                        }
+                                        let idx = seen_len as u16;
+                                        seen_words[seen_len] = word;
+                                        seen_len += 1;
+                                        idx
+                                    }
+                                };
+                            let (loc0_begin, loc0_len) = loc_of(start, end)?;
+                            let (loc1_begin, loc1_len) = loc_of(rs, re)?;
+                            if loc0_len == 0 || loc1_len == 0 || step_len >= raw_steps.len() {
+                                return None;
+                            }
+                            min_begin = min_begin.min(loc0_begin).min(loc1_begin);
+                            max_begin = max_begin.max(loc0_begin).max(loc1_begin);
+                            if times > 1 {
+                                let wb =
+                                    i64::from(slot_start) - i64::from(rem) * i64::from(sub_ticks);
+                                let we = i64::from(slot_start)
+                                    + i64::from(times - rem) * i64::from(sub_ticks);
+                                cuts[cut_len] = rustel_core::TickCut {
+                                    index: step_len as u16,
+                                    whole_begin: u16::try_from(wb).ok()?,
+                                    whole_end: u16::try_from(we).ok()?,
+                                };
+                                cut_len += 1;
+                            }
+                            raw_steps[step_len] = rustel_core::TickStep {
+                                part_begin: slot_start as u16,
+                                part_end: (slot_start + sub_ticks) as u16,
+                                value: value_idx,
+                                loc0_begin,
+                                loc0_len,
+                                loc1_begin,
+                                loc1_len,
+                            };
+                            step_len += 1;
+                        }
+                        RateSuffix::Fast(rate, rs, re) => {
+                            let (loc1_begin, loc1_len) = loc_of(rs, re)?;
+                            if loc1_len == 0 {
+                                return None;
+                            }
+                            let w = sub_ticks / rate;
+                            for r in 0..rate {
+                                let (start, end) = alt_words[usize::from(first)
+                                    + ((t * rate + r) as usize) % usize::from(len)];
+                                let word = &src[start..end];
+                                if matches!(word, "~" | "-") {
+                                    continue;
+                                }
+                                let value_idx =
+                                    match seen_words[..seen_len].iter().position(|&w| w == word) {
+                                        Some(idx) => idx as u16,
+                                        None => {
+                                            if seen_len >= seen_words.len() {
+                                                return None;
+                                            }
+                                            let idx = seen_len as u16;
+                                            seen_words[seen_len] = word;
+                                            seen_len += 1;
+                                            idx
+                                        }
+                                    };
+                                let (loc0_begin, loc0_len) = loc_of(start, end)?;
+                                if loc0_len == 0 || step_len >= raw_steps.len() {
+                                    return None;
+                                }
+                                min_begin = min_begin.min(loc0_begin).min(loc1_begin);
+                                max_begin = max_begin.max(loc0_begin).max(loc1_begin);
+                                let pb = slot_start + r * w;
+                                raw_steps[step_len] = rustel_core::TickStep {
+                                    part_begin: pb as u16,
+                                    part_end: (pb + w) as u16,
+                                    value: value_idx,
+                                    loc0_begin,
+                                    loc0_len,
+                                    loc1_begin,
+                                    loc1_len,
+                                };
+                                step_len += 1;
+                            }
+                        }
+                    },
+                    FlatItem::Group { first, len, suffix } => {
+                        let (rate, loc1_begin, loc1_len) = match suffix {
+                            RateSuffix::None => (1u32, 0u32, 0u16),
+                            RateSuffix::Fast(rate, rs, re) => {
+                                let (b, l) = loc_of(rs, re)?;
+                                if l == 0 {
+                                    return None;
+                                }
+                                (rate, b, l)
+                            }
+                            RateSuffix::Slow(..) => return None,
+                        };
+                        let w = sub_ticks / (u32::from(len) * rate);
+                        for r in 0..rate {
+                            for k in 0..usize::from(len) {
+                                let (start, end) = alt_words[usize::from(first) + k];
+                                let word = &src[start..end];
+                                if matches!(word, "~" | "-") {
+                                    continue;
+                                }
+                                let value_idx =
+                                    match seen_words[..seen_len].iter().position(|&w| w == word) {
+                                        Some(idx) => idx as u16,
+                                        None => {
+                                            if seen_len >= seen_words.len() {
+                                                return None;
+                                            }
+                                            let idx = seen_len as u16;
+                                            seen_words[seen_len] = word;
+                                            seen_len += 1;
+                                            idx
+                                        }
+                                    };
+                                let (loc0_begin, loc0_len) = loc_of(start, end)?;
+                                if loc1_len > 0 {
+                                    if loc0_len == 0 {
+                                        return None;
+                                    }
+                                    min_begin = min_begin.min(loc0_begin).min(loc1_begin);
+                                    max_begin = max_begin.max(loc0_begin).max(loc1_begin);
+                                } else if loc0_len > 0 {
+                                    min_begin = min_begin.min(loc0_begin);
+                                    max_begin = max_begin.max(loc0_begin);
+                                }
+                                if step_len >= raw_steps.len() {
+                                    return None;
+                                }
+                                let pb = slot_start + (r * u32::from(len) + (k as u32)) * w;
+                                raw_steps[step_len] = rustel_core::TickStep {
+                                    part_begin: pb as u16,
+                                    part_end: (pb + w) as u16,
+                                    value: value_idx,
+                                    loc0_begin,
+                                    loc0_len,
+                                    loc1_begin,
+                                    loc1_len,
+                                };
+                                step_len += 1;
+                            }
                         }
                     }
                 }
@@ -3905,7 +4122,7 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
         layer_values,
         in_cycles,
         &raw_steps[..step_len],
-        &[],
+        &cuts[..cut_len],
     )?;
     Some(pattern.with_steps(steps_meta))
 }

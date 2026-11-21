@@ -4351,6 +4351,8 @@ impl Layer {
                     Some(added) => {
                         if self.dress().keys().is_empty() {
                             added.clone()
+                        } else if added.is_empty() {
+                            self.dress().keys().clone()
                         } else {
                             ContextKeys::merge(added, self.dress().keys())
                         }
@@ -4363,15 +4365,23 @@ impl Layer {
                         map(&read)?.keys
                     }
                 };
-                let mut next = self.dress().clone();
-                if note_id != 0 {
-                    next.clear_custom_named();
+                let dress = if note_id != 0
+                    && self.dress().custom_named().is_none()
+                    && !self.dress().has_set()
+                    && keys.arc_ptr() == self.dress().keys().arc_ptr()
+                {
+                    self.dress.clone()
                 } else {
-                    next.set_custom_named(&crate::controls::note_names());
-                }
-                next.clear_set();
-                next.set_keys(keys);
-                let dress = (!next.is_bare()).then(|| next.into_arc());
+                    let mut next = self.dress().clone();
+                    if note_id != 0 {
+                        next.clear_custom_named();
+                    } else {
+                        next.set_custom_named(&crate::controls::note_names());
+                    }
+                    next.clear_set();
+                    next.set_keys(keys);
+                    (!next.is_bare()).then(|| next.into_arc())
+                };
                 dress_cache.put(from, dress.clone());
                 dress
             }
@@ -6953,6 +6963,8 @@ pub(crate) fn renote_in_place(
                         Some(added) => {
                             if layer.dress().keys().is_empty() {
                                 added.clone()
+                            } else if added.is_empty() {
+                                layer.dress().keys().clone()
                             } else {
                                 ContextKeys::merge(added, layer.dress().keys())
                             }
@@ -6966,15 +6978,23 @@ pub(crate) fn renote_in_place(
                             map(&read)?.keys
                         }
                     };
-                    let mut next = layer.dress().clone();
-                    if note_id != 0 {
-                        next.clear_custom_named();
+                    let dress = if note_id != 0
+                        && layer.dress().custom_named().is_none()
+                        && !layer.dress().has_set()
+                        && keys.arc_ptr() == layer.dress().keys().arc_ptr()
+                    {
+                        layer.dress.clone()
                     } else {
-                        next.set_custom_named(&crate::controls::note_names());
-                    }
-                    next.clear_set();
-                    next.set_keys(keys);
-                    let dress = (!next.is_bare()).then(|| next.into_arc());
+                        let mut next = layer.dress().clone();
+                        if note_id != 0 {
+                            next.clear_custom_named();
+                        } else {
+                            next.set_custom_named(&crate::controls::note_names());
+                        }
+                        next.clear_set();
+                        next.set_keys(keys);
+                        (!next.is_bare()).then(|| next.into_arc())
+                    };
                     dress_cache.put(from, dress.clone());
                     dress
                 }
@@ -7540,8 +7560,16 @@ pub(crate) fn filtered(pattern: &Pattern, keep: &ValuePredicate) -> Option<Patte
 /// The stack of `patterns`, when each is a sequence, a constant or silence:
 /// the layers of each, one after the other.
 pub(crate) fn stacked(patterns: &[Pattern]) -> Option<Pattern> {
+    stacked_iter(patterns.iter())
+}
+
+pub(crate) fn stacked_opt(patterns: &[Option<Pattern>]) -> Option<Pattern> {
+    stacked_iter(patterns.iter().filter_map(Option::as_ref))
+}
+
+fn stacked_iter<'a>(patterns: impl Iterator<Item = &'a Pattern> + Clone) -> Option<Pattern> {
     let mut total = 0usize;
-    for pattern in patterns {
+    for pattern in patterns.clone() {
         if pattern.is_rest() && folds(pattern) {
             continue;
         }

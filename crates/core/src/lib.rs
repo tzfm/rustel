@@ -17433,9 +17433,26 @@ fn lcm_steps(pats: &[Pattern]) -> Result<Option<Fraction>, ()> {
 }
 
 #[inline]
+fn is_plain_pure_cell(p: &Pattern) -> bool {
+    p.extras.is_none() && p.node_flags() == 0
+}
+
+#[inline]
 fn can_pack_pure_cells(pats: &[Pattern]) -> bool {
-    pats.iter()
-        .all(|p| p.extras.is_none() && p.node_flags() == 0)
+    pats.iter().all(is_plain_pure_cell)
+}
+
+fn lcm_steps_opt(pats: &[Option<Pattern>]) -> Result<Option<Fraction>, ()> {
+    let mut known = pats
+        .iter()
+        .filter_map(|p| p.as_ref().and_then(Pattern::steps));
+    let Some(mut steps) = known.next_back() else {
+        return Ok(None);
+    };
+    for next in known {
+        steps = steps.checked_lcm(next).ok_or(())?;
+    }
+    Ok(Some(steps))
 }
 
 #[inline]
@@ -17461,6 +17478,98 @@ pub fn stack(pats: Vec<Pattern>) -> Pattern {
         Node::Stack(pats.into_boxed_slice())
     };
     Pattern::of(node).with_steps(steps)
+}
+
+/// [`stack`] taking patterns from a stack-allocated slice without an
+/// intermediate `Vec<Pattern>` heap allocation.
+pub fn stack_slice(pats: &mut [Option<Pattern>]) -> Pattern {
+    let steps = match lcm_steps_opt(pats) {
+        Ok(steps) => steps,
+        Err(()) => {
+            return query_limit_pattern(mark_stepwise_refusal(QueryLimit::NativeFraction {
+                operation: "stack",
+            }));
+        }
+    };
+    if let Some(stacked) = sequence::stacked_opt(pats) {
+        return stacked.with_steps(steps);
+    }
+    let node = if pats
+        .iter()
+        .all(|p| p.as_ref().is_some_and(is_plain_pure_cell))
+    {
+        Node::StackPure(
+            pats.iter_mut()
+                .map(|p| p.take().expect("slot present").node)
+                .collect(),
+        )
+    } else {
+        Node::Stack(
+            pats.iter_mut()
+                .map(|p| p.take().expect("slot present"))
+                .collect(),
+        )
+    };
+    Pattern::of(node).with_steps(steps)
+}
+
+/// [`slowcat`] taking patterns from a stack-allocated slice without an
+/// intermediate `Vec<Pattern>` heap allocation.
+pub fn slowcat_slice(pats: &mut [Option<Pattern>]) -> Pattern {
+    if pats.is_empty() {
+        return silence();
+    }
+    if pats.len() == 1 {
+        return pats[0].take().expect("one slowcat input");
+    }
+    let steps = match lcm_steps_opt(pats) {
+        Ok(steps) => steps,
+        Err(_) => {
+            return query_limit_pattern(mark_stepwise_refusal(QueryLimit::NativeFraction {
+                operation: "slowcat",
+            }));
+        }
+    };
+    slowcat_slice_with_steps(pats, steps)
+}
+
+fn slowcat_slice_with_steps(pats: &mut [Option<Pattern>], steps: Option<Fraction>) -> Pattern {
+    if pats.len() == 1 {
+        return pats[0].take().expect("one slowcat input");
+    }
+    let node = if pats
+        .iter()
+        .all(|p| p.as_ref().is_some_and(is_plain_pure_cell))
+    {
+        Node::SlowCatPure(
+            pats.iter_mut()
+                .map(|p| p.take().expect("slot present").node)
+                .collect(),
+        )
+    } else {
+        Node::SlowCat(
+            pats.iter_mut()
+                .map(|p| p.take().expect("slot present"))
+                .collect(),
+        )
+    };
+    Pattern::of(node).split_queries().with_steps(steps)
+}
+
+/// [`fastcat`] taking patterns from a stack-allocated slice without an
+/// intermediate `Vec<Pattern>` heap allocation.
+pub fn fastcat_slice(pats: &mut [Option<Pattern>]) -> Pattern {
+    let n = pats.len();
+    if n == 0 {
+        return silence();
+    }
+    if n > 1 {
+        slowcat_slice_with_steps(pats, None)
+            .fast(Fraction::int(n as i128))
+            .with_steps(Some(Fraction::int(n as i128)))
+    } else {
+        slowcat_slice(pats)
+    }
 }
 
 fn slowcat_with_steps(mut pats: Vec<Pattern>, steps: Option<Fraction>) -> Pattern {

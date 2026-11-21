@@ -5120,6 +5120,12 @@ impl FunctionRef {
 
     /// Apply to an arbitrary pattern.
     pub fn apply(&self, pattern: crate::Pattern) -> crate::Pattern {
+        if self.runtime_settings.is_none()
+            && matches!(self.kind, FunctionKind::NativeProgram(_))
+            && !pattern.has_runtime_settings()
+        {
+            return self.apply_unbound(pattern);
+        }
         let owner = self
             .runtime_settings
             .clone()
@@ -5275,6 +5281,12 @@ impl FunctionRef {
         &self,
         pattern: crate::purity::PurePattern,
     ) -> Option<crate::purity::PurePattern> {
+        if self.runtime_settings.is_none()
+            && matches!(self.kind, FunctionKind::NativeProgram(_))
+            && !pattern.0.has_runtime_settings()
+        {
+            return self.apply_pure_unbound(pattern);
+        }
         let owner = self
             .runtime_settings
             .clone()

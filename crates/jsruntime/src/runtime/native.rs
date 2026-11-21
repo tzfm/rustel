@@ -825,6 +825,19 @@ impl<'p> Turn<'p> {
                 Some(Native::Pattern(spec.standalone_owned(value)))
             }
             BuiltinGlobal::List(kind) => {
+                if arguments.len() <= 8 {
+                    let mut buf: [Option<Pattern>; 8] = [const { None }; 8];
+                    for (slot, argument) in buf.iter_mut().zip(arguments) {
+                        let Native::Pattern(pattern) = self.part(names, argument, runtime)? else {
+                            return None;
+                        };
+                        *slot = Some(pattern);
+                    }
+                    return Some(Native::Pattern(list_slice(
+                        kind,
+                        &mut buf[..arguments.len()],
+                    )?));
+                }
                 let mut patterns = Vec::with_capacity(arguments.len());
                 for argument in arguments {
                     let Native::Pattern(pattern) = self.part(names, argument, runtime)? else {
@@ -1752,6 +1765,20 @@ fn list(kind: ListKind, mut patterns: Vec<Pattern>) -> Option<Pattern> {
         }
         ListKind::SlowCat => rustel_core::slowcat(patterns),
         ListKind::FastCat => rustel_core::fastcat(patterns),
+    })
+}
+
+fn list_slice(kind: ListKind, patterns: &mut [Option<Pattern>]) -> Option<Pattern> {
+    if patterns.is_empty() {
+        return None;
+    }
+    Some(match kind {
+        ListKind::Stack => rustel_core::stack_slice(patterns),
+        ListKind::SlowCat | ListKind::FastCat if patterns.len() == 1 => {
+            patterns[0].take().expect("one list value")
+        }
+        ListKind::SlowCat => rustel_core::slowcat_slice(patterns),
+        ListKind::FastCat => rustel_core::fastcat_slice(patterns),
     })
 }
 
